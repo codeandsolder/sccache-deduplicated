@@ -613,6 +613,7 @@ async fn get_compiler_outputs<T>(
 where
     T: Clone + CommandCreatorSync,
 {
+    let start = time::Instant::now();
     let mut arguments = arguments;
     arguments.extend([OsString::from("--print"), OsString::from("file-names")]);
     let prepared = super::rust_response::prepare(executable, &arguments)?;
@@ -628,7 +629,10 @@ where
 
     let outstr = String::from_utf8(outputs.stdout).context("Error parsing rustc output")?;
     if log_enabled!(Trace) {
-        trace!("get_compiler_outputs: {outstr:?}");
+        trace!(
+            "get_compiler_outputs in {}: {outstr:?}",
+            fmt_duration_as_secs(&start.elapsed())
+        );
     }
     Ok(outstr.lines().map(std::borrow::ToOwned::to_owned).collect())
 }
@@ -2836,17 +2840,35 @@ where
 
         let target_json_hash = hash_all(&target_json_files, pool);
 
+        // Output filenames depend on crate type, target and naming flags, not
+        // the canonical layout selected after source discovery. Query the compiler
+        // in the original namespace with the physical pre-pass arguments.
+        let outputs = async {
+            if let Some(metadata) = &self.parsed_args.metadata_only_output {
+                Ok(vec![metadata.clone()])
+            } else {
+                let arguments = prepass_os_string_arguments
+                    .iter()
+                    .flat_map(|(arg, val)| iter::once(arg).chain(val.as_ref()))
+                    .cloned()
+                    .collect();
+                get_compiler_outputs(creator, &self.executable, arguments, &cwd, &env_vars).await
+            }
+        };
+
         // Perform all hashing operations on the files.
         let (
             (source_files, source_hashes, mut env_deps, dep_info_text),
             extern_hashes,
             staticlib_hashes,
             target_json_hash,
+            mut outputs,
         ) = futures::try_join!(
             source_files_and_hashes_and_env_deps,
             extern_hashes,
             staticlib_hashes,
-            target_json_hash
+            target_json_hash,
+            outputs
         )?;
 
         if let Some(canonical) = canonical_paths.as_ref()
@@ -3138,27 +3160,6 @@ where
         // 10. The version of the compiler.
         self.version.hash(&mut HashToDigest { digest: &mut m });
 
-        // Turn arguments into a simple Vec<OsString> to calculate outputs.
-        let flat_os_string_arguments: Vec<OsString> = os_string_arguments
-            .iter()
-            .flat_map(|(arg, val)| iter::once(arg).chain(val.as_ref()))
-            .cloned()
-            .collect();
-
-        let mut outputs = if let Some(metadata) = &self.parsed_args.metadata_only_output {
-            vec![metadata.clone()]
-        } else {
-            // Linked outputs depend on the compiler and target. Query rustc
-            // rather than guessing executable or library naming conventions.
-            get_compiler_outputs(
-                creator,
-                &self.executable,
-                flat_os_string_arguments,
-                &cwd,
-                &env_vars,
-            )
-            .await?
-        };
         if self.parsed_args.emit.contains("metadata")
             && self.parsed_args.metadata_only_output.is_none()
         {
