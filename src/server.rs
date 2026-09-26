@@ -985,6 +985,13 @@ where
     /// Information tracking how many services (connected clients) are active.
     /// This field causes [`WaitUntilZero`] to wait until this struct drops.
     _info: ActiveInfo,
+
+    /// Notifications to deliver to the client while compiler is still running,
+    /// as [`Response::ArtifactNotification`], before [`CompileFinished`].
+    ///
+    /// `Some` only on the clone that owns a rustc compile task; `None` on the
+    /// shared service and every other clone.
+    notification_tx: Option<futures::channel::mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 type SccacheRequest = Message<Request, Body<()>>;
@@ -1174,6 +1181,7 @@ where
             creator: C::new(client),
             tx,
             _info: info,
+            notification_tx: None,
         }
     }
 
@@ -1192,6 +1200,7 @@ where
             creator: C::new(&client),
             tx,
             _info: info,
+            notification_tx: None,
         }
     }
 
@@ -1227,6 +1236,7 @@ where
             creator: C::new(&client),
             tx,
             _info: info,
+            notification_tx: None,
         }
     }
 
@@ -1316,6 +1326,14 @@ where
         std::mem::take(&mut *s)
     }
 
+    /// Artifact notifications to deliver to the client while the compiler is
+    /// still running before [`CompileFinished`].
+    ///
+    /// See [`SccacheService::notification_tx`] for more.
+    pub fn notification_tx(&self) -> Option<&futures::channel::mpsc::UnboundedSender<Vec<u8>>> {
+        self.notification_tx.as_ref()
+    }
+
     async fn merge_stats(&self, delta: ServerStats) {
         *self.stats.lock().await += delta;
     }
@@ -1356,6 +1374,8 @@ where
                 let mut finished = None;
                 while let Some(item) = body.next().await {
                     match item? {
+                        // Also part of `CompileFinished`'s stderr.
+                        Response::ArtifactNotification(_) => {}
                         Response::CompileFinished(f) => finished = Some(f),
                         _ => bail!("unexpected body response from compile_direct"),
                     }
@@ -1531,12 +1551,29 @@ where
                     CompilerArguments::Ok(hasher) => {
                         debug!("parse_arguments: Ok: {cmd:?}");
 
-                        let body = futures::stream::once(
-                            self.clone()
-                                .start_compile_task(c, hasher, cmd, cwd, env_vars)
-                                .map_ok(Response::CompileFinished),
-                        )
-                        .boxed();
+                        let body = if c.kind() == CompilerKind::Rust {
+                            // Only rustc emits artifact notifications,
+                            // for `.rmeta` pipelining.
+                            let (tx, rx) = futures::channel::mpsc::unbounded();
+                            let mut me = self.clone();
+                            me.notification_tx = Some(tx);
+                            let finished = util::spawn_on(
+                                &self.rt,
+                                me.start_compile_task(c, hasher, cmd, cwd, env_vars),
+                            );
+                            rx.map(|chunk| Ok(Response::ArtifactNotification(chunk)))
+                                .chain(futures::stream::once(async move {
+                                    finished.await?.map(Response::CompileFinished)
+                                }))
+                                .boxed()
+                        } else {
+                            futures::stream::once(
+                                self.clone()
+                                    .start_compile_task(c, hasher, cmd, cwd, env_vars)
+                                    .map_ok(Response::CompileFinished),
+                            )
+                            .boxed()
+                        };
 
                         return Message::WithBody(
                             Response::Compile(CompileResponse::CompileStarted),
@@ -3024,7 +3061,10 @@ mod tests {
 
         assert_eq!(Some(0), finished.retcode);
         assert!(
-            before_finished.is_empty(),
+            matches!(
+                before_finished.as_slice(),
+                [Response::ArtifactNotification(chunk)] if chunk == RMETA_NOTIFICATION
+            ),
             "delivered while the compiler runs: {before_finished:?}"
         );
         // The daemon leaves rustc's stderr intact.
