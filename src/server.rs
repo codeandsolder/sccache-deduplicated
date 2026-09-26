@@ -1358,33 +1358,40 @@ where
 
     /// Run a compile entirely in the current process (used in client-side mode).
     ///
-    /// Returns the `CompileResponse` variant and, when compilation started, the
-    /// accompanying `CompileFinished` result.
+    /// Returns a tuple of the `CompileResponse`, an optional `CompileFinished`,
+    /// and whether an artifact notification was written to `stderr` while the
+    /// compiler was still running.
     ///
     /// # Errors
     ///
     /// Returns an error if compilation handling fails, a body response cannot be
-    /// read, or the in-process protocol produces an unexpected response variant.
+    /// read or written, or the in-process protocol produces an unexpected response.
+
     pub async fn compile_direct(
         &self,
         compile: Compile,
-    ) -> Result<(CompileResponse, Option<CompileFinished>)> {
+        stderr: &mut dyn Write,
+    ) -> Result<(CompileResponse, Option<CompileFinished>, bool)> {
         match self.handle_compile(compile).await? {
             Message::WithBody(Response::Compile(resp), mut body) => {
                 let mut finished = None;
+                let mut forwarded_notification = false;
                 while let Some(item) = body.next().await {
                     match item? {
-                        // Also part of `CompileFinished`'s stderr.
-                        Response::ArtifactNotification(_) => {}
+                        Response::ArtifactNotification(chunk) => {
+                            stderr.write_all(&chunk)?;
+                            stderr.flush()?;
+                            forwarded_notification = true;
+                        }
                         Response::CompileFinished(f) => finished = Some(f),
                         _ => bail!("unexpected body response from compile_direct"),
                     }
                 }
                 let finished = finished
                     .ok_or_else(|| anyhow!("compile body ended without CompileFinished"))?;
-                Ok((resp, Some(finished)))
+                Ok((resp, Some(finished), forwarded_notification))
             }
-            Message::WithoutBody(Response::Compile(resp)) => Ok((resp, None)),
+            Message::WithoutBody(Response::Compile(resp)) => Ok((resp, None, false)),
             _ => bail!("unexpected response from handle_compile in compile_direct"),
         }
     }
@@ -3081,11 +3088,21 @@ mod tests {
     fn client_side_mode_rmeta_notification_delivery_on_rustc_miss() {
         let (_f, runtime, service, compile) = rustc_miss_fixture();
 
-        let (resp, finished) = runtime.block_on(service.compile_direct(compile)).unwrap();
+        let mut stderr = Vec::new();
+        let (resp, finished, forwarded) = runtime
+            .block_on(service.compile_direct(compile, &mut stderr))
+            .unwrap();
         let finished = finished.expect("compile started");
 
         assert!(matches!(resp, CompileResponse::CompileStarted));
         assert_eq!(Some(0), finished.retcode);
+        assert!(forwarded);
+        assert_eq!(
+            RMETA_NOTIFICATION,
+            stderr.as_slice(),
+            "forwarded while the compiler runs"
+        );
+        // The caller drops the copy in `CompileFinished`.
         assert_eq!(
             [RMETA_NOTIFICATION, OTHER_STDERR].concat(),
             finished.stderr,
