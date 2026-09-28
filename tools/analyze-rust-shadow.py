@@ -4,6 +4,7 @@ import collections
 import hashlib
 import json
 import pathlib
+import subprocess
 import sys
 import zipfile
 
@@ -94,25 +95,45 @@ def signature(record, drop=None):
     return json.dumps(parts, sort_keys=True, separators=(",", ":"), default=list)
 
 
+def iter_log_lines(path):
+    if path.suffix == ".zst":
+        proc = subprocess.Popen(
+            ["zstd", "-q", "-dc", str(path)],
+            stdout=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        assert proc.stdout is not None
+        try:
+            yield from proc.stdout
+        finally:
+            proc.stdout.close()
+            if proc.wait() != 0:
+                raise RuntimeError(f"zstd failed while reading {path}")
+    else:
+        with path.open("r", encoding="utf-8") as fh:
+            yield from fh
+
+
 def load_records(paths):
     records = []
     bad = 0
     for path in paths:
-        with path.open("r", encoding="utf-8") as fh:
-            for lineno, line in enumerate(fh, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    bad += 1
-                    print(f"{path}:{lineno}: invalid JSON: {exc}", file=sys.stderr)
-                    continue
-                if rec.get("schema") != 1 or "cache_key" not in rec:
-                    bad += 1
-                    continue
-                records.append(rec)
+        for lineno, line in enumerate(iter_log_lines(path), 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError as exc:
+                bad += 1
+                print(f"{path}:{lineno}: invalid JSON: {exc}", file=sys.stderr)
+                continue
+            if rec.get("schema") != 1 or "cache_key" not in rec:
+                bad += 1
+                continue
+            records.append(rec)
     return records, bad
 
 
