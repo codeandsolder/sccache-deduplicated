@@ -6,6 +6,7 @@ on:
 
 jobs:
   Snap:
+    if: github.repository == 'mozilla/sccache'
     runs-on: ubuntu-latest
 
     timeout-minutes: 45

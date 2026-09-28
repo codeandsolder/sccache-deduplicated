@@ -13,11 +13,13 @@
 // limitations under the License.
 
 use crate::cache::{FileObjectSource, Storage};
+#[cfg(target_os = "linux")]
+use crate::compiler::CompileCommandImpl;
 use crate::compiler::args::*;
 use crate::compiler::canonical_paths::CanonicalRustPaths;
 use crate::compiler::{
-    CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, CompileCommandImpl,
-    Compiler, CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, HashResult, Language,
+    CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, Compiler,
+    CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, HashResult, Language,
     SingleCompileCommand, c::ArtifactDescriptor,
 };
 #[cfg(feature = "dist-client")]
@@ -118,7 +120,6 @@ pub struct Rust {
     /// A shared, caching reader for rlib dependencies
     #[cfg(feature = "dist-client")]
     rlib_dep_reader: Option<Arc<RlibDepReader>>,
-    native_profile: String,
 }
 
 /// A struct on which to hang a `CompilerHasher` impl.
@@ -139,7 +140,9 @@ pub struct RustHasher {
     rlib_dep_reader: Option<Arc<RlibDepReader>>,
     /// Parsed arguments from the rustc invocation
     parsed_args: ParsedArguments,
-    native_profile: String,
+    // Normally resolved lazily only for invocations that actually request
+    // target-cpu=native. Tests may inject a profile to avoid spawning rustc.
+    native_profile: Option<String>,
 }
 
 /// a lookup proxy for determining the actual compiler used per file or directory
@@ -292,6 +295,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
 const CACHE_VERSION: &[u8] = b"6";
 
 /// Get absolute paths for all source files and env-deps listed in rustc's dep-info output.
+#[allow(clippy::too_many_arguments)]
 async fn get_source_files_and_env_deps<T>(
     creator: &T,
     crate_name: &str,
@@ -686,7 +690,20 @@ fn append_rust_shadow_record(path: &Path, record: &RustShadowRecord) {
         .create(true)
         .append(true)
         .open(path)
-        .and_then(|mut file| file.write_all(&encoded));
+        .and_then(|mut file| {
+            let written = file.write(&encoded)?;
+            if written == encoded.len() {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!(
+                        "short Rust shadow telemetry append: {written}/{} bytes",
+                        encoded.len()
+                    ),
+                ))
+            }
+        });
 
     if let Err(error) = result
         && !WARNED_RUST_SHADOW_LOG.swap(true, Ordering::Relaxed)
@@ -848,7 +865,6 @@ fn canonical_bwrap_arguments(
     let arguments = arguments
         .iter()
         .flat_map(|arg| arg.iter_os_strings())
-        .map(|arg| arg.to_owned())
         .collect::<Vec<_>>();
     canonical.bwrap_arguments(executable, &arguments, cwd)
 }
@@ -874,18 +890,6 @@ impl Rust {
             .map(|l| &l[6..])
             .context("rustc verbose version didn't have a line for `host:`")?
             .to_string();
-
-        let native_profile = cached_native_profile(
-            creator.clone(),
-            &executable,
-            rustc_verbose_version,
-            env_vars,
-        )
-        .await
-        .unwrap_or_else(|e| {
-            warn!("Failed to resolve rustc native CPU profile: {e:#}");
-            format!("unresolved:{host}")
-        });
 
         // it's fine to use the `executable` directly no matter if proxied or not
         let mut cmd = creator.new_command_sync(&executable);
@@ -955,7 +959,6 @@ impl Rust {
                 sysroot,
                 compiler_shlibs_digests: digests,
                 rlib_dep_reader,
-                native_profile: native_profile.clone(),
             })
         }
 
@@ -968,7 +971,6 @@ impl Rust {
                 version: rustc_verbose_version.to_string(),
                 sysroot,
                 compiler_shlibs_digests: digests,
-                native_profile: native_profile.clone(),
             })
         }
     }
@@ -1015,7 +1017,7 @@ where
                 #[cfg(feature = "dist-client")]
                 rlib_dep_reader: self.rlib_dep_reader.clone(),
                 parsed_args: args,
-                native_profile: self.native_profile.clone(),
+                native_profile: None,
             })),
             CompilerArguments::NotCompilation => CompilerArguments::NotCompilation,
             CompilerArguments::CannotCache(why, extra_info) => {
@@ -1870,9 +1872,11 @@ where
         let native_requested = native_target_requested(&effective_arguments);
         let target = compilation_target(&effective_arguments, &self.host);
         let mut allow_dist = true;
+        let mut resolved_native_profile = None;
         if native_requested && may_dist {
             if target.starts_with("x86_64-") {
                 rewrite_native_target_cpu(&mut effective_arguments, "x86-64-v2");
+                resolved_native_profile = Some("x86-64-v2".to_owned());
                 if !WARNED_DIST_NATIVE_PORTABLE.swap(true, Ordering::Relaxed) {
                     warn!(
                         "distributed Rust compile requested -C target-cpu=native; using x86-64-v2 for deterministic heterogeneous-worker codegen (performance may be reduced)"
@@ -1884,6 +1888,25 @@ where
                     "distributed Rust compile requested -C target-cpu=native for {target}; compiling locally because no portable native policy is defined for this target"
                 );
             }
+        }
+
+        if native_requested && (!may_dist || !allow_dist) {
+            let profile = if let Some(profile) = self.native_profile.as_ref() {
+                profile.clone()
+            } else {
+                cached_native_profile(
+                    (*creator).clone(),
+                    &self.executable,
+                    &self.version,
+                    &env_vars,
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("Failed to resolve rustc native CPU profile: {e:#}");
+                    format!("unresolved:{}", self.host)
+                })
+            };
+            resolved_native_profile = Some(profile);
         }
 
         let canonical_paths = CanonicalRustPaths::from_env(&env_vars, &cwd, &self.sysroot);
@@ -2012,18 +2035,17 @@ where
             target_json_hash
         )?;
 
-        if let Some(canonical) = canonical_paths.as_ref() {
-            if let Some(path) = source_files
+        if let Some(canonical) = canonical_paths.as_ref()
+            && let Some(path) = source_files
                 .iter()
                 .chain(abs_externs.iter())
                 .chain(abs_staticlibs.iter())
                 .find(|path| !canonical.root_is_known(path))
-            {
-                bail!(
-                    "canonical Rust build input {} is outside declared roots",
-                    path.display()
-                );
-            }
+        {
+            bail!(
+                "canonical Rust build input {} is outside declared roots",
+                path.display()
+            );
         }
 
         let shadow_inputs = shadow_log_path.as_ref().map(|_| {
@@ -2102,7 +2124,9 @@ where
         };
         args.hash(&mut HashToDigest { digest: &mut m });
         if native_requested && (!may_dist || !target.starts_with("x86_64-")) {
-            self.native_profile
+            resolved_native_profile
+                .as_ref()
+                .expect("native profile must be resolved for local native compilation")
                 .hash(&mut HashToDigest { digest: &mut m });
         }
         // 4. The digest of all source files (this includes src file from cmdline).
@@ -2368,7 +2392,7 @@ where
                 may_dist,
                 allow_dist,
                 native_requested,
-                resolved_native_profile: native_requested.then(|| self.native_profile.clone()),
+                resolved_native_profile: resolved_native_profile.clone(),
                 canonical_enabled: canonical.is_some(),
                 canonical_roots: rust_shadow_roots(canonical),
                 cwd_raw: cwd.to_string_lossy().into_owned(),
@@ -2496,6 +2520,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             }
             #[cfg(not(target_os = "linux"))]
             {
+                let _ = canonical;
                 bail!("experimental canonical Rust paths currently require Linux bubblewrap")
             }
         } else {
@@ -2800,6 +2825,47 @@ fn maybe_add_cargo_toml(input_path: &Path, verify: bool) -> Option<PathBuf> {
     }
 }
 
+#[cfg(feature = "dist-client")]
+fn lexical_parent_traversal_dirs(path: &Path) -> Vec<PathBuf> {
+    let mut current = PathBuf::new();
+    let mut required = Vec::new();
+
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                // Path lookup must enter the preceding component before a parent
+                // step. A tar containing only the normalized target file may omit
+                // that directory entirely, causing rustc to get ENOENT.
+                if !current.as_os_str().is_empty() {
+                    required.push(current.clone());
+                    current.pop();
+                }
+            }
+            std::path::Component::CurDir => {}
+            _ => current.push(component.as_os_str()),
+        }
+    }
+
+    required
+}
+
+#[test]
+#[cfg(feature = "dist-client")]
+fn test_lexical_parent_traversal_dirs() {
+    let path = Path::new(
+        "/cargo/libc/src/new/glibc/sysdeps/nptl/bits/../../x86/nptl/bits/struct_mutex.rs",
+    );
+    assert_eq!(
+        lexical_parent_traversal_dirs(path),
+        vec![
+            PathBuf::from("/cargo/libc/src/new/glibc/sysdeps/nptl/bits"),
+            PathBuf::from("/cargo/libc/src/new/glibc/sysdeps/nptl"),
+        ]
+    );
+
+    assert!(lexical_parent_traversal_dirs(Path::new("/cargo/libc/src/lib.rs")).is_empty());
+}
+
 #[test]
 #[cfg(feature = "dist-client")]
 fn test_maybe_add_cargo_toml() {
@@ -2862,7 +2928,25 @@ impl pkg::InputsPackager for RustInputsPackager {
         };
 
         let mut tar_inputs = vec![];
+        let mut tar_traversal_dirs = vec![];
         for input_path in inputs {
+            for traversal_dir in lexical_parent_traversal_dirs(&input_path) {
+                if !traversal_dir.is_dir() {
+                    bail!(
+                        "distributed Rust input requires missing traversal directory {}",
+                        traversal_dir.display()
+                    );
+                }
+                let dist_traversal_dir =
+                    path_transformer.as_dist(&traversal_dir).with_context(|| {
+                        format!(
+                            "unable to transform traversal directory {}",
+                            traversal_dir.display()
+                        )
+                    })?;
+                tar_traversal_dirs.push((traversal_dir, dist_traversal_dir));
+            }
+
             let input_path = pkg::simplify_path(&input_path)?;
             if let Some(ext) = input_path.extension() {
                 if !super::CAN_DIST_DYLIBS && ext == DLL_EXTENSION {
@@ -2984,6 +3068,9 @@ impl pkg::InputsPackager for RustInputsPackager {
         // There are almost certainly duplicates from explicit externs also within the lib search paths
         all_tar_inputs.dedup();
 
+        tar_traversal_dirs.sort_by(|a, b| a.1.cmp(&b.1));
+        tar_traversal_dirs.dedup_by(|a, b| a.1 == b.1);
+
         // If we're just creating an rlib then the only thing inspected inside dependency rlibs is the
         // metadata, in which case we can create a trimmed rlib (which is actually a .a) with the metadata
         let can_trim_rlibs = matches!(
@@ -2995,6 +3082,14 @@ impl pkg::InputsPackager for RustInputsPackager {
         );
 
         let mut builder = tar::Builder::new(wtr);
+
+        for (local_dir, dist_dir) in tar_traversal_dirs {
+            let tar_dir = dist_dir.trim_start_matches('/');
+            if tar_dir.is_empty() || tar_dir.split('/').any(|part| part == "..") {
+                bail!("unsafe distributed traversal directory {dist_dir}");
+            }
+            builder.append_dir(tar_dir, local_dir)?;
+        }
 
         for (input_path, dist_input_path) in all_tar_inputs.iter() {
             let mut file_header = pkg::make_tar_header(input_path, dist_input_path)?;
@@ -4315,7 +4410,7 @@ proc_macro false
             compiler_shlibs_digests: vec![FAKE_DIGEST.to_owned()],
             #[cfg(feature = "dist-client")]
             rlib_dep_reader: None,
-            native_profile: "test-native".into(),
+            native_profile: Some("test-native".into()),
             parsed_args: ParsedArguments {
                 arguments: vec![
                     Argument::Raw("a".into()),
@@ -4450,7 +4545,7 @@ proc_macro false
             compiler_shlibs_digests: vec![],
             #[cfg(feature = "dist-client")]
             rlib_dep_reader: None,
-            native_profile: "test-native".into(),
+            native_profile: Some("test-native".into()),
             parsed_args,
         });
 
@@ -4513,7 +4608,7 @@ proc_macro false
                 compiler_shlibs_digests: vec![],
                 #[cfg(feature = "dist-client")]
                 rlib_dep_reader: None,
-                native_profile: profile.to_owned(),
+                native_profile: Some(profile.to_owned()),
                 parsed_args: parsed_args.clone(),
             };
             mock_dep_info(&creator, &["foo.rs"]);
