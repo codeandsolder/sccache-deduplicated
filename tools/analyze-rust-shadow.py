@@ -116,9 +116,29 @@ def iter_log_lines(path):
             yield from fh
 
 
+def recover_embedded_records(line):
+    decoder = json.JSONDecoder()
+    recovered = []
+    marker = '{"schema":'
+    start = 0
+    while True:
+        start = line.find(marker, start)
+        if start < 0:
+            return recovered
+        try:
+            rec, _ = decoder.raw_decode(line[start:])
+        except json.JSONDecodeError:
+            start += len(marker)
+            continue
+        if isinstance(rec, dict) and rec.get("schema") == 1 and "cache_key" in rec:
+            recovered.append(rec)
+        start += len(marker)
+
+
 def load_records(paths):
     records = []
     bad = 0
+    recovered = 0
     for path in paths:
         for lineno, line in enumerate(iter_log_lines(path), 1):
             line = line.strip()
@@ -127,6 +147,15 @@ def load_records(paths):
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError as exc:
+                salvaged = recover_embedded_records(line)
+                if salvaged:
+                    records.extend(salvaged)
+                    recovered += len(salvaged)
+                    print(
+                        f"{path}:{lineno}: recovered {len(salvaged)} embedded record(s) from invalid JSON: {exc}",
+                        file=sys.stderr,
+                    )
+                    continue
                 bad += 1
                 print(f"{path}:{lineno}: invalid JSON: {exc}", file=sys.stderr)
                 continue
@@ -134,7 +163,7 @@ def load_records(paths):
                 bad += 1
                 continue
             records.append(rec)
-    return records, bad
+    return records, bad, recovered
 
 
 def normalization_summary(records):
@@ -224,7 +253,7 @@ def main():
     ap.add_argument("--json-out", type=pathlib.Path)
     args = ap.parse_args()
 
-    records, bad = load_records(args.logs)
+    records, bad, recovered = load_records(args.logs)
     if not records:
         raise SystemExit("no valid telemetry records")
 
@@ -240,6 +269,7 @@ def main():
     report = {
         "records": len(records),
         "invalid_records": bad,
+        "recovered_records": recovered,
         "distinct_cache_keys": len({r["cache_key"] for r in records}),
         "normalization_changes": dict(counts),
         "normalization_examples": dict(examples),

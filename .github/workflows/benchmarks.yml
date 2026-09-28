@@ -18,6 +18,7 @@ concurrency:
 
 jobs:
   benchmarks:
+    if: github.repository == 'mozilla/sccache'
     name: Run ${{ matrix.mode }} benchmarks (CodSpeed)
     runs-on: ubuntu-latest
     strategy:
