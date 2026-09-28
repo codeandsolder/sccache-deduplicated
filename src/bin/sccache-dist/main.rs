@@ -351,6 +351,10 @@ pub struct Scheduler {
     servers: Mutex<HashMap<ServerId, ServerDetails>>,
 }
 
+fn remove_assigned_job(jobs_assigned: &mut HashSet<JobId>, job_id: JobId) -> bool {
+    jobs_assigned.remove(&job_id)
+}
+
 struct ServerDetails {
     jobs_assigned: HashSet<JobId>,
     // Jobs assigned that haven't seen a state change. Can only be pending
@@ -721,7 +725,13 @@ impl SchedulerIncoming for Scheduler {
                 (JobState::Started, JobState::Complete) => {
                     let (job_id, _) = entry.remove_entry();
                     if let Some(entry) = server_details {
-                        assert!(entry.jobs_assigned.remove(&job_id))
+                        if !remove_assigned_job(&mut entry.jobs_assigned, job_id) {
+                            warn!(
+                                "Completed job {} was already absent from server {} assignment set",
+                                job_id,
+                                server_id.addr()
+                            );
+                        }
                     } else {
                         bail!("Job was marked as finished, but server is not known to scheduler")
                     }
@@ -851,5 +861,20 @@ impl ServerIncoming for Server {
             .do_update_job_state(job_id, JobState::Complete)
             .context("Updating job state failed")?;
         res
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+
+    #[test]
+    fn assigned_job_removal_is_idempotent() {
+        let job_id = JobId(42);
+        let mut assigned = HashSet::from([job_id]);
+
+        assert!(remove_assigned_job(&mut assigned, job_id));
+        assert!(!remove_assigned_job(&mut assigned, job_id));
+        assert!(assigned.is_empty());
     }
 }
