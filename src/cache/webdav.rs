@@ -1,0 +1,45 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::errors::*;
+use opendal::OperationContext;
+use opendal::Operator;
+use opendal::services::Webdav;
+use opendal_layer_logging::LoggingLayer;
+
+use super::http_client::set_user_agent;
+
+/// A cache that stores entries in a Webdav.
+pub struct WebdavCache;
+
+impl WebdavCache {
+    /// Create a new `WebdavCache`.
+    pub fn build(
+        endpoint: &str,
+        key_prefix: &str,
+        username: Option<&str>,
+        password: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<Operator> {
+        let builder = Webdav::default()
+            .endpoint(endpoint)
+            .root(key_prefix)
+            .username(username.unwrap_or_default())
+            .password(password.unwrap_or_default())
+            .token(token.unwrap_or_default());
+
+        let op = Operator::new(builder)?
+            .with_context(OperationContext::new().with_http_transport(set_user_agent()))
+            .layer(LoggingLayer::default());
+        Ok(op)
+    }
+}
