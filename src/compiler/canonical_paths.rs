@@ -584,9 +584,9 @@ mod tests {
 
         let pairs = args.windows(2).collect::<Vec<_>>();
         assert!(
-            pairs.iter().any(|pair| {
-                pair[0] == OsString::from("--dir") && pair[1] == OsString::from("/target")
-            }),
+            pairs
+                .iter()
+                .any(|pair| pair[0] == "--dir" && pair[1] == "/target"),
             "{args:?}"
         );
         assert!(!args.iter().any(|arg| arg == missing_target.as_os_str()));
