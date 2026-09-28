@@ -1,0 +1,466 @@
+use crate::dist;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RootMapping {
+    aliases: Vec<PathBuf>,
+    canonical: PathBuf,
+}
+
+impl RootMapping {
+    fn new(physical: PathBuf, canonical: &str) -> Self {
+        let mut aliases = vec![physical.clone()];
+        if let Ok(real) = physical.canonicalize()
+            && real != physical
+        {
+            aliases.push(real);
+        }
+        Self {
+            aliases,
+            canonical: PathBuf::from(canonical),
+        }
+    }
+
+    fn to_canonical(&self, path: &Path) -> Option<PathBuf> {
+        self.aliases.iter().find_map(|physical| {
+            path.strip_prefix(physical)
+                .ok()
+                .map(|suffix| self.canonical.join(suffix))
+        })
+    }
+
+    #[cfg(test)]
+    fn to_physical(&self, path: &Path) -> Option<PathBuf> {
+        path.strip_prefix(&self.canonical)
+            .ok()
+            .map(|suffix| self.aliases[0].join(suffix))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CanonicalRustPaths {
+    roots: Vec<RootMapping>,
+    pub(crate) build_root: PathBuf,
+    pub(crate) target_root: PathBuf,
+    pub(crate) cargo_home: Option<PathBuf>,
+    pub(crate) rust_root: PathBuf,
+}
+
+fn env_value(env: &[(OsString, OsString)], name: &str) -> Option<PathBuf> {
+    env.iter()
+        .rev()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| PathBuf::from(v))
+}
+
+fn enabled(env: &[(OsString, OsString)]) -> bool {
+    env.iter()
+        .rev()
+        .find(|(k, _)| k == "SCCACHE_EXPERIMENTAL_CANONICAL_RUST")
+        .is_some_and(|(_, v)| v == "1")
+}
+
+fn topmost_cargo_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .filter(|ancestor| ancestor.join("Cargo.toml").is_file())
+        .last()
+        .map(Path::to_owned)
+}
+
+fn path_env(name: &OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some(
+            "CARGO"
+                | "CARGO_HOME"
+                | "CARGO_INSTALL_ROOT"
+                | "CARGO_MANIFEST_DIR"
+                | "CARGO_MANIFEST_PATH"
+                | "CARGO_TARGET_DIR"
+                | "CARGO_TARGET_TMPDIR"
+                | "OUT_DIR"
+                | "PWD"
+                | "RUSTC"
+                | "RUSTDOC"
+        )
+    ) || name
+        .to_str()
+        .is_some_and(|name| name.starts_with("CARGO_BIN_EXE_"))
+}
+
+impl CanonicalRustPaths {
+    pub(crate) fn from_rustc_executable(
+        env: &[(OsString, OsString)],
+        cwd: &Path,
+        executable: &Path,
+    ) -> Option<Self> {
+        let rust_root = executable.parent()?.parent()?;
+        Self::from_env(env, cwd, rust_root)
+    }
+
+    pub(crate) fn from_env(
+        env: &[(OsString, OsString)],
+        cwd: &Path,
+        rust_root: &Path,
+    ) -> Option<Self> {
+        if !enabled(env) {
+            return None;
+        }
+
+        let build_root = env_value(env, "SCCACHE_CANONICAL_BUILD_ROOT")
+            .or_else(|| topmost_cargo_root(cwd))
+            .or_else(|| {
+                env_value(env, "CARGO_MANIFEST_DIR")
+                    .and_then(|manifest_dir| topmost_cargo_root(&manifest_dir))
+            })?;
+
+        let target_root = env_value(env, "SCCACHE_CANONICAL_TARGET_ROOT")
+            .or_else(|| env_value(env, "CARGO_TARGET_DIR"))
+            .unwrap_or_else(|| build_root.join("target"));
+        let cargo_home = env_value(env, "SCCACHE_CANONICAL_CARGO_HOME")
+            .or_else(|| env_value(env, "CARGO_HOME"))
+            .or_else(|| env_value(env, "HOME").map(|home| home.join(".cargo")));
+
+        let mut roots = vec![
+            RootMapping::new(target_root.clone(), "/target"),
+            RootMapping::new(build_root.clone(), "/build"),
+        ];
+        if let Some(ref cargo_home) = cargo_home {
+            roots.push(RootMapping::new(cargo_home.clone(), "/cargo"));
+        }
+        roots.push(RootMapping::new(rust_root.to_owned(), "/rust"));
+
+        Some(Self {
+            roots,
+            build_root,
+            target_root,
+            cargo_home,
+            rust_root: rust_root.to_owned(),
+        })
+    }
+
+    pub(crate) fn to_canonical(&self, path: &Path) -> PathBuf {
+        self.roots
+            .iter()
+            .find_map(|root| root.to_canonical(path))
+            .unwrap_or_else(|| path.to_owned())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn to_physical(&self, path: &Path) -> PathBuf {
+        self.roots
+            .iter()
+            .find_map(|root| root.to_physical(path))
+            .unwrap_or_else(|| path.to_owned())
+    }
+
+    pub(crate) fn os_to_canonical(&self, value: &OsStr) -> OsString {
+        let path = Path::new(value);
+        if path.is_absolute() {
+            self.to_canonical(path).into_os_string()
+        } else {
+            value.to_owned()
+        }
+    }
+
+    pub(crate) fn normalize_os_value(&self, value: &OsStr) -> OsString {
+        let Some(mut text) = value.to_str().map(str::to_owned) else {
+            return self.os_to_canonical(value);
+        };
+
+        let mut replacements = self
+            .roots
+            .iter()
+            .flat_map(|root| {
+                root.aliases.iter().filter_map(move |alias| {
+                    alias.to_str().map(|alias| {
+                        (
+                            alias.to_owned(),
+                            root.canonical.to_string_lossy().into_owned(),
+                        )
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        replacements.sort_by_key(|(physical, _)| std::cmp::Reverse(physical.len()));
+
+        for (physical, canonical) in replacements {
+            text = text.replace(&physical, &canonical);
+        }
+        text.into()
+    }
+
+    pub(crate) fn canonical_cwd(&self, cwd: &Path) -> PathBuf {
+        self.to_canonical(cwd)
+    }
+
+    pub(crate) fn canonical_executable(&self, executable: &Path) -> PathBuf {
+        self.to_canonical(executable)
+    }
+
+    pub(crate) fn root_is_known(&self, path: &Path) -> bool {
+        self.roots
+            .iter()
+            .any(|root| root.aliases.iter().any(|alias| path.starts_with(alias)))
+    }
+
+    pub(crate) fn env_to_canonical(
+        &self,
+        env: &[(OsString, OsString)],
+    ) -> Vec<(OsString, OsString)> {
+        env.iter()
+            .filter(|(k, _)| {
+                k != "SCCACHE_EXPERIMENTAL_CANONICAL_RUST"
+                    && !k.to_string_lossy().starts_with("SCCACHE_CANONICAL_")
+            })
+            .map(|(k, v)| {
+                let value = if matches!(k.to_str(), Some("TMPDIR" | "TMP" | "TEMP" | "TEMPDIR")) {
+                    OsString::from("/tmp")
+                } else if k == "HOME" {
+                    OsString::from("/tmp/home")
+                } else if k == "RUSTC" {
+                    OsString::from("/rust/bin/rustc")
+                } else if k == "RUSTDOC" {
+                    OsString::from("/rust/bin/rustdoc")
+                } else if path_env(k) {
+                    self.os_to_canonical(v)
+                } else {
+                    self.normalize_os_value(v)
+                };
+                (k.clone(), value)
+            })
+            .collect()
+    }
+
+    pub(crate) fn env_value_to_canonical(&self, name: &OsStr, value: &OsStr) -> OsString {
+        if matches!(name.to_str(), Some("TMPDIR" | "TMP" | "TEMP" | "TEMPDIR")) {
+            OsString::from("/tmp")
+        } else if name == "HOME" {
+            OsString::from("/tmp/home")
+        } else if name == "RUSTC" {
+            OsString::from("/rust/bin/rustc")
+        } else if name == "RUSTDOC" {
+            OsString::from("/rust/bin/rustdoc")
+        } else if path_env(name) {
+            self.os_to_canonical(value)
+        } else {
+            self.normalize_os_value(value)
+        }
+    }
+
+    pub(crate) fn add_to_transformer(&self, transformer: &mut dist::PathTransformer) {
+        for root in &self.roots {
+            transformer
+                .add_root_mapping(root.aliases[0].clone(), &root.canonical.to_string_lossy());
+            for alias in root.aliases.iter().skip(1) {
+                transformer.add_root_mapping(alias.clone(), &root.canonical.to_string_lossy());
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn bwrap_arguments(
+        &self,
+        executable: &Path,
+        arguments: &[OsString],
+        cwd: &Path,
+    ) -> Vec<OsString> {
+        let mut out = Vec::<OsString>::new();
+
+        macro_rules! push {
+            ($value:expr) => {
+                out.push(OsString::from($value))
+            };
+        }
+
+        push!("--die-with-parent");
+        push!("--tmpfs");
+        push!("/");
+        push!("--proc");
+        push!("/proc");
+        push!("--dev-bind");
+        push!("/dev");
+        push!("/dev");
+
+        for system in ["/usr", "/usr/local", "/etc", "/bin", "/lib", "/lib64"] {
+            if Path::new(system).exists() {
+                push!("--ro-bind");
+                push!(system);
+                push!(system);
+            }
+        }
+
+        for (physical, virtual_path) in self.mappings() {
+            if physical.exists() {
+                if virtual_path == Path::new("/target") {
+                    push!("--bind");
+                } else {
+                    push!("--ro-bind");
+                }
+                out.push(physical.as_os_str().to_owned());
+                out.push(virtual_path.as_os_str().to_owned());
+            } else {
+                push!("--dir");
+                out.push(virtual_path.as_os_str().to_owned());
+            }
+        }
+
+        push!("--tmpfs");
+        push!("/tmp");
+        push!("--dir");
+        push!("/tmp/home");
+        push!("--chdir");
+        out.push(self.canonical_cwd(cwd).into_os_string());
+        push!("--");
+        out.push(self.canonical_executable(executable).into_os_string());
+        out.extend(arguments.iter().map(|arg| self.normalize_os_value(arg)));
+        out
+    }
+
+    pub(crate) fn mappings(&self) -> impl Iterator<Item = (&Path, &Path)> {
+        self.roots
+            .iter()
+            .map(|root| (root.aliases[0].as_path(), root.canonical.as_path()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_roots_with_target_precedence() {
+        let env = vec![
+            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+            ("SCCACHE_CANONICAL_BUILD_ROOT".into(), "/work/a".into()),
+            (
+                "SCCACHE_CANONICAL_TARGET_ROOT".into(),
+                "/work/a/target".into(),
+            ),
+            (
+                "SCCACHE_CANONICAL_CARGO_HOME".into(),
+                "/home/u/.cargo".into(),
+            ),
+        ];
+        let roots =
+            CanonicalRustPaths::from_env(&env, Path::new("/work/a"), Path::new("/opt/rust"))
+                .unwrap();
+        assert_eq!(
+            roots.to_canonical(Path::new("/work/a/src/lib.rs")),
+            PathBuf::from("/build/src/lib.rs")
+        );
+        assert_eq!(
+            roots.to_canonical(Path::new("/work/a/target/release/deps/x.rlib")),
+            PathBuf::from("/target/release/deps/x.rlib")
+        );
+        assert_eq!(
+            roots.to_canonical(Path::new("/home/u/.cargo/registry/src/x/lib.rs")),
+            PathBuf::from("/cargo/registry/src/x/lib.rs")
+        );
+        assert_eq!(
+            roots.to_canonical(Path::new("/opt/rust/lib/rustlib/x")),
+            PathBuf::from("/rust/lib/rustlib/x")
+        );
+        assert_eq!(
+            roots.to_physical(Path::new("/build/src/lib.rs")),
+            PathBuf::from("/work/a/src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn normalizes_embedded_root_strings() {
+        let env = vec![
+            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+            ("SCCACHE_CANONICAL_BUILD_ROOT".into(), "/work/a".into()),
+            ("SCCACHE_CANONICAL_TARGET_ROOT".into(), "/cache/a".into()),
+        ];
+        let roots =
+            CanonicalRustPaths::from_env(&env, Path::new("/work/a"), Path::new("/opt/rust"))
+                .unwrap();
+        assert_eq!(
+            roots.normalize_os_value(OsStr::new("prefix=/work/a/src/lib.rs")),
+            OsString::from("prefix=/build/src/lib.rs")
+        );
+        assert_eq!(
+            roots.normalize_os_value(OsStr::new("x=/cache/a/debug;y=/work/a")),
+            OsString::from("x=/target/debug;y=/build")
+        );
+    }
+
+    #[test]
+    fn defaults_cargo_home_from_home() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname='x'\nversion='0.0.0'\n",
+        )
+        .unwrap();
+        let home = temp.path().join("home");
+        let env = vec![
+            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+            ("HOME".into(), home.clone().into_os_string()),
+        ];
+        let roots = CanonicalRustPaths::from_env(&env, temp.path(), Path::new("/rust")).unwrap();
+        assert_eq!(roots.cargo_home, Some(home.join(".cargo")));
+    }
+
+    #[test]
+    fn canonicalizes_common_temp_environment_variables() {
+        let env = vec![
+            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+            ("SCCACHE_CANONICAL_BUILD_ROOT".into(), "/work/a".into()),
+        ];
+        let roots =
+            CanonicalRustPaths::from_env(&env, Path::new("/work/a"), Path::new("/rust")).unwrap();
+        for name in ["TMPDIR", "TMP", "TEMP", "TEMPDIR"] {
+            assert_eq!(
+                roots.env_value_to_canonical(OsStr::new(name), OsStr::new("/host/tmp")),
+                OsString::from("/tmp")
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bwrap_uses_empty_dir_for_missing_target_root() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname='x'\nversion='0.0.0'\n",
+        )
+        .unwrap();
+        let missing_target = temp.path().join("missing-target");
+        let env = vec![
+            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+            (
+                "CARGO_TARGET_DIR".into(),
+                missing_target.clone().into_os_string(),
+            ),
+        ];
+        let roots = CanonicalRustPaths::from_env(&env, temp.path(), Path::new("/rust")).unwrap();
+        let args = roots.bwrap_arguments(
+            Path::new("/rust/bin/rustc"),
+            &[OsString::from("-vV")],
+            temp.path(),
+        );
+
+        let pairs = args.windows(2).collect::<Vec<_>>();
+        assert!(
+            pairs.iter().any(|pair| {
+                pair[0] == OsString::from("--dir") && pair[1] == OsString::from("/target")
+            }),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|arg| arg == missing_target.as_os_str()));
+    }
+
+    #[test]
+    fn disabled_without_opt_in() {
+        let env = vec![("SCCACHE_CANONICAL_BUILD_ROOT".into(), "/work/a".into())];
+        assert!(
+            CanonicalRustPaths::from_env(&env, Path::new("/work/a"), Path::new("/rust")).is_none()
+        );
+    }
+}

@@ -82,6 +82,7 @@ mod toolchain_imp {
         // These are _not_ tar safe, and must be made so before being added to the tar (see
         // `tar_safe_path`).
         symlinks: BTreeMap<PathBuf, PathBuf>,
+        root_mappings: Vec<(PathBuf, PathBuf)>,
     }
 
     impl ToolchainPackageBuilder {
@@ -90,7 +91,15 @@ mod toolchain_imp {
                 dir_set: BTreeMap::new(),
                 file_set: BTreeMap::new(),
                 symlinks: BTreeMap::new(),
+                root_mappings: Vec::new(),
             }
+        }
+
+        pub fn add_root_mapping(&mut self, local_root: PathBuf, archive_root: PathBuf) {
+            let local_root = local_root.canonicalize().unwrap_or(local_root);
+            self.root_mappings.push((local_root, archive_root));
+            self.root_mappings
+                .sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
         }
 
         pub fn add_common(&mut self) -> Result<()> {
@@ -188,6 +197,7 @@ mod toolchain_imp {
                 dir_set,
                 file_set,
                 symlinks,
+                root_mappings: _,
             } = self;
             let par: ParCompress<'_, Gzip, W> = ParCompressBuilder::new()
                 .compression_level(Compression::default())
@@ -217,12 +227,35 @@ mod toolchain_imp {
         ///
         /// Symlinks in the path are recorded for inclusion in the tarball.
         fn tarify_path(&mut self, path: &Path) -> Result<PathBuf> {
-            SimplifyPath {
+            let simplified = SimplifyPath {
                 resolved_symlinks: Some(&mut self.symlinks),
             }
-            .simplify(path)
-            .map(tar_safe_path)
+            .simplify(path)?;
+
+            for (local_root, archive_root) in &self.root_mappings {
+                if let Ok(suffix) = simplified.strip_prefix(local_root) {
+                    return Ok(tar_safe_path(archive_root.join(suffix)));
+                }
+            }
+
+            Ok(tar_safe_path(simplified))
         }
+    }
+
+    #[test]
+    fn toolchain_root_mapping_changes_archive_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let sysroot = temp.path().join("toolchain");
+        std::fs::create_dir_all(sysroot.join("bin")).unwrap();
+        let rustc = sysroot.join("bin/rustc");
+        std::fs::write(&rustc, b"rustc").unwrap();
+
+        let mut builder = ToolchainPackageBuilder::new();
+        builder.add_root_mapping(sysroot, PathBuf::from("/rust"));
+        assert_eq!(
+            builder.tarify_path(&rustc).unwrap(),
+            PathBuf::from("rust/bin/rustc")
+        );
     }
 
     /// Strip a leading slash, if any.
