@@ -36,6 +36,7 @@ use fs_err as fs;
 use log::Level::Trace;
 #[cfg(feature = "dist-client")]
 use semver::Version;
+use serde::Serialize;
 #[cfg(feature = "dist-client")]
 use std::borrow::Borrow;
 use std::borrow::Cow;
@@ -48,11 +49,12 @@ use std::env::consts::DLL_PREFIX;
 use std::env::consts::EXE_EXTENSION;
 use std::ffi::OsString;
 use std::fmt;
+use std::fs::OpenOptions;
 use std::future::Future;
 use std::hash::Hash;
 #[cfg(feature = "dist-client")]
 use std::io;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
 use std::iter;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -476,6 +478,224 @@ fn hashes_in_canonical_path_order(
         .collect::<Vec<_>>();
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
     pairs.into_iter().map(|(_, hash)| hash).collect()
+}
+
+const RUST_SHADOW_LOG_ENV: &str = "SCCACHE_RUST_SHADOW_LOG";
+
+static RUST_SHADOW_LOG_LOCK: LazyLock<std::sync::Mutex<()>> =
+    LazyLock::new(|| std::sync::Mutex::new(()));
+static WARNED_RUST_SHADOW_LOG: AtomicBool = AtomicBool::new(false);
+
+#[derive(Serialize)]
+struct RustShadowInput {
+    raw_path: String,
+    key_path: String,
+    digest: String,
+}
+
+#[derive(Serialize)]
+struct RustShadowEnvValue {
+    raw_text: Option<String>,
+    raw_blake3: String,
+    key_text: Option<String>,
+    key_blake3: String,
+}
+
+#[derive(Serialize)]
+struct RustShadowEnv {
+    name: String,
+    value: RustShadowEnvValue,
+}
+
+#[derive(Serialize)]
+struct RustShadowRoots {
+    build_root: String,
+    target_root: String,
+    cargo_home: Option<String>,
+    rust_root: String,
+}
+
+#[derive(Serialize)]
+struct RustShadowOutput {
+    cache_object_key: String,
+    raw_path: String,
+    key_path: String,
+    optional: bool,
+}
+
+#[derive(Serialize)]
+struct RustShadowRecord {
+    schema: u32,
+    timestamp_unix_ms: u64,
+    normalization_policy: String,
+    cache_key: String,
+    weak_toolchain_key: String,
+    cache_version: String,
+    crate_name: String,
+    crate_types: String,
+    host: String,
+    target: String,
+    compiler_version: String,
+    compiler_shlibs_digests: Vec<String>,
+    cache_control: String,
+    may_dist: bool,
+    allow_dist: bool,
+    native_requested: bool,
+    resolved_native_profile: Option<String>,
+    canonical_enabled: bool,
+    canonical_roots: Option<RustShadowRoots>,
+    cwd_raw: String,
+    cwd_key: String,
+    sysroot_raw: String,
+    sysroot_key: String,
+    arguments_raw: Vec<String>,
+    arguments_canonical: Vec<String>,
+    arguments_hashed_blob: String,
+    source_inputs: Vec<RustShadowInput>,
+    extern_inputs: Vec<RustShadowInput>,
+    staticlib_inputs: Vec<RustShadowInput>,
+    target_json_inputs: Vec<RustShadowInput>,
+    dep_env: Vec<RustShadowEnv>,
+    cargo_env: Vec<RustShadowEnv>,
+    outputs: Vec<RustShadowOutput>,
+}
+
+fn rust_cache_hashes_cargo_env(name: &std::ffi::OsStr) -> bool {
+    name.starts_with("CARGO_")
+        && name != "CARGO_MAKEFLAGS"
+        && !name.starts_with("CARGO_REGISTRIES_")
+        && name != "CARGO_BUILD_JOBS"
+        && name != "CARGO_ENCODED_RUSTFLAGS"
+}
+
+fn rust_shadow_plain_env(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some(
+            "CARGO"
+                | "CARGO_HOME"
+                | "CARGO_INSTALL_ROOT"
+                | "CARGO_MANIFEST_DIR"
+                | "CARGO_MANIFEST_PATH"
+                | "CARGO_TARGET_DIR"
+                | "CARGO_TARGET_TMPDIR"
+                | "OUT_DIR"
+                | "PWD"
+                | "RUSTC"
+                | "RUSTDOC"
+                | "TMPDIR"
+                | "TMP"
+                | "TEMP"
+                | "TEMPDIR"
+        )
+    ) || name
+        .to_str()
+        .is_some_and(|name| name.starts_with("CARGO_BIN_EXE_"))
+}
+
+fn rust_shadow_digest(value: &std::ffi::OsStr) -> String {
+    blake3::hash(value.as_encoded_bytes()).to_hex().to_string()
+}
+
+fn rust_shadow_env_value(
+    name: &std::ffi::OsStr,
+    raw: &std::ffi::OsStr,
+    canonical: Option<&CanonicalRustPaths>,
+) -> RustShadowEnvValue {
+    let key = canonical
+        .map(|canonical| canonical.env_value_to_canonical(name, raw))
+        .unwrap_or_else(|| raw.to_owned());
+    let show_text = rust_shadow_plain_env(name);
+    RustShadowEnvValue {
+        raw_text: show_text.then(|| raw.to_string_lossy().into_owned()),
+        raw_blake3: rust_shadow_digest(raw),
+        key_text: show_text.then(|| key.to_string_lossy().into_owned()),
+        key_blake3: rust_shadow_digest(&key),
+    }
+}
+
+fn rust_shadow_inputs(
+    paths: &[PathBuf],
+    hashes: &[String],
+    canonical: Option<&CanonicalRustPaths>,
+) -> Vec<RustShadowInput> {
+    paths
+        .iter()
+        .zip(hashes)
+        .map(|(path, digest)| RustShadowInput {
+            raw_path: path.to_string_lossy().into_owned(),
+            key_path: canonical
+                .map(|canonical| canonical.to_canonical(path))
+                .unwrap_or_else(|| path.clone())
+                .to_string_lossy()
+                .into_owned(),
+            digest: digest.clone(),
+        })
+        .collect()
+}
+
+fn rust_shadow_args(args: &[(OsString, Option<OsString>)]) -> Vec<String> {
+    args.iter()
+        .flat_map(|(arg, value)| std::iter::once(arg).chain(value.as_ref()))
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn rust_shadow_roots(canonical: Option<&CanonicalRustPaths>) -> Option<RustShadowRoots> {
+    canonical.map(|canonical| RustShadowRoots {
+        build_root: canonical.build_root.to_string_lossy().into_owned(),
+        target_root: canonical.target_root.to_string_lossy().into_owned(),
+        cargo_home: canonical
+            .cargo_home
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+        rust_root: canonical.rust_root.to_string_lossy().into_owned(),
+    })
+}
+
+fn append_rust_shadow_record(path: &Path, record: &RustShadowRecord) {
+    let mut encoded = match serde_json::to_vec(record) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            if !WARNED_RUST_SHADOW_LOG.swap(true, Ordering::Relaxed) {
+                warn!("failed to serialize Rust shadow-key telemetry: {error}");
+            }
+            return;
+        }
+    };
+    encoded.push(b'\n');
+
+    let _guard = RUST_SHADOW_LOG_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        if !WARNED_RUST_SHADOW_LOG.swap(true, Ordering::Relaxed) {
+            warn!(
+                "failed to create Rust shadow-key telemetry directory {}: {error}",
+                parent.display()
+            );
+        }
+        return;
+    }
+
+    let result = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(&encoded));
+
+    if let Err(error) = result
+        && !WARNED_RUST_SHADOW_LOG.swap(true, Ordering::Relaxed)
+    {
+        warn!(
+            "failed to append Rust shadow-key telemetry {}: {error}",
+            path.display()
+        );
+    }
 }
 
 static NATIVE_PROFILE_CACHE: LazyLock<std::sync::Mutex<HashMap<(PathBuf, String), String>>> =
@@ -1639,10 +1859,13 @@ where
         pool: &tokio::runtime::Handle,
         _rewrite_includes_only: bool,
         _storage: Arc<dyn Storage>,
-        _cache_control: CacheControl,
+        cache_control: CacheControl,
     ) -> Result<HashResult<T>> {
         trace!("[{}]: generate_hash_key", self.parsed_args.crate_name);
 
+        let shadow_log_path = std::env::var_os(RUST_SHADOW_LOG_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
         let mut effective_arguments = self.parsed_args.arguments.clone();
         let native_requested = native_target_requested(&effective_arguments);
         let target = compilation_target(&effective_arguments, &self.host);
@@ -1803,6 +2026,19 @@ where
             }
         }
 
+        let shadow_inputs = shadow_log_path.as_ref().map(|_| {
+            (
+                rust_shadow_inputs(&source_files, &source_hashes, canonical_paths.as_ref()),
+                rust_shadow_inputs(&abs_externs, &extern_hashes, canonical_paths.as_ref()),
+                rust_shadow_inputs(&abs_staticlibs, &staticlib_hashes, canonical_paths.as_ref()),
+                rust_shadow_inputs(
+                    &target_json_files,
+                    &target_json_hash,
+                    canonical_paths.as_ref(),
+                ),
+            )
+        });
+
         let source_hashes =
             hashes_in_canonical_path_order(&source_files, source_hashes, canonical_paths.as_ref());
         let extern_hashes =
@@ -1874,10 +2110,10 @@ where
         // 6. The digest of all static libraries listed on the commandline (self.staticlibs).
         // 7. The digest of the content of the target json file specified via `--target` (if any).
         for h in source_hashes
-            .into_iter()
-            .chain(extern_hashes)
-            .chain(staticlib_hashes)
-            .chain(target_json_hash)
+            .iter()
+            .chain(extern_hashes.iter())
+            .chain(staticlib_hashes.iter())
+            .chain(target_json_hash.iter())
         {
             m.update(h.as_bytes());
         }
@@ -1903,21 +2139,13 @@ where
             .collect();
         env_vars.sort();
         for (var, val) in env_vars.iter() {
-            if !var.starts_with("CARGO_") {
-                continue;
-            }
-
             // CARGO_MAKEFLAGS will have jobserver info which is extremely non-cacheable.
             // CARGO_REGISTRIES_*_TOKEN contains non-cacheable secrets.
             // Registry override config doesn't need to be hashed, because deps' package IDs
             // already uniquely identify the relevant registries.
             // CARGO_BUILD_JOBS only affects Cargo's parallelism, not rustc output.
-            // CARGO_ENCODED_RUSTFLAGS is already cached in argument list
-            if var == "CARGO_MAKEFLAGS"
-                || var.starts_with("CARGO_REGISTRIES_")
-                || var == "CARGO_BUILD_JOBS"
-                || var == "CARGO_ENCODED_RUSTFLAGS"
-            {
+            // CARGO_ENCODED_RUSTFLAGS is already cached in argument list.
+            if !rust_cache_hashes_cargo_env(var) {
                 continue;
             }
 
@@ -1940,8 +2168,9 @@ where
 
         // Turn arguments into a simple Vec<OsString> to calculate outputs.
         let flat_os_string_arguments: Vec<OsString> = os_string_arguments
-            .into_iter()
-            .flat_map(|(arg, val)| iter::once(arg).chain(val))
+            .iter()
+            .flat_map(|(arg, val)| iter::once(arg).chain(val.as_ref()))
+            .cloned()
             .collect();
 
         let mut outputs = get_compiler_outputs(
@@ -2062,13 +2291,114 @@ where
         }
 
         let inputs = source_files
-            .into_iter()
-            .chain(abs_externs)
-            .chain(abs_staticlibs)
+            .iter()
+            .chain(abs_externs.iter())
+            .chain(abs_staticlibs.iter())
+            .cloned()
             .collect();
 
+        let key = m.finish();
+
+        if let Some(shadow_log_path) = shadow_log_path.as_ref() {
+            let canonical = canonical_paths.as_ref();
+
+            let dep_env = env_deps
+                .iter()
+                .map(|(name, value)| RustShadowEnv {
+                    name: name.to_string_lossy().into_owned(),
+                    value: rust_shadow_env_value(name, value, canonical),
+                })
+                .collect::<Vec<_>>();
+
+            let cargo_env = env_vars
+                .iter()
+                .filter(|(name, _)| rust_cache_hashes_cargo_env(name))
+                .map(|(name, value)| RustShadowEnv {
+                    name: name.to_string_lossy().into_owned(),
+                    value: rust_shadow_env_value(name, value, canonical),
+                })
+                .collect::<Vec<_>>();
+
+            let mut shadow_outputs = outputs
+                .iter()
+                .map(|(cache_object_key, output)| RustShadowOutput {
+                    cache_object_key: cache_object_key.clone(),
+                    raw_path: output.path.to_string_lossy().into_owned(),
+                    key_path: canonical
+                        .map(|canonical| canonical.to_canonical(&output.path))
+                        .unwrap_or_else(|| output.path.clone())
+                        .to_string_lossy()
+                        .into_owned(),
+                    optional: output.optional,
+                })
+                .collect::<Vec<_>>();
+            shadow_outputs.sort_by(|a, b| a.cache_object_key.cmp(&b.cache_object_key));
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let timestamp_unix_ms = u64::try_from(now.as_millis()).unwrap_or(u64::MAX);
+
+            let (
+                shadow_source_inputs,
+                shadow_extern_inputs,
+                shadow_staticlib_inputs,
+                shadow_target_json_inputs,
+            ) = shadow_inputs
+                .expect("shadow input snapshot must exist when shadow logging is enabled");
+
+            let record = RustShadowRecord {
+                schema: 1,
+                timestamp_unix_ms,
+                normalization_policy: if canonical.is_some() {
+                    "canonical-rust-layout-v1".to_owned()
+                } else {
+                    "legacy-rust-v6".to_owned()
+                },
+                cache_key: key.clone(),
+                weak_toolchain_key: weak_toolchain_key.clone(),
+                cache_version: String::from_utf8_lossy(CACHE_VERSION).into_owned(),
+                crate_name: self.parsed_args.crate_name.clone(),
+                crate_types: format!("{:?}", self.parsed_args.crate_types),
+                host: self.host.clone(),
+                target: target.clone(),
+                compiler_version: self.version.clone(),
+                compiler_shlibs_digests: self.compiler_shlibs_digests.clone(),
+                cache_control: format!("{cache_control:?}"),
+                may_dist,
+                allow_dist,
+                native_requested,
+                resolved_native_profile: native_requested.then(|| self.native_profile.clone()),
+                canonical_enabled: canonical.is_some(),
+                canonical_roots: rust_shadow_roots(canonical),
+                cwd_raw: cwd.to_string_lossy().into_owned(),
+                cwd_key: canonical
+                    .map(|canonical| canonical.canonical_cwd(&cwd))
+                    .unwrap_or_else(|| cwd.clone())
+                    .to_string_lossy()
+                    .into_owned(),
+                sysroot_raw: self.sysroot.to_string_lossy().into_owned(),
+                sysroot_key: canonical
+                    .map(|canonical| canonical.to_canonical(&self.sysroot))
+                    .unwrap_or_else(|| self.sysroot.clone())
+                    .to_string_lossy()
+                    .into_owned(),
+                arguments_raw: rust_shadow_args(&os_string_arguments),
+                arguments_canonical: rust_shadow_args(&hash_os_string_arguments),
+                arguments_hashed_blob: args.to_string_lossy().into_owned(),
+                source_inputs: shadow_source_inputs,
+                extern_inputs: shadow_extern_inputs,
+                staticlib_inputs: shadow_staticlib_inputs,
+                target_json_inputs: shadow_target_json_inputs,
+                dep_env,
+                cargo_env,
+                outputs: shadow_outputs,
+            };
+            append_rust_shadow_record(shadow_log_path, &record);
+        }
+
         Ok(HashResult {
-            key: m.finish(),
+            key,
             compilation: Box::new(RustCompilation {
                 executable: self.executable.clone(),
                 host: self.host.clone(),
