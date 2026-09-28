@@ -90,6 +90,75 @@ fn path_env(name: &OsStr) -> bool {
         .is_some_and(|name| name.starts_with("CARGO_BIN_EXE_"))
 }
 
+fn embedded_path_match_is_token(text: &str, start: usize, end: usize) -> bool {
+    let prefix = &text[..start];
+    let token_start = prefix
+        .rfind(|c: char| {
+            matches!(
+                c,
+                '=' | ','
+                    | ';'
+                    | ':'
+                    | ' '
+                    | '\t'
+                    | '\n'
+                    | '\r'
+                    | '"'
+                    | '\''
+                    | '('
+                    | '['
+                    | '{'
+                    | '@'
+            )
+        })
+        .map_or(0, |index| index + 1);
+    let token_prefix = &prefix[token_start..];
+    let before_ok = !token_prefix.contains('/') && !token_prefix.contains('\\');
+
+    let after_ok = end == text.len()
+        || text[end..].chars().next().is_some_and(|c| {
+            matches!(
+                c,
+                '/' | '\\'
+                    | '='
+                    | ','
+                    | ';'
+                    | ':'
+                    | ' '
+                    | '\t'
+                    | '\n'
+                    | '\r'
+                    | '"'
+                    | '\''
+                    | ')'
+                    | ']'
+                    | '}'
+            )
+        });
+
+    before_ok && after_ok
+}
+
+fn replace_embedded_path(text: &str, physical: &str, canonical: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut copied_until = 0;
+
+    for (start, _) in text.match_indices(physical) {
+        if start < copied_until {
+            continue;
+        }
+        let end = start + physical.len();
+        if embedded_path_match_is_token(text, start, end) {
+            output.push_str(&text[copied_until..start]);
+            output.push_str(canonical);
+            copied_until = end;
+        }
+    }
+
+    output.push_str(&text[copied_until..]);
+    output
+}
+
 impl CanonicalRustPaths {
     pub(crate) fn from_rustc_executable(
         env: &[(OsString, OsString)],
@@ -187,7 +256,7 @@ impl CanonicalRustPaths {
         replacements.sort_by_key(|(physical, _)| std::cmp::Reverse(physical.len()));
 
         for (physical, canonical) in replacements {
-            text = text.replace(&physical, &canonical);
+            text = replace_embedded_path(&text, &physical, &canonical);
         }
         text.into()
     }
@@ -201,9 +270,12 @@ impl CanonicalRustPaths {
     }
 
     pub(crate) fn root_is_known(&self, path: &Path) -> bool {
-        self.roots
-            .iter()
-            .any(|root| root.aliases.iter().any(|alias| path.starts_with(alias)))
+        let candidate = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+        self.roots.iter().any(|root| {
+            root.aliases
+                .iter()
+                .any(|alias| candidate.starts_with(alias))
+        })
     }
 
     pub(crate) fn env_to_canonical(
@@ -390,6 +462,37 @@ mod tests {
     }
 
     #[test]
+    fn embedded_path_rewrite_respects_token_boundaries() {
+        let env = vec![
+            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+            ("SCCACHE_CANONICAL_BUILD_ROOT".into(), "/work/a".into()),
+        ];
+        let roots =
+            CanonicalRustPaths::from_env(&env, Path::new("/work/a"), Path::new("/rust")).unwrap();
+
+        assert_eq!(
+            roots.normalize_os_value(OsStr::new("-I/work/a/include")),
+            OsString::from("-I/build/include")
+        );
+        assert_eq!(
+            roots.normalize_os_value(OsStr::new("-Wl,-rpath,/work/a/lib")),
+            OsString::from("-Wl,-rpath,/build/lib")
+        );
+        assert_eq!(
+            roots.normalize_os_value(OsStr::new("/tmp/work/a/src/lib.rs")),
+            OsString::from("/tmp/work/a/src/lib.rs")
+        );
+        assert_eq!(
+            roots.normalize_os_value(OsStr::new("/work/ab/src/lib.rs")),
+            OsString::from("/work/ab/src/lib.rs")
+        );
+        assert_eq!(
+            roots.normalize_os_value(OsStr::new("prefix=/work/a;other=/work/a/src")),
+            OsString::from("prefix=/build;other=/build/src")
+        );
+    }
+
+    #[test]
     fn defaults_cargo_home_from_home() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -404,6 +507,36 @@ mod tests {
         ];
         let roots = CanonicalRustPaths::from_env(&env, temp.path(), Path::new("/rust")).unwrap();
         assert_eq!(roots.cargo_home, Some(home.join(".cargo")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_root_check_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let build = temp.path().join("build");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(build.join("inside")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(build.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(build.join("inside/ok.rs"), "pub fn ok() {}\n").unwrap();
+        std::fs::write(outside.join("escape.rs"), "pub fn escape() {}\n").unwrap();
+
+        symlink(build.join("inside"), build.join("inside-link")).unwrap();
+        symlink(&outside, build.join("escape-link")).unwrap();
+
+        let env = vec![
+            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+            (
+                "SCCACHE_CANONICAL_BUILD_ROOT".into(),
+                build.clone().into_os_string(),
+            ),
+        ];
+        let roots = CanonicalRustPaths::from_env(&env, &build, Path::new("/rust")).unwrap();
+
+        assert!(roots.root_is_known(&build.join("inside-link/ok.rs")));
+        assert!(!roots.root_is_known(&build.join("escape-link/escape.rs")));
     }
 
     #[test]
