@@ -14,9 +14,10 @@
 
 use crate::cache::{FileObjectSource, Storage};
 use crate::compiler::args::*;
+use crate::compiler::canonical_paths::CanonicalRustPaths;
 use crate::compiler::{
-    CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, Compiler,
-    CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, HashResult, Language,
+    CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, CompileCommandImpl,
+    Compiler, CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, HashResult, Language,
     SingleCompileCommand, c::ArtifactDescriptor,
 };
 #[cfg(feature = "dist-client")]
@@ -35,6 +36,7 @@ use fs_err as fs;
 use log::Level::Trace;
 #[cfg(feature = "dist-client")]
 use semver::Version;
+use serde::Serialize;
 #[cfg(feature = "dist-client")]
 use std::borrow::Borrow;
 use std::borrow::Cow;
@@ -43,20 +45,23 @@ use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
 use std::env::consts::DLL_EXTENSION;
 #[cfg(feature = "dist-client")]
-use std::env::consts::{DLL_PREFIX, EXE_EXTENSION};
+use std::env::consts::DLL_PREFIX;
+use std::env::consts::EXE_EXTENSION;
 use std::ffi::OsString;
 use std::fmt;
+use std::fs::OpenOptions;
 use std::future::Future;
 use std::hash::Hash;
 #[cfg(feature = "dist-client")]
 use std::io;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
 use std::iter;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process;
 #[cfg(feature = "dist-client")]
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time;
 
@@ -71,7 +76,6 @@ const RLIB_EXTENSION: &str = "rlib";
 const RMETA_EXTENSION: &str = "rmeta";
 
 /// Directory in the sysroot containing binary to which rustc is linked.
-#[cfg(feature = "dist-client")]
 const BINS_DIR: &str = "bin";
 
 /// Directory in the sysroot containing shared libraries to which rustc is linked.
@@ -114,6 +118,7 @@ pub struct Rust {
     /// A shared, caching reader for rlib dependencies
     #[cfg(feature = "dist-client")]
     rlib_dep_reader: Option<Arc<RlibDepReader>>,
+    native_profile: String,
 }
 
 /// A struct on which to hang a `CompilerHasher` impl.
@@ -134,6 +139,7 @@ pub struct RustHasher {
     rlib_dep_reader: Option<Arc<RlibDepReader>>,
     /// Parsed arguments from the rustc invocation
     parsed_args: ParsedArguments,
+    native_profile: String,
 }
 
 /// a lookup proxy for determining the actual compiler used per file or directory
@@ -221,6 +227,54 @@ pub struct RustCompilation {
     cwd: PathBuf,
     /// The environment variables
     env_vars: Vec<(OsString, OsString)>,
+    allow_dist: bool,
+    canonical_paths: Option<CanonicalRustPaths>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct CanonicalRustCompileCommand {
+    toolchain_executable: PathBuf,
+    runner_arguments: Vec<OsString>,
+    env_vars: Vec<(OsString, OsString)>,
+    cwd: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+#[async_trait]
+impl CompileCommandImpl for CanonicalRustCompileCommand {
+    fn get_executable(&self) -> PathBuf {
+        self.toolchain_executable.clone()
+    }
+
+    fn get_arguments(&self) -> Vec<OsString> {
+        self.runner_arguments.clone()
+    }
+
+    fn get_env_vars(&self) -> Vec<(OsString, OsString)> {
+        self.env_vars.clone()
+    }
+
+    fn get_cwd(&self) -> PathBuf {
+        self.cwd.clone()
+    }
+
+    async fn execute<T>(
+        &self,
+        _: &crate::server::SccacheService<T>,
+        creator: &T,
+    ) -> Result<process::Output>
+    where
+        T: CommandCreatorSync,
+    {
+        let mut cmd = creator.clone().new_command_sync("/usr/bin/bwrap");
+        cmd.args(&self.runner_arguments)
+            .env_clear()
+            .envs(self.env_vars.clone())
+            .current_dir("/");
+        cmd.share_jobserver();
+        run_input_output(cmd, None).await
+    }
 }
 
 // The selection of crate types for this compilation
@@ -246,6 +300,7 @@ async fn get_source_files_and_env_deps<T>(
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
     pool: &tokio::runtime::Handle,
+    dep_info_copy: Option<&Path>,
 ) -> Result<(Vec<PathBuf>, Vec<(OsString, OsString)>)>
 where
     T: CommandCreatorSync,
@@ -268,6 +323,12 @@ where
     trace!("[{}]: get dep-info: {:?}", crate_name, cmd);
     // Output of command is in file under dep_file, so we ignore stdout&stderr
     let _dep_info = run_input_output(cmd, None).await?;
+    if let Some(copy_to) = dep_info_copy {
+        if let Some(parent) = copy_to.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&dep_file, copy_to)?;
+    }
     // Parse the dep-info file, then hash the contents of those files.
     let cwd = cwd.to_owned();
     let name2 = crate_name.to_owned();
@@ -399,6 +460,399 @@ where
     Ok(outstr.lines().map(|l| l.to_owned()).collect())
 }
 
+fn hashes_in_canonical_path_order(
+    paths: &[PathBuf],
+    hashes: Vec<String>,
+    canonical: Option<&CanonicalRustPaths>,
+) -> Vec<String> {
+    let mut pairs = paths
+        .iter()
+        .cloned()
+        .zip(hashes)
+        .map(|(path, hash)| {
+            let identity = canonical
+                .map(|canonical| canonical.to_canonical(&path))
+                .unwrap_or_else(|| path.clone());
+            (identity, hash)
+        })
+        .collect::<Vec<_>>();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    pairs.into_iter().map(|(_, hash)| hash).collect()
+}
+
+const RUST_SHADOW_LOG_ENV: &str = "SCCACHE_RUST_SHADOW_LOG";
+
+static RUST_SHADOW_LOG_LOCK: LazyLock<std::sync::Mutex<()>> =
+    LazyLock::new(|| std::sync::Mutex::new(()));
+static WARNED_RUST_SHADOW_LOG: AtomicBool = AtomicBool::new(false);
+
+#[derive(Serialize)]
+struct RustShadowInput {
+    raw_path: String,
+    key_path: String,
+    digest: String,
+}
+
+#[derive(Serialize)]
+struct RustShadowEnvValue {
+    raw_text: Option<String>,
+    raw_blake3: String,
+    key_text: Option<String>,
+    key_blake3: String,
+}
+
+#[derive(Serialize)]
+struct RustShadowEnv {
+    name: String,
+    value: RustShadowEnvValue,
+}
+
+#[derive(Serialize)]
+struct RustShadowRoots {
+    build_root: String,
+    target_root: String,
+    cargo_home: Option<String>,
+    rust_root: String,
+}
+
+#[derive(Serialize)]
+struct RustShadowOutput {
+    cache_object_key: String,
+    raw_path: String,
+    key_path: String,
+    optional: bool,
+}
+
+#[derive(Serialize)]
+struct RustShadowRecord {
+    schema: u32,
+    timestamp_unix_ms: u64,
+    normalization_policy: String,
+    cache_key: String,
+    weak_toolchain_key: String,
+    cache_version: String,
+    crate_name: String,
+    crate_types: String,
+    host: String,
+    target: String,
+    compiler_version: String,
+    compiler_shlibs_digests: Vec<String>,
+    cache_control: String,
+    may_dist: bool,
+    allow_dist: bool,
+    native_requested: bool,
+    resolved_native_profile: Option<String>,
+    canonical_enabled: bool,
+    canonical_roots: Option<RustShadowRoots>,
+    cwd_raw: String,
+    cwd_key: String,
+    sysroot_raw: String,
+    sysroot_key: String,
+    arguments_raw: Vec<String>,
+    arguments_canonical: Vec<String>,
+    arguments_hashed_blob: String,
+    source_inputs: Vec<RustShadowInput>,
+    extern_inputs: Vec<RustShadowInput>,
+    staticlib_inputs: Vec<RustShadowInput>,
+    target_json_inputs: Vec<RustShadowInput>,
+    dep_env: Vec<RustShadowEnv>,
+    cargo_env: Vec<RustShadowEnv>,
+    outputs: Vec<RustShadowOutput>,
+}
+
+fn rust_cache_hashes_cargo_env(name: &std::ffi::OsStr) -> bool {
+    name.starts_with("CARGO_")
+        && name != "CARGO_MAKEFLAGS"
+        && !name.starts_with("CARGO_REGISTRIES_")
+        && name != "CARGO_BUILD_JOBS"
+        && name != "CARGO_ENCODED_RUSTFLAGS"
+}
+
+fn rust_shadow_plain_env(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some(
+            "CARGO"
+                | "CARGO_HOME"
+                | "CARGO_INSTALL_ROOT"
+                | "CARGO_MANIFEST_DIR"
+                | "CARGO_MANIFEST_PATH"
+                | "CARGO_TARGET_DIR"
+                | "CARGO_TARGET_TMPDIR"
+                | "OUT_DIR"
+                | "PWD"
+                | "RUSTC"
+                | "RUSTDOC"
+                | "TMPDIR"
+                | "TMP"
+                | "TEMP"
+                | "TEMPDIR"
+        )
+    ) || name
+        .to_str()
+        .is_some_and(|name| name.starts_with("CARGO_BIN_EXE_"))
+}
+
+fn rust_shadow_digest(value: &std::ffi::OsStr) -> String {
+    blake3::hash(value.as_encoded_bytes()).to_hex().to_string()
+}
+
+fn rust_shadow_env_value(
+    name: &std::ffi::OsStr,
+    raw: &std::ffi::OsStr,
+    canonical: Option<&CanonicalRustPaths>,
+) -> RustShadowEnvValue {
+    let key = canonical
+        .map(|canonical| canonical.env_value_to_canonical(name, raw))
+        .unwrap_or_else(|| raw.to_owned());
+    let show_text = rust_shadow_plain_env(name);
+    RustShadowEnvValue {
+        raw_text: show_text.then(|| raw.to_string_lossy().into_owned()),
+        raw_blake3: rust_shadow_digest(raw),
+        key_text: show_text.then(|| key.to_string_lossy().into_owned()),
+        key_blake3: rust_shadow_digest(&key),
+    }
+}
+
+fn rust_shadow_inputs(
+    paths: &[PathBuf],
+    hashes: &[String],
+    canonical: Option<&CanonicalRustPaths>,
+) -> Vec<RustShadowInput> {
+    paths
+        .iter()
+        .zip(hashes)
+        .map(|(path, digest)| RustShadowInput {
+            raw_path: path.to_string_lossy().into_owned(),
+            key_path: canonical
+                .map(|canonical| canonical.to_canonical(path))
+                .unwrap_or_else(|| path.clone())
+                .to_string_lossy()
+                .into_owned(),
+            digest: digest.clone(),
+        })
+        .collect()
+}
+
+fn rust_shadow_args(args: &[(OsString, Option<OsString>)]) -> Vec<String> {
+    args.iter()
+        .flat_map(|(arg, value)| std::iter::once(arg).chain(value.as_ref()))
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn rust_shadow_roots(canonical: Option<&CanonicalRustPaths>) -> Option<RustShadowRoots> {
+    canonical.map(|canonical| RustShadowRoots {
+        build_root: canonical.build_root.to_string_lossy().into_owned(),
+        target_root: canonical.target_root.to_string_lossy().into_owned(),
+        cargo_home: canonical
+            .cargo_home
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+        rust_root: canonical.rust_root.to_string_lossy().into_owned(),
+    })
+}
+
+fn append_rust_shadow_record(path: &Path, record: &RustShadowRecord) {
+    let mut encoded = match serde_json::to_vec(record) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            if !WARNED_RUST_SHADOW_LOG.swap(true, Ordering::Relaxed) {
+                warn!("failed to serialize Rust shadow-key telemetry: {error}");
+            }
+            return;
+        }
+    };
+    encoded.push(b'\n');
+
+    let _guard = RUST_SHADOW_LOG_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        if !WARNED_RUST_SHADOW_LOG.swap(true, Ordering::Relaxed) {
+            warn!(
+                "failed to create Rust shadow-key telemetry directory {}: {error}",
+                parent.display()
+            );
+        }
+        return;
+    }
+
+    let result = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(&encoded));
+
+    if let Err(error) = result
+        && !WARNED_RUST_SHADOW_LOG.swap(true, Ordering::Relaxed)
+    {
+        warn!(
+            "failed to append Rust shadow-key telemetry {}: {error}",
+            path.display()
+        );
+    }
+}
+
+static NATIVE_PROFILE_CACHE: LazyLock<std::sync::Mutex<HashMap<(PathBuf, String), String>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+static WARNED_DIST_NATIVE_PORTABLE: AtomicBool = AtomicBool::new(false);
+
+fn native_target_requested(arguments: &[Argument<ArgData>]) -> bool {
+    arguments.iter().any(|arg| {
+        matches!(
+            arg.get_data(),
+            Some(CodeGen(ArgCodegen {
+                opt,
+                value: Some(value)
+            })) if opt == "target-cpu" && value == "native"
+        )
+    })
+}
+
+fn compilation_target(arguments: &[Argument<ArgData>], host: &str) -> String {
+    for arg in arguments.iter().rev() {
+        match arg.get_data() {
+            Some(Target(ArgTarget::Name(target))) => return target.clone(),
+            Some(Target(ArgTarget::Path(_) | ArgTarget::Unsure(_))) => {
+                return "custom-target".to_owned();
+            }
+            _ => {}
+        }
+    }
+    host.to_owned()
+}
+
+fn rewrite_native_target_cpu(arguments: &mut [Argument<ArgData>], cpu: &str) {
+    for arg in arguments {
+        if let Argument::WithValue(_, CodeGen(ArgCodegen { opt, value }), _) = arg
+            && opt == "target-cpu"
+            && value.as_deref() == Some("native")
+        {
+            *value = Some(cpu.to_owned());
+        }
+    }
+}
+
+fn remove_dep_info_emit(arguments: &mut [Argument<ArgData>]) {
+    for arg in arguments {
+        if let Argument::WithValue(_, Emit(value), _) = arg {
+            let filtered = value
+                .split(',')
+                .filter(|item| *item != "dep-info")
+                .collect::<Vec<_>>()
+                .join(",");
+            *value = filtered;
+        }
+    }
+}
+
+fn parse_native_profile(llvm_ir: &str) -> Result<String> {
+    let marker = "\"target-cpu\"=\"";
+    let start = llvm_ir
+        .find(marker)
+        .context("native probe LLVM IR did not contain target-cpu")?
+        + marker.len();
+    let cpu_end = llvm_ir[start..]
+        .find('"')
+        .context("native probe target-cpu was unterminated")?
+        + start;
+    let cpu = &llvm_ir[start..cpu_end];
+
+    let feature_marker = "\"target-features\"=\"";
+    let features = llvm_ir[cpu_end..]
+        .find(feature_marker)
+        .and_then(|offset| {
+            let start = cpu_end + offset + feature_marker.len();
+            llvm_ir[start..]
+                .find('"')
+                .map(|end| &llvm_ir[start..start + end])
+        })
+        .unwrap_or("");
+
+    Ok(format!("{cpu}|{features}"))
+}
+
+async fn cached_native_profile<T>(
+    creator: T,
+    executable: &Path,
+    rustc_verbose_version: &str,
+    env_vars: &[(OsString, OsString)],
+) -> Result<String>
+where
+    T: CommandCreatorSync,
+{
+    let key = (executable.to_owned(), rustc_verbose_version.to_owned());
+    if let Some(profile) = NATIVE_PROFILE_CACHE
+        .lock()
+        .expect("native profile cache poisoned")
+        .get(&key)
+        .cloned()
+    {
+        return Ok(profile);
+    }
+
+    let profile = probe_native_profile(creator, executable, env_vars).await?;
+    let mut cache = NATIVE_PROFILE_CACHE
+        .lock()
+        .expect("native profile cache poisoned");
+    Ok(cache.entry(key).or_insert_with(|| profile.clone()).clone())
+}
+
+async fn probe_native_profile<T>(
+    mut creator: T,
+    executable: &Path,
+    env_vars: &[(OsString, OsString)],
+) -> Result<String>
+where
+    T: CommandCreatorSync,
+{
+    let temp_dir = tempfile::Builder::new()
+        .prefix("sccache-native")
+        .tempdir()
+        .context("Failed to create native-profile temp dir")?;
+    let mut cmd = creator.new_command_sync(executable);
+    cmd.args(&[
+        "-",
+        "--crate-name",
+        "sccache_native_probe",
+        "--crate-type",
+        "lib",
+        "--emit=llvm-ir=-",
+        "-C",
+        "target-cpu=native",
+    ])
+    .env_clear()
+    .envs(env_vars.to_vec())
+    .current_dir(temp_dir.path());
+
+    let source =
+        b"pub fn sccache_native_probe(x:u64)->u64{x.wrapping_mul(17).rotate_left(9)}\n".to_vec();
+    let output = run_input_output(cmd, Some(source)).await?;
+    let llvm_ir = String::from_utf8(output.stdout).context("native probe LLVM IR was not UTF-8")?;
+    parse_native_profile(&llvm_ir)
+}
+
+#[cfg(target_os = "linux")]
+fn canonical_bwrap_arguments(
+    canonical: &CanonicalRustPaths,
+    executable: &Path,
+    arguments: &[Argument<ArgData>],
+    cwd: &Path,
+) -> Vec<OsString> {
+    let arguments = arguments
+        .iter()
+        .flat_map(|arg| arg.iter_os_strings())
+        .map(|arg| arg.to_owned())
+        .collect::<Vec<_>>();
+    canonical.bwrap_arguments(executable, &arguments, cwd)
+}
+
 impl Rust {
     /// Create a new Rust compiler instance, calculating the hashes of
     /// all the shared libraries in its sysroot.
@@ -420,6 +874,18 @@ impl Rust {
             .map(|l| &l[6..])
             .context("rustc verbose version didn't have a line for `host:`")?
             .to_string();
+
+        let native_profile = cached_native_profile(
+            creator.clone(),
+            &executable,
+            rustc_verbose_version,
+            env_vars,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            warn!("Failed to resolve rustc native CPU profile: {e:#}");
+            format!("unresolved:{host}")
+        });
 
         // it's fine to use the `executable` directly no matter if proxied or not
         let mut cmd = creator.new_command_sync(&executable);
@@ -489,6 +955,7 @@ impl Rust {
                 sysroot,
                 compiler_shlibs_digests: digests,
                 rlib_dep_reader,
+                native_profile: native_profile.clone(),
             })
         }
 
@@ -501,6 +968,7 @@ impl Rust {
                 version: rustc_verbose_version.to_string(),
                 sysroot,
                 compiler_shlibs_digests: digests,
+                native_profile: native_profile.clone(),
             })
         }
     }
@@ -517,6 +985,7 @@ where
     fn get_toolchain_packager(&self) -> Box<dyn pkg::ToolchainPackager> {
         Box::new(RustToolchainPackager {
             sysroot: self.sysroot.clone(),
+            canonical: false,
         })
     }
     /// Parse `arguments` as rustc command-line arguments, determine if
@@ -546,6 +1015,7 @@ where
                 #[cfg(feature = "dist-client")]
                 rlib_dep_reader: self.rlib_dep_reader.clone(),
                 parsed_args: args,
+                native_profile: self.native_profile.clone(),
             })),
             CompilerArguments::NotCompilation => CompilerArguments::NotCompilation,
             CompilerArguments::CannotCache(why, extra_info) => {
@@ -1385,17 +1855,44 @@ where
         creator: &T,
         cwd: PathBuf,
         env_vars: Vec<(OsString, OsString)>,
-        _may_dist: bool,
+        may_dist: bool,
         pool: &tokio::runtime::Handle,
         _rewrite_includes_only: bool,
         _storage: Arc<dyn Storage>,
-        _cache_control: CacheControl,
+        cache_control: CacheControl,
     ) -> Result<HashResult<T>> {
         trace!("[{}]: generate_hash_key", self.parsed_args.crate_name);
+
+        let shadow_log_path = std::env::var_os(RUST_SHADOW_LOG_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let mut effective_arguments = self.parsed_args.arguments.clone();
+        let native_requested = native_target_requested(&effective_arguments);
+        let target = compilation_target(&effective_arguments, &self.host);
+        let mut allow_dist = true;
+        if native_requested && may_dist {
+            if target.starts_with("x86_64-") {
+                rewrite_native_target_cpu(&mut effective_arguments, "x86-64-v2");
+                if !WARNED_DIST_NATIVE_PORTABLE.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        "distributed Rust compile requested -C target-cpu=native; using x86-64-v2 for deterministic heterogeneous-worker codegen (performance may be reduced)"
+                    );
+                }
+            } else {
+                allow_dist = false;
+                warn!(
+                    "distributed Rust compile requested -C target-cpu=native for {target}; compiling locally because no portable native policy is defined for this target"
+                );
+            }
+        }
+
+        let canonical_paths = CanonicalRustPaths::from_env(&env_vars, &cwd, &self.sysroot);
+        if canonical_paths.is_some() {
+            remove_dep_info_emit(&mut effective_arguments);
+        }
+
         // TODO: this doesn't produce correct arguments if they should be concatenated - should use iter_os_strings
-        let os_string_arguments: Vec<(OsString, Option<OsString>)> = self
-            .parsed_args
-            .arguments
+        let os_string_arguments: Vec<(OsString, Option<OsString>)> = effective_arguments
             .iter()
             .map(|arg| {
                 (
@@ -1407,6 +1904,20 @@ where
         // `filtered_arguments` omits --emit and --out-dir arguments.
         // It's used for invoking rustc with `--emit=dep-info` to get the list of
         // source files for this crate.
+        let hash_os_string_arguments = os_string_arguments
+            .iter()
+            .map(|(arg, val)| {
+                if let Some(canonical) = canonical_paths.as_ref() {
+                    (
+                        canonical.normalize_os_value(arg),
+                        val.as_ref().map(|val| canonical.normalize_os_value(val)),
+                    )
+                } else {
+                    (arg.clone(), val.clone())
+                }
+            })
+            .collect::<Vec<_>>();
+
         let filtered_arguments = os_string_arguments
             .iter()
             .filter_map(|(arg, val)| {
@@ -1420,6 +1931,16 @@ where
             .cloned()
             .collect::<Vec<_>>();
         // Find all the source files and hash them
+        let dep_info_copy = canonical_paths.as_ref().and_then(|_| {
+            self.parsed_args.dep_info.as_ref().map(|dep_info| {
+                let out_dir = if self.parsed_args.output_dir.is_absolute() {
+                    self.parsed_args.output_dir.clone()
+                } else {
+                    cwd.join(&self.parsed_args.output_dir)
+                };
+                out_dir.join(dep_info)
+            })
+        });
         let source_hashes_pool = pool.clone();
         let source_files_and_hashes_and_env_deps = async {
             let (source_files, env_deps) = get_source_files_and_env_deps(
@@ -1430,6 +1951,7 @@ where
                 &cwd,
                 &env_vars,
                 pool,
+                dep_info_copy.as_deref(),
             )
             .await?;
             let source_hashes = hash_all(&source_files, &source_hashes_pool).await?;
@@ -1490,6 +2012,43 @@ where
             target_json_hash
         )?;
 
+        if let Some(canonical) = canonical_paths.as_ref() {
+            if let Some(path) = source_files
+                .iter()
+                .chain(abs_externs.iter())
+                .chain(abs_staticlibs.iter())
+                .find(|path| !canonical.root_is_known(path))
+            {
+                bail!(
+                    "canonical Rust build input {} is outside declared roots",
+                    path.display()
+                );
+            }
+        }
+
+        let shadow_inputs = shadow_log_path.as_ref().map(|_| {
+            (
+                rust_shadow_inputs(&source_files, &source_hashes, canonical_paths.as_ref()),
+                rust_shadow_inputs(&abs_externs, &extern_hashes, canonical_paths.as_ref()),
+                rust_shadow_inputs(&abs_staticlibs, &staticlib_hashes, canonical_paths.as_ref()),
+                rust_shadow_inputs(
+                    &target_json_files,
+                    &target_json_hash,
+                    canonical_paths.as_ref(),
+                ),
+            )
+        });
+
+        let source_hashes =
+            hashes_in_canonical_path_order(&source_files, source_hashes, canonical_paths.as_ref());
+        let extern_hashes =
+            hashes_in_canonical_path_order(&abs_externs, extern_hashes, canonical_paths.as_ref());
+        let staticlib_hashes = hashes_in_canonical_path_order(
+            &abs_staticlibs,
+            staticlib_hashes,
+            canonical_paths.as_ref(),
+        );
+
         // If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
         let mut m = Digest::new();
         // Hash inputs:
@@ -1499,6 +2058,9 @@ where
         for d in &self.compiler_shlibs_digests {
             m.update(d.as_bytes());
         }
+        if canonical_paths.is_some() {
+            m.update(b"canonical-rust-layout-v1");
+        }
         let weak_toolchain_key = m.clone().finish();
         // 3. The full commandline (self.arguments)
         // TODO: there will be full paths here, it would be nice to
@@ -1507,7 +2069,7 @@ where
         // by cargo: --extern, -L, --cfg. We'll filter those out, sort them,
         // and append them to the rest of the arguments.
         let args = {
-            let (mut sortables, rest): (Vec<_>, Vec<_>) = os_string_arguments
+            let (mut sortables, rest): (Vec<_>, Vec<_>) = hash_os_string_arguments
                 .iter()
                 // We exclude a few arguments from the hash:
                 //   -L, --extern, --out-dir, --diagnostic-width
@@ -1539,15 +2101,19 @@ where
                 })
         };
         args.hash(&mut HashToDigest { digest: &mut m });
+        if native_requested && (!may_dist || !target.starts_with("x86_64-")) {
+            self.native_profile
+                .hash(&mut HashToDigest { digest: &mut m });
+        }
         // 4. The digest of all source files (this includes src file from cmdline).
         // 5. The digest of all files listed on the commandline (self.externs).
         // 6. The digest of all static libraries listed on the commandline (self.staticlibs).
         // 7. The digest of the content of the target json file specified via `--target` (if any).
         for h in source_hashes
-            .into_iter()
-            .chain(extern_hashes)
-            .chain(staticlib_hashes)
-            .chain(target_json_hash)
+            .iter()
+            .chain(extern_hashes.iter())
+            .chain(staticlib_hashes.iter())
+            .chain(target_json_hash.iter())
         {
             m.update(h.as_bytes());
         }
@@ -1558,6 +2124,10 @@ where
         for (var, val) in env_deps.iter() {
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(b"=");
+            let val = canonical_paths
+                .as_ref()
+                .map(|canonical| canonical.env_value_to_canonical(var, val))
+                .unwrap_or_else(|| val.clone());
             val.hash(&mut HashToDigest { digest: &mut m });
         }
         let mut env_vars: Vec<_> = env_vars
@@ -1569,37 +2139,38 @@ where
             .collect();
         env_vars.sort();
         for (var, val) in env_vars.iter() {
-            if !var.starts_with("CARGO_") {
-                continue;
-            }
-
             // CARGO_MAKEFLAGS will have jobserver info which is extremely non-cacheable.
             // CARGO_REGISTRIES_*_TOKEN contains non-cacheable secrets.
             // Registry override config doesn't need to be hashed, because deps' package IDs
             // already uniquely identify the relevant registries.
             // CARGO_BUILD_JOBS only affects Cargo's parallelism, not rustc output.
-            // CARGO_ENCODED_RUSTFLAGS is already cached in argument list
-            if var == "CARGO_MAKEFLAGS"
-                || var.starts_with("CARGO_REGISTRIES_")
-                || var == "CARGO_BUILD_JOBS"
-                || var == "CARGO_ENCODED_RUSTFLAGS"
-            {
+            // CARGO_ENCODED_RUSTFLAGS is already cached in argument list.
+            if !rust_cache_hashes_cargo_env(var) {
                 continue;
             }
 
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(b"=");
+            let val = canonical_paths
+                .as_ref()
+                .map(|canonical| canonical.env_value_to_canonical(var, val))
+                .unwrap_or_else(|| val.clone());
             val.hash(&mut HashToDigest { digest: &mut m });
         }
         // 9. The cwd of the compile. This will wind up in the rlib.
-        cwd.hash(&mut HashToDigest { digest: &mut m });
+        let hash_cwd = canonical_paths
+            .as_ref()
+            .map(|canonical| canonical.canonical_cwd(&cwd))
+            .unwrap_or_else(|| cwd.clone());
+        hash_cwd.hash(&mut HashToDigest { digest: &mut m });
         // 10. The version of the compiler.
         self.version.hash(&mut HashToDigest { digest: &mut m });
 
         // Turn arguments into a simple Vec<OsString> to calculate outputs.
         let flat_os_string_arguments: Vec<OsString> = os_string_arguments
-            .into_iter()
-            .flat_map(|(arg, val)| iter::once(arg).chain(val))
+            .iter()
+            .flat_map(|(arg, val)| iter::once(arg).chain(val.as_ref()))
+            .cloned()
             .collect();
 
         let mut outputs = get_compiler_outputs(
@@ -1671,7 +2242,12 @@ where
                 )
             })
             .collect::<HashMap<_, _>>();
-        let dep_info = if let Some(dep_info) = &self.parsed_args.dep_info {
+        let dep_info = if canonical_paths.is_some() {
+            // A fresh physical dep-info file was already written by the hash pre-pass.
+            // Do not cache it, otherwise a cross-root hit would restore paths from the
+            // checkout that originally populated the cache.
+            None
+        } else if let Some(dep_info) = &self.parsed_args.dep_info {
             let p = self.parsed_args.output_dir.join(dep_info);
             outputs.insert(
                 dep_info.to_string_lossy().into_owned(),
@@ -1704,7 +2280,7 @@ where
                 },
             );
         }
-        let mut arguments = self.parsed_args.arguments.clone();
+        let mut arguments = effective_arguments;
         // Request color output unless json was requested. The client will strip colors if needed.
         if !self.parsed_args.has_json {
             arguments.push(Argument::WithValue(
@@ -1715,13 +2291,114 @@ where
         }
 
         let inputs = source_files
-            .into_iter()
-            .chain(abs_externs)
-            .chain(abs_staticlibs)
+            .iter()
+            .chain(abs_externs.iter())
+            .chain(abs_staticlibs.iter())
+            .cloned()
             .collect();
 
+        let key = m.finish();
+
+        if let Some(shadow_log_path) = shadow_log_path.as_ref() {
+            let canonical = canonical_paths.as_ref();
+
+            let dep_env = env_deps
+                .iter()
+                .map(|(name, value)| RustShadowEnv {
+                    name: name.to_string_lossy().into_owned(),
+                    value: rust_shadow_env_value(name, value, canonical),
+                })
+                .collect::<Vec<_>>();
+
+            let cargo_env = env_vars
+                .iter()
+                .filter(|(name, _)| rust_cache_hashes_cargo_env(name))
+                .map(|(name, value)| RustShadowEnv {
+                    name: name.to_string_lossy().into_owned(),
+                    value: rust_shadow_env_value(name, value, canonical),
+                })
+                .collect::<Vec<_>>();
+
+            let mut shadow_outputs = outputs
+                .iter()
+                .map(|(cache_object_key, output)| RustShadowOutput {
+                    cache_object_key: cache_object_key.clone(),
+                    raw_path: output.path.to_string_lossy().into_owned(),
+                    key_path: canonical
+                        .map(|canonical| canonical.to_canonical(&output.path))
+                        .unwrap_or_else(|| output.path.clone())
+                        .to_string_lossy()
+                        .into_owned(),
+                    optional: output.optional,
+                })
+                .collect::<Vec<_>>();
+            shadow_outputs.sort_by(|a, b| a.cache_object_key.cmp(&b.cache_object_key));
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let timestamp_unix_ms = u64::try_from(now.as_millis()).unwrap_or(u64::MAX);
+
+            let (
+                shadow_source_inputs,
+                shadow_extern_inputs,
+                shadow_staticlib_inputs,
+                shadow_target_json_inputs,
+            ) = shadow_inputs
+                .expect("shadow input snapshot must exist when shadow logging is enabled");
+
+            let record = RustShadowRecord {
+                schema: 1,
+                timestamp_unix_ms,
+                normalization_policy: if canonical.is_some() {
+                    "canonical-rust-layout-v1".to_owned()
+                } else {
+                    "legacy-rust-v6".to_owned()
+                },
+                cache_key: key.clone(),
+                weak_toolchain_key: weak_toolchain_key.clone(),
+                cache_version: String::from_utf8_lossy(CACHE_VERSION).into_owned(),
+                crate_name: self.parsed_args.crate_name.clone(),
+                crate_types: format!("{:?}", self.parsed_args.crate_types),
+                host: self.host.clone(),
+                target: target.clone(),
+                compiler_version: self.version.clone(),
+                compiler_shlibs_digests: self.compiler_shlibs_digests.clone(),
+                cache_control: format!("{cache_control:?}"),
+                may_dist,
+                allow_dist,
+                native_requested,
+                resolved_native_profile: native_requested.then(|| self.native_profile.clone()),
+                canonical_enabled: canonical.is_some(),
+                canonical_roots: rust_shadow_roots(canonical),
+                cwd_raw: cwd.to_string_lossy().into_owned(),
+                cwd_key: canonical
+                    .map(|canonical| canonical.canonical_cwd(&cwd))
+                    .unwrap_or_else(|| cwd.clone())
+                    .to_string_lossy()
+                    .into_owned(),
+                sysroot_raw: self.sysroot.to_string_lossy().into_owned(),
+                sysroot_key: canonical
+                    .map(|canonical| canonical.to_canonical(&self.sysroot))
+                    .unwrap_or_else(|| self.sysroot.clone())
+                    .to_string_lossy()
+                    .into_owned(),
+                arguments_raw: rust_shadow_args(&os_string_arguments),
+                arguments_canonical: rust_shadow_args(&hash_os_string_arguments),
+                arguments_hashed_blob: args.to_string_lossy().into_owned(),
+                source_inputs: shadow_source_inputs,
+                extern_inputs: shadow_extern_inputs,
+                staticlib_inputs: shadow_staticlib_inputs,
+                target_json_inputs: shadow_target_json_inputs,
+                dep_env,
+                cargo_env,
+                outputs: shadow_outputs,
+            };
+            append_rust_shadow_record(shadow_log_path, &record);
+        }
+
         Ok(HashResult {
-            key: m.finish(),
+            key,
             compilation: Box::new(RustCompilation {
                 executable: self.executable.clone(),
                 host: self.host.clone(),
@@ -1735,6 +2412,8 @@ where
                 dep_info,
                 cwd,
                 env_vars,
+                allow_dist,
+                canonical_paths,
                 #[cfg(feature = "dist-client")]
                 rlib_dep_reader: self.rlib_dep_reader.clone(),
             }),
@@ -1777,6 +2456,8 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             ref env_vars,
             ref host,
             ref sysroot,
+            allow_dist,
+            ref canonical_paths,
             ..
         } = *self;
 
@@ -1790,25 +2471,53 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
 
         trace!("[{}]: compile", crate_name);
 
-        let command = SingleCompileCommand {
-            executable: executable.to_owned(),
-            arguments: arguments
-                .iter()
-                .flat_map(|arg| arg.iter_os_strings())
-                .collect(),
-            env_vars: env_vars.to_owned(),
-            cwd: cwd.to_owned(),
-            // rustc reads `CARGO_MAKEFLAGS` and runs codegen on a thread pool
-            // sized by the jobserver. Without one, every concurrent rustc
-            // spawns as many threads as there are CPUs, which is the
-            // oversubscription sccache's own jobserver exists to prevent.
-            share_jobserver: true,
+        if let Some(canonical) = canonical_paths {
+            canonical.add_to_transformer(path_transformer);
+        }
+
+        let command: Box<dyn CompileCommand<T>> = if let Some(canonical) = canonical_paths {
+            #[cfg(target_os = "linux")]
+            {
+                let sysroot_rustc = sysroot
+                    .join(BINS_DIR)
+                    .join("rustc")
+                    .with_extension(EXE_EXTENSION);
+                CCompileCommand::new(CanonicalRustCompileCommand {
+                    toolchain_executable: executable.to_owned(),
+                    runner_arguments: canonical_bwrap_arguments(
+                        canonical,
+                        &sysroot_rustc,
+                        arguments,
+                        cwd,
+                    ),
+                    env_vars: canonical.env_to_canonical(env_vars),
+                    cwd: canonical.canonical_cwd(cwd),
+                })
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                bail!("experimental canonical Rust paths currently require Linux bubblewrap")
+            }
+        } else {
+            CCompileCommand::new(SingleCompileCommand {
+                executable: executable.to_owned(),
+                arguments: arguments
+                    .iter()
+                    .flat_map(|arg| arg.iter_os_strings())
+                    .collect(),
+                env_vars: env_vars.to_owned(),
+                cwd: cwd.to_owned(),
+                share_jobserver: true,
+            })
         };
 
         #[cfg(not(feature = "dist-client"))]
         let dist_command = None;
         #[cfg(feature = "dist-client")]
         let dist_command = (|| {
+            if !allow_dist {
+                return None;
+            }
             macro_rules! try_string_arg {
                 ($e:expr) => {
                     match $e {
@@ -1845,36 +2554,47 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
 
             // We can't rely on the packaged toolchain necessarily having the same default target triple
             // as us (typically host triple), so make sure to always explicitly specify a target.
+            if let Some(canonical) = canonical_paths {
+                for value in &mut dist_arguments {
+                    *value = canonical
+                        .normalize_os_value(std::ffi::OsStr::new(value))
+                        .into_string()
+                        .ok()?;
+                }
+            }
+
             if !saw_target {
                 dist_arguments.push(format!("--target={}", host));
             }
 
-            // Convert the paths of some important environment variables
-            let mut env_vars = dist::osstring_tuples_to_strings(env_vars)?;
             let mut changed_out_dir: Option<PathBuf> = None;
-            for (k, v) in env_vars.iter_mut() {
-                match k.as_str() {
-                    // We round-tripped from path to string and back to path, but it should be lossless
-                    "OUT_DIR" => {
-                        let dist_out_dir = path_transformer.as_dist(Path::new(v))?;
-                        if dist_out_dir != *v {
-                            changed_out_dir = Some(v.to_owned().into());
+            let env_vars = if let Some(canonical) = canonical_paths {
+                dist::osstring_tuples_to_strings(&canonical.env_to_canonical(env_vars))?
+            } else {
+                let mut env_vars = dist::osstring_tuples_to_strings(env_vars)?;
+                for (k, v) in env_vars.iter_mut() {
+                    match k.as_str() {
+                        "OUT_DIR" => {
+                            let dist_out_dir = path_transformer.as_dist(Path::new(v))?;
+                            if dist_out_dir != *v {
+                                changed_out_dir = Some(v.to_owned().into());
+                            }
+                            *v = dist_out_dir;
                         }
-                        *v = dist_out_dir;
+                        "TMPDIR" => {
+                            *v = String::new();
+                        }
+                        "CARGO" | "CARGO_MANIFEST_DIR" => {
+                            *v = path_transformer.as_dist(Path::new(v))?;
+                        }
+                        _ => (),
                     }
-                    "TMPDIR" => {
-                        // The server will need to find its own tempdir.
-                        *v = String::new();
-                    }
-                    "CARGO" | "CARGO_MANIFEST_DIR" => {
-                        *v = path_transformer.as_dist(Path::new(v))?;
-                    }
-                    _ => (),
                 }
-            }
-            // OUT_DIR was changed during transformation, check if this compilation is relying on anything
-            // inside it - if so, disallow distributed compilation (there are sometimes hardcoded paths present)
-            if let Some(out_dir) = changed_out_dir
+                env_vars
+            };
+
+            if canonical_paths.is_none()
+                && let Some(out_dir) = changed_out_dir
                 && self.inputs.iter().any(|input| input.starts_with(&out_dir))
             {
                 return None;
@@ -1885,6 +2605,14 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             // trying to do every single path.
             let mut remapped_disks = HashSet::new();
             for (local_path, dist_path) in get_path_mappings(path_transformer) {
+                if canonical_paths.is_some()
+                    && matches!(
+                        dist_path.as_str(),
+                        "/build" | "/target" | "/cargo" | "/rust"
+                    )
+                {
+                    continue;
+                }
                 let local_path = local_path.to_str()?;
                 // "The from=to parameter is scanned from right to left, so from may contain '=', but to may not."
                 if local_path.contains('=') {
@@ -1910,7 +2638,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             })
         })();
 
-        Ok((CCompileCommand::new(command), dist_command, Cacheable::Yes))
+        Ok((command, dist_command, Cacheable::Yes))
     }
 
     #[cfg(feature = "dist-client")]
@@ -1926,6 +2654,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             dep_info,
             rlib_dep_reader,
             env_vars,
+            canonical_paths,
             ..
         } = *{ self };
         trace!(
@@ -1941,7 +2670,8 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             path_transformer,
             rlib_dep_reader,
         });
-        let toolchain_packager = Box::new(RustToolchainPackager { sysroot });
+        let canonical = canonical_paths.is_some();
+        let toolchain_packager = Box::new(RustToolchainPackager { sysroot, canonical });
         let outputs_rewriter = Box::new(RustOutputsRewriter { dep_info });
 
         Ok((inputs_packager, toolchain_packager, outputs_rewriter))
@@ -1963,7 +2693,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
 fn get_path_mappings(
     path_transformer: &dist::PathTransformer,
 ) -> impl Iterator<Item = (PathBuf, String)> {
-    path_transformer.disk_mappings()
+    path_transformer.path_mappings()
 }
 
 #[cfg(feature = "dist-client")]
@@ -2304,6 +3034,7 @@ impl pkg::InputsPackager for RustInputsPackager {
 #[allow(unused)]
 struct RustToolchainPackager {
     sysroot: PathBuf,
+    canonical: bool,
 }
 
 #[cfg(feature = "dist-client")]
@@ -2317,9 +3048,12 @@ impl pkg::ToolchainPackager for RustToolchainPackager {
             "Packaging Rust compiler for sysroot {}",
             self.sysroot.display()
         );
-        let RustToolchainPackager { sysroot } = *self;
+        let RustToolchainPackager { sysroot, canonical } = *self;
 
         let mut package_builder = pkg::ToolchainPackageBuilder::new();
+        if canonical {
+            package_builder.add_root_mapping(sysroot.clone(), PathBuf::from("/rust"));
+        }
         package_builder.add_common()?;
 
         let bins_path = sysroot.join(BINS_DIR);
@@ -2766,6 +3500,35 @@ mod test {
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
     use test_case::test_case;
+
+    #[test]
+    fn test_parse_native_profile() {
+        let ir =
+            r#"attributes #0 = { "target-cpu"="znver2" "target-features"="+sse2,+avx2,-avx512f" }"#;
+        assert_eq!(
+            parse_native_profile(ir).unwrap(),
+            "znver2|+sse2,+avx2,-avx512f"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_native_target_cpu() {
+        let mut args = vec![Argument::WithValue(
+            "-C",
+            CodeGen(ArgCodegen {
+                opt: "target-cpu".into(),
+                value: Some("native".into()),
+            }),
+            ArgDisposition::Separated,
+        )];
+        assert!(native_target_requested(&args));
+        rewrite_native_target_cpu(&mut args, "x86-64-v2");
+        assert!(!native_target_requested(&args));
+        assert_eq!(
+            args[0].iter_os_strings().collect::<Vec<_>>(),
+            vec![OsString::from("-C"), OsString::from("target-cpu=x86-64-v2")]
+        );
+    }
 
     fn _parse_arguments(arguments: &[String]) -> CompilerArguments<ParsedArguments> {
         let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
@@ -3552,6 +4315,7 @@ proc_macro false
             compiler_shlibs_digests: vec![FAKE_DIGEST.to_owned()],
             #[cfg(feature = "dist-client")]
             rlib_dep_reader: None,
+            native_profile: "test-native".into(),
             parsed_args: ParsedArguments {
                 arguments: vec![
                     Argument::Raw("a".into()),
@@ -3686,6 +4450,7 @@ proc_macro false
             compiler_shlibs_digests: vec![],
             #[cfg(feature = "dist-client")]
             rlib_dep_reader: None,
+            native_profile: "test-native".into(),
             parsed_args,
         });
 
@@ -3709,6 +4474,137 @@ proc_macro false
             .wait()
             .unwrap()
             .key
+    }
+
+    #[test]
+    fn test_dist_native_normalizes_to_x86_64_v2() {
+        let f = TestFixture::new();
+        f.touch("foo.rs").unwrap();
+
+        let raw = [
+            "--emit",
+            "link",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "-C",
+            "target-cpu=native",
+        ];
+        let oargs = raw.iter().map(OsString::from).collect::<Vec<_>>();
+        let parsed_args = match parse_arguments(&oargs, f.tempdir.path()) {
+            CompilerArguments::Ok(parsed_args) => parsed_args,
+            other => panic!("unexpected parse result: {other:?}"),
+        };
+
+        let creator = new_creator();
+        let runtime = single_threaded_runtime();
+        let pool = runtime.handle().clone();
+
+        let run = |profile: &str, may_dist: bool| {
+            let mut hasher = RustHasher {
+                executable: "rustc".into(),
+                host: "x86_64-unknown-linux-gnu".to_owned(),
+                version: TEST_RUSTC_VERSION.to_string(),
+                sysroot: f.tempdir.path().join("sysroot"),
+                compiler_shlibs_digests: vec![],
+                #[cfg(feature = "dist-client")]
+                rlib_dep_reader: None,
+                native_profile: profile.to_owned(),
+                parsed_args: parsed_args.clone(),
+            };
+            mock_dep_info(&creator, &["foo.rs"]);
+            mock_file_names(&creator, &["foo.rlib"]);
+            hasher
+                .generate_hash_key(
+                    &creator,
+                    f.tempdir.path().to_owned(),
+                    vec![],
+                    may_dist,
+                    &pool,
+                    false,
+                    Arc::new(MockStorage::new(None, false)),
+                    CacheControl::Default,
+                )
+                .wait()
+                .unwrap()
+        };
+
+        let local_znver2 = run("znver2|+avx2", false);
+        let local_znver5 = run("znver5|+avx512f", false);
+        assert_ne!(local_znver2.key, local_znver5.key);
+
+        let dist_znver2 = run("znver2|+avx2", true);
+        let dist_znver5 = run("znver5|+avx512f", true);
+        assert_eq!(dist_znver2.key, dist_znver5.key);
+
+        let mut transformer = dist::PathTransformer::new();
+        let (local_command, dist_command, _) = dist_znver2
+            .compilation
+            .generate_compile_commands(&mut transformer, false)
+            .unwrap();
+
+        let local_args = local_command.get_arguments();
+        assert!(local_args.iter().any(|arg| arg == "target-cpu=x86-64-v2"));
+
+        #[cfg(feature = "dist-client")]
+        {
+            let dist_args = dist_command.unwrap().arguments;
+            assert!(dist_args.iter().any(|arg| arg == "target-cpu=x86-64-v2"));
+            assert!(!dist_args.iter().any(|arg| arg == "target-cpu=native"));
+        }
+    }
+
+    #[test]
+    fn test_canonical_hash_equal_across_physical_roots() {
+        fn mk_manifest(tempdir: &Path) -> Result<()> {
+            create_file(tempdir, "Cargo.toml", |mut f| {
+                f.write_all(b"[package]\nname='foo'\nversion='0.0.0'\n")
+            })?;
+            Ok(())
+        }
+
+        let args = [
+            "--emit",
+            "link",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+        ];
+        let a = TestFixture::new();
+        let b = TestFixture::new();
+        let env_a = vec![
+            (
+                OsString::from("SCCACHE_EXPERIMENTAL_CANONICAL_RUST"),
+                OsString::from("1"),
+            ),
+            (
+                OsString::from("CARGO_TARGET_DIR"),
+                a.tempdir.path().join("target").into_os_string(),
+            ),
+        ];
+        let env_b = vec![
+            (
+                OsString::from("SCCACHE_EXPERIMENTAL_CANONICAL_RUST"),
+                OsString::from("1"),
+            ),
+            (
+                OsString::from("CARGO_TARGET_DIR"),
+                b.tempdir.path().join("target").into_os_string(),
+            ),
+        ];
+
+        assert_eq!(
+            hash_key(&a, &args, &env_a, mk_manifest, false),
+            hash_key(&b, &args, &env_b, mk_manifest, false)
+        );
     }
 
     #[allow(clippy::unnecessary_unwrap)]

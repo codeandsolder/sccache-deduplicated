@@ -1,5 +1,8 @@
 name: ci
-on: [ push, pull_request ]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
 
 jobs:
   lint:
@@ -39,7 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        feature: [ azure, gcs, gha, memcached, redis, s3, webdav ]
+        feature: [ azure, gcs, gha, memcached, redis, s3, webdav, "dist-client,s3" ]
     steps:
       - name: Clone repository
         uses: actions/checkout@v5
