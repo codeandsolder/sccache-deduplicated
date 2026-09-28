@@ -160,6 +160,7 @@ fn replace_embedded_path(text: &str, physical: &str, canonical: &str) -> String 
 }
 
 impl CanonicalRustPaths {
+    #[cfg(target_os = "linux")]
     pub(crate) fn from_rustc_executable(
         env: &[(OsString, OsString)],
         cwd: &Path,
@@ -265,6 +266,7 @@ impl CanonicalRustPaths {
         self.to_canonical(cwd)
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn canonical_executable(&self, executable: &Path) -> PathBuf {
         self.to_canonical(executable)
     }
@@ -391,6 +393,7 @@ impl CanonicalRustPaths {
         out
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn mappings(&self) -> impl Iterator<Item = (&Path, &Path)> {
         self.roots
             .iter()

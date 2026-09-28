@@ -589,6 +589,9 @@ fn handle_compile_result<T>(
 where
     T: CommandCreatorSync,
 {
+    #[cfg(not(target_os = "linux"))]
+    let _ = env_vars;
+
     match response {
         CompileResponse::CompileStarted => {
             if let Some(finished) = finished {
