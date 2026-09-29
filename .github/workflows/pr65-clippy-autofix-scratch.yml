@@ -1,0 +1,71 @@
+name: PR65 Clippy Autofix Scratch
+
+on:
+  push:
+    branches: [ci/rust-skills2-strict]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pr65-clippy-autofix
+  cancel-in-progress: true
+
+jobs:
+  autofix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: true
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: nightly
+          components: clippy,rustfmt
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Apply machine-applicable Clippy fixes
+        shell: bash
+        run: |
+          set +e
+          cargo +nightly clippy --fix --allow-dirty --allow-staged --locked --workspace --all-targets -- \
+            -Dwarnings \
+            -Dunfulfilled_lint_expectations \
+            -Dunexpected_cfgs \
+            -Dunsafe_op_in_unsafe_fn \
+            -Dclippy::correctness \
+            -Dclippy::suspicious \
+            -Dclippy::perf \
+            -Dclippy::style \
+            -Dclippy::complexity \
+            -Dclippy::pedantic \
+            -Dclippy::nursery \
+            -Dclippy::unwrap_used \
+            -Dclippy::expect_used \
+            -Dclippy::panic \
+            -Dclippy::todo \
+            -Dclippy::unimplemented \
+            -Dclippy::dbg_macro \
+            -Dclippy::undocumented_unsafe_blocks \
+            -Dclippy::missing_safety_doc \
+            -Dclippy::await_holding_lock \
+            -Dclippy::allow_attributes \
+            -Dclippy::allow_attributes_without_reason
+          exit 0
+
+      - name: Format and commit fixes
+        shell: bash
+        run: |
+          cargo +nightly fmt --all
+          git diff --check
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No machine-applicable fixes"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "style: apply nightly clippy autofixes"
+          git push
