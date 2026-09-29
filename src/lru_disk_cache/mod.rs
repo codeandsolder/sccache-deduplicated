@@ -456,7 +456,7 @@ impl LruDiskCache {
 #[cfg(test)]
 mod tests {
     use super::fs::{self, File};
-    use super::{Error, LruDiskCache, LruDiskCacheAddEntry, get_all_files};
+    use super::{Error, LruDiskCache, LruDiskCacheAddEntry, Result, get_all_files};
 
     use filetime::{FileTime, set_file_times};
     use std::io::{self, Read, Write};

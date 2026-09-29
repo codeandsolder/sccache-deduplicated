@@ -82,8 +82,8 @@ pub enum Command {
     DebugPreprocessorCacheEntries,
 }
 
-fn flag_infer_long_and_short(name: &'static str) -> Arg {
-    flag_infer_long(name).short(name.chars().next().expect("Name needs at least one char"))
+fn flag_long_and_short(name: &'static str, short: char) -> Arg {
+    flag_infer_long(name).short(short)
 }
 
 fn flag_infer_long(name: &'static str) -> Arg {
@@ -126,7 +126,7 @@ fn get_clap_command() -> clap::Command {
             "\n"
         ))
         .args(&[
-            flag_infer_long_and_short("show-stats")
+            flag_long_and_short("show-stats", 's')
                 .help("show cache statistics")
                 .action(ArgAction::SetTrue),
             flag_infer_long("show-adv-stats")
@@ -141,7 +141,7 @@ fn get_clap_command() -> clap::Command {
             flag_infer_long("stop-server")
                 .help("stop background server")
                 .action(ArgAction::SetTrue),
-            flag_infer_long_and_short("zero-stats")
+            flag_long_and_short("zero-stats", 'z')
                 .help("zero statistics counters")
                 .action(ArgAction::SetTrue),
             flag_infer_long("dist-auth")
