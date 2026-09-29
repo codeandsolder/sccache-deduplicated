@@ -199,6 +199,28 @@ impl CanonicalRustPaths {
         ];
         if let Some(ref cargo_home) = cargo_home {
             roots.push(RootMapping::new(cargo_home.clone(), "/cargo"));
+
+            // cargo-ephemeral can materialize registry sources outside
+            // CARGO_HOME while keeping the persistent registry archives in
+            // CARGO_HOME. Treat that process-scoped source tree as the same
+            // canonical /cargo/registry/src namespace so cache keys remain
+            // stable and the bubblewrap compiler sandbox can see the cwd.
+            if let Some(ephemeral_registry_src) = env_value(env, "EPHEMERAL_CARGO_REGISTRY_SRC") {
+                let persistent_registry_src = cargo_home.join("registry/src");
+                let physical_ephemeral = ephemeral_registry_src
+                    .canonicalize()
+                    .unwrap_or_else(|_| ephemeral_registry_src.clone());
+                let physical_persistent = persistent_registry_src
+                    .canonicalize()
+                    .unwrap_or(persistent_registry_src);
+
+                if physical_ephemeral != physical_persistent {
+                    roots.push(RootMapping::new(
+                        ephemeral_registry_src,
+                        "/cargo/registry/src",
+                    ));
+                }
+            }
         }
         roots.push(RootMapping::new(rust_root.to_owned(), "/rust"));
 
@@ -479,6 +501,70 @@ mod tests {
             roots.to_physical(Path::new("/build/src/lib.rs")),
             PathBuf::from("/work/a/src/lib.rs")
         );
+    }
+
+    #[test]
+    fn maps_ephemeral_registry_source_into_cargo_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let build = temp.path().join("build");
+        let target = temp.path().join("target");
+        let cargo_home = temp.path().join("cargo");
+        let persistent_registry = cargo_home.join("registry/src");
+        let ephemeral_registry = temp.path().join("ephemeral-registry");
+
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&persistent_registry).unwrap();
+        std::fs::create_dir_all(ephemeral_registry.join("index/pkg")).unwrap();
+        std::fs::write(
+            build.join("Cargo.toml"),
+            "[workspace]
+",
+        )
+        .unwrap();
+
+        let env = vec![
+            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+            (
+                "SCCACHE_CANONICAL_BUILD_ROOT".into(),
+                build.clone().into_os_string(),
+            ),
+            ("CARGO_TARGET_DIR".into(), target.clone().into_os_string()),
+            ("CARGO_HOME".into(), cargo_home.clone().into_os_string()),
+            (
+                "EPHEMERAL_CARGO_REGISTRY_SRC".into(),
+                ephemeral_registry.clone().into_os_string(),
+            ),
+        ];
+
+        let roots = CanonicalRustPaths::from_env(&env, &build, Path::new("/rust")).unwrap();
+        let source = ephemeral_registry.join("index/pkg/src/lib.rs");
+        assert_eq!(
+            roots.to_canonical(&source),
+            PathBuf::from("/cargo/registry/src/index/pkg/src/lib.rs")
+        );
+        assert!(roots.root_is_known(&source));
+
+        #[cfg(target_os = "linux")]
+        {
+            let args = roots.bwrap_arguments(
+                Path::new("/rust/bin/rustc"),
+                &[source.clone().into_os_string()],
+                &ephemeral_registry.join("index/pkg"),
+            );
+            assert!(args.windows(2).any(|pair| {
+                pair[0] == ephemeral_registry.as_os_str()
+                    && pair[1] == OsStr::new("/cargo/registry/src")
+            }));
+            assert!(args.windows(2).any(|pair| {
+                pair[0] == OsStr::new("--chdir")
+                    && pair[1] == OsStr::new("/cargo/registry/src/index/pkg")
+            }));
+            assert!(
+                args.iter()
+                    .any(|arg| arg == OsStr::new("/cargo/registry/src/index/pkg/src/lib.rs"))
+            );
+        }
     }
 
     #[test]
