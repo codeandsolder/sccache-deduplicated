@@ -386,7 +386,7 @@ pub fn split_os_string_arg(val: OsString, split: &str) -> ArgParseResult<(String
 }
 
 /// The description of how an argument may be parsed
-#[derive(PartialEq, Eq, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub enum ArgInfo<T> {
     /// An simple flag argument, of the form "-foo"
     Flag(&'static str, T),
@@ -929,17 +929,31 @@ mod tests {
         static ARGS3: [ArgInfo<ArgData>; 1] =
             [take_arg!("-include", PathBuf, Concatenated, FooPath)];
 
-        assert_eq!((&ARGS[..], &ARGS2[..]).search("-include"), Some(&ARGS[0]));
-        assert_eq!(
-            (&ARGS[..], &ARGS2[..]).search("-include-pch"),
-            Some(&ARGS2[0])
+        assert!(
+            (&ARGS[..], &ARGS2[..])
+                .search("-include")
+                .is_some_and(|actual| std::ptr::eq(actual, &ARGS[0]))
         );
-        assert_eq!((&ARGS2[..], &ARGS[..]).search("-include"), Some(&ARGS[0]));
-        assert_eq!(
-            (&ARGS2[..], &ARGS[..]).search("-include-pch"),
-            Some(&ARGS2[0])
+        assert!(
+            (&ARGS[..], &ARGS2[..])
+                .search("-include-pch")
+                .is_some_and(|actual| std::ptr::eq(actual, &ARGS2[0]))
         );
-        assert_eq!((&ARGS[..], &ARGS3[..]).search("-include"), Some(&ARGS3[0]));
+        assert!(
+            (&ARGS2[..], &ARGS[..])
+                .search("-include")
+                .is_some_and(|actual| std::ptr::eq(actual, &ARGS[0]))
+        );
+        assert!(
+            (&ARGS2[..], &ARGS[..])
+                .search("-include-pch")
+                .is_some_and(|actual| std::ptr::eq(actual, &ARGS2[0]))
+        );
+        assert!(
+            (&ARGS[..], &ARGS3[..])
+                .search("-include")
+                .is_some_and(|actual| std::ptr::eq(actual, &ARGS3[0]))
+        );
     }
 
     #[test]
