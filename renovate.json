@@ -9,14 +9,17 @@
   "minimumReleaseAge": "3 days",
   "minimumReleaseAgeBehaviour": "timestamp-required",
   "internalChecksFilter": "strict",
-  "separateMultipleMajor": true,
-  "prConcurrentLimit": 0,
-  "prHourlyLimit": 0,
-  "rebaseWhen": "behind-base-branch",
+  "schedule": [
+    "after 2am and before 4am on tuesday"
+  ],
+  "separateMultipleMajor": false,
+  "prConcurrentLimit": 2,
+  "prHourlyLimit": 1,
+  "rebaseWhen": "conflicted",
   "lockFileMaintenance": {
     "enabled": true,
     "schedule": [
-      "before 3am"
+      "after 2am and before 3am on tuesday"
     ],
     "automerge": true,
     "automergeType": "pr"
@@ -36,43 +39,28 @@
       "enabled": false
     },
     {
-      "description": "Group routine compatible stable Rust dependency updates",
+      "description": "Cargo.toml dependency policy follows mozilla/sccache upstream; only local lockfile maintenance is allowed",
       "matchManagers": [
         "cargo"
       ],
       "matchUpdateTypes": [
+        "major",
         "minor",
         "patch",
         "pin",
         "pinDigest",
-        "digest"
+        "digest",
+        "bump",
+        "rollback",
+        "replacement"
       ],
-      "matchCurrentVersion": "!/^0/",
-      "groupName": "routine stable Rust dependencies"
-    },
-    {
-      "description": "Group GitHub Actions tooling updates into one reviewed change",
-      "matchManagers": [
-        "github-actions"
-      ],
-      "groupName": "GitHub Actions tooling",
-      "automerge": false
-    },
-    {
-      "description": "Automerge ordinary compatible updates after CI",
-      "matchUpdateTypes": [
-        "minor",
-        "patch",
-        "pin",
-        "pinDigest",
-        "digest"
-      ],
-      "matchCurrentVersion": "!/^0/",
-      "automerge": true,
-      "automergeType": "pr"
+      "enabled": false
     },
     {
       "description": "Cargo lockfile maintenance is age-gated by repository CI",
+      "matchManagers": [
+        "cargo"
+      ],
       "matchUpdateTypes": [
         "lockFileMaintenance"
       ],
@@ -81,23 +69,12 @@
       "automergeType": "pr"
     },
     {
-      "description": "Potentially breaking pre-1.0 updates stay open for the maintenance agent",
-      "matchCurrentVersion": "/^0\\./",
-      "automerge": false
-    },
-    {
-      "description": "Major updates are always attempted but stay open for the maintenance agent",
-      "matchUpdateTypes": [
-        "major"
+      "description": "Group all GitHub Actions maintenance into one reviewed PR",
+      "matchManagers": [
+        "github-actions"
       ],
-      "automerge": false
-    },
-    {
-      "description": "Package replacements stay open for the maintenance agent",
-      "matchUpdateTypes": [
-        "replacement"
-      ],
-      "minimumReleaseAge": null,
+      "groupName": "GitHub Actions tooling",
+      "groupSlug": "github-actions-tooling",
       "automerge": false
     }
   ]
