@@ -645,10 +645,6 @@ pub fn build_single_cache(
                 .with_skip_cache_check(skip_cache_check);
             Ok(Arc::new(storage))
         }
-        #[expect(
-            unreachable_patterns,
-            reason = "legacy upstream lint exception retained under strict CI"
-        )]
         _ => {
             bail!("Cache type not supported with current feature configuration")
         }

@@ -344,19 +344,11 @@ pub type ExitStatusValue = i32;
 #[cfg(windows)]
 pub type ExitStatusValue = u32;
 
-#[expect(
-    dead_code,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 pub fn exit_status(v: ExitStatusValue) -> ExitStatus {
     ExitStatus::from_raw(v)
 }
 
 /// A struct that mocks `std::process::Child`.
-#[expect(
-    dead_code,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 #[derive(Debug)]
 pub struct MockChild {
     //TODO: this doesn't work to actually track writes...
@@ -373,10 +365,6 @@ pub struct MockChild {
 /// A mocked child process that simply returns stored values for its status and output.
 impl MockChild {
     /// Create a `MockChild` that will return the specified `status`, `stdout`, and `stderr` when waited upon.
-    #[expect(
-        dead_code,
-        reason = "legacy upstream lint exception retained under strict CI"
-    )]
     pub fn new<T: AsRef<[u8]>, U: AsRef<[u8]>>(
         status: ExitStatus,
         stdout: T,
@@ -391,10 +379,6 @@ impl MockChild {
     }
 
     /// Create a `MockChild` that will return the specified `err` when waited upon.
-    #[expect(
-        dead_code,
-        reason = "legacy upstream lint exception retained under strict CI"
-    )]
     pub fn with_error(err: io::Error) -> MockChild {
         MockChild {
             stdin: None,
@@ -443,10 +427,6 @@ impl CommandChild for MockChild {
 
 pub enum ChildOrCall {
     Child(Result<MockChild>),
-    #[expect(
-        dead_code,
-        reason = "Read in the async_trait below, but rustc doesn't see it as used"
-    )]
     Call(Box<dyn Fn(&[OsString]) -> Result<MockChild> + Send>),
 }
 
@@ -460,10 +440,6 @@ impl fmt::Debug for ChildOrCall {
 }
 
 /// A mocked command that simply returns its `child` from `spawn`.
-#[expect(
-    dead_code,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 #[derive(Debug)]
 pub struct MockCommand {
     pub child: Option<ChildOrCall>,
@@ -522,10 +498,6 @@ impl RunCommand for MockCommand {
 }
 
 /// `MockCommandCreator` allows mocking out process creation by providing `MockChild` instances to be used in advance.
-#[expect(
-    dead_code,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 pub struct MockCommandCreator {
     /// Data to be used as the return value of `MockCommand::spawn`.
     pub children: Vec<ChildOrCall>,
@@ -533,20 +505,12 @@ pub struct MockCommandCreator {
 
 impl MockCommandCreator {
     /// The next `MockCommand` created will return `child` from `RunCommand::spawn`.
-    #[expect(
-        dead_code,
-        reason = "legacy upstream lint exception retained under strict CI"
-    )]
     pub fn next_command_spawns(&mut self, child: Result<MockChild>) {
         self.children.push(ChildOrCall::Child(child));
     }
 
     /// The next `MockCommand` created will call `call` with the command-line
     /// arguments passed to the command.
-    #[expect(
-        dead_code,
-        reason = "legacy upstream lint exception retained under strict CI"
-    )]
     pub fn next_command_calls<C>(&mut self, call: C)
     where
         C: Fn(&[OsString]) -> Result<MockChild> + Send + 'static,

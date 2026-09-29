@@ -153,10 +153,6 @@ pub fn mk_bin_contents<F: FnOnce(File) -> io::Result<()>>(
     let bin = dir.join(path);
     let parent = bin.parent().unwrap();
     fs::create_dir_all(parent)?;
-    #[expect(
-        clippy::unnecessary_cast,
-        reason = "legacy upstream lint exception retained under strict CI"
-    )]
     let f = fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -172,10 +168,6 @@ pub fn mk_bin(dir: &Path, path: &str) -> io::Result<PathBuf> {
 }
 
 #[cfg(not(unix))]
-#[expect(
-    dead_code,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 pub fn mk_bin_contents<F: FnOnce(File) -> io::Result<()>>(
     dir: &Path,
     path: &str,
@@ -225,18 +217,10 @@ impl TestFixture {
         }
     }
 
-    #[expect(
-        dead_code,
-        reason = "legacy upstream lint exception retained under strict CI"
-    )]
     pub fn touch(&self, path: &str) -> io::Result<PathBuf> {
         touch(self.tempdir.path(), path)
     }
 
-    #[expect(
-        dead_code,
-        reason = "legacy upstream lint exception retained under strict CI"
-    )]
     pub fn mk_bin(&self, path: &str) -> io::Result<PathBuf> {
         mk_bin(self.tempdir.path(), path)
     }

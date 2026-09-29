@@ -110,10 +110,6 @@ impl<I> CCompileCommand<I>
 where
     I: CompileCommandImpl,
 {
-    #[expect(
-        clippy::new_ret_no_self,
-        reason = "legacy upstream lint exception retained under strict CI"
-    )]
     pub fn new<T>(cmd: I) -> Box<dyn CompileCommand<T>>
     where
         T: CommandCreatorSync,
@@ -237,10 +233,6 @@ pub enum CompilerKind {
 
 // Used for tests
 // Need to be consistent with `Language`
-#[expect(
-    dead_code,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 const EXPECTED_LANGUAGE_COUNT: usize = 21;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -521,10 +513,6 @@ where
     /// Given information about a compiler command, generate a hash key
     /// that can be used for cache lookups, as well as any additional
     /// information that can be reused for compilation if necessary.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "legacy upstream lint exception retained under strict CI"
-    )]
     async fn generate_hash_key(
         &mut self,
         creator: &T,
@@ -542,10 +530,6 @@ where
 
     /// Look up a cached compile result in `storage`. If not found, run the
     /// compile and store the result.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "legacy upstream lint exception retained under strict CI"
-    )]
     async fn get_cached_or_compile(
         &mut self,
         service: &server::SccacheService<T>,
@@ -3645,10 +3629,6 @@ mod test_dist {
 
     pub struct ErrorPutToolchainClient;
     impl ErrorPutToolchainClient {
-        #[expect(
-            clippy::new_ret_no_self,
-            reason = "legacy upstream lint exception retained under strict CI"
-        )]
         pub fn new() -> Arc<dyn dist::Client> {
             Arc::new(ErrorPutToolchainClient)
         }
@@ -3697,10 +3677,6 @@ mod test_dist {
         tc: Toolchain,
     }
     impl ErrorAllocJobClient {
-        #[expect(
-            clippy::new_ret_no_self,
-            reason = "legacy upstream lint exception retained under strict CI"
-        )]
         pub fn new() -> Arc<dyn dist::Client> {
             Arc::new(Self {
                 tc: Toolchain {
@@ -3755,10 +3731,6 @@ mod test_dist {
         tc: Toolchain,
     }
     impl ErrorSubmitToolchainClient {
-        #[expect(
-            clippy::new_ret_no_self,
-            reason = "legacy upstream lint exception retained under strict CI"
-        )]
         pub fn new() -> Arc<dyn dist::Client> {
             Arc::new(Self {
                 has_started: AtomicBool::default(),
@@ -3829,10 +3801,6 @@ mod test_dist {
         tc: Toolchain,
     }
     impl ErrorRunJobClient {
-        #[expect(
-            clippy::new_ret_no_self,
-            reason = "legacy upstream lint exception retained under strict CI"
-        )]
         pub fn new() -> Arc<dyn dist::Client> {
             Arc::new(Self {
                 has_started: AtomicBool::default(),
@@ -3913,10 +3881,6 @@ mod test_dist {
     }
 
     impl OneshotClient {
-        #[expect(
-            clippy::new_ret_no_self,
-            reason = "legacy upstream lint exception retained under strict CI"
-        )]
         pub fn new(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Arc<dyn dist::Client> {
             Arc::new(Self {
                 has_started: AtomicBool::default(),

@@ -240,10 +240,6 @@ fn create_server_token(server_id: ServerId, auth_token: &str) -> String {
 }
 
 #[cfg(feature = "dist-server")]
-#[expect(
-    dead_code,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 pub enum ServerHandle {
     Container { cid: String, url: HTTPUrl },
     Process { pid: Pid, url: HTTPUrl },

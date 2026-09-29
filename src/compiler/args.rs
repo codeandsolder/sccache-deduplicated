@@ -307,7 +307,6 @@ macro_rules! ArgData {
     };
     { $( $tok:tt )+ } => {
         #[derive(Clone, Debug, PartialEq)]
-        #[expect(clippy::enum_variant_names, reason = "legacy upstream lint exception retained under strict CI")]
         enum ArgData {
             $($tok)+
         }
@@ -388,10 +387,6 @@ pub fn split_os_string_arg(val: OsString, split: &str) -> ArgParseResult<(String
 
 /// The description of how an argument may be parsed
 #[derive(PartialEq, Eq, Clone, Debug)]
-#[expect(
-    unpredictable_function_pointer_comparisons,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 pub enum ArgInfo<T> {
     /// An simple flag argument, of the form "-foo"
     Flag(&'static str, T),
@@ -734,10 +729,6 @@ mod tests {
     use self::ArgData::*;
 
     #[test]
-    #[expect(
-        clippy::cognitive_complexity,
-        reason = "legacy upstream lint exception retained under strict CI"
-    )]
     fn test_arginfo_cmp() {
         let info = flag!("-foo", FooFlag);
         assert_eq!(info.cmp("-foo"), Ordering::Equal);

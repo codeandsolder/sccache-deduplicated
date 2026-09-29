@@ -61,10 +61,6 @@ impl CCompilerImpl for Diab {
         parse_arguments(arguments, cwd, &ARGS[..])
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "legacy upstream lint exception retained under strict CI"
-    )]
     async fn preprocess<T>(
         &self,
         creator: &T,

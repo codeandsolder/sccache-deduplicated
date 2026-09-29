@@ -65,10 +65,6 @@ impl CCompilerImpl for Gcc {
         parse_arguments(arguments, cwd, &ARGS[..], self.gplusplus, self.kind())
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "legacy upstream lint exception retained under strict CI"
-    )]
     async fn preprocess<T>(
         &self,
         creator: &T,
@@ -831,10 +827,6 @@ pub fn language_to_gcc_arg(lang: Language) -> Option<&'static str> {
     lang.to_gcc_arg()
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 fn preprocess_cmd<F, T>(
     cmd: &mut T,
     parsed_args: &ParsedArguments,
@@ -917,10 +909,6 @@ fn preprocess_cmd<F, T>(
         .current_dir(cwd);
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 pub async fn preprocess<F, T>(
     creator: &T,
     executable: &Path,
@@ -956,10 +944,6 @@ where
     run_input_output(cmd, None).await
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 pub fn generate_compile_commands<F>(
     path_transformer: &mut dist::PathTransformer,
     executable: &Path,

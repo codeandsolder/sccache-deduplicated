@@ -38,10 +38,6 @@ static LOGGER: LazyLock<Result<(), Infallible>> = LazyLock::new(|| {
 pub struct SccacheTest<'a> {
     /// Tempdir used for Sccache cache and cargo output. It is kept in the struct only to have the
     /// destructor run when SccacheTest goes out of scope, but is never used otherwise.
-    #[expect(
-        dead_code,
-        reason = "legacy upstream lint exception retained under strict CI"
-    )]
     pub tempdir: tempfile::TempDir,
     pub env: Vec<(&'a str, std::ffi::OsString)>,
 }

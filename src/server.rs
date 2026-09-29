@@ -715,46 +715,26 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
     }
 
     /// Configures how long this server will be idle before shutting down.
-    #[expect(
-        dead_code,
-        reason = "legacy upstream lint exception retained under strict CI"
-    )]
     pub fn set_idle_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
     }
 
     /// Set the storage this server will use.
-    #[expect(
-        dead_code,
-        reason = "legacy upstream lint exception retained under strict CI"
-    )]
     pub fn set_storage(&mut self, storage: Arc<dyn Storage>) {
         self.service.storage = storage;
     }
 
     /// Returns a reference to a thread pool to run work on
-    #[expect(
-        dead_code,
-        reason = "legacy upstream lint exception retained under strict CI"
-    )]
     pub fn pool(&self) -> &tokio::runtime::Handle {
         &self.service.rt
     }
 
     /// Returns a reference to the command creator this server will use
-    #[expect(
-        dead_code,
-        reason = "legacy upstream lint exception retained under strict CI"
-    )]
     pub fn command_creator(&self) -> &C {
         &self.service.creator
     }
 
     /// Returns the port that this server is bound to
-    #[expect(
-        dead_code,
-        reason = "legacy upstream lint exception retained under strict CI"
-    )]
     pub fn local_addr(&self) -> Option<crate::net::SocketAddr> {
         self.listener.local_addr().unwrap()
     }
@@ -926,10 +906,6 @@ where
 
     /// Information tracking how many services (connected clients) are active.
     /// This field causes [WaitUntilZero] to wait until this struct drops.
-    #[expect(
-        dead_code,
-        reason = "legacy upstream lint exception retained under strict CI"
-    )]
     info: ActiveInfo,
 }
 
@@ -2534,10 +2510,6 @@ pub(crate) struct WaitUntilZero {
 }
 
 #[derive(Clone)]
-#[expect(
-    dead_code,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 pub struct ActiveInfo {
     info: Arc<std::sync::Mutex<Info>>,
 }

@@ -13,19 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![expect(
-    unused_imports,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
-#![expect(
-    dead_code,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
-#![expect(
-    unused_variables,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
-
 use crate::compiler::args::*;
 use crate::compiler::c::{ArtifactDescriptor, CCompilerImpl, CCompilerKind, ParsedArguments};
 use crate::compiler::gcc::ArgData::*;
@@ -177,10 +164,6 @@ impl CCompilerImpl for Nvcc {
         }
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "legacy upstream lint exception retained under strict CI"
-    )]
     async fn preprocess<T>(
         &self,
         creator: &T,
@@ -656,10 +639,6 @@ pub struct NvccGeneratedSubcommand {
     pub cacheable: Cacheable,
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 async fn group_nvcc_subcommands_by_compilation_stage<T>(
     creator: &T,
     executable: &Path,
@@ -949,10 +928,6 @@ where
     Ok(command_groups)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 async fn select_nvcc_subcommands<T, F>(
     creator: &T,
     executable: &Path,

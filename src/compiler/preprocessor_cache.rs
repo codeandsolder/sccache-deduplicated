@@ -376,10 +376,6 @@ static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
 });
 
 /// Compute the hash key of compiler preprocessing `input` with `args`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 pub fn preprocessor_cache_entry_hash_key(
     compiler_digest: &str,
     language: Language,

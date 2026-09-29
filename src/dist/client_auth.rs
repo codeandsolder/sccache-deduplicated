@@ -471,10 +471,6 @@ impl HyperBuilderWrap {
     }
 }
 
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 fn error_code_response<E>(uri: hyper::Uri, e: E) -> hyper::Result<Response<Full<Bytes>>>
 where
     E: std::fmt::Debug,

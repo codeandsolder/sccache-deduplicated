@@ -439,20 +439,12 @@ where
 
 /// Return the signal that caused a process to exit from `status`.
 #[cfg(unix)]
-#[expect(
-    dead_code,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 fn status_signal(status: process::ExitStatus) -> Option<i32> {
     status.signal()
 }
 
 /// Not implemented for non-Unix.
 #[cfg(not(unix))]
-#[expect(
-    dead_code,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 fn status_signal(_status: process::ExitStatus) -> Option<i32> {
     None
 }
@@ -521,10 +513,6 @@ fn handle_compile_finished(
 /// If the server returned `CompileStarted`, reads the follow-up `CompileFinished`
 /// from `conn`, falling back to local execution if the server disconnects
 /// unexpectedly.  Delegates to `handle_compile_result` for the final dispatch.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 fn handle_compile_response<T>(
     creator: T,
     runtime: &mut Runtime,
@@ -582,10 +570,6 @@ where
 
 /// Dispatch the outcome of a compile, whether received from the daemon over IPC
 /// or produced by a local `SccacheService` in client-side mode.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 fn handle_compile_result<T>(
     mut creator: T,
     runtime: &mut Runtime,
@@ -671,10 +655,6 @@ where
 /// The first entry in `cmdline` will be looked up in `path` if it is not
 /// an absolute path.
 /// See `request_compile` and `handle_compile_response`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 pub fn do_compile<T>(
     creator: T,
     runtime: &mut Runtime,
@@ -703,10 +683,6 @@ where
 ///
 /// Shares `handle_compile_result` with the daemon-IPC path so local-fallback
 /// execution is not duplicated.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 pub fn do_compile_client_side<C>(
     jobserver: &Client,
     runtime: &mut Runtime,

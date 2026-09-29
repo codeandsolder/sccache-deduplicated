@@ -13,18 +13,6 @@
 // limitations under the License.
 
 #![deny(rust_2018_idioms)]
-#![expect(
-    clippy::type_complexity,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
-#![expect(
-    clippy::new_without_default,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
-#![expect(
-    clippy::blocks_in_conditions,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
 #![recursion_limit = "256"]
 
 #[macro_use]

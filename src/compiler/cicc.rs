@@ -13,19 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![expect(
-    unused_imports,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
-#![expect(
-    dead_code,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
-#![expect(
-    unused_variables,
-    reason = "legacy upstream lint exception retained under strict CI"
-)]
-
 use crate::compiler::args::*;
 use crate::compiler::c::{ArtifactDescriptor, CCompilerImpl, CCompilerKind, ParsedArguments};
 use crate::compiler::{
@@ -82,10 +69,6 @@ impl CCompilerImpl for Cicc {
     ) -> CompilerArguments<ParsedArguments> {
         parse_arguments(arguments, cwd, Language::Ptx, &ARGS[..], 3)
     }
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "legacy upstream lint exception retained under strict CI"
-    )]
     async fn preprocess<T>(
         &self,
         _creator: &T,
