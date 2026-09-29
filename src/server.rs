@@ -1481,7 +1481,7 @@ where
                     }
                     CompilerArguments::CannotCache(why, extra_info) => {
                         append_noncacheable_record(why, extra_info.as_deref(), &cwd, &cmd);
-                        if let Some(extra_info) = extra_info {
+                        if let Some(extra_info) = extra_info.as_deref() {
                             debug!(
                                 "parse_arguments: CannotCache({}, {}): {:?}",
                                 why, extra_info, cmd
@@ -1490,8 +1490,7 @@ where
                             debug!("parse_arguments: CannotCache({}): {:?}", why, cmd);
                         }
                         let mut stats = self.stats.lock().await;
-                        stats.requests_not_cacheable += 1;
-                        *stats.not_cached.entry(why.to_string()).or_insert(0) += 1;
+                        stats.record_not_cacheable(why, extra_info.as_deref());
                     }
                     CompilerArguments::NotCompilation => {
                         debug!("parse_arguments: NotCompilation: {:?}", cmd);
@@ -1847,6 +1846,10 @@ pub struct ServerStats {
     pub compile_fails: u64,
     /// Counts of reasons why compiles were not cached.
     pub not_cached: HashMap<String, usize>,
+    /// Counts of the specific Rust crate types behind the crate-type
+    /// non-cacheable reason.
+    #[serde(default)]
+    pub not_cached_crate_types: HashMap<String, usize>,
     /// The count of compilations that were successfully distributed indexed
     /// by the server that ran those compilations.
     pub dist_compiles: HashMap<String, usize>,
@@ -1879,6 +1882,9 @@ impl std::ops::AddAssign for ServerStats {
         self.compile_fails += rhs.compile_fails;
         for (k, v) in rhs.not_cached {
             *self.not_cached.entry(k).or_default() += v;
+        }
+        for (k, v) in rhs.not_cached_crate_types {
+            *self.not_cached_crate_types.entry(k).or_default() += v;
         }
         for (k, v) in rhs.dist_compiles {
             *self.dist_compiles.entry(k).or_default() += v;
@@ -1940,6 +1946,7 @@ impl Default for ServerStats {
             compiler_write_duration: Duration::new(0, 0),
             compile_fails: u64::default(),
             not_cached: HashMap::new(),
+            not_cached_crate_types: HashMap::new(),
             dist_compiles: HashMap::new(),
             dist_errors: u64::default(),
             multi_level: None,
@@ -1960,6 +1967,20 @@ impl ServerStatsWriter for StdoutServerStatsWriter {
 }
 
 impl ServerStats {
+    fn record_not_cacheable(&mut self, why: &str, extra_info: Option<&str>) {
+        self.requests_not_cacheable += 1;
+        *self.not_cached.entry(why.to_string()).or_insert(0) += 1;
+
+        if why == "crate-type"
+            && let Some(crate_type) = extra_info
+        {
+            *self
+                .not_cached_crate_types
+                .entry(crate_type.to_string())
+                .or_insert(0) += 1;
+        }
+    }
+
     /// Print stats in a human-readable format.
     ///
     /// Return the formatted width of each of the (name, value) columns.
@@ -2128,6 +2149,21 @@ impl ServerStats {
                 writer.write(&format!(
                     "{:<name_width$} {:>stat_width$}",
                     reason,
+                    count,
+                    name_width = name_width,
+                    stat_width = stat_width,
+                ));
+            }
+            writer.write("");
+        }
+        if !self.not_cached_crate_types.is_empty() {
+            writer.write("Non-cacheable crate types:");
+            let mut counts: Vec<_> = self.not_cached_crate_types.iter().collect();
+            counts.sort_by(sort_func);
+            for (crate_type, count) in counts {
+                writer.write(&format!(
+                    "{:<name_width$} {:>stat_width$}",
+                    crate_type,
                     count,
                     name_width = name_width,
                     stat_width = stat_width,
@@ -2672,5 +2708,30 @@ mod tests {
                 .unwrap();
             assert!(find_s1 < find_s2);
         }
+    }
+
+    #[test]
+    fn test_print_non_cacheable_crate_type_details() {
+        let mut stats = ServerStats::default();
+        stats.record_not_cacheable("crate-type", Some("bin"));
+        stats.record_not_cacheable("crate-type", Some("bin"));
+        stats.record_not_cacheable("crate-type", Some("proc-macro"));
+        stats.record_not_cacheable("crate-type", Some("No crate-type passed"));
+        stats.record_not_cacheable("missing input", None);
+
+        let mut writer = StringWriter::new();
+        stats.print(&mut writer, false);
+
+        let output = writer.get_output();
+        assert_eq!(stats.requests_not_cacheable, 5);
+        assert_eq!(stats.not_cached.get("crate-type"), Some(&4));
+        assert_eq!(stats.not_cached_crate_types.get("bin"), Some(&2));
+        assert!(output.contains("Non-cacheable reasons:"));
+        assert!(output.contains("crate-type"));
+        assert!(output.contains("missing input"));
+        assert!(output.contains("Non-cacheable crate types:"));
+        assert!(output.contains("bin"));
+        assert!(output.contains("proc-macro"));
+        assert!(output.contains("No crate-type passed"));
     }
 }
