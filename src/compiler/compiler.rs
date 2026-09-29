@@ -1021,8 +1021,12 @@ where
                     .with_context(|| format!("unable to transform output path {}", path))
             );
             output_paths.push(local_path);
-            // Do this first so cleanup works correctly
-            let local_path = output_paths.last().expect("nothing in vec after push");
+            // Do this first so cleanup works correctly.
+            let local_path = try_or_cleanup!(
+                output_paths
+                    .last()
+                    .ok_or_else(|| anyhow!("output path missing immediately after insertion"))
+            );
 
             let mut file =
                 try_or_cleanup!(File::create(local_path).with_context(|| format!(
@@ -1034,7 +1038,14 @@ where
                     .with_context(|| format!("Failed to write output to {}", local_path.display()))
             );
 
-            assert!(count == len);
+            try_or_cleanup!(if count == len {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "distributed output length mismatch for {}: expected {len} bytes, wrote {count}",
+                    local_path.display()
+                ))
+            });
         }
         let extra_inputs = match tc_archive {
             Some(p) => vec![p],
@@ -1884,13 +1895,8 @@ compiler_version=__VERSION__
     };
     let mut lines = stdout.lines().filter_map(|line| {
         let line = line.trim();
-        if line.starts_with("compiler_id=") {
-            Some(line.strip_prefix("compiler_id=").unwrap())
-        } else if line.starts_with("compiler_version=") {
-            Some(line.strip_prefix("compiler_version=").unwrap())
-        } else {
-            None
-        }
+        line.strip_prefix("compiler_id=")
+            .or_else(|| line.strip_prefix("compiler_version="))
     });
     if let Some(kind) = lines.next() {
         let executable = resolved_executable;
