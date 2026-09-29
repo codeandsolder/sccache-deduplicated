@@ -399,11 +399,7 @@ impl CanonicalRustPaths {
         for root in &self.roots {
             let writable = root.canonical == Path::new("/target");
             for alias in &root.aliases {
-                if !alias.exists()
-                    || canonical_mounts
-                        .iter()
-                        .any(|canonical| alias.as_path() == *canonical)
-                {
+                if !alias.exists() || canonical_mounts.contains(&alias.as_path()) {
                     continue;
                 }
                 physical_aliases.push((alias.as_path(), writable));
