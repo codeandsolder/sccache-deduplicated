@@ -146,9 +146,7 @@ impl State {
                     *iter = Some(DirentIterator { entries, index: 0 });
                 }
 
-                let Some(iter) = iter.as_mut() else {
-                    return None;
-                };
+                let iter = iter.as_mut()?;
                 info!(
                     "{dirp:p}: reading entry {}/{}",
                     iter.index,
