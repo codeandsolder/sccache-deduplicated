@@ -15,7 +15,14 @@
 // limitations under the License.
 
 #![deny(rust_2018_idioms)]
-#![allow(dead_code, unused_imports)]
+#![expect(
+    dead_code,
+    reason = "legacy upstream lint exception retained under strict CI"
+)]
+#![expect(
+    unused_imports,
+    reason = "legacy upstream lint exception retained under strict CI"
+)]
 
 #[macro_use]
 extern crate log;
@@ -44,7 +51,7 @@ use std::time::{Duration, SystemTime};
 use test_case::test_case;
 use which::{which, which_in};
 
-mod harness;
+pub mod harness;
 
 #[derive(Clone)]
 struct Compiler {

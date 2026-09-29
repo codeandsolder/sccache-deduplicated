@@ -481,7 +481,10 @@ mod server {
                 Ok(r) => r,
                 Err(err) => {
                     // TODO: would ideally just use error_chain
-                    #[allow(unused_imports)]
+                    #[expect(
+                        unused_imports,
+                        reason = "legacy upstream lint exception retained under strict CI"
+                    )]
                     use std::error::Error;
                     let mut err_msg = err.to_string();
                     let mut maybe_cause = err.source();

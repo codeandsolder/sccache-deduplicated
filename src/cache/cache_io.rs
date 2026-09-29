@@ -439,11 +439,13 @@ mod tests {
             "Extracted content should be correct"
         );
 
-        // `tempfile` needs us to reset permissions for cleanup to work
-        #[allow(
-            clippy::permissions_set_readonly_false,
-            reason = "The affected directory is immediately deleted with no security implications"
-        )]
+        // `tempfile` needs us to restore owner write permission for cleanup.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perm.set_mode(perm.mode() | 0o200);
+        }
+        #[cfg(not(unix))]
         perm.set_readonly(false);
         std::fs::set_permissions(tmpdir.path(), perm).unwrap();
         tmpdir.close().unwrap();

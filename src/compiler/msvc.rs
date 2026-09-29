@@ -64,7 +64,10 @@ impl CCompilerImpl for Msvc {
         parse_arguments(arguments, cwd, self.is_clang)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "legacy upstream lint exception retained under strict CI"
+    )]
     async fn preprocess<T>(
         &self,
         creator: &T,
@@ -972,7 +975,10 @@ fn normpath(path: &str) -> String {
     path.to_owned()
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "legacy upstream lint exception retained under strict CI"
+)]
 pub fn preprocess_cmd<T>(
     cmd: &mut T,
     parsed_args: &ParsedArguments,
@@ -1030,7 +1036,10 @@ pub fn preprocess_cmd<T>(
     cmd.arg(&parsed_args.input);
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "legacy upstream lint exception retained under strict CI"
+)]
 pub async fn preprocess<T>(
     creator: &T,
     executable: &Path,

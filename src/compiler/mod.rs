@@ -19,7 +19,10 @@ pub(crate) mod canonical_paths;
 mod cicc;
 mod clang;
 #[macro_use]
-#[allow(clippy::module_inception)]
+#[expect(
+    clippy::module_inception,
+    reason = "legacy upstream lint exception retained under strict CI"
+)]
 mod compiler;
 mod cudafe;
 mod diab;

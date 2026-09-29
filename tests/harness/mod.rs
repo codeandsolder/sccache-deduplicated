@@ -96,7 +96,6 @@ pub fn get_stats<F: 'static + Fn(ServerInfo)>(f: F) {
         }));
 }
 
-#[allow(unused)]
 pub fn zero_stats() {
     trace!("sccache --zero-stats");
     drop(
@@ -241,7 +240,10 @@ fn create_server_token(server_id: ServerId, auth_token: &str) -> String {
 }
 
 #[cfg(feature = "dist-server")]
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "legacy upstream lint exception retained under strict CI"
+)]
 pub enum ServerHandle {
     Container { cid: String, url: HTTPUrl },
     Process { pid: Pid, url: HTTPUrl },

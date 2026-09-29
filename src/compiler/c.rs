@@ -80,7 +80,10 @@ pub struct ArtifactDescriptor {
 }
 
 /// The results of parsing a compiler commandline.
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "legacy upstream lint exception retained under strict CI"
+)]
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ParsedArguments {
     /// The input source file.
@@ -192,7 +195,10 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + Sync + 'static {
         env_vars: &[(OsString, OsString)],
     ) -> CompilerArguments<ParsedArguments>;
     /// Run the C preprocessor with the specified set of arguments.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "legacy upstream lint exception retained under strict CI"
+    )]
     async fn preprocess<T>(
         &self,
         creator: &T,
@@ -832,7 +838,10 @@ fn process_preprocessed_file(
 /// The `Continue` variant is `(start, hash_start)`.
 type PreprocessedLineAction = ControlFlow<(usize, usize, bool), (usize, usize)>;
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "legacy upstream lint exception retained under strict CI"
+)]
 fn process_preprocessor_line(
     input_file: &Path,
     cwd: &Path,
@@ -1036,7 +1045,10 @@ impl PreprocessorFSAbstraction for StandardFsAbstraction {}
 // Returns false if the include file was "too new" (meaning modified during or
 // after the start of the compilation) and therefore should disable
 // the preprocessor cache mode, otherwise true.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "legacy upstream lint exception retained under strict CI"
+)]
 fn remember_include_file(
     mut path: &[u8],
     input_file: &Path,
@@ -1332,7 +1344,6 @@ impl pkg::InputsPackager for CInputsPackager {
 }
 
 #[cfg(feature = "dist-client")]
-#[allow(unused)]
 struct CToolchainPackager {
     executable: PathBuf,
     kind: CCompilerKind,

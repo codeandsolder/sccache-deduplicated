@@ -14,7 +14,10 @@
 
 #[cfg(feature = "azure")]
 pub mod azure;
-#[allow(clippy::module_inception)]
+#[expect(
+    clippy::module_inception,
+    reason = "legacy upstream lint exception retained under strict CI"
+)]
 pub mod cache;
 pub mod cache_io;
 #[cfg(feature = "cos")]
@@ -25,7 +28,10 @@ pub mod gcs;
 #[cfg(feature = "gha")]
 pub mod gha;
 pub mod ipc_storage;
-#[allow(clippy::module_inception)]
+#[expect(
+    clippy::module_inception,
+    reason = "legacy upstream lint exception retained under strict CI"
+)]
 pub mod lazy_disk_cache;
 #[cfg(feature = "memcached")]
 pub mod memcached;

@@ -295,7 +295,10 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
 const CACHE_VERSION: &[u8] = b"6";
 
 /// Get absolute paths for all source files and env-deps listed in rustc's dep-info output.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "legacy upstream lint exception retained under strict CI"
+)]
 async fn get_source_files_and_env_deps<T>(
     creator: &T,
     crate_name: &str,
@@ -1847,7 +1850,10 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     })
 }
 
-#[allow(clippy::suspicious_else_formatting)] // False positive
+#[expect(
+    clippy::suspicious_else_formatting,
+    reason = "legacy upstream lint exception retained under strict CI"
+)] // False positive
 #[async_trait]
 impl<T> CompilerHasher<T> for RustHasher
 where
@@ -2904,7 +2910,10 @@ fn test_maybe_add_cargo_toml() {
 
 #[cfg(feature = "dist-client")]
 impl pkg::InputsPackager for RustInputsPackager {
-    #[allow(clippy::cognitive_complexity)] // TODO simplify this method.
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "legacy upstream lint exception retained under strict CI"
+    )] // TODO simplify this method.
     fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<dist::PathTransformer> {
         debug!("Packaging compile inputs for compile");
         let RustInputsPackager {
@@ -3127,7 +3136,6 @@ impl pkg::InputsPackager for RustInputsPackager {
 }
 
 #[cfg(feature = "dist-client")]
-#[allow(unused)]
 struct RustToolchainPackager {
     sysroot: PathBuf,
     canonical: bool,
@@ -3661,7 +3669,10 @@ LLVM version: 15.0.2
 "#;
 
     #[test]
-    #[allow(clippy::cognitive_complexity)]
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "legacy upstream lint exception retained under strict CI"
+    )]
     fn test_parse_arguments_simple() {
         let h = parses!(
             "--emit",
@@ -4768,7 +4779,10 @@ proc_macro false
         );
     }
 
-    #[allow(clippy::unnecessary_unwrap)]
+    #[expect(
+        clippy::unnecessary_unwrap,
+        reason = "legacy upstream lint exception retained under strict CI"
+    )]
     fn nothing(_path: &Path) -> Result<()> {
         Ok(())
     }

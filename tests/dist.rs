@@ -21,7 +21,7 @@ use std::process::Output;
 
 use sccache::errors::*;
 
-mod harness;
+pub mod harness;
 
 fn basic_compile(tmpdir: &Path, sccache_cfg_path: &Path, sccache_cached_cfg_path: &Path) {
     let envs: Vec<(_, &OsStr)> = vec![

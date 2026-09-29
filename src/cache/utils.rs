@@ -28,7 +28,10 @@ pub(in crate::cache) fn get_file_mode(file: &fs::File) -> Result<Option<u32>> {
 }
 
 #[cfg(windows)]
-#[allow(clippy::unnecessary_wraps)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "legacy upstream lint exception retained under strict CI"
+)]
 pub(in crate::cache) fn get_file_mode(_file: &fs::File) -> Result<Option<u32>> {
     Ok(None)
 }
@@ -43,7 +46,10 @@ pub(in crate::cache) fn set_file_mode(path: &Path, mode: u32) -> Result<()> {
 }
 
 #[cfg(windows)]
-#[allow(clippy::unnecessary_wraps)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "legacy upstream lint exception retained under strict CI"
+)]
 pub(in crate::cache) fn set_file_mode(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
