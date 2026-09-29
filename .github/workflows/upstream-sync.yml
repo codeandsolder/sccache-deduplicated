@@ -8,7 +8,6 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  actions: write
 
 jobs:
   sync:
@@ -26,7 +25,8 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote add upstream https://github.com/mozilla/sccache.git 2>/dev/null ||             git remote set-url upstream https://github.com/mozilla/sccache.git
+          git remote add upstream https://github.com/mozilla/sccache.git 2>/dev/null || \
+            git remote set-url upstream https://github.com/mozilla/sccache.git
           git fetch upstream main
           git fetch origin main
 
@@ -36,6 +36,7 @@ jobs:
           fi
 
           branch=automation/upstream-sync
+          git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch" 2>/dev/null || true
           git checkout -B "$branch" origin/main
           if ! git merge --no-edit upstream/main; then
             git merge --abort || true
@@ -56,37 +57,40 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          pr=$(gh pr list --head "$BRANCH" --base main --state open             --json number --jq '.[0].number // empty')
+          pr=$(gh pr list --head "$BRANCH" --base main --state open \
+            --json number --jq '.[0].number // empty')
           if [[ -z "$pr" ]]; then
-            gh pr create               --base main               --head "$BRANCH"               --title "chore: sync upstream mozilla/sccache"               --body "Automated clean merge of `mozilla/sccache:main`. Full fork CI is dispatched explicitly before merge."
-            pr=$(gh pr list --head "$BRANCH" --base main --state open               --json number --jq '.[0].number')
+            gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "chore: sync upstream mozilla/sccache" \
+              --body "Automated clean merge of \`mozilla/sccache:main\`. The PR is merged only after all fork PR checks pass."
+            pr=$(gh pr list --head "$BRANCH" --base main --state open \
+              --json number --jq '.[0].number')
           fi
           echo "number=$pr" >> "$GITHUB_OUTPUT"
 
-      - name: Dispatch full CI on sync branch
+      - name: Wait for all sync PR checks
         if: steps.prepare.outputs.needed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          BRANCH: ${{ steps.prepare.outputs.branch }}
+          PR: ${{ steps.pr.outputs.number }}
         shell: bash
         run: |
           set -euo pipefail
-          before=$(gh run list --workflow ci.yml --branch "$BRANCH"             --event workflow_dispatch --limit 1 --json databaseId             --jq '.[0].databaseId // 0')
-
-          gh workflow run ci.yml --ref "$BRANCH"
-
-          run_id=
+          count=0
           for _ in $(seq 1 60); do
-            candidate=$(gh run list --workflow ci.yml --branch "$BRANCH"               --event workflow_dispatch --limit 1 --json databaseId               --jq '.[0].databaseId // 0')
-            if [[ "$candidate" != "0" && "$candidate" != "$before" ]]; then
-              run_id=$candidate
+            count=$(gh pr checks "$PR" --json name --jq 'length' 2>/dev/null || echo 0)
+            if (( count > 0 )); then
               break
             fi
             sleep 2
           done
-
-          test -n "$run_id"
-          gh run watch "$run_id" --exit-status
+          if (( count == 0 )); then
+            echo "::error::No PR checks appeared for sync PR #$PR"
+            exit 1
+          fi
+          gh pr checks "$PR" --watch --fail-fast
 
       - name: Merge tested sync PR
         if: steps.prepare.outputs.needed == 'true'
