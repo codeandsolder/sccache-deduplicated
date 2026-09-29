@@ -80,7 +80,8 @@ jobs:
           set -euo pipefail
           count=0
           for _ in $(seq 1 60); do
-            count=$(gh pr checks "$PR" --json name --jq 'length' 2>/dev/null || echo 0)
+            count=$(gh pr checks "$PR" --json name --jq 'length' 2>/dev/null || true)
+            count=${count:-0}
             if (( count > 0 )); then
               break
             fi
