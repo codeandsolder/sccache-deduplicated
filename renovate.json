@@ -9,6 +9,7 @@
   "minimumReleaseAge": "3 days",
   "minimumReleaseAgeBehaviour": "timestamp-required",
   "internalChecksFilter": "strict",
+  "separateMajorMinor": false,
   "separateMultipleMajor": false,
   "prConcurrentLimit": 6,
   "prHourlyLimit": 3,
