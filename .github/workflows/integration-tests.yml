@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Clone repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
@@ -36,7 +36,7 @@ jobs:
         run: |
           cargo build --all-features
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-tests
           path: ./target/debug/sccache
@@ -49,7 +49,7 @@ jobs:
 
     steps:
       - name: Clone repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Test
         run: cd tests/integration && WITH_COVERAGE=1 make test-${{ matrix.type }}
@@ -74,7 +74,7 @@ jobs:
 
       - name: Upload coverage results (to Codecov.io)
         continue-on-error: ${{ github.repository != 'mozilla/sccache' }}
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7
         with:
           files: target/integration-coverage/reports/lcov.info
           name: codecov-umbrella-integration-${{ matrix.type }}
@@ -93,10 +93,10 @@ jobs:
 
     steps:
       - name: Clone repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Configure Cache Env
-        uses: actions/github-script@v8
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
           script: |
             core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
@@ -107,7 +107,7 @@ jobs:
         with:
           toolchain: "stable"
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: integration-tests
           path: /home/runner/.cargo/bin/
@@ -142,10 +142,10 @@ jobs:
       SCCACHE_ERROR_LOG: "${{ github.workspace }}\\server_log.txt"
 
     steps:
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
 
       - name: Clone repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
@@ -226,7 +226,7 @@ jobs:
     runs-on: ubuntu-24.04
     needs: build
     container:
-      image: rocm/dev-ubuntu-24.04:6.3
+      image: rocm/dev-ubuntu-24.04:7.2
 
     env:
       # SCCACHE_GHA_ENABLED: "on"
@@ -235,7 +235,7 @@ jobs:
 
     steps:
       - name: Clone repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # I don't want to break the cache during testing. Will turn on after I
       # make sure it's working.
@@ -271,7 +271,7 @@ jobs:
         run: |
           cargo build -p randomize_readdir
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: integration-tests
           path: /home/runner/.cargo/bin/
@@ -325,7 +325,7 @@ jobs:
       SCCACHE_PATH: target/debug/sccache
     steps:
       - name: Clone repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
