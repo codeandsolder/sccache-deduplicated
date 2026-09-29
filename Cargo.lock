@@ -3752,7 +3752,7 @@ dependencies = [
  "opendal-layer-logging",
  "openssl",
  "predicates",
- "rand 0.8.5",
+ "rand 0.10.2",
  "regex",
  "reqwest 0.13.4",
  "rouille",
