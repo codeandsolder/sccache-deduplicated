@@ -34,10 +34,10 @@ static LOGGER: LazyLock<Result<(), Infallible>> = LazyLock::new(|| {
 });
 
 /// Used as a test setup fixture. The drop implementation cleans up after a _successful_ test.
-/// We catch the panic to ensure that the drop runs and the TempDir is cleaned up.
+/// We catch the panic to ensure that the drop runs and the `TempDir` is cleaned up.
 pub struct SccacheTest<'a> {
     /// Tempdir used for Sccache cache and cargo output. It is kept in the struct only to have the
-    /// destructor run when SccacheTest goes out of scope, but is never used otherwise.
+    /// destructor run when `SccacheTest` goes out of scope, but is never used otherwise.
     pub tempdir: tempfile::TempDir,
     pub env: Vec<(&'a str, std::ffi::OsString)>,
 }

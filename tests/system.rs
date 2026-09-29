@@ -25,19 +25,16 @@ use crate::harness::{
 use assert_cmd::prelude::*;
 use fs::File;
 use fs_err as fs;
-use log::Level::Trace;
 use predicates::prelude::*;
 use regex::Regex;
 use serial_test::serial;
-use std::collections::HashMap;
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fmt::{self, format};
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs as unix_fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::path::Path;
+use std::process::Command;
 use std::str;
 use std::time::{Duration, SystemTime};
 use test_case::test_case;
@@ -76,7 +73,7 @@ fn adv_key_kind(lang: &str, compiler: &str) -> String {
             _ => language + " [nvcc]",
         },
         _ => {
-            trace!("Unknown compiler type: {}", compiler);
+            trace!("Unknown compiler type: {compiler}");
             language + "unknown"
         }
     }
@@ -86,7 +83,7 @@ fn adv_key_kind(lang: &str, compiler: &str) -> String {
 
 macro_rules! vec_from {
     ( $t:ty, $( $x:expr ),* ) => {
-        vec!($( Into::<$t>::into(&$x), )*)
+        vec![$( Into::<$t>::into(&$x), )*]
     };
 }
 
@@ -104,7 +101,7 @@ fn compile_cmdline<T: AsRef<OsStr>>(
             vec_from!(OsString, exe.as_ref(), "-c", input, "-o", output)
         }
         "cl.exe" => vec_from!(OsString, exe, "-c", input, format!("-Fo{}", output)),
-        _ => panic!("Unsupported compiler: {}", compiler),
+        _ => panic!("Unsupported compiler: {compiler}"),
     };
     if !extra_args.is_empty() {
         arg.append(&mut extra_args);
@@ -145,7 +142,7 @@ fn compile_cuda_cmdline<T: AsRef<OsStr>>(
                 output
             )
         }
-        _ => panic!("Unsupported compiler: {}", compiler),
+        _ => panic!("Unsupported compiler: {compiler}"),
     };
     if !extra_args.is_empty() {
         arg.append(&mut extra_args);
@@ -169,10 +166,10 @@ fn compile_hip_cmdline<T: AsRef<OsStr>>(
         "clang" => {
             vec_from!(OsString, exe, "-x", "hip", "-c", input, "-o", output)
         }
-        _ => panic!("Unsupported compiler: \"{}\"", compiler),
+        _ => panic!("Unsupported compiler: \"{compiler}\""),
     };
     for arch in archs {
-        arg.push(format!("--offload-arch={}", arch).into());
+        arg.push(format!("--offload-arch={arch}").into());
     }
     if !extra_args.is_empty() {
         arg.append(&mut extra_args);
@@ -206,7 +203,7 @@ fn copy_to_tempdir(inputs: &[&str], tempdir: &Path) {
     for f in inputs {
         let original_source_file = Path::new(file!()).parent().unwrap().join(f);
         let source_file = tempdir.join(f);
-        trace!("fs::copy({:?}, {:?})", original_source_file, source_file);
+        trace!("fs::copy({original_source_file:?}, {source_file:?})");
         fs::copy(&original_source_file, &source_file).unwrap();
         // Preprocessor cache will not cache files that are too recent.
         // Certain OS/FS combinations have a slow resolution (up to 2s for NFS),
@@ -224,7 +221,7 @@ fn test_basic_compile(compiler: Compiler, tempdir: &Path) {
         exe,
         env_vars,
     } = compiler;
-    println!("test_basic_compile: {}", name);
+    println!("test_basic_compile: {name}");
     // Compile a source file.
     copy_to_tempdir(&[INPUT, INPUT_ERR], tempdir);
 
@@ -276,7 +273,7 @@ fn test_basic_compile_into_null(compiler: Compiler, tempdir: &Path) {
         exe,
         env_vars,
     } = compiler;
-    println!("test_basic_compile_into_dev_null: {}", name);
+    println!("test_basic_compile_into_dev_null: {name}");
     zero_stats();
     // Compile a source file.
     copy_to_tempdir(&[INPUT, INPUT_ERR], tempdir);
@@ -326,7 +323,7 @@ fn test_basic_compile_into_dev_stdout(compiler: Compiler, tempdir: &Path) {
         exe,
         env_vars,
     } = compiler;
-    println!("test_basic_compile_into_dev_stdout: {}", name);
+    println!("test_basic_compile_into_dev_stdout: {name}");
     zero_stats();
     // Compile a source file.
     copy_to_tempdir(&[INPUT, INPUT_ERR], tempdir);
@@ -380,7 +377,7 @@ fn test_noncacheable_stats(compiler: Compiler, tempdir: &Path) {
         exe,
         env_vars,
     } = compiler;
-    println!("test_noncacheable_stats: {}", name);
+    println!("test_noncacheable_stats: {name}");
     copy_to_tempdir(&[INPUT], tempdir);
 
     trace!("compile");
@@ -622,7 +619,7 @@ fn test_split_dwarf_object_generate_output_dir_changes(compiler: Compiler, tempd
     sccache_command()
         .args(&args2)
         .current_dir(tempdir)
-        .envs(env_vars.clone())
+        .envs(env_vars)
         .assert()
         .success();
     get_stats(|info| {
@@ -639,7 +636,7 @@ fn test_gcc_clang_no_warnings_from_macro_expansion(compiler: Compiler, tempdir: 
         exe,
         env_vars,
     } = compiler;
-    println!("test_gcc_clang_no_warnings_from_macro_expansion: {}", name);
+    println!("test_gcc_clang_no_warnings_from_macro_expansion: {name}");
     // Compile a source file.
     copy_to_tempdir(&[INPUT_MACRO_EXPANSION], tempdir);
 
@@ -665,7 +662,7 @@ fn test_compile_with_define(compiler: Compiler, tempdir: &Path) {
         exe,
         env_vars,
     } = compiler;
-    println!("test_compile_with_define: {}", name);
+    println!("test_compile_with_define: {name}");
     // Compile a source file.
     copy_to_tempdir(&[INPUT_WITH_DEFINE], tempdir);
 
@@ -691,7 +688,7 @@ fn test_gcc_clang_depfile(compiler: Compiler, tempdir: &Path) {
         exe,
         env_vars,
     } = compiler;
-    println!("test_gcc_clang_depfile: {}", name);
+    println!("test_gcc_clang_depfile: {name}");
     copy_to_tempdir(&[INPUT], tempdir);
     fs::copy(tempdir.join(INPUT), tempdir.join("same-content.c")).unwrap();
 
@@ -769,7 +766,7 @@ fn run_sccache_command_tests(compiler: Compiler, tempdir: &Path, preprocessor_ca
 
         let version_output = match str::from_utf8(&version_cmd.stdout) {
             Ok(v) => v,
-            Err(e) => panic!("Invalid UTF-8 sequence: {}", e),
+            Err(e) => panic!("Invalid UTF-8 sequence: {e}"),
         };
 
         // Regex to match "Apple LLVM clang version" or "Apple clang version"
@@ -779,10 +776,7 @@ fn run_sccache_command_tests(compiler: Compiler, tempdir: &Path, preprocessor_ca
                 c.name("major").unwrap().as_str().parse::<usize>().unwrap(),
                 c.name("apple").is_some(),
             ),
-            None => panic!(
-                "Version info not found in --version output: {}",
-                version_output
-            ),
+            None => panic!("Version info not found in --version output: {version_output}"),
         };
         test_clang_cache_whitespace_normalization(
             compiler,
@@ -806,7 +800,7 @@ fn test_nvcc_cuda_compiles(compiler: &Compiler, tempdir: &Path) {
         exe,
         env_vars,
     } = compiler;
-    println!("test_nvcc_cuda_compiles: {}", name);
+    println!("test_nvcc_cuda_compiles: {name}");
     // Compile multiple source files.
     copy_to_tempdir(&[INPUT_FOR_CUDA_A, INPUT_FOR_CUDA_B], tempdir);
 
@@ -1286,7 +1280,7 @@ fn test_nvcc_proper_lang_stat_tracking(compiler: Compiler, tempdir: &Path) {
     } = compiler;
     zero_stats();
 
-    println!("test_nvcc_proper_lang_stat_tracking: {}", name);
+    println!("test_nvcc_proper_lang_stat_tracking: {name}");
     // Compile multiple source files.
     copy_to_tempdir(&[INPUT_FOR_CUDA_C, INPUT], tempdir);
 
@@ -1367,7 +1361,7 @@ fn test_clang_cuda_compiles(compiler: &Compiler, tempdir: &Path) {
         exe,
         env_vars,
     } = compiler;
-    println!("test_clang_cuda_compiles: {}", name);
+    println!("test_clang_cuda_compiles: {name}");
     // Compile multiple source files.
     copy_to_tempdir(&[INPUT_FOR_CUDA_A, INPUT_FOR_CUDA_B], tempdir);
 
@@ -1464,7 +1458,7 @@ fn test_clang_proper_lang_stat_tracking(compiler: Compiler, tempdir: &Path) {
     } = compiler;
     zero_stats();
 
-    println!("test_clang_proper_lang_stat_tracking: {}", name);
+    println!("test_clang_proper_lang_stat_tracking: {name}");
     // Compile multiple source files.
     copy_to_tempdir(&[INPUT_FOR_CUDA_C, INPUT], tempdir);
 
@@ -1540,7 +1534,7 @@ fn test_hip_compiles(compiler: &Compiler, tempdir: &Path) {
         exe,
         env_vars,
     } = compiler;
-    println!("test_hip_compiles: {}", name);
+    println!("test_hip_compiles: {name}");
     // Compile multiple source files.
     copy_to_tempdir(&[INPUT_FOR_HIP_A, INPUT_FOR_HIP_B], tempdir);
 
@@ -1637,7 +1631,7 @@ fn test_hip_compiles_multi_targets(compiler: &Compiler, tempdir: &Path) {
         exe,
         env_vars,
     } = compiler;
-    println!("test_hip_compiles_multi_targets: {}", name);
+    println!("test_hip_compiles_multi_targets: {name}");
     // Compile multiple source files.
     copy_to_tempdir(&[INPUT_FOR_HIP_A, INPUT_FOR_HIP_B], tempdir);
 
@@ -1744,7 +1738,7 @@ fn test_clang_multicall(compiler: Compiler, tempdir: &Path) {
         exe,
         env_vars,
     } = compiler;
-    println!("test_clang_multicall: {}", name);
+    println!("test_clang_multicall: {name}");
     // Compile a source file.
     copy_to_tempdir(&[INPUT_CLANG_MULTICALL], tempdir);
 
@@ -1774,8 +1768,8 @@ fn test_clang_cache_whitespace_normalization(
         exe,
         env_vars,
     } = compiler;
-    println!("test_clang_cache_whitespace_normalization: {}", name);
-    debug!("expecting hit: {}", hit);
+    println!("test_clang_cache_whitespace_normalization: {name}");
+    debug!("expecting hit: {hit}");
     // Compile a source file.
     copy_to_tempdir(&[INPUT_WITH_WHITESPACE, INPUT_WITH_WHITESPACE_ALT], tempdir);
     zero_stats();
@@ -1889,8 +1883,8 @@ fn find_cuda_compilers() -> Vec<Compiler> {
     // CUDA compilers like clang don't come with all of the components for compilation.
     // To consider a machine to have any cuda compilers we rely on the existence of `nvcc`
 
-    match which("nvcc") {
-        Ok(_) => candidates
+    if let Ok(_) = which("nvcc") {
+        candidates
             .iter()
             .filter_map(|c| {
                 which_in(c, env::var_os("PATH"), &cwd)
@@ -1901,14 +1895,13 @@ fn find_cuda_compilers() -> Vec<Compiler> {
                         env_vars: vec![],
                     })
             })
-            .collect::<Vec<_>>(),
-        Err(_) => {
-            eprintln!(
-                "unable to find `nvcc` in PATH={:?}",
-                env::var_os("PATH").unwrap_or_default()
-            );
-            vec![]
-        }
+            .collect::<Vec<_>>()
+    } else {
+        eprintln!(
+            "unable to find `nvcc` in PATH={:?}",
+            env::var_os("PATH").unwrap_or_default()
+        );
+        vec![]
     }
 }
 
@@ -1924,7 +1917,7 @@ fn find_hip_compiler() -> Option<Compiler> {
     if let Ok(hip_clang_path) = env::var("HIP_CLANG_PATH") {
         let clang_path = Path::new(&hip_clang_path).join("clang");
 
-        if let Ok(true) = clang_path.try_exists() {
+        if matches!(clang_path.try_exists(), Ok(true)) {
             return Some(Compiler {
                 name: "clang",
                 exe: clang_path.into_os_string(),
@@ -1935,7 +1928,7 @@ fn find_hip_compiler() -> Option<Compiler> {
     if let Ok(rocm_path) = env::var("ROCM_PATH") {
         let clang_path = Path::new(&rocm_path).join("llvm").join("bin").join("clang");
 
-        if let Ok(true) = clang_path.try_exists() {
+        if matches!(clang_path.try_exists(), Ok(true)) {
             return Some(Compiler {
                 name: "hip",
                 exe: clang_path.into_os_string(),
@@ -2004,12 +1997,11 @@ fn test_assembler_affects_cache(preprocessor_cache_mode: bool) {
 
     // GCC always assembles by spawning `as`, so it needs no flag to opt into
     // this, unlike clang.
-    let compiler = match find_compilers().into_iter().find(|c| c.name == "gcc") {
-        Some(compiler) => compiler,
-        None => {
-            warn!("No gcc found, skipping test");
-            return;
-        }
+    let compiler = if let Some(compiler) = find_compilers().into_iter().find(|c| c.name == "gcc") {
+        compiler
+    } else {
+        warn!("No gcc found, skipping test");
+        return;
     };
     let assembler = Command::new(&compiler.exe)
         .arg("-print-prog-name=as")
@@ -2018,12 +2010,11 @@ fn test_assembler_affects_cache(preprocessor_cache_mode: bool) {
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
         .and_then(|name| which_in(name, env::var_os("PATH"), env::current_dir().unwrap()).ok());
-    let assembler = match assembler {
-        Some(assembler) => assembler,
-        None => {
-            warn!("No assembler found, skipping test");
-            return;
-        }
+    let assembler = if let Some(assembler) = assembler {
+        assembler
+    } else {
+        warn!("No assembler found, skipping test");
+        return;
     };
 
     // Something that assembles identically and reports the same version, but

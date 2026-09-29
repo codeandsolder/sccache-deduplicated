@@ -1,16 +1,12 @@
 use fs_err as fs;
 use log::trace;
-#[cfg(any(feature = "dist-client", feature = "dist-server"))]
-use sccache::config::HTTPUrl;
-use sccache::dist::{self, SchedulerStatusResult, ServerId};
 use sccache::server::ServerInfo;
 use std::env;
 use std::fs::remove_dir_all;
 use std::io::Write;
-use std::net::{self, IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::str::{self, FromStr};
+use std::str::{self};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -65,6 +61,7 @@ pub fn start_local_daemon(cfg_path: &Path, cached_cfg_path: &Path) {
     }
 }
 
+#[must_use]
 pub fn stop_local_daemon() -> bool {
     trace!("sccache --stop-server");
     sccache_command()
@@ -75,6 +72,7 @@ pub fn stop_local_daemon() -> bool {
         .is_ok_and(|status| status.success())
 }
 
+#[must_use]
 pub fn clear_cache_local_daemon(tmpdir: &Path) -> bool {
     trace!("clear local cache daemon");
     let client_build_dir = tmpdir.join(DIST_CACHE_RELPATH);
@@ -119,6 +117,7 @@ pub fn write_source(path: &Path, filename: &str, contents: &str) {
     f.write_all(contents.as_bytes()).unwrap();
 }
 
+#[must_use]
 pub fn init_cargo(path: &Path, cargo_name: &str) -> PathBuf {
     let cargo_path = path.join(cargo_name);
     let source_path = "src";
@@ -127,6 +126,7 @@ pub fn init_cargo(path: &Path, cargo_name: &str) -> PathBuf {
 }
 
 // Prune any environment variables that could adversely affect test execution.
+#[must_use]
 pub fn prune_command(mut cmd: Command) -> Command {
     use sccache::util::OsStrExt;
 
@@ -138,10 +138,12 @@ pub fn prune_command(mut cmd: Command) -> Command {
     cmd
 }
 
+#[must_use]
 pub fn sccache_command() -> Command {
     prune_command(Command::new(env!("CARGO_BIN_EXE_sccache")))
 }
 
+#[must_use]
 pub fn cargo_command() -> Command {
     prune_command(Command::new("cargo"))
 }
@@ -151,6 +153,7 @@ pub fn sccache_dist_path() -> PathBuf {
     env!("CARGO_BIN_EXE_sccache-dist").into()
 }
 
+#[must_use]
 pub fn sccache_client_cfg(
     tmpdir: &Path,
     preprocessor_cache_mode: bool,
@@ -754,5 +757,5 @@ fn wait_for<F: Fn() -> Result<(), String>>(f: F, interval: Duration, max_wait: D
         }
         thread::sleep(interval);
     }
-    panic!("wait timed out, last error result: {}", lasterr)
+    panic!("wait timed out, last error result: {lasterr}")
 }
