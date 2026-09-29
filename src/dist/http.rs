@@ -1266,13 +1266,14 @@ mod client {
                 .spawn_blocking(move || -> Result<_> {
                     let bincode = bincode::serialize(&RunJobHttpRequest { command, outputs })
                         .context("failed to serialize run job request")?;
-                    let bincode_length = bincode.len();
+                    let bincode_length = u32::try_from(bincode.len())
+                        .context("run job request metadata exceeds the u32 wire-format limit")?;
 
                     let mut body = vec![];
-                    body.write_u32::<BigEndian>(bincode_length as u32)
-                        .expect("Infallible write of bincode length to vec failed");
+                    body.write_u32::<BigEndian>(bincode_length)
+                        .context("failed to encode run job request length")?;
                     body.write_all(&bincode)
-                        .expect("Infallible write of bincode body to vec failed");
+                        .context("failed to encode run job request metadata")?;
                     let path_transformer;
                     {
                         let mut compressor = ZlibWriteEncoder::new(&mut body, Compression::fast());

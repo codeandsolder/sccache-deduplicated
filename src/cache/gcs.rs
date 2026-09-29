@@ -72,7 +72,7 @@ impl GCSCache {
         }
 
         let op = Operator::new(builder)?
-            .with_context(OperationContext::new().with_http_transport(set_user_agent()))
+            .with_context(OperationContext::new().with_http_transport(set_user_agent()?))
             .layer(LoggingLayer::default());
         Ok(op)
     }

@@ -101,9 +101,12 @@ fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup
     let socket_path = tempdir.path().join("sock");
     let runtime = new_client_runtime()?;
     let exe_path = env::current_exe()?;
-    let workdir = exe_path
-        .parent()
-        .ok_or_else(|| anyhow!("current executable path has no parent: {exe_path:?}"))?;
+    let workdir = exe_path.parent().ok_or_else(|| {
+        anyhow!(
+            "current executable path has no parent: {}",
+            exe_path.display()
+        )
+    })?;
 
     // Spawn a blocking task to bind the Unix socket. Note that the socket
     // must be bound before spawning `_child` below to avoid a race between
@@ -149,6 +152,7 @@ fn redirect_stderr(f: File) -> io::Result<()> {
     if unsafe { dup2(f.as_raw_fd(), 2) } == -1 {
         return Err(io::Error::last_os_error());
     }
+    drop(f);
     Ok(())
 }
 
