@@ -1,5 +1,13 @@
 name: ci
-on: [ push, pull_request ]
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   lint:
@@ -39,7 +47,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        feature: [ azure, gcs, gha, memcached, redis, s3, webdav ]
+        feature: [ azure, gcs, gha, memcached, redis, s3, webdav, "dist-client,s3" ]
     steps:
       - name: Clone repository
         uses: actions/checkout@v5
@@ -234,6 +242,7 @@ jobs:
 
       - name: Upload coverage results (to Codecov.io)
         if: ${{ ! matrix.no_coverage }}
+        continue-on-error: ${{ github.repository != 'mozilla/sccache' }}
         uses: codecov/codecov-action@v5
         with:
           files: ${{ steps.coverage.outputs.report }}

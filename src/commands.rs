@@ -16,6 +16,8 @@ use crate::cache::{IpcStorage, storage_from_config};
 use crate::client::{ServerConnection, connect_to_server, connect_with_retry};
 use crate::cmdline::{Command, StatsFormat};
 use crate::compiler::ColorMode;
+#[cfg(target_os = "linux")]
+use crate::compiler::canonical_paths::CanonicalRustPaths;
 use crate::config::{Config, default_disk_cache_dir};
 use crate::jobserver::Client;
 use crate::mock_command::{CommandChild, CommandCreatorSync, ProcessCommandCreator, RunCommand};
@@ -522,6 +524,7 @@ fn handle_compile_response<T>(
     exe: &Path,
     cmdline: Vec<OsString>,
     cwd: &Path,
+    env_vars: &[(OsString, OsString)],
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<i32>
@@ -564,7 +567,7 @@ where
     };
 
     handle_compile_result(
-        creator, runtime, response, result, exe, cmdline, cwd, stdout, stderr,
+        creator, runtime, response, result, exe, cmdline, cwd, env_vars, stdout, stderr,
     )
 }
 
@@ -579,12 +582,16 @@ fn handle_compile_result<T>(
     exe: &Path,
     cmdline: Vec<OsString>,
     cwd: &Path,
+    env_vars: &[(OsString, OsString)],
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<i32>
 where
     T: CommandCreatorSync,
 {
+    #[cfg(not(target_os = "linux"))]
+    let _ = env_vars;
+
     match response {
         CompileResponse::CompileStarted => {
             if let Some(finished) = finished {
@@ -601,8 +608,31 @@ where
         }
     }
 
-    let mut cmd = creator.new_command_sync(exe);
-    cmd.args(&cmdline).current_dir(cwd);
+    #[cfg(target_os = "linux")]
+    let canonical_rust = CanonicalRustPaths::from_rustc_executable(env_vars, cwd, exe);
+
+    #[cfg(target_os = "linux")]
+    let mut cmd = if let Some(canonical) = canonical_rust {
+        let mut cmd = creator.new_command_sync("/usr/bin/bwrap");
+        let bwrap_args = canonical.bwrap_arguments(exe, &cmdline, cwd);
+        cmd.args(&bwrap_args)
+            .env_clear()
+            .envs(canonical.env_to_canonical(env_vars))
+            .current_dir("/");
+        cmd.share_jobserver();
+        cmd
+    } else {
+        let mut cmd = creator.new_command_sync(exe);
+        cmd.args(&cmdline).current_dir(cwd);
+        cmd
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let mut cmd = {
+        let mut cmd = creator.new_command_sync(exe);
+        cmd.args(&cmdline).current_dir(cwd);
+        cmd
+    };
     if log_enabled!(Trace) {
         trace!("running command: {:?}", cmd);
     }
@@ -647,9 +677,9 @@ where
 {
     trace!("do_compile");
     let exe_path = which_in(exe, path, cwd)?;
-    let res = request_compile(&mut conn, &exe_path, &cmdline, cwd, env_vars)?;
+    let res = request_compile(&mut conn, &exe_path, &cmdline, cwd, env_vars.clone())?;
     handle_compile_response(
-        creator, runtime, &mut conn, res, &exe_path, cmdline, cwd, stdout, stderr,
+        creator, runtime, &mut conn, res, &exe_path, cmdline, cwd, &env_vars, stdout, stderr,
     )
 }
 
@@ -692,7 +722,7 @@ where
         exe: exe_path.as_os_str().to_owned(),
         cwd: cwd.as_os_str().to_owned(),
         args: cmdline.clone(),
-        env_vars,
+        env_vars: env_vars.clone(),
     };
     let (compile_resp, finished) = runtime.block_on(service.compile_direct(compile))?;
     let creator = C::new(jobserver);
@@ -704,6 +734,7 @@ where
         &exe_path,
         cmdline,
         cwd,
+        &env_vars,
         stdout,
         stderr,
     )?;
@@ -1034,6 +1065,7 @@ mod test {
             exe,
             cmdline,
             cwd,
+            &[],
             &mut stdout,
             &mut stderr,
         )

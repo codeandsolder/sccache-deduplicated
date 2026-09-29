@@ -44,6 +44,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
+use std::fs::OpenOptions;
 use std::future::Future;
 use std::io::{self, Write};
 use std::marker::Unpin;
@@ -53,7 +54,7 @@ use std::mem;
 use std::os::android::net::SocketAddrExt;
 #[cfg(target_os = "linux")]
 use std::os::linux::net::SocketAddrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{ExitStatus, Output};
 use std::sync::Arc;
@@ -73,6 +74,93 @@ use tokio_util::codec::{LengthDelimitedCodec, length_delimited};
 use tower_service::Service;
 
 use crate::errors::*;
+
+const NONCACHEABLE_LOG_ENV: &str = "SCCACHE_NONCACHEABLE_LOG";
+
+#[derive(Serialize)]
+struct NonCacheableRecord {
+    schema: u32,
+    timestamp_unix_ms: u64,
+    reason: String,
+    extra_info: Option<String>,
+    cwd: String,
+    argv: Vec<String>,
+}
+
+fn append_noncacheable_record(
+    reason: &str,
+    extra_info: Option<&str>,
+    cwd: &Path,
+    cmd: &[OsString],
+) {
+    let Some(path) = env::var_os(NONCACHEABLE_LOG_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    else {
+        return;
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let record = NonCacheableRecord {
+        schema: 1,
+        timestamp_unix_ms: u64::try_from(now.as_millis()).unwrap_or(u64::MAX),
+        reason: reason.to_owned(),
+        extra_info: extra_info.map(str::to_owned),
+        cwd: cwd.to_string_lossy().into_owned(),
+        argv: cmd
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect(),
+    };
+
+    let mut encoded = match serde_json::to_vec(&record) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            warn!("failed to serialize non-cacheable compiler telemetry: {error}");
+            return;
+        }
+    };
+    encoded.push(b'\n');
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        warn!(
+            "failed to create non-cacheable compiler telemetry directory {}: {error}",
+            parent.display()
+        );
+        return;
+    }
+
+    let result = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| {
+            let written = file.write(&encoded)?;
+            if written == encoded.len() {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!(
+                        "short non-cacheable telemetry append: {written}/{} bytes",
+                        encoded.len()
+                    ),
+                ))
+            }
+        });
+
+    if let Err(error) = result {
+        warn!(
+            "failed to append non-cacheable compiler telemetry {}: {error}",
+            path.display()
+        );
+    }
+}
 
 /// If the server is idle for this many seconds, shut down.
 const DEFAULT_IDLE_TIMEOUT: u64 = 600;
@@ -1392,6 +1480,7 @@ where
                         );
                     }
                     CompilerArguments::CannotCache(why, extra_info) => {
+                        append_noncacheable_record(why, extra_info.as_deref(), &cwd, &cmd);
                         if let Some(extra_info) = extra_info {
                             debug!(
                                 "parse_arguments: CannotCache({}, {}): {:?}",
