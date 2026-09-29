@@ -12,32 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! This library implements a shim that randomizes the results of readdir
-//! and readdir64 for testing purposes. This is done by overriding the
-//! posix calls associated with reading directories; opendir, fdopendir,
-//! readdir, readdir64, and closedir.
+//! This library implements a shim that randomizes the results of `readdir`
+//! and `readdir64` for testing purposes. This is done by overriding the
+//! POSIX calls associated with reading directories: `opendir`, `fdopendir`,
+//! `readdir`, `readdir64`, and `closedir`.
 //!
-//! When readdir or readdir64 is first invoked, the shim will read the
+//! When `readdir` or `readdir64` is first invoked, the shim will read the
 //! entire directory into a vector, shuffle it, and store iteration
-//! state inside a custom DirentIterator structure. Note that we
+//! state inside a custom `DirentIterator` structure. Note that we
 //! assume that no new entries will be added to the directory while
 //! iterating, to keep things simple. Also keep in mind that calls to
 //! any of the directory reading operations can come from different
 //! threads, so the library state has to be kept in thread safe types
 //! where appropriate.
 //!
-//! Calls are dispatched to the "real" implementation in libc by using
-//! dlopen with RTLD_NEXT. Unfortunately it seems that the usual libraries
-//! for this like libloading do not support RTLD_NEXT, so these
+//! Calls are dispatched to the "real" implementation in `libc` by using
+//! `dlsym` with `RTLD_NEXT`. Unfortunately it seems that the usual libraries
+//! for this like `libloading` do not support `RTLD_NEXT`, so these
 //! functions are just invoked using unsafe calls.
 //!
-//! To use this library, set LD_PRELOAD=path/to/librandomize_readdir.so.
+//! To use this library, set `LD_PRELOAD=path/to/librandomize_readdir.so`.
 //! You can verify that the output is random by running for example
 //! `LD_PRELOAD=path/to/librandomize_readdir.so ls -U`.
 //!
-//! To test sccache with librandomize_readdir, export LD_PRELOAD in
-//! the integration test and then check that two the second invocation
-//! hits the cache. If not, something inside sccache relies implicitly
+//! To test `sccache` with `librandomize_readdir`, export `LD_PRELOAD` in
+//! the integration test and then check that the second invocation
+//! hits the cache. If not, something inside `sccache` relies implicitly
 //! on the order that files are returned from the filesystem, which is
 //! not defined, which is not ideal.
 
@@ -56,7 +56,7 @@ use std::env;
 use std::ffi::CStr;
 use std::fs::File;
 use std::process;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{OnceLock, PoisonError, RwLock, RwLockWriteGuard};
 
 type Opendir = unsafe extern "C" fn(dirname: *const c_char) -> *mut DIR;
 type Fdopendir = unsafe extern "C" fn(fd: c_int) -> *mut DIR;
@@ -99,8 +99,12 @@ struct State {
 }
 
 impl State {
+    fn dirs_mut(&self) -> RwLockWriteGuard<'_, HashMap<usize, ReaddirState>> {
+        self.dirs.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn new_opendir(&self, dirp: *mut DIR) {
-        self.dirs.write().expect("lock poisoned").insert(
+        self.dirs_mut().insert(
             dirp as usize,
             ReaddirState {
                 iter: None,
@@ -120,9 +124,7 @@ impl State {
         GetIter: FnOnce(&mut ReaddirState) -> &mut Option<DirentIterator<Dirent>>,
         Readdir: Fn() -> *mut Dirent,
     {
-        self.dirs
-            .write()
-            .expect("lock poisoned")
+        self.dirs_mut()
             .get_mut(&(dirp as usize))
             .and_then(|dirstate| {
                 let iter = get_iter(dirstate);
@@ -135,6 +137,7 @@ impl State {
                             break;
                         }
 
+                        // SAFETY: `readdir` returned a non-null pointer to a live dirent.
                         entries.push(unsafe { *entry });
                     }
 
@@ -143,10 +146,11 @@ impl State {
                     *iter = Some(DirentIterator { entries, index: 0 });
                 }
 
-                let iter = iter.as_mut().unwrap();
+                let Some(iter) = iter.as_mut() else {
+                    return None;
+                };
                 info!(
-                    "{:p}: reading entry {}/{}",
-                    dirp,
+                    "{dirp:p}: reading entry {}/{}",
                     iter.index,
                     iter.entries.len()
                 );
@@ -159,7 +163,10 @@ impl State {
         self.wrapped_readdir_inner(
             dirp,
             |dirstate| &mut dirstate.iter,
-            || unsafe { (self.readdir)(dirp) },
+            || {
+                // SAFETY: `dirp` is the live directory handle supplied by the caller.
+                unsafe { (self.readdir)(dirp) }
+            },
         )
     }
 
@@ -167,36 +174,56 @@ impl State {
         self.wrapped_readdir_inner(
             dirp,
             |dirstate| &mut dirstate.iter64,
-            || unsafe { (self.readdir64)(dirp) },
+            || {
+                // SAFETY: `dirp` is the live directory handle supplied by the caller.
+                unsafe { (self.readdir64)(dirp) }
+            },
         )
     }
 }
 
 static STATE: OnceLock<State> = OnceLock::new();
 
-fn load_next<Prototype: Copy>(name: &[u8]) -> Prototype {
-    unsafe {
-        let name = CStr::from_bytes_with_nul(name).expect("invalid c-string literal");
-        let sym = dlsym(RTLD_NEXT, name.as_ptr());
-        if sym.is_null() {
-            error!("failed to load libc function {:?}", name.to_string_lossy());
-            panic!("failed to load libc function pointer");
+fn load_next<Prototype: Copy>(name: &'static [u8]) -> Prototype {
+    let name = match CStr::from_bytes_with_nul(name) {
+        Ok(name) => name,
+        Err(error) => {
+            error!("invalid C string literal for libc symbol: {error}");
+            process::abort();
         }
+    };
 
-        *(&sym as *const *mut c_void as *const Prototype)
+    // SAFETY: `name` is a valid NUL-terminated symbol name and `RTLD_NEXT`
+    // requests the next implementation in the dynamic linker search order.
+    let sym = unsafe { dlsym(RTLD_NEXT, name.as_ptr()) };
+    if sym.is_null() {
+        error!("failed to load libc function {:?}", name.to_string_lossy());
+        process::abort();
     }
+    if std::mem::size_of::<Prototype>() != std::mem::size_of::<*mut c_void>() {
+        error!("resolved libc symbol has an incompatible pointer size");
+        process::abort();
+    }
+
+    // SAFETY: every call site supplies the exact function-pointer prototype
+    // for the named libc symbol, and the size check above guarantees the
+    // representation returned by `dlsym` fits in `Prototype`.
+    unsafe { std::ptr::read((&raw const sym).cast::<Prototype>()) }
 }
 
 #[ctor]
 fn init() {
     if let Ok(path) = env::var("RANDOMIZE_READDIR_LOG") {
-        let path = format!("{}.{}", path, process::id());
-        WriteLogger::init(
-            LevelFilter::Info,
-            Config::default(),
-            File::create(path).expect("failed to create log file"),
-        )
-        .expect("failed to initialize logger");
+        let pid = process::id();
+        let path = format!("{path}.{pid}");
+        match File::create(&path) {
+            Ok(file) => {
+                if let Err(error) = WriteLogger::init(LevelFilter::Info, Config::default(), file) {
+                    eprintln!("failed to initialize randomize_readdir logger: {error}");
+                }
+            }
+            Err(error) => eprintln!("failed to create randomize_readdir log {path}: {error}"),
+        }
     }
 
     // Force loading on module init.
@@ -226,11 +253,12 @@ fn init() {
 #[no_mangle]
 pub unsafe extern "C" fn opendir(dirname: *const c_char) -> *mut DIR {
     let state = STATE.wait();
+    // SAFETY: callers must provide the same valid C string pointer required by libc's `opendir`.
     let dirp = unsafe { (state.opendir)(dirname) };
 
     info!(
-        "{:p}: opening directory '{}'",
-        dirp,
+        "{dirp:p}: opening directory '{}'",
+        // SAFETY: this function's contract requires `dirname` to remain a valid NUL-terminated C string.
         unsafe { CStr::from_ptr(dirname) }.to_string_lossy()
     );
 
@@ -244,9 +272,10 @@ pub unsafe extern "C" fn opendir(dirname: *const c_char) -> *mut DIR {
 #[no_mangle]
 pub extern "C" fn fdopendir(dirfd: c_int) -> *mut DIR {
     let state = STATE.wait();
+    // SAFETY: `dirfd` is forwarded unchanged to libc, which validates it.
     let dirp = unsafe { (state.fdopendir)(dirfd) };
 
-    info!("{:p}: opening directory fd {}", dirp, dirfd);
+    info!("{dirp:p}: opening directory fd {dirfd}");
 
     if !dirp.is_null() {
         state.new_opendir(dirp);
@@ -274,15 +303,12 @@ pub extern "C" fn readdir64(dirp: *mut DIR) -> *mut dirent64 {
 /// - The directory stream must not be used after calling this function
 #[no_mangle]
 pub unsafe extern "C" fn closedir(dirp: *mut DIR) -> c_int {
-    info!("{:p}: closing handle", dirp);
+    info!("{dirp:p}: closing handle");
 
     let state = STATE.wait();
+    state.dirs_mut().remove(&(dirp as usize));
 
-    state
-        .dirs
-        .write()
-        .expect("lock poisoned")
-        .remove(&(dirp as usize));
-
+    // SAFETY: callers must provide the same live directory pointer required
+    // by libc's `closedir`.
     unsafe { (state.closedir)(dirp) }
 }
