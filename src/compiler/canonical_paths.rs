@@ -381,6 +381,43 @@ impl CanonicalRustPaths {
             }
         }
 
+        // Build scripts can generate Rust source containing absolute paths from
+        // their physical OUT_DIR/CARGO_MANIFEST_DIR. The rustc invocation is
+        // canonicalized to /target and /build, but include_bytes!/include_str!
+        // in that generated source still resolves the literal physical path.
+        //
+        // Keep only the declared roots available at their physical aliases as
+        // compatibility mounts. Compiler arguments/environment remain
+        // canonical, and any literal physical path embedded in an input file
+        // remains part of that file's cache-key material.
+        let canonical_mounts = self
+            .roots
+            .iter()
+            .map(|root| root.canonical.as_path())
+            .collect::<Vec<_>>();
+        let mut physical_aliases = Vec::new();
+        for root in &self.roots {
+            let writable = root.canonical == Path::new("/target");
+            for alias in &root.aliases {
+                if !alias.exists() || canonical_mounts.contains(&alias.as_path()) {
+                    continue;
+                }
+                physical_aliases.push((alias.as_path(), writable));
+            }
+        }
+        physical_aliases
+            .sort_by_key(|(alias, writable)| (alias.components().count(), u8::from(*writable)));
+
+        for (alias, writable) in physical_aliases {
+            if writable {
+                push!("--bind");
+            } else {
+                push!("--ro-bind");
+            }
+            out.push(alias.as_os_str().to_owned());
+            out.push(alias.as_os_str().to_owned());
+        }
+
         push!("--tmpfs");
         push!("/tmp");
         push!("--dir");
@@ -590,6 +627,59 @@ mod tests {
             "{args:?}"
         );
         assert!(!args.iter().any(|arg| arg == missing_target.as_os_str()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bwrap_keeps_declared_physical_roots_as_compatibility_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let build = temp.path().join("build");
+        let target = temp.path().join("target");
+        let cargo_home = temp.path().join("cargo-home");
+        let rust_root = temp.path().join("rust");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        std::fs::create_dir_all(&rust_root).unwrap();
+        std::fs::write(
+            build.join("Cargo.toml"),
+            "[workspace]
+",
+        )
+        .unwrap();
+
+        let env = vec![
+            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+            (
+                "SCCACHE_CANONICAL_BUILD_ROOT".into(),
+                build.clone().into_os_string(),
+            ),
+            (
+                "SCCACHE_CANONICAL_TARGET_ROOT".into(),
+                target.clone().into_os_string(),
+            ),
+            (
+                "SCCACHE_CANONICAL_CARGO_HOME".into(),
+                cargo_home.clone().into_os_string(),
+            ),
+        ];
+        let roots = CanonicalRustPaths::from_env(&env, &build, &rust_root).unwrap();
+        let args = roots.bwrap_arguments(
+            &rust_root.join("bin/rustc"),
+            &[OsString::from("-vV")],
+            &build,
+        );
+
+        let has_mount = |kind: &str, path: &Path| {
+            args.windows(3).any(|triple| {
+                triple[0] == kind && triple[1] == path.as_os_str() && triple[2] == path.as_os_str()
+            })
+        };
+
+        assert!(has_mount("--bind", &target));
+        assert!(has_mount("--ro-bind", &build));
+        assert!(has_mount("--ro-bind", &cargo_home));
+        assert!(has_mount("--ro-bind", &rust_root));
     }
 
     #[test]
