@@ -1,0 +1,104 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "forkProcessing": "enabled",
+  "dependencyDashboard": true,
+  "minimumReleaseAge": "3 days",
+  "minimumReleaseAgeBehaviour": "timestamp-required",
+  "internalChecksFilter": "strict",
+  "separateMultipleMajor": true,
+  "prConcurrentLimit": 0,
+  "prHourlyLimit": 0,
+  "rebaseWhen": "behind-base-branch",
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": [
+      "before 3am"
+    ],
+    "automerge": true,
+    "automergeType": "pr"
+  },
+  "packageRules": [
+    {
+      "description": "The Rust 1.91 workflow entries are an intentional MSRV floor, not update targets",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDepNames": [
+        "rust"
+      ],
+      "matchFileNames": [
+        ".github/workflows/ci.yml"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Group routine compatible stable Rust dependency updates",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
+      "matchCurrentVersion": "!/^0/",
+      "groupName": "routine stable Rust dependencies"
+    },
+    {
+      "description": "Group GitHub Actions tooling updates into one reviewed change",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "groupName": "GitHub Actions tooling",
+      "automerge": false
+    },
+    {
+      "description": "Automerge ordinary compatible updates after CI",
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
+      "matchCurrentVersion": "!/^0/",
+      "automerge": true,
+      "automergeType": "pr"
+    },
+    {
+      "description": "Cargo lockfile maintenance is age-gated by repository CI",
+      "matchUpdateTypes": [
+        "lockFileMaintenance"
+      ],
+      "minimumReleaseAge": null,
+      "automerge": true,
+      "automergeType": "pr"
+    },
+    {
+      "description": "Potentially breaking pre-1.0 updates stay open for the maintenance agent",
+      "matchCurrentVersion": "/^0\\./",
+      "automerge": false
+    },
+    {
+      "description": "Major updates are always attempted but stay open for the maintenance agent",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "Package replacements stay open for the maintenance agent",
+      "matchUpdateTypes": [
+        "replacement"
+      ],
+      "minimumReleaseAge": null,
+      "automerge": false
+    }
+  ]
+}
