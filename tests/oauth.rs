@@ -261,7 +261,7 @@ async fn test_auth_with_config(dist_auth: sccache::config::DistAuth) {
         sccache_process.try_wait().unwrap()
     });
     if let Some(s) = status {
-        assert!(s.success())
+        assert!(s.success());
     } else {
         sccache_process.kill().unwrap();
         panic!("Waited too long for process to exit")

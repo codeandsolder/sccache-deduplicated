@@ -1883,7 +1883,7 @@ fn find_cuda_compilers() -> Vec<Compiler> {
     // CUDA compilers like clang don't come with all of the components for compilation.
     // To consider a machine to have any cuda compilers we rely on the existence of `nvcc`
 
-    if let Ok(_) = which("nvcc") {
+    if which("nvcc").is_ok() {
         candidates
             .iter()
             .filter_map(|c| {
