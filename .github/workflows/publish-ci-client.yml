@@ -1,0 +1,74 @@
+name: Publish CI sccache client
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit/ref to publish
+        required: true
+        default: main
+        type: string
+      release_tag:
+        description: Immutable release tag
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-publish:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Resolve source revision
+        id: rev
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "source SHA: $sha"
+
+      - name: Install Rust 1.98.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.98.1 --profile minimal
+
+      - name: Build client-only binary
+        shell: bash
+        env:
+          RUSTFLAGS: "-C target-cpu=x86-64-v2"
+        run: |
+          set -euo pipefail
+          cargo +1.98.1 build --release --locked --bin sccache --no-default-features --features s3
+          install -D -m 0755 target/release/sccache dist/sccache-linux-x86_64-v2
+          sha256sum dist/sccache-linux-x86_64-v2 > dist/SHA256SUMS
+          {
+            echo "source_sha=${{ steps.rev.outputs.sha }}"
+            echo "rust_toolchain=1.98.1"
+            echo "rustflags=-C target-cpu=x86-64-v2"
+            echo "features=s3"
+          } > dist/build.txt
+
+      - name: Publish immutable release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; refusing to mutate an immutable toolchain release." >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" \
+            --target "${{ steps.rev.outputs.sha }}" \
+            --title "CI sccache client ${{ steps.rev.outputs.sha }}" \
+            --notes "Pinned client-only Linux x86-64-v2 sccache binary for centrally managed CI." \
+            dist/sccache-linux-x86_64-v2 dist/SHA256SUMS dist/build.txt
