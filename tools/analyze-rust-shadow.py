@@ -55,14 +55,16 @@ def input_digests(record, field):
     return tuple(sorted(item["digest"] for item in record.get(field, [])))
 
 
-def signature(record, drop=None):
+def signature(record, drops=()):
+    drops = set(drops)
     dep_env = env_map(record, "dep_env")
     cargo_env = env_map(record, "cargo_env")
 
-    if drop and drop.startswith("dep_env:"):
-        dep_env.pop(drop.split(":", 1)[1], None)
-    if drop and drop.startswith("cargo_env:"):
-        cargo_env.pop(drop.split(":", 1)[1], None)
+    for drop in drops:
+        if drop.startswith("dep_env:"):
+            dep_env.pop(drop.split(":", 1)[1], None)
+        elif drop.startswith("cargo_env:"):
+            cargo_env.pop(drop.split(":", 1)[1], None)
 
     parts = {
         "crate_name": record.get("crate_name"),
@@ -89,8 +91,9 @@ def signature(record, drop=None):
         "native_profile": "native",
         "compiler_shlibs": "compiler_shlibs_digests",
     }
-    if drop in drop_map:
-        parts.pop(drop_map[drop], None)
+    for drop in drops:
+        if drop in drop_map:
+            parts.pop(drop_map[drop], None)
 
     return json.dumps(parts, sort_keys=True, separators=(",", ":"), default=list)
 
@@ -191,10 +194,11 @@ def normalization_summary(records):
     return counts, examples
 
 
-def compare_candidate(records, cache_dir, drop):
+def compare_candidate(records, cache_dir, drops):
+    drops = tuple(drops)
     groups = collections.defaultdict(list)
     for rec in records:
-        groups[signature(rec, drop)].append(rec)
+        groups[signature(rec, drops)].append(rec)
 
     collision_groups = []
     for recs in groups.values():
@@ -203,7 +207,8 @@ def compare_candidate(records, cache_dir, drop):
             collision_groups.append((keys, recs))
 
     result = {
-        "candidate": drop,
+        "candidate": drops[0] if len(drops) == 1 else "+".join(drops),
+        "drops": list(drops),
         "collision_groups": len(collision_groups),
         "groups_equal_compiled": 0,
         "groups_different_compiled": 0,
@@ -251,11 +256,26 @@ def main():
     ap.add_argument("logs", nargs="+", type=pathlib.Path)
     ap.add_argument("--cache-dir", type=pathlib.Path, required=True)
     ap.add_argument("--json-out", type=pathlib.Path)
+    ap.add_argument(
+        "--canonical-only",
+        action="store_true",
+        help="analyze only records produced with canonical Rust mode enabled",
+    )
+    ap.add_argument(
+        "--drop-set",
+        action="append",
+        default=[],
+        metavar="A,B,...",
+        help="also analyze a combined candidate that drops the comma-separated dimensions",
+    )
     args = ap.parse_args()
 
     records, bad, recovered = load_records(args.logs)
+    loaded_records = len(records)
+    if args.canonical_only:
+        records = [r for r in records if r.get("canonical_enabled") is True]
     if not records:
-        raise SystemExit("no valid telemetry records")
+        raise SystemExit("no valid telemetry records after filtering")
 
     dep_names = sorted({item["name"] for r in records for item in r.get("dep_env", [])})
     cargo_names = sorted({item["name"] for r in records for item in r.get("cargo_env", [])})
@@ -263,10 +283,28 @@ def main():
     candidates += [f"dep_env:{name}" for name in dep_names]
     candidates += [f"cargo_env:{name}" for name in cargo_names]
 
+    combined = []
+    for spec in args.drop_set:
+        drops = tuple(part.strip() for part in spec.split(",") if part.strip())
+        if len(drops) < 2:
+            raise SystemExit(f"--drop-set requires at least two dimensions: {spec!r}")
+        unknown = [drop for drop in drops if drop not in candidates]
+        if unknown:
+            raise SystemExit(
+                f"--drop-set contains unknown dimension(s): {', '.join(unknown)}"
+            )
+        if drops not in combined:
+            combined.append(drops)
+
     counts, examples = normalization_summary(records)
-    analyses = [compare_candidate(records, args.cache_dir, c) for c in candidates]
+    analyses = [compare_candidate(records, args.cache_dir, (c,)) for c in candidates]
+    combined_analyses = [
+        compare_candidate(records, args.cache_dir, drops) for drops in combined
+    ]
 
     report = {
+        "loaded_records": loaded_records,
+        "canonical_only": args.canonical_only,
         "records": len(records),
         "invalid_records": bad,
         "recovered_records": recovered,
@@ -274,6 +312,7 @@ def main():
         "normalization_changes": dict(counts),
         "normalization_examples": dict(examples),
         "candidate_analysis": analyses,
+        "combined_candidate_analysis": combined_analyses,
     }
 
     text = json.dumps(report, indent=2, sort_keys=True)
