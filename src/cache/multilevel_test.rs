@@ -31,6 +31,18 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 #[test]
+fn average_duration_handles_more_than_u32_samples() {
+    let samples = u64::from(u32::MAX) + 1;
+    let total = Duration::from_secs(samples);
+    assert_eq!(average_duration(total, samples), Duration::from_secs(1));
+}
+
+#[test]
+fn duration_nanos_saturates_instead_of_truncating() {
+    assert_eq!(duration_nanos_u64(Duration::from_secs(u64::MAX)), u64::MAX);
+}
+
+#[test]
 fn test_multi_level_storage_get() {
     let runtime = RuntimeBuilder::new_multi_thread()
         .enable_all()

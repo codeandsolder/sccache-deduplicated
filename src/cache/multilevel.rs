@@ -200,6 +200,22 @@ impl std::ops::AddAssign for MultiLevelStats {
     }
 }
 
+fn duration_nanos_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn average_duration(total: Duration, samples: u64) -> Duration {
+    if samples == 0 {
+        return Duration::ZERO;
+    }
+
+    const NANOS_PER_SECOND: u128 = 1_000_000_000;
+    let average_nanos = total.as_nanos() / u128::from(samples);
+    let seconds = u64::try_from(average_nanos / NANOS_PER_SECOND).unwrap_or(u64::MAX);
+    let nanos = u32::try_from(average_nanos % NANOS_PER_SECOND).unwrap_or(999_999_999);
+    Duration::new(seconds, nanos)
+}
+
 impl LevelStats {
     /// Calculate hit rate as a percentage
     pub fn hit_rate(&self) -> f64 {
@@ -280,22 +296,14 @@ impl LevelStats {
         ));
 
         // 4. Timing stats
-        let avg_write_duration = if self.writes > 0 {
-            self.write_duration / self.writes as u32
-        } else {
-            Duration::default()
-        };
+        let avg_write_duration = average_duration(self.write_duration, self.writes);
         stats.push((
             format!("  {} avg cache write", self.name),
             crate::util::fmt_duration_as_secs(&avg_write_duration),
             2, // " s" is 2 chars
         ));
 
-        let avg_read_duration = if self.hits > 0 {
-            self.hit_duration / self.hits as u32
-        } else {
-            Duration::default()
-        };
+        let avg_read_duration = average_duration(self.hit_duration, self.hits);
         stats.push((
             format!("  {} avg cache read hit", self.name),
             crate::util::fmt_duration_as_secs(&avg_read_duration),
@@ -621,7 +629,7 @@ impl MultiLevelStorage {
                         inc_stat!(
                             stats_arc.as_deref(),
                             write_duration_nanos,
-                            duration.as_nanos() as u64
+                            duration_nanos_u64(duration)
                         );
                     }
                     Err(e) => {
@@ -662,7 +670,7 @@ impl Storage for MultiLevelStorage {
                     inc_stat!(
                         self.atomic_stats.get(idx),
                         hit_duration_nanos,
-                        duration.as_nanos() as u64
+                        duration_nanos_u64(duration)
                     );
                     // Mark misses for all levels checked before this hit
                     for miss_idx in 0..idx {
@@ -800,7 +808,7 @@ impl Storage for MultiLevelStorage {
                                 inc_stat!(
                                     self.atomic_stats.first(),
                                     write_duration_nanos,
-                                    duration.as_nanos() as u64
+                                    duration_nanos_u64(duration)
                                 );
                             }
                             Err(e) => {
@@ -853,7 +861,7 @@ impl Storage for MultiLevelStorage {
                             inc_stat!(
                                 stats_arc.as_deref(),
                                 write_duration_nanos,
-                                duration.as_nanos() as u64
+                                duration_nanos_u64(duration)
                             );
                         }
                     } else {
@@ -879,7 +887,7 @@ impl Storage for MultiLevelStorage {
                         inc_stat!(
                             stats_arc.as_deref(),
                             write_duration_nanos,
-                            duration.as_nanos() as u64
+                            duration_nanos_u64(duration)
                         );
                     }
                 }
@@ -926,7 +934,7 @@ impl Storage for MultiLevelStorage {
         let mut total = 0u64;
         for level in &self.levels {
             if let Some(size) = level.current_size().await? {
-                total += size;
+                total = total.saturating_add(size);
             }
         }
         if total > 0 { Ok(Some(total)) } else { Ok(None) }
@@ -936,7 +944,7 @@ impl Storage for MultiLevelStorage {
         let mut total = 0u64;
         for level in &self.levels {
             if let Some(size) = level.max_size().await? {
-                total += size;
+                total = total.saturating_add(size);
             }
         }
         if total > 0 { Ok(Some(total)) } else { Ok(None) }

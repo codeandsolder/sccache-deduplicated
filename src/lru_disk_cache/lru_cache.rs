@@ -118,19 +118,40 @@ pub trait CountableMeterWithMeasure<K, V, M> {
     fn meter_size(&self, current: M) -> Option<u64>;
 }
 
-/// For any other `Meter` with `Measure=usize`, just do the simple math.
+/// For any `Meter` with `Measure=usize`, use saturating arithmetic.
 impl<K, V, T> CountableMeterWithMeasure<K, V, usize> for T
 where
-    T: Meter<K, V>,
+    T: Meter<K, V, Measure = usize>,
 {
     fn meter_add(&self, current: usize, amount: usize) -> usize {
-        current + amount
+        current.saturating_add(amount)
     }
+
     fn meter_sub(&self, current: usize, amount: usize) -> usize {
-        current - amount
+        current.saturating_sub(amount)
     }
+
     fn meter_size(&self, current: usize) -> Option<u64> {
-        Some(current as u64)
+        Some(u64::try_from(current).unwrap_or(u64::MAX))
+    }
+}
+
+/// For byte-sized or otherwise wide meters, keep the measurement in `u64`
+/// end-to-end so 32-bit targets do not truncate large entries.
+impl<K, V, T> CountableMeterWithMeasure<K, V, u64> for T
+where
+    T: Meter<K, V, Measure = u64>,
+{
+    fn meter_add(&self, current: u64, amount: u64) -> u64 {
+        current.saturating_add(amount)
+    }
+
+    fn meter_sub(&self, current: u64, amount: u64) -> u64 {
+        current.saturating_sub(amount)
+    }
+
+    fn meter_size(&self, current: u64) -> Option<u64> {
+        Some(current)
     }
 }
 

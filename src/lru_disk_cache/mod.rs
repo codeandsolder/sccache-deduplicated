@@ -12,6 +12,8 @@ use std::hash::BuildHasher;
 use std::io;
 use std::io::prelude::*;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use filetime::{FileTime, set_file_times};
 pub use lru_cache::{LruCache, Meter};
@@ -26,12 +28,13 @@ struct FileSize;
 
 /// Given a tuple of (path, filesize), use the filesize for measurement.
 impl<K> Meter<K, u64> for FileSize {
-    type Measure = usize;
-    fn measure<Q: ?Sized>(&self, _: &Q, v: &u64) -> usize
+    type Measure = u64;
+
+    fn measure<Q: ?Sized>(&self, _: &Q, v: &u64) -> u64
     where
         K: Borrow<Q>,
     {
-        *v as usize
+        *v
     }
 }
 
@@ -65,8 +68,7 @@ fn get_all_files<P: AsRef<Path>>(path: P) -> Box<dyn Iterator<Item = (PathBuf, u
 pub struct LruDiskCache<S: BuildHasher = RandomState> {
     lru: LruCache<OsString, u64, S, FileSize>,
     root: PathBuf,
-    pending: Vec<OsString>,
-    pending_size: u64,
+    pending_size: Arc<AtomicU64>,
 }
 
 /// Errors returned by this crate.
@@ -78,6 +80,8 @@ pub enum Error {
     FileNotInCache,
     /// An IO Error occurred.
     Io(io::Error),
+    /// A prepared entry was committed to a different cache.
+    InvalidPendingEntry,
 }
 
 impl fmt::Display for Error {
@@ -85,7 +89,8 @@ impl fmt::Display for Error {
         match self {
             Error::FileTooLarge => write!(f, "File too large"),
             Error::FileNotInCache => write!(f, "File not in cache"),
-            Error::Io(e) => write!(f, "{}", e),
+            Error::Io(e) => write!(f, "{e}"),
+            Error::InvalidPendingEntry => write!(f, "prepared entry belongs to a different cache"),
         }
     }
 }
@@ -96,6 +101,7 @@ impl StdError for Error {
             Error::FileTooLarge => None,
             Error::FileNotInCache => None,
             Error::Io(e) => Some(e),
+            Error::InvalidPendingEntry => None,
         }
     }
 }
@@ -119,10 +125,36 @@ enum AddFile<'a> {
     RelPath(&'a OsStr),
 }
 
+struct PendingReservation {
+    pending_size: Arc<AtomicU64>,
+    size: u64,
+}
+
+impl PendingReservation {
+    fn new(pending_size: Arc<AtomicU64>, size: u64) -> Result<Self> {
+        pending_size
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(size)
+            })
+            .map_err(|_| Error::FileTooLarge)?;
+        Ok(Self { pending_size, size })
+    }
+}
+
+impl Drop for PendingReservation {
+    fn drop(&mut self) {
+        let _ = self
+            .pending_size
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(self.size))
+            });
+    }
+}
+
 pub struct LruDiskCacheAddEntry {
     file: NamedTempFile,
     key: OsString,
-    size: u64,
+    reservation: PendingReservation,
 }
 
 impl LruDiskCacheAddEntry {
@@ -147,15 +179,16 @@ impl LruDiskCache {
         LruDiskCache {
             lru: LruCache::with_meter(size, FileSize),
             root: PathBuf::from(path),
-            pending: vec![],
-            pending_size: 0,
+            pending_size: Arc::new(AtomicU64::new(0)),
         }
         .init()
     }
 
     /// Return the current size of all the files in the cache.
     pub fn size(&self) -> u64 {
-        self.lru.size() + self.pending_size
+        self.lru
+            .size()
+            .saturating_add(self.pending_size.load(Ordering::Relaxed))
     }
 
     /// Return the count of entries in the cache.
@@ -218,30 +251,22 @@ impl LruDiskCache {
         if !self.can_store(size) {
             return Err(Error::FileTooLarge);
         }
-        //TODO: ideally LRUCache::insert would give us back the entries it had to remove.
-        while self.size() + size > self.capacity() {
-            let (rel_path, _) = self.lru.remove_lru().expect("Unexpectedly empty cache!");
-            let remove_path = self.rel_to_abs_path(rel_path);
-            //TODO: check that files are removable during `init`, so that this is only
-            // due to outside interference.
-            fs::remove_file(&remove_path).unwrap_or_else(|e| {
-                // Sometimes the file has already been removed
-                // this seems to happen when the max cache size has been reached
-                // https://github.com/mozilla/sccache/issues/2092
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    debug!(
-                        "Error removing file from cache as it was not found: `{:?}`",
-                        remove_path
-                    );
+
+        while self.size().saturating_add(size) > self.capacity() {
+            let Some((rel_path, file_size)) = self.lru.remove_lru() else {
+                // Outstanding prepared entries can reserve all remaining capacity.
+                return Err(Error::FileTooLarge);
+            };
+            let remove_path = self.rel_to_abs_path(&rel_path);
+            if let Err(error) = fs::remove_file(&remove_path) {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    debug!("Cache entry disappeared before eviction: `{remove_path:?}`");
                 } else {
-                    panic!(
-                        "Error removing file from cache: `{:?}`: {}, {:?}",
-                        remove_path,
-                        e,
-                        e.kind()
-                    )
+                    // Restore accounting if eviction could not be completed.
+                    self.lru.insert(rel_path, file_size);
+                    return Err(Error::Io(error));
                 }
-            });
+            }
         }
         Ok(())
     }
@@ -329,39 +354,47 @@ impl LruDiskCache {
         key: K,
         size: u64,
     ) -> Result<LruDiskCacheAddEntry> {
-        // Ensure we have enough space for the advertized space.
         self.make_space(size)?;
-        let key = key.as_ref().to_owned();
-        self.pending.push(key.clone());
-        self.pending_size += size;
-        tempfile::Builder::new()
+        let reservation = PendingReservation::new(Arc::clone(&self.pending_size), size)?;
+        let file = tempfile::Builder::new()
             .prefix(TEMPFILE_PREFIX)
-            .tempfile_in(&self.root)
-            .map(|file| LruDiskCacheAddEntry { file, key, size })
-            .map_err(Into::into)
+            .tempfile_in(&self.root)?;
+        Ok(LruDiskCacheAddEntry {
+            file,
+            key: key.as_ref().to_owned(),
+            reservation,
+        })
     }
 
     /// Commit an entry coming from `LruDiskCache::prepare_add`.
     pub fn commit(&mut self, entry: LruDiskCacheAddEntry) -> Result<()> {
+        if !Arc::ptr_eq(&entry.reservation.pending_size, &self.pending_size) {
+            return Err(Error::InvalidPendingEntry);
+        }
+
         let LruDiskCacheAddEntry {
             mut file,
             key,
-            size,
+            reservation,
         } = entry;
+
+        // The prepared entry is no longer outstanding. From here on, account
+        // for its actual on-disk size rather than the advertised reservation.
+        drop(reservation);
+
         file.flush()?;
         let real_size = file.as_file().metadata()?.len();
-        // If the file is larger than the size that had been advertized, ensure
-        // we have enough space for it.
-        self.make_space(real_size.saturating_sub(size))?;
-        self.pending
-            .iter()
-            .position(|k| k == &key)
-            .map(|i| self.pending.remove(i))
-            .unwrap();
-        self.pending_size -= size;
+        self.make_space(real_size)?;
+
         let path = self.rel_to_abs_path(&key);
-        fs::create_dir_all(path.parent().unwrap())?;
-        file.persist(path).map_err(|e| e.error)?;
+        let parent = path.parent().ok_or_else(|| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cache entry path has no parent directory",
+            ))
+        })?;
+        fs::create_dir_all(parent)?;
+        file.persist(path).map_err(|error| error.error)?;
         self.lru.insert(key, real_size);
         Ok(())
     }
@@ -481,6 +514,49 @@ mod tests {
             })
             .unwrap()
         }
+    }
+
+    #[test]
+    fn test_dropped_prepared_entry_releases_reservation() -> Result<()> {
+        let f = TestFixture::new();
+        let mut cache = LruDiskCache::new(f.tmp(), 10)?;
+        let entry = cache.prepare_add("pending", 10)?;
+
+        assert_eq!(cache.size(), 10);
+        drop(entry);
+        assert_eq!(cache.size(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_cross_cache_commit_releases_origin_reservation() -> Result<()> {
+        let first = TestFixture::new();
+        let second = TestFixture::new();
+        let mut origin = LruDiskCache::new(first.tmp(), 10)?;
+        let mut other = LruDiskCache::new(second.tmp(), 10)?;
+        let entry = origin.prepare_add("pending", 10)?;
+
+        assert!(matches!(
+            other.commit(entry),
+            Err(Error::InvalidPendingEntry)
+        ));
+        assert_eq!(origin.size(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_commit_larger_than_reservation_releases_reservation_on_error() -> Result<()> {
+        let f = TestFixture::new();
+        let mut cache = LruDiskCache::new(f.tmp(), 10)?;
+        let mut entry = cache.prepare_add("pending", 5)?;
+        entry.as_file_mut().write_all(&[0; 11])?;
+
+        assert!(matches!(cache.commit(entry), Err(Error::FileTooLarge)));
+        assert_eq!(cache.size(), 0);
+
+        Ok(())
     }
 
     #[test]

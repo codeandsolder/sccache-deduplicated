@@ -147,11 +147,7 @@ impl de::Visitor<'_> for StringOrU64Visitor {
     where
         E: de::Error,
     {
-        if value < 0 {
-            Err(E::custom("negative values not supported"))
-        } else {
-            Ok(value as u64)
-        }
+        u64::try_from(value).map_err(|_| E::custom("negative values not supported"))
     }
 }
 
@@ -175,7 +171,7 @@ pub fn parse_size(val: &str) -> Option<u64> {
     } else {
         val
     };
-    u64::from_str(val).ok().map(|size| size * multiplier)
+    u64::from_str(val).ok()?.checked_mul(multiplier)
 }
 
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
@@ -1680,6 +1676,7 @@ fn test_parse_size() {
     assert_eq!(Some(10 * 1024 * 1024), parse_size("10M"));
     assert_eq!(Some(TEN_GIGS), parse_size("10G"));
     assert_eq!(Some(1024 * TEN_GIGS), parse_size("10T"));
+    assert_eq!(None, parse_size("18446744073709551615T"));
 }
 
 #[test]
