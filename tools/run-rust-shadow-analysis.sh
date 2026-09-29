@@ -7,6 +7,7 @@ REPORTS=$BASE/telemetry/reports
 ANALYZER=$BASE/maintenance/analyze-rust-shadow.py
 CURRENT=/dev/shm/sccache-rust-shadow/current.jsonl
 STATS_CURRENT=/dev/shm/sccache-rust-shadow/stats.jsonl
+ERROR_CURRENT=/dev/shm/sccache-rust-shadow/error.log
 CACHE=/var/cache/sccache
 
 mkdir -p "$REPORTS"
@@ -55,6 +56,15 @@ if [[ -s "$STATS_CURRENT" ]]; then
     zstd -q -t "$stats_tmp"
     mv "$stats_tmp" "$stats_out"
     ln -sfn "$(basename "$stats_out")" "$REPORTS/latest-stats.jsonl.zst"
+fi
+
+if [[ -s "$ERROR_CURRENT" ]]; then
+    error_out="$REPORTS/error-$stamp.log.zst"
+    error_tmp="$REPORTS/.error-$stamp.log.zst.tmp"
+    zstd -q -3 -T1 -c "$ERROR_CURRENT" >"$error_tmp"
+    zstd -q -t "$error_tmp"
+    mv "$error_tmp" "$error_out"
+    ln -sfn "$(basename "$error_out")" "$REPORTS/latest-error.log.zst"
 fi
 
 summary=$(
