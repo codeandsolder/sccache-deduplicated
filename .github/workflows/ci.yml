@@ -30,7 +30,7 @@ jobs:
             cargo_cmd: clippy --locked --all-targets -- -D warnings -A unknown-lints -A clippy::type_complexity -A clippy::new-without-default
     steps:
       - name: Clone repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
@@ -55,7 +55,7 @@ jobs:
         feature: [ azure, gcs, gha, memcached, redis, s3, webdav, "dist-client,s3" ]
     steps:
       - name: Clone repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Check feature ${{ matrix.feature }}
         run: cargo check --no-default-features --features ${{ matrix.feature }}
@@ -64,7 +64,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Clone repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Check
         run: npx --yes @taplo/cli fmt --check
@@ -90,10 +90,10 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: '0' # save disk space
     steps:
       - if: ${{ contains(matrix.os, 'windows') }}
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
 
       - name: Clone repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
@@ -195,7 +195,7 @@ jobs:
       - name: Upload coverage results (to Codecov.io)
         if: ${{ ! matrix.no_coverage }}
         continue-on-error: ${{ github.repository != 'mozilla/sccache' }}
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5
         with:
           files: ${{ steps.coverage.outputs.report }}
           ## flags: IntegrationTests, UnitTests, ${{ steps.vars.outputs.CODECOV_FLAGS }}
@@ -218,7 +218,7 @@ jobs:
       matrix: ${{ fromJSON(startsWith(github.ref, 'refs/tags/') && '{"include":[{"os":"ubuntu-22.04","target":"x86_64-unknown-linux-musl","container":"{\"image\":\"messense/rust-musl-cross:x86_64-musl\"}"},{"os":"ubuntu-22.04","target":"s390x-unknown-linux-musl","container":"{\"image\":\"messense/rust-musl-cross:s390x-musl\"}","lto":"false"},{"os":"ubuntu-22.04","target":"s390x-unknown-linux-gnu"},{"os":"ubuntu-22.04","target":"riscv64gc-unknown-linux-musl","container":"{\"image\":\"messense/rust-musl-cross:riscv64gc-musl\"}","rustflags":"-Ctarget-feature=+crt-static"},{"os":"ubuntu-22.04","target":"loongarch64-unknown-linux-musl","container":"{\"image\":\"messense/rust-musl-cross:loongarch64-musl\"}","rustflags":"-Ctarget-feature=+crt-static"},{"os":"ubuntu-22.04","binary":"sccache-dist","extra_args":"--no-default-features --features=\"dist-server\"","target":"x86_64-unknown-linux-musl","container":"{\"image\":\"messense/rust-musl-cross:x86_64-musl\"}"},{"os":"ubuntu-22.04","target":"aarch64-unknown-linux-musl","container":"{\"image\":\"messense/rust-musl-cross:aarch64-musl\"}"},{"os":"ubuntu-22.04","binary":"sccache-dist","extra_args":"--no-default-features --features=\"dist-server\"","target":"aarch64-unknown-linux-musl","container":"{\"image\":\"messense/rust-musl-cross:aarch64-musl\"}"},{"os":"ubuntu-22.04","target":"armv7-unknown-linux-musleabi","container":"{\"image\":\"messense/rust-musl-cross:armv7-musleabi\"}"},{"os":"ubuntu-22.04","target":"i686-unknown-linux-musl","container":"{\"image\":\"messense/rust-musl-cross:i686-musl\"}"},{"os":"macos-14","target":"aarch64-apple-darwin","macosx_deployment_target":"11.0"},{"os":"macos-15-intel","target":"x86_64-apple-darwin","macosx_deployment_target":"11.0"},{"os":"windows-2022","target":"x86_64-pc-windows-msvc","rustflags":"-Ctarget-feature=+crt-static"},{"os":"windows-2022","target":"aarch64-pc-windows-msvc","rustflags":"-Ctarget-feature=+crt-static"}]}' || '{"include":[{"os":"ubuntu-22.04","target":"x86_64-unknown-linux-musl","container":"{\"image\":\"messense/rust-musl-cross:x86_64-musl\"}","rustflags":"-C target-cpu=x86-64-v2"}]}') }}
     steps:
       - name: Clone repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
@@ -286,7 +286,7 @@ jobs:
           ID: ${{ startsWith(github.ref, 'refs/tags/') && github.ref || github.sha }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ matrix.binary || 'sccache' }}-${{ steps.id.outputs.id }}-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/${{ matrix.binary || 'sccache' }}${{ endsWith(matrix.target, '-msvc') && '.exe' || '' }}
@@ -304,7 +304,7 @@ jobs:
         job:
           - { os: ubuntu-22.04 }
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Prepare, build and test
         uses: vmactions/freebsd-vm@v1
         with:
@@ -363,7 +363,7 @@ jobs:
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
     steps:
       - name: Clone repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Check versions
         run: |
@@ -376,7 +376,7 @@ jobs:
           fi
 
       - name: Get artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
 
       - name: Create release assets
         run: |

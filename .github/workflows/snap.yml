@@ -13,12 +13,12 @@ jobs:
 
     steps:
     - name: Check out code
-      uses: actions/checkout@v5
+      uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       with:
         fetch-depth: 0  # needed for version determination
 
     - name: Build and publish the snap
-      uses: canonical/actions/build-snap@release
+      uses: canonical/actions/build-snap@369aa83db4b62bdf1cb4240f651f11f0eb9fac11 # release
       with:
         snapcraft-channel: edge
         review-opts: --allow-classic
