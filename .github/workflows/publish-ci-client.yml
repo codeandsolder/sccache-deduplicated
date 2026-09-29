@@ -1,4 +1,4 @@
-name: Publish CI sccache client
+name: Publish CI sccache bundle
 
 on:
   workflow_dispatch:
@@ -40,20 +40,25 @@ jobs:
           set -euo pipefail
           rustup toolchain install 1.98.1 --profile minimal
 
-      - name: Build client-only binary
+      - name: Build CI client + dist worker
         shell: bash
         env:
           RUSTFLAGS: "-C target-cpu=x86-64-v2"
         run: |
           set -euo pipefail
-          cargo +1.98.1 build --release --locked --bin sccache --no-default-features --features s3
+          cargo +1.98.1 build --release --locked \
+            --no-default-features \
+            --features s3,dist-client,dist-server \
+            --bin sccache --bin sccache-dist
+
           install -D -m 0755 target/release/sccache dist/sccache-linux-x86_64-v2
-          sha256sum dist/sccache-linux-x86_64-v2 > dist/SHA256SUMS
+          install -D -m 0755 target/release/sccache-dist dist/sccache-dist-linux-x86_64-v2
+          sha256sum dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2 > dist/SHA256SUMS
           {
             echo "source_sha=${{ steps.rev.outputs.sha }}"
             echo "rust_toolchain=1.98.1"
             echo "rustflags=-C target-cpu=x86-64-v2"
-            echo "features=s3"
+            echo "features=s3,dist-client,dist-server"
           } > dist/build.txt
 
       - name: Publish immutable release
@@ -69,6 +74,6 @@ jobs:
           fi
           gh release create "$RELEASE_TAG" \
             --target "${{ steps.rev.outputs.sha }}" \
-            --title "CI sccache client ${{ steps.rev.outputs.sha }}" \
-            --notes "Pinned client-only Linux x86-64-v2 sccache binary for centrally managed CI." \
-            dist/sccache-linux-x86_64-v2 dist/SHA256SUMS dist/build.txt
+            --title "CI sccache bundle ${{ steps.rev.outputs.sha }}" \
+            --notes "Pinned Linux x86-64-v2 sccache client + direct sccache-dist worker bundle for centrally managed CI." \
+            dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2 dist/SHA256SUMS dist/build.txt
