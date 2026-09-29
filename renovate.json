@@ -9,17 +9,14 @@
   "minimumReleaseAge": "3 days",
   "minimumReleaseAgeBehaviour": "timestamp-required",
   "internalChecksFilter": "strict",
-  "schedule": [
-    "after 2am and before 4am on tuesday"
-  ],
   "separateMultipleMajor": false,
-  "prConcurrentLimit": 2,
-  "prHourlyLimit": 1,
+  "prConcurrentLimit": 6,
+  "prHourlyLimit": 3,
   "rebaseWhen": "conflicted",
   "lockFileMaintenance": {
     "enabled": true,
     "schedule": [
-      "after 2am and before 3am on tuesday"
+      "before 3am"
     ],
     "automerge": true,
     "automergeType": "pr"
@@ -39,22 +36,39 @@
       "enabled": false
     },
     {
-      "description": "Cargo.toml dependency policy follows mozilla/sccache upstream; only local lockfile maintenance is allowed",
+      "description": "Group routine compatible stable Rust dependency updates",
       "matchManagers": [
         "cargo"
       ],
       "matchUpdateTypes": [
-        "major",
         "minor",
         "patch",
         "pin",
         "pinDigest",
-        "digest",
-        "bump",
-        "rollback",
-        "replacement"
+        "digest"
       ],
-      "enabled": false
+      "matchCurrentVersion": "!/^0/",
+      "groupName": "routine stable Rust dependencies",
+      "automerge": true,
+      "automergeType": "pr"
+    },
+    {
+      "description": "Pre-1.0 Rust dependency updates are reviewed individually",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchCurrentVersion": "/^0\\./",
+      "automerge": false
+    },
+    {
+      "description": "Latest major Rust dependency updates are attempted individually",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "automerge": false
     },
     {
       "description": "Cargo lockfile maintenance is age-gated by repository CI",
