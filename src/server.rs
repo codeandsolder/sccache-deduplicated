@@ -221,13 +221,13 @@ fn notify_server_startup(name: Option<&OsString>, status: ServerStartup) -> Resu
 }
 
 #[cfg(unix)]
-fn get_signal(status: ExitStatus) -> i32 {
+fn get_signal(status: &ExitStatus) -> Option<i32> {
     use std::os::unix::prelude::*;
-    status.signal().expect("must have signal")
+    status.signal()
 }
 #[cfg(windows)]
-fn get_signal(_status: ExitStatus) -> i32 {
-    panic!("no signals on windows")
+fn get_signal(_status: &ExitStatus) -> Option<i32> {
+    None
 }
 
 pub struct DistClientContainer {
@@ -333,10 +333,7 @@ impl DistClientContainer {
             | DistClientState::FailWithMessage(cfg, _)
             | DistClientState::RetryCreateAt(cfg, _) => {
                 warn!("State reset. Will recreate");
-                *state = DistClientState::RetryCreateAt(
-                    cfg,
-                    Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
-                );
+                *state = DistClientState::RetryCreateAt(cfg, Instant::now());
             }
             DistClientState::Disabled => (),
         }
@@ -358,7 +355,7 @@ impl DistClientContainer {
                     cfg.scheduler_url.clone(),
                     format!(
                         "enabled, not connected, will retry in {:.1}s",
-                        time.duration_since(Instant::now()).as_secs_f32()
+                        time.saturating_duration_since(Instant::now()).as_secs_f32()
                     ),
                 );
             }
@@ -378,38 +375,38 @@ impl DistClientContainer {
         let mut guard = self.state.lock().await;
         let state = &mut *guard;
         Self::maybe_recreate_state(state).await;
-        let res = match state {
+        match state {
             DistClientState::Some(_, dc) => Ok(Some(dc.clone())),
             DistClientState::Disabled | DistClientState::RetryCreateAt(_, _) => Ok(None),
-            DistClientState::FailWithMessage(_, msg) => Err(anyhow!(msg.clone())),
-        };
-        if res.is_err() {
-            let config = match mem::replace(state, DistClientState::Disabled) {
-                DistClientState::FailWithMessage(config, _) => config,
-                _ => unreachable!(),
-            };
-            // The client is most likely mis-configured, make sure we
-            // re-create on our next attempt.
-            *state = DistClientState::RetryCreateAt(
-                config,
-                Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
-            );
+            DistClientState::FailWithMessage(_, msg) => {
+                let msg = msg.clone();
+                let DistClientState::FailWithMessage(config, _) =
+                    mem::replace(state, DistClientState::Disabled)
+                else {
+                    return Err(anyhow!("distributed client state changed unexpectedly"));
+                };
+                // The client is most likely mis-configured, make sure we
+                // re-create on our next attempt.
+                *state = DistClientState::RetryCreateAt(config, Instant::now());
+                Err(anyhow!(msg))
+            }
         }
-        res
     }
 
     async fn maybe_recreate_state(state: &mut DistClientState) {
-        if let DistClientState::RetryCreateAt(_, instant) = *state {
-            if instant > Instant::now() {
-                return;
-            }
-            let config = match mem::replace(state, DistClientState::Disabled) {
-                DistClientState::RetryCreateAt(config, _) => config,
-                _ => unreachable!(),
-            };
-            info!("Attempting to recreate the dist client");
-            *state = Self::create_state(*config).await;
+        let DistClientState::RetryCreateAt(_, instant) = state else {
+            return;
+        };
+        if *instant > Instant::now() {
+            return;
         }
+        let DistClientState::RetryCreateAt(config, _) =
+            mem::replace(state, DistClientState::Disabled)
+        else {
+            return;
+        };
+        info!("Attempting to recreate the dist client");
+        *state = Self::create_state(*config).await;
     }
 
     // Attempt to recreate the dist client
@@ -587,8 +584,14 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                 let l = runtime.block_on(tokio::net::TcpListener::bind(addr))?;
                 let srv =
                     SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
+                let bound_addr = srv.try_local_addr()?.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::AddrNotAvailable,
+                        "TCP listener has no local address",
+                    )
+                })?;
                 Ok((
-                    srv.local_addr().unwrap(),
+                    bound_addr,
                     Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
                 ))
             }
@@ -603,8 +606,14 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                 };
                 let srv =
                     SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
+                let bound_addr = srv.try_local_addr()?.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::AddrNotAvailable,
+                        "Unix listener has no local address",
+                    )
+                })?;
                 Ok((
-                    srv.local_addr().unwrap(),
+                    bound_addr,
                     Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
                 ))
             }
@@ -621,7 +630,7 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                 let srv =
                     SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
                 Ok((
-                    srv.local_addr()
+                    srv.try_local_addr()?
                         .unwrap_or_else(|| crate::net::SocketAddr::UnixAbstract(p.clone())),
                     Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
                 ))
@@ -677,7 +686,10 @@ impl<C: CommandCreatorSync> SccacheServer<tokio::net::TcpListener, C> {
         storage: Arc<dyn Storage>,
     ) -> Result<Self> {
         let addr = crate::net::SocketAddr::with_port(port);
-        let listener = runtime.block_on(tokio::net::TcpListener::bind(addr.as_net().unwrap()))?;
+        let net_addr = addr
+            .as_net()
+            .ok_or_else(|| anyhow!("TCP server address unexpectedly was not a network address"))?;
+        let listener = runtime.block_on(tokio::net::TcpListener::bind(net_addr))?;
 
         Ok(Self::with_listener(
             listener,
@@ -735,8 +747,14 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
     }
 
     /// Returns the port that this server is bound to
+    pub fn try_local_addr(&self) -> io::Result<Option<crate::net::SocketAddr>> {
+        self.listener.local_addr()
+    }
+
+    /// Returns the address that this server is bound to, or `None` if the
+    /// listener cannot report it.
     pub fn local_addr(&self) -> Option<crate::net::SocketAddr> {
-        self.listener.local_addr().unwrap()
+        self.try_local_addr().ok().flatten()
     }
 
     /// Runs this server to completion.
@@ -1324,11 +1342,10 @@ where
             Some(x) => x, // TODO resolve the path right away
             _ => {
                 // fallback to using the path directly
-                metadata(&path2)
-                    .map(|attr| FileTime::from_last_modification_time(&attr))
-                    .ok()
-                    .map(move |filetime| (path2, filetime))
-                    .expect("Must contain sane data, otherwise mtime is not avail")
+                let attr = metadata(&path2).with_context(|| {
+                    format!("failed to read compiler metadata at {}", path2.display())
+                })?;
+                (path2, FileTime::from_last_modification_time(&attr))
             }
         };
 
@@ -1668,7 +1685,13 @@ where
 
                     match status.code() {
                         Some(code) => res.retcode = Some(code),
-                        None => res.signal = Some(get_signal(status)),
+                        None => match get_signal(&status) {
+                            Some(signal) => res.signal = Some(signal),
+                            None => {
+                                error!("process exited without an exit code or signal");
+                                res.retcode = Some(-2);
+                            }
+                        },
                     }
 
                     res.stdout = stdout;
@@ -1684,7 +1707,15 @@ where
 
                             match output.status.code() {
                                 Some(code) => res.retcode = Some(code),
-                                None => res.signal = Some(get_signal(output.status)),
+                                None => match get_signal(&output.status) {
+                                    Some(signal) => res.signal = Some(signal),
+                                    None => {
+                                        error!(
+                                            "failed process exited without an exit code or signal"
+                                        );
+                                        res.retcode = Some(-2);
+                                    }
+                                },
                             }
                             res.stdout = output.stdout;
                             res.stderr = output.stderr;
@@ -2008,11 +2039,7 @@ impl ServerStats {
 
         macro_rules! set_duration_stat {
             ($vec:ident, $dur:expr, $num:expr, $name:expr) => {{
-                let s = if $num > 0 {
-                    $dur / $num as u32
-                } else {
-                    Default::default()
-                };
+                let s = util::average_duration($dur, $num);
                 // name, value, suffix length
                 $vec.push(($name.to_string(), util::fmt_duration_as_secs(&s), 2));
             }};
@@ -2100,8 +2127,8 @@ impl ServerStats {
             }
         }
 
-        let name_width = stats_vec.iter().map(|(n, _, _)| n.len()).max().unwrap();
-        let stat_width = stats_vec.iter().map(|(_, s, _)| s.len()).max().unwrap();
+        let name_width = stats_vec.iter().map(|(n, _, _)| n.len()).max().unwrap_or(0);
+        let stat_width = stats_vec.iter().map(|(_, s, _)| s.len()).max().unwrap_or(0);
         for (name, stat, suffix_len) in stats_vec {
             writer.write(&format!(
                 "{:<name_width$} {:>stat_width$}",
@@ -2129,7 +2156,7 @@ impl ServerStats {
                     "  {:<name_width$} {:>stat_width$}",
                     reason,
                     count,
-                    name_width = name_width - 2,
+                    name_width = name_width.saturating_sub(2),
                     stat_width = stat_width,
                 ));
             }
@@ -2542,7 +2569,9 @@ impl std::future::Future for WaitUntilZero {
         match self.info.upgrade() {
             None => std::task::Poll::Ready(()),
             Some(arc) => {
-                let mut info = arc.lock().expect("we can't panic when holding lock");
+                let mut info = arc
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 info.waker = Some(cx.waker().clone());
                 std::task::Poll::Pending
             }

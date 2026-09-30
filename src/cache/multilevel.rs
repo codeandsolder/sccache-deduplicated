@@ -49,6 +49,7 @@ use crate::compiler::PreprocessorCacheEntry;
 use crate::config::CacheType;
 use crate::config::{Config, PreprocessorCacheModeConfig, WriteErrorPolicy};
 use crate::errors::*;
+use crate::util::average_duration;
 
 /// Increment an atomic stats counter, handling the Option check.
 /// Usage: `inc_stat!(optional_stats, field_name, value)`
@@ -202,18 +203,6 @@ impl std::ops::AddAssign for MultiLevelStats {
 
 fn duration_nanos_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-}
-
-fn average_duration(total: Duration, samples: u64) -> Duration {
-    if samples == 0 {
-        return Duration::ZERO;
-    }
-
-    const NANOS_PER_SECOND: u128 = 1_000_000_000;
-    let average_nanos = total.as_nanos() / u128::from(samples);
-    let seconds = u64::try_from(average_nanos / NANOS_PER_SECOND).unwrap_or(u64::MAX);
-    let nanos = u32::try_from(average_nanos % NANOS_PER_SECOND).unwrap_or(999_999_999);
-    Duration::new(seconds, nanos)
 }
 
 impl LevelStats {

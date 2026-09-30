@@ -455,6 +455,20 @@ fn hash_regular_archive(m: &mut Digest, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Return the average of a total duration over `samples` without truncating
+/// a 64-bit sample count to the `u32` divisor supported by `Duration`.
+pub fn average_duration(total: Duration, samples: u64) -> Duration {
+    if samples == 0 {
+        return Duration::ZERO;
+    }
+
+    const NANOS_PER_SECOND: u128 = 1_000_000_000;
+    let average_nanos = total.as_nanos() / u128::from(samples);
+    let seconds = u64::try_from(average_nanos / NANOS_PER_SECOND).unwrap_or(u64::MAX);
+    let nanos = u32::try_from(average_nanos % NANOS_PER_SECOND).unwrap_or(999_999_999);
+    Duration::new(seconds, nanos)
+}
+
 /// Format `duration` as seconds with a fractional component.
 pub fn fmt_duration_as_secs(duration: &Duration) -> String {
     format!("{}.{:03} s", duration.as_secs(), duration.subsec_millis())
