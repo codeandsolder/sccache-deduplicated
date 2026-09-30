@@ -590,12 +590,19 @@ pub fn parse_arguments(
         match arg.get_data() {
             Some(PassThrough) | Some(PassThroughWithPath(_)) | Some(PassThroughWithSuffix(_)) => {}
             Some(TooHardFlag) | Some(TooHard(_)) | Some(TooHardPath(_)) => {
-                cannot_cache!(arg.flag_str().expect("Can't be Argument::Raw/UnknownFlag",))
+                cannot_cache!(
+                    "unsupported compiler option",
+                    arg.flag_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("{arg:?}"))
+                )
             }
             Some(DoCompilation) => {
+                let Some(flag) = arg.flag_str() else {
+                    cannot_cache!("compilation flag was not representable", format!("{arg:?}"));
+                };
                 compilation = true;
-                compilation_flag =
-                    OsString::from(arg.flag_str().expect("Compilation flag expected"));
+                compilation_flag = OsString::from(flag);
             }
             Some(ShowIncludes) => {
                 show_includes = true;
@@ -639,7 +646,7 @@ pub fn parse_arguments(
                         input_arg = Some(val.clone());
                     }
                     Argument::UnknownFlag(ref flag) => common_args.push(flag.clone()),
-                    _ => unreachable!(),
+                    _ => cannot_cache!("unexpected MSVC argument variant", format!("{arg:?}")),
                 }
             }
         }
@@ -733,7 +740,7 @@ pub fn parse_arguments(
                 ),
                 None => match arg {
                     Argument::Raw(_) | Argument::UnknownFlag(_) => &mut common_args,
-                    _ => unreachable!(),
+                    _ => cannot_cache!("unexpected clang-cl argument variant", format!("{arg:?}")),
                 },
                 Some(DiagnosticsColor(_))
                 | Some(DiagnosticsColorFlag)
