@@ -991,9 +991,10 @@ where
                 }
                 Request::Shutdown => {
                     debug!("handle_client: shutdown");
-                    // Make the shutdown RPC itself a durability barrier for
-                    // detached cache work. CI may persist L0 as soon as the
-                    // stop-server command returns.
+                    // Drain detached cache work already registered while the
+                    // shutdown request is being handled. The server performs a
+                    // second drain after active client services finish, covering
+                    // work registered by compile requests that were already in flight.
                     me.storage.drain_background().await;
                     let info = me.get_info().await?;
                     let mut tx = me.tx.clone();

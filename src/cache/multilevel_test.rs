@@ -24,11 +24,11 @@ use std::env;
 use std::fs;
 use std::io::Cursor;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::Builder as TempBuilder;
 use tokio::runtime::Builder as RuntimeBuilder;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::sleep;
 
 #[test]
@@ -347,6 +347,81 @@ impl Storage for SlowWriteStorage {
     async fn max_size(&self) -> Result<Option<u64>> {
         Ok(None)
     }
+}
+
+#[test]
+fn background_task_drain_includes_concurrent_registration() -> Result<()> {
+    let runtime = RuntimeBuilder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()?;
+
+    let tasks = Arc::new(BackgroundTasks::default());
+    let first_started = Arc::new(Notify::new());
+    let first_release = Arc::new(Notify::new());
+    let first_completed = Arc::new(AtomicBool::new(false));
+    let second_started = Arc::new(Notify::new());
+    let second_release = Arc::new(Notify::new());
+    let second_completed = Arc::new(AtomicBool::new(false));
+
+    runtime.block_on(async {
+        let task_started = Arc::clone(&first_started);
+        let task_release = Arc::clone(&first_release);
+        let task_completed = Arc::clone(&first_completed);
+        tasks.spawn(async move {
+            task_started.notify_one();
+            task_release.notified().await;
+            task_completed.store(true, Ordering::SeqCst);
+        });
+
+        first_started.notified().await;
+
+        let drain_tasks = Arc::clone(&tasks);
+        let drain = tokio::spawn(async move {
+            drain_tasks.drain().await;
+        });
+
+        while !tasks.tracker.is_closed() {
+            tokio::task::yield_now().await;
+        }
+
+        let task_started = Arc::clone(&second_started);
+        let task_release = Arc::clone(&second_release);
+        let task_completed = Arc::clone(&second_completed);
+        tasks.spawn(async move {
+            task_started.notify_one();
+            task_release.notified().await;
+            task_completed.store(true, Ordering::SeqCst);
+        });
+        second_started.notified().await;
+
+        first_release.notify_one();
+        while !first_completed.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !drain.is_finished(),
+            "drain missed concurrently registered work"
+        );
+
+        second_release.notify_one();
+        drain.await?;
+
+        assert!(first_completed.load(Ordering::SeqCst));
+        assert!(second_completed.load(Ordering::SeqCst));
+
+        let post_barrier_ran = Arc::new(AtomicBool::new(false));
+        let post_barrier_ran_clone = Arc::clone(&post_barrier_ran);
+        tasks.spawn(async move {
+            post_barrier_ran_clone.store(true, Ordering::SeqCst);
+        });
+        tasks.drain().await;
+        assert!(post_barrier_ran.load(Ordering::SeqCst));
+
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    Ok(())
 }
 
 #[test]

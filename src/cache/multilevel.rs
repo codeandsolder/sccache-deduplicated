@@ -14,14 +14,14 @@
 
 use bytes::Bytes;
 use std::future::Future;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
-use tokio::task::JoinHandle;
+use tokio_util::task::TaskTracker;
 
 #[cfg(any(
     feature = "azure",
@@ -347,36 +347,28 @@ const DEFAULT_SLOW_LEVEL_WRITE_CONCURRENCY: usize = 4;
 
 #[derive(Default)]
 struct BackgroundTasks {
-    handles: Mutex<Vec<JoinHandle<()>>>,
+    tracker: TaskTracker,
 }
 
 impl BackgroundTasks {
+    /// Register detached cache work before it can begin executing.
     fn spawn<F>(&self, future: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let handle = tokio::spawn(future);
-        let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
-        handles.retain(|handle| !handle.is_finished());
-        handles.push(handle);
+        // TaskTracker creates its tracking token before tokio::spawn, so drain()
+        // cannot observe an empty tracker while this task has already started.
+        drop(self.tracker.spawn(future));
     }
 
+    /// Wait for all detached work belonging to this barrier.
+    ///
+    /// Closing does not reject later spawns: TaskTracker keeps tracking them. If a
+    /// task is registered while this wait is still non-empty it is included; a task
+    /// registered after the tracker reaches empty belongs to the next drain.
     async fn drain(&self) {
-        loop {
-            let handles = {
-                let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
-                if handles.is_empty() {
-                    return;
-                }
-                std::mem::take(&mut *handles)
-            };
-
-            for handle in handles {
-                if let Err(error) = handle.await {
-                    debug!("Background cache task failed to join: {}", error);
-                }
-            }
-        }
+        self.tracker.close();
+        self.tracker.wait().await;
     }
 }
 
