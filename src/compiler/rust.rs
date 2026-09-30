@@ -806,7 +806,7 @@ where
     let key = (executable.to_owned(), rustc_verbose_version.to_owned());
     if let Some(profile) = NATIVE_PROFILE_CACHE
         .lock()
-        .expect("native profile cache poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&key)
         .cloned()
     {
@@ -816,7 +816,7 @@ where
     let profile = probe_native_profile(creator, executable, env_vars).await?;
     let mut cache = NATIVE_PROFILE_CACHE
         .lock()
-        .expect("native profile cache poisoned");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     Ok(cache.entry(key).or_insert_with(|| profile.clone()).clone())
 }
 
@@ -1136,7 +1136,7 @@ impl RustupProxy {
         });
 
         let state = match state {
-            Ok(ProxyPath::Candidate(_)) => unreachable!("Q.E.D."),
+            Ok(candidate @ ProxyPath::Candidate(_)) => Ok(candidate),
             Ok(ProxyPath::ToBeDiscovered) => {
                 // simple check: is there a rustup in the same parent dir as rustc?
                 // that would be the preferred one
@@ -1618,7 +1618,12 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
         let arg = try_or_cannot_cache!(arg, "argument parse");
         match arg.get_data() {
             Some(TooHardFlag) | Some(TooHardPath(_)) => {
-                cannot_cache!(arg.flag_str().expect("Can't be Argument::Raw/UnknownFlag",))
+                cannot_cache!(
+                    "unsupported compiler option",
+                    arg.flag_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("{arg:?}"))
+                )
             }
             Some(NotCompilationFlag) | Some(NotCompilation(_)) => {
                 return CompilerArguments::NotCompilation;
@@ -1725,7 +1730,9 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
                         input = Some(val.clone());
                     }
                     Argument::UnknownFlag(_) => {}
-                    _ => unreachable!(),
+                    _ => {
+                        cannot_cache!("unexpected Rust argument variant", format!("{arg:?}"));
+                    }
                 }
             }
         }
@@ -1871,6 +1878,7 @@ where
         let native_requested = native_target_requested(&effective_arguments);
         let target = compilation_target(&effective_arguments, &self.host);
         let mut allow_dist = true;
+        let mut effective_cache_control = cache_control;
         let mut resolved_native_profile = None;
         if native_requested && may_dist {
             if target.starts_with("x86_64-") {
@@ -1893,17 +1901,23 @@ where
             let profile = if let Some(profile) = self.native_profile.as_ref() {
                 profile.clone()
             } else {
-                cached_native_profile(
+                match cached_native_profile(
                     (*creator).clone(),
                     &self.executable,
                     &self.version,
                     &env_vars,
                 )
                 .await
-                .unwrap_or_else(|e| {
-                    warn!("Failed to resolve rustc native CPU profile: {e:#}");
-                    format!("unresolved:{}", self.host)
-                })
+                {
+                    Ok(profile) => profile,
+                    Err(error) => {
+                        warn!(
+                            "Failed to resolve rustc native CPU profile; bypassing cache: {error:#}"
+                        );
+                        effective_cache_control = CacheControl::ForceNoCache;
+                        format!("unresolved:{}", self.host)
+                    }
+                }
             };
             resolved_native_profile = Some(profile);
         }
@@ -2123,10 +2137,11 @@ where
         };
         args.hash(&mut HashToDigest { digest: &mut m });
         if native_requested && (!may_dist || !target.starts_with("x86_64-")) {
-            resolved_native_profile
-                .as_ref()
-                .expect("native profile must be resolved for local native compilation")
-                .hash(&mut HashToDigest { digest: &mut m });
+            if let Some(profile) = resolved_native_profile.as_ref() {
+                profile.hash(&mut HashToDigest { digest: &mut m });
+            } else {
+                effective_cache_control = CacheControl::ForceNoCache;
+            }
         }
         // 4. The digest of all source files (this includes src file from cmdline).
         // 5. The digest of all files listed on the commandline (self.externs).
@@ -2362,62 +2377,64 @@ where
                 .unwrap_or_default();
             let timestamp_unix_ms = u64::try_from(now.as_millis()).unwrap_or(u64::MAX);
 
-            let (
+            if let Some((
                 shadow_source_inputs,
                 shadow_extern_inputs,
                 shadow_staticlib_inputs,
                 shadow_target_json_inputs,
-            ) = shadow_inputs
-                .expect("shadow input snapshot must exist when shadow logging is enabled");
-
-            let record = RustShadowRecord {
-                schema: 1,
-                timestamp_unix_ms,
-                normalization_policy: if canonical.is_some() {
-                    "canonical-rust-layout-v1".to_owned()
-                } else {
-                    "legacy-rust-v6".to_owned()
-                },
-                cache_key: key.clone(),
-                weak_toolchain_key: weak_toolchain_key.clone(),
-                cache_version: String::from_utf8_lossy(CACHE_VERSION).into_owned(),
-                crate_name: self.parsed_args.crate_name.clone(),
-                crate_types: format!("{:?}", self.parsed_args.crate_types),
-                host: self.host.clone(),
-                target: target.clone(),
-                compiler_version: self.version.clone(),
-                compiler_shlibs_digests: self.compiler_shlibs_digests.clone(),
-                cache_control: format!("{cache_control:?}"),
-                may_dist,
-                allow_dist,
-                native_requested,
-                resolved_native_profile: resolved_native_profile.clone(),
-                canonical_enabled: canonical.is_some(),
-                canonical_roots: rust_shadow_roots(canonical),
-                cwd_raw: cwd.to_string_lossy().into_owned(),
-                cwd_key: canonical
-                    .map(|canonical| canonical.canonical_cwd(&cwd))
-                    .unwrap_or_else(|| cwd.clone())
-                    .to_string_lossy()
-                    .into_owned(),
-                sysroot_raw: self.sysroot.to_string_lossy().into_owned(),
-                sysroot_key: canonical
-                    .map(|canonical| canonical.to_canonical(&self.sysroot))
-                    .unwrap_or_else(|| self.sysroot.clone())
-                    .to_string_lossy()
-                    .into_owned(),
-                arguments_raw: rust_shadow_args(&os_string_arguments),
-                arguments_canonical: rust_shadow_args(&hash_os_string_arguments),
-                arguments_hashed_blob: args.to_string_lossy().into_owned(),
-                source_inputs: shadow_source_inputs,
-                extern_inputs: shadow_extern_inputs,
-                staticlib_inputs: shadow_staticlib_inputs,
-                target_json_inputs: shadow_target_json_inputs,
-                dep_env,
-                cargo_env,
-                outputs: shadow_outputs,
-            };
-            append_rust_shadow_record(shadow_log_path, &record);
+            )) = shadow_inputs
+            {
+                let record = RustShadowRecord {
+                    schema: 1,
+                    timestamp_unix_ms,
+                    normalization_policy: if canonical.is_some() {
+                        "canonical-rust-layout-v1".to_owned()
+                    } else {
+                        "legacy-rust-v6".to_owned()
+                    },
+                    cache_key: key.clone(),
+                    weak_toolchain_key: weak_toolchain_key.clone(),
+                    cache_version: String::from_utf8_lossy(CACHE_VERSION).into_owned(),
+                    crate_name: self.parsed_args.crate_name.clone(),
+                    crate_types: format!("{:?}", self.parsed_args.crate_types),
+                    host: self.host.clone(),
+                    target: target.clone(),
+                    compiler_version: self.version.clone(),
+                    compiler_shlibs_digests: self.compiler_shlibs_digests.clone(),
+                    cache_control: format!("{effective_cache_control:?}"),
+                    may_dist,
+                    allow_dist,
+                    native_requested,
+                    resolved_native_profile: resolved_native_profile.clone(),
+                    canonical_enabled: canonical.is_some(),
+                    canonical_roots: rust_shadow_roots(canonical),
+                    cwd_raw: cwd.to_string_lossy().into_owned(),
+                    cwd_key: canonical
+                        .map(|canonical| canonical.canonical_cwd(&cwd))
+                        .unwrap_or_else(|| cwd.clone())
+                        .to_string_lossy()
+                        .into_owned(),
+                    sysroot_raw: self.sysroot.to_string_lossy().into_owned(),
+                    sysroot_key: canonical
+                        .map(|canonical| canonical.to_canonical(&self.sysroot))
+                        .unwrap_or_else(|| self.sysroot.clone())
+                        .to_string_lossy()
+                        .into_owned(),
+                    arguments_raw: rust_shadow_args(&os_string_arguments),
+                    arguments_canonical: rust_shadow_args(&hash_os_string_arguments),
+                    arguments_hashed_blob: args.to_string_lossy().into_owned(),
+                    source_inputs: shadow_source_inputs,
+                    extern_inputs: shadow_extern_inputs,
+                    staticlib_inputs: shadow_staticlib_inputs,
+                    target_json_inputs: shadow_target_json_inputs,
+                    dep_env,
+                    cargo_env,
+                    outputs: shadow_outputs,
+                };
+                append_rust_shadow_record(shadow_log_path, &record);
+            } else if !WARNED_RUST_SHADOW_LOG.swap(true, Ordering::Relaxed) {
+                warn!("Rust shadow logging enabled without an input snapshot; skipping record");
+            }
         }
 
         Ok(HashResult {
@@ -2441,6 +2458,7 @@ where
                 rlib_dep_reader: self.rlib_dep_reader.clone(),
             }),
             weak_toolchain_key,
+            cache_control: effective_cache_control,
         })
     }
 
@@ -4633,9 +4651,9 @@ proc_macro false
     }
 
     #[test]
-    fn test_dist_native_normalizes_to_x86_64_v2() {
+    fn test_dist_native_normalizes_to_x86_64_v2() -> Result<()> {
         let f = TestFixture::new();
-        f.touch("foo.rs").unwrap();
+        f.touch("foo.rs")?;
 
         let raw = [
             "--emit",
@@ -4653,14 +4671,14 @@ proc_macro false
         let oargs = raw.iter().map(OsString::from).collect::<Vec<_>>();
         let parsed_args = match parse_arguments(&oargs, f.tempdir.path()) {
             CompilerArguments::Ok(parsed_args) => parsed_args,
-            other => panic!("unexpected parse result: {other:?}"),
+            other => bail!("unexpected parse result: {other:?}"),
         };
 
         let creator = new_creator();
         let runtime = single_threaded_runtime();
         let pool = runtime.handle().clone();
 
-        let run = |profile: &str, may_dist: bool| {
+        let run = |profile: Option<&str>, may_dist: bool| -> Result<_> {
             let mut hasher = RustHasher {
                 executable: "rustc".into(),
                 host: "x86_64-unknown-linux-gnu".to_owned(),
@@ -4669,9 +4687,12 @@ proc_macro false
                 compiler_shlibs_digests: vec![],
                 #[cfg(feature = "dist-client")]
                 rlib_dep_reader: None,
-                native_profile: Some(profile.to_owned()),
+                native_profile: profile.map(str::to_owned),
                 parsed_args: parsed_args.clone(),
             };
+            if profile.is_none() {
+                next_command(&creator, Err(anyhow!("native profile probe failed")));
+            }
             mock_dep_info(&creator, &["foo.rs"]);
             mock_file_names(&creator, &["foo.rlib"]);
             hasher
@@ -4686,32 +4707,46 @@ proc_macro false
                     CacheControl::Default,
                 )
                 .wait()
-                .unwrap()
         };
 
-        let local_znver2 = run("znver2|+avx2", false);
-        let local_znver5 = run("znver5|+avx512f", false);
+        let local_znver2 = run(Some("znver2|+avx2"), false)?;
+        let local_znver5 = run(Some("znver5|+avx512f"), false)?;
         assert_ne!(local_znver2.key, local_znver5.key);
+        assert_eq!(local_znver2.cache_control, CacheControl::Default);
+        assert_eq!(local_znver5.cache_control, CacheControl::Default);
 
-        let dist_znver2 = run("znver2|+avx2", true);
-        let dist_znver5 = run("znver5|+avx512f", true);
+        let dist_znver2 = run(Some("znver2|+avx2"), true)?;
+        let dist_znver5 = run(Some("znver5|+avx512f"), true)?;
         assert_eq!(dist_znver2.key, dist_znver5.key);
+        assert_eq!(dist_znver2.cache_control, CacheControl::Default);
+        assert_eq!(dist_znver5.cache_control, CacheControl::Default);
+
+        let unresolved_native = run(None, false)?;
+        assert_eq!(
+            unresolved_native.cache_control,
+            CacheControl::ForceNoCache,
+            "unresolved native CPU identity must bypass cache lookup and storage"
+        );
 
         let mut transformer = dist::PathTransformer::new();
         let (local_command, dist_command, _) = dist_znver2
             .compilation
-            .generate_compile_commands(&mut transformer, false)
-            .unwrap();
+            .generate_compile_commands(&mut transformer, false)?;
 
         let local_args = local_command.get_arguments();
         assert!(local_args.iter().any(|arg| arg == "target-cpu=x86-64-v2"));
 
         #[cfg(feature = "dist-client")]
         {
-            let dist_args = dist_command.unwrap().arguments;
+            let Some(dist_command) = dist_command else {
+                bail!("distributed native compilation did not produce a distributed command");
+            };
+            let dist_args = dist_command.arguments;
             assert!(dist_args.iter().any(|arg| arg == "target-cpu=x86-64-v2"));
             assert!(!dist_args.iter().any(|arg| arg == "target-cpu=native"));
         }
+
+        Ok(())
     }
 
     #[test]

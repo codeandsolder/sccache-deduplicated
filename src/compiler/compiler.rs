@@ -567,7 +567,7 @@ where
             out_pretty,
             fmt_duration_as_secs(&start.elapsed())
         );
-        let (key, compilation, weak_toolchain_key) = match result {
+        let (key, compilation, weak_toolchain_key, cache_control) = match result {
             Err(e) => {
                 return match e.downcast::<ProcessError>() {
                     Ok(ProcessError(output)) => {
@@ -581,7 +581,8 @@ where
                 key,
                 compilation,
                 weak_toolchain_key,
-            }) => (key, compilation, weak_toolchain_key),
+                cache_control,
+            }) => (key, compilation, weak_toolchain_key, cache_control),
         };
         debug!("[{}]: Hash key: {}", out_pretty, key);
         // If `ForceRecache` is enabled, we won't check the cache.
@@ -1175,8 +1176,10 @@ where
     pub key: String,
     /// An object to use for the actual compilation, if necessary.
     pub compilation: Box<dyn Compilation<T> + 'static>,
-    /// A weak key that may be used to identify the toolchain
+    /// A weak key that may be used to identify the toolchain.
     pub weak_toolchain_key: String,
+    /// Effective cache policy after compiler-specific safety checks.
+    pub cache_control: CacheControl,
 }
 
 /// Possible results of parsing compiler arguments.
