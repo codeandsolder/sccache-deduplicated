@@ -929,13 +929,10 @@ fn process_preprocessor_line(
         } else {
             let mut encoded = Vec::with_capacity(include_path.len());
             encode_path(&mut encoded, &normalized)?;
-            normalized_include_paths.insert(include_path.to_owned(), Some(encoded));
-            // No entry API on hashmaps, so we need to query again
-            normalized_include_paths
-                .get(include_path)
-                .unwrap()
-                .as_ref()
-                .unwrap()
+            let normalized = normalized_include_paths
+                .entry(include_path.to_owned())
+                .or_insert_with(|| Some(encoded));
+            normalized.as_deref().unwrap_or(include_path)
         }
     };
 
@@ -975,7 +972,7 @@ pub fn normalize_path(path: &Path) -> PathBuf {
 
     for component in components {
         match component {
-            Component::Prefix(..) => unreachable!(),
+            Component::Prefix(prefix) => ret.push(prefix.as_os_str()),
             Component::RootDir => {
                 ret.push(component.as_os_str());
             }
@@ -1419,7 +1416,10 @@ impl pkg::ToolchainPackager for CToolchainPackager {
                 // Clang uses internal header files, so add them.
                 if let Some(limits_h) = named_file("file", "include/limits.h") {
                     info!("limits_h = {}", limits_h.display());
-                    package_builder.add_dir_contents(limits_h.parent().unwrap())?;
+                    let include_dir = limits_h
+                        .parent()
+                        .context("clang builtin limits.h path has no parent directory")?;
+                    package_builder.add_dir_contents(include_dir)?;
                 }
             }
 
@@ -1445,7 +1445,12 @@ impl pkg::ToolchainPackager for CToolchainPackager {
                 add_named_prog(&mut package_builder, "acclnk")?;
             }
 
-            _ => unreachable!(),
+            CCompilerKind::Diab | CCompilerKind::Msvc | CCompilerKind::TaskingVX => {
+                bail!(
+                    "distributed toolchain packaging is not implemented for {:?}",
+                    self.kind
+                );
+            }
         }
 
         // Bundle into a compressed tarfile.
