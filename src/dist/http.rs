@@ -521,7 +521,6 @@ mod server {
                 Ok(r) => r,
                 Err(err) => {
                     // TODO: would ideally just use error_chain
-                    use std::error::Error;
                     let mut err_msg = err.to_string();
                     let mut maybe_cause = err.source();
                     while let Some(cause) = maybe_cause {
