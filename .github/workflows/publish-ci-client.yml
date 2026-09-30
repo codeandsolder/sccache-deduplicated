@@ -19,13 +19,16 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: publish-ci-sccache-${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
 jobs:
   build-publish:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.head_branch == 'main' &&
-       contains(github.event.workflow_run.head_commit.message, '[publish-ci-bundle]'))
+       github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
@@ -77,8 +80,8 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "Release $RELEASE_TAG already exists; refusing to mutate an immutable toolchain release." >&2
-            exit 1
+            echo "Release $RELEASE_TAG already exists; immutable release is already published."
+            exit 0
           fi
           gh release create "$RELEASE_TAG" \
             --target "${{ steps.rev.outputs.sha }}" \
