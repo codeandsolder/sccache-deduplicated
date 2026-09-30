@@ -1,4 +1,5 @@
 use crate::dist;
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
@@ -306,24 +307,28 @@ impl CanonicalRustPaths {
         &self,
         env: &[(OsString, OsString)],
     ) -> Vec<(OsString, OsString)> {
+        self.env_to_canonical_preserving(env, &HashSet::new())
+    }
+
+    /// Canonicalize the compiler environment while preserving values that rustc
+    /// reported as explicit environment dependencies. Values consumed through
+    /// `env!`/`option_env!` are observable program data, so rewriting them before
+    /// compilation changes the resulting program rather than merely its cache key.
+    pub(crate) fn env_to_canonical_preserving(
+        &self,
+        env: &[(OsString, OsString)],
+        preserve: &HashSet<OsString>,
+    ) -> Vec<(OsString, OsString)> {
         env.iter()
             .filter(|(k, _)| {
                 k != "SCCACHE_EXPERIMENTAL_CANONICAL_RUST"
                     && !k.to_string_lossy().starts_with("SCCACHE_CANONICAL_")
             })
             .map(|(k, v)| {
-                let value = if matches!(k.to_str(), Some("TMPDIR" | "TMP" | "TEMP" | "TEMPDIR")) {
-                    OsString::from("/tmp")
-                } else if k == "HOME" {
-                    OsString::from("/tmp/home")
-                } else if k == "RUSTC" {
-                    OsString::from("/rust/bin/rustc")
-                } else if k == "RUSTDOC" {
-                    OsString::from("/rust/bin/rustdoc")
-                } else if path_env(k) {
-                    self.os_to_canonical(v)
+                let value = if preserve.contains(k) {
+                    v.clone()
                 } else {
-                    self.normalize_os_value(v)
+                    self.env_value_to_canonical(k, v)
                 };
                 (k.clone(), value)
             })
@@ -663,6 +668,29 @@ mod tests {
 
         assert!(roots.root_is_known(&build.join("inside-link/ok.rs")));
         assert!(!roots.root_is_known(&build.join("escape-link/escape.rs")));
+    }
+
+    #[test]
+    fn preserves_explicit_environment_dependencies() {
+        let env = vec![
+            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+            ("SCCACHE_CANONICAL_BUILD_ROOT".into(), "/work/a".into()),
+            ("CARGO_MANIFEST_DIR".into(), "/work/a/crate".into()),
+            ("CARGO_TARGET_DIR".into(), "/work/a/target".into()),
+        ];
+        let roots =
+            CanonicalRustPaths::from_env(&env, Path::new("/work/a"), Path::new("/rust")).unwrap();
+        let preserve = HashSet::from([OsString::from("CARGO_MANIFEST_DIR")]);
+        let canonical = roots.env_to_canonical_preserving(&env, &preserve);
+
+        assert_eq!(
+            env_value(&canonical, "CARGO_MANIFEST_DIR"),
+            Some(PathBuf::from("/work/a/crate"))
+        );
+        assert_eq!(
+            env_value(&canonical, "CARGO_TARGET_DIR"),
+            Some(PathBuf::from("/target"))
+        );
     }
 
     #[test]
