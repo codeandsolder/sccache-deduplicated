@@ -139,24 +139,12 @@ impl CCompilerImpl for Nvcc {
 
         match parsed_args {
             CompilerArguments::Ok(mut parsed_args) => {
-                match parsed_args.compilation_flag.to_str() {
-                    Some("") => { /* no compile flag is valid */ }
-                    Some(flag) => {
-                        // Add the compilation flag to `parsed_args.common_args` so
-                        // it's considered when computing the hash.
-                        //
-                        // Consider the following cases:
-                        //  $ sccache nvcc x.cu -o x.bin
-                        //  $ sccache nvcc x.cu -o x.cu.o -c
-                        //  $ sccache nvcc x.cu -o x.ptx -ptx
-                        //  $ sccache nvcc x.cu -o x.cubin -cubin
-                        //
-                        // The preprocessor output for all four are identical, so
-                        // without including the compilation flag in the hasher's
-                        // inputs, the same hash would be generated for all four.
-                        parsed_args.common_args.push(flag.into());
-                    }
-                    _ => unreachable!(),
+                // Include a non-empty compilation flag in the cache key without
+                // requiring compiler arguments to be valid UTF-8.
+                if !parsed_args.compilation_flag.is_empty() {
+                    parsed_args
+                        .common_args
+                        .push(parsed_args.compilation_flag.clone());
                 }
                 CompilerArguments::Ok(parsed_args)
             }
@@ -196,6 +184,15 @@ impl CCompilerImpl for Nvcc {
         // Resolve compiler avoiding ccache wrappers to prevent double-caching.
         let resolved_executable = resolve_compiler_avoiding_wrapper(executable, &env_vars);
 
+        let output_file_name = parsed_args
+            .outputs
+            .get("obj")
+            .context("Missing object file output")?
+            .path
+            .file_name()
+            .context("Object output path has no file name")?
+            .to_owned();
+
         let initialize_cmd_and_args = || {
             let mut command = creator.clone().new_command_sync(&resolved_executable);
             command
@@ -229,15 +226,6 @@ impl CCompilerImpl for Nvcc {
                     .collect::<Vec<_>>(),
             );
             if log_enabled!(Trace) {
-                let output_file_name = &parsed_args
-                    .outputs
-                    .get("obj")
-                    .context("Missing object file output")
-                    .unwrap()
-                    .path
-                    .file_name()
-                    .unwrap();
-
                 trace!(
                     "[{}]: dependencies command: {:?}",
                     output_file_name.to_string_lossy(),
@@ -260,15 +248,6 @@ impl CCompilerImpl for Nvcc {
                 NvccHostCompiler::Gcc => "-Xcompiler=-P",
             });
             if log_enabled!(Trace) {
-                let output_file_name = &parsed_args
-                    .outputs
-                    .get("obj")
-                    .context("Missing object file output")
-                    .unwrap()
-                    .path
-                    .file_name()
-                    .unwrap();
-
                 trace!(
                     "[{}]: preprocessor command: {:?}",
                     output_file_name.to_string_lossy(),
@@ -328,7 +307,10 @@ pub fn generate_compile_commands(
                 .iter()
                 .position(|x| x == "-keep-dir" || x == "--keep-dir")
             {
-                let dir = PathBuf::from(unhashed_args[idx + 1].as_os_str());
+                let dir_arg = unhashed_args
+                    .get(idx + 1)
+                    .context("NVCC -keep-dir/--keep-dir requires a directory")?;
+                let dir = PathBuf::from(dir_arg);
                 let dir = if dir.is_absolute() {
                     dir
                 } else {
@@ -377,10 +359,12 @@ pub fn generate_compile_commands(
                 continue;
             }
             if let Some(idx) = unhashed_args.iter().position(|x| x == "--threads") {
-                let arg = unhashed_args.get(idx + 1);
-                if let Some(arg) = arg.and_then(|arg| arg.to_str())
-                    && let Ok(arg) = arg.parse::<usize>()
-                {
+                let arg = unhashed_args
+                    .get(idx + 1)
+                    .context("NVCC --threads requires a numeric value")?
+                    .to_str()
+                    .context("NVCC --threads value is not valid UTF-8")?;
+                if let Ok(arg) = arg.parse::<usize>() {
                     num_parallel = arg;
                 }
                 unhashed_args.splice(idx..(idx + 2), []);
@@ -399,8 +383,7 @@ pub fn generate_compile_commands(
 
     let temp_dir = tempfile::Builder::new()
         .prefix("sccache_nvcc")
-        .tempdir()
-        .unwrap()
+        .tempdir()?
         .into_path();
 
     let mut arguments = vec![];
@@ -409,12 +392,16 @@ pub fn generate_compile_commands(
         arguments.extend(vec!["-x".into(), lang.into()]);
     }
 
-    let output = &parsed_args
+    let output = parsed_args
         .outputs
         .get("obj")
-        .context("Missing object file output")
-        .unwrap()
-        .path;
+        .context("Missing object file output")?
+        .path
+        .as_path();
+    let output_file_name = output
+        .file_name()
+        .context("Object output path has no file name")?
+        .to_owned();
 
     arguments.extend(vec![
         "-o".into(),
@@ -454,14 +441,19 @@ pub fn generate_compile_commands(
     // preprocessor embeds the name of the input file in comments, so without
     // canonicalizing here, cicc will get cache misses on otherwise identical
     // input that should produce a cache hit.
-    arguments.push(
-        (if parsed_args.input.is_absolute() {
-            parsed_args.input.clone()
-        } else {
-            cwd.join(&parsed_args.input).canonicalize().unwrap()
-        })
-        .into(),
-    );
+    let input = if parsed_args.input.is_absolute() {
+        parsed_args.input.clone()
+    } else {
+        cwd.join(&parsed_args.input)
+            .canonicalize()
+            .with_context(|| {
+                format!(
+                    "Failed to canonicalize NVCC input {}",
+                    parsed_args.input.display()
+                )
+            })?
+    };
+    arguments.push(input.into());
 
     let command = NvccCompileCommand {
         temp_dir,
@@ -474,7 +466,7 @@ pub fn generate_compile_commands(
         cwd: cwd.to_owned(),
         host_compiler: host_compiler.clone(),
         // Only here so we can include it in logs
-        output_file_name: output.file_name().unwrap().to_owned(),
+        output_file_name,
     };
 
     Ok((
@@ -972,8 +964,9 @@ where
 
     let mut ext_counts = HashMap::<String, i32>::new();
     let mut old_to_new = HashMap::<String, String>::new();
-    let is_valid_line_re = Regex::new(r"^#\$ (.*)$").unwrap();
-    let is_envvar_line_re = Regex::new(r"^([_A-Z]+)=(.*)$").unwrap();
+    let is_valid_line_re = Regex::new(r"^#\$ (.*)$").context("invalid NVCC dry-run line regex")?;
+    let is_envvar_line_re =
+        Regex::new(r"^([_A-Z]+)=(.*)$").context("invalid NVCC environment regex")?;
 
     let mut dryrun_env_vars = Vec::<(OsString, OsString)>::new();
     let mut dryrun_env_vars_re_map = HashMap::<String, regex::Regex>::new();
@@ -1064,7 +1057,7 @@ fn fold_env_vars_or_split_into_exe_and_args(
         }
     }
 
-    fn envvar_in_shell_format_re(var: &str) -> Regex {
+    fn envvar_in_shell_format_re(var: &str) -> Result<Regex> {
         Regex::new(
             &(if cfg!(target_os = "windows") {
                 regex::escape(&envvar_in_shell_format(var))
@@ -1072,16 +1065,16 @@ fn fold_env_vars_or_split_into_exe_and_args(
                 regex::escape(&envvar_in_shell_format(var)) + r"[^\w]"
             }),
         )
-        .unwrap()
+        .context("failed to build NVCC environment-variable regex")
     }
 
     // Intercept the environment variable lines and add them to the env_vars list
     if let Some(var) = re.captures(line) {
         let (_, [var, val]) = var.extract();
 
-        env_var_re_map
-            .entry(var.to_owned())
-            .or_insert_with_key(|var| envvar_in_shell_format_re(var));
+        if !env_var_re_map.contains_key(var) {
+            env_var_re_map.insert(var.to_owned(), envvar_in_shell_format_re(var)?);
+        }
 
         env_vars.push((var.into(), val.into()));
 
@@ -1131,7 +1124,7 @@ fn fold_env_vars_or_split_into_exe_and_args(
         .iter()
         .find(|(k, _)| k == "PATH")
         .map(|(_, p)| p.to_owned())
-        .unwrap();
+        .context("NVCC dry-run environment did not provide PATH")?;
 
     let exe = which_in(exe, env_path.into(), cwd)?;
 
@@ -1259,12 +1252,9 @@ where
                 "[{}]: run_commands_sequential cwd={:?}, cmd=\"{}\"",
                 output_file_name.to_string_lossy(),
                 cwd,
-                [
-                    vec![exe.clone().into_os_string().into_string().unwrap()],
-                    args.clone()
-                ]
-                .concat()
-                .join(" ")
+                [vec![exe.to_string_lossy().into_owned()], args.clone()]
+                    .concat()
+                    .join(" ")
             );
         }
 
@@ -1368,7 +1358,7 @@ fn compile_result_to_output(exe: &Path, res: protocol::CompileFinished) -> proce
             stderr: [
                 format!(
                     "{} terminated (signal: {})",
-                    exe.file_stem().unwrap().to_string_lossy(),
+                    exe.file_stem().unwrap_or(exe.as_os_str()).to_string_lossy(),
                     signal
                 )
                 .as_bytes(),
@@ -1911,6 +1901,39 @@ mod test {
             ovec!["-t1", "-t=2", "-t3", "--threads", "1", "--threads", "2"],
             a.unhashed_args
         );
+    }
+
+    #[test]
+    fn test_generate_compile_commands_rejects_missing_unhashed_option_values() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        fs::write(tempdir.path().join("foo.cu"), "")?;
+
+        for malformed in ["--threads", "-keep-dir"] {
+            let mut parsed = match parse_arguments_gcc(vec![
+                "-c".to_owned(),
+                "foo.cu".to_owned(),
+                "-o".to_owned(),
+                "foo.o".to_owned(),
+            ]) {
+                CompilerArguments::Ok(parsed) => parsed,
+                other => bail!("unexpected parse result: {other:?}"),
+            };
+            parsed.unhashed_args.push(malformed.into());
+
+            assert!(
+                generate_compile_commands(
+                    &parsed,
+                    Path::new("nvcc"),
+                    tempdir.path(),
+                    &[],
+                    &NvccHostCompiler::Gcc,
+                )
+                .is_err(),
+                "{malformed} without a value must be rejected"
+            );
+        }
+
+        Ok(())
     }
 
     #[test]
