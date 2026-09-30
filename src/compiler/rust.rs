@@ -568,6 +568,31 @@ struct RustShadowRecord {
     outputs: Vec<RustShadowOutput>,
 }
 
+fn cargo_manifest_input(env_vars: &[(OsString, OsString)], cwd: &Path) -> Option<PathBuf> {
+    let resolve = |value: &OsString| {
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        }
+    };
+
+    if let Some(manifest) = env_vars
+        .iter()
+        .find_map(|(name, value)| (name == "CARGO_MANIFEST_PATH").then(|| resolve(value)))
+        && manifest.is_file()
+    {
+        return Some(manifest);
+    }
+
+    let manifest_dir = env_vars
+        .iter()
+        .find_map(|(name, value)| (name == "CARGO_MANIFEST_DIR").then(|| resolve(value)))?;
+    let manifest = manifest_dir.join("Cargo.toml");
+    manifest.is_file().then_some(manifest)
+}
+
 fn rust_cache_hashes_cargo_env(name: &std::ffi::OsStr) -> bool {
     name.starts_with("CARGO_")
         && name != "CARGO_MAKEFLAGS"
@@ -1959,6 +1984,7 @@ where
             .cloned()
             .collect::<Vec<_>>();
         // Find all the source files and hash them
+        let cargo_manifest = cargo_manifest_input(&env_vars, &cwd);
         let dep_info_copy = canonical_paths.as_ref().and_then(|_| {
             self.parsed_args.dep_info.as_ref().map(|dep_info| {
                 let out_dir = if self.parsed_args.output_dir.is_absolute() {
@@ -1971,7 +1997,7 @@ where
         });
         let source_hashes_pool = pool.clone();
         let source_files_and_hashes_and_env_deps = async {
-            let (source_files, env_deps) = get_source_files_and_env_deps(
+            let (mut source_files, env_deps) = get_source_files_and_env_deps(
                 creator,
                 &self.parsed_args.crate_name,
                 &self.executable,
@@ -1982,6 +2008,13 @@ where
                 dep_info_copy.as_deref(),
             )
             .await?;
+            // Proc macros can read Cargo.toml through CARGO_MANIFEST_DIR while rustc
+            // is running, so the manifest is a real compiler input for both caching and dist.
+            if let Some(manifest) = cargo_manifest.as_ref()
+                && !source_files.contains(manifest)
+            {
+                source_files.push(manifest.clone());
+            }
             let source_hashes = hash_all(&source_files, &source_hashes_pool).await?;
             Ok((source_files, source_hashes, env_deps))
         };
@@ -2081,6 +2114,11 @@ where
         // Hash inputs:
         // 1. A version
         m.update(CACHE_VERSION);
+        if cargo_manifest.is_some() {
+            // Keep the manifest-input schema scoped to Cargo builds so unrelated Rust cache
+            // entries remain reusable while old Cargo entries cannot collide with this key.
+            m.update(b"cargo-manifest-input-v1");
+        }
         // 2. compiler_shlibs_digests
         for d in &self.compiler_shlibs_digests {
             m.update(d.as_bytes());
@@ -2825,29 +2863,6 @@ fn test_can_trim_this() {
 }
 
 #[cfg(feature = "dist-client")]
-fn maybe_add_cargo_toml(input_path: &Path, verify: bool) -> Option<PathBuf> {
-    let lib_rs = PathBuf::new().join("src").join("lib.rs");
-    if input_path.ends_with(lib_rs) {
-        let cargo_toml_path = input_path
-            .parent()
-            .expect("No parent")
-            .parent()
-            .expect("No parent")
-            .join("Cargo.toml");
-        // We want to:
-        //  - either make sure the file exists (verify=true)
-        //  - just return the path (verify=false)
-        if cargo_toml_path.is_file() || !verify {
-            Some(cargo_toml_path)
-        } else {
-            None
-        }
-    } else {
-        None
-    }
-}
-
-#[cfg(feature = "dist-client")]
 fn lexical_parent_traversal_dirs(path: &Path) -> Vec<PathBuf> {
     let mut current = PathBuf::new();
     let mut required = Vec::new();
@@ -2890,37 +2905,67 @@ fn test_lexical_parent_traversal_dirs() {
 
 #[test]
 #[cfg(feature = "dist-client")]
-fn test_maybe_add_cargo_toml() {
-    let (root, result_cargo_toml_path) = if cfg!(windows) {
-        (
-            r"C:\mozilla-source\mozilla-unified\third_party\rust",
-            r"C:\mozilla-source\mozilla-unified\third_party\rust\wgpu-core\Cargo.toml",
-        )
-    } else {
-        (
-            "/home/user/mozilla-source/mozilla-unified/third_party/rust",
-            "/home/user/mozilla-source/mozilla-unified/third_party/rust/wgpu-core/Cargo.toml",
-        )
+fn test_rust_inputs_packager_preserves_manifest_at_canonical_path() {
+    use crate::dist::pkg::InputsPackager;
+
+    let tempdir = tempfile::Builder::new()
+        .prefix("sccache_manifest_dist")
+        .tempdir()
+        .unwrap();
+    let crate_dir = tempdir
+        .path()
+        .join("registry")
+        .join("src")
+        .join("fast_image_resize-6.1.0");
+    let src_dir = crate_dir.join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+
+    let lib_rs = src_dir.join("lib.rs");
+    let manifest = crate_dir.join("Cargo.toml");
+    fs::write(&lib_rs, b"pub fn marker() {}\n").unwrap();
+    fs::write(
+        &manifest,
+        br#"[package]
+name = "fast_image_resize"
+version = "6.1.0"
+"#,
+    )
+    .unwrap();
+
+    let mut path_transformer = dist::PathTransformer::new();
+    path_transformer.add_root_mapping(tempdir.path().to_owned(), "/cargo");
+
+    let packager = RustInputsPackager {
+        env_vars: vec![(
+            OsString::from("CARGO_PKG_NAME"),
+            OsString::from("fast_image_resize"),
+        )],
+        crate_link_paths: vec![],
+        crate_types: CrateTypes {
+            rlib: true,
+            staticlib: false,
+        },
+        inputs: vec![lib_rs, manifest],
+        path_transformer,
+        rlib_dep_reader: None,
     };
 
-    let wgpu_core = PathBuf::from(&root)
-        .join("wgpu-core")
-        .join("src")
-        .join("core.rs");
-    let wgpu_lib = PathBuf::from(&root)
-        .join("wgpu-core")
-        .join("src")
-        .join("lib.rs");
-    assert!(maybe_add_cargo_toml(&wgpu_core, false).is_none());
-    assert!(maybe_add_cargo_toml(&wgpu_core, true).is_none());
-    assert!(
-        maybe_add_cargo_toml(&wgpu_lib, false)
-            == Some(PathBuf::from(&root).join("wgpu-core").join("Cargo.toml"))
-    );
-    assert!(
-        maybe_add_cargo_toml(&wgpu_lib, false).unwrap().to_str() == Some(result_cargo_toml_path)
-    );
-    assert!(maybe_add_cargo_toml(&wgpu_lib, true).is_none());
+    let mut package = Vec::new();
+    Box::new(packager).write_inputs(&mut package).unwrap();
+
+    let mut archive = tar::Archive::new(std::io::Cursor::new(package));
+    let paths = archive
+        .entries()
+        .unwrap()
+        .map(|entry| entry.unwrap().path().unwrap().into_owned())
+        .collect::<Vec<_>>();
+
+    assert!(paths.contains(&PathBuf::from(
+        "cargo/registry/src/fast_image_resize-6.1.0/src/lib.rs"
+    )));
+    assert!(paths.contains(&PathBuf::from(
+        "cargo/registry/src/fast_image_resize-6.1.0/Cargo.toml"
+    )));
 }
 
 #[cfg(feature = "dist-client")]
@@ -2988,18 +3033,6 @@ impl pkg::InputsPackager for RustInputsPackager {
                             })?,
                     );
                 }
-            }
-
-            if let Some(cargo_toml_path) = maybe_add_cargo_toml(&input_path, true) {
-                let dist_cargo_toml_path = path_transformer
-                    .as_dist(&cargo_toml_path)
-                    .with_context(|| {
-                        format!(
-                            "unable to transform input path {}",
-                            cargo_toml_path.display()
-                        )
-                    })?;
-                tar_inputs.push((cargo_toml_path, dist_cargo_toml_path));
             }
 
             let dist_input_path = path_transformer.as_dist(&input_path).with_context(|| {
@@ -4888,6 +4921,10 @@ proc_macro false
                 OsString::from("CARGO_TARGET_DIR"),
                 a.tempdir.path().join("target").into_os_string(),
             ),
+            (
+                OsString::from("CARGO_MANIFEST_DIR"),
+                a.tempdir.path().as_os_str().to_owned(),
+            ),
         ];
         let env_b = vec![
             (
@@ -4898,12 +4935,96 @@ proc_macro false
                 OsString::from("CARGO_TARGET_DIR"),
                 b.tempdir.path().join("target").into_os_string(),
             ),
+            (
+                OsString::from("CARGO_MANIFEST_DIR"),
+                b.tempdir.path().as_os_str().to_owned(),
+            ),
         ];
 
         assert_eq!(
             hash_key(&a, &args, &env_a, mk_manifest, false),
             hash_key(&b, &args, &env_b, mk_manifest, false)
         );
+    }
+
+    #[test]
+    fn test_cargo_manifest_path_overrides_manifest_dir() {
+        let f = TestFixture::new();
+        let default_manifest = f.tempdir.path().join("Cargo.toml");
+        let explicit_manifest = f.tempdir.path().join("Explicit.toml");
+        fs::write(&default_manifest, b"default").unwrap();
+        fs::write(&explicit_manifest, b"explicit").unwrap();
+
+        let env = vec![
+            (
+                OsString::from("CARGO_MANIFEST_DIR"),
+                f.tempdir.path().as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("CARGO_MANIFEST_PATH"),
+                explicit_manifest.as_os_str().to_owned(),
+            ),
+        ];
+
+        assert_eq!(
+            cargo_manifest_input(&env, f.tempdir.path()),
+            Some(explicit_manifest)
+        );
+    }
+
+    #[test]
+    fn test_cargo_manifest_contents_affect_hash_key() {
+        let f = TestFixture::new();
+        let args = [
+            "--emit",
+            "link",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+        ];
+        let env = vec![(
+            OsString::from("CARGO_MANIFEST_DIR"),
+            f.tempdir.path().as_os_str().to_owned(),
+        )];
+
+        let first = hash_key(
+            &f,
+            &args,
+            &env,
+            |root| {
+                fs::write(
+                    root.join("Cargo.toml"),
+                    b"[package]
+name='foo'
+version='1.0.0'
+",
+                )?;
+                Ok(())
+            },
+            false,
+        );
+        let second = hash_key(
+            &f,
+            &args,
+            &env,
+            |root| {
+                fs::write(
+                    root.join("Cargo.toml"),
+                    b"[package]
+name='foo'
+version='2.0.0'
+",
+                )?;
+                Ok(())
+            },
+            false,
+        );
+
+        assert_ne!(first, second);
     }
 
     #[allow(clippy::unnecessary_unwrap)]
