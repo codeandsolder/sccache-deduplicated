@@ -315,13 +315,14 @@ mod client {
     mod test {
         use crate::config;
         use crate::test::utils::create_file;
+        use anyhow::{Result, anyhow};
         use std::io::Write;
 
         use super::ClientToolchains;
 
         struct PanicToolchainPackager;
         impl PanicToolchainPackager {
-            fn new() -> Box<Self> {
+            fn boxed() -> Box<Self> {
                 Box::new(Self)
             }
         }
@@ -331,19 +332,15 @@ mod client {
         ))]
         impl crate::dist::pkg::ToolchainPackager for PanicToolchainPackager {
             fn write_pkg(self: Box<Self>, _f: super::fs::File) -> crate::errors::Result<()> {
-                panic!("should not have called packager")
+                Err(anyhow!("unexpected toolchain packager invocation"))
             }
         }
 
         #[test]
-        fn test_client_toolchains_custom() {
-            let td = tempfile::Builder::new()
-                .prefix("sccache")
-                .tempdir()
-                .unwrap();
+        fn test_client_toolchains_custom() -> Result<()> {
+            let td = tempfile::Builder::new().prefix("sccache").tempdir()?;
 
-            let ct1 =
-                create_file(td.path(), "ct1", |mut f| f.write_all(b"toolchain_contents")).unwrap();
+            let ct1 = create_file(td.path(), "ct1", |mut f| f.write_all(b"toolchain_contents"))?;
 
             let client_toolchains = ClientToolchains::new(
                 &td.path().join("cache"),
@@ -353,31 +350,25 @@ mod client {
                     archive: ct1.clone(),
                     archive_compiler_executable: "/my/compiler/in_archive".into(),
                 }],
-            )
-            .unwrap();
+            )?;
 
-            let (_tc, newpath) = client_toolchains
-                .put_toolchain(
-                    "/my/compiler".as_ref(),
-                    "weak_key",
-                    PanicToolchainPackager::new(),
-                )
-                .unwrap();
+            let (_tc, newpath) = client_toolchains.put_toolchain(
+                "/my/compiler".as_ref(),
+                "weak_key",
+                PanicToolchainPackager::boxed(),
+            )?;
             assert_eq!(
-                newpath.unwrap(),
+                newpath.ok_or_else(|| anyhow!("missing custom toolchain path"))?,
                 ("/my/compiler/in_archive".to_string(), ct1)
             );
+            Ok(())
         }
 
         #[test]
-        fn test_client_toolchains_custom_multiuse_archive() {
-            let td = tempfile::Builder::new()
-                .prefix("sccache")
-                .tempdir()
-                .unwrap();
+        fn test_client_toolchains_custom_multiuse_archive() -> Result<()> {
+            let td = tempfile::Builder::new().prefix("sccache").tempdir()?;
 
-            let ct1 =
-                create_file(td.path(), "ct1", |mut f| f.write_all(b"toolchain_contents")).unwrap();
+            let ct1 = create_file(td.path(), "ct1", |mut f| f.write_all(b"toolchain_contents"))?;
 
             let client_toolchains = ClientToolchains::new(
                 &td.path().join("cache"),
@@ -401,50 +392,41 @@ mod client {
                         archive_compiler_executable: "/my/compiler/in_archive".into(),
                     },
                 ],
-            )
-            .unwrap();
+            )?;
 
-            let (_tc, newpath) = client_toolchains
-                .put_toolchain(
-                    "/my/compiler".as_ref(),
-                    "weak_key",
-                    PanicToolchainPackager::new(),
-                )
-                .unwrap();
+            let (_tc, newpath) = client_toolchains.put_toolchain(
+                "/my/compiler".as_ref(),
+                "weak_key",
+                PanicToolchainPackager::boxed(),
+            )?;
             assert_eq!(
-                newpath.unwrap(),
+                newpath.ok_or_else(|| anyhow!("missing custom toolchain path"))?,
                 ("/my/compiler/in_archive".to_string(), ct1.clone())
             );
-            let (_tc, newpath) = client_toolchains
-                .put_toolchain(
-                    "/my/compiler2".as_ref(),
-                    "weak_key2",
-                    PanicToolchainPackager::new(),
-                )
-                .unwrap();
+            let (_tc, newpath) = client_toolchains.put_toolchain(
+                "/my/compiler2".as_ref(),
+                "weak_key2",
+                PanicToolchainPackager::boxed(),
+            )?;
             assert_eq!(
-                newpath.unwrap(),
+                newpath.ok_or_else(|| anyhow!("missing custom toolchain path"))?,
                 ("/my/compiler2/in_archive".to_string(), ct1.clone())
             );
-            let (_tc, newpath) = client_toolchains
-                .put_toolchain(
-                    "/my/compiler3".as_ref(),
-                    "weak_key2",
-                    PanicToolchainPackager::new(),
-                )
-                .unwrap();
+            let (_tc, newpath) = client_toolchains.put_toolchain(
+                "/my/compiler3".as_ref(),
+                "weak_key2",
+                PanicToolchainPackager::boxed(),
+            )?;
             assert_eq!(
-                newpath.unwrap(),
+                newpath.ok_or_else(|| anyhow!("missing custom toolchain path"))?,
                 ("/my/compiler/in_archive".to_string(), ct1)
             );
+            Ok(())
         }
 
         #[test]
-        fn test_client_toolchains_nodist() {
-            let td = tempfile::Builder::new()
-                .prefix("sccache")
-                .tempdir()
-                .unwrap();
+        fn test_client_toolchains_nodist() -> Result<()> {
+            let td = tempfile::Builder::new().prefix("sccache").tempdir()?;
 
             let client_toolchains = ClientToolchains::new(
                 &td.path().join("cache"),
@@ -452,29 +434,25 @@ mod client {
                 &[config::DistToolchainConfig::NoDist {
                     compiler_executable: "/my/compiler".into(),
                 }],
-            )
-            .unwrap();
+            )?;
 
             assert!(
                 client_toolchains
                     .put_toolchain(
                         "/my/compiler".as_ref(),
                         "weak_key",
-                        PanicToolchainPackager::new()
+                        PanicToolchainPackager::boxed()
                     )
                     .is_err()
             );
+            Ok(())
         }
 
         #[test]
-        fn test_client_toolchains_custom_nodist_conflict() {
-            let td = tempfile::Builder::new()
-                .prefix("sccache")
-                .tempdir()
-                .unwrap();
+        fn test_client_toolchains_custom_nodist_conflict() -> Result<()> {
+            let td = tempfile::Builder::new().prefix("sccache").tempdir()?;
 
-            let ct1 =
-                create_file(td.path(), "ct1", |mut f| f.write_all(b"toolchain_contents")).unwrap();
+            let ct1 = create_file(td.path(), "ct1", |mut f| f.write_all(b"toolchain_contents"))?;
 
             let client_toolchains = ClientToolchains::new(
                 &td.path().join("cache"),
@@ -491,6 +469,7 @@ mod client {
                 ],
             );
             assert!(client_toolchains.is_err());
+            Ok(())
         }
     }
 }
