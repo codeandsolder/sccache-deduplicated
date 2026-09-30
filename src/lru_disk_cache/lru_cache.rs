@@ -8,10 +8,10 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-//! A cache that holds a limited number of key-value pairs. When the
-//! capacity of the cache is exceeded, the least-recently-used
-//! (where "used" means a look-up or putting the pair into the cache)
-//! pair is automatically removed.
+//! A cache that holds a limited number of key-value pairs.
+//!
+//! When the capacity is exceeded, the least-recently-used pair is removed.
+//! A pair counts as used when it is looked up or inserted.
 //!
 //! # Examples
 //!
@@ -91,9 +91,9 @@ pub trait CountableMeter<K, V>: Meter<K, V> {
 }
 
 /// `Count` is all no-ops, the number of entries in the map is the size.
-impl<K, V, T: Meter<K, V>> CountableMeter<K, V> for T
+impl<K, V, T> CountableMeter<K, V> for T
 where
-    T: CountableMeterWithMeasure<K, V, <T as Meter<K, V>>::Measure>,
+    T: Meter<K, V> + CountableMeterWithMeasure<K, V, <T as Meter<K, V>>::Measure>,
 {
     fn add(&self, current: Self::Measure, amount: Self::Measure) -> Self::Measure {
         CountableMeterWithMeasure::meter_add(self, current, amount)
@@ -748,9 +748,7 @@ mod tests {
         cache.insert(1, 10);
         cache.insert(2, 20);
         assert_eq!(cache.len(), 2);
-        let opt1 = cache.remove(&1);
-        assert!(opt1.is_some());
-        assert_eq!(opt1.unwrap(), 10);
+        assert_eq!(cache.remove(&1), Some(10));
         assert!(cache.get_mut(&1).is_none());
         assert_eq!(cache.len(), 1);
     }

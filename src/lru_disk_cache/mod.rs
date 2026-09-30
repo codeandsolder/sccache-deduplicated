@@ -101,11 +101,8 @@ impl fmt::Display for Error {
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::FileTooLarge => None,
-            Self::FileNotInCache => None,
-            Self::Io(e) => Some(e),
-            Self::InvalidPendingEntry => None,
-            Self::InvalidCacheKey(_) => None,
+            Self::Io(error) => Some(error),
+            _ => None,
         }
     }
 }
@@ -176,6 +173,10 @@ impl LruDiskCache {
     ///
     /// The cache is not observant of changes to files under `path` from external sources, it
     /// expects to have sole maintence of the contents.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache directory cannot be created or initialized.
     pub fn new<T>(path: T, size: u64) -> Result<Self>
     where
         PathBuf: From<T>,
@@ -247,17 +248,22 @@ impl LruDiskCache {
                 .file_name()
                 .is_some_and(|name| name.starts_with(TEMPFILE_PREFIX))
             {
-                fs::remove_file(&file).unwrap_or_else(|e| {
-                    error!("Error removing temporary file `{}`: {e}", file.display());
-                });
-            } else if !self.can_store(size) {
-                fs::remove_file(file).unwrap_or_else(|e| {
+                if let Err(error) = fs::remove_file(&file) {
                     error!(
-                        "Error removing file `{e}` which is too large for the cache ({size} bytes)"
+                        "Error removing temporary file `{}`: {error}",
+                        file.display()
                     );
-                });
+                }
+            } else if !self.can_store(size) {
+                if let Err(error) = fs::remove_file(&file) {
+                    error!(
+                        "Error removing oversized cache file `{}` ({size} bytes): {error}",
+                        file.display()
+                    );
+                }
             } else {
-                self.add_file(AddFile::AbsPath(file), size)
+                let add_file = AddFile::AbsPath(file);
+                self.add_file(&add_file, size)
                     .unwrap_or_else(|e| error!("Error adding file: {e}"));
             }
         }
@@ -283,7 +289,10 @@ impl LruDiskCache {
             let remove_path = self.rel_to_abs_path(&rel_path);
             if let Err(error) = fs::remove_file(&remove_path) {
                 if error.kind() == std::io::ErrorKind::NotFound {
-                    debug!("Cache entry disappeared before eviction: `{remove_path:?}`");
+                    debug!(
+                        "Cache entry disappeared before eviction: `{}`",
+                        remove_path.display()
+                    );
                 } else {
                     // Restore accounting if eviction could not be completed.
                     self.lru.insert(rel_path, file_size);
@@ -295,13 +304,13 @@ impl LruDiskCache {
     }
 
     /// Add the file at `path` of size `size` to the cache.
-    fn add_file(&mut self, addfile_path: AddFile<'_>, size: u64) -> Result<()> {
+    fn add_file(&mut self, addfile_path: &AddFile<'_>, size: u64) -> Result<()> {
         let rel_path = match addfile_path {
-            AddFile::AbsPath(ref path) => path
+            AddFile::AbsPath(path) => path
                 .strip_prefix(&self.root)
                 .map_err(|_| Error::InvalidCacheKey(path.clone()))?
                 .as_os_str(),
-            AddFile::RelPath(path) => path,
+            AddFile::RelPath(path) => *path,
         };
         Self::validate_key(rel_path)?;
         self.make_space(size)?;
@@ -332,7 +341,7 @@ impl LruDiskCache {
             Some(size) => size,
             None => fs::metadata(path)?.len(),
         };
-        self.add_file(AddFile::RelPath(rel_path), size)
+        self.add_file(&AddFile::RelPath(rel_path), size)
             .map_err(|e| {
                 error!(
                     "Failed to insert file `{}`: {e}",
@@ -350,6 +359,10 @@ impl LruDiskCache {
     }
 
     /// Add a file by calling `with` with the open `File` corresponding to the cache at path `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key is invalid, writing fails, or the cache cannot make space.
     pub fn insert_with<K: AsRef<OsStr>, F: FnOnce(File) -> io::Result<()>>(
         &mut self,
         key: K,
@@ -359,6 +372,10 @@ impl LruDiskCache {
     }
 
     /// Add a file with `bytes` as its contents to the cache at path `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key is invalid, writing fails, or the cache cannot make space.
     pub fn insert_bytes<K: AsRef<OsStr>>(&mut self, key: K, bytes: &[u8]) -> Result<()> {
         self.insert_by(key, Some(bytes.len() as u64), |path| {
             let mut f = File::create(path)?;
@@ -368,6 +385,10 @@ impl LruDiskCache {
     }
 
     /// Add an existing file at `path` to the cache at path `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source cannot be read/moved, the key is invalid, or the cache cannot make space.
     pub fn insert_file<K: AsRef<OsStr>, P: AsRef<OsStr>>(&mut self, key: K, path: P) -> Result<()> {
         let size = fs::metadata(path.as_ref())?.len();
         self.insert_by(key, Some(size), |new_path| {
@@ -384,6 +405,10 @@ impl LruDiskCache {
 
     /// Prepare the insertion of a file at path `key`. The resulting entry must be
     /// committed with `LruDiskCache::commit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key is invalid, the reservation is too large, or the temporary file cannot be created.
     pub fn prepare_add<'a, K: AsRef<OsStr> + 'a>(
         &mut self,
         key: K,
@@ -403,6 +428,10 @@ impl LruDiskCache {
     }
 
     /// Commit an entry coming from `LruDiskCache::prepare_add`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the entry belongs to another cache, persistence fails, or capacity cannot be made available.
     pub fn commit(&mut self, entry: LruDiskCacheAddEntry) -> Result<()> {
         if !Arc::ptr_eq(&entry.reservation.pending_size, &self.pending_size) {
             return Err(Error::InvalidPendingEntry);
@@ -445,6 +474,10 @@ impl LruDiskCache {
     /// of the file if present. Avoid using this method if at all possible, prefer `.get`.
     /// Entries created by `LruDiskCache::prepare_add` but not yet committed return
     /// `Err(Error::FileNotInCache)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key is absent or the cached file cannot be touched/opened.
     pub fn get_file<K: AsRef<OsStr>>(&mut self, key: K) -> Result<File> {
         let rel_path = key.as_ref();
         let path = self.rel_to_abs_path(rel_path);
@@ -462,6 +495,10 @@ impl LruDiskCache {
     /// be opened. Updates the LRU state of the file if present.
     /// Entries created by `LruDiskCache::prepare_add` but not yet committed return
     /// `Err(Error::FileNotInCache)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key is absent or the cached file cannot be opened.
     pub fn get<K: AsRef<OsStr>>(&mut self, key: K) -> Result<Box<dyn ReadSeek>> {
         self.get_file(key).map(|f| Box::new(f) as Box<dyn ReadSeek>)
     }
@@ -475,12 +512,16 @@ impl LruDiskCache {
     }
 
     /// Remove the given key from the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an existing cached file cannot be removed.
     pub fn remove<K: AsRef<OsStr>>(&mut self, key: K) -> Result<()> {
         match self.lru.remove(key.as_ref()) {
             Some(_) => {
                 let path = self.rel_to_abs_path(key.as_ref());
                 fs::remove_file(&path).map_err(|e| {
-                    error!("Error removing file from cache: `{path:?}`: {e}");
+                    error!("Error removing file from cache: `{}`: {e}", path.display());
                     Into::into(e)
                 })
             }
