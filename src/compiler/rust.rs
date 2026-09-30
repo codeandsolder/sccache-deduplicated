@@ -19,8 +19,8 @@ use crate::compiler::args::*;
 use crate::compiler::canonical_paths::CanonicalRustPaths;
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, Compiler,
-    CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, HashResult, Language,
-    SingleCompileCommand, c::ArtifactDescriptor,
+    CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, GenerateHashKeyContext,
+    HashResult, Language, SingleCompileCommand, c::ArtifactDescriptor,
 };
 #[cfg(feature = "dist-client")]
 use crate::compiler::{DistPackagers, OutputsRewriter};
@@ -1871,15 +1871,17 @@ where
 {
     async fn generate_hash_key(
         &mut self,
-        creator: &T,
-        cwd: PathBuf,
-        env_vars: Vec<(OsString, OsString)>,
-        may_dist: bool,
-        pool: &tokio::runtime::Handle,
-        _rewrite_includes_only: bool,
-        _storage: Arc<dyn Storage>,
-        cache_control: CacheControl,
+        context: GenerateHashKeyContext<'_, T>,
     ) -> Result<HashResult<T>> {
+        let GenerateHashKeyContext {
+            creator,
+            cwd,
+            env_vars,
+            may_dist,
+            pool,
+            cache_control,
+            ..
+        } = context;
         trace!("[{}]: generate_hash_key", self.parsed_args.crate_name);
 
         let shadow_log_path = std::env::var_os(RUST_SHADOW_LOG_ENV)
@@ -4540,10 +4542,10 @@ proc_macro false
         let runtime = single_threaded_runtime();
         let pool = runtime.handle().clone();
         let res = hasher
-            .generate_hash_key(
-                &creator,
-                f.tempdir.path().to_owned(),
-                [
+            .generate_hash_key(GenerateHashKeyContext {
+                creator: &creator,
+                cwd: f.tempdir.path().to_owned(),
+                env_vars: [
                     (OsString::from("CARGO_PKG_NAME"), OsString::from("foo")),
                     (OsString::from("FOO"), OsString::from("bar")),
                     (OsString::from("CARGO_BLAH"), OsString::from("abc")),
@@ -4557,12 +4559,12 @@ proc_macro false
                     ),
                 ]
                 .to_vec(),
-                false,
-                &pool,
-                false,
-                Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
-                CacheControl::Default,
-            )
+                may_dist: false,
+                pool: &pool,
+                rewrite_includes_only: false,
+                storage: Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
+                cache_control: CacheControl::Default,
+            })
             .wait()
             .unwrap();
         let m = Digest::new();
@@ -4646,16 +4648,16 @@ proc_macro false
         mock_dep_info(&creator, &["foo.rs"]);
         mock_file_names(&creator, &["foo.rlib"]);
         hasher
-            .generate_hash_key(
-                &creator,
-                f.tempdir.path().to_owned(),
-                env_vars.to_owned(),
-                false,
-                &pool,
-                false,
-                Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
-                CacheControl::Default,
-            )
+            .generate_hash_key(GenerateHashKeyContext {
+                creator: &creator,
+                cwd: f.tempdir.path().to_owned(),
+                env_vars: env_vars.to_owned(),
+                may_dist: false,
+                pool: &pool,
+                rewrite_includes_only: false,
+                storage: Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
+                cache_control: CacheControl::Default,
+            })
             .wait()
             .unwrap()
             .key
@@ -4707,16 +4709,16 @@ proc_macro false
             mock_dep_info(&creator, &["foo.rs"]);
             mock_file_names(&creator, &["foo.rlib"]);
             hasher
-                .generate_hash_key(
-                    &creator,
-                    f.tempdir.path().to_owned(),
-                    vec![],
-                    may_dist,
-                    &pool,
-                    false,
-                    Arc::new(MockStorage::new(None, false)),
-                    CacheControl::Default,
-                )
+                .generate_hash_key(GenerateHashKeyContext {
+                    creator: &creator,
+                    cwd: f.tempdir.path().to_owned(),
+                    env_vars: vec![],
+                    may_dist: may_dist,
+                    pool: &pool,
+                    rewrite_includes_only: false,
+                    storage: Arc::new(MockStorage::new(None, false)),
+                    cache_control: CacheControl::Default,
+                })
                 .wait()
         };
 

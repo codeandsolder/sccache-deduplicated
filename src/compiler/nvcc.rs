@@ -530,19 +530,20 @@ impl CompileCommandImpl for NvccCompileCommand {
             output_file_name,
         } = self;
 
-        let nvcc_subcommand_groups = group_nvcc_subcommands_by_compilation_stage(
-            creator,
-            executable,
-            arguments,
-            compilation_flag,
-            cwd,
-            temp_dir.as_path(),
-            keep_dir.clone(),
-            env_vars,
-            host_compiler,
-            output_file_name,
-        )
-        .await?;
+        let nvcc_subcommand_groups =
+            group_nvcc_subcommands_by_compilation_stage(NvccGroupContext {
+                creator,
+                executable,
+                arguments,
+                compilation_flag,
+                cwd,
+                tmp: temp_dir.as_path(),
+                keep_dir: keep_dir.as_deref(),
+                env_vars,
+                host_compiler,
+                output_file_name,
+            })
+            .await?;
 
         let maybe_keep_temps_then_clean = || {
             // If the caller passed `-keep` or `-keep-dir`, copy the
@@ -626,21 +627,37 @@ pub struct NvccGeneratedSubcommand {
     pub cacheable: Cacheable,
 }
 
+struct NvccGroupContext<'a, T> {
+    creator: &'a T,
+    executable: &'a Path,
+    arguments: &'a [OsString],
+    compilation_flag: &'a OsStr,
+    cwd: &'a Path,
+    tmp: &'a Path,
+    keep_dir: Option<&'a Path>,
+    env_vars: &'a [(OsString, OsString)],
+    host_compiler: &'a NvccHostCompiler,
+    output_file_name: &'a OsStr,
+}
+
 async fn group_nvcc_subcommands_by_compilation_stage<T>(
-    creator: &T,
-    executable: &Path,
-    arguments: &[OsString],
-    compilation_flag: &OsStr,
-    cwd: &Path,
-    tmp: &Path,
-    keep_dir: Option<PathBuf>,
-    env_vars: &[(OsString, OsString)],
-    host_compiler: &NvccHostCompiler,
-    output_file_name: &OsStr,
+    context: NvccGroupContext<'_, T>,
 ) -> Result<Vec<Vec<NvccGeneratedSubcommand>>>
 where
     T: CommandCreatorSync,
 {
+    let NvccGroupContext {
+        creator,
+        executable,
+        arguments,
+        compilation_flag,
+        cwd,
+        tmp,
+        keep_dir,
+        env_vars,
+        host_compiler,
+        output_file_name,
+    } = context;
     // Run `nvcc --dryrun` twice to ensure the commands are correct
     // relative to the directory where they're run.
     //
@@ -674,29 +691,29 @@ where
 
     let (nvcc_commands, host_commands) = futures::future::try_join(
         // Get the nvcc compile command lines with paths relative to `tmp`
-        select_nvcc_subcommands(
+        select_nvcc_subcommands(NvccSelectContext {
             creator,
             executable,
             cwd,
-            &mut env_vars_1,
-            keep_dir.is_none(),
+            env_vars: &mut env_vars_1,
+            remap_filenames: keep_dir.is_none(),
             arguments,
-            is_nvcc_exe,
+            select_subcommand: is_nvcc_exe,
             host_compiler,
             output_file_name,
-        ),
+        }),
         // Get the host compile command lines with paths relative to `cwd` and absolute paths to `tmp`
-        select_nvcc_subcommands(
+        select_nvcc_subcommands(NvccSelectContext {
             creator,
             executable,
             cwd,
-            &mut env_vars_2,
-            keep_dir.is_none(),
-            &[arguments, &["--keep-dir".into(), tmp.into()][..]].concat(),
-            |exe| !is_nvcc_exe(exe),
+            env_vars: &mut env_vars_2,
+            remap_filenames: keep_dir.is_none(),
+            arguments: &[arguments, &["--keep-dir".into(), tmp.into()][..]].concat(),
+            select_subcommand: |exe| !is_nvcc_exe(exe),
             host_compiler,
             output_file_name,
-        ),
+        }),
     )
     .await?;
 
@@ -907,21 +924,36 @@ where
     Ok(command_groups)
 }
 
-async fn select_nvcc_subcommands<T, F>(
-    creator: &T,
-    executable: &Path,
-    cwd: &Path,
-    env_vars: &mut Vec<(OsString, OsString)>,
+struct NvccSelectContext<'a, T, F> {
+    creator: &'a T,
+    executable: &'a Path,
+    cwd: &'a Path,
+    env_vars: &'a mut Vec<(OsString, OsString)>,
     remap_filenames: bool,
-    arguments: &[OsString],
+    arguments: &'a [OsString],
     select_subcommand: F,
-    host_compiler: &NvccHostCompiler,
-    output_file_name: &OsStr,
+    host_compiler: &'a NvccHostCompiler,
+    output_file_name: &'a OsStr,
+}
+
+async fn select_nvcc_subcommands<T, F>(
+    context: NvccSelectContext<'_, T, F>,
 ) -> Result<Vec<(usize, PathBuf, Vec<String>)>>
 where
     F: Fn(&str) -> bool,
     T: CommandCreatorSync,
 {
+    let NvccSelectContext {
+        creator,
+        executable,
+        cwd,
+        env_vars,
+        remap_filenames,
+        arguments,
+        select_subcommand,
+        host_compiler,
+        output_file_name,
+    } = context;
     if log_enabled!(log::Level::Trace) {
         trace!(
             "[{}]: nvcc dryrun command: {:?}",
@@ -1569,18 +1601,18 @@ mod test {
             )),
         );
 
-        let groups = group_nvcc_subcommands_by_compilation_stage(
-            &creator,
-            &bin_dir.path().join("nvcc"),
-            &["-c", "kernel.cu", "-o", "kernel.o"].map(OsString::from),
-            OsStr::new("-c"),
-            bin_dir.path(),
-            bin_dir.path(),
-            None,
-            &[],
-            &NvccHostCompiler::Msvc,
-            OsStr::new("kernel.o"),
-        )
+        let groups = group_nvcc_subcommands_by_compilation_stage(NvccGroupContext {
+            creator: &creator,
+            executable: &bin_dir.path().join("nvcc"),
+            arguments: &["-c", "kernel.cu", "-o", "kernel.o"].map(OsString::from),
+            compilation_flag: OsStr::new("-c"),
+            cwd: bin_dir.path(),
+            tmp: bin_dir.path(),
+            keep_dir: None,
+            env_vars: &[],
+            host_compiler: &NvccHostCompiler::Msvc,
+            output_file_name: OsStr::new("kernel.o"),
+        })
         .wait()
         .unwrap();
 
@@ -1678,18 +1710,18 @@ mod test {
             )),
         );
 
-        let groups = group_nvcc_subcommands_by_compilation_stage(
-            &creator,
-            &bin_dir.path().join("nvcc"),
-            &["-c", "kernel.cu", "-o", "kernel.o"].map(OsString::from),
-            OsStr::new("-c"),
-            bin_dir.path(),
-            bin_dir.path(),
-            None,
-            &[],
-            &host_compiler,
-            OsStr::new("kernel.o"),
-        )
+        let groups = group_nvcc_subcommands_by_compilation_stage(NvccGroupContext {
+            creator: &creator,
+            executable: &bin_dir.path().join("nvcc"),
+            arguments: &["-c", "kernel.cu", "-o", "kernel.o"].map(OsString::from),
+            compilation_flag: OsStr::new("-c"),
+            cwd: bin_dir.path(),
+            tmp: bin_dir.path(),
+            keep_dir: None,
+            env_vars: &[],
+            host_compiler: &host_compiler,
+            output_file_name: OsStr::new("kernel.o"),
+        })
         .wait()
         .unwrap();
 

@@ -504,6 +504,29 @@ impl<T: CommandCreatorSync> Clone for Box<dyn CompilerProxy<T>> {
     }
 }
 
+pub(crate) struct GenerateHashKeyContext<'a, T> {
+    pub creator: &'a T,
+    pub cwd: PathBuf,
+    pub env_vars: Vec<(OsString, OsString)>,
+    pub may_dist: bool,
+    pub pool: &'a tokio::runtime::Handle,
+    pub rewrite_includes_only: bool,
+    pub storage: Arc<dyn Storage>,
+    pub cache_control: CacheControl,
+}
+
+pub(crate) struct CacheCompileContext<'a, T> {
+    pub service: &'a server::SccacheService<T>,
+    pub dist_client: Option<Arc<dyn dist::Client>>,
+    pub creator: T,
+    pub storage: Arc<dyn Storage>,
+    pub arguments: Vec<OsString>,
+    pub cwd: PathBuf,
+    pub env_vars: Vec<(OsString, OsString)>,
+    pub cache_control: CacheControl,
+    pub pool: tokio::runtime::Handle,
+}
+
 /// An interface to a compiler for hash key generation, the result of
 /// argument parsing.
 #[async_trait]
@@ -516,14 +539,7 @@ where
     /// information that can be reused for compilation if necessary.
     async fn generate_hash_key(
         &mut self,
-        creator: &T,
-        cwd: PathBuf,
-        env_vars: Vec<(OsString, OsString)>,
-        may_dist: bool,
-        pool: &tokio::runtime::Handle,
-        rewrite_includes_only: bool,
-        storage: Arc<dyn Storage>,
-        cache_control: CacheControl,
+        context: GenerateHashKeyContext<'_, T>,
     ) -> Result<HashResult<T>>;
 
     /// Return the state of any `--color` option passed to the compiler.
@@ -533,16 +549,19 @@ where
     /// compile and store the result.
     async fn get_cached_or_compile(
         &mut self,
-        service: &server::SccacheService<T>,
-        dist_client: Option<Arc<dyn dist::Client>>,
-        creator: T,
-        storage: Arc<dyn Storage>,
-        arguments: Vec<OsString>,
-        cwd: PathBuf,
-        env_vars: Vec<(OsString, OsString)>,
-        cache_control: CacheControl,
-        pool: tokio::runtime::Handle,
+        context: CacheCompileContext<'_, T>,
     ) -> Result<(CompileResult, process::Output)> {
+        let CacheCompileContext {
+            service,
+            dist_client,
+            creator,
+            storage,
+            arguments,
+            cwd,
+            env_vars,
+            cache_control,
+            pool,
+        } = context;
         let out_pretty = self.output_pretty().into_owned();
         debug!("[{out_pretty}]: get_cached_or_compile: {arguments:?}");
         let start = Instant::now();
@@ -552,16 +571,16 @@ where
             _ => false,
         };
         let result = self
-            .generate_hash_key(
-                &creator,
-                cwd.clone(),
-                env_vars.clone(),
+            .generate_hash_key(GenerateHashKeyContext {
+                creator: &creator,
+                cwd: cwd.clone(),
+                env_vars: env_vars.clone(),
                 may_dist,
-                &pool,
+                pool: &pool,
                 rewrite_includes_only,
-                storage.clone(),
+                storage: storage.clone(),
                 cache_control,
-            )
+            })
             .await;
         debug!(
             "[{out_pretty}]: generate_hash_key took {}",
@@ -715,7 +734,7 @@ where
                     // run a local compile, which doesn't need locally preprocessed code).
                     // For distributed compilation, the local preprocessing step still needs to be done.
                     return self
-                        .get_cached_or_compile(
+                        .get_cached_or_compile(CacheCompileContext {
                             service,
                             dist_client,
                             creator,
@@ -723,9 +742,9 @@ where
                             arguments,
                             cwd,
                             env_vars,
-                            CacheControl::ForceRecache,
+                            cache_control: CacheControl::ForceRecache,
                             pool,
-                        )
+                        })
                         .await;
                 }
 
@@ -2553,16 +2572,16 @@ LLVM version: 6.0",
                     o => bail!("Bad result from parse_arguments: {o:?}"),
                 };
                 hasher
-                    .generate_hash_key(
-                        &creator,
-                        cwd.to_path_buf(),
-                        vec![],
-                        false,
-                        pool,
-                        false,
-                        Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
-                        CacheControl::Default,
-                    )
+                    .generate_hash_key(GenerateHashKeyContext {
+                        creator: &creator,
+                        cwd: cwd.to_path_buf(),
+                        env_vars: vec![],
+                        may_dist: false,
+                        pool: pool,
+                        rewrite_includes_only: false,
+                        storage: Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
+                        cache_control: CacheControl::Default,
+                    })
                     .wait()
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2613,16 +2632,16 @@ LLVM version: 6.0",
                 o => bail!("Bad result from parse_arguments: {o:?}"),
             };
             Ok(hasher
-                .generate_hash_key(
-                    &creator,
-                    cwd.to_path_buf(),
-                    vec![],
-                    false,
-                    pool,
-                    false,
-                    Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
-                    CacheControl::Default,
-                )
+                .generate_hash_key(GenerateHashKeyContext {
+                    creator: &creator,
+                    cwd: cwd.to_path_buf(),
+                    env_vars: vec![],
+                    may_dist: false,
+                    pool: pool,
+                    rewrite_includes_only: false,
+                    storage: Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
+                    cache_control: CacheControl::Default,
+                })
                 .wait()?
                 .key)
         };
@@ -2709,16 +2728,16 @@ LLVM version: 6.0",
                     o => bail!("Bad result from parse_arguments: {o:?}"),
                 };
                 hasher
-                    .generate_hash_key(
-                        &creator,
-                        cwd.to_path_buf(),
-                        vec![],
-                        false,
-                        pool,
-                        false,
-                        Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
-                        CacheControl::Default,
-                    )
+                    .generate_hash_key(GenerateHashKeyContext {
+                        creator: &creator,
+                        cwd: cwd.to_path_buf(),
+                        env_vars: vec![],
+                        may_dist: false,
+                        pool: pool,
+                        rewrite_includes_only: false,
+                        storage: Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
+                        cache_control: CacheControl::Default,
+                    })
                     .wait()
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2777,16 +2796,16 @@ LLVM version: 6.0",
                     o => bail!("Bad result from parse_arguments: {o:?}"),
                 };
                 hasher
-                    .generate_hash_key(
-                        &creator,
-                        cwd.to_path_buf(),
-                        vec![],
-                        false,
-                        pool,
-                        false,
-                        Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
-                        CacheControl::Default,
-                    )
+                    .generate_hash_key(GenerateHashKeyContext {
+                        creator: &creator,
+                        cwd: cwd.to_path_buf(),
+                        env_vars: vec![],
+                        may_dist: false,
+                        pool: pool,
+                        rewrite_includes_only: false,
+                        storage: Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
+                        cache_control: CacheControl::Default,
+                    })
                     .wait()
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2886,17 +2905,17 @@ LLVM version: 6.0",
         };
         let (cached, res) = runtime.block_on(async {
             hasher
-                .get_cached_or_compile(
-                    &service,
-                    None,
-                    creator.clone(),
-                    storage.clone(),
-                    arguments.clone(),
-                    cwd.to_path_buf(),
-                    vec![],
-                    CacheControl::Default,
-                    pool.clone(),
-                )
+                .get_cached_or_compile(CacheCompileContext {
+                    service: &service,
+                    dist_client: None,
+                    creator: creator.clone(),
+                    storage: storage.clone(),
+                    arguments: arguments.clone(),
+                    cwd: cwd.to_path_buf(),
+                    env_vars: vec![],
+                    cache_control: CacheControl::Default,
+                    pool: pool.clone(),
+                })
                 .await
         })?;
         // Ensure that the object file was created.
@@ -2921,17 +2940,17 @@ LLVM version: 6.0",
         // There should be no actual compiler invocation.
         let (cached, res) = runtime.block_on(async {
             hasher
-                .get_cached_or_compile(
-                    &service,
-                    None,
-                    creator,
-                    storage,
-                    arguments,
-                    cwd.to_path_buf(),
-                    vec![],
-                    CacheControl::Default,
-                    pool,
-                )
+                .get_cached_or_compile(CacheCompileContext {
+                    service: &service,
+                    dist_client: None,
+                    creator: creator,
+                    storage: storage,
+                    arguments: arguments,
+                    cwd: cwd.to_path_buf(),
+                    env_vars: vec![],
+                    cache_control: CacheControl::Default,
+                    pool: pool,
+                })
                 .await
         })?;
         // Ensure that the object file was created.
@@ -3013,17 +3032,17 @@ LLVM version: 6.0",
         };
         let (cached, res) = runtime.block_on(async {
             hasher
-                .get_cached_or_compile(
-                    &service,
-                    Some(dist_client.clone()),
-                    creator.clone(),
-                    storage.clone(),
-                    arguments.clone(),
-                    cwd.to_path_buf(),
-                    vec![],
-                    CacheControl::Default,
-                    pool.clone(),
-                )
+                .get_cached_or_compile(CacheCompileContext {
+                    service: &service,
+                    dist_client: Some(dist_client.clone()),
+                    creator: creator.clone(),
+                    storage: storage.clone(),
+                    arguments: arguments.clone(),
+                    cwd: cwd.to_path_buf(),
+                    env_vars: vec![],
+                    cache_control: CacheControl::Default,
+                    pool: pool.clone(),
+                })
                 .await
         })?;
         // Ensure that the object file was created.
@@ -3048,17 +3067,17 @@ LLVM version: 6.0",
         // There should be no actual compiler invocation.
         let (cached, res) = runtime.block_on(async {
             hasher
-                .get_cached_or_compile(
-                    &service,
-                    Some(dist_client.clone()),
-                    creator,
-                    storage,
-                    arguments,
-                    cwd.to_path_buf(),
-                    vec![],
-                    CacheControl::Default,
-                    pool,
-                )
+                .get_cached_or_compile(CacheCompileContext {
+                    service: &service,
+                    dist_client: Some(dist_client.clone()),
+                    creator: creator,
+                    storage: storage,
+                    arguments: arguments,
+                    cwd: cwd.to_path_buf(),
+                    env_vars: vec![],
+                    cache_control: CacheControl::Default,
+                    pool: pool,
+                })
                 .await
         })?;
         // Ensure that the object file was created.
@@ -3134,17 +3153,18 @@ LLVM version: 6.0",
         };
         // The cache will return an error.
         storage.next_get(Err(anyhow!("Some Error")));
-        let (cached, res) = runtime.block_on(hasher.get_cached_or_compile(
-            &service,
-            None,
-            creator,
-            storage,
-            arguments.clone(),
-            cwd.to_path_buf(),
-            vec![],
-            CacheControl::Default,
-            pool,
-        ))?;
+        let (cached, res) =
+            runtime.block_on(hasher.get_cached_or_compile(CacheCompileContext {
+                service: &service,
+                dist_client: None,
+                creator: creator,
+                storage: storage,
+                arguments: arguments.clone(),
+                cwd: cwd.to_path_buf(),
+                env_vars: vec![],
+                cache_control: CacheControl::Default,
+                pool: pool,
+            }))?;
         // Ensure that the object file was created.
         assert!(fs::metadata(&obj).map(|m| m.len() > 0)?);
         match cached {
@@ -3221,17 +3241,18 @@ LLVM version: 6.0",
             o => bail!("Bad result from parse_arguments: {o:?}"),
         };
         storage.next_get(Ok(Cache::Hit(entry)));
-        let (cached, _res) = runtime.block_on(hasher.get_cached_or_compile(
-            &service,
-            None,
-            creator,
-            storage,
-            arguments.clone(),
-            cwd.to_path_buf(),
-            vec![],
-            CacheControl::Default,
-            pool,
-        ))?;
+        let (cached, _res) =
+            runtime.block_on(hasher.get_cached_or_compile(CacheCompileContext {
+                service: &service,
+                dist_client: None,
+                creator: creator,
+                storage: storage,
+                arguments: arguments.clone(),
+                cwd: cwd.to_path_buf(),
+                env_vars: vec![],
+                cache_control: CacheControl::Default,
+                pool: pool,
+            }))?;
         match cached {
             CompileResult::CacheHit(duration) => {
                 assert!(duration >= storage_delay);
@@ -3316,17 +3337,17 @@ LLVM version: 6.0",
         };
         let (cached, res) = runtime.block_on(async {
             hasher
-                .get_cached_or_compile(
-                    &service,
-                    None,
-                    creator.clone(),
-                    storage.clone(),
-                    arguments.clone(),
-                    cwd.to_path_buf(),
-                    vec![],
-                    CacheControl::Default,
-                    pool.clone(),
-                )
+                .get_cached_or_compile(CacheCompileContext {
+                    service: &service,
+                    dist_client: None,
+                    creator: creator.clone(),
+                    storage: storage.clone(),
+                    arguments: arguments.clone(),
+                    cwd: cwd.to_path_buf(),
+                    env_vars: vec![],
+                    cache_control: CacheControl::Default,
+                    pool: pool.clone(),
+                })
                 .await
         })?;
         // Ensure that the object file was created.
@@ -3344,17 +3365,17 @@ LLVM version: 6.0",
         // Now compile again, but force recaching.
         fs::remove_file(&obj)?;
         let (cached, res) = hasher
-            .get_cached_or_compile(
-                &service,
-                None,
-                creator,
-                storage,
-                arguments,
-                cwd.to_path_buf(),
-                vec![],
-                CacheControl::ForceRecache,
-                pool,
-            )
+            .get_cached_or_compile(CacheCompileContext {
+                service: &service,
+                dist_client: None,
+                creator: creator,
+                storage: storage,
+                arguments: arguments,
+                cwd: cwd.to_path_buf(),
+                env_vars: vec![],
+                cache_control: CacheControl::ForceRecache,
+                pool: pool,
+            })
             .wait()?;
         // Ensure that the object file was created.
         assert!(fs::metadata(&obj).map(|m| m.len() > 0)?);
@@ -3439,17 +3460,17 @@ LLVM version: 6.0",
         };
         let (cached, res) = runtime.block_on(async {
             hasher
-                .get_cached_or_compile(
-                    &service,
-                    None,
-                    creator,
-                    storage,
-                    arguments,
-                    cwd.to_path_buf(),
-                    vec![],
-                    CacheControl::Default,
-                    pool,
-                )
+                .get_cached_or_compile(CacheCompileContext {
+                    service: &service,
+                    dist_client: None,
+                    creator: creator,
+                    storage: storage,
+                    arguments: arguments,
+                    cwd: cwd.to_path_buf(),
+                    env_vars: vec![],
+                    cache_control: CacheControl::Default,
+                    pool: pool,
+                })
                 .await
         })?;
         assert_eq!(cached, CompileResult::Error);
@@ -3552,17 +3573,17 @@ LLVM version: 6.0",
             }
             let mut hasher = hasher.clone();
             let (cached, res) = hasher
-                .get_cached_or_compile(
-                    &service,
-                    Some(dist_client.clone()),
-                    creator.clone(),
-                    storage.clone(),
-                    arguments.clone(),
-                    cwd.to_path_buf(),
-                    vec![],
-                    CacheControl::ForceRecache,
-                    pool.clone(),
-                )
+                .get_cached_or_compile(CacheCompileContext {
+                    service: &service,
+                    dist_client: Some(dist_client.clone()),
+                    creator: creator.clone(),
+                    storage: storage.clone(),
+                    arguments: arguments.clone(),
+                    cwd: cwd.to_path_buf(),
+                    env_vars: vec![],
+                    cache_control: CacheControl::ForceRecache,
+                    pool: pool.clone(),
+                })
                 .wait()?;
             // Ensure that the object file was created.
             assert!(fs::metadata(&obj).map(|m| m.len() > 0)?);

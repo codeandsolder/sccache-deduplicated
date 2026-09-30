@@ -16,8 +16,8 @@ use crate::cache::readonly::ReadOnlyStorage;
 use crate::cache::{CacheMode, Storage, storage_from_config};
 use crate::compiler::PreprocessorCacheEntry;
 use crate::compiler::{
-    CacheControl, CompileResult, Compiler, CompilerArguments, CompilerHasher, CompilerKind,
-    CompilerProxy, DistType, Language, MissType, get_compiler_info,
+    CacheCompileContext, CacheControl, CompileResult, Compiler, CompilerArguments, CompilerHasher,
+    CompilerKind, CompilerProxy, DistType, Language, MissType, get_compiler_info,
 };
 #[cfg(feature = "dist-client")]
 use crate::config;
@@ -1538,15 +1538,17 @@ where
         util::spawn_on(&self.rt, async move {
             let result = match me.dist_client.get_client().await {
                 Ok(client) => std::panic::AssertUnwindSafe(hasher.get_cached_or_compile(
-                    &me,
-                    client,
-                    me.creator.clone(),
-                    me.storage.clone(),
-                    arguments,
-                    cwd,
-                    env_vars,
-                    cache_control,
-                    me.rt.clone(),
+                    CacheCompileContext {
+                        service: &me,
+                        dist_client: client,
+                        creator: me.creator.clone(),
+                        storage: me.storage.clone(),
+                        arguments: arguments,
+                        cwd: cwd,
+                        env_vars: env_vars,
+                        cache_control: cache_control,
+                        pool: me.rt.clone(),
+                    },
                 ))
                 .catch_unwind()
                 .await

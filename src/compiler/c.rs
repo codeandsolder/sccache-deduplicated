@@ -18,7 +18,7 @@ use crate::compiler::preprocessor_cache::{
 };
 use crate::compiler::{
     Cacheable, ColorMode, Compilation, CompileCommand, Compiler, CompilerArguments, CompilerHasher,
-    CompilerKind, HashResult, Language,
+    CompilerKind, GenerateHashKeyContext, HashResult, Language,
 };
 #[cfg(feature = "dist-client")]
 use crate::compiler::{DistPackagers, NoopOutputsRewriter};
@@ -378,15 +378,18 @@ where
 {
     async fn generate_hash_key(
         &mut self,
-        creator: &T,
-        cwd: PathBuf,
-        env_vars: Vec<(OsString, OsString)>,
-        may_dist: bool,
-        pool: &tokio::runtime::Handle,
-        rewrite_includes_only: bool,
-        storage: Arc<dyn Storage>,
-        cache_control: CacheControl,
+        context: GenerateHashKeyContext<'_, T>,
     ) -> Result<HashResult<T>> {
+        let GenerateHashKeyContext {
+            creator,
+            cwd,
+            env_vars,
+            may_dist,
+            pool,
+            rewrite_includes_only,
+            storage,
+            cache_control,
+        } = context;
         let start_of_compilation = std::time::SystemTime::now();
 
         let extra_hashes = hash_all(&self.parsed_args.extra_hash_files, &pool.clone()).await?;
