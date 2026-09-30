@@ -89,16 +89,17 @@ impl SccacheTest<'_> {
 
     /// Show the statistics for sccache. This will be called at the end of a test and making this
     /// an associated function will ensure that the struct lives until the end of the test.
-    pub fn show_stats(&self) -> assert_cmd::assert::AssertResult {
+    pub fn show_stats(&self) -> Result<assert_cmd::assert::Assert> {
         trace!("sccache --show-stats");
 
         Command::new(SCCACHE_BIN.as_os_str())
             .args(["--show-stats", "--stats-format=json"])
             .assert()
             .try_success()
+            .map_err(Into::into)
     }
 
-    pub fn show_text_stats(&self, advanced: bool) -> assert_cmd::assert::AssertResult {
+    pub fn show_text_stats(&self, advanced: bool) -> Result<assert_cmd::assert::Assert> {
         let cmd = if advanced {
             "--show-adv-stats"
         } else {
@@ -111,6 +112,7 @@ impl SccacheTest<'_> {
             .args([cmd, "--stats-format=text"])
             .assert()
             .try_success()
+            .map_err(Into::into)
     }
 }
 
