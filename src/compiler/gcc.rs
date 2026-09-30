@@ -371,7 +371,12 @@ where
 
         match arg.get_data() {
             Some(TooHardFlag) | Some(TooHard(_)) => {
-                cannot_cache!(arg.flag_str().expect("Can't be Argument::Raw/UnknownFlag",))
+                cannot_cache!(
+                    "unsupported compiler option",
+                    arg.flag_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("{arg:?}"))
+                )
             }
             Some(ModuleOnlyFlag) => module_only_flag = true,
             Some(PedanticFlag) => pedantic_flag = true,
@@ -379,9 +384,11 @@ where
             Some(Standard(version)) => language_extensions = version.starts_with("gnu"),
             Some(SplitDwarf) => split_dwarf = true,
             Some(DoCompilation) => {
+                let Some(flag) = arg.flag_str() else {
+                    cannot_cache!("compilation flag was not representable", format!("{arg:?}"));
+                };
                 compilation = true;
-                compilation_flag =
-                    OsString::from(arg.flag_str().expect("Compilation flag expected"));
+                compilation_flag = OsString::from(flag);
             }
             Some(ProfileGenerate) => profile_generate = true,
             Some(ClangProfileUse(path)) => {
@@ -423,7 +430,13 @@ where
                 }
             }
             Some(DepTarget(s)) => {
-                dep_flag = OsString::from(arg.flag_str().expect("Dep target flag expected"));
+                let Some(flag) = arg.flag_str() else {
+                    cannot_cache!(
+                        "dependency target flag was not representable",
+                        format!("{arg:?}")
+                    );
+                };
+                dep_flag = OsString::from(flag);
                 dep_target = Some(s.clone());
             }
             Some(DepArgumentPath(path)) => {
@@ -491,7 +504,7 @@ where
                     input_arg = Some(val.clone());
                 }
                 Argument::UnknownFlag(_) => {}
-                _ => unreachable!(),
+                _ => cannot_cache!("unexpected GCC argument variant", format!("{arg:?}")),
             },
         }
         let args = match arg.get_data() {
@@ -546,11 +559,18 @@ where
             | Some(XClang(_))
             | Some(DepTarget(_))
             | Some(SerializeDiagnostics(_)) => continue,
-            Some(TooHardFlag) | Some(TooHard(_)) => unreachable!(),
+            Some(TooHardFlag) | Some(TooHard(_)) => {
+                cannot_cache!(
+                    "unsupported compiler option",
+                    arg.flag_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("{arg:?}"))
+                )
+            }
             None => match arg {
                 Argument::Raw(_) => continue,
                 Argument::UnknownFlag(_) => &mut common_args,
-                _ => unreachable!(),
+                _ => cannot_cache!("unexpected GCC argument variant", format!("{arg:?}")),
             },
         };
 
@@ -605,7 +625,7 @@ where
                         flag.to_str().unwrap_or("").to_string()
                     )
                 }
-                _ => unreachable!(),
+                _ => cannot_cache!("unexpected -Xclang argument variant", format!("{arg:?}")),
             },
             Some(DiagnosticsColor(_))
             | Some(DiagnosticsColorFlag)
@@ -688,15 +708,23 @@ where
     };
     let mut outputs = HashMap::new();
     let output = match output_arg {
-        // We can't cache compilation that doesn't go to a file
-        None => PathBuf::from(Path::new(&input).with_extension("o").file_name().unwrap()),
-        Some(o) => o,
+        Some(output) => output,
+        None => {
+            let default_output = Path::new(&input).with_extension("o");
+            let Some(file_name) = default_output.file_name() else {
+                cannot_cache!(
+                    "input path has no file name",
+                    input.to_string_lossy().into_owned()
+                );
+            };
+            PathBuf::from(file_name)
+        }
     };
     if split_dwarf {
         let dwo = output.with_extension("dwo");
-        common_args.push(OsString::from(
-            "-D_gsplit_dwarf_path=".to_owned() + dwo.to_str().unwrap(),
-        ));
+        let mut split_dwarf_path = OsString::from("-D_gsplit_dwarf_path=");
+        split_dwarf_path.push(&dwo);
+        common_args.push(split_dwarf_path);
         // -gsplit-dwarf doesn't guarantee .dwo file if no -g is specified
         outputs.insert(
             "dwo",
