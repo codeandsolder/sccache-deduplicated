@@ -1,0 +1,86 @@
+name: Temporary strict Clippy autofix
+
+on:
+  push:
+    branches:
+      - ci/rust-skills2-strict
+
+permissions:
+  contents: write
+
+jobs:
+  autofix:
+    if: ${{ !contains(github.event.head_commit.message, '[strict-autofix]') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ci/rust-skills2-strict
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy,rustfmt
+
+      - name: Install pinned rust-skills2 Clippy config
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rust-skills2-clippy"
+          curl --fail --location --silent --show-error \
+            "https://raw.githubusercontent.com/codeandsolder/rust-skills2/7e5221a174d9707f25dc502581f6cf8bb277c2a8/.github/actions/rust-strict/clippy.toml" \
+            --output "$RUNNER_TEMP/rust-skills2-clippy/clippy.toml"
+
+      - name: Apply machine-applicable strict Clippy fixes
+        shell: bash
+        env:
+          CLIPPY_CONF_DIR: ${{ runner.temp }}/rust-skills2-clippy
+          CARGO_BUILD_WARNINGS: deny
+          RUSTC_WRAPPER: ""
+          RUSTC_WORKSPACE_WRAPPER: ""
+        run: |
+          set +e
+          cargo +nightly clippy --fix --allow-dirty --allow-staged \
+            --locked --workspace --all-targets -- \
+            -Dwarnings \
+            -Dunfulfilled_lint_expectations \
+            -Dunexpected_cfgs \
+            -Dunsafe_op_in_unsafe_fn \
+            -Dclippy::correctness \
+            -Dclippy::suspicious \
+            -Dclippy::perf \
+            -Dclippy::style \
+            -Dclippy::complexity \
+            -Dclippy::pedantic \
+            -Dclippy::nursery \
+            -Dclippy::unwrap_used \
+            -Dclippy::expect_used \
+            -Dclippy::panic \
+            -Dclippy::todo \
+            -Dclippy::unimplemented \
+            -Dclippy::dbg_macro \
+            -Dclippy::undocumented_unsafe_blocks \
+            -Dclippy::missing_safety_doc \
+            -Dclippy::await_holding_lock \
+            -Dclippy::allow_attributes \
+            -Dclippy::allow_attributes_without_reason
+          clippy_rc=$?
+          set -e
+          echo "clippy --fix exit code: $clippy_rc"
+          cargo +nightly fmt --all
+          git diff --check
+
+      - name: Commit autofixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "No machine-applicable fixes produced."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -u
+          git commit -m "style: apply strict Clippy machine fixes [strict-autofix]"
+          git push origin HEAD:ci/rust-skills2-strict
