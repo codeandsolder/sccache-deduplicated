@@ -95,9 +95,8 @@ fn init_logging() {
             builder.format_timestamp_millis();
         }
 
-        match builder.try_init() {
-            Ok(()) => (),
-            Err(e) => panic!("Failed to initialize logging: {e:?}"),
+        if let Err(error) = builder.try_init() {
+            eprintln!("sccache: failed to initialize logging: {error}");
         }
     }
 }

@@ -148,7 +148,7 @@ pub fn connect(addr: &SocketAddr) -> std::io::Result<Box<dyn Connection>> {
 mod unix_imp {
     use futures::TryFutureExt;
 
-    use super::*;
+    use super::{Acceptor, Connection, Future, SocketAddr};
 
     impl Acceptor for tokio::net::UnixListener {
         type Socket = tokio::net::UnixStream;
