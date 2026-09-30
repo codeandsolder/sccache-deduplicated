@@ -11,7 +11,7 @@ use std::fmt;
 use std::hash::BuildHasher;
 use std::io;
 use std::io::prelude::*;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -82,6 +82,8 @@ pub enum Error {
     Io(io::Error),
     /// A prepared entry was committed to a different cache.
     InvalidPendingEntry,
+    /// A cache key was not a safe relative path.
+    InvalidCacheKey(PathBuf),
 }
 
 impl fmt::Display for Error {
@@ -91,6 +93,7 @@ impl fmt::Display for Error {
             Error::FileNotInCache => write!(f, "File not in cache"),
             Error::Io(e) => write!(f, "{e}"),
             Error::InvalidPendingEntry => write!(f, "prepared entry belongs to a different cache"),
+            Error::InvalidCacheKey(path) => write!(f, "invalid cache key: {}", path.display()),
         }
     }
 }
@@ -102,6 +105,7 @@ impl StdError for Error {
             Error::FileNotInCache => None,
             Error::Io(e) => Some(e),
             Error::InvalidPendingEntry => None,
+            Error::InvalidCacheKey(_) => None,
         }
     }
 }
@@ -210,6 +214,21 @@ impl LruDiskCache {
         self.root.as_path()
     }
 
+    fn validate_key(key: &OsStr) -> Result<()> {
+        let path = Path::new(key);
+        let mut has_component = false;
+        for component in path.components() {
+            has_component = true;
+            if !matches!(component, Component::Normal(_)) {
+                return Err(Error::InvalidCacheKey(path.to_owned()));
+            }
+        }
+        if !has_component {
+            return Err(Error::InvalidCacheKey(path.to_owned()));
+        }
+        Ok(())
+    }
+
     /// Return the path that `key` would be stored at.
     fn rel_to_abs_path<K: AsRef<Path>>(&self, rel_path: K) -> PathBuf {
         self.root.join(rel_path)
@@ -221,8 +240,7 @@ impl LruDiskCache {
         for (file, size) in get_all_files(&self.root) {
             if file
                 .file_name()
-                .expect("Bad path?")
-                .starts_with(TEMPFILE_PREFIX)
+                .is_some_and(|name| name.starts_with(TEMPFILE_PREFIX))
             {
                 fs::remove_file(&file).unwrap_or_else(|e| {
                     error!("Error removing temporary file `{}`: {}", file.display(), e);
@@ -274,9 +292,13 @@ impl LruDiskCache {
     /// Add the file at `path` of size `size` to the cache.
     fn add_file(&mut self, addfile_path: AddFile<'_>, size: u64) -> Result<()> {
         let rel_path = match addfile_path {
-            AddFile::AbsPath(ref p) => p.strip_prefix(&self.root).expect("Bad path?").as_os_str(),
-            AddFile::RelPath(p) => p,
+            AddFile::AbsPath(ref path) => path
+                .strip_prefix(&self.root)
+                .map_err(|_| Error::InvalidCacheKey(path.clone()))?
+                .as_os_str(),
+            AddFile::RelPath(path) => path,
         };
+        Self::validate_key(rel_path)?;
         self.make_space(size)?;
         self.lru.insert(rel_path.to_owned(), size);
         Ok(())
@@ -294,8 +316,12 @@ impl LruDiskCache {
             return Err(Error::FileTooLarge);
         }
         let rel_path = key.as_ref();
+        Self::validate_key(rel_path)?;
         let path = self.rel_to_abs_path(rel_path);
-        fs::create_dir_all(path.parent().expect("Bad path?"))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::InvalidCacheKey(PathBuf::from(rel_path)))?;
+        fs::create_dir_all(parent)?;
         by(&path)?;
         let size = match size {
             Some(size) => size,
@@ -308,8 +334,13 @@ impl LruDiskCache {
                     rel_path.to_string_lossy(),
                     e
                 );
-                fs::remove_file(self.rel_to_abs_path(rel_path))
-                    .expect("Failed to remove file we just created!");
+                let cleanup_path = self.rel_to_abs_path(rel_path);
+                if let Err(cleanup_error) = fs::remove_file(&cleanup_path) {
+                    warn!(
+                        "Failed to remove rejected cache file {}: {cleanup_error}",
+                        cleanup_path.display()
+                    );
+                }
                 e
             })
     }
@@ -354,6 +385,7 @@ impl LruDiskCache {
         key: K,
         size: u64,
     ) -> Result<LruDiskCacheAddEntry> {
+        Self::validate_key(key.as_ref())?;
         self.make_space(size)?;
         let reservation = PendingReservation::new(Arc::clone(&self.pending_size), size)?;
         let file = tempfile::Builder::new()
@@ -514,6 +546,31 @@ mod tests {
             })
             .unwrap()
         }
+    }
+
+    #[test]
+    fn test_rejects_unsafe_cache_keys() -> Result<()> {
+        let f = TestFixture::new();
+        let mut cache = LruDiskCache::new(f.tmp(), 25)?;
+        let absolute = f.tmp().join("absolute-key");
+
+        for key in [
+            Path::new(""),
+            Path::new("../escape"),
+            Path::new("nested/../../escape"),
+            absolute.as_path(),
+        ] {
+            assert!(matches!(
+                cache.insert_bytes(key.as_os_str(), b"x"),
+                Err(Error::InvalidCacheKey(_))
+            ));
+            assert!(matches!(
+                cache.prepare_add(key.as_os_str(), 1),
+                Err(Error::InvalidCacheKey(_))
+            ));
+        }
+
+        Ok(())
     }
 
     #[test]
