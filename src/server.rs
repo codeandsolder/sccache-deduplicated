@@ -768,6 +768,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
             timeout,
             wait,
         } = self;
+        let storage = Arc::clone(&service.storage);
 
         // Create our "server future" which will simply handle all incoming
         // connections in separate tasks.
@@ -838,6 +839,17 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         // Note that we cap the amount of time this can take, however, as we
         // don't want to wait *too* long.
         runtime.block_on(async { time::timeout(SHUTDOWN_TIMEOUT, wait).await })?;
+
+        info!(
+            "draining detached cache work for at most {} seconds",
+            SHUTDOWN_TIMEOUT.as_secs()
+        );
+        match runtime
+            .block_on(async { time::timeout(SHUTDOWN_TIMEOUT, storage.drain_background()).await })
+        {
+            Ok(()) => info!("background cache work drained"),
+            Err(_) => warn!("timed out while draining background cache work"),
+        }
 
         info!("ok, fully shutting down now");
 
@@ -979,18 +991,16 @@ where
                 }
                 Request::Shutdown => {
                     debug!("handle_client: shutdown");
+                    // Make the shutdown RPC itself a durability barrier for
+                    // detached cache work. CI may persist L0 as soon as the
+                    // stop-server command returns.
+                    me.storage.drain_background().await;
+                    let info = me.get_info().await?;
                     let mut tx = me.tx.clone();
-                    future::try_join(
-                        async {
-                            let _ = tx.send(ServerMessage::Shutdown).await;
-                            Ok(())
-                        },
-                        me.get_info(),
-                    )
-                    .await
-                    .map(move |((), info)| {
-                        Message::WithoutBody(Response::ShuttingDown(Box::new(info)))
-                    })
+                    if tx.send(ServerMessage::Shutdown).await.is_err() {
+                        debug!("shutdown notification receiver dropped");
+                    }
+                    Ok(Message::WithoutBody(Response::ShuttingDown(Box::new(info))))
                 }
                 Request::StorageHandshake => {
                     debug!("handle_client: storage_handshake");
