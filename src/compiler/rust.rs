@@ -62,9 +62,11 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process;
 #[cfg(feature = "dist-client")]
+use std::sync::Arc;
+use std::sync::LazyLock;
+#[cfg(feature = "dist-client")]
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
 use std::time;
 
 use crate::errors::*;
