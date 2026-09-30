@@ -189,7 +189,6 @@ const INPUT_FOR_CUDA_B: &str = "test_b.cu";
 const INPUT_FOR_CUDA_C: &str = "test_c.cu";
 const INPUT_FOR_HIP_A: &str = "test_a.hip";
 const INPUT_FOR_HIP_B: &str = "test_b.hip";
-const INPUT_FOR_HIP_C: &str = "test_c.hip";
 const OUTPUT: &str = "test.o";
 #[cfg(unix)]
 const NULL_PATH: &str = "/dev/null";
@@ -369,33 +368,6 @@ fn test_basic_compile_into_dev_stdout(compiler: Compiler, tempdir: &Path) {
 #[cfg(not(unix))]
 fn test_basic_compile_into_dev_stdout(_: Compiler, _: &Path) {
     info!("Not unix, skipping tests with /dev/stdout");
-}
-
-fn test_noncacheable_stats(compiler: Compiler, tempdir: &Path) {
-    let Compiler {
-        name,
-        exe,
-        env_vars,
-    } = compiler;
-    println!("test_noncacheable_stats: {name}");
-    copy_to_tempdir(&[INPUT], tempdir);
-
-    trace!("compile");
-    sccache_command()
-        .arg(&exe)
-        .arg("-E")
-        .arg(INPUT)
-        .current_dir(tempdir)
-        .envs(env_vars)
-        .assert()
-        .success();
-    trace!("request stats");
-    get_stats(|info| {
-        assert_eq!(1, info.stats.compile_requests);
-        assert_eq!(0, info.stats.requests_executed);
-        assert_eq!(1, info.stats.not_cached.len());
-        assert_eq!(Some(&1), info.stats.not_cached.get("-E"));
-    });
 }
 
 fn test_msvc_deps(compiler: Compiler, tempdir: &Path) {
@@ -1958,7 +1930,7 @@ fn test_sccache_command(preprocessor_cache_mode: bool) {
         warn!("No compilers found, skipping test");
     } else {
         // Ensure there's no existing sccache server running.
-        stop_local_daemon();
+        let _ = stop_local_daemon();
         // Create the configurations
         let sccache_cfg = sccache_client_cfg(tempdir.path(), preprocessor_cache_mode);
         write_json_cfg(tempdir.path(), "sccache-cfg.json", &sccache_cfg);
@@ -1973,7 +1945,7 @@ fn test_sccache_command(preprocessor_cache_mode: bool) {
             run_sccache_command_tests(compiler, tempdir.path(), preprocessor_cache_mode);
             zero_stats();
         }
-        stop_local_daemon();
+        let _ = stop_local_daemon();
     }
 }
 
@@ -2044,7 +2016,7 @@ fn test_assembler_affects_cache(preprocessor_cache_mode: bool) {
     // The compiler is only looked at once per server, so anything that wants a
     // fresh look at the assembler needs a fresh server.
     let compile = |path: &OsString, expected_hits: u64| {
-        stop_local_daemon();
+        let _ = stop_local_daemon();
         start_local_daemon(&tempdir.path().join("sccache-cfg.json"), &cached_cfg);
         zero_stats();
         fs::remove_file(tempdir.path().join(OUTPUT)).ok();
@@ -2070,14 +2042,14 @@ fn test_assembler_affects_cache(preprocessor_cache_mode: bool) {
     compile(&wrapper_first, 0);
     // Back to the assembler the cache was populated with.
     compile(&path, 1);
-    stop_local_daemon();
+    let _ = stop_local_daemon();
 }
 
 #[test]
 #[serial]
 fn test_stats_no_server() {
     // Ensure there's no existing sccache server running.
-    stop_local_daemon();
+    let _ = stop_local_daemon();
     get_stats(|_| {});
     assert!(
         !stop_local_daemon(),
@@ -2107,7 +2079,7 @@ fn test_cuda_sccache_command(preprocessor_cache_mode: bool) {
         warn!("No compilers found, skipping test");
     } else {
         // Ensure there's no existing sccache server running.
-        stop_local_daemon();
+        let _ = stop_local_daemon();
         // Create the configurations
         let sccache_cfg = sccache_client_cfg(tempdir.path(), preprocessor_cache_mode);
         write_json_cfg(tempdir.path(), "sccache-cfg.json", &sccache_cfg);
@@ -2126,7 +2098,7 @@ fn test_cuda_sccache_command(preprocessor_cache_mode: bool) {
             }
             zero_stats();
         }
-        stop_local_daemon();
+        let _ = stop_local_daemon();
     }
 }
 
@@ -2142,7 +2114,7 @@ fn test_hip_sccache_command(preprocessor_cache_mode: bool) {
         .unwrap();
 
     if let Some(compiler) = find_hip_compiler() {
-        stop_local_daemon();
+        let _ = stop_local_daemon();
         // Create the configurations
         let sccache_cfg = sccache_client_cfg(tempdir.path(), preprocessor_cache_mode);
         write_json_cfg(tempdir.path(), "sccache-cfg.json", &sccache_cfg);
@@ -2155,7 +2127,7 @@ fn test_hip_sccache_command(preprocessor_cache_mode: bool) {
         );
         run_sccache_hip_command_tests(compiler, tempdir.path());
         zero_stats();
-        stop_local_daemon();
+        let _ = stop_local_daemon();
     }
 }
 

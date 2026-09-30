@@ -5,9 +5,13 @@ use std::env;
 use std::fs::remove_dir_all;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+#[cfg(feature = "dist-server")]
+use std::process::Output;
+use std::process::{Command, Stdio};
 use std::str::{self};
+#[cfg(feature = "dist-server")]
 use std::thread;
+#[cfg(feature = "dist-server")]
 use std::time::{Duration, Instant};
 
 use assert_cmd::prelude::*;
@@ -21,20 +25,31 @@ use nix::{
 };
 use predicates::prelude::*;
 use serde::Serialize;
+#[cfg(feature = "dist-server")]
 use uuid::Uuid;
 
+#[cfg(feature = "dist-server")]
 const CONTAINER_NAME_PREFIX: &str = "sccache_dist_test";
+#[cfg(feature = "dist-server")]
 const DIST_IMAGE: &str = "sccache_dist_test_image";
+#[cfg(feature = "dist-server")]
 const DIST_DOCKERFILE: &str = include_str!("Dockerfile.sccache-dist");
+#[cfg(feature = "dist-server")]
 const DIST_IMAGE_BWRAP_PATH: &str = "/usr/bin/bwrap";
+#[cfg(feature = "dist-server")]
 const MAX_STARTUP_WAIT: Duration = Duration::from_secs(5);
 const DIST_CACHE_RELPATH: &str = "client-dist-cache";
 
+#[cfg(feature = "dist-server")]
 const DIST_SERVER_TOKEN: &str = "THIS IS THE TEST TOKEN";
 
+#[cfg(feature = "dist-server")]
 const CONFIGS_CONTAINER_PATH: &str = "/sccache-bits";
+#[cfg(feature = "dist-server")]
 const BUILD_DIR_CONTAINER_PATH: &str = "/sccache-bits/build-dir";
+#[cfg(feature = "dist-server")]
 const SCHEDULER_PORT: u16 = 10500;
+#[cfg(feature = "dist-server")]
 const SERVER_PORT: u16 = 12345; // arbitrary
 
 const TC_CACHE_SIZE: u64 = 1024 * 1024 * 1024; // 1 gig
@@ -706,6 +721,7 @@ impl Drop for DistSystem {
     }
 }
 
+#[cfg(feature = "dist-server")]
 fn make_container_name(tag: &str) -> String {
     format!(
         "{}_{}_{}",
@@ -715,6 +731,7 @@ fn make_container_name(tag: &str) -> String {
     )
 }
 
+#[cfg(feature = "dist-server")]
 fn check_output(output: &Output) {
     if !output.status.success() {
         println!(
