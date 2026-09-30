@@ -1023,9 +1023,15 @@ impl Storage for MultiLevelStorage {
                     result = CacheMode::ReadWrite;
                     trace!("Cache level {} is read-write", idx);
                 }
-                Err(e) => {
-                    warn!("Error checking cache level {}: {}", idx, e);
-                    return Err(e);
+                Err(error) if idx == 0 => {
+                    warn!("Error checking required cache level 0: {}", error);
+                    return Err(error);
+                }
+                Err(error) => {
+                    warn!(
+                        "Cache level {} is unavailable during startup check: {}; continuing with faster levels",
+                        idx, error
+                    );
                 }
             }
         }
