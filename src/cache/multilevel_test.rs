@@ -198,6 +198,7 @@ struct InMemoryStorage {
     data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     access_log: Arc<Mutex<Vec<String>>>,
     raw_access_log: Arc<Mutex<Vec<String>>>,
+    existence_log: Arc<Mutex<Vec<String>>>,
 }
 
 impl InMemoryStorage {
@@ -206,6 +207,7 @@ impl InMemoryStorage {
             data: Arc::new(Mutex::new(HashMap::new())),
             access_log: Arc::new(Mutex::new(Vec::new())),
             raw_access_log: Arc::new(Mutex::new(Vec::new())),
+            existence_log: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -215,6 +217,10 @@ impl InMemoryStorage {
 
     fn get_raw_access_log(&self) -> Arc<Mutex<Vec<String>>> {
         Arc::clone(&self.raw_access_log)
+    }
+
+    fn get_existence_log(&self) -> Arc<Mutex<Vec<String>>> {
+        Arc::clone(&self.existence_log)
     }
 }
 
@@ -271,6 +277,14 @@ impl Storage for InMemoryStorage {
         Ok(None)
     }
 
+    async fn entry_exists(&self, key: &str) -> Result<Option<bool>> {
+        self.existence_log
+            .lock()
+            .await
+            .push(format!("entry_exists:{key}"));
+        Ok(Some(self.data.lock().await.contains_key(key)))
+    }
+
     /// Implement get_raw() to enable backfill testing with remote-like backends.
     /// This simulates the behavior of real remote backends (S3, Redis, etc.) that
     /// can efficiently return raw serialized cache entries for backfilling.
@@ -290,6 +304,107 @@ impl Storage for InMemoryStorage {
             .insert(key.to_string(), data.to_vec());
         Ok(Duration::ZERO)
     }
+}
+
+#[test]
+fn test_l0_hit_repairs_missing_l1_without_blocking_hit() {
+    let runtime = RuntimeBuilder::new_multi_thread()
+        .enable_all()
+        .worker_threads(1)
+        .build()
+        .unwrap();
+
+    let l0 = Arc::new(InMemoryStorage::new());
+    let l1 = Arc::new(InMemoryStorage::new());
+    let storage = MultiLevelStorage::new(vec![
+        l0.clone() as Arc<dyn Storage>,
+        l1.clone() as Arc<dyn Storage>,
+    ]);
+
+    runtime.block_on(async {
+        l0.put("repair_key", CacheWrite::default()).await.unwrap();
+        l0.get_raw_access_log().lock().await.clear();
+
+        assert!(matches!(
+            storage.get("repair_key").await.unwrap(),
+            Cache::Hit(_)
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if l1.data.lock().await.contains_key("repair_key") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            l1.get_existence_log().lock().await.as_slice(),
+            &["entry_exists:repair_key"]
+        );
+        assert_eq!(
+            l0.get_raw_access_log().lock().await.as_slice(),
+            &["get_raw:repair_key"]
+        );
+
+        let stats = storage.stats();
+        assert_eq!(stats.0[0].backfills_from, 1);
+        assert_eq!(stats.0[1].backfills_to, 1);
+        assert_eq!(stats.0[1].writes, 1);
+    });
+}
+
+#[test]
+fn test_l0_hit_does_not_read_source_when_l1_already_has_key() {
+    let runtime = RuntimeBuilder::new_multi_thread()
+        .enable_all()
+        .worker_threads(1)
+        .build()
+        .unwrap();
+
+    let l0 = Arc::new(InMemoryStorage::new());
+    let l1 = Arc::new(InMemoryStorage::new());
+    let storage = MultiLevelStorage::new(vec![
+        l0.clone() as Arc<dyn Storage>,
+        l1.clone() as Arc<dyn Storage>,
+    ]);
+
+    runtime.block_on(async {
+        l0.put("present_key", CacheWrite::default()).await.unwrap();
+        l1.put("present_key", CacheWrite::default()).await.unwrap();
+        l0.get_raw_access_log().lock().await.clear();
+        l1.get_existence_log().lock().await.clear();
+
+        assert!(matches!(
+            storage.get("present_key").await.unwrap(),
+            Cache::Hit(_)
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !l1.get_existence_log().lock().await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            l1.get_existence_log().lock().await.as_slice(),
+            &["entry_exists:present_key"]
+        );
+        assert!(l0.get_raw_access_log().lock().await.is_empty());
+
+        let stats = storage.stats();
+        assert_eq!(stats.0[0].backfills_from, 0);
+        assert_eq!(stats.0[1].backfills_to, 0);
+        assert_eq!(stats.0[1].writes, 0);
+    });
 }
 
 #[test]
