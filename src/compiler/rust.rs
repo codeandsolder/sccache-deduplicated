@@ -296,7 +296,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"6";
+const CACHE_VERSION: &[u8] = b"7";
 
 /// Get absolute paths for all source files and env-deps listed in rustc's dep-info output.
 #[allow(clippy::too_many_arguments)]
@@ -2086,7 +2086,7 @@ where
             m.update(d.as_bytes());
         }
         if canonical_paths.is_some() {
-            m.update(b"canonical-rust-layout-v1");
+            m.update(b"canonical-rust-layout-v2");
         }
         let weak_toolchain_key = m.clone().finish();
         // 3. The full commandline (self.arguments)
@@ -2395,7 +2395,7 @@ where
                 schema: 1,
                 timestamp_unix_ms,
                 normalization_policy: if canonical.is_some() {
-                    "canonical-rust-layout-v1".to_owned()
+                    "canonical-rust-layout-v2".to_owned()
                 } else {
                     "legacy-rust-v6".to_owned()
                 },
