@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::errors::*;
+use crate::errors::Result;
 use opendal::Operator;
 use opendal::services::Redis;
 use opendal_layer_logging::LoggingLayer;
@@ -26,6 +26,10 @@ pub struct RedisCache;
 
 impl RedisCache {
     /// Create a new `RedisCache` for the given URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the URL is invalid or the OpenDAL operator cannot be built.
     pub fn build_from_url(url: &str, key_prefix: &str, ttl: u64) -> Result<Operator> {
         let parsed = Url::parse(url)?;
 
@@ -52,6 +56,10 @@ impl RedisCache {
     }
 
     /// Create a new `RedisCache` for the given single instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the OpenDAL operator cannot be built.
     pub fn build_single(
         endpoint: &str,
         username: Option<&str>,
@@ -66,6 +74,10 @@ impl RedisCache {
     }
 
     /// Create a new `RedisCache` for the given cluster.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the OpenDAL operator cannot be built.
     pub fn build_cluster(
         endpoints: &str,
         username: Option<&str>,

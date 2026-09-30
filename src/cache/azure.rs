@@ -19,7 +19,7 @@ use opendal::OperationContext;
 use opendal::services::Azblob;
 use opendal_layer_logging::LoggingLayer;
 
-use crate::errors::*;
+use crate::errors::{Result, anyhow, bail};
 
 use super::http_client::set_user_agent;
 
@@ -48,6 +48,10 @@ impl AzureBlobCache {
     ///   resolved from `endpoint` (validated and used as-is — for sovereign
     ///   clouds or a custom endpoint) or synthesized from `storage_account` as
     ///   `https://{account}.blob.core.windows.net`.
+    /// # Errors
+    ///
+    /// Returns an error if authentication sources conflict, the endpoint is invalid,
+    /// required Entra configuration is missing, or the OpenDAL operator cannot be built.
     pub fn build(
         connection_string: Option<&str>,
         container: &str,
@@ -171,7 +175,8 @@ fn resolve_blob_endpoint(endpoint: Option<&str>, storage_account: Option<&str>) 
 
 #[cfg(test)]
 mod test {
-    use super::*;
+    use super::{AzureBlobCache, resolve_blob_endpoint};
+    use crate::errors::{Result, anyhow};
 
     #[test]
     fn test_resolve_blob_endpoint_from_account() -> Result<()> {
@@ -246,62 +251,78 @@ mod test {
     }
 
     #[test]
-    fn test_resolve_blob_endpoint_ignores_empty_strings() {
+    fn test_resolve_blob_endpoint_ignores_empty_strings() -> Result<()> {
         // An empty endpoint must not shadow a valid storage account.
         assert_eq!(
-            resolve_blob_endpoint(Some(""), Some("acct")).unwrap(),
+            resolve_blob_endpoint(Some(""), Some("acct"))?,
             "https://acct.blob.core.windows.net"
         );
         assert!(resolve_blob_endpoint(Some(""), Some("")).is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_build_entra_path_builds_operator() {
+    fn test_build_entra_path_builds_operator() -> Result<()> {
         // No connection string + a storage account selects the Entra path. The
         // operator is constructed lazily (no network), so build() succeeds; assert
         // the wiring (scheme + container) rather than just that it did not panic.
-        let op = AzureBlobCache::build(None, "container", "prefix", Some("mystorageacct"), None)
-            .unwrap();
+        let op = AzureBlobCache::build(None, "container", "prefix", Some("mystorageacct"), None)?;
         assert_eq!(op.info().scheme(), "azblob");
         assert_eq!(op.info().name(), "container");
+        Ok(())
     }
 
     #[test]
-    fn test_build_connection_string_path_builds_operator() {
+    fn test_build_connection_string_path_builds_operator() -> Result<()> {
         // AccountKey must be valid base64 (opendal validates it at build time).
         let conn = "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=dGVzdGtleQ==;EndpointSuffix=core.windows.net";
-        let op = AzureBlobCache::build(Some(conn), "container", "prefix", None, None).unwrap();
+        let op = AzureBlobCache::build(Some(conn), "container", "prefix", None, None)?;
         assert_eq!(op.info().scheme(), "azblob");
         assert_eq!(op.info().name(), "container");
+        Ok(())
     }
 
     #[test]
-    fn test_build_rejects_conflicting_auth_sources() {
+    fn test_build_rejects_conflicting_auth_sources() -> Result<()> {
         // Both operands of the mutual-exclusivity guard are exercised: a
         // connection string paired with a storage account, and with an endpoint.
-        let err = AzureBlobCache::build(Some("conn"), "container", "prefix", Some("acct"), None)
-            .unwrap_err();
+        let err =
+            match AzureBlobCache::build(Some("conn"), "container", "prefix", Some("acct"), None) {
+                Ok(_) => return Err(anyhow!("conflicting Azure auth sources were accepted")),
+                Err(error) => error,
+            };
         assert!(err.to_string().contains("not both"));
 
-        let err = AzureBlobCache::build(
+        let err = match AzureBlobCache::build(
             Some("conn"),
             "container",
             "prefix",
             None,
             Some("https://acct.blob.core.windows.net"),
-        )
-        .unwrap_err();
+        ) {
+            Ok(_) => return Err(anyhow!("conflicting Azure auth sources were accepted")),
+            Err(error) => error,
+        };
         assert!(err.to_string().contains("not both"));
+        Ok(())
     }
 
     #[test]
-    fn test_build_requires_an_auth_source() {
+    fn test_build_requires_an_auth_source() -> Result<()> {
         // A container with no connection string and no Entra source: the error
         // names both the env vars and the config fields, since this branch is
         // reachable from a file config too.
-        let err = AzureBlobCache::build(None, "container", "prefix", None, None).unwrap_err();
+        let err = match AzureBlobCache::build(None, "container", "prefix", None, None) {
+            Ok(_) => {
+                return Err(anyhow!(
+                    "Azure cache built without an authentication source"
+                ));
+            }
+            Err(error) => error,
+        };
         let msg = err.to_string();
         assert!(msg.contains("storage account or blob endpoint"), "{msg}");
+        Ok(())
     }
 
     #[test]
