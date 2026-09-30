@@ -251,7 +251,12 @@ fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup
     };
     let workdir = exe_path
         .parent()
-        .expect("executable path has no parent?!")
+        .ok_or_else(|| {
+            anyhow!(
+                "current executable path has no parent: {}",
+                exe_path.display()
+            )
+        })?
         .as_os_str()
         .encode_wide()
         .chain(Some(0u16))
@@ -313,10 +318,12 @@ fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup
         });
 
         futures::pin_mut!(incoming);
-        let socket = incoming.next().await;
-        let socket = socket.unwrap(); // incoming() never returns None
+        let socket = incoming
+            .next()
+            .await
+            .context("named-pipe startup stream ended before accepting a connection")??;
 
-        read_server_startup_status(socket?).await
+        read_server_startup_status(socket).await
     };
 
     let timeout = startup_timeout.unwrap_or(SERVER_STARTUP_TIMEOUT);
@@ -917,7 +924,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             let args: Vec<_> = env::args_os().collect();
             let env: Vec<_> = env::vars_os().collect();
             let out_file = File::create(out)?;
-            let cwd = env::current_dir().expect("A current working dir should exist");
+            let cwd = env::current_dir().context("failed to determine current directory")?;
 
             let pool = runtime.handle().clone();
             runtime.block_on(async move {
