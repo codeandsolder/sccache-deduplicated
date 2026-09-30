@@ -168,17 +168,25 @@ mod client {
         // TODO: by this point the toolchain should be known to exist
         pub fn get_toolchain(&self, tc: &Toolchain) -> Result<Option<fs::File>> {
             // TODO: be more relaxed about path casing and slashes on Windows
-            let file = if let Some(custom_tc_archive) =
-                self.custom_toolchain_archives.lock().unwrap().get(tc)
-            {
-                fs::File::open(custom_tc_archive).with_context(|| {
+            let custom_tc_archive = self
+                .custom_toolchain_archives
+                .lock()
+                .map_err(|_| anyhow::anyhow!("custom toolchain archive mutex poisoned"))?
+                .get(tc)
+                .cloned();
+            let file = if let Some(custom_tc_archive) = custom_tc_archive {
+                fs::File::open(&custom_tc_archive).with_context(|| {
                     format!(
                         "could not open file for toolchain {}",
                         custom_tc_archive.display()
                     )
                 })?
             } else {
-                match self.cache.lock().unwrap().get_file(tc) {
+                let mut cache = self
+                    .cache
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?;
+                match cache.get_file(tc) {
                     Ok(file) => file,
                     Err(LruError::FileNotInCache) => return Ok(None),
                     Err(e) => return Err(e).context("error while retrieving toolchain from cache"),
@@ -200,17 +208,20 @@ mod client {
                 )
             }
             if let Some(tc_and_paths) = self.get_custom_toolchain(compiler_path) {
-                debug!("Using custom toolchain for {compiler_path:?}");
+                debug!("Using custom toolchain for {}", compiler_path.display());
                 let (tc, compiler_path, archive) = tc_and_paths?;
                 return Ok((tc, Some((compiler_path, archive))));
             }
-            // Only permit one toolchain creation at a time. Not an issue if there are multiple attempts
-            // to create the same toolchain, just a waste of time
-            let mut cache = self.cache.lock().unwrap();
-            if let Some(archive_id) = self.weak_to_strong(weak_key) {
+            if let Some(archive_id) = self.weak_to_strong(weak_key)? {
                 debug!("Using cached toolchain {weak_key} -> {archive_id}");
                 return Ok((Toolchain { archive_id }, None));
             }
+            // Only permit one toolchain creation at a time. Not an issue if there are multiple attempts
+            // to create the same toolchain, just a waste of time
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?;
             debug!("Weak key {weak_key} appears to be new");
             let tmpfile = tempfile::NamedTempFile::new_in(self.cache_dir.join("toolchain_tmp"))?;
             toolchain_packager
@@ -225,60 +236,72 @@ mod client {
             &self,
             compiler_path: &Path,
         ) -> Option<Result<(Toolchain, String, PathBuf)>> {
-            match self
-                .custom_toolchain_paths
-                .lock()
-                .unwrap()
-                .get_mut(compiler_path)
-            {
-                Some((custom_tc, Some(tc))) => Some(Ok((
-                    tc.clone(),
-                    custom_tc.compiler_executable.clone(),
-                    custom_tc.archive.clone(),
-                ))),
-                Some((custom_tc, maybe_tc @ None)) => {
-                    let archive_id = match path_key(&custom_tc.archive) {
-                        Ok(archive_id) => archive_id,
-                        Err(e) => return Some(Err(e)),
-                    };
-                    let tc = Toolchain { archive_id };
-                    *maybe_tc = Some(tc.clone());
-                    // If this entry already exists, someone has two custom toolchains with the same strong hash
-                    if let Some(old_path) = self
-                        .custom_toolchain_archives
-                        .lock()
-                        .unwrap()
-                        .insert(tc.clone(), custom_tc.archive.clone())
-                    {
-                        // Log a warning if the user has identical toolchains at two different locations - it's
-                        // not strictly wrong, but it is a bit odd
-                        if old_path != custom_tc.archive {
-                            warn!(
-                                "Detected interchangeable toolchain archives at {} and {}",
-                                old_path.display(),
-                                custom_tc.archive.display()
-                            );
-                        }
+            let new_toolchain = {
+                let mut custom_toolchain_paths = match self.custom_toolchain_paths.lock() {
+                    Ok(paths) => paths,
+                    Err(_) => {
+                        return Some(Err(anyhow::anyhow!("custom toolchain path mutex poisoned")));
                     }
-                    Some(Ok((
-                        tc,
-                        custom_tc.compiler_executable.clone(),
-                        custom_tc.archive.clone(),
-                    )))
+                };
+                match custom_toolchain_paths.get_mut(compiler_path) {
+                    Some((custom_tc, Some(tc))) => {
+                        return Some(Ok((
+                            tc.clone(),
+                            custom_tc.compiler_executable.clone(),
+                            custom_tc.archive.clone(),
+                        )));
+                    }
+                    Some((custom_tc, maybe_tc @ None)) => {
+                        let archive_id = match path_key(&custom_tc.archive) {
+                            Ok(archive_id) => archive_id,
+                            Err(error) => return Some(Err(error)),
+                        };
+                        let tc = Toolchain { archive_id };
+                        *maybe_tc = Some(tc.clone());
+                        (
+                            tc,
+                            custom_tc.compiler_executable.clone(),
+                            custom_tc.archive.clone(),
+                        )
+                    }
+                    None => return None,
                 }
-                None => None,
+            };
+
+            let (tc, compiler_executable, archive) = new_toolchain;
+            let old_path = match self.custom_toolchain_archives.lock() {
+                Ok(mut archives) => archives.insert(tc.clone(), archive.clone()),
+                Err(_) => {
+                    return Some(Err(anyhow::anyhow!(
+                        "custom toolchain archive mutex poisoned"
+                    )));
+                }
+            };
+            // If this entry already exists, someone has two custom toolchains with the same strong hash.
+            if let Some(old_path) = old_path
+                && old_path != archive
+            {
+                warn!(
+                    "Detected interchangeable toolchain archives at {} and {}",
+                    old_path.display(),
+                    archive.display()
+                );
             }
+            Some(Ok((tc, compiler_executable, archive)))
         }
 
-        fn weak_to_strong(&self, weak_key: &str) -> Option<String> {
-            self.weak_map
+        fn weak_to_strong(&self, weak_key: &str) -> Result<Option<String>> {
+            let weak_map = self
+                .weak_map
                 .lock()
-                .unwrap()
-                .get(weak_key)
-                .map(String::to_owned)
+                .map_err(|_| anyhow::anyhow!("toolchain weak-map mutex poisoned"))?;
+            Ok(weak_map.get(weak_key).map(String::to_owned))
         }
         fn record_weak(&self, weak_key: String, key: String) -> Result<()> {
-            let mut weak_map = self.weak_map.lock().unwrap();
+            let mut weak_map = self
+                .weak_map
+                .lock()
+                .map_err(|_| anyhow::anyhow!("toolchain weak-map mutex poisoned"))?;
             weak_map.insert(weak_key, key);
             let weak_map_path = self.cache_dir.join("weak_map.json");
             fs::File::create(weak_map_path)
@@ -477,8 +500,13 @@ pub struct TcCache {
 }
 
 impl TcCache {
+    /// Create a toolchain cache rooted at `cache_dir`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying disk cache cannot be initialized.
     pub fn new(cache_dir: &Path, cache_size: u64) -> Result<Self> {
-        trace!("Using TcCache({cache_dir:?}, {cache_size})");
+        trace!("Using TcCache({}, {cache_size})", cache_dir.display());
         Ok(Self {
             inner: LruDiskCache::new(cache_dir, cache_size)?,
         })
@@ -489,6 +517,11 @@ impl TcCache {
         self.inner.contains_key(make_lru_key_path(&tc.archive_id))
     }
 
+    /// Insert a toolchain archive produced by `with` and verify its content hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing, reading, hashing, or validating the archive fails.
     pub fn insert_with<F: FnOnce(fs::File) -> io::Result<()>>(
         &mut self,
         tc: &Toolchain,
@@ -505,10 +538,20 @@ impl TcCache {
         }
     }
 
+    /// Open a cached toolchain archive as a file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the archive is missing or cannot be opened.
     pub fn get_file(&mut self, tc: &Toolchain) -> LruResult<fs::File> {
         self.inner.get_file(make_lru_key_path(&tc.archive_id))
     }
 
+    /// Open a cached toolchain archive as a readable, seekable stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the archive is missing or cannot be opened.
     pub fn get(&mut self, tc: &Toolchain) -> LruResult<Box<dyn ReadSeek>> {
         self.inner.get(make_lru_key_path(&tc.archive_id))
     }
@@ -523,6 +566,11 @@ impl TcCache {
         self.len() == 0
     }
 
+    /// Remove a toolchain archive from the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache entry cannot be removed.
     pub fn remove(&mut self, tc: &Toolchain) -> LruResult<()> {
         self.inner.remove(make_lru_key_path(&tc.archive_id))
     }
