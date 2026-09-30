@@ -29,7 +29,6 @@ use crate::protocol::{
     Compile, CompileFinished, CompileResponse, Request, Response, StorageHandshakeInfo,
 };
 use crate::util;
-#[cfg(feature = "dist-client")]
 use anyhow::Context as _;
 use bytes::{Bytes, BytesMut, buf::BufMut};
 use filetime::FileTime;
