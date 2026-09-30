@@ -73,9 +73,8 @@ fn retry<F: FnMut() -> Option<T>, T>(interval: Duration, until: Duration, mut f:
     while start.elapsed() < until {
         if let Some(res) = f() {
             return Some(res);
-        } else {
-            std::thread::sleep(interval);
         }
+        std::thread::sleep(interval);
     }
     None
 }
@@ -168,7 +167,7 @@ impl SeleniumContainer {
             let stdout = String::from_utf8(output.stdout).unwrap();
             stdout.trim().to_owned()
         };
-        SeleniumContainer { cid }
+        Self { cid }
     }
 }
 
@@ -232,7 +231,7 @@ async fn test_auth_with_config(dist_auth: sccache::config::DistAuth) {
         .tempdir()
         .unwrap();
     let sccache_config = config_with_dist_auth(conf_dir.path(), dist_auth);
-    assert!(sccache_config.basedirs.is_empty());
+    assert_eq!(sccache_config.basedirs, [] as [std::string::String; 0]);
     let sccache_config_path = conf_dir.path().join("sccache-config.json");
     fs::File::create(&sccache_config_path)
         .unwrap()
@@ -261,12 +260,11 @@ async fn test_auth_with_config(dist_auth: sccache::config::DistAuth) {
     let status = retry(Duration::from_secs(1), Duration::from_secs(10), || {
         sccache_process.try_wait().unwrap()
     });
-    match status {
-        Some(s) => assert!(s.success()),
-        None => {
-            sccache_process.kill().unwrap();
-            panic!("Waited too long for process to exit")
-        }
+    if let Some(s) = status {
+        assert!(s.success());
+    } else {
+        sccache_process.kill().unwrap();
+        panic!("Waited too long for process to exit")
     }
     println!("Validating cached config");
     let mut cached_config_string = String::new();

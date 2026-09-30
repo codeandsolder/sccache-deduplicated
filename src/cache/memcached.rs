@@ -19,12 +19,17 @@ use opendal::Operator;
 use opendal::services::Memcached;
 use opendal_layer_logging::LoggingLayer;
 
-use crate::errors::*;
+use crate::errors::Result;
 
 #[derive(Clone)]
 pub struct MemcachedCache;
 
 impl MemcachedCache {
+    /// Build a Memcached cache operator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the OpenDAL operator cannot be initialized.
     pub fn build(
         url: &str,
         username: Option<&str>,

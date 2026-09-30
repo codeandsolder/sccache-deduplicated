@@ -14,8 +14,9 @@
 
 #[cfg(feature = "azure")]
 pub mod azure;
-#[allow(clippy::module_inception)]
-pub mod cache;
+#[path = "cache.rs"]
+pub mod storage;
+pub use storage as cache;
 pub mod cache_io;
 #[cfg(feature = "cos")]
 pub mod cos;
@@ -25,7 +26,6 @@ pub mod gcs;
 #[cfg(feature = "gha")]
 pub mod gha;
 pub mod ipc_storage;
-#[allow(clippy::module_inception)]
 pub mod lazy_disk_cache;
 #[cfg(feature = "memcached")]
 pub mod memcached;

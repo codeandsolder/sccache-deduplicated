@@ -15,7 +15,7 @@ use opendal::Operator;
 use opendal::services::Oss;
 use opendal_layer_logging::LoggingLayer;
 
-use crate::errors::*;
+use crate::errors::Result;
 
 use super::http_client::set_user_agent;
 
@@ -23,6 +23,11 @@ pub struct OSSCache;
 
 // Implement the Object Storage Service for Alibaba cloud
 impl OSSCache {
+    /// Build an Alibaba OSS cache operator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the OpenDAL operator or HTTP transport cannot be initialized.
     pub fn build(
         bucket: &str,
         key_prefix: &str,
@@ -42,7 +47,7 @@ impl OSSCache {
         }
 
         let op = Operator::new(builder)?
-            .with_context(OperationContext::new().with_http_transport(set_user_agent()))
+            .with_context(OperationContext::new().with_http_transport(set_user_agent()?))
             .layer(LoggingLayer::default());
         Ok(op)
     }

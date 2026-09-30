@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::errors::*;
+use crate::errors::{Context, Result};
 use crate::net::Connection;
 use crate::protocol::{Request, Response};
 use crate::util;
@@ -30,9 +30,9 @@ pub struct ServerConnection {
 
 impl ServerConnection {
     /// Create a new connection using `stream`.
-    pub fn new(conn: Box<dyn Connection>) -> io::Result<ServerConnection> {
+    pub fn new(conn: Box<dyn Connection>) -> io::Result<Self> {
         let write_conn = conn.try_clone()?;
-        Ok(ServerConnection {
+        Ok(Self {
             reader: BufReader::new(conn),
             writer: BufWriter::new(write_conn),
         })
@@ -54,7 +54,7 @@ impl ServerConnection {
             .read_exact(&mut bytes)
             .context("Failed to read response header")?;
         let len = BigEndian::read_u32(&bytes);
-        trace!("Should read {} more bytes", len);
+        trace!("Should read {len} more bytes");
         let mut data = vec![0; len as usize];
         self.reader.read_exact(&mut data)?;
         trace!("Done reading");
@@ -86,7 +86,7 @@ pub fn connect_with_retry(addr: &crate::net::SocketAddr) -> io::Result<ServerCon
         Ok(conn) => Ok(conn),
         Err(e) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            format!("Connection to server timed out: {:?}", e),
+            format!("Connection to server timed out: {e:?}"),
         )),
     }
 }

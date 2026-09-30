@@ -12,24 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_imports, dead_code, unused_variables)]
-
 use crate::compiler::args::*;
-use crate::compiler::c::{ArtifactDescriptor, CCompilerImpl, CCompilerKind, ParsedArguments};
+#[cfg(test)]
+use crate::compiler::c::ArtifactDescriptor;
+use crate::compiler::c::{
+    CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext, ParsedArguments,
+};
 use crate::compiler::gcc::ArgData::*;
 use crate::compiler::{
-    CCompileCommand, Cacheable, CompileCommand, CompilerArguments, Language, gcc, write_temp_file,
+    CCompileCommand, Cacheable, CompileCommand, CompilerArguments, Language, gcc,
 };
-use crate::mock_command::{CommandCreator, CommandCreatorSync, RunCommand};
-use crate::util::{OsStrExt, run_input_output};
+use crate::mock_command::CommandCreatorSync;
 use crate::{counted_array, dist};
 use async_trait::async_trait;
-use fs::File;
-use fs_err as fs;
 use semver::{BuildMetadata, Prerelease, Version};
 use std::ffi::OsString;
-use std::future::Future;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -67,7 +64,7 @@ impl Clang {
 
         let parsed_version = match Version::parse(version_str.trim_end_matches('"')) {
             Ok(parsed_version) => parsed_version,
-            Err(e) => return false,
+            Err(_) => return false,
         };
 
         parsed_version
@@ -110,21 +107,20 @@ impl CCompilerImpl for Clang {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn preprocess<T>(
-        &self,
-        creator: &T,
-        executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        env_vars: &[(OsString, OsString)],
-        may_dist: bool,
-        rewrite_includes_only: bool,
-        preprocessor_cache_mode: bool,
-    ) -> Result<process::Output>
+    async fn preprocess<T>(&self, context: CPreprocessContext<'_, T>) -> Result<process::Output>
     where
         T: CommandCreatorSync,
     {
+        let CPreprocessContext {
+            creator,
+            executable,
+            parsed_args,
+            cwd,
+            env_vars,
+            may_dist,
+            rewrite_includes_only,
+            preprocessor_cache_mode,
+        } = context;
         let mut ignorable_whitespace_flags = if preprocessor_cache_mode {
             vec![]
         } else {
@@ -144,22 +140,19 @@ impl CCompilerImpl for Clang {
             cwd,
             env_vars,
             may_dist,
-            self.kind(),
-            rewrite_includes_only,
-            ignorable_whitespace_flags,
-            language_to_clang_arg,
+            gcc::GccPreprocessConfig {
+                kind: self.kind(),
+                rewrite_includes_only,
+                ignorable_whitespace_flags,
+                language_to_arg: language_to_clang_arg,
+            },
         )
         .await
     }
 
     fn generate_compile_commands<T>(
         &self,
-        path_transformer: &mut dist::PathTransformer,
-        executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        env_vars: &[(OsString, OsString)],
-        rewrite_includes_only: bool,
+        context: CCompileContext<'_>,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
         Option<dist::CompileCommand>,
@@ -168,18 +161,28 @@ impl CCompilerImpl for Clang {
     where
         T: CommandCreatorSync,
     {
+        let CCompileContext {
+            path_transformer,
+            executable,
+            parsed_args,
+            cwd,
+            env_vars,
+            rewrite_includes_only,
+        } = context;
         gcc::generate_compile_commands(
             path_transformer,
             executable,
             parsed_args,
             cwd,
             env_vars,
-            self.kind(),
-            rewrite_includes_only,
-            language_to_clang_arg,
+            gcc::GccCompileConfig {
+                kind: self.kind(),
+                rewrite_includes_only,
+                language_to_arg: language_to_clang_arg,
+            },
         )
         .map(|(command, dist_command, cacheable)| {
-            (CCompileCommand::new(command), dist_command, cacheable)
+            (CCompileCommand::boxed(command), dist_command, cacheable)
         })
     }
 }
@@ -298,7 +301,7 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
 
 // Maps the `-fprofile-use` argument to the actual path of the
 // .profdata file Clang will try to use.
-pub(crate) fn resolve_profile_use_path(arg: &Path, cwd: &Path) -> PathBuf {
+pub fn resolve_profile_use_path(arg: &Path, cwd: &Path) -> PathBuf {
     // Note that `arg` might be empty (if no argument was given to
     // -fprofile-use), in which case `path` will be `cwd` after
     // the next statement and "./default.profdata" at the end of the
@@ -326,8 +329,6 @@ mod test {
     use crate::server;
     use crate::test::mock_storage::MockStorage;
     use crate::test::utils::*;
-    use std::collections::HashMap;
-    use std::future::Future;
     use std::path::PathBuf;
 
     fn parse_arguments_(arguments: Vec<String>) -> CompilerArguments<ParsedArguments> {
@@ -406,8 +407,8 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
-        assert!(a.common_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(a.common_args, [] as [std::ffi::OsString; 0]);
     }
 
     #[test]
@@ -458,8 +459,8 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
-        assert!(a.common_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(a.common_args, [] as [std::ffi::OsString; 0]);
     }
 
     #[test]
@@ -485,7 +486,7 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["--cuda-gpu-arch=sm_50"], a.common_args);
 
         let b = parses!(
@@ -510,7 +511,7 @@ mod test {
                 }
             )
         );
-        assert!(b.preprocessor_args.is_empty());
+        assert_eq!(b.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(
             ovec!["--cuda-gpu-arch=sm_50", "--no-cuda-include-ptx=sm_50"],
             b.common_args
@@ -532,8 +533,8 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
-        assert!(a.common_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(a.common_args, [] as [std::ffi::OsString; 0]);
     }
 
     #[test]
@@ -559,7 +560,7 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["--offload-arch=gfx900"], a.common_args);
 
         let b = parses!(
@@ -583,7 +584,7 @@ mod test {
                 }
             )
         );
-        assert!(b.preprocessor_args.is_empty());
+        assert_eq!(b.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["--offload-arch=gfx900"], b.common_args);
     }
 
@@ -611,7 +612,7 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(
             ovec!["--offload-arch=gfx900", "--hip-path=/usr"],
             a.common_args
@@ -639,7 +640,7 @@ mod test {
                 }
             )
         );
-        assert!(b.preprocessor_args.is_empty());
+        assert_eq!(b.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(
             ovec![
                 "--offload-arch=gfx900",
@@ -663,7 +664,7 @@ mod test {
             "--hip-path=/usr"
         );
         assert_eq!(Language::Hip, a.language);
-        assert!(a.preprocessor_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(
             ovec!["--offload-arch=gfx900", "--hip-path=/usr"],
             a.common_args
@@ -727,7 +728,7 @@ mod test {
             "-Xclang",
             "/some/overlay.yaml"
         );
-        assert!(a.common_args.is_empty());
+        assert_eq!(a.common_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(
             ovec!["-Xclang", "-ivfsoverlay", "-Xclang", "/some/overlay.yaml"],
             a.preprocessor_args
@@ -762,7 +763,7 @@ mod test {
                 }
             )
         );
-        println!("{:?}", a);
+        println!("{a:?}");
         assert_eq!(
             ovec!["-Xclang", "-include", "-Xclang", "pch.hxx"],
             a.preprocessor_args
@@ -870,7 +871,7 @@ mod test {
             "-Xclang",
             "plugin.so"
         );
-        println!("A {:#?}", a);
+        println!("A {a:#?}");
         assert_eq!(
             ovec!["-Xclang", "-load", "-Xclang", "plugin.so"],
             a.common_args
@@ -1078,7 +1079,7 @@ mod test {
     #[test]
     fn test_parse_fplugin() {
         let a = parses!("-c", "foo.c", "-o", "foo.o", "-fplugin", "plugin.so");
-        println!("A {:#?}", a);
+        println!("A {a:#?}");
         assert_eq!(ovec!["-fplugin", "plugin.so"], a.common_args);
         assert_eq!(
             ovec![std::env::current_dir().unwrap().join("plugin.so")],
@@ -1089,7 +1090,7 @@ mod test {
     #[test]
     fn test_parse_fplugin_concatenated() {
         let a = parses!("-c", "foo.c", "-o", "foo.o", "-fplugin=plugin.so");
-        println!("A {:#?}", a);
+        println!("A {a:#?}");
         assert_eq!(ovec!["-fplugin", "plugin.so"], a.common_args);
         assert_eq!(
             ovec![std::env::current_dir().unwrap().join("plugin.so")],
@@ -1667,9 +1668,11 @@ mod test {
             &parsed_args,
             f.tempdir.path(),
             &[],
-            CCompilerKind::Clang,
-            false,
-            language_to_clang_arg,
+            gcc::GccCompileConfig {
+                kind: CCompilerKind::Clang,
+                rewrite_includes_only: false,
+                language_to_arg: language_to_clang_arg,
+            },
         )
         .unwrap();
         // ClangCUDA cannot be dist-compiled

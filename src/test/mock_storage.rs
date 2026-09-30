@@ -32,7 +32,7 @@ pub struct MockStorage {
 
 impl MockStorage {
     /// Create a new `MockStorage`. if `delay` is `Some`, wait for that amount of time before returning from operations.
-    pub(crate) fn new(delay: Option<Duration>, preprocessor_cache_mode: bool) -> MockStorage {
+    pub(crate) fn new(delay: Option<Duration>, preprocessor_cache_mode: bool) -> Self {
         let (tx, rx) = mpsc::unbounded();
         Self {
             tx,

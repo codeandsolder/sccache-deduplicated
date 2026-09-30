@@ -13,23 +13,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_imports, dead_code, unused_variables)]
-
 use crate::compiler::args::*;
-use crate::compiler::c::{ArtifactDescriptor, CCompilerImpl, CCompilerKind, ParsedArguments};
+use crate::compiler::c::{
+    ArtifactDescriptor, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
+    ParsedArguments,
+};
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
     SingleCompileCommand,
 };
 use crate::{counted_array, dist};
 
-use crate::mock_command::{CommandCreator, CommandCreatorSync, RunCommand};
+use crate::mock_command::CommandCreatorSync;
 
 use async_trait::async_trait;
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -41,14 +41,14 @@ pub struct Cicc {
     pub version: Option<String>,
 }
 
-pub(crate) const CICC_INPUT_SUFFIX: &str = ".cpp1.ii";
-pub(crate) const PTXAS_INPUT_SUFFIX: &str = ".ptx";
+pub const CICC_INPUT_SUFFIX: &str = ".cpp1.ii";
+pub const PTXAS_INPUT_SUFFIX: &str = ".ptx";
 
-pub(crate) fn is_cicc_input(arg: impl AsRef<OsStr>) -> bool {
+pub fn is_cicc_input(arg: impl AsRef<OsStr>) -> bool {
     arg.as_ref().to_string_lossy().ends_with(CICC_INPUT_SUFFIX)
 }
 
-pub(crate) fn is_ptxas_input(arg: impl AsRef<OsStr>) -> bool {
+pub fn is_ptxas_input(arg: impl AsRef<OsStr>) -> bool {
     arg.as_ref().to_string_lossy().ends_with(PTXAS_INPUT_SUFFIX)
 }
 
@@ -71,31 +71,18 @@ impl CCompilerImpl for Cicc {
     ) -> CompilerArguments<ParsedArguments> {
         parse_arguments(arguments, cwd, Language::Ptx, &ARGS[..], 3)
     }
-    #[allow(clippy::too_many_arguments)]
-    async fn preprocess<T>(
-        &self,
-        _creator: &T,
-        _executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        _env_vars: &[(OsString, OsString)],
-        _may_dist: bool,
-        _rewrite_includes_only: bool,
-        _preprocessor_cache_mode: bool,
-    ) -> Result<process::Output>
+    async fn preprocess<T>(&self, context: CPreprocessContext<'_, T>) -> Result<process::Output>
     where
         T: CommandCreatorSync,
     {
+        let CPreprocessContext {
+            parsed_args, cwd, ..
+        } = context;
         preprocess(cwd, parsed_args).await
     }
     fn generate_compile_commands<T>(
         &self,
-        path_transformer: &mut dist::PathTransformer,
-        executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        env_vars: &[(OsString, OsString)],
-        _rewrite_includes_only: bool,
+        context: CCompileContext<'_>,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
         Option<dist::CompileCommand>,
@@ -104,9 +91,17 @@ impl CCompilerImpl for Cicc {
     where
         T: CommandCreatorSync,
     {
+        let CCompileContext {
+            path_transformer,
+            executable,
+            parsed_args,
+            cwd,
+            env_vars,
+            ..
+        } = context;
         generate_compile_commands(path_transformer, executable, parsed_args, cwd, env_vars).map(
             |(command, dist_command, cacheable)| {
-                (CCompileCommand::new(command), dist_command, cacheable)
+                (CCompileCommand::boxed(command), dist_command, cacheable)
             },
         )
     }
@@ -129,7 +124,7 @@ where
         _ => None,
     }
     .unwrap_or(arguments.len() - input_arg_offset_from_end);
-    let input = args.splice(input_loc..input_loc + 1, []).next().unwrap();
+    let input = args.splice(input_loc..=input_loc, []).next().unwrap();
 
     let mut take_next = false;
     let mut outputs = HashMap::new();
@@ -170,7 +165,7 @@ where
                         module_id_file_name = Some(cwd.join(o));
                         &mut common_args
                     }
-                    Some(UnhashedPassThrough(o)) => {
+                    Some(UnhashedPassThrough(_)) => {
                         take_next = false;
                         &mut unhashed_args
                     }
@@ -188,12 +183,8 @@ where
                         }
                         &mut unhashed_args
                     }
-                    Some(UnhashedFlag) => {
-                        take_next = false;
-                        &mut unhashed_args
-                    }
                     None => match arg {
-                        Argument::Raw(ref p) => {
+                        Argument::Raw(_) => {
                             if take_next {
                                 take_next = false;
                                 &mut common_args
@@ -288,7 +279,7 @@ pub fn generate_compile_commands(
     let lang_str = &parsed_args.language.as_str();
     let out_file = match parsed_args.outputs.get("obj") {
         Some(obj) => &obj.path,
-        None => return Err(anyhow!("Missing {:?} file output", lang_str)),
+        None => return Err(anyhow!("Missing {lang_str:?} file output")),
     };
 
     let mut arguments: Vec<OsString> = vec![];
@@ -306,7 +297,7 @@ pub fn generate_compile_commands(
             out_file.file_name().unwrap().to_string_lossy(),
             executable.file_name().unwrap().to_string_lossy(),
             [
-                &[format!("cd {} &&", cwd.to_string_lossy()).to_string()],
+                &[format!("cd {} &&", cwd.to_string_lossy())],
                 &[executable.to_str().unwrap_or_default().to_string()][..],
                 &dist::osstrings_to_strings(&arguments).unwrap_or_default()[..]
             ]
@@ -349,7 +340,6 @@ pub fn generate_compile_commands(
 ArgData! { pub
     Output(PathBuf),
     PassThrough(OsString),
-    UnhashedFlag,
     GenModuleIdFileFlag,
     ModuleIdFileName(PathBuf),
     UnhashedPassThrough(OsString),
@@ -393,7 +383,7 @@ mod test {
 
         let parsed = match parse_arguments(&args, ".".as_ref(), Language::Ptx, &ARGS[..], 3) {
             CompilerArguments::Ok(parsed) => parsed,
-            other => panic!("Got unexpected parse result: {:?}", other),
+            other => panic!("Got unexpected parse result: {other:?}"),
         };
 
         assert_eq!(PathBuf::from("kernel.cpp1.ii"), parsed.input);
@@ -419,7 +409,7 @@ mod test {
         let parsed =
             match parse_arguments(&args, ".".as_ref(), Language::Cubin, &ptxas::ARGS[..], 3) {
                 CompilerArguments::Ok(parsed) => parsed,
-                other => panic!("Got unexpected parse result: {:?}", other),
+                other => panic!("Got unexpected parse result: {other:?}"),
             };
 
         assert_eq!(PathBuf::from("kernel.ptx"), parsed.input);
