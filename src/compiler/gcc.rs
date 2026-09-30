@@ -13,7 +13,10 @@
 // limitations under the License.
 
 use crate::compiler::args::*;
-use crate::compiler::c::{ArtifactDescriptor, CCompilerImpl, CCompilerKind, ParsedArguments};
+use crate::compiler::c::{
+    ArtifactDescriptor, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
+    ParsedArguments,
+};
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
     SingleCompileCommand, clang,
@@ -65,20 +68,20 @@ impl CCompilerImpl for Gcc {
         parse_arguments(arguments, cwd, &ARGS[..], self.gplusplus, self.kind())
     }
 
-    async fn preprocess<T>(
-        &self,
-        creator: &T,
-        executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        env_vars: &[(OsString, OsString)],
-        may_dist: bool,
-        rewrite_includes_only: bool,
-        preprocessor_cache_mode: bool,
-    ) -> Result<process::Output>
+    async fn preprocess<T>(&self, context: CPreprocessContext<'_, T>) -> Result<process::Output>
     where
         T: CommandCreatorSync,
     {
+        let CPreprocessContext {
+            creator,
+            executable,
+            parsed_args,
+            cwd,
+            env_vars,
+            may_dist,
+            rewrite_includes_only,
+            preprocessor_cache_mode,
+        } = context;
         let ignorable_whitespace_flags = if preprocessor_cache_mode {
             vec![]
         } else {
@@ -91,22 +94,19 @@ impl CCompilerImpl for Gcc {
             cwd,
             env_vars,
             may_dist,
-            self.kind(),
-            rewrite_includes_only,
-            ignorable_whitespace_flags,
-            language_to_gcc_arg,
+            GccPreprocessConfig {
+                kind: self.kind(),
+                rewrite_includes_only,
+                ignorable_whitespace_flags,
+                language_to_arg: language_to_gcc_arg,
+            },
         )
         .await
     }
 
     fn generate_compile_commands<T>(
         &self,
-        path_transformer: &mut dist::PathTransformer,
-        executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        env_vars: &[(OsString, OsString)],
-        rewrite_includes_only: bool,
+        context: CCompileContext<'_>,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
         Option<dist::CompileCommand>,
@@ -115,15 +115,25 @@ impl CCompilerImpl for Gcc {
     where
         T: CommandCreatorSync,
     {
+        let CCompileContext {
+            path_transformer,
+            executable,
+            parsed_args,
+            cwd,
+            env_vars,
+            rewrite_includes_only,
+        } = context;
         generate_compile_commands(
             path_transformer,
             executable,
             parsed_args,
             cwd,
             env_vars,
-            self.kind(),
-            rewrite_includes_only,
-            language_to_gcc_arg,
+            GccCompileConfig {
+                kind: self.kind(),
+                rewrite_includes_only: rewrite_includes_only,
+                language_to_arg: language_to_gcc_arg,
+            },
         )
         .map(|(command, dist_command, cacheable)| {
             (CCompileCommand::boxed(command), dist_command, cacheable)
@@ -855,20 +865,36 @@ pub fn language_to_gcc_arg(lang: Language) -> Option<&'static str> {
     lang.to_gcc_arg()
 }
 
+pub(crate) struct GccPreprocessConfig<F> {
+    pub kind: CCompilerKind,
+    pub rewrite_includes_only: bool,
+    pub ignorable_whitespace_flags: Vec<String>,
+    pub language_to_arg: F,
+}
+
+pub(crate) struct GccCompileConfig<F> {
+    pub kind: CCompilerKind,
+    pub rewrite_includes_only: bool,
+    pub language_to_arg: F,
+}
+
 fn preprocess_cmd<F, T>(
     cmd: &mut T,
     parsed_args: &ParsedArguments,
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
     may_dist: bool,
-    kind: CCompilerKind,
-    rewrite_includes_only: bool,
-    ignorable_whitespace_flags: Vec<String>,
-    language_to_arg: F,
+    config: GccPreprocessConfig<F>,
 ) where
     F: Fn(Language) -> Option<&'static str>,
     T: RunCommand,
 {
+    let GccPreprocessConfig {
+        kind,
+        rewrite_includes_only,
+        ignorable_whitespace_flags,
+        language_to_arg,
+    } = config;
     let language = language_to_arg(parsed_args.language);
     if let Some(lang) = &language {
         cmd.arg("-x").arg(lang);
@@ -944,10 +970,7 @@ pub async fn preprocess<F, T>(
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
     may_dist: bool,
-    kind: CCompilerKind,
-    rewrite_includes_only: bool,
-    ignorable_whitespace_flags: Vec<String>,
-    language_to_arg: F,
+    config: GccPreprocessConfig<F>,
 ) -> Result<process::Output>
 where
     F: Fn(Language) -> Option<&'static str>,
@@ -955,17 +978,7 @@ where
 {
     trace!("preprocess");
     let mut cmd = creator.clone().new_command_sync(executable);
-    preprocess_cmd(
-        &mut cmd,
-        parsed_args,
-        cwd,
-        env_vars,
-        may_dist,
-        kind,
-        rewrite_includes_only,
-        ignorable_whitespace_flags,
-        language_to_arg,
-    );
+    preprocess_cmd(&mut cmd, parsed_args, cwd, env_vars, may_dist, config);
     if log_enabled!(Trace) {
         trace!("preprocess: {cmd:?}");
     }
@@ -978,9 +991,7 @@ pub fn generate_compile_commands<F>(
     parsed_args: &ParsedArguments,
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
-    kind: CCompilerKind,
-    rewrite_includes_only: bool,
-    language_to_arg: F,
+    config: GccCompileConfig<F>,
 ) -> Result<(
     SingleCompileCommand,
     Option<dist::CompileCommand>,
@@ -989,6 +1000,11 @@ pub fn generate_compile_commands<F>(
 where
     F: Fn(Language) -> Option<&'static str>,
 {
+    let GccCompileConfig {
+        kind,
+        rewrite_includes_only,
+        language_to_arg,
+    } = config;
     // Unused arguments
     #[cfg(not(feature = "dist-client"))]
     {
@@ -2075,10 +2091,12 @@ mod test {
                 Path::new(""),
                 &[],
                 true,
-                CCompilerKind::Gcc,
-                true,
-                vec![],
-                language_to_gcc_arg,
+                GccPreprocessConfig {
+                    kind: CCompilerKind::Gcc,
+                    rewrite_includes_only: true,
+                    ignorable_whitespace_flags: vec![],
+                    language_to_arg: language_to_gcc_arg,
+                },
             );
             // make sure the architectures were rewritten to prepocessor defines
             let expected_args = ovec![
@@ -2111,10 +2129,12 @@ mod test {
             Path::new(""),
             &[],
             true,
-            CCompilerKind::Gcc,
-            true,
-            vec![],
-            language_to_gcc_arg,
+            GccPreprocessConfig {
+                kind: CCompilerKind::Gcc,
+                rewrite_includes_only: true,
+                ignorable_whitespace_flags: vec![],
+                language_to_arg: language_to_gcc_arg,
+            },
         );
         // make sure the architectures were rewritten to prepocessor defines
         let expected_args = ovec![
@@ -2146,10 +2166,12 @@ mod test {
             Path::new(""),
             &[],
             true,
-            CCompilerKind::Clang,
-            true,
-            vec![],
-            language_to_gcc_arg,
+            GccPreprocessConfig {
+                kind: CCompilerKind::Clang,
+                rewrite_includes_only: true,
+                ignorable_whitespace_flags: vec![],
+                language_to_arg: language_to_gcc_arg,
+            },
         );
         let expected_args = ovec!["-x", "c", "-E", "-frewrite-includes", "--", "foo.c"];
         assert_eq!(cmd.args, expected_args);
@@ -2172,10 +2194,12 @@ mod test {
             Path::new(""),
             &[],
             true,
-            CCompilerKind::Gcc,
-            true,
-            vec![],
-            language_to_gcc_arg,
+            GccPreprocessConfig {
+                kind: CCompilerKind::Gcc,
+                rewrite_includes_only: true,
+                ignorable_whitespace_flags: vec![],
+                language_to_arg: language_to_gcc_arg,
+            },
         );
         // disable with extensions enabled
         assert!(!cmd.args.contains(&"-fdirectives-only".into()));
@@ -2198,10 +2222,12 @@ mod test {
             Path::new(""),
             &[],
             true,
-            CCompilerKind::Gcc,
-            true,
-            vec![],
-            language_to_gcc_arg,
+            GccPreprocessConfig {
+                kind: CCompilerKind::Gcc,
+                rewrite_includes_only: true,
+                ignorable_whitespace_flags: vec![],
+                language_to_arg: language_to_gcc_arg,
+            },
         );
         // no reason to disable it with no extensions enabled
         assert!(cmd.args.contains(&"-fdirectives-only".into()));
@@ -2224,10 +2250,12 @@ mod test {
             Path::new(""),
             &[],
             true,
-            CCompilerKind::Gcc,
-            true,
-            vec![],
-            language_to_gcc_arg,
+            GccPreprocessConfig {
+                kind: CCompilerKind::Gcc,
+                rewrite_includes_only: true,
+                ignorable_whitespace_flags: vec![],
+                language_to_arg: language_to_gcc_arg,
+            },
         );
         // disable with extensions enabled
         assert!(!cmd.args.contains(&"-fdirectives-only".into()));
@@ -2716,9 +2744,11 @@ mod test {
             &parsed_args,
             f.tempdir.path(),
             &[],
-            CCompilerKind::Gcc,
-            false,
-            language_to_gcc_arg,
+            GccCompileConfig {
+                kind: CCompilerKind::Gcc,
+                rewrite_includes_only: false,
+                language_to_arg: language_to_gcc_arg,
+            },
         )
         .unwrap();
         #[cfg(feature = "dist-client")]
@@ -2778,9 +2808,11 @@ mod test {
             &parsed_args,
             f.tempdir.path(),
             &[],
-            CCompilerKind::Gcc,
-            false,
-            language_to_gcc_arg,
+            GccCompileConfig {
+                kind: CCompilerKind::Gcc,
+                rewrite_includes_only: false,
+                language_to_arg: language_to_gcc_arg,
+            },
         )
         .unwrap();
         // -v should never generate a dist_command
@@ -2838,9 +2870,11 @@ mod test {
             &parsed_args,
             f.tempdir.path(),
             &[],
-            CCompilerKind::Gcc,
-            false,
-            language_to_gcc_arg,
+            GccCompileConfig {
+                kind: CCompilerKind::Gcc,
+                rewrite_includes_only: false,
+                language_to_arg: language_to_gcc_arg,
+            },
         )
         .unwrap();
         // --verbose should never generate a dist_command
@@ -2867,9 +2901,11 @@ mod test {
             &parsed_args,
             f.tempdir.path(),
             &[],
-            CCompilerKind::Clang,
-            false,
-            language_to_gcc_arg,
+            GccCompileConfig {
+                kind: CCompilerKind::Clang,
+                rewrite_includes_only: false,
+                language_to_arg: language_to_gcc_arg,
+            },
         )
         .unwrap();
         let expected_args = ovec![
@@ -2936,10 +2972,12 @@ mod test {
             Path::new(""),
             &[],
             true,
-            CCompilerKind::Gcc,
-            true,
-            vec![],
-            language_to_gcc_arg,
+            GccPreprocessConfig {
+                kind: CCompilerKind::Gcc,
+                rewrite_includes_only: true,
+                ignorable_whitespace_flags: vec![],
+                language_to_arg: language_to_gcc_arg,
+            },
         );
         assert!(cmd.args.contains(&"-x".into()) && cmd.args.contains(&"c++-header".into()));
     }
@@ -2961,10 +2999,12 @@ mod test {
             Path::new(""),
             &[],
             true,
-            CCompilerKind::Gcc,
-            true,
-            vec![],
-            language_to_gcc_arg,
+            GccPreprocessConfig {
+                kind: CCompilerKind::Gcc,
+                rewrite_includes_only: true,
+                ignorable_whitespace_flags: vec![],
+                language_to_arg: language_to_gcc_arg,
+            },
         );
         assert!(cmd.args.contains(&"-x".into()) && cmd.args.contains(&"c++-header".into()));
     }
@@ -2986,10 +3026,12 @@ mod test {
             Path::new(""),
             &[],
             true,
-            CCompilerKind::Gcc,
-            true,
-            vec![],
-            language_to_gcc_arg,
+            GccPreprocessConfig {
+                kind: CCompilerKind::Gcc,
+                rewrite_includes_only: true,
+                ignorable_whitespace_flags: vec![],
+                language_to_arg: language_to_gcc_arg,
+            },
         );
         assert!(!cmd.args.contains(&"-x".into()));
     }

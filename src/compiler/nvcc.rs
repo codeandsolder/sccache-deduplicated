@@ -16,7 +16,9 @@
 use crate::compiler::args::*;
 #[cfg(test)]
 use crate::compiler::c::ArtifactDescriptor;
-use crate::compiler::c::{CCompilerImpl, CCompilerKind, ParsedArguments};
+use crate::compiler::c::{
+    CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext, ParsedArguments,
+};
 use crate::compiler::gcc::ArgData::*;
 use crate::compiler::{
     CCompileCommand, Cacheable, CompileCommand, CompileCommandImpl, CompilerArguments, Language,
@@ -149,20 +151,18 @@ impl CCompilerImpl for Nvcc {
         }
     }
 
-    async fn preprocess<T>(
-        &self,
-        creator: &T,
-        executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        env_vars: &[(OsString, OsString)],
-        _may_dist: bool,
-        _rewrite_includes_only: bool,
-        _preprocessor_cache_mode: bool,
-    ) -> Result<process::Output>
+    async fn preprocess<T>(&self, context: CPreprocessContext<'_, T>) -> Result<process::Output>
     where
         T: CommandCreatorSync,
     {
+        let CPreprocessContext {
+            creator,
+            executable,
+            parsed_args,
+            cwd,
+            env_vars,
+            ..
+        } = context;
         let env_vars = env_vars
             .iter()
             .filter(|(k, _)| k != "NVCC_PREPEND_FLAGS" && k != "NVCC_APPEND_FLAGS")
@@ -262,12 +262,7 @@ impl CCompilerImpl for Nvcc {
 
     fn generate_compile_commands<T>(
         &self,
-        _path_transformer: &mut dist::PathTransformer,
-        executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        env_vars: &[(OsString, OsString)],
-        _rewrite_includes_only: bool,
+        context: CCompileContext<'_>,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
         Option<dist::CompileCommand>,
@@ -276,6 +271,13 @@ impl CCompilerImpl for Nvcc {
     where
         T: CommandCreatorSync,
     {
+        let CCompileContext {
+            executable,
+            parsed_args,
+            cwd,
+            env_vars,
+            ..
+        } = context;
         generate_compile_commands(parsed_args, executable, cwd, env_vars, &self.host_compiler).map(
             |(command, dist_command, cacheable)| {
                 (CCompileCommand::boxed(command), dist_command, cacheable)

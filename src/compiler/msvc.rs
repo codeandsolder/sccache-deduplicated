@@ -13,7 +13,10 @@
 // limitations under the License.
 
 use crate::compiler::args::*;
-use crate::compiler::c::{ArtifactDescriptor, CCompilerImpl, CCompilerKind, ParsedArguments};
+use crate::compiler::c::{
+    ArtifactDescriptor, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
+    ParsedArguments,
+};
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
     SingleCompileCommand, clang, gcc, write_temp_file,
@@ -64,20 +67,20 @@ impl CCompilerImpl for Msvc {
         parse_arguments(arguments, cwd, self.is_clang)
     }
 
-    async fn preprocess<T>(
-        &self,
-        creator: &T,
-        executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        env_vars: &[(OsString, OsString)],
-        may_dist: bool,
-        rewrite_includes_only: bool,
-        _preprocessor_cache_mode: bool,
-    ) -> Result<process::Output>
+    async fn preprocess<T>(&self, context: CPreprocessContext<'_, T>) -> Result<process::Output>
     where
         T: CommandCreatorSync,
     {
+        let CPreprocessContext {
+            creator,
+            executable,
+            parsed_args,
+            cwd,
+            env_vars,
+            may_dist,
+            rewrite_includes_only,
+            ..
+        } = context;
         preprocess(
             creator,
             executable,
@@ -85,21 +88,18 @@ impl CCompilerImpl for Msvc {
             cwd,
             env_vars,
             may_dist,
-            &self.includes_prefix,
-            rewrite_includes_only,
-            self.is_clang,
+            MsvcPreprocessConfig {
+                includes_prefix: &self.includes_prefix,
+                rewrite_includes_only,
+                is_clang: self.is_clang,
+            },
         )
         .await
     }
 
     fn generate_compile_commands<T>(
         &self,
-        path_transformer: &mut dist::PathTransformer,
-        executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        env_vars: &[(OsString, OsString)],
-        _rewrite_includes_only: bool,
+        context: CCompileContext<'_>,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
         Option<dist::CompileCommand>,
@@ -108,6 +108,14 @@ impl CCompilerImpl for Msvc {
     where
         T: CommandCreatorSync,
     {
+        let CCompileContext {
+            path_transformer,
+            executable,
+            parsed_args,
+            cwd,
+            env_vars,
+            ..
+        } = context;
         generate_compile_commands(path_transformer, executable, parsed_args, cwd, env_vars).map(
             |(command, dist_command, cacheable)| {
                 (CCompileCommand::boxed(command), dist_command, cacheable)
@@ -1038,6 +1046,12 @@ pub fn preprocess_cmd<T>(
     cmd.arg(&parsed_args.input);
 }
 
+pub(crate) struct MsvcPreprocessConfig<'a> {
+    pub includes_prefix: &'a str,
+    pub rewrite_includes_only: bool,
+    pub is_clang: bool,
+}
+
 pub async fn preprocess<T>(
     creator: &T,
     executable: &Path,
@@ -1045,13 +1059,16 @@ pub async fn preprocess<T>(
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
     may_dist: bool,
-    includes_prefix: &str,
-    rewrite_includes_only: bool,
-    is_clang: bool,
+    config: MsvcPreprocessConfig<'_>,
 ) -> Result<process::Output>
 where
     T: CommandCreatorSync,
 {
+    let MsvcPreprocessConfig {
+        includes_prefix,
+        rewrite_includes_only,
+        is_clang,
+    } = config;
     let mut cmd = creator.clone().new_command_sync(executable);
     preprocess_cmd(
         &mut cmd,

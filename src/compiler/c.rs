@@ -170,6 +170,26 @@ pub enum CCompilerKind {
     TaskingVX,
 }
 
+pub(crate) struct CPreprocessContext<'a, T> {
+    pub creator: &'a T,
+    pub executable: &'a Path,
+    pub parsed_args: &'a ParsedArguments,
+    pub cwd: &'a Path,
+    pub env_vars: &'a [(OsString, OsString)],
+    pub may_dist: bool,
+    pub rewrite_includes_only: bool,
+    pub preprocessor_cache_mode: bool,
+}
+
+pub(crate) struct CCompileContext<'a> {
+    pub path_transformer: &'a mut dist::PathTransformer,
+    pub executable: &'a Path,
+    pub parsed_args: &'a ParsedArguments,
+    pub cwd: &'a Path,
+    pub env_vars: &'a [(OsString, OsString)],
+    pub rewrite_includes_only: bool,
+}
+
 /// An interface to a specific C compiler.
 #[async_trait]
 pub trait CCompilerImpl: Clone + fmt::Debug + Send + Sync + 'static {
@@ -192,29 +212,14 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + Sync + 'static {
         env_vars: &[(OsString, OsString)],
     ) -> CompilerArguments<ParsedArguments>;
     /// Run the C preprocessor with the specified set of arguments.
-    async fn preprocess<T>(
-        &self,
-        creator: &T,
-        executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        env_vars: &[(OsString, OsString)],
-        may_dist: bool,
-        rewrite_includes_only: bool,
-        preprocessor_cache_mode: bool,
-    ) -> Result<process::Output>
+    async fn preprocess<T>(&self, context: CPreprocessContext<'_, T>) -> Result<process::Output>
     where
         T: CommandCreatorSync;
     /// Generate a command that can be used to invoke the C compiler to perform
     /// the compilation.
     fn generate_compile_commands<T>(
         &self,
-        path_transformer: &mut dist::PathTransformer,
-        executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        env_vars: &[(OsString, OsString)],
-        rewrite_includes_only: bool,
+        context: CCompileContext<'_>,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
         Option<dist::CompileCommand>,
@@ -534,16 +539,16 @@ where
 
             let result = self
                 .compiler
-                .preprocess(
+                .preprocess(CPreprocessContext {
                     creator,
-                    &self.executable,
-                    &self.parsed_args,
-                    &cwd,
-                    &env_vars,
+                    executable: &self.executable,
+                    parsed_args: &self.parsed_args,
+                    cwd: &cwd,
+                    env_vars: &env_vars,
                     may_dist,
                     rewrite_includes_only,
-                    use_preprocessor_cache_mode,
-                )
+                    preprocessor_cache_mode: use_preprocessor_cache_mode,
+                })
                 .await;
             let out_pretty = self.parsed_args.output_pretty().into_owned();
             let result = result.map_err(|e| {
@@ -1195,14 +1200,14 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
         Option<dist::CompileCommand>,
         Cacheable,
     )> {
-        self.compiler.generate_compile_commands(
+        self.compiler.generate_compile_commands(CCompileContext {
             path_transformer,
-            &self.executable,
-            &self.parsed_args,
-            &self.cwd,
-            &self.env_vars,
+            executable: &self.executable,
+            parsed_args: &self.parsed_args,
+            cwd: &self.cwd,
+            env_vars: &self.env_vars,
             rewrite_includes_only,
-        )
+        })
     }
 
     #[cfg(feature = "dist-client")]

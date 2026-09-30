@@ -15,7 +15,9 @@
 use crate::compiler::args::*;
 #[cfg(test)]
 use crate::compiler::c::ArtifactDescriptor;
-use crate::compiler::c::{CCompilerImpl, CCompilerKind, ParsedArguments};
+use crate::compiler::c::{
+    CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext, ParsedArguments,
+};
 use crate::compiler::gcc::ArgData::*;
 use crate::compiler::{
     CCompileCommand, Cacheable, CompileCommand, CompilerArguments, Language, gcc,
@@ -105,20 +107,20 @@ impl CCompilerImpl for Clang {
         )
     }
 
-    async fn preprocess<T>(
-        &self,
-        creator: &T,
-        executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        env_vars: &[(OsString, OsString)],
-        may_dist: bool,
-        rewrite_includes_only: bool,
-        preprocessor_cache_mode: bool,
-    ) -> Result<process::Output>
+    async fn preprocess<T>(&self, context: CPreprocessContext<'_, T>) -> Result<process::Output>
     where
         T: CommandCreatorSync,
     {
+        let CPreprocessContext {
+            creator,
+            executable,
+            parsed_args,
+            cwd,
+            env_vars,
+            may_dist,
+            rewrite_includes_only,
+            preprocessor_cache_mode,
+        } = context;
         let mut ignorable_whitespace_flags = if preprocessor_cache_mode {
             vec![]
         } else {
@@ -138,22 +140,19 @@ impl CCompilerImpl for Clang {
             cwd,
             env_vars,
             may_dist,
-            self.kind(),
-            rewrite_includes_only,
-            ignorable_whitespace_flags,
-            language_to_clang_arg,
+            gcc::GccPreprocessConfig {
+                kind: self.kind(),
+                rewrite_includes_only,
+                ignorable_whitespace_flags,
+                language_to_arg: language_to_clang_arg,
+            },
         )
         .await
     }
 
     fn generate_compile_commands<T>(
         &self,
-        path_transformer: &mut dist::PathTransformer,
-        executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        env_vars: &[(OsString, OsString)],
-        rewrite_includes_only: bool,
+        context: CCompileContext<'_>,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
         Option<dist::CompileCommand>,
@@ -162,15 +161,25 @@ impl CCompilerImpl for Clang {
     where
         T: CommandCreatorSync,
     {
+        let CCompileContext {
+            path_transformer,
+            executable,
+            parsed_args,
+            cwd,
+            env_vars,
+            rewrite_includes_only,
+        } = context;
         gcc::generate_compile_commands(
             path_transformer,
             executable,
             parsed_args,
             cwd,
             env_vars,
-            self.kind(),
-            rewrite_includes_only,
-            language_to_clang_arg,
+            gcc::GccCompileConfig {
+                kind: self.kind(),
+                rewrite_includes_only: rewrite_includes_only,
+                language_to_arg: language_to_clang_arg,
+            },
         )
         .map(|(command, dist_command, cacheable)| {
             (CCompileCommand::boxed(command), dist_command, cacheable)
@@ -1659,9 +1668,11 @@ mod test {
             &parsed_args,
             f.tempdir.path(),
             &[],
-            CCompilerKind::Clang,
-            false,
-            language_to_clang_arg,
+            gcc::GccCompileConfig {
+                kind: CCompilerKind::Clang,
+                rewrite_includes_only: false,
+                language_to_arg: language_to_clang_arg,
+            },
         )
         .unwrap();
         // ClangCUDA cannot be dist-compiled
