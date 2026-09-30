@@ -89,11 +89,11 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::FileTooLarge => write!(f, "File too large"),
-            Error::FileNotInCache => write!(f, "File not in cache"),
-            Error::Io(e) => write!(f, "{e}"),
-            Error::InvalidPendingEntry => write!(f, "prepared entry belongs to a different cache"),
-            Error::InvalidCacheKey(path) => write!(f, "invalid cache key: {}", path.display()),
+            Self::FileTooLarge => write!(f, "File too large"),
+            Self::FileNotInCache => write!(f, "File not in cache"),
+            Self::Io(e) => write!(f, "{e}"),
+            Self::InvalidPendingEntry => write!(f, "prepared entry belongs to a different cache"),
+            Self::InvalidCacheKey(path) => write!(f, "invalid cache key: {}", path.display()),
         }
     }
 }
@@ -101,18 +101,18 @@ impl fmt::Display for Error {
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::FileTooLarge => None,
-            Error::FileNotInCache => None,
-            Error::Io(e) => Some(e),
-            Error::InvalidPendingEntry => None,
-            Error::InvalidCacheKey(_) => None,
+            Self::FileTooLarge => None,
+            Self::FileNotInCache => None,
+            Self::Io(e) => Some(e),
+            Self::InvalidPendingEntry => None,
+            Self::InvalidCacheKey(_) => None,
         }
     }
 }
 
 impl From<io::Error> for Error {
-    fn from(e: io::Error) -> Error {
-        Error::Io(e)
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
     }
 }
 
@@ -137,7 +137,7 @@ struct PendingReservation {
 impl PendingReservation {
     fn new(pending_size: Arc<AtomicU64>, size: u64) -> Result<Self> {
         pending_size
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(size)
             })
             .map_err(|_| Error::FileTooLarge)?;
@@ -149,7 +149,7 @@ impl Drop for PendingReservation {
     fn drop(&mut self) {
         let _ = self
             .pending_size
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(self.size))
             });
     }
@@ -180,7 +180,7 @@ impl LruDiskCache {
     where
         PathBuf: From<T>,
     {
-        LruDiskCache {
+        Self {
             lru: LruCache::with_meter(size, FileSize),
             root: PathBuf::from(path),
             pending_size: Arc::new(AtomicU64::new(0)),
@@ -189,6 +189,7 @@ impl LruDiskCache {
     }
 
     /// Return the current size of all the files in the cache.
+    #[must_use]
     pub fn size(&self) -> u64 {
         self.lru
             .size()
@@ -196,20 +197,24 @@ impl LruDiskCache {
     }
 
     /// Return the count of entries in the cache.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.lru.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.lru.len() == 0
     }
 
     /// Return the maximum size of the cache.
-    pub fn capacity(&self) -> u64 {
+    #[must_use]
+    pub const fn capacity(&self) -> u64 {
         self.lru.capacity()
     }
 
     /// Return the path in which the cache is stored.
+    #[must_use]
     pub fn path(&self) -> &Path {
         self.root.as_path()
     }
@@ -243,25 +248,25 @@ impl LruDiskCache {
                 .is_some_and(|name| name.starts_with(TEMPFILE_PREFIX))
             {
                 fs::remove_file(&file).unwrap_or_else(|e| {
-                    error!("Error removing temporary file `{}`: {}", file.display(), e);
+                    error!("Error removing temporary file `{}`: {e}", file.display());
                 });
             } else if !self.can_store(size) {
                 fs::remove_file(file).unwrap_or_else(|e| {
                     error!(
-                        "Error removing file `{}` which is too large for the cache ({} bytes)",
-                        e, size
+                        "Error removing file `{e}` which is too large for the cache ({size} bytes)"
                     );
                 });
             } else {
                 self.add_file(AddFile::AbsPath(file), size)
-                    .unwrap_or_else(|e| error!("Error adding file: {}", e));
+                    .unwrap_or_else(|e| error!("Error adding file: {e}"));
             }
         }
         Ok(self)
     }
 
     /// Returns `true` if the disk cache can store a file of `size` bytes.
-    pub fn can_store(&self, size: u64) -> bool {
+    #[must_use]
+    pub const fn can_store(&self, size: u64) -> bool {
         size <= self.lru.capacity()
     }
 
@@ -330,9 +335,8 @@ impl LruDiskCache {
         self.add_file(AddFile::RelPath(rel_path), size)
             .map_err(|e| {
                 error!(
-                    "Failed to insert file `{}`: {}",
-                    rel_path.to_string_lossy(),
-                    e
+                    "Failed to insert file `{}`: {e}",
+                    rel_path.to_string_lossy()
                 );
                 let cleanup_path = self.rel_to_abs_path(rel_path);
                 if let Err(cleanup_error) = fs::remove_file(&cleanup_path) {
@@ -371,7 +375,7 @@ impl LruDiskCache {
                 warn!("fs::rename failed, falling back to copy!");
                 fs::copy(path.as_ref(), new_path)?;
                 fs::remove_file(path.as_ref()).unwrap_or_else(|e| {
-                    error!("Failed to remove original file in insert_file: {}", e);
+                    error!("Failed to remove original file in insert_file: {e}");
                 });
                 Ok(())
             })
@@ -476,7 +480,7 @@ impl LruDiskCache {
             Some(_) => {
                 let path = self.rel_to_abs_path(key.as_ref());
                 fs::remove_file(&path).map_err(|e| {
-                    error!("Error removing file from cache: `{:?}`: {}", path, e);
+                    error!("Error removing file from cache: `{path:?}`: {e}");
                     Into::into(e)
                 })
             }
@@ -527,8 +531,8 @@ mod tests {
     }
 
     impl TestFixture {
-        pub fn new() -> TestFixture {
-            TestFixture {
+        pub fn new() -> Self {
+            Self {
                 tempdir: tempfile::Builder::new()
                     .prefix("lru-disk-cache-test")
                     .tempdir()
@@ -744,7 +748,7 @@ mod tests {
         let mut c = LruDiskCache::new(f.tmp(), 1).unwrap();
         match c.insert_bytes("a/b/c", &[0; 2]) {
             Err(Error::FileTooLarge) => {}
-            x => panic!("Unexpected result: {:?}", x),
+            x => panic!("Unexpected result: {x:?}"),
         }
     }
 

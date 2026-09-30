@@ -186,18 +186,16 @@ where
         let arg = try_or_cannot_cache!(arg, "argument parse");
 
         match arg.get_data() {
-            Some(TooHardFlag) | Some(TooHard(_)) => {
+            Some(TooHardFlag | TooHard(_)) => {
                 cannot_cache!(arg.flag_str().expect("Can't be Argument::Raw/UnknownFlag",))
             }
-            Some(NotCompilationFlag) | Some(NotCompilation(_)) => {
+            Some(NotCompilationFlag | NotCompilation(_)) => {
                 return CompilerArguments::NotCompilation;
             }
             Some(DoCompilation) => compilation = true,
             Some(Output(p)) => output_arg = Some(p.clone()),
             Some(DepFile(d)) => depfile = Some(d.clone()),
-            Some(PreprocessorArgument(_))
-            | Some(PreprocessorArgumentPath(_))
-            | Some(PassThrough(_)) => {}
+            Some(PreprocessorArgument(_) | PreprocessorArgumentPath(_) | PassThrough(_)) => {}
             None => match arg {
                 Argument::Raw(ref val) => {
                     if input_arg.is_some() {
@@ -212,14 +210,11 @@ where
         let args = match arg.get_data() {
             Some(PassThrough(_)) => &mut common_args,
             Some(DepFile(_)) => continue,
-            Some(PreprocessorArgument(_)) | Some(PreprocessorArgumentPath(_)) => {
-                &mut preprocessor_args
+            Some(PreprocessorArgument(_) | PreprocessorArgumentPath(_)) => &mut preprocessor_args,
+            Some(DoCompilation | Output(_)) => continue,
+            Some(TooHardFlag | TooHard(_) | NotCompilationFlag | NotCompilation(_)) => {
+                unreachable!()
             }
-            Some(DoCompilation) | Some(Output(_)) => continue,
-            Some(TooHardFlag)
-            | Some(TooHard(_))
-            | Some(NotCompilationFlag)
-            | Some(NotCompilation(_)) => unreachable!(),
             None => match arg {
                 Argument::Raw(_) => continue,
                 Argument::UnknownFlag(_) => &mut common_args,
@@ -321,7 +316,7 @@ where
         .current_dir(cwd);
 
     if log_enabled!(Trace) {
-        trace!("preprocess: {:?}", preprocess);
+        trace!("preprocess: {preprocess:?}");
     }
 
     let preprocess = run_input_output(preprocess, None);
@@ -351,7 +346,7 @@ where
             .current_dir(cwd);
 
         if log_enabled!(Trace) {
-            trace!("dep file generation: {:?}", generate_depfile);
+            trace!("dep file generation: {generate_depfile:?}");
         }
         let generate_depfile = run_input_output(generate_depfile, None);
         generate_depfile.and_then(|_| preprocess).await
@@ -429,7 +424,7 @@ mod test {
             ..
         } = match parse_arguments_(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -443,8 +438,8 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
-        assert!(common_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
         assert!(!msvc_show_includes);
     }
 
@@ -461,7 +456,7 @@ mod test {
             ..
         } = match parse_arguments_(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -475,8 +470,8 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
-        assert!(common_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
         assert!(!msvc_show_includes);
     }
 
@@ -493,7 +488,7 @@ mod test {
             ..
         } = match parse_arguments_(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.cc"), input.to_str());
         assert_eq!(Language::Cxx, language);
@@ -507,7 +502,7 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["-fabc", "-mxyz"], common_args);
         assert!(!msvc_show_includes);
     }
@@ -527,7 +522,7 @@ mod test {
             ..
         } = match parse_arguments_(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.cxx"), input.to_str());
         assert_eq!(Language::Cxx, language);
@@ -567,7 +562,7 @@ mod test {
             ..
         } = match parse_arguments_(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -603,7 +598,7 @@ mod test {
             ..
         } = match parse_arguments_(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -618,7 +613,7 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["-fabc"], common_args);
         assert!(!msvc_show_includes);
     }
@@ -637,7 +632,7 @@ mod test {
             ..
         } = match parse_arguments_(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -652,7 +647,7 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["-fabc"], common_args);
         assert!(!msvc_show_includes);
     }

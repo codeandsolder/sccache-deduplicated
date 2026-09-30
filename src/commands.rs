@@ -186,7 +186,7 @@ fn create_error_log() -> Result<File> {
     let f = match OpenOptions::new().create(true).append(true).open(&name) {
         Ok(f) => f,
         Err(_) => {
-            bail!("Cannot open/write log file '{}'", name);
+            bail!("Cannot open/write log file '{name}'");
         }
     };
     Ok(f)
@@ -364,8 +364,7 @@ fn connect_or_start_server(
                     "Timed out waiting for server startup. Maybe the remote service is unreachable?\nRun with SCCACHE_LOG=debug SCCACHE_NO_DAEMON=1 to get more information"
                 ),
                 ServerStartup::Err { reason } => bail!(
-                    "Server startup failed: {}\nRun with SCCACHE_LOG=debug SCCACHE_NO_DAEMON=1 to get more information",
-                    reason
+                    "Server startup failed: {reason}\nRun with SCCACHE_LOG=debug SCCACHE_NO_DAEMON=1 to get more information"
                 ),
             }
             let server = connect_with_retry(addr)?;
@@ -381,7 +380,7 @@ pub fn request_zero_stats(mut conn: ServerConnection) -> Result<()> {
     let response = conn.request(Request::ZeroStats).context(
         "failed to send zero statistics command to server or failed to receive response",
     )?;
-    if let Response::ZeroStats = response {
+    if matches!(response, Response::ZeroStats) {
         Ok(())
     } else {
         bail!("Unexpected server response!")
@@ -447,7 +446,7 @@ where
         args: args.iter().map(|a| a.as_ref().to_owned()).collect(),
         env_vars,
     });
-    trace!("request_compile: {:?}", req);
+    trace!("request_compile: {req:?}");
     //TODO: better error mapping?
     let response = conn
         .request(req)
@@ -487,7 +486,7 @@ fn handle_compile_finished(
     ) -> Result<()> {
         // rustc uses the `termcolor` crate which explicitly checks for TERM=="dumb", so
         // match that behavior here.
-        let dumb_term = env::var("TERM").map(|v| v == "dumb").unwrap_or(false);
+        let dumb_term = env::var("TERM").is_ok_and(|v| v == "dumb");
         // If the compiler options explicitly requested color output, or if this output stream
         // is a terminal and the compiler options didn't explicitly request non-color output,
         // then write the compiler output directly.
@@ -519,10 +518,10 @@ fn handle_compile_finished(
     )?;
 
     if let Some(ret) = response.retcode {
-        trace!("compiler exited with status {}", ret);
+        trace!("compiler exited with status {ret}");
         Ok(ret)
     } else if let Some(signal) = response.signal {
-        println!("sccache: Compiler killed by signal {}", signal);
+        println!("sccache: Compiler killed by signal {signal}");
         Ok(-2)
     } else {
         println!("sccache: Missing compiler exit status!");
@@ -618,8 +617,8 @@ where
             // Server disconnected before sending CompileFinished; fall back to local compilation.
         }
         CompileResponse::UnsupportedCompiler(s) => {
-            debug!("Server sent UnsupportedCompiler: {:?}", s);
-            bail!("Compiler not supported: {:?}", s);
+            debug!("Server sent UnsupportedCompiler: {s:?}");
+            bail!("Compiler not supported: {s:?}");
         }
         CompileResponse::UnhandledCompile => {
             debug!("Server sent UnhandledCompile");
@@ -652,7 +651,7 @@ where
         cmd
     };
     if log_enabled!(Trace) {
-        trace!("running command: {:?}", cmd);
+        trace!("running command: {cmd:?}");
     }
 
     let status = runtime.block_on(async move {
@@ -665,7 +664,7 @@ where
 
     Ok(status.code().unwrap_or_else(|| {
         if let Some(sig) = status_signal(status) {
-            println!("sccache: Compile terminated by signal {}", sig);
+            println!("sccache: Compile terminated by signal {sig}");
         }
         // Arbitrary.
         2
@@ -771,7 +770,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
 
     match cmd {
         Command::ShowStats(fmt, advanced) => {
-            trace!("Command::ShowStats({:?})", fmt);
+            trace!("Command::ShowStats({fmt:?})");
             let stats = match connect_to_server(&get_addr()) {
                 Ok(srv) => request_stats(srv).context("failed to get stats from server")?,
                 // If there is no server, spawning a new server would start with zero stats
@@ -801,7 +800,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                 let contents = std::fs::read(path)?;
                 let preprocessor_cache_entry =
                     crate::compiler::PreprocessorCacheEntry::read(&contents)?;
-                println!("{:#?}", preprocessor_cache_entry);
+                println!("{preprocessor_cache_entry:#?}");
                 println!("=========================");
             }
         }
@@ -833,7 +832,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                 }
                 ServerStartup::TimedOut => bail!("Timed out waiting for server startup"),
                 ServerStartup::AddrInUse => bail!("Server startup failed: Address in use"),
-                ServerStartup::Err { reason } => bail!("Server startup failed: {}", reason),
+                ServerStartup::Err { reason } => bail!("Server startup failed: {reason}"),
             }
         }
         Command::StopServer => {
@@ -867,7 +866,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     let cached_config = config::CachedConfig::load()?;
 
                     let parsed_auth_url = Url::parse(auth_url)
-                        .map_err(|_| anyhow!("Failed to parse URL {}", auth_url))?;
+                        .map_err(|_| anyhow!("Failed to parse URL {auth_url}"))?;
                     let token = dist::client_auth::get_token_oauth2_code_grant_pkce(
                         client_id,
                         parsed_auth_url,
@@ -888,7 +887,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     let cached_config = config::CachedConfig::load()?;
 
                     let parsed_auth_url = Url::parse(auth_url)
-                        .map_err(|_| anyhow!("Failed to parse URL {}", auth_url))?;
+                        .map_err(|_| anyhow!("Failed to parse URL {auth_url}"))?;
                     let token =
                         dist::client_auth::get_token_oauth2_implicit(client_id, parsed_auth_url)?;
 
@@ -944,7 +943,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             cwd,
             env_vars,
         } => {
-            trace!("Command::Compile {{ {:?}, {:?}, {:?} }}", exe, cmdline, cwd);
+            trace!("Command::Compile {{ {exe:?}, {cmdline:?}, {cwd:?} }}");
 
             let incr_env_strs = ["CARGO_BUILD_INCREMENTAL", "CARGO_INCREMENTAL"];
             incr_env_strs
@@ -952,8 +951,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                 .for_each(|incr_str| match env::var(incr_str) {
                     Ok(incr_val) if incr_val == "1" => {
                         println!(
-                            "sccache: incremental compilation is prohibited: Unset {} to continue.",
-                            incr_str
+                            "sccache: incremental compilation is prohibited: Unset {incr_str} to continue."
                         );
                         std::process::exit(1);
                     }
@@ -1042,12 +1040,12 @@ mod test {
 
     impl Connection for DisconnectedConnection {
         fn try_clone(&self) -> io::Result<Box<dyn Connection>> {
-            Ok(Box::new(DisconnectedConnection))
+            Ok(Box::new(Self))
         }
     }
 
-    /// A mid-compile server disconnect: the server sends CompileStarted then drops the
-    /// connection before CompileFinished.  handle_compile_response must fall back to
+    /// A mid-compile server disconnect: the server sends `CompileStarted` then drops the
+    /// connection before `CompileFinished`.  `handle_compile_response` must fall back to
     /// local compilation rather than panic.
     #[test]
     fn test_handle_compile_response_disconnect_falls_back_to_local() {

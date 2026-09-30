@@ -83,12 +83,10 @@ mod common {
             );
             if status.is_client_error() {
                 anyhow::bail!(HttpClientError(errmsg));
-            } else {
-                anyhow::bail!(errmsg);
             }
-        } else {
-            Ok(bincode::deserialize(&bytes)?)
+            anyhow::bail!(errmsg);
         }
+        Ok(bincode::deserialize(&bytes)?)
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -177,11 +175,13 @@ mod common {
 pub mod urls {
     use crate::dist::{JobId, ServerId};
 
+    #[must_use]
     pub fn scheduler_alloc_job(scheduler_url: &reqwest::Url) -> reqwest::Url {
         scheduler_url
             .join("/api/v1/scheduler/alloc_job")
             .expect("failed to create alloc job url")
     }
+    #[must_use]
     pub fn scheduler_server_certificate(
         scheduler_url: &reqwest::Url,
         server_id: ServerId,
@@ -193,43 +193,46 @@ pub mod urls {
             ))
             .expect("failed to create server certificate url")
     }
+    #[must_use]
     pub fn scheduler_heartbeat_server(scheduler_url: &reqwest::Url) -> reqwest::Url {
         scheduler_url
             .join("/api/v1/scheduler/heartbeat_server")
             .expect("failed to create heartbeat url")
     }
+    #[must_use]
     pub fn scheduler_job_state(scheduler_url: &reqwest::Url, job_id: JobId) -> reqwest::Url {
         scheduler_url
-            .join(&format!("/api/v1/scheduler/job_state/{}", job_id))
+            .join(&format!("/api/v1/scheduler/job_state/{job_id}"))
             .expect("failed to create job state url")
     }
+    #[must_use]
     pub fn scheduler_status(scheduler_url: &reqwest::Url) -> reqwest::Url {
         scheduler_url
             .join("/api/v1/scheduler/status")
             .expect("failed to create alloc job url")
     }
 
+    #[must_use]
     pub fn server_assign_job(server_id: ServerId, job_id: JobId) -> reqwest::Url {
         let url = format!(
-            "https://{}/api/v1/distserver/assign_job/{}",
-            server_id.addr(),
-            job_id
+            "https://{}/api/v1/distserver/assign_job/{job_id}",
+            server_id.addr()
         );
         reqwest::Url::parse(&url).expect("failed to create assign job url")
     }
+    #[must_use]
     pub fn server_submit_toolchain(server_id: ServerId, job_id: JobId) -> reqwest::Url {
         let url = format!(
-            "https://{}/api/v1/distserver/submit_toolchain/{}",
-            server_id.addr(),
-            job_id
+            "https://{}/api/v1/distserver/submit_toolchain/{job_id}",
+            server_id.addr()
         );
         reqwest::Url::parse(&url).expect("failed to create submit toolchain url")
     }
+    #[must_use]
     pub fn server_run_job(server_id: ServerId, job_id: JobId) -> reqwest::Url {
         let url = format!(
-            "https://{}/api/v1/distserver/run_job/{}",
-            server_id.addr(),
-            job_id
+            "https://{}/api/v1/distserver/run_job/{job_id}",
+            server_id.addr()
         );
         reqwest::Url::parse(&url).expect("failed to create run job url")
     }
@@ -1215,7 +1218,7 @@ mod client {
                                 res.cert_pem,
                             )
                             .context("Failed to update certificate")
-                            .unwrap_or_else(|e| warn!("Failed to update certificate: {:?}", e));
+                            .unwrap_or_else(|e| warn!("Failed to update certificate: {e:?}"));
                         })
                         .await;
 

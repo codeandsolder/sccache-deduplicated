@@ -114,7 +114,7 @@ where
     where
         T: CommandCreatorSync,
     {
-        Box::new(CCompileCommand { cmd }) as Box<dyn CompileCommand<T>>
+        Box::new(Self { cmd }) as Box<dyn CompileCommand<T>>
     }
 }
 
@@ -201,7 +201,7 @@ impl CompileCommandImpl for SingleCompileCommand {
     where
         T: CommandCreatorSync,
     {
-        let SingleCompileCommand {
+        let Self {
             executable,
             arguments,
             env_vars,
@@ -265,28 +265,28 @@ impl Language {
     pub fn from_file_name(file: &Path) -> Option<Self> {
         match file.extension().and_then(|e| e.to_str()) {
             // gcc: https://gcc.gnu.org/onlinedocs/gcc/Overall-Options.html
-            Some("s") => Some(Language::Assembler),
-            Some("S") | Some("sx") => Some(Language::AssemblerToPreprocess),
-            Some("c") => Some(Language::C),
+            Some("s") => Some(Self::Assembler),
+            Some("S" | "sx") => Some(Self::AssemblerToPreprocess),
+            Some("c") => Some(Self::C),
             // Could be C or C++
-            Some("h") => Some(Language::GenericHeader),
-            Some("i") => Some(Language::CPreprocessed),
-            Some("C") | Some("cc") | Some("cp") | Some("cpp") | Some("CPP") | Some("cxx")
-            | Some("c++") => Some(Language::Cxx),
-            Some("ii") => Some(Language::CxxPreprocessed),
-            Some("H") | Some("hh") | Some("hp") | Some("hpp") | Some("HPP") | Some("hxx")
-            | Some("h++") | Some("tcc") => Some(Language::CxxHeader),
-            Some("cppm") | Some("ixx") => Some(Language::CxxModule),
-            Some("m") => Some(Language::ObjectiveC),
-            Some("mi") => Some(Language::ObjectiveCPreprocessed),
-            Some("M") | Some("mm") => Some(Language::ObjectiveCxx),
-            Some("mii") => Some(Language::ObjectiveCxxPreprocessed),
-            Some("cu") => Some(Language::Cuda),
-            Some("ptx") => Some(Language::Ptx),
-            Some("cubin") => Some(Language::Cubin),
+            Some("h") => Some(Self::GenericHeader),
+            Some("i") => Some(Self::CPreprocessed),
+            Some("C" | "cc" | "cp" | "cpp" | "CPP" | "cxx" | "c++") => Some(Self::Cxx),
+            Some("ii") => Some(Self::CxxPreprocessed),
+            Some("H" | "hh" | "hp" | "hpp" | "HPP" | "hxx" | "h++" | "tcc") => {
+                Some(Self::CxxHeader)
+            }
+            Some("cppm" | "ixx") => Some(Self::CxxModule),
+            Some("m") => Some(Self::ObjectiveC),
+            Some("mi") => Some(Self::ObjectiveCPreprocessed),
+            Some("M" | "mm") => Some(Self::ObjectiveCxx),
+            Some("mii") => Some(Self::ObjectiveCxxPreprocessed),
+            Some("cu") => Some(Self::Cuda),
+            Some("ptx") => Some(Self::Ptx),
+            Some("cubin") => Some(Self::Cubin),
             // TODO cy
-            Some("rs") => Some(Language::Rust),
-            Some("hip") => Some(Language::Hip),
+            Some("rs") => Some(Self::Rust),
+            Some("hip") => Some(Self::Hip),
             e => {
                 trace!("Unknown source extension: {}", e.unwrap_or("(None)"));
                 None
@@ -294,102 +294,102 @@ impl Language {
         }
     }
 
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Language::AssemblerToPreprocess => "assemblerToPreprocess",
-            Language::Assembler => "assembler",
-            Language::C => "c",
-            Language::CHeader => "cHeader",
-            Language::CPreprocessed => "cPreprocessed",
-            Language::Cxx => "c++",
-            Language::CxxHeader => "c++Header",
-            Language::CxxPreprocessed => "c++Preprocessed",
-            Language::GenericHeader => "c/c++",
-            Language::ObjectiveC | Language::ObjectiveCHeader => "objc",
-            Language::ObjectiveCPreprocessed => "objcPreprocessed",
-            Language::ObjectiveCxx | Language::ObjectiveCxxHeader => "objc++",
-            Language::ObjectiveCxxPreprocessed => "objc++Preprocessed",
-            Language::Cuda => "cuda",
-            Language::CudaFE => "cuda",
-            Language::Ptx => "ptx",
-            Language::Cubin => "cubin",
-            Language::Rust => "rust",
-            Language::Hip => "hip",
-            Language::CxxModule => "c++-module",
+            Self::AssemblerToPreprocess => "assemblerToPreprocess",
+            Self::Assembler => "assembler",
+            Self::C => "c",
+            Self::CHeader => "cHeader",
+            Self::CPreprocessed => "cPreprocessed",
+            Self::Cxx => "c++",
+            Self::CxxHeader => "c++Header",
+            Self::CxxPreprocessed => "c++Preprocessed",
+            Self::GenericHeader => "c/c++",
+            Self::ObjectiveC | Self::ObjectiveCHeader => "objc",
+            Self::ObjectiveCPreprocessed => "objcPreprocessed",
+            Self::ObjectiveCxx | Self::ObjectiveCxxHeader => "objc++",
+            Self::ObjectiveCxxPreprocessed => "objc++Preprocessed",
+            Self::Cuda => "cuda",
+            Self::CudaFE => "cuda",
+            Self::Ptx => "ptx",
+            Self::Cubin => "cubin",
+            Self::Rust => "rust",
+            Self::Hip => "hip",
+            Self::CxxModule => "c++-module",
         }
     }
 
-    pub fn needs_c_preprocessing(self) -> bool {
+    pub const fn needs_c_preprocessing(self) -> bool {
         !matches!(
             self,
-            Language::Assembler
-                | Language::CPreprocessed
-                | Language::CxxPreprocessed
-                | Language::ObjectiveCPreprocessed
-                | Language::ObjectiveCxxPreprocessed
-                | Language::Rust
+            Self::Assembler
+                | Self::CPreprocessed
+                | Self::CxxPreprocessed
+                | Self::ObjectiveCPreprocessed
+                | Self::ObjectiveCxxPreprocessed
+                | Self::Rust
         )
     }
 
-    pub fn is_c_like_header(self) -> bool {
+    pub const fn is_c_like_header(self) -> bool {
         matches!(
             self,
-            Language::CHeader
-                | Language::CxxHeader
-                | Language::ObjectiveCHeader
-                | Language::ObjectiveCxxHeader
-                | Language::GenericHeader
+            Self::CHeader
+                | Self::CxxHeader
+                | Self::ObjectiveCHeader
+                | Self::ObjectiveCxxHeader
+                | Self::GenericHeader
         )
     }
 
-    pub fn to_c_preprocessed_language(self) -> Option<Language> {
+    pub const fn to_c_preprocessed_language(self) -> Option<Self> {
         match self {
-            Language::AssemblerToPreprocess => Some(Language::Assembler),
-            Language::C => Some(Language::CPreprocessed),
-            Language::Cxx => Some(Language::CxxPreprocessed),
-            Language::ObjectiveC => Some(Language::ObjectiveCPreprocessed),
-            Language::ObjectiveCxx => Some(Language::ObjectiveCxxPreprocessed),
+            Self::AssemblerToPreprocess => Some(Self::Assembler),
+            Self::C => Some(Self::CPreprocessed),
+            Self::Cxx => Some(Self::CxxPreprocessed),
+            Self::ObjectiveC => Some(Self::ObjectiveCPreprocessed),
+            Self::ObjectiveCxx => Some(Self::ObjectiveCxxPreprocessed),
             _ => None,
         }
     }
 
     /// Common implementation for GCC and Clang language argument mapping
-    fn to_compiler_arg(self, cuda_arg: &'static str) -> Option<&'static str> {
+    const fn to_compiler_arg(self, cuda_arg: &'static str) -> Option<&'static str> {
         match self {
-            Language::AssemblerToPreprocess => Some("assembler-with-cpp"),
-            Language::Assembler => Some("assembler"),
-            Language::C => Some("c"),
-            Language::CHeader => Some("c-header"),
-            Language::CPreprocessed => Some("cpp-output"),
-            Language::Cxx => Some("c++"),
-            Language::CxxHeader => Some("c++-header"),
-            Language::CxxPreprocessed => Some("c++-cpp-output"),
-            Language::ObjectiveC => Some("objective-c"),
-            Language::ObjectiveCHeader => Some("objective-c-header"),
-            Language::ObjectiveCPreprocessed => Some("objective-c-cpp-output"),
-            Language::ObjectiveCxx => Some("objective-c++"),
-            Language::ObjectiveCxxHeader => Some("objective-c++-header"),
-            Language::ObjectiveCxxPreprocessed => Some("objective-c++-cpp-output"),
-            Language::Cuda => Some(cuda_arg),
-            Language::CudaFE => None,
-            Language::Ptx => None,
-            Language::Cubin => None,
-            Language::Rust => None, // Let the compiler decide
-            Language::Hip => Some("hip"),
-            Language::GenericHeader => None, // Let the compiler decide
-            Language::CxxModule => Some("c++-module"),
+            Self::AssemblerToPreprocess => Some("assembler-with-cpp"),
+            Self::Assembler => Some("assembler"),
+            Self::C => Some("c"),
+            Self::CHeader => Some("c-header"),
+            Self::CPreprocessed => Some("cpp-output"),
+            Self::Cxx => Some("c++"),
+            Self::CxxHeader => Some("c++-header"),
+            Self::CxxPreprocessed => Some("c++-cpp-output"),
+            Self::ObjectiveC => Some("objective-c"),
+            Self::ObjectiveCHeader => Some("objective-c-header"),
+            Self::ObjectiveCPreprocessed => Some("objective-c-cpp-output"),
+            Self::ObjectiveCxx => Some("objective-c++"),
+            Self::ObjectiveCxxHeader => Some("objective-c++-header"),
+            Self::ObjectiveCxxPreprocessed => Some("objective-c++-cpp-output"),
+            Self::Cuda => Some(cuda_arg),
+            Self::CudaFE => None,
+            Self::Ptx => None,
+            Self::Cubin => None,
+            Self::Rust => None, // Let the compiler decide
+            Self::Hip => Some("hip"),
+            Self::GenericHeader => None, // Let the compiler decide
+            Self::CxxModule => Some("c++-module"),
         }
     }
 
     /// Returns the GCC-specific language argument for the `-x` flag
-    /// https://gcc.gnu.org/onlinedocs/gcc/Overall-Options.html
-    pub fn to_gcc_arg(self) -> Option<&'static str> {
+    /// <https://gcc.gnu.org/onlinedocs/gcc/Overall-Options.html>
+    pub const fn to_gcc_arg(self) -> Option<&'static str> {
         self.to_compiler_arg("cu")
     }
 
     /// Returns the Clang-specific language argument for the `-x` flag
-    /// https://github.com/llvm/llvm-project/blob/main/clang/include/clang/Driver/Types.def
-    pub fn to_clang_arg(self) -> Option<&'static str> {
+    /// <https://github.com/llvm/llvm-project/blob/main/clang/include/clang/Driver/Types.def>
+    pub const fn to_clang_arg(self) -> Option<&'static str> {
         self.to_compiler_arg("cuda")
     }
 }
@@ -424,17 +424,17 @@ impl CompilerKind {
     pub fn lang_comp_kind(&self, lang: &Language) -> String {
         let textual_lang = lang.as_str().to_owned();
         match self {
-            CompilerKind::C(CCompilerKind::Clang) => textual_lang + " [clang]",
-            CompilerKind::C(CCompilerKind::Diab) => textual_lang + " [diab]",
-            CompilerKind::C(CCompilerKind::Gcc) => textual_lang + " [gcc]",
-            CompilerKind::C(CCompilerKind::Msvc) => textual_lang + " [msvc]",
-            CompilerKind::C(CCompilerKind::Nvcc) => textual_lang + " [nvcc]",
-            CompilerKind::C(CCompilerKind::CudaFE) => textual_lang + " [cudafe++]",
-            CompilerKind::C(CCompilerKind::Cicc) => textual_lang + " [cicc]",
-            CompilerKind::C(CCompilerKind::Ptxas) => textual_lang + " [ptxas]",
-            CompilerKind::C(CCompilerKind::Nvhpc) => textual_lang + " [nvhpc]",
-            CompilerKind::C(CCompilerKind::TaskingVX) => textual_lang + " [taskingvx]",
-            CompilerKind::Rust => textual_lang,
+            Self::C(CCompilerKind::Clang) => textual_lang + " [clang]",
+            Self::C(CCompilerKind::Diab) => textual_lang + " [diab]",
+            Self::C(CCompilerKind::Gcc) => textual_lang + " [gcc]",
+            Self::C(CCompilerKind::Msvc) => textual_lang + " [msvc]",
+            Self::C(CCompilerKind::Nvcc) => textual_lang + " [nvcc]",
+            Self::C(CCompilerKind::CudaFE) => textual_lang + " [cudafe++]",
+            Self::C(CCompilerKind::Cicc) => textual_lang + " [cicc]",
+            Self::C(CCompilerKind::Ptxas) => textual_lang + " [ptxas]",
+            Self::C(CCompilerKind::Nvhpc) => textual_lang + " [nvhpc]",
+            Self::C(CCompilerKind::TaskingVX) => textual_lang + " [taskingvx]",
+            Self::Rust => textual_lang,
         }
     }
 }
@@ -472,7 +472,7 @@ where
 }
 
 impl<T: CommandCreatorSync> Clone for Box<dyn Compiler<T>> {
-    fn clone(&self) -> Box<dyn Compiler<T>> {
+    fn clone(&self) -> Self {
         self.box_clone()
     }
 }
@@ -498,7 +498,7 @@ where
 }
 
 impl<T: CommandCreatorSync> Clone for Box<dyn CompilerProxy<T>> {
-    fn clone(&self) -> Box<dyn CompilerProxy<T>> {
+    fn clone(&self) -> Self {
         self.box_clone()
     }
 }
@@ -543,7 +543,7 @@ where
         pool: tokio::runtime::Handle,
     ) -> Result<(CompileResult, process::Output)> {
         let out_pretty = self.output_pretty().into_owned();
-        debug!("[{}]: get_cached_or_compile: {:?}", out_pretty, arguments);
+        debug!("[{out_pretty}]: get_cached_or_compile: {arguments:?}");
         let start = Instant::now();
         let may_dist = dist_client.is_some();
         let rewrite_includes_only = match dist_client {
@@ -563,15 +563,14 @@ where
             )
             .await;
         debug!(
-            "[{}]: generate_hash_key took {}",
-            out_pretty,
+            "[{out_pretty}]: generate_hash_key took {}",
             fmt_duration_as_secs(&start.elapsed())
         );
         let (key, compilation, weak_toolchain_key, cache_control) = match result {
             Err(e) => {
                 return match e.downcast::<ProcessError>() {
                     Ok(ProcessError(output)) => {
-                        debug!("[{}]: process error: {:?}", out_pretty, output);
+                        debug!("[{out_pretty}]: process error: {output:?}");
                         Ok((CompileResult::Error, output))
                     }
                     Err(e) => Err(e),
@@ -584,7 +583,7 @@ where
                 cache_control,
             }) => (key, compilation, weak_toolchain_key, cache_control),
         };
-        debug!("[{}]: Hash key: {}", out_pretty, key);
+        debug!("[{out_pretty}]: Hash key: {key}");
         // If `ForceRecache` is enabled, we won't check the cache.
         let start = Instant::now();
         let cache_status = async {
@@ -618,8 +617,7 @@ where
         let lookup = match cache_status.await {
             (Ok(Ok(Cache::Hit(mut entry))), duration) => {
                 debug!(
-                    "[{}]: Cache hit in {}",
-                    out_pretty,
+                    "[{out_pretty}]: Cache hit in {}",
                     fmt_duration_as_secs(&duration)
                 );
                 let output = process::Output {
@@ -654,7 +652,7 @@ where
                     Ok(()) => Ok(CacheLookupResult::Success(hit, output)),
                     Err(e) => {
                         if e.downcast_ref::<DecompressionFailure>().is_some() {
-                            debug!("[{}]: Failed to decompress object", out_pretty);
+                            debug!("[{out_pretty}]: Failed to decompress object");
                             Ok(CacheLookupResult::Miss(MissType::CacheReadError))
                         } else {
                             Err(e)
@@ -664,41 +662,35 @@ where
             }
             (Ok(Ok(Cache::Miss)), duration) => {
                 debug!(
-                    "[{}]: Cache miss in {}",
-                    out_pretty,
+                    "[{out_pretty}]: Cache miss in {}",
                     fmt_duration_as_secs(&duration)
                 );
                 Ok(CacheLookupResult::Miss(MissType::Normal))
             }
             (Ok(Ok(Cache::None)), duration) => {
                 debug!(
-                    "[{}]: Cache none in {}",
-                    out_pretty,
+                    "[{out_pretty}]: Cache none in {}",
                     fmt_duration_as_secs(&duration)
                 );
                 Ok(CacheLookupResult::Miss(MissType::ForcedNoCache))
             }
             (Ok(Ok(Cache::Recache)), duration) => {
                 debug!(
-                    "[{}]: Cache recache in {}",
-                    out_pretty,
+                    "[{out_pretty}]: Cache recache in {}",
                     fmt_duration_as_secs(&duration)
                 );
                 Ok(CacheLookupResult::Miss(MissType::ForcedRecache))
             }
             (Ok(Err(err)), duration) => {
                 error!(
-                    "[{}]: Cache read error: {:?} in {}",
-                    out_pretty,
-                    err,
+                    "[{out_pretty}]: Cache read error: {err:?} in {}",
                     fmt_duration_as_secs(&duration)
                 );
                 Ok(CacheLookupResult::Miss(MissType::CacheReadError))
             }
             (Err(_), duration) => {
                 debug!(
-                    "[{}]: Cache timed out {}",
-                    out_pretty,
+                    "[{out_pretty}]: Cache timed out {}",
                     fmt_duration_as_secs(&duration)
                 );
                 Ok(CacheLookupResult::Miss(MissType::TimedOut))
@@ -749,8 +741,7 @@ where
                 let duration_compilation = start.elapsed();
                 if !compiler_result.status.success() {
                     debug!(
-                        "[{}]: Compiled in {}, but failed, not storing in cache",
-                        out_pretty,
+                        "[{out_pretty}]: Compiled in {}, but failed, not storing in cache",
                         fmt_duration_as_secs(&duration_compilation)
                     );
                     return Ok((
@@ -761,8 +752,7 @@ where
                 if miss_type == MissType::ForcedNoCache {
                     // Do not cache
                     debug!(
-                        "[{}]: Compiled in {}, but not caching",
-                        out_pretty,
+                        "[{out_pretty}]: Compiled in {}, but not caching",
                         fmt_duration_as_secs(&duration_compilation)
                     );
                     return Ok((
@@ -773,8 +763,7 @@ where
                 if cacheable != Cacheable::Yes {
                     // Not cacheable
                     debug!(
-                        "[{}]: Compiled in {}, but not cacheable",
-                        out_pretty,
+                        "[{out_pretty}]: Compiled in {}, but not cacheable",
                         fmt_duration_as_secs(&duration_compilation)
                     );
                     return Ok((
@@ -783,8 +772,7 @@ where
                     ));
                 }
                 debug!(
-                    "[{}]: Compiled in {}, storing in cache",
-                    out_pretty,
+                    "[{out_pretty}]: Compiled in {}, storing in cache",
                     fmt_duration_as_secs(&duration_compilation)
                 );
                 let start_create_artifact = Instant::now();
@@ -795,8 +783,7 @@ where
                 entry.put_stdout(&compiler_result.stdout)?;
                 entry.put_stderr(&compiler_result.stderr)?;
                 debug!(
-                    "[{}]: Created cache artifact in {}",
-                    out_pretty,
+                    "[{out_pretty}]: Created cache artifact in {}",
                     fmt_duration_as_secs(&start_create_artifact.elapsed())
                 );
 
@@ -807,7 +794,7 @@ where
                     let start = Instant::now();
                     match storage.put(&key, entry).await {
                         Ok(_) => {
-                            debug!("[{}]: Stored in cache successfully!", out_pretty2);
+                            debug!("[{out_pretty2}]: Stored in cache successfully!");
                             Ok(CacheWriteInfo {
                                 object_file_pretty: out_pretty2,
                                 duration: start.elapsed(),
@@ -823,7 +810,7 @@ where
                 ))
             }
         }
-        .with_context(|| format!("failed to store `{}` to cache", out_pretty))
+        .with_context(|| format!("failed to store `{out_pretty}` to cache"))
     }
 
     /// A descriptive string about the file that we're going to be producing.
@@ -886,18 +873,17 @@ where
         .generate_compile_commands(&mut path_transformer, rewrite_includes_only)
         .context("Failed to generate compile commands")?;
 
-    let dist_client = match dist_compile_cmd.clone().and(dist_client) {
-        Some(dc) => dc,
-        None => {
-            debug!("[{}]: Compiling locally", out_pretty);
-            return compile_cmd
-                .execute(service, &creator)
-                .await
-                .map(move |o| (cacheable, DistType::NoDist, o));
-        }
+    let dist_client = if let Some(dc) = dist_compile_cmd.clone().and(dist_client) {
+        dc
+    } else {
+        debug!("[{out_pretty}]: Compiling locally");
+        return compile_cmd
+            .execute(service, &creator)
+            .await
+            .map(move |o| (cacheable, DistType::NoDist, o));
     };
 
-    debug!("[{}]: Attempting distributed compilation", out_pretty);
+    debug!("[{out_pretty}]: Attempting distributed compilation");
     let out_pretty2 = out_pretty.clone();
 
     let local_executable = compile_cmd.get_executable();
@@ -906,7 +892,7 @@ where
     let do_dist_compile = async move {
         let mut dist_compile_cmd =
             dist_compile_cmd.context("Could not create distributed compile command")?;
-        debug!("[{}]: Creating distributed compile request", out_pretty);
+        debug!("[{out_pretty}]: Creating distributed compile request");
         let dist_output_paths = compilation
             .outputs()
             .map(|output| path_transformer.as_dist_abs(&cwd.join(output.path)))
@@ -915,10 +901,7 @@ where
         let (inputs_packager, toolchain_packager, outputs_rewriter) =
             compilation.into_dist_packagers(path_transformer)?;
 
-        debug!(
-            "[{}]: Identifying dist toolchain for {:?}",
-            out_pretty, local_executable
-        );
+        debug!("[{out_pretty}]: Identifying dist toolchain for {local_executable:?}");
         let (dist_toolchain, maybe_dist_compile_executable) = dist_client
             .put_toolchain(local_executable, weak_toolchain_key, toolchain_packager)
             .await?;
@@ -928,7 +911,7 @@ where
             tc_archive = Some(archive_path);
         }
 
-        debug!("[{}]: Requesting allocation", out_pretty);
+        debug!("[{out_pretty}]: Requesting allocation");
         let jares = dist_client.do_alloc_job(dist_toolchain.clone()).await?;
         let job_alloc = match jares {
             dist::AllocJobResult::Success {
@@ -936,8 +919,8 @@ where
                 need_toolchain: true,
             } => {
                 debug!(
-                    "[{}]: Sending toolchain {} for job {}",
-                    out_pretty, dist_toolchain.archive_id, job_alloc.job_id
+                    "[{out_pretty}]: Sending toolchain {} for job {}",
+                    dist_toolchain.archive_id, job_alloc.job_id
                 );
 
                 match dist_client
@@ -965,7 +948,7 @@ where
         }?;
         let job_id = job_alloc.job_id;
         let server_id = job_alloc.server_id;
-        debug!("[{}]: Running job", out_pretty);
+        debug!("[{out_pretty}]: Running job");
         let ((job_id, server_id), (jres, path_transformer)) = dist_client
             .do_run_job(
                 job_alloc,
@@ -976,15 +959,12 @@ where
             .await
             .map(move |res| ((job_id, server_id), res))
             .with_context(|| {
-                format!(
-                    "could not run distributed compilation job on {:?}",
-                    server_id
-                )
+                format!("could not run distributed compilation job on {server_id:?}")
             })?;
 
         let mut jc = match jres {
             dist::RunJobResult::Complete(jc) => jc,
-            dist::RunJobResult::JobNotFound => bail!("Job {} not found on server", job_id),
+            dist::RunJobResult::JobNotFound => bail!("Job {job_id} not found on server"),
         };
         debug!(
             "fetched {:?}",
@@ -1019,7 +999,7 @@ where
             let local_path = try_or_cleanup!(
                 path_transformer
                     .to_local(&path)
-                    .with_context(|| format!("unable to transform output path {}", path))
+                    .with_context(|| format!("unable to transform output path {path}"))
             );
             output_paths.push(local_path);
             // Do this first so cleanup works correctly.
@@ -1075,20 +1055,17 @@ where
         .or_else(move |e| async move {
             if let Some(HttpClientError(_)) = e.downcast_ref::<HttpClientError>() {
                 Err(e)
-            } else if let Some(lru_disk_cache::Error::FileTooLarge) =
-                e.downcast_ref::<lru_disk_cache::Error>()
+            } else if matches!(e.downcast_ref::<lru_disk_cache::Error>(), Some(lru_disk_cache::Error::FileTooLarge))
             {
                 Err(anyhow!(
-                    "Could not cache dist toolchain for {:?} locally.
-                 Increase `toolchain_cache_size` or decrease the toolchain archive size.",
-                    local_executable2
+                    "Could not cache dist toolchain for {local_executable2:?} locally.
+                 Increase `toolchain_cache_size` or decrease the toolchain archive size."
                 ))
             } else {
                 // `{:#}` prints the error and the causes in a single line.
-                let errmsg = format!("{:#}", e);
+                let errmsg = format!("{e:#}");
                 warn!(
-                    "[{}]: Could not perform distributed compile, falling back to local: {}",
-                    out_pretty2, errmsg
+                    "[{out_pretty2}]: Could not perform distributed compile, falling back to local: {errmsg}"
                 );
 
                 compile_cmd
@@ -1102,7 +1079,7 @@ where
 }
 
 impl<T: CommandCreatorSync> Clone for Box<dyn CompilerHasher<T>> {
-    fn clone(&self) -> Box<dyn CompilerHasher<T>> {
+    fn clone(&self) -> Self {
         self.box_clone()
     }
 }
@@ -1144,7 +1121,7 @@ where
 
 #[cfg(feature = "dist-client")]
 pub trait OutputsRewriter: Send {
-    /// Perform any post-compilation handling of outputs, given a Vec of the dist_path and local_path
+    /// Perform any post-compilation handling of outputs, given a Vec of the `dist_path` and `local_path`
     fn handle_outputs(
         self: Box<Self>,
         path_transformer: &dist::PathTransformer,
@@ -1280,38 +1257,34 @@ pub enum ColorMode {
 impl fmt::Debug for CompileResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            CompileResult::Error => write!(f, "CompileResult::Error"),
-            CompileResult::CacheHit(ref d) => write!(f, "CompileResult::CacheHit({:?})", d),
-            CompileResult::CacheMiss(ref m, ref dt, ref d, _) => {
-                write!(f, "CompileResult::CacheMiss({:?}, {:?}, {:?}, _)", d, m, dt)
+            Self::Error => write!(f, "CompileResult::Error"),
+            Self::CacheHit(ref d) => write!(f, "CompileResult::CacheHit({d:?})"),
+            Self::CacheMiss(ref m, ref dt, ref d, _) => {
+                write!(f, "CompileResult::CacheMiss({d:?}, {m:?}, {dt:?}, _)")
             }
-            CompileResult::NotCached(ref dt, ref d) => {
-                write!(f, "CompileResult::NotCached({:?}, {:?}_", dt, d)
+            Self::NotCached(ref dt, ref d) => {
+                write!(f, "CompileResult::NotCached({dt:?}, {d:?}_")
             }
-            CompileResult::NotCacheable(ref dt, ref d) => {
-                write!(f, "CompileResult::NotCacheable({:?}, {:?}_", dt, d)
+            Self::NotCacheable(ref dt, ref d) => {
+                write!(f, "CompileResult::NotCacheable({dt:?}, {d:?}_")
             }
-            CompileResult::CompileFailed(ref dt, ref d) => {
-                write!(f, "CompileResult::CompileFailed({:?}, {:?})", dt, d)
+            Self::CompileFailed(ref dt, ref d) => {
+                write!(f, "CompileResult::CompileFailed({dt:?}, {d:?})")
             }
         }
     }
 }
 
 /// Can't use derive(PartialEq) because of the `CacheWriteFuture`.
-impl PartialEq<CompileResult> for CompileResult {
-    fn eq(&self, other: &CompileResult) -> bool {
+impl PartialEq<Self> for CompileResult {
+    fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (&CompileResult::Error, &CompileResult::Error) => true,
-            (&CompileResult::CacheHit(_), &CompileResult::CacheHit(_)) => true,
-            (CompileResult::CacheMiss(m, dt, _, _), CompileResult::CacheMiss(n, dt2, _, _)) => {
-                m == n && dt == dt2
-            }
-            (CompileResult::NotCached(dt, _), CompileResult::NotCached(dt2, _)) => dt == dt2,
-            (CompileResult::NotCacheable(dt, _), CompileResult::NotCacheable(dt2, _)) => dt == dt2,
-            (CompileResult::CompileFailed(dt, _), CompileResult::CompileFailed(dt2, _)) => {
-                dt == dt2
-            }
+            (&Self::Error, &Self::Error) => true,
+            (&Self::CacheHit(_), &Self::CacheHit(_)) => true,
+            (Self::CacheMiss(m, dt, _, _), Self::CacheMiss(n, dt2, _, _)) => m == n && dt == dt2,
+            (Self::NotCached(dt, _), Self::NotCached(dt2, _)) => dt == dt2,
+            (Self::NotCacheable(dt, _), Self::NotCacheable(dt2, _)) => dt == dt2,
+            (Self::CompileFailed(dt, _), Self::CompileFailed(dt2, _)) => dt == dt2,
             _ => false,
         }
     }
@@ -1369,7 +1342,7 @@ fn is_rustc_like<P: AsRef<Path>>(p: P) -> bool {
             .file_stem()
             .map(|s| s.to_string_lossy().to_lowercase())
             .as_deref(),
-        Some("rustc") | Some("clippy-driver")
+        Some("rustc" | "clippy-driver")
     )
 }
 
@@ -1590,11 +1563,11 @@ where
                         // take the pathbuf for rustc as resolved by the proxy
                         match proxy.resolve_proxied_executable(creator1, cwd, env).await {
                             Ok((resolved_path, _time)) => {
-                                trace!("Resolved path with rustup proxy {:?}", resolved_path);
+                                trace!("Resolved path with rustup proxy {resolved_path:?}");
                                 Ok((Some(proxy), resolved_path))
                             }
                             Err(e) => {
-                                trace!("Could not resolve compiler with rustup proxy: {}", e);
+                                trace!("Could not resolve compiler with rustup proxy: {e}");
                                 Ok((None, rustc_executable))
                             }
                         }
@@ -1604,26 +1577,26 @@ where
                         Ok((None, rustc_executable))
                     }
                     Err(e) => {
-                        trace!("Did not find rustup due to {}, compiling without proxy", e);
+                        trace!("Did not find rustup due to {e}, compiling without proxy");
                         Ok((None, rustc_executable))
                     }
                 }
             });
 
-            let (proxy, resolved_rustc) = res
-                .await
-                .map(|(proxy, resolved_compiler_executable)| {
+            let (proxy, resolved_rustc) = res.await.map_or_else(
+                |_e| {
+                    trace!("Compiling rust without proxy");
+                    (None, rustc_executable2)
+                },
+                |(proxy, resolved_compiler_executable)| {
                     (
                         proxy
                             .map(Box::new)
                             .map(|x: Box<RustupProxy>| x as Box<dyn CompilerProxy<T>>),
                         resolved_compiler_executable,
                     )
-                })
-                .unwrap_or_else(|_e| {
-                    trace!("Compiling rust without proxy");
-                    (None, rustc_executable2)
-                });
+                },
+            );
 
             debug!("Using rustc at path: {resolved_rustc:?}");
 
@@ -1696,7 +1669,7 @@ where
         .arg("-")
         .arg("-o")
         .arg("-");
-    trace!("assembler_version: {:?}", cmd);
+    trace!("assembler_version: {cmd:?}");
     let output = cmd.spawn().await.ok()?.wait_with_output().await.ok()?;
 
     if !output.status.success() {
@@ -1736,7 +1709,7 @@ where
         .envs(env.iter().map(|s| (&s.0, &s.1)))
         .args(extra_args)
         .arg("-print-prog-name=as");
-    trace!("assembler_path: {:?}", cmd);
+    trace!("assembler_path: {cmd:?}");
     let output = cmd.spawn().await.ok()?.wait_with_output().await.ok()?;
 
     if !output.status.success() {
@@ -1782,14 +1755,14 @@ where
     let contents = match &path {
         Some(path) => Digest::file(path, pool)
             .await
-            .map_err(|e| debug!("Failed to hash assembler {}: {}", path.display(), e))
+            .map_err(|e| debug!("Failed to hash assembler {}: {e}", path.display()))
             .ok(),
         None => None,
     };
     if version.is_none() && contents.is_none() {
         return None;
     }
-    debug!("Found assembler {:?} at {:?}", version, path);
+    debug!("Found assembler {version:?} at {path:?}");
 
     let mut m = Digest::new();
     m.update(version.unwrap_or_default().as_bytes());
@@ -1883,7 +1856,7 @@ compiler_version=__VERSION__
     }
 
     cmd.arg("-E").arg(src);
-    trace!("compiler {:?}", cmd);
+    trace!("compiler {cmd:?}");
     let child = cmd.spawn().await?;
     let output = child
         .wait_with_output()
@@ -1910,7 +1883,7 @@ compiler_version=__VERSION__
             .map(str::to_owned);
         match kind {
             "clang" | "clang++" | "apple-clang" | "apple-clang++" => {
-                debug!("Found {}", kind);
+                debug!("Found {kind}");
                 let assembler_digest = detect_assembler(
                     &creator,
                     &executable,
@@ -1946,7 +1919,7 @@ compiler_version=__VERSION__
                 .map(|c| Box::new(c) as Box<dyn Compiler<T>>);
             }
             "gcc" | "g++" => {
-                debug!("Found {}", kind);
+                debug!("Found {kind}");
                 let assembler_digest =
                     detect_assembler(&creator, &executable, &[], cwd, &env, &pool).await;
                 return CCompiler::new(
@@ -1963,7 +1936,7 @@ compiler_version=__VERSION__
             }
             "msvc" | "msvc-clang" => {
                 let is_clang = kind == "msvc-clang";
-                debug!("Found MSVC (is clang: {})", is_clang);
+                debug!("Found MSVC (is clang: {is_clang})");
                 let prefix = msvc::detect_showincludes_prefix(
                     &creator,
                     executable.as_ref(),
@@ -1972,7 +1945,7 @@ compiler_version=__VERSION__
                     &pool,
                 )
                 .await?;
-                trace!("showIncludes prefix: '{}'", prefix);
+                trace!("showIncludes prefix: '{prefix}'");
 
                 return CCompiler::new(
                     Msvc {
@@ -2002,8 +1975,8 @@ compiler_version=__VERSION__
                 return CCompiler::new(
                     Nvcc {
                         host_compiler,
-                        version,
                         host_compiler_version,
+                        version,
                     },
                     executable,
                     &pool,
@@ -2035,9 +2008,9 @@ compiler_version=__VERSION__
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    debug!("nothing useful in detection output {:?}", stdout);
+    debug!("nothing useful in detection output {stdout:?}");
     debug!("compiler status: {}", output.status);
-    debug!("compiler stderr:\n{}", stderr);
+    debug!("compiler stderr:\n{stderr}");
 
     bail!(stderr.into_owned())
 }
@@ -2116,24 +2089,19 @@ mod test {
             if let Some(processed) = maybe_processed {
                 assert!(
                     !processed.needs_c_preprocessing(),
-                    "{:?} should not need preprocessing - it is a result of {:?} processing",
-                    processed,
-                    lang
+                    "{processed:?} should not need preprocessing - it is a result of {lang:?} processing"
                 );
             }
 
             if !lang.needs_c_preprocessing() {
                 assert!(
                     maybe_processed.is_none(),
-                    "{:?} should not be processed, but it produces the {:?} as a C preprocessing result",
-                    lang,
-                    maybe_processed
+                    "{lang:?} should not be processed, but it produces the {maybe_processed:?} as a C preprocessing result"
                 );
 
                 assert!(
                     !lang.is_c_like_header(),
-                    "{:?} should not be processed, but it is a C-like header and can be used as preprocessor input",
-                    lang
+                    "{lang:?} should not be processed, but it is a C-like header and can be used as preprocessor input"
                 );
             }
         }
@@ -2204,7 +2172,7 @@ mod test {
                 &creator,
                 Ok(MockChild::new(
                     exit_status(0),
-                    format!("compiler_id={}", kind),
+                    format!("compiler_id={kind}"),
                     "",
                 )),
             );
@@ -2213,14 +2181,13 @@ mod test {
                 ("-print-prog-name=as", "as"),
             ] {
                 next_command_calls(&creator, move |args| {
-                    assert!(args.iter().any(|arg| arg == probe), "{:?}", args);
+                    assert!(args.iter().any(|arg| arg == probe), "{args:?}");
                     // Clang answers for its own integrated assembler unless that
                     // one is turned off; gcc has none to turn off.
                     assert_eq!(
                         integrated_as,
                         args.iter().any(|arg| arg == "-fno-integrated-as"),
-                        "{:?}",
-                        args
+                        "{args:?}"
                     );
                     Ok(MockChild::new(exit_status(0), output, ""))
                 });
@@ -2286,7 +2253,7 @@ mod test {
             s = &s[4..];
         }
         let prefix = String::from("blah: ");
-        let stderr = format!("{}{}\r\n", prefix, s);
+        let stderr = format!("{prefix}{s}\r\n");
         // Compiler detection output
         next_command(
             &creator,
@@ -2562,7 +2529,7 @@ LLVM version: 6.0",
         let results = [11, 12]
             .iter()
             .map(|version| -> Result<_> {
-                let output = format!("compiler_id=clang\ncompiler_version=\"{}.0.0\"", version);
+                let output = format!("compiler_id=clang\ncompiler_version=\"{version}.0.0\"");
                 next_command(&creator, Ok(MockChild::new(exit_status(0), output, "")));
                 next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
                 let c = detect_compiler(
@@ -2582,9 +2549,9 @@ LLVM version: 6.0",
                 );
                 let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
                     CompilerArguments::Ok(h) => h,
-                    o => bail!("Bad result from parse_arguments: {:?}", o),
+                    o => bail!("Bad result from parse_arguments: {o:?}"),
                 };
-                Ok(hasher
+                hasher
                     .generate_hash_key(
                         &creator,
                         cwd.to_path_buf(),
@@ -2595,7 +2562,7 @@ LLVM version: 6.0",
                         Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
                         CacheControl::Default,
                     )
-                    .wait()?)
+                    .wait()
             })
             .collect::<Result<Vec<_>>>()?;
         assert_eq!(results.len(), 2);
@@ -2642,7 +2609,7 @@ LLVM version: 6.0",
             );
             let mut hasher = match c.parse_arguments(arguments, ".".as_ref(), &[]) {
                 CompilerArguments::Ok(h) => h,
-                o => bail!("Bad result from parse_arguments: {:?}", o),
+                o => bail!("Bad result from parse_arguments: {o:?}"),
             };
             Ok(hasher
                 .generate_hash_key(
@@ -2738,9 +2705,9 @@ LLVM version: 6.0",
                 );
                 let mut hasher = match c.parse_arguments(argument, ".".as_ref(), &[]) {
                     CompilerArguments::Ok(h) => h,
-                    o => bail!("Bad result from parse_arguments: {:?}", o),
+                    o => bail!("Bad result from parse_arguments: {o:?}"),
                 };
-                Ok(hasher
+                hasher
                     .generate_hash_key(
                         &creator,
                         cwd.to_path_buf(),
@@ -2751,7 +2718,7 @@ LLVM version: 6.0",
                         Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
                         CacheControl::Default,
                     )
-                    .wait()?)
+                    .wait()
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -2798,7 +2765,7 @@ LLVM version: 6.0",
                 .0;
 
                 // Only run the preprocessor on the non-preprocessed file
-                if !file.ends_with("i") {
+                if !file.ends_with('i') {
                     next_command(
                         &creator,
                         Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
@@ -2806,9 +2773,9 @@ LLVM version: 6.0",
                 }
                 let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
                     CompilerArguments::Ok(h) => h,
-                    o => bail!("Bad result from parse_arguments: {:?}", o),
+                    o => bail!("Bad result from parse_arguments: {o:?}"),
                 };
-                Ok(hasher
+                hasher
                     .generate_hash_key(
                         &creator,
                         cwd.to_path_buf(),
@@ -2819,7 +2786,7 @@ LLVM version: 6.0",
                         Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
                         CacheControl::Default,
                     )
-                    .wait()?)
+                    .wait()
             })
             .collect::<Result<Vec<_>>>()?;
         assert_eq!(results.len(), 2);
@@ -2914,7 +2881,7 @@ LLVM version: 6.0",
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
         let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
             CompilerArguments::Ok(h) => h,
-            o => bail!("Bad result from parse_arguments: {:?}", o),
+            o => bail!("Bad result from parse_arguments: {o:?}"),
         };
         let (cached, res) = runtime.block_on(async {
             hasher
@@ -2938,7 +2905,7 @@ LLVM version: 6.0",
                 // wait on cache write future so we don't race with it!
                 f.wait()?;
             }
-            _ => bail!("Unexpected compile result: {:?}", cached),
+            _ => bail!("Unexpected compile result: {cached:?}"),
         }
         assert_eq!(exit_status(0), res.status);
         assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
@@ -3041,7 +3008,7 @@ LLVM version: 6.0",
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
         let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
             CompilerArguments::Ok(h) => h,
-            o => bail!("Bad result from parse_arguments: {:?}", o),
+            o => bail!("Bad result from parse_arguments: {o:?}"),
         };
         let (cached, res) = runtime.block_on(async {
             hasher
@@ -3065,7 +3032,7 @@ LLVM version: 6.0",
                 // wait on cache write future so we don't race with it!
                 f.wait()?;
             }
-            _ => bail!("Unexpected compile result: {:?}", cached),
+            _ => bail!("Unexpected compile result: {cached:?}"),
         }
         assert_eq!(exit_status(0), res.status);
         assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
@@ -3162,7 +3129,7 @@ LLVM version: 6.0",
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
         let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
             CompilerArguments::Ok(h) => h,
-            o => bail!("Bad result from parse_arguments: {:?}", o),
+            o => bail!("Bad result from parse_arguments: {o:?}"),
         };
         // The cache will return an error.
         storage.next_get(Err(anyhow!("Some Error")));
@@ -3184,7 +3151,7 @@ LLVM version: 6.0",
                 // wait on cache write future so we don't race with it!
                 let _ = f.wait();
             }
-            _ => bail!("Unexpected compile result: {:?}", cached),
+            _ => bail!("Unexpected compile result: {cached:?}"),
         }
 
         assert_eq!(exit_status(0), res.status);
@@ -3250,7 +3217,7 @@ LLVM version: 6.0",
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
         let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
             CompilerArguments::Ok(h) => h,
-            o => bail!("Bad result from parse_arguments: {:?}", o),
+            o => bail!("Bad result from parse_arguments: {o:?}"),
         };
         storage.next_get(Ok(Cache::Hit(entry)));
         let (cached, _res) = runtime.block_on(hasher.get_cached_or_compile(
@@ -3268,7 +3235,7 @@ LLVM version: 6.0",
             CompileResult::CacheHit(duration) => {
                 assert!(duration >= storage_delay);
             }
-            _ => bail!("Unexpected compile result: {:?}", cached),
+            _ => bail!("Unexpected compile result: {cached:?}"),
         }
         Ok(())
     }
@@ -3344,7 +3311,7 @@ LLVM version: 6.0",
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
         let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
             CompilerArguments::Ok(h) => h,
-            o => bail!("Bad result from parse_arguments: {:?}", o),
+            o => bail!("Bad result from parse_arguments: {o:?}"),
         };
         let (cached, res) = runtime.block_on(async {
             hasher
@@ -3368,7 +3335,7 @@ LLVM version: 6.0",
                 // wait on cache write future so we don't race with it!
                 f.wait()?;
             }
-            _ => bail!("Unexpected compile result: {:?}", cached),
+            _ => bail!("Unexpected compile result: {cached:?}"),
         }
         assert_eq!(exit_status(0), res.status);
         assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
@@ -3395,7 +3362,7 @@ LLVM version: 6.0",
                 // wait on cache write future so we don't race with it!
                 f.wait()?;
             }
-            _ => bail!("Unexpected compile result: {:?}", cached),
+            _ => bail!("Unexpected compile result: {cached:?}"),
         }
         assert_eq!(exit_status(0), res.status);
         assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
@@ -3467,7 +3434,7 @@ LLVM version: 6.0",
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
         let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
             CompilerArguments::Ok(h) => h,
-            o => bail!("Bad result from parse_arguments: {:?}", o),
+            o => bail!("Bad result from parse_arguments: {o:?}"),
         };
         let (cached, res) = runtime.block_on(async {
             hasher
@@ -3546,7 +3513,7 @@ LLVM version: 6.0",
         // The compiler should be invoked twice, since we're forcing
         // recaching.
         let obj = f.tempdir.path().join("foo.o");
-        for _ in dist_clients.iter() {
+        for _ in &dist_clients {
             // The preprocessor invocation.
             next_command(
                 &creator,
@@ -3569,7 +3536,7 @@ LLVM version: 6.0",
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
         let hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
             CompilerArguments::Ok(h) => h,
-            o => bail!("Bad result from parse_arguments: {:?}", o),
+            o => bail!("Bad result from parse_arguments: {o:?}"),
         };
         // All these dist clients will fail, but should still result in successful compiles
         for dist_client in dist_clients {
@@ -3603,7 +3570,7 @@ LLVM version: 6.0",
                     // wait on cache write future so we don't race with it!
                     f.wait()?;
                 }
-                _ => bail!("Unexpected compile result: {:?}", cached),
+                _ => bail!("Unexpected compile result: {cached:?}"),
             }
             assert_eq!(exit_status(0), res.status);
             assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
@@ -3631,7 +3598,7 @@ mod test_dist {
     pub struct ErrorPutToolchainClient;
     impl ErrorPutToolchainClient {
         pub fn new() -> Arc<dyn dist::Client> {
-            Arc::new(ErrorPutToolchainClient)
+            Arc::new(Self)
         }
     }
     #[async_trait]

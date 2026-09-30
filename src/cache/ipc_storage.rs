@@ -56,6 +56,7 @@ impl IpcStorage {
     /// Return a clone of the underlying connection handle so callers can send
     /// additional RPCs (e.g., `RecordStats`) after the storage is no longer
     /// needed.
+    #[must_use]
     pub fn conn(&self) -> Arc<Mutex<ServerConnection>> {
         Arc::clone(&self.conn)
     }

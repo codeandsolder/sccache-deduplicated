@@ -45,16 +45,16 @@ pub struct Acquired {
 }
 
 impl Client {
-    pub fn new() -> Client {
-        Client::new_num(crate::util::num_cpus())
+    pub fn new() -> Self {
+        Self::new_num(crate::util::num_cpus())
     }
 
-    pub fn new_num(num: usize) -> Client {
+    pub fn new_num(num: usize) -> Self {
         let inner = jobserver::Client::new(num).expect("failed to create jobserver");
-        Client::_new(inner, false)
+        Self::_new(inner, false)
     }
 
-    fn _new(inner: jobserver::Client, inherited: bool) -> Client {
+    fn _new(inner: jobserver::Client, inherited: bool) -> Self {
         let (helper, tx) = if inherited {
             (None, None)
         } else {
@@ -75,7 +75,7 @@ impl Client {
             (Some(Arc::new(helper)), Some(tx))
         };
 
-        Client { inner, helper, tx }
+        Self { helper, tx, inner }
     }
 
     /// Configures this jobserver to be inherited by the specified command

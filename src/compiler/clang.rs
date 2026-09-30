@@ -292,7 +292,7 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
 
 // Maps the `-fprofile-use` argument to the actual path of the
 // .profdata file Clang will try to use.
-pub(crate) fn resolve_profile_use_path(arg: &Path, cwd: &Path) -> PathBuf {
+pub fn resolve_profile_use_path(arg: &Path, cwd: &Path) -> PathBuf {
     // Note that `arg` might be empty (if no argument was given to
     // -fprofile-use), in which case `path` will be `cwd` after
     // the next statement and "./default.profdata" at the end of the
@@ -398,8 +398,8 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
-        assert!(a.common_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(a.common_args, [] as [std::ffi::OsString; 0]);
     }
 
     #[test]
@@ -450,8 +450,8 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
-        assert!(a.common_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(a.common_args, [] as [std::ffi::OsString; 0]);
     }
 
     #[test]
@@ -477,7 +477,7 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["--cuda-gpu-arch=sm_50"], a.common_args);
 
         let b = parses!(
@@ -502,7 +502,7 @@ mod test {
                 }
             )
         );
-        assert!(b.preprocessor_args.is_empty());
+        assert_eq!(b.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(
             ovec!["--cuda-gpu-arch=sm_50", "--no-cuda-include-ptx=sm_50"],
             b.common_args
@@ -524,8 +524,8 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
-        assert!(a.common_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(a.common_args, [] as [std::ffi::OsString; 0]);
     }
 
     #[test]
@@ -551,7 +551,7 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["--offload-arch=gfx900"], a.common_args);
 
         let b = parses!(
@@ -575,7 +575,7 @@ mod test {
                 }
             )
         );
-        assert!(b.preprocessor_args.is_empty());
+        assert_eq!(b.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["--offload-arch=gfx900"], b.common_args);
     }
 
@@ -603,7 +603,7 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(
             ovec!["--offload-arch=gfx900", "--hip-path=/usr"],
             a.common_args
@@ -631,7 +631,7 @@ mod test {
                 }
             )
         );
-        assert!(b.preprocessor_args.is_empty());
+        assert_eq!(b.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(
             ovec![
                 "--offload-arch=gfx900",
@@ -655,7 +655,7 @@ mod test {
             "--hip-path=/usr"
         );
         assert_eq!(Language::Hip, a.language);
-        assert!(a.preprocessor_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(
             ovec!["--offload-arch=gfx900", "--hip-path=/usr"],
             a.common_args
@@ -719,7 +719,7 @@ mod test {
             "-Xclang",
             "/some/overlay.yaml"
         );
-        assert!(a.common_args.is_empty());
+        assert_eq!(a.common_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(
             ovec!["-Xclang", "-ivfsoverlay", "-Xclang", "/some/overlay.yaml"],
             a.preprocessor_args
@@ -754,7 +754,7 @@ mod test {
                 }
             )
         );
-        println!("{:?}", a);
+        println!("{a:?}");
         assert_eq!(
             ovec!["-Xclang", "-include", "-Xclang", "pch.hxx"],
             a.preprocessor_args
@@ -862,7 +862,7 @@ mod test {
             "-Xclang",
             "plugin.so"
         );
-        println!("A {:#?}", a);
+        println!("A {a:#?}");
         assert_eq!(
             ovec!["-Xclang", "-load", "-Xclang", "plugin.so"],
             a.common_args
@@ -1070,7 +1070,7 @@ mod test {
     #[test]
     fn test_parse_fplugin() {
         let a = parses!("-c", "foo.c", "-o", "foo.o", "-fplugin", "plugin.so");
-        println!("A {:#?}", a);
+        println!("A {a:#?}");
         assert_eq!(ovec!["-fplugin", "plugin.so"], a.common_args);
         assert_eq!(
             ovec![std::env::current_dir().unwrap().join("plugin.so")],
@@ -1081,7 +1081,7 @@ mod test {
     #[test]
     fn test_parse_fplugin_concatenated() {
         let a = parses!("-c", "foo.c", "-o", "foo.o", "-fplugin=plugin.so");
-        println!("A {:#?}", a);
+        println!("A {a:#?}");
         assert_eq!(ovec!["-fplugin", "plugin.so"], a.common_args);
         assert_eq!(
             ovec![std::env::current_dir().unwrap().join("plugin.so")],

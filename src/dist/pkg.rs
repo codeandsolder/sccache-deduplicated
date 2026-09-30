@@ -86,8 +86,9 @@ mod toolchain_imp {
     }
 
     impl ToolchainPackageBuilder {
-        pub fn new() -> Self {
-            ToolchainPackageBuilder {
+        #[must_use]
+        pub const fn new() -> Self {
+            Self {
                 dir_set: BTreeMap::new(),
                 file_set: BTreeMap::new(),
                 symlinks: BTreeMap::new(),
@@ -193,7 +194,7 @@ mod toolchain_imp {
                 par::compress::{Compression, ParCompress, ParCompressBuilder},
             };
 
-            let ToolchainPackageBuilder {
+            let Self {
                 dir_set,
                 file_set,
                 symlinks,
@@ -239,6 +240,12 @@ mod toolchain_imp {
             }
 
             Ok(tar_safe_path(simplified))
+        }
+    }
+
+    impl Default for ToolchainPackageBuilder {
+        fn default() -> Self {
+            Self::new()
         }
     }
 
@@ -308,9 +315,9 @@ mod toolchain_imp {
                 _ => bail!("Invalid endianness in elf header"),
             };
             let e_type = if little_endian {
-                ((elf_bytes[0x11] as u16) << 8) | elf_bytes[0x10] as u16
+                (u16::from(elf_bytes[0x11]) << 8) | u16::from(elf_bytes[0x10])
             } else {
-                ((elf_bytes[0x10] as u16) << 8) | elf_bytes[0x11] as u16
+                (u16::from(elf_bytes[0x10]) << 8) | u16::from(elf_bytes[0x11])
             };
             if e_type != 0x02 {
                 bail!("ldd failed on a non-ET_EXEC elf")
@@ -453,10 +460,7 @@ pub fn make_tar_header(src: &Path, dest: &str) -> io::Result<tar::Header> {
         // TODO: if the source file is a symlink, I think this does bad things
         file_header.set_metadata(&metadata);
     } else {
-        warn!(
-            "Couldn't get metadata of file {:?}, falling back to some defaults",
-            src
-        );
+        warn!("Couldn't get metadata of file {src:?}, falling back to some defaults");
         file_header.set_mode(0o644);
         file_header.set_uid(0);
         file_header.set_gid(0);
@@ -508,7 +512,7 @@ impl SimplifyPath<'_> {
         let mut final_path = PathBuf::new();
         for component in path.components() {
             match component {
-                c @ Component::RootDir | c @ Component::Prefix(_) | c @ Component::Normal(_) => {
+                c @ (Component::RootDir | Component::Prefix(_) | Component::Normal(_)) => {
                     final_path.push(c);
                     if self.resolved_symlinks.is_some() && final_path.is_symlink() {
                         let parent = final_path.parent().expect("symlinks have parents");

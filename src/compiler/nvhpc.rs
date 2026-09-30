@@ -104,7 +104,7 @@ impl CCompilerImpl for Nvhpc {
             //need for both we need separate compiler invocations
             let mut dep_cmd = initialize_cmd_and_args();
             let mut transformed_deps = vec![];
-            for item in parsed_args.dependency_args.iter() {
+            for item in &parsed_args.dependency_args {
                 if item == "-MD" {
                     transformed_deps.push(OsString::from("-M"));
                 } else if item == "-MMD" {
@@ -120,7 +120,7 @@ impl CCompilerImpl for Nvhpc {
                 .current_dir(cwd);
 
             if log_enabled!(Trace) {
-                trace!("dep-gen command: {:?}", dep_cmd);
+                trace!("dep-gen command: {dep_cmd:?}");
             }
             dep_cmd
         };
@@ -134,12 +134,14 @@ impl CCompilerImpl for Nvhpc {
             .envs(env_vars.to_vec())
             .current_dir(cwd);
         if log_enabled!(Trace) {
-            trace!("preprocess: {:?}", cmd);
+            trace!("preprocess: {cmd:?}");
         }
 
         //Need to chain the dependency generation and the preprocessor
         //to emulate a `proper` front end
-        if !parsed_args.dependency_args.is_empty() {
+        if parsed_args.dependency_args.is_empty() {
+            run_input_output(cmd, None).await
+        } else {
             let first = run_input_output(dep_before_preprocessor(), None);
             let second = run_input_output(cmd, None);
             // TODO: If we need to chain these to emulate a frontend, shouldn't
@@ -147,8 +149,6 @@ impl CCompilerImpl for Nvhpc {
             // (rather than via which drives these concurrently)
             let (_f, s) = futures::future::try_join(first, second).await?;
             Ok(s)
-        } else {
-            run_input_output(cmd, None).await
         }
     }
 
@@ -256,8 +256,8 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
-        assert!(a.common_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(a.common_args, [] as [std::ffi::OsString; 0]);
     }
 
     #[test]
@@ -275,8 +275,8 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
-        assert!(a.common_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(a.common_args, [] as [std::ffi::OsString; 0]);
     }
 
     #[test]
@@ -321,7 +321,7 @@ mod test {
             ],
             a.preprocessor_args
         );
-        assert!(a.dependency_args.is_empty());
+        assert_eq!(a.dependency_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["-fabc", "-gpu", "ccnative"], a.common_args);
     }
 

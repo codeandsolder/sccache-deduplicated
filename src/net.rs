@@ -35,11 +35,11 @@ pub enum SocketAddr {
 impl fmt::Display for SocketAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SocketAddr::Net(addr) => write!(f, "{}", addr),
+            Self::Net(addr) => write!(f, "{addr}"),
             #[cfg(unix)]
-            SocketAddr::Unix(p) => write!(f, "{}", p.display()),
+            Self::Unix(p) => write!(f, "{}", p.display()),
             #[cfg(any(target_os = "linux", target_os = "android"))]
-            SocketAddr::UnixAbstract(p) => write!(f, "\\x00{}", p.escape_ascii()),
+            Self::UnixAbstract(p) => write!(f, "\\x00{}", p.escape_ascii()),
         }
     }
 }
@@ -48,13 +48,13 @@ impl SocketAddr {
     /// Get a Net address that with IP part set to "127.0.0.1".
     #[inline]
     pub fn with_port(port: u16) -> Self {
-        SocketAddr::Net(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+        Self::Net(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
     }
 
     #[inline]
-    pub fn as_net(&self) -> Option<&std::net::SocketAddr> {
+    pub const fn as_net(&self) -> Option<&std::net::SocketAddr> {
         match self {
-            SocketAddr::Net(addr) => Some(addr),
+            Self::Net(addr) => Some(addr),
             #[cfg(unix)]
             _ => None,
         }
@@ -71,16 +71,16 @@ impl SocketAddr {
             if s.starts_with("\\x00") {
                 // Rust abstract path expects no prepend '\x00'.
                 let data = crate::util::ascii_unescape_default(&s.as_bytes()[4..])?;
-                return Ok(SocketAddr::UnixAbstract(data));
+                return Ok(Self::UnixAbstract(data));
             }
         }
         let path = std::path::PathBuf::from(s);
-        Ok(SocketAddr::Unix(path))
+        Ok(Self::Unix(path))
     }
 
     #[cfg(unix)]
-    pub fn is_unix_path(&self) -> bool {
-        matches!(self, SocketAddr::Unix(_))
+    pub const fn is_unix_path(&self) -> bool {
+        matches!(self, Self::Unix(_))
     }
 
     #[cfg(not(unix))]
@@ -102,12 +102,12 @@ impl Acceptor for tokio::net::TcpListener {
 
     #[inline]
     fn accept(&self) -> impl Future<Output = tokio::io::Result<Self::Socket>> + Send {
-        tokio::net::TcpListener::accept(self).and_then(|(s, _)| futures::future::ok(s))
+        Self::accept(self).and_then(|(s, _)| futures::future::ok(s))
     }
 
     #[inline]
     fn local_addr(&self) -> tokio::io::Result<Option<SocketAddr>> {
-        tokio::net::TcpListener::local_addr(self).map(|a| Some(SocketAddr::Net(a)))
+        Self::local_addr(self).map(|a| Some(SocketAddr::Net(a)))
     }
 }
 
@@ -119,7 +119,7 @@ pub trait Connection: std::io::Read + std::io::Write + Send {
 impl Connection for std::net::TcpStream {
     #[inline]
     fn try_clone(&self) -> std::io::Result<Box<dyn Connection>> {
-        let stream = std::net::TcpStream::try_clone(self)?;
+        let stream = Self::try_clone(self)?;
         Ok(Box::new(stream))
     }
 }
@@ -155,12 +155,12 @@ mod unix_imp {
 
         #[inline]
         fn accept(&self) -> impl Future<Output = tokio::io::Result<Self::Socket>> + Send {
-            tokio::net::UnixListener::accept(self).and_then(|(s, _)| futures::future::ok(s))
+            Self::accept(self).and_then(|(s, _)| futures::future::ok(s))
         }
 
         #[inline]
         fn local_addr(&self) -> tokio::io::Result<Option<SocketAddr>> {
-            let addr = tokio::net::UnixListener::local_addr(self)?;
+            let addr = Self::local_addr(self)?;
             if let Some(p) = addr.as_pathname() {
                 return Ok(Some(SocketAddr::Unix(p.to_path_buf())));
             }
@@ -177,7 +177,7 @@ mod unix_imp {
     impl Connection for std::os::unix::net::UnixStream {
         #[inline]
         fn try_clone(&self) -> std::io::Result<Box<dyn Connection>> {
-            let stream = std::os::unix::net::UnixStream::try_clone(self)?;
+            let stream = Self::try_clone(self)?;
             Ok(Box::new(stream))
         }
     }

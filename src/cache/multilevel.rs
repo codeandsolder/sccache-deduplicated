@@ -63,7 +63,7 @@ macro_rules! inc_stat {
 }
 
 /// Lock-free atomic counters for multi-level cache statistics.
-/// Stored directly in MultiLevelStorage to avoid mutex contention.
+/// Stored directly in `MultiLevelStorage` to avoid mutex contention.
 struct AtomicLevelStats {
     name: String,
     location: String,
@@ -96,7 +96,7 @@ impl AtomicLevelStats {
     /// Create atomic stats for a specific cache level with formatted name
     fn for_level(idx: usize, storage: &Arc<dyn Storage>) -> Self {
         Self::new(
-            format!("L{} ({})", idx, storage.cache_type_name()),
+            format!("L{idx} ({})", storage.cache_type_name()),
             storage.location(),
         )
     }
@@ -208,6 +208,7 @@ fn duration_nanos_u64(duration: Duration) -> u64 {
 
 impl LevelStats {
     /// Calculate hit rate as a percentage
+    #[must_use]
     pub fn hit_rate(&self) -> f64 {
         let total = self.hits + self.misses;
         if total > 0 {
@@ -218,6 +219,7 @@ impl LevelStats {
     }
 
     /// Calculate average hit latency in milliseconds
+    #[must_use]
     pub fn avg_hit_latency_ms(&self) -> f64 {
         if self.hits > 0 {
             self.hit_duration.as_secs_f64() * 1000.0 / self.hits as f64
@@ -227,6 +229,7 @@ impl LevelStats {
     }
 
     /// Calculate average write latency in milliseconds
+    #[must_use]
     pub fn avg_write_latency_ms(&self) -> f64 {
         if self.writes > 0 {
             self.write_duration.as_secs_f64() * 1000.0 / self.writes as f64
@@ -236,9 +239,10 @@ impl LevelStats {
     }
 
     /// Format stats for human-readable display
-    /// Returns a vector of (label, value_with_suffix, suffix_length) tuples
-    /// suffix_length is used for width calculations in formatting
+    /// Returns a vector of (label, `value_with_suffix`, `suffix_length`) tuples
+    /// `suffix_length` is used for width calculations in formatting
     /// Order: hits, misses, rate, writes, failures, backfills, write timing, read timing
+    #[must_use]
     pub fn format_stats(&self) -> Vec<(String, String, usize)> {
         let mut stats = vec![];
 
@@ -306,7 +310,8 @@ impl LevelStats {
 
 impl MultiLevelStats {
     /// Format all stats for human-readable display.
-    /// Returns a vector of (label, value, suffix_type) tuples.
+    /// Returns a vector of (label, value, `suffix_type`) tuples.
+    #[must_use]
     pub fn format_stats(&self) -> Vec<(String, String, usize)> {
         let mut result = vec![];
 
@@ -340,7 +345,7 @@ const SLOW_LEVEL_REPAIR_CONCURRENCY: usize = 16;
 /// - Cache hits trigger automatic async backfill to faster levels
 /// - Writes go to all levels in parallel
 ///
-/// Configure via SCCACHE_MULTILEVEL_CHAIN="disk,redis,s3" environment variable.
+/// Configure via `SCCACHE_MULTILEVEL_CHAIN="disk,redis,s3`" environment variable.
 /// See docs/MultiLevel.md for details.
 pub struct MultiLevelStorage {
     levels: Vec<Arc<dyn Storage>>,
@@ -371,11 +376,13 @@ impl MultiLevelStorage {
     ///
     /// Levels are checked in order (L0, L1, L2, ...) during reads.
     /// All levels receive writes in parallel.
+    #[must_use]
     pub fn new(levels: Vec<Arc<dyn Storage>>) -> Self {
         Self::with_write_error_policy(levels, WriteErrorPolicy::default())
     }
 
     /// Create a new multi-level storage with explicit write error policy.
+    #[must_use]
     pub fn with_write_error_policy(
         levels: Vec<Arc<dyn Storage>>,
         write_error_policy: WriteErrorPolicy,
@@ -383,7 +390,7 @@ impl MultiLevelStorage {
         let atomic_stats = AtomicLevelStats::from_levels(&levels);
         let basedirs = Self::collect_basedirs(&levels);
 
-        MultiLevelStorage {
+        Self {
             levels,
             write_error_policy,
             atomic_stats,
@@ -393,18 +400,19 @@ impl MultiLevelStorage {
     }
 
     /// Get a snapshot of current multi-level cache statistics.
+    #[must_use]
     pub fn stats(&self) -> MultiLevelStats {
         MultiLevelStats(self.atomic_stats.iter().map(|s| s.snapshot()).collect())
     }
 
     /// Create a multi-level storage from configuration.
     ///
-    /// Returns None if no levels are configured (SCCACHE_MULTILEVEL_CHAIN not set).
+    /// Returns None if no levels are configured (`SCCACHE_MULTILEVEL_CHAIN` not set).
     /// Returns an error if levels are specified but can't be built.
     ///
-    /// Each level specified in config.cache_configs.multilevel.chain must have its
-    /// corresponding configuration present (e.g., SCCACHE_DIR for disk,
-    /// SCCACHE_REDIS_ENDPOINT for redis, etc).
+    /// Each level specified in `config.cache_configs.multilevel.chain` must have its
+    /// corresponding configuration present (e.g., `SCCACHE_DIR` for disk,
+    /// `SCCACHE_REDIS_ENDPOINT` for redis, etc).
     pub fn from_config(config: &Config, pool: &tokio::runtime::Handle) -> Result<Option<Self>> {
         let ml_config = match config.cache_configs.multilevel.as_ref() {
             Some(cfg) if !cfg.chain.is_empty() => cfg,
@@ -526,7 +534,7 @@ impl MultiLevelStorage {
                             return Err(anyhow!("Cache level 'cos' requires the 'cos' feature"));
                         }
                         _ => {
-                            return Err(anyhow!("Unknown cache level: '{}'", level_name));
+                            return Err(anyhow!("Unknown cache level: '{level_name}'"));
                         }
                     };
 
@@ -538,14 +546,13 @@ impl MultiLevelStorage {
                             config.skip_cache_check,
                         )
                         .with_context(|| {
-                            format!("Failed to build cache for level '{}'", level_name)
+                            format!("Failed to build cache for level '{level_name}'")
                         })?;
                         storages.push(storage);
-                        trace!("Added cache level: {}", level_name);
+                        trace!("Added cache level: {level_name}");
                     } else {
                         return Err(anyhow!(
-                            "Cache level '{}' specified in SCCACHE_MULTILEVEL_CHAIN but not configured (missing environment variables)",
-                            level_name
+                            "Cache level '{level_name}' specified in SCCACHE_MULTILEVEL_CHAIN but not configured (missing environment variables)"
                         ));
                     }
                 }
@@ -581,7 +588,7 @@ impl MultiLevelStorage {
             storages.len()
         );
 
-        Ok(Some(MultiLevelStorage::with_write_error_policy(
+        Ok(Some(Self::with_write_error_policy(
             storages,
             write_error_policy,
         )))
@@ -619,23 +626,16 @@ impl MultiLevelStorage {
             for (idx, level, stats) in targets {
                 match level.entry_exists(&key).await {
                     Ok(Some(true)) => {
-                        trace!(
-                            "Cache level {} already contains {}, no repair needed",
-                            idx, key
-                        );
+                        trace!("Cache level {idx} already contains {key}, no repair needed");
                     }
                     Ok(Some(false)) => missing.push((idx, level, stats)),
                     Ok(None) => {
                         trace!(
-                            "Cache level {} has no cheap existence probe; skipping repair check",
-                            idx
+                            "Cache level {idx} has no cheap existence probe; skipping repair check"
                         );
                     }
                     Err(error) => {
-                        debug!(
-                            "Failed to probe cache level {} while repairing {}: {}",
-                            idx, key, error
-                        );
+                        debug!("Failed to probe cache level {idx} while repairing {key}: {error}");
                     }
                 }
             }
@@ -648,15 +648,13 @@ impl MultiLevelStorage {
                 Ok(Some(raw)) => raw,
                 Ok(None) => {
                     debug!(
-                        "Faster cache level {} could not provide raw bytes for repair of {}",
-                        hit_idx, key
+                        "Faster cache level {hit_idx} could not provide raw bytes for repair of {key}"
                     );
                     return;
                 }
                 Err(error) => {
                     debug!(
-                        "Failed reading raw bytes from cache level {} for repair of {}: {}",
-                        hit_idx, key, error
+                        "Failed reading raw bytes from cache level {hit_idx} for repair of {key}: {error}"
                     );
                     return;
                 }
@@ -676,15 +674,13 @@ impl MultiLevelStorage {
                             duration.as_nanos() as u64
                         );
                         trace!(
-                            "Repaired slower cache level {} from faster level {} in {:?}",
-                            idx, hit_idx, duration
+                            "Repaired slower cache level {idx} from faster level {hit_idx} in {duration:?}"
                         );
                     }
                     Err(error) => {
                         inc_stat!(Some(stats.as_ref()), write_failures, 1);
                         debug!(
-                            "Failed repairing cache level {} from level {} for {}: {}",
-                            idx, hit_idx, key, error
+                            "Failed repairing cache level {idx} from level {hit_idx} for {key}: {error}"
                         );
                     }
                 }
@@ -710,7 +706,7 @@ impl MultiLevelStorage {
         for (idx, level) in self.levels.iter().enumerate().skip(start_idx) {
             // Check if level is read-only before spawning task
             if matches!(level.check().await, Ok(CacheMode::ReadOnly)) {
-                debug!("Level {} is read-only, skipping write", idx);
+                debug!("Level {idx} is read-only, skipping write");
                 continue;
             }
 
@@ -722,9 +718,9 @@ impl MultiLevelStorage {
             tokio::spawn(async move {
                 let start = Instant::now();
                 match Self::write_entry_from_bytes(&level, &key, &data).await {
-                    Ok(_) => {
+                    Ok(()) => {
                         let duration = start.elapsed();
-                        trace!("Backfilled cache level {} on write in {:?}", idx, duration);
+                        trace!("Backfilled cache level {idx} on write in {duration:?}");
                         inc_stat!(stats_arc.as_deref(), writes, 1);
                         inc_stat!(
                             stats_arc.as_deref(),
@@ -733,7 +729,7 @@ impl MultiLevelStorage {
                         );
                     }
                     Err(e) => {
-                        debug!("Background write to level {} failed: {}", idx, e);
+                        debug!("Background write to level {idx} failed: {e}");
                         inc_stat!(stats_arc.as_deref(), write_failures, 1);
                     }
                 }
@@ -763,7 +759,7 @@ impl Storage for MultiLevelStorage {
             match cache_result {
                 Ok(Cache::Hit(entry)) => {
                     let duration = start.elapsed();
-                    debug!("Cache hit at level {} in {:?}", idx, duration);
+                    debug!("Cache hit at level {idx} in {duration:?}");
 
                     // Update stats
                     inc_stat!(self.atomic_stats.get(idx), hits, 1);
@@ -812,18 +808,16 @@ impl Storage for MultiLevelStorage {
                                         )
                                         .await
                                         {
-                                            Ok(_) => {
+                                            Ok(()) => {
                                                 trace!(
-                                                    "Backfilled cache level {} from level {}",
-                                                    backfill_idx, hit_level
+                                                    "Backfilled cache level {backfill_idx} from level {hit_level}"
                                                 );
                                                 // Update backfill_to stats
                                                 inc_stat!(stats_arc.as_deref(), backfills_to, 1);
                                             }
                                             Err(e) => {
                                                 debug!(
-                                                    "Background backfill from level {} to level {} failed: {}",
-                                                    hit_level, backfill_idx, e
+                                                    "Background backfill from level {hit_level} to level {backfill_idx} failed: {e}"
                                                 );
                                             }
                                         }
@@ -832,8 +826,7 @@ impl Storage for MultiLevelStorage {
                             }
                             None => {
                                 debug!(
-                                    "Cache backend at level {} does not support get_raw(), skipping backfill",
-                                    hit_level
+                                    "Cache backend at level {hit_level} does not support get_raw(), skipping backfill"
                                 );
                             }
                         }
@@ -842,17 +835,14 @@ impl Storage for MultiLevelStorage {
                     return Ok(Cache::Hit(entry));
                 }
                 Ok(Cache::Miss) => {
-                    trace!("Cache miss at level {}, trying next level", idx);
+                    trace!("Cache miss at level {idx}, trying next level");
                     continue;
                 }
                 Ok(other) => {
                     return Ok(other);
                 }
                 Err(e) => {
-                    warn!(
-                        "Error checking cache level {}: {}, trying next level",
-                        idx, e
-                    );
+                    warn!("Error checking cache level {idx}: {e}, trying next level");
                     continue;
                 }
             }
@@ -905,9 +895,9 @@ impl Storage for MultiLevelStorage {
                         // Attempt write and propagate errors
                         let start = Instant::now();
                         match Self::write_entry_from_bytes(l0, &key_str, &data).await {
-                            Ok(_) => {
+                            Ok(()) => {
                                 let duration = start.elapsed();
-                                trace!("Stored in cache level 0 in {:?}", duration);
+                                trace!("Stored in cache level 0 in {duration:?}");
                                 inc_stat!(self.atomic_stats.first(), writes, 1);
                                 inc_stat!(
                                     self.atomic_stats.first(),
@@ -954,11 +944,7 @@ impl Storage for MultiLevelStorage {
                             // Check if read-only before failing
                             if !matches!(level.check().await, Ok(CacheMode::ReadOnly)) {
                                 inc_stat!(stats_arc.as_deref(), write_failures, 1);
-                                return Err(anyhow!(
-                                    "Failed to write to cache level {}: {}",
-                                    idx,
-                                    e
-                                ));
+                                return Err(anyhow!("Failed to write to cache level {idx}: {e}"));
                             }
                         } else {
                             inc_stat!(stats_arc.as_deref(), writes, 1);
@@ -984,7 +970,7 @@ impl Storage for MultiLevelStorage {
                         // Check if read-only before failing
                         if !matches!(level.check().await, Ok(CacheMode::ReadOnly)) {
                             inc_stat!(stats_arc.as_deref(), write_failures, 1);
-                            return Err(anyhow!("Failed to write to cache level {}: {}", idx, e));
+                            return Err(anyhow!("Failed to write to cache level {idx}: {e}"));
                         }
                     } else {
                         inc_stat!(stats_arc.as_deref(), writes, 1);
@@ -1014,25 +1000,24 @@ impl Storage for MultiLevelStorage {
         for (idx, level) in self.levels.iter().enumerate() {
             match level.check().await {
                 Ok(CacheMode::ReadOnly) => {
-                    debug!("Cache level {} is read-only", idx);
+                    debug!("Cache level {idx} is read-only");
                 }
                 Ok(CacheMode::ReadWrite) => {
                     result = CacheMode::ReadWrite;
-                    trace!("Cache level {} is read-write", idx);
+                    trace!("Cache level {idx} is read-write");
                 }
                 Err(error) if idx == 0 => {
-                    warn!("Error checking required cache level 0: {}", error);
+                    warn!("Error checking required cache level 0: {error}");
                     return Err(error);
                 }
                 Err(error) => {
                     warn!(
-                        "Cache level {} is unavailable during startup check: {}; continuing with faster levels",
-                        idx, error
+                        "Cache level {idx} is unavailable during startup check: {error}; continuing with faster levels"
                     );
                 }
             }
         }
-        debug!("Multi-level cache mode: {:?}", result);
+        debug!("Multi-level cache mode: {result:?}");
         Ok(result)
     }
 
@@ -1106,10 +1091,7 @@ impl Storage for MultiLevelStorage {
 
                 tokio::spawn(async move {
                     if let Err(e) = level.put_preprocessor_cache_entry(&key, entry).await {
-                        warn!(
-                            "Failed to write preprocessor cache entry to level {}: {}",
-                            idx, e
-                        );
+                        warn!("Failed to write preprocessor cache entry to level {idx}: {e}");
                     }
                 })
             })

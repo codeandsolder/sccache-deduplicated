@@ -224,9 +224,8 @@ impl CCompilerImpl for Nvcc {
             );
             if log_enabled!(Trace) {
                 trace!(
-                    "[{}]: dependencies command: {:?}",
-                    output_file_name.to_string_lossy(),
-                    dependency_cmd
+                    "[{}]: dependencies command: {dependency_cmd:?}",
+                    output_file_name.to_string_lossy()
                 );
             }
             dependency_cmd
@@ -246,9 +245,8 @@ impl CCompilerImpl for Nvcc {
             });
             if log_enabled!(Trace) {
                 trace!(
-                    "[{}]: preprocessor command: {:?}",
-                    output_file_name.to_string_lossy(),
-                    preprocess_cmd
+                    "[{}]: preprocessor command: {preprocess_cmd:?}",
+                    output_file_name.to_string_lossy()
                 );
             }
             preprocess_cmd
@@ -264,12 +262,12 @@ impl CCompilerImpl for Nvcc {
 
     fn generate_compile_commands<T>(
         &self,
-        path_transformer: &mut dist::PathTransformer,
+        _path_transformer: &mut dist::PathTransformer,
         executable: &Path,
         parsed_args: &ParsedArguments,
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
-        rewrite_includes_only: bool,
+        _rewrite_includes_only: bool,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
         Option<dist::CompileCommand>,
@@ -320,7 +318,7 @@ pub fn generate_compile_commands(
                 x == "-keep" || x == "--keep" || x == "-save-temps" || x == "--save-temps"
             }) {
                 keep = true;
-                unhashed_args.splice(idx..(idx + 1), []);
+                unhashed_args.splice(idx..=idx, []);
                 if keep_dir.is_none() {
                     keep_dir = Some(cwd.to_path_buf());
                 }
@@ -352,7 +350,7 @@ pub fn generate_compile_commands(
                         num_parallel = arg;
                     }
                 }
-                unhashed_args.splice(idx..(idx + 1), []);
+                unhashed_args.splice(idx..=idx, []);
                 continue;
             }
             if let Some(idx) = unhashed_args.iter().position(|x| x == "--threads") {
@@ -408,9 +406,7 @@ pub fn generate_compile_commands(
         // executed), cicc/ptxas `-o` argument should point at the real out path
         // that's potentially relative to `cwd`.
         match parsed_args.compilation_flag.to_str() {
-            Some("-c") | Some("--compile") // compile to object
-            | Some("-dc") | Some("--device-c") // compile to object with -rdc=true
-            | Some("-dw") | Some("--device-w") // compile to object with -rdc=false
+            Some("-c" | "--compile" | "-dc" | "--device-c" | "-dw" | "--device-w") // compile to object with -rdc=false
             => output.into(),
             _ => {
                 if output.is_absolute() {
@@ -519,7 +515,7 @@ impl CompileCommandImpl for NvccCompileCommand {
     where
         T: CommandCreatorSync,
     {
-        let NvccCompileCommand {
+        let Self {
             temp_dir,
             keep_dir,
             num_parallel,
@@ -552,10 +548,10 @@ impl CompileCommandImpl for NvccCompileCommand {
             // override `-keep` and `-keep-dir` in our `nvcc --dryrun` call.
             let maybe_keep_temps = keep_dir.as_ref().and_then(|dst| {
                 fs::create_dir_all(dst)
-                    .and_then(|_| fs::read_dir(temp_dir))
+                    .and_then(|()| fs::read_dir(temp_dir))
                     .and_then(|files| {
                         files
-                            .filter_map(|path| path.ok())
+                            .filter_map(std::result::Result::ok)
                             .filter_map(|path| {
                                 path.file_name()
                                     .to_str()
@@ -569,7 +565,7 @@ impl CompileCommandImpl for NvccCompileCommand {
             maybe_keep_temps
                 .map_or_else(
                     || fs::remove_dir_all(temp_dir).ok(),
-                    |_| fs::remove_dir_all(temp_dir).ok(),
+                    |()| fs::remove_dir_all(temp_dir).ok(),
                 )
                 .unwrap_or(());
         };
@@ -739,7 +735,7 @@ where
 
         if let (env_vars, cacheable, Some(group)) = match exe.file_stem().and_then(|s| s.to_str()) {
             // fatbinary and nvlink are not cacheable
-            Some("fatbinary") | Some("nvlink") => (
+            Some("fatbinary" | "nvlink") => (
                 env_vars.clone(),
                 Cacheable::No,
                 Some(&mut final_assembly_group),
@@ -751,10 +747,9 @@ where
                     // If `nvcc` is invoked with `-c` (or any of its variants), remove the
                     // `--gen_module_id_file` flag. In this mode, we instruct `cudafe++`
                     // to generate this file, so cicc shouldn't generate it again.
-                    Some("-c") | Some("--compile") | Some("-dc") | Some("--device-c")
-                    | Some("-dw") | Some("--device-w") => {
+                    Some("-c" | "--compile" | "-dc" | "--device-c" | "-dw" | "--device-w") => {
                         if let Some(idx) = args.iter().position(|x| x == &gen_module_id_file_flag) {
-                            args.splice(idx..(idx + 1), []);
+                            args.splice(idx..=idx, []);
                         }
                     }
                     _ => {}
@@ -817,21 +812,21 @@ where
                     } else {
                         args.iter()
                             .position(|x| x == "-o")
-                            .and_then(|i| args.get(i + 1).map(|o| o.as_str()))
+                            .and_then(|i| args.get(i + 1).map(std::string::String::as_str))
                     }
                     .map(PathBuf::from)
                     .and_then(|out_path| {
                         out_path
                             .file_name()
                             .and_then(|out_name| out_name.to_str())
-                            .map(|out_name| out_name.to_owned())
+                            .map(std::borrow::ToOwned::to_owned)
                     })
                     .and_then(|out_name| {
                         // If the output file ends with...
                         // * .cpp1.ii - cicc/ptxas input
                         // * .cpp4.ii - cudafe++ input
                         if cicc::is_cicc_input(OsStr::new(&out_name)) {
-                            Some(out_name.clone())
+                            Some(out_name)
                         } else {
                             None
                         }
@@ -889,7 +884,7 @@ where
                     "[{}]: transformed nvcc command: \"{}\"",
                     output_file_name.to_string_lossy(),
                     [
-                        &[format!("cd {} &&", dir.to_string_lossy()).to_string()],
+                        &[format!("cd {} &&", dir.to_string_lossy())],
                         &[exe.to_str().unwrap_or_default().to_string()][..],
                         &args[..]
                     ]
@@ -1034,7 +1029,7 @@ fn select_valid_dryrun_lines(re: &Regex, line: &str) -> Result<String> {
             let (_, [rest]) = caps.extract();
             Ok(rest.to_string())
         }
-        _ => Err(anyhow!("nvcc error: {:?}", line)),
+        _ => Err(anyhow!("nvcc error: {line:?}")),
     }
 }
 
@@ -1048,9 +1043,9 @@ fn fold_env_vars_or_split_into_exe_and_args(
 ) -> Result<Option<(PathBuf, Vec<String>)>> {
     fn envvar_in_shell_format(var: &str) -> String {
         if cfg!(target_os = "windows") {
-            format!("%{}%", var) // %CICC_PATH%
+            format!("%{var}%") // %CICC_PATH%
         } else {
-            format!("${}", var) // $CICC_PATH
+            format!("${var}") // $CICC_PATH
         }
     }
 
@@ -1125,7 +1120,7 @@ fn fold_env_vars_or_split_into_exe_and_args(
 
     let exe = which_in(exe, env_path.into(), cwd)?;
 
-    Ok(Some((exe.clone(), args.to_vec())))
+    Ok(Some((exe, args.to_vec())))
 }
 
 fn remap_generated_filenames(
@@ -1157,61 +1152,58 @@ fn remap_generated_filenames(
             //
             // This ensures stable names are in cudafe++ output and #include directives,
             // eliminating one source of false-positive cache misses.
-            let arg = match maybe_extension {
-                Some(extension) => {
-                    old_to_new
-                        .entry(arg)
-                        .or_insert_with_key(|arg| {
-                            // Initialize or update the number of files with a given extension:
-                            // compute_70.cudafe1.stub.c -> x_0.cudafe1.stub.c
-                            // compute_60.cudafe1.stub.c -> x_1.cudafe1.stub.c
-                            // etc.
-                            let count = ext_counts
-                                .entry(extension.into())
-                                .and_modify(|c| *c += 1)
-                                .or_insert(0)
-                                .to_string();
-                            // Return `/tmp/dir/x_{count}.{ext}` as the new name, i.e. `/tmp/dir/x_0.cudafe1.stub.c`
-                            PathBuf::from(arg)
-                                .parent()
-                                .unwrap_or(Path::new(""))
-                                // Don't use the count as the first character of the file name, because the file name
-                                // may be used as an identifier (via the __FILE__ macro) and identifiers with leading
-                                // digits are not valid in C/C++, i.e. `x_0.cudafe1.cpp` instead of `0.cudafe1.cpp`.
-                                .join(format!("x_{count}{extension}"))
-                                .to_string_lossy()
-                                .to_string()
-                        })
-                        .to_owned()
+            let arg = if let Some(extension) = maybe_extension {
+                old_to_new
+                    .entry(arg)
+                    .or_insert_with_key(|arg| {
+                        // Initialize or update the number of files with a given extension:
+                        // compute_70.cudafe1.stub.c -> x_0.cudafe1.stub.c
+                        // compute_60.cudafe1.stub.c -> x_1.cudafe1.stub.c
+                        // etc.
+                        let count = ext_counts
+                            .entry(extension.into())
+                            .and_modify(|c| *c += 1)
+                            .or_insert(0)
+                            .to_string();
+                        // Return `/tmp/dir/x_{count}.{ext}` as the new name, i.e. `/tmp/dir/x_0.cudafe1.stub.c`
+                        PathBuf::from(arg)
+                            .parent()
+                            .unwrap_or(Path::new(""))
+                            // Don't use the count as the first character of the file name, because the file name
+                            // may be used as an identifier (via the __FILE__ macro) and identifiers with leading
+                            // digits are not valid in C/C++, i.e. `x_0.cudafe1.cpp` instead of `0.cudafe1.cpp`.
+                            .join(format!("x_{count}{extension}"))
+                            .to_string_lossy()
+                            .to_string()
+                    })
+                    .to_owned()
+            } else {
+                // If the argument isn't a file name with one of our extensions,
+                // it may _reference_ files we've renamed. Go through and replace
+                // all old names with their new stable names.
+                //
+                // Sort by string length descending so we don't accidentally replace
+                // `zzz.cudafe1.cpp` with the new name for `zzz.cudafe1.c`.
+                //
+                // For example, if we have these renames:
+                //
+                //   compute_70.cudafe1.cpp -> x_0.cudafe1.cpp
+                //   compute_70.cudafe1.c   -> x_2.cudafe1.c
+                //
+                // `compute_70.cudafe1.cpp` should be replaced with `x_0.cudafe1.cpp`, not `x_2.cudafe1.c`
+                //
+                let mut arg = arg.clone();
+                for (old, new) in old_to_new
+                    .iter()
+                    .sorted_by(|a, b| b.0.len().cmp(&a.0.len()))
+                {
+                    arg = arg.replace(old, new);
                 }
-                None => {
-                    // If the argument isn't a file name with one of our extensions,
-                    // it may _reference_ files we've renamed. Go through and replace
-                    // all old names with their new stable names.
-                    //
-                    // Sort by string length descending so we don't accidentally replace
-                    // `zzz.cudafe1.cpp` with the new name for `zzz.cudafe1.c`.
-                    //
-                    // For example, if we have these renames:
-                    //
-                    //   compute_70.cudafe1.cpp -> x_0.cudafe1.cpp
-                    //   compute_70.cudafe1.c   -> x_2.cudafe1.c
-                    //
-                    // `compute_70.cudafe1.cpp` should be replaced with `x_0.cudafe1.cpp`, not `x_2.cudafe1.c`
-                    //
-                    let mut arg = arg.clone();
-                    for (old, new) in old_to_new
-                        .iter()
-                        .sorted_by(|a, b| b.0.len().cmp(&a.0.len()))
-                    {
-                        arg = arg.replace(old, new);
-                    }
-                    arg
-                }
+                arg
             };
 
             if arg_is_msvc_preprocessor_output {
-                format!("-Fi{}", arg)
+                format!("-Fi{arg}")
             } else {
                 arg
             }
@@ -1245,9 +1237,8 @@ where
 
         if log_enabled!(log::Level::Trace) {
             trace!(
-                "[{}]: run_commands_sequential cwd={:?}, cmd=\"{}\"",
+                "[{}]: run_commands_sequential cwd={cwd:?}, cmd=\"{}\"",
                 output_file_name.to_string_lossy(),
-                cwd,
                 [vec![exe.to_string_lossy().into_owned()], args.clone()]
                     .concat()
                     .join(" ")
@@ -1283,14 +1274,10 @@ where
                         CompilerArguments::NotCompilation => Err(anyhow!("Not compilation")),
                         CompilerArguments::CannotCache(why, extra_info) => Err(extra_info
                             .map_or_else(
-                                || anyhow!("Cannot cache({}): {:?} {:?}", why, resolved_exe, args),
+                                || anyhow!("Cannot cache({why}): {resolved_exe:?} {args:?}"),
                                 |desc| {
                                     anyhow!(
-                                        "Cannot cache({}, {}): {:?} {:?}",
-                                        why,
-                                        desc,
-                                        resolved_exe,
-                                        args
+                                        "Cannot cache({why}, {desc}): {resolved_exe:?} {args:?}"
                                     )
                                 },
                             )),
@@ -1353,9 +1340,8 @@ fn compile_result_to_output(exe: &Path, res: protocol::CompileFinished) -> proce
             stdout: res.stdout,
             stderr: [
                 format!(
-                    "{} terminated (signal: {})",
-                    exe.file_stem().unwrap_or(exe.as_os_str()).to_string_lossy(),
-                    signal
+                    "{} terminated (signal: {signal})",
+                    exe.file_stem().unwrap_or(exe.as_os_str()).to_string_lossy()
                 )
                 .as_bytes(),
                 &res.stderr,
@@ -1758,7 +1744,7 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["-c"], a.common_args);
     }
 
@@ -1777,7 +1763,7 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["-c"], a.common_args);
     }
 
@@ -1796,7 +1782,7 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["-c"], a.common_args);
     }
 
@@ -1814,7 +1800,7 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["-c"], a.common_args);
     }
 
@@ -1833,7 +1819,7 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["-ccbin", "gcc", "-c"], a.common_args);
     }
 
@@ -1852,7 +1838,7 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["-ccbin", "/usr/bin/", "-c"], a.common_args);
     }
 
@@ -1889,7 +1875,7 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(
             ovec!["-t1", "-t=2", "-t3", "--threads", "1", "--threads", "2"],
             a.unhashed_args
@@ -1944,7 +1930,7 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["-c"], a.common_args);
     }
 
@@ -1964,7 +1950,7 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["-dc"], a.common_args);
     }
 
@@ -1984,7 +1970,7 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["-fatbin"], a.common_args);
     }
 
@@ -2004,7 +1990,7 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["-cubin"], a.common_args);
     }
 
@@ -2051,7 +2037,7 @@ mod test {
             ],
             a.preprocessor_args
         );
-        assert!(a.dependency_args.is_empty());
+        assert_eq!(a.dependency_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["-fabc", "-c"], a.common_args);
     }
 
@@ -2111,7 +2097,7 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(
             ovec!["--generate-code", "arch=compute_61,code=sm_61", "-c"],
             a.common_args

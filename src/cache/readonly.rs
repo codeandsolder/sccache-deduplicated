@@ -43,7 +43,7 @@ impl Storage for ReadOnlyStorage {
 
     /// Check the cache capability.
     ///
-    /// The ReadOnlyStorage cache is always read-only.
+    /// The `ReadOnlyStorage` cache is always read-only.
     async fn check(&self) -> Result<CacheMode> {
         Ok(CacheMode::ReadOnly)
     }

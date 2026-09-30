@@ -24,7 +24,7 @@ use url::Url;
 
 use super::http_client::set_user_agent;
 
-fn rw_to_scope(mode: CacheMode) -> &'static str {
+const fn rw_to_scope(mode: CacheMode) -> &'static str {
     match mode {
         CacheMode::ReadOnly => "https://www.googleapis.com/auth/devstorage.read_only",
         CacheMode::ReadWrite => "https://www.googleapis.com/auth/devstorage.read_write",
@@ -78,7 +78,7 @@ impl GCSCache {
     }
 }
 
-/// Fetch token from TaskCluster for GCS authentication
+/// Fetch token from `TaskCluster` for GCS authentication
 ///
 /// This feature is required to run [mozilla's CI](https://searchfox.org/mozilla-central/source/build/mozconfig.cache#67-84):
 ///
@@ -88,7 +88,7 @@ impl GCSCache {
 ///
 /// Reference: [gcpCredentials](https://docs.taskcluster.net/docs/reference/platform/auth/api#gcpCredentials)
 async fn fetch_taskcluster_token(url: &str, scope: &str) -> Result<String> {
-    debug!("gcs: start to load token from: {}", url);
+    debug!("gcs: start to load token from: {url}");
 
     let user_agent = format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     let client = Client::builder().user_agent(user_agent).build()?;
@@ -96,7 +96,7 @@ async fn fetch_taskcluster_token(url: &str, scope: &str) -> Result<String> {
 
     if res.status().is_success() {
         let resp = res.json::<TaskClusterToken>().await?;
-        debug!("gcs: token load succeeded for scope: {}", scope);
+        debug!("gcs: token load succeeded for scope: {scope}");
         Ok(resp.access_token)
     } else {
         let status_code = res.status();

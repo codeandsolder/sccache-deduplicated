@@ -186,7 +186,7 @@ fn test_multi_level_storage_backfill_on_hit() -> Result<()> {
 /// - Complex mock infrastructure (channels, queues, etc.)
 /// - Disk I/O operations
 ///
-/// The mock implements both Storage trait and get_raw() to simulate real backend
+/// The mock implements both Storage trait and `get_raw()` to simulate real backend
 /// behavior where remote caches support raw byte retrieval for efficient backfilling.
 struct InMemoryStorage {
     data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
@@ -221,7 +221,7 @@ impl InMemoryStorage {
 #[async_trait]
 impl Storage for InMemoryStorage {
     async fn get(&self, key: &str) -> Result<Cache> {
-        self.access_log.lock().await.push(format!("get:{}", key));
+        self.access_log.lock().await.push(format!("get:{key}"));
 
         let data = self.data.lock().await;
         match data.get(key) {
@@ -248,7 +248,7 @@ impl Storage for InMemoryStorage {
     }
 
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
-        self.access_log.lock().await.push(format!("put:{}", key));
+        self.access_log.lock().await.push(format!("put:{key}"));
 
         let data = entry.finish()?;
         self.data.lock().await.insert(key.to_string(), data);
@@ -279,18 +279,18 @@ impl Storage for InMemoryStorage {
         Ok(Some(self.data.lock().await.contains_key(key)))
     }
 
-    /// Implement get_raw() to enable backfill testing with remote-like backends.
+    /// Implement `get_raw()` to enable backfill testing with remote-like backends.
     /// This simulates the behavior of real remote backends (S3, Redis, etc.) that
     /// can efficiently return raw serialized cache entries for backfilling.
     async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {
         self.raw_access_log
             .lock()
             .await
-            .push(format!("get_raw:{}", key));
+            .push(format!("get_raw:{key}"));
         Ok(self.data.lock().await.get(key).cloned().map(Bytes::from))
     }
 
-    /// Implement put_raw() to enable backfill writes during testing.
+    /// Implement `put_raw()` to enable backfill writes during testing.
     async fn put_raw(&self, key: &str, data: Bytes) -> Result<Duration> {
         self.data
             .lock()
@@ -673,7 +673,7 @@ fn test_config_validation_invalid_level_name() -> Result<()> {
     // Should error with unknown cache level
     assert!(result.is_err());
     if let Err(e) = result {
-        let err_msg = format!("{}", e);
+        let err_msg = format!("{e}");
         assert!(err_msg.contains("Unknown cache level") || err_msg.contains("invalid_backend"));
     }
 
@@ -757,13 +757,12 @@ fn test_config_level_not_configured() -> Result<()> {
     // Should error with "not configured" or "requires" (when feature disabled)
     assert!(result.is_err());
     if let Err(e) = result {
-        let err_msg = format!("{}", e);
+        let err_msg = format!("{e}");
         assert!(
             err_msg.contains("not configured")
                 || err_msg.contains("missing")
                 || err_msg.contains("requires"),
-            "Expected error about missing config or feature, got: {}",
-            err_msg
+            "Expected error about missing config or feature, got: {err_msg}"
         );
     }
 
@@ -829,8 +828,8 @@ fn test_concurrent_write_and_read() -> Result<()> {
     let cache_l1 = Arc::new(InMemoryStorage::new());
 
     let storage = Arc::new(MultiLevelStorage::new(vec![
-        cache_l0.clone() as Arc<dyn Storage>,
-        cache_l1.clone() as Arc<dyn Storage>,
+        cache_l0 as Arc<dyn Storage>,
+        cache_l1 as Arc<dyn Storage>,
     ]));
 
     runtime.block_on(async {
@@ -933,8 +932,7 @@ fn test_storage_trait_methods() -> Result<()> {
         let location = storage.location();
         assert!(
             location.contains("Multi-level"),
-            "Location should mention Multi-level: {}",
-            location
+            "Location should mention Multi-level: {location}"
         );
 
         // Test current_size() - should return None or Some
@@ -1031,7 +1029,7 @@ fn test_empty_levels_new() -> Result<()> {
 
     // location() should still work
     let location = storage.location();
-    assert!(location.contains("0"));
+    assert!(location.contains('0'));
     Ok(())
 }
 
@@ -1281,15 +1279,15 @@ fn test_sequential_read_order() -> Result<()> {
         assert_eq!(l2_accesses.len(), 1, "L2 should contain setup put only");
         assert_eq!(
             l1_raw_log.lock().await.as_slice(),
-            &[format!("get_raw:{}", key)]
+            &[format!("get_raw:{key}")]
         );
         assert_eq!(
             l2_raw_log.lock().await.as_slice(),
-            &[format!("get_raw:{}", key)]
+            &[format!("get_raw:{key}")]
         );
 
-        assert_eq!(l0_accesses[0], format!("get:{}", key));
-        assert_eq!(l2_accesses[0], format!("put:{}", key)); // from setup
+        assert_eq!(l0_accesses[0], format!("get:{key}"));
+        assert_eq!(l2_accesses[0], format!("put:{key}")); // from setup
         Ok::<(), anyhow::Error>(())
     })?;
     Ok(())
@@ -1343,7 +1341,7 @@ fn test_read_stops_at_first_hit_not_parallel() -> Result<()> {
         );
         assert_eq!(
             l1_raw_log.lock().await.as_slice(),
-            &[format!("get_raw:{}", key)]
+            &[format!("get_raw:{key}")]
         );
         assert_eq!(
             l2_accesses.len(),
@@ -1357,7 +1355,7 @@ fn test_read_stops_at_first_hit_not_parallel() -> Result<()> {
 
 /// Storage mock that always fails on write (for testing error handling).
 ///
-/// Unlike ReadOnlyStorage (which is a valid mode), this returns actual errors
+/// Unlike `ReadOnlyStorage` (which is a valid mode), this returns actual errors
 /// to simulate real failure scenarios like disk full, network errors, etc.
 struct FailingStorage;
 
@@ -1467,8 +1465,7 @@ fn test_put_mode_l0_fails_on_error() -> Result<()> {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("Intentional") || err_msg.contains("put_raw not implemented"),
-            "Expected failure message, got: {}",
-            err_msg
+            "Expected failure message, got: {err_msg}"
         );
         Ok::<(), anyhow::Error>(())
     })?;

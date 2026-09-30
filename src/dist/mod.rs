@@ -335,8 +335,9 @@ mod path_transform {
     }
 
     impl PathTransformer {
+        #[must_use]
         pub fn new() -> Self {
-            PathTransformer {
+            Self {
                 dist_to_local_path: HashMap::new(),
                 root_mappings: Vec::new(),
             }
@@ -366,7 +367,7 @@ mod path_transform {
                         let dist_path = if suffix.is_empty() {
                             dist_root.clone()
                         } else {
-                            format!("{}/{}", dist_root, suffix)
+                            format!("{dist_root}/{suffix}")
                         };
                         self.dist_to_local_path
                             .insert(dist_path.clone(), p.to_owned());
@@ -388,6 +389,7 @@ mod path_transform {
             self.root_mappings.iter().cloned()
         }
 
+        #[must_use]
         pub fn to_local(&self, p: &str) -> Option<PathBuf> {
             if let Some(local) = self.dist_to_local_path.get(p) {
                 return Some(local.clone());
@@ -398,6 +400,12 @@ mod path_transform {
                 }
             }
             Some(PathBuf::from(p))
+        }
+    }
+
+    impl Default for PathTransformer {
+        fn default() -> Self {
+            Self::new()
         }
     }
 
@@ -417,6 +425,7 @@ mod path_transform {
     }
 }
 
+#[must_use]
 pub fn osstrings_to_strings(osstrings: &[OsString]) -> Option<Vec<String>> {
     osstrings
         .iter()
@@ -424,6 +433,7 @@ pub fn osstrings_to_strings(osstrings: &[OsString]) -> Option<Vec<String>> {
         .collect::<Option<_>>()
 }
 
+#[must_use]
 pub fn osstring_tuples_to_strings(
     osstring_tuples: &[(OsString, OsString)],
 ) -> Option<Vec<(String, String)>> {
@@ -433,6 +443,7 @@ pub fn osstring_tuples_to_strings(
         .collect::<Option<_>>()
 }
 
+#[must_use]
 pub fn strings_to_osstrings(strings: &[String]) -> Vec<OsString> {
     strings
         .iter()
@@ -441,6 +452,7 @@ pub fn strings_to_osstrings(strings: &[String]) -> Vec<OsString> {
 }
 
 // TODO: TryFrom
+#[must_use]
 pub fn try_compile_command_to_dist(
     command: compiler::SingleCompileCommand,
 ) -> Option<CompileCommand> {
@@ -493,10 +505,12 @@ impl FromStr for JobId {
 #[serde(deny_unknown_fields)]
 pub struct ServerId(SocketAddr);
 impl ServerId {
-    pub fn new(addr: SocketAddr) -> Self {
-        ServerId(addr)
+    #[must_use]
+    pub const fn new(addr: SocketAddr) -> Self {
+        Self(addr)
     }
-    pub fn addr(&self) -> SocketAddr {
+    #[must_use]
+    pub const fn addr(&self) -> SocketAddr {
         self.0
     }
 }
@@ -510,8 +524,15 @@ impl FromStr for ServerId {
 #[serde(deny_unknown_fields)]
 pub struct ServerNonce(u64);
 impl ServerNonce {
+    #[must_use]
     pub fn new() -> Self {
-        ServerNonce(OsRng.next_u64())
+        Self(OsRng.next_u64())
+    }
+}
+
+impl Default for ServerNonce {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -560,17 +581,18 @@ impl ProcessOutput {
     pub fn try_from(o: process::Output) -> Result<Self> {
         let code = match (o.status.code(), o.status.signal()) {
             (Some(c), _) => c,
-            (None, Some(s)) => bail!("Process status {} terminated with signal {}", o.status, s),
+            (None, Some(s)) => bail!("Process status {} terminated with signal {s}", o.status),
             (None, None) => bail!("Process status {} has no exit code or signal", o.status),
         };
-        Ok(ProcessOutput {
+        Ok(Self {
             code,
             stdout: o.stdout,
             stderr: o.stderr,
         })
     }
     #[cfg(test)]
-    pub fn fake_output(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
+    #[must_use]
+    pub const fn fake_output(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
         Self {
             code,
             stdout,
@@ -595,7 +617,7 @@ fn exit_status(code: i32) -> process::ExitStatus {
 impl From<ProcessOutput> for process::Output {
     fn from(o: ProcessOutput) -> Self {
         // TODO: handle signals, i.e. None code
-        process::Output {
+        Self {
             status: exit_status(o.code),
             stdout: o.stdout,
             stderr: o.stderr,
@@ -614,15 +636,17 @@ impl OutputData {
         let mut compressor = ZlibReadEncoder::new(r, Compression::fast());
         let mut res = vec![];
         io::copy(&mut compressor, &mut res)?;
-        Ok(OutputData(res, compressor.total_in()))
+        Ok(Self(res, compressor.total_in()))
     }
-    pub fn lens(&self) -> OutputDataLens {
+    #[must_use]
+    pub const fn lens(&self) -> OutputDataLens {
         OutputDataLens {
             actual: self.1,
             compressed: self.0.len() as u64,
         }
     }
     #[cfg(feature = "dist-client")]
+    #[must_use]
     pub fn into_reader(self) -> impl Read {
         use flate2::read::ZlibDecoder as ZlibReadDecoder;
         ZlibReadDecoder::new(io::Cursor::new(self.0))

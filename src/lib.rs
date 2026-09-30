@@ -77,9 +77,9 @@ pub fn main() {
     std::process::exit(match commands::run_command(command) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("sccache: error: {}", e);
+            eprintln!("sccache: error: {e}");
             for e in e.chain().skip(1) {
-                eprintln!("sccache: caused by: {}", e);
+                eprintln!("sccache: caused by: {e}");
             }
             2
         }
@@ -96,8 +96,8 @@ fn init_logging() {
         }
 
         match builder.try_init() {
-            Ok(_) => (),
-            Err(e) => panic!("Failed to initialize logging: {:?}", e),
+            Ok(()) => (),
+            Err(e) => panic!("Failed to initialize logging: {e:?}"),
         }
     }
 }

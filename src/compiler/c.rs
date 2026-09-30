@@ -96,7 +96,7 @@ pub struct ParsedArguments {
     pub outputs: HashMap<&'static str, ArtifactDescriptor>,
     /// Commandline arguments for dependency generation.
     pub dependency_args: Vec<OsString>,
-    /// Commandline arguments for the preprocessor (not including common_args).
+    /// Commandline arguments for the preprocessor (not including `common_args`).
     pub preprocessor_args: Vec<OsString>,
     /// Commandline arguments for the preprocessor or the compiler.
     pub common_args: Vec<OsString>,
@@ -116,7 +116,7 @@ pub struct ParsedArguments {
     pub profile_generate: bool,
     /// The color mode.
     pub color_mode: ColorMode,
-    /// arguments are incompatible with rewrite_includes_only
+    /// arguments are incompatible with `rewrite_includes_only`
     pub suppress_rewrite_includes_only: bool,
     /// Arguments are incompatible with preprocessor cache mode
     pub too_hard_for_preprocessor_cache_mode: Option<OsString>,
@@ -127,8 +127,7 @@ impl ParsedArguments {
         self.outputs
             .get("obj")
             .and_then(|o| o.path.file_name())
-            .map(|s| s.to_string_lossy())
-            .unwrap_or(Cow::Borrowed("Unknown filename"))
+            .map_or(Cow::Borrowed("Unknown filename"), |s| s.to_string_lossy())
     }
 }
 
@@ -231,10 +230,10 @@ where
         compiler: I,
         executable: PathBuf,
         pool: &tokio::runtime::Handle,
-    ) -> Result<CCompiler<I>> {
+    ) -> Result<Self> {
         let digest = Digest::file(executable.clone(), pool).await?;
 
-        Ok(CCompiler {
+        Ok(Self {
             executable,
             executable_digest: {
                 if let Some(version) = compiler.version() {
@@ -323,7 +322,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
         match self.compiler.parse_arguments(arguments, cwd, env_vars) {
             CompilerArguments::Ok(mut args) => {
                 // Handle SCCACHE_EXTRAFILES
-                for (k, v) in env_vars.iter() {
+                for (k, v) in env_vars {
                     if k.as_os_str() == OsStr::new("SCCACHE_EXTRAFILES") {
                         args.extra_hash_files.extend(std::env::split_paths(&v));
                     }
@@ -412,10 +411,7 @@ where
             .too_hard_for_preprocessor_cache_mode
             .is_some();
         if let Some(arg) = &self.parsed_args.too_hard_for_preprocessor_cache_mode {
-            debug!(
-                "generate_hash_key: Cannot use preprocessor cache because of {:?}",
-                arg
-            );
+            debug!("generate_hash_key: Cannot use preprocessor cache because of {arg:?}");
         }
 
         let needs_preprocessing = self.parsed_args.language.needs_c_preprocessing();
@@ -428,7 +424,7 @@ where
             let mut use_preprocessor_cache_mode = can_use_preprocessor_cache_mode;
 
             // Allow overrides from the env
-            for (key, val) in env_vars.iter() {
+            for (key, val) in &env_vars {
                 if key == "SCCACHE_DIRECT" {
                     if let Some(val) = val.to_str() {
                         use_preprocessor_cache_mode = match val.to_lowercase().as_str() {
@@ -496,7 +492,7 @@ where
                         .put_preprocessor_cache_entry(preprocessor_key, preprocessor_cache_entry)
                         .await
                     {
-                        debug!("Failed to update preprocessor cache: {}", e);
+                        debug!("Failed to update preprocessor cache: {e}");
                         update_failed = true;
                     }
                 }
@@ -529,9 +525,8 @@ where
                             weak_toolchain_key,
                             cache_control,
                         });
-                    } else {
-                        debug!("Preprocessor cache miss: {preprocessor_key}");
                     }
+                    debug!("Preprocessor cache miss: {preprocessor_key}");
                 }
             }
 
@@ -550,7 +545,7 @@ where
                 .await;
             let out_pretty = self.parsed_args.output_pretty().into_owned();
             let result = result.map_err(|e| {
-                debug!("[{}]: preprocessor failed: {:?}", out_pretty, e);
+                debug!("[{out_pretty}]: preprocessor failed: {e:?}");
                 e
             });
 
@@ -559,7 +554,7 @@ where
 
             let mut preprocessor_result = result.or_else(move |err| {
                 // Errors remove all traces of potential output.
-                debug!("removing files {:?}", outputs);
+                debug!("removing files {outputs:?}");
 
                 let v: std::result::Result<(), std::io::Error> =
                     outputs.values().try_for_each(|output| {
@@ -578,8 +573,7 @@ where
                 match err.downcast::<ProcessError>() {
                     Ok(ProcessError(output)) => {
                         debug!(
-                            "[{}]: preprocessor returned error status {:?}",
-                            out_pretty,
+                            "[{out_pretty}]: preprocessor returned error status {:?}",
                             output.status.code()
                         );
                         // Drop the stdout since it's the preprocessor output,
@@ -660,7 +654,7 @@ where
                 .put_preprocessor_cache_entry(&preprocessor_key, preprocessor_cache_entry)
                 .await
             {
-                debug!("Failed to update preprocessor cache: {}", e);
+                debug!("Failed to update preprocessor cache: {e}");
             }
         }
 
@@ -789,10 +783,10 @@ fn process_preprocessed_file(
             }
         } else if slice
             .strip_prefix(INCBIN_DIRECTIVE)
-            .filter(|slice| {
+            .as_ref()
+            .is_some_and(|slice| {
                 slice.starts_with(b"\"") || slice.starts_with(b" \"") || slice.starts_with(b" \\\"")
             })
-            .is_some()
         {
             // An assembler .inc bin (without the space) statement, which could be
             // part of inline assembly, refers to an external file. If the file
@@ -1090,7 +1084,7 @@ fn remember_include_file(
     let meta = match fs_impl.metadata(&path) {
         Ok(meta) => meta,
         Err(e) => {
-            debug!("Failed to stat include file {}: {}", path.display(), e);
+            debug!("Failed to stat include file {}: {e}", path.display());
             return Ok(false);
         }
     };
@@ -1113,7 +1107,7 @@ fn remember_include_file(
     let file = match fs_impl.open(&path) {
         Ok(file) => file,
         Err(e) => {
-            debug!("Failed to open header file {}: {}", path.display(), e);
+            debug!("Failed to open header file {}: {e}", path.display());
             return Ok(false);
         }
     };
@@ -1122,7 +1116,7 @@ fn remember_include_file(
         match Digest::reader_sync(file) {
             Ok(file_digest) => (file_digest, TimeMacroFinder::new()),
             Err(e) => {
-                debug!("Failed to read header file {}: {}", path.display(), e);
+                debug!("Failed to read header file {}: {e}", path.display());
                 return Ok(false);
             }
         }
@@ -1130,7 +1124,7 @@ fn remember_include_file(
         match Digest::reader_sync_time_macros(file) {
             Ok((file_digest, finder)) => (file_digest, finder),
             Err(e) => {
-                debug!("Failed to read header file {}: {}", path.display(), e);
+                debug!("Failed to read header file {}: {e}", path.display());
                 return Ok(false);
             }
         }
@@ -1214,7 +1208,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
         self: Box<Self>,
         path_transformer: dist::PathTransformer,
     ) -> Result<DistPackagers> {
-        let CCompilation {
+        let Self {
             parsed_args,
             cwd,
             preprocessed_input,
@@ -1270,7 +1264,7 @@ struct CInputsPackager {
 #[cfg(feature = "dist-client")]
 impl pkg::InputsPackager for CInputsPackager {
     fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<dist::PathTransformer> {
-        let CInputsPackager {
+        let Self {
             input_path,
             mut path_transformer,
             preprocessed_input,
@@ -1350,13 +1344,11 @@ impl pkg::ToolchainPackager for CToolchainPackager {
         // files by path.
         let named_file = |kind: &str, name: &str| -> Option<PathBuf> {
             let mut output = process::Command::new(&self.executable)
-                .arg(format!("-print-{}-name={}", kind, name))
+                .arg(format!("-print-{kind}-name={name}"))
                 .output()
                 .ok()?;
             debug!(
-                "find named {} {} output:\n{}\n===\n{}",
-                kind,
-                name,
+                "find named {kind} {name} output:\n{}\n===\n{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr),
             );
@@ -1535,7 +1527,7 @@ impl<'a> HashKeyParams<'a> {
     /// * `language` - Source language being compiled
     /// * `arguments` - Compiler arguments
     /// * `preprocessor_output` - Preprocessed source to hash
-    pub fn new(
+    pub const fn new(
         compiler_digest: &'a str,
         language: Language,
         arguments: &'a [OsString],
@@ -1555,31 +1547,31 @@ impl<'a> HashKeyParams<'a> {
     }
 
     /// Sets additional hash data to include in the cache key.
-    pub fn with_extra_hashes(mut self, extra_hashes: &'a [String]) -> Self {
+    pub const fn with_extra_hashes(mut self, extra_hashes: &'a [String]) -> Self {
         self.extra_hashes = extra_hashes;
         self
     }
 
     /// Sets the environment variables to consider for caching.
-    pub fn with_env_vars(mut self, env_vars: &'a [(OsString, OsString)]) -> Self {
+    pub const fn with_env_vars(mut self, env_vars: &'a [(OsString, OsString)]) -> Self {
         self.env_vars = env_vars;
         self
     }
 
     /// Sets whether this is a C++ compiler (affects clang/clang++ distinction).
-    pub fn with_plusplus(mut self, plusplus: bool) -> Self {
+    pub const fn with_plusplus(mut self, plusplus: bool) -> Self {
         self.plusplus = plusplus;
         self
     }
 
     /// Sets the base directories for path normalization.
-    pub fn with_basedirs(mut self, basedirs: &'a [Vec<u8>]) -> Self {
+    pub const fn with_basedirs(mut self, basedirs: &'a [Vec<u8>]) -> Self {
         self.basedirs = basedirs;
         self
     }
 
     /// Sets the identity of the assembler the compiler will run, if any.
-    pub fn with_assembler_digest(mut self, assembler_digest: Option<&'a str>) -> Self {
+    pub const fn with_assembler_digest(mut self, assembler_digest: Option<&'a str>) -> Self {
         self.assembler_digest = assembler_digest;
         self
     }
@@ -1588,7 +1580,7 @@ impl<'a> HashKeyParams<'a> {
     ///
     /// If `basedirs` are provided, paths in the preprocessor output will be normalized by
     /// stripping the longest matching basedir prefix. This enables cache hits across different
-    /// absolute paths (similar to ccache's CCACHE_BASEDIR).
+    /// absolute paths (similar to ccache's `CCACHE_BASEDIR`).
     ///
     /// # Note
     /// If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
@@ -1597,7 +1589,7 @@ impl<'a> HashKeyParams<'a> {
         m.update(self.compiler_digest.as_bytes());
         // clang and clang++ have different behavior despite being byte-for-byte identical binaries, so
         // we have to incorporate that into the hash as well.
-        m.update(&[self.plusplus as u8]);
+        m.update(&[u8::from(self.plusplus)]);
         m.update(CACHE_VERSION);
         m.update(self.language.as_str().as_bytes());
         hash_arguments(&mut m, self.arguments, self.basedirs);
@@ -1608,7 +1600,7 @@ impl<'a> HashKeyParams<'a> {
             m.update(assembler_digest.as_bytes());
         }
 
-        for (var, val) in self.env_vars.iter() {
+        for (var, val) in self.env_vars {
             if CACHED_ENV_VARS.contains(var.as_os_str()) {
                 var.hash(&mut HashToDigest { digest: &mut m });
                 m.update(&b"="[..]);
@@ -1856,7 +1848,7 @@ mod test {
     #[test]
     fn test_language_from_file_name() {
         fn t(extension: &str, expected: Language) {
-            let path_str = format!("input.{}", extension);
+            let path_str = format!("input.{extension}");
             let path = Path::new(&path_str);
             let actual = Language::from_file_name(path);
             assert_eq!(actual, Some(expected));
@@ -1907,7 +1899,7 @@ mod test {
     #[test]
     fn test_language_from_file_name_none() {
         fn t(extension: &str) {
-            let path_str = format!("input.{}", extension);
+            let path_str = format!("input.{extension}");
             let path = Path::new(&path_str);
             let actual = Language::from_file_name(path);
             let expected = None;

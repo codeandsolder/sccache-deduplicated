@@ -50,8 +50,8 @@ impl DiskCache {
         preprocessor_cache_mode_config: PreprocessorCacheModeConfig,
         rw_mode: CacheMode,
         basedirs: Vec<Vec<u8>>,
-    ) -> DiskCache {
-        DiskCache {
+    ) -> Self {
+        Self {
             lru: Arc::new(Mutex::new(LazyDiskCache::Uninit {
                 root: root.as_ref().to_os_string(),
                 max_size,
@@ -78,7 +78,7 @@ fn make_key_path(key: &str) -> PathBuf {
 #[async_trait]
 impl Storage for DiskCache {
     async fn get(&self, key: &str) -> Result<Cache> {
-        trace!("DiskCache::get({})", key);
+        trace!("DiskCache::get({key})");
         let path = make_key_path(key);
         let lru = self.lru.clone();
         let key = key.to_owned();
@@ -88,11 +88,11 @@ impl Storage for DiskCache {
                 let io = match lru.lock().unwrap().get_or_init()?.get(&path) {
                     Ok(f) => f,
                     Err(LruError::FileNotInCache) => {
-                        trace!("DiskCache::get({}): FileNotInCache", key);
+                        trace!("DiskCache::get({key}): FileNotInCache");
                         return Ok(Cache::Miss);
                     }
                     Err(LruError::Io(e)) => {
-                        trace!("DiskCache::get({}): IoError: {:?}", key, e);
+                        trace!("DiskCache::get({key}): IoError: {e:?}");
                         return Err(e.into());
                     }
                     Err(_) => unreachable!(),
@@ -114,7 +114,7 @@ impl Storage for DiskCache {
     }
 
     async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {
-        trace!("DiskCache::get_raw({})", key);
+        trace!("DiskCache::get_raw({key})");
         let path = make_key_path(key);
         let lru = self.lru.clone();
         let key = key.to_owned();
@@ -125,15 +125,15 @@ impl Storage for DiskCache {
                     Ok(mut io) => {
                         let mut data = Vec::new();
                         io.read_to_end(&mut data)?;
-                        trace!("DiskCache::get_raw({}): Found {} bytes", key, data.len());
+                        trace!("DiskCache::get_raw({key}): Found {} bytes", data.len());
                         Ok(Some(Bytes::from(data)))
                     }
                     Err(LruError::FileNotInCache) => {
-                        trace!("DiskCache::get_raw({}): FileNotInCache", key);
+                        trace!("DiskCache::get_raw({key}): FileNotInCache");
                         Ok(None)
                     }
                     Err(LruError::Io(e)) => {
-                        trace!("DiskCache::get_raw({}): IoError: {:?}", key, e);
+                        trace!("DiskCache::get_raw({key}): IoError: {e:?}");
                         Err(e.into())
                     }
                     Err(_) => unreachable!(),
@@ -163,14 +163,14 @@ impl Storage for DiskCache {
     }
 
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
-        trace!("DiskCache::put({})", key);
+        trace!("DiskCache::put({key})");
         // Delegate to put_raw after serializing the entry
         let data = entry.finish()?;
         self.put_raw(key, data.into()).await
     }
 
     async fn put_raw(&self, key: &str, data: Bytes) -> Result<Duration> {
-        trace!("DiskCache::put_raw({}, {} bytes)", key, data.len());
+        trace!("DiskCache::put_raw({key}, {} bytes)", data.len());
 
         if self.rw_mode == CacheMode::ReadOnly {
             return Err(anyhow!("Cannot write to a read-only cache"));

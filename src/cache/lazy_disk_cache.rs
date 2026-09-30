@@ -23,32 +23,34 @@ pub enum LazyDiskCache {
 impl LazyDiskCache {
     pub fn get_or_init(&mut self) -> Result<&mut LruDiskCache> {
         match self {
-            LazyDiskCache::Uninit { root, max_size } => {
-                *self = LazyDiskCache::Init(LruDiskCache::new(&root, *max_size)?);
+            Self::Uninit { root, max_size } => {
+                *self = Self::Init(LruDiskCache::new(&root, *max_size)?);
                 self.get_or_init()
             }
-            LazyDiskCache::Init(d) => Ok(d),
+            Self::Init(d) => Ok(d),
         }
     }
 
-    pub fn get(&mut self) -> Option<&mut LruDiskCache> {
+    pub const fn get(&mut self) -> Option<&mut LruDiskCache> {
         match self {
-            LazyDiskCache::Uninit { .. } => None,
-            LazyDiskCache::Init(d) => Some(d),
+            Self::Uninit { .. } => None,
+            Self::Init(d) => Some(d),
         }
     }
 
+    #[must_use]
     pub fn capacity(&self) -> u64 {
         match self {
-            LazyDiskCache::Uninit { max_size, .. } => *max_size,
-            LazyDiskCache::Init(d) => d.capacity(),
+            Self::Uninit { max_size, .. } => *max_size,
+            Self::Init(d) => d.capacity(),
         }
     }
 
+    #[must_use]
     pub fn path(&self) -> &Path {
         match self {
-            LazyDiskCache::Uninit { root, .. } => root.as_ref(),
-            LazyDiskCache::Init(d) => d.path(),
+            Self::Uninit { root, .. } => root.as_ref(),
+            Self::Init(d) => d.path(),
         }
     }
 }

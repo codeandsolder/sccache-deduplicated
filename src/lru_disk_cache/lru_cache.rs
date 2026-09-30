@@ -182,8 +182,9 @@ impl<K: Eq + Hash, V> LruCache<K, V> {
     /// use lru_cache::LruCache;
     /// let mut cache: LruCache<i32, &str> = LruCache::new(10);
     /// ```
+    #[must_use]
     pub fn new(capacity: u64) -> Self {
-        LruCache {
+        Self {
             map: LinkedHashMap::new(),
             current_measure: (),
             max_capacity: capacity,
@@ -226,8 +227,8 @@ impl<K: Eq + Hash, V, M: CountableMeter<K, V>> LruCache<K, V, RandomState, M> {
     /// assert_eq!(cache.size(), 4);
     /// assert_eq!(cache.len(), 2);
     /// ```
-    pub fn with_meter(capacity: u64, meter: M) -> LruCache<K, V, RandomState, M> {
-        LruCache {
+    pub fn with_meter(capacity: u64, meter: M) -> Self {
+        Self {
             map: LinkedHashMap::new(),
             current_measure: Default::default(),
             max_capacity: capacity,
@@ -238,8 +239,8 @@ impl<K: Eq + Hash, V, M: CountableMeter<K, V>> LruCache<K, V, RandomState, M> {
 
 impl<K: Eq + Hash, V, S: BuildHasher> LruCache<K, V, S, Count> {
     /// Creates an empty cache that can hold at most `capacity` items with the given hash builder.
-    pub fn with_hasher(capacity: u64, hash_builder: S) -> LruCache<K, V, S, Count> {
-        LruCache {
+    pub fn with_hasher(capacity: u64, hash_builder: S) -> Self {
+        Self {
             map: LinkedHashMap::with_hasher(hash_builder),
             current_measure: (),
             max_capacity: capacity,
@@ -315,7 +316,7 @@ impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> LruCache<K, V, S,
     /// Creates an empty cache that can hold at most `capacity` as measured by `meter` with the
     /// given hash builder.
     pub fn with_meter_and_hasher(capacity: u64, meter: M, hash_builder: S) -> Self {
-        LruCache {
+        Self {
             map: LinkedHashMap::with_hasher(hash_builder),
             current_measure: Default::default(),
             max_capacity: capacity,
@@ -333,7 +334,7 @@ impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> LruCache<K, V, S,
     /// let mut cache: LruCache<i32, &str> = LruCache::new(2);
     /// assert_eq!(cache.capacity(), 2);
     /// ```
-    pub fn capacity(&self) -> u64 {
+    pub const fn capacity(&self) -> u64 {
         self.max_capacity
     }
 
@@ -641,8 +642,8 @@ impl<K, V> ExactSizeIterator for IntoIter<K, V> {
 /// Accessing a cache through the iterator does _not_ affect the cache's LRU state.
 pub struct Iter<'a, K, V>(linked_hash_map::Iter<'a, K, V>);
 
-impl<'a, K, V> Clone for Iter<'a, K, V> {
-    fn clone(&self) -> Iter<'a, K, V> {
+impl<K, V> Clone for Iter<'_, K, V> {
+    fn clone(&self) -> Self {
         Iter(self.0.clone())
     }
 }
@@ -771,15 +772,15 @@ mod tests {
         cache.insert(1, 10);
         cache.insert(2, 20);
         cache.insert(3, 30);
-        assert_eq!(format!("{:?}", cache), "{3: 30, 2: 20, 1: 10}");
+        assert_eq!(format!("{cache:?}"), "{3: 30, 2: 20, 1: 10}");
         cache.insert(2, 22);
-        assert_eq!(format!("{:?}", cache), "{2: 22, 3: 30, 1: 10}");
+        assert_eq!(format!("{cache:?}"), "{2: 22, 3: 30, 1: 10}");
         cache.insert(6, 60);
-        assert_eq!(format!("{:?}", cache), "{6: 60, 2: 22, 3: 30}");
+        assert_eq!(format!("{cache:?}"), "{6: 60, 2: 22, 3: 30}");
         cache.get_mut(&3);
-        assert_eq!(format!("{:?}", cache), "{3: 30, 6: 60, 2: 22}");
+        assert_eq!(format!("{cache:?}"), "{3: 30, 6: 60, 2: 22}");
         cache.set_capacity(2);
-        assert_eq!(format!("{:?}", cache), "{3: 30, 6: 60}");
+        assert_eq!(format!("{cache:?}"), "{3: 30, 6: 60}");
     }
 
     #[test]
@@ -811,7 +812,7 @@ mod tests {
         cache.clear();
         assert!(cache.get_mut(&1).is_none());
         assert!(cache.get_mut(&2).is_none());
-        assert_eq!(format!("{:?}", cache), "{}");
+        assert_eq!(format!("{cache:?}"), "{}");
     }
 
     #[test]

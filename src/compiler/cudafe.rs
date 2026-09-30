@@ -116,7 +116,7 @@ pub fn generate_compile_commands(
     let lang_str = &parsed_args.language.as_str();
     let out_file = match parsed_args.outputs.get("obj") {
         Some(obj) => &obj.path,
-        None => return Err(anyhow!("Missing {:?} file output", lang_str)),
+        None => return Err(anyhow!("Missing {lang_str:?} file output")),
     };
 
     let mut arguments: Vec<OsString> = vec![];
@@ -134,7 +134,7 @@ pub fn generate_compile_commands(
             out_file.file_name().unwrap().to_string_lossy(),
             executable.file_name().unwrap().to_string_lossy(),
             [
-                &[format!("cd {} &&", cwd.to_string_lossy()).to_string()],
+                &[format!("cd {} &&", cwd.to_string_lossy())],
                 &[executable.to_str().unwrap_or_default().to_string()][..],
                 &dist::osstrings_to_strings(&arguments).unwrap_or_default()[..]
             ]

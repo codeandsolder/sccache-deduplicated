@@ -177,7 +177,7 @@ pub struct ParsedArguments {
     /// We don't need to track `profile-generate` since it's users work to make sure
     /// the `profdata` been generated from profraw files.
     ///
-    /// For more information, see https://doc.rust-lang.org/rustc/profile-guided-optimization.html
+    /// For more information, see <https://doc.rust-lang.org/rustc/profile-guided-optimization.html>
     profile: Option<PathBuf>,
     /// If `-Z profile` has been enabled, we will use a GCC-compatible, gcov-based
     /// coverage implementation.
@@ -187,10 +187,10 @@ pub struct ParsedArguments {
     ///
     /// We need to add the profile into our outputs to enable distributed compilation.
     ///
-    /// For more information, see https://doc.rust-lang.org/rustc/instrument-coverage.html
+    /// For more information, see <https://doc.rust-lang.org/rustc/instrument-coverage.html>
     gcno: Option<PathBuf>,
     /// rustc says that emits .rlib for --emit=metadata
-    /// https://github.com/rust-lang/rust/issues/54852
+    /// <https://github.com/rust-lang/rust/issues/54852>
     emit: HashSet<String>,
     /// The value of any `--color` option passed on the commandline.
     color_mode: ColorMode,
@@ -323,7 +323,7 @@ where
         .env_clear()
         .envs(env_vars.to_vec())
         .current_dir(cwd);
-    trace!("[{}]: get dep-info: {:?}", crate_name, cmd);
+    trace!("[{crate_name}]: get dep-info: {cmd:?}");
     // Output of command is in file under dep_file, so we ignore stdout&stderr
     let _dep_info = run_input_output(cmd, None).await?;
     if let Some(copy_to) = dep_info_copy {
@@ -338,14 +338,13 @@ where
     let parsed = pool
         .spawn_blocking(move || {
             parse_dep_file(&dep_file, &cwd)
-                .with_context(|| format!("Failed to parse dep info for {}", name2))
+                .with_context(|| format!("Failed to parse dep info for {name2}"))
         })
         .await?;
 
     parsed.map(move |(files, env_deps)| {
         trace!(
-            "[{}]: got {} source files and {} env-deps from dep-info in {}",
-            crate_name,
+            "[{crate_name}]: got {} source files and {} env-deps from dep-info in {}",
             files.len(),
             env_deps.len(),
             fmt_duration_as_secs(&start.elapsed())
@@ -452,15 +451,15 @@ where
         .envs(env_vars.to_vec())
         .current_dir(cwd);
     if log_enabled!(Trace) {
-        trace!("get_compiler_outputs: {:?}", cmd);
+        trace!("get_compiler_outputs: {cmd:?}");
     }
     let outputs = run_input_output(cmd, None).await?;
 
     let outstr = String::from_utf8(outputs.stdout).context("Error parsing rustc output")?;
     if log_enabled!(Trace) {
-        trace!("get_compiler_outputs: {:?}", outstr);
+        trace!("get_compiler_outputs: {outstr:?}");
     }
-    Ok(outstr.lines().map(|l| l.to_owned()).collect())
+    Ok(outstr.lines().map(std::borrow::ToOwned::to_owned).collect())
 }
 
 fn hashes_in_canonical_path_order(
@@ -473,9 +472,8 @@ fn hashes_in_canonical_path_order(
         .cloned()
         .zip(hashes)
         .map(|(path, hash)| {
-            let identity = canonical
-                .map(|canonical| canonical.to_canonical(&path))
-                .unwrap_or_else(|| path.clone());
+            let identity =
+                canonical.map_or_else(|| path.clone(), |canonical| canonical.to_canonical(&path));
             (identity, hash)
         })
         .collect::<Vec<_>>();
@@ -605,9 +603,10 @@ fn rust_shadow_env_value(
     raw: &std::ffi::OsStr,
     canonical: Option<&CanonicalRustPaths>,
 ) -> RustShadowEnvValue {
-    let key = canonical
-        .map(|canonical| canonical.env_value_to_canonical(name, raw))
-        .unwrap_or_else(|| raw.to_owned());
+    let key = canonical.map_or_else(
+        || raw.to_owned(),
+        |canonical| canonical.env_value_to_canonical(name, raw),
+    );
     let show_text = rust_shadow_plain_env(name);
     RustShadowEnvValue {
         raw_text: show_text.then(|| raw.to_string_lossy().into_owned()),
@@ -628,8 +627,7 @@ fn rust_shadow_inputs(
         .map(|(path, digest)| RustShadowInput {
             raw_path: path.to_string_lossy().into_owned(),
             key_path: canonical
-                .map(|canonical| canonical.to_canonical(path))
-                .unwrap_or_else(|| path.clone())
+                .map_or_else(|| path.clone(), |canonical| canonical.to_canonical(path))
                 .to_string_lossy()
                 .into_owned(),
             digest: digest.clone(),
@@ -670,7 +668,7 @@ fn append_rust_shadow_record(path: &Path, record: &RustShadowRecord) {
 
     let _guard = RUST_SHADOW_LOG_LOCK
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -878,7 +876,7 @@ impl Rust {
         rustc_verbose_version: &str,
         dist_archive: Option<PathBuf>,
         pool: tokio::runtime::Handle,
-    ) -> Result<Rust>
+    ) -> Result<Self>
     where
         T: CommandCreatorSync,
     {
@@ -904,13 +902,13 @@ impl Rust {
             let sysroot = PathBuf::from(outstr.trim_end());
             let libs_path = sysroot.join(LIBS_DIR);
             let mut libs = fs::read_dir(&libs_path)
-                .with_context(|| format!("Failed to list rustc sysroot: `{:?}`", libs_path))?
+                .with_context(|| format!("Failed to list rustc sysroot: `{libs_path:?}`"))?
                 .filter_map(|e| {
                     e.ok().and_then(|e| {
                         e.file_type().ok().and_then(|t| {
                             let p = e.path();
                             if (t.is_file() || t.is_symlink() && p.is_file())
-                                && p.extension().map(|e| e == DLL_EXTENSION).unwrap_or(false)
+                                && p.extension().is_some_and(|e| e == DLL_EXTENSION)
                             {
                                 Some(p)
                             } else {
@@ -921,7 +919,7 @@ impl Rust {
                 })
                 .collect::<Vec<_>>();
             if let Some(path) = dist_archive {
-                trace!("Hashing {:?} along with rustc libs.", path);
+                trace!("Hashing {path:?} along with rustc libs.");
                 libs.push(path);
             }
             libs.sort();
@@ -945,13 +943,12 @@ impl Rust {
                 Ok(r) => Some(Arc::new(r)),
                 Err(e) => {
                     warn!(
-                        "Failed to initialise RlibDepDecoder, distributed compiles will be inefficient: {}",
-                        e
+                        "Failed to initialise RlibDepDecoder, distributed compiles will be inefficient: {e}"
                     );
                     None
                 }
             };
-            hash_all(&libs, &pool).await.map(move |digests| Rust {
+            hash_all(&libs, &pool).await.map(move |digests| Self {
                 executable,
                 host,
                 version: rustc_verbose_version.to_string(),
@@ -1056,7 +1053,7 @@ where
                 .context("Failed to parse output of rustup which rustc")?;
 
             let proxied_compiler = PathBuf::from(stdout.trim());
-            trace!("proxy: rustup which rustc produced: {:?}", proxied_compiler);
+            trace!("proxy: rustup which rustc produced: {proxied_compiler:?}");
             // TODO: Delegate FS access to a thread pool if possible
             let attr = fs::metadata(proxied_compiler.as_path())
                 .context("Failed to obtain metadata of the resolved, true rustc")?;
@@ -1170,7 +1167,7 @@ impl RustupProxy {
                         Ok(ProxyPath::Candidate(proxy_candidate))
                     }
                     Err(e) => {
-                        trace!("proxy: rustup is not present: {}", e);
+                        trace!("proxy: rustup is not present: {e}");
                         Ok(ProxyPath::ToBeDiscovered)
                     }
                 }
@@ -1193,7 +1190,7 @@ impl RustupProxy {
                 let stdout = String::from_utf8(rustup_candidate_check.stdout)
                     .map_err(|_e| anyhow!("Response of `rustup --version` is not valid UTF-8"))?;
                 Ok(if stdout.trim().starts_with("rustup ") {
-                    trace!("PROXY rustup --version produced: {}", stdout);
+                    trace!("PROXY rustup --version produced: {stdout}");
                     Self::new(&proxy_executable).map(Some)
                 } else {
                     Err(anyhow!("Unexpected output or `rustup --version`"))
@@ -1222,7 +1219,7 @@ struct ArgCrateTypes {
 impl FromArg for ArgCrateTypes {
     fn process(arg: OsString) -> ArgParseResult<Self> {
         let arg = String::process(arg)?;
-        let mut crate_types = ArgCrateTypes {
+        let mut crate_types = Self {
             rlib: false,
             staticlib: false,
             others: HashSet::new(),
@@ -1243,7 +1240,7 @@ impl FromArg for ArgCrateTypes {
 }
 impl IntoArg for ArgCrateTypes {
     fn into_arg_os_string(self) -> OsString {
-        let ArgCrateTypes {
+        let Self {
             rlib,
             staticlib,
             others,
@@ -1259,7 +1256,7 @@ impl IntoArg for ArgCrateTypes {
         types_string.into()
     }
     fn into_arg_string(self, _transformer: PathTransformerFn<'_>) -> ArgToStringResult {
-        let ArgCrateTypes {
+        let Self {
             rlib,
             staticlib,
             others,
@@ -1288,17 +1285,17 @@ impl FromArg for ArgLinkLibrary {
             // If no kind is specified, the default is dylib.
             (name, None) => ("dylib".to_owned(), name),
         };
-        Ok(ArgLinkLibrary { kind, name })
+        Ok(Self { kind, name })
     }
 }
 impl IntoArg for ArgLinkLibrary {
     fn into_arg_os_string(self) -> OsString {
-        let ArgLinkLibrary { kind, name } = self;
+        let Self { kind, name } = self;
         make_os_string!(kind, "=", name)
     }
     fn into_arg_string(self, _transformer: PathTransformerFn<'_>) -> ArgToStringResult {
-        let ArgLinkLibrary { kind, name } = self;
-        Ok(format!("{}={}", kind, name))
+        let Self { kind, name } = self;
+        Ok(format!("{kind}={name}"))
     }
 }
 
@@ -1314,7 +1311,7 @@ impl FromArg for ArgLinkPath {
             // If no kind is specified, the path is used to search for all kinds
             (path, None) => ("all".to_owned(), path),
         };
-        Ok(ArgLinkPath {
+        Ok(Self {
             kind,
             path: path.into(),
         })
@@ -1322,12 +1319,12 @@ impl FromArg for ArgLinkPath {
 }
 impl IntoArg for ArgLinkPath {
     fn into_arg_os_string(self) -> OsString {
-        let ArgLinkPath { kind, path } = self;
+        let Self { kind, path } = self;
         make_os_string!(kind, "=", path)
     }
     fn into_arg_string(self, transformer: PathTransformerFn<'_>) -> ArgToStringResult {
-        let ArgLinkPath { kind, path } = self;
-        Ok(format!("{}={}", kind, path.into_arg_string(transformer)?))
+        let Self { kind, path } = self;
+        Ok(format!("{kind}={}", path.into_arg_string(transformer)?))
     }
 }
 
@@ -1339,12 +1336,12 @@ struct ArgCodegen {
 impl FromArg for ArgCodegen {
     fn process(arg: OsString) -> ArgParseResult<Self> {
         let (opt, value) = split_os_string_arg(arg, "=")?;
-        Ok(ArgCodegen { opt, value })
+        Ok(Self { opt, value })
     }
 }
 impl IntoArg for ArgCodegen {
     fn into_arg_os_string(self) -> OsString {
-        let ArgCodegen { opt, value } = self;
+        let Self { opt, value } = self;
         if let Some(value) = value {
             make_os_string!(opt, "=", value)
         } else {
@@ -1352,9 +1349,9 @@ impl IntoArg for ArgCodegen {
         }
     }
     fn into_arg_string(self, transformer: PathTransformerFn<'_>) -> ArgToStringResult {
-        let ArgCodegen { opt, value } = self;
+        let Self { opt, value } = self;
         Ok(if let Some(value) = value {
-            format!("{}={}", opt, value.into_arg_string(transformer)?)
+            format!("{opt}={}", value.into_arg_string(transformer)?)
         } else {
             opt
         })
@@ -1369,12 +1366,12 @@ struct ArgUnstable {
 impl FromArg for ArgUnstable {
     fn process(arg: OsString) -> ArgParseResult<Self> {
         let (opt, value) = split_os_string_arg(arg, "=")?;
-        Ok(ArgUnstable { opt, value })
+        Ok(Self { opt, value })
     }
 }
 impl IntoArg for ArgUnstable {
     fn into_arg_os_string(self) -> OsString {
-        let ArgUnstable { opt, value } = self;
+        let Self { opt, value } = self;
         if let Some(value) = value {
             make_os_string!(opt, "=", value)
         } else {
@@ -1382,9 +1379,9 @@ impl IntoArg for ArgUnstable {
         }
     }
     fn into_arg_string(self, transformer: PathTransformerFn<'_>) -> ArgToStringResult {
-        let ArgUnstable { opt, value } = self;
+        let Self { opt, value } = self;
         Ok(if let Some(value) = value {
-            format!("{}={}", opt, value.into_arg_string(transformer)?)
+            format!("{opt}={}", value.into_arg_string(transformer)?)
         } else {
             opt
         })
@@ -1399,7 +1396,7 @@ struct ArgExtern {
 impl FromArg for ArgExtern {
     fn process(arg: OsString) -> ArgParseResult<Self> {
         if let (name, Some(path)) = split_os_string_arg(arg, "=")? {
-            Ok(ArgExtern {
+            Ok(Self {
                 name,
                 path: path.into(),
             })
@@ -1410,12 +1407,12 @@ impl FromArg for ArgExtern {
 }
 impl IntoArg for ArgExtern {
     fn into_arg_os_string(self) -> OsString {
-        let ArgExtern { name, path } = self;
+        let Self { name, path } = self;
         make_os_string!(name, "=", path)
     }
     fn into_arg_string(self, transformer: PathTransformerFn<'_>) -> ArgToStringResult {
-        let ArgExtern { name, path } = self;
-        Ok(format!("{}={}", name, path.into_arg_string(transformer)?))
+        let Self { name, path } = self;
+        Ok(format!("{name}={}", path.into_arg_string(transformer)?))
     }
 }
 
@@ -1428,12 +1425,8 @@ enum ArgTarget {
 impl FromArg for ArgTarget {
     fn process(arg: OsString) -> ArgParseResult<Self> {
         // Is it obviously a json file path?
-        if Path::new(&arg)
-            .extension()
-            .map(|ext| ext == "json")
-            .unwrap_or(false)
-        {
-            return Ok(ArgTarget::Path(arg.into()));
+        if Path::new(&arg).extension().is_some_and(|ext| ext == "json") {
+            return Ok(Self::Path(arg.into()));
         }
         // Time for clever detection - if we append .json (even if it's clearly
         // a directory, i.e. resulting in /my/dir/.json), does the path exist?
@@ -1443,10 +1436,10 @@ impl FromArg for ArgTarget {
             // Unfortunately, we're now not sure what will happen without having
             // a list of all the built-in targets handy, as they don't get .json
             // auto-added for target json discovery
-            return Ok(ArgTarget::Unsure(arg));
+            return Ok(Self::Unsure(arg));
         }
         // The file doesn't exist so it can't be a path, safe to assume it's a name
-        Ok(ArgTarget::Name(
+        Ok(Self::Name(
             arg.into_string().map_err(ArgParseError::InvalidUnicode)?,
         ))
     }
@@ -1454,16 +1447,16 @@ impl FromArg for ArgTarget {
 impl IntoArg for ArgTarget {
     fn into_arg_os_string(self) -> OsString {
         match self {
-            ArgTarget::Name(s) => s.into(),
-            ArgTarget::Path(p) => p.into(),
-            ArgTarget::Unsure(s) => s,
+            Self::Name(s) => s.into(),
+            Self::Path(p) => p.into(),
+            Self::Unsure(s) => s,
         }
     }
     fn into_arg_string(self, transformer: PathTransformerFn<'_>) -> ArgToStringResult {
         Ok(match self {
-            ArgTarget::Name(s) => s,
-            ArgTarget::Path(p) => p.into_arg_string(transformer)?,
-            ArgTarget::Unsure(s) => s.into_arg_string(transformer)?,
+            Self::Name(s) => s,
+            Self::Path(p) => p.into_arg_string(transformer)?,
+            Self::Unsure(s) => s.into_arg_string(transformer)?,
         })
     }
 }
@@ -1540,11 +1533,11 @@ counted_array!(static ARGS: [ArgInfo<ArgData>; _] = [
 /// (unlike GCC), and does not recursively expand `@file` directives found
 /// inside a response file.
 ///
-/// Rustc reference: https://github.com/rust-lang/rust/blob/main/compiler/rustc_driver_impl/src/args.rs
+/// Rustc reference: <https://github.com/rust-lang/rust/blob/main/compiler/rustc_driver_impl/src/args.rs>
 fn split_rust_response_file_args(contents: &str) -> Vec<OsString> {
     contents
         .lines()
-        .map(|line| line.trim())
+        .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(OsString::from)
         .collect()
@@ -1558,7 +1551,11 @@ pub struct ExpandResponseFile<'a> {
 impl<'a> ExpandResponseFile<'a> {
     pub fn new(cwd: &'a Path, args: &[OsString]) -> Self {
         ExpandResponseFile {
-            stack: args.iter().rev().map(|a| a.to_owned()).collect(),
+            stack: args
+                .iter()
+                .rev()
+                .map(std::borrow::ToOwned::to_owned)
+                .collect(),
             cwd,
         }
     }
@@ -1579,7 +1576,7 @@ impl Iterator for ExpandResponseFile<'_> {
             let res = fs_err::File::open(&file)
                 .and_then(|f| BufReader::new(f).read_to_string(&mut contents));
             if let Err(e) = res {
-                debug!("failed to read @-file `{}`: {}", file.display(), e);
+                debug!("failed to read @-file `{}`: {e}", file.display());
                 return Some(arg);
             }
             let new_args = split_rust_response_file_args(&contents);
@@ -1617,15 +1614,14 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     for (idx, arg) in ArgsIter::new(it, &ARGS[..]).enumerate() {
         let arg = try_or_cannot_cache!(arg, "argument parse");
         match arg.get_data() {
-            Some(TooHardFlag) | Some(TooHardPath(_)) => {
+            Some(TooHardFlag | TooHardPath(_)) => {
                 cannot_cache!(
                     "unsupported compiler option",
                     arg.flag_str()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| format!("{arg:?}"))
+                        .map_or_else(|| format!("{arg:?}"), str::to_owned)
                 )
             }
-            Some(NotCompilationFlag) | Some(NotCompilation(_)) => {
+            Some(NotCompilationFlag | NotCompilation(_)) => {
                 return CompilerArguments::NotCompilation;
             }
             Some(LinkLibrary(ArgLinkLibrary { kind, name })) => {
@@ -1687,7 +1683,7 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
                 }
             }
             Some(Unstable(ArgUnstable { opt, value })) => match value.as_deref() {
-                Some("y") | Some("yes") | Some("on") | None if opt == "profile" => {
+                Some("y" | "yes" | "on") | None if opt == "profile" => {
                     gcno = true;
                 }
                 _ => (),
@@ -1769,10 +1765,11 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     // If it's not an rlib and not a staticlib then crate-type wasn't passed,
     // so it will usually be inferred as a binary, though the `#![crate_type`
     // annotation may dictate otherwise - either way, we don't know what to do.
-    if let CrateTypes {
-        rlib: false,
-        staticlib: false,
-    } = crate_types
+    if crate_types
+        == (CrateTypes {
+            rlib: false,
+            staticlib: false,
+        })
     {
         cannot_cache!("crate-type", "No crate-type passed".to_owned())
     }
@@ -1813,11 +1810,11 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     let staticlibs = static_lib_names
         .into_iter()
         .filter_map(|name| {
-            for path in static_link_paths.iter() {
+            for path in &static_link_paths {
                 for f in &[
-                    format_args!("lib{}.a", name),
-                    format_args!("{}.lib", name),
-                    format_args!("{}.a", name),
+                    format_args!("lib{name}.a"),
+                    format_args!("{name}.lib"),
+                    format_args!("{name}.a"),
                 ] {
                     let lib_path = path.join(fmt::format(*f));
                     if lib_path.exists() {
@@ -1843,9 +1840,9 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
         crate_link_paths,
         staticlibs,
         crate_name,
-        dep_info: dep_info.map(|s| s.into()),
-        profile: profile.map(|s| s.into()),
-        gcno: gcno.map(|s| s.into()),
+        dep_info: dep_info.map(std::convert::Into::into),
+        profile: profile.map(std::convert::Into::into),
+        gcno: gcno.map(std::convert::Into::into),
         emit,
         color_mode,
         has_json,
@@ -2159,13 +2156,13 @@ where
         //    output. Additionally also has all environment variables starting with `CARGO_`,
         //    since those are not listed in dep-info but affect cacheability.
         env_deps.sort();
-        for (var, val) in env_deps.iter() {
+        for (var, val) in &env_deps {
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(b"=");
-            let val = canonical_paths
-                .as_ref()
-                .map(|canonical| canonical.env_value_to_canonical(var, val))
-                .unwrap_or_else(|| val.clone());
+            let val = canonical_paths.as_ref().map_or_else(
+                || val.clone(),
+                |canonical| canonical.env_value_to_canonical(var, val),
+            );
             val.hash(&mut HashToDigest { digest: &mut m });
         }
         let mut env_vars: Vec<_> = env_vars
@@ -2176,7 +2173,7 @@ where
             .cloned()
             .collect();
         env_vars.sort();
-        for (var, val) in env_vars.iter() {
+        for (var, val) in &env_vars {
             // CARGO_MAKEFLAGS will have jobserver info which is extremely non-cacheable.
             // CARGO_REGISTRIES_*_TOKEN contains non-cacheable secrets.
             // Registry override config doesn't need to be hashed, because deps' package IDs
@@ -2189,17 +2186,16 @@ where
 
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(b"=");
-            let val = canonical_paths
-                .as_ref()
-                .map(|canonical| canonical.env_value_to_canonical(var, val))
-                .unwrap_or_else(|| val.clone());
+            let val = canonical_paths.as_ref().map_or_else(
+                || val.clone(),
+                |canonical| canonical.env_value_to_canonical(var, val),
+            );
             val.hash(&mut HashToDigest { digest: &mut m });
         }
         // 9. The cwd of the compile. This will wind up in the rlib.
         let hash_cwd = canonical_paths
             .as_ref()
-            .map(|canonical| canonical.canonical_cwd(&cwd))
-            .unwrap_or_else(|| cwd.clone());
+            .map_or_else(|| cwd.clone(), |canonical| canonical.canonical_cwd(&cwd));
         hash_cwd.hash(&mut HashToDigest { digest: &mut m });
         // 10. The version of the compiler.
         self.version.hash(&mut HashToDigest { digest: &mut m });
@@ -2363,8 +2359,10 @@ where
                     cache_object_key: cache_object_key.clone(),
                     raw_path: output.path.to_string_lossy().into_owned(),
                     key_path: canonical
-                        .map(|canonical| canonical.to_canonical(&output.path))
-                        .unwrap_or_else(|| output.path.clone())
+                        .map_or_else(
+                            || output.path.clone(),
+                            |canonical| canonical.to_canonical(&output.path),
+                        )
                         .to_string_lossy()
                         .into_owned(),
                     optional: output.optional,
@@ -2410,14 +2408,15 @@ where
                     canonical_roots: rust_shadow_roots(canonical),
                     cwd_raw: cwd.to_string_lossy().into_owned(),
                     cwd_key: canonical
-                        .map(|canonical| canonical.canonical_cwd(&cwd))
-                        .unwrap_or_else(|| cwd.clone())
+                        .map_or_else(|| cwd.clone(), |canonical| canonical.canonical_cwd(&cwd))
                         .to_string_lossy()
                         .into_owned(),
                     sysroot_raw: self.sysroot.to_string_lossy().into_owned(),
                     sysroot_key: canonical
-                        .map(|canonical| canonical.to_canonical(&self.sysroot))
-                        .unwrap_or_else(|| self.sysroot.clone())
+                        .map_or_else(
+                            || self.sysroot.clone(),
+                            |canonical| canonical.to_canonical(&self.sysroot),
+                        )
                         .to_string_lossy()
                         .into_owned(),
                     arguments_raw: rust_shadow_args(&os_string_arguments),
@@ -2489,7 +2488,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
         Option<dist::CompileCommand>,
         Cacheable,
     )> {
-        let RustCompilation {
+        let Self {
             ref executable,
             ref arguments,
             ref crate_name,
@@ -2510,7 +2509,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             let _ = sysroot;
         }
 
-        trace!("[{}]: compile", crate_name);
+        trace!("[{crate_name}]: compile");
 
         if let Some(canonical) = canonical_paths {
             canonical.add_to_transformer(path_transformer);
@@ -2576,7 +2575,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             let mut saw_target = false;
 
             // flat_map would be nice but the lifetimes don't work out
-            for argument in arguments.iter() {
+            for argument in arguments {
                 let path_transformer_fn = &mut |p: &Path| path_transformer.as_dist(p);
                 if let Argument::Raw(input_path) = argument {
                     // Need to explicitly handle the input argument as it's not parsed as a path
@@ -2606,7 +2605,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             }
 
             if !saw_target {
-                dist_arguments.push(format!("--target={}", host));
+                dist_arguments.push(format!("--target={host}"));
             }
 
             let mut changed_out_dir: Option<PathBuf> = None;
@@ -2614,7 +2613,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                 dist::osstring_tuples_to_strings(&canonical.env_to_canonical(env_vars))?
             } else {
                 let mut env_vars = dist::osstring_tuples_to_strings(env_vars)?;
-                for (k, v) in env_vars.iter_mut() {
+                for (k, v) in &mut env_vars {
                     match k.as_str() {
                         "OUT_DIR" => {
                             let dist_out_dir = path_transformer.as_dist(Path::new(v))?;
@@ -2663,7 +2662,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                 if remapped_disks.contains(&dist_path) {
                     continue;
                 }
-                dist_arguments.push(format!("--remap-path-prefix={}={}", dist_path, local_path));
+                dist_arguments.push(format!("--remap-path-prefix={dist_path}={local_path}"));
                 remapped_disks.insert(dist_path);
             }
 
@@ -2688,7 +2687,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
         self: Box<Self>,
         path_transformer: dist::PathTransformer,
     ) -> Result<DistPackagers> {
-        let RustCompilation {
+        let Self {
             inputs,
             crate_link_paths,
             sysroot,
@@ -2699,10 +2698,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             canonical_paths,
             ..
         } = *{ self };
-        trace!(
-            "Dist inputs: inputs={:?} crate_link_paths={:?}",
-            inputs, crate_link_paths
-        );
+        trace!("Dist inputs: inputs={inputs:?} crate_link_paths={crate_link_paths:?}");
 
         let inputs_packager = Box::new(RustInputsPackager {
             env_vars,
@@ -2750,15 +2746,12 @@ struct RustInputsPackager {
 
 #[cfg(feature = "dist-client")]
 fn can_trim_this(input_path: &Path) -> bool {
-    trace!("can_trim_this: input_path={:?}", input_path);
+    trace!("can_trim_this: input_path={input_path:?}");
     // A dependency that also emits a linkable artifact is handed to its
     // dependents as a whole rlib rather than as metadata, so trimming it to
     // metadata strands the remote compile.
     // https://bugzilla.mozilla.org/show_bug.cgi?id=1760743
-    input_path
-        .extension()
-        .map(|e| e == RLIB_EXTENSION)
-        .unwrap_or(false)
+    input_path.extension().is_some_and(|e| e == RLIB_EXTENSION)
         && !has_link_artifact_sibling(input_path)
 }
 
@@ -2880,7 +2873,10 @@ fn test_lexical_parent_traversal_dirs() {
         ]
     );
 
-    assert!(lexical_parent_traversal_dirs(Path::new("/cargo/libc/src/lib.rs")).is_empty());
+    assert_eq!(
+        lexical_parent_traversal_dirs(Path::new("/cargo/libc/src/lib.rs")),
+        [] as [std::path::PathBuf; 0]
+    );
 }
 
 #[test]
@@ -2908,12 +2904,13 @@ fn test_maybe_add_cargo_toml() {
         .join("lib.rs");
     assert!(maybe_add_cargo_toml(&wgpu_core, false).is_none());
     assert!(maybe_add_cargo_toml(&wgpu_core, true).is_none());
-    assert!(
-        maybe_add_cargo_toml(&wgpu_lib, false)
-            == Some(PathBuf::from(&root).join("wgpu-core").join("Cargo.toml"))
+    assert_eq!(
+        maybe_add_cargo_toml(&wgpu_lib, false),
+        Some(PathBuf::from(&root).join("wgpu-core").join("Cargo.toml"))
     );
-    assert!(
-        maybe_add_cargo_toml(&wgpu_lib, false).unwrap().to_str() == Some(result_cargo_toml_path)
+    assert_eq!(
+        maybe_add_cargo_toml(&wgpu_lib, false).unwrap().to_str(),
+        Some(result_cargo_toml_path)
     );
     assert!(maybe_add_cargo_toml(&wgpu_lib, true).is_none());
 }
@@ -2922,7 +2919,7 @@ fn test_maybe_add_cargo_toml() {
 impl pkg::InputsPackager for RustInputsPackager {
     fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<dist::PathTransformer> {
         debug!("Packaging compile inputs for compile");
-        let RustInputsPackager {
+        let Self {
             crate_link_paths,
             crate_types,
             inputs,
@@ -3006,7 +3003,7 @@ impl pkg::InputsPackager for RustInputsPackager {
         if log_enabled!(Trace)
             && let Some((_, ref dep_crate_names)) = rlib_dep_reader_and_names
         {
-            trace!("Identified dependency crate names: {:?}", dep_crate_names);
+            trace!("Identified dependency crate names: {dep_crate_names:?}");
         }
 
         // Given the link paths, find the things we need to send over the wire to the remote machine. If
@@ -3107,7 +3104,7 @@ impl pkg::InputsPackager for RustInputsPackager {
             builder.append_dir(tar_dir, local_dir)?;
         }
 
-        for (input_path, dist_input_path) in all_tar_inputs.iter() {
+        for (input_path, dist_input_path) in &all_tar_inputs {
             let mut file_header = pkg::make_tar_header(input_path, dist_input_path)?;
             let file = fs::File::open(input_path)?;
             if can_trim_rlibs && can_trim_this(input_path) {
@@ -3158,7 +3155,7 @@ impl pkg::ToolchainPackager for RustToolchainPackager {
             "Packaging Rust compiler for sysroot {}",
             self.sysroot.display()
         );
-        let RustToolchainPackager { sysroot, canonical } = *self;
+        let Self { sysroot, canonical } = *self;
 
         let mut package_builder = pkg::ToolchainPackageBuilder::new();
         if canonical {
@@ -3207,7 +3204,7 @@ impl OutputsRewriter for RustOutputsRewriter {
             for dep_info_local_path in output_paths {
                 trace!("Comparing with {}", dep_info_local_path.display());
                 if dep_info == *dep_info_local_path {
-                    info!("Replacing using the transformer {:?}", path_transformer);
+                    info!("Replacing using the transformer {path_transformer:?}");
                     // Found the dep info file, read it in
                     let f = fs::File::open(&dep_info)
                         .with_context(|| "Failed to open dep info file")?;
@@ -3222,15 +3219,12 @@ impl OutputsRewriter for RustOutputsRewriter {
                                 local_path.display()
                             )
                         })?;
-                        error!(
-                            "RE replacing {} with {} in {}",
-                            re_str, local_path_str, deps
-                        );
+                        error!("RE replacing {re_str} with {local_path_str} in {deps}");
                         let re = regex::Regex::new(&re_str).expect("Invalid regex");
                         deps = re.replace_all(&deps, local_path_str).into_owned();
                     }
                     if !extra_inputs.is_empty() {
-                        deps = deps.replace(": ", &format!(":{} ", extra_input_str));
+                        deps = deps.replace(": ", &format!(":{extra_input_str} "));
                     }
                     // Write the depinfo file
                     let f =
@@ -3325,7 +3319,7 @@ impl Meter<PathBuf, RlibDepsDetail> for DepsSize {
         //let k_size = mem::size_of::<PathBuf>() + k.capacity();
         let k_size = 3 * 8 + 100;
 
-        let crate_names_size: usize = v.deps.iter().map(|s| s.capacity()).sum();
+        let crate_names_size: usize = v.deps.iter().map(std::string::String::capacity).sum();
         let v_size: usize = mem::size_of::<RlibDepsDetail>() + // Systemtime and vec itself
             v.deps.capacity() * mem::size_of::<String>() + // Each string in the vec
             crate_names_size; // Contents of all strings
@@ -3395,13 +3389,13 @@ impl RlibDepReader {
         let cache = LruCache::with_meter(CACHE_SIZE, DepsSize);
         let rustc_version = Self::get_rustc_version(&executable, env_vars)?;
 
-        let rlib_dep_reader = RlibDepReader {
+        let rlib_dep_reader = Self {
             cache: Mutex::new(cache),
             executable,
             ls_arg: Self::get_correct_ls_arg(rustc_version),
         };
         if let Err(e) = rlib_dep_reader.discover_rlib_deps(env_vars, &temp_rlib) {
-            bail!("Failed to read deps from minimal rlib: {}", e)
+            bail!("Failed to read deps from minimal rlib: {e}")
         }
 
         Ok(rlib_dep_reader)
@@ -3501,8 +3495,11 @@ impl RlibDepReader {
         }
 
         let stdout = String::from_utf8(stdout).context("Error parsing rustc -Z ls output")?;
-        let deps: Vec<_> = parse_rustc_z_ls(&stdout)
-            .map(|deps| deps.into_iter().map(|dep| dep.to_owned()).collect())?;
+        let deps: Vec<_> = parse_rustc_z_ls(&stdout).map(|deps| {
+            deps.into_iter()
+                .map(std::borrow::ToOwned::to_owned)
+                .collect()
+        })?;
 
         {
             // This will behave poorly if the rlib is changing under our feet, but in that case rustc
@@ -3564,10 +3561,7 @@ fn parse_rustc_z_ls(stdout: &str) -> Result<Vec<&str>> {
             .next()
             .context("No lib string on line from rustc -Z ls")?;
         if num != dep_names.len() + 1 {
-            bail!(
-                "Unexpected numbering of {} in rustc -Z ls output",
-                libstring
-            )
+            bail!("Unexpected numbering of {libstring} in rustc -Z ls output")
         }
         assert!(line_splits.next().is_none());
 
@@ -3666,7 +3660,7 @@ mod test {
         }
     }
 
-    const TEST_RUSTC_VERSION: &str = r#"
+    const TEST_RUSTC_VERSION: &str = r"
 rustc 1.66.1 (90743e729 2023-01-10)
 binary: rustc
 commit-hash: 90743e7298aca107ddaa0c202a4d3604e29bfeb6
@@ -3674,7 +3668,7 @@ commit-date: 2023-01-10
 host: x86_64-unknown-linux-gnu
 release: 1.66.1
 LLVM version: 15.0.2
-"#;
+";
 
     #[test]
     fn test_parse_arguments_simple() {
@@ -3691,7 +3685,7 @@ LLVM version: 15.0.2
         );
         assert_eq!(h.output_dir.to_str(), Some("out"));
         assert!(h.dep_info.is_none());
-        assert!(h.externs.is_empty());
+        assert_eq!(h.externs, [] as [std::path::PathBuf; 0]);
         let h = parses!(
             "--emit=link",
             "foo.rs",
@@ -4206,12 +4200,12 @@ bar.rs:
 
     #[test]
     fn test_parse_dep_info_with_escaped_spaces() {
-        let deps = r#"foo: baz.rs abc\ def.rs
+        let deps = r"foo: baz.rs abc\ def.rs
 
 baz.rs:
 
 abc def.rs:
-"#;
+";
         assert_eq!(pathvec!["abc def.rs", "baz.rs"], parse_dep_info(deps, ""));
     }
 
@@ -4368,15 +4362,15 @@ proc_macro false
     #[cfg(feature = "dist-client")]
     #[test]
     fn test_rlib_dep_reader_parse_rustc_version() {
-        let v0 = RlibDepReader::parse_rustc_version("rustc 1.2.3 aaaa".as_bytes());
+        let v0 = RlibDepReader::parse_rustc_version(b"rustc 1.2.3 aaaa");
         assert!(v0.is_ok());
         let v0 = v0.unwrap();
         assert_eq!(v0.major, 1);
         assert_eq!(v0.minor, 2);
         assert_eq!(v0.patch, 3);
 
-        assert!(RlibDepReader::parse_rustc_version("rutc 1.2.3 aaaa".as_bytes()).is_err());
-        assert!(RlibDepReader::parse_rustc_version("1.2.3".as_bytes()).is_err());
+        assert!(RlibDepReader::parse_rustc_version(b"rutc 1.2.3 aaaa").is_err());
+        assert!(RlibDepReader::parse_rustc_version(b"1.2.3").is_err());
     }
 
     #[cfg(feature = "dist-client")]
@@ -4436,8 +4430,8 @@ proc_macro false
             let dep_info_path = dep_info_path.unwrap();
             let mut f = File::create(dep_info_path)?;
             writeln!(f, "blah: {}", sorted_deps.iter().join(" "))?;
-            for d in sorted_deps.iter() {
-                writeln!(f, "{}:", d)?;
+            for d in &sorted_deps {
+                writeln!(f, "{d}:")?;
             }
             Ok(MockChild::new(exit_status(0), "", ""))
         });
@@ -4464,7 +4458,7 @@ proc_macro false
         const FAKE_DIGEST: &str = "abcd1234";
         const BAZ_O_SIZE: u64 = 1024;
         // We'll just use empty files for each of these.
-        for s in ["foo.rs", "bar.rs", "bar.rlib"].iter() {
+        for s in &["foo.rs", "bar.rs", "bar.rlib"] {
             f.touch(s).unwrap();
         }
         // libbaz.a needs to be a valid archive.
@@ -4604,17 +4598,17 @@ proc_macro false
         let oargs = args.iter().map(OsString::from).collect::<Vec<OsString>>();
         let parsed_args = match parse_arguments(&oargs, f.tempdir.path()) {
             CompilerArguments::Ok(parsed_args) => parsed_args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         // Just use empty files for sources.
         {
             let src = &"foo.rs";
-            let s = format!("Failed to create {}", src);
+            let s = format!("Failed to create {src}");
             f.touch(src).expect(&s);
         }
         // as well as externs
-        for e in parsed_args.externs.iter() {
-            let s = format!("Failed to create {:?}", e);
+        for e in &parsed_args.externs {
+            let s = format!("Failed to create {e:?}");
             f.touch(e.to_str().unwrap()).expect(&s);
         }
         pre_func(f.tempdir.path()).expect("Failed to execute pre_func");
@@ -5186,8 +5180,14 @@ proc_macro false
             split_rust_response_file_args("--emit\n\n\nfoo.rs\n")
         );
         // Empty input.
-        assert!(split_rust_response_file_args("").is_empty());
-        assert!(split_rust_response_file_args("\n\n  \n\t\n").is_empty());
+        assert_eq!(
+            split_rust_response_file_args(""),
+            [] as [std::ffi::OsString; 0]
+        );
+        assert_eq!(
+            split_rust_response_file_args("\n\n  \n\t\n"),
+            [] as [std::ffi::OsString; 0]
+        );
         // Carriage returns are trimmed.
         assert_eq!(
             ovec!["--emit", "foo.rs"],
@@ -5210,11 +5210,11 @@ proc_macro false
         let result = parse_arguments(&args, td.path());
         let parsed = match result {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(parsed.output_dir.to_str(), Some("out"));
         assert!(parsed.dep_info.is_some());
-        assert!(parsed.externs.is_empty());
+        assert_eq!(parsed.externs, [] as [std::path::PathBuf; 0]);
     }
 
     #[test]

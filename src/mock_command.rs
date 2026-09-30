@@ -172,14 +172,14 @@ impl CommandChild for Child {
     }
 
     async fn wait(self) -> io::Result<ExitStatus> {
-        let Child { mut inner, token } = self;
+        let Self { mut inner, token } = self;
         inner.wait().await.inspect(|_ret| {
             drop(token);
         })
     }
 
     async fn wait_with_output(self) -> io::Result<Output> {
-        let Child { inner, token } = self;
+        let Self { inner, token } = self;
         inner.wait_with_output().await.inspect(|_ret| {
             drop(token);
         })
@@ -193,15 +193,15 @@ pub struct AsyncCommand {
 }
 
 impl AsyncCommand {
-    pub fn new<S: AsRef<OsStr>>(program: S, jobserver: Client) -> AsyncCommand {
-        AsyncCommand {
+    pub fn new<S: AsRef<OsStr>>(program: S, jobserver: Client) -> Self {
+        Self {
             inner: Some(Command::new(program)),
             jobserver,
             share_jobserver: false,
         }
     }
 
-    fn inner(&mut self) -> &mut Command {
+    const fn inner(&mut self) -> &mut Command {
         self.inner.as_mut().expect("can't reuse commands")
     }
 }
@@ -211,15 +211,15 @@ impl AsyncCommand {
 impl RunCommand for AsyncCommand {
     type C = Child;
 
-    fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut AsyncCommand {
+    fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Self {
         self.inner().arg(arg);
         self
     }
-    fn args<S: AsRef<OsStr>>(&mut self, args: &[S]) -> &mut AsyncCommand {
+    fn args<S: AsRef<OsStr>>(&mut self, args: &[S]) -> &mut Self {
         self.inner().args(args);
         self
     }
-    fn env<K, V>(&mut self, key: K, val: V) -> &mut AsyncCommand
+    fn env<K, V>(&mut self, key: K, val: V) -> &mut Self
     where
         K: AsRef<OsStr>,
         V: AsRef<OsStr>,
@@ -236,28 +236,28 @@ impl RunCommand for AsyncCommand {
         self.inner().envs(vars);
         self
     }
-    fn env_clear(&mut self) -> &mut AsyncCommand {
+    fn env_clear(&mut self) -> &mut Self {
         self.inner().env_clear();
         self
     }
-    fn current_dir<P: AsRef<Path>>(&mut self, dir: P) -> &mut AsyncCommand {
+    fn current_dir<P: AsRef<Path>>(&mut self, dir: P) -> &mut Self {
         self.inner().current_dir(dir);
         self
     }
 
-    fn stdin(&mut self, cfg: Stdio) -> &mut AsyncCommand {
+    fn stdin(&mut self, cfg: Stdio) -> &mut Self {
         self.inner().stdin(cfg);
         self
     }
-    fn stdout(&mut self, cfg: Stdio) -> &mut AsyncCommand {
+    fn stdout(&mut self, cfg: Stdio) -> &mut Self {
         self.inner().stdout(cfg);
         self
     }
-    fn stderr(&mut self, cfg: Stdio) -> &mut AsyncCommand {
+    fn stderr(&mut self, cfg: Stdio) -> &mut Self {
         self.inner().stderr(cfg);
         self
     }
-    fn share_jobserver(&mut self) -> &mut AsyncCommand {
+    fn share_jobserver(&mut self) -> &mut Self {
         self.share_jobserver = true;
         self
     }
@@ -284,7 +284,7 @@ impl RunCommand for AsyncCommand {
         let child = inner
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("failed to spawn {:?}", inner))?;
+            .with_context(|| format!("failed to spawn {inner:?}"))?;
 
         Ok(Child {
             inner: child,
@@ -309,8 +309,8 @@ pub struct ProcessCommandCreator {
 impl CommandCreator for ProcessCommandCreator {
     type Cmd = AsyncCommand;
 
-    fn new(client: &Client) -> ProcessCommandCreator {
-        ProcessCommandCreator {
+    fn new(client: &Client) -> Self {
+        Self {
             jobserver: client.clone(),
         }
     }
@@ -324,7 +324,7 @@ impl CommandCreator for ProcessCommandCreator {
 impl CommandCreatorSync for ProcessCommandCreator {
     type Cmd = AsyncCommand;
 
-    fn new(client: &Client) -> ProcessCommandCreator {
+    fn new(client: &Client) -> Self {
         CommandCreator::new(client)
     }
 
@@ -365,12 +365,8 @@ pub struct MockChild {
 /// A mocked child process that simply returns stored values for its status and output.
 impl MockChild {
     /// Create a `MockChild` that will return the specified `status`, `stdout`, and `stderr` when waited upon.
-    pub fn new<T: AsRef<[u8]>, U: AsRef<[u8]>>(
-        status: ExitStatus,
-        stdout: T,
-        stderr: U,
-    ) -> MockChild {
-        MockChild {
+    pub fn new<T: AsRef<[u8]>, U: AsRef<[u8]>>(status: ExitStatus, stdout: T, stderr: U) -> Self {
+        Self {
             stdin: Some(io::Cursor::new(vec![])),
             stdout: Some(io::Cursor::new(stdout.as_ref().to_vec())),
             stderr: Some(io::Cursor::new(stderr.as_ref().to_vec())),
@@ -379,8 +375,8 @@ impl MockChild {
     }
 
     /// Create a `MockChild` that will return the specified `err` when waited upon.
-    pub fn with_error(err: io::Error) -> MockChild {
-        MockChild {
+    pub const fn with_error(err: io::Error) -> Self {
+        Self {
             stdin: None,
             stdout: None,
             stderr: None,
@@ -410,7 +406,7 @@ impl CommandChild for MockChild {
     }
 
     async fn wait_with_output(self) -> io::Result<Output> {
-        let MockChild {
+        let Self {
             stdout,
             stderr,
             wait_result,
@@ -419,8 +415,8 @@ impl CommandChild for MockChild {
 
         wait_result.unwrap().map(|status| Output {
             status,
-            stdout: stdout.map(|c| c.into_inner()).unwrap_or_else(Vec::new),
-            stderr: stderr.map(|c| c.into_inner()).unwrap_or_else(Vec::new),
+            stdout: stdout.map_or_else(Vec::new, std::io::Cursor::into_inner),
+            stderr: stderr.map_or_else(Vec::new, std::io::Cursor::into_inner),
         })
     }
 }
@@ -433,8 +429,8 @@ pub enum ChildOrCall {
 impl fmt::Debug for ChildOrCall {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            ChildOrCall::Child(ref r) => write!(f, "ChildOrCall::Child({:?}", r),
-            ChildOrCall::Call(_) => write!(f, "ChildOrCall::Call(...)"),
+            Self::Child(ref r) => write!(f, "ChildOrCall::Child({r:?}"),
+            Self::Call(_) => write!(f, "ChildOrCall::Call(...)"),
         }
     }
 }
@@ -450,15 +446,15 @@ pub struct MockCommand {
 impl RunCommand for MockCommand {
     type C = MockChild;
 
-    fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut MockCommand {
+    fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Self {
         self.args.push(arg.as_ref().to_owned());
         self
     }
-    fn args<S: AsRef<OsStr>>(&mut self, args: &[S]) -> &mut MockCommand {
+    fn args<S: AsRef<OsStr>>(&mut self, args: &[S]) -> &mut Self {
         self.args.extend(args.iter().map(|a| a.as_ref().to_owned()));
         self
     }
-    fn env<K, V>(&mut self, _key: K, _val: V) -> &mut MockCommand
+    fn env<K, V>(&mut self, _key: K, _val: V) -> &mut Self
     where
         K: AsRef<OsStr>,
         V: AsRef<OsStr>,
@@ -473,20 +469,20 @@ impl RunCommand for MockCommand {
     {
         self
     }
-    fn env_clear(&mut self) -> &mut MockCommand {
+    fn env_clear(&mut self) -> &mut Self {
         self
     }
-    fn current_dir<P: AsRef<Path>>(&mut self, _dir: P) -> &mut MockCommand {
+    fn current_dir<P: AsRef<Path>>(&mut self, _dir: P) -> &mut Self {
         //TODO: assert value of dir
         self
     }
-    fn stdin(&mut self, _cfg: Stdio) -> &mut MockCommand {
+    fn stdin(&mut self, _cfg: Stdio) -> &mut Self {
         self
     }
-    fn stdout(&mut self, _cfg: Stdio) -> &mut MockCommand {
+    fn stdout(&mut self, _cfg: Stdio) -> &mut Self {
         self
     }
-    fn stderr(&mut self, _cfg: Stdio) -> &mut MockCommand {
+    fn stderr(&mut self, _cfg: Stdio) -> &mut Self {
         self
     }
     async fn spawn(&mut self) -> Result<MockChild> {
@@ -522,8 +518,8 @@ impl MockCommandCreator {
 impl CommandCreator for MockCommandCreator {
     type Cmd = MockCommand;
 
-    fn new(_client: &Client) -> MockCommandCreator {
-        MockCommandCreator {
+    fn new(_client: &Client) -> Self {
+        Self {
             children: Vec::new(),
         }
     }
@@ -545,8 +541,8 @@ impl CommandCreator for MockCommandCreator {
 impl<T: CommandCreator + 'static + Send> CommandCreatorSync for Arc<Mutex<T>> {
     type Cmd = T::Cmd;
 
-    fn new(client: &Client) -> Arc<Mutex<T>> {
-        Arc::new(Mutex::new(T::new(client)))
+    fn new(client: &Client) -> Self {
+        Self::new(Mutex::new(T::new(client)))
     }
 
     fn new_command_sync<S: AsRef<OsStr>>(&mut self, program: S) -> T::Cmd {

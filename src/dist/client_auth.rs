@@ -20,7 +20,7 @@ use crate::util::new_client_runtime;
 // These (arbitrary) ports need to be registered as valid redirect urls in the oauth provider you're using
 pub const VALID_PORTS: &[u16] = &[12731, 32492, 56909];
 // If token is valid for under this amount of time, print a warning
-const MIN_TOKEN_VALIDITY: Duration = Duration::from_secs(2 * 24 * 60 * 60);
+const MIN_TOKEN_VALIDITY: Duration = Duration::from_hours(48);
 const MIN_TOKEN_VALIDITY_WARNING: &str = "two days";
 
 fn query_pairs(url: &str) -> Result<HashMap<String, String>> {
@@ -57,7 +57,7 @@ fn json_response<T: Serialize>(data: &T) -> Result<Response<Full<Bytes>>> {
     Ok(response(StatusCode::OK, "application/json", body))
 }
 
-const REDIRECT_WITH_AUTH_JSON: &str = r##"<!doctype html>
+const REDIRECT_WITH_AUTH_JSON: &str = r#"<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"></head>
 <body>
@@ -82,7 +82,7 @@ const REDIRECT_WITH_AUTH_JSON: &str = r##"<!doctype html>
     </script>
 </body>
 </html>
-"##;
+"#;
 
 mod code_grant_pkce {
     use super::{
@@ -189,10 +189,7 @@ mod code_grant_pkce {
     fn handle_token_response(res: TokenResponse) -> Result<(String, Instant)> {
         let token = res.access_token;
         if res.token_type.to_lowercase() != TOKEN_TYPE_RESULT_PARAM_VALUE {
-            bail!(
-                "Token type in response is not {}",
-                TOKEN_TYPE_RESULT_PARAM_VALUE
-            )
+            bail!("Token type in response is not {TOKEN_TYPE_RESULT_PARAM_VALUE}")
         }
         // Calculate ASAP the actual time at which the token will expire.
         let expires_at = Instant::now()
@@ -201,12 +198,12 @@ mod code_grant_pkce {
         Ok((token, expires_at))
     }
 
-    const SUCCESS_AFTER_REDIRECT: &str = r##"<!doctype html>
+    const SUCCESS_AFTER_REDIRECT: &str = r#"<!doctype html>
     <html lang="en">
     <head><meta charset="utf-8"></head>
     <body>In-browser step of authentication complete, you can now close this page!</body>
     </html>
-    "##;
+    "#;
 
     pub fn serve(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>> {
         let mut state = STATE
@@ -237,7 +234,7 @@ mod code_grant_pkce {
                     .context("OAuth PKCE shutdown was already requested")?;
                 shutdown_tx
                     .send(())
-                    .map_err(|_| anyhow!("OAuth server shutdown receiver was dropped"))?;
+                    .map_err(|()| anyhow!("OAuth server shutdown receiver was dropped"))?;
                 html_response(SUCCESS_AFTER_REDIRECT)
             }
             _ => {
@@ -269,8 +266,7 @@ mod code_grant_pkce {
         let res = client.post(token_url).json(&token_request).send()?;
         if !res.status().is_success() {
             bail!(
-                "Sending code to {} failed, HTTP error: {}",
-                token_url,
+                "Sending code to {token_url} failed, HTTP error: {}",
                 res.status()
             )
         }
@@ -280,14 +276,8 @@ mod code_grant_pkce {
                 .context("Failed to parse token response as JSON")?,
         )?;
         if expires_at.saturating_duration_since(Instant::now()) < MIN_TOKEN_VALIDITY {
-            warn!(
-                "Token retrieved expires in under {}",
-                MIN_TOKEN_VALIDITY_WARNING
-            );
-            eprintln!(
-                "sccache: Token retrieved expires in under {}",
-                MIN_TOKEN_VALIDITY_WARNING
-            );
+            warn!("Token retrieved expires in under {MIN_TOKEN_VALIDITY_WARNING}");
+            eprintln!("sccache: Token retrieved expires in under {MIN_TOKEN_VALIDITY_WARNING}");
         }
         Ok(token)
     }
@@ -348,10 +338,7 @@ mod implicit {
             .get(TOKEN_TYPE_RESULT_PARAM)
             .context("No token type found in response")?;
         if bearer.to_lowercase() != TOKEN_TYPE_RESULT_PARAM_VALUE {
-            bail!(
-                "Token type in response is not {}",
-                TOKEN_TYPE_RESULT_PARAM_VALUE
-            )
+            bail!("Token type in response is not {TOKEN_TYPE_RESULT_PARAM_VALUE}")
         }
         let expires_in = params
             .get(EXPIRES_IN_RESULT_PARAM)
@@ -369,7 +356,7 @@ mod implicit {
         Ok((token.to_owned(), expires_at, state.to_owned()))
     }
 
-    const SAVE_AUTH_AFTER_REDIRECT: &str = r##"<!doctype html>
+    const SAVE_AUTH_AFTER_REDIRECT: &str = r#"<!doctype html>
     <html lang="en">
     <head><meta charset="utf-8"></head>
     <body>
@@ -396,7 +383,7 @@ mod implicit {
         </script>
     </body>
     </html>
-    "##;
+    "#;
 
     pub fn serve(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>> {
         let mut state = STATE
@@ -418,13 +405,9 @@ mod implicit {
                     return Err(anyhow!("Mismatched auth states after redirect"));
                 }
                 if expires_at.saturating_duration_since(Instant::now()) < MIN_TOKEN_VALIDITY {
-                    warn!(
-                        "Token retrieved expires in under {}",
-                        MIN_TOKEN_VALIDITY_WARNING
-                    );
+                    warn!("Token retrieved expires in under {MIN_TOKEN_VALIDITY_WARNING}");
                     eprintln!(
-                        "sccache: Token retrieved expires in under {}",
-                        MIN_TOKEN_VALIDITY_WARNING
+                        "sccache: Token retrieved expires in under {MIN_TOKEN_VALIDITY_WARNING}"
                     );
                 }
                 // Deliberately in reverse order for a 'happens-before' relationship
@@ -438,7 +421,7 @@ mod implicit {
                     .context("OAuth implicit shutdown was already requested")?;
                 shutdown_tx
                     .send(())
-                    .map_err(|_| anyhow!("OAuth server shutdown receiver was dropped"))?;
+                    .map_err(|()| anyhow!("OAuth server shutdown receiver was dropped"))?;
                 json_response(&"")?
             }
             _ => {
@@ -460,10 +443,10 @@ struct HyperBuilderWrap {
 }
 
 impl HyperBuilderWrap {
-    pub async fn try_bind(addr: SocketAddr) -> io::Result<HyperBuilderWrap> {
+    pub async fn try_bind(addr: SocketAddr) -> io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
 
-        Ok(HyperBuilderWrap { listener })
+        Ok(Self { listener })
     }
 
     // Typing out a hyper service is a major pain, so let's focus on our simple
@@ -508,11 +491,8 @@ fn error_code_response<E>(uri: hyper::Uri, e: E) -> hyper::Result<Response<Full<
 where
     E: std::fmt::Debug,
 {
-    let body = format!("{:?}", e);
-    eprintln!(
-        "sccache: Error during a request to {} on the client auth web server\n{}",
-        uri, body
-    );
+    let body = format!("{e:?}");
+    eprintln!("sccache: Error during a request to {uri} on the client auth web server\n{body}");
     Ok::<Response<Full<Bytes>>, hyper::Error>(response(
         StatusCode::INTERNAL_SERVER_ERROR,
         "text/plain; charset=utf-8",
@@ -539,17 +519,17 @@ async fn try_bind() -> Result<HyperBuilderWrap> {
             Err(ref e) if e.kind() == io::ErrorKind::ConnectionRefused => (),
             Err(e) => {
                 return Err(e)
-                    .with_context(|| format!("Failed to check {} is available for binding", addr));
+                    .with_context(|| format!("Failed to check {addr} is available for binding"));
             }
         }
 
         match HyperBuilderWrap::try_bind(addr).await {
             Ok(s) => return Ok(s),
             Err(ref error) if error.kind() == io::ErrorKind::AddrInUse => continue,
-            Err(e) => return Err(e).with_context(|| format!("Failed to bind to {}", addr)),
+            Err(e) => return Err(e).with_context(|| format!("Failed to bind to {addr}")),
         }
     }
-    bail!("Could not bind to any valid port: ({:?})", VALID_PORTS)
+    bail!("Could not bind to any valid port: ({VALID_PORTS:?})")
 }
 
 async fn serve_until_shutdown<F>(

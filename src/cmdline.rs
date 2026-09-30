@@ -30,7 +30,7 @@ pub enum StatsFormat {
 }
 
 impl StatsFormat {
-    fn as_str(&self) -> &'static str {
+    const fn as_str(&self) -> &'static str {
         match self {
             Self::Text => "text",
             Self::Json => "json",
@@ -45,7 +45,7 @@ impl FromStr for StatsFormat {
         match s {
             "text" => Ok(Self::Text),
             "json" => Ok(Self::Json),
-            _ => bail!("Unrecognized stats format: {:?}", s),
+            _ => bail!("Unrecognized stats format: {s:?}"),
         }
     }
 }
@@ -203,7 +203,7 @@ pub fn try_parse() -> Result<Command> {
             match exe
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .map(|s| s.to_lowercase())
+                .map(str::to_lowercase)
             {
                 // If the executable has its standard name, do nothing.
                 Some(ref e) if e == env!("CARGO_PKG_NAME") => {}

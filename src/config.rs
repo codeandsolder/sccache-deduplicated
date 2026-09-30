@@ -55,12 +55,11 @@ impl FromStr for WriteErrorPolicy {
 
     fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
-            "ignore" => Ok(WriteErrorPolicy::Ignore),
-            "l0" => Ok(WriteErrorPolicy::L0),
-            "all" => Ok(WriteErrorPolicy::All),
+            "ignore" => Ok(Self::Ignore),
+            "l0" => Ok(Self::L0),
+            "all" => Ok(Self::All),
             _ => Err(anyhow!(
-                "Invalid write policy '{}'. Valid values: ignore, l0, all",
-                s
+                "Invalid write policy '{s}'. Valid values: ignore, l0, all"
             )),
         }
     }
@@ -69,9 +68,9 @@ impl FromStr for WriteErrorPolicy {
 impl fmt::Display for WriteErrorPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            WriteErrorPolicy::Ignore => write!(f, "ignore"),
-            WriteErrorPolicy::L0 => write!(f, "l0"),
-            WriteErrorPolicy::All => write!(f, "all"),
+            Self::Ignore => write!(f, "ignore"),
+            Self::L0 => write!(f, "l0"),
+            Self::All => write!(f, "all"),
         }
     }
 }
@@ -98,6 +97,7 @@ pub const INSECURE_DIST_CLIENT_TOKEN: &str = "dangerously_insecure_client";
 
 // Unfortunately this means that nothing else can use the sccache cache dir as
 // this top level directory is used directly to store sccache cached objects...
+#[must_use]
 pub fn default_disk_cache_dir() -> PathBuf {
     ProjectDirs::from("", ORGANIZATION, APP_NAME).map_or_else(
         || env::temp_dir().join(APP_NAME),
@@ -105,6 +105,7 @@ pub fn default_disk_cache_dir() -> PathBuf {
     )
 }
 // ...whereas subdirectories are used of this one
+#[must_use]
 pub fn default_dist_cache_dir() -> PathBuf {
     ProjectDirs::from("", ORGANIZATION, DIST_APP_NAME).map_or_else(
         || env::temp_dir().join(DIST_APP_NAME),
@@ -112,10 +113,10 @@ pub fn default_dist_cache_dir() -> PathBuf {
     )
 }
 
-fn default_disk_cache_size() -> u64 {
+const fn default_disk_cache_size() -> u64 {
     TEN_GIGS
 }
-fn default_toolchain_cache_size() -> u64 {
+const fn default_toolchain_cache_size() -> u64 {
     TEN_GIGS
 }
 
@@ -132,7 +133,7 @@ impl de::Visitor<'_> for StringOrU64Visitor {
     where
         E: de::Error,
     {
-        parse_size(value).ok_or_else(|| E::custom(format!("Invalid size value: {}", value)))
+        parse_size(value).ok_or_else(|| E::custom(format!("Invalid size value: {value}")))
     }
 
     fn visit_u64<E>(self, value: u64) -> StdResult<Self::Value, E>
@@ -157,6 +158,7 @@ where
     deserializer.deserialize_any(StringOrU64Visitor)
 }
 
+#[must_use]
 pub fn parse_size(val: &str) -> Option<u64> {
     let multiplier = match val.chars().last().map(|v| v.to_ascii_uppercase()) {
         Some('K') => 1024,
@@ -194,15 +196,15 @@ impl<'a> Deserialize<'a> for HTTPUrl {
         use serde::de::Error;
         let helper: String = Deserialize::deserialize(deserializer)?;
         let url = parse_http_url(&helper).map_err(D::Error::custom)?;
-        Ok(HTTPUrl(url))
+        Ok(Self(url))
     }
 }
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 fn parse_http_url(url: &str) -> Result<reqwest::Url> {
     use std::net::SocketAddr;
     let url = if let Ok(sa) = url.parse::<SocketAddr>() {
-        warn!("Url {} has no scheme, assuming http", url);
-        reqwest::Url::parse(&format!("http://{}", sa))
+        warn!("Url {url} has no scheme, assuming http");
+        reqwest::Url::parse(&format!("http://{sa}"))
     } else {
         reqwest::Url::parse(url)
     }?;
@@ -217,9 +219,11 @@ fn parse_http_url(url: &str) -> Result<reqwest::Url> {
 }
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 impl HTTPUrl {
-    pub fn from_url(u: reqwest::Url) -> Self {
-        HTTPUrl(u)
+    #[must_use]
+    pub const fn from_url(u: reqwest::Url) -> Self {
+        Self(u)
     }
+    #[must_use]
     pub fn to_url(&self) -> reqwest::Url {
         self.0.clone()
     }
@@ -287,6 +291,7 @@ impl Default for PreprocessorCacheModeConfig {
 
 impl PreprocessorCacheModeConfig {
     /// Return a default [`Self`], but with the cache active.
+    #[must_use]
     pub fn activated() -> Self {
         Self {
             use_preprocessor_cache_mode: true,
@@ -308,7 +313,7 @@ pub struct DiskCacheConfig {
 
 impl Default for DiskCacheConfig {
     fn default() -> Self {
-        DiskCacheConfig {
+        Self {
             dir: default_disk_cache_dir(),
             size: default_disk_cache_size(),
             preprocessor_cache_mode: PreprocessorCacheModeConfig::activated(),
@@ -330,8 +335,8 @@ pub enum CacheModeConfig {
 impl From<CacheModeConfig> for CacheMode {
     fn from(value: CacheModeConfig) -> Self {
         match value {
-            CacheModeConfig::ReadOnly => CacheMode::ReadOnly,
-            CacheModeConfig::ReadWrite => CacheMode::ReadWrite,
+            CacheModeConfig::ReadOnly => Self::ReadOnly,
+            CacheModeConfig::ReadWrite => Self::ReadWrite,
         }
     }
 }
@@ -367,7 +372,7 @@ pub struct GHACacheConfig {
 /// Please change this value freely if we have a better choice.
 const DEFAULT_MEMCACHED_CACHE_EXPIRATION: u32 = 86400;
 
-fn default_memcached_cache_expiration() -> u32 {
+const fn default_memcached_cache_expiration() -> u32 {
     DEFAULT_MEMCACHED_CACHE_EXPIRATION
 }
 
@@ -536,7 +541,7 @@ impl CacheConfigs {
     /// Return cache type in an arbitrary but
     /// consistent ordering (Phase 1 behavior - single cache)
     fn into_fallback(self) -> (Option<CacheType>, DiskCacheConfig) {
-        let CacheConfigs {
+        let Self {
             azure,
             disk,
             gcs,
@@ -610,21 +615,21 @@ impl CacheConfigs {
                         // Mark it by continuing - it will be added to the storage list there
                         continue;
                     }
-                    _ => bail!("Unknown cache level: {}", level_name),
+                    _ => bail!("Unknown cache level: {level_name}"),
                 };
                 caches.push(cache_type);
             }
             Ok(caches)
         } else {
             // No levels specified - use single cache (backward compatible)
-            let (cache_type, _) = self.clone().into_fallback();
+            let (cache_type, _) = self.into_fallback();
             Ok(cache_type.map(|ct| vec![ct]).unwrap_or_default())
         }
     }
 
     /// Override self with any existing fields from other
     fn merge(&mut self, other: Self) {
-        let CacheConfigs {
+        let Self {
             azure,
             disk,
             gcs,
@@ -730,12 +735,12 @@ impl<'a> Deserialize<'a> for DistAuth {
         let helper: Helper = Deserialize::deserialize(deserializer)?;
 
         Ok(match helper {
-            Helper::Token { token } => DistAuth::Token { token },
+            Helper::Token { token } => Self::Token { token },
             Helper::Oauth2CodeGrantPKCE {
                 client_id,
                 auth_url,
                 token_url,
-            } => DistAuth::Oauth2CodeGrantPKCE {
+            } => Self::Oauth2CodeGrantPKCE {
                 client_id,
                 auth_url,
                 token_url,
@@ -743,7 +748,7 @@ impl<'a> Deserialize<'a> for DistAuth {
             Helper::Oauth2Implicit {
                 client_id,
                 auth_url,
-            } => DistAuth::Oauth2Implicit {
+            } => Self::Oauth2Implicit {
                 client_id,
                 auth_url,
             },
@@ -753,7 +758,7 @@ impl<'a> Deserialize<'a> for DistAuth {
 
 impl Default for DistAuth {
     fn default() -> Self {
-        DistAuth::Token {
+        Self::Token {
             token: INSECURE_DIST_CLIENT_TOKEN.to_owned(),
         }
     }
@@ -804,11 +809,11 @@ pub struct FileConfig {
 // If the file doesn't exist or we can't read it, log the issue and proceed. If the
 // config exists but doesn't parse then something is wrong - return an error.
 pub fn try_read_config_file<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
-    debug!("Attempting to read config file at {:?}", path);
+    debug!("Attempting to read config file at {path:?}");
     let mut file = match File::open(path) {
         Ok(f) => f,
         Err(e) => {
-            debug!("Couldn't open config file: {}", e);
+            debug!("Couldn't open config file: {e}");
             return Ok(None);
         }
     };
@@ -817,7 +822,7 @@ pub fn try_read_config_file<T: DeserializeOwned>(path: &Path) -> Result<Option<T
     match file.read_to_string(&mut string) {
         Ok(_) => (),
         Err(e) => {
-            warn!("Failed to read config file: {}", e);
+            warn!("Failed to read config file: {e}");
             return Ok(None);
         }
     }
@@ -858,7 +863,7 @@ fn cache_mode_from_env_var(env_var_name: &str) -> Option<CacheModeConfig> {
         "READ_ONLY" => Some(CacheModeConfig::ReadOnly),
         "READ_WRITE" => Some(CacheModeConfig::ReadWrite),
         _ => {
-            warn!("{} must be 'READ_ONLY' or 'READ_WRITE'", env_var_name);
+            warn!("{env_var_name} must be 'READ_ONLY' or 'READ_WRITE'");
             None
         }
     })
@@ -881,10 +886,7 @@ fn bool_from_env_var(env_var_name: &str) -> Result<Option<bool>> {
         .map(|value| match value.to_lowercase().as_str() {
             "true" | "on" | "1" => Ok(true),
             "false" | "off" | "0" => Ok(false),
-            _ => bail!(
-                "{} must be 'true', 'on', '1', 'false', 'off' or '0'.",
-                env_var_name
-            ),
+            _ => bail!("{env_var_name} must be 'true', 'on', '1', 'false', 'off' or '0'."),
         })
         .transpose()
 }
@@ -913,8 +915,8 @@ fn config_from_env() -> Result<EnvConfig> {
         Some(S3CacheConfig {
             bucket,
             region,
-            no_credentials,
             key_prefix,
+            no_credentials,
             endpoint,
             use_ssl,
             server_side_encryption,
@@ -927,7 +929,7 @@ fn config_from_env() -> Result<EnvConfig> {
         None
     };
 
-    if s3.as_ref().map(|s3| s3.no_credentials).unwrap_or_default()
+    if s3.as_ref().is_some_and(|s3| s3.no_credentials)
         && (env::var_os("AWS_ACCESS_KEY_ID").is_some()
             || env::var_os("AWS_SECRET_ACCESS_KEY").is_some())
     {
@@ -960,11 +962,11 @@ fn config_from_env() -> Result<EnvConfig> {
                 .unwrap_or(CacheModeConfig::ReadWrite);
 
             Some(RedisCacheConfig {
-                url,
                 endpoint,
                 cluster_endpoints,
                 username,
                 password,
+                url,
                 db,
                 ttl,
                 key_prefix,
@@ -1163,8 +1165,8 @@ fn config_from_env() -> Result<EnvConfig> {
 
         Some(OSSCacheConfig {
             bucket,
-            endpoint,
             key_prefix,
+            endpoint,
             no_credentials,
             rw_mode,
         })
@@ -1172,10 +1174,7 @@ fn config_from_env() -> Result<EnvConfig> {
         None
     };
 
-    if oss
-        .as_ref()
-        .map(|oss| oss.no_credentials)
-        .unwrap_or_default()
+    if oss.as_ref().is_some_and(|oss| oss.no_credentials)
         && (env::var_os("ALIBABA_CLOUD_ACCESS_KEY_ID").is_some()
             || env::var_os("ALIBABA_CLOUD_ACCESS_KEY_SECRET").is_some())
     {
@@ -1192,8 +1191,8 @@ fn config_from_env() -> Result<EnvConfig> {
 
         Some(COSCacheConfig {
             bucket,
-            endpoint,
             key_prefix,
+            endpoint,
             rw_mode,
         })
     } else {
@@ -1274,7 +1273,7 @@ fn config_from_env() -> Result<EnvConfig> {
         s.to_string_lossy()
             .split(split_symbol)
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_owned())
+            .map(std::borrow::ToOwned::to_owned)
             .collect()
     });
 
@@ -1319,7 +1318,7 @@ pub struct Config {
     pub server_startup_timeout: Option<std::time::Duration>,
     pub skip_cache_check: bool,
     /// Base directory (or directories) to strip from paths for cache key computation.
-    /// Similar to ccache's CCACHE_BASEDIR.
+    /// Similar to ccache's `CCACHE_BASEDIR`.
     pub basedirs: Vec<Vec<u8>>,
     pub client_side_mode: bool,
 }
@@ -1374,7 +1373,7 @@ impl Config {
         for d in basedirs_raw {
             let p = Utf8TypedPathBuf::from(d);
             if !p.is_absolute() {
-                bail!("Basedir path must be absolute: {:?}", p);
+                bail!("Basedir path must be absolute: {p:?}");
             }
             // Normalize basedir:
             // remove double separators, cur_dirs, parent_dirs, trailing slashes
@@ -1408,7 +1407,7 @@ impl Config {
                 .iter()
                 .map(|b| String::from_utf8_lossy(b).into_owned())
                 .collect();
-            debug!("Using basedirs for path normalization: {:?}", basedirs_str);
+            debug!("Using basedirs for path normalization: {basedirs_str:?}");
         }
 
         let client_side_mode = env_client_side_mode.unwrap_or(file_client_side_mode)
@@ -2018,7 +2017,7 @@ fn config_basedirs_overrides() {
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert!(config.basedirs.is_empty());
+    assert_eq!(config.basedirs, [] as [std::vec::Vec<u8>; 0]);
 
     // Test that both empty results in empty
     let env_conf = EnvConfig {
@@ -2036,7 +2035,7 @@ fn config_basedirs_overrides() {
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert!(config.basedirs.is_empty());
+    assert_eq!(config.basedirs, [] as [std::vec::Vec<u8>; 0]);
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
@@ -2052,7 +2051,7 @@ fn config_basedirs_overrides() {
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert!(config.basedirs.is_empty());
+    assert_eq!(config.basedirs, [] as [std::vec::Vec<u8>; 0]);
 }
 
 #[test]
@@ -2091,7 +2090,7 @@ fn test_deserialize_basedirs_missing() {
     "#;
 
     let config: FileConfig = toml::from_str(toml).unwrap();
-    assert!(config.basedirs.is_empty());
+    assert_eq!(config.basedirs, [] as [std::string::String; 0]);
 }
 
 #[test]
@@ -3306,7 +3305,7 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert!(config.basedirs.is_empty());
+    assert_eq!(config.basedirs, [] as [std::vec::Vec<u8>; 0]);
 
     let input = b"# 1 \"/home/user/project/src/main.c\"";
     let output = strip_basedirs(input, &config.basedirs);

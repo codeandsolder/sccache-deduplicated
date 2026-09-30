@@ -31,21 +31,21 @@ use crate::jobserver::Client;
 /// Return a `Vec` with each listed entry converted to an owned `String`.
 macro_rules! stringvec {
     ( $( $x:expr ),* ) => {
-        vec!($( $x.to_owned(), )*)
+        vec![$( $x.to_owned(), )*]
     };
 }
 
 /// Return a `Vec` with each listed entry converted to an owned `OsString`.
 macro_rules! ovec {
     ( $( $x:expr ),* ) => {
-        vec!($( ::std::ffi::OsString::from($x), )*)
+        vec![$( ::std::ffi::OsString::from($x), )*]
     };
 }
 
 /// Return a `Vec` with each listed entry converted to an owned `PathBuf`.
 macro_rules! pathvec {
     ( $( $x:expr ),* ) => {
-        vec!($( ::std::path::PathBuf::from($x), )*)
+        vec![$( ::std::path::PathBuf::from($x), )*]
     };
 }
 
@@ -99,9 +99,7 @@ pub fn next_assembler(creator: &Arc<Mutex<MockCommandCreator>>, version: &str, p
         next_command_calls(creator, move |args| {
             assert!(
                 args.iter().any(|arg| arg == probe),
-                "{} missing from assembler probe: {:?}",
-                probe,
-                args
+                "{probe} missing from assembler probe: {args:?}"
             );
             Ok(MockChild::new(exit_status(0), &output, ""))
         });
@@ -156,7 +154,7 @@ pub fn mk_bin_contents<F: FnOnce(File) -> io::Result<()>>(
     let f = fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .mode(0o666 | (libc::S_IXUSR as u32))
+        .mode(0o666 | libc::S_IXUSR)
         .open(&bin)?;
     fill_contents(f)?;
     bin.canonicalize()
@@ -195,7 +193,7 @@ pub fn mk_bin(dir: &Path, path: &str) -> io::Result<PathBuf> {
 }
 
 impl TestFixture {
-    pub fn new() -> TestFixture {
+    pub fn new() -> Self {
         let tempdir = tempfile::Builder::new()
             .prefix("sccache_test")
             .tempdir()
@@ -204,13 +202,13 @@ impl TestFixture {
         builder.recursive(true);
         let mut paths = vec![];
         let mut bins = vec![];
-        for d in SUBDIRS.iter() {
+        for d in SUBDIRS {
             let p = tempdir.path().join(d);
             builder.create(&p).unwrap();
             bins.push(mk_bin(&p, BIN_NAME).unwrap());
             paths.push(p);
         }
-        TestFixture {
+        Self {
             tempdir,
             paths: env::join_paths(paths).unwrap(),
             bins,
@@ -238,7 +236,7 @@ pub fn single_threaded_runtime() -> tokio::runtime::Runtime {
 /// as it was possible for `futures` at `0.1`.
 ///
 /// Intended for test only!
-pub(crate) trait Waiter<R> {
+pub trait Waiter<R> {
     fn wait(self) -> R;
 }
 

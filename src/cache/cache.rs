@@ -94,7 +94,7 @@ pub trait Storage: Send + Sync {
             match self.get_raw(key).await {
                 Ok(raw) => raw,
                 Err(error) => {
-                    debug!("Failed to get raw bytes for cache backfill: {}", error);
+                    debug!("Failed to get raw bytes for cache backfill: {error}");
                     None
                 }
             }
@@ -205,7 +205,7 @@ pub trait Storage: Send + Sync {
     }
 }
 
-/// Wrapper for opendal::Operator that adds basedirs support
+/// Wrapper for `opendal::Operator` that adds basedirs support
 #[cfg(any(
     feature = "azure",
     feature = "gcs",
@@ -236,7 +236,12 @@ pub struct RemoteStorage {
     feature = "cos"
 ))]
 impl RemoteStorage {
-    pub fn new(operator: opendal::Operator, basedirs: Vec<Vec<u8>>, rw_mode: CacheMode) -> Self {
+    #[must_use]
+    pub const fn new(
+        operator: opendal::Operator,
+        basedirs: Vec<Vec<u8>>,
+        rw_mode: CacheMode,
+    ) -> Self {
         Self {
             operator,
             basedirs,
@@ -245,7 +250,8 @@ impl RemoteStorage {
         }
     }
 
-    pub fn with_skip_cache_check(mut self, skip_cache_check: bool) -> Self {
+    #[must_use]
+    pub const fn with_skip_cache_check(mut self, skip_cache_check: bool) -> Self {
         self.skip_cache_check = skip_cache_check;
         self
     }
@@ -278,14 +284,14 @@ impl Storage for RemoteStorage {
             }
             Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok((Cache::Miss, None)),
             Err(e) => {
-                warn!("Got unexpected error: {:?}", e);
+                warn!("Got unexpected error: {e:?}");
                 Ok((Cache::Miss, None))
             }
         }
     }
 
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
-        trace!("RemoteStorage::put({})", key);
+        trace!("RemoteStorage::put({key})");
         // Delegate to put_raw after serializing the entry
         let data = entry.finish()?;
         self.put_raw(key, data.into()).await
@@ -321,7 +327,7 @@ impl Storage for RemoteStorage {
             Err(err) if err.kind() == ErrorKind::RateLimited => {
                 eprintln!("cache storage read check: {err:?}, but we decide to keep running");
             }
-            Err(err) => bail!("cache storage failed to read: {:?}", err),
+            Err(err) => bail!("cache storage failed to read: {err:?}"),
         }
 
         // No need to check write if we are in manually-set read-only mode
@@ -387,34 +393,33 @@ impl Storage for RemoteStorage {
     /// there is no way to extract the original bytes back from the parsed ZIP archive.
     /// For backfill we need the raw bytes to write directly to another cache level.
     async fn entry_exists(&self, key: &str) -> Result<Option<bool>> {
-        trace!("opendal::Operator::entry_exists({})", key);
+        trace!("opendal::Operator::entry_exists({key})");
         match self.operator.stat(&normalize_key(key)).await {
             Ok(_) => Ok(Some(true)),
             Err(error) if error.kind() == opendal::ErrorKind::NotFound => Ok(Some(false)),
-            Err(error) => Err(anyhow!("Failed to stat cache entry {}: {:?}", key, error)),
+            Err(error) => Err(anyhow!("Failed to stat cache entry {key}: {error:?}")),
         }
     }
 
     async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {
-        trace!("opendal::Operator::get_raw({})", key);
+        trace!("opendal::Operator::get_raw({key})");
         match self.operator.read(&normalize_key(key)).await {
             Ok(res) => {
                 let data = res.to_bytes();
                 trace!(
-                    "opendal::Operator::get_raw({}): Found {} bytes",
-                    key,
+                    "opendal::Operator::get_raw({key}): Found {} bytes",
                     data.len()
                 );
                 Ok(Some(data))
             }
             Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
-                trace!("opendal::Operator::get_raw({}): NotFound", key);
+                trace!("opendal::Operator::get_raw({key}): NotFound");
                 Ok(None)
             }
             Err(e) => {
-                warn!("opendal::Operator::get_raw({}): Error: {:?}", key, e);
+                warn!("opendal::Operator::get_raw({key}): Error: {e:?}");
                 // Return error instead of silently returning None
-                Err(anyhow!("Failed to read raw bytes: {:?}", e))
+                Err(anyhow!("Failed to read raw bytes: {e:?}"))
             }
         }
     }
@@ -425,7 +430,7 @@ impl Storage for RemoteStorage {
     /// pre-serialized bytes directly. Paired with `get_raw()` for efficient
     /// level-to-level data transfer without a deserialize/reserialize round-trip.
     async fn put_raw(&self, key: &str, data: Bytes) -> Result<Duration> {
-        trace!("opendal::Operator::put_raw({}, {} bytes)", key, data.len());
+        trace!("opendal::Operator::put_raw({key}, {} bytes)", data.len());
         let start = std::time::Instant::now();
 
         if self.rw_mode == CacheMode::ReadOnly {
@@ -438,8 +443,8 @@ impl Storage for RemoteStorage {
     }
 }
 
-/// Build a single cache storage from CacheType
-/// Helper function used by storage_from_config for both single and multi-level caches
+/// Build a single cache storage from `CacheType`
+/// Helper function used by `storage_from_config` for both single and multi-level caches
 #[cfg(any(
     feature = "azure",
     feature = "gcs",
@@ -701,7 +706,7 @@ pub fn storage_from_config(
     let (dir, size) = (&config.fallback_cache.dir, config.fallback_cache.size);
     let preprocessor_cache_mode_config = config.fallback_cache.preprocessor_cache_mode;
     let rw_mode = config.fallback_cache.rw_mode.into();
-    debug!("Init disk cache with dir {:?}, size {}", dir, size);
+    debug!("Init disk cache with dir {dir:?}, size {size}");
     Ok(Arc::new(DiskCache::new(
         dir,
         size,

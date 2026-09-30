@@ -103,7 +103,7 @@ mod client {
             // Load in toolchain configuration
             let mut custom_toolchain_paths = HashMap::new();
             let mut disabled_toolchains = HashSet::new();
-            for ct in toolchain_configs.iter() {
+            for ct in toolchain_configs {
                 match ct {
                     config::DistToolchainConfig::PathOverride {
                         compiler_executable,
@@ -200,7 +200,7 @@ mod client {
                 )
             }
             if let Some(tc_and_paths) = self.get_custom_toolchain(compiler_path) {
-                debug!("Using custom toolchain for {:?}", compiler_path);
+                debug!("Using custom toolchain for {compiler_path:?}");
                 let (tc, compiler_path, archive) = tc_and_paths?;
                 return Ok((tc, Some((compiler_path, archive))));
             }
@@ -208,10 +208,10 @@ mod client {
             // to create the same toolchain, just a waste of time
             let mut cache = self.cache.lock().unwrap();
             if let Some(archive_id) = self.weak_to_strong(weak_key) {
-                debug!("Using cached toolchain {} -> {}", weak_key, archive_id);
+                debug!("Using cached toolchain {weak_key} -> {archive_id}");
                 return Ok((Toolchain { archive_id }, None));
             }
-            debug!("Weak key {} appears to be new", weak_key);
+            debug!("Weak key {weak_key} appears to be new");
             let tmpfile = tempfile::NamedTempFile::new_in(self.cache_dir.join("toolchain_tmp"))?;
             toolchain_packager
                 .write_pkg(fs_err::File::from_parts(tmpfile.reopen()?, tmpfile.path()))
@@ -299,7 +299,7 @@ mod client {
         struct PanicToolchainPackager;
         impl PanicToolchainPackager {
             fn new() -> Box<Self> {
-                Box::new(PanicToolchainPackager)
+                Box::new(Self)
             }
         }
         #[cfg(all(
@@ -340,7 +340,10 @@ mod client {
                     PanicToolchainPackager::new(),
                 )
                 .unwrap();
-            assert!(newpath.unwrap() == ("/my/compiler/in_archive".to_string(), ct1));
+            assert_eq!(
+                newpath.unwrap(),
+                ("/my/compiler/in_archive".to_string(), ct1)
+            );
         }
 
         #[test]
@@ -385,7 +388,10 @@ mod client {
                     PanicToolchainPackager::new(),
                 )
                 .unwrap();
-            assert!(newpath.unwrap() == ("/my/compiler/in_archive".to_string(), ct1.clone()));
+            assert_eq!(
+                newpath.unwrap(),
+                ("/my/compiler/in_archive".to_string(), ct1.clone())
+            );
             let (_tc, newpath) = client_toolchains
                 .put_toolchain(
                     "/my/compiler2".as_ref(),
@@ -393,7 +399,10 @@ mod client {
                     PanicToolchainPackager::new(),
                 )
                 .unwrap();
-            assert!(newpath.unwrap() == ("/my/compiler2/in_archive".to_string(), ct1.clone()));
+            assert_eq!(
+                newpath.unwrap(),
+                ("/my/compiler2/in_archive".to_string(), ct1.clone())
+            );
             let (_tc, newpath) = client_toolchains
                 .put_toolchain(
                     "/my/compiler3".as_ref(),
@@ -401,7 +410,10 @@ mod client {
                     PanicToolchainPackager::new(),
                 )
                 .unwrap();
-            assert!(newpath.unwrap() == ("/my/compiler/in_archive".to_string(), ct1));
+            assert_eq!(
+                newpath.unwrap(),
+                ("/my/compiler/in_archive".to_string(), ct1)
+            );
         }
 
         #[test]
@@ -465,13 +477,14 @@ pub struct TcCache {
 }
 
 impl TcCache {
-    pub fn new(cache_dir: &Path, cache_size: u64) -> Result<TcCache> {
-        trace!("Using TcCache({:?}, {})", cache_dir, cache_size);
-        Ok(TcCache {
+    pub fn new(cache_dir: &Path, cache_size: u64) -> Result<Self> {
+        trace!("Using TcCache({cache_dir:?}, {cache_size})");
+        Ok(Self {
             inner: LruDiskCache::new(cache_dir, cache_size)?,
         })
     }
 
+    #[must_use]
     pub fn contains_toolchain(&self, tc: &Toolchain) -> bool {
         self.inner.contains_key(make_lru_key_path(&tc.archive_id))
     }
@@ -500,10 +513,12 @@ impl TcCache {
         self.inner.get(make_lru_key_path(&tc.archive_id))
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

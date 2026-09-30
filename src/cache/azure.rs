@@ -36,7 +36,7 @@ impl AzureBlobCache {
     ///   behavior.
     /// * **Microsoft Entra ID (passwordless)** — when `connection_string` is
     ///   `None`, the operator is built without any account key or SAS token, so
-    ///   OpenDAL (via its bundled `reqsign` dependency) resolves credentials
+    ///   `OpenDAL` (via its bundled `reqsign` dependency) resolves credentials
     ///   from the ambient environment and signs each request with an
     ///   `Authorization: Bearer <token>` header. Supported credential sources,
     ///   in the order `reqsign` tries them: a **service principal**
@@ -63,31 +63,28 @@ impl AzureBlobCache {
         let storage_account = storage_account.filter(|s| !s.is_empty());
         let endpoint = endpoint.filter(|s| !s.is_empty());
 
-        let builder = match connection_string {
-            Some(connection_string) => {
-                // Both the env and file config surfaces flow through here. The
-                // env parser rejects this combination too, but a file config
-                // bypasses that check, so enforce mutual exclusivity centrally.
-                if storage_account.is_some() || endpoint.is_some() {
-                    bail!(
-                        "Azure cache accepts either a connection string or a storage account / endpoint (Entra ID), not both."
-                    );
-                }
-                Azblob::from_connection_string(connection_string)?
-                    .container(container)
-                    .root(key_prefix)
+        let builder = if let Some(connection_string) = connection_string {
+            // Both the env and file config surfaces flow through here. The
+            // env parser rejects this combination too, but a file config
+            // bypasses that check, so enforce mutual exclusivity centrally.
+            if storage_account.is_some() || endpoint.is_some() {
+                bail!(
+                    "Azure cache accepts either a connection string or a storage account / endpoint (Entra ID), not both."
+                );
             }
-            None => {
-                // Entra ID / passwordless path. Deliberately leave account_key,
-                // sas_token and connection_string unset: OpenDAL then loads
-                // Entra credentials (managed identity / workload identity /
-                // service principal) from the environment via reqsign.
-                let endpoint = resolve_blob_endpoint(endpoint, storage_account)?;
-                Azblob::default()
-                    .endpoint(&endpoint)
-                    .container(container)
-                    .root(key_prefix)
-            }
+            Azblob::from_connection_string(connection_string)?
+                .container(container)
+                .root(key_prefix)
+        } else {
+            // Entra ID / passwordless path. Deliberately leave account_key,
+            // sas_token and connection_string unset: OpenDAL then loads
+            // Entra credentials (managed identity / workload identity /
+            // service principal) from the environment via reqsign.
+            let endpoint = resolve_blob_endpoint(endpoint, storage_account)?;
+            Azblob::default()
+                .endpoint(&endpoint)
+                .container(container)
+                .root(key_prefix)
         };
 
         let op = Operator::new(builder)?
@@ -99,7 +96,7 @@ impl AzureBlobCache {
 
 /// Resolve the Azure Blob endpoint for the Entra ID (passwordless) path.
 ///
-/// OpenDAL's Azblob backend requires an explicit endpoint and does not derive
+/// `OpenDAL`'s Azblob backend requires an explicit endpoint and does not derive
 /// one from the account name, so callers must supply either a full `endpoint`
 /// (for sovereign clouds or a custom endpoint) or a `storage_account` name from
 /// which the public-cloud endpoint is synthesized. An explicit endpoint takes
@@ -143,8 +140,7 @@ fn resolve_blob_endpoint(endpoint: Option<&str>, storage_account: Option<&str>) 
             let is_loopback = host.eq_ignore_ascii_case("localhost")
                 || host_ip
                     .parse::<std::net::IpAddr>()
-                    .map(|ip| ip.is_loopback())
-                    .unwrap_or(false);
+                    .is_ok_and(|ip| ip.is_loopback());
             match uri.scheme_str() {
                 Some("https") => {}
                 Some("http") if is_loopback => {}

@@ -111,9 +111,8 @@ impl PreprocessorCacheEntry {
             // An easy way is to throw away all entries when there are too many.
             // Let's do that for now.
             debug!(
-                "Too many entries in preprocessor cache entry file ({}/{}), starting over",
-                self.results.len(),
-                MAX_PREPROCESSOR_CACHE_ENTRIES
+                "Too many entries in preprocessor cache entry file ({}/{MAX_PREPROCESSOR_CACHE_ENTRIES}), starting over",
+                self.results.len()
             );
             self.results.clear();
             self.number_of_entries = 0;
@@ -122,7 +121,7 @@ impl PreprocessorCacheEntry {
             .into_iter()
             .map(|(digest, path)| {
                 let meta = std::fs::symlink_metadata(&path)?;
-                let mtime: Option<Timestamp> = meta.modified().ok().map(|t| t.into());
+                let mtime: Option<Timestamp> = meta.modified().ok().map(std::convert::Into::into);
                 let ctime = meta.ctime_or_creation().ok();
 
                 let should_cache_time = match (mtime, ctime) {
@@ -149,8 +148,7 @@ impl PreprocessorCacheEntry {
                     // does not. This also puts an upper bound on the number
                     // of entries.
                     debug!(
-                        "Too many include entries in preprocessor cache entry file ({}/{}), starting over",
-                        new_number_of_entries, MAX_PREPROCESSOR_CACHE_FILE_INFO_ENTRIES
+                        "Too many include entries in preprocessor cache entry file ({new_number_of_entries}/{MAX_PREPROCESSOR_CACHE_FILE_INFO_ENTRIES}), starting over"
                     );
                     self.results.clear();
                 }
@@ -208,9 +206,8 @@ impl PreprocessorCacheEntry {
                 }
                 Err(e) => {
                     debug!(
-                        "{} is in a preprocessor cache entry but can't be read ({})",
-                        path.display(),
-                        e
+                        "{} is in a preprocessor cache entry but can't be read ({e})",
+                        path.display()
                     );
                     return false;
                 }
@@ -224,18 +221,16 @@ impl PreprocessorCacheEntry {
                         if mtime_matches && ctime_matches {
                             trace!("mtime+ctime hit for {}", path.display());
                             continue;
-                        } else {
-                            trace!("mtime+ctime miss for {}", path.display());
                         }
+                        trace!("mtime+ctime miss for {}", path.display());
                     }
                     (Some(mtime), None) => {
                         let mtime_matches = meta.modified().map(Into::into).ok() == Some(mtime);
                         if mtime_matches {
                             trace!("mtime hit for {}", path.display());
                             continue;
-                        } else {
-                            trace!("mtime miss for {}", path.display());
                         }
+                        trace!("mtime miss for {}", path.display());
                     }
                     _ => { /* Nothing was recorded, fall back to contents comparison */ }
                 }
@@ -245,9 +240,8 @@ impl PreprocessorCacheEntry {
                 Ok(file) => file,
                 Err(e) => {
                     debug!(
-                        "{} is in a preprocessor cache entry but can't be opened ({})",
-                        path.display(),
-                        e
+                        "{} is in a preprocessor cache entry but can't be opened ({e})",
+                        path.display()
                     );
                     return false;
                 }
@@ -262,9 +256,8 @@ impl PreprocessorCacheEntry {
                     }
                     Err(e) => {
                         debug!(
-                            "{} is in a preprocessor cache entry but can't be read ({})",
-                            path.display(),
-                            e
+                            "{} is in a preprocessor cache entry but can't be read ({e})",
+                            path.display()
                         );
                         return false;
                     }
@@ -275,9 +268,8 @@ impl PreprocessorCacheEntry {
                     Ok((new_digest, finder)) => (new_digest, finder),
                     Err(e) => {
                         debug!(
-                            "{} is in a preprocessor cache entry but can't be read ({})",
-                            path.display(),
-                            e
+                            "{} is in a preprocessor cache entry but can't be read ({e})",
+                            path.display()
                         );
                         return false;
                     }
@@ -325,22 +317,20 @@ impl PreprocessorCacheEntry {
                         Ok(meta) => meta,
                         Err(e) => {
                             debug!(
-                                "{} is in a preprocessor cache entry but can't be read ({})",
-                                path.display(),
-                                e
-                            );
-                            return false;
-                        }
-                    };
-                    let mtime = match meta.modified() {
-                        Ok(mtime) => mtime,
-                        Err(_) => {
-                            debug!(
-                                "Couldn't get mtime of {} which contains __TIMESTAMP__",
+                                "{} is in a preprocessor cache entry but can't be read ({e})",
                                 path.display()
                             );
                             return false;
                         }
+                    };
+                    let mtime = if let Ok(mtime) = meta.modified() {
+                        mtime
+                    } else {
+                        debug!(
+                            "Couldn't get mtime of {} which contains __TIMESTAMP__",
+                            path.display()
+                        );
+                        return false;
                     };
                     let mtime: chrono::DateTime<chrono::Local> = chrono::DateTime::from(mtime);
                     new_digest.delimiter(b"timestamp");
@@ -393,7 +383,7 @@ pub fn preprocessor_cache_entry_hash_key(
     m.update(compiler_digest.as_bytes());
     // clang and clang++ have different behavior despite being byte-for-byte identical binaries, so
     // we have to incorporate that into the hash as well.
-    m.update(&[plusplus as u8]);
+    m.update(&[u8::from(plusplus)]);
     m.update(&[FORMAT_VERSION]);
     m.update(language.as_str().as_bytes());
     hash_arguments(&mut m, arguments, basedirs);
@@ -407,7 +397,7 @@ pub fn preprocessor_cache_entry_hash_key(
         m.update(assembler_digest.as_bytes());
     }
 
-    for (var, val) in env_vars.iter() {
+    for (var, val) in env_vars {
         if CACHED_ENV_VARS.contains(var.as_os_str()) {
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(&b"="[..]);
@@ -483,11 +473,10 @@ impl From<bincode::Error> for Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Io(e) => e.fmt(f),
-            Error::Deserialization(e) => e.fmt(f),
-            Error::UnknownFormat(format) => f.write_fmt(format_args!(
-                "Unknown preprocessor cache entry format {:x}",
-                format
+            Self::Io(e) => e.fmt(f),
+            Self::Deserialization(e) => e.fmt(f),
+            Self::UnknownFormat(format) => f.write_fmt(format_args!(
+                "Unknown preprocessor cache entry format {format:x}"
             )),
         }
     }

@@ -15,7 +15,7 @@
 #[macro_use]
 mod args;
 mod c;
-pub(crate) mod canonical_paths;
+pub mod canonical_paths;
 mod cicc;
 mod clang;
 #[macro_use]

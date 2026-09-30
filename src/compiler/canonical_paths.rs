@@ -39,7 +39,7 @@ impl RootMapping {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CanonicalRustPaths {
+pub struct CanonicalRustPaths {
     roots: Vec<RootMapping>,
     pub(crate) build_root: PathBuf,
     pub(crate) target_root: PathBuf,
@@ -529,8 +529,8 @@ mod tests {
                 "SCCACHE_CANONICAL_BUILD_ROOT".into(),
                 build.clone().into_os_string(),
             ),
-            ("CARGO_TARGET_DIR".into(), target.clone().into_os_string()),
-            ("CARGO_HOME".into(), cargo_home.clone().into_os_string()),
+            ("CARGO_TARGET_DIR".into(), target.into_os_string()),
+            ("CARGO_HOME".into(), cargo_home.into_os_string()),
             (
                 "EPHEMERAL_CARGO_REGISTRY_SRC".into(),
                 ephemeral_registry.clone().into_os_string(),
@@ -549,7 +549,7 @@ mod tests {
         {
             let args = roots.bwrap_arguments(
                 Path::new("/rust/bin/rustc"),
-                &[source.clone().into_os_string()],
+                &[source.into_os_string()],
                 &ephemeral_registry.join("index/pkg"),
             );
             assert!(args.windows(2).any(|pair| {

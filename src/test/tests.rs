@@ -44,7 +44,7 @@ struct ServerOptions {
 ///
 /// * The port on which the server is listening.
 /// * A `Sender` which can be used to send messages to the server.
-///   (Most usefully, ServerMessage::Shutdown.)
+///   (Most usefully, `ServerMessage::Shutdown`.)
 /// * An `Arc`-and-`Mutex`-wrapped `MockCommandCreator` which the server will
 ///   use for all process creation.
 /// * The `JoinHandle` for the server thread.

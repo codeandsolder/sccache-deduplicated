@@ -33,7 +33,8 @@ pub struct S3Cache {
 }
 
 impl S3Cache {
-    pub fn new(bucket: String, key_prefix: String, no_credentials: bool) -> Self {
+    #[must_use]
+    pub const fn new(bucket: String, key_prefix: String, no_credentials: bool) -> Self {
         Self {
             bucket,
             region: None,
@@ -47,29 +48,38 @@ impl S3Cache {
             enable_virtual_host_style: None,
         }
     }
+    #[must_use]
     pub fn with_region(mut self, region: Option<String>) -> Self {
         self.region = region;
         self
     }
+    #[must_use]
     pub fn with_endpoint(mut self, endpoint: Option<String>) -> Self {
         self.endpoint = endpoint;
         self
     }
-    pub fn with_use_ssl(mut self, use_ssl: Option<bool>) -> Self {
+    #[must_use]
+    pub const fn with_use_ssl(mut self, use_ssl: Option<bool>) -> Self {
         self.use_ssl = use_ssl;
         self
     }
-    pub fn with_server_side_encryption(mut self, server_side_encryption: Option<bool>) -> Self {
+    #[must_use]
+    pub const fn with_server_side_encryption(
+        mut self,
+        server_side_encryption: Option<bool>,
+    ) -> Self {
         self.server_side_encryption = server_side_encryption;
         self
     }
-    pub fn with_server_side_encryption_aws_kms(
+    #[must_use]
+    pub const fn with_server_side_encryption_aws_kms(
         mut self,
         server_side_encryption_aws_kms: Option<bool>,
     ) -> Self {
         self.server_side_encryption_aws_kms = server_side_encryption_aws_kms;
         self
     }
+    #[must_use]
     pub fn with_server_side_encryption_kms_key_id(
         mut self,
         server_side_encryption_kms_key_id: Option<String>,
@@ -77,7 +87,8 @@ impl S3Cache {
         self.server_side_encryption_kms_key_id = server_side_encryption_kms_key_id;
         self
     }
-    pub fn with_enable_virtual_host_style(
+    #[must_use]
+    pub const fn with_enable_virtual_host_style(
         mut self,
         enable_virtual_host_style: Option<bool>,
     ) -> Self {
@@ -91,7 +102,7 @@ impl S3Cache {
             builder = builder.region(region);
         }
 
-        if let Some(true) = &self.enable_virtual_host_style {
+        if matches!(&self.enable_virtual_host_style, Some(true)) {
             builder = builder.enable_virtual_host_style();
         }
 
@@ -130,11 +141,11 @@ impl S3Cache {
     }
 }
 
-/// Resolve given endpoint along with use_ssl settings.
+/// Resolve given endpoint along with `use_ssl` settings.
 fn endpoint_resolver(endpoint: &str, use_ssl: Option<bool>) -> Result<String> {
     let endpoint_uri: http::Uri = endpoint
         .try_into()
-        .map_err(|err| anyhow!("input endpoint {endpoint} is invalid: {:?}", err))?;
+        .map_err(|err| anyhow!("input endpoint {endpoint} is invalid: {err:?}"))?;
     let mut parts = endpoint_uri.into_parts();
     match use_ssl {
         Some(true) => {
@@ -222,7 +233,7 @@ mod test {
 
         for (name, endpoint, use_ssl, expected) in cases {
             let actual = endpoint_resolver(endpoint, use_ssl)?;
-            assert_eq!(actual, expected, "{}", name);
+            assert_eq!(actual, expected, "{name}");
         }
 
         Ok(())

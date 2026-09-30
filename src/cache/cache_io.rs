@@ -48,15 +48,15 @@ pub enum Cache {
 impl fmt::Debug for Cache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            Cache::Hit(_) => write!(f, "Cache::Hit(...)"),
-            Cache::Miss => write!(f, "Cache::Miss"),
-            Cache::None => write!(f, "Cache::None"),
-            Cache::Recache => write!(f, "Cache::Recache"),
+            Self::Hit(_) => write!(f, "Cache::Hit(...)"),
+            Self::Miss => write!(f, "Cache::Miss"),
+            Self::None => write!(f, "Cache::None"),
+            Self::Recache => write!(f, "Cache::Recache"),
         }
     }
 }
 
-/// CacheMode is used to represent which mode we are using.
+/// `CacheMode` is used to represent which mode we are using.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CacheMode {
     /// Only read cache from storage.
@@ -89,13 +89,13 @@ impl std::error::Error for DecompressionFailure {}
 
 impl CacheRead {
     /// Create a cache entry from `reader`.
-    pub fn from<R>(reader: R) -> Result<CacheRead>
+    pub fn from<R>(reader: R) -> Result<Self>
     where
         R: ReadSeek + 'static,
     {
         let z = ZipArchive::new(Box::new(reader) as Box<dyn ReadSeek>)
             .context("Failed to parse cache entry")?;
-        Ok(CacheRead { zip: z })
+        Ok(Self { zip: z })
     }
 
     /// Get an object from this cache entry at `name` and write it to `to`.
@@ -226,19 +226,20 @@ pub struct CacheWrite {
 
 impl CacheWrite {
     /// Create a new, empty cache entry.
-    pub fn new() -> CacheWrite {
-        CacheWrite {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
             zip: ZipWriter::new(Cursor::new(vec![])),
         }
     }
 
     /// Create a new cache entry populated with the contents of `objects`.
-    pub async fn from_objects<T>(objects: T, pool: &tokio::runtime::Handle) -> Result<CacheWrite>
+    pub async fn from_objects<T>(objects: T, pool: &tokio::runtime::Handle) -> Result<Self>
     where
         T: IntoIterator<Item = FileObjectSource> + Send + Sync + 'static,
     {
         pool.spawn_blocking(move || {
-            let mut entry = CacheWrite::new();
+            let mut entry = Self::new();
             for FileObjectSource {
                 key,
                 path,
@@ -246,12 +247,12 @@ impl CacheWrite {
             } in objects
             {
                 let f = fs::File::open(&path)
-                    .with_context(|| format!("failed to open file `{:?}`", path));
+                    .with_context(|| format!("failed to open file `{path:?}`"));
                 match (f, optional) {
                     (Ok(mut f), _) => {
                         let mode = get_file_mode(&f)?;
                         entry.put_object(&key, &mut f, mode).with_context(|| {
-                            format!("failed to put object `{:?}` in cache entry", path)
+                            format!("failed to put object `{path:?}` in cache entry")
                         })?;
                     }
                     (Err(e), false) => return Err(e),
@@ -307,7 +308,7 @@ impl CacheWrite {
 
     /// Finish writing data to the cache entry writer, and return the data.
     pub fn finish(self) -> Result<Vec<u8>> {
-        let CacheWrite { mut zip } = self;
+        let Self { mut zip } = self;
         let cur = zip.finish().context("Failed to finish cache entry zip")?;
         Ok(cur.into_inner())
     }
