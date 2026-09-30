@@ -31,17 +31,15 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 
 #[test]
-fn average_duration_handles_more_than_u32_samples() -> Result<()> {
+fn average_duration_handles_more_than_u32_samples() {
     let samples = u64::from(u32::MAX) + 1;
     let total = Duration::from_secs(samples);
     assert_eq!(average_duration(total, samples), Duration::from_secs(1));
-    Ok(())
 }
 
 #[test]
-fn duration_nanos_saturates_instead_of_truncating() -> Result<()> {
+fn duration_nanos_saturates_instead_of_truncating() {
     assert_eq!(duration_nanos_u64(Duration::from_secs(u64::MAX)), u64::MAX);
-    Ok(())
 }
 
 #[test]
@@ -224,16 +222,12 @@ impl Storage for InMemoryStorage {
         self.access_log.lock().await.push(format!("get:{key}"));
 
         let data = self.data.lock().await;
-        match data.get(key) {
-            Some(bytes) => {
-                let cursor = Cursor::new(bytes.clone());
-                match CacheRead::from(cursor) {
-                    Ok(hit) => Ok(Cache::Hit(hit)),
-                    Err(_) => Ok(Cache::Miss),
-                }
-            }
-            None => Ok(Cache::Miss),
-        }
+        Ok(data.get(key).map_or_else(
+            || Cache::Miss,
+            |bytes| {
+                CacheRead::from(Cursor::new(bytes.clone())).map_or_else(|_| Cache::Miss, Cache::Hit)
+            },
+        ))
     }
 
     async fn get_with_raw(&self, key: &str) -> Result<(Cache, Option<Bytes>)> {
@@ -301,12 +295,11 @@ impl Storage for InMemoryStorage {
 }
 
 #[test]
-fn test_l0_hit_repairs_missing_l1_without_blocking_hit() {
+fn test_l0_hit_repairs_missing_l1_without_blocking_hit() -> Result<()> {
     let runtime = RuntimeBuilder::new_multi_thread()
         .enable_all()
         .worker_threads(1)
-        .build()
-        .unwrap();
+        .build()?;
 
     let l0 = Arc::new(InMemoryStorage::new());
     let l1 = Arc::new(InMemoryStorage::new());
@@ -316,13 +309,10 @@ fn test_l0_hit_repairs_missing_l1_without_blocking_hit() {
     ]);
 
     runtime.block_on(async {
-        l0.put("repair_key", CacheWrite::default()).await.unwrap();
+        l0.put("repair_key", CacheWrite::default()).await?;
         l0.get_raw_access_log().lock().await.clear();
 
-        assert!(matches!(
-            storage.get("repair_key").await.unwrap(),
-            Cache::Hit(_)
-        ));
+        assert!(matches!(storage.get("repair_key").await?, Cache::Hit(_)));
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -332,8 +322,7 @@ fn test_l0_hit_repairs_missing_l1_without_blocking_hit() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
-        .await
-        .unwrap();
+        .await?;
 
         assert_eq!(
             l1.get_existence_log().lock().await.as_slice(),
@@ -348,16 +337,17 @@ fn test_l0_hit_repairs_missing_l1_without_blocking_hit() {
         assert_eq!(stats.0[0].backfills_from, 1);
         assert_eq!(stats.0[1].backfills_to, 1);
         assert_eq!(stats.0[1].writes, 1);
-    });
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
 }
 
 #[test]
-fn test_l0_hit_does_not_read_source_when_l1_already_has_key() {
+fn test_l0_hit_does_not_read_source_when_l1_already_has_key() -> Result<()> {
     let runtime = RuntimeBuilder::new_multi_thread()
         .enable_all()
         .worker_threads(1)
-        .build()
-        .unwrap();
+        .build()?;
 
     let l0 = Arc::new(InMemoryStorage::new());
     let l1 = Arc::new(InMemoryStorage::new());
@@ -367,15 +357,12 @@ fn test_l0_hit_does_not_read_source_when_l1_already_has_key() {
     ]);
 
     runtime.block_on(async {
-        l0.put("present_key", CacheWrite::default()).await.unwrap();
-        l1.put("present_key", CacheWrite::default()).await.unwrap();
+        l0.put("present_key", CacheWrite::default()).await?;
+        l1.put("present_key", CacheWrite::default()).await?;
         l0.get_raw_access_log().lock().await.clear();
         l1.get_existence_log().lock().await.clear();
 
-        assert!(matches!(
-            storage.get("present_key").await.unwrap(),
-            Cache::Hit(_)
-        ));
+        assert!(matches!(storage.get("present_key").await?, Cache::Hit(_)));
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -385,8 +372,7 @@ fn test_l0_hit_does_not_read_source_when_l1_already_has_key() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
-        .await
-        .unwrap();
+        .await?;
 
         assert_eq!(
             l1.get_existence_log().lock().await.as_slice(),
@@ -398,7 +384,9 @@ fn test_l0_hit_does_not_read_source_when_l1_already_has_key() {
         assert_eq!(stats.0[0].backfills_from, 0);
         assert_eq!(stats.0[1].backfills_to, 0);
         assert_eq!(stats.0[1].writes, 0);
-    });
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
 }
 
 #[test]
@@ -662,6 +650,7 @@ fn test_config_validation_invalid_level_name() -> Result<()> {
         .build()?;
 
     // Set invalid level name
+    // SAFETY: this test is serialized on multilevel_env, so these process-wide env changes cannot race peer tests.
     unsafe {
         env::set_var("SCCACHE_MULTILEVEL_CHAIN", "disk,invalid_backend,s3");
         env::set_var("SCCACHE_DIR", "/tmp/test-cache");
@@ -677,6 +666,7 @@ fn test_config_validation_invalid_level_name() -> Result<()> {
         assert!(err_msg.contains("Unknown cache level") || err_msg.contains("invalid_backend"));
     }
 
+    // SAFETY: this test is serialized on multilevel_env; restore the process-wide variables before releasing the lock.
     unsafe {
         env::remove_var("SCCACHE_MULTILEVEL_CHAIN");
         env::remove_var("SCCACHE_DIR");
@@ -744,6 +734,7 @@ fn test_config_level_not_configured() -> Result<()> {
         .build()?;
 
     // Set level without configuration
+    // SAFETY: this test is serialized on multilevel_env, so these process-wide env changes cannot race peer tests.
     unsafe {
         env::set_var("SCCACHE_MULTILEVEL_CHAIN", "redis");
         // Don't set SCCACHE_REDIS_ENDPOINT
@@ -766,6 +757,7 @@ fn test_config_level_not_configured() -> Result<()> {
         );
     }
 
+    // SAFETY: this test is serialized on multilevel_env; restore the process-wide variable before releasing the lock.
     unsafe {
         env::remove_var("SCCACHE_MULTILEVEL_CHAIN");
     }
@@ -1019,7 +1011,7 @@ fn test_preprocessor_cache_mode() -> Result<()> {
 }
 
 #[test]
-fn test_empty_levels_new() -> Result<()> {
+fn test_empty_levels_new() {
     // Edge case: creating MultiLevelStorage with empty vec
     // This is allowed but from_config prevents it
     let storage = MultiLevelStorage::new(vec![]);
@@ -1030,7 +1022,6 @@ fn test_empty_levels_new() -> Result<()> {
     // location() should still work
     let location = storage.location();
     assert!(location.contains('0'));
-    Ok(())
 }
 
 #[test]
@@ -1120,10 +1111,12 @@ fn test_mixed_readonly_chain_is_readwrite_in_check() -> Result<()> {
     let runtime = RuntimeBuilder::new_current_thread().enable_all().build()?;
 
     // Writable L0, read-only L1
-    let rw_l0 = Arc::new(InMemoryStorage::new());
-    let ro_l1 = Arc::new(ReadOnlyStorage(Arc::new(InMemoryStorage::new())));
-    let storage =
-        MultiLevelStorage::new(vec![rw_l0 as Arc<dyn Storage>, ro_l1 as Arc<dyn Storage>]);
+    let writable_l0 = Arc::new(InMemoryStorage::new());
+    let read_only_l1 = Arc::new(ReadOnlyStorage(Arc::new(InMemoryStorage::new())));
+    let storage = MultiLevelStorage::new(vec![
+        writable_l0 as Arc<dyn Storage>,
+        read_only_l1 as Arc<dyn Storage>,
+    ]);
     runtime.block_on(async {
         assert!(
             matches!(storage.check().await?, CacheMode::ReadWrite),
@@ -1133,10 +1126,12 @@ fn test_mixed_readonly_chain_is_readwrite_in_check() -> Result<()> {
     })?;
 
     // Read-only L0, writable L1: still writable (put() skips L0)
-    let ro_l0 = Arc::new(ReadOnlyStorage(Arc::new(InMemoryStorage::new())));
-    let rw_l1 = Arc::new(InMemoryStorage::new());
-    let storage =
-        MultiLevelStorage::new(vec![ro_l0 as Arc<dyn Storage>, rw_l1 as Arc<dyn Storage>]);
+    let read_only_l0 = Arc::new(ReadOnlyStorage(Arc::new(InMemoryStorage::new())));
+    let writable_l1 = Arc::new(InMemoryStorage::new());
+    let storage = MultiLevelStorage::new(vec![
+        read_only_l0 as Arc<dyn Storage>,
+        writable_l1 as Arc<dyn Storage>,
+    ]);
     runtime.block_on(async {
         assert!(
             matches!(storage.check().await?, CacheMode::ReadWrite),
@@ -1177,30 +1172,23 @@ impl Storage for CheckFailingStorage {
 }
 
 #[test]
-fn test_unavailable_l1_does_not_block_healthy_l0() {
-    let runtime = RuntimeBuilder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+fn test_unavailable_l1_does_not_block_healthy_l0() -> Result<()> {
+    let runtime = RuntimeBuilder::new_current_thread().enable_all().build()?;
 
     let l0 = Arc::new(InMemoryStorage::new());
     let l1 = Arc::new(CheckFailingStorage);
     let storage = MultiLevelStorage::new(vec![l0 as Arc<dyn Storage>, l1 as Arc<dyn Storage>]);
 
     runtime.block_on(async {
-        assert!(matches!(
-            storage.check().await.unwrap(),
-            CacheMode::ReadWrite
-        ));
-    });
+        assert!(matches!(storage.check().await?, CacheMode::ReadWrite));
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
 }
 
 #[test]
-fn test_unavailable_l0_remains_fatal() {
-    let runtime = RuntimeBuilder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+fn test_unavailable_l0_remains_fatal() -> Result<()> {
+    let runtime = RuntimeBuilder::new_current_thread().enable_all().build()?;
 
     let l0 = Arc::new(CheckFailingStorage);
     let l1 = Arc::new(InMemoryStorage::new());
@@ -1208,7 +1196,9 @@ fn test_unavailable_l0_remains_fatal() {
 
     runtime.block_on(async {
         assert!(storage.check().await.is_err());
-    });
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
 }
 
 #[test]
@@ -1216,10 +1206,12 @@ fn test_all_readonly_chain_is_readonly_in_check() -> Result<()> {
     // Only a chain in which EVERY level is read-only is itself read-only.
     let runtime = RuntimeBuilder::new_current_thread().enable_all().build()?;
 
-    let ro_l0 = Arc::new(ReadOnlyStorage(Arc::new(InMemoryStorage::new())));
-    let ro_l1 = Arc::new(ReadOnlyStorage(Arc::new(InMemoryStorage::new())));
-    let storage =
-        MultiLevelStorage::new(vec![ro_l0 as Arc<dyn Storage>, ro_l1 as Arc<dyn Storage>]);
+    let read_only_l0 = Arc::new(ReadOnlyStorage(Arc::new(InMemoryStorage::new())));
+    let read_only_l1 = Arc::new(ReadOnlyStorage(Arc::new(InMemoryStorage::new())));
+    let storage = MultiLevelStorage::new(vec![
+        read_only_l0 as Arc<dyn Storage>,
+        read_only_l1 as Arc<dyn Storage>,
+    ]);
     runtime.block_on(async {
         assert!(
             matches!(storage.check().await?, CacheMode::ReadOnly),
@@ -1458,11 +1450,14 @@ fn test_put_mode_l0_fails_on_error() -> Result<()> {
         let entry = CacheWrite::new();
         let result = storage.put("test_key", entry).await;
 
-        assert!(
-            result.is_err(),
-            "WriteErrorPolicy::L0 should fail when L0 write fails"
-        );
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = match result {
+            Ok(_) => {
+                return Err(anyhow!(
+                    "WriteErrorPolicy::L0 unexpectedly succeeded when L0 write failed"
+                ));
+            }
+            Err(error) => error.to_string(),
+        };
         assert!(
             err_msg.contains("Intentional") || err_msg.contains("put_raw not implemented"),
             "Expected failure message, got: {err_msg}"
