@@ -357,18 +357,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_extract_object_to_devnull_works() {
+    fn test_extract_object_to_devnull_works() -> Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .worker_threads(1)
-            .build()
-            .unwrap();
+            .build()?;
 
         let pool = runtime.handle();
 
         let cache_data = CacheWrite::new();
-        let cache_read =
-            CacheRead::from(std::io::Cursor::new(cache_data.finish().unwrap())).unwrap();
+        let cache_read = CacheRead::from(std::io::Cursor::new(cache_data.finish()?))?;
 
         let objects = vec![FileObjectSource {
             key: "test_key".to_string(),
@@ -376,30 +374,28 @@ mod tests {
             optional: false,
         }];
 
-        let result = runtime.block_on(cache_read.extract_objects(objects, pool));
-        assert!(result.is_ok(), "Extracting to /dev/null should succeed");
+        runtime.block_on(cache_read.extract_objects(objects, pool))?;
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_extract_object_to_dev_fd_something() {
+    fn test_extract_object_to_dev_fd_something() -> Result<()> {
         // Open a pipe, write to `/dev/fd/{fd}` and check the other end that the correct data was written.
         use std::os::fd::AsRawFd;
         use tokio::io::AsyncReadExt;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .worker_threads(1)
-            .build()
-            .unwrap();
+            .build()?;
         let pool = runtime.handle();
         let mut cache_data = CacheWrite::new();
         let data = b"test data";
-        cache_data.put_bytes("test_key", data).unwrap();
-        let cache_read =
-            CacheRead::from(std::io::Cursor::new(cache_data.finish().unwrap())).unwrap();
+        cache_data.put_bytes("test_key", data)?;
+        let cache_read = CacheRead::from(std::io::Cursor::new(cache_data.finish()?))?;
         runtime.block_on(async {
-            let (sender, mut receiver) = tokio::net::unix::pipe::pipe().unwrap();
-            let sender_fd = sender.into_blocking_fd().unwrap();
+            let (sender, mut receiver) = tokio::net::unix::pipe::pipe()?;
+            let sender_fd = sender.into_blocking_fd()?;
             let raw_fd = sender_fd.as_raw_fd();
             let fd_path = PathBuf::from(format!("/dev/fd/{raw_fd}"));
             let objects = vec![FileObjectSource {
@@ -408,64 +404,58 @@ mod tests {
                 optional: false,
             }];
             // On FreeBSD, `/dev/fd/{fd}` does not always exist (i.e. without mounting `fdescfs`), so we skip this test if we get `ENOENT`.
-            if ! fd_path.exists() {
+            if !fd_path.exists() {
                 info!("Skipping test_extract_object_to_dev_fd_something because /dev/fd/{raw_fd} does not exist");
-                return;
+                return Ok(());
             }
-            let result = cache_read.extract_objects(objects, pool).await;
-            assert!(
-                result.is_ok(),
-                "Extracting to /dev/fd/{raw_fd} should succeed"
-            );
+            cache_read.extract_objects(objects, pool).await?;
             let mut buf = vec![0; data.len()];
-            let n = receiver.read_exact(&mut buf).await.unwrap();
+            let n = receiver.read_exact(&mut buf).await?;
             assert_eq!(n, data.len(), "Read the correct number of bytes");
             assert_eq!(buf, data, "Read the correct data from /dev/fd/{raw_fd}");
-        });
+            Ok::<(), anyhow::Error>(())
+        })?;
+        Ok(())
     }
 
     #[test]
-    fn test_extract_object_to_non_writable_path() {
+    fn test_extract_object_to_non_writable_path() -> Result<()> {
         // See `test_extract_object_to_dev_fd_something`: we still cannot cover all platforms by the other tests. Here we test a more portable case of creating a file and making its parent directory non-writable, in which case we should still be able to extract the object successfully.
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .worker_threads(1)
-            .build()
-            .unwrap();
+            .build()?;
 
         let pool = runtime.handle();
 
         let mut cache_data = CacheWrite::new();
-        cache_data.put_bytes("test_key", b"real_test_data").unwrap();
-        let cache_read =
-            CacheRead::from(std::io::Cursor::new(cache_data.finish().unwrap())).unwrap();
+        cache_data.put_bytes("test_key", b"real_test_data")?;
+        let cache_read = CacheRead::from(std::io::Cursor::new(cache_data.finish()?))?;
 
-        let tmpdir = tempfile::tempdir().unwrap();
+        let tmpdir = tempfile::tempdir()?;
         let target_path = tmpdir.path().join("test_file");
-        std::fs::write(&target_path, b"test").unwrap();
+        std::fs::write(&target_path, b"test")?;
         // The current Rust fs permissions API is kind of awkward...
-        let mut perm = tmpdir.path().metadata().unwrap().permissions();
+        let mut perm = tmpdir.path().metadata()?.permissions();
         perm.set_readonly(true);
-        std::fs::set_permissions(tmpdir.path(), perm.clone()).unwrap();
-        // Note that this doesn't guarantee that the a new file cannot be created anymore.
+        std::fs::set_permissions(tmpdir.path(), perm.clone())?;
+        // Note that this doesn't guarantee that a new file cannot be created anymore.
         // For example, as documented in `std::fs::Permissions::set_readonly`, the
         // `FILE_ATTRIBUTE_READONLY` attribute on Windows is entirely ignored for directories.
-        // std::fs::File::create(tmpdir.path().join("another_file")).unwrap_err();
 
         let objects = vec![FileObjectSource {
             key: "test_key".to_string(),
             path: target_path.clone(),
             optional: false,
         }];
-
         let result = runtime.block_on(cache_read.extract_objects(objects, pool));
         assert!(
             result.is_ok(),
             "Extracting to the target path should succeed"
         );
         // Test the content; make sure the old content is overwritten
-        let content = std::fs::read(&target_path).unwrap();
+        let content = std::fs::read(&target_path)?;
         assert_eq!(
             content, b"real_test_data",
             "Extracted content should be correct"
@@ -479,24 +469,23 @@ mod tests {
         }
         #[cfg(not(unix))]
         perm.set_readonly(false);
-        std::fs::set_permissions(tmpdir.path(), perm).unwrap();
-        tmpdir.close().unwrap();
+        std::fs::set_permissions(tmpdir.path(), perm)?;
+        tmpdir.close()?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn test_extract_object_to_nul_works() {
+    fn test_extract_object_to_nul_works() -> Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .worker_threads(1)
-            .build()
-            .unwrap();
+            .build()?;
 
         let pool = runtime.handle();
 
         let cache_data = CacheWrite::new();
-        let cache_read =
-            CacheRead::from(std::io::Cursor::new(cache_data.finish().unwrap())).unwrap();
+        let cache_read = CacheRead::from(std::io::Cursor::new(cache_data.finish()?))?;
 
         let objects = vec![FileObjectSource {
             key: "test_key".to_string(),
@@ -504,7 +493,7 @@ mod tests {
             optional: false,
         }];
 
-        let result = runtime.block_on(cache_read.extract_objects(objects, pool));
-        assert!(result.is_ok(), "Extracting to NUL should succeed");
+        runtime.block_on(cache_read.extract_objects(objects, pool))?;
+        Ok(())
     }
 }
