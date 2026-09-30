@@ -79,8 +79,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(test)]
-use crate::errors::Context;
 use crate::errors::{Result, anyhow, bail};
 
 /// Result of [`Storage::get_path`].
@@ -753,19 +751,19 @@ pub fn storage_from_config(
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use crate::config::CacheModeConfig;
+    use super::{CacheMode, CacheWrite, RemoteStorage, storage_from_config};
+    use crate::compiler::PreprocessorCacheEntry;
+    use crate::config::{self, CacheModeConfig, CacheType, Config};
+    use crate::errors::{Result, anyhow};
     use fs_err as fs;
 
     #[test]
-    fn test_read_write_mode_local() {
+    fn test_read_write_mode_local() -> Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .worker_threads(1)
-            .build()
-            .unwrap();
+            .build()?;
 
-        // Use disk cache.
         let mut config = Config {
             cache: None,
             ..Default::default()
@@ -773,88 +771,84 @@ mod test {
 
         let tempdir = tempfile::Builder::new()
             .prefix("sccache_test_rust_cargo")
-            .tempdir()
-            .context("Failed to create tempdir")
-            .unwrap();
+            .tempdir()?;
         let cache_dir = tempdir.path().join("cache");
-        fs::create_dir(&cache_dir).unwrap();
+        fs::create_dir(&cache_dir)?;
 
         config.fallback_cache.dir = cache_dir;
-
-        // Test Read Write
         config.fallback_cache.rw_mode = CacheModeConfig::ReadWrite;
 
         {
-            let cache = storage_from_config(&config, runtime.handle()).unwrap();
-
+            let cache = storage_from_config(&config, runtime.handle())?;
             runtime.block_on(async move {
-                cache.put("test1", CacheWrite::default()).await.unwrap();
+                cache.put("test1", CacheWrite::default()).await?;
                 cache
                     .put_preprocessor_cache_entry("test1", PreprocessorCacheEntry::default())
-                    .await
-                    .unwrap();
-            });
+                    .await?;
+                Ok::<(), anyhow::Error>(())
+            })?;
         }
 
-        // Test Read-only
         config.fallback_cache.rw_mode = CacheModeConfig::ReadOnly;
 
         {
-            let cache = storage_from_config(&config, runtime.handle()).unwrap();
-
+            let cache = storage_from_config(&config, runtime.handle())?;
             runtime.block_on(async move {
-                assert_eq!(
-                    cache
-                        .put("test1", CacheWrite::default())
-                        .await
-                        .unwrap_err()
-                        .to_string(),
-                    "Cannot write to a read-only cache"
-                );
-                assert_eq!(
-                    cache
-                        .put_preprocessor_cache_entry("test1", PreprocessorCacheEntry::default())
-                        .await
-                        .unwrap_err()
-                        .to_string(),
-                    "Cannot write to a read-only cache"
-                );
-            });
+                match cache.put("test1", CacheWrite::default()).await {
+                    Ok(_) => {
+                        return Err(anyhow!("read-only cache unexpectedly accepted a cache put"));
+                    }
+                    Err(error) => {
+                        assert_eq!(error.to_string(), "Cannot write to a read-only cache");
+                    }
+                }
+                match cache
+                    .put_preprocessor_cache_entry("test1", PreprocessorCacheEntry::default())
+                    .await
+                {
+                    Ok(()) => {
+                        return Err(anyhow!(
+                            "read-only cache unexpectedly accepted a preprocessor-cache put"
+                        ));
+                    }
+                    Err(error) => {
+                        assert_eq!(error.to_string(), "Cannot write to a read-only cache");
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            })?;
         }
+
+        Ok(())
     }
 
     #[test]
     #[cfg(feature = "s3")]
-    fn test_operator_storage_s3_with_basedirs() {
-        // Create S3 operator (doesn't need real credentials for this test)
+    fn test_operator_storage_s3_with_basedirs() -> Result<()> {
         let operator = crate::cache::s3::S3Cache::new(
             "test-bucket".to_string(),
             "test-prefix".to_string(),
-            true, // no_credentials = true
+            true,
         )
         .with_region(Some("us-east-1".to_string()))
-        .build()
-        .expect("Failed to create S3 cache operator");
+        .build()?;
 
         let basedirs = vec![b"/home/user/project".to_vec(), b"/opt/build".to_vec()];
-
-        // Wrap with OperatorStorage
         let storage = RemoteStorage::new(operator, basedirs.clone(), CacheMode::ReadWrite);
 
-        // Verify basedirs are stored and retrieved correctly
         assert_eq!(storage.basedirs(), basedirs.as_slice());
         assert_eq!(storage.basedirs().len(), 2);
         assert_eq!(storage.basedirs()[0], b"/home/user/project".to_vec());
         assert_eq!(storage.basedirs()[1], b"/opt/build".to_vec());
+        Ok(())
     }
 
     #[test]
     #[cfg(feature = "s3")]
-    fn test_skip_remote_cache_check_uses_configured_mode() {
+    fn test_skip_remote_cache_check_uses_configured_mode() -> Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .build()
-            .unwrap();
+            .build()?;
 
         for (configured_mode, expected_mode) in [
             (CacheModeConfig::ReadOnly, CacheMode::ReadOnly),
@@ -879,8 +873,8 @@ mod test {
                 ..Default::default()
             };
 
-            let storage = storage_from_config(&single_cache_config, runtime.handle()).unwrap();
-            assert_eq!(runtime.block_on(storage.check()).unwrap(), expected_mode);
+            let storage = storage_from_config(&single_cache_config, runtime.handle())?;
+            assert_eq!(runtime.block_on(storage.check())?, expected_mode);
 
             let multilevel_config = Config {
                 cache_configs: config::CacheConfigs {
@@ -895,15 +889,15 @@ mod test {
                 ..Default::default()
             };
 
-            let storage = storage_from_config(&multilevel_config, runtime.handle()).unwrap();
-            assert_eq!(runtime.block_on(storage.check()).unwrap(), expected_mode);
+            let storage = storage_from_config(&multilevel_config, runtime.handle())?;
+            assert_eq!(runtime.block_on(storage.check())?, expected_mode);
         }
+        Ok(())
     }
 
     #[test]
     #[cfg(feature = "redis")]
-    fn test_operator_storage_redis_with_basedirs() {
-        // Create Redis operator
+    fn test_operator_storage_redis_with_basedirs() -> Result<()> {
         let operator = crate::cache::redis::RedisCache::build_single(
             "redis://localhost:6379",
             None,
@@ -911,25 +905,21 @@ mod test {
             0,
             "test-prefix",
             0,
-        )
-        .expect("Failed to create Redis cache operator");
+        )?;
 
         let basedirs = vec![b"/workspace".to_vec()];
-
-        // Wrap with OperatorStorage
         let storage = RemoteStorage::new(operator, basedirs.clone(), CacheMode::ReadWrite);
 
-        // Verify basedirs work
         assert_eq!(storage.basedirs(), basedirs.as_slice());
         assert_eq!(storage.basedirs().len(), 1);
+        Ok(())
     }
 
     #[test]
     #[cfg(feature = "redis")]
-    fn test_operator_storage_redis_with_read_only() {
-        // Create Redis operator
-
+    fn test_operator_storage_redis_with_read_only() -> Result<()> {
         use crate::test::utils::Waiter;
+
         let operator = crate::cache::redis::RedisCache::build_single(
             "redis://localhost:6379",
             None,
@@ -937,17 +927,17 @@ mod test {
             0,
             "test-prefix",
             0,
-        )
-        .expect("Failed to create Redis cache operator");
+        )?;
 
-        // Wrap with OperatorStorage
         let storage = RemoteStorage::new(operator, vec![], CacheMode::ReadOnly);
-
-        // Verify put fails
-        let result = storage.put("test", CacheWrite::default()).wait();
-        match result {
-            Ok(_) => panic!("expected error, got success {result:?}"),
-            Err(err) => assert_eq!(err.to_string(), "storage is read-only"),
+        match storage.put("test", CacheWrite::default()).wait() {
+            Ok(_) => Err(anyhow!(
+                "read-only Redis cache unexpectedly accepted a cache put"
+            )),
+            Err(error) => {
+                assert_eq!(error.to_string(), "storage is read-only");
+                Ok(())
+            }
         }
     }
 }
