@@ -217,6 +217,7 @@ Multi-level caching enables hierarchical cache storage with automatic backfill. 
   - Each level must be separately configured with its own environment variables
   - If not set, sccache uses single-level mode (legacy behavior)
 * `SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY` controls error handling on cache writes (default: `l0`)
+* `SCCACHE_MULTILEVEL_SLOW_WRITE_CONCURRENCY` limits concurrent writes/backfills to slower cache levels (default: `4`; minimum: `1`)
   - `ignore` - never fail on write errors, log warnings only (most permissive)
   - `l0` - fail only if L0 (first level) write fails (default, balances reliability and performance)
   - `all` - fail if any read-write level fails (most strict)

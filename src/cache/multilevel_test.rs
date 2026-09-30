@@ -24,6 +24,7 @@ use std::env;
 use std::fs;
 use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::Builder as TempBuilder;
 use tokio::runtime::Builder as RuntimeBuilder;
@@ -290,6 +291,124 @@ impl Storage for InMemoryStorage {
             .insert(key.to_string(), data.to_vec());
         Ok(Duration::ZERO)
     }
+}
+
+struct SlowWriteStorage {
+    delay: Duration,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+    writes: AtomicUsize,
+}
+
+impl SlowWriteStorage {
+    fn new(delay: Duration) -> Self {
+        Self {
+            delay,
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+            writes: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl Storage for SlowWriteStorage {
+    async fn get(&self, _key: &str) -> Result<Cache> {
+        Ok(Cache::Miss)
+    }
+
+    async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
+        self.put_raw(key, entry.finish()?.into()).await
+    }
+
+    async fn put_raw(&self, _key: &str, _data: Bytes) -> Result<Duration> {
+        let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
+        sleep(self.delay).await;
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        Ok(self.delay)
+    }
+
+    async fn check(&self) -> Result<CacheMode> {
+        Ok(CacheMode::ReadWrite)
+    }
+
+    fn location(&self) -> String {
+        "SlowWrite".to_owned()
+    }
+
+    async fn current_size(&self) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    async fn max_size(&self) -> Result<Option<u64>> {
+        Ok(None)
+    }
+}
+
+#[test]
+fn test_slow_level_write_concurrency_and_drain() {
+    let runtime = RuntimeBuilder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+
+    let l0 = Arc::new(InMemoryStorage::new());
+    let l1 = Arc::new(SlowWriteStorage::new(Duration::from_millis(25)));
+    let storage = MultiLevelStorage::with_write_error_policy_and_concurrency(
+        vec![l0 as Arc<dyn Storage>, l1.clone() as Arc<dyn Storage>],
+        WriteErrorPolicy::L0,
+        2,
+    );
+
+    runtime.block_on(async {
+        for i in 0..8 {
+            storage
+                .put_raw(&format!("queued-{i}"), Bytes::from_static(b"entry"))
+                .await
+                .unwrap();
+        }
+
+        storage.drain_background().await;
+
+        assert_eq!(l1.writes.load(Ordering::SeqCst), 8);
+        assert_eq!(l1.in_flight.load(Ordering::SeqCst), 0);
+        assert!(
+            l1.max_in_flight.load(Ordering::SeqCst) <= 2,
+            "slow-level concurrency exceeded configured bound"
+        );
+    });
+}
+
+#[test]
+fn test_backfill_is_tracked_by_drain() {
+    let runtime = RuntimeBuilder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+
+    let l0 = Arc::new(SlowWriteStorage::new(Duration::from_millis(25)));
+    let l1 = Arc::new(InMemoryStorage::new());
+    let storage = MultiLevelStorage::new(vec![
+        l0.clone() as Arc<dyn Storage>,
+        l1.clone() as Arc<dyn Storage>,
+    ]);
+
+    runtime.block_on(async {
+        l1.put("backfill", CacheWrite::default()).await.unwrap();
+        assert!(matches!(
+            storage.get("backfill").await.unwrap(),
+            Cache::Hit(_)
+        ));
+
+        storage.drain_background().await;
+
+        assert_eq!(l0.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(l0.in_flight.load(Ordering::SeqCst), 0);
+    });
 }
 
 #[test]
