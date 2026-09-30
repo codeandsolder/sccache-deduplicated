@@ -425,12 +425,11 @@ fn background_task_drain_includes_concurrent_registration() -> Result<()> {
 }
 
 #[test]
-fn test_slow_level_write_concurrency_and_drain() {
+fn test_slow_level_write_concurrency_and_drain() -> Result<()> {
     let runtime = RuntimeBuilder::new_multi_thread()
         .enable_all()
         .worker_threads(2)
-        .build()
-        .unwrap();
+        .build()?;
 
     let l0 = Arc::new(InMemoryStorage::new());
     let l1 = Arc::new(SlowWriteStorage::new(Duration::from_millis(25)));
@@ -444,8 +443,7 @@ fn test_slow_level_write_concurrency_and_drain() {
         for i in 0..8 {
             storage
                 .put_raw(&format!("queued-{i}"), Bytes::from_static(b"entry"))
-                .await
-                .unwrap();
+                .await?;
         }
 
         storage.drain_background().await;
@@ -456,7 +454,11 @@ fn test_slow_level_write_concurrency_and_drain() {
             l1.max_in_flight.load(Ordering::SeqCst) <= 2,
             "slow-level concurrency exceeded configured bound"
         );
-    });
+
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    Ok(())
 }
 
 #[test]

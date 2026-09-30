@@ -224,11 +224,12 @@ impl LevelStats {
     /// Calculate hit rate as a percentage
     #[must_use]
     pub fn hit_rate(&self) -> f64 {
+        const SCALE: u128 = 100_000_000;
+
         let total = self.hits.saturating_add(self.misses);
         if total == 0 {
             return 0.0;
         }
-        const SCALE: u128 = 100_000_000;
         let scaled = u128::from(self.hits) * SCALE / u128::from(total);
         let scaled = u32::try_from(scaled).unwrap_or(100_000_000);
         f64::from(scaled) / 1_000_000.0
@@ -363,7 +364,7 @@ impl BackgroundTasks {
 
     /// Wait for all detached work belonging to this barrier.
     ///
-    /// Closing does not reject later spawns: TaskTracker keeps tracking them. If a
+    /// Closing does not reject later spawns: `TaskTracker` keeps tracking them. If a
     /// task is registered while this wait is still non-empty it is included; a task
     /// registered after the tracker reaches empty belongs to the next drain.
     async fn drain(&self) {
@@ -604,7 +605,7 @@ impl MultiLevelStorage {
 
     /// Create a multi-level storage from configuration.
     ///
-    /// Returns None if no levels are configured (SCCACHE_MULTILEVEL_CHAIN not set).
+    /// Returns `None` if no levels are configured (`SCCACHE_MULTILEVEL_CHAIN` is not set).
     ///
     /// # Errors
     ///
@@ -645,6 +646,49 @@ impl MultiLevelStorage {
     /// faster-level hit immediately. Slower levels are probed only when they expose
     /// a cheap existence check, and the source object is read only if at least one
     /// slower level is actually missing the key.
+    fn backfill_faster_levels(&self, key: &str, hit_level: usize, raw_bytes: Option<Bytes>) {
+        if hit_level == 0 {
+            return;
+        }
+
+        let Some(raw_bytes) = raw_bytes else {
+            debug!(
+                "Cache backend at level {hit_level} does not support get_raw(), skipping backfill"
+            );
+            return;
+        };
+
+        inc_stat!(
+            self.atomic_stats.get(hit_level),
+            backfills_from,
+            u64::try_from(hit_level).unwrap_or(u64::MAX)
+        );
+
+        for backfill_idx in 0..hit_level {
+            let key = key.to_string();
+            let bytes = raw_bytes.clone();
+            let level = Arc::clone(&self.levels[backfill_idx]);
+            let stats = self.atomic_stats.get(backfill_idx).map(Arc::clone);
+            let background_tasks = Arc::clone(&self.background_tasks);
+
+            background_tasks.spawn(async move {
+                match Self::write_entry_from_bytes(&level, &key, &bytes).await {
+                    Ok(()) => {
+                        trace!(
+                            "Backfilled cache level {backfill_idx} from level {hit_level}"
+                        );
+                        inc_stat!(stats.as_deref(), backfills_to, 1);
+                    }
+                    Err(error) => {
+                        debug!(
+                            "Background backfill from level {hit_level} to level {backfill_idx} failed: {error}"
+                        );
+                    }
+                }
+            });
+        }
+    }
+
     fn repair_slower_levels_from_hit(&self, key: &str, hit_idx: usize) {
         if hit_idx + 1 >= self.levels.len() {
             return;
@@ -834,74 +878,20 @@ impl Storage for MultiLevelStorage {
                     // background. This is intentionally non-blocking so a hot L0 remains hot.
                     self.repair_slower_levels_from_hit(key, idx);
 
-                    // If hit at level > 0, backfill to faster levels (L0 to L(idx-1))
-                    if idx > 0 {
-                        let key_str = key.to_string();
-                        let hit_level = idx;
-
-                        // Raw bytes obtained above are reused for backfilling;
-                        // no second read is needed for a raw-capable level.
-                        match raw_bytes_for_backfill {
-                            Some(raw_bytes) => {
-                                // Update backfill stats
-                                inc_stat!(
-                                    self.atomic_stats.get(hit_level),
-                                    backfills_from,
-                                    u64::try_from(idx).unwrap_or(u64::MAX)
-                                );
-
-                                // Spawn background backfill tasks for each faster level
-                                // Iterate slice directly instead of creating Vec
-                                for backfill_idx in 0..idx {
-                                    let key_bf = key_str.clone();
-                                    let bytes_bf = raw_bytes.clone();
-                                    let level_bf = Arc::clone(&self.levels[backfill_idx]);
-                                    let stats_arc =
-                                        self.atomic_stats.get(backfill_idx).map(Arc::clone);
-                                    let background_tasks = Arc::clone(&self.background_tasks);
-
-                                    background_tasks.spawn(async move {
-                                        match Self::write_entry_from_bytes(
-                                            &level_bf, &key_bf, &bytes_bf,
-                                        )
-                                        .await
-                                        {
-                                            Ok(()) => {
-                                                trace!(
-                                                    "Backfilled cache level {backfill_idx} from level {hit_level}"
-                                                );
-                                                // Update backfill_to stats
-                                                inc_stat!(stats_arc.as_deref(), backfills_to, 1);
-                                            }
-                                            Err(e) => {
-                                                debug!(
-                                                    "Background backfill from level {hit_level} to level {backfill_idx} failed: {e}"
-                                                );
-                                            }
-                                        }
-                                    });
-                                }
-                            }
-                            None => {
-                                debug!(
-                                    "Cache backend at level {hit_level} does not support get_raw(), skipping backfill"
-                                );
-                            }
-                        }
-                    }
+                    // Raw bytes obtained above are reused for backfilling;
+                    // no second read is needed for a raw-capable level.
+                    self.backfill_faster_levels(key, idx, raw_bytes_for_backfill);
 
                     return Ok(Cache::Hit(entry));
                 }
                 Ok(Cache::Miss) => {
                     trace!("Cache miss at level {idx}, trying next level");
-                    continue;
                 }
                 Ok(other) => {
                     return Ok(other);
                 }
                 Err(e) => {
                     warn!("Error checking cache level {idx}: {e}, trying next level");
-                    continue;
                 }
             }
         }
@@ -1030,7 +1020,7 @@ impl Storage for MultiLevelStorage {
                                 Ok(result) => {
                                     let _ = tx.send(result).await;
                                 }
-                                Err(error) => debug!("Slow-level write setup failed: {}", error),
+                                Err(error) => debug!("Slow-level write setup failed: {error}"),
                             }
                         });
                     }
