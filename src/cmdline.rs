@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::errors::*;
+use crate::errors::{Context, Result, anyhow, bail};
 use clap::{Arg, ArgAction, ArgGroup, ValueEnum, error::ErrorKind};
 use std::env;
 use std::ffi::OsString;
@@ -183,7 +183,94 @@ fn get_clap_command() -> clap::Command {
         )
 }
 
-/// Parse the commandline args into a `Result<Command>` to execute.
+fn stats_format(matches: &clap::ArgMatches) -> Result<StatsFormat> {
+    matches
+        .get_one::<StatsFormat>("stats-format")
+        .cloned()
+        .ok_or_else(|| anyhow!("stats format missing despite clap default"))
+}
+
+fn package_toolchain_command(matches: &clap::ArgMatches) -> Result<Command> {
+    let mut values = matches
+        .get_many::<PathBuf>("package-toolchain")
+        .ok_or_else(|| anyhow!("package-toolchain requires executable and output paths"))?
+        .cloned();
+
+    let exe = values
+        .next()
+        .ok_or_else(|| anyhow!("package-toolchain executable is missing"))?;
+    let out = values
+        .next()
+        .ok_or_else(|| anyhow!("package-toolchain output path is missing"))?;
+    if values.next().is_some() {
+        bail!("package-toolchain received more than two values");
+    }
+
+    Ok(Command::PackageToolchain(exe, out))
+}
+
+fn compile_command(matches: &clap::ArgMatches, cwd: PathBuf) -> Result<Command> {
+    let mut env_vars = env::vars_os().collect::<Vec<_>>();
+
+    env_vars.retain(|(key, _)| {
+        key != "LD_PRELOAD"
+            && key != "RUNNING_UNDER_RR"
+            && key != "HOSTNAME"
+            && key != "PWD"
+            && key != "HOST"
+            && key != "RPM_BUILD_ROOT"
+            && key != "SOURCE_DATE_EPOCH"
+            && key != "RPM_PACKAGE_RELEASE"
+            && key != "MINICOM"
+            && key != "DESTDIR"
+            && key != "RPM_PACKAGE_VERSION"
+            && key != "CARGO_MAKEFLAGS"
+    });
+
+    let mut values = matches
+        .get_many::<OsString>("CMD")
+        .ok_or_else(|| anyhow!("compiler command is missing"))?
+        .cloned();
+    let exe = values
+        .next()
+        .ok_or_else(|| anyhow!("compiler executable is missing"))?;
+    let cmdline = values.collect();
+
+    Ok(Command::Compile {
+        exe,
+        cmdline,
+        cwd,
+        env_vars,
+    })
+}
+
+fn command_from_matches(matches: &clap::ArgMatches, cwd: PathBuf) -> Result<Command> {
+    if matches.get_flag("show-stats") {
+        Ok(Command::ShowStats(stats_format(matches)?, false))
+    } else if matches.get_flag("show-adv-stats") {
+        Ok(Command::ShowStats(stats_format(matches)?, true))
+    } else if matches.get_flag("start-server") {
+        Ok(Command::StartServer)
+    } else if matches.get_flag("debug-preprocessor-cache") {
+        Ok(Command::DebugPreprocessorCacheEntries)
+    } else if matches.get_flag("stop-server") {
+        Ok(Command::StopServer)
+    } else if matches.get_flag("zero-stats") {
+        Ok(Command::ZeroStats)
+    } else if matches.get_flag("dist-auth") {
+        Ok(Command::DistAuth)
+    } else if matches.get_flag("dist-status") {
+        Ok(Command::DistStatus)
+    } else if matches.contains_id("package-toolchain") {
+        package_toolchain_command(matches)
+    } else if matches.contains_id("CMD") {
+        compile_command(matches, cwd)
+    } else {
+        Err(anyhow!("no command selected after argument parsing"))
+    }
+}
+
+/// Parse the commandline args into a Result<Command> to execute.
 pub fn try_parse() -> Result<Command> {
     trace!("parse");
 
@@ -258,81 +345,6 @@ pub fn try_parse() -> Result<Command> {
             // provided
             bail!("`{ENV_VAR_INTERNAL_START_SERVER}=1` can't be used with other commands");
         }
-        (false, Ok(matches)) => {
-            if matches.get_flag("show-stats") {
-                let fmt = matches
-                    .get_one("stats-format")
-                    .cloned()
-                    .expect("There is a default value");
-                Ok(Command::ShowStats(fmt, false))
-            } else if matches.get_flag("show-adv-stats") {
-                let fmt = matches
-                    .get_one("stats-format")
-                    .cloned()
-                    .expect("There is a default value");
-                Ok(Command::ShowStats(fmt, true))
-            } else if matches.get_flag("start-server") {
-                Ok(Command::StartServer)
-            } else if matches.get_flag("debug-preprocessor-cache") {
-                Ok(Command::DebugPreprocessorCacheEntries)
-            } else if matches.get_flag("stop-server") {
-                Ok(Command::StopServer)
-            } else if matches.get_flag("zero-stats") {
-                Ok(Command::ZeroStats)
-            } else if matches.get_flag("dist-auth") {
-                Ok(Command::DistAuth)
-            } else if matches.get_flag("dist-status") {
-                Ok(Command::DistStatus)
-            } else if matches.contains_id("package-toolchain") {
-                let mut toolchain_values = matches
-                    .get_many("package-toolchain")
-                    .expect("`package-toolchain` requires two values")
-                    .cloned()
-                    .collect::<Vec<PathBuf>>();
-                let maybe_out = toolchain_values.pop();
-                let maybe_exe = toolchain_values.pop();
-                match (maybe_exe, maybe_out) {
-                    (Some(exe), Some(out)) => Ok(Command::PackageToolchain(exe, out)),
-                    _ => unreachable!("clap should enforce two values"),
-                }
-            } else if matches.contains_id("CMD") {
-                let mut env_vars = env::vars_os().collect::<Vec<_>>();
-
-                // If we're running under rr, avoid the `LD_PRELOAD` bits, as it will
-                // almost surely do the wrong thing, as the compiler gets executed
-                // in a different process tree.
-                env_vars.retain(|(k, _v)| {
-                    k != "LD_PRELOAD"
-                        && k != "RUNNING_UNDER_RR"
-                        && k != "HOSTNAME"
-                        && k != "PWD"
-                        && k != "HOST"
-                        && k != "RPM_BUILD_ROOT"
-                        && k != "SOURCE_DATE_EPOCH"
-                        && k != "RPM_PACKAGE_RELEASE"
-                        && k != "MINICOM"
-                        && k != "DESTDIR"
-                        && k != "RPM_PACKAGE_VERSION"
-                        && k != "CARGO_MAKEFLAGS"
-                });
-
-                let cmd = matches
-                    .get_many("CMD")
-                    .expect("CMD is required")
-                    .cloned()
-                    .collect::<Vec<OsString>>();
-                match cmd.as_slice() {
-                    [exe, cmdline @ ..] => Ok(Command::Compile {
-                        exe: exe.to_owned(),
-                        cmdline: cmdline.to_owned(),
-                        cwd,
-                        env_vars,
-                    }),
-                    _ => unreachable!("clap should enforce at least one value in cmd"),
-                }
-            } else {
-                unreachable!("Either the arg group or env variable should provide a command");
-            }
-        }
+        (false, Ok(matches)) => command_from_matches(&matches, cwd),
     }
 }
