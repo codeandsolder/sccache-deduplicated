@@ -414,10 +414,10 @@ pub fn generate_compile_commands(
             Some("-c") | Some("--compile") // compile to object
             | Some("-dc") | Some("--device-c") // compile to object with -rdc=true
             | Some("-dw") | Some("--device-w") // compile to object with -rdc=false
-            => output.clone().into(),
+            => output.into(),
             _ => {
                 if output.is_absolute() {
-                    output.clone().into()
+                    output.into()
                 } else {
                     cwd.join(output).into()
                 }

@@ -371,12 +371,10 @@ where
 
         match arg.get_data() {
             Some(TooHardFlag) | Some(TooHard(_)) => {
-                cannot_cache!(
-                    "unsupported compiler option",
-                    arg.flag_str()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| format!("{arg:?}"))
-                )
+                let Some(flag) = arg.flag_str() else {
+                    cannot_cache!("unsupported compiler option", format!("{arg:?}"));
+                };
+                cannot_cache!(flag)
             }
             Some(ModuleOnlyFlag) => module_only_flag = true,
             Some(PedanticFlag) => pedantic_flag = true,
