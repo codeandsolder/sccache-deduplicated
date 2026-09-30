@@ -521,8 +521,9 @@ mod server {
                 Ok(r) => r,
                 Err(err) => {
                     // TODO: would ideally just use error_chain
+                    let err: Box<dyn std::error::Error + 'static> = err.into();
                     let mut err_msg = err.to_string();
-                    let mut maybe_cause = std::error::Error::source(&err);
+                    let mut maybe_cause = std::error::Error::source(&*err);
                     while let Some(cause) = maybe_cause {
                         err_msg.push_str(", caused by: ");
                         err_msg.push_str(&cause.to_string());
@@ -530,7 +531,6 @@ mod server {
                     }
 
                     warn!("Res {} error: {}", $reqid, err_msg);
-                    let err: Box<dyn std::error::Error + 'static> = err.into();
                     let json = ErrJson::from_err(&*err);
                     return rouille::Response::json(&json).with_status_code($code);
                 }
