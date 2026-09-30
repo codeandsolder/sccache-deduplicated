@@ -14,28 +14,23 @@
 // limitations under the License.
 
 use crate::compiler::args::*;
-use crate::compiler::c::{ArtifactDescriptor, CCompilerImpl, CCompilerKind, ParsedArguments};
+use crate::compiler::c::{CCompilerImpl, CCompilerKind, ParsedArguments};
 use crate::compiler::gcc::ArgData::*;
 use crate::compiler::{
-    self, CCompileCommand, Cacheable, CompileCommand, CompileCommandImpl, CompilerArguments,
-    Language, cicc, gcc, get_compiler_info, write_temp_file,
+    CCompileCommand, Cacheable, CompileCommand, CompileCommandImpl, CompilerArguments, Language,
+    cicc, gcc,
 };
-use crate::mock_command::{
-    CommandChild, CommandCreator, CommandCreatorSync, ExitStatusValue, RunCommand, exit_status,
-};
+use crate::mock_command::{CommandCreatorSync, ExitStatusValue, RunCommand, exit_status};
 use crate::util::{OsStrExt, resolve_compiler_avoiding_wrapper, run_input_output};
 use crate::{counted_array, dist, protocol, server};
 use async_trait::async_trait;
-use fs::File;
 use fs_err as fs;
-use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use log::Level::Trace;
 use regex::Regex;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::future::{Future, IntoFuture};
-use std::io::{self, BufRead, Read, Write};
+use std::io::BufRead;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -159,8 +154,8 @@ impl CCompilerImpl for Nvcc {
         parsed_args: &ParsedArguments,
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
-        may_dist: bool,
-        rewrite_includes_only: bool,
+        _may_dist: bool,
+        _rewrite_includes_only: bool,
         _preprocessor_cache_mode: bool,
     ) -> Result<process::Output>
     where
@@ -564,7 +559,7 @@ impl CompileCommandImpl for NvccCompileCommand {
                                     .to_str()
                                     .map(|file| (path.path(), file.to_owned()))
                             })
-                            .try_fold((), |res, (path, file)| fs::rename(path, dst.join(file)))
+                            .try_fold((), |(), (path, file)| fs::rename(path, dst.join(file)))
                     })
                     .ok()
             });
@@ -598,7 +593,7 @@ impl CompileCommandImpl for NvccCompileCommand {
         ] {
             for command_groups in command_group_chunks {
                 let results = futures::future::join_all(command_groups.iter().map(|commands| {
-                    run_nvcc_subcommands_group(service, creator, cwd, commands, output_file_name)
+                    run_nvcc_subcommands_group(service, creator, commands, output_file_name)
                 }))
                 .await;
 
@@ -985,7 +980,7 @@ where
             Ok(line) => line,
             // Ignore lines that don't start with `#$ `. For some reason, nvcc
             // on Windows prints the name of the input file without the prefix
-            Err(err) => continue,
+            Err(_) => continue,
         };
 
         let maybe_exe_and_args = fold_env_vars_or_split_into_exe_and_args(
@@ -1225,7 +1220,6 @@ fn remap_generated_filenames(
 async fn run_nvcc_subcommands_group<T>(
     service: &server::SccacheService<T>,
     creator: &T,
-    cwd: &Path,
     commands: &[NvccGeneratedSubcommand],
     output_file_name: &OsStr,
 ) -> Result<process::Output>
@@ -1479,14 +1473,11 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::compiler::gcc;
     use crate::compiler::*;
     use crate::mock_command::*;
     use crate::test::utils::*;
-    use std::collections::HashMap;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
 
     fn parse_arguments_gcc(arguments: Vec<String>) -> CompilerArguments<ParsedArguments> {
         let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();

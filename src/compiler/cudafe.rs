@@ -14,21 +14,18 @@
 // limitations under the License.
 
 use crate::compiler::args::*;
-use crate::compiler::c::{ArtifactDescriptor, CCompilerImpl, CCompilerKind, ParsedArguments};
+use crate::compiler::c::{CCompilerImpl, CCompilerKind, ParsedArguments};
 use crate::compiler::cicc;
 use crate::compiler::{
-    CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
-    SingleCompileCommand,
+    CCompileCommand, Cacheable, CompileCommand, CompilerArguments, Language, SingleCompileCommand,
 };
 use crate::{counted_array, dist};
 
-use crate::mock_command::{CommandCreator, CommandCreatorSync, RunCommand};
+use crate::mock_command::CommandCreatorSync;
 
 use async_trait::async_trait;
 
-use std::collections::HashMap;
 use std::ffi::OsString;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 

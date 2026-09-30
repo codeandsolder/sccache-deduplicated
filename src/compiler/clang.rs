@@ -13,21 +13,17 @@
 // limitations under the License.
 
 use crate::compiler::args::*;
-use crate::compiler::c::{ArtifactDescriptor, CCompilerImpl, CCompilerKind, ParsedArguments};
+use crate::compiler::c::{CCompilerImpl, CCompilerKind, ParsedArguments};
 use crate::compiler::gcc::ArgData::*;
 use crate::compiler::{
-    CCompileCommand, Cacheable, CompileCommand, CompilerArguments, Language, gcc, write_temp_file,
+    CCompileCommand, Cacheable, CompileCommand, CompilerArguments, Language, gcc,
 };
-use crate::mock_command::{CommandCreator, CommandCreatorSync, RunCommand};
-use crate::util::{OsStrExt, run_input_output};
+use crate::mock_command::CommandCreatorSync;
 use crate::{counted_array, dist};
 use async_trait::async_trait;
-use fs::File;
 use fs_err as fs;
 use semver::{BuildMetadata, Prerelease, Version};
 use std::ffi::OsString;
-use std::future::Future;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -65,7 +61,7 @@ impl Clang {
 
         let parsed_version = match Version::parse(version_str.trim_end_matches('"')) {
             Ok(parsed_version) => parsed_version,
-            Err(e) => return false,
+            Err(_) => return false,
         };
 
         parsed_version
@@ -323,8 +319,6 @@ mod test {
     use crate::server;
     use crate::test::mock_storage::MockStorage;
     use crate::test::utils::*;
-    use std::collections::HashMap;
-    use std::future::Future;
     use std::path::PathBuf;
 
     fn parse_arguments_(arguments: Vec<String>) -> CompilerArguments<ParsedArguments> {

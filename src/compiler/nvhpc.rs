@@ -14,21 +14,18 @@
 // limitations under the License.
 
 use crate::compiler::args::*;
-use crate::compiler::c::{ArtifactDescriptor, CCompilerImpl, CCompilerKind, ParsedArguments};
+use crate::compiler::c::{CCompilerImpl, CCompilerKind, ParsedArguments};
 use crate::compiler::gcc::ArgData::*;
 use crate::compiler::{
-    CCompileCommand, Cacheable, CompileCommand, CompilerArguments, Language, gcc, write_temp_file,
+    CCompileCommand, Cacheable, CompileCommand, CompilerArguments, Language, gcc,
 };
-use crate::mock_command::{CommandCreator, CommandCreatorSync, RunCommand};
-use crate::util::{OsStrExt, run_input_output};
+use crate::mock_command::{CommandCreatorSync, RunCommand};
+use crate::util::run_input_output;
 use crate::{counted_array, dist};
 use async_trait::async_trait;
-use fs::File;
 use fs_err as fs;
 use log::Level::Trace;
 use std::ffi::OsString;
-use std::future::Future;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -75,8 +72,8 @@ impl CCompilerImpl for Nvhpc {
         parsed_args: &ParsedArguments,
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
-        may_dist: bool,
-        rewrite_includes_only: bool,
+        _may_dist: bool,
+        _rewrite_includes_only: bool,
         _preprocessor_cache_mode: bool,
     ) -> Result<process::Output>
     where
@@ -223,12 +220,7 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::compiler::gcc;
     use crate::compiler::*;
-    use crate::mock_command::*;
-    use crate::test::utils::*;
-    use std::collections::HashMap;
-    use std::path::PathBuf;
 
     fn parse_arguments_(arguments: Vec<String>) -> CompilerArguments<ParsedArguments> {
         let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();

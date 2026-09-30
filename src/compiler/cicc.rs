@@ -21,13 +21,12 @@ use crate::compiler::{
 };
 use crate::{counted_array, dist};
 
-use crate::mock_command::{CommandCreator, CommandCreatorSync, RunCommand};
+use crate::mock_command::CommandCreatorSync;
 
 use async_trait::async_trait;
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -167,7 +166,7 @@ where
                         module_id_file_name = Some(cwd.join(o));
                         &mut common_args
                     }
-                    Some(UnhashedPassThrough(o)) => {
+                    Some(UnhashedPassThrough(_)) => {
                         take_next = false;
                         &mut unhashed_args
                     }
@@ -185,12 +184,8 @@ where
                         }
                         &mut unhashed_args
                     }
-                    Some(UnhashedFlag) => {
-                        take_next = false;
-                        &mut unhashed_args
-                    }
                     None => match arg {
-                        Argument::Raw(ref p) => {
+                        Argument::Raw(_) => {
                             if take_next {
                                 take_next = false;
                                 &mut common_args
@@ -346,7 +341,6 @@ pub fn generate_compile_commands(
 ArgData! { pub
     Output(PathBuf),
     PassThrough(OsString),
-    UnhashedFlag,
     GenModuleIdFileFlag,
     ModuleIdFileName(PathBuf),
     UnhashedPassThrough(OsString),
