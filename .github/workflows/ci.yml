@@ -220,7 +220,9 @@ jobs:
       command: |
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends gcc clang
-        cargo +1.98.1 test --locked --lib --bins --tests
+        # Integration tests start/stop their own sccache server and are covered by the
+        # normal CI test job; keep this lane focused on cacheable compilation/unit tests.
+        cargo +1.98.1 test --locked --lib --bins
       rust-toolchain: "1.98.1"
       rustflags: "-C target-cpu=x86-64-v2"
 
