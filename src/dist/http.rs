@@ -27,7 +27,7 @@ mod common {
     use {crate::util::BASE64_URL_SAFE_ENGINE, base64::Engine, std::collections::HashMap};
 
     use crate::dist;
-    use crate::errors::*;
+    use crate::errors::{Context, Result, anyhow};
 
     // Note that content-length is necessary due to https://github.com/tiny-http/tiny-http/issues/147
     pub trait ReqwestRequestBuilderExt: Sized {
@@ -1116,7 +1116,7 @@ mod client {
         ServerCertificateHttpResponse, bincode_req_fut,
     };
     use super::urls;
-    use crate::errors::*;
+    use crate::errors::{Context, Result, anyhow};
 
     const REQUEST_TIMEOUT_SECS: u64 = 1200;
     const CONNECT_TIMEOUT_SECS: u64 = 5;
@@ -1126,13 +1126,18 @@ mod client {
         scheduler_url: reqwest::Url,
         // cert_digest -> cert_pem
         server_certs: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
-        client: Arc<Mutex<reqwest::Client>>,
+        http_client: Arc<Mutex<reqwest::Client>>,
         pool: tokio::runtime::Handle,
         tc_cache: Arc<cache::ClientToolchains>,
         rewrite_includes_only: bool,
     }
 
     impl Client {
+        /// Create a distributed-compilation HTTP client.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if the HTTP client or local toolchain cache cannot be initialized.
         pub fn new(
             pool: &tokio::runtime::Handle,
             scheduler_url: reqwest::Url,
@@ -1158,8 +1163,8 @@ mod client {
             Ok(Self {
                 auth_token,
                 scheduler_url,
-                server_certs: Default::default(),
-                client: Arc::new(Mutex::new(client)),
+                server_certs: Arc::default(),
+                http_client: Arc::new(Mutex::new(client)),
                 pool: pool.clone(),
                 tc_cache: Arc::new(client_toolchains),
                 rewrite_includes_only,
@@ -1180,7 +1185,8 @@ mod client {
             );
             for cert_pem in certs.values() {
                 client_async_builder = client_async_builder.add_root_certificate(
-                    reqwest::Certificate::from_pem(cert_pem).expect("previously valid cert"),
+                    reqwest::Certificate::from_pem(cert_pem)
+                        .context("stored server certificate is no longer valid")?,
                 );
             }
             // Finish the client
@@ -1203,10 +1209,16 @@ mod client {
         async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
             let scheduler_url = self.scheduler_url.clone();
             let url = urls::scheduler_alloc_job(&scheduler_url)?;
-            let mut req = self.client.lock().unwrap().post(url);
+            let mut req = {
+                let client = self
+                    .http_client
+                    .lock()
+                    .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
+                client.post(url)
+            };
             req = req.bearer_auth(self.auth_token.clone()).bincode(&tc)?;
 
-            let client = self.client.clone();
+            let http_client = self.http_client.clone();
             let server_certs = self.server_certs.clone();
 
             match bincode_req_fut(req).await? {
@@ -1220,7 +1232,11 @@ mod client {
                         job_alloc,
                         need_toolchain,
                     });
-                    if server_certs.lock().unwrap().contains_key(&cert_digest) {
+                    let has_certificate = server_certs
+                        .lock()
+                        .map_err(|_| anyhow!("server certificate mutex poisoned"))?
+                        .contains_key(&cert_digest);
+                    if has_certificate {
                         return alloc_job_res;
                     }
                     info!(
@@ -1228,7 +1244,12 @@ mod client {
                         server_id.addr()
                     );
                     let url = urls::scheduler_server_certificate(&scheduler_url, server_id)?;
-                    let req = client.lock().unwrap().get(url);
+                    let req = {
+                        let client = http_client
+                            .lock()
+                            .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
+                        client.get(url)
+                    };
                     let res: ServerCertificateHttpResponse = bincode_req_fut(req)
                         .await
                         .context("GET to scheduler server_certificate failed")?;
@@ -1240,19 +1261,24 @@ mod client {
                     // dropping a runtime in asynchronous context.
                     // For the time being, we work around this by off-loading it
                     // to a dedicated blocking-friendly thread pool.
-                    let _ = self
-                        .pool
-                        .spawn_blocking(move || {
+                    self.pool
+                        .spawn_blocking(move || -> Result<()> {
+                            let mut client = http_client
+                                .lock()
+                                .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
+                            let mut certs = server_certs
+                                .lock()
+                                .map_err(|_| anyhow!("server certificate mutex poisoned"))?;
                             Self::update_certs(
-                                &mut client.lock().unwrap(),
-                                &mut server_certs.lock().unwrap(),
+                                &mut client,
+                                &mut certs,
                                 res.cert_digest,
                                 res.cert_pem,
                             )
-                            .context("Failed to update certificate")
-                            .unwrap_or_else(|e| warn!("Failed to update certificate: {e:?}"));
+                            .context("failed to update server certificates")
                         })
-                        .await;
+                        .await
+                        .context("certificate update task failed")??;
 
                     alloc_job_res
                 }
@@ -1263,7 +1289,13 @@ mod client {
         async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
             let scheduler_url = self.scheduler_url.clone();
             let url = urls::scheduler_status(&scheduler_url)?;
-            let req = self.client.lock().unwrap().get(url);
+            let req = {
+                let client = self
+                    .http_client
+                    .lock()
+                    .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
+                client.get(url)
+            };
             bincode_req_fut(req).await
         }
 
@@ -1275,7 +1307,13 @@ mod client {
             match self.tc_cache.get_toolchain(&tc) {
                 Ok(Some(toolchain_file)) => {
                     let url = urls::server_submit_toolchain(job_alloc.server_id, job_alloc.job_id)?;
-                    let req = self.client.lock().unwrap().post(url);
+                    let req = {
+                        let client = self
+                            .http_client
+                            .lock()
+                            .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
+                        client.post(url)
+                    };
                     let toolchain_file = tokio::fs::File::from_std(toolchain_file.into());
                     let toolchain_file_stream = tokio_util::io::ReaderStream::new(toolchain_file);
                     let body = Body::wrap_stream(toolchain_file_stream);
@@ -1327,7 +1365,13 @@ mod client {
                     Ok((body, path_transformer))
                 })
                 .await??;
-            let mut req = self.client.lock().unwrap().post(url);
+            let mut req = {
+                let client = self
+                    .http_client
+                    .lock()
+                    .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
+                client.post(url)
+            };
             req = req.bearer_auth(job_alloc.auth.clone()).bytes(body);
             bincode_req_fut(req)
                 .map_ok(|res| (res, path_transformer))
