@@ -402,7 +402,7 @@ fn test_l0_hit_does_not_read_source_when_l1_already_has_key() {
 }
 
 #[test]
-fn test_multilevel_raw_hit_reads_backend_once() {
+fn test_multilevel_raw_hit_reads_backend_once() -> Result<()> {
     let runtime = RuntimeBuilder::new_multi_thread()
         .enable_all()
         .worker_threads(1)

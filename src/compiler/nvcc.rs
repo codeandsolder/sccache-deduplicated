@@ -14,6 +14,8 @@
 // limitations under the License.
 
 use crate::compiler::args::*;
+#[cfg(test)]
+use crate::compiler::c::ArtifactDescriptor;
 use crate::compiler::c::{CCompilerImpl, CCompilerKind, ParsedArguments};
 use crate::compiler::gcc::ArgData::*;
 use crate::compiler::{
@@ -1176,7 +1178,7 @@ fn remap_generated_filenames(
                                 // Don't use the count as the first character of the file name, because the file name
                                 // may be used as an identifier (via the __FILE__ macro) and identifiers with leading
                                 // digits are not valid in C/C++, i.e. `x_0.cudafe1.cpp` instead of `0.cudafe1.cpp`.
-                                .join("x_".to_owned() + &count + extension)
+                                .join(format!("x_{count}{extension}"))
                                 .to_string_lossy()
                                 .to_string()
                         })

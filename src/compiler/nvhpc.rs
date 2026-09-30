@@ -14,6 +14,8 @@
 // limitations under the License.
 
 use crate::compiler::args::*;
+#[cfg(test)]
+use crate::compiler::c::ArtifactDescriptor;
 use crate::compiler::c::{CCompilerImpl, CCompilerKind, ParsedArguments};
 use crate::compiler::gcc::ArgData::*;
 use crate::compiler::{
@@ -23,7 +25,6 @@ use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::run_input_output;
 use crate::{counted_array, dist};
 use async_trait::async_trait;
-use fs_err as fs;
 use log::Level::Trace;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

@@ -3199,9 +3199,11 @@ impl OutputsRewriter for RustOutputsRewriter {
         // remap-path-prefix is documented to only apply to 'inputs'.
         trace!("Pondering on rewriting dep file {:?}", self.dep_info);
         if let Some(dep_info) = self.dep_info {
-            let extra_input_str = extra_inputs
-                .iter()
-                .fold(String::new(), |s, p| s + " " + &p.to_string_lossy());
+            let extra_input_str = extra_inputs.iter().fold(String::new(), |mut output, path| {
+                output.push(' ');
+                output.push_str(&path.to_string_lossy());
+                output
+            });
             for dep_info_local_path in output_paths {
                 trace!("Comparing with {}", dep_info_local_path.display());
                 if dep_info == *dep_info_local_path {
