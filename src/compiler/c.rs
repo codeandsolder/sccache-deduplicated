@@ -762,18 +762,19 @@ fn process_preprocessed_file(
         && (start == 0 || bytes[start - 1] == b'\n')
         {
             match process_preprocessor_line(
-                input_file,
-                cwd,
-                included_files,
-                config,
-                time_of_compilation,
-                bytes,
+                PreprocessorLineContext {
+                    input_file,
+                    cwd,
+                    included_files,
+                    config,
+                    time_of_compilation,
+                    bytes,
+                    digest: &mut digest,
+                    normalized_include_paths: &mut normalized_include_paths,
+                    fs_impl: &fs_impl,
+                },
                 start,
                 hash_start,
-                &mut digest,
-                total_len,
-                &mut normalized_include_paths,
-                &fs_impl,
             )? {
                 ControlFlow::Continue((s, h)) => {
                     start = s;
@@ -833,20 +834,38 @@ fn process_preprocessed_file(
 /// The `Continue` variant is `(start, hash_start)`.
 type PreprocessedLineAction = ControlFlow<(usize, usize, bool), (usize, usize)>;
 
-fn process_preprocessor_line(
-    input_file: &Path,
-    cwd: &Path,
-    included_files: &mut HashMap<PathBuf, String>,
+struct PreprocessorLineContext<'a, F> {
+    input_file: &'a Path,
+    cwd: &'a Path,
+    included_files: &'a mut HashMap<PathBuf, String>,
     config: PreprocessorCacheModeConfig,
     time_of_compilation: std::time::SystemTime,
-    bytes: &mut [u8],
+    bytes: &'a mut [u8],
+    digest: &'a mut Digest,
+    normalized_include_paths: &'a mut HashMap<Vec<u8>, Option<Vec<u8>>>,
+    fs_impl: &'a F,
+}
+
+fn process_preprocessor_line<F>(
+    context: PreprocessorLineContext<'_, F>,
     mut start: usize,
     mut hash_start: usize,
-    digest: &mut Digest,
-    total_len: usize,
-    normalized_include_paths: &mut HashMap<Vec<u8>, Option<Vec<u8>>>,
-    fs_impl: &impl PreprocessorFSAbstraction,
-) -> Result<PreprocessedLineAction> {
+) -> Result<PreprocessedLineAction>
+where
+    F: PreprocessorFSAbstraction,
+{
+    let PreprocessorLineContext {
+        input_file,
+        cwd,
+        included_files,
+        config,
+        time_of_compilation,
+        bytes,
+        digest,
+        normalized_include_paths,
+        fs_impl,
+    } = context;
+    let total_len = bytes.len();
     let mut slice = &bytes[start..];
     // Workarounds for preprocessor linemarker bugs in GCC version 6.
     if slice.get(2) == Some(&b'3') {
@@ -937,8 +956,8 @@ fn process_preprocessor_line(
         }
     };
 
-    if !remember_include_file(
-        include_path,
+    if !remember_include_file(RememberIncludeContext {
+        path: include_path,
         input_file,
         cwd,
         included_files,
@@ -947,7 +966,7 @@ fn process_preprocessor_line(
         config,
         time_of_compilation,
         fs_impl,
-    )? {
+    })? {
         return Ok(ControlFlow::Break((start, hash_start, false)));
     }
     // Everything of interest between hash_start and start has been hashed now.
@@ -1030,20 +1049,36 @@ struct StandardFsAbstraction;
 
 impl PreprocessorFSAbstraction for StandardFsAbstraction {}
 
-// Returns false if the include file was "too new" (meaning modified during or
-// after the start of the compilation) and therefore should disable
-// the preprocessor cache mode, otherwise true.
-fn remember_include_file(
-    mut path: &[u8],
-    input_file: &Path,
-    cwd: &Path,
-    included_files: &mut HashMap<PathBuf, String>,
-    digest: &mut Digest,
+struct RememberIncludeContext<'a, F> {
+    path: &'a [u8],
+    input_file: &'a Path,
+    cwd: &'a Path,
+    included_files: &'a mut HashMap<PathBuf, String>,
+    digest: &'a mut Digest,
     system: bool,
     config: PreprocessorCacheModeConfig,
     time_of_compilation: std::time::SystemTime,
-    fs_impl: &impl PreprocessorFSAbstraction,
-) -> Result<bool> {
+    fs_impl: &'a F,
+}
+
+// Returns false if the include file was "too new" (meaning modified during or
+// after the start of the compilation) and therefore should disable
+// the preprocessor cache mode, otherwise true.
+fn remember_include_file<F>(context: RememberIncludeContext<'_, F>) -> Result<bool>
+where
+    F: PreprocessorFSAbstraction,
+{
+    let RememberIncludeContext {
+        mut path,
+        input_file,
+        cwd,
+        included_files,
+        digest,
+        system,
+        config,
+        time_of_compilation,
+        fs_impl,
+    } = context;
     // TODO if precompiled header.
     if path.len() >= 2 && path[0] == b'<' && path[path.len() - 1] == b'>' {
         // Typically <built-in> or <command-line>.
@@ -2074,20 +2109,22 @@ int value;
         };
 
         let mut bytes = line.to_vec();
-        let total_len = bytes.len();
+        let mut digest = Digest::new();
+        let mut normalized_include_paths = HashMap::new();
         process_preprocessor_line(
-            input_file,
-            Path::new(""),
-            include_files,
-            config,
-            std::time::SystemTime::now(),
-            &mut bytes,
+            PreprocessorLineContext {
+                input_file,
+                cwd: Path::new(""),
+                included_files: include_files,
+                config,
+                time_of_compilation: std::time::SystemTime::now(),
+                bytes: &mut bytes,
+                digest: &mut digest,
+                normalized_include_paths: &mut normalized_include_paths,
+                fs_impl,
+            },
             0,
             0,
-            &mut Digest::new(),
-            total_len,
-            &mut HashMap::new(),
-            fs_impl,
         )
         .unwrap()
     }
