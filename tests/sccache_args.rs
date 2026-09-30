@@ -4,21 +4,24 @@
 //! <http://creativecommons.org/publicdomain/zero/1.0>/
 pub mod helpers;
 
+#[cfg(any(feature = "gcs", feature = "s3"))]
 use anyhow::Result;
+#[cfg(any(feature = "gcs", feature = "s3"))]
 use assert_cmd::prelude::*;
+#[cfg(any(feature = "gcs", feature = "s3"))]
 use helpers::{SCCACHE_BIN, stop_sccache};
+#[cfg(any(feature = "gcs", feature = "s3"))]
 use predicates::prelude::*;
+#[cfg(any(feature = "gcs", feature = "s3"))]
 use serial_test::serial;
+#[cfg(any(feature = "gcs", feature = "s3"))]
 use std::process::Command;
-
-#[macro_use]
-extern crate log;
 
 #[test]
 #[serial]
 #[cfg(feature = "gcs")]
 fn test_gcp_arg_check() -> Result<()> {
-    trace!("sccache with log");
+    log::trace!("sccache with log");
     stop_sccache()?;
 
     let mut cmd = Command::new(SCCACHE_BIN.as_os_str());

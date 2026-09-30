@@ -4767,7 +4767,7 @@ proc_macro false
                     creator: &creator,
                     cwd: f.tempdir.path().to_owned(),
                     env_vars: vec![],
-                    may_dist: may_dist,
+                    may_dist,
                     pool: &pool,
                     rewrite_includes_only: false,
                     storage: Arc::new(MockStorage::new(None, false)),
@@ -4895,16 +4895,16 @@ proc_macro false
             mock_file_names(&creator, &["foo.rlib"]);
 
             let result = hasher
-                .generate_hash_key(
-                    &creator,
-                    manifest.clone(),
-                    env,
-                    false,
-                    &pool,
-                    false,
-                    Arc::new(MockStorage::new(None, false)),
-                    CacheControl::Default,
-                )
+                .generate_hash_key(GenerateHashKeyContext {
+                    creator: &creator,
+                    cwd: manifest.clone(),
+                    env_vars: env,
+                    may_dist: false,
+                    pool: &pool,
+                    rewrite_includes_only: false,
+                    storage: Arc::new(MockStorage::new(None, false)),
+                    cache_control: CacheControl::Default,
+                })
                 .wait()
                 .unwrap();
 

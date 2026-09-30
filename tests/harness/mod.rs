@@ -1,13 +1,21 @@
 use fs_err as fs;
 use log::trace;
+#[cfg(feature = "dist-server")]
+use sccache::config::HTTPUrl;
+#[cfg(feature = "dist-server")]
+use sccache::dist::{self, SchedulerStatusResult, ServerId};
 use sccache::server::ServerInfo;
 use std::env;
 use std::fs::remove_dir_all;
 use std::io::Write;
+#[cfg(feature = "dist-server")]
+use std::net::{self, IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "dist-server")]
 use std::process::Output;
 use std::process::{Command, Stdio};
+#[cfg(feature = "dist-server")]
+use std::str::FromStr;
 use std::str::{self};
 #[cfg(feature = "dist-server")]
 use std::thread;
@@ -488,8 +496,7 @@ impl DistSystem {
                     env::set_var("SCCACHE_LOG", "sccache=trace");
                 }
                 env_logger::try_init().unwrap();
-                server.start().unwrap();
-                unreachable!();
+                server.start().unwrap()
             }
         };
 
@@ -762,6 +769,7 @@ fn wait_for_http(url: HTTPUrl, interval: Duration, max_wait: Duration) {
     )
 }
 
+#[cfg(feature = "dist-server")]
 fn wait_for<F: Fn() -> Result<(), String>>(f: F, interval: Duration, max_wait: Duration) {
     let start = Instant::now();
     let mut lasterr;

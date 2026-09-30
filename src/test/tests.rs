@@ -15,7 +15,7 @@
 use crate::cache::CacheMode;
 use crate::cache::disk::DiskCache;
 use crate::client::connect_to_server;
-use crate::commands::{do_compile, request_shutdown, request_stats};
+use crate::commands::{CompileInvocation, do_compile, request_shutdown, request_stats};
 use crate::config::PreprocessorCacheModeConfig;
 use crate::jobserver::Client;
 use crate::mock_command::*;

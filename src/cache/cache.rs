@@ -775,9 +775,13 @@ pub fn storage_from_config(
 
 #[cfg(test)]
 mod test {
-    use super::{CacheMode, CacheWrite, RemoteStorage, storage_from_config};
+    #[cfg(any(feature = "s3", feature = "redis"))]
+    use super::{CacheMode, RemoteStorage, Storage};
+    use super::{CacheWrite, storage_from_config};
     use crate::compiler::PreprocessorCacheEntry;
-    use crate::config::{self, CacheModeConfig, CacheType, Config};
+    #[cfg(feature = "s3")]
+    use crate::config::{self, CacheType};
+    use crate::config::{CacheModeConfig, Config};
     use crate::errors::{Result, anyhow};
     use fs_err as fs;
 

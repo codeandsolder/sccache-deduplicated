@@ -126,7 +126,7 @@ fn test_dist_basic() {
     write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);
     let sccache_cached_cfg_path = tmpdir.join("sccache-cached-cfg");
 
-    stop_local_daemon();
+    let _ = stop_local_daemon();
     start_local_daemon(&sccache_cfg_path, &sccache_cached_cfg_path);
     basic_compile(tmpdir, &sccache_cfg_path, &sccache_cached_cfg_path);
 
@@ -159,7 +159,7 @@ fn test_dist_restartedserver() {
     write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);
     let sccache_cached_cfg_path = tmpdir.join("sccache-cached-cfg");
 
-    stop_local_daemon();
+    let _ = stop_local_daemon();
     start_local_daemon(&sccache_cfg_path, &sccache_cached_cfg_path);
     basic_compile(tmpdir, &sccache_cfg_path, &sccache_cached_cfg_path);
 
@@ -194,7 +194,7 @@ fn test_dist_nobuilder() {
     write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);
     let sccache_cached_cfg_path = tmpdir.join("sccache-cached-cfg");
 
-    stop_local_daemon();
+    let _ = stop_local_daemon();
     start_local_daemon(&sccache_cfg_path, &sccache_cached_cfg_path);
     basic_compile(tmpdir, &sccache_cfg_path, &sccache_cached_cfg_path);
 
@@ -260,7 +260,7 @@ fn test_dist_failingserver() {
     write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);
     let sccache_cached_cfg_path = tmpdir.join("sccache-cached-cfg");
 
-    stop_local_daemon();
+    let _ = stop_local_daemon();
     start_local_daemon(&sccache_cfg_path, &sccache_cached_cfg_path);
     basic_compile(tmpdir, &sccache_cfg_path, &sccache_cached_cfg_path);
 
@@ -293,7 +293,7 @@ fn test_dist_cargo_build() {
     write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);
     let sccache_cached_cfg_path = tmpdir.join("sccache-cached-cfg");
 
-    stop_local_daemon();
+    let _ = stop_local_daemon();
     start_local_daemon(&sccache_cfg_path, &sccache_cached_cfg_path);
     rust_compile(tmpdir, &sccache_cfg_path, &sccache_cached_cfg_path)
         .assert()
@@ -327,7 +327,7 @@ fn test_dist_cargo_makeflags() {
     write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);
     let sccache_cached_cfg_path = tmpdir.join("sccache-cached-cfg");
 
-    stop_local_daemon();
+    let _ = stop_local_daemon();
     start_local_daemon(&sccache_cfg_path, &sccache_cached_cfg_path);
     let compile_output = rust_compile(tmpdir, &sccache_cfg_path, &sccache_cached_cfg_path);
 
@@ -374,7 +374,7 @@ fn test_dist_preprocesspr_cache_bug_2173() {
     write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);
     let sccache_cached_cfg_path = tmpdir.join("sccache-cached-cfg");
 
-    stop_local_daemon();
+    let _ = stop_local_daemon();
     start_local_daemon(&sccache_cfg_path, &sccache_cached_cfg_path);
 
     basic_compile(tmpdir, &sccache_cfg_path, &sccache_cached_cfg_path);
@@ -424,12 +424,18 @@ fn test_dist_toolchain() {
     let sccache_cfg_path = tmpdir.join("sccache-cfg.json");
     write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);
     let sccache_cached_cfg_path = tmpdir.join("sccache-cached-cfg");
-    stop_local_daemon();
+    let _ = stop_local_daemon();
     start_local_daemon(&sccache_cfg_path, &sccache_cached_cfg_path);
     basic_compile(tmpdir, &sccache_cfg_path, &sccache_cached_cfg_path);
 
-    stop_local_daemon();
-    clear_cache_local_daemon(tmpdir);
+    assert!(
+        stop_local_daemon(),
+        "failed to stop local daemon before cache clear"
+    );
+    assert!(
+        clear_cache_local_daemon(tmpdir),
+        "failed to clear local daemon cache"
+    );
 
     start_local_daemon(&sccache_cfg_path, &sccache_cached_cfg_path);
     basic_compile(tmpdir, &sccache_cfg_path, &sccache_cached_cfg_path);
