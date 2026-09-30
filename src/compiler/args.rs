@@ -5,7 +5,6 @@ use std::fmt::{self, Debug, Display};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
-use std::str;
 
 pub type ArgParseResult<T> = StdResult<T, ArgParseError>;
 pub type ArgToStringResult = StdResult<String, ArgToStringError>;
@@ -187,9 +186,7 @@ impl<T: ArgumentValue> Iterator for Iter<'_, T> {
                     if let Some(d) = d
                         && !v.is_empty()
                     {
-                        s.push(OsString::from(
-                            str::from_utf8(&[d]).expect("delimiter should be ascii"),
-                        ));
+                        s.push(char::from(d).to_string());
                     }
                     s.push(v);
                     Some(s)
@@ -241,7 +238,7 @@ impl<T: ArgumentValue, F: FnMut(&Path) -> Option<String>> Iterator for IterStrin
                     if let Some(d) = d
                         && !v.is_empty()
                     {
-                        s.push_str(str::from_utf8(&[d]).expect("delimiter should be ascii"));
+                        s.push(char::from(d));
                     }
                     s.push_str(&v);
                     Some(Ok(s))
@@ -380,7 +377,7 @@ impl IntoArg for () {
 pub fn split_os_string_arg(val: OsString, split: &str) -> ArgParseResult<(String, Option<String>)> {
     let val = val.into_string().map_err(ArgParseError::InvalidUnicode)?;
     let mut split_it = val.splitn(2, split);
-    let s1 = split_it.next().expect("splitn with no values");
+    let s1 = split_it.next().unwrap_or_default();
     let maybe_s2 = split_it.next();
     Ok((s1.to_owned(), maybe_s2.map(|s| s.to_owned())))
 }
