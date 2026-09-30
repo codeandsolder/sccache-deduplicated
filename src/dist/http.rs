@@ -522,11 +522,11 @@ mod server {
                 Err(err) => {
                     // TODO: would ideally just use error_chain
                     let mut err_msg = err.to_string();
-                    let mut maybe_cause = err.source();
+                    let mut maybe_cause = std::error::Error::source(&err);
                     while let Some(cause) = maybe_cause {
                         err_msg.push_str(", caused by: ");
                         err_msg.push_str(&cause.to_string());
-                        maybe_cause = cause.source();
+                        maybe_cause = std::error::Error::source(cause);
                     }
 
                     warn!("Res {} error: {}", $reqid, err_msg);

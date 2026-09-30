@@ -12,7 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::cache_io::{Cache, CacheMode, CacheRead, CacheWrite, ReadSeek};
+#[cfg(any(
+    feature = "azure",
+    feature = "gcs",
+    feature = "gha",
+    feature = "memcached",
+    feature = "redis",
+    feature = "s3",
+    feature = "webdav",
+    feature = "oss",
+    feature = "cos"
+))]
+use super::cache_io::CacheRead;
+use super::cache_io::{Cache, CacheMode, CacheWrite};
 #[cfg(feature = "azure")]
 use crate::cache::azure::AzureBlobCache;
 #[cfg(feature = "cos")]
@@ -79,7 +91,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::errors::{Result, anyhow, bail};
+#[cfg(any(
+    feature = "azure",
+    feature = "gcs",
+    feature = "gha",
+    feature = "memcached",
+    feature = "redis",
+    feature = "s3",
+    feature = "webdav",
+    feature = "oss",
+    feature = "cos"
+))]
+use crate::errors::bail;
+use crate::errors::{Result, anyhow};
 
 /// Result of [`Storage::get_path`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
