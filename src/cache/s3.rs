@@ -15,7 +15,7 @@ use opendal::Operator;
 use opendal::services::S3;
 use opendal_layer_logging::LoggingLayer;
 
-use crate::errors::*;
+use crate::errors::{Result, anyhow};
 
 use super::http_client::set_user_agent;
 
@@ -95,6 +95,11 @@ impl S3Cache {
         self.enable_virtual_host_style = enable_virtual_host_style;
         self
     }
+    /// Build the configured S3 cache operator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the endpoint is invalid or OpenDAL/HTTP initialization fails.
     pub fn build(self) -> Result<Operator> {
         let mut builder = S3::default().bucket(&self.bucket).root(&self.key_prefix);
 

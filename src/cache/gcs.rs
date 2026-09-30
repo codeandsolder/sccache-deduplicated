@@ -14,7 +14,7 @@
 // limitations under the License.
 
 use crate::cache::CacheMode;
-use crate::errors::*;
+use crate::errors::{Result, anyhow};
 use opendal::Operator;
 use opendal::{OperationContext, services::Gcs};
 use opendal_layer_logging::LoggingLayer;
@@ -35,7 +35,12 @@ const fn rw_to_scope(mode: CacheMode) -> &'static str {
 pub struct GCSCache;
 
 impl GCSCache {
-    /// Create a new `GCSCache` storing data in `bucket`
+    /// Create a new `GCSCache` storing data in `bucket`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials, the optional credential URL, runtime setup,
+    /// token retrieval, or OpenDAL initialization fails.
     pub fn build(
         bucket: &str,
         key_prefix: &str,

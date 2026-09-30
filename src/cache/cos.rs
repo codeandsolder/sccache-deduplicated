@@ -15,7 +15,7 @@ use opendal::Operator;
 use opendal::services::Cos;
 use opendal_layer_logging::LoggingLayer;
 
-use crate::errors::*;
+use crate::errors::Result;
 
 use super::http_client::set_user_agent;
 
@@ -23,6 +23,11 @@ pub struct COSCache;
 
 // Implement for Tencent Cloud Object Storage
 impl COSCache {
+    /// Build a Tencent COS cache operator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the OpenDAL operator or HTTP transport cannot be initialized.
     pub fn build(bucket: &str, key_prefix: &str, endpoint: Option<&str>) -> Result<Operator> {
         let mut builder = Cos::default().bucket(bucket).root(key_prefix);
 

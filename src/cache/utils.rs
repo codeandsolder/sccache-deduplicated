@@ -14,7 +14,7 @@ use fs_err as fs;
 
 use std::path::Path;
 
-use crate::errors::*;
+use crate::errors::Result;
 
 /// Normalize key `abcdef` into `a/b/c/abcdef`
 pub(in crate::cache) fn normalize_key(key: &str) -> String {

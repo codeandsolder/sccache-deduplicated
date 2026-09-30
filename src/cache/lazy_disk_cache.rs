@@ -10,7 +10,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::errors::*;
+use crate::errors::Result;
 use crate::lru_disk_cache::LruDiskCache;
 use std::ffi::OsString;
 use std::path::Path;
@@ -21,6 +21,11 @@ pub enum LazyDiskCache {
 }
 
 impl LazyDiskCache {
+    /// Return the initialized disk cache, creating it on first use.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying disk cache cannot be initialized.
     pub fn get_or_init(&mut self) -> Result<&mut LruDiskCache> {
         match self {
             Self::Uninit { root, max_size } => {
@@ -39,7 +44,7 @@ impl LazyDiskCache {
     }
 
     #[must_use]
-    pub fn capacity(&self) -> u64 {
+    pub const fn capacity(&self) -> u64 {
         match self {
             Self::Uninit { max_size, .. } => *max_size,
             Self::Init(d) => d.capacity(),
