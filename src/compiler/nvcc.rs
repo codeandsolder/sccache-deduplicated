@@ -278,7 +278,7 @@ impl CCompilerImpl for Nvcc {
     {
         generate_compile_commands(parsed_args, executable, cwd, env_vars, &self.host_compiler).map(
             |(command, dist_command, cacheable)| {
-                (CCompileCommand::new(command), dist_command, cacheable)
+                (CCompileCommand::boxed(command), dist_command, cacheable)
             },
         )
     }
@@ -1786,6 +1786,7 @@ mod test {
         assert_eq!(ovec!["-c"], a.common_args);
     }
 
+    #[test]
     fn test_parse_arguments_simple_cu_msvc() {
         let a = parses_msvc!("-c", "foo.cu", "-o", "foo.o");
         assert_eq!(Some("foo.cu"), a.input.to_str());

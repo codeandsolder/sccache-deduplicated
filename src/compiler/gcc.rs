@@ -126,7 +126,7 @@ impl CCompilerImpl for Gcc {
             language_to_gcc_arg,
         )
         .map(|(command, dist_command, cacheable)| {
-            (CCompileCommand::new(command), dist_command, cacheable)
+            (CCompileCommand::boxed(command), dist_command, cacheable)
         })
     }
 }

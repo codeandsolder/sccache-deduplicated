@@ -173,7 +173,7 @@ impl CCompilerImpl for Clang {
             language_to_clang_arg,
         )
         .map(|(command, dist_command, cacheable)| {
-            (CCompileCommand::new(command), dist_command, cacheable)
+            (CCompileCommand::boxed(command), dist_command, cacheable)
         })
     }
 }

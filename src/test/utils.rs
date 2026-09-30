@@ -154,7 +154,7 @@ pub fn mk_bin_contents<F: FnOnce(File) -> io::Result<()>>(
     let f = fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .mode(0o666 | libc::S_IXUSR)
+        .mode(0o766)
         .open(&bin)?;
     fill_contents(f)?;
     bin.canonicalize()

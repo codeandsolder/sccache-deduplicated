@@ -668,6 +668,17 @@ pub fn build_single_cache(
                 .with_skip_cache_check(skip_cache_check);
             Ok(Arc::new(storage))
         }
+        #[cfg(not(all(
+            feature = "azure",
+            feature = "gcs",
+            feature = "gha",
+            feature = "memcached",
+            feature = "redis",
+            feature = "s3",
+            feature = "webdav",
+            feature = "oss",
+            feature = "cos"
+        )))]
         _ => {
             bail!("Cache type not supported with current feature configuration")
         }

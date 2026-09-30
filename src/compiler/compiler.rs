@@ -110,7 +110,7 @@ impl<I> CCompileCommand<I>
 where
     I: CompileCommandImpl,
 {
-    pub fn new<T>(cmd: I) -> Box<dyn CompileCommand<T>>
+    pub fn boxed<T>(cmd: I) -> Box<dyn CompileCommand<T>>
     where
         T: CommandCreatorSync,
     {
@@ -233,6 +233,7 @@ pub enum CompilerKind {
 
 // Used for tests
 // Need to be consistent with `Language`
+#[cfg(test)]
 const EXPECTED_LANGUAGE_COUNT: usize = 21;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -3472,10 +3473,10 @@ LLVM version: 6.0",
         let runtime = Runtime::new()?;
         let pool = runtime.handle().clone();
         let dist_clients = vec![
-            test_dist::ErrorPutToolchainClient::new(),
-            test_dist::ErrorAllocJobClient::new(),
-            test_dist::ErrorSubmitToolchainClient::new(),
-            test_dist::ErrorRunJobClient::new(),
+            test_dist::ErrorPutToolchainClient::client(),
+            test_dist::ErrorAllocJobClient::client(),
+            test_dist::ErrorSubmitToolchainClient::client(),
+            test_dist::ErrorRunJobClient::client(),
         ];
         // Write a dummy input file so the preprocessor cache mode can work
         std::fs::write(f.tempdir.path().join("foo.c"), "whatever")?;
@@ -3597,7 +3598,7 @@ mod test_dist {
 
     pub struct ErrorPutToolchainClient;
     impl ErrorPutToolchainClient {
-        pub fn new() -> Arc<dyn dist::Client> {
+        pub fn client() -> Arc<dyn dist::Client> {
             Arc::new(Self)
         }
     }
@@ -3645,7 +3646,7 @@ mod test_dist {
         tc: Toolchain,
     }
     impl ErrorAllocJobClient {
-        pub fn new() -> Arc<dyn dist::Client> {
+        pub fn client() -> Arc<dyn dist::Client> {
             Arc::new(Self {
                 tc: Toolchain {
                     archive_id: "somearchiveid".to_owned(),
@@ -3699,7 +3700,7 @@ mod test_dist {
         tc: Toolchain,
     }
     impl ErrorSubmitToolchainClient {
-        pub fn new() -> Arc<dyn dist::Client> {
+        pub fn client() -> Arc<dyn dist::Client> {
             Arc::new(Self {
                 has_started: AtomicBool::default(),
                 tc: Toolchain {
@@ -3769,7 +3770,7 @@ mod test_dist {
         tc: Toolchain,
     }
     impl ErrorRunJobClient {
-        pub fn new() -> Arc<dyn dist::Client> {
+        pub fn client() -> Arc<dyn dist::Client> {
             Arc::new(Self {
                 has_started: AtomicBool::default(),
                 tc: Toolchain {

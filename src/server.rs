@@ -916,7 +916,7 @@ where
 
     /// Information tracking how many services (connected clients) are active.
     /// This field causes [`WaitUntilZero`] to wait until this struct drops.
-    info: ActiveInfo,
+    _info: ActiveInfo,
 }
 
 type SccacheRequest = Message<Request, Body<()>>;
@@ -1102,7 +1102,7 @@ where
             rt,
             creator: C::new(client),
             tx,
-            info,
+            _info: info,
         }
     }
 
@@ -2480,7 +2480,7 @@ pub(crate) struct WaitUntilZero {
 
 #[derive(Clone)]
 pub struct ActiveInfo {
-    info: Arc<std::sync::Mutex<Info>>,
+    _info: Arc<std::sync::Mutex<Info>>,
 }
 
 struct Info {
@@ -2500,7 +2500,7 @@ impl WaitUntilZero {
     pub(crate) fn new() -> (Self, ActiveInfo) {
         let info = Arc::new(std::sync::Mutex::new(Info { waker: None }));
 
-        (Self { info: Arc::downgrade(&info) }, ActiveInfo { info })
+        (Self { info: Arc::downgrade(&info) }, ActiveInfo { _info: info })
     }
 }
 

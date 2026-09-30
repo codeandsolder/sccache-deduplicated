@@ -96,7 +96,7 @@ impl CCompilerImpl for Diab {
     {
         generate_compile_commands(path_transformer, executable, parsed_args, cwd, env_vars).map(
             |(command, dist_command, cacheable)| {
-                (CCompileCommand::new(command), dist_command, cacheable)
+                (CCompileCommand::boxed(command), dist_command, cacheable)
             },
         )
     }

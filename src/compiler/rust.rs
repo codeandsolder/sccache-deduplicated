@@ -2522,7 +2522,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                     .join(BINS_DIR)
                     .join("rustc")
                     .with_extension(EXE_EXTENSION);
-                CCompileCommand::new(CanonicalRustCompileCommand {
+                CCompileCommand::boxed(CanonicalRustCompileCommand {
                     toolchain_executable: executable.to_owned(),
                     runner_arguments: canonical_bwrap_arguments(
                         canonical,
@@ -2540,7 +2540,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                 bail!("experimental canonical Rust paths currently require Linux bubblewrap")
             }
         } else {
-            CCompileCommand::new(SingleCompileCommand {
+            CCompileCommand::boxed(SingleCompileCommand {
                 executable: executable.to_owned(),
                 arguments: arguments
                     .iter()

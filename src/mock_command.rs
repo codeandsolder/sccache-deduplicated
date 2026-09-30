@@ -349,6 +349,7 @@ pub fn exit_status(v: ExitStatusValue) -> ExitStatus {
 }
 
 /// A struct that mocks `std::process::Child`.
+#[cfg(test)]
 #[derive(Debug)]
 pub struct MockChild {
     //TODO: this doesn't work to actually track writes...
@@ -363,6 +364,7 @@ pub struct MockChild {
 }
 
 /// A mocked child process that simply returns stored values for its status and output.
+#[cfg(test)]
 impl MockChild {
     /// Create a `MockChild` that will return the specified `status`, `stdout`, and `stderr` when waited upon.
     pub fn new<T: AsRef<[u8]>, U: AsRef<[u8]>>(status: ExitStatus, stdout: T, stderr: U) -> Self {
@@ -385,6 +387,7 @@ impl MockChild {
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl CommandChild for MockChild {
     type I = io::Cursor<Vec<u8>>;
@@ -421,11 +424,13 @@ impl CommandChild for MockChild {
     }
 }
 
+#[cfg(test)]
 pub enum ChildOrCall {
     Child(Result<MockChild>),
     Call(Box<dyn Fn(&[OsString]) -> Result<MockChild> + Send>),
 }
 
+#[cfg(test)]
 impl fmt::Debug for ChildOrCall {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
@@ -436,12 +441,14 @@ impl fmt::Debug for ChildOrCall {
 }
 
 /// A mocked command that simply returns its `child` from `spawn`.
+#[cfg(test)]
 #[derive(Debug)]
 pub struct MockCommand {
     pub child: Option<ChildOrCall>,
     pub args: Vec<OsString>,
 }
 
+#[cfg(test)]
 #[async_trait]
 impl RunCommand for MockCommand {
     type C = MockChild;
@@ -494,11 +501,13 @@ impl RunCommand for MockCommand {
 }
 
 /// `MockCommandCreator` allows mocking out process creation by providing `MockChild` instances to be used in advance.
+#[cfg(test)]
 pub struct MockCommandCreator {
     /// Data to be used as the return value of `MockCommand::spawn`.
     pub children: Vec<ChildOrCall>,
 }
 
+#[cfg(test)]
 impl MockCommandCreator {
     /// The next `MockCommand` created will return `child` from `RunCommand::spawn`.
     pub fn next_command_spawns(&mut self, child: Result<MockChild>) {
@@ -515,6 +524,7 @@ impl MockCommandCreator {
     }
 }
 
+#[cfg(test)]
 impl CommandCreator for MockCommandCreator {
     type Cmd = MockCommand;
 
