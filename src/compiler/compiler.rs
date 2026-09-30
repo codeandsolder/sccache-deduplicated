@@ -2994,7 +2994,7 @@ LLVM version: 6.0",
         const COMPILER_STDERR: &[u8] = b"compiler stderr";
         let obj = f.tempdir.path().join("foo.o");
         // Dist client will do the compilation
-        let dist_client = test_dist::OneshotClient::new(
+        let dist_client = test_dist::OneshotClient::client(
             0,
             COMPILER_STDOUT.to_owned(),
             COMPILER_STDERR.to_owned(),
@@ -3850,7 +3850,7 @@ mod test_dist {
     }
 
     impl OneshotClient {
-        pub fn new(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Arc<dyn dist::Client> {
+        pub fn client(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Arc<dyn dist::Client> {
             Arc::new(Self {
                 has_started: AtomicBool::default(),
                 tc: Toolchain {

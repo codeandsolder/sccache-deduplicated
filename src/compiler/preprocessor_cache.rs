@@ -365,19 +365,35 @@ static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
     .collect()
 });
 
+pub(crate) struct PreprocessorCacheKey<'a> {
+    pub compiler_digest: &'a str,
+    pub language: Language,
+    pub arguments: &'a [OsString],
+    pub extra_hashes: &'a [String],
+    pub assembler_digest: Option<&'a str>,
+    pub env_vars: &'a [(OsString, OsString)],
+    pub input_file: &'a Path,
+    pub plusplus: bool,
+    pub config: PreprocessorCacheModeConfig,
+    pub basedirs: &'a [Vec<u8>],
+}
+
 /// Compute the hash key of compiler preprocessing `input` with `args`.
 pub fn preprocessor_cache_entry_hash_key(
-    compiler_digest: &str,
-    language: Language,
-    arguments: &[OsString],
-    extra_hashes: &[String],
-    assembler_digest: Option<&str>,
-    env_vars: &[(OsString, OsString)],
-    input_file: &Path,
-    plusplus: bool,
-    config: PreprocessorCacheModeConfig,
-    basedirs: &[Vec<u8>],
+    input: PreprocessorCacheKey<'_>,
 ) -> anyhow::Result<Option<String>> {
+    let PreprocessorCacheKey {
+        compiler_digest,
+        language,
+        arguments,
+        extra_hashes,
+        assembler_digest,
+        env_vars,
+        input_file,
+        plusplus,
+        config,
+        basedirs,
+    } = input;
     // If you change any of the inputs to the hash, you should change `FORMAT_VERSION`.
     let mut m = Digest::new();
     m.update(compiler_digest.as_bytes());
@@ -715,37 +731,27 @@ mod test {
         fs::write(&file2_path, content).unwrap();
 
         let config = PreprocessorCacheModeConfig::activated();
+        let hash = |input_file: &Path, basedirs: &[Vec<u8>]| {
+            preprocessor_cache_entry_hash_key(PreprocessorCacheKey {
+                compiler_digest: "test_digest",
+                language: Language::C,
+                arguments: &[],
+                extra_hashes: &[],
+                assembler_digest: None,
+                env_vars: &[],
+                input_file,
+                plusplus: false,
+                config,
+                basedirs,
+            })
+            .unwrap()
+            .unwrap()
+        };
 
         // Test 1: With basedirs, hashes should be the same
-        let hash1_with_basedirs = preprocessor_cache_entry_hash_key(
-            "test_digest",
-            Language::C,
-            &[],
-            &[],
-            None,
-            &[],
-            &file1_path,
-            false,
-            config,
-            &dirs,
-        )
-        .unwrap()
-        .unwrap();
+        let hash1_with_basedirs = hash(&file1_path, &dirs);
 
-        let hash2_with_basedirs = preprocessor_cache_entry_hash_key(
-            "test_digest",
-            Language::C,
-            &[],
-            &[],
-            None,
-            &[],
-            &file2_path,
-            false,
-            config,
-            &dirs,
-        )
-        .unwrap()
-        .unwrap();
+        let hash2_with_basedirs = hash(&file2_path, &dirs);
 
         assert_eq!(
             hash1_with_basedirs, hash2_with_basedirs,
@@ -753,35 +759,9 @@ mod test {
         );
 
         // Test 2: With basedir1 for first, and basedir2 for second, hashes should be the same
-        let hash1_with_basedirs = preprocessor_cache_entry_hash_key(
-            "test_digest",
-            Language::C,
-            &[],
-            &[],
-            None,
-            &[],
-            &file1_path,
-            false,
-            config,
-            &dirs[..1],
-        )
-        .unwrap()
-        .unwrap();
+        let hash1_with_basedirs = hash(&file1_path, &dirs[..1]);
 
-        let hash2_with_basedirs = preprocessor_cache_entry_hash_key(
-            "test_digest",
-            Language::C,
-            &[],
-            &[],
-            None,
-            &[],
-            &file2_path,
-            false,
-            config,
-            &dirs[1..],
-        )
-        .unwrap()
-        .unwrap();
+        let hash2_with_basedirs = hash(&file2_path, &dirs[1..]);
 
         assert_eq!(
             hash1_with_basedirs, hash2_with_basedirs,
@@ -789,35 +769,9 @@ mod test {
         );
 
         // Test 3: Without basedirs, hashes should be different
-        let hash1_no_basedirs = preprocessor_cache_entry_hash_key(
-            "test_digest",
-            Language::C,
-            &[],
-            &[],
-            None,
-            &[],
-            &file1_path,
-            false,
-            config,
-            &[],
-        )
-        .unwrap()
-        .unwrap();
+        let hash1_no_basedirs = hash(&file1_path, &[]);
 
-        let hash2_no_basedirs = preprocessor_cache_entry_hash_key(
-            "test_digest",
-            Language::C,
-            &[],
-            &[],
-            None,
-            &[],
-            &file2_path,
-            false,
-            config,
-            &[],
-        )
-        .unwrap()
-        .unwrap();
+        let hash2_no_basedirs = hash(&file2_path, &[]);
 
         assert_ne!(
             hash1_no_basedirs, hash2_no_basedirs,

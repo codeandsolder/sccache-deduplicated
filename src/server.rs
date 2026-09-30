@@ -1664,7 +1664,7 @@ where
                         Some(code) => res.retcode = Some(code),
                         None => {
                             if let Some(signal) = get_signal(&status) {
-                                res.signal = Some(signal)
+                                res.signal = Some(signal);
                             } else {
                                 error!("process exited without an exit code or signal");
                                 res.retcode = Some(-2);
@@ -1687,7 +1687,7 @@ where
                                 Some(code) => res.retcode = Some(code),
                                 None => {
                                     if let Some(signal) = get_signal(&output.status) {
-                                        res.signal = Some(signal)
+                                        res.signal = Some(signal);
                                     } else {
                                         error!(
                                             "failed process exited without an exit code or signal"

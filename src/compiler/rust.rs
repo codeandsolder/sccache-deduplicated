@@ -294,20 +294,34 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
 /// Version number for cache key.
 const CACHE_VERSION: &[u8] = b"6";
 
+struct RustDepInfoRequest<'a, T> {
+    creator: &'a T,
+    crate_name: &'a str,
+    executable: &'a Path,
+    arguments: &'a [OsString],
+    cwd: &'a Path,
+    env_vars: &'a [(OsString, OsString)],
+    pool: &'a tokio::runtime::Handle,
+    dep_info_copy: Option<&'a Path>,
+}
+
 /// Get absolute paths for all source files and env-deps listed in rustc's dep-info output.
 async fn get_source_files_and_env_deps<T>(
-    creator: &T,
-    crate_name: &str,
-    executable: &Path,
-    arguments: &[OsString],
-    cwd: &Path,
-    env_vars: &[(OsString, OsString)],
-    pool: &tokio::runtime::Handle,
-    dep_info_copy: Option<&Path>,
+    request: RustDepInfoRequest<'_, T>,
 ) -> Result<(Vec<PathBuf>, Vec<(OsString, OsString)>)>
 where
     T: CommandCreatorSync,
 {
+    let RustDepInfoRequest {
+        creator,
+        crate_name,
+        executable,
+        arguments,
+        cwd,
+        env_vars,
+        pool,
+        dep_info_copy,
+    } = request;
     let start = time::Instant::now();
     // Get the full list of source files from rustc's dep-info.
     let temp_dir = tempfile::Builder::new()
@@ -1976,16 +1990,16 @@ where
         });
         let source_hashes_pool = pool.clone();
         let source_files_and_hashes_and_env_deps = async {
-            let (source_files, env_deps) = get_source_files_and_env_deps(
+            let (source_files, env_deps) = get_source_files_and_env_deps(RustDepInfoRequest {
                 creator,
-                &self.parsed_args.crate_name,
-                &self.executable,
-                &filtered_arguments,
-                &cwd,
-                &env_vars,
+                crate_name: &self.parsed_args.crate_name,
+                executable: &self.executable,
+                arguments: &filtered_arguments,
+                cwd: &cwd,
+                env_vars: &env_vars,
                 pool,
-                dep_info_copy.as_deref(),
-            )
+                dep_info_copy: dep_info_copy.as_deref(),
+            })
             .await?;
             let source_hashes = hash_all(&source_files, &source_hashes_pool).await?;
             Ok((source_files, source_hashes, env_deps))

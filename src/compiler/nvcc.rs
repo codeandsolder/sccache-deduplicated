@@ -742,17 +742,15 @@ where
             ),
             // cicc and ptxas are cacheable
             Some("cicc") => {
-                match compilation_flag.to_str() {
-                    // Fix for CTK < 12.8:
-                    // If `nvcc` is invoked with `-c` (or any of its variants), remove the
-                    // `--gen_module_id_file` flag. In this mode, we instruct `cudafe++`
-                    // to generate this file, so cicc shouldn't generate it again.
-                    Some("-c" | "--compile" | "-dc" | "--device-c" | "-dw" | "--device-w") => {
-                        if let Some(idx) = args.iter().position(|x| x == &gen_module_id_file_flag) {
-                            args.splice(idx..=idx, []);
-                        }
-                    }
-                    _ => {}
+                // Fix for CTK < 12.8:
+                // If `nvcc` is invoked with `-c` (or any of its variants), remove the
+                // `--gen_module_id_file` flag. In this mode, we instruct `cudafe++`
+                // to generate this file, so cicc shouldn't generate it again.
+                if let Some("-c" | "--compile" | "-dc" | "--device-c" | "-dw" | "--device-w") =
+                    compilation_flag.to_str()
+                    && let Some(idx) = args.iter().position(|x| x == &gen_module_id_file_flag)
+                {
+                    args.splice(idx..=idx, []);
                 }
                 let group = args
                     .iter()
@@ -821,16 +819,11 @@ where
                             .and_then(|out_name| out_name.to_str())
                             .map(std::borrow::ToOwned::to_owned)
                     })
-                    .and_then(|out_name| {
-                        // If the output file ends with...
-                        // * .cpp1.ii - cicc/ptxas input
-                        // * .cpp4.ii - cudafe++ input
-                        if cicc::is_cicc_input(OsStr::new(&out_name)) {
-                            Some(out_name)
-                        } else {
-                            None
-                        }
-                    }) {
+                    // If the output file ends with...
+                    // * .cpp1.ii - cicc/ptxas input
+                    // * .cpp4.ii - cudafe++ input
+                    .filter(|out_name| cicc::is_cicc_input(OsStr::new(out_name.as_str())))
+                    {
                         let new_device_compile_group = vec![];
                         device_compile_groups.insert(out_file.clone(), new_device_compile_group);
                         (

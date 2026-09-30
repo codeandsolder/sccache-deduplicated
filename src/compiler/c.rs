@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::cache::{FileObjectSource, Storage};
-use crate::compiler::preprocessor_cache::preprocessor_cache_entry_hash_key;
+use crate::compiler::preprocessor_cache::{
+    PreprocessorCacheKey, preprocessor_cache_entry_hash_key,
+};
 use crate::compiler::{
     Cacheable, ColorMode, Compilation, CompileCommand, Compiler, CompilerArguments, CompilerHasher,
     CompilerKind, HashResult, Language,
@@ -452,18 +454,18 @@ where
         };
 
         let mut preprocessor_key = if use_preprocessor_cache_mode {
-            preprocessor_cache_entry_hash_key(
-                &self.executable_digest,
-                self.parsed_args.language,
-                &preprocessor_and_arch_args,
-                &extra_hashes,
-                assembler_digest.as_deref(),
-                &env_vars,
-                &absolute_input_path,
-                self.compiler.plusplus(),
-                preprocessor_cache_mode_config,
-                storage.basedirs(),
-            )?
+            preprocessor_cache_entry_hash_key(PreprocessorCacheKey {
+                compiler_digest: &self.executable_digest,
+                language: self.parsed_args.language,
+                arguments: &preprocessor_and_arch_args,
+                extra_hashes: &extra_hashes,
+                assembler_digest: assembler_digest.as_deref(),
+                env_vars: &env_vars,
+                input_file: &absolute_input_path,
+                plusplus: self.compiler.plusplus(),
+                config: preprocessor_cache_mode_config,
+                basedirs: storage.basedirs(),
+            })?
         } else {
             None
         };

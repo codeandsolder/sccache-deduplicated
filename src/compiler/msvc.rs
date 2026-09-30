@@ -1435,7 +1435,7 @@ impl Iterator for SplitMsvcResponseFileArgs<'_> {
                     // This will reduce `backslash_count` to either 0 or 1.
                     Self::append_backslashes_to(&mut arg, &mut backslash_count, 2);
                     if backslash_count == 0 {
-                        in_quotes = !in_quotes
+                        in_quotes = !in_quotes;
                     } else {
                         backslash_count = 0;
                         arg.push('"');
