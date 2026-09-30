@@ -179,7 +179,7 @@ impl CCompilerImpl for Nvhpc {
             env_vars,
             gcc::GccCompileConfig {
                 kind: self.kind(),
-                rewrite_includes_only: rewrite_includes_only,
+                rewrite_includes_only,
                 language_to_arg: gcc::language_to_gcc_arg,
             },
         )

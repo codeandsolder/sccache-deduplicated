@@ -131,7 +131,7 @@ impl CCompilerImpl for Gcc {
             env_vars,
             GccCompileConfig {
                 kind: self.kind(),
-                rewrite_includes_only: rewrite_includes_only,
+                rewrite_includes_only,
                 language_to_arg: language_to_gcc_arg,
             },
         )
