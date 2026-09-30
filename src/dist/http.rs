@@ -27,6 +27,8 @@ mod common {
     use {crate::util::BASE64_URL_SAFE_ENGINE, base64::Engine, std::collections::HashMap};
 
     use crate::dist;
+    #[cfg(feature = "dist-client")]
+    use crate::errors::HttpClientError;
     use crate::errors::{Context, Result, anyhow};
 
     // Note that content-length is necessary due to https://github.com/tiny-http/tiny-http/issues/147

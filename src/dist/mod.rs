@@ -26,6 +26,8 @@ use std::str::FromStr;
 #[cfg(feature = "dist-server")]
 use std::sync::Mutex;
 
+#[cfg(feature = "dist-server")]
+use crate::errors::Error;
 use crate::errors::{Result, bail};
 
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
