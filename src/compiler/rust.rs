@@ -230,6 +230,10 @@ pub struct RustCompilation {
     cwd: PathBuf,
     /// The environment variables
     env_vars: Vec<(OsString, OsString)>,
+    /// Environment variables rustc reported as explicit source dependencies.
+    /// These values are observable through env!/option_env! and must not be
+    /// rewritten before compilation.
+    env_dep_names: HashSet<OsString>,
     allow_dist: bool,
     canonical_paths: Option<CanonicalRustPaths>,
 }
@@ -2146,13 +2150,27 @@ where
         //    output. Additionally also has all environment variables starting with `CARGO_`,
         //    since those are not listed in dep-info but affect cacheability.
         env_deps.sort();
+        let env_dep_names = env_deps
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<HashSet<_>>();
+        let canonical_env_dep_differs = canonical_paths.as_ref().is_some_and(|canonical| {
+            env_deps
+                .iter()
+                .any(|(name, value)| canonical.env_value_to_canonical(name, value) != *value)
+        });
+        if canonical_env_dep_differs && may_dist && allow_dist {
+            allow_dist = false;
+            warn!(
+                "Rust source observes a host-specific environment value; compiling locally because canonical distributed compilation cannot preserve that runtime-visible value"
+            );
+        }
         for (var, val) in env_deps.iter() {
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(b"=");
-            let val = canonical_paths
-                .as_ref()
-                .map(|canonical| canonical.env_value_to_canonical(var, val))
-                .unwrap_or_else(|| val.clone());
+            // rustc reports env!/option_env! inputs in dep-info. Their exact
+            // values are observable program data, so canonicalizing them would
+            // make distinct outputs share a cache key.
             val.hash(&mut HashToDigest { digest: &mut m });
         }
         let mut env_vars: Vec<_> = env_vars
@@ -2331,7 +2349,8 @@ where
                 .iter()
                 .map(|(name, value)| RustShadowEnv {
                     name: name.to_string_lossy().into_owned(),
-                    value: rust_shadow_env_value(name, value, canonical),
+                    // Explicit env-deps are hashed exactly as observed.
+                    value: rust_shadow_env_value(name, value, None),
                 })
                 .collect::<Vec<_>>();
 
@@ -2437,6 +2456,7 @@ where
                 dep_info,
                 cwd,
                 env_vars,
+                env_dep_names,
                 allow_dist,
                 canonical_paths,
                 #[cfg(feature = "dist-client")]
@@ -2479,6 +2499,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             ref crate_name,
             ref cwd,
             ref env_vars,
+            ref env_dep_names,
             ref host,
             ref sysroot,
             allow_dist,
@@ -2515,7 +2536,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                         arguments,
                         cwd,
                     ),
-                    env_vars: canonical.env_to_canonical(env_vars),
+                    env_vars: canonical.env_to_canonical_preserving(env_vars, env_dep_names),
                     cwd: canonical.canonical_cwd(cwd),
                 })
             }
@@ -4717,6 +4738,123 @@ proc_macro false
             assert!(dist_args.iter().any(|arg| arg == "target-cpu=x86-64-v2"));
             assert!(!dist_args.iter().any(|arg| arg == "target-cpu=native"));
         }
+    }
+
+    #[test]
+    fn test_canonical_env_dep_preserves_physical_value_and_key() {
+        fn run(f: &TestFixture) -> (String, OsString) {
+            create_file(f.tempdir.path(), "Cargo.toml", |mut file| {
+                file.write_all(b"[package]\nname='foo'\nversion='0.0.0'\n")
+            })
+            .unwrap();
+            f.touch("foo.rs").unwrap();
+
+            let args = [
+                "--emit",
+                "link",
+                "foo.rs",
+                "--out-dir",
+                "out",
+                "--crate-name",
+                "foo",
+                "--crate-type",
+                "lib",
+            ];
+            let oargs = args.iter().map(OsString::from).collect::<Vec<_>>();
+            let parsed_args = match parse_arguments(&oargs, f.tempdir.path()) {
+                CompilerArguments::Ok(parsed_args) => parsed_args,
+                other => panic!("Got unexpected parse result: {other:?}"),
+            };
+            let mut hasher = Box::new(RustHasher {
+                executable: "rustc".into(),
+                host: "x86-64-unknown-unknown-unknown".to_owned(),
+                version: TEST_RUSTC_VERSION.to_string(),
+                sysroot: f.tempdir.path().join("sysroot"),
+                compiler_shlibs_digests: vec![],
+                #[cfg(feature = "dist-client")]
+                rlib_dep_reader: None,
+                native_profile: Some("test-native".into()),
+                parsed_args,
+            });
+
+            let manifest = f.tempdir.path().to_owned();
+            let env = vec![
+                (
+                    OsString::from("SCCACHE_EXPERIMENTAL_CANONICAL_RUST"),
+                    OsString::from("1"),
+                ),
+                (
+                    OsString::from("SCCACHE_CANONICAL_BUILD_ROOT"),
+                    manifest.clone().into_os_string(),
+                ),
+                (
+                    OsString::from("CARGO_MANIFEST_DIR"),
+                    manifest.clone().into_os_string(),
+                ),
+            ];
+            let creator = new_creator();
+            let runtime = single_threaded_runtime();
+            let pool = runtime.handle().clone();
+            let manifest_for_dep = manifest.clone();
+
+            next_command_calls(&creator, move |args| {
+                let mut dep_info_path = None;
+                let mut it = args.iter();
+                while let Some(arg) = it.next() {
+                    if arg == "-o" {
+                        dep_info_path = it.next();
+                        break;
+                    }
+                }
+                let mut file = File::create(dep_info_path.unwrap())?;
+                writeln!(file, "blah: foo.rs")?;
+                writeln!(file, "foo.rs:")?;
+                writeln!(
+                    file,
+                    "# env-dep:CARGO_MANIFEST_DIR={}",
+                    manifest_for_dep.display()
+                )?;
+                Ok(MockChild::new(exit_status(0), "", ""))
+            });
+            mock_file_names(&creator, &["foo.rlib"]);
+
+            let result = hasher
+                .generate_hash_key(
+                    &creator,
+                    manifest.clone(),
+                    env,
+                    false,
+                    &pool,
+                    false,
+                    Arc::new(MockStorage::new(None, false)),
+                    CacheControl::Default,
+                )
+                .wait()
+                .unwrap();
+
+            let mut transformer = dist::PathTransformer::new();
+            let (command, _, _) = result
+                .compilation
+                .generate_compile_commands(&mut transformer, false)
+                .unwrap();
+            let manifest_env = command
+                .get_env_vars()
+                .into_iter()
+                .find(|(name, _)| name == "CARGO_MANIFEST_DIR")
+                .map(|(_, value)| value)
+                .unwrap();
+
+            (result.key, manifest_env)
+        }
+
+        let a = TestFixture::new();
+        let b = TestFixture::new();
+        let (key_a, manifest_a) = run(&a);
+        let (key_b, manifest_b) = run(&b);
+
+        assert_eq!(manifest_a, a.tempdir.path().as_os_str());
+        assert_eq!(manifest_b, b.tempdir.path().as_os_str());
+        assert_ne!(key_a, key_b);
     }
 
     #[test]
