@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use crate::cache::{Cache, CacheMode, CacheWrite, Storage};
 use crate::compiler::PreprocessorCacheEntry;
 use crate::config::PreprocessorCacheModeConfig;
-use crate::errors::*;
+use crate::errors::{Result, anyhow};
 use bytes::Bytes;
 
 pub struct ReadOnlyStorage(pub Arc<dyn Storage>);
@@ -113,12 +113,13 @@ mod test {
     use crate::test::mock_storage::MockStorage;
 
     #[test]
-    fn readonly_storage_is_readonly() {
+    fn readonly_storage_is_readonly() -> Result<()> {
         let storage = ReadOnlyStorage(Arc::new(MockStorage::new(None, false)));
         assert_eq!(
-            storage.check().now_or_never().unwrap().unwrap(),
-            CacheMode::ReadOnly
+            storage.check().now_or_never().transpose()?,
+            Some(CacheMode::ReadOnly)
         );
+        Ok(())
     }
 
     #[test]
@@ -141,19 +142,17 @@ mod test {
     }
 
     #[test]
-    fn readonly_storage_forwards_basedirs() {
+    fn readonly_storage_forwards_basedirs() -> Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .worker_threads(1)
-            .build()
-            .unwrap();
+            .build()?;
 
         let tempdir = tempfile::Builder::new()
             .prefix("readonly_storage_forwards_basedirs")
-            .tempdir()
-            .expect("Failed to create tempdir");
+            .tempdir()?;
         let cache_dir = tempdir.path().join("cache");
-        std::fs::create_dir(&cache_dir).unwrap();
+        std::fs::create_dir(&cache_dir)?;
 
         let basedirs = vec![
             b"/home/user/project".to_vec(),
@@ -172,51 +171,53 @@ mod test {
         let readonly_storage = ReadOnlyStorage(std::sync::Arc::new(disk_cache));
 
         assert_eq!(readonly_storage.basedirs(), basedirs.as_slice());
+        Ok(())
     }
 
     #[test]
-    fn readonly_storage_put_err() {
+    fn readonly_storage_put_err() -> Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .worker_threads(1)
-            .build()
-            .unwrap();
+            .build()?;
 
         let storage = ReadOnlyStorage(Arc::new(MockStorage::new(None, true)));
         runtime.block_on(async move {
-            assert_eq!(
-                storage
-                    .put("test1", CacheWrite::default())
-                    .await
-                    .unwrap_err()
-                    .to_string(),
-                "Cannot write to read-only storage"
-            );
-            assert_eq!(
-                storage
-                    .put_preprocessor_cache_entry("test1", PreprocessorCacheEntry::default())
-                    .await
-                    .unwrap_err()
-                    .to_string(),
-                "Cannot write to read-only storage"
-            );
-        });
+            match storage.put("test1", CacheWrite::default()).await {
+                Ok(_) => {
+                    return Err(anyhow!(
+                        "read-only storage unexpectedly accepted a cache put"
+                    ));
+                }
+                Err(error) => assert_eq!(error.to_string(), "Cannot write to read-only storage"),
+            }
+            match storage
+                .put_preprocessor_cache_entry("test1", PreprocessorCacheEntry::default())
+                .await
+            {
+                Ok(()) => {
+                    return Err(anyhow!(
+                        "read-only storage unexpectedly accepted a preprocessor-cache put"
+                    ));
+                }
+                Err(error) => assert_eq!(error.to_string(), "Cannot write to read-only storage"),
+            }
+            Ok(())
+        })
     }
 
     #[test]
-    fn readonly_storage_forwards_cache_type_name() {
+    fn readonly_storage_forwards_cache_type_name() -> Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .worker_threads(1)
-            .build()
-            .unwrap();
+            .build()?;
 
         let tempdir = tempfile::Builder::new()
             .prefix("readonly_cache_type_name")
-            .tempdir()
-            .expect("Failed to create tempdir");
+            .tempdir()?;
         let cache_dir = tempdir.path().join("cache");
-        std::fs::create_dir(&cache_dir).unwrap();
+        std::fs::create_dir(&cache_dir)?;
 
         let disk_cache = crate::cache::disk::DiskCache::new(
             &cache_dir,
@@ -230,5 +231,6 @@ mod test {
         let readonly_storage = ReadOnlyStorage(std::sync::Arc::new(disk_cache));
 
         assert_eq!(readonly_storage.cache_type_name(), "disk");
+        Ok(())
     }
 }
