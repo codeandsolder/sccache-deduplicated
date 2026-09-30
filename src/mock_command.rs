@@ -49,7 +49,9 @@ use crate::errors::*;
 use crate::jobserver::{Acquired, Client};
 use async_trait::async_trait;
 use std::boxed::Box;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
+#[cfg(test)]
+use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::Path;

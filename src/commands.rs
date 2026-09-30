@@ -529,6 +529,13 @@ fn handle_compile_finished(
     }
 }
 
+pub struct CompileInvocation<'a> {
+    pub exe: &'a Path,
+    pub cmdline: Vec<OsString>,
+    pub cwd: &'a Path,
+    pub env_vars: Vec<(OsString, OsString)>,
+}
+
 /// Handle `response`, the response from sending a `Compile` request to the server.
 ///
 /// If the server returned `CompileStarted`, reads the follow-up `CompileFinished`
@@ -539,10 +546,7 @@ fn handle_compile_response<T>(
     runtime: &mut Runtime,
     conn: &mut ServerConnection,
     response: CompileResponse,
-    exe: &Path,
-    cmdline: Vec<OsString>,
-    cwd: &Path,
-    env_vars: &[(OsString, OsString)],
+    invocation: CompileInvocation<'_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<i32>
@@ -585,7 +589,7 @@ where
     };
 
     handle_compile_result(
-        creator, runtime, response, result, exe, cmdline, cwd, env_vars, stdout, stderr,
+        creator, runtime, response, result, invocation, stdout, stderr,
     )
 }
 
@@ -596,10 +600,7 @@ fn handle_compile_result<T>(
     runtime: &mut Runtime,
     response: CompileResponse,
     finished: Option<CompileFinished>,
-    exe: &Path,
-    cmdline: Vec<OsString>,
-    cwd: &Path,
-    env_vars: &[(OsString, OsString)],
+    invocation: CompileInvocation<'_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<i32>
@@ -607,7 +608,7 @@ where
     T: CommandCreatorSync,
 {
     #[cfg(not(target_os = "linux"))]
-    let _ = env_vars;
+    let _ = &invocation.env_vars;
 
     match response {
         CompileResponse::CompileStarted => {
@@ -626,28 +627,33 @@ where
     }
 
     #[cfg(target_os = "linux")]
-    let canonical_rust = CanonicalRustPaths::from_rustc_executable(env_vars, cwd, exe);
+    let canonical_rust = CanonicalRustPaths::from_rustc_executable(
+        &invocation.env_vars,
+        invocation.cwd,
+        invocation.exe,
+    );
 
     #[cfg(target_os = "linux")]
     let mut cmd = if let Some(canonical) = canonical_rust {
         let mut cmd = creator.new_command_sync("/usr/bin/bwrap");
-        let bwrap_args = canonical.bwrap_arguments(exe, &cmdline, cwd);
+        let bwrap_args =
+            canonical.bwrap_arguments(invocation.exe, &invocation.cmdline, invocation.cwd);
         cmd.args(&bwrap_args)
             .env_clear()
-            .envs(canonical.env_to_canonical(env_vars))
+            .envs(canonical.env_to_canonical(&invocation.env_vars))
             .current_dir("/");
         cmd.share_jobserver();
         cmd
     } else {
-        let mut cmd = creator.new_command_sync(exe);
-        cmd.args(&cmdline).current_dir(cwd);
+        let mut cmd = creator.new_command_sync(invocation.exe);
+        cmd.args(&invocation.cmdline).current_dir(invocation.cwd);
         cmd
     };
 
     #[cfg(not(target_os = "linux"))]
     let mut cmd = {
-        let mut cmd = creator.new_command_sync(exe);
-        cmd.args(&cmdline).current_dir(cwd);
+        let mut cmd = creator.new_command_sync(invocation.exe);
+        cmd.args(&invocation.cmdline).current_dir(invocation.cwd);
         cmd
     };
     if log_enabled!(Trace) {
@@ -680,11 +686,8 @@ pub fn do_compile<T>(
     creator: T,
     runtime: &mut Runtime,
     mut conn: ServerConnection,
-    exe: &Path,
-    cmdline: Vec<OsString>,
-    cwd: &Path,
+    invocation: CompileInvocation<'_>,
     path: Option<OsString>,
-    env_vars: Vec<(OsString, OsString)>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<i32>
@@ -692,11 +695,27 @@ where
     T: CommandCreatorSync,
 {
     trace!("do_compile");
-    let exe_path = which_in(exe, path, cwd)?;
-    let res = request_compile(&mut conn, &exe_path, &cmdline, cwd, env_vars.clone())?;
-    handle_compile_response(
-        creator, runtime, &mut conn, res, &exe_path, cmdline, cwd, &env_vars, stdout, stderr,
-    )
+    let exe_path = which_in(invocation.exe, path, invocation.cwd)?;
+    let res = request_compile(
+        &mut conn,
+        &exe_path,
+        &invocation.cmdline,
+        invocation.cwd,
+        invocation.env_vars.clone(),
+    )?;
+    let CompileInvocation {
+        cmdline,
+        cwd,
+        env_vars,
+        ..
+    } = invocation;
+    let invocation = CompileInvocation {
+        exe: &exe_path,
+        cmdline,
+        cwd,
+        env_vars,
+    };
+    handle_compile_response(creator, runtime, &mut conn, res, invocation, stdout, stderr)
 }
 
 /// Run a compile in client-side mode: the compile pipeline executes in this
@@ -708,11 +727,8 @@ pub fn do_compile_client_side<C>(
     jobserver: &Client,
     runtime: &mut Runtime,
     conn: ServerConnection,
-    exe: &Path,
-    cmdline: Vec<OsString>,
-    cwd: &Path,
+    invocation: CompileInvocation<'_>,
     path: Option<OsString>,
-    env_vars: Vec<(OsString, OsString)>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<i32>
@@ -720,7 +736,7 @@ where
     C: CommandCreatorSync + Clone + Send + Sync + 'static,
 {
     trace!("do_compile_client_side");
-    let exe_path = which_in(exe, path, cwd)?;
+    let exe_path = which_in(invocation.exe, path, invocation.cwd)?;
     let storage = IpcStorage::connect(conn)?;
     let conn_arc = storage.conn();
     let (tx, _rx) = futures::channel::mpsc::channel(1);
@@ -735,21 +751,22 @@ where
     );
     let compile = Compile {
         exe: exe_path.as_os_str().to_owned(),
-        cwd: cwd.as_os_str().to_owned(),
-        args: cmdline.clone(),
-        env_vars: env_vars.clone(),
+        cwd: invocation.cwd.as_os_str().to_owned(),
+        args: invocation.cmdline.clone(),
+        env_vars: invocation.env_vars.clone(),
     };
     let (compile_resp, finished) = runtime.block_on(service.compile_direct(compile))?;
     let creator = C::new(jobserver);
+    let invocation = CompileInvocation {
+        exe: &exe_path,
+        ..invocation
+    };
     let exit_code = handle_compile_result(
         creator,
         runtime,
         compile_resp,
         finished,
-        &exe_path,
-        cmdline,
-        cwd,
-        &env_vars,
+        invocation,
         stdout,
         stderr,
     )?;
@@ -968,30 +985,36 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     .worker_threads(2)
                     .enable_all()
                     .build()?;
+                let invocation = CompileInvocation {
+                    exe: exe.as_ref(),
+                    cmdline,
+                    cwd: &cwd,
+                    env_vars,
+                };
                 let res = do_compile_client_side::<ProcessCommandCreator>(
                     &jobserver,
                     &mut runtime,
                     conn,
-                    exe.as_ref(),
-                    cmdline,
-                    &cwd,
+                    invocation,
                     env::var_os("PATH"),
-                    env_vars,
                     &mut io::stdout(),
                     &mut io::stderr(),
                 );
                 return res.context("failed to execute compile");
             }
             let mut runtime = new_client_runtime()?;
+            let invocation = CompileInvocation {
+                exe: exe.as_ref(),
+                cmdline,
+                cwd: &cwd,
+                env_vars,
+            };
             let res = do_compile(
                 ProcessCommandCreator::new(&jobserver),
                 &mut runtime,
                 conn,
-                exe.as_ref(),
-                cmdline,
-                &cwd,
+                invocation,
                 env::var_os("PATH"),
-                env_vars,
                 &mut io::stdout(),
                 &mut io::stderr(),
             );
@@ -1071,15 +1094,18 @@ mod test {
         let mut stdout = vec![];
         let mut stderr = vec![];
 
+        let invocation = CompileInvocation {
+            exe,
+            cmdline,
+            cwd,
+            env_vars: vec![],
+        };
         let code = handle_compile_response(
             creator,
             &mut runtime,
             &mut conn,
             CompileResponse::CompileStarted,
-            exe,
-            cmdline,
-            cwd,
-            &[],
+            invocation,
             &mut stdout,
             &mut stderr,
         )

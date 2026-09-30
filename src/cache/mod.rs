@@ -14,7 +14,9 @@
 
 #[cfg(feature = "azure")]
 pub mod azure;
-pub mod cache;
+#[path = "cache.rs"]
+pub mod storage;
+pub use storage as cache;
 pub mod cache_io;
 #[cfg(feature = "cos")]
 pub mod cos;

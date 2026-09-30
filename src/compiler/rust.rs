@@ -2507,6 +2507,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             let _ = path_transformer;
             let _ = host;
             let _ = sysroot;
+            let _ = allow_dist;
         }
 
         trace!("[{crate_name}]: compile");
@@ -3243,7 +3244,7 @@ impl OutputsRewriter for RustOutputsRewriter {
 #[test]
 #[cfg(all(feature = "dist-client", target_os = "windows"))]
 fn test_rust_outputs_rewriter() {
-    use crate::compiler::compiler::OutputsRewriter;
+    use crate::compiler::OutputsRewriter;
     use crate::test::utils::create_file;
     use std::io::Write;
 

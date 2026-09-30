@@ -46,12 +46,34 @@ use crate::cache::utils::normalize_key;
 #[cfg(feature = "webdav")]
 use crate::cache::webdav::WebdavCache;
 use crate::compiler::PreprocessorCacheEntry;
-use crate::config::Config;
-use crate::config::{self, CacheType, PreprocessorCacheModeConfig};
+#[cfg(any(
+    feature = "azure",
+    feature = "gcs",
+    feature = "gha",
+    feature = "memcached",
+    feature = "redis",
+    feature = "s3",
+    feature = "webdav",
+    feature = "oss",
+    feature = "cos"
+))]
+use crate::config::{self, CacheType};
+use crate::config::{Config, PreprocessorCacheModeConfig};
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+#[cfg(any(
+    feature = "azure",
+    feature = "gcs",
+    feature = "gha",
+    feature = "memcached",
+    feature = "redis",
+    feature = "s3",
+    feature = "webdav",
+    feature = "oss",
+    feature = "cos"
+))]
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;

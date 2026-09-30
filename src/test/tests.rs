@@ -192,15 +192,18 @@ fn test_server_unsupported_compiler() {
     let mut stderr = Cursor::new(Vec::new());
     let path = Some(f.paths);
     let mut runtime = Runtime::new().unwrap();
+    let invocation = CompileInvocation {
+        exe,
+        cmdline,
+        cwd,
+        env_vars: vec![],
+    };
     let res = do_compile(
         client_creator,
         &mut runtime,
         conn,
-        exe,
-        cmdline,
-        cwd,
+        invocation,
         path,
-        vec![],
         &mut stdout,
         &mut stderr,
     );
@@ -269,17 +272,20 @@ fn test_server_compile() {
     let mut stderr = Cursor::new(Vec::new());
     let path = Some(f.paths);
     let mut runtime = Runtime::new().unwrap();
+    let invocation = CompileInvocation {
+        exe,
+        cmdline,
+        cwd,
+        env_vars: vec![],
+    };
     assert_eq!(
         0,
         do_compile(
             client_creator,
             &mut runtime,
             conn,
-            exe,
-            cmdline,
-            cwd,
+            invocation,
             path,
-            vec![],
             &mut stdout,
             &mut stderr
         )

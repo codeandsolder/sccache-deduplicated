@@ -18,8 +18,9 @@ mod c;
 pub mod canonical_paths;
 mod cicc;
 mod clang;
+#[path = "compiler.rs"]
 #[macro_use]
-mod compiler;
+mod core;
 mod cudafe;
 mod diab;
 mod gcc;
@@ -34,5 +35,5 @@ mod tasking_vx;
 mod counted_array;
 
 pub use crate::compiler::c::CCompilerKind;
-pub use crate::compiler::compiler::*;
+pub use crate::compiler::core::*;
 pub use crate::compiler::preprocessor_cache::PreprocessorCacheEntry;

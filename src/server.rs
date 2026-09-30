@@ -1120,7 +1120,7 @@ where
             rt,
             creator: C::new(&client),
             tx,
-            info,
+            _info: info,
         }
     }
 
@@ -1155,7 +1155,7 @@ where
             rt,
             creator: C::new(&client),
             tx,
-            info,
+            _info: info,
         }
     }
 
