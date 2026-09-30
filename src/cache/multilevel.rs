@@ -49,7 +49,19 @@ use crate::compiler::PreprocessorCacheEntry;
 ))]
 use crate::config::CacheType;
 use crate::config::{Config, PreprocessorCacheModeConfig, WriteErrorPolicy};
-use crate::errors::*;
+#[cfg(any(
+    feature = "azure",
+    feature = "gcs",
+    feature = "gha",
+    feature = "memcached",
+    feature = "redis",
+    feature = "s3",
+    feature = "webdav",
+    feature = "oss",
+    feature = "cos"
+))]
+use crate::errors::Context;
+use crate::errors::{Result, anyhow};
 use crate::util::average_duration;
 
 /// Increment an atomic stats counter, handling the Option check.
@@ -82,14 +94,14 @@ impl AtomicLevelStats {
         Self {
             name,
             location,
-            hits: Default::default(),
-            misses: Default::default(),
-            writes: Default::default(),
-            write_failures: Default::default(),
-            backfills_from: Default::default(),
-            backfills_to: Default::default(),
-            hit_duration_nanos: Default::default(),
-            write_duration_nanos: Default::default(),
+            hits: AtomicU64::default(),
+            misses: AtomicU64::default(),
+            writes: AtomicU64::default(),
+            write_failures: AtomicU64::default(),
+            backfills_from: AtomicU64::default(),
+            backfills_to: AtomicU64::default(),
+            hit_duration_nanos: AtomicU64::default(),
+            write_duration_nanos: AtomicU64::default(),
         }
     }
 
@@ -210,32 +222,26 @@ impl LevelStats {
     /// Calculate hit rate as a percentage
     #[must_use]
     pub fn hit_rate(&self) -> f64 {
-        let total = self.hits + self.misses;
-        if total > 0 {
-            (self.hits as f64 / total as f64) * 100.0
-        } else {
-            0.0
+        let total = self.hits.saturating_add(self.misses);
+        if total == 0 {
+            return 0.0;
         }
+        const SCALE: u128 = 100_000_000;
+        let scaled = u128::from(self.hits) * SCALE / u128::from(total);
+        let scaled = u32::try_from(scaled).unwrap_or(100_000_000);
+        f64::from(scaled) / 1_000_000.0
     }
 
     /// Calculate average hit latency in milliseconds
     #[must_use]
     pub fn avg_hit_latency_ms(&self) -> f64 {
-        if self.hits > 0 {
-            self.hit_duration.as_secs_f64() * 1000.0 / self.hits as f64
-        } else {
-            0.0
-        }
+        average_duration(self.hit_duration, self.hits).as_secs_f64() * 1000.0
     }
 
     /// Calculate average write latency in milliseconds
     #[must_use]
     pub fn avg_write_latency_ms(&self) -> f64 {
-        if self.writes > 0 {
-            self.write_duration.as_secs_f64() * 1000.0 / self.writes as f64
-        } else {
-            0.0
-        }
+        average_duration(self.write_duration, self.writes).as_secs_f64() * 1000.0
     }
 
     /// Format stats for human-readable display
@@ -405,14 +411,161 @@ impl MultiLevelStorage {
         MultiLevelStats(self.atomic_stats.iter().map(|s| s.snapshot()).collect())
     }
 
+    fn build_disk_level(
+        config: &Config,
+        pool: &tokio::runtime::Handle,
+    ) -> Result<Arc<dyn Storage>> {
+        let disk_config = config.cache_configs.disk.as_ref().ok_or_else(|| {
+            anyhow!("Disk cache specified in levels but not configured (set SCCACHE_DIR)")
+        })?;
+        debug!(
+            "Adding disk cache level with dir {}, size {}",
+            disk_config.dir.display(),
+            disk_config.size
+        );
+        Ok(Arc::new(DiskCache::new(
+            &disk_config.dir,
+            disk_config.size,
+            pool,
+            disk_config.preprocessor_cache_mode,
+            disk_config.rw_mode.into(),
+            config.basedirs.clone(),
+        )))
+    }
+
+    #[cfg(any(
+        feature = "azure",
+        feature = "gcs",
+        feature = "gha",
+        feature = "memcached",
+        feature = "redis",
+        feature = "s3",
+        feature = "webdav",
+        feature = "oss",
+        feature = "cos"
+    ))]
+    fn configured_remote_cache_type(
+        level_name: &str,
+        config: &Config,
+    ) -> Result<Option<CacheType>> {
+        match level_name.to_ascii_lowercase().as_str() {
+            #[cfg(feature = "s3")]
+            "s3" => Ok(config.cache_configs.s3.clone().map(CacheType::S3)),
+            #[cfg(not(feature = "s3"))]
+            "s3" => Err(anyhow!("Cache level 's3' requires the 's3' feature")),
+            #[cfg(feature = "redis")]
+            "redis" => Ok(config.cache_configs.redis.clone().map(CacheType::Redis)),
+            #[cfg(not(feature = "redis"))]
+            "redis" => Err(anyhow!("Cache level 'redis' requires the 'redis' feature")),
+            #[cfg(feature = "memcached")]
+            "memcached" => Ok(config
+                .cache_configs
+                .memcached
+                .clone()
+                .map(CacheType::Memcached)),
+            #[cfg(not(feature = "memcached"))]
+            "memcached" => Err(anyhow!(
+                "Cache level 'memcached' requires the 'memcached' feature"
+            )),
+            #[cfg(feature = "gcs")]
+            "gcs" => Ok(config.cache_configs.gcs.clone().map(CacheType::GCS)),
+            #[cfg(not(feature = "gcs"))]
+            "gcs" => Err(anyhow!("Cache level 'gcs' requires the 'gcs' feature")),
+            #[cfg(feature = "gha")]
+            "gha" => Ok(config.cache_configs.gha.clone().map(CacheType::GHA)),
+            #[cfg(not(feature = "gha"))]
+            "gha" => Err(anyhow!("Cache level 'gha' requires the 'gha' feature")),
+            #[cfg(feature = "azure")]
+            "azure" => Ok(config.cache_configs.azure.clone().map(CacheType::Azure)),
+            #[cfg(not(feature = "azure"))]
+            "azure" => Err(anyhow!("Cache level 'azure' requires the 'azure' feature")),
+            #[cfg(feature = "webdav")]
+            "webdav" => Ok(config.cache_configs.webdav.clone().map(CacheType::Webdav)),
+            #[cfg(not(feature = "webdav"))]
+            "webdav" => Err(anyhow!(
+                "Cache level 'webdav' requires the 'webdav' feature"
+            )),
+            #[cfg(feature = "oss")]
+            "oss" => Ok(config.cache_configs.oss.clone().map(CacheType::OSS)),
+            #[cfg(not(feature = "oss"))]
+            "oss" => Err(anyhow!("Cache level 'oss' requires the 'oss' feature")),
+            #[cfg(feature = "cos")]
+            "cos" => Ok(config.cache_configs.cos.clone().map(CacheType::COS)),
+            #[cfg(not(feature = "cos"))]
+            "cos" => Err(anyhow!("Cache level 'cos' requires the 'cos' feature")),
+            _ => Err(anyhow!("Unknown cache level: '{level_name}'")),
+        }
+    }
+
+    #[cfg(any(
+        feature = "azure",
+        feature = "gcs",
+        feature = "gha",
+        feature = "memcached",
+        feature = "redis",
+        feature = "s3",
+        feature = "webdav",
+        feature = "oss",
+        feature = "cos"
+    ))]
+    fn build_remote_level(
+        level_name: &str,
+        config: &Config,
+        pool: &tokio::runtime::Handle,
+    ) -> Result<Arc<dyn Storage>> {
+        let cache_type = Self::configured_remote_cache_type(level_name, config)?.ok_or_else(|| {
+            anyhow!(
+                "Cache level '{level_name}' specified in SCCACHE_MULTILEVEL_CHAIN but not configured (missing environment variables)"
+            )
+        })?;
+        let storage =
+            build_single_cache(&cache_type, &config.basedirs, pool, config.skip_cache_check)
+                .with_context(|| format!("Failed to build cache for level '{level_name}'"))?;
+        trace!("Added cache level: {level_name}");
+        Ok(storage)
+    }
+
+    #[cfg(not(any(
+        feature = "azure",
+        feature = "gcs",
+        feature = "gha",
+        feature = "memcached",
+        feature = "redis",
+        feature = "s3",
+        feature = "webdav",
+        feature = "oss",
+        feature = "cos"
+    )))]
+    fn build_remote_level(
+        level_name: &str,
+        _config: &Config,
+        _pool: &tokio::runtime::Handle,
+    ) -> Result<Arc<dyn Storage>> {
+        Err(anyhow!(
+            "Cache level '{level_name}' requires a backend feature to be enabled (e.g., --features redis,s3)"
+        ))
+    }
+
+    fn build_level(
+        level_name: &str,
+        config: &Config,
+        pool: &tokio::runtime::Handle,
+    ) -> Result<Arc<dyn Storage>> {
+        if level_name.eq_ignore_ascii_case("disk") {
+            Self::build_disk_level(config, pool)
+        } else {
+            Self::build_remote_level(level_name, config, pool)
+        }
+    }
+
     /// Create a multi-level storage from configuration.
     ///
-    /// Returns None if no levels are configured (`SCCACHE_MULTILEVEL_CHAIN` not set).
-    /// Returns an error if levels are specified but can't be built.
+    /// Returns None if no levels are configured (SCCACHE_MULTILEVEL_CHAIN not set).
     ///
-    /// Each level specified in `config.cache_configs.multilevel.chain` must have its
-    /// corresponding configuration present (e.g., `SCCACHE_DIR` for disk,
-    /// `SCCACHE_REDIS_ENDPOINT` for redis, etc).
+    /// # Errors
+    ///
+    /// Returns an error if a configured level is unknown, disabled at compile time,
+    /// missing its backend configuration, or cannot be initialized.
     pub fn from_config(config: &Config, pool: &tokio::runtime::Handle) -> Result<Option<Self>> {
         let ml_config = match config.cache_configs.multilevel.as_ref() {
             Some(cfg) if !cfg.chain.is_empty() => cfg,
@@ -424,164 +577,11 @@ impl MultiLevelStorage {
             ml_config.chain.len()
         );
 
-        let levels = &ml_config.chain;
-        let write_error_policy = ml_config.write_error_policy;
-
-        let mut storages: Vec<Arc<dyn Storage>> = Vec::new();
-
-        // Build caches in the exact order specified in levels
-        for level_name in levels {
-            let level_name = level_name.trim();
-
-            if level_name.eq_ignore_ascii_case("disk") {
-                // Build disk cache from config
-                let disk_config = config.cache_configs.disk.as_ref().ok_or_else(|| {
-                    anyhow!("Disk cache specified in levels but not configured (set SCCACHE_DIR)")
-                })?;
-                let preprocessor_cache_mode_config = disk_config.preprocessor_cache_mode;
-                let rw_mode = disk_config.rw_mode.into();
-                debug!(
-                    "Adding disk cache level with dir {:?}, size {}",
-                    disk_config.dir, disk_config.size
-                );
-                let disk_storage: Arc<dyn Storage> = Arc::new(DiskCache::new(
-                    &disk_config.dir,
-                    disk_config.size,
-                    pool,
-                    preprocessor_cache_mode_config,
-                    rw_mode,
-                    config.basedirs.clone(),
-                ));
-                storages.push(disk_storage);
-                trace!("Added disk cache level");
-            } else {
-                // Build remote cache - get the appropriate CacheType
-                #[cfg(any(
-                    feature = "azure",
-                    feature = "gcs",
-                    feature = "gha",
-                    feature = "memcached",
-                    feature = "redis",
-                    feature = "s3",
-                    feature = "webdav",
-                    feature = "oss",
-                    feature = "cos"
-                ))]
-                {
-                    let cache_type = match level_name.to_lowercase().as_str() {
-                        #[cfg(feature = "s3")]
-                        "s3" => config.cache_configs.s3.clone().map(CacheType::S3),
-                        #[cfg(not(feature = "s3"))]
-                        "s3" => return Err(anyhow!("Cache level 's3' requires the 's3' feature")),
-                        #[cfg(feature = "redis")]
-                        "redis" => config.cache_configs.redis.clone().map(CacheType::Redis),
-                        #[cfg(not(feature = "redis"))]
-                        "redis" => {
-                            return Err(anyhow!(
-                                "Cache level 'redis' requires the 'redis' feature"
-                            ));
-                        }
-                        #[cfg(feature = "memcached")]
-                        "memcached" => config
-                            .cache_configs
-                            .memcached
-                            .clone()
-                            .map(CacheType::Memcached),
-                        #[cfg(not(feature = "memcached"))]
-                        "memcached" => {
-                            return Err(anyhow!(
-                                "Cache level 'memcached' requires the 'memcached' feature"
-                            ));
-                        }
-                        #[cfg(feature = "gcs")]
-                        "gcs" => config.cache_configs.gcs.clone().map(CacheType::GCS),
-                        #[cfg(not(feature = "gcs"))]
-                        "gcs" => {
-                            return Err(anyhow!("Cache level 'gcs' requires the 'gcs' feature"));
-                        }
-                        #[cfg(feature = "gha")]
-                        "gha" => config.cache_configs.gha.clone().map(CacheType::GHA),
-                        #[cfg(not(feature = "gha"))]
-                        "gha" => {
-                            return Err(anyhow!("Cache level 'gha' requires the 'gha' feature"));
-                        }
-                        #[cfg(feature = "azure")]
-                        "azure" => config.cache_configs.azure.clone().map(CacheType::Azure),
-                        #[cfg(not(feature = "azure"))]
-                        "azure" => {
-                            return Err(anyhow!(
-                                "Cache level 'azure' requires the 'azure' feature"
-                            ));
-                        }
-                        #[cfg(feature = "webdav")]
-                        "webdav" => config.cache_configs.webdav.clone().map(CacheType::Webdav),
-                        #[cfg(not(feature = "webdav"))]
-                        "webdav" => {
-                            return Err(anyhow!(
-                                "Cache level 'webdav' requires the 'webdav' feature"
-                            ));
-                        }
-                        #[cfg(feature = "oss")]
-                        "oss" => config.cache_configs.oss.clone().map(CacheType::OSS),
-                        #[cfg(not(feature = "oss"))]
-                        "oss" => {
-                            return Err(anyhow!("Cache level 'oss' requires the 'oss' feature"));
-                        }
-                        #[cfg(feature = "cos")]
-                        "cos" => config.cache_configs.cos.clone().map(CacheType::COS),
-                        #[cfg(not(feature = "cos"))]
-                        "cos" => {
-                            return Err(anyhow!("Cache level 'cos' requires the 'cos' feature"));
-                        }
-                        _ => {
-                            return Err(anyhow!("Unknown cache level: '{level_name}'"));
-                        }
-                    };
-
-                    if let Some(cache_type) = cache_type {
-                        let storage = build_single_cache(
-                            &cache_type,
-                            &config.basedirs,
-                            pool,
-                            config.skip_cache_check,
-                        )
-                        .with_context(|| {
-                            format!("Failed to build cache for level '{level_name}'")
-                        })?;
-                        storages.push(storage);
-                        trace!("Added cache level: {level_name}");
-                    } else {
-                        return Err(anyhow!(
-                            "Cache level '{level_name}' specified in SCCACHE_MULTILEVEL_CHAIN but not configured (missing environment variables)"
-                        ));
-                    }
-                }
-                #[cfg(not(any(
-                    feature = "azure",
-                    feature = "gcs",
-                    feature = "gha",
-                    feature = "memcached",
-                    feature = "redis",
-                    feature = "s3",
-                    feature = "webdav",
-                    feature = "oss",
-                    feature = "cos"
-                )))]
-                {
-                    return Err(anyhow!(
-                        "Cache level '{}' requires a backend feature to be enabled (e.g., --features redis,s3)",
-                        level_name
-                    ));
-                }
-            }
-        }
-
-        if storages.is_empty() {
-            return Err(anyhow!(
-                "Multi-level cache configured with {} levels but none could be built",
-                levels.len()
-            ));
-        }
+        let storages = ml_config
+            .chain
+            .iter()
+            .map(|level_name| Self::build_level(level_name.trim(), config, pool))
+            .collect::<Result<Vec<_>>>()?;
 
         debug!(
             "Initialized multi-level storage with {} total levels",
@@ -590,7 +590,7 @@ impl MultiLevelStorage {
 
         Ok(Some(Self::with_write_error_policy(
             storages,
-            write_error_policy,
+            ml_config.write_error_policy,
         )))
     }
 
@@ -671,7 +671,7 @@ impl MultiLevelStorage {
                         inc_stat!(
                             Some(stats.as_ref()),
                             write_duration_nanos,
-                            duration.as_nanos() as u64
+                            duration_nanos_u64(duration)
                         );
                         trace!(
                             "Repaired slower cache level {idx} from faster level {hit_idx} in {duration:?}"
@@ -790,7 +790,7 @@ impl Storage for MultiLevelStorage {
                                 inc_stat!(
                                     self.atomic_stats.get(hit_level),
                                     backfills_from,
-                                    idx as u64
+                                    u64::try_from(idx).unwrap_or(u64::MAX)
                                 );
 
                                 // Spawn background backfill tasks for each faster level
