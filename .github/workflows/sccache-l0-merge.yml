@@ -24,3 +24,17 @@ jobs:
       source-run-id: ${{ github.event_name == 'workflow_run' && format('{0}', github.event.workflow_run.id) || '0' }}
       source-event: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.event || 'workflow_dispatch' }}
       bootstrap-only: ${{ github.event_name == 'workflow_dispatch' }}
+
+  garage-upload:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.event == 'push' ||
+      github.event.workflow_run.event == 'workflow_dispatch'
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@main
+    with:
+      garage-upload-only: true
+      source-run-id: ${{ github.event_name == 'workflow_run' && format('{0}', github.event.workflow_run.id) || '0' }}
