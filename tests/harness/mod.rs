@@ -376,7 +376,7 @@ impl DistSystem {
         wait_for_http(scheduler_url, Duration::from_millis(100), MAX_STARTUP_WAIT);
         wait_for(
             || {
-                let status = self.scheduler_status();
+                let status = self.scheduler_status()?;
                 if matches!(
                     status,
                     SchedulerStatusResult {
@@ -550,7 +550,7 @@ impl DistSystem {
         wait_for_http(url, Duration::from_millis(100), MAX_STARTUP_WAIT);
         wait_for(
             || {
-                let status = self.scheduler_status();
+                let status = self.scheduler_status()?;
                 if matches!(
                     status,
                     SchedulerStatusResult {
@@ -574,13 +574,14 @@ impl DistSystem {
         HTTPUrl::from_url(reqwest::Url::parse(&url).unwrap())
     }
 
-    fn scheduler_status(&self) -> SchedulerStatusResult {
-        let res = reqwest::blocking::get(dist::http::urls::scheduler_status(
-            &self.scheduler_url().to_url(),
-        ))
-        .unwrap();
-        assert!(res.status().is_success());
-        bincode::deserialize_from(res).unwrap()
+    fn scheduler_status(&self) -> Result<SchedulerStatusResult, String> {
+        let url = dist::http::urls::scheduler_status(&self.scheduler_url().to_url())
+            .map_err(|error| error.to_string())?;
+        let res = reqwest::blocking::get(url).map_err(|error| error.to_string())?;
+        if !res.status().is_success() {
+            return Err(format!("scheduler status request failed: {}", res.status()));
+        }
+        bincode::deserialize_from(res).map_err(|error| error.to_string())
     }
 }
 

@@ -174,67 +174,99 @@ mod common {
 
 pub mod urls {
     use crate::dist::{JobId, ServerId};
+    use crate::errors::Result;
 
-    #[must_use]
-    pub fn scheduler_alloc_job(scheduler_url: &reqwest::Url) -> reqwest::Url {
-        scheduler_url
-            .join("/api/v1/scheduler/alloc_job")
-            .expect("failed to create alloc job url")
+    /// Build the scheduler allocation endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `scheduler_url` cannot be used as a base URL.
+    pub fn scheduler_alloc_job(scheduler_url: &reqwest::Url) -> Result<reqwest::Url> {
+        Ok(scheduler_url.join("/api/v1/scheduler/alloc_job")?)
     }
-    #[must_use]
+
+    /// Build the scheduler certificate endpoint for `server_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `scheduler_url` cannot be used as a base URL.
     pub fn scheduler_server_certificate(
         scheduler_url: &reqwest::Url,
         server_id: ServerId,
-    ) -> reqwest::Url {
-        scheduler_url
-            .join(&format!(
-                "/api/v1/scheduler/server_certificate/{}",
-                server_id.addr()
-            ))
-            .expect("failed to create server certificate url")
-    }
-    #[must_use]
-    pub fn scheduler_heartbeat_server(scheduler_url: &reqwest::Url) -> reqwest::Url {
-        scheduler_url
-            .join("/api/v1/scheduler/heartbeat_server")
-            .expect("failed to create heartbeat url")
-    }
-    #[must_use]
-    pub fn scheduler_job_state(scheduler_url: &reqwest::Url, job_id: JobId) -> reqwest::Url {
-        scheduler_url
-            .join(&format!("/api/v1/scheduler/job_state/{job_id}"))
-            .expect("failed to create job state url")
-    }
-    #[must_use]
-    pub fn scheduler_status(scheduler_url: &reqwest::Url) -> reqwest::Url {
-        scheduler_url
-            .join("/api/v1/scheduler/status")
-            .expect("failed to create alloc job url")
+    ) -> Result<reqwest::Url> {
+        Ok(scheduler_url.join(&format!(
+            "/api/v1/scheduler/server_certificate/{}",
+            server_id.addr()
+        ))?)
     }
 
-    #[must_use]
-    pub fn server_assign_job(server_id: ServerId, job_id: JobId) -> reqwest::Url {
+    /// Build the scheduler heartbeat endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `scheduler_url` cannot be used as a base URL.
+    pub fn scheduler_heartbeat_server(scheduler_url: &reqwest::Url) -> Result<reqwest::Url> {
+        Ok(scheduler_url.join("/api/v1/scheduler/heartbeat_server")?)
+    }
+
+    /// Build the scheduler job-state endpoint for `job_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `scheduler_url` cannot be used as a base URL.
+    pub fn scheduler_job_state(
+        scheduler_url: &reqwest::Url,
+        job_id: JobId,
+    ) -> Result<reqwest::Url> {
+        Ok(scheduler_url.join(&format!("/api/v1/scheduler/job_state/{job_id}"))?)
+    }
+
+    /// Build the scheduler status endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `scheduler_url` cannot be used as a base URL.
+    pub fn scheduler_status(scheduler_url: &reqwest::Url) -> Result<reqwest::Url> {
+        Ok(scheduler_url.join("/api/v1/scheduler/status")?)
+    }
+
+    /// Build the server assignment endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the generated server URL is invalid.
+    pub fn server_assign_job(server_id: ServerId, job_id: JobId) -> Result<reqwest::Url> {
         let url = format!(
             "https://{}/api/v1/distserver/assign_job/{job_id}",
             server_id.addr()
         );
-        reqwest::Url::parse(&url).expect("failed to create assign job url")
+        Ok(reqwest::Url::parse(&url)?)
     }
-    #[must_use]
-    pub fn server_submit_toolchain(server_id: ServerId, job_id: JobId) -> reqwest::Url {
+
+    /// Build the server toolchain-submission endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the generated server URL is invalid.
+    pub fn server_submit_toolchain(server_id: ServerId, job_id: JobId) -> Result<reqwest::Url> {
         let url = format!(
             "https://{}/api/v1/distserver/submit_toolchain/{job_id}",
             server_id.addr()
         );
-        reqwest::Url::parse(&url).expect("failed to create submit toolchain url")
+        Ok(reqwest::Url::parse(&url)?)
     }
-    #[must_use]
-    pub fn server_run_job(server_id: ServerId, job_id: JobId) -> reqwest::Url {
+
+    /// Build the server run-job endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the generated server URL is invalid.
+    pub fn server_run_job(server_id: ServerId, job_id: JobId) -> Result<reqwest::Url> {
         let url = format!(
             "https://{}/api/v1/distserver/run_job/{job_id}",
             server_id.addr()
         );
-        reqwest::Url::parse(&url).expect("failed to create run job url")
+        Ok(reqwest::Url::parse(&url)?)
     }
 }
 
@@ -866,7 +898,7 @@ mod server {
             tc: Toolchain,
             auth: String,
         ) -> Result<AssignJobResult> {
-            let url = urls::server_assign_job(server_id, job_id);
+            let url = urls::server_assign_job(server_id, job_id)?;
             let req = self.client.lock().unwrap().post(url);
             bincode_req(req.bearer_auth(auth).bincode(&tc)?)
                 .context("POST to scheduler assign_job failed")
@@ -936,7 +968,7 @@ mod server {
                 cert_pem: cert_pem.clone(),
             };
             let job_authorizer = JWTJobAuthorizer::new(jwt_key);
-            let heartbeat_url = urls::scheduler_heartbeat_server(&scheduler_url);
+            let heartbeat_url = urls::scheduler_heartbeat_server(&scheduler_url)?;
             let requester = ServerRequester {
                 client: new_reqwest_blocking_client(),
                 scheduler_url,
@@ -1045,7 +1077,7 @@ mod server {
             job_id: JobId,
             state: JobState,
         ) -> Result<UpdateJobStateResult> {
-            let url = urls::scheduler_job_state(&self.scheduler_url, job_id);
+            let url = urls::scheduler_job_state(&self.scheduler_url, job_id)?;
             bincode_req(
                 self.client
                     .post(url)
@@ -1170,7 +1202,7 @@ mod client {
     impl dist::Client for Client {
         async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
             let scheduler_url = self.scheduler_url.clone();
-            let url = urls::scheduler_alloc_job(&scheduler_url);
+            let url = urls::scheduler_alloc_job(&scheduler_url)?;
             let mut req = self.client.lock().unwrap().post(url);
             req = req.bearer_auth(self.auth_token.clone()).bincode(&tc)?;
 
@@ -1195,7 +1227,7 @@ mod client {
                         "Need to request new certificate for server {}",
                         server_id.addr()
                     );
-                    let url = urls::scheduler_server_certificate(&scheduler_url, server_id);
+                    let url = urls::scheduler_server_certificate(&scheduler_url, server_id)?;
                     let req = client.lock().unwrap().get(url);
                     let res: ServerCertificateHttpResponse = bincode_req_fut(req)
                         .await
@@ -1230,7 +1262,7 @@ mod client {
 
         async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
             let scheduler_url = self.scheduler_url.clone();
-            let url = urls::scheduler_status(&scheduler_url);
+            let url = urls::scheduler_status(&scheduler_url)?;
             let req = self.client.lock().unwrap().get(url);
             bincode_req_fut(req).await
         }
@@ -1242,7 +1274,7 @@ mod client {
         ) -> Result<SubmitToolchainResult> {
             match self.tc_cache.get_toolchain(&tc) {
                 Ok(Some(toolchain_file)) => {
-                    let url = urls::server_submit_toolchain(job_alloc.server_id, job_alloc.job_id);
+                    let url = urls::server_submit_toolchain(job_alloc.server_id, job_alloc.job_id)?;
                     let req = self.client.lock().unwrap().post(url);
                     let toolchain_file = tokio::fs::File::from_std(toolchain_file.into());
                     let toolchain_file_stream = tokio_util::io::ReaderStream::new(toolchain_file);
@@ -1262,7 +1294,7 @@ mod client {
             outputs: Vec<String>,
             inputs_packager: Box<dyn InputsPackager>,
         ) -> Result<(RunJobResult, PathTransformer)> {
-            let url = urls::server_run_job(job_alloc.server_id, job_alloc.job_id);
+            let url = urls::server_run_job(job_alloc.server_id, job_alloc.job_id)?;
 
             let (body, path_transformer) = self
                 .pool
