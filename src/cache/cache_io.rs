@@ -11,7 +11,7 @@
 // limitations under the License.
 
 use super::utils::{get_file_mode, set_file_mode};
-use crate::errors::*;
+use crate::errors::{Context, Result, bail};
 use fs_err as fs;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -89,6 +89,10 @@ impl std::error::Error for DecompressionFailure {}
 
 impl CacheRead {
     /// Create a cache entry from `reader`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `reader` does not contain a valid cache archive.
     pub fn from<R>(reader: R) -> Result<Self>
     where
         R: ReadSeek + 'static,
@@ -100,6 +104,10 @@ impl CacheRead {
 
     /// Get an object from this cache entry at `name` and write it to `to`.
     /// If the file has stored permissions, return them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the object is missing, malformed, or cannot be decompressed.
     pub fn get_object<T>(&mut self, name: &str, to: &mut T) -> Result<Option<u32>>
     where
         T: Write,
@@ -129,6 +137,12 @@ impl CacheRead {
         bytes
     }
 
+    /// Extract cached objects atomically to their requested output paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required object is missing or an output cannot be created,
+    /// persisted, or restored.
     pub async fn extract_objects<T>(
         mut self,
         objects: T,
@@ -156,9 +170,8 @@ impl CacheRead {
                     debug!("Skipping output to {}", path.display());
                     continue;
                 }
-                let dir = match path.parent() {
-                    Some(d) => d,
-                    None => bail!("Output file without a parent directory!"),
+                let Some(dir) = path.parent() else {
+                    bail!("Output file without a parent directory!");
                 };
                 // Write the cache entry to a tempfile and then atomically
                 // move it to its final location so that other rustc invocations
@@ -173,8 +186,8 @@ impl CacheRead {
                                 }
                             }
                             (Err(e), false) => return Err(e),
-                            // skip if no object found and it's optional
-                            (Err(_), true) => continue,
+                            // Skip if no object was found and it is optional.
+                            (Err(_), true) => {}
                         }
                     }
                     (Err(e), false) => {
@@ -192,8 +205,8 @@ impl CacheRead {
                             warn!("Failed to reset file mode: {e}");
                         }
                     }
-                    // skip if no object found and it's optional
-                    (Err(_), true) => continue,
+                    // Skip if no object was found and it is optional.
+                    (Err(_), true) => {}
                 }
             }
             Ok(())
@@ -234,6 +247,10 @@ impl CacheWrite {
     }
 
     /// Create a new cache entry populated with the contents of `objects`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required input cannot be opened, read, or added to the archive.
     pub async fn from_objects<T>(objects: T, pool: &tokio::runtime::Handle) -> Result<Self>
     where
         T: IntoIterator<Item = FileObjectSource> + Send + Sync + 'static,
@@ -247,16 +264,16 @@ impl CacheWrite {
             } in objects
             {
                 let f = fs::File::open(&path)
-                    .with_context(|| format!("failed to open file `{path:?}`"));
+                    .with_context(|| format!("failed to open file `{}`", path.display()));
                 match (f, optional) {
                     (Ok(mut f), _) => {
                         let mode = get_file_mode(&f)?;
                         entry.put_object(&key, &mut f, mode).with_context(|| {
-                            format!("failed to put object `{path:?}` in cache entry")
+                            format!("failed to put object `{}` in cache entry", path.display())
                         })?;
                     }
                     (Err(e), false) => return Err(e),
-                    (Err(_), true) => continue,
+                    (Err(_), true) => {}
                 }
             }
             Ok(entry)
@@ -266,6 +283,10 @@ impl CacheWrite {
 
     /// Add an object containing the contents of `from` to this cache entry at `name`.
     /// If `mode` is `Some`, store the file entry with that mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the archive entry cannot be created, read, or compressed.
     pub fn put_object<T>(&mut self, name: &str, from: &mut T, mode: Option<u32>) -> Result<()>
     where
         T: Read,
@@ -273,11 +294,7 @@ impl CacheWrite {
         // We're going to declare the compression method as "stored",
         // but we're actually going to store zstd-compressed blobs.
         let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
-        let opts = if let Some(mode) = mode {
-            opts.unix_permissions(mode)
-        } else {
-            opts
-        };
+        let opts = mode.map_or(opts, |mode| opts.unix_permissions(mode));
         self.zip
             .start_file(name, opts)
             .context("Failed to start cache entry object")?;
@@ -290,10 +307,20 @@ impl CacheWrite {
         Ok(())
     }
 
+    /// Store compiler stdout in this cache entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data cannot be written to the archive.
     pub fn put_stdout(&mut self, bytes: &[u8]) -> Result<()> {
         self.put_bytes("stdout", bytes)
     }
 
+    /// Store compiler stderr in this cache entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data cannot be written to the archive.
     pub fn put_stderr(&mut self, bytes: &[u8]) -> Result<()> {
         self.put_bytes("stderr", bytes)
     }
@@ -307,6 +334,10 @@ impl CacheWrite {
     }
 
     /// Finish writing data to the cache entry writer, and return the data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if finalizing the cache archive fails.
     pub fn finish(self) -> Result<Vec<u8>> {
         let Self { mut zip } = self;
         let cur = zip.finish().context("Failed to finish cache entry zip")?;
