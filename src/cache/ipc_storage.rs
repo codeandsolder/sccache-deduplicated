@@ -62,9 +62,14 @@ impl IpcStorage {
 
     async fn rpc(&self, req: Request) -> Result<Response> {
         let conn = Arc::clone(&self.conn);
-        tokio::task::spawn_blocking(move || conn.lock().unwrap().request(req))
-            .await
-            .context("spawn_blocking panicked")?
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn
+                .lock()
+                .map_err(|_| anyhow!("IpcStorage connection lock is poisoned"))?;
+            conn.request(req)
+        })
+        .await
+        .context("IpcStorage RPC task failed")?
     }
 }
 
