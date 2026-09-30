@@ -76,6 +76,10 @@ impl fmt::Display for WriteErrorPolicy {
     }
 }
 
+fn default_multilevel_slow_write_concurrency() -> usize {
+    4
+}
+
 /// Configuration for multi-level cache.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MultiLevelConfig {
@@ -85,6 +89,9 @@ pub struct MultiLevelConfig {
     /// Write failure handling policy
     #[serde(default)]
     pub write_error_policy: WriteErrorPolicy,
+    /// Maximum number of concurrent operations against slower cache levels.
+    #[serde(default = "default_multilevel_slow_write_concurrency")]
+    pub slow_write_concurrency: usize,
 }
 
 static CACHED_CONFIG_PATH: LazyLock<PathBuf> = LazyLock::new(CachedConfig::file_config_path);
@@ -1246,9 +1253,18 @@ fn config_from_env() -> Result<EnvConfig> {
             .and_then(|s| s.parse::<WriteErrorPolicy>().ok())
             .unwrap_or_default();
 
+        let slow_write_concurrency =
+            number_from_env_var::<usize>("SCCACHE_MULTILEVEL_SLOW_WRITE_CONCURRENCY")
+                .transpose()?
+                .unwrap_or_else(default_multilevel_slow_write_concurrency);
+        if slow_write_concurrency == 0 {
+            bail!("SCCACHE_MULTILEVEL_SLOW_WRITE_CONCURRENCY must be at least 1");
+        }
+
         Some(MultiLevelConfig {
             chain,
             write_error_policy,
+            slow_write_concurrency,
         })
     } else {
         None
@@ -3501,6 +3517,7 @@ fn test_get_cache_levels_invalid_level() {
         multilevel: Some(MultiLevelConfig {
             chain: vec!["unknown_cache".to_string()],
             write_error_policy: WriteErrorPolicy::default(),
+            slow_write_concurrency: default_multilevel_slow_write_concurrency(),
         }),
         ..Default::default()
     };
@@ -3521,6 +3538,7 @@ fn test_get_cache_levels_missing_config() {
         multilevel: Some(MultiLevelConfig {
             chain: vec!["s3".to_string()],
             write_error_policy: WriteErrorPolicy::default(),
+            slow_write_concurrency: default_multilevel_slow_write_concurrency(),
         }),
         ..Default::default()
     };
