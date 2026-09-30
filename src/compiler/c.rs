@@ -2013,7 +2013,7 @@ mod test {
                     PreprocessorFileMetadata {
                         is_dir: false,
                         is_file: true,
-                        modified: Some(Timestamp::new(12341234, 0)),
+                        modified: Some(Timestamp::new(12_341_234, 0)),
                         ctime_or_creation: None,
                     },
                 )]
@@ -2306,7 +2306,7 @@ int value;
                     PreprocessorFileMetadata {
                         is_dir: true,
                         is_file: false,
-                        modified: Some(Timestamp::new(12341234, 0)),
+                        modified: Some(Timestamp::new(12_341_234, 0)),
                         ctime_or_creation: None,
                     },
                 )]
@@ -2336,7 +2336,7 @@ int value;
                     PreprocessorFileMetadata {
                         is_dir: false,
                         is_file: true,
-                        modified: Some(Timestamp::new(12341234, 0)),
+                        modified: Some(Timestamp::new(12_341_234, 0)),
                         ctime_or_creation: None,
                     },
                 )]

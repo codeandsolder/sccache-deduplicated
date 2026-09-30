@@ -630,7 +630,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "Too many calls to MockCommandCreator::new_command")]
     fn test_unexpected_new_command() {
         // If next_command_spawns hasn't been called enough times,
         // new_command should panic.

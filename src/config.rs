@@ -2880,7 +2880,7 @@ scheduler_url = "http://1.2.3.4:10600"
 # a set of prepackaged toolchains
 toolchains = []
 # the maximum size of the toolchain cache in bytes
-toolchain_cache_size = 5368709120
+toolchain_cache_size = 5_368_709_120
 cache_dir = "/home/user/.cache/sccache-dist-client"
 
 [dist.auth]
@@ -3063,7 +3063,7 @@ key_prefix = "cosprefix"
                 scheduler_url: Some("http://1.2.3.4:10600".to_owned()),
                 cache_dir: PathBuf::from("/home/user/.cache/sccache-dist-client"),
                 toolchains: vec![],
-                toolchain_cache_size: 5368709120,
+                toolchain_cache_size: 5_368_709_120,
                 rewrite_includes_only: false,
             },
             server_startup_timeout_ms: Some(10000),

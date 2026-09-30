@@ -1085,13 +1085,13 @@ mod tests {
         use super::*;
 
         #[test]
-        #[should_panic]
+        #[should_panic(expected = "assertion")]
         fn test_arginfo_process_flag() {
             flag!("-foo", FooFlag).process("-bar", || None).unwrap();
         }
 
         #[test]
-        #[should_panic]
+        #[should_panic(expected = "assertion")]
         fn test_arginfo_process_take_arg() {
             take_arg!("-foo", OsString, Separated, Foo)
                 .process("-bar", || None)
@@ -1099,7 +1099,7 @@ mod tests {
         }
 
         #[test]
-        #[should_panic]
+        #[should_panic(expected = "assertion")]
         fn test_arginfo_process_take_concat_arg() {
             take_arg!("-foo", OsString, Concatenated, Foo)
                 .process("-bar", || None)
@@ -1107,7 +1107,7 @@ mod tests {
         }
 
         #[test]
-        #[should_panic]
+        #[should_panic(expected = "assertion")]
         fn test_arginfo_process_take_concat_arg_delim() {
             take_arg!("-foo", OsString, Concatenated(b'='), Foo)
                 .process("-bar", || None)
@@ -1115,7 +1115,7 @@ mod tests {
         }
 
         #[test]
-        #[should_panic]
+        #[should_panic(expected = "assertion")]
         fn test_arginfo_process_take_maybe_concat_arg() {
             take_arg!("-foo", OsString, CanBeSeparated, Foo)
                 .process("-bar", || None)
@@ -1123,7 +1123,7 @@ mod tests {
         }
 
         #[test]
-        #[should_panic]
+        #[should_panic(expected = "assertion")]
         fn test_arginfo_process_take_maybe_concat_arg_delim() {
             take_arg!("-foo", OsString, CanBeSeparated(b'='), Foo)
                 .process("-bar", || None)
@@ -1131,14 +1131,14 @@ mod tests {
         }
 
         #[test]
-        #[should_panic]
+        #[should_panic(expected = "can't precede")]
         fn test_args_iter_unsorted() {
             static ARGS: [ArgInfo<ArgData>; 2] = [flag!("-foo", FooFlag), flag!("-bar", FooFlag)];
             ArgsIter::new(Vec::<OsString>::new().into_iter(), &ARGS[..]);
         }
 
         #[test]
-        #[should_panic]
+        #[should_panic(expected = "can't precede")]
         fn test_args_iter_unsorted_2() {
             static ARGS: [ArgInfo<ArgData>; 2] = [flag!("-foo", FooFlag), flag!("-foo", FooFlag)];
             ArgsIter::new(Vec::<OsString>::new().into_iter(), &ARGS[..]);

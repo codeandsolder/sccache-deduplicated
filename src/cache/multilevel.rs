@@ -646,6 +646,18 @@ impl MultiLevelStorage {
     /// faster-level hit immediately. Slower levels are probed only when they expose
     /// a cheap existence check, and the source object is read only if at least one
     /// slower level is actually missing the key.
+    async fn read_level_with_raw(&self, idx: usize, key: &str) -> (Result<Cache>, Option<Bytes>) {
+        let level = &self.levels[idx];
+        if idx == 0 {
+            return (level.get(key).await, None);
+        }
+
+        match level.get_with_raw(key).await {
+            Ok((cache, raw_bytes)) => (Ok(cache), raw_bytes),
+            Err(error) => (Err(error), None),
+        }
+    }
+
     fn backfill_faster_levels(&self, key: &str, hit_level: usize, raw_bytes: Option<Bytes>) {
         if hit_level == 0 {
             return;
@@ -844,18 +856,7 @@ impl Storage for MultiLevelStorage {
     async fn get(&self, key: &str) -> Result<Cache> {
         for (idx, level) in self.levels.iter().enumerate() {
             let start = Instant::now();
-            let mut raw_bytes_for_backfill = None;
-            let cache_result = if idx > 0 {
-                match level.get_with_raw(key).await {
-                    Ok((cache, raw_bytes)) => {
-                        raw_bytes_for_backfill = raw_bytes;
-                        Ok(cache)
-                    }
-                    Err(error) => Err(error),
-                }
-            } else {
-                level.get(key).await
-            };
+            let (cache_result, raw_bytes_for_backfill) = self.read_level_with_raw(idx, key).await;
 
             match cache_result {
                 Ok(Cache::Hit(entry)) => {
