@@ -502,7 +502,7 @@ impl DistClientContainer {
     fn get_cached_config_auth_token(auth_url: &str) -> Result<String> {
         let cached_config = config::CachedConfig::reload()?;
         cached_config
-            .with(|c| c.dist.auth_tokens.get(auth_url).map(String::to_owned))
+            .with(|c| c.dist.auth_tokens.get(auth_url).map(String::to_owned))?
             .with_context(|| format!("token for url {} not present in cached config", auth_url))
     }
 }

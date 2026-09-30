@@ -31,7 +31,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
 use std::str::FromStr;
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 use std::{collections::HashMap, fmt};
 use typed_path::Utf8TypedPathBuf;
 
@@ -87,8 +87,7 @@ pub struct MultiLevelConfig {
     pub write_error_policy: WriteErrorPolicy,
 }
 
-static CACHED_CONFIG_PATH: LazyLock<PathBuf> = LazyLock::new(CachedConfig::file_config_path);
-static CACHED_CONFIG: Mutex<Option<CachedFileConfig>> = Mutex::new(None);
+static CACHED_CONFIG: Mutex<Option<(PathBuf, CachedFileConfig)>> = Mutex::new(None);
 
 const ORGANIZATION: &str = "Mozilla";
 const APP_NAME: &str = "sccache";
@@ -100,17 +99,17 @@ pub const INSECURE_DIST_CLIENT_TOKEN: &str = "dangerously_insecure_client";
 // Unfortunately this means that nothing else can use the sccache cache dir as
 // this top level directory is used directly to store sccache cached objects...
 pub fn default_disk_cache_dir() -> PathBuf {
-    ProjectDirs::from("", ORGANIZATION, APP_NAME)
-        .expect("Unable to retrieve disk cache directory")
-        .cache_dir()
-        .to_owned()
+    ProjectDirs::from("", ORGANIZATION, APP_NAME).map_or_else(
+        || env::temp_dir().join(APP_NAME),
+        |dirs| dirs.cache_dir().to_owned(),
+    )
 }
 // ...whereas subdirectories are used of this one
 pub fn default_dist_cache_dir() -> PathBuf {
-    ProjectDirs::from("", ORGANIZATION, DIST_APP_NAME)
-        .expect("Unable to retrieve dist cache directory")
-        .cache_dir()
-        .to_owned()
+    ProjectDirs::from("", ORGANIZATION, DIST_APP_NAME).map_or_else(
+        || env::temp_dir().join(DIST_APP_NAME),
+        |dirs| dirs.cache_dir().to_owned(),
+    )
 }
 
 fn default_disk_cache_size() -> u64 {
@@ -1291,24 +1290,24 @@ fn config_from_env() -> Result<EnvConfig> {
 // The directories crate changed the location of `config_dir` on macos in version 3,
 // so we also check the config in `preference_dir` (new in that version), which
 // corresponds to the old location, for compatibility with older setups.
-fn config_file(env_var: &str, leaf: &str) -> PathBuf {
+fn config_file(env_var: &str, leaf: &str) -> Result<PathBuf> {
     if let Some(env_value) = env::var_os(env_var) {
-        return env_value.into();
+        return Ok(env_value.into());
     }
-    let dirs =
-        ProjectDirs::from("", ORGANIZATION, APP_NAME).expect("Unable to get config directory");
+    let dirs = ProjectDirs::from("", ORGANIZATION, APP_NAME)
+        .context("unable to determine the user configuration directory")?;
     // If the new location exists, use that.
     let path = dirs.config_dir().join(leaf);
     if path.exists() {
-        return path;
+        return Ok(path);
     }
     // If the old location exists, use that.
     let path = dirs.preference_dir().join(leaf);
     if path.exists() {
-        return path;
+        return Ok(path);
     }
     // Otherwise, use the new location.
-    dirs.config_dir().join(leaf)
+    Ok(dirs.config_dir().join(leaf))
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1330,7 +1329,7 @@ impl Config {
         let env_conf = config_from_env()?;
         let skip_cache_check = skip_cache_check_from_env()?;
 
-        let file_conf_path = config_file("SCCACHE_CONF", "config");
+        let file_conf_path = config_file("SCCACHE_CONF", "config")?;
         let file_conf = try_read_config_file(&file_conf_path)
             .context("Failed to load config file")?
             .unwrap_or_default();
@@ -1449,58 +1448,82 @@ pub struct CachedFileConfig {
     pub dist: CachedDistConfig,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct CachedConfig(());
+#[derive(Debug, PartialEq, Eq)]
+pub struct CachedConfig {
+    file_conf_path: PathBuf,
+}
 
 impl CachedConfig {
     pub fn load() -> Result<Self> {
-        let mut cached_file_config = CACHED_CONFIG.lock().unwrap();
+        let mut cached = CACHED_CONFIG
+            .lock()
+            .map_err(|_| anyhow!("cached config lock is poisoned"))?;
 
-        if cached_file_config.is_none() {
-            let cfg = Self::load_file_config().context("Unable to initialise cached config")?;
-            *cached_file_config = Some(cfg);
+        if cached.is_none() {
+            let file_conf_path = config_file("SCCACHE_CACHED_CONF", "cached-config")?;
+            let cfg = Self::load_file_config(&file_conf_path)
+                .context("Unable to initialise cached config")?;
+            *cached = Some((file_conf_path, cfg));
         }
-        Ok(CachedConfig(()))
+
+        let file_conf_path = cached
+            .as_ref()
+            .map(|(path, _)| path.clone())
+            .context("cached config was not initialised")?;
+        Ok(Self { file_conf_path })
     }
+
     pub fn reload() -> Result<Self> {
         {
-            let mut cached_file_config = CACHED_CONFIG.lock().unwrap();
-            *cached_file_config = None;
-        };
+            let mut cached = CACHED_CONFIG
+                .lock()
+                .map_err(|_| anyhow!("cached config lock is poisoned"))?;
+            *cached = None;
+        }
         Self::load()
     }
-    pub fn with<F: FnOnce(&CachedFileConfig) -> T, T>(&self, f: F) -> T {
-        let cached_file_config = CACHED_CONFIG.lock().unwrap();
-        let cached_file_config = cached_file_config.as_ref().unwrap();
 
-        f(cached_file_config)
+    pub fn with<F: FnOnce(&CachedFileConfig) -> T, T>(&self, f: F) -> Result<T> {
+        let cached = CACHED_CONFIG
+            .lock()
+            .map_err(|_| anyhow!("cached config lock is poisoned"))?;
+        let (path, config) = cached
+            .as_ref()
+            .context("cached config was not initialised")?;
+        if path != &self.file_conf_path {
+            bail!("cached config handle is stale after reload");
+        }
+        Ok(f(config))
     }
-    pub fn with_mut<F: FnOnce(&mut CachedFileConfig)>(&self, f: F) -> Result<()> {
-        let mut cached_file_config = CACHED_CONFIG.lock().unwrap();
-        let cached_file_config = cached_file_config.as_mut().unwrap();
 
-        let mut new_config = cached_file_config.clone();
+    pub fn with_mut<F: FnOnce(&mut CachedFileConfig)>(&self, f: F) -> Result<()> {
+        let mut cached = CACHED_CONFIG
+            .lock()
+            .map_err(|_| anyhow!("cached config lock is poisoned"))?;
+        let (path, config) = cached
+            .as_mut()
+            .context("cached config was not initialised")?;
+        if path != &self.file_conf_path {
+            bail!("cached config handle is stale after reload");
+        }
+
+        let mut new_config = config.clone();
         f(&mut new_config);
-        Self::save_file_config(&new_config)?;
-        *cached_file_config = new_config;
+        Self::save_file_config(path, &new_config)?;
+        *config = new_config;
         Ok(())
     }
 
-    fn file_config_path() -> PathBuf {
-        config_file("SCCACHE_CACHED_CONF", "cached-config")
-    }
-    fn load_file_config() -> Result<CachedFileConfig> {
-        let file_conf_path = &*CACHED_CONFIG_PATH;
-
+    fn load_file_config(file_conf_path: &Path) -> Result<CachedFileConfig> {
         if !file_conf_path.exists() {
             let file_conf_dir = file_conf_path
                 .parent()
-                .expect("Cached conf file has no parent directory");
+                .context("cached config path has no parent directory")?;
             if !file_conf_dir.is_dir() {
                 fs::create_dir_all(file_conf_dir)
                     .context("Failed to create dir to hold cached config")?;
             }
-            Self::save_file_config(&Default::default()).with_context(|| {
+            Self::save_file_config(file_conf_path, &Default::default()).with_context(|| {
                 format!(
                     "Unable to create cached config file at {}",
                     file_conf_path.display()
@@ -1511,11 +1534,13 @@ impl CachedConfig {
             .context("Failed to load cached config file")?
             .with_context(|| format!("Failed to load from {}", file_conf_path.display()))
     }
-    fn save_file_config(c: &CachedFileConfig) -> Result<()> {
-        let file_conf_path = &*CACHED_CONFIG_PATH;
+
+    fn save_file_config(file_conf_path: &Path, config: &CachedFileConfig) -> Result<()> {
+        let serialized =
+            toml::to_string(config).context("failed to serialize cached configuration")?;
         let mut file = File::create(file_conf_path).context("Could not open config for writing")?;
-        file.write_all(toml::to_string(c).unwrap().as_bytes())
-            .map_err(Into::into)
+        file.write_all(serialized.as_bytes())
+            .context("failed to write cached configuration")
     }
 }
 
