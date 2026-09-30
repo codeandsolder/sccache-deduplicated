@@ -548,7 +548,7 @@ async fn serve_until_shutdown<F>(
     shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<()>
 where
-    F: Fn(hyper::Request<hyper::body::Incoming>) -> anyhow::Result<Response<Full<Bytes>>>
+    F: Fn(&hyper::Request<hyper::body::Incoming>) -> anyhow::Result<Response<Full<Bytes>>>
         + Send
         + 'static
         + Copy

@@ -29,7 +29,7 @@ mod common {
     use crate::dist;
     #[cfg(feature = "dist-client")]
     use crate::errors::HttpClientError;
-    use crate::errors::{Context, Result, anyhow};
+    use crate::errors::{Context, Result};
 
     // Note that content-length is necessary due to https://github.com/tiny-http/tiny-http/issues/147
     pub trait ReqwestRequestBuilderExt: Sized {
