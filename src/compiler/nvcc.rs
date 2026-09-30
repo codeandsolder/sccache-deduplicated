@@ -691,29 +691,33 @@ where
 
     let (nvcc_commands, host_commands) = futures::future::try_join(
         // Get the nvcc compile command lines with paths relative to `tmp`
-        select_nvcc_subcommands(NvccSelectContext {
-            creator,
-            executable,
-            cwd,
-            env_vars: &mut env_vars_1,
-            remap_filenames: keep_dir.is_none(),
-            arguments,
-            select_subcommand: is_nvcc_exe,
-            host_compiler,
-            output_file_name,
-        }),
+        select_nvcc_subcommands(
+            NvccSelectContext {
+                creator,
+                executable,
+                cwd,
+                env_vars: &mut env_vars_1,
+                remap_filenames: keep_dir.is_none(),
+                arguments,
+                host_compiler,
+                output_file_name,
+            },
+            is_nvcc_exe,
+        ),
         // Get the host compile command lines with paths relative to `cwd` and absolute paths to `tmp`
-        select_nvcc_subcommands(NvccSelectContext {
-            creator,
-            executable,
-            cwd,
-            env_vars: &mut env_vars_2,
-            remap_filenames: keep_dir.is_none(),
-            arguments: &[arguments, &["--keep-dir".into(), tmp.into()][..]].concat(),
-            select_subcommand: |exe| !is_nvcc_exe(exe),
-            host_compiler,
-            output_file_name,
-        }),
+        select_nvcc_subcommands(
+            NvccSelectContext {
+                creator,
+                executable,
+                cwd,
+                env_vars: &mut env_vars_2,
+                remap_filenames: keep_dir.is_none(),
+                arguments: &[arguments, &["--keep-dir".into(), tmp.into()][..]].concat(),
+                host_compiler,
+                output_file_name,
+            },
+            |exe| !is_nvcc_exe(exe),
+        ),
     )
     .await?;
 
@@ -924,20 +928,20 @@ where
     Ok(command_groups)
 }
 
-struct NvccSelectContext<'a, T, F> {
+struct NvccSelectContext<'a, T> {
     creator: &'a T,
     executable: &'a Path,
     cwd: &'a Path,
     env_vars: &'a mut Vec<(OsString, OsString)>,
     remap_filenames: bool,
     arguments: &'a [OsString],
-    select_subcommand: F,
     host_compiler: &'a NvccHostCompiler,
     output_file_name: &'a OsStr,
 }
 
 async fn select_nvcc_subcommands<T, F>(
-    context: NvccSelectContext<'_, T, F>,
+    context: NvccSelectContext<'_, T>,
+    select_subcommand: F,
 ) -> Result<Vec<(usize, PathBuf, Vec<String>)>>
 where
     F: Fn(&str) -> bool,
@@ -950,7 +954,6 @@ where
         env_vars,
         remap_filenames,
         arguments,
-        select_subcommand,
         host_compiler,
         output_file_name,
     } = context;

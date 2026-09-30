@@ -515,7 +515,7 @@ pub(crate) struct GenerateHashKeyContext<'a, T> {
     pub cache_control: CacheControl,
 }
 
-pub(crate) struct CacheCompileContext<'a, T> {
+pub(crate) struct CacheCompileContext<'a, T: CommandCreatorSync> {
     pub service: &'a server::SccacheService<T>,
     pub dist_client: Option<Arc<dyn dist::Client>>,
     pub creator: T,

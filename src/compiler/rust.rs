@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cache::{FileObjectSource, Storage};
+use crate::cache::FileObjectSource;
 #[cfg(target_os = "linux")]
 use crate::compiler::CompileCommandImpl;
 use crate::compiler::args::*;

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cache::{FileObjectSource, Storage};
+use crate::cache::FileObjectSource;
 use crate::compiler::preprocessor_cache::{
     PreprocessorCacheKey, preprocessor_cache_entry_hash_key,
 };
@@ -42,7 +42,7 @@ use std::io;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use crate::errors::*;
 
