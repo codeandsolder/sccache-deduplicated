@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::cache_io::*;
+use super::cache_io::{Cache, CacheMode, CacheRead, CacheWrite, ReadSeek};
 #[cfg(feature = "azure")]
 use crate::cache::azure::AzureBlobCache;
 #[cfg(feature = "cos")]
@@ -79,7 +79,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::errors::*;
+#[cfg(test)]
+use crate::errors::Context;
+use crate::errors::{Result, anyhow, bail};
 
 /// Result of [`Storage::get_path`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -465,8 +467,140 @@ impl Storage for RemoteStorage {
     }
 }
 
-/// Build a single cache storage from `CacheType`
-/// Helper function used by `storage_from_config` for both single and multi-level caches
+#[cfg(feature = "azure")]
+fn build_azure_operator(c: &config::AzureCacheConfig) -> Result<opendal::Operator> {
+    AzureBlobCache::build(
+        c.connection_string.as_deref(),
+        &c.container,
+        &c.key_prefix,
+        c.storage_account.as_deref(),
+        c.endpoint.as_deref(),
+    )
+    .map_err(|err| anyhow!("create azure cache failed: {err:?}"))
+}
+
+#[cfg(feature = "gcs")]
+fn build_gcs_operator(c: &config::GCSCacheConfig) -> Result<opendal::Operator> {
+    GCSCache::build(
+        &c.bucket,
+        &c.key_prefix,
+        c.cred_path.as_deref(),
+        c.service_account.as_deref(),
+        c.rw_mode.into(),
+        c.credential_url.as_deref(),
+    )
+    .map_err(|err| anyhow!("create gcs cache failed: {err:?}"))
+}
+
+#[cfg(feature = "gha")]
+fn build_gha_operator(c: &config::GHACacheConfig) -> Result<opendal::Operator> {
+    GHACache::build(&c.version).map_err(|err| anyhow!("create gha cache failed: {err:?}"))
+}
+
+#[cfg(feature = "memcached")]
+fn build_memcached_operator(c: &config::MemcachedCacheConfig) -> Result<opendal::Operator> {
+    MemcachedCache::build(
+        &c.url,
+        c.username.as_deref(),
+        c.password.as_deref(),
+        &c.key_prefix,
+        c.expiration,
+    )
+    .map_err(|err| anyhow!("create memcached cache failed: {err:?}"))
+}
+
+#[cfg(feature = "redis")]
+fn build_redis_operator(c: &config::RedisCacheConfig) -> Result<opendal::Operator> {
+    let operator = match (&c.endpoint, &c.cluster_endpoints, &c.url) {
+        (Some(url), None, None) => {
+            debug!("Init redis single-node cache with url {url}");
+            RedisCache::build_single(
+                url,
+                c.username.as_deref(),
+                c.password.as_deref(),
+                c.db,
+                &c.key_prefix,
+                c.ttl,
+            )
+        }
+        (None, Some(urls), None) => {
+            debug!("Init redis cluster cache with urls {urls}");
+            RedisCache::build_cluster(
+                urls,
+                c.username.as_deref(),
+                c.password.as_deref(),
+                c.db,
+                &c.key_prefix,
+                c.ttl,
+            )
+        }
+        (None, None, Some(url)) => {
+            warn!("Init redis single-node cache from deprecated API with url {url}");
+            if c.username.is_some()
+                || c.password.is_some()
+                || c.db != crate::config::DEFAULT_REDIS_DB
+            {
+                bail!(
+                    "username, password and db have no effect when url is set; use endpoint or cluster_endpoints"
+                );
+            }
+            RedisCache::build_from_url(url, &c.key_prefix, c.ttl)
+        }
+        _ => bail!("exactly one of endpoint, cluster_endpoints, or url must be set"),
+    };
+    operator.map_err(|err| anyhow!("create redis cache failed: {err:?}"))
+}
+
+#[cfg(feature = "s3")]
+fn build_s3_operator(c: &config::S3CacheConfig) -> Result<opendal::Operator> {
+    S3Cache::new(c.bucket.clone(), c.key_prefix.clone(), c.no_credentials)
+        .with_region(c.region.clone())
+        .with_endpoint(c.endpoint.clone())
+        .with_use_ssl(c.use_ssl)
+        .with_server_side_encryption(c.server_side_encryption)
+        .with_server_side_encryption_aws_kms(c.server_side_encryption_aws_kms)
+        .with_server_side_encryption_kms_key_id(c.server_side_encryption_kms_key_id.clone())
+        .with_enable_virtual_host_style(c.enable_virtual_host_style)
+        .build()
+        .map_err(|err| anyhow!("create s3 cache failed: {err:?}"))
+}
+
+#[cfg(feature = "webdav")]
+fn build_webdav_operator(c: &config::WebdavCacheConfig) -> Result<opendal::Operator> {
+    WebdavCache::build(
+        &c.endpoint,
+        &c.key_prefix,
+        c.username.as_deref(),
+        c.password.as_deref(),
+        c.token.as_deref(),
+        c.disable_create_dir,
+    )
+    .map_err(|err| anyhow!("create webdav cache failed: {err:?}"))
+}
+
+#[cfg(feature = "oss")]
+fn build_oss_operator(c: &config::OSSCacheConfig) -> Result<opendal::Operator> {
+    OSSCache::build(
+        &c.bucket,
+        &c.key_prefix,
+        c.endpoint.as_deref(),
+        c.no_credentials,
+    )
+    .map_err(|err| anyhow!("create oss cache failed: {err:?}"))
+}
+
+#[cfg(feature = "cos")]
+fn build_cos_operator(c: &config::COSCacheConfig) -> Result<opendal::Operator> {
+    COSCache::build(&c.bucket, &c.key_prefix, c.endpoint.as_deref())
+        .map_err(|err| anyhow!("create cos cache failed: {err:?}"))
+}
+
+/// Build a single cache storage from CacheType.
+///
+/// # Errors
+///
+/// Returns an error if the selected backend is unavailable in this build, is
+/// misconfigured, or cannot initialize its storage operator.
 #[cfg(any(
     feature = "azure",
     feature = "gcs",
@@ -484,231 +618,98 @@ pub fn build_single_cache(
     _pool: &tokio::runtime::Handle,
     skip_cache_check: bool,
 ) -> Result<Arc<dyn Storage>> {
-    match cache_type {
+    let (operator, rw_mode) = match cache_type {
         #[cfg(feature = "azure")]
-        CacheType::Azure(config::AzureCacheConfig {
-            connection_string,
-            container,
-            key_prefix,
-            storage_account,
-            endpoint,
-            rw_mode,
-        }) => {
-            debug!("Init azure cache with container {container}, key_prefix {key_prefix}");
-            let operator = AzureBlobCache::build(
-                connection_string.as_deref(),
-                container,
-                key_prefix,
-                storage_account.as_deref(),
-                endpoint.as_deref(),
-            )
-            .map_err(|err| anyhow!("create azure cache failed: {err:?}"))?;
-            let storage = RemoteStorage::new(operator, basedirs.to_vec(), (*rw_mode).into())
-                .with_skip_cache_check(skip_cache_check);
-            Ok(Arc::new(storage))
+        CacheType::Azure(c) => {
+            debug!(
+                "Init azure cache with container {}, key_prefix {}",
+                c.container, c.key_prefix
+            );
+            (build_azure_operator(c)?, c.rw_mode.into())
         }
+        #[cfg(not(feature = "azure"))]
+        CacheType::Azure(_) => bail!("Azure cache support is not enabled"),
         #[cfg(feature = "gcs")]
-        CacheType::GCS(config::GCSCacheConfig {
-            bucket,
-            key_prefix,
-            cred_path,
-            rw_mode,
-            service_account,
-            credential_url,
-        }) => {
-            debug!("Init gcs cache with bucket {bucket}, key_prefix {key_prefix}");
-
-            let operator = GCSCache::build(
-                bucket,
-                key_prefix,
-                cred_path.as_deref(),
-                service_account.as_deref(),
-                (*rw_mode).into(),
-                credential_url.as_deref(),
-            )
-            .map_err(|err| anyhow!("create gcs cache failed: {err:?}"))?;
-            let storage = RemoteStorage::new(operator, basedirs.to_vec(), (*rw_mode).into())
-                .with_skip_cache_check(skip_cache_check);
-            Ok(Arc::new(storage))
+        CacheType::GCS(c) => {
+            debug!(
+                "Init gcs cache with bucket {}, key_prefix {}",
+                c.bucket, c.key_prefix
+            );
+            (build_gcs_operator(c)?, c.rw_mode.into())
         }
+        #[cfg(not(feature = "gcs"))]
+        CacheType::GCS(_) => bail!("GCS cache support is not enabled"),
         #[cfg(feature = "gha")]
-        CacheType::GHA(config::GHACacheConfig {
-            version, rw_mode, ..
-        }) => {
-            debug!("Init gha cache with version {version}");
-
-            let operator = GHACache::build(version)
-                .map_err(|err| anyhow!("create gha cache failed: {err:?}"))?;
-            let storage = RemoteStorage::new(operator, basedirs.to_vec(), (*rw_mode).into())
-                .with_skip_cache_check(skip_cache_check);
-            Ok(Arc::new(storage))
+        CacheType::GHA(c) => {
+            debug!("Init gha cache with version {}", c.version);
+            (build_gha_operator(c)?, c.rw_mode.into())
         }
+        #[cfg(not(feature = "gha"))]
+        CacheType::GHA(_) => bail!("GitHub Actions cache support is not enabled"),
         #[cfg(feature = "memcached")]
-        CacheType::Memcached(config::MemcachedCacheConfig {
-            url,
-            username,
-            password,
-            expiration,
-            key_prefix,
-            rw_mode,
-        }) => {
-            debug!("Init memcached cache with url {url}");
-
-            let operator = MemcachedCache::build(
-                url,
-                username.as_deref(),
-                password.as_deref(),
-                key_prefix,
-                *expiration,
-            )
-            .map_err(|err| anyhow!("create memcached cache failed: {err:?}"))?;
-            let storage = RemoteStorage::new(operator, basedirs.to_vec(), (*rw_mode).into())
-                .with_skip_cache_check(skip_cache_check);
-            Ok(Arc::new(storage))
+        CacheType::Memcached(c) => {
+            debug!("Init memcached cache with url {}", c.url);
+            (build_memcached_operator(c)?, c.rw_mode.into())
         }
+        #[cfg(not(feature = "memcached"))]
+        CacheType::Memcached(_) => bail!("Memcached cache support is not enabled"),
         #[cfg(feature = "redis")]
-        CacheType::Redis(config::RedisCacheConfig {
-            endpoint,
-            cluster_endpoints,
-            username,
-            password,
-            db,
-            url,
-            ttl,
-            key_prefix,
-            rw_mode,
-        }) => {
-            let storage = match (endpoint, cluster_endpoints, url) {
-                (Some(url), None, None) => {
-                    debug!("Init redis single-node cache with url {url}");
-                    RedisCache::build_single(
-                        url,
-                        username.as_deref(),
-                        password.as_deref(),
-                        *db,
-                        key_prefix,
-                        *ttl,
-                    )
-                }
-                (None, Some(urls), None) => {
-                    debug!("Init redis cluster cache with urls {urls}");
-                    RedisCache::build_cluster(
-                        urls,
-                        username.as_deref(),
-                        password.as_deref(),
-                        *db,
-                        key_prefix,
-                        *ttl,
-                    )
-                }
-                (None, None, Some(url)) => {
-                    warn!("Init redis single-node cache from deprecated API with url {url}");
-                    if username.is_some() || password.is_some() || *db != crate::config::DEFAULT_REDIS_DB {
-                        bail!("`username`, `password` and `db` has no effect when `url` is set. Please use `endpoint` or `cluster_endpoints` for new API accessing");
-                    }
-
-                    RedisCache::build_from_url(url, key_prefix, *ttl)
-                }
-                _ => bail!("Only one of `endpoint`, `cluster_endpoints`, `url` must be set"),
-            }
-            .map_err(|err| anyhow!("create redis cache failed: {err:?}"))?;
-            let storage = RemoteStorage::new(storage, basedirs.to_vec(), (*rw_mode).into())
-                .with_skip_cache_check(skip_cache_check);
-            Ok(Arc::new(storage))
-        }
+        CacheType::Redis(c) => (build_redis_operator(c)?, c.rw_mode.into()),
+        #[cfg(not(feature = "redis"))]
+        CacheType::Redis(_) => bail!("Redis cache support is not enabled"),
         #[cfg(feature = "s3")]
         CacheType::S3(c) => {
             debug!(
-                "Init s3 cache with bucket {}, endpoint {:?}",
-                c.bucket, c.endpoint
+                "Init s3 cache with bucket {}, endpoint {}",
+                c.bucket,
+                c.endpoint.as_deref().unwrap_or("<default>")
             );
-            let storage_builder =
-                S3Cache::new(c.bucket.clone(), c.key_prefix.clone(), c.no_credentials);
-            let operator = storage_builder
-                .with_region(c.region.clone())
-                .with_endpoint(c.endpoint.clone())
-                .with_use_ssl(c.use_ssl)
-                .with_server_side_encryption(c.server_side_encryption)
-                .with_server_side_encryption_aws_kms(c.server_side_encryption_aws_kms)
-                .with_server_side_encryption_kms_key_id(c.server_side_encryption_kms_key_id.clone())
-                .with_enable_virtual_host_style(c.enable_virtual_host_style)
-                .build()
-                .map_err(|err| anyhow!("create s3 cache failed: {err:?}"))?;
-
-            let storage = RemoteStorage::new(operator, basedirs.to_vec(), c.rw_mode.into())
-                .with_skip_cache_check(skip_cache_check);
-            Ok(Arc::new(storage))
+            (build_s3_operator(c)?, c.rw_mode.into())
         }
+        #[cfg(not(feature = "s3"))]
+        CacheType::S3(_) => bail!("S3 cache support is not enabled"),
         #[cfg(feature = "webdav")]
         CacheType::Webdav(c) => {
             debug!("Init webdav cache with endpoint {}", c.endpoint);
-
-            let operator = WebdavCache::build(
-                &c.endpoint,
-                &c.key_prefix,
-                c.username.as_deref(),
-                c.password.as_deref(),
-                c.token.as_deref(),
-                c.disable_create_dir,
-            )
-            .map_err(|err| anyhow!("create webdav cache failed: {err:?}"))?;
-
-            let storage = RemoteStorage::new(operator, basedirs.to_vec(), c.rw_mode.into())
-                .with_skip_cache_check(skip_cache_check);
-            Ok(Arc::new(storage))
+            (build_webdav_operator(c)?, c.rw_mode.into())
         }
+        #[cfg(not(feature = "webdav"))]
+        CacheType::Webdav(_) => bail!("WebDAV cache support is not enabled"),
         #[cfg(feature = "oss")]
         CacheType::OSS(c) => {
             debug!(
-                "Init oss cache with bucket {}, endpoint {:?}",
-                c.bucket, c.endpoint
+                "Init oss cache with bucket {}, endpoint {}",
+                c.bucket,
+                c.endpoint.as_deref().unwrap_or("<default>")
             );
-
-            let operator = OSSCache::build(
-                &c.bucket,
-                &c.key_prefix,
-                c.endpoint.as_deref(),
-                c.no_credentials,
-            )
-            .map_err(|err| anyhow!("create oss cache failed: {err:?}"))?;
-
-            let storage = RemoteStorage::new(operator, basedirs.to_vec(), c.rw_mode.into())
-                .with_skip_cache_check(skip_cache_check);
-            Ok(Arc::new(storage))
+            (build_oss_operator(c)?, c.rw_mode.into())
         }
+        #[cfg(not(feature = "oss"))]
+        CacheType::OSS(_) => bail!("OSS cache support is not enabled"),
         #[cfg(feature = "cos")]
         CacheType::COS(c) => {
             debug!(
-                "Init cos cache with bucket {}, endpoint {:?}",
-                c.bucket, c.endpoint
+                "Init cos cache with bucket {}, endpoint {}",
+                c.bucket,
+                c.endpoint.as_deref().unwrap_or("<default>")
             );
-
-            let operator = COSCache::build(&c.bucket, &c.key_prefix, c.endpoint.as_deref())
-                .map_err(|err| anyhow!("create cos cache failed: {err:?}"))?;
-
-            let storage = RemoteStorage::new(operator, basedirs.to_vec(), c.rw_mode.into())
-                .with_skip_cache_check(skip_cache_check);
-            Ok(Arc::new(storage))
+            (build_cos_operator(c)?, c.rw_mode.into())
         }
-        #[cfg(not(all(
-            feature = "azure",
-            feature = "gcs",
-            feature = "gha",
-            feature = "memcached",
-            feature = "redis",
-            feature = "s3",
-            feature = "webdav",
-            feature = "oss",
-            feature = "cos"
-        )))]
-        _ => {
-            bail!("Cache type not supported with current feature configuration")
-        }
-    }
+        #[cfg(not(feature = "cos"))]
+        CacheType::COS(_) => bail!("COS cache support is not enabled"),
+    };
+
+    let storage = RemoteStorage::new(operator, basedirs.to_vec(), rw_mode)
+        .with_skip_cache_check(skip_cache_check);
+    Ok(Arc::new(storage))
 }
 
 /// Get a suitable `Storage` implementation from configuration.
 /// Supports both single-cache (backward compatible) and multi-level cache configurations.
+///
+/// # Errors
+///
+/// Returns an error if a configured cache backend is invalid or cannot be initialized.
 pub fn storage_from_config(
     config: &Config,
     pool: &tokio::runtime::Handle,
@@ -739,7 +740,7 @@ pub fn storage_from_config(
     let (dir, size) = (&config.fallback_cache.dir, config.fallback_cache.size);
     let preprocessor_cache_mode_config = config.fallback_cache.preprocessor_cache_mode;
     let rw_mode = config.fallback_cache.rw_mode.into();
-    debug!("Init disk cache with dir {dir:?}, size {size}");
+    debug!("Init disk cache with dir {}, size {size}", dir.display());
     Ok(Arc::new(DiskCache::new(
         dir,
         size,
