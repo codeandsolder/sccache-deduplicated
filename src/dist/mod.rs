@@ -26,7 +26,7 @@ use std::str::FromStr;
 #[cfg(feature = "dist-server")]
 use std::sync::Mutex;
 
-use crate::errors::*;
+use crate::errors::{Result, bail};
 
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 mod cache;
@@ -217,8 +217,16 @@ mod path_transform {
                 .chain(self.disk_mappings())
         }
 
-        pub fn to_local(&self, p: &str) -> Option<PathBuf> {
-            self.dist_to_local_path.get(p).cloned()
+        /// Transform a distributed path back to its local Windows path.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the distributed path has no recorded local mapping.
+        pub fn to_local(&self, p: &str) -> crate::errors::Result<PathBuf> {
+            self.dist_to_local_path
+                .get(p)
+                .cloned()
+                .ok_or_else(|| crate::errors::anyhow!("unknown distributed path: {p}"))
         }
     }
 
@@ -325,7 +333,6 @@ mod path_transform {
 #[cfg(unix)]
 mod path_transform {
     use std::collections::HashMap;
-    use std::iter;
     use std::path::{Path, PathBuf};
 
     #[derive(Debug)]
@@ -381,25 +388,36 @@ mod path_transform {
             Some(dist_path)
         }
 
-        pub fn disk_mappings(&self) -> impl Iterator<Item = (PathBuf, String)> {
-            iter::empty()
+        pub fn disk_mappings(&self) -> impl Iterator<Item = (PathBuf, String)> + '_ {
+            // Unix paths have no drive-prefix mappings. Keep the method shape
+            // aligned with Windows while returning an allocation-free empty iterator.
+            self.root_mappings.iter().take(0).cloned()
         }
 
         pub fn path_mappings(&self) -> impl Iterator<Item = (PathBuf, String)> + '_ {
             self.root_mappings.iter().cloned()
         }
 
-        #[must_use]
-        pub fn to_local(&self, p: &str) -> Option<PathBuf> {
+        /// Transform a distributed path back to its local Unix path.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the path contains an embedded NUL byte.
+        pub fn to_local(&self, p: &str) -> crate::errors::Result<PathBuf> {
+            if p.as_bytes().contains(&0) {
+                return Err(crate::errors::anyhow!(
+                    "distributed path contains an embedded NUL"
+                ));
+            }
             if let Some(local) = self.dist_to_local_path.get(p) {
-                return Some(local.clone());
+                return Ok(local.clone());
             }
             for (local_root, dist_root) in &self.root_mappings {
                 if let Ok(suffix) = Path::new(p).strip_prefix(dist_root) {
-                    return Some(local_root.join(suffix));
+                    return Ok(local_root.join(suffix));
                 }
             }
-            Some(PathBuf::from(p))
+            Ok(PathBuf::from(p))
         }
     }
 
@@ -410,18 +428,19 @@ mod path_transform {
     }
 
     #[test]
-    fn test_root_mapping() {
+    fn test_root_mapping() -> crate::errors::Result<()> {
         let mut pt = PathTransformer::new();
         pt.add_root_mapping(PathBuf::from("/physical/project"), "/build");
         assert_eq!(
             pt.as_dist(Path::new("/physical/project/src/lib.rs"))
-                .unwrap(),
-            "/build/src/lib.rs"
+                .as_deref(),
+            Some("/build/src/lib.rs")
         );
         assert_eq!(
-            pt.to_local("/build/src/lib.rs").unwrap(),
+            pt.to_local("/build/src/lib.rs")?,
             PathBuf::from("/physical/project/src/lib.rs")
         );
+        Ok(())
     }
 }
 
@@ -546,12 +565,11 @@ pub enum JobState {
 }
 impl fmt::Display for JobState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use self::JobState::*;
         match *self {
-            Pending => "pending",
-            Ready => "ready",
-            Started => "started",
-            Complete => "complete",
+            Self::Pending => "pending",
+            Self::Ready => "ready",
+            Self::Started => "started",
+            Self::Complete => "complete",
         }
         .fmt(f)
     }
@@ -577,6 +595,11 @@ pub struct ProcessOutput {
     pub stderr: Vec<u8>,
 }
 impl ProcessOutput {
+    /// Convert a process output into the cross-platform distributed representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the process terminated without a portable exit code.
     #[cfg(unix)]
     pub fn try_from(o: process::Output) -> Result<Self> {
         let code = match (o.status.code(), o.status.signal()) {
@@ -629,6 +652,11 @@ impl From<ProcessOutput> for process::Output {
 #[serde(deny_unknown_fields)]
 pub struct OutputData(Vec<u8>, u64);
 impl OutputData {
+    /// Compress output data read from `r`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if reading or compression fails.
     #[cfg(any(feature = "dist-server", all(feature = "dist-client", test)))]
     pub fn try_from_reader<R: Read>(r: R) -> io::Result<Self> {
         use flate2::Compression;
