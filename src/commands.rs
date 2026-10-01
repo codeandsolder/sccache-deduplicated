@@ -1057,13 +1057,10 @@ mod test {
         ];
         let expected = cmdline.clone();
 
-        creator
-            .lock()
-            .unwrap()
-            .next_command_calls(move |args| {
-                assert_eq!(args, expected.as_slice());
-                Ok(MockChild::new(exit_status(0), "", ""))
-            });
+        creator.lock().unwrap().next_command_calls(move |args| {
+            assert_eq!(args, expected.as_slice());
+            Ok(MockChild::new(exit_status(0), "", ""))
+        });
 
         let env_vars = vec![
             (
