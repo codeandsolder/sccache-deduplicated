@@ -220,7 +220,7 @@ fn run(command: Command) -> Result<i32> {
             };
 
             daemonize(&[])?;
-            let scheduler = Scheduler::new();
+            let scheduler = Scheduler::from_env()?;
             let http_scheduler = dist::http::Scheduler::new(
                 public_addr,
                 scheduler,
@@ -328,11 +328,63 @@ fn init_logging() {
     }
 }
 
-// Maximum number of jobs per core - only occurs for one core, usually less, see load_weight()
-const MAX_PER_CORE_LOAD: f64 = 2f64;
+const DEFAULT_JOB_SLACK_STATIC: usize = 1;
+const DEFAULT_JOB_SLACK_PERCENT: f64 = 12.5;
+const JOB_SLACK_STATIC_ENV: &str = "SCCACHE_DIST_JOB_SLACK_STATIC";
+const JOB_SLACK_PERCENT_ENV: &str = "SCCACHE_DIST_JOB_SLACK_PERCENT";
 const SERVER_REMEMBER_ERROR_TIMEOUT: Duration = Duration::from_secs(300);
 const UNCLAIMED_PENDING_TIMEOUT: Duration = Duration::from_secs(300);
 const UNCLAIMED_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct JobSlackConfig {
+    static_jobs: usize,
+    percent: f64,
+}
+
+impl Default for JobSlackConfig {
+    fn default() -> Self {
+        Self {
+            static_jobs: DEFAULT_JOB_SLACK_STATIC,
+            percent: DEFAULT_JOB_SLACK_PERCENT,
+        }
+    }
+}
+
+impl JobSlackConfig {
+    fn from_env() -> Result<Self> {
+        let static_jobs = match env::var(JOB_SLACK_STATIC_ENV) {
+            Ok(value) => value.parse::<usize>().with_context(|| {
+                format!("{JOB_SLACK_STATIC_ENV} must be a non-negative integer")
+            })?,
+            Err(env::VarError::NotPresent) => DEFAULT_JOB_SLACK_STATIC,
+            Err(err) => return Err(err).context(format!("reading {JOB_SLACK_STATIC_ENV}")),
+        };
+
+        let percent = match env::var(JOB_SLACK_PERCENT_ENV) {
+            Ok(value) => value
+                .parse::<f64>()
+                .with_context(|| format!("{JOB_SLACK_PERCENT_ENV} must be a number"))?,
+            Err(env::VarError::NotPresent) => DEFAULT_JOB_SLACK_PERCENT,
+            Err(err) => return Err(err).context(format!("reading {JOB_SLACK_PERCENT_ENV}")),
+        };
+        if !percent.is_finite() || percent < 0.0 {
+            bail!("{JOB_SLACK_PERCENT_ENV} must be finite and non-negative");
+        }
+
+        Ok(Self {
+            static_jobs,
+            percent,
+        })
+    }
+
+    fn max_jobs(self, core_count: usize) -> usize {
+        let proportional = ((core_count as f64) * self.percent / 100.0).floor() as usize;
+        core_count
+            .saturating_add(self.static_jobs)
+            .saturating_add(proportional)
+    }
+}
 
 #[derive(Copy, Clone)]
 struct JobDetail {
@@ -348,6 +400,7 @@ pub struct Scheduler {
     // scheduler must not begin again at JobId(0).
     job_id_base: u64,
     job_count: AtomicUsize,
+    job_slack: JobSlackConfig,
 
     // Currently running jobs, can never be Complete
     jobs: Mutex<BTreeMap<JobId, JobDetail>>,
@@ -373,15 +426,33 @@ struct ServerDetails {
 
 impl Scheduler {
     pub fn new() -> Self {
+        Self::new_with_job_slack(JobSlackConfig::default())
+    }
+
+    fn from_env() -> Result<Self> {
+        let job_slack = JobSlackConfig::from_env()?;
+        info!(
+            "Distributed scheduler job slack: static={} percent={}%",
+            job_slack.static_jobs, job_slack.percent
+        );
+        Ok(Self::new_with_job_slack(job_slack))
+    }
+
+    fn new_with_job_slack(job_slack: JobSlackConfig) -> Self {
         let mut bytes = [0u8; size_of::<u64>()];
         OsRng.fill_bytes(&mut bytes);
-        Self::with_job_id_base(u64::from_le_bytes(bytes))
+        Self::with_job_id_base_and_slack(u64::from_le_bytes(bytes), job_slack)
     }
 
     fn with_job_id_base(job_id_base: u64) -> Self {
+        Self::with_job_id_base_and_slack(job_id_base, JobSlackConfig::default())
+    }
+
+    fn with_job_id_base_and_slack(job_id_base: u64, job_slack: JobSlackConfig) -> Self {
         Scheduler {
             job_id_base,
             job_count: AtomicUsize::new(0),
+            job_slack,
             jobs: Mutex::new(BTreeMap::new()),
             servers: Mutex::new(HashMap::new()),
         }
@@ -439,18 +510,14 @@ impl Default for Scheduler {
     }
 }
 
-fn load_weight(job_count: usize, core_count: usize) -> f64 {
-    // Oversubscribe cores just a little to make up for network and I/O latency. This formula is
-    // not based on hard data but an extrapolation to high core counts of the conventional wisdom
-    // that slightly more jobs than cores achieve the shortest compile time. Which is originally
-    // about local compiles and this is over the network, so be slightly less conservative.
-    let cores_plus_slack = core_count + 1 + core_count / 8;
-    // Note >=, not >, because the question is "can we add another job"?
-    if job_count >= cores_plus_slack {
-        MAX_PER_CORE_LOAD + 1f64 // no new jobs for now
-    } else {
-        job_count as f64 / core_count as f64
+fn load_weight(job_count: usize, core_count: usize, job_slack: JobSlackConfig) -> Option<f64> {
+    // Admission and balancing are deliberately separate. The in-flight limit controls how many
+    // jobs may be assigned to a worker, while the weight still reflects jobs per real CPU so
+    // heterogeneous workers remain balanced by actual compute capacity.
+    if core_count == 0 || job_count >= job_slack.max_jobs(core_count) {
+        return None;
     }
+    Some(job_count as f64 / core_count as f64)
 }
 
 impl SchedulerIncoming for Scheduler {
@@ -466,34 +533,30 @@ impl SchedulerIncoming for Scheduler {
             let res = {
                 let mut best = None;
                 let mut best_err = None;
-                let mut best_load: f64 = MAX_PER_CORE_LOAD;
+                let mut best_load = f64::INFINITY;
                 let now = Instant::now();
                 for (&server_id, details) in servers.iter_mut() {
-                    let load = load_weight(details.jobs_assigned.len(), details.num_cpus);
+                    let Some(load) = load_weight(
+                        details.jobs_assigned.len(),
+                        details.num_cpus,
+                        self.job_slack,
+                    ) else {
+                        continue;
+                    };
 
                     if let Some(last_error) = details.last_error {
-                        if load < MAX_PER_CORE_LOAD {
-                            if now.duration_since(last_error) > SERVER_REMEMBER_ERROR_TIMEOUT {
-                                details.last_error = None;
-                            }
-                            match best_err {
-                                Some((
-                                    _,
-                                    &mut ServerDetails {
-                                        last_error: Some(best_last_err),
-                                        ..
-                                    },
-                                )) => {
-                                    if last_error < best_last_err {
-                                        trace!(
-                                            "Selected {:?}, its most recent error is {:?} ago",
-                                            server_id,
-                                            now - last_error
-                                        );
-                                        best_err = Some((server_id, details));
-                                    }
-                                }
-                                _ => {
+                        if now.duration_since(last_error) > SERVER_REMEMBER_ERROR_TIMEOUT {
+                            details.last_error = None;
+                        }
+                        match best_err {
+                            Some((
+                                _,
+                                &mut ServerDetails {
+                                    last_error: Some(best_last_err),
+                                    ..
+                                },
+                            )) => {
+                                if last_error < best_last_err {
                                     trace!(
                                         "Selected {:?}, its most recent error is {:?} ago",
                                         server_id,
@@ -501,6 +564,14 @@ impl SchedulerIncoming for Scheduler {
                                     );
                                     best_err = Some((server_id, details));
                                 }
+                            }
+                            _ => {
+                                trace!(
+                                    "Selected {:?}, its most recent error is {:?} ago",
+                                    server_id,
+                                    now - last_error
+                                );
+                                best_err = Some((server_id, details));
                             }
                         }
                     } else if load < best_load {
@@ -891,6 +962,29 @@ mod scheduler_tests {
         assert_eq!(scheduler0.next_job_id(), JobId(0x1000));
         assert_eq!(scheduler0.next_job_id(), JobId(0x1001));
         assert_eq!(scheduler1.next_job_id(), JobId(0x2000));
+    }
+
+    #[test]
+    fn default_job_slack_preserves_historical_threshold() {
+        let slack = JobSlackConfig::default();
+
+        for cores in [1, 2, 7, 8, 12, 16, 64] {
+            assert_eq!(slack.max_jobs(cores), cores + 1 + cores / 8);
+        }
+        assert!(load_weight(13, 12, slack).is_some());
+        assert!(load_weight(14, 12, slack).is_none());
+    }
+
+    #[test]
+    fn configured_job_slack_can_queue_well_beyond_worker_width() {
+        let slack = JobSlackConfig {
+            static_jobs: 0,
+            percent: 400.0,
+        };
+
+        assert_eq!(slack.max_jobs(12), 60);
+        assert!(load_weight(59, 12, slack).is_some());
+        assert!(load_weight(60, 12, slack).is_none());
     }
 
     #[test]

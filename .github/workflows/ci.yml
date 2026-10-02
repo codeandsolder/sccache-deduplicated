@@ -52,13 +52,17 @@ jobs:
       RUSTFLAGS: ${{ startsWith(github.ref, 'refs/tags/') && '' || '-C target-cpu=x86-64-v2' }}
     strategy:
       matrix:
-        feature: [ azure, gcs, gha, memcached, redis, s3, webdav, "dist-client,s3" ]
+        feature: [ azure, gcs, gha, memcached, redis, s3, webdav, dist-server, "dist-client,s3" ]
     steps:
       - name: Clone repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Check feature ${{ matrix.feature }}
         run: cargo check --no-default-features --features ${{ matrix.feature }}
+
+      - name: Test scheduler unit tests
+        if: ${{ matrix.feature == 'dist-server' }}
+        run: cargo test --locked --no-default-features --features=dist-server --bin sccache-dist scheduler_tests
 
   toml_format:
     runs-on: ubuntu-latest
