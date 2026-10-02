@@ -328,8 +328,6 @@ fn init_logging() {
     }
 }
 
-// Maximum number of jobs per core - only occurs for one core, usually less, see load_weight()
-const MAX_PER_CORE_LOAD: f64 = 2f64;
 const DIST_JOB_SLACK_STATIC_ENV: &str = "SCCACHE_DIST_JOB_SLACK_STATIC";
 const DIST_JOB_SLACK_PERCENT_ENV: &str = "SCCACHE_DIST_JOB_SLACK_PERCENT";
 const SERVER_REMEMBER_ERROR_TIMEOUT: Duration = Duration::from_secs(300);
@@ -514,20 +512,16 @@ impl Default for Scheduler {
     }
 }
 
-fn load_weight(
+fn has_capacity(
     job_count: usize,
     core_count: usize,
     capacity_policy: SchedulerCapacityPolicy,
-) -> f64 {
-    // Oversubscribe cores to make up for network, I/O, and compiler phase latency. The defaults
-    // preserve the historical policy exactly: one static slot plus one eighth of the CPUs.
-    let cores_plus_slack = capacity_policy.max_jobs(core_count);
-    // Note >=, not >, because the question is "can we add another job"?
-    if job_count >= cores_plus_slack {
-        MAX_PER_CORE_LOAD + 1f64 // no new jobs for now
-    } else {
-        job_count as f64 / core_count as f64
-    }
+) -> bool {
+    job_count < capacity_policy.max_jobs(core_count)
+}
+
+fn load_weight(job_count: usize, core_count: usize) -> f64 {
+    job_count as f64 / core_count as f64
 }
 
 impl SchedulerIncoming for Scheduler {
@@ -543,38 +537,31 @@ impl SchedulerIncoming for Scheduler {
             let res = {
                 let mut best = None;
                 let mut best_err = None;
-                let mut best_load: f64 = MAX_PER_CORE_LOAD;
+                let mut best_load = f64::INFINITY;
                 let now = Instant::now();
                 for (&server_id, details) in servers.iter_mut() {
-                    let load = load_weight(
+                    if !has_capacity(
                         details.jobs_assigned.len(),
                         details.num_cpus,
                         self.capacity_policy,
-                    );
+                    ) {
+                        continue;
+                    }
+                    let load = load_weight(details.jobs_assigned.len(), details.num_cpus);
 
                     if let Some(last_error) = details.last_error {
-                        if load < MAX_PER_CORE_LOAD {
-                            if now.duration_since(last_error) > SERVER_REMEMBER_ERROR_TIMEOUT {
-                                details.last_error = None;
-                            }
-                            match best_err {
-                                Some((
-                                    _,
-                                    &mut ServerDetails {
-                                        last_error: Some(best_last_err),
-                                        ..
-                                    },
-                                )) => {
-                                    if last_error < best_last_err {
-                                        trace!(
-                                            "Selected {:?}, its most recent error is {:?} ago",
-                                            server_id,
-                                            now - last_error
-                                        );
-                                        best_err = Some((server_id, details));
-                                    }
-                                }
-                                _ => {
+                        if now.duration_since(last_error) > SERVER_REMEMBER_ERROR_TIMEOUT {
+                            details.last_error = None;
+                        }
+                        match best_err {
+                            Some((
+                                _,
+                                &mut ServerDetails {
+                                    last_error: Some(best_last_err),
+                                    ..
+                                },
+                            )) => {
+                                if last_error < best_last_err {
                                     trace!(
                                         "Selected {:?}, its most recent error is {:?} ago",
                                         server_id,
@@ -582,6 +569,14 @@ impl SchedulerIncoming for Scheduler {
                                     );
                                     best_err = Some((server_id, details));
                                 }
+                            }
+                            _ => {
+                                trace!(
+                                    "Selected {:?}, its most recent error is {:?} ago",
+                                    server_id,
+                                    now - last_error
+                                );
+                                best_err = Some((server_id, details));
                             }
                         }
                     } else if load < best_load {
@@ -979,8 +974,10 @@ mod scheduler_tests {
             percent_slack: 400.0,
         };
         assert_eq!(policy.max_jobs(12), 60);
-        assert!(load_weight(59, 12, policy) < MAX_PER_CORE_LOAD);
-        assert!(load_weight(60, 12, policy) > MAX_PER_CORE_LOAD);
+        assert!(has_capacity(59, 12, policy));
+        assert!(!has_capacity(60, 12, policy));
+        assert_eq!(load_weight(12, 12), 1.0);
+        assert!(load_weight(59, 12) > 2.0);
     }
 
     #[test]
