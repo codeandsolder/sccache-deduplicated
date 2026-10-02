@@ -220,7 +220,7 @@ fn run(command: Command) -> Result<i32> {
             };
 
             daemonize(&[])?;
-            let scheduler = Scheduler::new();
+            let scheduler = Scheduler::from_env()?;
             let http_scheduler = dist::http::Scheduler::new(
                 public_addr,
                 scheduler,
@@ -330,6 +330,8 @@ fn init_logging() {
 
 // Maximum number of jobs per core - only occurs for one core, usually less, see load_weight()
 const MAX_PER_CORE_LOAD: f64 = 2f64;
+const DIST_JOB_SLACK_STATIC_ENV: &str = "SCCACHE_DIST_JOB_SLACK_STATIC";
+const DIST_JOB_SLACK_PERCENT_ENV: &str = "SCCACHE_DIST_JOB_SLACK_PERCENT";
 const SERVER_REMEMBER_ERROR_TIMEOUT: Duration = Duration::from_secs(300);
 const UNCLAIMED_PENDING_TIMEOUT: Duration = Duration::from_secs(300);
 const UNCLAIMED_READY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -353,6 +355,61 @@ pub struct Scheduler {
     jobs: Mutex<BTreeMap<JobId, JobDetail>>,
 
     servers: Mutex<HashMap<ServerId, ServerDetails>>,
+    capacity_policy: SchedulerCapacityPolicy,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct SchedulerCapacityPolicy {
+    static_slack: usize,
+    percent_slack: f64,
+}
+
+impl Default for SchedulerCapacityPolicy {
+    fn default() -> Self {
+        Self {
+            static_slack: 1,
+            percent_slack: 12.5,
+        }
+    }
+}
+
+impl SchedulerCapacityPolicy {
+    fn from_env() -> Result<Self> {
+        let defaults = Self::default();
+        let static_slack = match env::var(DIST_JOB_SLACK_STATIC_ENV) {
+            Ok(value) => value.parse::<usize>().with_context(|| {
+                format!("{DIST_JOB_SLACK_STATIC_ENV} must be a non-negative integer")
+            })?,
+            Err(env::VarError::NotPresent) => defaults.static_slack,
+            Err(e) => return Err(e).context(format!("Failed to read {DIST_JOB_SLACK_STATIC_ENV}")),
+        };
+        let percent_slack = match env::var(DIST_JOB_SLACK_PERCENT_ENV) {
+            Ok(value) => {
+                let value = value.parse::<f64>().with_context(|| {
+                    format!("{DIST_JOB_SLACK_PERCENT_ENV} must be a non-negative number")
+                })?;
+                if !value.is_finite() || value < 0.0 {
+                    bail!("{DIST_JOB_SLACK_PERCENT_ENV} must be a finite non-negative number");
+                }
+                value
+            }
+            Err(env::VarError::NotPresent) => defaults.percent_slack,
+            Err(e) => {
+                return Err(e).context(format!("Failed to read {DIST_JOB_SLACK_PERCENT_ENV}"));
+            }
+        };
+        Ok(Self {
+            static_slack,
+            percent_slack,
+        })
+    }
+
+    fn max_jobs(self, core_count: usize) -> usize {
+        let percent_slack = ((core_count as f64) * self.percent_slack / 100.0).floor() as usize;
+        core_count
+            .saturating_add(self.static_slack)
+            .saturating_add(percent_slack)
+    }
 }
 
 fn remove_assigned_job(jobs_assigned: &mut HashSet<JobId>, job_id: JobId) -> bool {
@@ -373,17 +430,35 @@ struct ServerDetails {
 
 impl Scheduler {
     pub fn new() -> Self {
+        Self::with_capacity_policy(SchedulerCapacityPolicy::default())
+    }
+
+    fn from_env() -> Result<Self> {
+        Ok(Self::with_capacity_policy(
+            SchedulerCapacityPolicy::from_env()?,
+        ))
+    }
+
+    fn with_capacity_policy(capacity_policy: SchedulerCapacityPolicy) -> Self {
         let mut bytes = [0u8; size_of::<u64>()];
         OsRng.fill_bytes(&mut bytes);
-        Self::with_job_id_base(u64::from_le_bytes(bytes))
+        Self::with_job_id_base_and_policy(u64::from_le_bytes(bytes), capacity_policy)
     }
 
     fn with_job_id_base(job_id_base: u64) -> Self {
+        Self::with_job_id_base_and_policy(job_id_base, SchedulerCapacityPolicy::default())
+    }
+
+    fn with_job_id_base_and_policy(
+        job_id_base: u64,
+        capacity_policy: SchedulerCapacityPolicy,
+    ) -> Self {
         Scheduler {
             job_id_base,
             job_count: AtomicUsize::new(0),
             jobs: Mutex::new(BTreeMap::new()),
             servers: Mutex::new(HashMap::new()),
+            capacity_policy,
         }
     }
 
@@ -439,12 +514,14 @@ impl Default for Scheduler {
     }
 }
 
-fn load_weight(job_count: usize, core_count: usize) -> f64 {
-    // Oversubscribe cores just a little to make up for network and I/O latency. This formula is
-    // not based on hard data but an extrapolation to high core counts of the conventional wisdom
-    // that slightly more jobs than cores achieve the shortest compile time. Which is originally
-    // about local compiles and this is over the network, so be slightly less conservative.
-    let cores_plus_slack = core_count + 1 + core_count / 8;
+fn load_weight(
+    job_count: usize,
+    core_count: usize,
+    capacity_policy: SchedulerCapacityPolicy,
+) -> f64 {
+    // Oversubscribe cores to make up for network, I/O, and compiler phase latency. The defaults
+    // preserve the historical policy exactly: one static slot plus one eighth of the CPUs.
+    let cores_plus_slack = capacity_policy.max_jobs(core_count);
     // Note >=, not >, because the question is "can we add another job"?
     if job_count >= cores_plus_slack {
         MAX_PER_CORE_LOAD + 1f64 // no new jobs for now
@@ -469,7 +546,11 @@ impl SchedulerIncoming for Scheduler {
                 let mut best_load: f64 = MAX_PER_CORE_LOAD;
                 let now = Instant::now();
                 for (&server_id, details) in servers.iter_mut() {
-                    let load = load_weight(details.jobs_assigned.len(), details.num_cpus);
+                    let load = load_weight(
+                        details.jobs_assigned.len(),
+                        details.num_cpus,
+                        self.capacity_policy,
+                    );
 
                     if let Some(last_error) = details.last_error {
                         if load < MAX_PER_CORE_LOAD {
@@ -882,6 +963,25 @@ impl ServerIncoming for Server {
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
+
+    #[test]
+    fn default_capacity_policy_matches_legacy_formula() {
+        let policy = SchedulerCapacityPolicy::default();
+        for cores in 1..=256 {
+            assert_eq!(policy.max_jobs(cores), cores + 1 + cores / 8);
+        }
+    }
+
+    #[test]
+    fn capacity_policy_supports_large_oversubscription() {
+        let policy = SchedulerCapacityPolicy {
+            static_slack: 0,
+            percent_slack: 400.0,
+        };
+        assert_eq!(policy.max_jobs(12), 60);
+        assert!(load_weight(59, 12, policy) < MAX_PER_CORE_LOAD);
+        assert!(load_weight(60, 12, policy) > MAX_PER_CORE_LOAD);
+    }
 
     #[test]
     fn scheduler_instances_namespace_job_ids() {
