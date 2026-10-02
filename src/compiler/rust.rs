@@ -695,8 +695,8 @@ fn append_rust_shadow_record(path: &Path, record: &RustShadowRecord) {
             if written == encoded.len() {
                 Ok(())
             } else {
-                Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
                     format!(
                         "short Rust shadow telemetry append: {written}/{} bytes",
                         encoded.len()
