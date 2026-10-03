@@ -497,7 +497,8 @@ impl HyperBuilderWrap {
     }
 }
 
-fn error_code_response<E>(uri: &hyper::Uri, e: E) -> Response<Full<Bytes>>where
+fn error_code_response<E>(uri: &hyper::Uri, e: E) -> Response<Full<Bytes>>
+where
     E: std::fmt::Debug,
 {
     let body = format!("{e:?}");

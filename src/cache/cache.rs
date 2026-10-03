@@ -397,7 +397,8 @@ impl Storage for RemoteStorage {
             Err(err) => {
                 eprintln!("storage write check failed: {err:?}");
                 false
-            }        };
+            }
+        };
 
         let mode = if can_write {
             CacheMode::ReadWrite
@@ -797,6 +798,7 @@ mod test {
             .enable_all()
             .worker_threads(1)
             .build()?;
+
         let mut config = Config {
             cache: None,
             ..Default::default()

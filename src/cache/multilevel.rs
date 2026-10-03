@@ -397,7 +397,8 @@ pub struct MultiLevelStorage {
 }
 
 impl MultiLevelStorage {
-    /// Collect and deduplicate basedirs from all cache levels.    fn collect_basedirs(levels: &[Arc<dyn Storage>]) -> Vec<Vec<u8>> {
+    /// Collect and deduplicate basedirs from all cache levels.
+    fn collect_basedirs(levels: &[Arc<dyn Storage>]) -> Vec<Vec<u8>> {
         let mut seen = Vec::new();
         for level in levels {
             for basedir in level.basedirs() {
@@ -796,7 +797,8 @@ impl MultiLevelStorage {
                             Some(stats.as_ref()),
                             write_duration_nanos,
                             duration_nanos_u64(duration)
-                        );                        trace!(
+                        );
+                        trace!(
                             "Repaired slower cache level {idx} from faster level {hit_idx} in {duration:?}"
                         );
                     }
