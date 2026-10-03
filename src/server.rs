@@ -778,8 +778,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
 
                 // We're not interested if the task panicked; immediately process
                 // another connection
-                #[allow(clippy::let_underscore_future)]
-                let _ = tokio::spawn(conn);
+                drop(tokio::spawn(conn));
             }
         };
 
