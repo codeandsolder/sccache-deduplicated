@@ -4,8 +4,10 @@ use reqwest::ClientBuilder;
 
 /// Build an HTTP transport with a custom user agent (helps with monitoring on
 /// the server side).
-pub fn set_user_agent() -> HttpTransporter {
+pub fn set_user_agent() -> reqwest::Result<HttpTransporter> {
     let user_agent = format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-    let client = ClientBuilder::new().user_agent(user_agent).build().unwrap();
-    HttpTransporter::new(ReqwestTransport::new(client))
+    ClientBuilder::new()
+        .user_agent(user_agent)
+        .build()
+        .map(|client| HttpTransporter::new(ReqwestTransport::new(client)))
 }

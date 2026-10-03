@@ -8,10 +8,10 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-//! A cache that holds a limited number of key-value pairs. When the
-//! capacity of the cache is exceeded, the least-recently-used
-//! (where "used" means a look-up or putting the pair into the cache)
-//! pair is automatically removed.
+//! A cache that holds a limited number of key-value pairs.
+//!
+//! When the capacity is exceeded, the least-recently-used pair is removed.
+//! A pair counts as used when it is looked up or inserted.
 //!
 //! # Examples
 //!
@@ -91,9 +91,9 @@ pub trait CountableMeter<K, V>: Meter<K, V> {
 }
 
 /// `Count` is all no-ops, the number of entries in the map is the size.
-impl<K, V, T: Meter<K, V>> CountableMeter<K, V> for T
+impl<K, V, T> CountableMeter<K, V> for T
 where
-    T: CountableMeterWithMeasure<K, V, <T as Meter<K, V>>::Measure>,
+    T: Meter<K, V> + CountableMeterWithMeasure<K, V, <T as Meter<K, V>>::Measure>,
 {
     fn add(&self, current: Self::Measure, amount: Self::Measure) -> Self::Measure {
         CountableMeterWithMeasure::meter_add(self, current, amount)
@@ -118,19 +118,40 @@ pub trait CountableMeterWithMeasure<K, V, M> {
     fn meter_size(&self, current: M) -> Option<u64>;
 }
 
-/// For any other `Meter` with `Measure=usize`, just do the simple math.
+/// For any `Meter` with `Measure=usize`, use saturating arithmetic.
 impl<K, V, T> CountableMeterWithMeasure<K, V, usize> for T
 where
-    T: Meter<K, V>,
+    T: Meter<K, V, Measure = usize>,
 {
     fn meter_add(&self, current: usize, amount: usize) -> usize {
-        current + amount
+        current.saturating_add(amount)
     }
+
     fn meter_sub(&self, current: usize, amount: usize) -> usize {
-        current - amount
+        current.saturating_sub(amount)
     }
+
     fn meter_size(&self, current: usize) -> Option<u64> {
-        Some(current as u64)
+        Some(u64::try_from(current).unwrap_or(u64::MAX))
+    }
+}
+
+/// For byte-sized or otherwise wide meters, keep the measurement in `u64`
+/// end-to-end so 32-bit targets do not truncate large entries.
+impl<K, V, T> CountableMeterWithMeasure<K, V, u64> for T
+where
+    T: Meter<K, V, Measure = u64>,
+{
+    fn meter_add(&self, current: u64, amount: u64) -> u64 {
+        current.saturating_add(amount)
+    }
+
+    fn meter_sub(&self, current: u64, amount: u64) -> u64 {
+        current.saturating_sub(amount)
+    }
+
+    fn meter_size(&self, current: u64) -> Option<u64> {
+        Some(current)
     }
 }
 
@@ -161,8 +182,9 @@ impl<K: Eq + Hash, V> LruCache<K, V> {
     /// use lru_cache::LruCache;
     /// let mut cache: LruCache<i32, &str> = LruCache::new(10);
     /// ```
+    #[must_use]
     pub fn new(capacity: u64) -> Self {
-        LruCache {
+        Self {
             map: LinkedHashMap::new(),
             current_measure: (),
             max_capacity: capacity,
@@ -205,8 +227,8 @@ impl<K: Eq + Hash, V, M: CountableMeter<K, V>> LruCache<K, V, RandomState, M> {
     /// assert_eq!(cache.size(), 4);
     /// assert_eq!(cache.len(), 2);
     /// ```
-    pub fn with_meter(capacity: u64, meter: M) -> LruCache<K, V, RandomState, M> {
-        LruCache {
+    pub fn with_meter(capacity: u64, meter: M) -> Self {
+        Self {
             map: LinkedHashMap::new(),
             current_measure: Default::default(),
             max_capacity: capacity,
@@ -217,8 +239,8 @@ impl<K: Eq + Hash, V, M: CountableMeter<K, V>> LruCache<K, V, RandomState, M> {
 
 impl<K: Eq + Hash, V, S: BuildHasher> LruCache<K, V, S, Count> {
     /// Creates an empty cache that can hold at most `capacity` items with the given hash builder.
-    pub fn with_hasher(capacity: u64, hash_builder: S) -> LruCache<K, V, S, Count> {
-        LruCache {
+    pub fn with_hasher(capacity: u64, hash_builder: S) -> Self {
+        Self {
             map: LinkedHashMap::with_hasher(hash_builder),
             current_measure: (),
             max_capacity: capacity,
@@ -294,7 +316,7 @@ impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> LruCache<K, V, S,
     /// Creates an empty cache that can hold at most `capacity` as measured by `meter` with the
     /// given hash builder.
     pub fn with_meter_and_hasher(capacity: u64, meter: M, hash_builder: S) -> Self {
-        LruCache {
+        Self {
             map: LinkedHashMap::with_hasher(hash_builder),
             current_measure: Default::default(),
             max_capacity: capacity,
@@ -312,7 +334,7 @@ impl<K: Eq + Hash, V, S: BuildHasher, M: CountableMeter<K, V>> LruCache<K, V, S,
     /// let mut cache: LruCache<i32, &str> = LruCache::new(2);
     /// assert_eq!(cache.capacity(), 2);
     /// ```
-    pub fn capacity(&self) -> u64 {
+    pub const fn capacity(&self) -> u64 {
         self.max_capacity
     }
 
@@ -620,8 +642,8 @@ impl<K, V> ExactSizeIterator for IntoIter<K, V> {
 /// Accessing a cache through the iterator does _not_ affect the cache's LRU state.
 pub struct Iter<'a, K, V>(linked_hash_map::Iter<'a, K, V>);
 
-impl<'a, K, V> Clone for Iter<'a, K, V> {
-    fn clone(&self) -> Iter<'a, K, V> {
+impl<K, V> Clone for Iter<'_, K, V> {
+    fn clone(&self) -> Self {
         Iter(self.0.clone())
     }
 }
@@ -726,9 +748,7 @@ mod tests {
         cache.insert(1, 10);
         cache.insert(2, 20);
         assert_eq!(cache.len(), 2);
-        let opt1 = cache.remove(&1);
-        assert!(opt1.is_some());
-        assert_eq!(opt1.unwrap(), 10);
+        assert_eq!(cache.remove(&1), Some(10));
         assert!(cache.get_mut(&1).is_none());
         assert_eq!(cache.len(), 1);
     }
@@ -750,15 +770,15 @@ mod tests {
         cache.insert(1, 10);
         cache.insert(2, 20);
         cache.insert(3, 30);
-        assert_eq!(format!("{:?}", cache), "{3: 30, 2: 20, 1: 10}");
+        assert_eq!(format!("{cache:?}"), "{3: 30, 2: 20, 1: 10}");
         cache.insert(2, 22);
-        assert_eq!(format!("{:?}", cache), "{2: 22, 3: 30, 1: 10}");
+        assert_eq!(format!("{cache:?}"), "{2: 22, 3: 30, 1: 10}");
         cache.insert(6, 60);
-        assert_eq!(format!("{:?}", cache), "{6: 60, 2: 22, 3: 30}");
+        assert_eq!(format!("{cache:?}"), "{6: 60, 2: 22, 3: 30}");
         cache.get_mut(&3);
-        assert_eq!(format!("{:?}", cache), "{3: 30, 6: 60, 2: 22}");
+        assert_eq!(format!("{cache:?}"), "{3: 30, 6: 60, 2: 22}");
         cache.set_capacity(2);
-        assert_eq!(format!("{:?}", cache), "{3: 30, 6: 60}");
+        assert_eq!(format!("{cache:?}"), "{3: 30, 6: 60}");
     }
 
     #[test]
@@ -790,7 +810,7 @@ mod tests {
         cache.clear();
         assert!(cache.get_mut(&1).is_none());
         assert!(cache.get_mut(&2).is_none());
-        assert_eq!(format!("{:?}", cache), "{}");
+        assert_eq!(format!("{cache:?}"), "{}");
     }
 
     #[test]

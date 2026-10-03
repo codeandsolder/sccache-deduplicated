@@ -15,7 +15,7 @@
 use crate::cache::CacheMode;
 use crate::cache::disk::DiskCache;
 use crate::client::connect_to_server;
-use crate::commands::{do_compile, request_shutdown, request_stats};
+use crate::commands::{CompileInvocation, do_compile, request_shutdown, request_stats};
 use crate::config::PreprocessorCacheModeConfig;
 use crate::jobserver::Client;
 use crate::mock_command::*;
@@ -44,7 +44,7 @@ struct ServerOptions {
 ///
 /// * The port on which the server is listening.
 /// * A `Sender` which can be used to send messages to the server.
-///   (Most usefully, ServerMessage::Shutdown.)
+///   (Most usefully, `ServerMessage::Shutdown`.)
 /// * An `Arc`-and-`Mutex`-wrapped `MockCommandCreator` which the server will
 ///   use for all process creation.
 /// * The `JoinHandle` for the server thread.
@@ -192,15 +192,18 @@ fn test_server_unsupported_compiler() {
     let mut stderr = Cursor::new(Vec::new());
     let path = Some(f.paths);
     let mut runtime = Runtime::new().unwrap();
+    let invocation = CompileInvocation {
+        exe,
+        cmdline,
+        cwd,
+        env_vars: vec![],
+    };
     let res = do_compile(
         client_creator,
         &mut runtime,
         conn,
-        exe,
-        cmdline,
-        cwd,
+        invocation,
         path,
-        vec![],
         &mut stdout,
         &mut stderr,
     );
@@ -269,17 +272,20 @@ fn test_server_compile() {
     let mut stderr = Cursor::new(Vec::new());
     let path = Some(f.paths);
     let mut runtime = Runtime::new().unwrap();
+    let invocation = CompileInvocation {
+        exe,
+        cmdline,
+        cwd,
+        env_vars: vec![],
+    };
     assert_eq!(
         0,
         do_compile(
             client_creator,
             &mut runtime,
             conn,
-            exe,
-            cmdline,
-            cwd,
+            invocation,
             path,
-            vec![],
             &mut stdout,
             &mut stderr
         )

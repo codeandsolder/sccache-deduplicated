@@ -10,7 +10,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::errors::*;
+use crate::errors::Result;
 use opendal::OperationContext;
 use opendal::Operator;
 use opendal::services::Webdav;
@@ -23,6 +23,9 @@ pub struct WebdavCache;
 
 impl WebdavCache {
     /// Create a new `WebdavCache`.
+    /// # Errors
+    ///
+    /// Returns an error if the OpenDAL operator or HTTP transport cannot be initialized.
     pub fn build(
         endpoint: &str,
         key_prefix: &str,
@@ -40,7 +43,7 @@ impl WebdavCache {
             .disable_create_dir(disable_create_dir);
 
         let op = Operator::new(builder)?
-            .with_context(OperationContext::new().with_http_transport(set_user_agent()))
+            .with_context(OperationContext::new().with_http_transport(set_user_agent()?))
             .layer(LoggingLayer::default());
         Ok(op)
     }

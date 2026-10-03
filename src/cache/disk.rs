@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::errors::*;
+use crate::errors::{Result, anyhow};
 
 use super::lazy_disk_cache::LazyDiskCache;
 use super::utils::normalize_key;
@@ -50,8 +50,8 @@ impl DiskCache {
         preprocessor_cache_mode_config: PreprocessorCacheModeConfig,
         rw_mode: CacheMode,
         basedirs: Vec<Vec<u8>>,
-    ) -> DiskCache {
-        DiskCache {
+    ) -> Self {
+        Self {
             lru: Arc::new(Mutex::new(LazyDiskCache::Uninit {
                 root: root.as_ref().to_os_string(),
                 max_size,
@@ -78,24 +78,26 @@ fn make_key_path(key: &str) -> PathBuf {
 #[async_trait]
 impl Storage for DiskCache {
     async fn get(&self, key: &str) -> Result<Cache> {
-        trace!("DiskCache::get({})", key);
+        trace!("DiskCache::get({key})");
         let path = make_key_path(key);
         let lru = self.lru.clone();
         let key = key.to_owned();
 
         self.pool
             .spawn_blocking(move || {
-                let io = match lru.lock().unwrap().get_or_init()?.get(&path) {
+                let mut guard = lru
+                    .lock()
+                    .map_err(|_| anyhow!("disk cache mutex poisoned"))?;
+                let io = match guard.get_or_init()?.get(&path) {
                     Ok(f) => f,
                     Err(LruError::FileNotInCache) => {
-                        trace!("DiskCache::get({}): FileNotInCache", key);
+                        trace!("DiskCache::get({key}): FileNotInCache");
                         return Ok(Cache::Miss);
                     }
-                    Err(LruError::Io(e)) => {
-                        trace!("DiskCache::get({}): IoError: {:?}", key, e);
+                    Err(e) => {
+                        trace!("DiskCache::get({key}): {e}");
                         return Err(e.into());
                     }
-                    Err(_) => unreachable!(),
                 };
                 let hit = CacheRead::from(io)?;
                 Ok(Cache::Hit(hit))
@@ -114,63 +116,74 @@ impl Storage for DiskCache {
     }
 
     async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {
-        trace!("DiskCache::get_raw({})", key);
+        trace!("DiskCache::get_raw({key})");
         let path = make_key_path(key);
         let lru = self.lru.clone();
         let key = key.to_owned();
 
         self.pool
-            .spawn_blocking(
-                move || match lru.lock().unwrap().get_or_init()?.get(&path) {
+            .spawn_blocking(move || {
+                let mut guard = lru
+                    .lock()
+                    .map_err(|_| anyhow!("disk cache mutex poisoned"))?;
+                match guard.get_or_init()?.get(&path) {
                     Ok(mut io) => {
                         let mut data = Vec::new();
                         io.read_to_end(&mut data)?;
-                        trace!("DiskCache::get_raw({}): Found {} bytes", key, data.len());
+                        trace!("DiskCache::get_raw({key}): Found {} bytes", data.len());
                         Ok(Some(Bytes::from(data)))
                     }
                     Err(LruError::FileNotInCache) => {
-                        trace!("DiskCache::get_raw({}): FileNotInCache", key);
+                        trace!("DiskCache::get_raw({key}): FileNotInCache");
                         Ok(None)
                     }
-                    Err(LruError::Io(e)) => {
-                        trace!("DiskCache::get_raw({}): IoError: {:?}", key, e);
+                    Err(e) => {
+                        trace!("DiskCache::get_raw({key}): {e}");
                         Err(e.into())
                     }
-                    Err(_) => unreachable!(),
-                },
-            )
+                }
+            })
             .await?
     }
 
     async fn get_path(&self, key: &str) -> GetPathResult {
         let rel_path = make_key_path(key);
         let lru = self.lru.clone();
-        self.pool
+        match self
+            .pool
             .spawn_blocking(move || {
-                match lru
-                    .lock()
-                    .unwrap()
+                let mut guard = match lru.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        warn!("disk cache mutex poisoned while resolving a cache path");
+                        poisoned.into_inner()
+                    }
+                };
+                guard
                     .get_or_init()
                     .ok()
-                    .and_then(|c| c.get_abs_path(&rel_path))
-                {
-                    Some(p) => GetPathResult::Found(p),
-                    None => GetPathResult::Miss,
-                }
+                    .and_then(|cache| cache.get_abs_path(&rel_path))
+                    .map_or(GetPathResult::Miss, GetPathResult::Found)
             })
             .await
-            .unwrap_or(GetPathResult::Miss)
+        {
+            Ok(result) => result,
+            Err(error) => {
+                warn!("disk cache path task failed: {error}");
+                GetPathResult::Miss
+            }
+        }
     }
 
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
-        trace!("DiskCache::put({})", key);
+        trace!("DiskCache::put({key})");
         // Delegate to put_raw after serializing the entry
         let data = entry.finish()?;
         self.put_raw(key, data.into()).await
     }
 
     async fn put_raw(&self, key: &str, data: Bytes) -> Result<Duration> {
-        trace!("DiskCache::put_raw({}, {} bytes)", key, data.len());
+        trace!("DiskCache::put_raw({key}, {} bytes)", data.len());
 
         if self.rw_mode == CacheMode::ReadOnly {
             return Err(anyhow!("Cannot write to a read-only cache"));
@@ -182,13 +195,17 @@ impl Storage for DiskCache {
         self.pool
             .spawn_blocking(move || {
                 let start = Instant::now();
-                let mut f = lru
-                    .lock()
-                    .unwrap()
-                    .get_or_init()?
-                    .prepare_add(key, data.len() as u64)?;
+                let mut f = {
+                    let mut guard = lru
+                        .lock()
+                        .map_err(|_| anyhow!("disk cache mutex poisoned"))?;
+                    guard.get_or_init()?.prepare_add(key, data.len() as u64)?
+                };
                 f.as_file_mut().write_all(&data)?;
-                lru.lock().unwrap().get().unwrap().commit(f)?;
+                let mut guard = lru
+                    .lock()
+                    .map_err(|_| anyhow!("disk cache mutex poisoned"))?;
+                guard.get_or_init()?.commit(f)?;
                 Ok(start.elapsed())
             })
             .await?
@@ -199,7 +216,11 @@ impl Storage for DiskCache {
     }
 
     fn location(&self) -> String {
-        format!("Local disk: {:?}", self.lru.lock().unwrap().path())
+        let guard = self
+            .lru
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        format!("Local disk: {}", guard.path().display())
     }
 
     fn cache_type_name(&self) -> &'static str {
@@ -207,10 +228,18 @@ impl Storage for DiskCache {
     }
 
     async fn current_size(&self) -> Result<Option<u64>> {
-        Ok(self.lru.lock().unwrap().get().map(|l| l.size()))
+        let mut guard = self
+            .lru
+            .lock()
+            .map_err(|_| anyhow!("disk cache mutex poisoned"))?;
+        Ok(guard.get().map(|cache| cache.size()))
     }
     async fn max_size(&self) -> Result<Option<u64>> {
-        Ok(Some(self.lru.lock().unwrap().capacity()))
+        let guard = self
+            .lru
+            .lock()
+            .map_err(|_| anyhow!("disk cache mutex poisoned"))?;
+        Ok(Some(guard.capacity()))
     }
     fn preprocessor_cache_mode_config(&self) -> PreprocessorCacheModeConfig {
         self.preprocessor_cache_mode_config
@@ -220,13 +249,15 @@ impl Storage for DiskCache {
     }
     async fn get_preprocessor_cache_entry(&self, key: &str) -> Result<Option<Box<dyn ReadSeek>>> {
         let key = normalize_key(key);
-        Ok(self
+        let mut guard = self
             .preprocessor_cache
             .lock()
-            .unwrap()
-            .get_or_init()?
-            .get(key)
-            .ok())
+            .map_err(|_| anyhow!("preprocessor cache mutex poisoned"))?;
+        match guard.get_or_init()?.get(key) {
+            Ok(entry) => Ok(Some(entry)),
+            Err(LruError::FileNotInCache) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
     async fn put_preprocessor_cache_entry(
         &self,
@@ -238,20 +269,20 @@ impl Storage for DiskCache {
         }
 
         let key = normalize_key(key);
-        let mut f = self
-            .preprocessor_cache
-            .lock()
-            .unwrap()
-            .get_or_init()?
-            .prepare_add(key, 0)?;
+        let mut f = {
+            let mut guard = self
+                .preprocessor_cache
+                .lock()
+                .map_err(|_| anyhow!("preprocessor cache mutex poisoned"))?;
+            guard.get_or_init()?.prepare_add(key, 0)?
+        };
         preprocessor_cache_entry.serialize_to(BufWriter::new(f.as_file_mut()))?;
-        Ok(self
+        let mut guard = self
             .preprocessor_cache
             .lock()
-            .unwrap()
-            .get()
-            .unwrap()
-            .commit(f)?)
+            .map_err(|_| anyhow!("preprocessor cache mutex poisoned"))?;
+        guard.get_or_init()?.commit(f)?;
+        Ok(())
     }
 }
 
@@ -260,11 +291,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_disk_cache_type_name() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
+    fn test_disk_cache_type_name() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
 
         let disk = DiskCache::new(
             tempdir.path(),
@@ -276,5 +305,6 @@ mod tests {
         );
 
         assert_eq!(disk.cache_type_name(), "disk");
+        Ok(())
     }
 }

@@ -111,9 +111,8 @@ impl PreprocessorCacheEntry {
             // An easy way is to throw away all entries when there are too many.
             // Let's do that for now.
             debug!(
-                "Too many entries in preprocessor cache entry file ({}/{}), starting over",
-                self.results.len(),
-                MAX_PREPROCESSOR_CACHE_ENTRIES
+                "Too many entries in preprocessor cache entry file ({}/{MAX_PREPROCESSOR_CACHE_ENTRIES}), starting over",
+                self.results.len()
             );
             self.results.clear();
             self.number_of_entries = 0;
@@ -122,7 +121,7 @@ impl PreprocessorCacheEntry {
             .into_iter()
             .map(|(digest, path)| {
                 let meta = std::fs::symlink_metadata(&path)?;
-                let mtime: Option<Timestamp> = meta.modified().ok().map(|t| t.into());
+                let mtime: Option<Timestamp> = meta.modified().ok().map(std::convert::Into::into);
                 let ctime = meta.ctime_or_creation().ok();
 
                 let should_cache_time = match (mtime, ctime) {
@@ -149,8 +148,7 @@ impl PreprocessorCacheEntry {
                     // does not. This also puts an upper bound on the number
                     // of entries.
                     debug!(
-                        "Too many include entries in preprocessor cache entry file ({}/{}), starting over",
-                        new_number_of_entries, MAX_PREPROCESSOR_CACHE_FILE_INFO_ENTRIES
+                        "Too many include entries in preprocessor cache entry file ({new_number_of_entries}/{MAX_PREPROCESSOR_CACHE_FILE_INFO_ENTRIES}), starting over"
                     );
                     self.results.clear();
                 }
@@ -208,9 +206,8 @@ impl PreprocessorCacheEntry {
                 }
                 Err(e) => {
                     debug!(
-                        "{} is in a preprocessor cache entry but can't be read ({})",
-                        path.display(),
-                        e
+                        "{} is in a preprocessor cache entry but can't be read ({e})",
+                        path.display()
                     );
                     return false;
                 }
@@ -224,18 +221,16 @@ impl PreprocessorCacheEntry {
                         if mtime_matches && ctime_matches {
                             trace!("mtime+ctime hit for {}", path.display());
                             continue;
-                        } else {
-                            trace!("mtime+ctime miss for {}", path.display());
                         }
+                        trace!("mtime+ctime miss for {}", path.display());
                     }
                     (Some(mtime), None) => {
                         let mtime_matches = meta.modified().map(Into::into).ok() == Some(mtime);
                         if mtime_matches {
                             trace!("mtime hit for {}", path.display());
                             continue;
-                        } else {
-                            trace!("mtime miss for {}", path.display());
                         }
+                        trace!("mtime miss for {}", path.display());
                     }
                     _ => { /* Nothing was recorded, fall back to contents comparison */ }
                 }
@@ -245,9 +240,8 @@ impl PreprocessorCacheEntry {
                 Ok(file) => file,
                 Err(e) => {
                     debug!(
-                        "{} is in a preprocessor cache entry but can't be opened ({})",
-                        path.display(),
-                        e
+                        "{} is in a preprocessor cache entry but can't be opened ({e})",
+                        path.display()
                     );
                     return false;
                 }
@@ -262,9 +256,8 @@ impl PreprocessorCacheEntry {
                     }
                     Err(e) => {
                         debug!(
-                            "{} is in a preprocessor cache entry but can't be read ({})",
-                            path.display(),
-                            e
+                            "{} is in a preprocessor cache entry but can't be read ({e})",
+                            path.display()
                         );
                         return false;
                     }
@@ -275,9 +268,8 @@ impl PreprocessorCacheEntry {
                     Ok((new_digest, finder)) => (new_digest, finder),
                     Err(e) => {
                         debug!(
-                            "{} is in a preprocessor cache entry but can't be read ({})",
-                            path.display(),
-                            e
+                            "{} is in a preprocessor cache entry but can't be read ({e})",
+                            path.display()
                         );
                         return false;
                     }
@@ -325,22 +317,20 @@ impl PreprocessorCacheEntry {
                         Ok(meta) => meta,
                         Err(e) => {
                             debug!(
-                                "{} is in a preprocessor cache entry but can't be read ({})",
-                                path.display(),
-                                e
-                            );
-                            return false;
-                        }
-                    };
-                    let mtime = match meta.modified() {
-                        Ok(mtime) => mtime,
-                        Err(_) => {
-                            debug!(
-                                "Couldn't get mtime of {} which contains __TIMESTAMP__",
+                                "{} is in a preprocessor cache entry but can't be read ({e})",
                                 path.display()
                             );
                             return false;
                         }
+                    };
+                    let mtime = if let Ok(mtime) = meta.modified() {
+                        mtime
+                    } else {
+                        debug!(
+                            "Couldn't get mtime of {} which contains __TIMESTAMP__",
+                            path.display()
+                        );
+                        return false;
                     };
                     let mtime: chrono::DateTime<chrono::Local> = chrono::DateTime::from(mtime);
                     new_digest.delimiter(b"timestamp");
@@ -375,26 +365,41 @@ static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
     .collect()
 });
 
+pub(crate) struct PreprocessorCacheKey<'a> {
+    pub compiler_digest: &'a str,
+    pub language: Language,
+    pub arguments: &'a [OsString],
+    pub extra_hashes: &'a [String],
+    pub assembler_digest: Option<&'a str>,
+    pub env_vars: &'a [(OsString, OsString)],
+    pub input_file: &'a Path,
+    pub plusplus: bool,
+    pub config: PreprocessorCacheModeConfig,
+    pub basedirs: &'a [Vec<u8>],
+}
+
 /// Compute the hash key of compiler preprocessing `input` with `args`.
-#[allow(clippy::too_many_arguments)]
 pub fn preprocessor_cache_entry_hash_key(
-    compiler_digest: &str,
-    language: Language,
-    arguments: &[OsString],
-    extra_hashes: &[String],
-    assembler_digest: Option<&str>,
-    env_vars: &[(OsString, OsString)],
-    input_file: &Path,
-    plusplus: bool,
-    config: PreprocessorCacheModeConfig,
-    basedirs: &[Vec<u8>],
+    input: PreprocessorCacheKey<'_>,
 ) -> anyhow::Result<Option<String>> {
+    let PreprocessorCacheKey {
+        compiler_digest,
+        language,
+        arguments,
+        extra_hashes,
+        assembler_digest,
+        env_vars,
+        input_file,
+        plusplus,
+        config,
+        basedirs,
+    } = input;
     // If you change any of the inputs to the hash, you should change `FORMAT_VERSION`.
     let mut m = Digest::new();
     m.update(compiler_digest.as_bytes());
     // clang and clang++ have different behavior despite being byte-for-byte identical binaries, so
     // we have to incorporate that into the hash as well.
-    m.update(&[plusplus as u8]);
+    m.update(&[u8::from(plusplus)]);
     m.update(&[FORMAT_VERSION]);
     m.update(language.as_str().as_bytes());
     hash_arguments(&mut m, arguments, basedirs);
@@ -408,7 +413,7 @@ pub fn preprocessor_cache_entry_hash_key(
         m.update(assembler_digest.as_bytes());
     }
 
-    for (var, val) in env_vars.iter() {
+    for (var, val) in env_vars {
         if CACHED_ENV_VARS.contains(var.as_os_str()) {
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(&b"="[..]);
@@ -484,11 +489,10 @@ impl From<bincode::Error> for Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Io(e) => e.fmt(f),
-            Error::Deserialization(e) => e.fmt(f),
-            Error::UnknownFormat(format) => f.write_fmt(format_args!(
-                "Unknown preprocessor cache entry format {:x}",
-                format
+            Self::Io(e) => e.fmt(f),
+            Self::Deserialization(e) => e.fmt(f),
+            Self::UnknownFormat(format) => f.write_fmt(format_args!(
+                "Unknown preprocessor cache entry format {format:x}"
             )),
         }
     }
@@ -727,37 +731,27 @@ mod test {
         fs::write(&file2_path, content).unwrap();
 
         let config = PreprocessorCacheModeConfig::activated();
+        let hash = |input_file: &Path, basedirs: &[Vec<u8>]| {
+            preprocessor_cache_entry_hash_key(PreprocessorCacheKey {
+                compiler_digest: "test_digest",
+                language: Language::C,
+                arguments: &[],
+                extra_hashes: &[],
+                assembler_digest: None,
+                env_vars: &[],
+                input_file,
+                plusplus: false,
+                config,
+                basedirs,
+            })
+            .unwrap()
+            .unwrap()
+        };
 
         // Test 1: With basedirs, hashes should be the same
-        let hash1_with_basedirs = preprocessor_cache_entry_hash_key(
-            "test_digest",
-            Language::C,
-            &[],
-            &[],
-            None,
-            &[],
-            &file1_path,
-            false,
-            config,
-            &dirs,
-        )
-        .unwrap()
-        .unwrap();
+        let hash1_with_basedirs = hash(&file1_path, &dirs);
 
-        let hash2_with_basedirs = preprocessor_cache_entry_hash_key(
-            "test_digest",
-            Language::C,
-            &[],
-            &[],
-            None,
-            &[],
-            &file2_path,
-            false,
-            config,
-            &dirs,
-        )
-        .unwrap()
-        .unwrap();
+        let hash2_with_basedirs = hash(&file2_path, &dirs);
 
         assert_eq!(
             hash1_with_basedirs, hash2_with_basedirs,
@@ -765,35 +759,9 @@ mod test {
         );
 
         // Test 2: With basedir1 for first, and basedir2 for second, hashes should be the same
-        let hash1_with_basedirs = preprocessor_cache_entry_hash_key(
-            "test_digest",
-            Language::C,
-            &[],
-            &[],
-            None,
-            &[],
-            &file1_path,
-            false,
-            config,
-            &dirs[..1],
-        )
-        .unwrap()
-        .unwrap();
+        let hash1_with_basedirs = hash(&file1_path, &dirs[..1]);
 
-        let hash2_with_basedirs = preprocessor_cache_entry_hash_key(
-            "test_digest",
-            Language::C,
-            &[],
-            &[],
-            None,
-            &[],
-            &file2_path,
-            false,
-            config,
-            &dirs[1..],
-        )
-        .unwrap()
-        .unwrap();
+        let hash2_with_basedirs = hash(&file2_path, &dirs[1..]);
 
         assert_eq!(
             hash1_with_basedirs, hash2_with_basedirs,
@@ -801,35 +769,9 @@ mod test {
         );
 
         // Test 3: Without basedirs, hashes should be different
-        let hash1_no_basedirs = preprocessor_cache_entry_hash_key(
-            "test_digest",
-            Language::C,
-            &[],
-            &[],
-            None,
-            &[],
-            &file1_path,
-            false,
-            config,
-            &[],
-        )
-        .unwrap()
-        .unwrap();
+        let hash1_no_basedirs = hash(&file1_path, &[]);
 
-        let hash2_no_basedirs = preprocessor_cache_entry_hash_key(
-            "test_digest",
-            Language::C,
-            &[],
-            &[],
-            None,
-            &[],
-            &file2_path,
-            false,
-            config,
-            &[],
-        )
-        .unwrap()
-        .unwrap();
+        let hash2_no_basedirs = hash(&file2_path, &[]);
 
         assert_ne!(
             hash1_no_basedirs, hash2_no_basedirs,
