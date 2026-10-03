@@ -610,6 +610,9 @@ where
     #[cfg(not(target_os = "linux"))]
     let _ = &invocation.env_vars;
 
+    #[cfg(target_os = "linux")]
+    let use_canonical_fallback = matches!(&response, CompileResponse::CompileStarted);
+
     match response {
         CompileResponse::CompileStarted => {
             if let Some(finished) = finished {
@@ -627,11 +630,18 @@ where
     }
 
     #[cfg(target_os = "linux")]
-    let canonical_rust = CanonicalRustPaths::from_rustc_executable(
-        &invocation.env_vars,
-        invocation.cwd,
-        invocation.exe,
-    );
+    let canonical_rust = if use_canonical_fallback {
+        CanonicalRustPaths::from_rustc_executable(
+            &invocation.env_vars,
+            invocation.cwd,
+            invocation.exe,
+        )
+    } else {
+        // The daemon rejected this invocation before canonical compilation began.
+        // Canonicalizing the raw fallback would change caller-visible outputs such
+        // as rustc dep-info from physical paths to /build and /target.
+        None
+    };
 
     #[cfg(target_os = "linux")]
     let mut cmd = if let Some(canonical) = canonical_rust {
@@ -1065,6 +1075,66 @@ mod test {
         fn try_clone(&self) -> io::Result<Box<dyn Connection>> {
             Ok(Box::new(Self))
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_unhandled_rust_compile_falls_back_with_physical_arguments() -> Result<()> {
+        let mut runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let client = Client::new_num(1);
+        let creator = Arc::new(Mutex::new(MockCommandCreator::new(&client)));
+        let cmdline = vec![
+            OsString::from("--crate-name"),
+            OsString::from("build_script_build"),
+            OsString::from("build.rs"),
+            OsString::from("--emit=dep-info,link"),
+        ];
+        let expected = cmdline.clone();
+
+        creator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .next_command_calls(move |args| {
+                assert_eq!(args, expected.as_slice());
+                Ok(MockChild::new(exit_status(0), "", ""))
+            });
+
+        let invocation = CompileInvocation {
+            exe: Path::new("/rust/bin/rustc"),
+            cmdline,
+            cwd: Path::new("/work/project"),
+            env_vars: vec![
+                (
+                    OsString::from("SCCACHE_EXPERIMENTAL_CANONICAL_RUST"),
+                    OsString::from("1"),
+                ),
+                (
+                    OsString::from("SCCACHE_CANONICAL_BUILD_ROOT"),
+                    OsString::from("/work/project"),
+                ),
+                (
+                    OsString::from("SCCACHE_CANONICAL_TARGET_ROOT"),
+                    OsString::from("/work/project/target"),
+                ),
+            ],
+        };
+        let mut stdout = vec![];
+        let mut stderr = vec![];
+
+        let code = handle_compile_result(
+            creator,
+            &mut runtime,
+            CompileResponse::UnhandledCompile,
+            None,
+            invocation,
+            &mut stdout,
+            &mut stderr,
+        )?;
+
+        assert_eq!(code, 0);
+        Ok(())
     }
 
     /// A mid-compile server disconnect: the server sends `CompileStarted` then drops the
