@@ -340,6 +340,18 @@ impl CanonicalRustPaths {
             OsString::from("/tmp")
         } else if name == "HOME" {
             OsString::from("/tmp/home")
+        } else if name == "CARGO" {
+            // Cargo may invoke procedural macros that call Cargo again (for
+            // example proc-macro-crate uses `cargo locate-project`). The
+            // client-side CARGO can point at a site wrapper outside the
+            // packaged sysroot, which does not exist on a dist worker. Prefer
+            // a preserved real Cargo when the local toolchain has one; ordinary
+            // toolchains package `bin/cargo` directly.
+            if self.rust_root.join("bin/cargo.real").is_file() {
+                OsString::from("/rust/bin/cargo.real")
+            } else {
+                OsString::from("/rust/bin/cargo")
+            }
         } else if name == "RUSTC" {
             OsString::from("/rust/bin/rustc")
         } else if name == "RUSTDOC" {
@@ -691,6 +703,54 @@ mod tests {
             env_value(&canonical, "CARGO_TARGET_DIR"),
             Some(PathBuf::from("/target"))
         );
+    }
+
+    #[test]
+    fn canonicalizes_cargo_to_packaged_real_binary() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let rust_root = temp.path().join("rust");
+        std::fs::create_dir_all(rust_root.join("bin"))?;
+        std::fs::write(rust_root.join("bin/cargo.real"), b"cargo")?;
+
+        let env = vec![
+            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+            ("SCCACHE_CANONICAL_BUILD_ROOT".into(), "/work/a".into()),
+        ];
+        let roots = CanonicalRustPaths::from_env(&env, Path::new("/work/a"), &rust_root)
+            .ok_or_else(|| anyhow::anyhow!("canonical Rust paths unexpectedly disabled"))?;
+
+        assert_eq!(
+            roots.env_value_to_canonical(
+                OsStr::new("CARGO"),
+                OsStr::new("/usr/local/libexec/sentinelx-bin/cargo"),
+            ),
+            OsString::from("/rust/bin/cargo.real")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonicalizes_cargo_to_standard_packaged_binary() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let rust_root = temp.path().join("rust");
+        std::fs::create_dir_all(rust_root.join("bin"))?;
+        std::fs::write(rust_root.join("bin/cargo"), b"cargo")?;
+
+        let env = vec![
+            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+            ("SCCACHE_CANONICAL_BUILD_ROOT".into(), "/work/a".into()),
+        ];
+        let roots = CanonicalRustPaths::from_env(&env, Path::new("/work/a"), &rust_root)
+            .ok_or_else(|| anyhow::anyhow!("canonical Rust paths unexpectedly disabled"))?;
+
+        assert_eq!(
+            roots.env_value_to_canonical(
+                OsStr::new("CARGO"),
+                OsStr::new("/home/user/.cargo/bin/cargo"),
+            ),
+            OsString::from("/rust/bin/cargo")
+        );
+        Ok(())
     }
 
     #[test]
