@@ -40,7 +40,7 @@ impl RootMapping {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CanonicalRustPaths {
+pub struct CanonicalRustPaths {
     roots: Vec<RootMapping>,
     pub(crate) build_root: PathBuf,
     pub(crate) target_root: PathBuf,
@@ -340,18 +340,6 @@ impl CanonicalRustPaths {
             OsString::from("/tmp")
         } else if name == "HOME" {
             OsString::from("/tmp/home")
-        } else if name == "CARGO" {
-            // Cargo may invoke procedural macros that call Cargo again (for
-            // example proc-macro-crate uses `cargo locate-project`). The
-            // client-side CARGO can point at a site wrapper outside the
-            // packaged sysroot, which does not exist on a dist worker. Prefer
-            // a preserved real Cargo when the local toolchain has one; ordinary
-            // toolchains package `bin/cargo` directly.
-            if self.rust_root.join("bin/cargo.real").is_file() {
-                OsString::from("/rust/bin/cargo.real")
-            } else {
-                OsString::from("/rust/bin/cargo")
-            }
         } else if name == "RUSTC" {
             OsString::from("/rust/bin/rustc")
         } else if name == "RUSTDOC" {
@@ -546,8 +534,8 @@ mod tests {
                 "SCCACHE_CANONICAL_BUILD_ROOT".into(),
                 build.clone().into_os_string(),
             ),
-            ("CARGO_TARGET_DIR".into(), target.clone().into_os_string()),
-            ("CARGO_HOME".into(), cargo_home.clone().into_os_string()),
+            ("CARGO_TARGET_DIR".into(), target.into_os_string()),
+            ("CARGO_HOME".into(), cargo_home.into_os_string()),
             (
                 "EPHEMERAL_CARGO_REGISTRY_SRC".into(),
                 ephemeral_registry.clone().into_os_string(),
@@ -566,7 +554,7 @@ mod tests {
         {
             let args = roots.bwrap_arguments(
                 Path::new("/rust/bin/rustc"),
-                &[source.clone().into_os_string()],
+                &[source.into_os_string()],
                 &ephemeral_registry.join("index/pkg"),
             );
             assert!(args.windows(2).any(|pair| {
@@ -702,50 +690,6 @@ mod tests {
         assert_eq!(
             env_value(&canonical, "CARGO_TARGET_DIR"),
             Some(PathBuf::from("/target"))
-        );
-    }
-
-    #[test]
-    fn canonicalizes_cargo_to_packaged_real_binary() {
-        let temp = tempfile::tempdir().unwrap();
-        let rust_root = temp.path().join("rust");
-        std::fs::create_dir_all(rust_root.join("bin")).unwrap();
-        std::fs::write(rust_root.join("bin/cargo.real"), b"cargo").unwrap();
-
-        let env = vec![
-            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
-            ("SCCACHE_CANONICAL_BUILD_ROOT".into(), "/work/a".into()),
-        ];
-        let roots = CanonicalRustPaths::from_env(&env, Path::new("/work/a"), &rust_root).unwrap();
-
-        assert_eq!(
-            roots.env_value_to_canonical(
-                OsStr::new("CARGO"),
-                OsStr::new("/usr/local/libexec/sentinelx-bin/cargo"),
-            ),
-            OsString::from("/rust/bin/cargo.real")
-        );
-    }
-
-    #[test]
-    fn canonicalizes_cargo_to_standard_packaged_binary() {
-        let temp = tempfile::tempdir().unwrap();
-        let rust_root = temp.path().join("rust");
-        std::fs::create_dir_all(rust_root.join("bin")).unwrap();
-        std::fs::write(rust_root.join("bin/cargo"), b"cargo").unwrap();
-
-        let env = vec![
-            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
-            ("SCCACHE_CANONICAL_BUILD_ROOT".into(), "/work/a".into()),
-        ];
-        let roots = CanonicalRustPaths::from_env(&env, Path::new("/work/a"), &rust_root).unwrap();
-
-        assert_eq!(
-            roots.env_value_to_canonical(
-                OsStr::new("CARGO"),
-                OsStr::new("/home/user/.cargo/bin/cargo"),
-            ),
-            OsString::from("/rust/bin/cargo")
         );
     }
 

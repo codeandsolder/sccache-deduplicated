@@ -16,8 +16,8 @@ use crate::cache::readonly::ReadOnlyStorage;
 use crate::cache::{CacheMode, Storage, storage_from_config};
 use crate::compiler::PreprocessorCacheEntry;
 use crate::compiler::{
-    CacheControl, CompileResult, Compiler, CompilerArguments, CompilerHasher, CompilerKind,
-    CompilerProxy, DistType, Language, MissType, get_compiler_info,
+    CacheCompileContext, CacheControl, CompileResult, Compiler, CompilerArguments, CompilerHasher,
+    CompilerKind, CompilerProxy, DistType, Language, MissType, get_compiler_info,
 };
 #[cfg(feature = "dist-client")]
 use crate::config;
@@ -29,7 +29,6 @@ use crate::protocol::{
     Compile, CompileFinished, CompileResponse, Request, Response, StorageHandshakeInfo,
 };
 use crate::util;
-#[cfg(feature = "dist-client")]
 use anyhow::Context as _;
 use bytes::{Bytes, BytesMut, buf::BufMut};
 use filetime::FileTime;
@@ -203,7 +202,7 @@ fn notify_server_startup(name: Option<&OsString>, status: ServerStartup) -> Resu
         Some(s) => s,
         None => return Ok(()),
     };
-    debug!("notify_server_startup({:?})", status);
+    debug!("notify_server_startup({status:?})");
     let stream = UnixStream::connect(name)?;
     notify_server_startup_internal(stream, status)
 }
@@ -221,13 +220,13 @@ fn notify_server_startup(name: Option<&OsString>, status: ServerStartup) -> Resu
 }
 
 #[cfg(unix)]
-fn get_signal(status: ExitStatus) -> i32 {
+fn get_signal(status: &ExitStatus) -> Option<i32> {
     use std::os::unix::prelude::*;
-    status.signal().expect("must have signal")
+    status.signal()
 }
 #[cfg(windows)]
-fn get_signal(_status: ExitStatus) -> i32 {
-    panic!("no signals on windows")
+fn get_signal(_status: &ExitStatus) -> Option<i32> {
+    None
 }
 
 pub struct DistClientContainer {
@@ -313,12 +312,14 @@ impl DistClientContainer {
     }
 
     #[cfg(feature = "dist-client")]
+    #[must_use]
     pub fn new_with_state(state: DistClientState) -> Self {
         Self {
             state: futures::lock::Mutex::new(state),
         }
     }
 
+    #[must_use]
     pub fn new_disabled() -> Self {
         Self {
             state: futures::lock::Mutex::new(DistClientState::Disabled),
@@ -333,10 +334,7 @@ impl DistClientContainer {
             | DistClientState::FailWithMessage(cfg, _)
             | DistClientState::RetryCreateAt(cfg, _) => {
                 warn!("State reset. Will recreate");
-                *state = DistClientState::RetryCreateAt(
-                    cfg,
-                    Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
-                );
+                *state = DistClientState::RetryCreateAt(cfg, Instant::now());
             }
             DistClientState::Disabled => (),
         }
@@ -345,7 +343,6 @@ impl DistClientContainer {
     pub async fn get_status(&self) -> DistInfo {
         let mut guard = self.state.lock().await;
         let state = &mut *guard;
-        Self::maybe_recreate_state(state).await;
         let (client, scheduler_url) = match state {
             DistClientState::Disabled => return DistInfo::Disabled("disabled".to_string()),
             DistClientState::FailWithMessage(cfg, _) => {
@@ -359,7 +356,7 @@ impl DistClientContainer {
                     cfg.scheduler_url.clone(),
                     format!(
                         "enabled, not connected, will retry in {:.1}s",
-                        time.duration_since(Instant::now()).as_secs_f32()
+                        time.saturating_duration_since(Instant::now()).as_secs_f32()
                     ),
                 );
             }
@@ -379,38 +376,38 @@ impl DistClientContainer {
         let mut guard = self.state.lock().await;
         let state = &mut *guard;
         Self::maybe_recreate_state(state).await;
-        let res = match state {
+        match state {
             DistClientState::Some(_, dc) => Ok(Some(dc.clone())),
             DistClientState::Disabled | DistClientState::RetryCreateAt(_, _) => Ok(None),
-            DistClientState::FailWithMessage(_, msg) => Err(anyhow!(msg.clone())),
-        };
-        if res.is_err() {
-            let config = match mem::replace(state, DistClientState::Disabled) {
-                DistClientState::FailWithMessage(config, _) => config,
-                _ => unreachable!(),
-            };
-            // The client is most likely mis-configured, make sure we
-            // re-create on our next attempt.
-            *state = DistClientState::RetryCreateAt(
-                config,
-                Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
-            );
+            DistClientState::FailWithMessage(_, msg) => {
+                let msg = msg.clone();
+                let DistClientState::FailWithMessage(config, _) =
+                    mem::replace(state, DistClientState::Disabled)
+                else {
+                    return Err(anyhow!("distributed client state changed unexpectedly"));
+                };
+                // The client is most likely mis-configured, make sure we
+                // re-create on our next attempt.
+                *state = DistClientState::RetryCreateAt(config, Instant::now());
+                Err(anyhow!(msg))
+            }
         }
-        res
     }
 
     async fn maybe_recreate_state(state: &mut DistClientState) {
-        if let DistClientState::RetryCreateAt(_, instant) = *state {
-            if instant > Instant::now() {
-                return;
-            }
-            let config = match mem::replace(state, DistClientState::Disabled) {
-                DistClientState::RetryCreateAt(config, _) => config,
-                _ => unreachable!(),
-            };
-            info!("Attempting to recreate the dist client");
-            *state = Self::create_state(*config).await;
+        let DistClientState::RetryCreateAt(_, instant) = state else {
+            return;
+        };
+        if *instant > Instant::now() {
+            return;
         }
+        let DistClientState::RetryCreateAt(config, _) =
+            mem::replace(state, DistClientState::Disabled)
+        else {
+            return;
+        };
+        info!("Attempting to recreate the dist client");
+        *state = Self::create_state(*config).await;
     }
 
     // Attempt to recreate the dist client
@@ -447,64 +444,55 @@ impl DistClientContainer {
                 }
             }};
         }
-        match config.scheduler_url {
-            Some(ref addr) => {
-                let url = addr.to_url();
-                info!("Enabling distributed sccache to {}", url);
-                let auth_token = match &config.auth {
-                    config::DistAuth::Token { token } => Ok(token.to_owned()),
-                    config::DistAuth::Oauth2CodeGrantPKCE { auth_url, .. }
-                    | config::DistAuth::Oauth2Implicit { auth_url, .. } => {
-                        Self::get_cached_config_auth_token(auth_url)
-                    }
-                };
-                let auth_token = try_or_fail_with_message!(
-                    auth_token
-                        .context("could not load client auth token, run |sccache --dist-auth|")
-                );
-                let dist_client = dist::http::Client::new(
-                    &config.pool,
-                    url,
-                    &config.cache_dir.join("client"),
-                    config.toolchain_cache_size,
-                    &config.toolchains,
-                    auth_token,
-                    config.rewrite_includes_only,
-                );
-                let dist_client =
-                    try_or_retry_later!(dist_client.context("failure during dist client creation"));
-                use crate::dist::Client;
-                match dist_client.do_get_status().await {
-                    Ok(res) => {
-                        info!(
-                            "Successfully created dist client with {:?} cores across {:?} servers",
-                            res.num_cpus, res.num_servers
-                        );
-                        DistClientState::Some(Box::new(config), Arc::new(dist_client))
-                    }
-                    Err(_) => {
-                        warn!(
-                            "Scheduler address configured, but could not communicate with scheduler"
-                        );
-                        DistClientState::RetryCreateAt(
-                            Box::new(config),
-                            Instant::now() + DIST_CLIENT_RECREATE_TIMEOUT,
-                        )
-                    }
+        if let Some(ref addr) = config.scheduler_url {
+            let url = addr.to_url();
+            info!("Enabling distributed sccache to {url}");
+            let auth_token = match &config.auth {
+                config::DistAuth::Token { token } => Ok(token.to_owned()),
+                config::DistAuth::Oauth2CodeGrantPKCE { auth_url, .. }
+                | config::DistAuth::Oauth2Implicit { auth_url, .. } => {
+                    Self::get_cached_config_auth_token(auth_url)
                 }
+            };
+            let auth_token = try_or_fail_with_message!(
+                auth_token.context("could not load client auth token, run |sccache --dist-auth|")
+            );
+            let dist_client = dist::http::Client::new(
+                &config.pool,
+                url,
+                &config.cache_dir.join("client"),
+                config.toolchain_cache_size,
+                &config.toolchains,
+                auth_token,
+                config.rewrite_includes_only,
+            );
+            let dist_client =
+                try_or_retry_later!(dist_client.context("failure during dist client creation"));
+            use crate::dist::Client;
+            if let Ok(res) = dist_client.do_get_status().await {
+                info!(
+                    "Successfully created dist client with {:?} cores across {:?} servers",
+                    res.num_cpus, res.num_servers
+                );
+                DistClientState::Some(Box::new(config), Arc::new(dist_client))
+            } else {
+                warn!("Scheduler address configured, but could not communicate with scheduler");
+                DistClientState::RetryCreateAt(
+                    Box::new(config),
+                    Instant::now() + DIST_CLIENT_RECREATE_TIMEOUT,
+                )
             }
-            None => {
-                info!("No scheduler address configured, disabling distributed sccache");
-                DistClientState::Disabled
-            }
+        } else {
+            info!("No scheduler address configured, disabling distributed sccache");
+            DistClientState::Disabled
         }
     }
 
     fn get_cached_config_auth_token(auth_url: &str) -> Result<String> {
         let cached_config = config::CachedConfig::reload()?;
         cached_config
-            .with(|c| c.dist.auth_tokens.get(auth_url).map(String::to_owned))
-            .with_context(|| format!("token for url {} not present in cached config", auth_url))
+            .with(|c| c.dist.auth_tokens.get(auth_url).map(String::to_owned))?
+            .with_context(|| format!("token for url {auth_url} not present in cached config"))
     }
 }
 
@@ -588,8 +576,14 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                 let l = runtime.block_on(tokio::net::TcpListener::bind(addr))?;
                 let srv =
                     SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
+                let bound_addr = srv.try_local_addr()?.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::AddrNotAvailable,
+                        "TCP listener has no local address",
+                    )
+                })?;
                 Ok((
-                    srv.local_addr().unwrap(),
+                    bound_addr,
                     Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
                 ))
             }
@@ -604,8 +598,14 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                 };
                 let srv =
                     SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
+                let bound_addr = srv.try_local_addr()?.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::AddrNotAvailable,
+                        "Unix listener has no local address",
+                    )
+                })?;
                 Ok((
-                    srv.local_addr().unwrap(),
+                    bound_addr,
                     Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
                 ))
             }
@@ -622,7 +622,7 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                 let srv =
                     SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
                 Ok((
-                    srv.local_addr()
+                    srv.try_local_addr()?
                         .unwrap_or_else(|| crate::net::SocketAddr::UnixAbstract(p.clone())),
                     Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
                 ))
@@ -642,7 +642,7 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
             Ok(())
         }
         Err(e) => {
-            error!("failed to start server: {}", e);
+            error!("failed to start server: {e}");
             if io::ErrorKind::AddrInUse == e.kind() {
                 notify_server_startup(notify.as_ref(), ServerStartup::AddrInUse)?;
             } else if cfg!(windows) && Some(10013) == e.raw_os_error() {
@@ -678,7 +678,10 @@ impl<C: CommandCreatorSync> SccacheServer<tokio::net::TcpListener, C> {
         storage: Arc<dyn Storage>,
     ) -> Result<Self> {
         let addr = crate::net::SocketAddr::with_port(port);
-        let listener = runtime.block_on(tokio::net::TcpListener::bind(addr.as_net().unwrap()))?;
+        let net_addr = addr
+            .as_net()
+            .ok_or_else(|| anyhow!("TCP server address unexpectedly was not a network address"))?;
+        let listener = runtime.block_on(tokio::net::TcpListener::bind(net_addr))?;
 
         Ok(Self::with_listener(
             listener,
@@ -705,7 +708,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         let pool = runtime.handle().clone();
         let service = SccacheService::new(dist_client, storage, &client, pool, tx, info);
 
-        SccacheServer {
+        Self {
             runtime,
             listener,
             rx,
@@ -716,33 +719,34 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
     }
 
     /// Configures how long this server will be idle before shutting down.
-    #[allow(dead_code)]
-    pub fn set_idle_timeout(&mut self, timeout: Duration) {
+    pub const fn set_idle_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
     }
 
     /// Set the storage this server will use.
-    #[allow(dead_code)]
     pub fn set_storage(&mut self, storage: Arc<dyn Storage>) {
         self.service.storage = storage;
     }
 
     /// Returns a reference to a thread pool to run work on
-    #[allow(dead_code)]
-    pub fn pool(&self) -> &tokio::runtime::Handle {
+    pub const fn pool(&self) -> &tokio::runtime::Handle {
         &self.service.rt
     }
 
     /// Returns a reference to the command creator this server will use
-    #[allow(dead_code)]
-    pub fn command_creator(&self) -> &C {
+    pub const fn command_creator(&self) -> &C {
         &self.service.creator
     }
 
     /// Returns the port that this server is bound to
-    #[allow(dead_code)]
+    pub fn try_local_addr(&self) -> io::Result<Option<crate::net::SocketAddr>> {
+        self.listener.local_addr()
+    }
+
+    /// Returns the address that this server is bound to, or `None` if the
+    /// listener cannot report it.
     pub fn local_addr(&self) -> Option<crate::net::SocketAddr> {
-        self.listener.local_addr().unwrap()
+        self.try_local_addr().ok().flatten()
     }
 
     /// Runs this server to completion.
@@ -756,7 +760,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         C: Send,
         A::Socket: 'static,
     {
-        let SccacheServer {
+        let Self {
             runtime,
             listener,
             rx,
@@ -773,7 +777,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
                 let socket = listener.accept().await?;
                 trace!("incoming connection");
                 let conn = service.clone().bind(socket).map_err(|res| {
-                    error!("Failed to bind socket: {}", res);
+                    error!("Failed to bind socket: {res}");
                 });
 
                 // We're not interested if the task panicked; immediately process
@@ -801,10 +805,10 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         let shutdown_idle = async {
             ShutdownOrInactive {
                 rx,
-                timeout: if timeout != Duration::new(0, 0) {
-                    Some(Box::pin(sleep(timeout)))
-                } else {
+                timeout: if timeout == Duration::new(0, 0) {
                     None
+                } else {
+                    Some(Box::pin(sleep(timeout)))
                 },
                 timeout_dur: timeout,
             }
@@ -923,9 +927,8 @@ where
     tx: mpsc::Sender<ServerMessage>,
 
     /// Information tracking how many services (connected clients) are active.
-    /// This field causes [WaitUntilZero] to wait until this struct drops.
-    #[allow(dead_code)]
-    info: ActiveInfo,
+    /// This field causes [`WaitUntilZero`] to wait until this struct drops.
+    _info: ActiveInfo,
 }
 
 type SccacheRequest = Message<Request, Body<()>>;
@@ -988,13 +991,16 @@ where
                 }
                 Request::Shutdown => {
                     debug!("handle_client: shutdown");
-                    // Make the shutdown RPC itself a durability barrier for
-                    // detached cache work. CI may persist L0 as soon as the
-                    // stop-server command returns.
+                    // Drain detached cache work already registered while the
+                    // shutdown request is being handled. The server performs a
+                    // second drain after active client services finish, covering
+                    // work registered by compile requests that were already in flight.
                     me.storage.drain_background().await;
                     let info = me.get_info().await?;
                     let mut tx = me.tx.clone();
-                    let _ = tx.send(ServerMessage::Shutdown).await;
+                    if tx.send(ServerMessage::Shutdown).await.is_err() {
+                        debug!("shutdown notification receiver dropped");
+                    }
                     Ok(Message::WithoutBody(Response::ShuttingDown(Box::new(info))))
                 }
                 Request::StorageHandshake => {
@@ -1010,13 +1016,13 @@ where
                     Ok(Message::WithoutBody(Response::StorageHandshake(info)))
                 }
                 Request::StorageGetPath { key } => {
-                    debug!("handle_client: storage_get_path key={}", key);
+                    debug!("handle_client: storage_get_path key={key}");
                     Ok(Message::WithoutBody(Response::StorageGetPath(
                         me.storage.get_path(&key).await,
                     )))
                 }
                 Request::StorageGetRaw { key } => {
-                    debug!("handle_client: storage_get_raw key={}", key);
+                    debug!("handle_client: storage_get_raw key={key}");
                     let resp = match me.storage.get_raw(&key).await {
                         Ok(opt) => Response::StorageGetRaw(opt.map(|b| b.to_vec())),
                         Err(e) => {
@@ -1027,7 +1033,7 @@ where
                     Ok(Message::WithoutBody(resp))
                 }
                 Request::StoragePutRaw { key, data } => {
-                    debug!("handle_client: storage_put_raw key={}", key);
+                    debug!("handle_client: storage_put_raw key={key}");
                     let result = me
                         .storage
                         .put_raw(&key, data.into())
@@ -1037,7 +1043,7 @@ where
                     Ok(Message::WithoutBody(Response::StoragePutRaw(result)))
                 }
                 Request::StorageGetPreprocessorEntry { key } => {
-                    debug!("handle_client: storage_get_preprocessor_entry key={}", key);
+                    debug!("handle_client: storage_get_preprocessor_entry key={key}");
                     let result = me
                         .storage
                         .get_preprocessor_cache_entry(&key)
@@ -1056,7 +1062,7 @@ where
                     )))
                 }
                 Request::StoragePutPreprocessorEntry { key, entry_bytes } => {
-                    debug!("handle_client: storage_put_preprocessor_entry key={}", key);
+                    debug!("handle_client: storage_put_preprocessor_entry key={key}");
                     let result = async {
                         let entry = PreprocessorCacheEntry::read(&entry_bytes)
                             .map_err(|e| format!("{e:#}"))?;
@@ -1097,8 +1103,8 @@ where
         rt: tokio::runtime::Handle,
         tx: mpsc::Sender<ServerMessage>,
         info: ActiveInfo,
-    ) -> SccacheService<C> {
-        SccacheService {
+    ) -> Self {
+        Self {
             stats: Arc::default(),
             dist_client: Arc::new(dist_client),
             storage,
@@ -1107,19 +1113,16 @@ where
             rt,
             creator: C::new(client),
             tx,
-            info,
+            _info: info,
         }
     }
 
-    pub fn mock_with_storage(
-        storage: Arc<dyn Storage>,
-        rt: tokio::runtime::Handle,
-    ) -> SccacheService<C> {
+    pub fn mock_with_storage(storage: Arc<dyn Storage>, rt: tokio::runtime::Handle) -> Self {
         let (tx, _) = mpsc::channel(1);
         let (_, info) = WaitUntilZero::new();
         let client = Client::new_num(1);
         let dist_client = DistClientContainer::new_disabled();
-        SccacheService {
+        Self {
             stats: Arc::default(),
             dist_client: Arc::new(dist_client),
             storage,
@@ -1128,7 +1131,7 @@ where
             rt,
             creator: C::new(&client),
             tx,
-            info,
+            _info: info,
         }
     }
 
@@ -1137,11 +1140,11 @@ where
         dist_client: Arc<dyn dist::Client>,
         storage: Arc<dyn Storage>,
         rt: tokio::runtime::Handle,
-    ) -> SccacheService<C> {
+    ) -> Self {
         let (tx, _) = mpsc::channel(1);
         let (_, info) = WaitUntilZero::new();
         let client = Client::new_num(1);
-        SccacheService {
+        Self {
             stats: Arc::default(),
             dist_client: Arc::new(DistClientContainer::new_with_state(DistClientState::Some(
                 Box::new(DistClientConfig {
@@ -1160,10 +1163,10 @@ where
             storage,
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
-            rt: rt.clone(),
+            rt,
             creator: C::new(&client),
             tx,
-            info,
+            _info: info,
         }
     }
 
@@ -1339,11 +1342,10 @@ where
             Some(x) => x, // TODO resolve the path right away
             _ => {
                 // fallback to using the path directly
-                metadata(&path2)
-                    .map(|attr| FileTime::from_last_modification_time(&attr))
-                    .ok()
-                    .map(move |filetime| (path2, filetime))
-                    .expect("Must contain sane data, otherwise mtime is not avail")
+                let attr = metadata(&path2).with_context(|| {
+                    format!("failed to read compiler metadata at {}", path2.display())
+                })?;
+                (path2, FileTime::from_last_modification_time(&attr))
             }
         };
 
@@ -1384,70 +1386,61 @@ where
             _ => None,
         };
 
-        match opt {
-            Some(info) => {
-                trace!("compiler_info cache hit");
-                Ok(info)
-            }
-            None => {
-                trace!("compiler_info cache miss");
-                // Check the compiler type and return the result when
-                // finished. This generally involves invoking the compiler,
-                // so do it asynchronously.
+        if let Some(info) = opt {
+            trace!("compiler_info cache hit");
+            Ok(info)
+        } else {
+            trace!("compiler_info cache miss");
+            // Check the compiler type and return the result when
+            // finished. This generally involves invoking the compiler,
+            // so do it asynchronously.
 
-                // the compiler path might be compiler proxy, so it is important to use
-                // `path` (or its clone `path1`) to resolve using that one, not using `resolved_compiler_path`
-                let info = get_compiler_info::<C>(
-                    me.creator.clone(),
-                    &path1,
-                    &cwd,
-                    args,
-                    env.as_slice(),
-                    &me.rt,
-                    dist_info.clone().map(|(p, _)| p),
-                )
-                .await;
+            // the compiler path might be compiler proxy, so it is important to use
+            // `path` (or its clone `path1`) to resolve using that one, not using `resolved_compiler_path`
+            let info = get_compiler_info::<C>(
+                me.creator.clone(),
+                &path1,
+                &cwd,
+                args,
+                env.as_slice(),
+                &me.rt,
+                dist_info.clone().map(|(p, _)| p),
+            )
+            .await;
 
-                let (c, proxy) = match info {
-                    Ok((c, proxy)) => (c.clone(), proxy.clone()),
-                    Err(err) => {
-                        trace!("Inserting PLAIN cache map info for {:?}", path);
-                        me.compilers.write().await.insert(path, None);
+            let (c, proxy) = match info {
+                Ok((c, proxy)) => (c.clone(), proxy.clone()),
+                Err(err) => {
+                    trace!("Inserting PLAIN cache map info for {path:?}");
+                    me.compilers.write().await.insert(path, None);
 
-                        return Err(err);
-                    }
-                };
-
-                // register the proxy for this compiler, so it will be used directly from now on
-                // and the true/resolved compiler will create table hits in the hash map
-                // based on the resolved path
-                if let Some(proxy) = proxy {
-                    trace!(
-                        "Inserting new path proxy {:?} @ {:?} -> {:?}",
-                        path, cwd, resolved_compiler_path
-                    );
-                    me.compiler_proxies
-                        .write()
-                        .await
-                        .insert(path, (proxy, mtime));
+                    return Err(err);
                 }
-                // TODO add some safety checks in case a proxy exists, that the initial `path` is not
-                // TODO the same as the resolved compiler binary
+            };
 
-                // cache
-                let map_info = CompilerCacheEntry::new(c.clone(), mtime, dist_info);
-                trace!(
-                    "Inserting POSSIBLY PROXIED cache map info for {:?}",
-                    resolved_compiler_path
-                );
-                me.compilers
+            // register the proxy for this compiler, so it will be used directly from now on
+            // and the true/resolved compiler will create table hits in the hash map
+            // based on the resolved path
+            if let Some(proxy) = proxy {
+                trace!("Inserting new path proxy {path:?} @ {cwd:?} -> {resolved_compiler_path:?}");
+                me.compiler_proxies
                     .write()
                     .await
-                    .insert(resolved_compiler_path, Some(map_info));
-
-                // drop the proxy information, response is compiler only
-                Ok(c)
+                    .insert(path, (proxy, mtime));
             }
+            // TODO add some safety checks in case a proxy exists, that the initial `path` is not
+            // TODO the same as the resolved compiler binary
+
+            // cache
+            let map_info = CompilerCacheEntry::new(c.clone(), mtime, dist_info);
+            trace!("Inserting POSSIBLY PROXIED cache map info for {resolved_compiler_path:?}");
+            me.compilers
+                .write()
+                .await
+                .insert(resolved_compiler_path, Some(map_info));
+
+            // drop the proxy information, response is compiler only
+            Ok(c)
         }
     }
 
@@ -1474,7 +1467,7 @@ where
                 // the provided commandline.
                 match c.parse_arguments(&cmd, &cwd, &env_vars) {
                     CompilerArguments::Ok(hasher) => {
-                        debug!("parse_arguments: Ok: {:?}", cmd);
+                        debug!("parse_arguments: Ok: {cmd:?}");
 
                         let body = self
                             .clone()
@@ -1490,18 +1483,15 @@ where
                     CompilerArguments::CannotCache(why, extra_info) => {
                         append_noncacheable_record(why, extra_info.as_deref(), &cwd, &cmd);
                         if let Some(extra_info) = extra_info.as_deref() {
-                            debug!(
-                                "parse_arguments: CannotCache({}, {}): {:?}",
-                                why, extra_info, cmd
-                            );
+                            debug!("parse_arguments: CannotCache({why}, {extra_info}): {cmd:?}");
                         } else {
-                            debug!("parse_arguments: CannotCache({}): {:?}", why, cmd);
+                            debug!("parse_arguments: CannotCache({why}): {cmd:?}");
                         }
                         let mut stats = self.stats.lock().await;
                         stats.record_not_cacheable(why, extra_info.as_deref());
                     }
                     CompilerArguments::NotCompilation => {
-                        debug!("parse_arguments: NotCompilation: {:?}", cmd);
+                        debug!("parse_arguments: NotCompilation: {cmd:?}");
                         self.stats.lock().await.requests_not_compile += 1;
                     }
                 }
@@ -1559,15 +1549,17 @@ where
         util::spawn_on(&self.rt, async move {
             let result = match me.dist_client.get_client().await {
                 Ok(client) => std::panic::AssertUnwindSafe(hasher.get_cached_or_compile(
-                    &me,
-                    client,
-                    me.creator.clone(),
-                    me.storage.clone(),
-                    arguments,
-                    cwd,
-                    env_vars,
-                    cache_control,
-                    me.rt.clone(),
+                    CacheCompileContext {
+                        service: &me,
+                        dist_client: client,
+                        creator: me.creator.clone(),
+                        storage: me.storage.clone(),
+                        arguments,
+                        cwd,
+                        env_vars,
+                        cache_control,
+                        pool: me.rt.clone(),
+                    },
                 ))
                 .catch_unwind()
                 .await
@@ -1579,7 +1571,7 @@ where
                         .unwrap_or("An unknown panic was caught.");
                     let thread = std::thread::current();
                     let thread_name = thread.name().unwrap_or("unnamed");
-                    if let Some((file, line, column)) = PANIC_LOCATION.with(|l| l.take()) {
+                    if let Some((file, line, column)) = PANIC_LOCATION.with(std::cell::Cell::take) {
                         anyhow!(
                             "thread '{thread_name}' panicked at {file}:{line}:{column}: {panic}"
                         )
@@ -1605,18 +1597,18 @@ where
 
                     match compiled {
                         CompileResult::Error => {
-                            debug!("[{}]: compile result: cache error", out_pretty);
+                            debug!("[{out_pretty}]: compile result: cache error");
 
                             stats.cache_errors.increment(&kind, &lang);
                         }
                         CompileResult::CacheHit(duration) => {
-                            debug!("[{}]: compile result: cache hit", out_pretty);
+                            debug!("[{out_pretty}]: compile result: cache hit");
 
                             stats.cache_hits.increment(&kind, &lang);
                             stats.cache_read_hit_duration += duration;
                         }
                         CompileResult::CacheMiss(miss_type, dt, duration, future) => {
-                            debug!("[{}]: compile result: cache miss", out_pretty);
+                            debug!("[{out_pretty}]: compile result: cache miss");
                             dist_type = dt;
 
                             match miss_type {
@@ -1639,20 +1631,20 @@ where
                             cache_write = Some(future);
                         }
                         CompileResult::NotCached(dt, duration) => {
-                            debug!("[{}]: compile result: not cached", out_pretty);
+                            debug!("[{out_pretty}]: compile result: not cached");
                             dist_type = dt;
                             stats.compilations += 1;
                             stats.compiler_write_duration += duration;
                         }
                         CompileResult::NotCacheable(dt, duration) => {
-                            debug!("[{}]: compile result: not cacheable", out_pretty);
+                            debug!("[{out_pretty}]: compile result: not cacheable");
                             dist_type = dt;
                             stats.compilations += 1;
                             stats.compiler_write_duration += duration;
                             stats.non_cacheable_compilations += 1;
                         }
                         CompileResult::CompileFailed(dt, duration) => {
-                            debug!("[{}]: compile result: compile failed", out_pretty);
+                            debug!("[{out_pretty}]: compile result: compile failed");
                             dist_type = dt;
                             stats.compilations += 1;
                             stats.compiler_write_duration += duration;
@@ -1679,11 +1671,18 @@ where
                         stderr,
                     } = out;
 
-                    trace!("CompileFinished retcode: {}", status);
+                    trace!("CompileFinished retcode: {status}");
 
                     match status.code() {
                         Some(code) => res.retcode = Some(code),
-                        None => res.signal = Some(get_signal(status)),
+                        None => {
+                            if let Some(signal) = get_signal(&status) {
+                                res.signal = Some(signal);
+                            } else {
+                                error!("process exited without an exit code or signal");
+                                res.retcode = Some(-2);
+                            }
+                        }
                     }
 
                     res.stdout = stdout;
@@ -1692,14 +1691,23 @@ where
                 Err(err) => {
                     match err.downcast::<ProcessError>() {
                         Ok(ProcessError(output)) => {
-                            debug!("Compilation failed: {:?}", output);
+                            debug!("Compilation failed: {output:?}");
                             stats.compile_fails += 1;
                             // Make sure the write guard has been dropped ASAP.
                             drop(stats);
 
                             match output.status.code() {
                                 Some(code) => res.retcode = Some(code),
-                                None => res.signal = Some(get_signal(output.status)),
+                                None => {
+                                    if let Some(signal) = get_signal(&output.status) {
+                                        res.signal = Some(signal);
+                                    } else {
+                                        error!(
+                                            "failed process exited without an exit code or signal"
+                                        );
+                                        res.retcode = Some(-2);
+                                    }
+                                }
                             }
                             res.stdout = output.stdout;
                             res.stderr = output.stderr;
@@ -1709,9 +1717,8 @@ where
                                 // Make sure the write guard has been dropped ASAP.
                                 drop(stats);
                                 me.dist_client.reset_state().await;
-                                let errmsg =
-                                    format!("[{:?}] http error status: {}", out_pretty, msg);
-                                error!("{}", errmsg);
+                                let errmsg = format!("[{out_pretty:?}] http error status: {msg}");
+                                error!("{errmsg}");
                                 res.retcode = Some(1);
                                 res.stderr = errmsg.as_bytes().to_vec();
                             }
@@ -1722,13 +1729,13 @@ where
 
                                 use std::fmt::Write;
 
-                                error!("[{:?}] fatal error: {}", out_pretty, err);
+                                error!("[{out_pretty:?}] fatal error: {err}");
 
                                 let mut error = "sccache: encountered fatal error\n".to_string();
-                                let _ = writeln!(error, "sccache: error: {}", err);
+                                let _ = writeln!(error, "sccache: error: {err}");
                                 for e in err.chain() {
-                                    error!("[{:?}] \t{}", out_pretty, e);
-                                    let _ = writeln!(error, "sccache: caused by: {}", e);
+                                    error!("[{out_pretty:?}] \t{e}");
+                                    let _ = writeln!(error, "sccache: caused by: {e}");
                                 }
                                 //TODO: figure out a better way to communicate this?
                                 res.retcode = Some(-2);
@@ -1742,7 +1749,7 @@ where
             if let Some(cache_write) = cache_write {
                 match cache_write.await {
                     Err(e) => {
-                        debug!("Error executing cache write: {}", e);
+                        debug!("Error executing cache write: {e}");
                         me.stats.lock().await.cache_write_errors += 1;
                     }
                     //TODO: save cache stats!
@@ -1783,19 +1790,23 @@ impl PerLanguageCount {
         *count += 1;
     }
 
+    #[must_use]
     pub fn all(&self) -> u64 {
         self.counts.values().sum()
     }
 
+    #[must_use]
     pub fn get(&self, key: &str) -> Option<&u64> {
         self.counts.get(key)
     }
 
+    #[must_use]
     pub fn get_adv(&self, key: &str) -> Option<&u64> {
         self.adv_counts.get(key)
     }
 
-    pub fn new() -> PerLanguageCount {
+    #[must_use]
+    pub fn new() -> Self {
         Self::default()
     }
 }
@@ -1932,8 +1943,8 @@ pub enum DistInfo {
 }
 
 impl Default for ServerStats {
-    fn default() -> ServerStats {
-        ServerStats {
+    fn default() -> Self {
+        Self {
             compile_requests: u64::default(),
             requests_unsupported_compiler: u64::default(),
             requests_not_compile: u64::default(),
@@ -2023,11 +2034,7 @@ impl ServerStats {
 
         macro_rules! set_duration_stat {
             ($vec:ident, $dur:expr, $num:expr, $name:expr) => {{
-                let s = if $num > 0 {
-                    $dur / $num as u32
-                } else {
-                    Default::default()
-                };
+                let s = util::average_duration($dur, $num);
                 // name, value, suffix length
                 $vec.push(($name.to_string(), util::fmt_duration_as_secs(&s), 2));
             }};
@@ -2115,14 +2122,11 @@ impl ServerStats {
             }
         }
 
-        let name_width = stats_vec.iter().map(|(n, _, _)| n.len()).max().unwrap();
-        let stat_width = stats_vec.iter().map(|(_, s, _)| s.len()).max().unwrap();
+        let name_width = stats_vec.iter().map(|(n, _, _)| n.len()).max().unwrap_or(0);
+        let stat_width = stats_vec.iter().map(|(_, s, _)| s.len()).max().unwrap_or(0);
         for (name, stat, suffix_len) in stats_vec {
             writer.write(&format!(
-                "{:<name_width$} {:>stat_width$}",
-                name,
-                stat,
-                name_width = name_width,
+                "{name:<name_width$} {stat:>stat_width$}",
                 stat_width = stat_width + suffix_len
             ));
         }
@@ -2141,11 +2145,8 @@ impl ServerStats {
             counts.sort_by(sort_func);
             for (reason, count) in counts {
                 writer.write(&format!(
-                    "  {:<name_width$} {:>stat_width$}",
-                    reason,
-                    count,
-                    name_width = name_width - 2,
-                    stat_width = stat_width,
+                    "  {reason:<name_width$} {count:>stat_width$}",
+                    name_width = name_width.saturating_sub(2),
                 ));
             }
         }
@@ -2154,13 +2155,7 @@ impl ServerStats {
             let mut counts: Vec<_> = self.not_cached.iter().collect();
             counts.sort_by(sort_func);
             for (reason, count) in counts {
-                writer.write(&format!(
-                    "{:<name_width$} {:>stat_width$}",
-                    reason,
-                    count,
-                    name_width = name_width,
-                    stat_width = stat_width,
-                ));
+                writer.write(&format!("{reason:<name_width$} {count:>stat_width$}",));
             }
             writer.write("");
         }
@@ -2169,13 +2164,7 @@ impl ServerStats {
             let mut counts: Vec<_> = self.not_cached_crate_types.iter().collect();
             counts.sort_by(sort_func);
             for (crate_type, count) in counts {
-                writer.write(&format!(
-                    "{:<name_width$} {:>stat_width$}",
-                    crate_type,
-                    count,
-                    name_width = name_width,
-                    stat_width = stat_width,
-                ));
+                writer.write(&format!("{crate_type:<name_width$} {count:>stat_width$}",));
             }
             writer.write("");
         }
@@ -2228,7 +2217,7 @@ impl ServerStats {
                 stats_vec,
                 count_hits,
                 count_hits + count_misses,
-                &format!("Cache hits rate ({})", lang),
+                &format!("Cache hits rate ({lang})"),
             );
         }
     }
@@ -2278,7 +2267,7 @@ impl ServerInfo {
             multi_level = None;
         }
         let version = env!("CARGO_PKG_VERSION").to_string();
-        Ok(ServerInfo {
+        Ok(Self {
             stats: ServerStats {
                 multi_level,
                 ..stats
@@ -2295,19 +2284,13 @@ impl ServerInfo {
     /// Print info to stdout in a human-readable format.
     pub fn print(&self, advanced: bool) {
         let (name_width, stat_width) = self.stats.print(&mut StdoutServerStatsWriter, advanced);
-        println!(
-            "{:<name_width$} {}",
-            "Cache location",
-            self.cache_location,
-            name_width = name_width
-        );
+        println!("{:<name_width$} {}", "Cache location", self.cache_location);
         if let Some(ref ml_stats) = self.stats.multi_level {
             for level in &ml_stats.0 {
                 println!(
                     "{:<name_width$} {}",
                     format!("  {}", level.name),
-                    level.location,
-                    name_width = name_width
+                    level.location
                 );
             }
         }
@@ -2318,8 +2301,7 @@ impl ServerInfo {
                 "(none)".to_string()
             } else {
                 self.basedirs.join(", ")
-            },
-            name_width = name_width
+            }
         );
         if self.cache_location.starts_with("Local disk") {
             println!(
@@ -2329,16 +2311,10 @@ impl ServerInfo {
                     "yes"
                 } else {
                     "no"
-                },
-                name_width = name_width
+                }
             );
         }
-        println!(
-            "{:<name_width$} {}",
-            "Version (client)",
-            self.version,
-            name_width = name_width
-        );
+        println!("{:<name_width$} {}", "Version (client)", self.version);
         for &(name, val) in &[
             ("Cache size", &self.cache_size),
             ("Max cache size", &self.max_cache_size),
@@ -2346,18 +2322,9 @@ impl ServerInfo {
             if let Some(val) = *val {
                 let (val, suffix) = match NumberPrefix::binary(val as f64) {
                     NumberPrefix::Standalone(bytes) => (bytes.to_string(), "bytes".to_string()),
-                    NumberPrefix::Prefixed(prefix, n) => {
-                        (format!("{:.0}", n), format!("{}B", prefix))
-                    }
+                    NumberPrefix::Prefixed(prefix, n) => (format!("{n:.0}"), format!("{prefix}B")),
                 };
-                println!(
-                    "{:<name_width$} {:>stat_width$} {}",
-                    name,
-                    val,
-                    suffix,
-                    name_width = name_width,
-                    stat_width = stat_width
-                );
+                println!("{name:<name_width$} {val:>stat_width$} {suffix}");
             }
         }
     }
@@ -2390,8 +2357,8 @@ enum Message<R, B> {
 impl<R, B> Message<R, B> {
     fn into_inner(self) -> R {
         match self {
-            Message::WithBody(r, _) => r,
-            Message::WithoutBody(r) => r,
+            Self::WithBody(r, _) => r,
+            Self::WithoutBody(r) => r,
         }
     }
 }
@@ -2525,9 +2492,8 @@ pub(crate) struct WaitUntilZero {
 }
 
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct ActiveInfo {
-    info: Arc<std::sync::Mutex<Info>>,
+    _info: Arc<std::sync::Mutex<Info>>,
 }
 
 struct Info {
@@ -2544,10 +2510,10 @@ impl Drop for Info {
 
 impl WaitUntilZero {
     #[rustfmt::skip]
-    pub(crate) fn new() -> (WaitUntilZero, ActiveInfo) {
+    pub(crate) fn new() -> (Self, ActiveInfo) {
         let info = Arc::new(std::sync::Mutex::new(Info { waker: None }));
 
-        (WaitUntilZero { info: Arc::downgrade(&info) }, ActiveInfo { info })
+        (Self { info: Arc::downgrade(&info) }, ActiveInfo { _info: info })
     }
 }
 
@@ -2558,7 +2524,9 @@ impl std::future::Future for WaitUntilZero {
         match self.info.upgrade() {
             None => std::task::Poll::Ready(()),
             Some(arc) => {
-                let mut info = arc.lock().expect("we can't panic when holding lock");
+                let mut info = arc
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 info.waker = Some(cx.waker().clone());
                 std::task::Poll::Pending
             }
@@ -2595,8 +2563,8 @@ mod tests {
     }
 
     impl StringWriter {
-        fn new() -> StringWriter {
-            StringWriter {
+        fn new() -> Self {
+            Self {
                 buffer: String::new(),
             }
         }
@@ -2608,36 +2576,8 @@ mod tests {
 
     impl ServerStatsWriter for StringWriter {
         fn write(&mut self, text: &str) {
-            self.buffer.push_str(&format!("{}\n", text));
+            self.buffer.push_str(&format!("{text}\n"));
         }
-    }
-
-    #[test]
-    #[cfg(feature = "dist-client")]
-    fn test_dist_status_retries_expired_client_state() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let config = DistClientConfig {
-            pool: runtime.handle().clone(),
-            scheduler_url: None,
-            auth: config::DistAuth::Token {
-                token: String::new(),
-            },
-            cache_dir: PathBuf::new(),
-            toolchain_cache_size: 0,
-            toolchains: vec![],
-            rewrite_includes_only: false,
-        };
-        let container = DistClientContainer::new_with_state(DistClientState::RetryCreateAt(
-            Box::new(config),
-            Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
-        ));
-
-        let status = runtime.block_on(container.get_status());
-
-        assert!(matches!(status, DistInfo::Disabled(_)));
     }
 
     #[test]

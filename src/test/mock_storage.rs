@@ -32,7 +32,7 @@ pub struct MockStorage {
 
 impl MockStorage {
     /// Create a new `MockStorage`. if `delay` is `Some`, wait for that amount of time before returning from operations.
-    pub(crate) fn new(delay: Option<Duration>, preprocessor_cache_mode: bool) -> MockStorage {
+    pub(crate) fn new(delay: Option<Duration>, preprocessor_cache_mode: bool) -> Self {
         let (tx, rx) = mpsc::unbounded();
         Self {
             tx,
@@ -54,11 +54,9 @@ impl Storage for MockStorage {
         if let Some(delay) = self.delay {
             sleep(delay).await;
         }
-        self.rx
-            .lock()
-            .await
-            .try_recv()
-            .expect("MockStorage get called but no get results available")
+        let next = self.rx.lock().await.try_next().unwrap();
+
+        next.expect("MockStorage get called but no get results available")
     }
     async fn put(&self, _key: &str, _entry: CacheWrite) -> Result<Duration> {
         Ok(if let Some(delay) = self.delay {
