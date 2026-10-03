@@ -397,8 +397,7 @@ pub struct MultiLevelStorage {
 }
 
 impl MultiLevelStorage {
-    /// Collect and deduplicate basedirs from all cache levels.
-    fn collect_basedirs(levels: &[Arc<dyn Storage>]) -> Vec<Vec<u8>> {
+    /// Collect and deduplicate basedirs from all cache levels.    fn collect_basedirs(levels: &[Arc<dyn Storage>]) -> Vec<Vec<u8>> {
         let mut seen = Vec::new();
         for level in levels {
             for basedir in level.basedirs() {
@@ -640,12 +639,29 @@ impl MultiLevelStorage {
         )))
     }
 
-    /// Ensure slower cache levels contain an entry already served by a faster level.
-    ///
-    /// This path is deliberately detached from the cache hit: the caller gets the
-    /// faster-level hit immediately. Slower levels are probed only when they expose
-    /// a cheap existence check, and the source object is read only if at least one
-    /// slower level is actually missing the key.
+    fn record_hit_and_schedule_backfills(
+        &self,
+        key: &str,
+        idx: usize,
+        duration: Duration,
+        raw_bytes_for_backfill: Option<Bytes>,
+    ) {
+        debug!("Cache hit at level {idx} in {duration:?}");
+
+        inc_stat!(self.atomic_stats.get(idx), hits, 1);
+        inc_stat!(
+            self.atomic_stats.get(idx),
+            hit_duration_nanos,
+            duration_nanos_u64(duration)
+        );
+        for miss_idx in 0..idx {
+            inc_stat!(self.atomic_stats.get(miss_idx), misses, 1);
+        }
+
+        self.repair_slower_levels_from_hit(key, idx);
+        self.backfill_faster_levels(key, idx, raw_bytes_for_backfill);
+    }
+
     async fn read_level_with_raw(&self, idx: usize, key: &str) -> (Result<Cache>, Option<Bytes>) {
         let level = &self.levels[idx];
         if idx == 0 {
@@ -701,6 +717,12 @@ impl MultiLevelStorage {
         }
     }
 
+    /// Ensure slower cache levels contain an entry already served by a faster level.
+    ///
+    /// This path is deliberately detached from the cache hit: the caller gets the
+    /// faster-level hit immediately. Slower levels are probed only when they expose
+    /// a cheap existence check, and the source object is read only if at least one
+    /// slower level is actually missing the key.
     fn repair_slower_levels_from_hit(&self, key: &str, hit_idx: usize) {
         if hit_idx + 1 >= self.levels.len() {
             return;
@@ -774,8 +796,7 @@ impl MultiLevelStorage {
                             Some(stats.as_ref()),
                             write_duration_nanos,
                             duration_nanos_u64(duration)
-                        );
-                        trace!(
+                        );                        trace!(
                             "Repaired slower cache level {idx} from faster level {hit_idx} in {duration:?}"
                         );
                     }
@@ -854,35 +875,18 @@ impl MultiLevelStorage {
 #[async_trait]
 impl Storage for MultiLevelStorage {
     async fn get(&self, key: &str) -> Result<Cache> {
-        for (idx, level) in self.levels.iter().enumerate() {
+        for idx in 0..self.levels.len() {
             let start = Instant::now();
             let (cache_result, raw_bytes_for_backfill) = self.read_level_with_raw(idx, key).await;
 
             match cache_result {
                 Ok(Cache::Hit(entry)) => {
-                    let duration = start.elapsed();
-                    debug!("Cache hit at level {idx} in {duration:?}");
-
-                    // Update stats
-                    inc_stat!(self.atomic_stats.get(idx), hits, 1);
-                    inc_stat!(
-                        self.atomic_stats.get(idx),
-                        hit_duration_nanos,
-                        duration_nanos_u64(duration)
+                    self.record_hit_and_schedule_backfills(
+                        key,
+                        idx,
+                        start.elapsed(),
+                        raw_bytes_for_backfill,
                     );
-                    // Mark misses for all levels checked before this hit
-                    for miss_idx in 0..idx {
-                        inc_stat!(self.atomic_stats.get(miss_idx), misses, 1);
-                    }
-
-                    // A fast-level hit should also repair missing slower levels in the
-                    // background. This is intentionally non-blocking so a hot L0 remains hot.
-                    self.repair_slower_levels_from_hit(key, idx);
-
-                    // Raw bytes obtained above are reused for backfilling;
-                    // no second read is needed for a raw-capable level.
-                    self.backfill_faster_levels(key, idx, raw_bytes_for_backfill);
-
                     return Ok(Cache::Hit(entry));
                 }
                 Ok(Cache::Miss) => {

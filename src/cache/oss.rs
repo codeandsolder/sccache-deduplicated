@@ -27,7 +27,7 @@ impl OSSCache {
     ///
     /// # Errors
     ///
-    /// Returns an error if the OpenDAL operator or HTTP transport cannot be initialized.
+    /// Returns an error if the `OpenDAL` operator or HTTP transport cannot be initialized.
     pub fn build(
         bucket: &str,
         key_prefix: &str,

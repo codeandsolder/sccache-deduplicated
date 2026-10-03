@@ -40,7 +40,7 @@ impl GCSCache {
     /// # Errors
     ///
     /// Returns an error if credentials, the optional credential URL, runtime setup,
-    /// token retrieval, or OpenDAL initialization fails.
+    /// token retrieval, or `OpenDAL` initialization fails.
     pub fn build(
         bucket: &str,
         key_prefix: &str,

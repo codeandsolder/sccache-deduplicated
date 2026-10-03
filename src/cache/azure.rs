@@ -51,7 +51,7 @@ impl AzureBlobCache {
     /// # Errors
     ///
     /// Returns an error if authentication sources conflict, the endpoint is invalid,
-    /// required Entra configuration is missing, or the OpenDAL operator cannot be built.
+    /// required Entra configuration is missing, or the `OpenDAL` operator cannot be built.
     pub fn build(
         connection_string: Option<&str>,
         container: &str,

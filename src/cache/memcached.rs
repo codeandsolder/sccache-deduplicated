@@ -29,7 +29,7 @@ impl MemcachedCache {
     ///
     /// # Errors
     ///
-    /// Returns an error if the OpenDAL operator cannot be initialized.
+    /// Returns an error if the `OpenDAL` operator cannot be initialized.
     pub fn build(
         url: &str,
         username: Option<&str>,

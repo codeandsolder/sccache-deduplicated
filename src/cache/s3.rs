@@ -99,7 +99,7 @@ impl S3Cache {
     ///
     /// # Errors
     ///
-    /// Returns an error if the endpoint is invalid or OpenDAL/HTTP initialization fails.
+    /// Returns an error if the endpoint is invalid or `OpenDAL`/HTTP initialization fails.
     pub fn build(self) -> Result<Operator> {
         let mut builder = S3::default().bucket(&self.bucket).root(&self.key_prefix);
 

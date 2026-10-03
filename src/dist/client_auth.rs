@@ -497,8 +497,7 @@ impl HyperBuilderWrap {
     }
 }
 
-fn error_code_response<E>(uri: &hyper::Uri, e: E) -> Response<Full<Bytes>>
-where
+fn error_code_response<E>(uri: &hyper::Uri, e: E) -> Response<Full<Bytes>>where
     E: std::fmt::Debug,
 {
     let body = format!("{e:?}");
@@ -565,7 +564,7 @@ where
     Ok(())
 }
 
-/// Complete an OAuth2 authorization-code + PKCE flow using a temporary local callback server.
+/// Complete an `OAuth2` authorization-code + PKCE flow using a temporary local callback server.
 ///
 /// # Errors
 ///
@@ -637,7 +636,7 @@ pub fn get_token_oauth2_code_grant_pkce(
         .context("Failed to convert oauth2 code into a token")
 }
 
-/// Complete an OAuth2 implicit flow using a temporary local callback server.
+/// Complete an `OAuth2` implicit flow using a temporary local callback server.
 ///
 /// # Errors
 ///

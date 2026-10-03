@@ -25,7 +25,7 @@ impl WebdavCache {
     /// Create a new `WebdavCache`.
     /// # Errors
     ///
-    /// Returns an error if the OpenDAL operator or HTTP transport cannot be initialized.
+    /// Returns an error if the `OpenDAL` operator or HTTP transport cannot be initialized.
     pub fn build(
         endpoint: &str,
         key_prefix: &str,

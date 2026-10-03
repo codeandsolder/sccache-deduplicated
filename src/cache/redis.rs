@@ -29,7 +29,7 @@ impl RedisCache {
     ///
     /// # Errors
     ///
-    /// Returns an error if the URL is invalid or the OpenDAL operator cannot be built.
+    /// Returns an error if the URL is invalid or the `OpenDAL` operator cannot be built.
     pub fn build_from_url(url: &str, key_prefix: &str, ttl: u64) -> Result<Operator> {
         let parsed = Url::parse(url)?;
 
@@ -59,7 +59,7 @@ impl RedisCache {
     ///
     /// # Errors
     ///
-    /// Returns an error if the OpenDAL operator cannot be built.
+    /// Returns an error if the `OpenDAL` operator cannot be built.
     pub fn build_single(
         endpoint: &str,
         username: Option<&str>,
@@ -77,7 +77,7 @@ impl RedisCache {
     ///
     /// # Errors
     ///
-    /// Returns an error if the OpenDAL operator cannot be built.
+    /// Returns an error if the `OpenDAL` operator cannot be built.
     pub fn build_cluster(
         endpoints: &str,
         username: Option<&str>,

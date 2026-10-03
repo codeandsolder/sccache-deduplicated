@@ -30,7 +30,7 @@ impl GHACache {
     ///
     /// # Errors
     ///
-    /// Returns an error if the OpenDAL operator or HTTP transport cannot be initialized.
+    /// Returns an error if the `OpenDAL` operator or HTTP transport cannot be initialized.
     pub fn build(version: &str) -> Result<Operator> {
         let mut builder = Ghac::default()
             // This is the prefix of gha cache.

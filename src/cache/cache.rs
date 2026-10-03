@@ -397,8 +397,7 @@ impl Storage for RemoteStorage {
             Err(err) => {
                 eprintln!("storage write check failed: {err:?}");
                 false
-            }
-        };
+            }        };
 
         let mode = if can_write {
             CacheMode::ReadWrite
@@ -624,7 +623,7 @@ fn build_cos_operator(c: &config::COSCacheConfig) -> Result<opendal::Operator> {
         .map_err(|err| anyhow!("create cos cache failed: {err:?}"))
 }
 
-/// Build a single cache storage from CacheType.
+/// Build a single cache storage from `CacheType`.
 ///
 /// # Errors
 ///
@@ -798,7 +797,6 @@ mod test {
             .enable_all()
             .worker_threads(1)
             .build()?;
-
         let mut config = Config {
             cache: None,
             ..Default::default()

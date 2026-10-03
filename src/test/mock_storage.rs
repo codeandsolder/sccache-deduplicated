@@ -57,7 +57,7 @@ impl Storage for MockStorage {
         }
         self.rx.lock().await.try_recv().map_err(|error| {
             anyhow::anyhow!("MockStorage get called but no get results available: {error}")
-        })
+        })?
     }
     async fn put(&self, _key: &str, _entry: CacheWrite) -> Result<Duration> {
         Ok(if let Some(delay) = self.delay {
