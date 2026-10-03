@@ -17,7 +17,7 @@ use crate::cache::cache_io::{Cache, CacheRead, CacheWrite};
 use crate::client::ServerConnection;
 use crate::compiler::PreprocessorCacheEntry;
 use crate::config::PreprocessorCacheModeConfig;
-use crate::errors::*;
+use crate::errors::{Context, Result, anyhow, bail};
 use crate::protocol::{Request, Response, StorageHandshakeInfo};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -41,6 +41,10 @@ pub struct IpcStorage {
 impl IpcStorage {
     /// Connect to the daemon and perform the `StorageHandshake` RPC.
     /// Returns an `IpcStorage` that can be used as an `Arc<dyn Storage>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the handshake request fails or the daemon returns an unexpected response.
     pub fn connect(mut conn: ServerConnection) -> Result<Self> {
         let resp = conn.request(Request::StorageHandshake)?;
         let handshake = match resp {
@@ -56,15 +60,21 @@ impl IpcStorage {
     /// Return a clone of the underlying connection handle so callers can send
     /// additional RPCs (e.g., `RecordStats`) after the storage is no longer
     /// needed.
+    #[must_use]
     pub fn conn(&self) -> Arc<Mutex<ServerConnection>> {
         Arc::clone(&self.conn)
     }
 
     async fn rpc(&self, req: Request) -> Result<Response> {
         let conn = Arc::clone(&self.conn);
-        tokio::task::spawn_blocking(move || conn.lock().unwrap().request(req))
-            .await
-            .context("spawn_blocking panicked")?
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn
+                .lock()
+                .map_err(|_| anyhow!("IpcStorage connection lock is poisoned"))?;
+            conn.request(req)
+        })
+        .await
+        .context("IpcStorage RPC task failed")?
     }
 }
 
@@ -75,20 +85,16 @@ impl Storage for IpcStorage {
             GetPathResult::Found(path) => {
                 let file = std::fs::File::open(&path)
                     .with_context(|| format!("IpcStorage::get: open {}", path.display()))?;
-                match CacheRead::from(file) {
-                    Ok(entry) => Ok(Cache::Hit(entry)),
-                    Err(_) => Ok(Cache::Miss),
-                }
+                Ok(CacheRead::from(file).map_or_else(|_| Cache::Miss, Cache::Hit))
             }
             GetPathResult::Miss => Ok(Cache::Miss),
             // Backend doesn't support paths (S3, Redis, …); fall back to bytes over IPC.
-            GetPathResult::Unsupported => match self.get_raw(key).await? {
-                Some(bytes) => match CacheRead::from(Cursor::new(bytes)) {
-                    Ok(entry) => Ok(Cache::Hit(entry)),
-                    Err(_) => Ok(Cache::Miss),
+            GetPathResult::Unsupported => Ok(self.get_raw(key).await?.map_or_else(
+                || Cache::Miss,
+                |bytes| {
+                    CacheRead::from(Cursor::new(bytes)).map_or_else(|_| Cache::Miss, Cache::Hit)
                 },
-                None => Ok(Cache::Miss),
-            },
+            )),
         }
     }
 

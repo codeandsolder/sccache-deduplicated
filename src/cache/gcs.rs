@@ -14,7 +14,7 @@
 // limitations under the License.
 
 use crate::cache::CacheMode;
-use crate::errors::*;
+use crate::errors::{Result, anyhow};
 use opendal::Operator;
 use opendal::{OperationContext, services::Gcs};
 use opendal_layer_logging::LoggingLayer;
@@ -24,7 +24,7 @@ use url::Url;
 
 use super::http_client::set_user_agent;
 
-fn rw_to_scope(mode: CacheMode) -> &'static str {
+const fn rw_to_scope(mode: CacheMode) -> &'static str {
     match mode {
         CacheMode::ReadOnly => "https://www.googleapis.com/auth/devstorage.read_only",
         CacheMode::ReadWrite => "https://www.googleapis.com/auth/devstorage.read_write",
@@ -35,7 +35,12 @@ fn rw_to_scope(mode: CacheMode) -> &'static str {
 pub struct GCSCache;
 
 impl GCSCache {
-    /// Create a new `GCSCache` storing data in `bucket`
+    /// Create a new `GCSCache` storing data in `bucket`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials, the optional credential URL, runtime setup,
+    /// token retrieval, or `OpenDAL` initialization fails.
     pub fn build(
         bucket: &str,
         key_prefix: &str,
@@ -72,13 +77,13 @@ impl GCSCache {
         }
 
         let op = Operator::new(builder)?
-            .with_context(OperationContext::new().with_http_transport(set_user_agent()))
+            .with_context(OperationContext::new().with_http_transport(set_user_agent()?))
             .layer(LoggingLayer::default());
         Ok(op)
     }
 }
 
-/// Fetch token from TaskCluster for GCS authentication
+/// Fetch token from `TaskCluster` for GCS authentication
 ///
 /// This feature is required to run [mozilla's CI](https://searchfox.org/mozilla-central/source/build/mozconfig.cache#67-84):
 ///
@@ -88,7 +93,7 @@ impl GCSCache {
 ///
 /// Reference: [gcpCredentials](https://docs.taskcluster.net/docs/reference/platform/auth/api#gcpCredentials)
 async fn fetch_taskcluster_token(url: &str, scope: &str) -> Result<String> {
-    debug!("gcs: start to load token from: {}", url);
+    debug!("gcs: start to load token from: {url}");
 
     let user_agent = format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     let client = Client::builder().user_agent(user_agent).build()?;
@@ -96,7 +101,7 @@ async fn fetch_taskcluster_token(url: &str, scope: &str) -> Result<String> {
 
     if res.status().is_success() {
         let resp = res.json::<TaskClusterToken>().await?;
-        debug!("gcs: token load succeeded for scope: {}", scope);
+        debug!("gcs: token load succeeded for scope: {scope}");
         Ok(resp.access_token)
     } else {
         let status_code = res.status();

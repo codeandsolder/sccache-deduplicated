@@ -13,7 +13,10 @@
 // limitations under the License.
 
 use crate::compiler::args::*;
-use crate::compiler::c::{ArtifactDescriptor, CCompilerImpl, CCompilerKind, ParsedArguments};
+use crate::compiler::c::{
+    ArtifactDescriptor, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
+    ParsedArguments,
+};
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
     SingleCompileCommand, clang, gcc, write_temp_file,
@@ -64,21 +67,20 @@ impl CCompilerImpl for Msvc {
         parse_arguments(arguments, cwd, self.is_clang)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn preprocess<T>(
-        &self,
-        creator: &T,
-        executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        env_vars: &[(OsString, OsString)],
-        may_dist: bool,
-        rewrite_includes_only: bool,
-        _preprocessor_cache_mode: bool,
-    ) -> Result<process::Output>
+    async fn preprocess<T>(&self, context: CPreprocessContext<'_, T>) -> Result<process::Output>
     where
         T: CommandCreatorSync,
     {
+        let CPreprocessContext {
+            creator,
+            executable,
+            parsed_args,
+            cwd,
+            env_vars,
+            may_dist,
+            rewrite_includes_only,
+            ..
+        } = context;
         preprocess(
             creator,
             executable,
@@ -86,21 +88,18 @@ impl CCompilerImpl for Msvc {
             cwd,
             env_vars,
             may_dist,
-            &self.includes_prefix,
-            rewrite_includes_only,
-            self.is_clang,
+            MsvcPreprocessConfig {
+                includes_prefix: &self.includes_prefix,
+                rewrite_includes_only,
+                is_clang: self.is_clang,
+            },
         )
         .await
     }
 
     fn generate_compile_commands<T>(
         &self,
-        path_transformer: &mut dist::PathTransformer,
-        executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        env_vars: &[(OsString, OsString)],
-        _rewrite_includes_only: bool,
+        context: CCompileContext<'_>,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
         Option<dist::CompileCommand>,
@@ -109,9 +108,17 @@ impl CCompilerImpl for Msvc {
     where
         T: CommandCreatorSync,
     {
+        let CCompileContext {
+            path_transformer,
+            executable,
+            parsed_args,
+            cwd,
+            env_vars,
+            ..
+        } = context;
         generate_compile_commands(path_transformer, executable, parsed_args, cwd, env_vars).map(
             |(command, dist_command, cacheable)| {
-                (CCompileCommand::new(command), dist_command, cacheable)
+                (CCompileCommand::boxed(command), dist_command, cacheable)
             },
         )
     }
@@ -207,7 +214,7 @@ where
     for (k, v) in env {
         cmd.env(k, v);
     }
-    trace!("detect_showincludes_prefix: {:?}", cmd);
+    trace!("detect_showincludes_prefix: {cmd:?}");
 
     let output = run_input_output(cmd, None).await?;
 
@@ -244,10 +251,7 @@ where
     }
     drop(tempdir);
 
-    debug!(
-        "failed to detect showIncludes prefix with output: {}",
-        preprocessor_output
-    );
+    debug!("failed to detect showIncludes prefix with output: {preprocessor_output}");
 
     bail!("Failed to detect showIncludes prefix")
 }
@@ -589,14 +593,19 @@ pub fn parse_arguments(
     for arg in it {
         let arg = try_or_cannot_cache!(arg, "argument parse");
         match arg.get_data() {
-            Some(PassThrough) | Some(PassThroughWithPath(_)) | Some(PassThroughWithSuffix(_)) => {}
-            Some(TooHardFlag) | Some(TooHard(_)) | Some(TooHardPath(_)) => {
-                cannot_cache!(arg.flag_str().expect("Can't be Argument::Raw/UnknownFlag",))
+            Some(PassThrough | PassThroughWithPath(_) | PassThroughWithSuffix(_)) => {}
+            Some(TooHardFlag | TooHard(_) | TooHardPath(_)) => {
+                let Some(flag) = arg.flag_str() else {
+                    cannot_cache!("unsupported compiler option", format!("{arg:?}"));
+                };
+                cannot_cache!(flag)
             }
             Some(DoCompilation) => {
+                let Some(flag) = arg.flag_str() else {
+                    cannot_cache!("compilation flag was not representable", format!("{arg:?}"));
+                };
                 compilation = true;
-                compilation_flag =
-                    OsString::from(arg.flag_str().expect("Compilation flag expected"));
+                compilation_flag = OsString::from(flag);
             }
             Some(ShowIncludes) => {
                 show_includes = true;
@@ -613,12 +622,14 @@ pub fn parse_arguments(
             Some(DepFile(p)) => depfile = Some(p.clone()),
             Some(ProgramDatabase(p)) => pdb = Some(p.clone()),
             Some(DebugInfo) => debug_info = true,
-            Some(PreprocessorArgument(_))
-            | Some(PreprocessorArgumentPath(_))
-            | Some(ExtraHashFile(_))
-            | Some(Ignore)
-            | Some(IgnoreWithSuffix(_))
-            | Some(ExternalIncludePath(_)) => {}
+            Some(
+                PreprocessorArgument(_)
+                | PreprocessorArgumentPath(_)
+                | ExtraHashFile(_)
+                | Ignore
+                | IgnoreWithSuffix(_)
+                | ExternalIncludePath(_),
+            ) => {}
             Some(SuppressCompilation) => {
                 return CompilerArguments::NotCompilation;
             }
@@ -640,21 +651,23 @@ pub fn parse_arguments(
                         input_arg = Some(val.clone());
                     }
                     Argument::UnknownFlag(ref flag) => common_args.push(flag.clone()),
-                    _ => unreachable!(),
+                    _ => cannot_cache!("unexpected MSVC argument variant", format!("{arg:?}")),
                 }
             }
         }
         match arg.get_data() {
-            Some(PreprocessorArgument(_)) | Some(PreprocessorArgumentPath(_)) => preprocessor_args
+            Some(PreprocessorArgument(_) | PreprocessorArgumentPath(_)) => preprocessor_args
                 .extend(
                     arg.normalize(NormalizedDisposition::Concatenated)
                         .iter_os_strings(),
                 ),
-            Some(ProgramDatabase(_))
-            | Some(DebugInfo)
-            | Some(PassThrough)
-            | Some(PassThroughWithPath(_))
-            | Some(PassThroughWithSuffix(_)) => common_args.extend(
+            Some(
+                ProgramDatabase(_)
+                | DebugInfo
+                | PassThrough
+                | PassThroughWithPath(_)
+                | PassThroughWithSuffix(_),
+            ) => common_args.extend(
                 arg.normalize(NormalizedDisposition::Concatenated)
                     .iter_os_strings(),
             ),
@@ -688,7 +701,7 @@ pub fn parse_arguments(
             // so we just skip them entirely. -FS may also have a side effect of creating
             // race conditions in which we may try to read the PDB before MSPDBSRC is done
             // writing it, so we're better off ignoring the flags.
-            Some(Ignore) | Some(IgnoreWithSuffix(_)) => {}
+            Some(Ignore | IgnoreWithSuffix(_)) => {}
             _ => {}
         }
     }
@@ -715,38 +728,42 @@ pub fn parse_arguments(
             // Eagerly bail if it looks like we need to do more complicated work
             use crate::compiler::gcc::ArgData::*;
             let args = match arg.get_data() {
-                Some(SplitDwarf)
-                | Some(TestCoverage)
-                | Some(Coverage)
-                | Some(DoCompilation)
-                | Some(Language(_))
-                | Some(Output(_))
-                | Some(TooHardFlag)
-                | Some(XClang(_))
-                | Some(ClangModuleOutput(_))
-                | Some(ExtraHashFileClangModuleFile(_))
-                | Some(ModuleOnlyFlag)
-                | Some(IntegratedAs)
-                | Some(NoIntegratedAs)
-                | Some(TooHard(_)) => cannot_cache!(
+                Some(
+                    SplitDwarf
+                    | TestCoverage
+                    | Coverage
+                    | DoCompilation
+                    | Language(_)
+                    | Output(_)
+                    | TooHardFlag
+                    | XClang(_)
+                    | ClangModuleOutput(_)
+                    | ExtraHashFileClangModuleFile(_)
+                    | ModuleOnlyFlag
+                    | IntegratedAs
+                    | NoIntegratedAs
+                    | TooHard(_),
+                ) => cannot_cache!(
                     arg.flag_str()
                         .unwrap_or("Can't handle complex arguments through clang",)
                 ),
                 None => match arg {
                     Argument::Raw(_) | Argument::UnknownFlag(_) => &mut common_args,
-                    _ => unreachable!(),
+                    _ => cannot_cache!("unexpected clang-cl argument variant", format!("{arg:?}")),
                 },
-                Some(DiagnosticsColor(_))
-                | Some(DiagnosticsColorFlag)
-                | Some(NoDiagnosticsColorFlag)
-                | Some(Arch(_))
-                | Some(PassThroughFlag)
-                | Some(PassThrough(_))
-                | Some(PassThroughPath(_))
-                | Some(PedanticFlag)
-                | Some(Standard(_))
-                | Some(SerializeDiagnostics(_)) => &mut common_args,
-                Some(UnhashedFlag) | Some(Unhashed(_)) => &mut unhashed_args,
+                Some(
+                    DiagnosticsColor(_)
+                    | DiagnosticsColorFlag
+                    | NoDiagnosticsColorFlag
+                    | Arch(_)
+                    | PassThroughFlag
+                    | PassThrough(_)
+                    | PassThroughPath(_)
+                    | PedanticFlag
+                    | Standard(_)
+                    | SerializeDiagnostics(_),
+                ) => &mut common_args,
+                Some(UnhashedFlag | Unhashed(_)) => &mut unhashed_args,
 
                 Some(ProfileGenerate) => {
                     profile_generate = true;
@@ -762,12 +779,12 @@ pub fn parse_arguments(
                     extra_hash_files.push(cwd.join(path));
                     &mut common_args
                 }
-                Some(PreprocessorArgumentFlag)
-                | Some(PreprocessorArgument(_))
-                | Some(PreprocessorArgumentPath(_)) => &mut preprocessor_args,
-                Some(DepArgumentPath(_)) | Some(DepTarget(_)) | Some(NeedDepTarget) => {
-                    &mut dependency_args
-                }
+                Some(
+                    PreprocessorArgumentFlag
+                    | PreprocessorArgument(_)
+                    | PreprocessorArgumentPath(_),
+                ) => &mut preprocessor_args,
+                Some(DepArgumentPath(_) | DepTarget(_) | NeedDepTarget) => &mut dependency_args,
             };
             // Normalize attributes such as "-I foo", "-D FOO=bar", as
             // "-Ifoo", "-DFOO=bar", etc. and "-includefoo", "idirafterbar" as
@@ -972,7 +989,6 @@ fn normpath(path: &str) -> String {
     path.to_owned()
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn preprocess_cmd<T>(
     cmd: &mut T,
     parsed_args: &ParsedArguments,
@@ -1030,7 +1046,12 @@ pub fn preprocess_cmd<T>(
     cmd.arg(&parsed_args.input);
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct MsvcPreprocessConfig<'a> {
+    pub includes_prefix: &'a str,
+    pub rewrite_includes_only: bool,
+    pub is_clang: bool,
+}
+
 pub async fn preprocess<T>(
     creator: &T,
     executable: &Path,
@@ -1038,13 +1059,16 @@ pub async fn preprocess<T>(
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
     may_dist: bool,
-    includes_prefix: &str,
-    rewrite_includes_only: bool,
-    is_clang: bool,
+    config: MsvcPreprocessConfig<'_>,
 ) -> Result<process::Output>
 where
     T: CommandCreatorSync,
 {
+    let MsvcPreprocessConfig {
+        includes_prefix,
+        rewrite_includes_only,
+        is_clang,
+    } = config;
     let mut cmd = creator.clone().new_command_sync(executable);
     preprocess_cmd(
         &mut cmd,
@@ -1057,7 +1081,7 @@ where
     );
 
     if log_enabled!(Debug) {
-        debug!("preprocess: {:?}", cmd);
+        debug!("preprocess: {cmd:?}");
     }
 
     let parsed_args = parsed_args.clone();
@@ -1077,10 +1101,10 @@ where
         let mut f = BufWriter::new(f);
 
         encode_path(&mut f, objfile)
-            .with_context(|| format!("Couldn't encode objfile filename: '{:?}'", objfile))?;
+            .with_context(|| format!("Couldn't encode objfile filename: '{objfile:?}'"))?;
         write!(f, ": ")?;
         encode_path(&mut f, &parsed_args.input)
-            .with_context(|| format!("Couldn't encode input filename: '{:?}'", objfile))?;
+            .with_context(|| format!("Couldn't encode input filename: '{objfile:?}'"))?;
         write!(f, " ")?;
         let process::Output {
             status,
@@ -1094,9 +1118,9 @@ where
         for line in stderr.lines() {
             if line.starts_with(&includes_prefix) {
                 let dep = normpath(line[includes_prefix.len()..].trim());
-                trace!("included: {}", dep);
+                trace!("included: {dep}");
                 if deps.insert(dep.clone()) && !dep.contains(' ') {
-                    write!(f, "{} ", dep)?;
+                    write!(f, "{dep} ")?;
                 }
                 if !parsed_args.msvc_show_includes {
                     continue;
@@ -1115,7 +1139,7 @@ where
         sorted.sort();
         for dep in sorted {
             if !dep.contains(' ') {
-                writeln!(f, "{}:", dep)?;
+                writeln!(f, "{dep}:")?;
             }
         }
         Ok(process::Output {
@@ -1233,7 +1257,7 @@ fn generate_compile_commands(
 ///   example, @respfile.1 @respfile.2) as you want.
 /// ```
 ///
-/// Per Microsoft [2], response files are used by MSBuild:
+/// Per Microsoft [2], response files are used by `MSBuild`:
 ///
 /// ```text
 ///   Response (.rsp) files are text files that contain MSBuild.exe
@@ -1271,7 +1295,11 @@ impl<'a> ExpandIncludeFile<'a> {
     pub fn new(cwd: &'a Path, args: &[OsString]) -> Self {
         ExpandIncludeFile {
             // Reverse the provided iterator so we can pop from end to visit in the original order.
-            args: args.iter().rev().map(|a| a.to_owned()).collect(),
+            args: args
+                .iter()
+                .rev()
+                .map(std::borrow::ToOwned::to_owned)
+                .collect(),
             stack: Vec::new(),
             cwd,
         }
@@ -1301,19 +1329,19 @@ impl Iterator for ExpandIncludeFile<'_> {
             let content = match File::open(&file_path).and_then(|mut file| read_text(&mut file)) {
                 Ok(content) => content,
                 Err(err) => {
-                    debug!("failed to read @-file `{}`: {}", file_path.display(), err);
+                    debug!("failed to read @-file `{}`: {err}", file_path.display());
                     // If we failed to read the file content, return the original arg (including the `@` directive).
                     return Some(arg);
                 }
             };
 
-            trace!("Expanded response file {:?} to {:?}", file_path, content);
+            trace!("Expanded response file {file_path:?} to {content:?}");
 
             // Parse the response file contents, taking into account quote-wrapped strings and new-line separators.
             // Special implementation to account for MSVC response file format.
             let resp_file_args = SplitMsvcResponseFileArgs::from(&content).collect::<Vec<_>>();
             // Pump arguments back to the stack, in reverse order so we can `Vec::pop` and visit in original front-to-back order.
-            let rev_args = resp_file_args.iter().rev().map(|s| s.into());
+            let rev_args = resp_file_args.iter().rev().map(std::convert::Into::into);
             self.stack.extend(rev_args);
         }
     }
@@ -1344,9 +1372,9 @@ where
 /// This produces results identical to `CommandLineToArgvW` except in the
 /// following cases:
 ///
-///  1. When passed an empty string, CommandLineToArgvW returns the path to the
+///  1. When passed an empty string, `CommandLineToArgvW` returns the path to the
 ///     current executable file. Here, the iterator will simply be empty.
-///  2. CommandLineToArgvW interprets the first argument differently than the
+///  2. `CommandLineToArgvW` interprets the first argument differently than the
 ///     rest. Here, all arguments are treated in identical fashion.
 ///
 /// Parsing rules:
@@ -1361,8 +1389,8 @@ where
 ///    interpreted literally.
 ///
 /// References:
-///  - https://msdn.microsoft.com/en-us/library/windows/desktop/bb776391(v=vs.85).aspx
-///  - https://msdn.microsoft.com/en-us/library/windows/desktop/17w5ykft(v=vs.85).aspx
+///  - <https://msdn.microsoft.com/en-us/library/windows/desktop/bb776391(v=vs.85).aspx>
+///  - <https://msdn.microsoft.com/en-us/library/windows/desktop/17w5ykft(v=vs.85).aspx>
 #[derive(Clone, Debug)]
 struct SplitMsvcResponseFileArgs<'a> {
     /// String slice of the file content that is being parsed.
@@ -1423,15 +1451,11 @@ impl Iterator for SplitMsvcResponseFileArgs<'_> {
                     // Only append half the number of backslashes encountered, because this is an escaped string.
                     // This will reduce `backslash_count` to either 0 or 1.
                     Self::append_backslashes_to(&mut arg, &mut backslash_count, 2);
-                    match backslash_count == 0 {
-                        // If there are no remaining encountered backslashes,
-                        // then we have found either the start or end of a quoted argument.
-                        true => in_quotes = !in_quotes,
-                        // The quote character is escaped, so it is treated as a literal and appended to the arg string.
-                        false => {
-                            backslash_count = 0;
-                            arg.push('"');
-                        }
+                    if backslash_count == 0 {
+                        in_quotes = !in_quotes;
+                    } else {
+                        backslash_count = 0;
+                        arg.push('"');
                     }
                 }
                 // If whitespace is encountered, only preserve it if we are currently in quotes.
@@ -1493,7 +1517,7 @@ mod test {
         if s.starts_with("\\\\?\\") {
             s = &s[4..];
         }
-        let stderr = format!("blah: {}\r\n", s);
+        let stderr = format!("blah: {s}\r\n");
         let stdout = String::from("some\r\nstdout\r\n");
         next_command(&creator, Ok(MockChild::new(exit_status(0), stdout, stderr)));
         assert_eq!(
@@ -1518,7 +1542,7 @@ mod test {
             ..
         } = match parse_arguments(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -1533,8 +1557,8 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
-        assert!(common_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
         assert!(!msvc_show_includes);
     }
 
@@ -1548,7 +1572,7 @@ mod test {
             ..
         } = match parse_arguments(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.cpp"), input.to_str());
         assert_eq!(Language::Cxx, language);
@@ -1588,7 +1612,7 @@ mod test {
             ..
         } = match parse_arguments(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -1618,7 +1642,7 @@ mod test {
             ..
         } = match parse_arguments(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -1633,8 +1657,8 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
-        assert!(common_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
         assert!(!msvc_show_includes);
     }
 
@@ -1651,7 +1675,7 @@ mod test {
             ..
         } = match parse_arguments(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -1665,8 +1689,8 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
-        assert!(common_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
         assert!(!msvc_show_includes);
     }
 
@@ -1680,7 +1704,7 @@ mod test {
             ..
         } = match parse_arguments(args.clone()) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         // MSVC doesn't support double dashes. If we got one, we'll pass them
@@ -1695,11 +1719,11 @@ mod test {
             ..
         } = match parse_arguments_clang(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert!(double_dash_input);
-        assert!(common_args.is_empty());
+        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
 
         let args = ovec!["-c", "-Fofoo.obj", "foo.c", "--"];
         let ParsedArguments {
@@ -1709,12 +1733,12 @@ mod test {
             ..
         } = match parse_arguments_clang(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         // Double dash after input file is ignored.
         assert!(!double_dash_input);
-        assert!(common_args.is_empty());
+        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
 
         let args = ovec!["-c", "-Fofoo.obj", "foo.c", "--", "bar.c"];
         assert_eq!(
@@ -1742,7 +1766,7 @@ mod test {
             ..
         } = match parse_arguments(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -1756,8 +1780,8 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
-        assert!(common_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
         assert!(!msvc_show_includes);
     }
 
@@ -1792,7 +1816,7 @@ mod test {
                 ..
             } = match parse_arguments(args) {
                 CompilerArguments::Ok(args) => args,
-                o => panic!("Got unexpected parse result: {:?}", o),
+                o => panic!("Got unexpected parse result: {o:?}"),
             };
             assert_eq!(Some("foo.c"), input.to_str());
             assert_eq!(Language::C, language);
@@ -1807,8 +1831,8 @@ mod test {
                     }
                 )
             );
-            assert!(preprocessor_args.is_empty());
-            assert!(common_args.is_empty());
+            assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
+            assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
             assert!(!msvc_show_includes);
         }
     }
@@ -1841,10 +1865,10 @@ mod test {
             ..
         } = match parse_arguments(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert!(profile_generate);
-        assert!(preprocessor_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(
             dependency_args,
             ovec!(
@@ -1886,7 +1910,7 @@ mod test {
             ..
         } = match parse_arguments(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -1900,7 +1924,7 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(common_args, ovec!["-foo", "-bar"]);
         assert!(!msvc_show_includes);
     }
@@ -1929,7 +1953,7 @@ mod test {
             ..
         } = match parse_arguments(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -2028,7 +2052,7 @@ mod test {
             ..
         } = match parse_arguments(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -2049,7 +2073,7 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(common_args, ovec!["-Zi", "-Fdfoo.pdb"]);
         assert!(!msvc_show_includes);
     }
@@ -2068,7 +2092,7 @@ mod test {
             ..
         } = match parse_arguments(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -2089,7 +2113,7 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(common_args, ovec!["-Zi", "-Fdfoo"]);
         assert!(!msvc_show_includes);
     }
@@ -2108,7 +2132,7 @@ mod test {
             ..
         } = match parse_arguments(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -2129,7 +2153,7 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(common_args, ovec!["-Zi", "-Fdfoo.pdb"]);
         assert!(!msvc_show_includes);
     }
@@ -2148,7 +2172,7 @@ mod test {
             ..
         } = match parse_arguments(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -2169,7 +2193,7 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(common_args, ovec!["-Zi", "-Fdfoo.db"]);
         assert!(!msvc_show_includes);
     }
@@ -2188,7 +2212,7 @@ mod test {
             ..
         } = match parse_arguments(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -2209,7 +2233,7 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(common_args, ovec!["-Zi", "-Fdoutput/foo"]);
         assert!(!msvc_show_includes);
     }
@@ -2237,7 +2261,7 @@ mod test {
             ..
         } = match parse_arguments(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -2252,7 +2276,7 @@ mod test {
             )
         );
         assert_eq!(1, outputs.len());
-        assert!(preprocessor_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(
             common_args,
             ovec![
@@ -2287,7 +2311,7 @@ mod test {
                 ..
             } = match parse_arguments(args) {
                 CompilerArguments::Ok(args) => args,
-                o => panic!("Got unexpected parse result: {:?}", o),
+                o => panic!("Got unexpected parse result: {o:?}"),
             };
             assert_eq!(Some("foo.c"), input.to_str());
             assert_eq!(Language::C, language);
@@ -2302,10 +2326,10 @@ mod test {
                 )
             );
             assert_eq!(1, outputs.len());
-            assert!(preprocessor_args.is_empty());
+            assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
             assert_eq!(
                 common_args,
-                ovec!["/experimental:external", format!("/external:W{}", n)]
+                ovec!["/experimental:external", format!("/external:W{n}")]
             );
             assert!(!msvc_show_includes);
         }
@@ -2338,7 +2362,7 @@ mod test {
             )
         );
         assert_eq!(1, outputs.len());
-        assert!(preprocessor_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(common_args, ovec!["/feature:rcpc"]);
     }
 
@@ -2369,7 +2393,7 @@ mod test {
             )
         );
         assert_eq!(1, outputs.len());
-        assert!(preprocessor_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(common_args, ovec!["/openmp:llvm"]);
     }
 
@@ -2416,12 +2440,12 @@ mod test {
             ..
         } = match parse_arguments(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("dictionary.c"), input.to_str());
-        assert!(preprocessor_args.is_empty());
-        assert!(dependency_args.is_empty());
-        assert!(!common_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(dependency_args, [] as [std::ffi::OsString; 0]);
+        assert_ne!(common_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(
             common_args,
             ovec!(
@@ -2482,11 +2506,11 @@ mod test {
             ..
         } = match parse_arguments(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
-        assert!(preprocessor_args.is_empty());
-        assert!(dependency_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(dependency_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(
             common_args,
             ovec!(
@@ -2744,7 +2768,7 @@ mod test {
             ..
         } = match parse_arguments(ovec![arg]) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Failed to parse @-file, err: {:?}", o),
+            o => panic!("Failed to parse @-file, err: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -2758,8 +2782,8 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
-        assert!(common_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
         assert!(!msvc_show_includes);
     }
 
@@ -2792,7 +2816,7 @@ mod test {
             ..
         } = match parse_arguments(ovec![arg]) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Failed to parse @-file, err: {:?}", o),
+            o => panic!("Failed to parse @-file, err: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -2806,8 +2830,8 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
-        assert!(common_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
         assert!(!msvc_show_includes);
     }
 
@@ -2834,7 +2858,7 @@ mod test {
             ..
         } = match parse_arguments(ovec![arg]) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Failed to parse @-file, err: {:?}", o),
+            o => panic!("Failed to parse @-file, err: {o:?}"),
         };
         assert_eq!(Some("Foo Bar.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -2848,8 +2872,8 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
-        assert!(common_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
         assert!(!msvc_show_includes);
     }
 
@@ -2876,7 +2900,7 @@ mod test {
             ..
         } = match parse_arguments(ovec![arg]) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Failed to parse @-file, err: {:?}", o),
+            o => panic!("Failed to parse @-file, err: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -2890,8 +2914,8 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
-        assert!(common_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
         assert!(!msvc_show_includes);
     }
 
@@ -2918,7 +2942,7 @@ mod test {
             ..
         } = match parse_arguments(ovec![arg]) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Failed to parse @-file, err: {:?}", o),
+            o => panic!("Failed to parse @-file, err: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -2932,8 +2956,8 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
-        assert!(common_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
         assert!(!msvc_show_includes);
     }
 
@@ -2967,7 +2991,7 @@ mod test {
             ..
         } = match parse_arguments(ovec![arg]) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Failed to parse @-file, err: {:?}", o),
+            o => panic!("Failed to parse @-file, err: {o:?}"),
         };
         assert_eq!(Some("foo€.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -2981,8 +3005,8 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
-        assert!(common_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
         assert!(!msvc_show_includes);
     }
 
@@ -3015,7 +3039,7 @@ mod test {
             ..
         } = match parse_arguments(ovec![arg]) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Failed to parse @-file, err: {:?}", o),
+            o => panic!("Failed to parse @-file, err: {o:?}"),
         };
         assert_eq!(Some("foo€.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -3029,8 +3053,8 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
-        assert!(common_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
         assert!(!msvc_show_includes);
     }
 
@@ -3055,7 +3079,7 @@ mod test {
         let args = ovec!["-c", "-Fofoo.o.bj", "--", "foo.c"];
         let parsed_args = match parse_arguments_clang(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         let mut cmd = MockCommand {
             child: None,
@@ -3130,7 +3154,7 @@ mod test {
         let args = ovec!["-c", "-Fofoo.obj", "--", "foo.c"];
         let parsed_args = match parse_arguments_clang(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         let f = TestFixture::new();
         let compiler = &f.bins[0];
@@ -3260,7 +3284,7 @@ mod test {
             ..
         } = match parse_arguments(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(ovec!["-fsanitize-blacklist=list.txt"], common_args);
         assert_eq!(

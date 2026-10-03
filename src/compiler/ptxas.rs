@@ -13,24 +13,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_imports, dead_code, unused_variables)]
-
 use crate::compiler::args::*;
-use crate::compiler::c::{ArtifactDescriptor, CCompilerImpl, CCompilerKind, ParsedArguments};
-use crate::compiler::cicc;
-use crate::compiler::{
-    CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
-    SingleCompileCommand,
+use crate::compiler::c::{
+    CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext, ParsedArguments,
 };
+use crate::compiler::cicc;
+use crate::compiler::{CCompileCommand, Cacheable, CompileCommand, CompilerArguments, Language};
 use crate::{counted_array, dist};
 
-use crate::mock_command::{CommandCreator, CommandCreatorSync, RunCommand};
+use crate::mock_command::CommandCreatorSync;
 
 use async_trait::async_trait;
 
-use std::collections::HashMap;
 use std::ffi::OsString;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -61,31 +56,18 @@ impl CCompilerImpl for Ptxas {
     ) -> CompilerArguments<ParsedArguments> {
         cicc::parse_arguments(arguments, cwd, Language::Cubin, &ARGS[..], 3)
     }
-    #[allow(clippy::too_many_arguments)]
-    async fn preprocess<T>(
-        &self,
-        _creator: &T,
-        _executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        _env_vars: &[(OsString, OsString)],
-        _may_dist: bool,
-        _rewrite_includes_only: bool,
-        _preprocessor_cache_mode: bool,
-    ) -> Result<process::Output>
+    async fn preprocess<T>(&self, context: CPreprocessContext<'_, T>) -> Result<process::Output>
     where
         T: CommandCreatorSync,
     {
+        let CPreprocessContext {
+            parsed_args, cwd, ..
+        } = context;
         cicc::preprocess(cwd, parsed_args).await
     }
     fn generate_compile_commands<T>(
         &self,
-        path_transformer: &mut dist::PathTransformer,
-        executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        env_vars: &[(OsString, OsString)],
-        _rewrite_includes_only: bool,
+        context: CCompileContext<'_>,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
         Option<dist::CompileCommand>,
@@ -94,9 +76,17 @@ impl CCompilerImpl for Ptxas {
     where
         T: CommandCreatorSync,
     {
+        let CCompileContext {
+            path_transformer,
+            executable,
+            parsed_args,
+            cwd,
+            env_vars,
+            ..
+        } = context;
         cicc::generate_compile_commands(path_transformer, executable, parsed_args, cwd, env_vars)
             .map(|(command, dist_command, cacheable)| {
-                (CCompileCommand::new(command), dist_command, cacheable)
+                (CCompileCommand::boxed(command), dist_command, cacheable)
             })
     }
 }

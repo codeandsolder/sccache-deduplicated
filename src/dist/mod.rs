@@ -26,7 +26,9 @@ use std::str::FromStr;
 #[cfg(feature = "dist-server")]
 use std::sync::Mutex;
 
-use crate::errors::*;
+#[cfg(feature = "dist-server")]
+use crate::errors::Error;
+use crate::errors::{Result, bail};
 
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 mod cache;
@@ -217,8 +219,16 @@ mod path_transform {
                 .chain(self.disk_mappings())
         }
 
-        pub fn to_local(&self, p: &str) -> Option<PathBuf> {
-            self.dist_to_local_path.get(p).cloned()
+        /// Transform a distributed path back to its local Windows path.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the distributed path has no recorded local mapping.
+        pub fn to_local(&self, p: &str) -> crate::errors::Result<PathBuf> {
+            self.dist_to_local_path
+                .get(p)
+                .cloned()
+                .ok_or_else(|| crate::errors::anyhow!("unknown distributed path: {p}"))
         }
     }
 
@@ -325,7 +335,6 @@ mod path_transform {
 #[cfg(unix)]
 mod path_transform {
     use std::collections::HashMap;
-    use std::iter;
     use std::path::{Path, PathBuf};
 
     #[derive(Debug)]
@@ -335,8 +344,9 @@ mod path_transform {
     }
 
     impl PathTransformer {
+        #[must_use]
         pub fn new() -> Self {
-            PathTransformer {
+            Self {
                 dist_to_local_path: HashMap::new(),
                 root_mappings: Vec::new(),
             }
@@ -366,7 +376,7 @@ mod path_transform {
                         let dist_path = if suffix.is_empty() {
                             dist_root.clone()
                         } else {
-                            format!("{}/{}", dist_root, suffix)
+                            format!("{dist_root}/{suffix}")
                         };
                         self.dist_to_local_path
                             .insert(dist_path.clone(), p.to_owned());
@@ -380,43 +390,63 @@ mod path_transform {
             Some(dist_path)
         }
 
-        pub fn disk_mappings(&self) -> impl Iterator<Item = (PathBuf, String)> {
-            iter::empty()
+        pub fn disk_mappings(&self) -> impl Iterator<Item = (PathBuf, String)> + '_ {
+            // Unix paths have no drive-prefix mappings. Keep the method shape
+            // aligned with Windows while returning an allocation-free empty iterator.
+            self.root_mappings.iter().take(0).cloned()
         }
 
         pub fn path_mappings(&self) -> impl Iterator<Item = (PathBuf, String)> + '_ {
             self.root_mappings.iter().cloned()
         }
 
-        pub fn to_local(&self, p: &str) -> Option<PathBuf> {
+        /// Transform a distributed path back to its local Unix path.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the path contains an embedded NUL byte.
+        pub fn to_local(&self, p: &str) -> crate::errors::Result<PathBuf> {
+            if p.as_bytes().contains(&0) {
+                return Err(crate::errors::anyhow!(
+                    "distributed path contains an embedded NUL"
+                ));
+            }
             if let Some(local) = self.dist_to_local_path.get(p) {
-                return Some(local.clone());
+                return Ok(local.clone());
             }
             for (local_root, dist_root) in &self.root_mappings {
                 if let Ok(suffix) = Path::new(p).strip_prefix(dist_root) {
-                    return Some(local_root.join(suffix));
+                    return Ok(local_root.join(suffix));
                 }
             }
-            Some(PathBuf::from(p))
+            Ok(PathBuf::from(p))
+        }
+    }
+
+    impl Default for PathTransformer {
+        fn default() -> Self {
+            Self::new()
         }
     }
 
     #[test]
-    fn test_root_mapping() {
+    fn test_root_mapping() -> crate::errors::Result<()> {
         let mut pt = PathTransformer::new();
         pt.add_root_mapping(PathBuf::from("/physical/project"), "/build");
         assert_eq!(
             pt.as_dist(Path::new("/physical/project/src/lib.rs"))
-                .unwrap(),
-            "/build/src/lib.rs"
+                .as_deref(),
+            Some("/build/src/lib.rs")
         );
         assert_eq!(
-            pt.to_local("/build/src/lib.rs").unwrap(),
+            pt.to_local("/build/src/lib.rs")?,
             PathBuf::from("/physical/project/src/lib.rs")
         );
+        Ok(())
     }
 }
 
+#[must_use]
 pub fn osstrings_to_strings(osstrings: &[OsString]) -> Option<Vec<String>> {
     osstrings
         .iter()
@@ -424,6 +454,7 @@ pub fn osstrings_to_strings(osstrings: &[OsString]) -> Option<Vec<String>> {
         .collect::<Option<_>>()
 }
 
+#[must_use]
 pub fn osstring_tuples_to_strings(
     osstring_tuples: &[(OsString, OsString)],
 ) -> Option<Vec<(String, String)>> {
@@ -433,6 +464,7 @@ pub fn osstring_tuples_to_strings(
         .collect::<Option<_>>()
 }
 
+#[must_use]
 pub fn strings_to_osstrings(strings: &[String]) -> Vec<OsString> {
     strings
         .iter()
@@ -441,6 +473,7 @@ pub fn strings_to_osstrings(strings: &[String]) -> Vec<OsString> {
 }
 
 // TODO: TryFrom
+#[must_use]
 pub fn try_compile_command_to_dist(
     command: compiler::SingleCompileCommand,
 ) -> Option<CompileCommand> {
@@ -493,10 +526,12 @@ impl FromStr for JobId {
 #[serde(deny_unknown_fields)]
 pub struct ServerId(SocketAddr);
 impl ServerId {
-    pub fn new(addr: SocketAddr) -> Self {
-        ServerId(addr)
+    #[must_use]
+    pub const fn new(addr: SocketAddr) -> Self {
+        Self(addr)
     }
-    pub fn addr(&self) -> SocketAddr {
+    #[must_use]
+    pub const fn addr(&self) -> SocketAddr {
         self.0
     }
 }
@@ -510,8 +545,15 @@ impl FromStr for ServerId {
 #[serde(deny_unknown_fields)]
 pub struct ServerNonce(u64);
 impl ServerNonce {
+    #[must_use]
     pub fn new() -> Self {
-        ServerNonce(OsRng.next_u64())
+        Self(OsRng.next_u64())
+    }
+}
+
+impl Default for ServerNonce {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -525,12 +567,11 @@ pub enum JobState {
 }
 impl fmt::Display for JobState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use self::JobState::*;
         match *self {
-            Pending => "pending",
-            Ready => "ready",
-            Started => "started",
-            Complete => "complete",
+            Self::Pending => "pending",
+            Self::Ready => "ready",
+            Self::Started => "started",
+            Self::Complete => "complete",
         }
         .fmt(f)
     }
@@ -556,21 +597,27 @@ pub struct ProcessOutput {
     pub stderr: Vec<u8>,
 }
 impl ProcessOutput {
+    /// Convert a process output into the cross-platform distributed representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the process terminated without a portable exit code.
     #[cfg(unix)]
     pub fn try_from(o: process::Output) -> Result<Self> {
         let code = match (o.status.code(), o.status.signal()) {
             (Some(c), _) => c,
-            (None, Some(s)) => bail!("Process status {} terminated with signal {}", o.status, s),
+            (None, Some(s)) => bail!("Process status {} terminated with signal {s}", o.status),
             (None, None) => bail!("Process status {} has no exit code or signal", o.status),
         };
-        Ok(ProcessOutput {
+        Ok(Self {
             code,
             stdout: o.stdout,
             stderr: o.stderr,
         })
     }
     #[cfg(test)]
-    pub fn fake_output(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
+    #[must_use]
+    pub const fn fake_output(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
         Self {
             code,
             stdout,
@@ -595,7 +642,7 @@ fn exit_status(code: i32) -> process::ExitStatus {
 impl From<ProcessOutput> for process::Output {
     fn from(o: ProcessOutput) -> Self {
         // TODO: handle signals, i.e. None code
-        process::Output {
+        Self {
             status: exit_status(o.code),
             stdout: o.stdout,
             stderr: o.stderr,
@@ -607,6 +654,11 @@ impl From<ProcessOutput> for process::Output {
 #[serde(deny_unknown_fields)]
 pub struct OutputData(Vec<u8>, u64);
 impl OutputData {
+    /// Compress output data read from `r`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if reading or compression fails.
     #[cfg(any(feature = "dist-server", all(feature = "dist-client", test)))]
     pub fn try_from_reader<R: Read>(r: R) -> io::Result<Self> {
         use flate2::Compression;
@@ -614,15 +666,17 @@ impl OutputData {
         let mut compressor = ZlibReadEncoder::new(r, Compression::fast());
         let mut res = vec![];
         io::copy(&mut compressor, &mut res)?;
-        Ok(OutputData(res, compressor.total_in()))
+        Ok(Self(res, compressor.total_in()))
     }
-    pub fn lens(&self) -> OutputDataLens {
+    #[must_use]
+    pub const fn lens(&self) -> OutputDataLens {
         OutputDataLens {
             actual: self.1,
             compressed: self.0.len() as u64,
         }
     }
     #[cfg(feature = "dist-client")]
+    #[must_use]
     pub fn into_reader(self) -> impl Read {
         use flate2::read::ZlibDecoder as ZlibReadDecoder;
         ZlibReadDecoder::new(io::Cursor::new(self.0))
