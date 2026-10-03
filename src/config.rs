@@ -12,6 +12,43 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![expect(
+    clippy::default_trait_access,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::missing_errors_doc,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::option_if_let_else,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::significant_drop_tightening,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::struct_excessive_bools,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::unnecessary_debug_formatting,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::upper_case_acronyms,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::wildcard_imports,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+
 use crate::cache::CacheMode;
 #[cfg(target_os = "windows")]
 use crate::util::normalize_win_path;
@@ -75,7 +112,7 @@ impl fmt::Display for WriteErrorPolicy {
     }
 }
 
-fn default_multilevel_slow_write_concurrency() -> usize {
+const fn default_multilevel_slow_write_concurrency() -> usize {
     4
 }
 

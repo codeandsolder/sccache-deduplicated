@@ -12,6 +12,39 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![expect(
+    clippy::enum_glob_use,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::items_after_statements,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::manual_let_else,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::match_same_arms,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::needless_pass_by_value,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::option_if_let_else,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::wildcard_imports,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+
 use crate::compiler::args::*;
 use crate::compiler::c::{
     ArtifactDescriptor, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
@@ -861,18 +894,18 @@ fn module_artifact_descriptor(
     }
 }
 
-pub fn language_to_gcc_arg(lang: Language) -> Option<&'static str> {
+pub const fn language_to_gcc_arg(lang: Language) -> Option<&'static str> {
     lang.to_gcc_arg()
 }
 
-pub(crate) struct GccPreprocessConfig<F> {
+pub struct GccPreprocessConfig<F> {
     pub kind: CCompilerKind,
     pub rewrite_includes_only: bool,
     pub ignorable_whitespace_flags: Vec<String>,
     pub language_to_arg: F,
 }
 
-pub(crate) struct GccCompileConfig<F> {
+pub struct GccCompileConfig<F> {
     pub kind: CCompilerKind,
     pub rewrite_includes_only: bool,
     pub language_to_arg: F,

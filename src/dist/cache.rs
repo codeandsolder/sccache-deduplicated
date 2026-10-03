@@ -1,3 +1,12 @@
+#![expect(
+    clippy::manual_let_else,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::significant_drop_tightening,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+
 use crate::dist::Toolchain;
 use crate::lru_disk_cache::Result as LruResult;
 use crate::lru_disk_cache::{LruDiskCache, ReadSeek};

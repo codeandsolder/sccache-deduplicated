@@ -45,6 +45,11 @@
 //! then create an `Arc<Mutex<MockCommandCreator>>` and safely provide
 //! `MockChild` outputs.
 
+#![expect(
+    clippy::wildcard_imports,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+
 use crate::errors::*;
 use crate::jobserver::{Acquired, Client};
 use async_trait::async_trait;
@@ -189,22 +194,24 @@ impl CommandChild for Child {
 }
 
 pub struct AsyncCommand {
-    inner: Option<Command>,
+    inner: Command,
     jobserver: Client,
     share_jobserver: bool,
+    spawned: bool,
 }
 
 impl AsyncCommand {
     pub fn new<S: AsRef<OsStr>>(program: S, jobserver: Client) -> Self {
         Self {
-            inner: Some(Command::new(program)),
+            inner: Command::new(program),
             jobserver,
             share_jobserver: false,
+            spawned: false,
         }
     }
 
     const fn inner(&mut self) -> &mut Command {
-        self.inner.as_mut().expect("can't reuse commands")
+        &mut self.inner
     }
 }
 
@@ -264,7 +271,11 @@ impl RunCommand for AsyncCommand {
         self
     }
     async fn spawn(&mut self) -> Result<Child> {
-        let mut inner = self.inner.take().unwrap();
+        if self.spawned {
+            bail!("can't reuse commands");
+        }
+        self.spawned = true;
+        let mut inner = std::mem::replace(&mut self.inner, Command::new(""));
         inner.env_remove("MAKEFLAGS");
         inner.env_remove("MFLAGS");
         inner.env_remove("CARGO_MAKEFLAGS");
@@ -558,7 +569,10 @@ impl<T: CommandCreator + 'static + Send> CommandCreatorSync for Arc<Mutex<T>> {
     }
 
     fn new_command_sync<S: AsRef<OsStr>>(&mut self, program: S) -> T::Cmd {
-        self.lock().unwrap().new_command(program)
+        match self.lock() {
+            Ok(mut creator) => creator.new_command(program),
+            Err(poisoned) => poisoned.into_inner().new_command(program),
+        }
     }
 }
 

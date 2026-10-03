@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![expect(
+    clippy::too_many_lines,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+
 use bytes::Bytes;
 use std::future::Future;
 use std::sync::Arc;

@@ -826,7 +826,7 @@ fn generate_preprocessor_output_with_paths(num_includes: usize, basedir: &[u8]) 
     for i in 0..num_includes {
         data.extend_from_slice(b"# 1 \"");
         data.extend_from_slice(basedir);
-        data.extend_from_slice(format!("src/module{}/file{}.c\"\n", i % 10, i).as_bytes());
+        data.extend_from_slice(format!("src/module{}/file{i}.c\"\n", i % 10).as_bytes());
         data.extend_from_slice(b"int function_");
         data.extend_from_slice(format!("{i}").as_bytes());
         data.extend_from_slice(b"() { return 0; }\n");

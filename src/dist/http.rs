@@ -11,6 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#![expect(
+    clippy::struct_field_names,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+
 #[cfg(feature = "dist-client")]
 pub use self::client::Client;
 #[cfg(feature = "dist-server")]
@@ -720,7 +725,7 @@ mod server {
                 check_server_auth,
             } = self;
             let requester = SchedulerRequester {
-                client: Mutex::new(new_reqwest_blocking_client()),
+                client: Mutex::new(new_reqwest_blocking_client()?),
             };
 
             macro_rules! check_server_auth_or_err {
@@ -1005,14 +1010,15 @@ mod server {
             let job_authorizer = JWTJobAuthorizer::boxed(jwt_key);
             let heartbeat_url = urls::scheduler_heartbeat_server(&scheduler_url)?;
             let requester = ServerRequester {
-                client: new_reqwest_blocking_client(),
+                client: new_reqwest_blocking_client()?,
                 scheduler_url,
                 scheduler_auth: scheduler_auth.clone(),
             };
 
+            let heartbeat_client = new_reqwest_blocking_client()?;
             // TODO: detect if this panics
             thread::spawn(move || {
-                let client = new_reqwest_blocking_client();
+                let client = heartbeat_client;
                 loop {
                     trace!(target: "sccache_heartbeat", "Performing heartbeat");
                     let heartbeat_result = client

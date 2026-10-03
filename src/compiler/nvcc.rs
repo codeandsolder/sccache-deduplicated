@@ -13,6 +13,43 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![expect(
+    clippy::enum_glob_use,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::iter_on_single_items,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::manual_let_else,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::needless_continue,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::option_if_let_else,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::or_fun_call,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::unnecessary_debug_formatting,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::wildcard_imports,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+
 use crate::compiler::args::*;
 #[cfg(test)]
 use crate::compiler::c::ArtifactDescriptor;

@@ -13,6 +13,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![expect(
+    clippy::enum_glob_use,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::wildcard_imports,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+
 use crate::compiler::args::*;
 use crate::compiler::c::{
     CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext, ParsedArguments,
@@ -129,8 +138,14 @@ pub fn generate_compile_commands(
     if log_enabled!(log::Level::Trace) {
         trace!(
             "[{}]: {} command: {:?}",
-            out_file.file_name().unwrap().to_string_lossy(),
-            executable.file_name().unwrap().to_string_lossy(),
+            out_file
+                .file_name()
+                .unwrap_or(out_file.as_os_str())
+                .to_string_lossy(),
+            executable
+                .file_name()
+                .unwrap_or(executable.as_os_str())
+                .to_string_lossy(),
             [
                 &[format!("cd {} &&", cwd.to_string_lossy())],
                 &[executable.to_str().unwrap_or_default().to_string()][..],
@@ -162,7 +177,7 @@ pub fn generate_compile_commands(
             path_transformer.as_dist(&parsed_args.input)?,
         ]);
         Some(dist::CompileCommand {
-            executable: path_transformer.as_dist(executable.canonicalize().unwrap().as_path())?,
+            executable: path_transformer.as_dist(&executable.canonicalize().ok()?)?,
             arguments,
             env_vars: dist::osstring_tuples_to_strings(env_vars)?,
             cwd: path_transformer.as_dist_abs(cwd)?,

@@ -10,6 +10,8 @@ use serial_test::serial;
 // https://github.com/mozilla/sccache/issues/234
 #[cfg(not(target_os = "macos"))]
 fn test_server_port_in_use() {
+    const MSG: &str = "Server startup failed:";
+
     // Bind an arbitrary free port.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let sccache = env!("CARGO_BIN_EXE_sccache");
@@ -24,7 +26,6 @@ fn test_server_port_in_use() {
         .unwrap();
     assert!(!output.status.success());
     let s = String::from_utf8_lossy(&output.stderr);
-    const MSG: &str = "Server startup failed:";
     assert!(
         s.contains(MSG),
         "Output did not contain '{MSG}':\n========\n{s}\n========"

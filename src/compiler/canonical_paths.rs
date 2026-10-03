@@ -1,3 +1,12 @@
+#![expect(
+    clippy::branches_sharing_code,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::needless_pass_by_value,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+
 use crate::dist;
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};

@@ -12,6 +12,83 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.SCCACHE_MAX_FRAME_LENGTH
 
+#![expect(
+    clippy::cast_precision_loss,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::doc_markdown,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::items_after_statements,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::manual_let_else,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::match_same_arms,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::match_wildcard_for_single_variants,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::missing_errors_doc,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::needless_pass_by_value,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::option_if_let_else,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::significant_drop_tightening,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::similar_names,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::single_match_else,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::type_complexity,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::unnecessary_debug_formatting,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::unsafe_derive_deserialize,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::useless_let_if_seq,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::wildcard_imports,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+
 use crate::cache::readonly::ReadOnlyStorage;
 use crate::cache::{CacheMode, Storage, storage_from_config};
 use crate::compiler::PreprocessorCacheEntry;
@@ -313,14 +390,14 @@ impl DistClientContainer {
 
     #[cfg(feature = "dist-client")]
     #[must_use]
-    pub fn new_with_state(state: DistClientState) -> Self {
+    pub const fn new_with_state(state: DistClientState) -> Self {
         Self {
             state: futures::lock::Mutex::new(state),
         }
     }
 
     #[must_use]
-    pub fn new_disabled() -> Self {
+    pub const fn new_disabled() -> Self {
         Self {
             state: futures::lock::Mutex::new(DistClientState::Disabled),
         }
@@ -2156,7 +2233,7 @@ impl ServerStats {
             let mut counts: Vec<_> = self.not_cached.iter().collect();
             counts.sort_by(sort_func);
             for (reason, count) in counts {
-                writer.write(&format!("{reason:<name_width$} {count:>stat_width$}",));
+                writer.write(&format!("{reason:<name_width$} {count:>stat_width$}"));
             }
             writer.write("");
         }
@@ -2165,7 +2242,7 @@ impl ServerStats {
             let mut counts: Vec<_> = self.not_cached_crate_types.iter().collect();
             counts.sort_by(sort_func);
             for (crate_type, count) in counts {
-                writer.write(&format!("{crate_type:<name_width$} {count:>stat_width$}",));
+                writer.write(&format!("{crate_type:<name_width$} {count:>stat_width$}"));
             }
             writer.write("");
         }

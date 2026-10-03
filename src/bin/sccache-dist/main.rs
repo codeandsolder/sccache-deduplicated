@@ -186,7 +186,7 @@ fn run(command: Command) -> Result<i32> {
                         .context("Failed to create a checker for valid JWTs")?,
                 ),
                 scheduler_config::ClientAuth::ProxyToken { url, cache_secs } => {
-                    Box::new(token_check::ProxyTokenCheck::new(url, cache_secs))
+                    Box::new(token_check::ProxyTokenCheck::new(url, cache_secs)?)
                 }
             };
 

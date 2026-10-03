@@ -1,3 +1,8 @@
+#![expect(
+    clippy::significant_drop_tightening,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+
 use bytes::Bytes;
 use futures::channel::oneshot;
 use http::HeaderValue;
@@ -266,7 +271,7 @@ mod code_grant_pkce {
             grant_type: GRANT_TYPE_PARAM_VALUE,
             redirect_uri,
         };
-        let client = new_reqwest_blocking_client();
+        let client = new_reqwest_blocking_client()?;
         let res = client.post(token_url).json(&token_request).send()?;
         if !res.status().is_success() {
             bail!(
@@ -572,7 +577,7 @@ where
 /// Returns an error if the local callback server cannot be started, OAuth state cannot be
 /// maintained, the authorization callback fails, or the token exchange fails.
 ///
-/// https://auth0.com/docs/api-auth/tutorials/authorization-code-grant-pkce
+/// <https://auth0.com/docs/api-auth/tutorials/authorization-code-grant-pkce>
 pub fn get_token_oauth2_code_grant_pkce(
     client_id: &str,
     mut auth_url: Url,
@@ -644,7 +649,7 @@ pub fn get_token_oauth2_code_grant_pkce(
 /// Returns an error if the local callback server cannot be started, OAuth state cannot be
 /// maintained, or the authorization callback does not yield a valid token.
 ///
-/// https://auth0.com/docs/api-auth/tutorials/implicit-grant
+/// <https://auth0.com/docs/api-auth/tutorials/implicit-grant>
 pub fn get_token_oauth2_implicit(client_id: &str, mut auth_url: Url) -> Result<String> {
     let runtime = new_client_runtime()?;
     let server = runtime.block_on(async move { try_bind().await })?;

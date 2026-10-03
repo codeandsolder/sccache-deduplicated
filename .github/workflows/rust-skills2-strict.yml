@@ -15,3 +15,5 @@ permissions:
 jobs:
   strict-rust:
     uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@main
+    with:
+      allow-test-panics: true

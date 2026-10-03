@@ -96,21 +96,28 @@ impl ClientAuthCheck for ProxyTokenCheck {
 }
 
 impl ProxyTokenCheck {
-    pub fn new(url: String, cache_secs: Option<u64>) -> Self {
+    /// Build a proxy-backed token checker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blocking HTTP client cannot be initialized.
+    pub fn new(url: String, cache_secs: Option<u64>) -> Result<Self> {
         let maybe_auth_cache: Option<Mutex<(HashMap<String, Instant>, Duration)>> =
             cache_secs.map(|secs| Mutex::new((HashMap::new(), Duration::from_secs(secs))));
-        Self {
-            client: new_reqwest_blocking_client(),
+        Ok(Self {
+            client: new_reqwest_blocking_client()?,
             maybe_auth_cache,
             url,
-        }
+        })
     }
 
     fn check_token_with_forwarding(&self, token: &str) -> Result<()> {
         trace!("Validating token by forwarding to {}", self.url);
         // If the token is cached and not cache has not expired, return it
         if let Some(ref auth_cache) = self.maybe_auth_cache {
-            let mut auth_cache = auth_cache.lock().unwrap();
+            let mut auth_cache = auth_cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("proxy token auth cache mutex poisoned"))?;
             let (ref mut auth_cache, cache_duration) = *auth_cache;
             if let Some(cached_at) = auth_cache.get(token) {
                 if cached_at.elapsed() < cache_duration {
@@ -131,7 +138,9 @@ impl ProxyTokenCheck {
         }
         // Cache the token
         if let Some(ref auth_cache) = self.maybe_auth_cache {
-            let mut auth_cache = auth_cache.lock().unwrap();
+            let mut auth_cache = auth_cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("proxy token auth cache mutex poisoned"))?;
             let (ref mut auth_cache, _) = *auth_cache;
             auth_cache.insert(token.to_owned(), Instant::now());
         }

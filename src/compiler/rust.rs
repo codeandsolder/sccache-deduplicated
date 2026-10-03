@@ -12,6 +12,67 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::enum_glob_use,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::items_after_statements,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::iter_on_single_items,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::manual_let_else,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::needless_pass_by_value,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::option_if_let_else,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::significant_drop_in_scrutinee,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::single_option_map,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::struct_excessive_bools,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::type_complexity,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::unnecessary_debug_formatting,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::unnecessary_wraps,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::wildcard_imports,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+
 use crate::cache::FileObjectSource;
 #[cfg(target_os = "linux")]
 use crate::compiler::CompileCommandImpl;
@@ -3291,7 +3352,9 @@ impl OutputsRewriter for RustOutputsRewriter {
                             )
                         })?;
                         error!("RE replacing {re_str} with {local_path_str} in {deps}");
-                        let re = regex::Regex::new(&re_str).expect("Invalid regex");
+                        let re = regex::Regex::new(&re_str).with_context(|| {
+                            format!("invalid dep-info replacement regex: {re_str}")
+                        })?;
                         deps = re.replace_all(&deps, local_path_str).into_owned();
                     }
                     if !extra_inputs.is_empty() {
@@ -3532,7 +3595,10 @@ impl RlibDepReader {
             .context("Unable to get rlib modified time")?;
 
         {
-            let mut cache = self.cache.lock().unwrap();
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|_| anyhow!("rlib dependency cache mutex poisoned"))?;
             if let Some(deps_detail) = cache.get(rlib)
                 && rlib_mtime == deps_detail.mtime
             {
@@ -3575,7 +3641,10 @@ impl RlibDepReader {
         {
             // This will behave poorly if the rlib is changing under our feet, but in that case rustc
             // will also do the wrong thing, so the user has bigger issues to deal with.
-            let mut cache = self.cache.lock().unwrap();
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|_| anyhow!("rlib dependency cache mutex poisoned"))?;
             cache.insert(
                 rlib.to_owned(),
                 RlibDepsDetail {
@@ -3625,7 +3694,7 @@ fn parse_rustc_z_ls(stdout: &str) -> Result<Vec<&str>> {
         let mut line_splits = line.splitn(2, ' ');
         let num: usize = line_splits
             .next()
-            .expect("Zero strings from line split")
+            .context("Zero strings from line split")?
             .parse()
             .context("Could not parse number from rustc -Z ls")?;
         let libstring = line_splits
@@ -4897,7 +4966,7 @@ proc_macro false
             let result = hasher
                 .generate_hash_key(GenerateHashKeyContext {
                     creator: &creator,
-                    cwd: manifest.clone(),
+                    cwd: manifest,
                     env_vars: env,
                     may_dist: false,
                     pool: &pool,

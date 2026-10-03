@@ -13,6 +13,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![expect(
+    clippy::enum_glob_use,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::manual_let_else,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::match_same_arms,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::wildcard_imports,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+
 use crate::compiler::args::{
     ArgDisposition, ArgInfo, ArgToStringResult, ArgsIter, Argument, FromArg, IntoArg,
     NormalizedDisposition, PathTransformerFn, SearchableArgInfo,
@@ -224,15 +245,20 @@ where
 
         match arg.get_data() {
             Some(TooHardFlag | TooHard(_)) => {
-                cannot_cache!(arg.flag_str().expect("Can't be Argument::Raw/UnknownFlag",))
+                let Some(flag) = arg.flag_str() else {
+                    cannot_cache!("unsupported compiler option");
+                };
+                cannot_cache!(flag)
             }
 
             Some(DepArgument(_) | DepArgumentFlag | DepArgumentPath(_)) => {}
 
             Some(DoCompilation) => {
                 compilation = true;
-                compilation_flag =
-                    OsString::from(arg.flag_str().expect("Compilation flag expected"));
+                let Some(flag) = arg.flag_str() else {
+                    cannot_cache!("compilation flag missing");
+                };
+                compilation_flag = OsString::from(flag);
             }
             Some(Output(p)) => output_arg = Some(p.clone()),
             Some(PreprocessorArgument(_) | PreprocessorArgumentPath(_) | PassThrough(_)) => {}

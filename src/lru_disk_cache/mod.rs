@@ -133,22 +133,38 @@ struct PendingReservation {
 
 impl PendingReservation {
     fn new(pending_size: Arc<AtomicU64>, size: u64) -> Result<Self> {
-        pending_size
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(size)
-            })
-            .map_err(|_| Error::FileTooLarge)?;
+        let mut current = pending_size.load(Ordering::Relaxed);
+        loop {
+            let next = current.checked_add(size).ok_or(Error::FileTooLarge)?;
+            match pending_size.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
         Ok(Self { pending_size, size })
     }
 }
 
 impl Drop for PendingReservation {
     fn drop(&mut self) {
-        let _ = self
-            .pending_size
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(current.saturating_sub(self.size))
-            });
+        let mut current = self.pending_size.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(self.size);
+            match self.pending_size.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
 }
 

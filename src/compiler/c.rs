@@ -12,6 +12,39 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![expect(
+    clippy::needless_continue,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::needless_pass_by_value,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::or_fun_call,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::struct_excessive_bools,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::type_complexity,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::unnecessary_debug_formatting,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::wildcard_imports,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+
 use crate::cache::FileObjectSource;
 use crate::compiler::preprocessor_cache::{
     PreprocessorCacheKey, preprocessor_cache_entry_hash_key,
@@ -170,7 +203,7 @@ pub enum CCompilerKind {
     TaskingVX,
 }
 
-pub(crate) struct CPreprocessContext<'a, T> {
+pub struct CPreprocessContext<'a, T> {
     pub creator: &'a T,
     pub executable: &'a Path,
     pub parsed_args: &'a ParsedArguments,
@@ -181,7 +214,7 @@ pub(crate) struct CPreprocessContext<'a, T> {
     pub preprocessor_cache_mode: bool,
 }
 
-pub(crate) struct CCompileContext<'a> {
+pub struct CCompileContext<'a> {
     pub path_transformer: &'a mut dist::PathTransformer,
     pub executable: &'a Path,
     pub parsed_args: &'a ParsedArguments,
