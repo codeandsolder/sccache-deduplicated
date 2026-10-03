@@ -592,6 +592,9 @@ where
     #[cfg(not(target_os = "linux"))]
     let _ = env_vars;
 
+    #[cfg(target_os = "linux")]
+    let use_canonical_fallback = matches!(&response, CompileResponse::CompileStarted);
+
     match response {
         CompileResponse::CompileStarted => {
             if let Some(finished) = finished {
@@ -609,7 +612,14 @@ where
     }
 
     #[cfg(target_os = "linux")]
-    let canonical_rust = CanonicalRustPaths::from_rustc_executable(env_vars, cwd, exe);
+    let canonical_rust = if use_canonical_fallback {
+        CanonicalRustPaths::from_rustc_executable(env_vars, cwd, exe)
+    } else {
+        // The daemon rejected this invocation before canonical compilation began.
+        // Canonicalizing the raw fallback would change caller-visible outputs such
+        // as rustc dep-info from physical paths to /build and /target.
+        None
+    };
 
     #[cfg(target_os = "linux")]
     let mut cmd = if let Some(canonical) = canonical_rust {
@@ -1033,6 +1043,59 @@ mod test {
     /// A mid-compile server disconnect: the server sends CompileStarted then drops the
     /// connection before CompileFinished.  handle_compile_response must fall back to
     /// local compilation rather than panic.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_unhandled_rust_compile_falls_back_with_physical_arguments() {
+        let mut runtime = make_runtime();
+        let client = Client::new_num(1);
+        let creator = Arc::new(Mutex::new(MockCommandCreator::new(&client)));
+        let cmdline = vec![
+            OsString::from("--crate-name"),
+            OsString::from("build_script_build"),
+            OsString::from("build.rs"),
+            OsString::from("--emit=dep-info,link"),
+        ];
+        let expected = cmdline.clone();
+
+        creator.lock().unwrap().next_command_calls(move |args| {
+            assert_eq!(args, expected.as_slice());
+            Ok(MockChild::new(exit_status(0), "", ""))
+        });
+
+        let env_vars = vec![
+            (
+                OsString::from("SCCACHE_EXPERIMENTAL_CANONICAL_RUST"),
+                OsString::from("1"),
+            ),
+            (
+                OsString::from("SCCACHE_CANONICAL_BUILD_ROOT"),
+                OsString::from("/work/project"),
+            ),
+            (
+                OsString::from("SCCACHE_CANONICAL_TARGET_ROOT"),
+                OsString::from("/work/project/target"),
+            ),
+        ];
+        let mut stdout = vec![];
+        let mut stderr = vec![];
+
+        let code = handle_compile_result(
+            creator,
+            &mut runtime,
+            CompileResponse::UnhandledCompile,
+            None,
+            Path::new("/rust/bin/rustc"),
+            cmdline,
+            Path::new("/work/project"),
+            &env_vars,
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+
+        assert_eq!(code, 0);
+    }
+
     #[test]
     fn test_handle_compile_response_disconnect_falls_back_to_local() {
         let mut runtime = make_runtime();
