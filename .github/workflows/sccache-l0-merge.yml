@@ -19,7 +19,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.event == 'push' ||
       github.event.workflow_run.event == 'workflow_dispatch'
-    uses: codeandsolder/ci-workflows/.github/workflows/merge-sccache-l0.yml@main
+    uses: codeandsolder/ci-workflows/.github/workflows/merge-sccache-l0.yml@57216c70e71428e87eafafc721b7ee5a39caf29c # main
     with:
       source-run-id: ${{ github.event_name == 'workflow_run' && format('{0}', github.event.workflow_run.id) || '0' }}
       source-event: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.event || 'workflow_dispatch' }}
