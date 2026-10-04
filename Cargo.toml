@@ -46,7 +46,7 @@ backon = { version = "1", default-features = false, features = [
   "std-blocking-sleep",
 ] }
 base64 = "0.23"
-bincode = "1"
+bincode = "3"
 blake3 = "1"
 byteorder = "1.5"
 bytes = "1"
