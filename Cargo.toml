@@ -84,7 +84,7 @@ opendal = { version = "0.59.0", optional = true, default-features = false }
 opendal-http-transport-reqwest = { version = "0.59.0", optional = true }
 opendal-layer-logging = { version = "0.59.0", optional = true }
 openssl = { version = "0.10.75", optional = true }
-rand = "0.8.4"
+rand = "0.10.0"
 regex = "1.10.3"
 reqwest = { version = "0.13", features = [
   "json",
@@ -121,7 +121,7 @@ walkdir = "2"
 # by default which pulls in an outdated failure version
 which = { version = "6", default-features = false }
 zip = { version = "0.6", default-features = false }
-zstd = "0.13"
+zstd = "0.14"
 
 # dist-server only
 nix = { version = "0.31.0", optional = true, features = [
@@ -135,16 +135,16 @@ rouille = { version = "3.6", optional = true, default-features = false, features
   "ssl",
 ] }
 syslog = { version = "7", optional = true }
-version-compare = { version = "0.1.1", optional = true }
+version-compare = { version = "0.2.0", optional = true }
 
 [dev-dependencies]
 assert_cmd = "2.0.13"
 cc = "1.0"
 chrono = "0.4.42"
-divan = { package = "codspeed-divan-compat", version = "4" }
+divan = { package = "codspeed-divan-compat", version = "5" }
 filetime = "0.2"
 predicates = "=3.1.4"
-serial_test = "3.1"
+serial_test = "4.0"
 temp-env = "0.3.6"
 test-case = "3.3.1"
 thirtyfour = "0.37"
@@ -165,7 +165,7 @@ features = [
   "Win32_System_Console",
   "Win32_Security",
 ]
-version = "0.52"
+version = "0.61"
 
 [features]
 all = [

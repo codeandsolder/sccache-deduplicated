@@ -102,7 +102,6 @@ mod code_grant_pkce {
     use futures::channel::oneshot;
     use http_body_util::Full;
     use hyper::{Method, Request, Response, StatusCode};
-    use rand::{RngCore, rngs::OsRng};
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
@@ -159,7 +158,7 @@ mod code_grant_pkce {
     #[must_use]
     pub fn generate_verifier_and_challenge() -> (String, String) {
         let mut code_verifier_bytes = vec![0; NUM_CODE_VERIFIER_BYTES];
-        OsRng.fill_bytes(&mut code_verifier_bytes);
+        rand::fill(&mut code_verifier_bytes);
         let code_verifier = BASE64_URL_SAFE_ENGINE.encode(&code_verifier_bytes);
         let mut hasher = Sha256::new();
         hasher.update(&code_verifier);

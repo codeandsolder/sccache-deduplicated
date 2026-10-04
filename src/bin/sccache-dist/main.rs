@@ -3,7 +3,6 @@ extern crate log;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
-use rand::{RngCore, rngs::OsRng};
 use sccache::config::{
     INSECURE_DIST_CLIENT_TOKEN, scheduler as scheduler_config, server as server_config,
 };
@@ -148,7 +147,7 @@ fn run(command: Command) -> Result<i32> {
     match command {
         Command::Auth(AuthSubcommand::Base64 { num_bytes }) => {
             let mut bytes = vec![0; num_bytes];
-            OsRng.fill_bytes(&mut bytes);
+            rand::fill(&mut bytes);
             // As long as it can be copied, it doesn't matter if this is base64 or hex etc
             println!("{}", BASE64_URL_SAFE_ENGINE.encode(bytes));
             Ok(0)
@@ -440,7 +439,7 @@ impl Scheduler {
 
     fn new_with_job_slack(job_slack: JobSlackConfig) -> Self {
         let mut bytes = [0u8; size_of::<u64>()];
-        OsRng.fill_bytes(&mut bytes);
+        rand::fill(&mut bytes);
         Self::with_job_id_base_and_slack(u64::from_le_bytes(bytes), job_slack)
     }
 
