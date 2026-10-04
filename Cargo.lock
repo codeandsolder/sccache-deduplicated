@@ -929,7 +929,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1025,7 +1025,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2363,7 +2363,7 @@ version = "0.58.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33dbff14cc9bb085224256d6a81289d2f3202e85b06f408d42534b42162a4231"
 dependencies = [
- "opendal-core",
+ "opendal-core 0.58.2",
  "opendal-service-azblob",
  "opendal-service-cos",
  "opendal-service-gcs",
@@ -2402,6 +2402,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "opendal-core"
+version = "0.59.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddff5c648dcb3922c2bec71e0d26e881ddf9c367cb7c9a59ed7f2d39a4f38218"
+dependencies = [
+ "anyhow",
+ "asyncband 0.7.3",
+ "base64 0.23.1",
+ "bytes",
+ "futures",
+ "http",
+ "jiff",
+ "log",
+ "md-5",
+ "percent-encoding",
+ "quick-xml 0.41.0",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+ "uuid",
+ "web-time",
+]
+
+[[package]]
 name = "opendal-http-transport-reqwest"
 version = "0.58.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2411,18 +2436,18 @@ dependencies = [
  "futures",
  "http",
  "http-body",
- "opendal-core",
+ "opendal-core 0.58.2",
  "reqwest",
 ]
 
 [[package]]
 name = "opendal-layer-logging"
-version = "0.58.2"
+version = "0.59.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2de17c61cd32e9d8d7d8efb91795e714dbccbafbc3c4e219e1542f4d6324161"
+checksum = "e6fd30cc4be601d5adf4936f3bcc186be5e09046c85b4e0f4e6c47ac10966335"
 dependencies = [
  "log",
- "opendal-core",
+ "opendal-core 0.59.3",
 ]
 
 [[package]]
@@ -2435,7 +2460,7 @@ dependencies = [
  "bytes",
  "http",
  "log",
- "opendal-core",
+ "opendal-core 0.58.2",
  "opendal-service-azure-common",
  "quick-xml 0.41.0",
  "reqsign-azure-storage",
@@ -2453,7 +2478,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcc1bfdac4f54d9018c462dd32ad9e2f68fdf584f825c811550c8ffc87894cd"
 dependencies = [
  "http",
- "opendal-core",
+ "opendal-core 0.58.2",
 ]
 
 [[package]]
@@ -2465,7 +2490,7 @@ dependencies = [
  "bytes",
  "http",
  "log",
- "opendal-core",
+ "opendal-core 0.58.2",
  "quick-xml 0.41.0",
  "reqsign-core",
  "reqsign-file-read-tokio",
@@ -2483,7 +2508,7 @@ dependencies = [
  "bytes",
  "http",
  "log",
- "opendal-core",
+ "opendal-core 0.58.2",
  "percent-encoding",
  "quick-xml 0.41.0",
  "reqsign-core",
@@ -2504,7 +2529,7 @@ dependencies = [
  "ghac",
  "http",
  "log",
- "opendal-core",
+ "opendal-core 0.58.2",
  "opendal-service-azblob",
  "prost",
  "reqsign-azure-storage",
@@ -2521,7 +2546,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67736ba662efae21785a166d4a47f63868a3492af602e3198f7bdaed15fb4f42"
 dependencies = [
  "fastpool",
- "opendal-core",
+ "opendal-core 0.58.2",
  "serde",
  "tokio",
  "url",
@@ -2536,7 +2561,7 @@ dependencies = [
  "bytes",
  "http",
  "log",
- "opendal-core",
+ "opendal-core 0.58.2",
  "quick-xml 0.41.0",
  "reqsign-aliyun-oss",
  "reqsign-core",
@@ -2553,7 +2578,7 @@ dependencies = [
  "bytes",
  "fastpool",
  "http",
- "opendal-core",
+ "opendal-core 0.58.2",
  "redis",
  "serde",
  "tokio",
@@ -2571,7 +2596,7 @@ dependencies = [
  "http",
  "log",
  "md-5",
- "opendal-core",
+ "opendal-core 0.58.2",
  "quick-xml 0.41.0",
  "reqsign-aws-v4",
  "reqsign-core",
@@ -2591,7 +2616,7 @@ dependencies = [
  "bytes",
  "http",
  "log",
- "opendal-core",
+ "opendal-core 0.58.2",
  "quick-xml 0.41.0",
  "serde",
 ]
@@ -3016,7 +3041,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3499,7 +3524,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3556,7 +3581,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4175,7 +4200,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4194,7 +4219,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix 1.1.5",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4910,7 +4935,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

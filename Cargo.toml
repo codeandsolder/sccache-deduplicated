@@ -82,7 +82,7 @@ number_prefix = "0.4"
 object = "0.40"
 opendal = { version = "0.58.1", optional = true, default-features = false }
 opendal-http-transport-reqwest = { version = "0.58.1", optional = true }
-opendal-layer-logging = { version = "0.58.1", optional = true }
+opendal-layer-logging = { version = "0.59.0", optional = true }
 openssl = { version = "0.10.75", optional = true }
 rand = "0.8.4"
 regex = "1.10.3"
