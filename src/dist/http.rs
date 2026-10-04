@@ -11,6 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#![expect(
+    clippy::struct_field_names,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+
 #[cfg(feature = "dist-client")]
 pub use self::client::Client;
 #[cfg(feature = "dist-server")]
@@ -27,7 +32,9 @@ mod common {
     use {crate::util::BASE64_URL_SAFE_ENGINE, base64::Engine, std::collections::HashMap};
 
     use crate::dist;
-    use crate::errors::*;
+    #[cfg(feature = "dist-client")]
+    use crate::errors::HttpClientError;
+    use crate::errors::{Context, Result};
 
     // Note that content-length is necessary due to https://github.com/tiny-http/tiny-http/issues/147
     pub trait ReqwestRequestBuilderExt: Sized {
@@ -83,12 +90,10 @@ mod common {
             );
             if status.is_client_error() {
                 anyhow::bail!(HttpClientError(errmsg));
-            } else {
-                anyhow::bail!(errmsg);
             }
-        } else {
-            Ok(bincode::deserialize(&bytes)?)
+            anyhow::bail!(errmsg);
         }
+        Ok(bincode::deserialize(&bytes)?)
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -176,62 +181,99 @@ mod common {
 
 pub mod urls {
     use crate::dist::{JobId, ServerId};
+    use crate::errors::Result;
 
-    pub fn scheduler_alloc_job(scheduler_url: &reqwest::Url) -> reqwest::Url {
-        scheduler_url
-            .join("/api/v1/scheduler/alloc_job")
-            .expect("failed to create alloc job url")
+    /// Build the scheduler allocation endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `scheduler_url` cannot be used as a base URL.
+    pub fn scheduler_alloc_job(scheduler_url: &reqwest::Url) -> Result<reqwest::Url> {
+        Ok(scheduler_url.join("/api/v1/scheduler/alloc_job")?)
     }
+
+    /// Build the scheduler certificate endpoint for `server_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `scheduler_url` cannot be used as a base URL.
     pub fn scheduler_server_certificate(
         scheduler_url: &reqwest::Url,
         server_id: ServerId,
-    ) -> reqwest::Url {
-        scheduler_url
-            .join(&format!(
-                "/api/v1/scheduler/server_certificate/{}",
-                server_id.addr()
-            ))
-            .expect("failed to create server certificate url")
-    }
-    pub fn scheduler_heartbeat_server(scheduler_url: &reqwest::Url) -> reqwest::Url {
-        scheduler_url
-            .join("/api/v1/scheduler/heartbeat_server")
-            .expect("failed to create heartbeat url")
-    }
-    pub fn scheduler_job_state(scheduler_url: &reqwest::Url, job_id: JobId) -> reqwest::Url {
-        scheduler_url
-            .join(&format!("/api/v1/scheduler/job_state/{}", job_id))
-            .expect("failed to create job state url")
-    }
-    pub fn scheduler_status(scheduler_url: &reqwest::Url) -> reqwest::Url {
-        scheduler_url
-            .join("/api/v1/scheduler/status")
-            .expect("failed to create alloc job url")
+    ) -> Result<reqwest::Url> {
+        Ok(scheduler_url.join(&format!(
+            "/api/v1/scheduler/server_certificate/{}",
+            server_id.addr()
+        ))?)
     }
 
-    pub fn server_assign_job(server_id: ServerId, job_id: JobId) -> reqwest::Url {
-        let url = format!(
-            "https://{}/api/v1/distserver/assign_job/{}",
-            server_id.addr(),
-            job_id
-        );
-        reqwest::Url::parse(&url).expect("failed to create assign job url")
+    /// Build the scheduler heartbeat endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `scheduler_url` cannot be used as a base URL.
+    pub fn scheduler_heartbeat_server(scheduler_url: &reqwest::Url) -> Result<reqwest::Url> {
+        Ok(scheduler_url.join("/api/v1/scheduler/heartbeat_server")?)
     }
-    pub fn server_submit_toolchain(server_id: ServerId, job_id: JobId) -> reqwest::Url {
-        let url = format!(
-            "https://{}/api/v1/distserver/submit_toolchain/{}",
-            server_id.addr(),
-            job_id
-        );
-        reqwest::Url::parse(&url).expect("failed to create submit toolchain url")
+
+    /// Build the scheduler job-state endpoint for `job_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `scheduler_url` cannot be used as a base URL.
+    pub fn scheduler_job_state(
+        scheduler_url: &reqwest::Url,
+        job_id: JobId,
+    ) -> Result<reqwest::Url> {
+        Ok(scheduler_url.join(&format!("/api/v1/scheduler/job_state/{job_id}"))?)
     }
-    pub fn server_run_job(server_id: ServerId, job_id: JobId) -> reqwest::Url {
+
+    /// Build the scheduler status endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `scheduler_url` cannot be used as a base URL.
+    pub fn scheduler_status(scheduler_url: &reqwest::Url) -> Result<reqwest::Url> {
+        Ok(scheduler_url.join("/api/v1/scheduler/status")?)
+    }
+
+    /// Build the server assignment endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the generated server URL is invalid.
+    pub fn server_assign_job(server_id: ServerId, job_id: JobId) -> Result<reqwest::Url> {
         let url = format!(
-            "https://{}/api/v1/distserver/run_job/{}",
-            server_id.addr(),
-            job_id
+            "https://{}/api/v1/distserver/assign_job/{job_id}",
+            server_id.addr()
         );
-        reqwest::Url::parse(&url).expect("failed to create run job url")
+        Ok(reqwest::Url::parse(&url)?)
+    }
+
+    /// Build the server toolchain-submission endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the generated server URL is invalid.
+    pub fn server_submit_toolchain(server_id: ServerId, job_id: JobId) -> Result<reqwest::Url> {
+        let url = format!(
+            "https://{}/api/v1/distserver/submit_toolchain/{job_id}",
+            server_id.addr()
+        );
+        Ok(reqwest::Url::parse(&url)?)
+    }
+
+    /// Build the server run-job endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the generated server URL is invalid.
+    pub fn server_run_job(server_id: ServerId, job_id: JobId) -> Result<reqwest::Url> {
+        let url = format!(
+            "https://{}/api/v1/distserver/run_job/{job_id}",
+            server_id.addr()
+        );
+        Ok(reqwest::Url::parse(&url)?)
     }
 }
 
@@ -263,7 +305,7 @@ mod server {
         JobId, JobState, RunJobResult, SchedulerStatusResult, ServerId, ServerNonce,
         SubmitToolchainResult, Toolchain, ToolchainReader, UpdateJobStateResult,
     };
-    use crate::errors::*;
+    use crate::errors::{Context, Result, anyhow};
 
     const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
     const HEARTBEAT_ERROR_INTERVAL: Duration = Duration::from_secs(10);
@@ -472,7 +514,10 @@ mod server {
         }
 
         fn into_data(self) -> String {
-            serde_json::to_string(&self).expect("infallible serialization for ErrJson failed")
+            match serde_json::to_string(&self) {
+                Ok(data) => data,
+                Err(error) => format!("failed to serialize authentication error: {error}"),
+            }
         }
     }
     macro_rules! try_or_err_and_log {
@@ -481,18 +526,16 @@ mod server {
                 Ok(r) => r,
                 Err(err) => {
                     // TODO: would ideally just use error_chain
-                    #[allow(unused_imports)]
-                    use std::error::Error;
+                    let err: Box<dyn std::error::Error + 'static> = err.into();
                     let mut err_msg = err.to_string();
-                    let mut maybe_cause = err.source();
+                    let mut maybe_cause = std::error::Error::source(&*err);
                     while let Some(cause) = maybe_cause {
                         err_msg.push_str(", caused by: ");
                         err_msg.push_str(&cause.to_string());
-                        maybe_cause = cause.source();
+                        maybe_cause = std::error::Error::source(cause);
                     }
 
                     warn!("Res {} error: {}", $reqid, err_msg);
-                    let err: Box<dyn std::error::Error + 'static> = err.into();
                     let json = ErrJson::from_err(&*err);
                     return rouille::Response::json(&json).with_status_code($code);
                 }
@@ -597,7 +640,7 @@ mod server {
         server_key: Vec<u8>,
     }
     impl JWTJobAuthorizer {
-        fn new(server_key: Vec<u8>) -> Box<Self> {
+        fn boxed(server_key: Vec<u8>) -> Box<Self> {
             Box::new(Self { server_key })
         }
     }
@@ -626,19 +669,19 @@ mod server {
     }
 
     #[test]
-    fn test_job_token_verification() {
-        let ja = JWTJobAuthorizer::new(vec![1, 2, 2]);
+    fn test_job_token_verification() -> Result<()> {
+        let ja = JWTJobAuthorizer::boxed(vec![1, 2, 2]);
 
         let job_id = JobId(55);
-        let token = ja.generate_token(job_id).unwrap();
+        let token = ja.generate_token(job_id)?;
 
         let job_id2 = JobId(56);
-        let token2 = ja.generate_token(job_id2).unwrap();
+        let token2 = ja.generate_token(job_id2)?;
 
-        let ja2 = JWTJobAuthorizer::new(vec![1, 2, 3]);
+        let ja2 = JWTJobAuthorizer::boxed(vec![1, 2, 3]);
 
         // Check tokens are deterministic
-        assert_eq!(token, ja.generate_token(job_id).unwrap());
+        assert_eq!(token, ja.generate_token(job_id)?);
         // Check token verification works
         assert!(ja.verify_token(job_id, &token).is_ok());
         assert!(ja.verify_token(job_id, &token2).is_err());
@@ -647,6 +690,7 @@ mod server {
         // Check token verification with a different key fails
         assert!(ja2.verify_token(job_id, &token).is_err());
         assert!(ja2.verify_token(job_id2, &token2).is_err());
+        Ok(())
     }
 
     pub struct Scheduler<S> {
@@ -681,7 +725,7 @@ mod server {
                 check_server_auth,
             } = self;
             let requester = SchedulerRequester {
-                client: Mutex::new(new_reqwest_blocking_client()),
+                client: Mutex::new(new_reqwest_blocking_client()?),
             };
 
             macro_rules! check_server_auth_or_err {
@@ -740,7 +784,8 @@ mod server {
                 );
                 for (_, cert_pem) in certs.values() {
                     client_builder = client_builder.add_root_certificate(
-                        reqwest::Certificate::from_pem(cert_pem).expect("previously valid cert"),
+                        reqwest::Certificate::from_pem(cert_pem)
+                            .context("stored server certificate is no longer valid")?,
                     );
                 }
                 // Finish the client
@@ -782,14 +827,24 @@ mod server {
                         trace!("Req {}: alloc_job: {:?}", req_id, toolchain);
 
                         let alloc_job_res: AllocJobResult = try_or_500_log!(req_id, handler.handle_alloc_job(&requester, toolchain));
-                        let certs = server_certificates.lock().unwrap();
+                        let certs = try_or_500_log!(
+                            req_id,
+                            server_certificates
+                                .lock()
+                                .map_err(|_| anyhow!("server certificate mutex poisoned"))
+                        );
                         let res = AllocJobHttpResponse::from_alloc_job_result(alloc_job_res, &certs);
                         prepare_response(request, &res)
                     },
                     (GET) (/api/v1/scheduler/server_certificate/{server_id: ServerId}) => {
                         let certs = {
-                            let guard = server_certificates.lock().unwrap();
-                            guard.get(&server_id).map(|v|v.to_owned())
+                            let guard = try_or_500_log!(
+                                req_id,
+                                server_certificates
+                                    .lock()
+                                    .map_err(|_| anyhow!("server certificate mutex poisoned"))
+                            );
+                            guard.get(&server_id).map(ToOwned::to_owned)
                         };
 
                         let (cert_digest, cert_pem) = try_or_500_log!(req_id, certs
@@ -806,12 +861,25 @@ mod server {
                         trace!(target: "sccache_heartbeat", "Req {}: heartbeat_server: {:?}", req_id, heartbeat_server);
 
                         let HeartbeatServerHttpRequest { num_cpus, jwt_key, server_nonce, cert_digest, cert_pem } = heartbeat_server;
+                        let mut requester_client = try_or_500_log!(
+                            req_id,
+                            requester
+                                .client
+                                .lock()
+                                .map_err(|_| anyhow!("scheduler HTTP client mutex poisoned"))
+                        );
+                        let mut certs = try_or_500_log!(
+                            req_id,
+                            server_certificates
+                                .lock()
+                                .map_err(|_| anyhow!("server certificate mutex poisoned"))
+                        );
                         try_or_500_log!(req_id, maybe_update_certs(
-                            &mut requester.client.lock().unwrap(),
-                            &mut server_certificates.lock().unwrap(),
+                            &mut requester_client,
+                            &mut certs,
                             server_id, cert_digest, cert_pem
                         ));
-                        let job_authorizer = JWTJobAuthorizer::new(jwt_key);
+                        let job_authorizer = JWTJobAuthorizer::boxed(jwt_key);
                         let res: HeartbeatServerResult = try_or_500_log!(req_id, handler.handle_heartbeat_server(
                             server_id, server_nonce,
                             num_cpus,
@@ -840,7 +908,7 @@ mod server {
                 ))();
                  trace!(target: "sccache_http", "Res {}: {:?}", req_id, response);
                 response
-            }).map_err(|e| anyhow!(format!("Failed to start http server for sccache scheduler: {}", e)))?;
+            }).map_err(|e| anyhow!("Failed to start http server for sccache scheduler: {e}"))?;
 
             // This limit is rouille's default for `start_server_with_pool`, which
             // we would use, except that interface doesn't permit any sort of
@@ -848,7 +916,7 @@ mod server {
             let server = server.pool_size(num_cpus() * 8);
             server.run();
 
-            panic!("Rouille server terminated")
+            Err(anyhow!("Rouille scheduler server terminated"))
         }
     }
 
@@ -864,8 +932,14 @@ mod server {
             tc: Toolchain,
             auth: String,
         ) -> Result<AssignJobResult> {
-            let url = urls::server_assign_job(server_id, job_id);
-            let req = self.client.lock().unwrap().post(url);
+            let url = urls::server_assign_job(server_id, job_id)?;
+            let req = {
+                let client = self
+                    .client
+                    .lock()
+                    .map_err(|_| anyhow!("scheduler HTTP client mutex poisoned"))?;
+                client.post(url)
+            };
             bincode_req(req.bearer_auth(auth).bincode(&tc)?)
                 .context("POST to scheduler assign_job failed")
         }
@@ -933,26 +1007,26 @@ mod server {
                 cert_digest,
                 cert_pem: cert_pem.clone(),
             };
-            let job_authorizer = JWTJobAuthorizer::new(jwt_key);
-            let heartbeat_url = urls::scheduler_heartbeat_server(&scheduler_url);
+            let job_authorizer = JWTJobAuthorizer::boxed(jwt_key);
+            let heartbeat_url = urls::scheduler_heartbeat_server(&scheduler_url)?;
             let requester = ServerRequester {
-                client: new_reqwest_blocking_client(),
+                client: new_reqwest_blocking_client()?,
                 scheduler_url,
                 scheduler_auth: scheduler_auth.clone(),
             };
 
+            let heartbeat_client = new_reqwest_blocking_client()?;
             // TODO: detect if this panics
             thread::spawn(move || {
-                let client = new_reqwest_blocking_client();
+                let client = heartbeat_client;
                 loop {
                     trace!(target: "sccache_heartbeat", "Performing heartbeat");
-                    match bincode_req(
-                        client
-                            .post(heartbeat_url.clone())
-                            .bearer_auth(scheduler_auth.clone())
-                            .bincode(&heartbeat_req)
-                            .expect("failed to serialize heartbeat"),
-                    ) {
+                    let heartbeat_result = client
+                        .post(heartbeat_url.clone())
+                        .bearer_auth(scheduler_auth.clone())
+                        .bincode(&heartbeat_req)
+                        .and_then(bincode_req);
+                    match heartbeat_result {
                         Ok(HeartbeatServerResult { is_new }) => {
                             trace!(target: "sccache_heartbeat", "Heartbeat success is_new={}", is_new);
                             // TODO: if is_new, terminate all running jobs
@@ -988,7 +1062,12 @@ mod server {
                         job_auth_or_401!(request, &job_authorizer, job_id);
                         trace!("Req {}: submit_toolchain({})", req_id, job_id);
 
-                        let body = request.data().expect("body was already read in submit_toolchain");
+                        let body = try_or_400_log!(
+                            req_id,
+                            request
+                                .data()
+                                .context("missing submit_toolchain request body")
+                        );
                         let toolchain_rdr = ToolchainReader(Box::new(body));
                         let res: SubmitToolchainResult = try_or_500_log!(req_id, handler.handle_submit_toolchain(&requester, job_id, toolchain_rdr));
                         prepare_response(request, &res)
@@ -996,7 +1075,10 @@ mod server {
                     (POST) (/api/v1/distserver/run_job/{job_id: JobId}) => {
                         job_auth_or_401!(request, &job_authorizer, job_id);
 
-                        let mut body = request.data().expect("body was already read in run_job");
+                        let mut body = try_or_400_log!(
+                            req_id,
+                            request.data().context("missing run_job request body")
+                        );
                         let bincode_length = try_or_500_log!(req_id, body.read_u32::<BigEndian>()
                             .context("failed to read run job input length")) as u64;
 
@@ -1019,7 +1101,7 @@ mod server {
                 ))();
                 trace!("Res {}: {:?}", req_id, response);
                 response
-            }, cert_pem, privkey_pem).map_err(|e| anyhow!(format!("Failed to start http server for sccache server: {}", e)))?;
+            }, cert_pem, privkey_pem).map_err(|e| anyhow!("Failed to start http server for sccache server: {e}"))?;
 
             // This limit is rouille's default for `start_server_with_pool`, which
             // we would use, except that interface doesn't permit any sort of
@@ -1027,7 +1109,7 @@ mod server {
             let server = server.pool_size(num_cpus() * 8);
             server.run();
 
-            panic!("Rouille server terminated")
+            Err(anyhow!("Rouille HTTPS server terminated"))
         }
     }
 
@@ -1043,7 +1125,7 @@ mod server {
             job_id: JobId,
             state: JobState,
         ) -> Result<UpdateJobStateResult> {
-            let url = urls::scheduler_job_state(&self.scheduler_url, job_id);
+            let url = urls::scheduler_job_state(&self.scheduler_url, job_id)?;
             bincode_req(
                 self.client
                     .post(url)
@@ -1082,7 +1164,7 @@ mod client {
         ServerCertificateHttpResponse, bincode_req_fut,
     };
     use super::urls;
-    use crate::errors::*;
+    use crate::errors::{Context, Result, anyhow};
 
     const REQUEST_TIMEOUT_SECS: u64 = 1200;
     const CONNECT_TIMEOUT_SECS: u64 = 5;
@@ -1092,13 +1174,18 @@ mod client {
         scheduler_url: reqwest::Url,
         // cert_digest -> cert_pem
         server_certs: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
-        client: Arc<Mutex<reqwest::Client>>,
+        http_client: Arc<Mutex<reqwest::Client>>,
         pool: tokio::runtime::Handle,
         tc_cache: Arc<cache::ClientToolchains>,
         rewrite_includes_only: bool,
     }
 
     impl Client {
+        /// Create a distributed-compilation HTTP client.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if the HTTP client or local toolchain cache cannot be initialized.
         pub fn new(
             pool: &tokio::runtime::Handle,
             scheduler_url: reqwest::Url,
@@ -1124,8 +1211,8 @@ mod client {
             Ok(Self {
                 auth_token,
                 scheduler_url,
-                server_certs: Default::default(),
-                client: Arc::new(Mutex::new(client)),
+                server_certs: Arc::default(),
+                http_client: Arc::new(Mutex::new(client)),
                 pool: pool.clone(),
                 tc_cache: Arc::new(client_toolchains),
                 rewrite_includes_only,
@@ -1146,7 +1233,8 @@ mod client {
             );
             for cert_pem in certs.values() {
                 client_async_builder = client_async_builder.add_root_certificate(
-                    reqwest::Certificate::from_pem(cert_pem).expect("previously valid cert"),
+                    reqwest::Certificate::from_pem(cert_pem)
+                        .context("stored server certificate is no longer valid")?,
                 );
             }
             // Finish the client
@@ -1168,11 +1256,17 @@ mod client {
     impl dist::Client for Client {
         async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
             let scheduler_url = self.scheduler_url.clone();
-            let url = urls::scheduler_alloc_job(&scheduler_url);
-            let mut req = self.client.lock().unwrap().post(url);
+            let url = urls::scheduler_alloc_job(&scheduler_url)?;
+            let mut req = {
+                let client = self
+                    .http_client
+                    .lock()
+                    .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
+                client.post(url)
+            };
             req = req.bearer_auth(self.auth_token.clone()).bincode(&tc)?;
 
-            let client = self.client.clone();
+            let http_client = self.http_client.clone();
             let server_certs = self.server_certs.clone();
 
             match bincode_req_fut(req).await? {
@@ -1186,15 +1280,24 @@ mod client {
                         job_alloc,
                         need_toolchain,
                     });
-                    if server_certs.lock().unwrap().contains_key(&cert_digest) {
+                    let has_certificate = server_certs
+                        .lock()
+                        .map_err(|_| anyhow!("server certificate mutex poisoned"))?
+                        .contains_key(&cert_digest);
+                    if has_certificate {
                         return alloc_job_res;
                     }
                     info!(
                         "Need to request new certificate for server {}",
                         server_id.addr()
                     );
-                    let url = urls::scheduler_server_certificate(&scheduler_url, server_id);
-                    let req = client.lock().unwrap().get(url);
+                    let url = urls::scheduler_server_certificate(&scheduler_url, server_id)?;
+                    let req = {
+                        let client = http_client
+                            .lock()
+                            .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
+                        client.get(url)
+                    };
                     let res: ServerCertificateHttpResponse = bincode_req_fut(req)
                         .await
                         .context("GET to scheduler server_certificate failed")?;
@@ -1206,19 +1309,24 @@ mod client {
                     // dropping a runtime in asynchronous context.
                     // For the time being, we work around this by off-loading it
                     // to a dedicated blocking-friendly thread pool.
-                    let _ = self
-                        .pool
-                        .spawn_blocking(move || {
+                    self.pool
+                        .spawn_blocking(move || -> Result<()> {
+                            let mut client = http_client
+                                .lock()
+                                .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
+                            let mut certs = server_certs
+                                .lock()
+                                .map_err(|_| anyhow!("server certificate mutex poisoned"))?;
                             Self::update_certs(
-                                &mut client.lock().unwrap(),
-                                &mut server_certs.lock().unwrap(),
+                                &mut client,
+                                &mut certs,
                                 res.cert_digest,
                                 res.cert_pem,
                             )
-                            .context("Failed to update certificate")
-                            .unwrap_or_else(|e| warn!("Failed to update certificate: {:?}", e));
+                            .context("failed to update server certificates")
                         })
-                        .await;
+                        .await
+                        .context("certificate update task failed")??;
 
                     alloc_job_res
                 }
@@ -1228,8 +1336,14 @@ mod client {
 
         async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
             let scheduler_url = self.scheduler_url.clone();
-            let url = urls::scheduler_status(&scheduler_url);
-            let req = self.client.lock().unwrap().get(url);
+            let url = urls::scheduler_status(&scheduler_url)?;
+            let req = {
+                let client = self
+                    .http_client
+                    .lock()
+                    .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
+                client.get(url)
+            };
             bincode_req_fut(req).await
         }
 
@@ -1240,8 +1354,14 @@ mod client {
         ) -> Result<SubmitToolchainResult> {
             match self.tc_cache.get_toolchain(&tc) {
                 Ok(Some(toolchain_file)) => {
-                    let url = urls::server_submit_toolchain(job_alloc.server_id, job_alloc.job_id);
-                    let req = self.client.lock().unwrap().post(url);
+                    let url = urls::server_submit_toolchain(job_alloc.server_id, job_alloc.job_id)?;
+                    let req = {
+                        let client = self
+                            .http_client
+                            .lock()
+                            .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
+                        client.post(url)
+                    };
                     let toolchain_file = tokio::fs::File::from_std(toolchain_file.into());
                     let toolchain_file_stream = tokio_util::io::ReaderStream::new(toolchain_file);
                     let body = Body::wrap_stream(toolchain_file_stream);
@@ -1260,20 +1380,21 @@ mod client {
             outputs: Vec<String>,
             inputs_packager: Box<dyn InputsPackager>,
         ) -> Result<(RunJobResult, PathTransformer)> {
-            let url = urls::server_run_job(job_alloc.server_id, job_alloc.job_id);
+            let url = urls::server_run_job(job_alloc.server_id, job_alloc.job_id)?;
 
             let (body, path_transformer) = self
                 .pool
                 .spawn_blocking(move || -> Result<_> {
                     let bincode = bincode::serialize(&RunJobHttpRequest { command, outputs })
                         .context("failed to serialize run job request")?;
-                    let bincode_length = bincode.len();
+                    let bincode_length = u32::try_from(bincode.len())
+                        .context("run job request metadata exceeds the u32 wire-format limit")?;
 
                     let mut body = vec![];
-                    body.write_u32::<BigEndian>(bincode_length as u32)
-                        .expect("Infallible write of bincode length to vec failed");
+                    body.write_u32::<BigEndian>(bincode_length)
+                        .context("failed to encode run job request length")?;
                     body.write_all(&bincode)
-                        .expect("Infallible write of bincode body to vec failed");
+                        .context("failed to encode run job request metadata")?;
                     let path_transformer;
                     {
                         let mut compressor = ZlibWriteEncoder::new(&mut body, Compression::fast());
@@ -1292,7 +1413,13 @@ mod client {
                     Ok((body, path_transformer))
                 })
                 .await??;
-            let mut req = self.client.lock().unwrap().post(url);
+            let mut req = {
+                let client = self
+                    .http_client
+                    .lock()
+                    .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
+                client.post(url)
+            };
             req = req.bearer_auth(job_alloc.auth.clone()).bytes(body);
             bincode_req_fut(req)
                 .map_ok(|res| (res, path_transformer))

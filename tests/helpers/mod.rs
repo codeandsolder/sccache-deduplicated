@@ -1,5 +1,3 @@
-#![allow(clippy::result_large_err)]
-
 use anyhow::{Context, Result};
 use assert_cmd::assert::OutputAssertExt;
 use chrono::Local;
@@ -36,11 +34,10 @@ static LOGGER: LazyLock<Result<(), Infallible>> = LazyLock::new(|| {
 });
 
 /// Used as a test setup fixture. The drop implementation cleans up after a _successful_ test.
-/// We catch the panic to ensure that the drop runs and the TempDir is cleaned up.
+/// We catch the panic to ensure that the drop runs and the `TempDir` is cleaned up.
 pub struct SccacheTest<'a> {
     /// Tempdir used for Sccache cache and cargo output. It is kept in the struct only to have the
-    /// destructor run when SccacheTest goes out of scope, but is never used otherwise.
-    #[allow(dead_code)]
+    /// destructor run when `SccacheTest` goes out of scope, but is never used otherwise.
     pub tempdir: tempfile::TempDir,
     pub env: Vec<(&'a str, std::ffi::OsString)>,
 }
@@ -92,16 +89,17 @@ impl SccacheTest<'_> {
 
     /// Show the statistics for sccache. This will be called at the end of a test and making this
     /// an associated function will ensure that the struct lives until the end of the test.
-    pub fn show_stats(&self) -> assert_cmd::assert::AssertResult {
+    pub fn show_stats(&self) -> Result<assert_cmd::assert::Assert> {
         trace!("sccache --show-stats");
 
         Command::new(SCCACHE_BIN.as_os_str())
             .args(["--show-stats", "--stats-format=json"])
             .assert()
             .try_success()
+            .map_err(Into::into)
     }
 
-    pub fn show_text_stats(&self, advanced: bool) -> assert_cmd::assert::AssertResult {
+    pub fn show_text_stats(&self, advanced: bool) -> Result<assert_cmd::assert::Assert> {
         let cmd = if advanced {
             "--show-adv-stats"
         } else {
@@ -114,6 +112,7 @@ impl SccacheTest<'_> {
             .args([cmd, "--stats-format=text"])
             .assert()
             .try_success()
+            .map_err(Into::into)
     }
 }
 

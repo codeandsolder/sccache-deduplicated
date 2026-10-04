@@ -18,23 +18,38 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::str;
 
-use crate::errors::*;
+use crate::errors::{Result, anyhow, bail};
 
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-pub use self::toolchain_imp::*;
+pub use self::toolchain_imp::ToolchainPackageBuilder;
 
 pub trait ToolchainPackager: Send {
+    /// Write the packaged toolchain to `f`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if packaging or writing the toolchain fails.
     fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()>;
 }
 
 pub trait InputsPackager: Send {
+    /// Write packaged compiler inputs and return the corresponding path transformer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if packaging or writing an input fails.
     fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<dist::PathTransformer>;
 }
 
 pub trait OutputsRepackager {
+    /// Repackage compiler outputs and return the corresponding path transformer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading or writing an output fails.
     fn repackage_outputs(self: Box<Self>, wtr: &mut dyn io::Write)
     -> Result<dist::PathTransformer>;
 }
@@ -47,7 +62,7 @@ mod toolchain_imp {
     use super::ToolchainPackager;
     use fs_err as fs;
 
-    use crate::errors::*;
+    use crate::errors::{Result, bail};
 
     // Distributed client, but an unsupported platform for toolchain packaging so
     // create a failing implementation that will conflict with any others.
@@ -72,7 +87,7 @@ mod toolchain_imp {
     use std::str;
     use walkdir::WalkDir;
 
-    use crate::errors::*;
+    use crate::errors::{Context, Result, bail};
 
     pub struct ToolchainPackageBuilder {
         // Put dirs and file in a deterministic order (map from tar_path -> real_path)
@@ -86,8 +101,9 @@ mod toolchain_imp {
     }
 
     impl ToolchainPackageBuilder {
-        pub fn new() -> Self {
-            ToolchainPackageBuilder {
+        #[must_use]
+        pub const fn new() -> Self {
+            Self {
                 dir_set: BTreeMap::new(),
                 file_set: BTreeMap::new(),
                 symlinks: BTreeMap::new(),
@@ -102,14 +118,29 @@ mod toolchain_imp {
                 .sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
         }
 
+        /// Add paths that every packaged toolchain requires.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if a required common path cannot be added.
         pub fn add_common(&mut self) -> Result<()> {
             self.add_dir(PathBuf::from("/tmp"))
         }
 
+        /// Add an executable and the dynamic libraries required to run it.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if a path is not absolute or dependency discovery fails.
         pub fn add_executable_and_deps(&mut self, executable: PathBuf) -> Result<()> {
             let mut remaining = vec![executable];
             while let Some(obj_path) = remaining.pop() {
-                assert!(obj_path.is_absolute());
+                if !obj_path.is_absolute() {
+                    bail!(
+                        "toolchain dependency path is not absolute: {}",
+                        obj_path.display()
+                    );
+                }
                 // If any parent directories are a symlink, resolve it first and record the link.
                 // This is important because ld-linux may not be configured to look in the resolved
                 // or non-resolved directory (i.e., both directories must work at runtime).
@@ -128,20 +159,25 @@ mod toolchain_imp {
             Ok(())
         }
 
+        /// Add a directory entry to the package.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if `dir_path` is not an absolute directory or path processing fails.
         pub fn add_dir(&mut self, dir_path: PathBuf) -> Result<()> {
-            assert!(dir_path.is_absolute());
+            if !dir_path.is_absolute() {
+                bail!(
+                    "toolchain directory path is not absolute: {}",
+                    dir_path.display()
+                );
+            }
             if !dir_path.is_dir() {
                 bail!(format!(
                     "{} was not a dir when readying for tar",
                     dir_path.to_string_lossy()
                 ))
             }
-            if dir_path
-                .components()
-                .next_back()
-                .expect("asserted absolute")
-                == Component::RootDir
-            {
+            if matches!(dir_path.components().next_back(), Some(Component::RootDir)) {
                 return Ok(());
             }
             let tar_path = self.tarify_path(&dir_path)?;
@@ -149,8 +185,18 @@ mod toolchain_imp {
             Ok(())
         }
 
+        /// Add a file entry to the package.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if `file_path` is not an absolute file or path processing fails.
         pub fn add_file(&mut self, file_path: PathBuf) -> Result<()> {
-            assert!(file_path.is_absolute());
+            if !file_path.is_absolute() {
+                bail!(
+                    "toolchain file path is not absolute: {}",
+                    file_path.display()
+                );
+            }
             if !file_path.is_file() {
                 bail!(format!(
                     "{} was not a file when readying for tar",
@@ -162,6 +208,11 @@ mod toolchain_imp {
             Ok(())
         }
 
+        /// Add all regular files reachable directly beneath `dir_path`.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if directory traversal, metadata lookup, or file insertion fails.
         pub fn add_dir_contents(&mut self, dir_path: &Path) -> Result<()> {
             // Although by not following symlinks we could break a custom
             // constructed toolchain with links everywhere, this is just a
@@ -171,7 +222,8 @@ mod toolchain_imp {
                 let file_type = entry.file_type();
                 if file_type.is_dir() {
                     continue;
-                } else if file_type.is_symlink() {
+                }
+                if file_type.is_symlink() {
                     let metadata = fs::metadata(entry.path())?;
                     if !metadata.file_type().is_file() {
                         continue;
@@ -187,13 +239,18 @@ mod toolchain_imp {
             Ok(())
         }
 
+        /// Write the package as a deterministic compressed tar archive.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if archive construction or compression fails.
         pub fn into_compressed_tar<W: Write + Send + 'static>(self, writer: W) -> Result<()> {
             use gzp::{
                 deflate::Gzip,
                 par::compress::{Compression, ParCompress, ParCompressBuilder},
             };
 
-            let ToolchainPackageBuilder {
+            let Self {
                 dir_set,
                 file_set,
                 symlinks,
@@ -242,20 +299,27 @@ mod toolchain_imp {
         }
     }
 
+    impl Default for ToolchainPackageBuilder {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     #[test]
-    fn toolchain_root_mapping_changes_archive_identity() {
-        let temp = tempfile::tempdir().unwrap();
+    fn toolchain_root_mapping_changes_archive_identity() -> Result<()> {
+        let temp = tempfile::tempdir()?;
         let sysroot = temp.path().join("toolchain");
-        std::fs::create_dir_all(sysroot.join("bin")).unwrap();
+        std::fs::create_dir_all(sysroot.join("bin"))?;
         let rustc = sysroot.join("bin/rustc");
-        std::fs::write(&rustc, b"rustc").unwrap();
+        std::fs::write(&rustc, b"rustc")?;
 
         let mut builder = ToolchainPackageBuilder::new();
         builder.add_root_mapping(sysroot, PathBuf::from("/rust"));
         assert_eq!(
-            builder.tarify_path(&rustc).unwrap(),
+            builder.tarify_path(&rustc)?,
             PathBuf::from("rust/bin/rustc")
         );
+        Ok(())
     }
 
     /// Strip a leading slash, if any.
@@ -308,9 +372,9 @@ mod toolchain_imp {
                 _ => bail!("Invalid endianness in elf header"),
             };
             let e_type = if little_endian {
-                ((elf_bytes[0x11] as u16) << 8) | elf_bytes[0x10] as u16
+                (u16::from(elf_bytes[0x11]) << 8) | u16::from(elf_bytes[0x10])
             } else {
-                ((elf_bytes[0x10] as u16) << 8) | elf_bytes[0x11] as u16
+                (u16::from(elf_bytes[0x10]) << 8) | u16::from(elf_bytes[0x11])
             };
             if e_type != 0x02 {
                 bail!("ldd failed on a non-ET_EXEC elf")
@@ -394,17 +458,14 @@ mod toolchain_imp {
 \tlibpthread.so.0 => /lib/x86_64-linux-gnu/libpthread.so.0 (0x00007f69ca010000)
 ";
         assert_eq!(
-            parse_ldd_output(ubuntu_ls_output)
-                .iter()
-                .map(|p| p.to_str().unwrap())
-                .collect::<Vec<_>>(),
-            &[
-                "/lib/x86_64-linux-gnu/libselinux.so.1",
-                "/lib/x86_64-linux-gnu/libc.so.6",
-                "/lib/x86_64-linux-gnu/libpcre.so.3",
-                "/lib/x86_64-linux-gnu/libdl.so.2",
-                "/lib64/ld-linux-x86-64.so.2",
-                "/lib/x86_64-linux-gnu/libpthread.so.0",
+            parse_ldd_output(ubuntu_ls_output),
+            vec![
+                PathBuf::from("/lib/x86_64-linux-gnu/libselinux.so.1"),
+                PathBuf::from("/lib/x86_64-linux-gnu/libc.so.6"),
+                PathBuf::from("/lib/x86_64-linux-gnu/libpcre.so.3"),
+                PathBuf::from("/lib/x86_64-linux-gnu/libdl.so.2"),
+                PathBuf::from("/lib64/ld-linux-x86-64.so.2"),
+                PathBuf::from("/lib/x86_64-linux-gnu/libpthread.so.0"),
             ]
         );
     }
@@ -429,21 +490,23 @@ mod toolchain_imp {
 \t/lib64/ld-linux-x86-64.so.2 => /usr/lib64/ld-linux-x86-64.so.2 (0x00007f49809e9000)
 ";
         assert_eq!(
-            parse_ldd_output(archlinux_ls_output)
-                .iter()
-                .map(|p| p.to_str().unwrap())
-                .collect::<Vec<_>>(),
-            &[
-                "/usr/lib/libcap.so.2",
-                "/lib/x86_64-linux-gnu/libc.so.6",
-                "/usr/lib/libc.so.6",
-                "/lib64/ld-linux-x86-64.so.2",
-                "/usr/lib64/ld-linux-x86-64.so.2",
+            parse_ldd_output(archlinux_ls_output),
+            vec![
+                PathBuf::from("/usr/lib/libcap.so.2"),
+                PathBuf::from("/lib/x86_64-linux-gnu/libc.so.6"),
+                PathBuf::from("/usr/lib/libc.so.6"),
+                PathBuf::from("/lib64/ld-linux-x86-64.so.2"),
+                PathBuf::from("/usr/lib64/ld-linux-x86-64.so.2"),
             ]
         );
     }
 }
 
+/// Build a tar header for `src`, using the absolute archive path `dest`.
+///
+/// # Errors
+///
+/// Returns an error if `dest` is not absolute or the tar header cannot be populated.
 pub fn make_tar_header(src: &Path, dest: &str) -> io::Result<tar::Header> {
     let metadata_res = fs::metadata(src);
 
@@ -454,26 +517,26 @@ pub fn make_tar_header(src: &Path, dest: &str) -> io::Result<tar::Header> {
         file_header.set_metadata(&metadata);
     } else {
         warn!(
-            "Couldn't get metadata of file {:?}, falling back to some defaults",
-            src
+            "Couldn't get metadata of file {}, falling back to some defaults",
+            src.display()
         );
         file_header.set_mode(0o644);
         file_header.set_uid(0);
         file_header.set_gid(0);
         file_header.set_mtime(0);
-        file_header
-            .set_device_major(0)
-            .expect("expected a ustar header");
-        file_header
-            .set_device_minor(0)
-            .expect("expected a ustar header");
+        file_header.set_device_major(0)?;
+        file_header.set_device_minor(0)?;
         file_header.set_entry_type(tar::EntryType::file());
     }
 
-    // tar-rs imposes that `set_path` takes a relative path
-    assert!(dest.starts_with('/'));
+    // tar-rs imposes that `set_path` takes a relative path.
+    if !dest.starts_with('/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "archive destination path must be absolute",
+        ));
+    }
     let dest = dest.trim_start_matches('/');
-    assert!(!dest.starts_with('/'));
     // `set_path` converts its argument to a Path and back to bytes on Windows, so this is
     // a bit of an inefficient round-trip. Windows path separators will also be normalised
     // to be like Unix, and the path is (now) relative so there should be no funny results
@@ -483,15 +546,14 @@ pub fn make_tar_header(src: &Path, dest: &str) -> io::Result<tar::Header> {
     Ok(file_header)
 }
 
-/// Simplify a path to one without any relative components, erroring if it looks
-/// like there could be any symlink complexity that means a simplified path is not
-/// equivalent to the original (see the documentation of `fs::canonicalize` for an
-/// example).
+/// Simplify a path to remove relative components while preserving meaningful symlink paths.
 ///
-/// So why avoid resolving symlinks? Any path that we are trying to simplify has
-/// (usually) been added to an archive because something will try access it, but
-/// resolving symlinks (be they for the actual file or directory components) can
-/// make the accessed path 'disappear' in favour of the canonical path.
+/// Resolving every symlink can make an archived path disappear in favor of its canonical path,
+/// so this rejects cases where simplification would be ambiguous.
+///
+/// # Errors
+///
+/// Returns an error when path simplification encounters unsupported symlink traversal.
 pub fn simplify_path(path: &Path) -> Result<PathBuf> {
     SimplifyPath {
         resolved_symlinks: None,
@@ -504,22 +566,28 @@ struct SimplifyPath<'a> {
 }
 
 impl SimplifyPath<'_> {
+    /// Simplify `path`, recording resolved symlinks when configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when filesystem access fails or symlink traversal is unsupported.
     pub fn simplify(&mut self, path: &Path) -> Result<PathBuf> {
         let mut final_path = PathBuf::new();
         for component in path.components() {
             match component {
-                c @ Component::RootDir | c @ Component::Prefix(_) | c @ Component::Normal(_) => {
+                c @ (Component::RootDir | Component::Prefix(_) | Component::Normal(_)) => {
                     final_path.push(c);
                     if self.resolved_symlinks.is_some() && final_path.is_symlink() {
-                        let parent = final_path.parent().expect("symlinks have parents");
+                        let parent = final_path.parent().ok_or_else(|| {
+                            anyhow!("symlink path has no parent: {}", final_path.display())
+                        })?;
                         let link_target = final_path.read_link()?;
                         let new_final_path = self.simplify(&parent.join(&link_target))?;
                         let old_final_path =
                             std::mem::replace(&mut final_path, new_final_path.clone());
-                        self.resolved_symlinks
-                            .as_mut()
-                            .unwrap()
-                            .insert(old_final_path, new_final_path);
+                        if let Some(resolved_symlinks) = self.resolved_symlinks.as_deref_mut() {
+                            resolved_symlinks.insert(old_final_path, new_final_path);
+                        }
                     }
                 }
                 Component::ParentDir => {
@@ -531,7 +599,7 @@ impl SimplifyPath<'_> {
                     }
                     final_path.pop();
                 }
-                Component::CurDir => continue,
+                Component::CurDir => {}
             }
         }
         Ok(final_path)

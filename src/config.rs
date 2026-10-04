@@ -12,6 +12,43 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![expect(
+    clippy::default_trait_access,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::missing_errors_doc,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::option_if_let_else,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::significant_drop_tightening,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::struct_excessive_bools,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::unnecessary_debug_formatting,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![allow(
+    clippy::upper_case_acronyms,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![allow(
+    clippy::wildcard_imports,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+
 use crate::cache::CacheMode;
 #[cfg(target_os = "windows")]
 use crate::util::normalize_win_path;
@@ -31,7 +68,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
 use std::str::FromStr;
-use std::sync::{LazyLock, Mutex};
+use std::sync::Mutex;
 use std::{collections::HashMap, fmt};
 use typed_path::Utf8TypedPathBuf;
 
@@ -55,12 +92,11 @@ impl FromStr for WriteErrorPolicy {
 
     fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
-            "ignore" => Ok(WriteErrorPolicy::Ignore),
-            "l0" => Ok(WriteErrorPolicy::L0),
-            "all" => Ok(WriteErrorPolicy::All),
+            "ignore" => Ok(Self::Ignore),
+            "l0" => Ok(Self::L0),
+            "all" => Ok(Self::All),
             _ => Err(anyhow!(
-                "Invalid write policy '{}'. Valid values: ignore, l0, all",
-                s
+                "Invalid write policy '{s}'. Valid values: ignore, l0, all"
             )),
         }
     }
@@ -69,14 +105,14 @@ impl FromStr for WriteErrorPolicy {
 impl fmt::Display for WriteErrorPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            WriteErrorPolicy::Ignore => write!(f, "ignore"),
-            WriteErrorPolicy::L0 => write!(f, "l0"),
-            WriteErrorPolicy::All => write!(f, "all"),
+            Self::Ignore => write!(f, "ignore"),
+            Self::L0 => write!(f, "l0"),
+            Self::All => write!(f, "all"),
         }
     }
 }
 
-fn default_multilevel_slow_write_concurrency() -> usize {
+const fn default_multilevel_slow_write_concurrency() -> usize {
     4
 }
 
@@ -94,8 +130,7 @@ pub struct MultiLevelConfig {
     pub slow_write_concurrency: usize,
 }
 
-static CACHED_CONFIG_PATH: LazyLock<PathBuf> = LazyLock::new(CachedConfig::file_config_path);
-static CACHED_CONFIG: Mutex<Option<CachedFileConfig>> = Mutex::new(None);
+static CACHED_CONFIG: Mutex<Option<(PathBuf, CachedFileConfig)>> = Mutex::new(None);
 
 const ORGANIZATION: &str = "Mozilla";
 const APP_NAME: &str = "sccache";
@@ -106,24 +141,26 @@ pub const INSECURE_DIST_CLIENT_TOKEN: &str = "dangerously_insecure_client";
 
 // Unfortunately this means that nothing else can use the sccache cache dir as
 // this top level directory is used directly to store sccache cached objects...
+#[must_use]
 pub fn default_disk_cache_dir() -> PathBuf {
-    ProjectDirs::from("", ORGANIZATION, APP_NAME)
-        .expect("Unable to retrieve disk cache directory")
-        .cache_dir()
-        .to_owned()
+    ProjectDirs::from("", ORGANIZATION, APP_NAME).map_or_else(
+        || env::temp_dir().join(APP_NAME),
+        |dirs| dirs.cache_dir().to_owned(),
+    )
 }
 // ...whereas subdirectories are used of this one
+#[must_use]
 pub fn default_dist_cache_dir() -> PathBuf {
-    ProjectDirs::from("", ORGANIZATION, DIST_APP_NAME)
-        .expect("Unable to retrieve dist cache directory")
-        .cache_dir()
-        .to_owned()
+    ProjectDirs::from("", ORGANIZATION, DIST_APP_NAME).map_or_else(
+        || env::temp_dir().join(DIST_APP_NAME),
+        |dirs| dirs.cache_dir().to_owned(),
+    )
 }
 
-fn default_disk_cache_size() -> u64 {
+const fn default_disk_cache_size() -> u64 {
     TEN_GIGS
 }
-fn default_toolchain_cache_size() -> u64 {
+const fn default_toolchain_cache_size() -> u64 {
     TEN_GIGS
 }
 
@@ -140,7 +177,7 @@ impl de::Visitor<'_> for StringOrU64Visitor {
     where
         E: de::Error,
     {
-        parse_size(value).ok_or_else(|| E::custom(format!("Invalid size value: {}", value)))
+        parse_size(value).ok_or_else(|| E::custom(format!("Invalid size value: {value}")))
     }
 
     fn visit_u64<E>(self, value: u64) -> StdResult<Self::Value, E>
@@ -154,11 +191,7 @@ impl de::Visitor<'_> for StringOrU64Visitor {
     where
         E: de::Error,
     {
-        if value < 0 {
-            Err(E::custom("negative values not supported"))
-        } else {
-            Ok(value as u64)
-        }
+        u64::try_from(value).map_err(|_| E::custom("negative values not supported"))
     }
 }
 
@@ -169,6 +202,7 @@ where
     deserializer.deserialize_any(StringOrU64Visitor)
 }
 
+#[must_use]
 pub fn parse_size(val: &str) -> Option<u64> {
     let multiplier = match val.chars().last().map(|v| v.to_ascii_uppercase()) {
         Some('K') => 1024,
@@ -182,7 +216,7 @@ pub fn parse_size(val: &str) -> Option<u64> {
     } else {
         val
     };
-    u64::from_str(val).ok().map(|size| size * multiplier)
+    u64::from_str(val).ok()?.checked_mul(multiplier)
 }
 
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
@@ -206,15 +240,15 @@ impl<'a> Deserialize<'a> for HTTPUrl {
         use serde::de::Error;
         let helper: String = Deserialize::deserialize(deserializer)?;
         let url = parse_http_url(&helper).map_err(D::Error::custom)?;
-        Ok(HTTPUrl(url))
+        Ok(Self(url))
     }
 }
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 fn parse_http_url(url: &str) -> Result<reqwest::Url> {
     use std::net::SocketAddr;
     let url = if let Ok(sa) = url.parse::<SocketAddr>() {
-        warn!("Url {} has no scheme, assuming http", url);
-        reqwest::Url::parse(&format!("http://{}", sa))
+        warn!("Url {url} has no scheme, assuming http");
+        reqwest::Url::parse(&format!("http://{sa}"))
     } else {
         reqwest::Url::parse(url)
     }?;
@@ -229,9 +263,11 @@ fn parse_http_url(url: &str) -> Result<reqwest::Url> {
 }
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 impl HTTPUrl {
-    pub fn from_url(u: reqwest::Url) -> Self {
-        HTTPUrl(u)
+    #[must_use]
+    pub const fn from_url(u: reqwest::Url) -> Self {
+        Self(u)
     }
+    #[must_use]
     pub fn to_url(&self) -> reqwest::Url {
         self.0.clone()
     }
@@ -299,6 +335,7 @@ impl Default for PreprocessorCacheModeConfig {
 
 impl PreprocessorCacheModeConfig {
     /// Return a default [`Self`], but with the cache active.
+    #[must_use]
     pub fn activated() -> Self {
         Self {
             use_preprocessor_cache_mode: true,
@@ -320,7 +357,7 @@ pub struct DiskCacheConfig {
 
 impl Default for DiskCacheConfig {
     fn default() -> Self {
-        DiskCacheConfig {
+        Self {
             dir: default_disk_cache_dir(),
             size: default_disk_cache_size(),
             preprocessor_cache_mode: PreprocessorCacheModeConfig::activated(),
@@ -342,8 +379,8 @@ pub enum CacheModeConfig {
 impl From<CacheModeConfig> for CacheMode {
     fn from(value: CacheModeConfig) -> Self {
         match value {
-            CacheModeConfig::ReadOnly => CacheMode::ReadOnly,
-            CacheModeConfig::ReadWrite => CacheMode::ReadWrite,
+            CacheModeConfig::ReadOnly => Self::ReadOnly,
+            CacheModeConfig::ReadWrite => Self::ReadWrite,
         }
     }
 }
@@ -379,7 +416,7 @@ pub struct GHACacheConfig {
 /// Please change this value freely if we have a better choice.
 const DEFAULT_MEMCACHED_CACHE_EXPIRATION: u32 = 86400;
 
-fn default_memcached_cache_expiration() -> u32 {
+const fn default_memcached_cache_expiration() -> u32 {
     DEFAULT_MEMCACHED_CACHE_EXPIRATION
 }
 
@@ -548,7 +585,7 @@ impl CacheConfigs {
     /// Return cache type in an arbitrary but
     /// consistent ordering (Phase 1 behavior - single cache)
     fn into_fallback(self) -> (Option<CacheType>, DiskCacheConfig) {
-        let CacheConfigs {
+        let Self {
             azure,
             disk,
             gcs,
@@ -622,21 +659,21 @@ impl CacheConfigs {
                         // Mark it by continuing - it will be added to the storage list there
                         continue;
                     }
-                    _ => bail!("Unknown cache level: {}", level_name),
+                    _ => bail!("Unknown cache level: {level_name}"),
                 };
                 caches.push(cache_type);
             }
             Ok(caches)
         } else {
             // No levels specified - use single cache (backward compatible)
-            let (cache_type, _) = self.clone().into_fallback();
+            let (cache_type, _) = self.into_fallback();
             Ok(cache_type.map(|ct| vec![ct]).unwrap_or_default())
         }
     }
 
     /// Override self with any existing fields from other
     fn merge(&mut self, other: Self) {
-        let CacheConfigs {
+        let Self {
             azure,
             disk,
             gcs,
@@ -742,12 +779,12 @@ impl<'a> Deserialize<'a> for DistAuth {
         let helper: Helper = Deserialize::deserialize(deserializer)?;
 
         Ok(match helper {
-            Helper::Token { token } => DistAuth::Token { token },
+            Helper::Token { token } => Self::Token { token },
             Helper::Oauth2CodeGrantPKCE {
                 client_id,
                 auth_url,
                 token_url,
-            } => DistAuth::Oauth2CodeGrantPKCE {
+            } => Self::Oauth2CodeGrantPKCE {
                 client_id,
                 auth_url,
                 token_url,
@@ -755,7 +792,7 @@ impl<'a> Deserialize<'a> for DistAuth {
             Helper::Oauth2Implicit {
                 client_id,
                 auth_url,
-            } => DistAuth::Oauth2Implicit {
+            } => Self::Oauth2Implicit {
                 client_id,
                 auth_url,
             },
@@ -765,7 +802,7 @@ impl<'a> Deserialize<'a> for DistAuth {
 
 impl Default for DistAuth {
     fn default() -> Self {
-        DistAuth::Token {
+        Self::Token {
             token: INSECURE_DIST_CLIENT_TOKEN.to_owned(),
         }
     }
@@ -816,11 +853,11 @@ pub struct FileConfig {
 // If the file doesn't exist or we can't read it, log the issue and proceed. If the
 // config exists but doesn't parse then something is wrong - return an error.
 pub fn try_read_config_file<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
-    debug!("Attempting to read config file at {:?}", path);
+    debug!("Attempting to read config file at {path:?}");
     let mut file = match File::open(path) {
         Ok(f) => f,
         Err(e) => {
-            debug!("Couldn't open config file: {}", e);
+            debug!("Couldn't open config file: {e}");
             return Ok(None);
         }
     };
@@ -829,7 +866,7 @@ pub fn try_read_config_file<T: DeserializeOwned>(path: &Path) -> Result<Option<T
     match file.read_to_string(&mut string) {
         Ok(_) => (),
         Err(e) => {
-            warn!("Failed to read config file: {}", e);
+            warn!("Failed to read config file: {e}");
             return Ok(None);
         }
     }
@@ -870,7 +907,7 @@ fn cache_mode_from_env_var(env_var_name: &str) -> Option<CacheModeConfig> {
         "READ_ONLY" => Some(CacheModeConfig::ReadOnly),
         "READ_WRITE" => Some(CacheModeConfig::ReadWrite),
         _ => {
-            warn!("{} must be 'READ_ONLY' or 'READ_WRITE'", env_var_name);
+            warn!("{env_var_name} must be 'READ_ONLY' or 'READ_WRITE'");
             None
         }
     })
@@ -893,10 +930,7 @@ fn bool_from_env_var(env_var_name: &str) -> Result<Option<bool>> {
         .map(|value| match value.to_lowercase().as_str() {
             "true" | "on" | "1" => Ok(true),
             "false" | "off" | "0" => Ok(false),
-            _ => bail!(
-                "{} must be 'true', 'on', '1', 'false', 'off' or '0'.",
-                env_var_name
-            ),
+            _ => bail!("{env_var_name} must be 'true', 'on', '1', 'false', 'off' or '0'."),
         })
         .transpose()
 }
@@ -925,8 +959,8 @@ fn config_from_env() -> Result<EnvConfig> {
         Some(S3CacheConfig {
             bucket,
             region,
-            no_credentials,
             key_prefix,
+            no_credentials,
             endpoint,
             use_ssl,
             server_side_encryption,
@@ -939,7 +973,7 @@ fn config_from_env() -> Result<EnvConfig> {
         None
     };
 
-    if s3.as_ref().map(|s3| s3.no_credentials).unwrap_or_default()
+    if s3.as_ref().is_some_and(|s3| s3.no_credentials)
         && (env::var_os("AWS_ACCESS_KEY_ID").is_some()
             || env::var_os("AWS_SECRET_ACCESS_KEY").is_some())
     {
@@ -972,11 +1006,11 @@ fn config_from_env() -> Result<EnvConfig> {
                 .unwrap_or(CacheModeConfig::ReadWrite);
 
             Some(RedisCacheConfig {
-                url,
                 endpoint,
                 cluster_endpoints,
                 username,
                 password,
+                url,
                 db,
                 ttl,
                 key_prefix,
@@ -1175,8 +1209,8 @@ fn config_from_env() -> Result<EnvConfig> {
 
         Some(OSSCacheConfig {
             bucket,
-            endpoint,
             key_prefix,
+            endpoint,
             no_credentials,
             rw_mode,
         })
@@ -1184,10 +1218,7 @@ fn config_from_env() -> Result<EnvConfig> {
         None
     };
 
-    if oss
-        .as_ref()
-        .map(|oss| oss.no_credentials)
-        .unwrap_or_default()
+    if oss.as_ref().is_some_and(|oss| oss.no_credentials)
         && (env::var_os("ALIBABA_CLOUD_ACCESS_KEY_ID").is_some()
             || env::var_os("ALIBABA_CLOUD_ACCESS_KEY_SECRET").is_some())
     {
@@ -1204,8 +1235,8 @@ fn config_from_env() -> Result<EnvConfig> {
 
         Some(COSCacheConfig {
             bucket,
-            endpoint,
             key_prefix,
+            endpoint,
             rw_mode,
         })
     } else {
@@ -1295,7 +1326,7 @@ fn config_from_env() -> Result<EnvConfig> {
         s.to_string_lossy()
             .split(split_symbol)
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_owned())
+            .map(std::borrow::ToOwned::to_owned)
             .collect()
     });
 
@@ -1311,24 +1342,24 @@ fn config_from_env() -> Result<EnvConfig> {
 // The directories crate changed the location of `config_dir` on macos in version 3,
 // so we also check the config in `preference_dir` (new in that version), which
 // corresponds to the old location, for compatibility with older setups.
-fn config_file(env_var: &str, leaf: &str) -> PathBuf {
+fn config_file(env_var: &str, leaf: &str) -> Result<PathBuf> {
     if let Some(env_value) = env::var_os(env_var) {
-        return env_value.into();
+        return Ok(env_value.into());
     }
-    let dirs =
-        ProjectDirs::from("", ORGANIZATION, APP_NAME).expect("Unable to get config directory");
+    let dirs = ProjectDirs::from("", ORGANIZATION, APP_NAME)
+        .context("unable to determine the user configuration directory")?;
     // If the new location exists, use that.
     let path = dirs.config_dir().join(leaf);
     if path.exists() {
-        return path;
+        return Ok(path);
     }
     // If the old location exists, use that.
     let path = dirs.preference_dir().join(leaf);
     if path.exists() {
-        return path;
+        return Ok(path);
     }
     // Otherwise, use the new location.
-    dirs.config_dir().join(leaf)
+    Ok(dirs.config_dir().join(leaf))
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1340,7 +1371,7 @@ pub struct Config {
     pub server_startup_timeout: Option<std::time::Duration>,
     pub skip_cache_check: bool,
     /// Base directory (or directories) to strip from paths for cache key computation.
-    /// Similar to ccache's CCACHE_BASEDIR.
+    /// Similar to ccache's `CCACHE_BASEDIR`.
     pub basedirs: Vec<Vec<u8>>,
     pub client_side_mode: bool,
 }
@@ -1350,7 +1381,7 @@ impl Config {
         let env_conf = config_from_env()?;
         let skip_cache_check = skip_cache_check_from_env()?;
 
-        let file_conf_path = config_file("SCCACHE_CONF", "config");
+        let file_conf_path = config_file("SCCACHE_CONF", "config")?;
         let file_conf = try_read_config_file(&file_conf_path)
             .context("Failed to load config file")?
             .unwrap_or_default();
@@ -1395,7 +1426,7 @@ impl Config {
         for d in basedirs_raw {
             let p = Utf8TypedPathBuf::from(d);
             if !p.is_absolute() {
-                bail!("Basedir path must be absolute: {:?}", p);
+                bail!("Basedir path must be absolute: {p:?}");
             }
             // Normalize basedir:
             // remove double separators, cur_dirs, parent_dirs, trailing slashes
@@ -1429,7 +1460,7 @@ impl Config {
                 .iter()
                 .map(|b| String::from_utf8_lossy(b).into_owned())
                 .collect();
-            debug!("Using basedirs for path normalization: {:?}", basedirs_str);
+            debug!("Using basedirs for path normalization: {basedirs_str:?}");
         }
 
         let client_side_mode = env_client_side_mode.unwrap_or(file_client_side_mode)
@@ -1469,58 +1500,82 @@ pub struct CachedFileConfig {
     pub dist: CachedDistConfig,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct CachedConfig(());
+#[derive(Debug, PartialEq, Eq)]
+pub struct CachedConfig {
+    file_conf_path: PathBuf,
+}
 
 impl CachedConfig {
     pub fn load() -> Result<Self> {
-        let mut cached_file_config = CACHED_CONFIG.lock().unwrap();
+        let mut cached = CACHED_CONFIG
+            .lock()
+            .map_err(|_| anyhow!("cached config lock is poisoned"))?;
 
-        if cached_file_config.is_none() {
-            let cfg = Self::load_file_config().context("Unable to initialise cached config")?;
-            *cached_file_config = Some(cfg);
+        if cached.is_none() {
+            let file_conf_path = config_file("SCCACHE_CACHED_CONF", "cached-config")?;
+            let cfg = Self::load_file_config(&file_conf_path)
+                .context("Unable to initialise cached config")?;
+            *cached = Some((file_conf_path, cfg));
         }
-        Ok(CachedConfig(()))
+
+        let file_conf_path = cached
+            .as_ref()
+            .map(|(path, _)| path.clone())
+            .context("cached config was not initialised")?;
+        Ok(Self { file_conf_path })
     }
+
     pub fn reload() -> Result<Self> {
         {
-            let mut cached_file_config = CACHED_CONFIG.lock().unwrap();
-            *cached_file_config = None;
-        };
+            let mut cached = CACHED_CONFIG
+                .lock()
+                .map_err(|_| anyhow!("cached config lock is poisoned"))?;
+            *cached = None;
+        }
         Self::load()
     }
-    pub fn with<F: FnOnce(&CachedFileConfig) -> T, T>(&self, f: F) -> T {
-        let cached_file_config = CACHED_CONFIG.lock().unwrap();
-        let cached_file_config = cached_file_config.as_ref().unwrap();
 
-        f(cached_file_config)
+    pub fn with<F: FnOnce(&CachedFileConfig) -> T, T>(&self, f: F) -> Result<T> {
+        let cached = CACHED_CONFIG
+            .lock()
+            .map_err(|_| anyhow!("cached config lock is poisoned"))?;
+        let (path, config) = cached
+            .as_ref()
+            .context("cached config was not initialised")?;
+        if path != &self.file_conf_path {
+            bail!("cached config handle is stale after reload");
+        }
+        Ok(f(config))
     }
-    pub fn with_mut<F: FnOnce(&mut CachedFileConfig)>(&self, f: F) -> Result<()> {
-        let mut cached_file_config = CACHED_CONFIG.lock().unwrap();
-        let cached_file_config = cached_file_config.as_mut().unwrap();
 
-        let mut new_config = cached_file_config.clone();
+    pub fn with_mut<F: FnOnce(&mut CachedFileConfig)>(&self, f: F) -> Result<()> {
+        let mut cached = CACHED_CONFIG
+            .lock()
+            .map_err(|_| anyhow!("cached config lock is poisoned"))?;
+        let (path, config) = cached
+            .as_mut()
+            .context("cached config was not initialised")?;
+        if path != &self.file_conf_path {
+            bail!("cached config handle is stale after reload");
+        }
+
+        let mut new_config = config.clone();
         f(&mut new_config);
-        Self::save_file_config(&new_config)?;
-        *cached_file_config = new_config;
+        Self::save_file_config(path, &new_config)?;
+        *config = new_config;
         Ok(())
     }
 
-    fn file_config_path() -> PathBuf {
-        config_file("SCCACHE_CACHED_CONF", "cached-config")
-    }
-    fn load_file_config() -> Result<CachedFileConfig> {
-        let file_conf_path = &*CACHED_CONFIG_PATH;
-
+    fn load_file_config(file_conf_path: &Path) -> Result<CachedFileConfig> {
         if !file_conf_path.exists() {
             let file_conf_dir = file_conf_path
                 .parent()
-                .expect("Cached conf file has no parent directory");
+                .context("cached config path has no parent directory")?;
             if !file_conf_dir.is_dir() {
                 fs::create_dir_all(file_conf_dir)
                     .context("Failed to create dir to hold cached config")?;
             }
-            Self::save_file_config(&Default::default()).with_context(|| {
+            Self::save_file_config(file_conf_path, &Default::default()).with_context(|| {
                 format!(
                     "Unable to create cached config file at {}",
                     file_conf_path.display()
@@ -1531,11 +1586,13 @@ impl CachedConfig {
             .context("Failed to load cached config file")?
             .with_context(|| format!("Failed to load from {}", file_conf_path.display()))
     }
-    fn save_file_config(c: &CachedFileConfig) -> Result<()> {
-        let file_conf_path = &*CACHED_CONFIG_PATH;
+
+    fn save_file_config(file_conf_path: &Path, config: &CachedFileConfig) -> Result<()> {
+        let serialized =
+            toml::to_string(config).context("failed to serialize cached configuration")?;
         let mut file = File::create(file_conf_path).context("Could not open config for writing")?;
-        file.write_all(toml::to_string(c).unwrap().as_bytes())
-            .map_err(Into::into)
+        file.write_all(serialized.as_bytes())
+            .context("failed to write cached configuration")
     }
 }
 
@@ -1696,6 +1753,7 @@ fn test_parse_size() {
     assert_eq!(Some(10 * 1024 * 1024), parse_size("10M"));
     assert_eq!(Some(TEN_GIGS), parse_size("10G"));
     assert_eq!(Some(1024 * TEN_GIGS), parse_size("10T"));
+    assert_eq!(None, parse_size("18446744073709551615T"));
 }
 
 #[test]
@@ -2012,7 +2070,7 @@ fn config_basedirs_overrides() {
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert!(config.basedirs.is_empty());
+    assert_eq!(config.basedirs, [] as [std::vec::Vec<u8>; 0]);
 
     // Test that both empty results in empty
     let env_conf = EnvConfig {
@@ -2030,7 +2088,7 @@ fn config_basedirs_overrides() {
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert!(config.basedirs.is_empty());
+    assert_eq!(config.basedirs, [] as [std::vec::Vec<u8>; 0]);
     let env_conf = EnvConfig {
         cache: Default::default(),
         basedirs: None,
@@ -2046,7 +2104,7 @@ fn config_basedirs_overrides() {
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert!(config.basedirs.is_empty());
+    assert_eq!(config.basedirs, [] as [std::vec::Vec<u8>; 0]);
 }
 
 #[test]
@@ -2085,7 +2143,7 @@ fn test_deserialize_basedirs_missing() {
     "#;
 
     let config: FileConfig = toml::from_str(toml).unwrap();
-    assert!(config.basedirs.is_empty());
+    assert_eq!(config.basedirs, [] as [std::string::String; 0]);
 }
 
 #[test]
@@ -2859,7 +2917,7 @@ scheduler_url = "http://1.2.3.4:10600"
 # a set of prepackaged toolchains
 toolchains = []
 # the maximum size of the toolchain cache in bytes
-toolchain_cache_size = 5368709120
+toolchain_cache_size = 5_368_709_120
 cache_dir = "/home/user/.cache/sccache-dist-client"
 
 [dist.auth]
@@ -3042,7 +3100,7 @@ key_prefix = "cosprefix"
                 scheduler_url: Some("http://1.2.3.4:10600".to_owned()),
                 cache_dir: PathBuf::from("/home/user/.cache/sccache-dist-client"),
                 toolchains: vec![],
-                toolchain_cache_size: 5368709120,
+                toolchain_cache_size: 5_368_709_120,
                 rewrite_includes_only: false,
             },
             server_startup_timeout_ms: Some(10000),
@@ -3300,7 +3358,7 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert!(config.basedirs.is_empty());
+    assert_eq!(config.basedirs, [] as [std::vec::Vec<u8>; 0]);
 
     let input = b"# 1 \"/home/user/project/src/main.c\"";
     let output = strip_basedirs(input, &config.basedirs);

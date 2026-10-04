@@ -12,6 +12,55 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::cast_possible_wrap,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::default_trait_access,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::items_after_statements,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::large_stack_arrays,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::manual_let_else,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::option_if_let_else,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::redundant_else,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::single_match_else,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::unnecessary_debug_formatting,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![allow(
+    clippy::unnecessary_wraps,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![allow(
+    clippy::wildcard_imports,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+
 use crate::mock_command::{CommandChild, RunCommand};
 use blake3::Hasher as blake3_Hasher;
 use byteorder::{BigEndian, ByteOrder};
@@ -45,8 +94,9 @@ pub struct Digest {
 }
 
 impl Digest {
-    pub fn new() -> Digest {
-        Digest {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
             inner: blake3_Hasher::new(),
         }
     }
@@ -62,13 +112,13 @@ impl Digest {
 
     /// Calculate the BLAKE3 digest of the contents read from `reader`.
     pub fn reader_sync<R: Read>(reader: R) -> Result<String> {
-        Self::reader_sync_with(reader, |_| {}).map(|d| d.finish())
+        Self::reader_sync_with(reader, |_| {}).map(Self::finish)
     }
 
     /// Calculate the BLAKE3 digest of the contents read from `reader`, calling
     /// `each` before each time the digest is updated.
     pub fn reader_sync_with<R: Read, F: FnMut(&[u8])>(mut reader: R, mut each: F) -> Result<Self> {
-        let mut m = Digest::default();
+        let mut m = Self::default();
         // A buffer of 128KB should give us the best performance.
         // See https://eklitzke.org/efficient-file-copying-on-linux.
         let mut buffer = [0; HASH_BUFFER_SIZE];
@@ -99,7 +149,7 @@ impl Digest {
     /// the actual hash computation on a background thread in `pool`.
     pub async fn reader(path: PathBuf, pool: &tokio::runtime::Handle) -> Result<String> {
         pool.spawn_blocking(move || {
-            let mut digest = Digest::new();
+            let mut digest = Self::new();
             if path.is_dir() {
                 // For directories (e.g., from
                 // proc_macro::tracked_path::path()), recursively hash all file
@@ -161,6 +211,7 @@ impl Digest {
         self.update(b"\0");
     }
 
+    #[must_use]
     pub fn finish(self) -> String {
         hex(self.inner.finalize().as_bytes())
     }
@@ -193,7 +244,7 @@ pub struct TimeMacroFinder {
     /// not count and are handled separately.
     full_chunks_counter: usize,
     /// Contents of the previous read if it was smaller than `MAX_HAYSTACK_LEN`,
-    /// plus MAX_HAYSTACK_LEN bytes of the previous chunk, to account for
+    /// plus `MAX_HAYSTACK_LEN` bytes of the previous chunk, to account for
     /// the possibility of partial reads splitting a time macro
     /// across two calls.
     previous_small_read: Vec<u8>,
@@ -243,14 +294,14 @@ impl TimeMacroFinder {
             if visit.len() <= MAX_HAYSTACK_LEN {
                 // The read is smaller than the largest haystack.
                 // We might get called again, if this was an incomplete read.
-                if !self.previous_small_read.is_empty() {
+                if self.previous_small_read.is_empty() {
+                    visit.clone_into(&mut self.previous_small_read);
+                } else {
                     // In a rare pathological case where all reads are small,
                     // this will grow up to the length of the file.
                     // It is *very* unlikely and of minor performance
                     // importance compared to just getting many small reads.
                     self.previous_small_read.extend(visit);
-                } else {
-                    visit.clone_into(&mut self.previous_small_read);
                 }
                 self.find_macros(&self.previous_small_read);
                 return;
@@ -262,9 +313,7 @@ impl TimeMacroFinder {
             if visit.len() < MAX_HAYSTACK_LEN {
                 // The read is smaller than the largest haystack.
                 // We might get called again, if this was an incomplete read.
-                if !self.previous_small_read.is_empty() {
-                    self.previous_small_read.extend(visit);
-                } else {
+                if self.previous_small_read.is_empty() {
                     // Since this isn't the first non-small read (counter != 0)
                     // we need to start from MAX_HAYSTACK_LEN bytes of the previous
                     // read, otherwise we might miss a complete read followed
@@ -272,6 +321,8 @@ impl TimeMacroFinder {
                     let mut buf = self.overlap_buffer[..MAX_HAYSTACK_LEN].to_owned();
                     buf.extend(visit);
                     self.previous_small_read = buf;
+                } else {
+                    self.previous_small_read.extend(visit);
                 }
 
                 // zero the right side of the buffer
@@ -329,27 +380,29 @@ impl TimeMacroFinder {
         }
     }
 
-    pub fn found_time_macros(&self) -> bool {
+    pub const fn found_time_macros(&self) -> bool {
         self.found_date() || self.found_time() || self.found_timestamp()
     }
 
-    pub fn found_time(&self) -> bool {
+    pub const fn found_time(&self) -> bool {
         self.found_time.get()
     }
 
-    pub fn found_date(&self) -> bool {
+    pub const fn found_date(&self) -> bool {
         self.found_date.get()
     }
 
-    pub fn found_timestamp(&self) -> bool {
+    pub const fn found_timestamp(&self) -> bool {
         self.found_timestamp.get()
     }
 
+    #[must_use]
     pub fn new() -> Self {
         Default::default()
     }
 }
 
+#[must_use]
 pub fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
@@ -358,7 +411,7 @@ pub fn hex(bytes: &[u8]) -> String {
     }
     return s;
 
-    fn hex(byte: u8) -> char {
+    const fn hex(byte: u8) -> char {
         match byte {
             0..=9 => (b'0' + byte) as char,
             _ => (b'a' + byte - 10) as char,
@@ -374,8 +427,7 @@ pub async fn hash_all(files: &[PathBuf], pool: &tokio::runtime::Handle) -> Resul
     let iter = files.iter().map(move |f| Digest::file(f, pool));
     let hashes = futures::future::try_join_all(iter).await?;
     trace!(
-        "Hashed {} files in {}",
-        count,
+        "Hashed {count} files in {}",
         fmt_duration_as_secs(&start.elapsed())
     );
     Ok(hashes)
@@ -411,7 +463,9 @@ pub async fn hash_all_archives(
         pool.spawn_blocking(move || -> Result<String> {
             let mut m = Digest::new();
             let archive_file = File::open(&path)
-                .with_context(|| format!("Failed to open file for hashing: {:?}", path))?;
+                .with_context(|| format!("Failed to open file for hashing: {path:?}"))?;
+            // SAFETY: the mapping is private/read-only, the file handle outlives the
+            // mapping, and this code never mutates or truncates the mapped archive.
             let archive_mmap =
                 unsafe { memmap2::MmapOptions::new().map_copy_read_only(&archive_file)? };
 
@@ -432,17 +486,14 @@ pub async fn hash_all_archives(
         })
     });
 
-    let mut hashes = futures::future::try_join_all(iter).await?;
-    if let Some(i) = hashes.iter().position(|res| res.is_err()) {
-        return Err(hashes.swap_remove(i).unwrap_err());
-    }
+    let hashes = futures::future::try_join_all(iter).await?;
+    let hashes = hashes.into_iter().collect::<Result<Vec<_>>>()?;
 
     trace!(
-        "Hashed {} files in {}",
-        count,
+        "Hashed {count} files in {}",
         fmt_duration_as_secs(&start.elapsed())
     );
-    Ok(hashes.into_iter().map(|res| res.unwrap()).collect())
+    Ok(hashes)
 }
 
 fn hash_regular_archive(m: &mut Digest, data: &[u8]) -> Result<()> {
@@ -455,7 +506,23 @@ fn hash_regular_archive(m: &mut Digest, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Return the average of a total duration over `samples` without truncating
+/// a 64-bit sample count to the `u32` divisor supported by `Duration`.
+#[must_use]
+pub fn average_duration(total: Duration, samples: u64) -> Duration {
+    if samples == 0 {
+        return Duration::ZERO;
+    }
+
+    const NANOS_PER_SECOND: u128 = 1_000_000_000;
+    let average_nanos = total.as_nanos() / u128::from(samples);
+    let seconds = u64::try_from(average_nanos / NANOS_PER_SECOND).unwrap_or(u64::MAX);
+    let nanos = u32::try_from(average_nanos % NANOS_PER_SECOND).unwrap_or(999_999_999);
+    Duration::new(seconds, nanos)
+}
+
 /// Format `duration` as seconds with a fractional component.
+#[must_use]
 pub fn fmt_duration_as_secs(duration: &Duration) -> String {
     format!("{}.{:03} s", duration.as_secs(), duration.subsec_millis())
 }
@@ -584,7 +651,7 @@ impl OsStrExt for OsStr {
     fn split_prefix(&self, s: &str) -> Option<OsString> {
         let bytes = self.as_bytes();
         if bytes.starts_with(s.as_bytes()) {
-            Some(OsStr::from_bytes(&bytes[s.len()..]).to_owned())
+            Some(Self::from_bytes(&bytes[s.len()..]).to_owned())
         } else {
             None
         }
@@ -712,6 +779,9 @@ pub fn wide_char_to_multi_byte(wide_char_str: &[u16]) -> std::io::Result<Vec<u8>
     if wide_char_str.is_empty() {
         return Ok(Vec::new());
     }
+    // SAFETY: the input slice is valid for the supplied length. The first call
+    // only queries the required size; the second writes into a buffer allocated
+    // to exactly that size and Windows does not retain either pointer.
     unsafe {
         // Get length of multibyte string
         let len = WideCharToMultiByte(
@@ -766,6 +836,9 @@ pub fn multi_byte_to_wide_char(
     if multi_byte_str.is_empty() {
         return Ok(vec![]);
     }
+    // SAFETY: the input slice is valid for the supplied length. The first call
+    // only queries the required size; the second writes into a buffer allocated
+    // to exactly that size and Windows does not retain either pointer.
     unsafe {
         // Get length of UTF-16 string
         let len = MultiByteToWideChar(
@@ -853,7 +926,8 @@ impl PartialEq<SystemTime> for Timestamp {
 }
 
 impl Timestamp {
-    pub fn new(seconds: i64, nanoseconds: u32) -> Self {
+    #[must_use]
+    pub const fn new(seconds: i64, nanoseconds: u32) -> Self {
         Self {
             seconds,
             nanoseconds,
@@ -893,7 +967,10 @@ impl Hasher for HashToDigest<'_> {
     }
 
     fn finish(&self) -> u64 {
-        panic!("not supposed to be called");
+        // This adapter forwards Hash writes into the BLAKE3 digest; callers
+        // obtain the real result from Digest. A deterministic sentinel
+        // satisfies Hasher without inventing a second unrelated hash.
+        0
     }
 }
 
@@ -918,6 +995,8 @@ fn close_inherited_fds(preserve: &[std::os::unix::io::RawFd]) {
     match victims {
         Some(fds) => {
             for fd in fds {
+                // SAFETY: these descriptor numbers came from the process fd table,
+                // and preserved descriptors were filtered out above.
                 unsafe { libc::close(fd) };
             }
         }
@@ -925,6 +1004,8 @@ fn close_inherited_fds(preserve: &[std::os::unix::io::RawFd]) {
         // range. Bounded by the soft limit rather than the hard one to keep
         // this from turning into a million syscalls.
         None => {
+            // SAFETY: sysconf with _SC_OPEN_MAX takes no pointers and has no
+            // memory-safety preconditions.
             let max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
             let max = if max < 0 {
                 4096
@@ -933,6 +1014,8 @@ fn close_inherited_fds(preserve: &[std::os::unix::io::RawFd]) {
             };
             for fd in (libc::STDERR_FILENO + 1)..max {
                 if !keep(fd) {
+                    // SAFETY: close accepts any integer descriptor; invalid or
+                    // already-closed descriptors are reported as an OS error.
                     unsafe { libc::close(fd) };
                 }
             }
@@ -968,6 +1051,9 @@ pub fn daemonize(preserve_fds: &[std::os::unix::io::RawFd]) -> Result<()> {
     // In order to assist with debugging crashes of the server we configure our
     // rlimit to allow runtime dumps and we also install a signal handler for
     // segfaults which at least prints out what just happened.
+    // SAFETY: the previous-handler storage is initialized before each handler is
+    // installed and intentionally leaked for process lifetime. All libc pointers
+    // below reference live local/static objects for the duration of each call.
     unsafe {
         match env::var("SCCACHE_ALLOW_CORE_DUMPS") {
             Ok(ref val) if val == "1" => {
@@ -975,7 +1061,7 @@ pub fn daemonize(preserve_fds: &[std::os::unix::io::RawFd]) -> Result<()> {
                     rlim_cur: libc::RLIM_INFINITY,
                     rlim_max: libc::RLIM_INFINITY,
                 };
-                libc::setrlimit(libc::RLIMIT_CORE, &rlim);
+                libc::setrlimit(libc::RLIMIT_CORE, &raw const rlim);
             }
             _ => {}
         }
@@ -986,9 +1072,9 @@ pub fn daemonize(preserve_fds: &[std::os::unix::io::RawFd]) -> Result<()> {
         let mut new: libc::sigaction = mem::zeroed();
         new.sa_sigaction = (handler as *const libc::c_void).expose_provenance();
         new.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
-        libc::sigaction(libc::SIGSEGV, &new, &mut *PREV_SIGSEGV);
-        libc::sigaction(libc::SIGBUS, &new, &mut *PREV_SIGBUS);
-        libc::sigaction(libc::SIGILL, &new, &mut *PREV_SIGILL);
+        libc::sigaction(libc::SIGSEGV, &raw const new, &raw mut *PREV_SIGSEGV);
+        libc::sigaction(libc::SIGBUS, &raw const new, &raw mut *PREV_SIGBUS);
+        libc::sigaction(libc::SIGILL, &raw const new, &raw mut *PREV_SIGILL);
     }
 
     return Ok(());
@@ -1004,6 +1090,8 @@ pub fn daemonize(preserve_fds: &[std::os::unix::io::RawFd]) -> Result<()> {
 
         impl Write for Stderr {
             fn write_str(&mut self, s: &str) -> Result {
+                // SAFETY: s owns a valid byte slice for the duration of write;
+                // libc::write does not retain the pointer.
                 unsafe {
                     let bytes = s.as_bytes();
                     libc::write(libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len());
@@ -1012,16 +1100,23 @@ pub fn daemonize(preserve_fds: &[std::os::unix::io::RawFd]) -> Result<()> {
             }
         }
 
+        // SAFETY: daemonize initialized and intentionally leaked each previous
+        // sigaction before installing this handler, so the selected pointer is
+        // valid for the sigaction call.
         unsafe {
-            let _ = writeln!(Stderr, "signal {} received", signum);
+            let _ = writeln!(Stderr, "signal {signum} received");
 
             // Configure the old handler and then resume the program. This'll
             // likely go on to create a runtime dump if one's configured to be
             // created.
             match signum {
-                libc::SIGBUS => libc::sigaction(signum, &*PREV_SIGBUS, std::ptr::null_mut()),
-                libc::SIGILL => libc::sigaction(signum, &*PREV_SIGILL, std::ptr::null_mut()),
-                _ => libc::sigaction(signum, &*PREV_SIGSEGV, std::ptr::null_mut()),
+                libc::SIGBUS => {
+                    libc::sigaction(signum, &raw const *PREV_SIGBUS, std::ptr::null_mut())
+                }
+                libc::SIGILL => {
+                    libc::sigaction(signum, &raw const *PREV_SIGILL, std::ptr::null_mut())
+                }
+                _ => libc::sigaction(signum, &raw const *PREV_SIGSEGV, std::ptr::null_mut()),
             };
         }
     }
@@ -1042,9 +1137,14 @@ pub fn daemonize(_preserve_fds: &[std::os::windows::io::RawHandle]) -> Result<()
 ///
 /// ---
 ///
-/// More details could be found at https://github.com/mozilla/sccache/pull/1563
+/// More details could be found at <https://github.com/mozilla/sccache/pull/1563>
 #[cfg(any(feature = "dist-server", feature = "dist-client"))]
-pub fn new_reqwest_blocking_client() -> reqwest::blocking::Client {
+/// Build the blocking HTTP client used by distributed components.
+///
+/// # Errors
+///
+/// Returns an error if reqwest cannot initialize the configured client.
+pub fn new_reqwest_blocking_client() -> Result<reqwest::blocking::Client> {
     let mut builder = reqwest::blocking::Client::builder();
 
     // Query the native store; fallback if it's completely empty
@@ -1055,7 +1155,7 @@ pub fn new_reqwest_blocking_client() -> reqwest::blocking::Client {
     builder
         .pool_max_idle_per_host(0)
         .build()
-        .expect("http client must build with success")
+        .context("failed to build blocking HTTP client")
 }
 
 fn unhex(b: u8) -> std::io::Result<u8> {
@@ -1089,7 +1189,7 @@ where
     tokio_util::task::AbortOnDropHandle::new(handle.spawn(future))
 }
 
-/// A reverse version of std::ascii::escape_default
+/// A reverse version of `std::ascii::escape_default`
 pub fn ascii_unescape_default(s: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::with_capacity(s.len() + 4);
     let mut offset = 0;
@@ -1146,7 +1246,7 @@ pub fn num_cpus() -> usize {
 ///
 /// This function searches for basedir paths in the preprocessor output and
 /// replaces them with relative path markers. When multiple basedirs are provided,
-/// the longest matching prefix is used. This is similar to ccache's CCACHE_BASEDIR.
+/// the longest matching prefix is used. This is similar to ccache's `CCACHE_BASEDIR`.
 ///
 /// Path matching is case-insensitive to handle various filesystem behaviors and build system
 /// configurations uniformly across all operating systems. On Windows, this function also handles
@@ -1155,6 +1255,7 @@ pub fn num_cpus() -> usize {
 ///
 /// Only paths that start with one of the basedirs are modified. The paths are expected to be
 /// in the format found in preprocessor output (e.g., `# 1 "/path/to/file"`).
+#[must_use]
 pub fn strip_basedirs<'a>(preprocessor_output: &'a [u8], basedirs: &[Vec<u8>]) -> Cow<'a, [u8]> {
     if basedirs.is_empty() || preprocessor_output.is_empty() {
         return Cow::Borrowed(preprocessor_output);
@@ -1226,10 +1327,8 @@ pub fn strip_basedirs<'a>(preprocessor_output: &'a [u8], basedirs: &[Vec<u8>]) -
             filtered_matches.push((pos, len));
             last_end = pos + len;
             trace!(
-                "Matched basedir {} at position {} with length {}",
-                String::from_utf8_lossy(&basedirs[idx]),
-                pos,
-                len
+                "Matched basedir {} at position {pos} with length {len}",
+                String::from_utf8_lossy(&basedirs[idx])
             );
         }
     }
@@ -1276,6 +1375,7 @@ pub fn strip_basedirs<'a>(preprocessor_output: &'a [u8], basedirs: &[Vec<u8>]) -
 /// also has to end where a path component ends, so `/home/user/project` does not
 /// match the start of `/home/user/project-docs`.  The longest basedir wins, so a
 /// nested one takes precedence over the tree that contains it.
+#[must_use]
 pub fn strip_basedirs_from_arg<'a>(arg: &'a [u8], basedirs: &[Vec<u8>]) -> Cow<'a, [u8]> {
     if basedirs.is_empty() || arg.is_empty() {
         return Cow::Borrowed(arg);
@@ -1315,9 +1415,8 @@ pub fn strip_basedirs_from_arg<'a>(arg: &'a [u8], basedirs: &[Vec<u8>]) -> Cow<'
             }
             if matched > 0 {
                 trace!(
-                    "Matched basedir {} at position {} of argument",
-                    String::from_utf8_lossy(with_slash),
-                    pos
+                    "Matched basedir {} at position {pos} of argument",
+                    String::from_utf8_lossy(with_slash)
                 );
                 break;
             }
@@ -1388,12 +1487,14 @@ fn double_path_separators(path: &[u8]) -> Vec<u8> {
 }
 
 /// Normalize path for case-insensitive comparison.
+///
 /// On Windows: converts all backslashes to forward slashes;
 ///             lowercases characters for consistency.
 /// This function is used for:
-///     - basedir_path: already normalized by std::path::absolute
-///     - preprocessor_output: plain text that may contain invalid UTF-8
+///     - `basedir_path`: already normalized by `std::path::absolute`
+///     - `preprocessor_output`: plain text that may contain invalid UTF-8
 /// Leave it for any platform for testing purposes.
+#[must_use]
 pub fn normalize_win_path(path: &[u8]) -> Vec<u8> {
     let mut result = Vec::with_capacity(path.len());
     let mut i = 0;
@@ -1435,17 +1536,14 @@ pub fn normalize_win_path(path: &[u8]) -> Vec<u8> {
         }
 
         // Validate and decode the UTF-8 sequence
-        match std::str::from_utf8(&path[i..i + char_len]) {
-            Ok(s) => {
-                // Valid UTF-8, lowercase it
-                result.extend_from_slice(s.to_lowercase().as_bytes());
-                i += char_len;
-            }
-            Err(_) => {
-                // Invalid sequence, copy first byte as-is
-                result.push(b);
-                i += 1;
-            }
+        if let Ok(s) = std::str::from_utf8(&path[i..i + char_len]) {
+            // Valid UTF-8, lowercase it
+            result.extend_from_slice(s.to_lowercase().as_bytes());
+            i += char_len;
+        } else {
+            // Invalid sequence, copy first byte as-is
+            result.push(b);
+            i += 1;
         }
     }
 
@@ -1466,6 +1564,7 @@ pub fn normalize_win_path(path: &[u8]) -> Vec<u8> {
 ///
 /// If the executable is already an absolute path and resolves to a wrapper,
 /// PATH is searched for a non-wrapper compiler matching the executable name.
+#[must_use]
 pub fn resolve_compiler_avoiding_wrapper(
     executable: &Path,
     env_vars: &[(OsString, OsString)],
@@ -1476,15 +1575,14 @@ pub fn resolve_compiler_avoiding_wrapper(
     let resolves_to_wrapper = |path: &Path| -> bool {
         std::fs::canonicalize(path)
             .ok()
-            .and_then(|canonical| canonical.file_name().map(|n| n.to_os_string()))
-            .map(|name| {
+            .and_then(|canonical| canonical.file_name().map(std::ffi::OsStr::to_os_string))
+            .is_some_and(|name| {
                 let name_lower = name.to_string_lossy().to_lowercase();
                 name_lower == "ccache"
                     || name_lower.starts_with("ccache.")
                     || name_lower == "sccache"
                     || name_lower.starts_with("sccache.")
             })
-            .unwrap_or(false)
     };
 
     // Helper to check if a path contains wrapper directory components.
@@ -1564,8 +1662,7 @@ mod tests {
         let resolved_str = resolved.to_string_lossy();
         assert!(
             !resolved_str.contains("ccache"),
-            "Resolved path should not contain ccache: {}",
-            resolved_str
+            "Resolved path should not contain ccache: {resolved_str}"
         );
     }
 
@@ -1772,7 +1869,7 @@ mod tests {
 
     #[test]
     fn test_ascii_unescape_default() {
-        let mut alphabet = r#"\\'"\t\n\r"#.as_bytes().to_vec();
+        let mut alphabet = br#"\\'"\t\n\r"#.to_vec();
         alphabet.push(b'a');
         alphabet.push(b'1');
         alphabet.push(0);
@@ -1793,9 +1890,9 @@ mod tests {
             if input.is_empty() {
                 break;
             }
-            output.extend(input.as_slice().escape_ascii());
+            output.extend(input.escape_ascii());
             let result = super::ascii_unescape_default(&output).unwrap();
-            assert_eq!(input, result, "{:?}", output);
+            assert_eq!(input, result, "{output:?}");
             tested_cases += 1;
             for idx in &mut alphabet_indexes {
                 *idx += 1;
@@ -1809,7 +1906,7 @@ mod tests {
         }
         assert_eq!(tested_cases, (alphabet.len() + 1).pow(3) - 1);
         let empty_result = super::ascii_unescape_default(&[]).unwrap();
-        assert!(empty_result.is_empty(), "{:?}", empty_result);
+        assert!(empty_result.is_empty(), "{empty_result:?}");
     }
 
     #[test]

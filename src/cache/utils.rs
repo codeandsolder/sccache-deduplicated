@@ -14,11 +14,11 @@ use fs_err as fs;
 
 use std::path::Path;
 
-use crate::errors::*;
+use crate::errors::Result;
 
 /// Normalize key `abcdef` into `a/b/c/abcdef`
 pub(in crate::cache) fn normalize_key(key: &str) -> String {
-    format!("{}/{}/{}/{}", &key[0..1], &key[1..2], &key[2..3], key)
+    format!("{}/{}/{}/{key}", &key[0..1], &key[1..2], &key[2..3])
 }
 
 #[cfg(unix)]
@@ -28,7 +28,6 @@ pub(in crate::cache) fn get_file_mode(file: &fs::File) -> Result<Option<u32>> {
 }
 
 #[cfg(windows)]
-#[allow(clippy::unnecessary_wraps)]
 pub(in crate::cache) fn get_file_mode(_file: &fs::File) -> Result<Option<u32>> {
     Ok(None)
 }
@@ -43,7 +42,6 @@ pub(in crate::cache) fn set_file_mode(path: &Path, mode: u32) -> Result<()> {
 }
 
 #[cfg(windows)]
-#[allow(clippy::unnecessary_wraps)]
 pub(in crate::cache) fn set_file_mode(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }

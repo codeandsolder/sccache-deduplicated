@@ -1,3 +1,20 @@
+#![expect(
+    clippy::match_same_arms,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::needless_pass_by_value,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::option_if_let_else,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::unnecessary_debug_formatting,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+
 use std::cmp::Ordering;
 use std::error::Error;
 use std::ffi::OsString;
@@ -5,7 +22,6 @@ use std::fmt::{self, Debug, Display};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
-use std::str;
 
 pub type ArgParseResult<T> = StdResult<T, ArgParseError>;
 pub type ArgToStringResult = StdResult<String, ArgToStringError>;
@@ -21,11 +37,11 @@ pub enum ArgParseError {
 impl Display for ArgParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
-            ArgParseError::UnexpectedEndOfArgs => "Unexpected end of args".into(),
-            ArgParseError::InvalidUnicode(s) => format!("String {:?} contained invalid unicode", s),
-            ArgParseError::Other(s) => format!("Arg-specific parsing failed: {}", s),
+            Self::UnexpectedEndOfArgs => "Unexpected end of args".into(),
+            Self::InvalidUnicode(s) => format!("String {s:?} contained invalid unicode"),
+            Self::Other(s) => format!("Arg-specific parsing failed: {s}"),
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
@@ -44,14 +60,14 @@ pub enum ArgToStringError {
 impl Display for ArgToStringError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
-            ArgToStringError::FailedPathTransform(p) => {
-                format!("Path {:?} could not be transformed", p)
+            Self::FailedPathTransform(p) => {
+                format!("Path {p:?} could not be transformed")
             }
-            ArgToStringError::InvalidUnicode(s) => {
-                format!("String {:?} contained invalid unicode", s)
+            Self::InvalidUnicode(s) => {
+                format!("String {s:?} contained invalid unicode")
             }
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
@@ -78,7 +94,7 @@ pub enum Argument<T> {
     /// Known flag argument ; e.g. "-bar"
     Flag(&'static str, T),
     /// Known argument with a value ; e.g. "-qux bar", where the way the
-    /// value is passed is described by the ArgDisposition type.
+    /// value is passed is described by the `ArgDisposition` type.
     WithValue(&'static str, T, ArgDisposition),
 }
 
@@ -105,8 +121,11 @@ impl<T: ArgumentValue> Argument<T> {
     /// normalize a parsed argument to a preferred disposition.
     pub fn normalize(self, disposition: NormalizedDisposition) -> Self {
         match self {
-            Argument::WithValue(s, v, ArgDisposition::CanBeConcatenated(d))
-            | Argument::WithValue(s, v, ArgDisposition::CanBeSeparated(d)) => Argument::WithValue(
+            Self::WithValue(
+                s,
+                v,
+                ArgDisposition::CanBeConcatenated(d) | ArgDisposition::CanBeSeparated(d),
+            ) => Self::WithValue(
                 s,
                 v,
                 match disposition {
@@ -120,28 +139,28 @@ impl<T: ArgumentValue> Argument<T> {
 
     pub fn to_os_string(&self) -> OsString {
         match *self {
-            Argument::Raw(ref s) | Argument::UnknownFlag(ref s) => s.clone(),
-            Argument::Flag(ref s, _) | Argument::WithValue(ref s, _, _) => s.into(),
+            Self::Raw(ref s) | Self::UnknownFlag(ref s) => s.clone(),
+            Self::Flag(ref s, _) | Self::WithValue(ref s, _, _) => s.into(),
         }
     }
 
-    pub fn flag_str(&self) -> Option<&'static str> {
+    pub const fn flag_str(&self) -> Option<&'static str> {
         match *self {
-            Argument::Flag(s, _) | Argument::WithValue(s, _, _) => Some(s),
+            Self::Flag(s, _) | Self::WithValue(s, _, _) => Some(s),
             _ => None,
         }
     }
 
-    pub fn get_data(&self) -> Option<&T> {
+    pub const fn get_data(&self) -> Option<&T> {
         match *self {
-            Argument::Flag(_, ref d) => Some(d),
-            Argument::WithValue(_, ref d, _) => Some(d),
+            Self::Flag(_, ref d) => Some(d),
+            Self::WithValue(_, ref d, _) => Some(d),
             _ => None,
         }
     }
 
     /// Transforms a parsed argument into an iterator.
-    pub fn iter_os_strings(&self) -> Iter<'_, T> {
+    pub const fn iter_os_strings(&self) -> Iter<'_, T> {
         Iter {
             arg: self,
             emitted: 0,
@@ -150,7 +169,7 @@ impl<T: ArgumentValue> Argument<T> {
 
     /// Transforms a parsed argument into an iterator over strings, with transformed paths.
     #[cfg(feature = "dist-client")]
-    pub fn iter_strings<F: FnMut(&Path) -> Option<String>>(
+    pub const fn iter_strings<F: FnMut(&Path) -> Option<String>>(
         &self,
         path_transformer: F,
     ) -> IterStrings<'_, T, F> {
@@ -181,23 +200,21 @@ impl<T: ArgumentValue> Iterator for Iter<'_, T> {
                 _ => None,
             },
             Argument::WithValue(s, ref v, ref d) => match (self.emitted, d) {
-                (0, &ArgDisposition::CanBeSeparated(d)) | (0, &ArgDisposition::Concatenated(d)) => {
+                (0, &ArgDisposition::CanBeSeparated(d) | &ArgDisposition::Concatenated(d)) => {
                     let mut s = OsString::from(s);
                     let v = v.clone().into_arg_os_string();
                     if let Some(d) = d
                         && !v.is_empty()
                     {
-                        s.push(OsString::from(
-                            str::from_utf8(&[d]).expect("delimiter should be ascii"),
-                        ));
+                        s.push(char::from(d).to_string());
                     }
                     s.push(v);
                     Some(s)
                 }
-                (0, &ArgDisposition::Separated) | (0, &ArgDisposition::CanBeConcatenated(_)) => {
+                (0, &ArgDisposition::Separated | &ArgDisposition::CanBeConcatenated(_)) => {
                     Some(s.into())
                 }
-                (1, &ArgDisposition::Separated) | (1, &ArgDisposition::CanBeConcatenated(_)) => {
+                (1, &ArgDisposition::Separated | &ArgDisposition::CanBeConcatenated(_)) => {
                     Some(v.clone().into_arg_os_string())
                 }
                 _ => None,
@@ -232,7 +249,7 @@ impl<T: ArgumentValue, F: FnMut(&Path) -> Option<String>> Iterator for IterStrin
                 _ => None,
             },
             Argument::WithValue(s, ref v, ref d) => match (self.emitted, d) {
-                (0, &ArgDisposition::CanBeSeparated(d)) | (0, &ArgDisposition::Concatenated(d)) => {
+                (0, &ArgDisposition::CanBeSeparated(d) | &ArgDisposition::Concatenated(d)) => {
                     let mut s = s.to_owned();
                     let v = match v.clone().into_arg_string(&mut self.path_transformer) {
                         Ok(s) => s,
@@ -241,15 +258,15 @@ impl<T: ArgumentValue, F: FnMut(&Path) -> Option<String>> Iterator for IterStrin
                     if let Some(d) = d
                         && !v.is_empty()
                     {
-                        s.push_str(str::from_utf8(&[d]).expect("delimiter should be ascii"));
+                        s.push(char::from(d));
                     }
                     s.push_str(&v);
                     Some(Ok(s))
                 }
-                (0, &ArgDisposition::Separated) | (0, &ArgDisposition::CanBeConcatenated(_)) => {
+                (0, &ArgDisposition::Separated | &ArgDisposition::CanBeConcatenated(_)) => {
                     Some(Ok(s.to_owned()))
                 }
-                (1, &ArgDisposition::Separated) | (1, &ArgDisposition::CanBeConcatenated(_)) => {
+                (1, &ArgDisposition::Separated | &ArgDisposition::CanBeConcatenated(_)) => {
                     Some(v.clone().into_arg_string(&mut self.path_transformer))
                 }
                 _ => None,
@@ -307,7 +324,6 @@ macro_rules! ArgData {
     };
     { $( $tok:tt )+ } => {
         #[derive(Clone, Debug, PartialEq)]
-        #[allow(clippy::enum_variant_names)]
         enum ArgData {
             $($tok)+
         }
@@ -381,19 +397,18 @@ impl IntoArg for () {
 pub fn split_os_string_arg(val: OsString, split: &str) -> ArgParseResult<(String, Option<String>)> {
     let val = val.into_string().map_err(ArgParseError::InvalidUnicode)?;
     let mut split_it = val.splitn(2, split);
-    let s1 = split_it.next().expect("splitn with no values");
+    let s1 = split_it.next().unwrap_or_default();
     let maybe_s2 = split_it.next();
-    Ok((s1.to_owned(), maybe_s2.map(|s| s.to_owned())))
+    Ok((s1.to_owned(), maybe_s2.map(std::borrow::ToOwned::to_owned)))
 }
 
 /// The description of how an argument may be parsed
-#[derive(PartialEq, Eq, Clone, Debug)]
-#[allow(unpredictable_function_pointer_comparisons)]
+#[derive(Clone, Debug)]
 pub enum ArgInfo<T> {
     /// An simple flag argument, of the form "-foo"
     Flag(&'static str, T),
     /// An argument with a value ; e.g. "-qux bar", where the way the
-    /// value is passed is described by the ArgDisposition type.
+    /// value is passed is described by the `ArgDisposition` type.
     TakeArg(
         &'static str,
         fn(OsString) -> ArgParseResult<T>,
@@ -411,11 +426,11 @@ impl<T: ArgumentValue> ArgInfo<T> {
         F: FnOnce() -> Option<OsString>,
     {
         Ok(match self {
-            ArgInfo::Flag(s, variant) => {
+            Self::Flag(s, variant) => {
                 debug_assert_eq!(s, arg);
                 Argument::Flag(s, variant)
             }
-            ArgInfo::TakeArg(s, create, ArgDisposition::Separated) => {
+            Self::TakeArg(s, create, ArgDisposition::Separated) => {
                 debug_assert_eq!(s, arg);
                 if let Some(a) = get_next_arg() {
                     Argument::WithValue(s, create(a)?, ArgDisposition::Separated)
@@ -423,7 +438,7 @@ impl<T: ArgumentValue> ArgInfo<T> {
                     return Err(ArgParseError::UnexpectedEndOfArgs);
                 }
             }
-            ArgInfo::TakeArg(s, create, ArgDisposition::Concatenated(d)) => {
+            Self::TakeArg(s, create, ArgDisposition::Concatenated(d)) => {
                 let mut len = s.len();
                 debug_assert_eq!(&arg[..len], s);
                 if let Some(d) = d
@@ -437,12 +452,15 @@ impl<T: ArgumentValue> ArgInfo<T> {
                     ArgDisposition::Concatenated(d),
                 )
             }
-            ArgInfo::TakeArg(s, create, ArgDisposition::CanBeSeparated(d))
-            | ArgInfo::TakeArg(s, create, ArgDisposition::CanBeConcatenated(d)) => {
+            Self::TakeArg(
+                s,
+                create,
+                ArgDisposition::CanBeSeparated(d) | ArgDisposition::CanBeConcatenated(d),
+            ) => {
                 let derived = if arg == s {
-                    ArgInfo::TakeArg(s, create, ArgDisposition::Separated)
+                    Self::TakeArg(s, create, ArgDisposition::Separated)
                 } else {
-                    ArgInfo::TakeArg(s, create, ArgDisposition::Concatenated(d))
+                    Self::TakeArg(s, create, ArgDisposition::Concatenated(d))
                 };
                 match derived.process(arg, get_next_arg) {
                     Err(ArgParseError::UnexpectedEndOfArgs) if d.is_none() => {
@@ -464,16 +482,16 @@ impl<T: ArgumentValue> ArgInfo<T> {
     /// how it differs.
     fn cmp(&self, arg: &str) -> Ordering {
         match self {
-            &ArgInfo::TakeArg(s, _, ArgDisposition::CanBeSeparated(None))
-            | &ArgInfo::TakeArg(s, _, ArgDisposition::Concatenated(None))
-            | &ArgInfo::TakeArg(s, _, ArgDisposition::CanBeConcatenated(None))
+            &Self::TakeArg(s, _, ArgDisposition::CanBeSeparated(None))
+            | &Self::TakeArg(s, _, ArgDisposition::Concatenated(None))
+            | &Self::TakeArg(s, _, ArgDisposition::CanBeConcatenated(None))
                 if arg.starts_with(s) =>
             {
                 Ordering::Equal
             }
-            &ArgInfo::TakeArg(s, _, ArgDisposition::CanBeSeparated(Some(d)))
-            | &ArgInfo::TakeArg(s, _, ArgDisposition::Concatenated(Some(d)))
-            | &ArgInfo::TakeArg(s, _, ArgDisposition::CanBeConcatenated(Some(d)))
+            &Self::TakeArg(s, _, ArgDisposition::CanBeSeparated(Some(d)))
+            | &Self::TakeArg(s, _, ArgDisposition::Concatenated(Some(d)))
+            | &Self::TakeArg(s, _, ArgDisposition::CanBeConcatenated(Some(d)))
                 if arg.len() > s.len() && arg.starts_with(s) =>
             {
                 arg.as_bytes()[s.len()].cmp(&d)
@@ -482,9 +500,9 @@ impl<T: ArgumentValue> ArgInfo<T> {
         }
     }
 
-    fn flag_str(&self) -> &'static str {
+    const fn flag_str(&self) -> &'static str {
         match self {
-            &ArgInfo::Flag(s, _) | &ArgInfo::TakeArg(s, _, _) => s,
+            &Self::Flag(s, _) | &Self::TakeArg(s, _, _) => s,
         }
     }
 }
@@ -520,7 +538,7 @@ where
     None
 }
 
-/// Trait for generically search over a "set" of ArgInfos.
+/// Trait for generically search over a "set" of `ArgInfos`.
 pub trait SearchableArgInfo<T> {
     fn search(&self, key: &str) -> Option<&ArgInfo<T>>;
 
@@ -528,7 +546,7 @@ pub trait SearchableArgInfo<T> {
     fn check(&self) -> bool;
 }
 
-/// Allow to search over a sorted array of ArgInfo items associated with extra
+/// Allow to search over a sorted array of `ArgInfo` items associated with extra
 /// data.
 impl<T: ArgumentValue> SearchableArgInfo<T> for &'static [ArgInfo<T>] {
     fn search(&self, key: &str) -> Option<&ArgInfo<T>> {
@@ -540,13 +558,13 @@ impl<T: ArgumentValue> SearchableArgInfo<T> for &'static [ArgInfo<T>] {
         self.windows(2).all(|w| {
             let a = w[0].flag_str();
             let b = w[1].flag_str();
-            assert!(a < b, "{} can't precede {}", a, b);
+            assert!(a < b, "{a} can't precede {b}");
             true
         })
     }
 }
 
-/// Allow to search over a couple of arrays of ArgInfo, where the second
+/// Allow to search over a couple of arrays of `ArgInfo`, where the second
 /// complements or overrides the first one.
 impl<T: ArgumentValue> SearchableArgInfo<T> for (&'static [ArgInfo<T>], &'static [ArgInfo<T>]) {
     fn search(&self, key: &str) -> Option<&ArgInfo<T>> {
@@ -593,7 +611,7 @@ where
     pub fn new(arguments: I, arg_info: S) -> Self {
         #[cfg(debug_assertions)]
         debug_assert!(arg_info.check());
-        ArgsIter {
+        Self {
             arguments,
             arg_info,
             seen_double_dashes: None,
@@ -601,7 +619,7 @@ where
         }
     }
 
-    pub fn with_double_dashes(mut self) -> Self {
+    pub const fn with_double_dashes(mut self) -> Self {
         self.seen_double_dashes = Some(false);
         self
     }
@@ -641,8 +659,8 @@ where
     }
 }
 
-/// Helper macro used to define ArgInfo::Flag's.
-/// Variant is an enum variant, e.g. enum ArgType { Variant }
+/// Helper macro used to define `ArgInfo::Flag`'s.
+/// Variant is an enum variant, e.g. enum `ArgType` { Variant }
 ///     flag!("-foo", Variant)
 macro_rules! flag {
     ($s:expr, $variant:expr) => {
@@ -650,11 +668,11 @@ macro_rules! flag {
     };
 }
 
-/// Helper macro used to define ArgInfo::TakeArg's.
-/// Variant is an enum variant, e.g. enum ArgType { Variant(OsString) }
-///     take_arg!("-foo", OsString, Separated, Variant)
-///     take_arg!("-foo", OsString, Concatenated, Variant)
-///     take_arg!("-foo", OsString, Concatenated(b'='), Variant)
+/// Helper macro used to define `ArgInfo::TakeArg`'s.
+/// Variant is an enum variant, e.g. enum `ArgType` { Variant(OsString) }
+///     take_arg!("-foo", `OsString`, Separated, Variant)
+///     take_arg!("-foo", `OsString`, Concatenated, Variant)
+///     take_arg!("-foo", `OsString`, Concatenated(b'='), Variant)
 macro_rules! take_arg {
     ($s:expr, $vtype:ident, Separated, $variant:expr) => {
         ArgInfo::TakeArg(
@@ -731,7 +749,6 @@ mod tests {
     use self::ArgData::*;
 
     #[test]
-    #[allow(clippy::cognitive_complexity)]
     fn test_arginfo_cmp() {
         let info = flag!("-foo", FooFlag);
         assert_eq!(info.cmp("-foo"), Ordering::Equal);
@@ -932,17 +949,31 @@ mod tests {
         static ARGS3: [ArgInfo<ArgData>; 1] =
             [take_arg!("-include", PathBuf, Concatenated, FooPath)];
 
-        assert_eq!((&ARGS[..], &ARGS2[..]).search("-include"), Some(&ARGS[0]));
-        assert_eq!(
-            (&ARGS[..], &ARGS2[..]).search("-include-pch"),
-            Some(&ARGS2[0])
+        assert!(
+            (&ARGS[..], &ARGS2[..])
+                .search("-include")
+                .is_some_and(|actual| std::ptr::eq(actual, &raw const ARGS[0]))
         );
-        assert_eq!((&ARGS2[..], &ARGS[..]).search("-include"), Some(&ARGS[0]));
-        assert_eq!(
-            (&ARGS2[..], &ARGS[..]).search("-include-pch"),
-            Some(&ARGS2[0])
+        assert!(
+            (&ARGS[..], &ARGS2[..])
+                .search("-include-pch")
+                .is_some_and(|actual| std::ptr::eq(actual, &raw const ARGS2[0]))
         );
-        assert_eq!((&ARGS[..], &ARGS3[..]).search("-include"), Some(&ARGS3[0]));
+        assert!(
+            (&ARGS2[..], &ARGS[..])
+                .search("-include")
+                .is_some_and(|actual| std::ptr::eq(actual, &raw const ARGS[0]))
+        );
+        assert!(
+            (&ARGS2[..], &ARGS[..])
+                .search("-include-pch")
+                .is_some_and(|actual| std::ptr::eq(actual, &raw const ARGS2[0]))
+        );
+        assert!(
+            (&ARGS[..], &ARGS3[..])
+                .search("-include")
+                .is_some_and(|actual| std::ptr::eq(actual, &raw const ARGS3[0]))
+        );
     }
 
     #[test]
@@ -1071,13 +1102,13 @@ mod tests {
         use super::*;
 
         #[test]
-        #[should_panic]
+        #[should_panic(expected = "assertion")]
         fn test_arginfo_process_flag() {
             flag!("-foo", FooFlag).process("-bar", || None).unwrap();
         }
 
         #[test]
-        #[should_panic]
+        #[should_panic(expected = "assertion")]
         fn test_arginfo_process_take_arg() {
             take_arg!("-foo", OsString, Separated, Foo)
                 .process("-bar", || None)
@@ -1085,7 +1116,7 @@ mod tests {
         }
 
         #[test]
-        #[should_panic]
+        #[should_panic(expected = "assertion")]
         fn test_arginfo_process_take_concat_arg() {
             take_arg!("-foo", OsString, Concatenated, Foo)
                 .process("-bar", || None)
@@ -1093,7 +1124,7 @@ mod tests {
         }
 
         #[test]
-        #[should_panic]
+        #[should_panic(expected = "assertion")]
         fn test_arginfo_process_take_concat_arg_delim() {
             take_arg!("-foo", OsString, Concatenated(b'='), Foo)
                 .process("-bar", || None)
@@ -1101,7 +1132,7 @@ mod tests {
         }
 
         #[test]
-        #[should_panic]
+        #[should_panic(expected = "assertion")]
         fn test_arginfo_process_take_maybe_concat_arg() {
             take_arg!("-foo", OsString, CanBeSeparated, Foo)
                 .process("-bar", || None)
@@ -1109,7 +1140,7 @@ mod tests {
         }
 
         #[test]
-        #[should_panic]
+        #[should_panic(expected = "assertion")]
         fn test_arginfo_process_take_maybe_concat_arg_delim() {
             take_arg!("-foo", OsString, CanBeSeparated(b'='), Foo)
                 .process("-bar", || None)
@@ -1117,14 +1148,14 @@ mod tests {
         }
 
         #[test]
-        #[should_panic]
+        #[should_panic(expected = "can't precede")]
         fn test_args_iter_unsorted() {
             static ARGS: [ArgInfo<ArgData>; 2] = [flag!("-foo", FooFlag), flag!("-bar", FooFlag)];
             ArgsIter::new(Vec::<OsString>::new().into_iter(), &ARGS[..]);
         }
 
         #[test]
-        #[should_panic]
+        #[should_panic(expected = "can't precede")]
         fn test_args_iter_unsorted_2() {
             static ARGS: [ArgInfo<ArgData>; 2] = [flag!("-foo", FooFlag), flag!("-foo", FooFlag)];
             ArgsIter::new(Vec::<OsString>::new().into_iter(), &ARGS[..]);

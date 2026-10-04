@@ -12,11 +12,46 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cache::{FileObjectSource, Storage};
-use crate::compiler::preprocessor_cache::preprocessor_cache_entry_hash_key;
+#![expect(
+    clippy::needless_continue,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::needless_pass_by_value,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::or_fun_call,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::struct_excessive_bools,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::type_complexity,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::unnecessary_debug_formatting,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![allow(
+    clippy::wildcard_imports,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+
+use crate::cache::FileObjectSource;
+use crate::compiler::preprocessor_cache::{
+    PreprocessorCacheKey, preprocessor_cache_entry_hash_key,
+};
 use crate::compiler::{
     Cacheable, ColorMode, Compilation, CompileCommand, Compiler, CompilerArguments, CompilerHasher,
-    CompilerKind, HashResult, Language,
+    CompilerKind, GenerateHashKeyContext, HashResult, Language,
 };
 #[cfg(feature = "dist-client")]
 use crate::compiler::{DistPackagers, NoopOutputsRewriter};
@@ -40,7 +75,7 @@ use std::io;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use crate::errors::*;
 
@@ -80,7 +115,6 @@ pub struct ArtifactDescriptor {
 }
 
 /// The results of parsing a compiler commandline.
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ParsedArguments {
     /// The input source file.
@@ -97,7 +131,7 @@ pub struct ParsedArguments {
     pub outputs: HashMap<&'static str, ArtifactDescriptor>,
     /// Commandline arguments for dependency generation.
     pub dependency_args: Vec<OsString>,
-    /// Commandline arguments for the preprocessor (not including common_args).
+    /// Commandline arguments for the preprocessor (not including `common_args`).
     pub preprocessor_args: Vec<OsString>,
     /// Commandline arguments for the preprocessor or the compiler.
     pub common_args: Vec<OsString>,
@@ -117,7 +151,7 @@ pub struct ParsedArguments {
     pub profile_generate: bool,
     /// The color mode.
     pub color_mode: ColorMode,
-    /// arguments are incompatible with rewrite_includes_only
+    /// arguments are incompatible with `rewrite_includes_only`
     pub suppress_rewrite_includes_only: bool,
     /// Arguments are incompatible with preprocessor cache mode
     pub too_hard_for_preprocessor_cache_mode: Option<OsString>,
@@ -128,8 +162,7 @@ impl ParsedArguments {
         self.outputs
             .get("obj")
             .and_then(|o| o.path.file_name())
-            .map(|s| s.to_string_lossy())
-            .unwrap_or(Cow::Borrowed("Unknown filename"))
+            .map_or(Cow::Borrowed("Unknown filename"), |s| s.to_string_lossy())
     }
 }
 
@@ -170,6 +203,26 @@ pub enum CCompilerKind {
     TaskingVX,
 }
 
+pub struct CPreprocessContext<'a, T> {
+    pub creator: &'a T,
+    pub executable: &'a Path,
+    pub parsed_args: &'a ParsedArguments,
+    pub cwd: &'a Path,
+    pub env_vars: &'a [(OsString, OsString)],
+    pub may_dist: bool,
+    pub rewrite_includes_only: bool,
+    pub preprocessor_cache_mode: bool,
+}
+
+pub struct CCompileContext<'a> {
+    pub path_transformer: &'a mut dist::PathTransformer,
+    pub executable: &'a Path,
+    pub parsed_args: &'a ParsedArguments,
+    pub cwd: &'a Path,
+    pub env_vars: &'a [(OsString, OsString)],
+    pub rewrite_includes_only: bool,
+}
+
 /// An interface to a specific C compiler.
 #[async_trait]
 pub trait CCompilerImpl: Clone + fmt::Debug + Send + Sync + 'static {
@@ -192,30 +245,14 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + Sync + 'static {
         env_vars: &[(OsString, OsString)],
     ) -> CompilerArguments<ParsedArguments>;
     /// Run the C preprocessor with the specified set of arguments.
-    #[allow(clippy::too_many_arguments)]
-    async fn preprocess<T>(
-        &self,
-        creator: &T,
-        executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        env_vars: &[(OsString, OsString)],
-        may_dist: bool,
-        rewrite_includes_only: bool,
-        preprocessor_cache_mode: bool,
-    ) -> Result<process::Output>
+    async fn preprocess<T>(&self, context: CPreprocessContext<'_, T>) -> Result<process::Output>
     where
         T: CommandCreatorSync;
     /// Generate a command that can be used to invoke the C compiler to perform
     /// the compilation.
     fn generate_compile_commands<T>(
         &self,
-        path_transformer: &mut dist::PathTransformer,
-        executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        env_vars: &[(OsString, OsString)],
-        rewrite_includes_only: bool,
+        context: CCompileContext<'_>,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
         Option<dist::CompileCommand>,
@@ -233,10 +270,10 @@ where
         compiler: I,
         executable: PathBuf,
         pool: &tokio::runtime::Handle,
-    ) -> Result<CCompiler<I>> {
+    ) -> Result<Self> {
         let digest = Digest::file(executable.clone(), pool).await?;
 
-        Ok(CCompiler {
+        Ok(Self {
             executable,
             executable_digest: {
                 if let Some(version) = compiler.version() {
@@ -325,7 +362,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
         match self.compiler.parse_arguments(arguments, cwd, env_vars) {
             CompilerArguments::Ok(mut args) => {
                 // Handle SCCACHE_EXTRAFILES
-                for (k, v) in env_vars.iter() {
+                for (k, v) in env_vars {
                     if k.as_os_str() == OsStr::new("SCCACHE_EXTRAFILES") {
                         args.extra_hash_files.extend(std::env::split_paths(&v));
                     }
@@ -374,15 +411,18 @@ where
 {
     async fn generate_hash_key(
         &mut self,
-        creator: &T,
-        cwd: PathBuf,
-        env_vars: Vec<(OsString, OsString)>,
-        may_dist: bool,
-        pool: &tokio::runtime::Handle,
-        rewrite_includes_only: bool,
-        storage: Arc<dyn Storage>,
-        cache_control: CacheControl,
+        context: GenerateHashKeyContext<'_, T>,
     ) -> Result<HashResult<T>> {
+        let GenerateHashKeyContext {
+            creator,
+            cwd,
+            env_vars,
+            may_dist,
+            pool,
+            rewrite_includes_only,
+            storage,
+            cache_control,
+        } = context;
         let start_of_compilation = std::time::SystemTime::now();
 
         let extra_hashes = hash_all(&self.parsed_args.extra_hash_files, &pool.clone()).await?;
@@ -414,10 +454,7 @@ where
             .too_hard_for_preprocessor_cache_mode
             .is_some();
         if let Some(arg) = &self.parsed_args.too_hard_for_preprocessor_cache_mode {
-            debug!(
-                "generate_hash_key: Cannot use preprocessor cache because of {:?}",
-                arg
-            );
+            debug!("generate_hash_key: Cannot use preprocessor cache because of {arg:?}");
         }
 
         let needs_preprocessing = self.parsed_args.language.needs_c_preprocessing();
@@ -430,7 +467,7 @@ where
             let mut use_preprocessor_cache_mode = can_use_preprocessor_cache_mode;
 
             // Allow overrides from the env
-            for (key, val) in env_vars.iter() {
+            for (key, val) in &env_vars {
                 if key == "SCCACHE_DIRECT" {
                     if let Some(val) = val.to_str() {
                         use_preprocessor_cache_mode = match val.to_lowercase().as_str() {
@@ -458,18 +495,18 @@ where
         };
 
         let mut preprocessor_key = if use_preprocessor_cache_mode {
-            preprocessor_cache_entry_hash_key(
-                &self.executable_digest,
-                self.parsed_args.language,
-                &preprocessor_and_arch_args,
-                &extra_hashes,
-                assembler_digest.as_deref(),
-                &env_vars,
-                &absolute_input_path,
-                self.compiler.plusplus(),
-                preprocessor_cache_mode_config,
-                storage.basedirs(),
-            )?
+            preprocessor_cache_entry_hash_key(PreprocessorCacheKey {
+                compiler_digest: &self.executable_digest,
+                language: self.parsed_args.language,
+                arguments: &preprocessor_and_arch_args,
+                extra_hashes: &extra_hashes,
+                assembler_digest: assembler_digest.as_deref(),
+                env_vars: &env_vars,
+                input_file: &absolute_input_path,
+                plusplus: self.compiler.plusplus(),
+                config: preprocessor_cache_mode_config,
+                basedirs: storage.basedirs(),
+            })?
         } else {
             None
         };
@@ -498,7 +535,7 @@ where
                         .put_preprocessor_cache_entry(preprocessor_key, preprocessor_cache_entry)
                         .await
                     {
-                        debug!("Failed to update preprocessor cache: {}", e);
+                        debug!("Failed to update preprocessor cache: {e}");
                         update_failed = true;
                     }
                 }
@@ -529,29 +566,29 @@ where
                                 env_vars: env_vars.clone(),
                             }),
                             weak_toolchain_key,
+                            cache_control,
                         });
-                    } else {
-                        debug!("Preprocessor cache miss: {preprocessor_key}");
                     }
+                    debug!("Preprocessor cache miss: {preprocessor_key}");
                 }
             }
 
             let result = self
                 .compiler
-                .preprocess(
+                .preprocess(CPreprocessContext {
                     creator,
-                    &self.executable,
-                    &self.parsed_args,
-                    &cwd,
-                    &env_vars,
+                    executable: &self.executable,
+                    parsed_args: &self.parsed_args,
+                    cwd: &cwd,
+                    env_vars: &env_vars,
                     may_dist,
                     rewrite_includes_only,
-                    use_preprocessor_cache_mode,
-                )
+                    preprocessor_cache_mode: use_preprocessor_cache_mode,
+                })
                 .await;
             let out_pretty = self.parsed_args.output_pretty().into_owned();
             let result = result.map_err(|e| {
-                debug!("[{}]: preprocessor failed: {:?}", out_pretty, e);
+                debug!("[{out_pretty}]: preprocessor failed: {e:?}");
                 e
             });
 
@@ -560,7 +597,7 @@ where
 
             let mut preprocessor_result = result.or_else(move |err| {
                 // Errors remove all traces of potential output.
-                debug!("removing files {:?}", outputs);
+                debug!("removing files {outputs:?}");
 
                 let v: std::result::Result<(), std::io::Error> =
                     outputs.values().try_for_each(|output| {
@@ -579,8 +616,7 @@ where
                 match err.downcast::<ProcessError>() {
                     Ok(ProcessError(output)) => {
                         debug!(
-                            "[{}]: preprocessor returned error status {:?}",
-                            out_pretty,
+                            "[{out_pretty}]: preprocessor returned error status {:?}",
                             output.status.code()
                         );
                         // Drop the stdout since it's the preprocessor output,
@@ -661,7 +697,7 @@ where
                 .put_preprocessor_cache_entry(&preprocessor_key, preprocessor_cache_entry)
                 .await
             {
-                debug!("Failed to update preprocessor cache: {}", e);
+                debug!("Failed to update preprocessor cache: {e}");
             }
         }
 
@@ -686,6 +722,7 @@ where
                 env_vars,
             }),
             weak_toolchain_key,
+            cache_control,
         })
     }
 
@@ -761,18 +798,19 @@ fn process_preprocessed_file(
         && (start == 0 || bytes[start - 1] == b'\n')
         {
             match process_preprocessor_line(
-                input_file,
-                cwd,
-                included_files,
-                config,
-                time_of_compilation,
-                bytes,
+                PreprocessorLineContext {
+                    input_file,
+                    cwd,
+                    included_files,
+                    config,
+                    time_of_compilation,
+                    bytes,
+                    digest: &mut digest,
+                    normalized_include_paths: &mut normalized_include_paths,
+                    fs_impl: &fs_impl,
+                },
                 start,
                 hash_start,
-                &mut digest,
-                total_len,
-                &mut normalized_include_paths,
-                &fs_impl,
             )? {
                 ControlFlow::Continue((s, h)) => {
                     start = s;
@@ -789,10 +827,10 @@ fn process_preprocessed_file(
             }
         } else if slice
             .strip_prefix(INCBIN_DIRECTIVE)
-            .filter(|slice| {
+            .as_ref()
+            .is_some_and(|slice| {
                 slice.starts_with(b"\"") || slice.starts_with(b" \"") || slice.starts_with(b" \\\"")
             })
-            .is_some()
         {
             // An assembler .inc bin (without the space) statement, which could be
             // part of inline assembly, refers to an external file. If the file
@@ -832,21 +870,38 @@ fn process_preprocessed_file(
 /// The `Continue` variant is `(start, hash_start)`.
 type PreprocessedLineAction = ControlFlow<(usize, usize, bool), (usize, usize)>;
 
-#[allow(clippy::too_many_arguments)]
-fn process_preprocessor_line(
-    input_file: &Path,
-    cwd: &Path,
-    included_files: &mut HashMap<PathBuf, String>,
+struct PreprocessorLineContext<'a, F> {
+    input_file: &'a Path,
+    cwd: &'a Path,
+    included_files: &'a mut HashMap<PathBuf, String>,
     config: PreprocessorCacheModeConfig,
     time_of_compilation: std::time::SystemTime,
-    bytes: &mut [u8],
+    bytes: &'a mut [u8],
+    digest: &'a mut Digest,
+    normalized_include_paths: &'a mut HashMap<Vec<u8>, Option<Vec<u8>>>,
+    fs_impl: &'a F,
+}
+
+fn process_preprocessor_line<F>(
+    context: PreprocessorLineContext<'_, F>,
     mut start: usize,
     mut hash_start: usize,
-    digest: &mut Digest,
-    total_len: usize,
-    normalized_include_paths: &mut HashMap<Vec<u8>, Option<Vec<u8>>>,
-    fs_impl: &impl PreprocessorFSAbstraction,
-) -> Result<PreprocessedLineAction> {
+) -> Result<PreprocessedLineAction>
+where
+    F: PreprocessorFSAbstraction,
+{
+    let PreprocessorLineContext {
+        input_file,
+        cwd,
+        included_files,
+        config,
+        time_of_compilation,
+        bytes,
+        digest,
+        normalized_include_paths,
+        fs_impl,
+    } = context;
+    let total_len = bytes.len();
     let mut slice = &bytes[start..];
     // Workarounds for preprocessor linemarker bugs in GCC version 6.
     if slice.get(2) == Some(&b'3') {
@@ -930,18 +985,15 @@ fn process_preprocessor_line(
         } else {
             let mut encoded = Vec::with_capacity(include_path.len());
             encode_path(&mut encoded, &normalized)?;
-            normalized_include_paths.insert(include_path.to_owned(), Some(encoded));
-            // No entry API on hashmaps, so we need to query again
-            normalized_include_paths
-                .get(include_path)
-                .unwrap()
-                .as_ref()
-                .unwrap()
+            let normalized = normalized_include_paths
+                .entry(include_path.to_owned())
+                .or_insert_with(|| Some(encoded));
+            normalized.as_deref().unwrap_or(include_path)
         }
     };
 
-    if !remember_include_file(
-        include_path,
+    if !remember_include_file(RememberIncludeContext {
+        path: include_path,
         input_file,
         cwd,
         included_files,
@@ -950,7 +1002,7 @@ fn process_preprocessor_line(
         config,
         time_of_compilation,
         fs_impl,
-    )? {
+    })? {
         return Ok(ControlFlow::Break((start, hash_start, false)));
     }
     // Everything of interest between hash_start and start has been hashed now.
@@ -976,7 +1028,7 @@ pub fn normalize_path(path: &Path) -> PathBuf {
 
     for component in components {
         match component {
-            Component::Prefix(..) => unreachable!(),
+            Component::Prefix(prefix) => ret.push(prefix.as_os_str()),
             Component::RootDir => {
                 ret.push(component.as_os_str());
             }
@@ -1033,21 +1085,36 @@ struct StandardFsAbstraction;
 
 impl PreprocessorFSAbstraction for StandardFsAbstraction {}
 
-// Returns false if the include file was "too new" (meaning modified during or
-// after the start of the compilation) and therefore should disable
-// the preprocessor cache mode, otherwise true.
-#[allow(clippy::too_many_arguments)]
-fn remember_include_file(
-    mut path: &[u8],
-    input_file: &Path,
-    cwd: &Path,
-    included_files: &mut HashMap<PathBuf, String>,
-    digest: &mut Digest,
+struct RememberIncludeContext<'a, F> {
+    path: &'a [u8],
+    input_file: &'a Path,
+    cwd: &'a Path,
+    included_files: &'a mut HashMap<PathBuf, String>,
+    digest: &'a mut Digest,
     system: bool,
     config: PreprocessorCacheModeConfig,
     time_of_compilation: std::time::SystemTime,
-    fs_impl: &impl PreprocessorFSAbstraction,
-) -> Result<bool> {
+    fs_impl: &'a F,
+}
+
+// Returns false if the include file was "too new" (meaning modified during or
+// after the start of the compilation) and therefore should disable
+// the preprocessor cache mode, otherwise true.
+fn remember_include_file<F>(context: RememberIncludeContext<'_, F>) -> Result<bool>
+where
+    F: PreprocessorFSAbstraction,
+{
+    let RememberIncludeContext {
+        mut path,
+        input_file,
+        cwd,
+        included_files,
+        digest,
+        system,
+        config,
+        time_of_compilation,
+        fs_impl,
+    } = context;
     // TODO if precompiled header.
     if path.len() >= 2 && path[0] == b'<' && path[path.len() - 1] == b'>' {
         // Typically <built-in> or <command-line>.
@@ -1095,7 +1162,7 @@ fn remember_include_file(
     let meta = match fs_impl.metadata(&path) {
         Ok(meta) => meta,
         Err(e) => {
-            debug!("Failed to stat include file {}: {}", path.display(), e);
+            debug!("Failed to stat include file {}: {e}", path.display());
             return Ok(false);
         }
     };
@@ -1118,7 +1185,7 @@ fn remember_include_file(
     let file = match fs_impl.open(&path) {
         Ok(file) => file,
         Err(e) => {
-            debug!("Failed to open header file {}: {}", path.display(), e);
+            debug!("Failed to open header file {}: {e}", path.display());
             return Ok(false);
         }
     };
@@ -1127,7 +1194,7 @@ fn remember_include_file(
         match Digest::reader_sync(file) {
             Ok(file_digest) => (file_digest, TimeMacroFinder::new()),
             Err(e) => {
-                debug!("Failed to read header file {}: {}", path.display(), e);
+                debug!("Failed to read header file {}: {e}", path.display());
                 return Ok(false);
             }
         }
@@ -1135,7 +1202,7 @@ fn remember_include_file(
         match Digest::reader_sync_time_macros(file) {
             Ok((file_digest, finder)) => (file_digest, finder),
             Err(e) => {
-                debug!("Failed to read header file {}: {}", path.display(), e);
+                debug!("Failed to read header file {}: {e}", path.display());
                 return Ok(false);
             }
         }
@@ -1204,14 +1271,14 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
         Option<dist::CompileCommand>,
         Cacheable,
     )> {
-        self.compiler.generate_compile_commands(
+        self.compiler.generate_compile_commands(CCompileContext {
             path_transformer,
-            &self.executable,
-            &self.parsed_args,
-            &self.cwd,
-            &self.env_vars,
+            executable: &self.executable,
+            parsed_args: &self.parsed_args,
+            cwd: &self.cwd,
+            env_vars: &self.env_vars,
             rewrite_includes_only,
-        )
+        })
     }
 
     #[cfg(feature = "dist-client")]
@@ -1219,7 +1286,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
         self: Box<Self>,
         path_transformer: dist::PathTransformer,
     ) -> Result<DistPackagers> {
-        let CCompilation {
+        let Self {
             parsed_args,
             cwd,
             preprocessed_input,
@@ -1275,7 +1342,7 @@ struct CInputsPackager {
 #[cfg(feature = "dist-client")]
 impl pkg::InputsPackager for CInputsPackager {
     fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<dist::PathTransformer> {
-        let CInputsPackager {
+        let Self {
             input_path,
             mut path_transformer,
             preprocessed_input,
@@ -1332,7 +1399,6 @@ impl pkg::InputsPackager for CInputsPackager {
 }
 
 #[cfg(feature = "dist-client")]
-#[allow(unused)]
 struct CToolchainPackager {
     executable: PathBuf,
     kind: CCompilerKind,
@@ -1356,13 +1422,11 @@ impl pkg::ToolchainPackager for CToolchainPackager {
         // files by path.
         let named_file = |kind: &str, name: &str| -> Option<PathBuf> {
             let mut output = process::Command::new(&self.executable)
-                .arg(format!("-print-{}-name={}", kind, name))
+                .arg(format!("-print-{kind}-name={name}"))
                 .output()
                 .ok()?;
             debug!(
-                "find named {} {} output:\n{}\n===\n{}",
-                kind,
-                name,
+                "find named {kind} {name} output:\n{}\n===\n{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr),
             );
@@ -1422,7 +1486,10 @@ impl pkg::ToolchainPackager for CToolchainPackager {
                 // Clang uses internal header files, so add them.
                 if let Some(limits_h) = named_file("file", "include/limits.h") {
                     info!("limits_h = {}", limits_h.display());
-                    package_builder.add_dir_contents(limits_h.parent().unwrap())?;
+                    let include_dir = limits_h
+                        .parent()
+                        .context("clang builtin limits.h path has no parent directory")?;
+                    package_builder.add_dir_contents(include_dir)?;
                 }
             }
 
@@ -1448,7 +1515,12 @@ impl pkg::ToolchainPackager for CToolchainPackager {
                 add_named_prog(&mut package_builder, "acclnk")?;
             }
 
-            _ => unreachable!(),
+            CCompilerKind::Diab | CCompilerKind::Msvc | CCompilerKind::TaskingVX => {
+                bail!(
+                    "distributed toolchain packaging is not implemented for {:?}",
+                    self.kind
+                );
+            }
         }
 
         // Bundle into a compressed tarfile.
@@ -1533,7 +1605,7 @@ impl<'a> HashKeyParams<'a> {
     /// * `language` - Source language being compiled
     /// * `arguments` - Compiler arguments
     /// * `preprocessor_output` - Preprocessed source to hash
-    pub fn new(
+    pub const fn new(
         compiler_digest: &'a str,
         language: Language,
         arguments: &'a [OsString],
@@ -1553,31 +1625,31 @@ impl<'a> HashKeyParams<'a> {
     }
 
     /// Sets additional hash data to include in the cache key.
-    pub fn with_extra_hashes(mut self, extra_hashes: &'a [String]) -> Self {
+    pub const fn with_extra_hashes(mut self, extra_hashes: &'a [String]) -> Self {
         self.extra_hashes = extra_hashes;
         self
     }
 
     /// Sets the environment variables to consider for caching.
-    pub fn with_env_vars(mut self, env_vars: &'a [(OsString, OsString)]) -> Self {
+    pub const fn with_env_vars(mut self, env_vars: &'a [(OsString, OsString)]) -> Self {
         self.env_vars = env_vars;
         self
     }
 
     /// Sets whether this is a C++ compiler (affects clang/clang++ distinction).
-    pub fn with_plusplus(mut self, plusplus: bool) -> Self {
+    pub const fn with_plusplus(mut self, plusplus: bool) -> Self {
         self.plusplus = plusplus;
         self
     }
 
     /// Sets the base directories for path normalization.
-    pub fn with_basedirs(mut self, basedirs: &'a [Vec<u8>]) -> Self {
+    pub const fn with_basedirs(mut self, basedirs: &'a [Vec<u8>]) -> Self {
         self.basedirs = basedirs;
         self
     }
 
     /// Sets the identity of the assembler the compiler will run, if any.
-    pub fn with_assembler_digest(mut self, assembler_digest: Option<&'a str>) -> Self {
+    pub const fn with_assembler_digest(mut self, assembler_digest: Option<&'a str>) -> Self {
         self.assembler_digest = assembler_digest;
         self
     }
@@ -1586,7 +1658,7 @@ impl<'a> HashKeyParams<'a> {
     ///
     /// If `basedirs` are provided, paths in the preprocessor output will be normalized by
     /// stripping the longest matching basedir prefix. This enables cache hits across different
-    /// absolute paths (similar to ccache's CCACHE_BASEDIR).
+    /// absolute paths (similar to ccache's `CCACHE_BASEDIR`).
     ///
     /// # Note
     /// If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
@@ -1595,7 +1667,7 @@ impl<'a> HashKeyParams<'a> {
         m.update(self.compiler_digest.as_bytes());
         // clang and clang++ have different behavior despite being byte-for-byte identical binaries, so
         // we have to incorporate that into the hash as well.
-        m.update(&[self.plusplus as u8]);
+        m.update(&[u8::from(self.plusplus)]);
         m.update(CACHE_VERSION);
         m.update(self.language.as_str().as_bytes());
         hash_arguments(&mut m, self.arguments, self.basedirs);
@@ -1606,7 +1678,7 @@ impl<'a> HashKeyParams<'a> {
             m.update(assembler_digest.as_bytes());
         }
 
-        for (var, val) in self.env_vars.iter() {
+        for (var, val) in self.env_vars {
             if CACHED_ENV_VARS.contains(var.as_os_str()) {
                 var.hash(&mut HashToDigest { digest: &mut m });
                 m.update(&b"="[..]);
@@ -1854,7 +1926,7 @@ mod test {
     #[test]
     fn test_language_from_file_name() {
         fn t(extension: &str, expected: Language) {
-            let path_str = format!("input.{}", extension);
+            let path_str = format!("input.{extension}");
             let path = Path::new(&path_str);
             let actual = Language::from_file_name(path);
             assert_eq!(actual, Some(expected));
@@ -1905,7 +1977,7 @@ mod test {
     #[test]
     fn test_language_from_file_name_none() {
         fn t(extension: &str) {
-            let path_str = format!("input.{}", extension);
+            let path_str = format!("input.{extension}");
             let path = Path::new(&path_str);
             let actual = Language::from_file_name(path);
             let expected = None;
@@ -1974,7 +2046,7 @@ mod test {
                     PreprocessorFileMetadata {
                         is_dir: false,
                         is_file: true,
-                        modified: Some(Timestamp::new(12341234, 0)),
+                        modified: Some(Timestamp::new(12_341_234, 0)),
                         ctime_or_creation: None,
                     },
                 )]
@@ -2073,20 +2145,22 @@ int value;
         };
 
         let mut bytes = line.to_vec();
-        let total_len = bytes.len();
+        let mut digest = Digest::new();
+        let mut normalized_include_paths = HashMap::new();
         process_preprocessor_line(
-            input_file,
-            Path::new(""),
-            include_files,
-            config,
-            std::time::SystemTime::now(),
-            &mut bytes,
+            PreprocessorLineContext {
+                input_file,
+                cwd: Path::new(""),
+                included_files: include_files,
+                config,
+                time_of_compilation: std::time::SystemTime::now(),
+                bytes: &mut bytes,
+                digest: &mut digest,
+                normalized_include_paths: &mut normalized_include_paths,
+                fs_impl,
+            },
             0,
             0,
-            &mut Digest::new(),
-            total_len,
-            &mut HashMap::new(),
-            fs_impl,
         )
         .unwrap()
     }
@@ -2265,7 +2339,7 @@ int value;
                     PreprocessorFileMetadata {
                         is_dir: true,
                         is_file: false,
-                        modified: Some(Timestamp::new(12341234, 0)),
+                        modified: Some(Timestamp::new(12_341_234, 0)),
                         ctime_or_creation: None,
                     },
                 )]
@@ -2295,7 +2369,7 @@ int value;
                     PreprocessorFileMetadata {
                         is_dir: false,
                         is_file: true,
-                        modified: Some(Timestamp::new(12341234, 0)),
+                        modified: Some(Timestamp::new(12_341_234, 0)),
                         ctime_or_creation: None,
                     },
                 )]

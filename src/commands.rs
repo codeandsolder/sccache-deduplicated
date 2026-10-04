@@ -12,6 +12,47 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![expect(
+    clippy::items_after_statements,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::manual_let_else,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::needless_for_each,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::needless_pass_by_ref_mut,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::needless_pass_by_value,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::option_if_let_else,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::single_match_else,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::unnecessary_debug_formatting,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![allow(
+    clippy::wildcard_imports,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+
 use crate::cache::{IpcStorage, storage_from_config};
 use crate::client::{ServerConnection, connect_to_server, connect_with_retry};
 use crate::cmdline::{Command, StatsFormat};
@@ -101,7 +142,12 @@ fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup
     let socket_path = tempdir.path().join("sock");
     let runtime = new_client_runtime()?;
     let exe_path = env::current_exe()?;
-    let workdir = exe_path.parent().expect("executable path has no parent?!");
+    let workdir = exe_path.parent().ok_or_else(|| {
+        anyhow!(
+            "current executable path has no parent: {}",
+            exe_path.display()
+        )
+    })?;
 
     // Spawn a blocking task to bind the Unix socket. Note that the socket
     // must be bound before spawning `_child` below to avoid a race between
@@ -138,23 +184,34 @@ fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup
 }
 
 #[cfg(not(windows))]
-fn redirect_stderr(f: File) {
+fn redirect_stderr(f: File) -> io::Result<()> {
     use libc::dup2;
-    use std::os::unix::io::IntoRawFd;
-    // Ignore errors here.
-    unsafe {
-        dup2(f.into_raw_fd(), 2);
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `f` owns a valid descriptor for the duration of the call, and
+    // descriptor 2 is the conventional process stderr target for `dup2`.
+    if unsafe { dup2(f.as_raw_fd(), 2) } == -1 {
+        return Err(io::Error::last_os_error());
     }
+    drop(f);
+    Ok(())
 }
 
 #[cfg(windows)]
-fn redirect_stderr(f: File) {
-    use std::os::windows::io::IntoRawHandle;
+fn redirect_stderr(f: File) -> io::Result<()> {
+    use std::os::windows::io::{AsRawHandle, IntoRawHandle};
     use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
-    // Ignore errors here.
-    unsafe {
-        SetStdHandle(STD_ERROR_HANDLE, f.into_raw_handle() as _);
+
+    // SAFETY: `f` owns a valid OS handle while SetStdHandle reads it. The
+    // handle is kept alive for the process lifetime on success below.
+    if unsafe { SetStdHandle(STD_ERROR_HANDLE, f.as_raw_handle() as _) } == 0 {
+        return Err(io::Error::last_os_error());
     }
+
+    // SetStdHandle stores rather than duplicates the handle, so ownership must
+    // outlive this function. The process standard-handle table owns its use now.
+    let _ = f.into_raw_handle();
+    Ok(())
 }
 
 /// Create the log file and return an error if cannot be created
@@ -170,7 +227,7 @@ fn create_error_log() -> Result<File> {
     let f = match OpenOptions::new().create(true).append(true).open(&name) {
         Ok(f) => f,
         Err(_) => {
-            bail!("Cannot open/write log file '{}'", name);
+            bail!("Cannot open/write log file '{name}'");
         }
     };
     Ok(f)
@@ -178,9 +235,8 @@ fn create_error_log() -> Result<File> {
 
 /// If `SCCACHE_ERROR_LOG` is set, redirect stderr to it.
 fn redirect_error_log(f: File) -> Result<()> {
-    debug!("redirecting stderr into {:?}", f);
-    redirect_stderr(f);
-    Ok(())
+    debug!("redirecting stderr into {f:?}");
+    redirect_stderr(f).context("failed to redirect stderr")
 }
 
 /// Re-execute the current executable as a background server.
@@ -236,7 +292,12 @@ fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup
     };
     let workdir = exe_path
         .parent()
-        .expect("executable path has no parent?!")
+        .ok_or_else(|| {
+            anyhow!(
+                "current executable path has no parent: {}",
+                exe_path.display()
+            )
+        })?
         .as_os_str()
         .encode_wide()
         .chain(Some(0u16))
@@ -298,10 +359,12 @@ fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup
         });
 
         futures::pin_mut!(incoming);
-        let socket = incoming.next().await;
-        let socket = socket.unwrap(); // incoming() never returns None
+        let socket = incoming
+            .next()
+            .await
+            .context("named-pipe startup stream ended before accepting a connection")??;
 
-        read_server_startup_status(socket?).await
+        read_server_startup_status(socket).await
     };
 
     let timeout = startup_timeout.unwrap_or(SERVER_STARTUP_TIMEOUT);
@@ -342,8 +405,7 @@ fn connect_or_start_server(
                     "Timed out waiting for server startup. Maybe the remote service is unreachable?\nRun with SCCACHE_LOG=debug SCCACHE_NO_DAEMON=1 to get more information"
                 ),
                 ServerStartup::Err { reason } => bail!(
-                    "Server startup failed: {}\nRun with SCCACHE_LOG=debug SCCACHE_NO_DAEMON=1 to get more information",
-                    reason
+                    "Server startup failed: {reason}\nRun with SCCACHE_LOG=debug SCCACHE_NO_DAEMON=1 to get more information"
                 ),
             }
             let server = connect_with_retry(addr)?;
@@ -359,7 +421,7 @@ pub fn request_zero_stats(mut conn: ServerConnection) -> Result<()> {
     let response = conn.request(Request::ZeroStats).context(
         "failed to send zero statistics command to server or failed to receive response",
     )?;
-    if let Response::ZeroStats = response {
+    if matches!(response, Response::ZeroStats) {
         Ok(())
     } else {
         bail!("Unexpected server response!")
@@ -425,7 +487,7 @@ where
         args: args.iter().map(|a| a.as_ref().to_owned()).collect(),
         env_vars,
     });
-    trace!("request_compile: {:?}", req);
+    trace!("request_compile: {req:?}");
     //TODO: better error mapping?
     let response = conn
         .request(req)
@@ -439,14 +501,12 @@ where
 
 /// Return the signal that caused a process to exit from `status`.
 #[cfg(unix)]
-#[allow(dead_code)]
 fn status_signal(status: process::ExitStatus) -> Option<i32> {
     status.signal()
 }
 
 /// Not implemented for non-Unix.
 #[cfg(not(unix))]
-#[allow(dead_code)]
 fn status_signal(_status: process::ExitStatus) -> Option<i32> {
     None
 }
@@ -467,7 +527,7 @@ fn handle_compile_finished(
     ) -> Result<()> {
         // rustc uses the `termcolor` crate which explicitly checks for TERM=="dumb", so
         // match that behavior here.
-        let dumb_term = env::var("TERM").map(|v| v == "dumb").unwrap_or(false);
+        let dumb_term = env::var("TERM").is_ok_and(|v| v == "dumb");
         // If the compiler options explicitly requested color output, or if this output stream
         // is a terminal and the compiler options didn't explicitly request non-color output,
         // then write the compiler output directly.
@@ -499,10 +559,10 @@ fn handle_compile_finished(
     )?;
 
     if let Some(ret) = response.retcode {
-        trace!("compiler exited with status {}", ret);
+        trace!("compiler exited with status {ret}");
         Ok(ret)
     } else if let Some(signal) = response.signal {
-        println!("sccache: Compiler killed by signal {}", signal);
+        println!("sccache: Compiler killed by signal {signal}");
         Ok(-2)
     } else {
         println!("sccache: Missing compiler exit status!");
@@ -510,21 +570,24 @@ fn handle_compile_finished(
     }
 }
 
+pub struct CompileInvocation<'a> {
+    pub exe: &'a Path,
+    pub cmdline: Vec<OsString>,
+    pub cwd: &'a Path,
+    pub env_vars: Vec<(OsString, OsString)>,
+}
+
 /// Handle `response`, the response from sending a `Compile` request to the server.
 ///
 /// If the server returned `CompileStarted`, reads the follow-up `CompileFinished`
 /// from `conn`, falling back to local execution if the server disconnects
 /// unexpectedly.  Delegates to `handle_compile_result` for the final dispatch.
-#[allow(clippy::too_many_arguments)]
 fn handle_compile_response<T>(
     creator: T,
     runtime: &mut Runtime,
     conn: &mut ServerConnection,
     response: CompileResponse,
-    exe: &Path,
-    cmdline: Vec<OsString>,
-    cwd: &Path,
-    env_vars: &[(OsString, OsString)],
+    invocation: CompileInvocation<'_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<i32>
@@ -567,22 +630,18 @@ where
     };
 
     handle_compile_result(
-        creator, runtime, response, result, exe, cmdline, cwd, env_vars, stdout, stderr,
+        creator, runtime, response, result, invocation, stdout, stderr,
     )
 }
 
 /// Dispatch the outcome of a compile, whether received from the daemon over IPC
 /// or produced by a local `SccacheService` in client-side mode.
-#[allow(clippy::too_many_arguments)]
 fn handle_compile_result<T>(
     mut creator: T,
     runtime: &mut Runtime,
     response: CompileResponse,
     finished: Option<CompileFinished>,
-    exe: &Path,
-    cmdline: Vec<OsString>,
-    cwd: &Path,
-    env_vars: &[(OsString, OsString)],
+    invocation: CompileInvocation<'_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<i32>
@@ -590,7 +649,7 @@ where
     T: CommandCreatorSync,
 {
     #[cfg(not(target_os = "linux"))]
-    let _ = env_vars;
+    let _ = &invocation.env_vars;
 
     #[cfg(target_os = "linux")]
     let use_canonical_fallback = matches!(&response, CompileResponse::CompileStarted);
@@ -603,8 +662,8 @@ where
             // Server disconnected before sending CompileFinished; fall back to local compilation.
         }
         CompileResponse::UnsupportedCompiler(s) => {
-            debug!("Server sent UnsupportedCompiler: {:?}", s);
-            bail!("Compiler not supported: {:?}", s);
+            debug!("Server sent UnsupportedCompiler: {s:?}");
+            bail!("Compiler not supported: {s:?}");
         }
         CompileResponse::UnhandledCompile => {
             debug!("Server sent UnhandledCompile");
@@ -613,7 +672,11 @@ where
 
     #[cfg(target_os = "linux")]
     let canonical_rust = if use_canonical_fallback {
-        CanonicalRustPaths::from_rustc_executable(env_vars, cwd, exe)
+        CanonicalRustPaths::from_rustc_executable(
+            &invocation.env_vars,
+            invocation.cwd,
+            invocation.exe,
+        )
     } else {
         // The daemon rejected this invocation before canonical compilation began.
         // Canonicalizing the raw fallback would change caller-visible outputs such
@@ -624,27 +687,28 @@ where
     #[cfg(target_os = "linux")]
     let mut cmd = if let Some(canonical) = canonical_rust {
         let mut cmd = creator.new_command_sync("/usr/bin/bwrap");
-        let bwrap_args = canonical.bwrap_arguments(exe, &cmdline, cwd);
+        let bwrap_args =
+            canonical.bwrap_arguments(invocation.exe, &invocation.cmdline, invocation.cwd);
         cmd.args(&bwrap_args)
             .env_clear()
-            .envs(canonical.env_to_canonical(env_vars))
+            .envs(canonical.env_to_canonical(&invocation.env_vars))
             .current_dir("/");
         cmd.share_jobserver();
         cmd
     } else {
-        let mut cmd = creator.new_command_sync(exe);
-        cmd.args(&cmdline).current_dir(cwd);
+        let mut cmd = creator.new_command_sync(invocation.exe);
+        cmd.args(&invocation.cmdline).current_dir(invocation.cwd);
         cmd
     };
 
     #[cfg(not(target_os = "linux"))]
     let mut cmd = {
-        let mut cmd = creator.new_command_sync(exe);
-        cmd.args(&cmdline).current_dir(cwd);
+        let mut cmd = creator.new_command_sync(invocation.exe);
+        cmd.args(&invocation.cmdline).current_dir(invocation.cwd);
         cmd
     };
     if log_enabled!(Trace) {
-        trace!("running command: {:?}", cmd);
+        trace!("running command: {cmd:?}");
     }
 
     let status = runtime.block_on(async move {
@@ -657,7 +721,7 @@ where
 
     Ok(status.code().unwrap_or_else(|| {
         if let Some(sig) = status_signal(status) {
-            println!("sccache: Compile terminated by signal {}", sig);
+            println!("sccache: Compile terminated by signal {sig}");
         }
         // Arbitrary.
         2
@@ -669,16 +733,12 @@ where
 /// The first entry in `cmdline` will be looked up in `path` if it is not
 /// an absolute path.
 /// See `request_compile` and `handle_compile_response`.
-#[allow(clippy::too_many_arguments)]
 pub fn do_compile<T>(
     creator: T,
     runtime: &mut Runtime,
     mut conn: ServerConnection,
-    exe: &Path,
-    cmdline: Vec<OsString>,
-    cwd: &Path,
+    invocation: CompileInvocation<'_>,
     path: Option<OsString>,
-    env_vars: Vec<(OsString, OsString)>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<i32>
@@ -686,11 +746,27 @@ where
     T: CommandCreatorSync,
 {
     trace!("do_compile");
-    let exe_path = which_in(exe, path, cwd)?;
-    let res = request_compile(&mut conn, &exe_path, &cmdline, cwd, env_vars.clone())?;
-    handle_compile_response(
-        creator, runtime, &mut conn, res, &exe_path, cmdline, cwd, &env_vars, stdout, stderr,
-    )
+    let exe_path = which_in(invocation.exe, path, invocation.cwd)?;
+    let res = request_compile(
+        &mut conn,
+        &exe_path,
+        &invocation.cmdline,
+        invocation.cwd,
+        invocation.env_vars.clone(),
+    )?;
+    let CompileInvocation {
+        cmdline,
+        cwd,
+        env_vars,
+        ..
+    } = invocation;
+    let invocation = CompileInvocation {
+        exe: &exe_path,
+        cmdline,
+        cwd,
+        env_vars,
+    };
+    handle_compile_response(creator, runtime, &mut conn, res, invocation, stdout, stderr)
 }
 
 /// Run a compile in client-side mode: the compile pipeline executes in this
@@ -698,16 +774,12 @@ where
 ///
 /// Shares `handle_compile_result` with the daemon-IPC path so local-fallback
 /// execution is not duplicated.
-#[allow(clippy::too_many_arguments)]
 pub fn do_compile_client_side<C>(
     jobserver: &Client,
     runtime: &mut Runtime,
     conn: ServerConnection,
-    exe: &Path,
-    cmdline: Vec<OsString>,
-    cwd: &Path,
+    invocation: CompileInvocation<'_>,
     path: Option<OsString>,
-    env_vars: Vec<(OsString, OsString)>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<i32>
@@ -715,7 +787,7 @@ where
     C: CommandCreatorSync + Clone + Send + Sync + 'static,
 {
     trace!("do_compile_client_side");
-    let exe_path = which_in(exe, path, cwd)?;
+    let exe_path = which_in(invocation.exe, path, invocation.cwd)?;
     let storage = IpcStorage::connect(conn)?;
     let conn_arc = storage.conn();
     let (tx, _rx) = futures::channel::mpsc::channel(1);
@@ -730,21 +802,22 @@ where
     );
     let compile = Compile {
         exe: exe_path.as_os_str().to_owned(),
-        cwd: cwd.as_os_str().to_owned(),
-        args: cmdline.clone(),
-        env_vars: env_vars.clone(),
+        cwd: invocation.cwd.as_os_str().to_owned(),
+        args: invocation.cmdline.clone(),
+        env_vars: invocation.env_vars.clone(),
     };
     let (compile_resp, finished) = runtime.block_on(service.compile_direct(compile))?;
     let creator = C::new(jobserver);
+    let invocation = CompileInvocation {
+        exe: &exe_path,
+        ..invocation
+    };
     let exit_code = handle_compile_result(
         creator,
         runtime,
         compile_resp,
         finished,
-        &exe_path,
-        cmdline,
-        cwd,
-        &env_vars,
+        invocation,
         stdout,
         stderr,
     )?;
@@ -765,7 +838,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
 
     match cmd {
         Command::ShowStats(fmt, advanced) => {
-            trace!("Command::ShowStats({:?})", fmt);
+            trace!("Command::ShowStats({fmt:?})");
             let stats = match connect_to_server(&get_addr()) {
                 Ok(srv) => request_stats(srv).context("failed to get stats from server")?,
                 // If there is no server, spawning a new server would start with zero stats
@@ -795,7 +868,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                 let contents = std::fs::read(path)?;
                 let preprocessor_cache_entry =
                     crate::compiler::PreprocessorCacheEntry::read(&contents)?;
-                println!("{:#?}", preprocessor_cache_entry);
+                println!("{preprocessor_cache_entry:#?}");
                 println!("=========================");
             }
         }
@@ -827,7 +900,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                 }
                 ServerStartup::TimedOut => bail!("Timed out waiting for server startup"),
                 ServerStartup::AddrInUse => bail!("Server startup failed: Address in use"),
-                ServerStartup::Err { reason } => bail!("Server startup failed: {}", reason),
+                ServerStartup::Err { reason } => bail!("Server startup failed: {reason}"),
             }
         }
         Command::StopServer => {
@@ -861,7 +934,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     let cached_config = config::CachedConfig::load()?;
 
                     let parsed_auth_url = Url::parse(auth_url)
-                        .map_err(|_| anyhow!("Failed to parse URL {}", auth_url))?;
+                        .map_err(|_| anyhow!("Failed to parse URL {auth_url}"))?;
                     let token = dist::client_auth::get_token_oauth2_code_grant_pkce(
                         client_id,
                         parsed_auth_url,
@@ -882,7 +955,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     let cached_config = config::CachedConfig::load()?;
 
                     let parsed_auth_url = Url::parse(auth_url)
-                        .map_err(|_| anyhow!("Failed to parse URL {}", auth_url))?;
+                        .map_err(|_| anyhow!("Failed to parse URL {auth_url}"))?;
                     let token =
                         dist::client_auth::get_token_oauth2_implicit(client_id, parsed_auth_url)?;
 
@@ -918,7 +991,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             let args: Vec<_> = env::args_os().collect();
             let env: Vec<_> = env::vars_os().collect();
             let out_file = File::create(out)?;
-            let cwd = env::current_dir().expect("A current working dir should exist");
+            let cwd = env::current_dir().context("failed to determine current directory")?;
 
             let pool = runtime.handle().clone();
             runtime.block_on(async move {
@@ -938,7 +1011,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             cwd,
             env_vars,
         } => {
-            trace!("Command::Compile {{ {:?}, {:?}, {:?} }}", exe, cmdline, cwd);
+            trace!("Command::Compile {{ {exe:?}, {cmdline:?}, {cwd:?} }}");
 
             let incr_env_strs = ["CARGO_BUILD_INCREMENTAL", "CARGO_INCREMENTAL"];
             incr_env_strs
@@ -946,8 +1019,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                 .for_each(|incr_str| match env::var(incr_str) {
                     Ok(incr_val) if incr_val == "1" => {
                         println!(
-                            "sccache: incremental compilation is prohibited: Unset {} to continue.",
-                            incr_str
+                            "sccache: incremental compilation is prohibited: Unset {incr_str} to continue."
                         );
                         std::process::exit(1);
                     }
@@ -964,30 +1036,36 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     .worker_threads(2)
                     .enable_all()
                     .build()?;
+                let invocation = CompileInvocation {
+                    exe: exe.as_ref(),
+                    cmdline,
+                    cwd: &cwd,
+                    env_vars,
+                };
                 let res = do_compile_client_side::<ProcessCommandCreator>(
                     &jobserver,
                     &mut runtime,
                     conn,
-                    exe.as_ref(),
-                    cmdline,
-                    &cwd,
+                    invocation,
                     env::var_os("PATH"),
-                    env_vars,
                     &mut io::stdout(),
                     &mut io::stderr(),
                 );
                 return res.context("failed to execute compile");
             }
             let mut runtime = new_client_runtime()?;
+            let invocation = CompileInvocation {
+                exe: exe.as_ref(),
+                cmdline,
+                cwd: &cwd,
+                env_vars,
+            };
             let res = do_compile(
                 ProcessCommandCreator::new(&jobserver),
                 &mut runtime,
                 conn,
-                exe.as_ref(),
-                cmdline,
-                &cwd,
+                invocation,
                 env::var_os("PATH"),
-                env_vars,
                 &mut io::stdout(),
                 &mut io::stderr(),
             );
@@ -1036,17 +1114,16 @@ mod test {
 
     impl Connection for DisconnectedConnection {
         fn try_clone(&self) -> io::Result<Box<dyn Connection>> {
-            Ok(Box::new(DisconnectedConnection))
+            Ok(Box::new(Self))
         }
     }
 
-    /// A mid-compile server disconnect: the server sends CompileStarted then drops the
-    /// connection before CompileFinished.  handle_compile_response must fall back to
-    /// local compilation rather than panic.
     #[test]
     #[cfg(target_os = "linux")]
-    fn test_unhandled_rust_compile_falls_back_with_physical_arguments() {
-        let mut runtime = make_runtime();
+    fn test_unhandled_rust_compile_falls_back_with_physical_arguments() -> Result<()> {
+        let mut runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
         let client = Client::new_num(1);
         let creator = Arc::new(Mutex::new(MockCommandCreator::new(&client)));
         let cmdline = vec![
@@ -1057,25 +1134,33 @@ mod test {
         ];
         let expected = cmdline.clone();
 
-        creator.lock().unwrap().next_command_calls(move |args| {
-            assert_eq!(args, expected.as_slice());
-            Ok(MockChild::new(exit_status(0), "", ""))
-        });
+        creator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .next_command_calls(move |args| {
+                assert_eq!(args, expected.as_slice());
+                Ok(MockChild::new(exit_status(0), "", ""))
+            });
 
-        let env_vars = vec![
-            (
-                OsString::from("SCCACHE_EXPERIMENTAL_CANONICAL_RUST"),
-                OsString::from("1"),
-            ),
-            (
-                OsString::from("SCCACHE_CANONICAL_BUILD_ROOT"),
-                OsString::from("/work/project"),
-            ),
-            (
-                OsString::from("SCCACHE_CANONICAL_TARGET_ROOT"),
-                OsString::from("/work/project/target"),
-            ),
-        ];
+        let invocation = CompileInvocation {
+            exe: Path::new("/rust/bin/rustc"),
+            cmdline,
+            cwd: Path::new("/work/project"),
+            env_vars: vec![
+                (
+                    OsString::from("SCCACHE_EXPERIMENTAL_CANONICAL_RUST"),
+                    OsString::from("1"),
+                ),
+                (
+                    OsString::from("SCCACHE_CANONICAL_BUILD_ROOT"),
+                    OsString::from("/work/project"),
+                ),
+                (
+                    OsString::from("SCCACHE_CANONICAL_TARGET_ROOT"),
+                    OsString::from("/work/project/target"),
+                ),
+            ],
+        };
         let mut stdout = vec![];
         let mut stderr = vec![];
 
@@ -1084,18 +1169,18 @@ mod test {
             &mut runtime,
             CompileResponse::UnhandledCompile,
             None,
-            Path::new("/rust/bin/rustc"),
-            cmdline,
-            Path::new("/work/project"),
-            &env_vars,
+            invocation,
             &mut stdout,
             &mut stderr,
-        )
-        .unwrap();
+        )?;
 
         assert_eq!(code, 0);
+        Ok(())
     }
 
+    /// A mid-compile server disconnect: the server sends `CompileStarted` then drops the
+    /// connection before `CompileFinished`.  `handle_compile_response` must fall back to
+    /// local compilation rather than panic.
     #[test]
     fn test_handle_compile_response_disconnect_falls_back_to_local() {
         let mut runtime = make_runtime();
@@ -1120,15 +1205,18 @@ mod test {
         let mut stdout = vec![];
         let mut stderr = vec![];
 
+        let invocation = CompileInvocation {
+            exe,
+            cmdline,
+            cwd,
+            env_vars: vec![],
+        };
         let code = handle_compile_response(
             creator,
             &mut runtime,
             &mut conn,
             CompileResponse::CompileStarted,
-            exe,
-            cmdline,
-            cwd,
-            &[],
+            invocation,
             &mut stdout,
             &mut stderr,
         )

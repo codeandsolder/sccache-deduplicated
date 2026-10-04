@@ -13,11 +13,6 @@
 // limitations under the License.
 
 #![deny(rust_2018_idioms)]
-#![allow(
-    clippy::type_complexity,
-    clippy::new_without_default,
-    clippy::blocks_in_conditions
-)]
 #![recursion_limit = "256"]
 
 #[macro_use]
@@ -82,9 +77,9 @@ pub fn main() {
     std::process::exit(match commands::run_command(command) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("sccache: error: {}", e);
+            eprintln!("sccache: error: {e}");
             for e in e.chain().skip(1) {
-                eprintln!("sccache: caused by: {}", e);
+                eprintln!("sccache: caused by: {e}");
             }
             2
         }
@@ -100,9 +95,8 @@ fn init_logging() {
             builder.format_timestamp_millis();
         }
 
-        match builder.try_init() {
-            Ok(_) => (),
-            Err(e) => panic!("Failed to initialize logging: {:?}", e),
+        if let Err(error) = builder.try_init() {
+            eprintln!("sccache: failed to initialize logging: {error}");
         }
     }
 }

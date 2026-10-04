@@ -1,17 +1,25 @@
 use fs_err as fs;
 use log::trace;
-#[cfg(any(feature = "dist-client", feature = "dist-server"))]
+#[cfg(feature = "dist-server")]
 use sccache::config::HTTPUrl;
+#[cfg(feature = "dist-server")]
 use sccache::dist::{self, SchedulerStatusResult, ServerId};
 use sccache::server::ServerInfo;
 use std::env;
 use std::fs::remove_dir_all;
 use std::io::Write;
+#[cfg(feature = "dist-server")]
 use std::net::{self, IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::str::{self, FromStr};
+#[cfg(feature = "dist-server")]
+use std::process::Output;
+use std::process::{Command, Stdio};
+#[cfg(feature = "dist-server")]
+use std::str::FromStr;
+use std::str::{self};
+#[cfg(feature = "dist-server")]
 use std::thread;
+#[cfg(feature = "dist-server")]
 use std::time::{Duration, Instant};
 
 use assert_cmd::prelude::*;
@@ -25,20 +33,31 @@ use nix::{
 };
 use predicates::prelude::*;
 use serde::Serialize;
+#[cfg(feature = "dist-server")]
 use uuid::Uuid;
 
+#[cfg(feature = "dist-server")]
 const CONTAINER_NAME_PREFIX: &str = "sccache_dist_test";
+#[cfg(feature = "dist-server")]
 const DIST_IMAGE: &str = "sccache_dist_test_image";
+#[cfg(feature = "dist-server")]
 const DIST_DOCKERFILE: &str = include_str!("Dockerfile.sccache-dist");
+#[cfg(feature = "dist-server")]
 const DIST_IMAGE_BWRAP_PATH: &str = "/usr/bin/bwrap";
+#[cfg(feature = "dist-server")]
 const MAX_STARTUP_WAIT: Duration = Duration::from_secs(5);
 const DIST_CACHE_RELPATH: &str = "client-dist-cache";
 
+#[cfg(feature = "dist-server")]
 const DIST_SERVER_TOKEN: &str = "THIS IS THE TEST TOKEN";
 
+#[cfg(feature = "dist-server")]
 const CONFIGS_CONTAINER_PATH: &str = "/sccache-bits";
+#[cfg(feature = "dist-server")]
 const BUILD_DIR_CONTAINER_PATH: &str = "/sccache-bits/build-dir";
+#[cfg(feature = "dist-server")]
 const SCHEDULER_PORT: u16 = 10500;
+#[cfg(feature = "dist-server")]
 const SERVER_PORT: u16 = 12345; // arbitrary
 
 const TC_CACHE_SIZE: u64 = 1024 * 1024 * 1024; // 1 gig
@@ -65,6 +84,7 @@ pub fn start_local_daemon(cfg_path: &Path, cached_cfg_path: &Path) {
     }
 }
 
+#[must_use]
 pub fn stop_local_daemon() -> bool {
     trace!("sccache --stop-server");
     sccache_command()
@@ -75,6 +95,7 @@ pub fn stop_local_daemon() -> bool {
         .is_ok_and(|status| status.success())
 }
 
+#[must_use]
 pub fn clear_cache_local_daemon(tmpdir: &Path) -> bool {
     trace!("clear local cache daemon");
     let client_build_dir = tmpdir.join(DIST_CACHE_RELPATH);
@@ -96,7 +117,6 @@ pub fn get_stats<F: 'static + Fn(ServerInfo)>(f: F) {
         }));
 }
 
-#[allow(unused)]
 pub fn zero_stats() {
     trace!("sccache --zero-stats");
     drop(
@@ -120,6 +140,7 @@ pub fn write_source(path: &Path, filename: &str, contents: &str) {
     f.write_all(contents.as_bytes()).unwrap();
 }
 
+#[must_use]
 pub fn init_cargo(path: &Path, cargo_name: &str) -> PathBuf {
     let cargo_path = path.join(cargo_name);
     let source_path = "src";
@@ -128,6 +149,7 @@ pub fn init_cargo(path: &Path, cargo_name: &str) -> PathBuf {
 }
 
 // Prune any environment variables that could adversely affect test execution.
+#[must_use]
 pub fn prune_command(mut cmd: Command) -> Command {
     use sccache::util::OsStrExt;
 
@@ -139,10 +161,12 @@ pub fn prune_command(mut cmd: Command) -> Command {
     cmd
 }
 
+#[must_use]
 pub fn sccache_command() -> Command {
     prune_command(Command::new(env!("CARGO_BIN_EXE_sccache")))
 }
 
+#[must_use]
 pub fn cargo_command() -> Command {
     prune_command(Command::new("cargo"))
 }
@@ -152,6 +176,7 @@ pub fn sccache_dist_path() -> PathBuf {
     env!("CARGO_BIN_EXE_sccache-dist").into()
 }
 
+#[must_use]
 pub fn sccache_client_cfg(
     tmpdir: &Path,
     preprocessor_cache_mode: bool,
@@ -241,7 +266,6 @@ fn create_server_token(server_id: ServerId, auth_token: &str) -> String {
 }
 
 #[cfg(feature = "dist-server")]
-#[allow(dead_code)]
 pub enum ServerHandle {
     Container { cid: String, url: HTTPUrl },
     Process { pid: Pid, url: HTTPUrl },
@@ -360,7 +384,7 @@ impl DistSystem {
         wait_for_http(scheduler_url, Duration::from_millis(100), MAX_STARTUP_WAIT);
         wait_for(
             || {
-                let status = self.scheduler_status();
+                let status = self.scheduler_status()?;
                 if matches!(
                     status,
                     SchedulerStatusResult {
@@ -472,8 +496,7 @@ impl DistSystem {
                     env::set_var("SCCACHE_LOG", "sccache=trace");
                 }
                 env_logger::try_init().unwrap();
-                server.start().unwrap();
-                unreachable!();
+                server.start().unwrap()
             }
         };
 
@@ -534,7 +557,7 @@ impl DistSystem {
         wait_for_http(url, Duration::from_millis(100), MAX_STARTUP_WAIT);
         wait_for(
             || {
-                let status = self.scheduler_status();
+                let status = self.scheduler_status()?;
                 if matches!(
                     status,
                     SchedulerStatusResult {
@@ -558,13 +581,14 @@ impl DistSystem {
         HTTPUrl::from_url(reqwest::Url::parse(&url).unwrap())
     }
 
-    fn scheduler_status(&self) -> SchedulerStatusResult {
-        let res = reqwest::blocking::get(dist::http::urls::scheduler_status(
-            &self.scheduler_url().to_url(),
-        ))
-        .unwrap();
-        assert!(res.status().is_success());
-        bincode::deserialize_from(res).unwrap()
+    fn scheduler_status(&self) -> Result<SchedulerStatusResult, String> {
+        let url = dist::http::urls::scheduler_status(&self.scheduler_url().to_url())
+            .map_err(|error| error.to_string())?;
+        let res = reqwest::blocking::get(url).map_err(|error| error.to_string())?;
+        if !res.status().is_success() {
+            return Err(format!("scheduler status request failed: {}", res.status()));
+        }
+        bincode::deserialize_from(res).map_err(|error| error.to_string())
     }
 }
 
@@ -705,6 +729,7 @@ impl Drop for DistSystem {
     }
 }
 
+#[cfg(feature = "dist-server")]
 fn make_container_name(tag: &str) -> String {
     format!(
         "{}_{}_{}",
@@ -714,6 +739,7 @@ fn make_container_name(tag: &str) -> String {
     )
 }
 
+#[cfg(feature = "dist-server")]
 fn check_output(output: &Output) {
     if !output.status.success() {
         println!(
@@ -743,6 +769,7 @@ fn wait_for_http(url: HTTPUrl, interval: Duration, max_wait: Duration) {
     )
 }
 
+#[cfg(feature = "dist-server")]
 fn wait_for<F: Fn() -> Result<(), String>>(f: F, interval: Duration, max_wait: Duration) {
     let start = Instant::now();
     let mut lasterr;
@@ -756,5 +783,5 @@ fn wait_for<F: Fn() -> Result<(), String>>(f: F, interval: Duration, max_wait: D
         }
         thread::sleep(interval);
     }
-    panic!("wait timed out, last error result: {}", lasterr)
+    panic!("wait timed out, last error result: {lasterr}")
 }

@@ -11,7 +11,7 @@
 // limitations under the License.
 
 use super::utils::{get_file_mode, set_file_mode};
-use crate::errors::*;
+use crate::errors::{Context, Result, bail};
 use fs_err as fs;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -48,15 +48,15 @@ pub enum Cache {
 impl fmt::Debug for Cache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            Cache::Hit(_) => write!(f, "Cache::Hit(...)"),
-            Cache::Miss => write!(f, "Cache::Miss"),
-            Cache::None => write!(f, "Cache::None"),
-            Cache::Recache => write!(f, "Cache::Recache"),
+            Self::Hit(_) => write!(f, "Cache::Hit(...)"),
+            Self::Miss => write!(f, "Cache::Miss"),
+            Self::None => write!(f, "Cache::None"),
+            Self::Recache => write!(f, "Cache::Recache"),
         }
     }
 }
 
-/// CacheMode is used to represent which mode we are using.
+/// `CacheMode` is used to represent which mode we are using.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CacheMode {
     /// Only read cache from storage.
@@ -89,17 +89,25 @@ impl std::error::Error for DecompressionFailure {}
 
 impl CacheRead {
     /// Create a cache entry from `reader`.
-    pub fn from<R>(reader: R) -> Result<CacheRead>
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `reader` does not contain a valid cache archive.
+    pub fn from<R>(reader: R) -> Result<Self>
     where
         R: ReadSeek + 'static,
     {
         let z = ZipArchive::new(Box::new(reader) as Box<dyn ReadSeek>)
             .context("Failed to parse cache entry")?;
-        Ok(CacheRead { zip: z })
+        Ok(Self { zip: z })
     }
 
     /// Get an object from this cache entry at `name` and write it to `to`.
     /// If the file has stored permissions, return them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the object is missing, malformed, or cannot be decompressed.
     pub fn get_object<T>(&mut self, name: &str, to: &mut T) -> Result<Option<u32>>
     where
         T: Write,
@@ -129,6 +137,12 @@ impl CacheRead {
         bytes
     }
 
+    /// Extract cached objects atomically to their requested output paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required object is missing or an output cannot be created,
+    /// persisted, or restored.
     pub async fn extract_objects<T>(
         mut self,
         objects: T,
@@ -156,9 +170,8 @@ impl CacheRead {
                     debug!("Skipping output to {}", path.display());
                     continue;
                 }
-                let dir = match path.parent() {
-                    Some(d) => d,
-                    None => bail!("Output file without a parent directory!"),
+                let Some(dir) = path.parent() else {
+                    bail!("Output file without a parent directory!");
                 };
                 // Write the cache entry to a tempfile and then atomically
                 // move it to its final location so that other rustc invocations
@@ -173,8 +186,8 @@ impl CacheRead {
                                 }
                             }
                             (Err(e), false) => return Err(e),
-                            // skip if no object found and it's optional
-                            (Err(_), true) => continue,
+                            // Skip if no object was found and it is optional.
+                            (Err(_), true) => {}
                         }
                     }
                     (Err(e), false) => {
@@ -192,8 +205,8 @@ impl CacheRead {
                             warn!("Failed to reset file mode: {e}");
                         }
                     }
-                    // skip if no object found and it's optional
-                    (Err(_), true) => continue,
+                    // Skip if no object was found and it is optional.
+                    (Err(_), true) => {}
                 }
             }
             Ok(())
@@ -226,19 +239,24 @@ pub struct CacheWrite {
 
 impl CacheWrite {
     /// Create a new, empty cache entry.
-    pub fn new() -> CacheWrite {
-        CacheWrite {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
             zip: ZipWriter::new(Cursor::new(vec![])),
         }
     }
 
     /// Create a new cache entry populated with the contents of `objects`.
-    pub async fn from_objects<T>(objects: T, pool: &tokio::runtime::Handle) -> Result<CacheWrite>
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required input cannot be opened, read, or added to the archive.
+    pub async fn from_objects<T>(objects: T, pool: &tokio::runtime::Handle) -> Result<Self>
     where
         T: IntoIterator<Item = FileObjectSource> + Send + Sync + 'static,
     {
         pool.spawn_blocking(move || {
-            let mut entry = CacheWrite::new();
+            let mut entry = Self::new();
             for FileObjectSource {
                 key,
                 path,
@@ -246,16 +264,16 @@ impl CacheWrite {
             } in objects
             {
                 let f = fs::File::open(&path)
-                    .with_context(|| format!("failed to open file `{:?}`", path));
+                    .with_context(|| format!("failed to open file `{}`", path.display()));
                 match (f, optional) {
                     (Ok(mut f), _) => {
                         let mode = get_file_mode(&f)?;
                         entry.put_object(&key, &mut f, mode).with_context(|| {
-                            format!("failed to put object `{:?}` in cache entry", path)
+                            format!("failed to put object `{}` in cache entry", path.display())
                         })?;
                     }
                     (Err(e), false) => return Err(e),
-                    (Err(_), true) => continue,
+                    (Err(_), true) => {}
                 }
             }
             Ok(entry)
@@ -265,6 +283,10 @@ impl CacheWrite {
 
     /// Add an object containing the contents of `from` to this cache entry at `name`.
     /// If `mode` is `Some`, store the file entry with that mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the archive entry cannot be created, read, or compressed.
     pub fn put_object<T>(&mut self, name: &str, from: &mut T, mode: Option<u32>) -> Result<()>
     where
         T: Read,
@@ -272,11 +294,7 @@ impl CacheWrite {
         // We're going to declare the compression method as "stored",
         // but we're actually going to store zstd-compressed blobs.
         let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
-        let opts = if let Some(mode) = mode {
-            opts.unix_permissions(mode)
-        } else {
-            opts
-        };
+        let opts = mode.map_or(opts, |mode| opts.unix_permissions(mode));
         self.zip
             .start_file(name, opts)
             .context("Failed to start cache entry object")?;
@@ -289,10 +307,20 @@ impl CacheWrite {
         Ok(())
     }
 
+    /// Store compiler stdout in this cache entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data cannot be written to the archive.
     pub fn put_stdout(&mut self, bytes: &[u8]) -> Result<()> {
         self.put_bytes("stdout", bytes)
     }
 
+    /// Store compiler stderr in this cache entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data cannot be written to the archive.
     pub fn put_stderr(&mut self, bytes: &[u8]) -> Result<()> {
         self.put_bytes("stderr", bytes)
     }
@@ -306,8 +334,12 @@ impl CacheWrite {
     }
 
     /// Finish writing data to the cache entry writer, and return the data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if finalizing the cache archive fails.
     pub fn finish(self) -> Result<Vec<u8>> {
-        let CacheWrite { mut zip } = self;
+        let Self { mut zip } = self;
         let cur = zip.finish().context("Failed to finish cache entry zip")?;
         Ok(cur.into_inner())
     }
@@ -325,18 +357,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_extract_object_to_devnull_works() {
+    fn test_extract_object_to_devnull_works() -> Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .worker_threads(1)
-            .build()
-            .unwrap();
+            .build()?;
 
         let pool = runtime.handle();
 
         let cache_data = CacheWrite::new();
-        let cache_read =
-            CacheRead::from(std::io::Cursor::new(cache_data.finish().unwrap())).unwrap();
+        let cache_read = CacheRead::from(std::io::Cursor::new(cache_data.finish()?))?;
 
         let objects = vec![FileObjectSource {
             key: "test_key".to_string(),
@@ -344,30 +374,28 @@ mod tests {
             optional: false,
         }];
 
-        let result = runtime.block_on(cache_read.extract_objects(objects, pool));
-        assert!(result.is_ok(), "Extracting to /dev/null should succeed");
+        runtime.block_on(cache_read.extract_objects(objects, pool))?;
+        Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_extract_object_to_dev_fd_something() {
+    fn test_extract_object_to_dev_fd_something() -> Result<()> {
         // Open a pipe, write to `/dev/fd/{fd}` and check the other end that the correct data was written.
         use std::os::fd::AsRawFd;
         use tokio::io::AsyncReadExt;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .worker_threads(1)
-            .build()
-            .unwrap();
+            .build()?;
         let pool = runtime.handle();
         let mut cache_data = CacheWrite::new();
         let data = b"test data";
-        cache_data.put_bytes("test_key", data).unwrap();
-        let cache_read =
-            CacheRead::from(std::io::Cursor::new(cache_data.finish().unwrap())).unwrap();
+        cache_data.put_bytes("test_key", data)?;
+        let cache_read = CacheRead::from(std::io::Cursor::new(cache_data.finish()?))?;
         runtime.block_on(async {
-            let (sender, mut receiver) = tokio::net::unix::pipe::pipe().unwrap();
-            let sender_fd = sender.into_blocking_fd().unwrap();
+            let (sender, mut receiver) = tokio::net::unix::pipe::pipe()?;
+            let sender_fd = sender.into_blocking_fd()?;
             let raw_fd = sender_fd.as_raw_fd();
             let fd_path = PathBuf::from(format!("/dev/fd/{raw_fd}"));
             let objects = vec![FileObjectSource {
@@ -376,93 +404,88 @@ mod tests {
                 optional: false,
             }];
             // On FreeBSD, `/dev/fd/{fd}` does not always exist (i.e. without mounting `fdescfs`), so we skip this test if we get `ENOENT`.
-            if ! fd_path.exists() {
+            if !fd_path.exists() {
                 info!("Skipping test_extract_object_to_dev_fd_something because /dev/fd/{raw_fd} does not exist");
-                return;
+                return Ok(());
             }
-            let result = cache_read.extract_objects(objects, pool).await;
-            assert!(
-                result.is_ok(),
-                "Extracting to /dev/fd/{raw_fd} should succeed"
-            );
+            cache_read.extract_objects(objects, pool).await?;
             let mut buf = vec![0; data.len()];
-            let n = receiver.read_exact(&mut buf).await.unwrap();
+            let n = receiver.read_exact(&mut buf).await?;
             assert_eq!(n, data.len(), "Read the correct number of bytes");
             assert_eq!(buf, data, "Read the correct data from /dev/fd/{raw_fd}");
-        });
+            Ok::<(), anyhow::Error>(())
+        })?;
+        Ok(())
     }
 
     #[test]
-    fn test_extract_object_to_non_writable_path() {
+    fn test_extract_object_to_non_writable_path() -> Result<()> {
         // See `test_extract_object_to_dev_fd_something`: we still cannot cover all platforms by the other tests. Here we test a more portable case of creating a file and making its parent directory non-writable, in which case we should still be able to extract the object successfully.
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .worker_threads(1)
-            .build()
-            .unwrap();
+            .build()?;
 
         let pool = runtime.handle();
 
         let mut cache_data = CacheWrite::new();
-        cache_data.put_bytes("test_key", b"real_test_data").unwrap();
-        let cache_read =
-            CacheRead::from(std::io::Cursor::new(cache_data.finish().unwrap())).unwrap();
+        cache_data.put_bytes("test_key", b"real_test_data")?;
+        let cache_read = CacheRead::from(std::io::Cursor::new(cache_data.finish()?))?;
 
-        let tmpdir = tempfile::tempdir().unwrap();
+        let tmpdir = tempfile::tempdir()?;
         let target_path = tmpdir.path().join("test_file");
-        std::fs::write(&target_path, b"test").unwrap();
+        std::fs::write(&target_path, b"test")?;
         // The current Rust fs permissions API is kind of awkward...
-        let mut perm = tmpdir.path().metadata().unwrap().permissions();
+        let mut perm = tmpdir.path().metadata()?.permissions();
         perm.set_readonly(true);
-        std::fs::set_permissions(tmpdir.path(), perm.clone()).unwrap();
-        // Note that this doesn't guarantee that the a new file cannot be created anymore.
+        std::fs::set_permissions(tmpdir.path(), perm.clone())?;
+        // Note that this doesn't guarantee that a new file cannot be created anymore.
         // For example, as documented in `std::fs::Permissions::set_readonly`, the
         // `FILE_ATTRIBUTE_READONLY` attribute on Windows is entirely ignored for directories.
-        // std::fs::File::create(tmpdir.path().join("another_file")).unwrap_err();
 
         let objects = vec![FileObjectSource {
             key: "test_key".to_string(),
             path: target_path.clone(),
             optional: false,
         }];
-
         let result = runtime.block_on(cache_read.extract_objects(objects, pool));
         assert!(
             result.is_ok(),
             "Extracting to the target path should succeed"
         );
         // Test the content; make sure the old content is overwritten
-        let content = std::fs::read(&target_path).unwrap();
+        let content = std::fs::read(&target_path)?;
         assert_eq!(
             content, b"real_test_data",
             "Extracted content should be correct"
         );
 
-        // `tempfile` needs us to reset permissions for cleanup to work
-        #[allow(
-            clippy::permissions_set_readonly_false,
-            reason = "The affected directory is immediately deleted with no security implications"
-        )]
+        // `tempfile` needs us to restore owner write permission for cleanup.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perm.set_mode(perm.mode() | 0o200);
+        }
+        #[cfg(not(unix))]
         perm.set_readonly(false);
-        std::fs::set_permissions(tmpdir.path(), perm).unwrap();
-        tmpdir.close().unwrap();
+        std::fs::set_permissions(tmpdir.path(), perm)?;
+        tmpdir.close()?;
+        Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn test_extract_object_to_nul_works() {
+    fn test_extract_object_to_nul_works() -> Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .worker_threads(1)
-            .build()
-            .unwrap();
+            .build()?;
 
         let pool = runtime.handle();
 
         let cache_data = CacheWrite::new();
-        let cache_read =
-            CacheRead::from(std::io::Cursor::new(cache_data.finish().unwrap())).unwrap();
+        let cache_read = CacheRead::from(std::io::Cursor::new(cache_data.finish()?))?;
 
         let objects = vec![FileObjectSource {
             key: "test_key".to_string(),
@@ -470,7 +493,7 @@ mod tests {
             optional: false,
         }];
 
-        let result = runtime.block_on(cache_read.extract_objects(objects, pool));
-        assert!(result.is_ok(), "Extracting to NUL should succeed");
+        runtime.block_on(cache_read.extract_objects(objects, pool))?;
+        Ok(())
     }
 }

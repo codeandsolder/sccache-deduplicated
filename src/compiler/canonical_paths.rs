@@ -1,3 +1,12 @@
+#![expect(
+    clippy::branches_sharing_code,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::needless_pass_by_value,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+
 use crate::dist;
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
@@ -40,7 +49,7 @@ impl RootMapping {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CanonicalRustPaths {
+pub struct CanonicalRustPaths {
     roots: Vec<RootMapping>,
     pub(crate) build_root: PathBuf,
     pub(crate) target_root: PathBuf,
@@ -546,8 +555,8 @@ mod tests {
                 "SCCACHE_CANONICAL_BUILD_ROOT".into(),
                 build.clone().into_os_string(),
             ),
-            ("CARGO_TARGET_DIR".into(), target.clone().into_os_string()),
-            ("CARGO_HOME".into(), cargo_home.clone().into_os_string()),
+            ("CARGO_TARGET_DIR".into(), target.into_os_string()),
+            ("CARGO_HOME".into(), cargo_home.into_os_string()),
             (
                 "EPHEMERAL_CARGO_REGISTRY_SRC".into(),
                 ephemeral_registry.clone().into_os_string(),
@@ -566,7 +575,7 @@ mod tests {
         {
             let args = roots.bwrap_arguments(
                 Path::new("/rust/bin/rustc"),
-                &[source.clone().into_os_string()],
+                &[source.into_os_string()],
                 &ephemeral_registry.join("index/pkg"),
             );
             assert!(args.windows(2).any(|pair| {
@@ -706,17 +715,18 @@ mod tests {
     }
 
     #[test]
-    fn canonicalizes_cargo_to_packaged_real_binary() {
-        let temp = tempfile::tempdir().unwrap();
+    fn canonicalizes_cargo_to_packaged_real_binary() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let rust_root = temp.path().join("rust");
-        std::fs::create_dir_all(rust_root.join("bin")).unwrap();
-        std::fs::write(rust_root.join("bin/cargo.real"), b"cargo").unwrap();
+        std::fs::create_dir_all(rust_root.join("bin"))?;
+        std::fs::write(rust_root.join("bin/cargo.real"), b"cargo")?;
 
         let env = vec![
             ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
             ("SCCACHE_CANONICAL_BUILD_ROOT".into(), "/work/a".into()),
         ];
-        let roots = CanonicalRustPaths::from_env(&env, Path::new("/work/a"), &rust_root).unwrap();
+        let roots = CanonicalRustPaths::from_env(&env, Path::new("/work/a"), &rust_root)
+            .ok_or_else(|| anyhow::anyhow!("canonical Rust paths unexpectedly disabled"))?;
 
         assert_eq!(
             roots.env_value_to_canonical(
@@ -725,20 +735,22 @@ mod tests {
             ),
             OsString::from("/rust/bin/cargo.real")
         );
+        Ok(())
     }
 
     #[test]
-    fn canonicalizes_cargo_to_standard_packaged_binary() {
-        let temp = tempfile::tempdir().unwrap();
+    fn canonicalizes_cargo_to_standard_packaged_binary() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
         let rust_root = temp.path().join("rust");
-        std::fs::create_dir_all(rust_root.join("bin")).unwrap();
-        std::fs::write(rust_root.join("bin/cargo"), b"cargo").unwrap();
+        std::fs::create_dir_all(rust_root.join("bin"))?;
+        std::fs::write(rust_root.join("bin/cargo"), b"cargo")?;
 
         let env = vec![
             ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
             ("SCCACHE_CANONICAL_BUILD_ROOT".into(), "/work/a".into()),
         ];
-        let roots = CanonicalRustPaths::from_env(&env, Path::new("/work/a"), &rust_root).unwrap();
+        let roots = CanonicalRustPaths::from_env(&env, Path::new("/work/a"), &rust_root)
+            .ok_or_else(|| anyhow::anyhow!("canonical Rust paths unexpectedly disabled"))?;
 
         assert_eq!(
             roots.env_value_to_canonical(
@@ -747,6 +759,7 @@ mod tests {
             ),
             OsString::from("/rust/bin/cargo")
         );
+        Ok(())
     }
 
     #[test]

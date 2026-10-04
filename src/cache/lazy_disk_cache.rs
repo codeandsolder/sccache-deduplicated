@@ -10,7 +10,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::errors::*;
+use crate::errors::Result;
 use crate::lru_disk_cache::LruDiskCache;
 use std::ffi::OsString;
 use std::path::Path;
@@ -21,34 +21,41 @@ pub enum LazyDiskCache {
 }
 
 impl LazyDiskCache {
+    /// Return the initialized disk cache, creating it on first use.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying disk cache cannot be initialized.
     pub fn get_or_init(&mut self) -> Result<&mut LruDiskCache> {
         match self {
-            LazyDiskCache::Uninit { root, max_size } => {
-                *self = LazyDiskCache::Init(LruDiskCache::new(&root, *max_size)?);
+            Self::Uninit { root, max_size } => {
+                *self = Self::Init(LruDiskCache::new(&root, *max_size)?);
                 self.get_or_init()
             }
-            LazyDiskCache::Init(d) => Ok(d),
+            Self::Init(d) => Ok(d),
         }
     }
 
-    pub fn get(&mut self) -> Option<&mut LruDiskCache> {
+    pub const fn get(&mut self) -> Option<&mut LruDiskCache> {
         match self {
-            LazyDiskCache::Uninit { .. } => None,
-            LazyDiskCache::Init(d) => Some(d),
+            Self::Uninit { .. } => None,
+            Self::Init(d) => Some(d),
         }
     }
 
-    pub fn capacity(&self) -> u64 {
+    #[must_use]
+    pub const fn capacity(&self) -> u64 {
         match self {
-            LazyDiskCache::Uninit { max_size, .. } => *max_size,
-            LazyDiskCache::Init(d) => d.capacity(),
+            Self::Uninit { max_size, .. } => *max_size,
+            Self::Init(d) => d.capacity(),
         }
     }
 
+    #[must_use]
     pub fn path(&self) -> &Path {
         match self {
-            LazyDiskCache::Uninit { root, .. } => root.as_ref(),
-            LazyDiskCache::Init(d) => d.path(),
+            Self::Uninit { root, .. } => root.as_ref(),
+            Self::Init(d) => d.path(),
         }
     }
 }

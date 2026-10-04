@@ -13,11 +13,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(
+    clippy::enum_glob_use,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::manual_let_else,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::match_same_arms,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![expect(
+    clippy::too_many_lines,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![allow(
+    clippy::wildcard_imports,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+
 use crate::compiler::args::{
     ArgDisposition, ArgInfo, ArgToStringResult, ArgsIter, Argument, FromArg, IntoArg,
     NormalizedDisposition, PathTransformerFn, SearchableArgInfo,
 };
-use crate::compiler::c::{ArtifactDescriptor, CCompilerImpl, CCompilerKind, ParsedArguments};
+use crate::compiler::c::{
+    ArtifactDescriptor, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
+    ParsedArguments,
+};
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
     SingleCompileCommand,
@@ -61,32 +85,25 @@ impl CCompilerImpl for Diab {
         parse_arguments(arguments, cwd, &ARGS[..])
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn preprocess<T>(
-        &self,
-        creator: &T,
-        executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        env_vars: &[(OsString, OsString)],
-        may_dist: bool,
-        _rewrite_includes_only: bool,
-        _preprocessor_cache_mode: bool,
-    ) -> Result<process::Output>
+    async fn preprocess<T>(&self, context: CPreprocessContext<'_, T>) -> Result<process::Output>
     where
         T: CommandCreatorSync,
     {
+        let CPreprocessContext {
+            creator,
+            executable,
+            parsed_args,
+            cwd,
+            env_vars,
+            may_dist,
+            ..
+        } = context;
         preprocess(creator, executable, parsed_args, cwd, env_vars, may_dist).await
     }
 
     fn generate_compile_commands<T>(
         &self,
-        path_transformer: &mut dist::PathTransformer,
-        executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        env_vars: &[(OsString, OsString)],
-        _rewrite_includes_only: bool,
+        context: CCompileContext<'_>,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
         Option<dist::CompileCommand>,
@@ -95,9 +112,17 @@ impl CCompilerImpl for Diab {
     where
         T: CommandCreatorSync,
     {
+        let CCompileContext {
+            path_transformer,
+            executable,
+            parsed_args,
+            cwd,
+            env_vars,
+            ..
+        } = context;
         generate_compile_commands(path_transformer, executable, parsed_args, cwd, env_vars).map(
             |(command, dist_command, cacheable)| {
-                (CCompileCommand::new(command), dist_command, cacheable)
+                (CCompileCommand::boxed(command), dist_command, cacheable)
             },
         )
     }
@@ -199,9 +224,13 @@ where
         // We refuse to cache concatenated arguments (like "-include@foo") because they're a
         // mess. See https://github.com/mozilla/sccache/issues/150#issuecomment-318586953
         match arg {
-            Argument::WithValue(_, ref v, ArgDisposition::Separated)
-            | Argument::WithValue(_, ref v, ArgDisposition::CanBeConcatenated(_))
-            | Argument::WithValue(_, ref v, ArgDisposition::CanBeSeparated(_)) => {
+            Argument::WithValue(
+                _,
+                ref v,
+                ArgDisposition::Separated
+                | ArgDisposition::CanBeConcatenated(_)
+                | ArgDisposition::CanBeSeparated(_),
+            ) => {
                 if v.clone().into_arg_os_string().starts_with("@") {
                     cannot_cache!("@");
                 }
@@ -215,21 +244,24 @@ where
         }
 
         match arg.get_data() {
-            Some(TooHardFlag) | Some(TooHard(_)) => {
-                cannot_cache!(arg.flag_str().expect("Can't be Argument::Raw/UnknownFlag",))
+            Some(TooHardFlag | TooHard(_)) => {
+                let Some(flag) = arg.flag_str() else {
+                    cannot_cache!("unsupported compiler option");
+                };
+                cannot_cache!(flag)
             }
 
-            Some(DepArgument(_)) | Some(DepArgumentFlag) | Some(DepArgumentPath(_)) => {}
+            Some(DepArgument(_) | DepArgumentFlag | DepArgumentPath(_)) => {}
 
             Some(DoCompilation) => {
                 compilation = true;
-                compilation_flag =
-                    OsString::from(arg.flag_str().expect("Compilation flag expected"));
+                let Some(flag) = arg.flag_str() else {
+                    cannot_cache!("compilation flag missing");
+                };
+                compilation_flag = OsString::from(flag);
             }
             Some(Output(p)) => output_arg = Some(p.clone()),
-            Some(PreprocessorArgument(_))
-            | Some(PreprocessorArgumentPath(_))
-            | Some(PassThrough(_)) => {}
+            Some(PreprocessorArgument(_) | PreprocessorArgumentPath(_) | PassThrough(_)) => {}
             None => match arg {
                 Argument::Raw(ref val) => {
                     if input_arg.is_some() {
@@ -243,14 +275,10 @@ where
         }
         let args = match arg.get_data() {
             Some(PassThrough(_)) => &mut common_args,
-            Some(DepArgument(_)) | Some(DepArgumentFlag) | Some(DepArgumentPath(_)) => {
-                &mut dependency_args
-            }
-            Some(PreprocessorArgument(_)) | Some(PreprocessorArgumentPath(_)) => {
-                &mut preprocessor_args
-            }
-            Some(DoCompilation) | Some(Output(_)) => continue,
-            Some(TooHardFlag) | Some(TooHard(_)) => unreachable!(),
+            Some(DepArgument(_) | DepArgumentFlag | DepArgumentPath(_)) => &mut dependency_args,
+            Some(PreprocessorArgument(_) | PreprocessorArgumentPath(_)) => &mut preprocessor_args,
+            Some(DoCompilation | Output(_)) => continue,
+            Some(TooHardFlag | TooHard(_)) => unreachable!(),
             None => match arg {
                 Argument::Raw(_) => continue,
                 Argument::UnknownFlag(_) => &mut common_args,
@@ -342,7 +370,7 @@ where
         .current_dir(cwd);
 
     if log_enabled!(Trace) {
-        trace!("preprocess: {:?}", cmd);
+        trace!("preprocess: {cmd:?}");
     }
     run_input_output(cmd, None).await
 }
@@ -393,7 +421,11 @@ pub struct ExpandAtArgs<'a> {
 impl<'a> ExpandAtArgs<'a> {
     pub fn new(cwd: &'a Path, args: &[OsString]) -> Self {
         ExpandAtArgs {
-            stack: args.iter().rev().map(|a| a.to_owned()).collect(),
+            stack: args
+                .iter()
+                .rev()
+                .map(std::borrow::ToOwned::to_owned)
+                .collect(),
             cwd,
         }
     }
@@ -450,7 +482,8 @@ impl Iterator for ExpandAtArgs<'_> {
                 return Some(arg);
             }
             let new_args = contents.split_whitespace().collect::<Vec<_>>();
-            self.stack.extend(new_args.iter().rev().map(|s| s.into()));
+            self.stack
+                .extend(new_args.iter().rev().map(std::convert::Into::into));
         }
     }
 }
@@ -488,7 +521,7 @@ mod test {
             ..
         } = match parse_arguments_(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -502,8 +535,8 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
-        assert!(common_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
         assert!(!msvc_show_includes);
     }
 
@@ -520,7 +553,7 @@ mod test {
             ..
         } = match parse_arguments_(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -534,8 +567,8 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
-        assert!(common_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
         assert!(!msvc_show_includes);
     }
 
@@ -552,7 +585,7 @@ mod test {
             ..
         } = match parse_arguments_(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.cc"), input.to_str());
         assert_eq!(Language::Cxx, language);
@@ -566,7 +599,7 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["-fabc", "-mxyz"], common_args);
         assert!(!msvc_show_includes);
     }
@@ -586,7 +619,7 @@ mod test {
             ..
         } = match parse_arguments_(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.cxx"), input.to_str());
         assert_eq!(Language::Cxx, language);
@@ -628,7 +661,7 @@ mod test {
             ..
         } = match parse_arguments_(args) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -742,7 +775,7 @@ mod test {
             ..
         } = match parse_arguments_(vec![arg]) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -756,8 +789,8 @@ mod test {
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
-        assert!(common_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
         assert!(!msvc_show_includes);
     }
 

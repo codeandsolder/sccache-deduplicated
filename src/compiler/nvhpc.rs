@@ -13,24 +13,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_imports, dead_code, unused_variables)]
+#![allow(
+    clippy::enum_glob_use,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
+#![allow(
+    clippy::wildcard_imports,
+    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
+)]
 
 use crate::compiler::args::*;
-use crate::compiler::c::{ArtifactDescriptor, CCompilerImpl, CCompilerKind, ParsedArguments};
+#[cfg(test)]
+use crate::compiler::c::ArtifactDescriptor;
+use crate::compiler::c::{
+    CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext, ParsedArguments,
+};
 use crate::compiler::gcc::ArgData::*;
 use crate::compiler::{
-    CCompileCommand, Cacheable, CompileCommand, CompilerArguments, Language, gcc, write_temp_file,
+    CCompileCommand, Cacheable, CompileCommand, CompilerArguments, Language, gcc,
 };
-use crate::mock_command::{CommandCreator, CommandCreatorSync, RunCommand};
-use crate::util::{OsStrExt, run_input_output};
+use crate::mock_command::{CommandCreatorSync, RunCommand};
+use crate::util::run_input_output;
 use crate::{counted_array, dist};
 use async_trait::async_trait;
-use fs::File;
-use fs_err as fs;
 use log::Level::Trace;
 use std::ffi::OsString;
-use std::future::Future;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -70,21 +77,18 @@ impl CCompilerImpl for Nvhpc {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn preprocess<T>(
-        &self,
-        creator: &T,
-        executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        env_vars: &[(OsString, OsString)],
-        may_dist: bool,
-        rewrite_includes_only: bool,
-        _preprocessor_cache_mode: bool,
-    ) -> Result<process::Output>
+    async fn preprocess<T>(&self, context: CPreprocessContext<'_, T>) -> Result<process::Output>
     where
         T: CommandCreatorSync,
     {
+        let CPreprocessContext {
+            creator,
+            executable,
+            parsed_args,
+            cwd,
+            env_vars,
+            ..
+        } = context;
         let language = match parsed_args.language {
             Language::C => Ok("c"),
             Language::Cxx => Ok("c++"),
@@ -109,7 +113,7 @@ impl CCompilerImpl for Nvhpc {
             //need for both we need separate compiler invocations
             let mut dep_cmd = initialize_cmd_and_args();
             let mut transformed_deps = vec![];
-            for item in parsed_args.dependency_args.iter() {
+            for item in &parsed_args.dependency_args {
                 if item == "-MD" {
                     transformed_deps.push(OsString::from("-M"));
                 } else if item == "-MMD" {
@@ -125,7 +129,7 @@ impl CCompilerImpl for Nvhpc {
                 .current_dir(cwd);
 
             if log_enabled!(Trace) {
-                trace!("dep-gen command: {:?}", dep_cmd);
+                trace!("dep-gen command: {dep_cmd:?}");
             }
             dep_cmd
         };
@@ -139,12 +143,14 @@ impl CCompilerImpl for Nvhpc {
             .envs(env_vars.to_vec())
             .current_dir(cwd);
         if log_enabled!(Trace) {
-            trace!("preprocess: {:?}", cmd);
+            trace!("preprocess: {cmd:?}");
         }
 
         //Need to chain the dependency generation and the preprocessor
         //to emulate a `proper` front end
-        if !parsed_args.dependency_args.is_empty() {
+        if parsed_args.dependency_args.is_empty() {
+            run_input_output(cmd, None).await
+        } else {
             let first = run_input_output(dep_before_preprocessor(), None);
             let second = run_input_output(cmd, None);
             // TODO: If we need to chain these to emulate a frontend, shouldn't
@@ -152,19 +158,12 @@ impl CCompilerImpl for Nvhpc {
             // (rather than via which drives these concurrently)
             let (_f, s) = futures::future::try_join(first, second).await?;
             Ok(s)
-        } else {
-            run_input_output(cmd, None).await
         }
     }
 
     fn generate_compile_commands<T>(
         &self,
-        path_transformer: &mut dist::PathTransformer,
-        executable: &Path,
-        parsed_args: &ParsedArguments,
-        cwd: &Path,
-        env_vars: &[(OsString, OsString)],
-        rewrite_includes_only: bool,
+        context: CCompileContext<'_>,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
         Option<dist::CompileCommand>,
@@ -173,18 +172,28 @@ impl CCompilerImpl for Nvhpc {
     where
         T: CommandCreatorSync,
     {
+        let CCompileContext {
+            path_transformer,
+            executable,
+            parsed_args,
+            cwd,
+            env_vars,
+            rewrite_includes_only,
+        } = context;
         gcc::generate_compile_commands(
             path_transformer,
             executable,
             parsed_args,
             cwd,
             env_vars,
-            self.kind(),
-            rewrite_includes_only,
-            gcc::language_to_gcc_arg,
+            gcc::GccCompileConfig {
+                kind: self.kind(),
+                rewrite_includes_only,
+                language_to_arg: gcc::language_to_gcc_arg,
+            },
         )
         .map(|(command, dist_command, cacheable)| {
-            (CCompileCommand::new(command), dist_command, cacheable)
+            (CCompileCommand::boxed(command), dist_command, cacheable)
         })
     }
 }
@@ -226,12 +235,7 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::compiler::gcc;
     use crate::compiler::*;
-    use crate::mock_command::*;
-    use crate::test::utils::*;
-    use std::collections::HashMap;
-    use std::path::PathBuf;
 
     fn parse_arguments_(arguments: Vec<String>) -> CompilerArguments<ParsedArguments> {
         let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
@@ -266,8 +270,8 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
-        assert!(a.common_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(a.common_args, [] as [std::ffi::OsString; 0]);
     }
 
     #[test]
@@ -285,8 +289,8 @@ mod test {
                 }
             )
         );
-        assert!(a.preprocessor_args.is_empty());
-        assert!(a.common_args.is_empty());
+        assert_eq!(a.preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(a.common_args, [] as [std::ffi::OsString; 0]);
     }
 
     #[test]
@@ -331,7 +335,7 @@ mod test {
             ],
             a.preprocessor_args
         );
-        assert!(a.dependency_args.is_empty());
+        assert_eq!(a.dependency_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(ovec!["-fabc", "-gpu", "ccnative"], a.common_args);
     }
 

@@ -18,7 +18,7 @@ use opendal::services::Ghac;
 use opendal_layer_logging::LoggingLayer;
 
 use crate::VERSION;
-use crate::errors::*;
+use crate::errors::Result;
 
 use super::http_client::set_user_agent;
 
@@ -26,6 +26,11 @@ use super::http_client::set_user_agent;
 pub struct GHACache;
 
 impl GHACache {
+    /// Build a GitHub Actions cache operator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `OpenDAL` operator or HTTP transport cannot be initialized.
     pub fn build(version: &str) -> Result<Operator> {
         let mut builder = Ghac::default()
             // This is the prefix of gha cache.
@@ -42,7 +47,7 @@ impl GHACache {
         };
 
         let op = Operator::new(builder)?
-            .with_context(OperationContext::new().with_http_transport(set_user_agent()))
+            .with_context(OperationContext::new().with_http_transport(set_user_agent()?))
             .layer(LoggingLayer::default());
         Ok(op)
     }
