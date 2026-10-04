@@ -418,7 +418,7 @@ pub fn generate_compile_commands(
     let temp_dir = tempfile::Builder::new()
         .prefix("sccache_nvcc")
         .tempdir()?
-        .into_path();
+        .keep();
 
     let mut arguments = vec![];
 
