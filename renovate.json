@@ -24,6 +24,16 @@
   },
   "packageRules": [
     {
+      "description": "bincode 2+ requires an explicit wire-format/protocol migration; bincode 3.0.0 is a compile-error placeholder",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchDepNames": [
+        "bincode"
+      ],
+      "allowedVersions": "<2.0.0"
+    },
+    {
       "description": "The Rust 1.91 workflow entries are an intentional MSRV floor, not update targets",
       "matchManagers": [
         "github-actions"
