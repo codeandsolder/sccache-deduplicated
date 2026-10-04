@@ -3682,7 +3682,7 @@ dependencies = [
  "version-compare",
  "walkdir",
  "which",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
  "zip 0.6.6",
  "zstd",
 ]
