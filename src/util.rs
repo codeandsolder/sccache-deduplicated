@@ -52,11 +52,11 @@
     clippy::unnecessary_debug_formatting,
     reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
 )]
-#![expect(
+#![allow(
     clippy::unnecessary_wraps,
     reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
 )]
-#![expect(
+#![allow(
     clippy::wildcard_imports,
     reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
 )]
