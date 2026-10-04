@@ -16,7 +16,7 @@
     clippy::case_sensitive_file_extension_comparisons,
     reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
 )]
-#![expect(
+#![allow(
     clippy::enum_glob_use,
     reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
 )]
@@ -68,7 +68,7 @@
     clippy::unnecessary_wraps,
     reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
 )]
-#![expect(
+#![allow(
     clippy::wildcard_imports,
     reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
 )]
