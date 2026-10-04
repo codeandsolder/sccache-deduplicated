@@ -14,7 +14,6 @@
 
 use crate::compiler;
 use async_trait::async_trait;
-use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fmt;
@@ -547,7 +546,7 @@ pub struct ServerNonce(u64);
 impl ServerNonce {
     #[must_use]
     pub fn new() -> Self {
-        Self(OsRng.next_u64())
+        Self(rand::random())
     }
 }
 
