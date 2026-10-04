@@ -45,7 +45,7 @@
 //! then create an `Arc<Mutex<MockCommandCreator>>` and safely provide
 //! `MockChild` outputs.
 
-#![expect(
+#![allow(
     clippy::wildcard_imports,
     reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
 )]
