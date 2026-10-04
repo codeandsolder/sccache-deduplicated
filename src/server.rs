@@ -16,7 +16,7 @@
     clippy::cast_precision_loss,
     reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
 )]
-#![expect(
+#![allow(
     clippy::doc_markdown,
     reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
 )]
@@ -84,7 +84,7 @@
     clippy::useless_let_if_seq,
     reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
 )]
-#![expect(
+#![allow(
     clippy::wildcard_imports,
     reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
 )]
