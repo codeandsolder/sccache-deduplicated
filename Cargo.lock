@@ -2331,7 +2331,7 @@ version = "0.59.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef16fe6b19b73b49ce39e3e0f4cec27e54789eee5d5f752cb2d26bd3e9449686"
 dependencies = [
- "opendal-core 0.59.3",
+ "opendal-core",
  "opendal-service-azblob",
  "opendal-service-cos",
  "opendal-service-gcs",
@@ -2350,7 +2350,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ddff5c648dcb3922c2bec71e0d26e881ddf9c367cb7c9a59ed7f2d39a4f38218"
 dependencies = [
  "anyhow",
- "asyncband 0.7.3",
+ "asyncband",
  "base64 0.23.1",
  "bytes",
  "futures",
@@ -2379,7 +2379,7 @@ dependencies = [
  "futures",
  "http",
  "http-body",
- "opendal-core 0.59.3",
+ "opendal-core",
  "reqwest",
 ]
 
@@ -2390,7 +2390,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6fd30cc4be601d5adf4936f3bcc186be5e09046c85b4e0f4e6c47ac10966335"
 dependencies = [
  "log",
- "opendal-core 0.59.3",
+ "opendal-core",
 ]
 
 [[package]]
@@ -2403,7 +2403,7 @@ dependencies = [
  "bytes",
  "http",
  "log",
- "opendal-core 0.59.3",
+ "opendal-core",
  "opendal-service-azure-common",
  "quick-xml 0.41.0",
  "reqsign-azure-storage",
@@ -2421,7 +2421,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9dd98dfe60b62baa344f3fd4cee68dbb8538483569cded75c8b614c57880a9b9"
 dependencies = [
  "http",
- "opendal-core 0.59.3",
+ "opendal-core",
 ]
 
 [[package]]
@@ -2433,7 +2433,7 @@ dependencies = [
  "bytes",
  "http",
  "log",
- "opendal-core 0.59.3",
+ "opendal-core",
  "quick-xml 0.41.0",
  "reqsign-core",
  "reqsign-file-read-tokio",
@@ -2451,7 +2451,7 @@ dependencies = [
  "bytes",
  "http",
  "log",
- "opendal-core 0.59.3",
+ "opendal-core",
  "percent-encoding",
  "quick-xml 0.41.0",
  "reqsign-core",
@@ -2473,7 +2473,7 @@ dependencies = [
  "ghac",
  "http",
  "log",
- "opendal-core 0.59.3",
+ "opendal-core",
  "opendal-service-azblob",
  "prost",
  "reqsign-azure-storage",
@@ -2489,8 +2489,8 @@ version = "0.59.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20fa8426acfaf56c3c74c94c2e1524107c9a1571e54842cdc82cf9bee3a582c2"
 dependencies = [
- "asyncband 0.7.3",
- "opendal-core 0.59.3",
+ "asyncband",
+ "opendal-core",
  "serde",
  "tokio",
  "url",
@@ -2505,7 +2505,7 @@ dependencies = [
  "bytes",
  "http",
  "log",
- "opendal-core 0.59.3",
+ "opendal-core",
  "quick-xml 0.41.0",
  "reqsign-aliyun-oss",
  "reqsign-core",
@@ -2519,10 +2519,10 @@ version = "0.59.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c9882dff1e78bde3aabacebdc6fc49a41368cb158cd3e1c2b6d9db8ea8e414b"
 dependencies = [
- "asyncband 0.7.3",
+ "asyncband",
  "bytes",
  "http",
- "opendal-core 0.59.3",
+ "opendal-core",
  "redis",
  "serde",
  "tokio",
@@ -2540,7 +2540,7 @@ dependencies = [
  "http",
  "log",
  "md-5",
- "opendal-core 0.59.3",
+ "opendal-core",
  "quick-xml 0.41.0",
  "reqsign-aws-v4",
  "reqsign-core",
@@ -2559,7 +2559,7 @@ dependencies = [
  "bytes",
  "http",
  "log",
- "opendal-core 0.59.3",
+ "opendal-core",
  "quick-xml 0.41.0",
  "serde",
 ]
@@ -3217,7 +3217,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7260e6c1d89422ba62d624a32c491b561386fb364ac4bf0959c740e34b251a2e"
 dependencies = [
  "anyhow",
- "asyncband 0.7.3",
+ "asyncband",
  "base64 0.23.1",
  "bytes",
  "form_urlencoded",
@@ -3239,7 +3239,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85fed85c436b6b920e4b36310f699a77771a91e38ae483df48447bd7d162671c"
 dependencies = [
  "anyhow",
- "asyncband 0.7.3",
+ "asyncband",
  "base64 0.23.1",
  "bytes",
  "hex",
@@ -5230,18 +5230,18 @@ dependencies = [
 
 [[package]]
 name = "zstd"
-version = "0.13.3"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+checksum = "bf06bd8162af0734b344780deb55b42a2429ae430870d13fcc12f238e880fe6e"
 dependencies = [
  "zstd-safe",
 ]
 
 [[package]]
 name = "zstd-safe"
-version = "7.3.0"
+version = "8.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64d80649ab6db9d9f6f9c80a40becd948eda4714a0a5ac8c4d157a32231c7882"
+checksum = "ae42c0555055784c70058d19ba8e275528e8a99a706684868ace5da4e716a4ab"
 dependencies = [
  "zstd-sys",
 ]
