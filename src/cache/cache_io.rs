@@ -18,7 +18,7 @@ use std::fmt;
 use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 /// Cache object sourced by a file.
@@ -293,7 +293,7 @@ impl CacheWrite {
     {
         // We're going to declare the compression method as "stored",
         // but we're actually going to store zstd-compressed blobs.
-        let opts = FileOptions::default().compression_method(CompressionMethod::Stored);
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
         let opts = mode.map_or(opts, |mode| opts.unix_permissions(mode));
         self.zip
             .start_file(name, opts)
@@ -339,7 +339,7 @@ impl CacheWrite {
     ///
     /// Returns an error if finalizing the cache archive fails.
     pub fn finish(self) -> Result<Vec<u8>> {
-        let Self { mut zip } = self;
+        let Self { zip } = self;
         let cur = zip.finish().context("Failed to finish cache entry zip")?;
         Ok(cur.into_inner())
     }
