@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![expect(
+#![allow(
     clippy::enum_glob_use,
     reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
 )]
@@ -36,7 +36,7 @@
     clippy::unnecessary_debug_formatting,
     reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
 )]
-#![expect(
+#![allow(
     clippy::wildcard_imports,
     reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
 )]
