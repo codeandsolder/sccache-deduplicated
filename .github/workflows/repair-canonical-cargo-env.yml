@@ -36,12 +36,6 @@ jobs:
                   raise SystemExit(f'{label}: expected exactly one match, found {count}')
               s = s.replace(old, new, 1)
 
-          replace_once(
-              '    dep_env: Vec<RustShadowEnv>,\n    cargo_env: Vec<RustShadowEnv>,\n    outputs: Vec<RustShadowOutput>,\n',
-              '    dep_env: Vec<RustShadowEnv>,\n    cargo_env: Vec<RustShadowEnv>,\n    cargo_env_hashed: Vec<RustShadowEnv>,\n    outputs: Vec<RustShadowOutput>,\n',
-              'shadow field',
-          )
-
           anchor = '''fn rust_cache_hashes_cargo_env(name: &std::ffi::OsStr) -> bool {
               name.starts_with("CARGO_")
                   && name != "CARGO_MAKEFLAGS"
@@ -130,33 +124,6 @@ jobs:
                   }
           '''
           replace_once(old_hash, new_hash, 'hash loop')
-
-          shadow = '''            let cargo_env = env_vars
-                      .iter()
-                      .filter(|(name, _)| rust_cache_hashes_cargo_env(name))
-                      .map(|(name, value)| RustShadowEnv {
-                          name: name.to_string_lossy().into_owned(),
-                          value: rust_shadow_env_value(name, value, canonical),
-                      })
-                      .collect::<Vec<_>>();
-          '''
-          shadow_new = shadow + '''
-                      let cargo_env_hashed = rust_cargo_env_for_hash(&env_vars, canonical)
-                          .into_iter()
-                          .map(|(name, value)| RustShadowEnv {
-                              name: name.to_string_lossy().into_owned(),
-                              // This is the effective value fed into the cache digest.
-                              value: rust_shadow_env_value(&name, &value, None),
-                          })
-                          .collect::<Vec<_>>();
-          '''
-          replace_once(shadow, shadow_new, 'shadow env')
-          replace_once('"canonical-rust-layout-v2".to_owned()', '"canonical-rust-layout-v3".to_owned()', 'shadow policy')
-          replace_once(
-              '                    dep_env,\n                    cargo_env,\n                    outputs: shadow_outputs,\n',
-              '                    dep_env,\n                    cargo_env,\n                    cargo_env_hashed,\n                    outputs: shadow_outputs,\n',
-              'shadow record',
-          )
 
           old_test = '''        let env_a = vec![
                       (
