@@ -352,6 +352,7 @@ impl CompileCommandImpl for CanonicalRustCompileCommand {
 pub struct CrateTypes {
     rlib: bool,
     staticlib: bool,
+    cdylib: bool,
 }
 
 /// Emit types that we will cache.
@@ -890,6 +891,24 @@ fn compilation_target(arguments: &[Argument<ArgData>], host: &str) -> String {
     host.to_owned()
 }
 
+fn dist_toolchain_weak_key(
+    base: &Digest,
+    target: &str,
+    target_std_manifest_digest: Option<&str>,
+) -> String {
+    let mut weak = base.clone();
+    weak.update(b"rust-dist-toolchain-target-v1");
+    weak.update(target.as_bytes());
+    match target_std_manifest_digest {
+        Some(digest) => {
+            weak.update(b"target-std-present");
+            weak.update(digest.as_bytes());
+        }
+        None => weak.update(b"target-std-missing"),
+    }
+    weak.finish()
+}
+
 fn rewrite_native_target_cpu(arguments: &mut [Argument<ArgData>], cpu: &str) {
     for arg in arguments {
         if let Argument::WithValue(_, CodeGen(ArgCodegen { opt, value }), _) = arg
@@ -1362,6 +1381,7 @@ macro_rules! make_os_string {
 struct ArgCrateTypes {
     rlib: bool,
     staticlib: bool,
+    cdylib: bool,
     others: HashSet<String>,
 }
 impl FromArg for ArgCrateTypes {
@@ -1370,6 +1390,7 @@ impl FromArg for ArgCrateTypes {
         let mut crate_types = Self {
             rlib: false,
             staticlib: false,
+            cdylib: false,
             others: HashSet::new(),
         };
         for ty in arg.split(',') {
@@ -1378,6 +1399,7 @@ impl FromArg for ArgCrateTypes {
                 // is true right now but may not be in the future
                 "lib" | "rlib" => crate_types.rlib = true,
                 "staticlib" => crate_types.staticlib = true,
+                "cdylib" => crate_types.cdylib = true,
                 other => {
                     crate_types.others.insert(other.to_owned());
                 }
@@ -1391,6 +1413,7 @@ impl IntoArg for ArgCrateTypes {
         let Self {
             rlib,
             staticlib,
+            cdylib,
             others,
         } = self;
         let mut types: Vec<_> = others
@@ -1398,6 +1421,7 @@ impl IntoArg for ArgCrateTypes {
             .map(String::as_str)
             .chain(if rlib { Some("rlib") } else { None })
             .chain(if staticlib { Some("staticlib") } else { None })
+            .chain(if cdylib { Some("cdylib") } else { None })
             .collect();
         types.sort_unstable();
         let types_string = types.join(",");
@@ -1407,6 +1431,7 @@ impl IntoArg for ArgCrateTypes {
         let Self {
             rlib,
             staticlib,
+            cdylib,
             others,
         } = self;
         let mut types: Vec<_> = others
@@ -1414,6 +1439,7 @@ impl IntoArg for ArgCrateTypes {
             .map(String::as_str)
             .chain(if rlib { Some("rlib") } else { None })
             .chain(if staticlib { Some("staticlib") } else { None })
+            .chain(if cdylib { Some("cdylib") } else { None })
             .collect();
         types.sort_unstable();
         let types_string = types.join(",");
@@ -1743,7 +1769,10 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     let mut crate_types = CrateTypes {
         rlib: false,
         staticlib: false,
+        cdylib: false,
     };
+    let mut target_name: Option<String> = None;
+    let mut has_opaque_linker_args = false;
     let mut extra_filename = None;
     let mut externs = vec![];
     let mut crate_link_paths = vec![];
@@ -1797,10 +1826,12 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
             Some(CrateType(ArgCrateTypes {
                 rlib,
                 staticlib,
+                cdylib,
                 others,
             })) => {
-                // We can't cache non-rlib/staticlib crates, because rustc invokes the
-                // system linker to link them, and we don't know about all the linker inputs.
+                // General linked Rust artifacts remain non-cacheable because their system
+                // linker inputs are opaque. wasm32-wasip2 is handled narrowly after all
+                // arguments are parsed: its linker ships in the Rust sysroot.
                 if !others.is_empty() {
                     let mut others: Vec<&str> = others.iter().map(String::as_str).collect();
                     others.sort_unstable();
@@ -1809,6 +1840,7 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
                 }
                 crate_types.rlib |= rlib;
                 crate_types.staticlib |= staticlib;
+                crate_types.cdylib |= cdylib;
             }
             Some(CrateName(value)) => crate_name = Some(value.clone()),
             Some(OutDir(value)) => output_dir = Some(value.clone()),
@@ -1817,6 +1849,9 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
                 match (opt.as_ref(), value) {
                     ("extra-filename", Some(value)) => extra_filename = Some(value.to_owned()),
                     ("extra-filename", None) => cannot_cache!("extra-filename"),
+                    ("linker" | "link-arg" | "link-args", _) => {
+                        has_opaque_linker_args = true;
+                    }
                     ("profile-use", Some(v)) => profile = Some(v.clone()),
                     // Incremental compilation makes a mess of sccache's entire world
                     // view. It produces additional compiler outputs that we don't cache,
@@ -1851,7 +1886,7 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
             Some(Target(target)) => match target {
                 ArgTarget::Path(json_path) => target_json = Some(json_path.to_owned()),
                 ArgTarget::Unsure(_) => cannot_cache!("target unsure"),
-                ArgTarget::Name(_) => (),
+                ArgTarget::Name(name) => target_name = Some(name.clone()),
             },
             None => {
                 match arg {
@@ -1888,6 +1923,19 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
         }
     }
 
+    // Unlike general cdylibs, wasm32-wasip2 is an only-cdylib target whose
+    // component linker (wasm-component-ld/rust-lld) is shipped inside rustc's
+    // sysroot and therefore travels in the distributed toolchain archive.
+    // Keep the exception deliberately narrow and reject custom linker inputs.
+    if crate_types.cdylib
+        && (target_name.as_deref() != Some("wasm32-wasip2")
+            || crate_types.rlib
+            || crate_types.staticlib
+            || has_opaque_linker_args)
+    {
+        cannot_cache!("crate-type", "cdylib".to_owned())
+    }
+
     // Unwrap required values.
     macro_rules! req {
         ($x:ident) => {
@@ -1917,6 +1965,7 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
         == (CrateTypes {
             rlib: false,
             staticlib: false,
+            cdylib: false,
         })
     {
         cannot_cache!("crate-type", "No crate-type passed".to_owned())
@@ -2256,7 +2305,24 @@ where
         if canonical_paths.is_some() {
             m.update(b"canonical-rust-layout-v2");
         }
-        let weak_toolchain_key = m.clone().finish();
+        // Dist toolchain archives recursively contain the Rust sysroot, including
+        // installed cross-target standard libraries. Key the weak toolchain cache
+        // by both the effective target and rustup's target-std manifest so a
+        // host-only archive cannot be reused for a later cross-target compile,
+        // and installing a previously-missing target invalidates a failed/stale
+        // archive without perturbing the normal compilation cache key.
+        let target_std_manifest = self
+            .sysroot
+            .join(LIBS_DIR)
+            .join("rustlib")
+            .join(format!("manifest-rust-std-{target}"));
+        let target_std_manifest_digest = if target_std_manifest.is_file() {
+            Some(Digest::file(target_std_manifest, pool).await?)
+        } else {
+            None
+        };
+        let weak_toolchain_key =
+            dist_toolchain_weak_key(&m, &target, target_std_manifest_digest.as_deref());
         // 3. The full commandline (self.arguments)
         // TODO: there will be full paths here, it would be nice to
         // normalize them so we can get cross-machine cache hits.
@@ -3067,6 +3133,7 @@ version = "6.1.0"
         crate_types: CrateTypes {
             rlib: true,
             staticlib: false,
+            cdylib: false,
         },
         inputs: vec![lib_rs, manifest],
         path_transformer,
@@ -3256,6 +3323,7 @@ impl pkg::InputsPackager for RustInputsPackager {
             CrateTypes {
                 rlib: true,
                 staticlib: false,
+                cdylib: false,
             }
         );
 
@@ -4078,6 +4146,65 @@ LLVM version: 15.0.2
     }
 
     #[test]
+    fn test_parse_arguments_wasip2_cdylib_is_cacheable() {
+        let parsed = parses!(
+            "--emit",
+            "link",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "cdylib",
+            "--target",
+            "wasm32-wasip2"
+        );
+        assert!(parsed.crate_types.cdylib);
+        assert!(!parsed.crate_types.rlib);
+        assert!(!parsed.crate_types.staticlib);
+    }
+
+    #[test]
+    fn test_parse_arguments_cdylib_stays_noncachable_outside_wasip2() {
+        let native = fails!(
+            "--emit",
+            "link",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "cdylib"
+        );
+        assert_eq!(
+            native,
+            CompilerArguments::CannotCache("crate-type", Some("cdylib".to_string()))
+        );
+
+        let custom_linker = fails!(
+            "--emit",
+            "link",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "cdylib",
+            "--target",
+            "wasm32-wasip2",
+            "-C",
+            "linker=/tmp/custom-linker"
+        );
+        assert_eq!(
+            custom_linker,
+            CompilerArguments::CannotCache("crate-type", Some("cdylib".to_string()))
+        );
+    }
+
+    #[test]
     fn test_parse_arguments_incremental() {
         parses!(
             "--emit",
@@ -4682,6 +4809,7 @@ proc_macro false
                 crate_types: CrateTypes {
                     rlib: true,
                     staticlib: false,
+                    cdylib: false,
                 },
                 dep_info: None,
                 emit,
@@ -5544,6 +5672,23 @@ version='2.0.0'
             ArgDisposition::Separated
         )));
         assert_eq!(h.target_json, Some(PathBuf::from("/path/to/target.json")));
+    }
+
+    #[test]
+    fn dist_toolchain_weak_key_tracks_target_and_std_manifest() {
+        let mut base = Digest::new();
+        base.update(b"same-rustc");
+
+        let host =
+            dist_toolchain_weak_key(&base, "x86_64-unknown-linux-gnu", Some("host-std-digest"));
+        let wasm = dist_toolchain_weak_key(&base, "wasm32-wasip2", Some("wasm-std-digest"));
+        let wasm_missing = dist_toolchain_weak_key(&base, "wasm32-wasip2", None);
+        let wasm_repeated =
+            dist_toolchain_weak_key(&base, "wasm32-wasip2", Some("wasm-std-digest"));
+
+        assert_ne!(host, wasm);
+        assert_ne!(wasm_missing, wasm);
+        assert_eq!(wasm, wasm_repeated);
     }
 
     #[test]
