@@ -1,0 +1,68 @@
+name: Repair jsonwebtoken crypto provider
+
+on:
+  push:
+    branches: [fix/jsonwebtoken-crypto-provider]
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out fix branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: fix/jsonwebtoken-crypto-provider
+
+      - name: Apply provider and regression gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          cargo = Path('Cargo.toml')
+          s = cargo.read_text()
+          old = 'jwt = { package = "jsonwebtoken", version = "11", optional = true }'
+          new = 'jwt = { package = "jsonwebtoken", version = "11", optional = true, features = ["aws_lc_rs"] }'
+          if s.count(old) != 1:
+              raise SystemExit(f'expected exactly one jsonwebtoken dependency line, found {s.count(old)}')
+          cargo.write_text(s.replace(old, new, 1))
+
+          ci = Path('.github/workflows/ci.yml')
+          s = ci.read_text()
+          needle = '''      - name: Test scheduler unit tests
+                if: ${{ matrix.feature == 'dist-server' }}
+                run: cargo test --locked --no-default-features --features=dist-server --bin sccache-dist scheduler_tests
+          '''
+          addition = needle + '''
+                - name: Test distributed JWT signing
+                  if: ${{ matrix.feature == 'dist-server' }}
+                  run: cargo test --locked --no-default-features --features=dist-server --lib test_job_token_verification
+          '''
+          if 'Test distributed JWT signing' not in s:
+              if s.count(needle) != 1:
+                  raise SystemExit(f'expected scheduler test block once, found {s.count(needle)}')
+              s = s.replace(needle, addition, 1)
+              ci.write_text(s)
+          PY
+
+      - name: Refresh lockfile for selected crypto provider
+        run: cargo update -p jsonwebtoken --precise 11.1.0
+
+      - name: Verify JWT signing regression
+        run: cargo test --locked --no-default-features --features=dist-server --lib test_job_token_verification
+
+      - name: Commit final fix and remove one-shot workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/repair-jsonwebtoken-provider.yml
+          git add Cargo.toml Cargo.lock .github/workflows/ci.yml
+          git diff --cached --check
+          git config user.name codeandsolder
+          git config user.email codeandsolder@gmail.com
+          git commit -m 'fix(dist): select jsonwebtoken crypto provider'
+          git push origin HEAD:fix/jsonwebtoken-crypto-provider
