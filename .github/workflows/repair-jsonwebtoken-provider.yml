@@ -33,20 +33,17 @@ jobs:
 
           ci = Path('.github/workflows/ci.yml')
           s = ci.read_text()
-          needle = '''      - name: Test scheduler unit tests
-                if: ${{ matrix.feature == 'dist-server' }}
-                run: cargo test --locked --no-default-features --features=dist-server --bin sccache-dist scheduler_tests
-          '''
-          addition = needle + '''
-                - name: Test distributed JWT signing
-                  if: ${{ matrix.feature == 'dist-server' }}
-                  run: cargo test --locked --no-default-features --features=dist-server --lib test_job_token_verification
-          '''
+          run_line = '        run: cargo test --locked --no-default-features --features=dist-server --bin sccache-dist scheduler_tests'
           if 'Test distributed JWT signing' not in s:
-              if s.count(needle) != 1:
-                  raise SystemExit(f'expected scheduler test block once, found {s.count(needle)}')
-              s = s.replace(needle, addition, 1)
-              ci.write_text(s)
+              if s.count(run_line) != 1:
+                  raise SystemExit(f'expected scheduler test command once, found {s.count(run_line)}')
+              expr = '$' + "{{ matrix.feature == 'dist-server' }}"
+              addition = run_line + '\n\n' + (
+                  '      - name: Test distributed JWT signing\n'
+                  f'        if: {expr}\n'
+                  '        run: cargo test --locked --no-default-features --features=dist-server --lib test_job_token_verification'
+              )
+              ci.write_text(s.replace(run_line, addition, 1))
           PY
 
       - name: Refresh lockfile for selected crypto provider
