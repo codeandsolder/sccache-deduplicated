@@ -675,6 +675,48 @@ fn rust_cache_hashes_cargo_env(name: &std::ffi::OsStr) -> bool {
         && name != "CARGO_ENCODED_RUSTFLAGS"
 }
 
+fn rust_cargo_env_for_hash(
+    env: &[(OsString, OsString)],
+    canonical: Option<&CanonicalRustPaths>,
+) -> Vec<(OsString, OsString)> {
+    let mut hashed = env
+        .iter()
+        .filter(|(name, _)| rust_cache_hashes_cargo_env(name))
+        .filter(|(name, _)| {
+            canonical.is_none() || !matches!(name.to_str(), Some("CARGO_HOME" | "CARGO_TARGET_DIR"))
+        })
+        .map(|(name, value)| {
+            let value = canonical.map_or_else(
+                || value.clone(),
+                |canonical| canonical.env_value_to_canonical(name, value),
+            );
+            (name.clone(), value)
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(canonical) = canonical {
+        if let Some(cargo_home) = canonical.cargo_home.as_ref() {
+            hashed.push((
+                OsString::from("CARGO_HOME"),
+                canonical.env_value_to_canonical(
+                    std::ffi::OsStr::new("CARGO_HOME"),
+                    cargo_home.as_os_str(),
+                ),
+            ));
+        }
+        hashed.push((
+            OsString::from("CARGO_TARGET_DIR"),
+            canonical.env_value_to_canonical(
+                std::ffi::OsStr::new("CARGO_TARGET_DIR"),
+                canonical.target_root.as_os_str(),
+            ),
+        ));
+    }
+
+    hashed.sort();
+    hashed
+}
+
 fn rust_shadow_plain_env(name: &std::ffi::OsStr) -> bool {
     matches!(
         name.to_str(),
@@ -2308,23 +2350,14 @@ where
             .cloned()
             .collect();
         env_vars.sort();
-        for (var, val) in &env_vars {
-            // CARGO_MAKEFLAGS will have jobserver info which is extremely non-cacheable.
-            // CARGO_REGISTRIES_*_TOKEN contains non-cacheable secrets.
-            // Registry override config doesn't need to be hashed, because deps' package IDs
-            // already uniquely identify the relevant registries.
-            // CARGO_BUILD_JOBS only affects Cargo's parallelism, not rustc output.
-            // CARGO_ENCODED_RUSTFLAGS is already cached in argument list.
-            if !rust_cache_hashes_cargo_env(var) {
-                continue;
-            }
-
+        // In canonical mode, hash Cargo's semantic defaults rather than whether
+        // CARGO_HOME/CARGO_TARGET_DIR happened to be explicitly exported by the
+        // invoking Cargo wrapper. Their physical roots are already represented by
+        // CanonicalRustPaths, and direct env!/option_env! observations remain in
+        // env_deps above and are therefore still hashed exactly as observed.
+        for (var, val) in rust_cargo_env_for_hash(&env_vars, canonical_paths.as_ref()) {
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(b"=");
-            let val = canonical_paths.as_ref().map_or_else(
-                || val.clone(),
-                |canonical| canonical.env_value_to_canonical(var, val),
-            );
             val.hash(&mut HashToDigest { digest: &mut m });
         }
         // 9. The cwd of the compile. This will wind up in the rlib.
@@ -5034,6 +5067,10 @@ proc_macro false
                 a.tempdir.path().join("target").into_os_string(),
             ),
             (
+                OsString::from("CARGO_HOME"),
+                PathBuf::from("/tmp/sccache-canonical-explicit-home/.cargo").into_os_string(),
+            ),
+            (
                 OsString::from("CARGO_MANIFEST_DIR"),
                 a.tempdir.path().as_os_str().to_owned(),
             ),
@@ -5044,8 +5081,8 @@ proc_macro false
                 OsString::from("1"),
             ),
             (
-                OsString::from("CARGO_TARGET_DIR"),
-                b.tempdir.path().join("target").into_os_string(),
+                OsString::from("HOME"),
+                PathBuf::from("/tmp/sccache-canonical-implicit-home").into_os_string(),
             ),
             (
                 OsString::from("CARGO_MANIFEST_DIR"),

@@ -1,0 +1,29 @@
+name: Distributed JWT regression
+
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - src/dist/**
+      - src/bin/sccache-dist/**
+      - .github/workflows/dist-jwt-regression.yml
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - src/dist/**
+      - src/bin/sccache-dist/**
+      - .github/workflows/dist-jwt-regression.yml
+
+permissions:
+  contents: read
+
+jobs:
+  jwt-signing:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Verify distributed JWT signing
+        run: cargo test --locked --no-default-features --features=dist-server --lib test_job_token_verification
