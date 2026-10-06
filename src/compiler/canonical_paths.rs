@@ -79,6 +79,29 @@ fn topmost_cargo_root(start: &Path) -> Option<PathBuf> {
         .map(Path::to_owned)
 }
 
+fn target_root_from_out_dir(env: &[(OsString, OsString)]) -> Option<PathBuf> {
+    let out_dir = env_value(env, "OUT_DIR")?;
+
+    // Cargo writes CACHEDIR.TAG (and normally .rustc_info.json) at the actual
+    // target root. Prefer that marker so cross-target layouts such as
+    // target/<triple>/<profile>/build/... still map to the whole target tree.
+    if let Some(root) = out_dir.ancestors().find(|ancestor| {
+        ancestor.join("CACHEDIR.TAG").is_file() || ancestor.join(".rustc_info.json").is_file()
+    }) {
+        return Some(root.to_owned());
+    }
+
+    // During very early Cargo startup the marker may not exist yet. OUT_DIR has
+    // the stable .../<profile>/build/<package-hash>/out shape, so the profile
+    // directory is still a safe canonical root for every generated input used
+    // by that compiler invocation.
+    let package_hash = out_dir.parent()?;
+    let build_dir = package_hash.parent()?;
+    (build_dir.file_name() == Some(OsStr::new("build")))
+        .then(|| build_dir.parent().map(Path::to_owned))
+        .flatten()
+}
+
 fn path_env(name: &OsStr) -> bool {
     matches!(
         name.to_str(),
@@ -198,6 +221,7 @@ impl CanonicalRustPaths {
 
         let target_root = env_value(env, "SCCACHE_CANONICAL_TARGET_ROOT")
             .or_else(|| env_value(env, "CARGO_TARGET_DIR"))
+            .or_else(|| target_root_from_out_dir(env))
             .unwrap_or_else(|| build_root.join("target"));
         let cargo_home = env_value(env, "SCCACHE_CANONICAL_CARGO_HOME")
             .or_else(|| env_value(env, "CARGO_HOME"))
@@ -526,6 +550,42 @@ mod tests {
         assert_eq!(
             roots.to_physical(Path::new("/build/src/lib.rs")),
             PathBuf::from("/work/a/src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn infers_shared_target_root_from_out_dir_for_registry_dependency() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry_crate = temp.path().join("cargo/registry/src/index/serde_core");
+        let target = temp.path().join("workspace-target");
+        let out_dir = target.join("debug/build/serde_core-hash/out");
+        std::fs::create_dir_all(&registry_crate).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(
+            registry_crate.join("Cargo.toml"),
+            "[package]\nname='serde_core'\nversion='1.0.0'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        let generated = out_dir.join("private.rs");
+        std::fs::write(&generated, "pub const PRIVATE: () = ();\n").unwrap();
+
+        let env = vec![
+            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+            ("OUT_DIR".into(), out_dir.into_os_string()),
+        ];
+        let roots =
+            CanonicalRustPaths::from_env(&env, &registry_crate, Path::new("/rust")).unwrap();
+
+        assert_eq!(roots.target_root, target);
+        assert!(roots.root_is_known(&generated));
+        assert_eq!(
+            roots.to_canonical(&generated),
+            PathBuf::from("/target/debug/build/serde_core-hash/out/private.rs")
         );
     }
 
