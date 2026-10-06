@@ -45,11 +45,11 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "source SHA: $sha"
 
-      - name: Install Rust 1.98.1
+      - name: Install Rust 1.99.0
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install 1.98.1 --profile minimal
+          rustup toolchain install 1.99.0 --profile minimal
 
       - name: Build CI client + dist worker
         shell: bash
@@ -57,7 +57,7 @@ jobs:
           RUSTFLAGS: "-C target-cpu=x86-64-v2"
         run: |
           set -euo pipefail
-          cargo +1.98.1 build --release --locked \
+          cargo +1.99.0 build --release --locked \
             --no-default-features \
             --features s3,dist-client,dist-server \
             --bin sccache --bin sccache-dist
@@ -67,7 +67,7 @@ jobs:
           sha256sum dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2 > dist/SHA256SUMS
           {
             echo "source_sha=${{ steps.rev.outputs.sha }}"
-            echo "rust_toolchain=1.98.1"
+            echo "rust_toolchain=1.99.0"
             echo "rustflags=-C target-cpu=x86-64-v2"
             echo "features=s3,dist-client,dist-server"
           } > dist/build.txt
