@@ -661,10 +661,6 @@ impl SchedulerIncoming for Scheduler {
         num_cpus: usize,
         job_authorizer: Box<dyn JobAuthorizer>,
     ) -> Result<HeartbeatServerResult> {
-        if num_cpus == 0 {
-            bail!("Invalid number of CPUs (0) specified in heartbeat")
-        }
-
         // LOCKS
         let mut jobs = self.jobs.lock().unwrap();
         let mut servers = self.servers.lock().unwrap();
@@ -675,6 +671,7 @@ impl SchedulerIncoming for Scheduler {
             Some(ref mut details) if details.server_nonce == server_nonce => {
                 let now = Instant::now();
                 details.last_seen = now;
+                details.num_cpus = num_cpus;
 
                 let mut stale_jobs = Vec::new();
                 for (&job_id, &last_seen) in details.jobs_unclaimed.iter() {
