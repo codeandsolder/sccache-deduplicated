@@ -557,7 +557,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1015,7 +1015,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2315,9 +2315,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "opendal"
-version = "0.59.3"
+version = "0.59.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef16fe6b19b73b49ce39e3e0f4cec27e54789eee5d5f752cb2d26bd3e9449686"
+checksum = "3cbd193aec6d62efaff87611dfae52c132aed650bb3cb0c684c0a9394f09a42a"
 dependencies = [
  "opendal-core",
  "opendal-service-azblob",
@@ -2333,9 +2333,9 @@ dependencies = [
 
 [[package]]
 name = "opendal-core"
-version = "0.59.3"
+version = "0.59.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddff5c648dcb3922c2bec71e0d26e881ddf9c367cb7c9a59ed7f2d39a4f38218"
+checksum = "54b5555d753dd6a6383dc0891254b72f3cdc40c011ba0372b560e0ae5aa29f5c"
 dependencies = [
  "anyhow",
  "asyncband",
@@ -2383,9 +2383,9 @@ dependencies = [
 
 [[package]]
 name = "opendal-service-azblob"
-version = "0.59.3"
+version = "0.59.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f79d8340796e728bf79248d183c59760996059c882c7b151845b8169103bf08d"
+checksum = "c32c3fc2e507c854ce53615b28fc2208f5e00cbe456c4d344ffdfbf4c9cb976d"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -2404,9 +2404,9 @@ dependencies = [
 
 [[package]]
 name = "opendal-service-azure-common"
-version = "0.59.3"
+version = "0.59.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9dd98dfe60b62baa344f3fd4cee68dbb8538483569cded75c8b614c57880a9b9"
+checksum = "cc93c30bd347a36d93fd46d47f3e2bb6494dcf9458938aa501fe046ff8f7562f"
 dependencies = [
  "http",
  "opendal-core",
@@ -2414,9 +2414,9 @@ dependencies = [
 
 [[package]]
 name = "opendal-service-cos"
-version = "0.59.3"
+version = "0.59.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb37f62818e163131e9f588c45cf18998ba5136dc77d585996264fe6bde5c76f"
+checksum = "4b99e9f5bc01a8e6afbbba67a478d48d77b18169e3128315c06e7eb305b5a78e"
 dependencies = [
  "bytes",
  "http",
@@ -2431,9 +2431,9 @@ dependencies = [
 
 [[package]]
 name = "opendal-service-gcs"
-version = "0.59.3"
+version = "0.59.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "658545a6d3ef1b650117abdb04ed6b8b9bafeae19ed8ace6a3c36212d5999fbe"
+checksum = "e1b5e42c6606ea1e37fa9cdedf07dc998073a45eb5044317c0fa6f3153e98d6e"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2453,9 +2453,9 @@ dependencies = [
 
 [[package]]
 name = "opendal-service-ghac"
-version = "0.59.3"
+version = "0.59.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0435ce0df1d40d48134ccd4fe10f36406f801f28c1112a22579ccdf03a2f2682"
+checksum = "5e458403615dce199898a42dc6d288c83084a288b64f91be4f952f44e06c45bd"
 dependencies = [
  "bytes",
  "ghac",
@@ -2473,9 +2473,9 @@ dependencies = [
 
 [[package]]
 name = "opendal-service-memcached"
-version = "0.59.3"
+version = "0.59.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20fa8426acfaf56c3c74c94c2e1524107c9a1571e54842cdc82cf9bee3a582c2"
+checksum = "42d3b98f39fdc87b284391cbb5c6d17e42f26701c45bbeb7ae8fd6ddd5d7dbe7"
 dependencies = [
  "asyncband",
  "opendal-core",
@@ -2486,9 +2486,9 @@ dependencies = [
 
 [[package]]
 name = "opendal-service-oss"
-version = "0.59.3"
+version = "0.59.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f09301e6909337878f95e5991447a875e93fc510295528685b931efdb28f3d7e"
+checksum = "d64d2909b444008e42f00137a50df6b55ba599eeb6c8b46c71a2a84948f91880"
 dependencies = [
  "bytes",
  "http",
@@ -2503,9 +2503,9 @@ dependencies = [
 
 [[package]]
 name = "opendal-service-redis"
-version = "0.59.3"
+version = "0.59.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c9882dff1e78bde3aabacebdc6fc49a41368cb158cd3e1c2b6d9db8ea8e414b"
+checksum = "67bdcf0db50dafddb62b3a62c21bd81e8e6ae200852b1887d594ce722d052570"
 dependencies = [
  "asyncband",
  "bytes",
@@ -2518,9 +2518,9 @@ dependencies = [
 
 [[package]]
 name = "opendal-service-s3"
-version = "0.59.3"
+version = "0.59.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9de51cba3b83c8130e211045fd2b9d454c4b73f557ad88b71244c2ab943b2b05"
+checksum = "1d83e716c25a81fe2ca701894b8e14b9966acca3812af250e50132accb19da02"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -2539,9 +2539,9 @@ dependencies = [
 
 [[package]]
 name = "opendal-service-webdav"
-version = "0.59.3"
+version = "0.59.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbafeacae29dd3c86f72026977fcf08cf23468636cb2c97b0b332b730bce591c"
+checksum = "bd439c1cc6f407d29df60555e104df84741a57abac63c1683fb5e6fc822266ef"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2972,7 +2972,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3436,7 +3436,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3493,7 +3493,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4112,7 +4112,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4832,7 +4832,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
