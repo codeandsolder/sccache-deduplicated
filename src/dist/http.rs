@@ -245,13 +245,15 @@ mod server {
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
     use std::convert::Infallible;
+    use std::env;
+    use std::fs;
     use std::io::Read;
     use std::net::SocketAddr;
     use std::result::Result as StdResult;
     use std::sync::atomic;
-    use std::sync::{LazyLock, Mutex};
+    use std::sync::{Arc, LazyLock, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::common::{
         AllocJobHttpResponse, HeartbeatServerHttpRequest, ReqwestRequestBuilderExt,
@@ -268,6 +270,184 @@ mod server {
     const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
     const HEARTBEAT_ERROR_INTERVAL: Duration = Duration::from_secs(10);
     pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
+
+    const LOAD_AWARE_CPU_PERCENT_ENV: &str = "SCCACHE_DIST_MAX_HOST_CPU_PERCENT";
+    const LOAD_AWARE_REENABLE_SECONDS_ENV: &str = "SCCACHE_DIST_REENABLE_AFTER_SECONDS";
+
+    struct LoadAwareCapacity {
+        threshold_percent: f64,
+        reenable_after: Duration,
+        physical_cpus: usize,
+        previous_cpu_times: Option<(u64, u64)>,
+        unavailable: bool,
+        below_since: Option<Instant>,
+    }
+
+    impl LoadAwareCapacity {
+        fn from_env() -> Result<Option<Self>> {
+            let Some(raw) = env::var_os(LOAD_AWARE_CPU_PERCENT_ENV) else {
+                return Ok(None);
+            };
+            if !cfg!(target_os = "linux") {
+                return Err(anyhow!(
+                    "{LOAD_AWARE_CPU_PERCENT_ENV} is supported only on Linux"
+                ));
+            }
+            let raw = raw
+                .into_string()
+                .map_err(|_| anyhow!("{LOAD_AWARE_CPU_PERCENT_ENV} is not valid UTF-8"))?;
+            let threshold_percent = raw
+                .parse::<f64>()
+                .map_err(|e| anyhow!("invalid {LOAD_AWARE_CPU_PERCENT_ENV}={raw:?}: {e}"))?;
+            if !threshold_percent.is_finite() || !(0.0..=100.0).contains(&threshold_percent) {
+                return Err(anyhow!("{LOAD_AWARE_CPU_PERCENT_ENV} must be in 0..=100"));
+            }
+            let reenable_seconds = match env::var(LOAD_AWARE_REENABLE_SECONDS_ENV) {
+                Ok(raw) => raw.parse::<u64>().map_err(|e| {
+                    anyhow!("invalid {LOAD_AWARE_REENABLE_SECONDS_ENV}={raw:?}: {e}")
+                })?,
+                Err(env::VarError::NotPresent) => 300,
+                Err(e) => {
+                    return Err(anyhow!(
+                        "could not read {LOAD_AWARE_REENABLE_SECONDS_ENV}: {e}"
+                    ));
+                }
+            };
+            Ok(Some(Self {
+                threshold_percent,
+                reenable_after: Duration::from_secs(reenable_seconds),
+                physical_cpus: num_cpus(),
+                previous_cpu_times: None,
+                unavailable: false,
+                below_since: None,
+            }))
+        }
+
+        fn advertised_cpus(&mut self, running_jobs: usize) -> usize {
+            let Some(busy_percent) = self.sample_cpu_busy_percent() else {
+                return self.current_capacity();
+            };
+            self.advertised_cpus_for_sample(running_jobs, busy_percent, Instant::now())
+        }
+
+        fn advertised_cpus_for_sample(
+            &mut self,
+            running_jobs: usize,
+            busy_percent: f64,
+            now: Instant,
+        ) -> usize {
+            if self.unavailable {
+                if busy_percent < self.threshold_percent {
+                    let below_since = self.below_since.get_or_insert(now);
+                    if now.duration_since(*below_since) >= self.reenable_after {
+                        self.unavailable = false;
+                        self.below_since = None;
+                        info!(
+                            "Host CPU remained below {:.1}% for {:?}; restoring {} advertised CPUs",
+                            self.threshold_percent, self.reenable_after, self.physical_cpus
+                        );
+                    }
+                } else {
+                    self.below_since = None;
+                }
+            } else if running_jobs == 0 && busy_percent > self.threshold_percent {
+                self.unavailable = true;
+                self.below_since = None;
+                info!(
+                    "Host CPU busy {:.1}% exceeds {:.1}% with no running distributed jobs; advertising zero CPUs",
+                    busy_percent, self.threshold_percent
+                );
+            }
+            self.current_capacity()
+        }
+
+        fn sample_cpu_busy_percent(&mut self) -> Option<f64> {
+            let current = read_linux_cpu_times()?;
+            let previous = self.previous_cpu_times.replace(current)?;
+            let total = current.0.saturating_sub(previous.0);
+            let idle = current.1.saturating_sub(previous.1);
+            (total != 0).then(|| 100.0 * total.saturating_sub(idle) as f64 / total as f64)
+        }
+
+        fn current_capacity(&self) -> usize {
+            if self.unavailable {
+                0
+            } else {
+                self.physical_cpus
+            }
+        }
+    }
+
+    #[test]
+    fn load_aware_capacity_only_yields_to_external_load_when_idle() {
+        let now = Instant::now();
+        let mut state = LoadAwareCapacity {
+            threshold_percent: 50.0,
+            reenable_after: Duration::from_secs(5),
+            physical_cpus: 8,
+            previous_cpu_times: None,
+            unavailable: false,
+            below_since: None,
+        };
+
+        assert_eq!(state.advertised_cpus_for_sample(1, 90.0, now), 8);
+        assert_eq!(state.advertised_cpus_for_sample(0, 90.0, now), 0);
+    }
+
+    #[test]
+    fn load_aware_capacity_requires_sustained_recovery() {
+        let start = Instant::now();
+        let mut state = LoadAwareCapacity {
+            threshold_percent: 50.0,
+            reenable_after: Duration::from_secs(5),
+            physical_cpus: 8,
+            previous_cpu_times: None,
+            unavailable: true,
+            below_since: None,
+        };
+
+        assert_eq!(state.advertised_cpus_for_sample(0, 20.0, start), 0);
+        assert_eq!(
+            state.advertised_cpus_for_sample(0, 20.0, start + Duration::from_secs(4)),
+            0
+        );
+        assert_eq!(
+            state.advertised_cpus_for_sample(0, 20.0, start + Duration::from_secs(5)),
+            8
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_linux_cpu_times() -> Option<(u64, u64)> {
+        let stat = fs::read_to_string("/proc/stat").ok()?;
+        let mut fields = stat.lines().next()?.split_whitespace();
+        (fields.next()? == "cpu").then_some(())?;
+        let values = fields
+            .take(8)
+            .map(str::parse::<u64>)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .ok()?;
+        (values.len() == 8).then_some(())?;
+        Some((values.iter().sum(), values[3].saturating_add(values[4])))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn read_linux_cpu_times() -> Option<(u64, u64)> {
+        None
+    }
+
+    struct RunningJobGuard(Arc<atomic::AtomicUsize>);
+    impl RunningJobGuard {
+        fn new(counter: &Arc<atomic::AtomicUsize>) -> Self {
+            counter.fetch_add(1, atomic::Ordering::SeqCst);
+            Self(Arc::clone(counter))
+        }
+    }
+    impl Drop for RunningJobGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, atomic::Ordering::SeqCst);
+        }
+    }
 
     pub fn bincode_req<T: serde::de::DeserializeOwned + 'static>(
         req: reqwest::blocking::RequestBuilder,
@@ -926,13 +1106,11 @@ mod server {
                 server_nonce,
                 handler,
             } = self;
-            let heartbeat_req = HeartbeatServerHttpRequest {
-                num_cpus: num_cpus(),
-                jwt_key: jwt_key.clone(),
-                server_nonce,
-                cert_digest,
-                cert_pem: cert_pem.clone(),
-            };
+            let mut load_aware_capacity = LoadAwareCapacity::from_env()?;
+            let running_jobs = Arc::new(atomic::AtomicUsize::new(0));
+            let heartbeat_running_jobs = Arc::clone(&running_jobs);
+            let heartbeat_jwt_key = jwt_key.clone();
+            let heartbeat_cert_pem = cert_pem.clone();
             let job_authorizer = JWTJobAuthorizer::new(jwt_key);
             let heartbeat_url = urls::scheduler_heartbeat_server(&scheduler_url);
             let requester = ServerRequester {
@@ -946,13 +1124,27 @@ mod server {
                 let client = new_reqwest_blocking_client();
                 loop {
                     trace!(target: "sccache_heartbeat", "Performing heartbeat");
-                    match bincode_req(
+                    let advertised_cpus =
+                        load_aware_capacity.as_mut().map_or_else(num_cpus, |state| {
+                            state.advertised_cpus(
+                                heartbeat_running_jobs.load(atomic::Ordering::SeqCst),
+                            )
+                        });
+                    let heartbeat_req = HeartbeatServerHttpRequest {
+                        num_cpus: advertised_cpus,
+                        jwt_key: heartbeat_jwt_key.clone(),
+                        server_nonce: server_nonce.clone(),
+                        cert_digest: cert_digest.clone(),
+                        cert_pem: heartbeat_cert_pem.clone(),
+                    };
+                    let heartbeat_result = bincode_req(
                         client
                             .post(heartbeat_url.clone())
                             .bearer_auth(scheduler_auth.clone())
                             .bincode(&heartbeat_req)
                             .expect("failed to serialize heartbeat"),
-                    ) {
+                    );
+                    match heartbeat_result {
                         Ok(HeartbeatServerResult { is_new }) => {
                             trace!(target: "sccache_heartbeat", "Heartbeat success is_new={}", is_new);
                             // TODO: if is_new, terminate all running jobs
@@ -1009,6 +1201,7 @@ mod server {
                         let inputs_rdr = InputsReader(Box::new(ZlibReadDecoder::new(body)));
                         let outputs = outputs.into_iter().collect();
 
+                        let _running_job = RunningJobGuard::new(&running_jobs);
                         let res: RunJobResult = try_or_500_log!(req_id, handler.handle_run_job(&requester, job_id, command, outputs, inputs_rdr));
                         prepare_response(request, &res)
                     },

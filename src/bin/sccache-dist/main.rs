@@ -420,6 +420,10 @@ impl Default for Scheduler {
 }
 
 fn load_weight(job_count: usize, core_count: usize) -> f64 {
+    if core_count == 0 {
+        return MAX_PER_CORE_LOAD + 1.0;
+    }
+
     // Oversubscribe cores just a little to make up for network and I/O latency. This formula is
     // not based on hard data but an extrapolation to high core counts of the conventional wisdom
     // that slightly more jobs than cores achieve the shortest compile time. Which is originally
@@ -593,10 +597,6 @@ impl SchedulerIncoming for Scheduler {
         num_cpus: usize,
         job_authorizer: Box<dyn JobAuthorizer>,
     ) -> Result<HeartbeatServerResult> {
-        if num_cpus == 0 {
-            bail!("Invalid number of CPUs (0) specified in heartbeat")
-        }
-
         // LOCKS
         let mut jobs = self.jobs.lock().unwrap();
         let mut servers = self.servers.lock().unwrap();
@@ -607,6 +607,7 @@ impl SchedulerIncoming for Scheduler {
             Some(ref mut details) if details.server_nonce == server_nonce => {
                 let now = Instant::now();
                 details.last_seen = now;
+                details.num_cpus = num_cpus;
 
                 let mut stale_jobs = Vec::new();
                 for (&job_id, &last_seen) in details.jobs_unclaimed.iter() {
@@ -870,6 +871,11 @@ impl ServerIncoming for Server {
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
+
+    #[test]
+    fn zero_cpu_server_has_no_capacity() {
+        assert!(load_weight(0, 0) > MAX_PER_CORE_LOAD);
+    }
 
     struct TestJobAuthorizer;
 
