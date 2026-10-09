@@ -895,9 +895,14 @@ fn dist_toolchain_weak_key(
     base: &Digest,
     target: &str,
     target_std_manifest_digest: Option<&str>,
+    noncanonical_sysroot: Option<&Path>,
 ) -> String {
     let mut weak = base.clone();
     weak.update(b"rust-dist-toolchain-target-v1");
+    if let Some(sysroot) = noncanonical_sysroot {
+        weak.update(b"noncanonical-sysroot-v1");
+        weak.update(sysroot.as_os_str().as_encoded_bytes());
+    }
     weak.update(target.as_bytes());
     match target_std_manifest_digest {
         Some(digest) => {
@@ -2321,8 +2326,12 @@ where
         } else {
             None
         };
-        let weak_toolchain_key =
-            dist_toolchain_weak_key(&m, &target, target_std_manifest_digest.as_deref());
+        let weak_toolchain_key = dist_toolchain_weak_key(
+            &m,
+            &target,
+            target_std_manifest_digest.as_deref(),
+            canonical_paths.is_none().then_some(self.sysroot.as_path()),
+        );
         // 3. The full commandline (self.arguments)
         // TODO: there will be full paths here, it would be nice to
         // normalize them so we can get cross-machine cache hits.
@@ -5675,20 +5684,39 @@ version='2.0.0'
     }
 
     #[test]
-    fn dist_toolchain_weak_key_tracks_target_and_std_manifest() {
+    fn dist_toolchain_weak_key_tracks_target_std_manifest_and_physical_layout() {
         let mut base = Digest::new();
         base.update(b"same-rustc");
 
-        let host =
-            dist_toolchain_weak_key(&base, "x86_64-unknown-linux-gnu", Some("host-std-digest"));
-        let wasm = dist_toolchain_weak_key(&base, "wasm32-wasip2", Some("wasm-std-digest"));
-        let wasm_missing = dist_toolchain_weak_key(&base, "wasm32-wasip2", None);
+        let host = dist_toolchain_weak_key(
+            &base,
+            "x86_64-unknown-linux-gnu",
+            Some("host-std-digest"),
+            None,
+        );
+        let wasm = dist_toolchain_weak_key(&base, "wasm32-wasip2", Some("wasm-std-digest"), None);
+        let wasm_missing = dist_toolchain_weak_key(&base, "wasm32-wasip2", None, None);
         let wasm_repeated =
-            dist_toolchain_weak_key(&base, "wasm32-wasip2", Some("wasm-std-digest"));
+            dist_toolchain_weak_key(&base, "wasm32-wasip2", Some("wasm-std-digest"), None);
 
         assert_ne!(host, wasm);
         assert_ne!(wasm_missing, wasm);
         assert_eq!(wasm, wasm_repeated);
+
+        let root_toolchain = dist_toolchain_weak_key(
+            &base,
+            "x86_64-unknown-linux-gnu",
+            Some("host-std-digest"),
+            Some(Path::new("/root/.rustup/toolchains/1.99.0")),
+        );
+        let user_toolchain = dist_toolchain_weak_key(
+            &base,
+            "x86_64-unknown-linux-gnu",
+            Some("host-std-digest"),
+            Some(Path::new("/home/user/.rustup/toolchains/1.99.0")),
+        );
+        assert_ne!(root_toolchain, user_toolchain);
+        assert_ne!(root_toolchain, host);
     }
 
     #[test]
