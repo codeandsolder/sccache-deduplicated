@@ -163,15 +163,6 @@ pub trait Storage: Send + Sync {
         Ok(None)
     }
 
-    /// Check whether a cache entry exists without fetching its object bytes.
-    ///
-    /// Returns Ok(None) when the backend has no cheap existence probe. Multi-level
-    /// caches use this to repair slower levels from a faster-level hit without
-    /// turning the repair check into a full remote cache read.
-    async fn entry_exists(&self, _key: &str) -> Result<Option<bool>> {
-        Ok(None)
-    }
-
     /// Put raw serialized cache entry bytes under `key` (for multi-level backfill).
     /// Returns an error if the implementation doesn't support raw access.
     /// This is used by multi-level caches to backfill faster levels.
@@ -445,15 +436,6 @@ impl Storage for RemoteStorage {
     /// this returns the raw bytes without parsing. `CacheRead` is a one-way transformation —
     /// there is no way to extract the original bytes back from the parsed ZIP archive.
     /// For backfill we need the raw bytes to write directly to another cache level.
-    async fn entry_exists(&self, key: &str) -> Result<Option<bool>> {
-        trace!("opendal::Operator::entry_exists({key})");
-        match self.operator.stat(&normalize_key(key)).await {
-            Ok(_) => Ok(Some(true)),
-            Err(error) if error.kind() == opendal::ErrorKind::NotFound => Ok(Some(false)),
-            Err(error) => Err(anyhow!("Failed to stat cache entry {key}: {error:?}")),
-        }
-    }
-
     async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {
         trace!("opendal::Operator::get_raw({key})");
         match self.operator.read(&normalize_key(key)).await {
