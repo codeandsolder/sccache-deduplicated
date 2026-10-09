@@ -664,7 +664,6 @@ impl MultiLevelStorage {
             inc_stat!(self.atomic_stats.get(miss_idx), misses, 1);
         }
 
-        self.repair_slower_levels_from_hit(key, idx);
         self.backfill_faster_levels(key, idx, raw_bytes_for_backfill);
     }
 
@@ -721,101 +720,6 @@ impl MultiLevelStorage {
                 }
             });
         }
-    }
-
-    /// Ensure slower cache levels contain an entry already served by a faster level.
-    ///
-    /// This path is deliberately detached from the cache hit: the caller gets the
-    /// faster-level hit immediately. Slower levels are probed only when they expose
-    /// a cheap existence check, and the source object is read only if at least one
-    /// slower level is actually missing the key.
-    fn repair_slower_levels_from_hit(&self, key: &str, hit_idx: usize) {
-        if hit_idx + 1 >= self.levels.len() {
-            return;
-        }
-
-        let source = Arc::clone(&self.levels[hit_idx]);
-        let source_stats = Arc::clone(&self.atomic_stats[hit_idx]);
-        let targets = self
-            .levels
-            .iter()
-            .enumerate()
-            .skip(hit_idx + 1)
-            .map(|(idx, level)| (idx, Arc::clone(level), Arc::clone(&self.atomic_stats[idx])))
-            .collect::<Vec<_>>();
-        let key = key.to_owned();
-        let semaphore = Arc::clone(&self.slow_level_semaphore);
-        let background_tasks = Arc::clone(&self.background_tasks);
-
-        background_tasks.spawn(async move {
-            let Ok(_permit) = semaphore.acquire_owned().await else {
-                return;
-            };
-
-            let mut missing = Vec::new();
-            for (idx, level, stats) in targets {
-                match level.entry_exists(&key).await {
-                    Ok(Some(true)) => {
-                        trace!("Cache level {idx} already contains {key}, no repair needed");
-                    }
-                    Ok(Some(false)) => missing.push((idx, level, stats)),
-                    Ok(None) => {
-                        trace!(
-                            "Cache level {idx} has no cheap existence probe; skipping repair check"
-                        );
-                    }
-                    Err(error) => {
-                        debug!("Failed to probe cache level {idx} while repairing {key}: {error}");
-                    }
-                }
-            }
-
-            if missing.is_empty() {
-                return;
-            }
-
-            let raw = match source.get_raw(&key).await {
-                Ok(Some(raw)) => raw,
-                Ok(None) => {
-                    debug!(
-                        "Faster cache level {hit_idx} could not provide raw bytes for repair of {key}"
-                    );
-                    return;
-                }
-                Err(error) => {
-                    debug!(
-                        "Failed reading raw bytes from cache level {hit_idx} for repair of {key}: {error}"
-                    );
-                    return;
-                }
-            };
-
-            for (idx, level, stats) in missing {
-                let start = Instant::now();
-                match Self::write_entry_from_bytes(&level, &key, &raw).await {
-                    Ok(()) => {
-                        let duration = start.elapsed();
-                        inc_stat!(Some(source_stats.as_ref()), backfills_from, 1);
-                        inc_stat!(Some(stats.as_ref()), backfills_to, 1);
-                        inc_stat!(Some(stats.as_ref()), writes, 1);
-                        inc_stat!(
-                            Some(stats.as_ref()),
-                            write_duration_nanos,
-                            duration_nanos_u64(duration)
-                        );
-                        trace!(
-                            "Repaired slower cache level {idx} from faster level {hit_idx} in {duration:?}"
-                        );
-                    }
-                    Err(error) => {
-                        inc_stat!(Some(stats.as_ref()), write_failures, 1);
-                        debug!(
-                            "Failed repairing cache level {idx} from level {hit_idx} for {key}: {error}"
-                        );
-                    }
-                }
-            }
-        });
     }
 
     /// Helper to write cache entry from raw bytes.
@@ -1085,13 +989,21 @@ impl Storage for MultiLevelStorage {
                     result = CacheMode::ReadWrite;
                     trace!("Cache level {idx} is read-write");
                 }
-                Err(error) if idx == 0 => {
-                    warn!("Error checking required cache level 0: {error}");
+                Err(error)
+                    if self.write_error_policy == WriteErrorPolicy::All
+                        || (idx == 0 && self.write_error_policy == WriteErrorPolicy::L0) =>
+                {
+                    warn!("Error checking required cache level {idx}: {error}");
                     return Err(error);
                 }
                 Err(error) => {
+                    // A tolerated check failure must not make the composite
+                    // permanently read-only. The level may recover and be
+                    // writable later; actual write failures are handled by
+                    // write_error_policy.
+                    result = CacheMode::ReadWrite;
                     warn!(
-                        "Cache level {idx} is unavailable during startup check: {error}; continuing with faster levels"
+                        "Cache level {idx} is unavailable during startup check: {error}; continuing and treating it as potentially writable"
                     );
                 }
             }
