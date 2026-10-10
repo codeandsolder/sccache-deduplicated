@@ -371,14 +371,10 @@ where
         }
 
         match arg.get_data() {
-            Some(TooHardFlag) | Some(TooHard(_)) => {
-                cannot_cache!(
-                    "unsupported compiler option",
-                    arg.flag_str()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| format!("{arg:?}"))
-                )
-            }
+            Some(TooHardFlag) | Some(TooHard(_)) => match arg.flag_str() {
+                Some(flag) => cannot_cache!(flag),
+                None => cannot_cache!("unsupported compiler option", format!("{arg:?}")),
+            },
             Some(ModuleOnlyFlag) => module_only_flag = true,
             Some(PedanticFlag) => pedantic_flag = true,
             // standard values vary, but extension values all start with "gnu"
@@ -560,14 +556,10 @@ where
             | Some(XClang(_))
             | Some(DepTarget(_))
             | Some(SerializeDiagnostics(_)) => continue,
-            Some(TooHardFlag) | Some(TooHard(_)) => {
-                cannot_cache!(
-                    "unsupported compiler option",
-                    arg.flag_str()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| format!("{arg:?}"))
-                )
-            }
+            Some(TooHardFlag) | Some(TooHard(_)) => match arg.flag_str() {
+                Some(flag) => cannot_cache!(flag),
+                None => cannot_cache!("unsupported compiler option", format!("{arg:?}")),
+            },
             None => match arg {
                 Argument::Raw(_) => continue,
                 Argument::UnknownFlag(_) => &mut common_args,

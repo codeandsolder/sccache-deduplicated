@@ -653,14 +653,10 @@ pub fn parse_arguments(
         let arg = try_or_cannot_cache!(arg, "argument parse");
         match arg.get_data() {
             Some(PassThrough) | Some(PassThroughWithPath(_)) | Some(PassThroughWithSuffix(_)) => {}
-            Some(TooHardFlag) | Some(TooHard(_)) | Some(TooHardPath(_)) => {
-                cannot_cache!(
-                    "unsupported compiler option",
-                    arg.flag_str()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| format!("{arg:?}"))
-                )
-            }
+            Some(TooHardFlag) | Some(TooHard(_)) | Some(TooHardPath(_)) => match arg.flag_str() {
+                Some(flag) => cannot_cache!(flag),
+                None => cannot_cache!("unsupported compiler option", format!("{arg:?}")),
+            },
             Some(DoCompilation) => {
                 let Some(flag) = arg.flag_str() else {
                     cannot_cache!("compilation flag was not representable", format!("{arg:?}"));
