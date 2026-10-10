@@ -42,7 +42,7 @@ pub(crate) mod utils;
 pub mod webdav;
 
 #[cfg(any_http_remote)]
-pub(crate) mod http_client;
+mod http_client;
 
 pub use crate::cache::cache::*;
 pub use crate::cache::cache_io::*;

@@ -10,14 +10,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use opendal::OperationContext;
 use opendal::Operator;
 use opendal::services::Oss;
 use opendal_layer_logging::LoggingLayer;
 
 use crate::errors::*;
 
-use super::http_client::set_user_agent;
+use super::http_client::build_http_context;
 
 pub struct OSSCache;
 
@@ -42,7 +41,7 @@ impl OSSCache {
         }
 
         let op = Operator::new(builder)?
-            .with_context(OperationContext::new().with_http_transport(set_user_agent()))
+            .with_context(build_http_context()?)
             .layer(LoggingLayer::default());
         Ok(op)
     }

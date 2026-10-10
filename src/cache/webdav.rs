@@ -11,12 +11,11 @@
 // limitations under the License.
 
 use crate::errors::*;
-use opendal::OperationContext;
 use opendal::Operator;
 use opendal::services::Webdav;
 use opendal_layer_logging::LoggingLayer;
 
-use super::http_client::set_user_agent;
+use super::http_client::build_http_context;
 
 /// A cache that stores entries in a Webdav.
 pub struct WebdavCache;
@@ -40,7 +39,7 @@ impl WebdavCache {
             .disable_create_dir(disable_create_dir);
 
         let op = Operator::new(builder)?
-            .with_context(OperationContext::new().with_http_transport(set_user_agent()))
+            .with_context(build_http_context()?)
             .layer(LoggingLayer::default());
         Ok(op)
     }

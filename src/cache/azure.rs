@@ -15,13 +15,12 @@
 
 use opendal::Operator;
 
-use opendal::OperationContext;
 use opendal::services::Azblob;
 use opendal_layer_logging::LoggingLayer;
 
 use crate::errors::*;
 
-use super::http_client::set_user_agent;
+use super::http_client::build_http_context;
 
 pub struct AzureBlobCache;
 
@@ -91,7 +90,7 @@ impl AzureBlobCache {
         };
 
         let op = Operator::new(builder)?
-            .with_context(OperationContext::new().with_http_transport(set_user_agent()))
+            .with_context(build_http_context()?)
             .layer(LoggingLayer::default());
         Ok(op)
     }

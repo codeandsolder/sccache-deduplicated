@@ -1,11 +1,20 @@
-use opendal::HttpTransporter;
+use opendal::{HttpTransporter, OperationContext};
 use opendal_http_transport_reqwest::ReqwestTransport;
 use reqwest::ClientBuilder;
 
-/// Build an HTTP transport with a custom user agent (helps with monitoring on
-/// the server side).
-pub fn set_user_agent() -> HttpTransporter {
-    let user_agent = format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-    let client = ClientBuilder::new().user_agent(user_agent).build().unwrap();
-    HttpTransporter::new(ReqwestTransport::new(client))
+use crate::errors::*;
+
+/// Build the OpenDAL context shared by HTTP-backed cache services.
+///
+/// # Errors
+///
+/// Returns an error if reqwest cannot construct the cache HTTP client.
+pub(super) fn build_http_context() -> Result<OperationContext> {
+    let user_agent = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+    let client = ClientBuilder::new()
+        .user_agent(user_agent)
+        .build()
+        .context("failed to build cache HTTP client")?;
+    let transport = HttpTransporter::new(ReqwestTransport::new(client));
+    Ok(OperationContext::new().with_http_transport(transport))
 }
