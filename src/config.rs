@@ -1340,6 +1340,11 @@ impl Config {
             .unwrap_or_default();
 
         let mut config = Self::from_env_and_file_configs(env_conf, file_conf)?;
+        if let Some(cache_dir) =
+            env::var_os("SCCACHE_DIST_CLIENT_CACHE_DIR").filter(|value| !value.is_empty())
+        {
+            config.dist.cache_dir = cache_dir.into();
+        }
         config.skip_cache_check = skip_cache_check;
         Ok(config)
     }
@@ -3128,6 +3133,29 @@ size = "7g"
             client_side_mode: false,
         }
     );
+}
+
+#[test]
+#[serial(config_from_env)]
+fn test_dist_client_cache_dir_env_overrides_file_config() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let config_path = temp.path().join("config");
+    let env_cache_dir = temp.path().join("root-dist-cache");
+    std::fs::write(&config_path, "[dist]\ncache_dir = \"/file-cache\"\n")?;
+
+    unsafe {
+        env::set_var("SCCACHE_CONF", &config_path);
+        env::set_var("SCCACHE_DIST_CLIENT_CACHE_DIR", &env_cache_dir);
+    }
+    let config = Config::load();
+    unsafe {
+        env::remove_var("SCCACHE_DIST_CLIENT_CACHE_DIR");
+        env::remove_var("SCCACHE_CONF");
+    }
+
+    let config = config?;
+    assert_eq!(config.dist.cache_dir, env_cache_dir);
+    Ok(())
 }
 
 // Integration tests: Config normalization + strip_basedirs usage
