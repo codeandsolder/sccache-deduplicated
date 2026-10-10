@@ -384,11 +384,16 @@ fn connect_or_start_server(
     trace!("connect_or_start_server({addr})");
     match connect_to_server(addr) {
         Ok(server) => Ok(server),
-        Err(ref e)
+        Err(e)
             if (e.kind() == io::ErrorKind::ConnectionRefused
                 || e.kind() == io::ErrorKind::TimedOut)
                 || (e.kind() == io::ErrorKind::NotFound && addr.is_unix_path()) =>
         {
+            if env::var("SCCACHE_NO_AUTO_START_SERVER").as_deref() == Ok("1") {
+                return Err(e)
+                    .context("sccache server is unavailable and SCCACHE_NO_AUTO_START_SERVER=1");
+            }
+
             // If the connection was refused we probably need to start
             // the server.
             match run_server_process(startup_timeout)? {
