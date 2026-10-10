@@ -136,23 +136,42 @@ fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup
 }
 
 #[cfg(not(windows))]
-fn redirect_stderr(f: File) {
-    use libc::dup2;
-    use std::os::unix::io::IntoRawFd;
-    // Ignore errors here.
-    unsafe {
-        dup2(f.into_raw_fd(), 2);
+fn redirect_stderr(f: File) -> io::Result<()> {
+    use libc::{STDERR_FILENO, dup2};
+    use std::os::fd::{AsRawFd, IntoRawFd};
+
+    let raw_fd = f.as_raw_fd();
+    // SAFETY: `f` owns a valid descriptor for the duration of the call, and
+    // `STDERR_FILENO` is the conventional process stderr target for `dup2`.
+    if unsafe { dup2(raw_fd, STDERR_FILENO) } == -1 {
+        return Err(io::Error::last_os_error());
     }
+    if raw_fd == STDERR_FILENO {
+        // `dup2(fd, fd)` is a no-op. Relinquish Rust ownership so dropping
+        // `f` does not close the stderr descriptor we just installed.
+        let _ = f.into_raw_fd();
+    } else {
+        // `dup2` duplicated the descriptor; close our original descriptor.
+        drop(f);
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
-fn redirect_stderr(f: File) {
-    use std::os::windows::io::IntoRawHandle;
+fn redirect_stderr(f: File) -> io::Result<()> {
+    use std::os::windows::io::{AsRawHandle, IntoRawHandle};
     use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
-    // Ignore errors here.
-    unsafe {
-        SetStdHandle(STD_ERROR_HANDLE, f.into_raw_handle() as _);
+
+    // SAFETY: `f` owns a valid OS handle while SetStdHandle reads it. The
+    // handle is kept alive for the process lifetime on success below.
+    if unsafe { SetStdHandle(STD_ERROR_HANDLE, f.as_raw_handle() as _) } == 0 {
+        return Err(io::Error::last_os_error());
     }
+
+    // SetStdHandle stores the handle value rather than duplicating it. Relinquish
+    // Rust ownership so the handle stays open for the remainder of the process.
+    let _ = f.into_raw_handle();
+    Ok(())
 }
 
 /// Create the log file and return an error if cannot be created
@@ -176,9 +195,8 @@ fn create_error_log() -> Result<File> {
 
 /// If `SCCACHE_ERROR_LOG` is set, redirect stderr to it.
 fn redirect_error_log(f: File) -> Result<()> {
-    debug!("redirecting stderr into {:?}", f);
-    redirect_stderr(f);
-    Ok(())
+    debug!("redirecting stderr into {f:?}");
+    redirect_stderr(f).context("failed to redirect stderr")
 }
 
 /// Re-execute the current executable as a background server.
