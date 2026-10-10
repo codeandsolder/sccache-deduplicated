@@ -1002,9 +1002,7 @@ impl Storage for MultiLevelStorage {
                     // writable later; actual write failures are handled by
                     // write_error_policy.
                     result = CacheMode::ReadWrite;
-                    warn!(
-                        "Cache level {idx} is unavailable during startup check: {error}; continuing and treating it as potentially writable"
-                    );
+                    warn!("Cache level {idx} is unavailable: {error}; continuing");
                 }
             }
         }

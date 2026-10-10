@@ -399,10 +399,6 @@ pub struct Scheduler {
     servers: Mutex<HashMap<ServerId, ServerDetails>>,
 }
 
-fn remove_assigned_job(jobs_assigned: &mut HashSet<JobId>, job_id: JobId) -> bool {
-    jobs_assigned.remove(&job_id)
-}
-
 struct ServerDetails {
     jobs_assigned: HashSet<JobId>,
     // Jobs assigned that haven't seen a state change. Can only be pending
@@ -633,6 +629,19 @@ impl SchedulerIncoming for Scheduler {
         {
             // LOCKS
             let mut jobs = self.jobs.lock().unwrap();
+            let servers = self.servers.lock().unwrap();
+
+            if !servers
+                .get(&server_id)
+                .is_some_and(|details| details.jobs_assigned.contains(&job_id))
+            {
+                let msg = format!(
+                    "Job {} assignment was cleaned up before allocation completed",
+                    job_id
+                );
+                warn!("{}", msg);
+                return Ok(AllocJobResult::Fail { msg });
+            }
 
             info!(
                 "Job {} successfully assigned and saved with state {:?}",
@@ -799,13 +808,7 @@ impl SchedulerIncoming for Scheduler {
                 (JobState::Started, JobState::Complete) => {
                     let (job_id, _) = entry.remove_entry();
                     if let Some(entry) = server_details {
-                        if !remove_assigned_job(&mut entry.jobs_assigned, job_id) {
-                            warn!(
-                                "Completed job {} was already absent from server {} assignment set",
-                                job_id,
-                                server_id.addr()
-                            );
-                        }
+                        assert!(entry.jobs_assigned.remove(&job_id))
                     } else {
                         bail!("Job was marked as finished, but server is not known to scheduler")
                     }
@@ -1027,7 +1030,7 @@ mod scheduler_tests {
     }
 
     #[test]
-    fn completion_after_assignment_cleanup_is_tolerated() {
+    fn allocation_fails_if_assignment_is_cleaned_up() {
         let scheduler = Scheduler::new();
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
         let server_nonce = ServerNonce::new();
@@ -1054,29 +1057,13 @@ mod scheduler_tests {
                 },
             )
             .unwrap();
-        let job_id = match allocation {
-            AllocJobResult::Success { job_alloc, .. } => job_alloc.job_id,
-            AllocJobResult::Fail { msg } => panic!("unexpected allocation failure: {msg}"),
-        };
 
-        assert!(scheduler.jobs.lock().unwrap().contains_key(&job_id));
-        assert!(
-            !scheduler
-                .servers
-                .lock()
-                .unwrap()
-                .get(&server_id)
-                .unwrap()
-                .jobs_assigned
-                .contains(&job_id)
-        );
+        assert!(matches!(allocation, AllocJobResult::Fail { .. }));
+        assert!(scheduler.jobs.lock().unwrap().is_empty());
 
-        for state in [JobState::Ready, JobState::Started, JobState::Complete] {
-            assert!(matches!(
-                scheduler.handle_update_job_state(job_id, server_id, state),
-                Ok(UpdateJobStateResult::Success)
-            ));
-        }
-        assert!(!scheduler.jobs.lock().unwrap().contains_key(&job_id));
+        let servers = scheduler.servers.lock().unwrap();
+        let details = servers.get(&server_id).unwrap();
+        assert!(details.jobs_assigned.is_empty());
+        assert!(details.jobs_unclaimed.is_empty());
     }
 }
