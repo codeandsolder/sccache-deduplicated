@@ -1540,6 +1540,40 @@ mod test {
         assert!(!msvc_show_includes);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_arguments_split_dwarf_non_utf8_output() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let output = OsString::from_vec(b"foo-\xff.o".to_vec());
+        let args = vec![
+            OsString::from("-gsplit-dwarf"),
+            OsString::from("-c"),
+            OsString::from("foo.cpp"),
+            OsString::from("-o"),
+            output.clone(),
+        ];
+        let parsed = parse_arguments(&args, ".".as_ref(), &ARGS[..], false, CCompilerKind::Gcc);
+        let CompilerArguments::Ok(parsed) = parsed else {
+            panic!("expected non-UTF-8 output path to remain cacheable");
+        };
+
+        assert_eq!(
+            parsed.outputs["obj"].path.as_os_str().as_bytes(),
+            output.as_os_str().as_bytes()
+        );
+        assert_eq!(
+            parsed.outputs["dwo"].path.as_os_str().as_bytes(),
+            b"foo-\xff.dwo"
+        );
+        assert!(
+            parsed
+                .common_args
+                .iter()
+                .any(|arg| { arg.as_os_str().as_bytes() == b"-D_gsplit_dwarf_path=foo-\xff.dwo" })
+        );
+    }
+
     #[test]
     fn test_parse_arguments_linker_options() {
         let args = stringvec![
