@@ -948,7 +948,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             let args: Vec<_> = env::args_os().collect();
             let env: Vec<_> = env::vars_os().collect();
             let out_file = File::create(out)?;
-            let cwd = env::current_dir().expect("A current working dir should exist");
+            let cwd = env::current_dir().context("failed to determine current directory")?;
 
             let pool = runtime.handle().clone();
             runtime.block_on(async move {
