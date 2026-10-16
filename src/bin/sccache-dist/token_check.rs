@@ -108,9 +108,11 @@ impl ProxyTokenCheck {
 
     fn check_token_with_forwarding(&self, token: &str) -> Result<()> {
         trace!("Validating token by forwarding to {}", self.url);
-        // If the token is cached and not cache has not expired, return it
-        if let Some(ref auth_cache) = self.maybe_auth_cache {
-            let mut auth_cache = auth_cache.lock().unwrap();
+        // If the token is cached and the cache entry has not expired, return it.
+        if let Some(auth_cache) = &self.maybe_auth_cache {
+            let mut auth_cache = auth_cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("proxy token auth cache mutex poisoned"))?;
             let (ref mut auth_cache, cache_duration) = *auth_cache;
             if let Some(cached_at) = auth_cache.get(token) {
                 if cached_at.elapsed() < cache_duration {
@@ -129,9 +131,11 @@ impl ProxyTokenCheck {
         if !res.status().is_success() {
             bail!("Token forwarded to {} returned {}", self.url, res.status());
         }
-        // Cache the token
-        if let Some(ref auth_cache) = self.maybe_auth_cache {
-            let mut auth_cache = auth_cache.lock().unwrap();
+        // Cache the token.
+        if let Some(auth_cache) = &self.maybe_auth_cache {
+            let mut auth_cache = auth_cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("proxy token auth cache mutex poisoned"))?;
             let (ref mut auth_cache, _) = *auth_cache;
             auth_cache.insert(token.to_owned(), Instant::now());
         }
@@ -198,6 +202,31 @@ impl ValidJWTCheck {
         // Decode the JWT, discarding any claims - we just care about validity
         let _tokendata = jwt::decode::<Claims>(token, &pkcs1, &validation)
             .context("Unable to validate and decode jwt")?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_proxy_token_cache_returns_client_error() -> Result<()> {
+        let checker = ProxyTokenCheck::new("http://127.0.0.1:9".to_owned(), Some(60));
+        let cache = checker
+            .maybe_auth_cache
+            .as_ref()
+            .context("proxy token cache should be enabled for this test")?;
+
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Ok(_guard) = cache.lock() else {
+                return;
+            };
+            std::panic::resume_unwind(Box::new("poison proxy token auth cache"));
+        }));
+        assert!(poison.is_err());
+
+        assert!(checker.check("token").is_err());
         Ok(())
     }
 }
