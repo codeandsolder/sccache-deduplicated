@@ -62,9 +62,14 @@ impl IpcStorage {
 
     async fn rpc(&self, req: Request) -> Result<Response> {
         let conn = Arc::clone(&self.conn);
-        tokio::task::spawn_blocking(move || conn.lock().unwrap().request(req))
-            .await
-            .context("spawn_blocking panicked")?
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn
+                .lock()
+                .map_err(|_| anyhow!("IPC storage connection lock is poisoned"))?;
+            conn.request(req)
+        })
+        .await
+        .context("IPC storage RPC task failed")?
     }
 }
 
@@ -209,5 +214,52 @@ impl Storage for IpcStorage {
                 bail!("IpcStorage::put_preprocessor_cache_entry: unexpected response: {other:?}")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn poisoned_connection_lock_is_reported_as_rpc_error() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let stream = TcpStream::connect(listener.local_addr()?)?;
+        let (_peer, _) = listener.accept()?;
+        let conn = ServerConnection::new(Box::new(stream))?;
+        let storage = IpcStorage {
+            conn: Arc::new(Mutex::new(conn)),
+            handshake: StorageHandshakeInfo {
+                location: String::new(),
+                cache_type_name: "ipc".to_owned(),
+                basedirs: Vec::new(),
+                preprocessor_cache_mode_config: PreprocessorCacheModeConfig::default(),
+                cache_mode: CacheMode::ReadWrite,
+                max_size: None,
+            },
+        };
+
+        let conn = storage.conn();
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Ok(_guard) = conn.lock() else {
+                return;
+            };
+            std::panic::resume_unwind(Box::new("poison IPC storage connection"));
+        }));
+        assert!(poison.is_err());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let Err(error) = runtime.block_on(storage.rpc(Request::GetStats)) else {
+            bail!("poisoned IPC storage connection unexpectedly accepted an RPC");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("IPC storage connection lock is poisoned")
+        );
+        Ok(())
     }
 }
