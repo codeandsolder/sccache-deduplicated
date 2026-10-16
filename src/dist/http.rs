@@ -681,7 +681,10 @@ mod server {
                 check_server_auth,
             } = self;
             let requester = SchedulerRequester {
-                client: Mutex::new(new_reqwest_blocking_client()),
+                client: Mutex::new(
+                    new_reqwest_blocking_client()
+                        .context("failed to build scheduler HTTP client")?,
+                ),
             };
 
             macro_rules! check_server_auth_or_err {
@@ -936,38 +939,41 @@ mod server {
             let job_authorizer = JWTJobAuthorizer::new(jwt_key);
             let heartbeat_url = urls::scheduler_heartbeat_server(&scheduler_url);
             let requester = ServerRequester {
-                client: new_reqwest_blocking_client(),
+                client: new_reqwest_blocking_client()
+                    .context("failed to build scheduler requester HTTP client")?,
                 scheduler_url,
                 scheduler_auth: scheduler_auth.clone(),
             };
 
-            // TODO: detect if this panics
-            thread::spawn(move || {
-                let client = new_reqwest_blocking_client();
-                loop {
-                    trace!(target: "sccache_heartbeat", "Performing heartbeat");
-                    match bincode_req(
-                        client
+            let heartbeat_client =
+                new_reqwest_blocking_client().context("failed to build heartbeat HTTP client")?;
+            thread::Builder::new()
+                .spawn(move || {
+                    let client = heartbeat_client;
+                    loop {
+                        trace!(target: "sccache_heartbeat", "Performing heartbeat");
+                        let heartbeat = client
                             .post(heartbeat_url.clone())
                             .bearer_auth(scheduler_auth.clone())
                             .bincode(&heartbeat_req)
-                            .expect("failed to serialize heartbeat"),
-                    ) {
-                        Ok(HeartbeatServerResult { is_new }) => {
-                            trace!(target: "sccache_heartbeat", "Heartbeat success is_new={}", is_new);
-                            // TODO: if is_new, terminate all running jobs
-                            if is_new {
-                                info!("Server connected to scheduler");
+                            .and_then(bincode_req);
+                        match heartbeat {
+                            Ok(HeartbeatServerResult { is_new }) => {
+                                trace!(target: "sccache_heartbeat", "Heartbeat success is_new={}", is_new);
+                                // TODO: if is_new, terminate all running jobs
+                                if is_new {
+                                    info!("Server connected to scheduler");
+                                }
+                                thread::sleep(HEARTBEAT_INTERVAL)
                             }
-                            thread::sleep(HEARTBEAT_INTERVAL)
-                        }
-                        Err(e) => {
-                            error!(target: "sccache_heartbeat", "Failed to send heartbeat to server: {}", e);
-                            thread::sleep(HEARTBEAT_ERROR_INTERVAL)
+                            Err(e) => {
+                                error!(target: "sccache_heartbeat", "Failed to send heartbeat to server: {}", e);
+                                thread::sleep(HEARTBEAT_ERROR_INTERVAL)
+                            }
                         }
                     }
-                }
-            });
+                })
+                .context("failed to start heartbeat thread")?;
 
             info!("Server listening for clients on {}", bind_address);
             let request_count = atomic::AtomicUsize::new(0);

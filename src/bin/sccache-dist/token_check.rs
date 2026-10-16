@@ -96,14 +96,15 @@ impl ClientAuthCheck for ProxyTokenCheck {
 }
 
 impl ProxyTokenCheck {
-    pub fn new(url: String, cache_secs: Option<u64>) -> Self {
+    pub(super) fn new(url: String, cache_secs: Option<u64>) -> Result<Self> {
         let maybe_auth_cache: Option<Mutex<(HashMap<String, Instant>, Duration)>> =
             cache_secs.map(|secs| Mutex::new((HashMap::new(), Duration::from_secs(secs))));
-        Self {
-            client: new_reqwest_blocking_client(),
+        Ok(Self {
+            client: new_reqwest_blocking_client()
+                .context("failed to build proxy-token validation HTTP client")?,
             maybe_auth_cache,
             url,
-        }
+        })
     }
 
     fn check_token_with_forwarding(&self, token: &str) -> Result<()> {

@@ -1075,18 +1075,19 @@ pub fn daemonize(_preserve_fds: &[std::os::windows::io::RawHandle]) -> Result<()
     Ok(())
 }
 
-/// Disable connection pool to avoid broken connection between runtime
+// The sccache-dist binary is a separate crate in this package, so this helper must be public
+// even though the util module is hidden from normal generated documentation.
+/// Build the blocking HTTP client used by distributed sccache components,
+/// with connection pooling disabled to avoid reusing connections across runtimes.
 ///
-/// # TODO
+/// The longer-term fix is to use one Tokio runtime and keep reqwest alive inside it.
+/// See <https://github.com/mozilla/sccache/pull/1563> for background.
 ///
-/// We should refactor sccache current model to make sure that we only have
-/// one tokio runtime and keep reqwest alive inside it.
+/// # Errors
 ///
-/// ---
-///
-/// More details could be found at https://github.com/mozilla/sccache/pull/1563
+/// Returns an error if reqwest cannot construct the client.
 #[cfg(any_dist)]
-pub fn new_reqwest_blocking_client() -> reqwest::blocking::Client {
+pub fn new_reqwest_blocking_client() -> reqwest::Result<reqwest::blocking::Client> {
     let mut builder = reqwest::blocking::Client::builder();
 
     // Query the native store; fallback if it's completely empty
@@ -1094,10 +1095,7 @@ pub fn new_reqwest_blocking_client() -> reqwest::blocking::Client {
         builder = builder.tls_certs_only(Vec::new());
     }
 
-    builder
-        .pool_max_idle_per_host(0)
-        .build()
-        .expect("http client must build with success")
+    builder.pool_max_idle_per_host(0).build()
 }
 
 fn unhex(b: u8) -> std::io::Result<u8> {
