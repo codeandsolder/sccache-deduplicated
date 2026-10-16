@@ -499,6 +499,12 @@ impl OutputData {
             compressed: self.0.len() as u64,
         }
     }
+    #[cfg(all(test, feature = "dist-client"))]
+    pub(crate) fn with_misreported_size(mut self) -> Self {
+        self.1 += 1;
+        self
+    }
+
     #[cfg(feature = "dist-client")]
     pub fn into_reader(self) -> impl Read {
         use flate2::read::ZlibDecoder as ZlibReadDecoder;

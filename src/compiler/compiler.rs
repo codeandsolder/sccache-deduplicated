@@ -1050,7 +1050,14 @@ where
                     .with_context(|| format!("Failed to write output to {}", local_path.display()))
             );
 
-            assert!(count == len);
+            try_or_cleanup!(if count == len {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "distributed output length mismatch for {}: worker reported {len} bytes, decoded {count}",
+                    local_path.display()
+                ))
+            });
         }
         let extra_inputs = match tc_archive {
             Some(p) => vec![p],
@@ -3127,11 +3134,11 @@ LLVM version: 6.0",
         const COMPILER_STDERR: &[u8] = b"compiler stderr";
         let obj = f.tempdir.path().join("foo.o");
         // Dist client will do the compilation
-        let dist_client = test_dist::OneshotClient::new(
+        let dist_client = Arc::new(test_dist::OneshotClient::new(
             0,
             COMPILER_STDOUT.to_owned(),
             COMPILER_STDERR.to_owned(),
-        );
+        ));
         let service = server::SccacheService::mock_with_dist_client(
             dist_client.clone(),
             storage.clone(),
@@ -3620,6 +3627,7 @@ LLVM version: 6.0",
             test_dist::ErrorAllocJobClient::new(),
             test_dist::ErrorSubmitToolchainClient::new(),
             test_dist::ErrorRunJobClient::new(),
+            Arc::new(test_dist::OneshotClient::output_size_mismatch()),
         ];
         // Write a dummy input file so the preprocessor cache mode can work
         std::fs::write(f.tempdir.path().join("foo.c"), "whatever").unwrap();
@@ -3991,22 +3999,30 @@ mod test_dist {
         }
     }
 
-    pub struct OneshotClient {
+    pub(super) struct OneshotClient {
         has_started: AtomicBool,
         tc: Toolchain,
         output: ProcessOutput,
+        misreport_output_size: bool,
     }
 
     impl OneshotClient {
-        #[allow(clippy::new_ret_no_self)]
-        pub fn new(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Arc<dyn dist::Client> {
-            Arc::new(Self {
+        pub(super) fn new(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
+            Self {
                 has_started: AtomicBool::default(),
                 tc: Toolchain {
                     archive_id: "somearchiveid".to_owned(),
                 },
                 output: ProcessOutput::fake_output(code, stdout, stderr),
-            })
+                misreport_output_size: false,
+            }
+        }
+
+        pub(super) fn output_size_mismatch() -> Self {
+            Self {
+                misreport_output_size: true,
+                ..Self::new(0, Vec::new(), Vec::new())
+            }
         }
     }
 
@@ -4059,6 +4075,11 @@ mod test_dist {
                 .map(|name| {
                     let data = format!("some data in {}", name);
                     let data = OutputData::try_from_reader(data.as_bytes()).unwrap();
+                    let data = if self.misreport_output_size {
+                        data.with_misreported_size()
+                    } else {
+                        data
+                    };
                     (name, data)
                 })
                 .collect();
