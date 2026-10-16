@@ -688,16 +688,23 @@ where
         None => cannot_cache!("unknown source language"),
     };
     let mut outputs = HashMap::new();
-    let output = match output_arg {
-        // We can't cache compilation that doesn't go to a file
-        None => PathBuf::from(Path::new(&input).with_extension("o").file_name().unwrap()),
-        Some(o) => o,
+    let output = if let Some(output) = output_arg {
+        output
+    } else {
+        let default_output = Path::new(&input).with_extension("o");
+        let Some(file_name) = default_output.file_name() else {
+            cannot_cache!(
+                "input path has no file name",
+                input.to_string_lossy().into_owned()
+            );
+        };
+        PathBuf::from(file_name)
     };
     if split_dwarf {
         let dwo = output.with_extension("dwo");
-        common_args.push(OsString::from(
-            "-D_gsplit_dwarf_path=".to_owned() + dwo.to_str().unwrap(),
-        ));
+        let mut split_dwarf_path = OsString::from("-D_gsplit_dwarf_path=");
+        split_dwarf_path.push(&dwo);
+        common_args.push(split_dwarf_path);
         // -gsplit-dwarf doesn't guarantee .dwo file if no -g is specified
         outputs.insert(
             "dwo",
@@ -1511,6 +1518,52 @@ mod test {
                 && common_args.contains(&"-D_gsplit_dwarf_path=foo.dwo".into())
         );
         assert!(!msvc_show_includes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_arguments_split_dwarf_non_utf8_output() -> Result<()> {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let output = OsString::from_vec(b"foo-\xff.o".to_vec());
+        let args = vec![
+            OsString::from("-gsplit-dwarf"),
+            OsString::from("-c"),
+            OsString::from("foo.cpp"),
+            OsString::from("-o"),
+            output.clone(),
+        ];
+        let parsed = parse_arguments(&args, ".".as_ref(), &ARGS[..], false, CCompilerKind::Gcc);
+        let CompilerArguments::Ok(parsed) = parsed else {
+            bail!("non-UTF-8 output path should remain cacheable");
+        };
+        let obj = parsed.outputs.get("obj").context("missing object output")?;
+        let dwo = parsed
+            .outputs
+            .get("dwo")
+            .context("missing split-DWARF output")?;
+
+        assert_eq!(
+            obj.path.as_os_str().as_bytes(),
+            output.as_os_str().as_bytes()
+        );
+        assert_eq!(dwo.path.as_os_str().as_bytes(), b"foo-\xff.dwo");
+        assert!(
+            parsed
+                .common_args
+                .iter()
+                .any(|arg| arg.as_os_str().as_bytes() == b"-D_gsplit_dwarf_path=foo-\xff.dwo")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_arguments_input_without_file_name_is_not_cacheable() {
+        let args = stringvec!["-x", "c", "-c", "/"];
+        assert_eq!(
+            parse_arguments_(args, false),
+            CompilerArguments::CannotCache("input path has no file name", Some("/".to_owned()))
+        );
     }
 
     #[test]
