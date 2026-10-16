@@ -634,8 +634,8 @@ mod test {
     }
 
     #[test]
-    #[should_panic]
-    fn test_unexpected_new_command() {
+    #[should_panic(expected = "Too many calls to MockCommandCreator::new_command")]
+    fn unexpected_new_command_panics() {
         // If next_command_spawns hasn't been called enough times,
         // new_command should panic.
         let client = Client::new_num(1);

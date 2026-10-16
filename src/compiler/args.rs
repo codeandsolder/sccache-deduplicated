@@ -412,11 +412,11 @@ impl<T: ArgumentValue> ArgInfo<T> {
     {
         Ok(match self {
             ArgInfo::Flag(s, variant) => {
-                debug_assert_eq!(s, arg);
+                debug_assert_eq!(s, arg, "argument descriptor does not match input");
                 Argument::Flag(s, variant)
             }
             ArgInfo::TakeArg(s, create, ArgDisposition::Separated) => {
-                debug_assert_eq!(s, arg);
+                debug_assert_eq!(s, arg, "argument descriptor does not match input");
                 if let Some(a) = get_next_arg() {
                     Argument::WithValue(s, create(a)?, ArgDisposition::Separated)
                 } else {
@@ -425,7 +425,7 @@ impl<T: ArgumentValue> ArgInfo<T> {
             }
             ArgInfo::TakeArg(s, create, ArgDisposition::Concatenated(d)) => {
                 let mut len = s.len();
-                debug_assert_eq!(&arg[..len], s);
+                debug_assert_eq!(&arg[..len], s, "argument descriptor does not match input");
                 if let Some(d) = d
                     && arg.as_bytes().get(len) == Some(&d)
                 {
@@ -1071,61 +1071,61 @@ mod tests {
         use super::*;
 
         #[test]
-        #[should_panic]
-        fn test_arginfo_process_flag() {
+        #[should_panic(expected = "argument descriptor does not match input")]
+        fn arginfo_flag_mismatch_panics() {
             flag!("-foo", FooFlag).process("-bar", || None).unwrap();
         }
 
         #[test]
-        #[should_panic]
-        fn test_arginfo_process_take_arg() {
+        #[should_panic(expected = "argument descriptor does not match input")]
+        fn arginfo_separated_value_mismatch_panics() {
             take_arg!("-foo", OsString, Separated, Foo)
                 .process("-bar", || None)
                 .unwrap();
         }
 
         #[test]
-        #[should_panic]
-        fn test_arginfo_process_take_concat_arg() {
+        #[should_panic(expected = "argument descriptor does not match input")]
+        fn arginfo_concatenated_value_mismatch_panics() {
             take_arg!("-foo", OsString, Concatenated, Foo)
                 .process("-bar", || None)
                 .unwrap();
         }
 
         #[test]
-        #[should_panic]
-        fn test_arginfo_process_take_concat_arg_delim() {
+        #[should_panic(expected = "argument descriptor does not match input")]
+        fn arginfo_delimited_concatenated_value_mismatch_panics() {
             take_arg!("-foo", OsString, Concatenated(b'='), Foo)
                 .process("-bar", || None)
                 .unwrap();
         }
 
         #[test]
-        #[should_panic]
-        fn test_arginfo_process_take_maybe_concat_arg() {
+        #[should_panic(expected = "argument descriptor does not match input")]
+        fn arginfo_separable_value_mismatch_panics() {
             take_arg!("-foo", OsString, CanBeSeparated, Foo)
                 .process("-bar", || None)
                 .unwrap();
         }
 
         #[test]
-        #[should_panic]
-        fn test_arginfo_process_take_maybe_concat_arg_delim() {
+        #[should_panic(expected = "argument descriptor does not match input")]
+        fn arginfo_delimited_separable_value_mismatch_panics() {
             take_arg!("-foo", OsString, CanBeSeparated(b'='), Foo)
                 .process("-bar", || None)
                 .unwrap();
         }
 
         #[test]
-        #[should_panic]
-        fn test_args_iter_unsorted() {
+        #[should_panic(expected = "can't precede")]
+        fn args_iter_unsorted_descriptors_panics() {
             static ARGS: [ArgInfo<ArgData>; 2] = [flag!("-foo", FooFlag), flag!("-bar", FooFlag)];
             ArgsIter::new(Vec::<OsString>::new().into_iter(), &ARGS[..]);
         }
 
         #[test]
-        #[should_panic]
-        fn test_args_iter_unsorted_2() {
+        #[should_panic(expected = "can't precede")]
+        fn args_iter_duplicate_descriptors_panics() {
             static ARGS: [ArgInfo<ArgData>; 2] = [flag!("-foo", FooFlag), flag!("-foo", FooFlag)];
             ArgsIter::new(Vec::<OsString>::new().into_iter(), &ARGS[..]);
         }

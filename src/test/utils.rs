@@ -265,8 +265,8 @@ fn test_map_contains_ok() {
 }
 
 #[test]
-#[should_panic]
-fn test_map_contains_extra_key() {
+#[should_panic(expected = "contains 2 elements, expected 1")]
+fn assert_map_contains_panics_on_extra_key() {
     let mut m = HashMap::new();
     m.insert("a", 1);
     m.insert("b", 2);
@@ -274,16 +274,16 @@ fn test_map_contains_extra_key() {
 }
 
 #[test]
-#[should_panic]
-fn test_map_contains_missing_key() {
+#[should_panic(expected = "missing key")]
+fn assert_map_contains_panics_on_missing_key() {
     let mut m = HashMap::new();
     m.insert("a", 1);
     assert_map_contains!(m, ("a", 1), ("b", 2));
 }
 
 #[test]
-#[should_panic]
-fn test_map_contains_wrong_value() {
+#[should_panic(expected = "doesn't match expected")]
+fn assert_map_contains_panics_on_wrong_value() {
     let mut m = HashMap::new();
     m.insert("a", 1);
     m.insert("b", 3);
