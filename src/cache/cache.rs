@@ -34,6 +34,8 @@ use crate::cache::disk::DiskCache;
 use crate::cache::gcs::GCSCache;
 #[cfg(feature = "gha")]
 use crate::cache::gha::GHACache;
+#[cfg(feature = "s3")]
+use crate::cache::managed::ManagedRemoteCache;
 #[cfg(feature = "memcached")]
 use crate::cache::memcached::MemcachedCache;
 use crate::cache::multilevel::{MultiLevelStats, MultiLevelStorage};
@@ -266,6 +268,8 @@ pub struct RemoteStorage {
     basedirs: Vec<Vec<u8>>,
     rw_mode: CacheMode,
     skip_cache_check: bool,
+    #[cfg(feature = "s3")]
+    managed_capacity: Option<Arc<ManagedRemoteCache>>,
 }
 
 #[cfg(any(
@@ -291,12 +295,21 @@ impl RemoteStorage {
             basedirs,
             rw_mode,
             skip_cache_check: false,
+            #[cfg(feature = "s3")]
+            managed_capacity: None,
         }
     }
 
     #[must_use]
     pub const fn with_skip_cache_check(mut self, skip_cache_check: bool) -> Self {
         self.skip_cache_check = skip_cache_check;
+        self
+    }
+
+    #[cfg(feature = "s3")]
+    #[must_use]
+    pub fn with_managed_capacity(mut self, managed_capacity: Arc<ManagedRemoteCache>) -> Self {
+        self.managed_capacity = Some(managed_capacity);
         self
     }
 }
@@ -320,9 +333,14 @@ impl Storage for RemoteStorage {
     }
 
     async fn get_with_raw(&self, key: &str) -> Result<(Cache, Option<Bytes>)> {
-        match self.operator.read(&normalize_key(key)).await {
+        let path = normalize_key(key);
+        match self.operator.read(&path).await {
             Ok(res) => {
                 let data = res.to_bytes();
+                #[cfg(feature = "s3")]
+                if let Some(manager) = &self.managed_capacity {
+                    manager.record_access(&path, data.len() as u64);
+                }
                 let hit = CacheRead::from(io::Cursor::new(data.clone()))?;
                 Ok((Cache::Hit(hit), Some(data)))
             }
@@ -419,10 +437,18 @@ impl Storage for RemoteStorage {
     }
 
     async fn current_size(&self) -> Result<Option<u64>> {
+        #[cfg(feature = "s3")]
+        if let Some(manager) = &self.managed_capacity {
+            return Ok(manager.current_size());
+        }
         Ok(None)
     }
 
     async fn max_size(&self) -> Result<Option<u64>> {
+        #[cfg(feature = "s3")]
+        if let Some(manager) = &self.managed_capacity {
+            return Ok(Some(manager.high_watermark()));
+        }
         Ok(None)
     }
 
@@ -438,9 +464,14 @@ impl Storage for RemoteStorage {
     /// For backfill we need the raw bytes to write directly to another cache level.
     async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {
         trace!("opendal::Operator::get_raw({key})");
-        match self.operator.read(&normalize_key(key)).await {
+        let path = normalize_key(key);
+        match self.operator.read(&path).await {
             Ok(res) => {
                 let data = res.to_bytes();
+                #[cfg(feature = "s3")]
+                if let Some(manager) = &self.managed_capacity {
+                    manager.record_access(&path, data.len() as u64);
+                }
                 trace!(
                     "opendal::Operator::get_raw({key}): Found {} bytes",
                     data.len()
@@ -472,7 +503,19 @@ impl Storage for RemoteStorage {
             bail!("storage is read-only");
         }
 
-        self.operator.write(&normalize_key(key), data).await?;
+        let path = normalize_key(key);
+        let size = data.len() as u64;
+        if let Err(error) = self.operator.write(&path, data).await {
+            #[cfg(feature = "s3")]
+            if let Some(manager) = &self.managed_capacity {
+                manager.record_write_failure();
+            }
+            return Err(error.into());
+        }
+        #[cfg(feature = "s3")]
+        if let Some(manager) = &self.managed_capacity {
+            manager.record_write(&path, size);
+        }
 
         Ok(start.elapsed())
     }
@@ -629,14 +672,18 @@ pub fn build_single_cache(
     _pool: &tokio::runtime::Handle,
     skip_cache_check: bool,
 ) -> Result<Arc<dyn Storage>> {
-    let (operator, rw_mode) = match cache_type {
+    let (operator, rw_mode, managed_capacity_config): (
+        opendal::Operator,
+        CacheMode,
+        Option<config::S3CapacityConfig>,
+    ) = match cache_type {
         #[cfg(feature = "azure")]
         CacheType::Azure(c) => {
             debug!(
                 "Init azure cache with container {}, key_prefix {}",
                 c.container, c.key_prefix
             );
-            (build_azure_operator(c)?, c.rw_mode.into())
+            (build_azure_operator(c)?, c.rw_mode.into(), None)
         }
         #[cfg(not(feature = "azure"))]
         CacheType::Azure(_) => bail!("Azure cache support is not enabled"),
@@ -646,26 +693,26 @@ pub fn build_single_cache(
                 "Init gcs cache with bucket {}, key_prefix {}",
                 c.bucket, c.key_prefix
             );
-            (build_gcs_operator(c)?, c.rw_mode.into())
+            (build_gcs_operator(c)?, c.rw_mode.into(), None)
         }
         #[cfg(not(feature = "gcs"))]
         CacheType::GCS(_) => bail!("GCS cache support is not enabled"),
         #[cfg(feature = "gha")]
         CacheType::GHA(c) => {
             debug!("Init gha cache with version {}", c.version);
-            (build_gha_operator(c)?, c.rw_mode.into())
+            (build_gha_operator(c)?, c.rw_mode.into(), None)
         }
         #[cfg(not(feature = "gha"))]
         CacheType::GHA(_) => bail!("GitHub Actions cache support is not enabled"),
         #[cfg(feature = "memcached")]
         CacheType::Memcached(c) => {
             debug!("Init memcached cache with url {}", c.url);
-            (build_memcached_operator(c)?, c.rw_mode.into())
+            (build_memcached_operator(c)?, c.rw_mode.into(), None)
         }
         #[cfg(not(feature = "memcached"))]
         CacheType::Memcached(_) => bail!("Memcached cache support is not enabled"),
         #[cfg(feature = "redis")]
-        CacheType::Redis(c) => (build_redis_operator(c)?, c.rw_mode.into()),
+        CacheType::Redis(c) => (build_redis_operator(c)?, c.rw_mode.into(), None),
         #[cfg(not(feature = "redis"))]
         CacheType::Redis(_) => bail!("Redis cache support is not enabled"),
         #[cfg(feature = "s3")]
@@ -675,14 +722,14 @@ pub fn build_single_cache(
                 c.bucket,
                 c.endpoint.as_deref().unwrap_or("<default>")
             );
-            (build_s3_operator(c)?, c.rw_mode.into())
+            (build_s3_operator(c)?, c.rw_mode.into(), c.capacity.clone())
         }
         #[cfg(not(feature = "s3"))]
         CacheType::S3(_) => bail!("S3 cache support is not enabled"),
         #[cfg(feature = "webdav")]
         CacheType::Webdav(c) => {
             debug!("Init webdav cache with endpoint {}", c.endpoint);
-            (build_webdav_operator(c)?, c.rw_mode.into())
+            (build_webdav_operator(c)?, c.rw_mode.into(), None)
         }
         #[cfg(not(feature = "webdav"))]
         CacheType::Webdav(_) => bail!("WebDAV cache support is not enabled"),
@@ -693,7 +740,7 @@ pub fn build_single_cache(
                 c.bucket,
                 c.endpoint.as_deref().unwrap_or("<default>")
             );
-            (build_oss_operator(c)?, c.rw_mode.into())
+            (build_oss_operator(c)?, c.rw_mode.into(), None)
         }
         #[cfg(not(feature = "oss"))]
         CacheType::OSS(_) => bail!("OSS cache support is not enabled"),
@@ -704,14 +751,25 @@ pub fn build_single_cache(
                 c.bucket,
                 c.endpoint.as_deref().unwrap_or("<default>")
             );
-            (build_cos_operator(c)?, c.rw_mode.into())
+            (build_cos_operator(c)?, c.rw_mode.into(), None)
         }
         #[cfg(not(feature = "cos"))]
         CacheType::COS(_) => bail!("COS cache support is not enabled"),
     };
 
-    let storage = RemoteStorage::new(operator, basedirs.to_vec(), rw_mode)
+    #[cfg(feature = "s3")]
+    let managed_capacity = managed_capacity_config
+        .map(|config| ManagedRemoteCache::new(operator.clone(), config))
+        .transpose()?;
+    #[cfg(not(feature = "s3"))]
+    let _ = managed_capacity_config;
+
+    let mut storage = RemoteStorage::new(operator, basedirs.to_vec(), rw_mode)
         .with_skip_cache_check(skip_cache_check);
+    #[cfg(feature = "s3")]
+    if let Some(manager) = managed_capacity {
+        storage = storage.with_managed_capacity(manager);
+    }
     Ok(Arc::new(storage))
 }
 
@@ -883,6 +941,7 @@ mod test {
                 server_side_encryption_kms_key_id: None,
                 enable_virtual_host_style: None,
                 rw_mode: configured_mode,
+                capacity: None,
             };
             let single_cache_config = Config {
                 cache: Some(CacheType::S3(cache_config.clone())),
