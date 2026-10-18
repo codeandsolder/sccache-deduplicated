@@ -319,7 +319,7 @@ pub mod urls {
 
 #[cfg(feature = "dist-server")]
 mod server {
-    use crate::util::{new_reqwest_blocking_client, num_cpus};
+    use crate::util::{new_reqwest_blocking_builder, new_reqwest_blocking_client, num_cpus};
     use byteorder::{BigEndian, ReadBytesExt};
     use rouille::accept;
     use serde::{Deserialize, Serialize};
@@ -979,18 +979,21 @@ mod server {
                     "Adding new certificate for {} to scheduler",
                     server_id.addr()
                 );
-                let mut client_builder = reqwest::blocking::ClientBuilder::new();
+                let mut client_builder = new_reqwest_blocking_builder()?;
                 // Add all the certificates we know about
-                client_builder = client_builder.add_root_certificate(
+                let mut roots = vec![
                     reqwest::Certificate::from_pem(&cert_pem)
                         .context("failed to interpret pem as certificate")?,
-                );
-                for (_, cert_pem) in certs.values() {
-                    client_builder = client_builder.add_root_certificate(
-                        reqwest::Certificate::from_pem(cert_pem)
-                            .context("stored server certificate is no longer valid")?,
-                    );
+                ];
+                for (id, (_, pem)) in certs.iter() {
+                    if *id != server_id {
+                        roots.push(
+                            reqwest::Certificate::from_pem(pem)
+                                .context("stored server certificate is no longer valid")?,
+                        );
+                    }
                 }
+                client_builder = client_builder.tls_certs_merge(roots);
                 // Finish the client
                 let new_client = client_builder
                     // Disable connection pool to avoid broken connection
@@ -1590,7 +1593,7 @@ mod client {
         ) -> Result<Self> {
             let timeout = Duration::new(REQUEST_TIMEOUT_SECS, 0);
             let connect_timeout = Duration::new(CONNECT_TIMEOUT_SECS, 0);
-            let client = reqwest::ClientBuilder::new()
+            let client = crate::util::new_reqwest_client_builder()?
                 .timeout(timeout)
                 .connect_timeout(connect_timeout)
                 // Disable connection pool to avoid broken connection
@@ -1619,22 +1622,26 @@ mod client {
             cert_digest: Vec<u8>,
             cert_pem: Vec<u8>,
         ) -> Result<()> {
-            let mut client_async_builder = reqwest::ClientBuilder::new();
+            let mut client_async_builder = crate::util::new_reqwest_client_builder()?;
             // Add all the certificates we know about
-            client_async_builder = client_async_builder.add_root_certificate(
+            let mut roots = vec![
                 reqwest::Certificate::from_pem(&cert_pem)
                     .context("failed to interpret pem as certificate")?,
-            );
-            for cert_pem in certs.values() {
-                client_async_builder = client_async_builder.add_root_certificate(
-                    reqwest::Certificate::from_pem(cert_pem)
-                        .context("stored server certificate is no longer valid")?,
-                );
+            ];
+            for (digest, pem) in certs.iter() {
+                if *digest != cert_digest {
+                    roots.push(
+                        reqwest::Certificate::from_pem(pem)
+                            .context("stored server certificate is no longer valid")?,
+                    );
+                }
             }
+            client_async_builder = client_async_builder.tls_certs_merge(roots);
             // Finish the client
             let timeout = Duration::new(REQUEST_TIMEOUT_SECS, 0);
             let new_client_async = client_async_builder
                 .timeout(timeout)
+                .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
                 // Disable keep-alive
                 .pool_max_idle_per_host(0)
                 .build()
