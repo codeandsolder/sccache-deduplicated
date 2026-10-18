@@ -164,12 +164,10 @@ mod unix_imp {
             if let Some(p) = addr.as_pathname() {
                 return Ok(Some(SocketAddr::Unix(p.to_path_buf())));
             }
-            // TODO: support get addr from abstract socket.
-            // tokio::net::SocketAddr needs to support `as_abstract_name`.
-            // #[cfg(any(target_os = "linux", target_os = "android"))]
-            // if let Some(p) = addr.0.as_abstract_name() {
-            //     return Ok(SocketAddr::UnixAbstract(p.to_vec()));
-            // }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if let Some(name) = addr.as_abstract_name() {
+                return Ok(Some(SocketAddr::UnixAbstract(name.to_vec())));
+            }
             Ok(None)
         }
     }
@@ -180,5 +178,33 @@ mod unix_imp {
             let stream = std::os::unix::net::UnixStream::try_clone(self)?;
             Ok(Box::new(stream))
         }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod tests {
+    use anyhow::{Context, bail};
+
+    use super::*;
+
+    #[test]
+    fn unix_listener_reports_abstract_local_addr() -> anyhow::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()?;
+        let _runtime_guard = runtime.enter();
+        let name = format!("sccache-net-test-{}", std::process::id()).into_bytes();
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(&name)?;
+        let listener = std::os::unix::net::UnixListener::bind_addr(&addr)?;
+        listener.set_nonblocking(true)?;
+        let listener = tokio::net::UnixListener::from_std(listener)?;
+
+        let local_addr = Acceptor::local_addr(&listener)?
+            .context("abstract Unix listener reported no local address")?;
+        let SocketAddr::UnixAbstract(actual) = local_addr else {
+            bail!("expected abstract Unix address, got {local_addr:?}");
+        };
+        assert_eq!(actual, name);
+        Ok(())
     }
 }
