@@ -2897,38 +2897,25 @@ fn parse_rustc_z_ls(stdout: &str) -> Result<Vec<&str>> {
             break;
         }
 
-        let mut line_splits = line.splitn(2, ' ');
-        let num: usize = line_splits
+        let mut fields = line.split_whitespace();
+        let num: usize = fields
             .next()
-            .expect("Zero strings from line split")
+            .context("Missing dependency number in rustc -Z ls output")?
             .parse()
             .context("Could not parse number from rustc -Z ls")?;
-        let libstring = line_splits
+        let crate_id = fields
             .next()
-            .context("No lib string on line from rustc -Z ls")?;
+            .context("Missing crate identifier in rustc -Z ls output")?;
         if num != dep_names.len() + 1 {
-            bail!(
-                "Unexpected numbering of {} in rustc -Z ls output",
-                libstring
-            )
+            bail!("Unexpected numbering of {crate_id} in rustc -Z ls output")
         }
-        assert!(line_splits.next().is_none());
 
-        let mut libstring_splits = libstring.rsplitn(2, '-');
-        // Most things get printed as ${LIBNAME}-${HASH} but for some things
-        // (native code-only libraries?), ${LIBNAME} is all you get.
-        let libname = {
-            let maybe_hash = libstring_splits
-                .next()
-                .context("Nothing in lib string from `rustc -Z ls`")?;
-            if let Some(name) = libstring_splits.next() {
-                name
-            } else {
-                maybe_hash
-            }
-        };
-        assert!(libstring_splits.next().is_none());
-
+        // Newer rustc versions append dependency metadata after the crate
+        // identifier. Some identifiers have no disambiguator, so only inspect
+        // the first token and strip an optional final `-<disambiguator>`.
+        let libname = crate_id
+            .rsplit_once('-')
+            .map_or(crate_id, |(name, _disambiguator)| name);
         dep_names.push(libname);
     }
 
@@ -3706,6 +3693,15 @@ proc_macro false
         assert_eq!(res[0], "lucet_runtime");
         assert_eq!(res[1], "lucet_runtime_internals");
         assert_eq!(res[2], "lucet_runtime_macros");
+    }
+
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn test_parse_rustc_z_ls_with_dependency_metadata() -> Result<()> {
+        let output = "Crate info:\nname opendal_service_s3\n=External Dependencies=\n1 reqsign_aws_core-824b77e9de180c8f hash ed6d715519cd50a44cd673d28c09d9ff host_hash None kind Unconditional public\n2 crc_fast hash 99b4ed1b65ace7d6b134d74fd14a65ca host_hash None kind Unconditional public\n\n";
+        let res = parse_rustc_z_ls(output)?;
+        assert_eq!(res, ["reqsign_aws_core", "crc_fast"]);
+        Ok(())
     }
 
     #[cfg(feature = "dist-client")]
