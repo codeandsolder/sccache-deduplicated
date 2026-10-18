@@ -571,15 +571,18 @@ impl TcCache {
         tc: &Toolchain,
         with: F,
     ) -> Result<()> {
-        self.inner
-            .insert_with(make_lru_key_path(&tc.archive_id), with)?;
-        let verified_archive_id = file_key(self.get(tc)?)?;
-        // TODO: remove created toolchain?
-        if verified_archive_id == tc.archive_id {
-            Ok(())
-        } else {
-            Err(anyhow!("written file does not match expected hash key"))
+        let staged = self.inner.temporary_file()?;
+        with(fs_err::File::from_parts(staged.reopen()?, staged.path()))?;
+
+        let actual_archive_id = file_key(staged.reopen()?)?;
+        if actual_archive_id != tc.archive_id {
+            return Err(anyhow!("written file does not match expected hash key"));
         }
+
+        let staged_path = staged.into_temp_path();
+        self.inner
+            .insert_file(make_lru_key_path(&tc.archive_id), staged_path.as_os_str())?;
+        Ok(())
     }
 
     pub fn get_file(&mut self, tc: &Toolchain) -> LruResult<fs::File> {
@@ -622,4 +625,70 @@ fn file_key<R: Read>(rdr: R) -> Result<String> {
 /// Make a path to the cache entry with key `key`.
 fn make_lru_key_path(key: &str) -> PathBuf {
     Path::new(&key[0..1]).join(&key[1..2]).join(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    fn test_toolchain(contents: &[u8]) -> anyhow::Result<Toolchain> {
+        Ok(Toolchain {
+            archive_id: file_key(contents)?,
+        })
+    }
+
+    #[test]
+    fn failed_upload_never_commits_partial_toolchain() -> anyhow::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let expected_contents = b"complete toolchain archive";
+        let toolchain = test_toolchain(expected_contents)?;
+        let mut cache = TcCache::new(tempdir.path(), 1024 * 1024)?;
+        let cache_path = tempdir
+            .path()
+            .join(make_lru_key_path(&toolchain.archive_id));
+
+        let result = cache.insert_with(&toolchain, |mut file| {
+            file.write_all(b"partial toolchain")?;
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "injected interrupted upload",
+            ))
+        });
+
+        assert!(result.is_err());
+        assert!(!cache.contains_toolchain(&toolchain));
+        assert!(cache.is_empty());
+        assert!(!cache_path.exists());
+        assert!(fs::read_dir(tempdir.path())?.next().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn hash_mismatch_never_commits_toolchain_and_allows_retry() -> anyhow::Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let expected_contents = b"complete toolchain archive";
+        let toolchain = test_toolchain(expected_contents)?;
+        let mut cache = TcCache::new(tempdir.path(), 1024 * 1024)?;
+        let cache_path = tempdir
+            .path()
+            .join(make_lru_key_path(&toolchain.archive_id));
+
+        let result = cache.insert_with(&toolchain, |mut file| {
+            file.write_all(b"different complete toolchain")
+        });
+
+        assert!(result.is_err());
+        assert!(!cache.contains_toolchain(&toolchain));
+        assert!(cache.is_empty());
+        assert!(!cache_path.exists());
+        assert!(fs::read_dir(tempdir.path())?.next().is_none());
+
+        cache.insert_with(&toolchain, |mut file| file.write_all(expected_contents))?;
+        assert!(cache.contains_toolchain(&toolchain));
+        assert_eq!(cache.len(), 1);
+        assert!(cache_path.exists());
+        Ok(())
+    }
 }

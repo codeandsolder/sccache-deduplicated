@@ -177,6 +177,14 @@ impl LruDiskCache {
         self.root.as_path()
     }
 
+    /// Create a cache-local temporary file that startup cleanup will recognize.
+    pub(crate) fn temporary_file(&self) -> Result<NamedTempFile> {
+        tempfile::Builder::new()
+            .prefix(TEMPFILE_PREFIX)
+            .tempfile_in(&self.root)
+            .map_err(Into::into)
+    }
+
     /// Return the path that `key` would be stored at.
     fn rel_to_abs_path<K: AsRef<Path>>(&self, rel_path: K) -> PathBuf {
         self.root.join(rel_path)
@@ -334,11 +342,8 @@ impl LruDiskCache {
         let key = key.as_ref().to_owned();
         self.pending.push(key.clone());
         self.pending_size += size;
-        tempfile::Builder::new()
-            .prefix(TEMPFILE_PREFIX)
-            .tempfile_in(&self.root)
+        self.temporary_file()
             .map(|file| LruDiskCacheAddEntry { file, key, size })
-            .map_err(Into::into)
     }
 
     /// Commit an entry coming from `LruDiskCache::prepare_add`.
