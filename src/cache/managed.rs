@@ -15,8 +15,8 @@
 //! Cache artifacts stay immutable. Tiny sidecars hold shared temperature
 //! metadata and a separate tiny state object tracks an approximate namespace
 //! size. Every metadata mutation writes a per-process generation token as the
-//! object body, so the S3 ETag changes even when only metadata values changed.
-//! ETag-guarded writes therefore provide real cross-process CAS, allowing many
+//! object body, so the S3 `ETag` changes even when only metadata values changed.
+//! `ETag`-guarded writes therefore provide real cross-process CAS, allowing many
 //! sccache processes, users, and hosts to contribute without a central daemon.
 //! Expensive full listings happen only when the shared estimate crosses the
 //! high watermark, the shared state is missing/corrupt, or a cache write fails.
@@ -67,7 +67,7 @@ struct Candidate {
 struct ScoredCandidate {
     candidate: Candidate,
     metadata_etag: Option<String>,
-    virtual_last_access: f64,
+    virtual_last_access: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -92,16 +92,26 @@ pub struct ManagedRemoteCache {
 }
 
 impl ManagedRemoteCache {
+    /// Create a shared managed-cache controller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the capacity configuration is invalid or the
+    /// object-store backend lacks the conditional metadata operations required
+    /// for safe multi-process coordination.
     pub fn new(operator: Operator, config: S3CapacityConfig) -> anyhow::Result<Arc<Self>> {
         config.validate()?;
         validate_operator_capabilities(&operator)?;
+        let initial_flush = Instant::now()
+            .checked_sub(Duration::from_hours(24))
+            .unwrap_or_else(Instant::now);
         Ok(Arc::new(Self {
             operator,
             config,
             touches: Mutex::new(HashMap::new()),
             pending_write_bytes: AtomicU64::new(0),
             state_flush_running: AtomicBool::new(false),
-            last_state_flush: Mutex::new(Instant::now() - Duration::from_secs(86_400)),
+            last_state_flush: Mutex::new(initial_flush),
             prune_running: AtomicBool::new(false),
             known_size: AtomicU64::new(0),
             size_known: AtomicBool::new(false),
@@ -110,7 +120,7 @@ impl ManagedRemoteCache {
         }))
     }
 
-    pub fn high_watermark(&self) -> u64 {
+    pub const fn high_watermark(&self) -> u64 {
         self.config.high_watermark
     }
 
@@ -157,40 +167,40 @@ impl ManagedRemoteCache {
             .touches
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match touches.get_mut(data_path) {
-            Some(touch) => {
-                touch.pending_hits = touch.pending_hits.saturating_add(1);
-                touch.size = size;
-                if now.duration_since(touch.last_flush) < interval {
-                    return None;
-                }
+        let result = if let Some(touch) = touches.get_mut(data_path) {
+            touch.pending_hits = touch.pending_hits.saturating_add(1);
+            touch.size = size;
+            if now.duration_since(touch.last_flush) < interval {
+                None
+            } else {
                 let hits = touch.pending_hits;
                 touch.pending_hits = 0;
                 touch.last_flush = now;
                 Some((hits, touch.size))
             }
-            None => {
+        } else {
+            if touches.len() >= MAX_TOUCH_ENTRIES {
+                let stale_after =
+                    Duration::from_secs(self.config.heat_half_life_secs.saturating_mul(2));
+                touches.retain(|_, touch| now.duration_since(touch.last_flush) < stale_after);
                 if touches.len() >= MAX_TOUCH_ENTRIES {
-                    let stale_after =
-                        Duration::from_secs(self.config.heat_half_life_secs.saturating_mul(2));
-                    touches.retain(|_, touch| now.duration_since(touch.last_flush) < stale_after);
-                    if touches.len() >= MAX_TOUCH_ENTRIES {
-                        // Local coalescing state is only an optimization. Clearing it
-                        // costs extra metadata writes but cannot lose cache correctness.
-                        touches.clear();
-                    }
+                    // Local coalescing state is only an optimization. Clearing it
+                    // costs extra metadata writes but cannot lose cache correctness.
+                    touches.clear();
                 }
-                touches.insert(
-                    data_path.to_owned(),
-                    PendingTouch {
-                        last_flush: now,
-                        pending_hits: 0,
-                        size,
-                    },
-                );
-                Some((1, size))
             }
-        }
+            touches.insert(
+                data_path.to_owned(),
+                PendingTouch {
+                    last_flush: now,
+                    pending_hits: 0,
+                    size,
+                },
+            );
+            Some((1, size))
+        };
+        drop(touches);
+        result
     }
 
     fn maybe_schedule_state_flush(self: &Arc<Self>) {
@@ -284,7 +294,7 @@ impl ManagedRemoteCache {
                 .await
             {
                 Ok(_) => return Ok(Some(next)),
-                Err(error) if error.kind() == ErrorKind::ConditionNotMatch => continue,
+                Err(error) if error.kind() == ErrorKind::ConditionNotMatch => {}
                 Err(error) => return Err(error.into()),
             }
         }
@@ -329,7 +339,7 @@ impl ManagedRemoteCache {
                         .await
                     {
                         Ok(_) => return Ok(()),
-                        Err(error) if error.kind() == ErrorKind::ConditionNotMatch => continue,
+                        Err(error) if error.kind() == ErrorKind::ConditionNotMatch => {}
                         Err(error) => return Err(error.into()),
                     }
                 }
@@ -343,7 +353,7 @@ impl ManagedRemoteCache {
                         .await
                     {
                         Ok(_) => return Ok(()),
-                        Err(error) if error.kind() == ErrorKind::ConditionNotMatch => continue,
+                        Err(error) if error.kind() == ErrorKind::ConditionNotMatch => {}
                         Err(error) => return Err(error.into()),
                     }
                 }
@@ -428,8 +438,7 @@ impl ManagedRemoteCache {
                         entry
                             .metadata()
                             .last_modified()
-                            .map(timestamp_seconds)
-                            .unwrap_or(0),
+                            .map_or(0, timestamp_seconds),
                     );
                 }
                 continue;
@@ -446,8 +455,7 @@ impl ManagedRemoteCache {
                 listed_last_access: entry
                     .metadata()
                     .last_modified()
-                    .map(timestamp_seconds)
-                    .unwrap_or(0),
+                    .map_or(0, timestamp_seconds),
             });
         }
 
@@ -545,7 +553,7 @@ impl ManagedRemoteCache {
 
             scored.sort_unstable_by(|a, b| {
                 a.virtual_last_access
-                    .total_cmp(&b.virtual_last_access)
+                    .cmp(&b.virtual_last_access)
                     .then_with(|| a.candidate.path.cmp(&b.candidate.path))
             });
 
@@ -568,8 +576,8 @@ impl ManagedRemoteCache {
 
         if total > self.config.high_watermark {
             warn!(
-                "managed cache prune made insufficient progress: {} bytes remain above high watermark {}",
-                total, self.config.high_watermark
+                "managed cache prune made insufficient progress: {total} bytes remain above high watermark {}",
+                self.config.high_watermark
             );
         } else {
             debug!("managed cache prune complete: {total} bytes remain");
@@ -593,13 +601,14 @@ impl ManagedRemoteCache {
                     last_access,
                     now,
                     self.config.heat_half_life_secs,
-                ) as f64
-                    / 1000.0;
-                // Logarithmic heat bonus: 1 hit buys roughly one half-life,
-                // 15 hits ~4 half-lives, 255 hits ~8. Frequency matters without
-                // allowing one ancient burst to pin an object forever.
-                let virtual_last_access = last_access as f64
-                    + self.config.heat_half_life_secs as f64 * (1.0 + effective_heat).log2();
+                );
+                // Integer fixed-point logarithmic heat bonus. Exact powers retain
+                // the intuitive mapping: 1 hit ~= 1 half-life, 15 hits ~= 4, and
+                // 255 hits ~= 8. Linear interpolation inside each power-of-two
+                // interval avoids floating-point precision/cast issues and keeps
+                // the score monotonic.
+                let bonus = heat_bonus_seconds(effective_heat, self.config.heat_half_life_secs);
+                let virtual_last_access = last_access.saturating_add(bonus);
                 Ok(Some(ScoredCandidate {
                     candidate,
                     metadata_etag: metadata.etag().map(str::to_owned),
@@ -607,7 +616,7 @@ impl ManagedRemoteCache {
                 }))
             }
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(Some(ScoredCandidate {
-                virtual_last_access: candidate.listed_last_access as f64,
+                virtual_last_access: candidate.listed_last_access,
                 candidate,
                 metadata_etag: None,
             })),
@@ -704,7 +713,7 @@ impl ManagedRemoteCache {
                         .await
                     {
                         Ok(_) => return Ok(next),
-                        Err(error) if error.kind() == ErrorKind::ConditionNotMatch => continue,
+                        Err(error) if error.kind() == ErrorKind::ConditionNotMatch => {}
                         Err(error) => return Err(error.into()),
                     }
                 }
@@ -717,7 +726,7 @@ impl ManagedRemoteCache {
                         .await
                     {
                         Ok(_) => return Ok(actual_remaining),
-                        Err(error) if error.kind() == ErrorKind::ConditionNotMatch => continue,
+                        Err(error) if error.kind() == ErrorKind::ConditionNotMatch => {}
                         Err(error) => return Err(error.into()),
                     }
                 }
@@ -758,7 +767,7 @@ impl ManagedRemoteCache {
                         .await
                     {
                         Ok(metadata) => return self.lease_etag(&path, metadata).await.map(Some),
-                        Err(error) if error.kind() == ErrorKind::ConditionNotMatch => continue,
+                        Err(error) if error.kind() == ErrorKind::ConditionNotMatch => {}
                         Err(error) => return Err(error.into()),
                     }
                 }
@@ -771,7 +780,7 @@ impl ManagedRemoteCache {
                         .await
                     {
                         Ok(metadata) => return self.lease_etag(&path, metadata).await.map(Some),
-                        Err(error) if error.kind() == ErrorKind::ConditionNotMatch => continue,
+                        Err(error) if error.kind() == ErrorKind::ConditionNotMatch => {}
                         Err(error) => return Err(error.into()),
                     }
                 }
@@ -834,11 +843,11 @@ impl ManagedRemoteCache {
     }
 
     fn capacity_state_path(&self) -> String {
-        format!("{}/{}", self.metadata_prefix(), CAPACITY_STATE_BASENAME)
+        format!("{}/{CAPACITY_STATE_BASENAME}", self.metadata_prefix())
     }
 
     fn lease_path(&self) -> String {
-        format!("{}/{}", self.metadata_prefix(), PRUNE_LEASE_BASENAME)
+        format!("{}/{PRUNE_LEASE_BASENAME}", self.metadata_prefix())
     }
 
     fn mutation_body(&self) -> Bytes {
@@ -898,12 +907,47 @@ fn decayed_heat_milli(heat: u64, then: u64, now: u64, half_life_secs: u64) -> u6
     if heat == 0 || now <= then || half_life_secs == 0 {
         return heat;
     }
-    let periods = (now - then) as f64 / half_life_secs as f64;
-    (heat as f64 * 2_f64.powf(-periods)).round() as u64
+
+    let elapsed = now - then;
+    let full_halves = elapsed / half_life_secs;
+    if full_halves >= u64::from(u64::BITS) {
+        return 0;
+    }
+    let shift = u32::try_from(full_halves).unwrap_or(u64::BITS);
+    let decayed = heat.checked_shr(shift).unwrap_or(0);
+    let remainder = elapsed % half_life_secs;
+    if remainder == 0 || decayed == 0 {
+        return decayed;
+    }
+
+    // Linear interpolation from H to H/2 inside one half-life. It slightly
+    // overestimates the true exponential between boundaries, which is a safe
+    // bias for eviction: a recently hot object survives a little longer.
+    let maximum_loss = decayed / 2;
+    let loss = u128::from(maximum_loss) * u128::from(remainder) / u128::from(half_life_secs);
+    decayed.saturating_sub(u64::try_from(loss).unwrap_or(maximum_loss))
+}
+
+const HEAT_BONUS_UNITS: u64 = 1024;
+const MILLI_HIT: u64 = 1000;
+
+fn heat_bonus_seconds(heat_milli: u64, half_life_secs: u64) -> u64 {
+    let value = u128::from(MILLI_HIT.saturating_add(heat_milli));
+    let mut base = u128::from(MILLI_HIT);
+    let mut whole_halves = 0_u64;
+    while value >= base.saturating_mul(2) {
+        base = base.saturating_mul(2);
+        whole_halves = whole_halves.saturating_add(1);
+    }
+
+    let fractional_units = (value.saturating_sub(base) * u128::from(HEAT_BONUS_UNITS)) / base;
+    let units = u128::from(whole_halves) * u128::from(HEAT_BONUS_UNITS) + fractional_units;
+    let seconds = u128::from(half_life_secs) * units / u128::from(HEAT_BONUS_UNITS);
+    u64::try_from(seconds).unwrap_or(u64::MAX)
 }
 
 fn timestamp_seconds(timestamp: opendal::raw::Timestamp) -> u64 {
-    timestamp.into_inner().as_second().max(0) as u64
+    timestamp.into_inner().as_second().max(0).cast_unsigned()
 }
 
 fn unix_seconds() -> u64 {
@@ -923,5 +967,16 @@ mod tests {
         assert_eq!(decayed_heat_milli(8_000, 100, 110, 10), 4_000);
         assert_eq!(decayed_heat_milli(8_000, 100, 120, 10), 2_000);
         assert!(decayed_heat_milli(8_000, 100, 119, 10) > 2_000);
+    }
+
+    #[test]
+    fn heat_bonus_matches_power_of_two_landmarks() {
+        let half_life = 10_000;
+        assert_eq!(heat_bonus_seconds(0, half_life), 0);
+        assert_eq!(heat_bonus_seconds(1_000, half_life), half_life);
+        assert_eq!(heat_bonus_seconds(15_000, half_life), 4 * half_life);
+        assert_eq!(heat_bonus_seconds(255_000, half_life), 8 * half_life);
+        assert!(heat_bonus_seconds(500, half_life) > 0);
+        assert!(heat_bonus_seconds(500, half_life) < half_life);
     }
 }
