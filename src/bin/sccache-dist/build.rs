@@ -180,7 +180,7 @@ impl OverlayBuilder {
         } = {
             let mut toolchain_dir_map = self.toolchain_dir_map.lock().unwrap();
             // Create the toolchain dir (if necessary) while we have an exclusive lock
-            let toolchain_dir = self.dir.join("toolchains").join(&tc.archive_id);
+            let toolchain_dir = self.dir.join("toolchains").join(tc.archive_id());
             if toolchain_dir_map.contains_key(tc) && toolchain_dir.exists() {
                 // TODO: use if let when sccache can use NLL
                 let entry = toolchain_dir_map
@@ -189,14 +189,14 @@ impl OverlayBuilder {
                 entry.build_count += 1;
                 entry.clone()
             } else {
-                trace!("Creating toolchain directory for {}", tc.archive_id);
+                trace!("Creating toolchain directory for {}", tc.archive_id());
                 fs::create_dir(&toolchain_dir)?;
 
                 let mut tccache = tccache.lock().unwrap();
                 let toolchain_rdr = match tccache.get(tc) {
                     Ok(rdr) => rdr,
                     Err(LruError::FileNotInCache) => {
-                        bail!("expected toolchain {}, but not available", tc.archive_id)
+                        bail!("expected toolchain {}, but not available", tc.archive_id())
                     }
                     Err(e) => {
                         return Err(Error::from(e).context("failed to get toolchain from cache"));
@@ -234,7 +234,7 @@ impl OverlayBuilder {
                     for (tc, _) in entries {
                         warn!("Removing old un-compressed toolchain: {:?}", tc);
                         assert!(toolchain_dir_map.remove(tc).is_some());
-                        fs::remove_dir_all(self.dir.join("toolchains").join(&tc.archive_id))
+                        fs::remove_dir_all(self.dir.join("toolchains").join(tc.archive_id()))
                             .context("Failed to remove old toolchain directory")?;
                     }
                 }
@@ -242,11 +242,11 @@ impl OverlayBuilder {
             }
         };
 
-        trace!("Creating build directory for {}-{}", tc.archive_id, id);
+        trace!("Creating build directory for {}-{}", tc.archive_id(), id);
         let build_dir = self
             .dir
             .join("builds")
-            .join(format!("{}-{}", tc.archive_id, id));
+            .join(format!("{}-{}", tc.archive_id(), id));
         fs::create_dir(&build_dir)?;
         Ok(OverlaySpec {
             build_dir,
@@ -706,11 +706,11 @@ impl DockerBuilder {
             Ok(rdr) => rdr,
             Err(LruError::FileNotInCache) => bail!(
                 "Expected to find toolchain {}, but not available",
-                tc.archive_id
+                tc.archive_id()
             ),
             Err(e) => {
                 return Err(e)
-                    .with_context(|| format!("Failed to use toolchain {}", tc.archive_id));
+                    .with_context(|| format!("Failed to use toolchain {}", tc.archive_id()));
             }
         };
 
@@ -724,7 +724,7 @@ impl DockerBuilder {
             .context("Failed to copy toolchain tar into container")?;
         drop(toolchain_rdr);
 
-        let imagename = format!("sccache-builder-{}", &tc.archive_id);
+        let imagename = format!("sccache-builder-{}", tc.archive_id());
         Command::new("docker")
             .args(["commit", &cid, &imagename])
             .check_run()

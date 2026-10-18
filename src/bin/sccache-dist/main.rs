@@ -951,7 +951,7 @@ mod scheduler_tests {
     }
 
     #[test]
-    fn allocation_fails_if_assignment_is_cleaned_up() {
+    fn allocation_fails_if_assignment_is_cleaned_up() -> Result<()> {
         let scheduler = Scheduler::new();
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
         let server_nonce = ServerNonce::new();
@@ -973,9 +973,9 @@ mod scheduler_tests {
         let allocation = scheduler
             .handle_alloc_job(
                 &requester,
-                Toolchain {
-                    archive_id: "test-toolchain".to_owned(),
-                },
+                Toolchain::try_from(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+                )?,
             )
             .unwrap();
 
@@ -986,5 +986,6 @@ mod scheduler_tests {
         let details = servers.get(&server_id).unwrap();
         assert!(details.jobs_assigned.is_empty());
         assert!(details.jobs_unclaimed.is_empty());
+        Ok(())
     }
 }

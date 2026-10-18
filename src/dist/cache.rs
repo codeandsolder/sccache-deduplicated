@@ -1,7 +1,7 @@
 use crate::dist::Toolchain;
 use crate::lru_disk_cache::Result as LruResult;
 use crate::lru_disk_cache::{LruDiskCache, ReadSeek};
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use fs_err as fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -208,22 +208,37 @@ mod client {
             // to create the same toolchain, just a waste of time
             let mut cache = self.cache.lock().unwrap();
             if let Some(archive_id) = self.weak_to_strong(weak_key) {
-                let tc = Toolchain { archive_id };
-                match cache.get_file(&tc) {
-                    Ok(_) => {
-                        debug!("Using cached toolchain {} -> {}", weak_key, tc.archive_id);
-                        return Ok((tc, None));
+                match Toolchain::try_from(archive_id) {
+                    Ok(tc) => {
+                        match cache.get_file(&tc) {
+                            Ok(_) => {
+                                debug!(
+                                    "Using cached toolchain {} -> {}",
+                                    weak_key,
+                                    tc.archive_id()
+                                );
+                                return Ok((tc, None));
+                            }
+                            Err(LruError::FileNotInCache) => {}
+                            Err(LruError::Io(error))
+                                if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => {
+                                return Err(e).context("error while validating cached toolchain");
+                            }
+                        }
+                        debug!(
+                            "Weak toolchain mapping {} -> {} is stale; repackaging",
+                            weak_key,
+                            tc.archive_id()
+                        );
                     }
-                    Err(LruError::FileNotInCache) => {}
-                    Err(LruError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        return Err(e).context("error while validating cached toolchain");
+                    Err(error) => {
+                        warn!(
+                            "Ignoring invalid cached toolchain mapping for {}: {}",
+                            weak_key, error
+                        );
                     }
                 }
-                debug!(
-                    "Weak toolchain mapping {} -> {} is stale; repackaging",
-                    weak_key, tc.archive_id
-                );
             }
             debug!("Weak key {} requires toolchain packaging", weak_key);
             let tmpfile = tempfile::NamedTempFile::new_in(self.cache_dir.join("toolchain_tmp"))?;
@@ -231,7 +246,7 @@ mod client {
                 .write_pkg(fs_err::File::from_parts(tmpfile.reopen()?, tmpfile.path()))
                 .context("Could not package toolchain")?;
             let tc = cache.insert_file(tmpfile.path())?;
-            self.record_weak(weak_key.to_owned(), tc.archive_id.clone())?;
+            self.record_weak(weak_key.to_owned(), tc.archive_id().to_owned())?;
             Ok((tc, None))
         }
 
@@ -255,7 +270,8 @@ mod client {
                         Ok(archive_id) => archive_id,
                         Err(e) => return Some(Err(e)),
                     };
-                    let tc = Toolchain { archive_id };
+                    let tc = Toolchain::try_from(archive_id)
+                        .context("custom toolchain archive produced an invalid hash")?;
                     *maybe_tc = Some(tc.clone());
                     // If this entry already exists, someone has two custom toolchains with the same strong hash
                     if let Some(old_path) = self
@@ -365,14 +381,36 @@ mod client {
             }
 
             #[test]
+            fn invalid_weak_mapping_repackages_instead_of_panicking() -> anyhow::Result<()> {
+                let (_td, cache_dir, first, _) = cached_toolchain()?;
+                drop(first);
+
+                std::fs::write(
+                    cache_dir.join("weak_map.json"),
+                    r#"{"weak_key":"../escape"}"#,
+                )?;
+
+                let second = ClientToolchains::new(&cache_dir, 1024 * 1024, &[])?;
+                let (repacked, _) = second.put_toolchain(
+                    "/my/compiler".as_ref(),
+                    "weak_key",
+                    Box::new(StaticToolchainPackager),
+                )?;
+
+                assert!(second.get_toolchain(&repacked)?.is_some());
+                assert_eq!(repacked.archive_id().len(), 64);
+                Ok(())
+            }
+
+            #[test]
             fn missing_archive_file_repackages_without_restart() -> anyhow::Result<()> {
                 let (_td, cache_dir, client, toolchain) = cached_toolchain()?;
 
                 let archive_path = cache_dir
                     .join("tc")
-                    .join(&toolchain.archive_id[0..1])
-                    .join(&toolchain.archive_id[1..2])
-                    .join(&toolchain.archive_id);
+                    .join(&toolchain.archive_id()[0..1])
+                    .join(&toolchain.archive_id()[1..2])
+                    .join(toolchain.archive_id());
                 std::fs::remove_file(archive_path)?;
 
                 let (repacked, _) = client.put_toolchain(
@@ -563,7 +601,7 @@ impl TcCache {
     }
 
     pub fn contains_toolchain(&self, tc: &Toolchain) -> bool {
-        self.inner.contains_key(make_lru_key_path(&tc.archive_id))
+        self.inner.contains_key(make_lru_key_path(tc))
     }
 
     pub fn insert_with<F: FnOnce(fs::File) -> io::Result<()>>(
@@ -571,11 +609,10 @@ impl TcCache {
         tc: &Toolchain,
         with: F,
     ) -> Result<()> {
-        self.inner
-            .insert_with(make_lru_key_path(&tc.archive_id), with)?;
+        self.inner.insert_with(make_lru_key_path(tc), with)?;
         let verified_archive_id = file_key(self.get(tc)?)?;
         // TODO: remove created toolchain?
-        if verified_archive_id == tc.archive_id {
+        if verified_archive_id == tc.archive_id() {
             Ok(())
         } else {
             Err(anyhow!("written file does not match expected hash key"))
@@ -583,11 +620,11 @@ impl TcCache {
     }
 
     pub fn get_file(&mut self, tc: &Toolchain) -> LruResult<fs::File> {
-        self.inner.get_file(make_lru_key_path(&tc.archive_id))
+        self.inner.get_file(make_lru_key_path(tc))
     }
 
     pub fn get(&mut self, tc: &Toolchain) -> LruResult<Box<dyn ReadSeek>> {
-        self.inner.get(make_lru_key_path(&tc.archive_id))
+        self.inner.get(make_lru_key_path(tc))
     }
 
     pub fn len(&self) -> usize {
@@ -599,15 +636,16 @@ impl TcCache {
     }
 
     pub fn remove(&mut self, tc: &Toolchain) -> LruResult<()> {
-        self.inner.remove(make_lru_key_path(&tc.archive_id))
+        self.inner.remove(make_lru_key_path(tc))
     }
 
     #[cfg(feature = "dist-client")]
     fn insert_file(&mut self, path: &Path) -> Result<Toolchain> {
         let archive_id = path_key(path)?;
-        self.inner
-            .insert_file(make_lru_key_path(&archive_id), path)?;
-        Ok(Toolchain { archive_id })
+        let tc = Toolchain::try_from(archive_id)
+            .context("toolchain archive produced an invalid hash")?;
+        self.inner.insert_file(make_lru_key_path(&tc), path)?;
+        Ok(tc)
     }
 }
 
@@ -620,6 +658,7 @@ fn file_key<R: Read>(rdr: R) -> Result<String> {
     Digest::reader_sync(rdr)
 }
 /// Make a path to the cache entry with key `key`.
-fn make_lru_key_path(key: &str) -> PathBuf {
+fn make_lru_key_path(toolchain: &Toolchain) -> PathBuf {
+    let key = toolchain.archive_id();
     Path::new(&key[0..1]).join(&key[1..2]).join(key)
 }

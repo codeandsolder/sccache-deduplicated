@@ -952,7 +952,9 @@ where
             } => {
                 debug!(
                     "[{}]: Sending toolchain {} for job {}",
-                    out_pretty, dist_toolchain.archive_id, job_alloc.job_id
+                    out_pretty,
+                    dist_toolchain.archive_id(),
+                    job_alloc.job_id
                 );
 
                 match dist_client
@@ -3078,7 +3080,7 @@ LLVM version: 6.0",
     #[test_case(true ; "with preprocessor cache")]
     #[test_case(false ; "without preprocessor cache")]
     #[cfg(feature = "dist-client")]
-    fn test_compiler_get_cached_or_compile_dist(preprocessor_cache_mode: bool) {
+    fn test_compiler_get_cached_or_compile_dist(preprocessor_cache_mode: bool) -> Result<()> {
         drop(env_logger::try_init());
         let creator = new_creator();
         let f = TestFixture::new();
@@ -3131,7 +3133,7 @@ LLVM version: 6.0",
             0,
             COMPILER_STDOUT.to_owned(),
             COMPILER_STDERR.to_owned(),
-        );
+        )?;
         let service = server::SccacheService::mock_with_dist_client(
             dist_client.clone(),
             storage.clone(),
@@ -3204,6 +3206,7 @@ LLVM version: 6.0",
         assert_eq!(exit_status(0), res.status);
         assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
         assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
+        Ok(())
     }
 
     #[test_case(true ; "with preprocessor cache")]
@@ -3608,7 +3611,7 @@ LLVM version: 6.0",
     #[test_case(true ; "with preprocessor cache")]
     #[test_case(false ; "without preprocessor cache")]
     #[cfg(feature = "dist-client")]
-    fn test_compiler_get_cached_or_compile_dist_error(preprocessor_cache_mode: bool) {
+    fn test_compiler_get_cached_or_compile_dist_error(preprocessor_cache_mode: bool) -> Result<()> {
         drop(env_logger::try_init());
         let creator = new_creator();
         let f = TestFixture::new();
@@ -3617,9 +3620,9 @@ LLVM version: 6.0",
         let pool = runtime.handle().clone();
         let dist_clients = vec![
             test_dist::ErrorPutToolchainClient::new(),
-            test_dist::ErrorAllocJobClient::new(),
-            test_dist::ErrorSubmitToolchainClient::new(),
-            test_dist::ErrorRunJobClient::new(),
+            test_dist::ErrorAllocJobClient::new()?,
+            test_dist::ErrorSubmitToolchainClient::new()?,
+            test_dist::ErrorRunJobClient::new()?,
         ];
         // Write a dummy input file so the preprocessor cache mode can work
         std::fs::write(f.tempdir.path().join("foo.c"), "whatever").unwrap();
@@ -3722,6 +3725,7 @@ LLVM version: 6.0",
             assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
             assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
         }
+        Ok(())
     }
 }
 
@@ -3739,6 +3743,13 @@ mod test_dist {
     use std::sync::{Arc, atomic::AtomicBool};
 
     use crate::errors::*;
+
+    const TEST_ARCHIVE_ID: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn test_toolchain() -> Result<Toolchain> {
+        Toolchain::try_from(TEST_ARCHIVE_ID.to_owned()).map_err(Into::into)
+    }
 
     pub struct ErrorPutToolchainClient;
     impl ErrorPutToolchainClient {
@@ -3792,12 +3803,10 @@ mod test_dist {
     }
     impl ErrorAllocJobClient {
         #[allow(clippy::new_ret_no_self)]
-        pub fn new() -> Arc<dyn dist::Client> {
-            Arc::new(Self {
-                tc: Toolchain {
-                    archive_id: "somearchiveid".to_owned(),
-                },
-            })
+        pub fn new() -> Result<Arc<dyn dist::Client>> {
+            Ok(Arc::new(Self {
+                tc: test_toolchain()?,
+            }))
         }
     }
     #[async_trait]
@@ -3847,13 +3856,11 @@ mod test_dist {
     }
     impl ErrorSubmitToolchainClient {
         #[allow(clippy::new_ret_no_self)]
-        pub fn new() -> Arc<dyn dist::Client> {
-            Arc::new(Self {
+        pub fn new() -> Result<Arc<dyn dist::Client>> {
+            Ok(Arc::new(Self {
                 has_started: AtomicBool::default(),
-                tc: Toolchain {
-                    archive_id: "somearchiveid".to_owned(),
-                },
-            })
+                tc: test_toolchain()?,
+            }))
         }
     }
 
@@ -3918,13 +3925,11 @@ mod test_dist {
     }
     impl ErrorRunJobClient {
         #[allow(clippy::new_ret_no_self)]
-        pub fn new() -> Arc<dyn dist::Client> {
-            Arc::new(Self {
+        pub fn new() -> Result<Arc<dyn dist::Client>> {
+            Ok(Arc::new(Self {
                 has_started: AtomicBool::default(),
-                tc: Toolchain {
-                    archive_id: "somearchiveid".to_owned(),
-                },
-            })
+                tc: test_toolchain()?,
+            }))
         }
     }
 
@@ -3999,14 +4004,12 @@ mod test_dist {
 
     impl OneshotClient {
         #[allow(clippy::new_ret_no_self)]
-        pub fn new(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Arc<dyn dist::Client> {
-            Arc::new(Self {
+        pub fn new(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Result<Arc<dyn dist::Client>> {
+            Ok(Arc::new(Self {
                 has_started: AtomicBool::default(),
-                tc: Toolchain {
-                    archive_id: "somearchiveid".to_owned(),
-                },
+                tc: test_toolchain()?,
                 output: ProcessOutput::fake_output(code, stdout, stderr),
-            })
+            }))
         }
     }
 

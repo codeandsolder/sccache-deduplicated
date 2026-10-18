@@ -344,12 +344,65 @@ pub fn try_compile_command_to_dist(
 }
 
 // TODO: Clone by assuming immutable/no GC for now
-// TODO: make fields non-public?
-// TODO: make archive_id validate that it's just a bunch of hex chars
-#[derive(Debug, Hash, Eq, PartialEq, Clone, Serialize, Deserialize)]
+
+/// Error returned when a toolchain archive ID is not a usable hexadecimal cache key.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct InvalidToolchainArchiveId;
+
+impl fmt::Display for InvalidToolchainArchiveId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("toolchain archive ID must contain at least two ASCII hexadecimal characters")
+    }
+}
+
+impl std::error::Error for InvalidToolchainArchiveId {}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct UncheckedToolchain {
+    archive_id: String,
+}
+
+/// Strong identifier for a packaged distributed-compilation toolchain.
+///
+/// Archive IDs contain at least two ASCII hexadecimal characters. The first two
+/// characters are used to fan out the on-disk toolchain cache, so validating the
+/// identifier at construction and deserialization keeps cache paths relative and
+/// makes that indexing safe.
+#[derive(Debug, Hash, Eq, PartialEq, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, try_from = "UncheckedToolchain")]
 pub struct Toolchain {
-    pub archive_id: String,
+    archive_id: String,
+}
+
+impl Toolchain {
+    /// Returns the strong archive ID for this toolchain.
+    pub fn archive_id(&self) -> &str {
+        &self.archive_id
+    }
+}
+
+impl TryFrom<String> for Toolchain {
+    type Error = InvalidToolchainArchiveId;
+
+    fn try_from(archive_id: String) -> std::result::Result<Self, Self::Error> {
+        let is_valid =
+            archive_id.len() >= 2 && archive_id.bytes().all(|byte| byte.is_ascii_hexdigit());
+
+        if is_valid {
+            Ok(Self { archive_id })
+        } else {
+            Err(InvalidToolchainArchiveId)
+        }
+    }
+}
+
+impl TryFrom<UncheckedToolchain> for Toolchain {
+    type Error = InvalidToolchainArchiveId;
+
+    fn try_from(toolchain: UncheckedToolchain) -> std::result::Result<Self, Self::Error> {
+        toolchain.archive_id.try_into()
+    }
 }
 
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug, Ord, PartialOrd, Serialize, Deserialize)]

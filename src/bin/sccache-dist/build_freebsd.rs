@@ -240,7 +240,7 @@ impl PotBuilder {
         pot_cmd: &PathBuf,
         pot_clone_args: &[String],
     ) -> Result<String> {
-        let imagename = format!("sccache-image-{}", &tc.archive_id);
+        let imagename = format!("sccache-image-{}", tc.archive_id());
         trace!("Creating toolchain image: {}", imagename);
         let mut clone_args: Vec<&str> = ["clone", "-p", &imagename, "-P", clone_from].to_vec();
         clone_args.append(&mut pot_clone_args.iter().map(|s| s as &str).collect());
@@ -253,7 +253,7 @@ impl PotBuilder {
         let toolchain_rdr = match tccache.get(tc) {
             Ok(rdr) => rdr,
             Err(LruError::FileNotInCache) => {
-                bail!("expected toolchain {}, but not available", tc.archive_id)
+                bail!("expected toolchain {}, but not available", tc.archive_id())
             }
             Err(e) => return Err(Error::from(e).context("failed to get toolchain from cache")),
         };
