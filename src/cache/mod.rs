@@ -27,6 +27,8 @@ pub mod gcs;
 pub mod gha;
 pub mod ipc_storage;
 pub mod lazy_disk_cache;
+#[cfg(feature = "s3")]
+pub mod managed;
 #[cfg(feature = "memcached")]
 pub mod memcached;
 pub mod multilevel;

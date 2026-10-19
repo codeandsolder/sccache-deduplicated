@@ -138,6 +138,19 @@ bucket = "name"
 endpoint = "s3-us-east-1.amazonaws.com"
 use_ssl = true
 key_prefix = "s3prefix"
+# Optional cooperative capacity management for a dedicated/shared sccache namespace.
+# Cache objects remain immutable; compact sidecars hold shared heat metadata.
+# Multiple users/hosts can safely contribute touches, while a distributed lease ensures
+# only one process reconciles/prunes the namespace at a time.
+# [cache.s3.capacity]
+# high_watermark = 11811160064 # start pruning at 11 GiB
+# low_watermark = 9663676416   # stop near 9 GiB
+# touch_interval_secs = 60     # coalesce hot-key metadata updates per process
+# state_flush_interval_secs = 5
+# heat_half_life_secs = 21600  # 6 hours
+# eviction_concurrency = 16
+# lease_ttl_secs = 600
+# metadata_prefix = ".sccache-meta/v1"
 # SSE-S3 with an S3-managed key (AES256).
 server_side_encryption = false
 # SSE-KMS with the AWS-managed KMS key (aws/s3).
@@ -258,6 +271,17 @@ export SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY="all"
 * `SCCACHE_S3_USE_SSL` s3 endpoint requires TLS, set this to `true`
 * `SCCACHE_S3_KEY_PREFIX` s3 key prefix (optional)
 * `SCCACHE_S3_RW_MODE` allows to use s3 backend in read-only mode if set to `READ_ONLY`
+* `SCCACHE_S3_CAPACITY_HIGH_WATERMARK` enables cooperative S3 capacity management when paired with `SCCACHE_S3_CAPACITY_LOW_WATERMARK`
+* `SCCACHE_S3_CAPACITY_LOW_WATERMARK` target size after pruning; must be smaller than the high watermark
+* `SCCACHE_S3_CAPACITY_TOUCH_INTERVAL_SECS` coalesces per-process heat updates (default `60`)
+* `SCCACHE_S3_CAPACITY_STATE_FLUSH_INTERVAL_SECS` maximum interval before a writer flushes its coalesced byte delta into the shared capacity state (default `5`)
+* `SCCACHE_S3_CAPACITY_HEAT_HALF_LIFE_SECS` half-life for the shared decaying hit counter (default `21600`, six hours)
+* `SCCACHE_S3_CAPACITY_EVICTION_CONCURRENCY` bounds concurrent metadata reads/deletes during pruning (default `16`)
+* `SCCACHE_S3_CAPACITY_LEASE_TTL_SECS` distributed controller lease lifetime (default `600`)
+* `SCCACHE_S3_CAPACITY_METADATA_PREFIX` sidecar namespace inside the configured S3 key prefix (default `.sccache-meta/v1`)
+
+Managed capacity is intended for an sccache-owned namespace, not an arbitrary mixed-use bucket. Artifact bytes are never rewritten merely to refresh access state. Instead, every cache key has a tiny metadata sidecar whose S3 user metadata stores a decaying heat score, last-access time, and artifact size. Each sidecar/control mutation also changes a tiny generation-token body, ensuring its S3 ETag changes; ETag-conditional writes can therefore merge activity from independent sccache daemons and users without a central process. Hot entries receive a logarithmic recency bonus during eviction; the heat score decays over time so historical bursts cannot pin objects indefinitely. A short optimistic recheck immediately before deletion prevents stale eviction decisions in normal races.
+
 
 The endpoint used then becomes `${SCCACHE_BUCKET}.s3-{SCCACHE_REGION}.amazonaws.com`.
 If you are not using the default endpoint and `SCCACHE_REGION` is undefined, it

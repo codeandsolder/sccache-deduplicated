@@ -510,6 +510,71 @@ pub struct WebdavCacheConfig {
     pub disable_create_dir: bool,
 }
 
+const fn default_s3_capacity_touch_interval_secs() -> u64 {
+    60
+}
+const fn default_s3_capacity_state_flush_interval_secs() -> u64 {
+    5
+}
+const fn default_s3_capacity_heat_half_life_secs() -> u64 {
+    6 * 60 * 60
+}
+const fn default_s3_capacity_eviction_concurrency() -> usize {
+    16
+}
+const fn default_s3_capacity_lease_ttl_secs() -> u64 {
+    10 * 60
+}
+fn default_s3_capacity_metadata_prefix() -> String {
+    ".sccache-meta/v1".to_owned()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct S3CapacityConfig {
+    pub high_watermark: u64,
+    pub low_watermark: u64,
+    #[serde(default = "default_s3_capacity_touch_interval_secs")]
+    pub touch_interval_secs: u64,
+    #[serde(default = "default_s3_capacity_state_flush_interval_secs")]
+    pub state_flush_interval_secs: u64,
+    #[serde(default = "default_s3_capacity_heat_half_life_secs")]
+    pub heat_half_life_secs: u64,
+    #[serde(default = "default_s3_capacity_eviction_concurrency")]
+    pub eviction_concurrency: usize,
+    #[serde(default = "default_s3_capacity_lease_ttl_secs")]
+    pub lease_ttl_secs: u64,
+    #[serde(default = "default_s3_capacity_metadata_prefix")]
+    pub metadata_prefix: String,
+}
+
+impl S3CapacityConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.low_watermark >= self.high_watermark {
+            bail!("S3 managed cache low_watermark must be smaller than high_watermark");
+        }
+        if self.high_watermark == 0 {
+            bail!("S3 managed cache high_watermark must be non-zero");
+        }
+        if self.touch_interval_secs == 0 || self.state_flush_interval_secs == 0 {
+            bail!("S3 managed cache intervals must be non-zero");
+        }
+        if self.heat_half_life_secs == 0 {
+            bail!("S3 managed cache heat_half_life_secs must be non-zero");
+        }
+        if self.eviction_concurrency == 0 {
+            bail!("S3 managed cache eviction_concurrency must be non-zero");
+        }
+        if self.lease_ttl_secs < 3 {
+            bail!("S3 managed cache lease_ttl_secs must be at least 3 seconds");
+        }
+        if self.metadata_prefix.trim_matches('/').is_empty() {
+            bail!("S3 managed cache metadata_prefix must be non-empty");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct S3CacheConfig {
@@ -526,6 +591,8 @@ pub struct S3CacheConfig {
     pub enable_virtual_host_style: Option<bool>,
     #[serde(default)]
     pub rw_mode: CacheModeConfig,
+    #[serde(default)]
+    pub capacity: Option<S3CapacityConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -955,6 +1022,43 @@ fn config_from_env() -> Result<EnvConfig> {
         let enable_virtual_host_style = bool_from_env_var("SCCACHE_S3_ENABLE_VIRTUAL_HOST_STYLE")?;
         let rw_mode =
             cache_mode_from_env_var("SCCACHE_S3_RW_MODE").unwrap_or(CacheModeConfig::ReadWrite);
+        let capacity = match (
+            number_from_env_var::<u64>("SCCACHE_S3_CAPACITY_HIGH_WATERMARK").transpose()?,
+            number_from_env_var::<u64>("SCCACHE_S3_CAPACITY_LOW_WATERMARK").transpose()?,
+        ) {
+            (None, None) => None,
+            (Some(high_watermark), Some(low_watermark)) => Some(S3CapacityConfig {
+                high_watermark,
+                low_watermark,
+                touch_interval_secs: number_from_env_var("SCCACHE_S3_CAPACITY_TOUCH_INTERVAL_SECS")
+                    .transpose()?
+                    .unwrap_or_else(default_s3_capacity_touch_interval_secs),
+                state_flush_interval_secs: number_from_env_var(
+                    "SCCACHE_S3_CAPACITY_STATE_FLUSH_INTERVAL_SECS",
+                )
+                .transpose()?
+                .unwrap_or_else(default_s3_capacity_state_flush_interval_secs),
+                heat_half_life_secs: number_from_env_var("SCCACHE_S3_CAPACITY_HEAT_HALF_LIFE_SECS")
+                    .transpose()?
+                    .unwrap_or_else(default_s3_capacity_heat_half_life_secs),
+                eviction_concurrency: number_from_env_var(
+                    "SCCACHE_S3_CAPACITY_EVICTION_CONCURRENCY",
+                )
+                .transpose()?
+                .unwrap_or_else(default_s3_capacity_eviction_concurrency),
+                lease_ttl_secs: number_from_env_var("SCCACHE_S3_CAPACITY_LEASE_TTL_SECS")
+                    .transpose()?
+                    .unwrap_or_else(default_s3_capacity_lease_ttl_secs),
+                metadata_prefix: string_from_env_var("SCCACHE_S3_CAPACITY_METADATA_PREFIX")
+                    .unwrap_or_else(default_s3_capacity_metadata_prefix),
+            }),
+            _ => bail!(
+                "SCCACHE_S3_CAPACITY_HIGH_WATERMARK and SCCACHE_S3_CAPACITY_LOW_WATERMARK must be set together"
+            ),
+        };
+        if let Some(capacity) = &capacity {
+            capacity.validate()?;
+        }
 
         Some(S3CacheConfig {
             bucket,
@@ -968,6 +1072,7 @@ fn config_from_env() -> Result<EnvConfig> {
             server_side_encryption_kms_key_id,
             enable_virtual_host_style,
             rw_mode,
+            capacity,
         })
     } else {
         None
@@ -2432,6 +2537,99 @@ fn test_env_basedirs_not_set() {
 }
 
 #[test]
+fn test_s3_capacity_file_config() {
+    let toml = r#"
+[cache.s3]
+bucket = "cache"
+no_credentials = true
+
+[cache.s3.capacity]
+high_watermark = 11811160064
+low_watermark = 9663676416
+touch_interval_secs = 30
+heat_half_life_secs = 3600
+"#;
+    let config: FileConfig = toml::from_str(toml).unwrap();
+    let capacity = config.cache.s3.unwrap().capacity.unwrap();
+    assert_eq!(capacity.high_watermark, 11 * 1024 * 1024 * 1024);
+    assert_eq!(capacity.low_watermark, 9 * 1024 * 1024 * 1024);
+    assert_eq!(capacity.touch_interval_secs, 30);
+    assert_eq!(capacity.state_flush_interval_secs, 5);
+    assert_eq!(capacity.heat_half_life_secs, 3600);
+    assert_eq!(capacity.eviction_concurrency, 16);
+    assert_eq!(capacity.lease_ttl_secs, 600);
+    assert_eq!(capacity.metadata_prefix, ".sccache-meta/v1");
+    capacity.validate().unwrap();
+}
+
+#[test]
+fn test_s3_capacity_rejects_too_short_lease() {
+    let capacity = S3CapacityConfig {
+        high_watermark: 100,
+        low_watermark: 50,
+        touch_interval_secs: 60,
+        state_flush_interval_secs: 60,
+        heat_half_life_secs: 3600,
+        eviction_concurrency: 1,
+        lease_ttl_secs: 2,
+        metadata_prefix: ".meta".to_owned(),
+    };
+    assert!(capacity.validate().is_err());
+}
+
+#[test]
+fn test_s3_capacity_rejects_inverted_watermarks() {
+    let capacity = S3CapacityConfig {
+        high_watermark: 100,
+        low_watermark: 100,
+        touch_interval_secs: 60,
+        state_flush_interval_secs: 60,
+        heat_half_life_secs: 3600,
+        eviction_concurrency: 1,
+        lease_ttl_secs: 60,
+        metadata_prefix: ".meta".to_owned(),
+    };
+    assert!(capacity.validate().is_err());
+}
+
+#[test]
+#[serial(config_from_env)]
+fn test_s3_capacity_from_env() {
+    unsafe {
+        env::set_var("SCCACHE_BUCKET", "cache");
+        env::set_var("SCCACHE_S3_CAPACITY_HIGH_WATERMARK", "1000");
+        env::set_var("SCCACHE_S3_CAPACITY_LOW_WATERMARK", "700");
+        env::set_var("SCCACHE_S3_CAPACITY_TOUCH_INTERVAL_SECS", "5");
+    }
+    let config = config_from_env().unwrap();
+    unsafe {
+        env::remove_var("SCCACHE_BUCKET");
+        env::remove_var("SCCACHE_S3_CAPACITY_HIGH_WATERMARK");
+        env::remove_var("SCCACHE_S3_CAPACITY_LOW_WATERMARK");
+        env::remove_var("SCCACHE_S3_CAPACITY_TOUCH_INTERVAL_SECS");
+    }
+    let capacity = config.cache.s3.unwrap().capacity.unwrap();
+    assert_eq!(capacity.high_watermark, 1000);
+    assert_eq!(capacity.low_watermark, 700);
+    assert_eq!(capacity.touch_interval_secs, 5);
+}
+
+#[test]
+#[serial(config_from_env)]
+fn test_s3_capacity_env_requires_both_watermarks() {
+    unsafe {
+        env::set_var("SCCACHE_BUCKET", "cache");
+        env::set_var("SCCACHE_S3_CAPACITY_HIGH_WATERMARK", "1000");
+    }
+    let result = config_from_env();
+    unsafe {
+        env::remove_var("SCCACHE_BUCKET");
+        env::remove_var("SCCACHE_S3_CAPACITY_HIGH_WATERMARK");
+    }
+    assert!(result.is_err());
+}
+
+#[test]
 #[serial(config_from_env)]
 #[cfg(feature = "s3")]
 fn test_s3_no_credentials_conflict() {
@@ -3066,6 +3264,7 @@ key_prefix = "cosprefix"
                     server_side_encryption_kms_key_id: None,
                     enable_virtual_host_style: None,
                     rw_mode: CacheModeConfig::ReadWrite,
+                    capacity: None,
                 }),
                 webdav: Some(WebdavCacheConfig {
                     endpoint: "http://127.0.0.1:8080".to_string(),
@@ -3589,6 +3788,7 @@ fn test_get_cache_levels_single_cache() {
             server_side_encryption_kms_key_id: None,
             enable_virtual_host_style: None,
             rw_mode: CacheModeConfig::ReadWrite,
+            capacity: None,
         }),
         ..Default::default()
     };
