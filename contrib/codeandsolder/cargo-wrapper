@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REAL=/usr/local/libexec/cargo-codeandsolder-real
+args=("$@")
+
+if (( ${#args[@]} )) && [[ "${args[0]}" == +* ]]; then
+    export RUSTUP_TOOLCHAIN="${args[0]#+}"
+    args=("${args[@]:1}")
+fi
+
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+
+# The real Cargo binary below is not the rustup proxy. Resolve the active
+# toolchain once in the caller's working directory so rustc invocations run
+# with the repository's rust-toolchain(.toml) override even when Cargo changes
+# a child process cwd into the registry or another dependency directory.
+if [[ -z "${RUSTUP_TOOLCHAIN+x}" ]]; then
+    if active_toolchain="$(rustup show active-toolchain 2>/dev/null)"; then
+        export RUSTUP_TOOLCHAIN="${active_toolchain%% *}"
+    fi
+fi
+
+compile=0
+for arg in "${args[@]}"; do
+    case "$arg" in
+        build|check|test|run|bench|rustc|rustdoc|doc|clippy|fix)
+            compile=1
+            break
+            ;;
+    esac
+done
+
+if (( compile )) && [[ -z "${CARGO_INCREMENTAL+x}" ]]; then
+    export CARGO_INCREMENTAL=0
+fi
+
+# Resolve the effective target root without exporting CARGO_TARGET_DIR: doing
+# that changes Cargo semantics and masks project-local [build] target-dir.
+# A nested Cargo invocation inherits the parent wrapper's derived root, so mark
+# derived values and recompute them at each Cargo boundary. An unmarked value is
+# an explicit caller override and is preserved.
+if [[ "${SCCACHE_CANONICAL_TARGET_ROOT_ORIGIN:-}" == "codeandsolder-cargo-wrapper" ]]; then
+    unset SCCACHE_CANONICAL_TARGET_ROOT SCCACHE_CANONICAL_TARGET_ROOT_ORIGIN
+fi
+if (( compile )) && [[ -z "${SCCACHE_CANONICAL_TARGET_ROOT:-}" ]]; then
+    target_dir_arg=""
+    metadata_args=(metadata --no-deps --format-version 1)
+
+    for ((i=0; i<${#args[@]}; i++)); do
+        case "${args[i]}" in
+            -m|--manifest-path)
+                if (( i+1 < ${#args[@]} )); then
+                    metadata_args+=(--manifest-path "${args[i+1]}")
+                    ((i+=1))
+                fi
+                ;;
+            -m=*|--manifest-path=*)
+                metadata_args+=(--manifest-path "${args[i]#*=}")
+                ;;
+            --config)
+                if (( i+1 < ${#args[@]} )); then
+                    metadata_args+=(--config "${args[i+1]}")
+                    ((i+=1))
+                fi
+                ;;
+            --config=*)
+                metadata_args+=("${args[i]}")
+                ;;
+            --target-dir)
+                if (( i+1 < ${#args[@]} )); then
+                    target_dir_arg="${args[i+1]}"
+                    ((i+=1))
+                fi
+                ;;
+            --target-dir=*)
+                target_dir_arg="${args[i]#*=}"
+                ;;
+        esac
+    done
+
+    canonical_target=""
+    if [[ -n "$target_dir_arg" ]]; then
+        canonical_target="$(realpath -m -- "$target_dir_arg")"
+    elif [[ -n "${CARGO_TARGET_DIR+x}" ]]; then
+        canonical_target="$(realpath -m -- "$CARGO_TARGET_DIR")"
+    else
+        metadata_json="$("$REAL" "${metadata_args[@]}" 2>/dev/null || true)"
+        if [[ -n "$metadata_json" ]]; then
+            canonical_target="$(jq -r '.target_directory // empty' <<<"$metadata_json")"
+        fi
+    fi
+
+    if [[ -n "$canonical_target" ]]; then
+        export SCCACHE_CANONICAL_TARGET_ROOT="$canonical_target"
+        export SCCACHE_CANONICAL_TARGET_ROOT_ORIGIN=codeandsolder-cargo-wrapper
+    fi
+fi
+
+exec "$REAL" "${args[@]}"

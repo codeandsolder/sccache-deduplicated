@@ -2123,13 +2123,41 @@ where
             resolved_native_profile = Some(profile);
         }
 
-        let canonical_paths = CanonicalRustPaths::from_env(&env_vars, &cwd, &self.sysroot);
-        if canonical_paths.is_some() {
-            remove_dep_info_emit(&mut effective_arguments);
+        let mut canonical_paths = CanonicalRustPaths::from_env(&env_vars, &cwd, &self.sysroot);
+        if let Some(canonical) = canonical_paths.as_ref() {
+            let output_dir = if self.parsed_args.output_dir.is_absolute() {
+                self.parsed_args.output_dir.clone()
+            } else {
+                cwd.join(&self.parsed_args.output_dir)
+            };
+            // The canonical sandbox mounts /build read-only and /target writable.
+            // Validate the paths we already know before the dep-info pre-pass so
+            // a bad mapping cannot make that discovery step mutate/fail under a
+            // location that canonical execution could not safely use anyway.
+            let invalid_known_path = if !canonical.root_is_known(&cwd) {
+                Some(&cwd)
+            } else if !canonical
+                .to_canonical(&output_dir)
+                .starts_with(Path::new("/target"))
+            {
+                Some(&output_dir)
+            } else {
+                None
+            };
+            if let Some(path) = invalid_known_path {
+                warn!(
+                    "canonical Rust path mapping does not safely cover {}; falling back to ordinary sccache for this compilation",
+                    path.display()
+                );
+                canonical_paths = None;
+            }
         }
 
-        // TODO: this doesn't produce correct arguments if they should be concatenated - should use iter_os_strings
-        let os_string_arguments: Vec<(OsString, Option<OsString>)> = effective_arguments
+        // Keep the original argument set until canonical path eligibility has been
+        // validated against the inputs discovered by rustc's dep-info pre-pass.
+        // Canonical mode suppresses dep-info from the real compile, while an
+        // ordinary fallback must preserve the caller's original --emit request.
+        let prepass_os_string_arguments: Vec<(OsString, Option<OsString>)> = effective_arguments
             .iter()
             .map(|arg| {
                 (
@@ -2138,24 +2166,11 @@ where
                 )
             })
             .collect();
-        // `filtered_arguments` omits --emit and --out-dir arguments.
-        // It's used for invoking rustc with `--emit=dep-info` to get the list of
-        // source files for this crate.
-        let hash_os_string_arguments = os_string_arguments
-            .iter()
-            .map(|(arg, val)| {
-                if let Some(canonical) = canonical_paths.as_ref() {
-                    (
-                        canonical.normalize_os_value(arg),
-                        val.as_ref().map(|val| canonical.normalize_os_value(val)),
-                    )
-                } else {
-                    (arg.clone(), val.clone())
-                }
-            })
-            .collect::<Vec<_>>();
 
-        let filtered_arguments = os_string_arguments
+        // `filtered_arguments` omits --emit and --out-dir arguments. It is used
+        // for invoking rustc with `--emit=dep-info` to discover the complete set
+        // of source inputs before deciding whether canonical mode is safe.
+        let filtered_arguments = prepass_os_string_arguments
             .iter()
             .filter_map(|(arg, val)| {
                 if arg == "--emit" || arg == "--out-dir" {
@@ -2262,13 +2277,43 @@ where
                 .iter()
                 .chain(abs_externs.iter())
                 .chain(abs_staticlibs.iter())
+                .chain(target_json_files.iter())
                 .find(|path| !canonical.root_is_known(path))
         {
-            bail!(
-                "canonical Rust build input {} is outside declared roots",
+            warn!(
+                "canonical Rust path mapping does not cover {}; falling back to ordinary sccache for this compilation",
                 path.display()
             );
+            canonical_paths = None;
         }
+
+        if canonical_paths.is_some() {
+            remove_dep_info_emit(&mut effective_arguments);
+        }
+
+        // TODO: this doesn't produce correct arguments if they should be concatenated - should use iter_os_strings
+        let os_string_arguments: Vec<(OsString, Option<OsString>)> = effective_arguments
+            .iter()
+            .map(|arg| {
+                (
+                    arg.to_os_string(),
+                    arg.get_data().cloned().map(IntoArg::into_arg_os_string),
+                )
+            })
+            .collect();
+        let hash_os_string_arguments = os_string_arguments
+            .iter()
+            .map(|(arg, val)| {
+                if let Some(canonical) = canonical_paths.as_ref() {
+                    (
+                        canonical.normalize_os_value(arg),
+                        val.as_ref().map(|val| canonical.normalize_os_value(val)),
+                    )
+                } else {
+                    (arg.clone(), val.clone())
+                }
+            })
+            .collect::<Vec<_>>();
 
         let shadow_inputs = shadow_log_path.as_ref().map(|_| {
             (
@@ -5173,6 +5218,186 @@ proc_macro false
     }
 
     #[test]
+    fn test_canonical_unknown_source_falls_back_without_failing() -> Result<()> {
+        let f = TestFixture::new();
+        f.touch("foo.rs")?;
+        let external = tempfile::tempdir()?;
+        let external_source = external.path().join("shared.rs");
+        fs::write(&external_source, b"pub const SHARED: u8 = 1;\n")?;
+
+        let raw = [
+            "--emit",
+            "link,dep-info",
+            "foo.rs",
+            "--out-dir",
+            "target/out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+        ];
+        let oargs = raw.iter().map(OsString::from).collect::<Vec<_>>();
+        let parsed_args = match parse_arguments(&oargs, f.tempdir.path()) {
+            CompilerArguments::Ok(parsed_args) => parsed_args,
+            other => bail!("unexpected parse result: {other:?}"),
+        };
+
+        let creator = new_creator();
+        mock_dep_info(
+            &creator,
+            &[
+                "foo.rs",
+                external_source.to_str().context("non-UTF-8 temp path")?,
+            ],
+        );
+        mock_file_names(&creator, &["foo.rlib"]);
+        let runtime = single_threaded_runtime();
+        let pool = runtime.handle().clone();
+        let mut hasher = RustHasher {
+            executable: "rustc".into(),
+            host: "x86_64-unknown-linux-gnu".to_owned(),
+            version: TEST_RUSTC_VERSION.to_string(),
+            sysroot: f.tempdir.path().join("sysroot"),
+            compiler_shlibs_digests: vec![],
+            #[cfg(feature = "dist-client")]
+            rlib_dep_reader: None,
+            native_profile: Some("test-native".into()),
+            parsed_args,
+        };
+        let env = vec![
+            (
+                OsString::from("SCCACHE_EXPERIMENTAL_CANONICAL_RUST"),
+                OsString::from("1"),
+            ),
+            (
+                OsString::from("SCCACHE_CANONICAL_BUILD_ROOT"),
+                f.tempdir.path().as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("SCCACHE_CANONICAL_TARGET_ROOT"),
+                f.tempdir.path().join("target").into_os_string(),
+            ),
+        ];
+
+        let result = hasher
+            .generate_hash_key(GenerateHashKeyContext {
+                creator: &creator,
+                cwd: f.tempdir.path().to_owned(),
+                env_vars: env,
+                may_dist: false,
+                pool: &pool,
+                rewrite_includes_only: false,
+                storage: Arc::new(MockStorage::new(None, false)),
+                cache_control: CacheControl::Default,
+            })
+            .wait()?;
+
+        let mut transformer = dist::PathTransformer::new();
+        let (command, _, _) = result
+            .compilation
+            .generate_compile_commands(&mut transformer, false)?;
+        let arguments = command.get_arguments();
+
+        assert!(
+            !arguments.iter().any(|arg| arg == "--die-with-parent"),
+            "fallback unexpectedly kept canonical bubblewrap execution"
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair[0] == "--emit" && pair[1] == "link,dep-info"),
+            "ordinary fallback did not preserve the caller's dep-info emission"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_canonical_output_outside_target_falls_back_without_failing() -> Result<()> {
+        let f = TestFixture::new();
+        f.touch("foo.rs")?;
+
+        let raw = [
+            "--emit",
+            "link,dep-info",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+        ];
+        let oargs = raw.iter().map(OsString::from).collect::<Vec<_>>();
+        let parsed_args = match parse_arguments(&oargs, f.tempdir.path()) {
+            CompilerArguments::Ok(parsed_args) => parsed_args,
+            other => bail!("unexpected parse result: {other:?}"),
+        };
+
+        let creator = new_creator();
+        mock_dep_info(&creator, &["foo.rs"]);
+        mock_file_names(&creator, &["foo.rlib"]);
+        let runtime = single_threaded_runtime();
+        let pool = runtime.handle().clone();
+        let mut hasher = RustHasher {
+            executable: "rustc".into(),
+            host: "x86_64-unknown-linux-gnu".to_owned(),
+            version: TEST_RUSTC_VERSION.to_string(),
+            sysroot: f.tempdir.path().join("sysroot"),
+            compiler_shlibs_digests: vec![],
+            #[cfg(feature = "dist-client")]
+            rlib_dep_reader: None,
+            native_profile: Some("test-native".into()),
+            parsed_args,
+        };
+        let env = vec![
+            (
+                OsString::from("SCCACHE_EXPERIMENTAL_CANONICAL_RUST"),
+                OsString::from("1"),
+            ),
+            (
+                OsString::from("SCCACHE_CANONICAL_BUILD_ROOT"),
+                f.tempdir.path().as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("SCCACHE_CANONICAL_TARGET_ROOT"),
+                f.tempdir.path().join("target").into_os_string(),
+            ),
+        ];
+
+        let result = hasher
+            .generate_hash_key(GenerateHashKeyContext {
+                creator: &creator,
+                cwd: f.tempdir.path().to_owned(),
+                env_vars: env,
+                may_dist: false,
+                pool: &pool,
+                rewrite_includes_only: false,
+                storage: Arc::new(MockStorage::new(None, false)),
+                cache_control: CacheControl::Default,
+            })
+            .wait()?;
+
+        let mut transformer = dist::PathTransformer::new();
+        let (command, _, _) = result
+            .compilation
+            .generate_compile_commands(&mut transformer, false)?;
+        let arguments = command.get_arguments();
+        assert!(
+            !arguments.iter().any(|arg| arg == "--die-with-parent"),
+            "output under read-only /build unexpectedly kept canonical execution"
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair[0] == "--emit" && pair[1] == "link,dep-info"),
+            "ordinary fallback did not preserve the caller's dep-info emission"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_canonical_hash_equal_across_physical_roots() {
         fn mk_manifest(tempdir: &Path) -> Result<()> {
             create_file(tempdir, "Cargo.toml", |mut f| {
@@ -5186,7 +5411,7 @@ proc_macro false
             "link",
             "foo.rs",
             "--out-dir",
-            "out",
+            "target/out",
             "--crate-name",
             "foo",
             "--crate-type",
