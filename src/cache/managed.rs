@@ -30,6 +30,7 @@ use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 use log::{debug, warn};
 use opendal::{EntryMode, ErrorKind, Metadata, Operator};
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::config::S3CapacityConfig;
@@ -74,6 +75,12 @@ struct ScoredCandidate {
 struct CapacityStateSnapshot {
     etag: String,
     estimated_size: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PruneLease {
+    etag: String,
+    owner: String,
 }
 
 #[derive(Debug)]
@@ -217,8 +224,7 @@ impl ManagedRemoteCache {
         let pending = self.pending_write_bytes.load(Ordering::Relaxed);
         let delta_threshold = ((self.config.high_watermark - self.config.low_watermark) / 32)
             .clamp(4 * 1024 * 1024, 64 * 1024 * 1024);
-        if self.size_known.load(Ordering::Relaxed) && !interval_elapsed && pending < delta_threshold
-        {
+        if !interval_elapsed && pending < delta_threshold {
             return;
         }
         if self
@@ -388,27 +394,65 @@ impl ManagedRemoteCache {
         });
     }
 
-    async fn reconcile_and_prune(&self) -> anyhow::Result<()> {
-        let Some(lease_etag) = self.acquire_prune_lease().await? else {
+    async fn reconcile_and_prune(self: &Arc<Self>) -> anyhow::Result<()> {
+        let Some(acquired_lease) = self.acquire_prune_lease().await? else {
             debug!("managed cache reconciliation skipped: another controller owns the lease");
             return Ok(());
         };
+        let lease = Arc::new(Mutex::new(acquired_lease));
+        let lease_valid = Arc::new(AtomicBool::new(true));
+        let heartbeat_stop = Arc::new(AtomicBool::new(false));
+        let heartbeat_wake = Arc::new(Notify::new());
+        let heartbeat = tokio::spawn({
+            let this = Arc::clone(self);
+            let lease = Arc::clone(&lease);
+            let lease_valid = Arc::clone(&lease_valid);
+            let heartbeat_stop = Arc::clone(&heartbeat_stop);
+            let heartbeat_wake = Arc::clone(&heartbeat_wake);
+            async move {
+                this.prune_lease_heartbeat(&lease, &lease_valid, &heartbeat_stop, &heartbeat_wake)
+                    .await;
+            }
+        });
 
         // Every pending byte here belongs to an artifact whose PUT already
         // succeeded, so a full listing while we hold the controller lease covers
         // it. Writes that arrive after this swap remain pending for the next state
         // flush and are merged through the shared state object.
         let covered_pending = self.pending_write_bytes.swap(0, Ordering::AcqRel);
-        let state_before = self.read_capacity_state().await?;
-        let result = self
-            .reconcile_and_prune_while_leased(state_before.as_ref())
-            .await;
+        let result = async {
+            let state_before = self.read_capacity_state().await?;
+            self.reconcile_and_prune_while_leased(state_before.as_ref(), &lease_valid)
+                .await
+        }
+        .await;
         if result.is_err() {
             self.pending_write_bytes
                 .fetch_add(covered_pending, Ordering::Relaxed);
         }
-        if let Err(error) = self.release_prune_lease(&lease_etag).await {
-            warn!("managed cache lease release failed: {error:#}");
+
+        heartbeat_stop.store(true, Ordering::Release);
+        heartbeat_wake.notify_one();
+        if let Err(error) = heartbeat.await {
+            lease_valid.store(false, Ordering::Release);
+            warn!("managed cache lease heartbeat task failed: {error}");
+        }
+
+        let lease_snapshot = lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let lease_still_valid = lease_valid.load(Ordering::Acquire);
+        if lease_still_valid {
+            if let Err(error) = self.release_prune_lease(&lease_snapshot.etag).await {
+                warn!("managed cache lease release failed: {error:#}");
+            }
+        } else {
+            warn!("managed cache reconciliation lost its prune lease; leaving the lease to expire");
+        }
+
+        if !lease_still_valid && result.is_ok() {
+            anyhow::bail!("managed cache prune lease was lost during reconciliation");
         }
         result
     }
@@ -416,8 +460,10 @@ impl ManagedRemoteCache {
     async fn reconcile_and_prune_while_leased(
         &self,
         state_before: Option<&CapacityStateSnapshot>,
+        lease_valid: &AtomicBool,
     ) -> anyhow::Result<()> {
         let entries = self.operator.list_with("").recursive(true).await?;
+        ensure_prune_lease_valid(lease_valid)?;
         let metadata_prefix = format!("{}/", self.metadata_prefix());
         let mut metadata_modified = HashMap::new();
         let mut candidates = Vec::new();
@@ -467,12 +513,15 @@ impl ManagedRemoteCache {
 
         self.cleanup_orphan_sidecars(&metadata_modified, &candidates)
             .await;
+        ensure_prune_lease_valid(lease_valid)?;
 
         let remaining = if total > self.config.high_watermark {
-            self.prune_candidates(total, candidates).await?
+            self.prune_candidates(total, candidates, lease_valid)
+                .await?
         } else {
             total
         };
+        ensure_prune_lease_valid(lease_valid)?;
 
         let estimated = self
             .finalize_capacity_state(state_before, remaining)
@@ -516,12 +565,14 @@ impl ManagedRemoteCache {
         &self,
         mut total: u64,
         mut candidates: Vec<Candidate>,
+        lease_valid: &AtomicBool,
     ) -> anyhow::Result<u64> {
         candidates.sort_unstable_by_key(|candidate| candidate.listed_last_access);
         let mut candidates = VecDeque::from(candidates);
         let now = unix_seconds();
 
         while total > self.config.low_watermark && !candidates.is_empty() {
+            ensure_prune_lease_valid(lease_valid)?;
             let need = total - self.config.low_watermark;
             let mut selected = Vec::new();
             let mut selected_bytes = 0_u64;
@@ -561,6 +612,7 @@ impl ManagedRemoteCache {
                 if total <= self.config.low_watermark {
                     break;
                 }
+                ensure_prune_lease_valid(lease_valid)?;
                 match self.evict_candidate(&scored_candidate).await {
                     Ok(true) => {
                         total = total.saturating_sub(scored_candidate.candidate.size);
@@ -736,7 +788,72 @@ impl ManagedRemoteCache {
         anyhow::bail!("managed cache capacity state lost repeated metadata races")
     }
 
-    async fn acquire_prune_lease(&self) -> anyhow::Result<Option<String>> {
+    async fn prune_lease_heartbeat(
+        self: &Arc<Self>,
+        lease: &Mutex<PruneLease>,
+        lease_valid: &AtomicBool,
+        stop: &AtomicBool,
+        wake: &Notify,
+    ) {
+        let renewal_interval = prune_lease_renewal_interval(self.config.lease_ttl_secs);
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(renewal_interval) => {}
+                () = wake.notified() => {}
+            }
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+
+            let snapshot = lease
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            match self.renew_prune_lease(&snapshot).await {
+                Ok(Some(etag)) => {
+                    lease
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .etag = etag;
+                }
+                Ok(None) => {
+                    lease_valid.store(false, Ordering::Release);
+                    warn!("managed cache prune lease renewal lost ownership");
+                    return;
+                }
+                Err(error) => {
+                    lease_valid.store(false, Ordering::Release);
+                    warn!("managed cache prune lease renewal failed: {error:#}");
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn renew_prune_lease(&self, lease: &PruneLease) -> anyhow::Result<Option<String>> {
+        let path = self.lease_path();
+        let expires = unix_seconds().saturating_add(self.config.lease_ttl_secs);
+        match self
+            .operator
+            .write_with(&path, self.mutation_body())
+            .if_match(&lease.etag)
+            .user_metadata(prune_lease_metadata(&lease.owner, expires))
+            .await
+        {
+            Ok(metadata) => self.lease_etag(&path, metadata).await.map(Some),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::ConditionNotMatch | ErrorKind::NotFound
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn acquire_prune_lease(&self) -> anyhow::Result<Option<PruneLease>> {
         let path = self.lease_path();
         let now = unix_seconds();
         let expires = now.saturating_add(self.config.lease_ttl_secs);
@@ -745,10 +862,7 @@ impl ManagedRemoteCache {
             std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_owned()),
             std::process::id()
         );
-        let values = vec![
-            (LEASE_EXPIRES_KEY.to_owned(), expires.to_string()),
-            (LEASE_OWNER_KEY.to_owned(), owner),
-        ];
+        let values = prune_lease_metadata(&owner, expires);
 
         for _ in 0..CAS_ATTEMPTS {
             match self.operator.stat(&path).await {
@@ -766,7 +880,13 @@ impl ManagedRemoteCache {
                         .user_metadata(values.clone())
                         .await
                     {
-                        Ok(metadata) => return self.lease_etag(&path, metadata).await.map(Some),
+                        Ok(metadata) => {
+                            let etag = self.lease_etag(&path, metadata).await?;
+                            return Ok(Some(PruneLease {
+                                etag,
+                                owner: owner.clone(),
+                            }));
+                        }
                         Err(error) if error.kind() == ErrorKind::ConditionNotMatch => {}
                         Err(error) => return Err(error.into()),
                     }
@@ -779,7 +899,13 @@ impl ManagedRemoteCache {
                         .user_metadata(values.clone())
                         .await
                     {
-                        Ok(metadata) => return self.lease_etag(&path, metadata).await.map(Some),
+                        Ok(metadata) => {
+                            let etag = self.lease_etag(&path, metadata).await?;
+                            return Ok(Some(PruneLease {
+                                etag,
+                                owner: owner.clone(),
+                            }));
+                        }
                         Err(error) if error.kind() == ErrorKind::ConditionNotMatch => {}
                         Err(error) => return Err(error.into()),
                     }
@@ -794,12 +920,12 @@ impl ManagedRemoteCache {
         if let Some(etag) = metadata.etag() {
             return Ok(etag.to_owned());
         }
-        Ok(self
-            .operator
+        self.operator
             .stat(path)
             .await?
             .etag()
-            .map_or_else(String::new, str::to_owned))
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("managed cache prune lease has no ETag"))
     }
 
     async fn release_prune_lease(&self, etag: &str) -> anyhow::Result<()> {
@@ -810,10 +936,7 @@ impl ManagedRemoteCache {
         // Keep the tiny lease object permanently. Recreating a lock object
         // can fail when the cache is already at its hard object-store quota,
         // precisely when emergency pruning matters most.
-        let values = vec![
-            (LEASE_EXPIRES_KEY.to_owned(), "0".to_owned()),
-            (LEASE_OWNER_KEY.to_owned(), String::new()),
-        ];
+        let values = prune_lease_metadata("", 0);
         match self
             .operator
             .write_with(&self.lease_path(), self.mutation_body())
@@ -899,6 +1022,25 @@ fn capacity_state_metadata(estimated_size: u64, reconciled_at: u64) -> Vec<(Stri
     ]
 }
 
+fn prune_lease_metadata(owner: &str, expires: u64) -> Vec<(String, String)> {
+    vec![
+        (LEASE_EXPIRES_KEY.to_owned(), expires.to_string()),
+        (LEASE_OWNER_KEY.to_owned(), owner.to_owned()),
+    ]
+}
+
+fn prune_lease_renewal_interval(ttl_secs: u64) -> Duration {
+    Duration::from_secs((ttl_secs / 3).max(1))
+}
+
+fn ensure_prune_lease_valid(lease_valid: &AtomicBool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        lease_valid.load(Ordering::Acquire),
+        "managed cache prune lease ownership was lost"
+    );
+    Ok(())
+}
+
 fn metadata_u64(metadata: &Metadata, key: &str) -> Option<u64> {
     metadata.user_metadata()?.get(key)?.parse().ok()
 }
@@ -978,5 +1120,20 @@ mod tests {
         assert_eq!(heat_bonus_seconds(255_000, half_life), 8 * half_life);
         assert!(heat_bonus_seconds(500, half_life) > 0);
         assert!(heat_bonus_seconds(500, half_life) < half_life);
+    }
+
+    #[test]
+    fn prune_lease_renewal_interval_keeps_margin() {
+        assert_eq!(prune_lease_renewal_interval(600), Duration::from_secs(200));
+        assert_eq!(prune_lease_renewal_interval(3), Duration::from_secs(1));
+        assert_eq!(prune_lease_renewal_interval(1), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn lost_prune_lease_fails_closed() {
+        let lease_valid = AtomicBool::new(true);
+        assert!(ensure_prune_lease_valid(&lease_valid).is_ok());
+        lease_valid.store(false, Ordering::Release);
+        assert!(ensure_prune_lease_valid(&lease_valid).is_err());
     }
 }

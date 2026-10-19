@@ -565,8 +565,8 @@ impl S3CapacityConfig {
         if self.eviction_concurrency == 0 {
             bail!("S3 managed cache eviction_concurrency must be non-zero");
         }
-        if self.lease_ttl_secs == 0 {
-            bail!("S3 managed cache lease_ttl_secs must be non-zero");
+        if self.lease_ttl_secs < 3 {
+            bail!("S3 managed cache lease_ttl_secs must be at least 3 seconds");
         }
         if self.metadata_prefix.trim_matches('/').is_empty() {
             bail!("S3 managed cache metadata_prefix must be non-empty");
@@ -2560,6 +2560,21 @@ heat_half_life_secs = 3600
     assert_eq!(capacity.lease_ttl_secs, 600);
     assert_eq!(capacity.metadata_prefix, ".sccache-meta/v1");
     capacity.validate().unwrap();
+}
+
+#[test]
+fn test_s3_capacity_rejects_too_short_lease() {
+    let capacity = S3CapacityConfig {
+        high_watermark: 100,
+        low_watermark: 50,
+        touch_interval_secs: 60,
+        state_flush_interval_secs: 60,
+        heat_half_life_secs: 3600,
+        eviction_concurrency: 1,
+        lease_ttl_secs: 2,
+        metadata_prefix: ".meta".to_owned(),
+    };
+    assert!(capacity.validate().is_err());
 }
 
 #[test]
