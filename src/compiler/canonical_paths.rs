@@ -453,6 +453,15 @@ impl CanonicalRustPaths {
             }
         }
 
+        // Set up the sandbox temporary filesystem before mounting declared
+        // physical aliases below. Cargo target roots commonly live under /tmp;
+        // mounting an alias first and then replacing /tmp with a tmpfs would
+        // hide it from rustc while preserved OUT_DIR values still point at it.
+        push!("--tmpfs");
+        push!("/tmp");
+        push!("--dir");
+        push!("/tmp/home");
+
         // Build scripts can generate Rust source containing absolute paths from
         // their physical OUT_DIR/CARGO_MANIFEST_DIR. The rustc invocation is
         // canonicalized to /target and /build, but include_bytes!/include_str!
@@ -490,10 +499,6 @@ impl CanonicalRustPaths {
             out.push(alias.as_os_str().to_owned());
         }
 
-        push!("--tmpfs");
-        push!("/tmp");
-        push!("--dir");
-        push!("/tmp/home");
         push!("--chdir");
         out.push(self.canonical_cwd(cwd).into_os_string());
         push!("--");
@@ -923,6 +928,23 @@ mod tests {
         assert!(has_mount("--ro-bind", &build));
         assert!(has_mount("--ro-bind", &cargo_home));
         assert!(has_mount("--ro-bind", &rust_root));
+
+        let tmpfs_index = args
+            .windows(2)
+            .position(|pair| pair[0] == "--tmpfs" && pair[1] == "/tmp")
+            .unwrap();
+        let target_alias_index = args
+            .windows(3)
+            .position(|triple| {
+                triple[0] == "--bind"
+                    && triple[1] == target.as_os_str()
+                    && triple[2] == target.as_os_str()
+            })
+            .unwrap();
+        assert!(
+            tmpfs_index < target_alias_index,
+            "physical target alias under /tmp must be mounted after the sandbox tmpfs: {args:?}"
+        );
     }
 
     #[test]
