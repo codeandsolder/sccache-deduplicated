@@ -157,7 +157,7 @@ pub struct ParsedArguments {
     pub too_hard_for_preprocessor_cache_mode: Option<OsString>,
 }
 
-pub(crate) fn is_native_codegen_arg(arg: &OsStr) -> bool {
+pub fn is_native_codegen_arg(arg: &OsStr) -> bool {
     matches!(
         arg.to_str(),
         Some("-march=native" | "-mcpu=native" | "-mtune=native")

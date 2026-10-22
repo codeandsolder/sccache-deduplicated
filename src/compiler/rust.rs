@@ -2177,9 +2177,7 @@ where
         let target = compilation_target(&effective_arguments, &self.host);
         let mut allow_dist = true;
         let mut effective_cache_control = cache_control;
-        let mut resolved_native_profile = None;
-
-        if native_requested {
+        let resolved_native_profile = if native_requested {
             let profile = if let Some(profile) = self.native_profile.as_ref() {
                 profile.clone()
             } else {
@@ -2202,8 +2200,10 @@ where
                     }
                 }
             };
-            resolved_native_profile = Some(profile);
-        }
+            Some(profile)
+        } else {
+            None
+        };
 
         if native_requested && may_dist && allow_dist {
             if target != self.host {
