@@ -1,338 +1,342 @@
 from pathlib import Path
-p=Path('/srv/scratch/sccache-native-resolution/src/compiler/rust.rs')
-s=p.read_text()
 
-s=s.replace('use std::collections::{HashMap, HashSet};','use std::collections::{BTreeSet, HashMap, HashSet};',1)
+p = Path('/srv/scratch/sccache-native-main/src/compiler/rust.rs')
+s = p.read_text()
 
-# Add resolution fields to structs.
-s=s.replace(
-'''    /// A shared, caching reader for rlib dependencies
-    #[cfg(feature = "dist-client")]
-    rlib_dep_reader: Option<Arc<RlibDepReader>>,
-}
+def replace(old: str, new: str, count: int = 1) -> None:
+    global s
+    if s.count(old) < count:
+        raise SystemExit(f'missing anchor: {old[:80]!r}')
+    s = s.replace(old, new, count)
 
-/// A struct on which to hang a `CompilerHasher` impl.''',
-'''    /// A shared, caching reader for rlib dependencies
-    #[cfg(feature = "dist-client")]
-    rlib_dep_reader: Option<Arc<RlibDepReader>>,
-    /// Host-native CPU resolution for this compiler.
-    native_cpu_resolution: Option<NativeCpuResolution>,
-}
+replace(
+'''static NATIVE_PROFILE_CACHE: LazyLock<std::sync::Mutex<HashMap<(PathBuf, String), String>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
-/// A struct on which to hang a `CompilerHasher` impl.''',1)
-s=s.replace(
-'''    /// A shared, caching reader for rlib dependencies
-    #[cfg(feature = "dist-client")]
-    rlib_dep_reader: Option<Arc<RlibDepReader>>,
-    /// Parsed arguments from the rustc invocation
-    parsed_args: ParsedArguments,
-}''',
-'''    /// A shared, caching reader for rlib dependencies
-    #[cfg(feature = "dist-client")]
-    rlib_dep_reader: Option<Arc<RlibDepReader>>,
-    /// Host-native CPU resolution for this compiler.
-    native_cpu_resolution: Option<NativeCpuResolution>,
-    /// Parsed arguments from the rustc invocation
-    parsed_args: ParsedArguments,
-}''',1)
+static WARNED_DIST_NATIVE_PORTABLE: AtomicBool = AtomicBool::new(false);
+''',
+'''static NATIVE_PROFILE_CACHE: LazyLock<std::sync::Mutex<HashMap<(PathBuf, String), String>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
-# Helpers before ParsedArguments.
-needle='''#[derive(Debug, Clone, PartialEq)]
-pub struct ParsedArguments {'''
-helpers=r'''#[derive(Debug, Clone)]
-struct NativeCpuResolution {
-    fingerprint: String,
-    cpu: Option<String>,
-    explicit_cpu_matches_native_features: bool,
-}
+static EXPLICIT_CPU_PROFILE_CACHE: LazyLock<
+    std::sync::Mutex<HashMap<(PathBuf, String, String), String>>,
+> = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+''')
 
-fn native_codegen_requests(arguments: &[Argument<ArgData>]) -> (bool, bool) {
-    let mut target_cpu = false;
-    let mut tune_cpu = false;
-    for argument in arguments {
-        if let Some(CodeGen(ArgCodegen { opt, value: Some(value) })) = argument.get_data()
-            && value == "native"
-        {
-            match opt.as_str() {
-                "target-cpu" => target_cpu = true,
-                "tune-cpu" => tune_cpu = true,
-                _ => {}
-            }
-        }
-    }
-    (target_cpu, tune_cpu)
-}
-
-fn parse_native_cpu_name(target_cpus: &str) -> Option<String> {
-    target_cpus.lines().find_map(|line| {
-        let line = line.trim();
-        if !line.starts_with("native") {
-            return None;
-        }
-        let (_, tail) = line.split_once("(currently ")?;
-        Some(tail.trim_end_matches([')', '.']).to_owned())
+replace(
+'''fn compilation_target(arguments: &[Argument<ArgData>], host: &str) -> String {''',
+'''fn native_tune_requested(arguments: &[Argument<ArgData>]) -> bool {
+    arguments.iter().any(|arg| {
+        matches!(
+            arg.get_data(),
+            Some(CodeGen(ArgCodegen {
+                opt,
+                value: Some(value)
+            })) if opt == "tune-cpu" && value == "native"
+        )
     })
 }
 
-fn cfg_target_features(cfg: &str) -> BTreeSet<String> {
-    cfg.lines()
-        .filter_map(|line| {
-            line.strip_prefix("target_feature=\"")
-                .and_then(|feature| feature.strip_suffix('"'))
-                .map(str::to_owned)
-        })
-        .collect()
+fn compilation_target(arguments: &[Argument<ArgData>], host: &str) -> String {''')
+
+replace(
+'''    let profile = probe_native_profile(creator, executable, env_vars).await?;
+    let mut cache = NATIVE_PROFILE_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(cache.entry(key).or_insert_with(|| profile.clone()).clone())
 }
 
-async fn rustc_print<T>(
-    creator: &T,
+async fn probe_native_profile<T>(
+    mut creator: T,
     executable: &Path,
-    print: &str,
-    codegen: Option<&str>,
     env_vars: &[(OsString, OsString)],
 ) -> Result<String>
 where
     T: CommandCreatorSync,
 {
-    let mut cmd = creator.clone().new_command_sync(executable);
-    cmd.arg("--print")
-        .arg(print)
-        .env_clear()
-        .envs(env_vars.to_vec());
-    if let Some(codegen) = codegen {
-        cmd.arg("-C").arg(codegen);
-    }
-    let output = run_input_output(cmd, None).await?;
-    String::from_utf8(output.stdout).context("Error parsing rustc --print output")
+    let temp_dir = tempfile::Builder::new()
+        .prefix("sccache-native")
+        .tempdir()
+        .context("Failed to create native-profile temp dir")?;
+    let mut cmd = creator.new_command_sync(executable);
+    cmd.args(&[
+        "-",
+        "--crate-name",
+        "sccache_native_probe",
+        "--crate-type",
+        "lib",
+        "--emit=llvm-ir=-",
+        "-C",
+        "target-cpu=native",
+    ])
+    .env_clear()
+    .envs(env_vars.to_vec())
+    .current_dir(temp_dir.path());
+
+    let source =
+        b"pub fn sccache_native_probe(x:u64)->u64{x.wrapping_mul(17).rotate_left(9)}\\n".to_vec();
+    let output = run_input_output(cmd, Some(source)).await?;
+    let llvm_ir = String::from_utf8(output.stdout).context("native probe LLVM IR was not UTF-8")?;
+    parse_native_profile(&llvm_ir)
+}
+''',
+'''    let profile = probe_cpu_profile(creator, executable, env_vars, "native").await?;
+    let mut cache = NATIVE_PROFILE_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(cache.entry(key).or_insert_with(|| profile.clone()).clone())
 }
 
-async fn resolve_host_native_cpu<T>(
-    creator: &T,
+async fn cached_explicit_cpu_profile<T>(
+    creator: T,
     executable: &Path,
+    rustc_verbose_version: &str,
     env_vars: &[(OsString, OsString)],
-) -> Result<NativeCpuResolution>
+    cpu: &str,
+) -> Result<String>
 where
     T: CommandCreatorSync,
 {
-    let target_cpus = rustc_print(creator, executable, "target-cpus", None, env_vars).await?;
-    let cpu = parse_native_cpu_name(&target_cpus);
-    let native_cfg = rustc_print(
-        creator,
-        executable,
-        "cfg",
-        Some("target-cpu=native"),
-        env_vars,
-    )
-    .await?;
-    let explicit_cpu_matches_native_features = if let Some(cpu) = cpu.as_deref() {
-        let explicit_cfg = rustc_print(
-            creator,
-            executable,
-            "cfg",
-            Some(&format!("target-cpu={cpu}")),
-            env_vars,
-        )
-        .await?;
-        cfg_target_features(&native_cfg) == cfg_target_features(&explicit_cfg)
-    } else {
-        false
-    };
+    let key = (
+        executable.to_owned(),
+        rustc_verbose_version.to_owned(),
+        cpu.to_owned(),
+    );
+    if let Some(profile) = EXPLICIT_CPU_PROFILE_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .cloned()
+    {
+        return Ok(profile);
+    }
 
-    let mut digest = Digest::new();
-    digest.update(b"sccache-rust-native-cpu-v1\0");
-    digest.update(target_cpus.as_bytes());
-    digest.update(native_cfg.as_bytes());
-    Ok(NativeCpuResolution {
-        fingerprint: digest.finish(),
-        cpu,
-        explicit_cpu_matches_native_features,
-    })
+    let profile = probe_cpu_profile(creator, executable, env_vars, cpu).await?;
+    let mut cache = EXPLICIT_CPU_PROFILE_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(cache.entry(key).or_insert_with(|| profile.clone()).clone())
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ParsedArguments {'''
-if needle not in s: raise SystemExit('helpers needle missing')
-s=s.replace(needle,helpers,1)
+fn native_profile_cpu(profile: &str) -> Option<&str> {
+    let (cpu, _) = profile.split_once('|')?;
+    (!cpu.is_empty()).then_some(cpu)
+}
 
-# Resolve once in Rust::new before sysroot probe.
-needle='''        // it's fine to use the `executable` directly no matter if proxied or not
-        let mut cmd = creator.new_command_sync(&executable);'''
-repl='''        let native_cpu_resolution = match resolve_host_native_cpu(&creator, &executable, env_vars).await {
-            Ok(resolution) => Some(resolution),
-            Err(error) => {
-                debug!("Failed to resolve rustc native CPU: {error:#}");
-                None
-            }
-        };
+async fn probe_cpu_profile<T>(
+    mut creator: T,
+    executable: &Path,
+    env_vars: &[(OsString, OsString)],
+    cpu: &str,
+) -> Result<String>
+where
+    T: CommandCreatorSync,
+{
+    let temp_dir = tempfile::Builder::new()
+        .prefix("sccache-native")
+        .tempdir()
+        .context("Failed to create native-profile temp dir")?;
+    let mut cmd = creator.new_command_sync(executable);
+    cmd.args(&[
+        "-",
+        "--crate-name",
+        "sccache_native_probe",
+        "--crate-type",
+        "lib",
+        "--emit=llvm-ir=-",
+        "-C",
+    ])
+    .arg(format!("target-cpu={cpu}"))
+    .env_clear()
+    .envs(env_vars.to_vec())
+    .current_dir(temp_dir.path());
 
-        // it's fine to use the `executable` directly no matter if proxied or not
-        let mut cmd = creator.new_command_sync(&executable);'''
-if needle not in s: raise SystemExit('new probe needle missing')
-s=s.replace(needle,repl,1)
+    let source =
+        b"pub fn sccache_native_probe(x:u64)->u64{x.wrapping_mul(17).rotate_left(9)}\\n".to_vec();
+    let output = run_input_output(cmd, Some(source)).await?;
+    let llvm_ir = String::from_utf8(output.stdout).context("native probe LLVM IR was not UTF-8")?;
+    parse_native_profile(&llvm_ir)
+}
+''')
 
-# Both Rust initializers.
-s=s.replace('''                dist_archive,
-                rlib_dep_reader,
-            })''','''                dist_archive,
-                rlib_dep_reader,
-                native_cpu_resolution,
-            })''',1)
-s=s.replace('''                compiler_shlibs_digests: digests,
-                dist_archive,
-            })''','''                compiler_shlibs_digests: digests,
-                dist_archive,
-                native_cpu_resolution,
-            })''',1)
-
-# Parse: fail native uncached if discovery failed, otherwise pass resolution.
-needle='''        match parse_arguments(arguments, cwd) {
-            CompilerArguments::Ok(args) => CompilerArguments::Ok(Box::new(RustHasher {'''
-repl='''        match parse_arguments(arguments, cwd) {
-            CompilerArguments::Ok(args) => {
-                let (target_cpu_native, tune_cpu_native) = native_codegen_requests(&args.arguments);
-                if (target_cpu_native || tune_cpu_native) && self.native_cpu_resolution.is_none() {
-                    return CompilerArguments::CannotCache("native CPU resolution unavailable", None);
+replace(
+'''        let mut effective_arguments = self.parsed_args.arguments.clone();
+        let native_requested = native_target_requested(&effective_arguments);
+        let target = compilation_target(&effective_arguments, &self.host);
+        let mut allow_dist = true;
+        let mut effective_cache_control = cache_control;
+        let mut resolved_native_profile = None;
+        if native_requested && may_dist {
+            if target.starts_with("x86_64-") {
+                rewrite_native_target_cpu(&mut effective_arguments, "x86-64-v2");
+                resolved_native_profile = Some("x86-64-v2".to_owned());
+                if !WARNED_DIST_NATIVE_PORTABLE.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        "distributed Rust compile requested -C target-cpu=native; using x86-64-v2 for deterministic heterogeneous-worker codegen (performance may be reduced)"
+                    );
                 }
-                CompilerArguments::Ok(Box::new(RustHasher {'''
-if needle not in s: raise SystemExit('parse start missing')
-s=s.replace(needle,repl,1)
-needle='''                #[cfg(feature = "dist-client")]
-                rlib_dep_reader: self.rlib_dep_reader.clone(),
-                parsed_args: args,
-            })),'''
-repl='''                #[cfg(feature = "dist-client")]
-                rlib_dep_reader: self.rlib_dep_reader.clone(),
-                native_cpu_resolution: self.native_cpu_resolution.clone(),
-                parsed_args: args,
-            }))
-            },'''
-if needle not in s: raise SystemExit('parse end missing')
-s=s.replace(needle,repl,1)
-
-# Hash host resolution iff request uses native.
-needle='''        let weak_toolchain_key = rust_dist_toolchain_weak_key(&m, &self.sysroot);
-        // 3. The full commandline (self.arguments)'''
-repl='''        let weak_toolchain_key = rust_dist_toolchain_weak_key(&m, &self.sysroot);
-        let (target_cpu_native, tune_cpu_native) = native_codegen_requests(&self.parsed_args.arguments);
-        if target_cpu_native || tune_cpu_native {
-            if let Some(resolution) = &self.native_cpu_resolution {
-                m.update(resolution.fingerprint.as_bytes());
+            } else {
+                allow_dist = false;
+                warn!(
+                    "distributed Rust compile requested -C target-cpu=native for {target}; compiling locally because no portable native policy is defined for this target"
+                );
             }
         }
-        // 3. The full commandline (self.arguments)'''
-if needle not in s: raise SystemExit('hash needle missing')
-s=s.replace(needle,repl,1)
 
-# Add field to RustCompilation.
-needle='''    /// The environment variables
-    env_vars: Vec<(OsString, OsString)>,
-}'''
-repl='''    /// The environment variables
-    env_vars: Vec<(OsString, OsString)>,
-    /// Host-native CPU resolution used for safe distributed rewriting.
-    native_cpu_resolution: Option<NativeCpuResolution>,
-}'''
-if needle not in s: raise SystemExit('compilation field missing')
-s=s.replace(needle,repl,1)
-
-# Pass field into compilation.
-needle='''                #[cfg(feature = "dist-client")]
-                rlib_dep_reader: self.rlib_dep_reader.clone(),
-            }),'''
-repl='''                #[cfg(feature = "dist-client")]
-                rlib_dep_reader: self.rlib_dep_reader.clone(),
-                native_cpu_resolution: self.native_cpu_resolution.clone(),
-            }),'''
-if needle not in s: raise SystemExit('compilation init missing')
-s=s.replace(needle,repl,1)
-
-# Destructure.
-needle='''            ref env_vars,
-            ref host,
-            ref sysroot,
-            ..
-        } = *self;'''
-repl='''            ref env_vars,
-            ref host,
-            ref sysroot,
-            ref native_cpu_resolution,
-            ..
-        } = *self;'''
-if needle not in s: raise SystemExit('destructure missing')
-s=s.replace(needle,repl,1)
-
-# Dist guard + rewrite.
-needle='''            let mut dist_arguments = vec![];
-            let mut saw_target = false;
-
-            // flat_map would be nice but the lifetimes don't work out
-            for argument in arguments.iter() {
-                let path_transformer_fn = &mut |p: &Path| path_transformer.as_dist(p);'''
-repl='''            let mut dist_arguments = vec![];
-            let mut saw_target = false;
-            let (target_cpu_native, tune_cpu_native) = native_codegen_requests(arguments);
-            let has_explicit_target = arguments
-                .iter()
-                .any(|argument| matches!(argument.get_data(), Some(Target(_))));
-            if target_cpu_native || tune_cpu_native {
-                let resolution = native_cpu_resolution.as_ref()?;
-                if has_explicit_target
-                    || resolution.cpu.is_none()
-                    || (target_cpu_native && !resolution.explicit_cpu_matches_native_features)
+        if native_requested && (!may_dist || !allow_dist) {
+            let profile = if let Some(profile) = self.native_profile.as_ref() {
+                profile.clone()
+            } else {
+                match cached_native_profile(
+                    (*creator).clone(),
+                    &self.executable,
+                    &self.version,
+                    &env_vars,
+                )
+                .await
                 {
-                    return None;
+                    Ok(profile) => profile,
+                    Err(error) => {
+                        warn!(
+                            "Failed to resolve rustc native CPU profile; bypassing cache: {error:#}"
+                        );
+                        effective_cache_control = CacheControl::ForceNoCache;
+                        format!("unresolved:{}", self.host)
+                    }
                 }
-            }
+            };
+            resolved_native_profile = Some(profile);
+        }
+''',
+'''        let mut effective_arguments = self.parsed_args.arguments.clone();
+        let native_target = native_target_requested(&effective_arguments);
+        let native_tune = native_tune_requested(&effective_arguments);
+        let native_requested = native_target || native_tune;
+        let target = compilation_target(&effective_arguments, &self.host);
+        let mut allow_dist = true;
+        let mut effective_cache_control = cache_control;
+        let mut resolved_native_profile = None;
+        let mut native_rewritten_to_explicit = false;
 
-            // flat_map would be nice but the lifetimes don't work out
-            for argument in arguments.iter() {
-                let path_transformer_fn = &mut |p: &Path| path_transformer.as_dist(p);
-                if let Some(CodeGen(ArgCodegen { opt, value: Some(value) })) = argument.get_data()
-                    && value == "native"
-                    && matches!(opt.as_str(), "target-cpu" | "tune-cpu")
+        if native_requested {
+            let profile = if let Some(profile) = self.native_profile.as_ref() {
+                profile.clone()
+            } else {
+                match cached_native_profile(
+                    (*creator).clone(),
+                    &self.executable,
+                    &self.version,
+                    &env_vars,
+                )
+                .await
                 {
-                    let cpu = native_cpu_resolution.as_ref()?.cpu.as_ref()?;
-                    dist_arguments.push(argument.flag_str()?.to_owned());
-                    dist_arguments.push(format!("{opt}={cpu}"));
-                    continue;
-                }'''
-if needle not in s: raise SystemExit('dist loop missing')
-s=s.replace(needle,repl,1)
+                    Ok(profile) => profile,
+                    Err(error) => {
+                        warn!(
+                            "Failed to resolve rustc native CPU profile; bypassing cache and distributed compilation: {error:#}"
+                        );
+                        effective_cache_control = CacheControl::ForceNoCache;
+                        allow_dist = false;
+                        format!("unresolved:{}", self.host)
+                    }
+                }
+            };
+            resolved_native_profile = Some(profile);
+        }
 
-# Test RustHasher direct initializers.
-needle='''            #[cfg(feature = "dist-client")]
-            rlib_dep_reader: None,
-            parsed_args: ParsedArguments {'''
-repl='''            #[cfg(feature = "dist-client")]
-            rlib_dep_reader: None,
-            native_cpu_resolution: None,
-            parsed_args: ParsedArguments {'''
-if needle not in s: raise SystemExit('test init missing')
-s=s.replace(needle,repl)
+        if native_requested && may_dist && allow_dist {
+            if native_tune {
+                allow_dist = false;
+                warn!(
+                    "distributed Rust compile requested -C tune-cpu=native; compiling locally because native tuning is not yet resolved for workers"
+                );
+            } else if target != self.host {
+                allow_dist = false;
+                warn!(
+                    "distributed Rust compile requested -C target-cpu=native for {target}; compiling locally because native resolution is only proven for host target {}",
+                    self.host
+                );
+            } else if let Some(profile) = resolved_native_profile.as_ref()
+                && let Some(cpu) = native_profile_cpu(profile)
+            {
+                match cached_explicit_cpu_profile(
+                    (*creator).clone(),
+                    &self.executable,
+                    &self.version,
+                    &env_vars,
+                    cpu,
+                )
+                .await
+                {
+                    Ok(explicit_profile) if explicit_profile == *profile => {
+                        rewrite_native_target_cpu(&mut effective_arguments, cpu);
+                        native_rewritten_to_explicit = true;
+                    }
+                    Ok(explicit_profile) => {
+                        allow_dist = false;
+                        warn!(
+                            "rustc native CPU profile {profile:?} does not match explicit {cpu} profile {explicit_profile:?}; compiling locally"
+                        );
+                    }
+                    Err(error) => {
+                        allow_dist = false;
+                        warn!(
+                            "Failed to verify explicit rustc CPU profile for {cpu}; compiling native request locally: {error:#}"
+                        );
+                    }
+                }
+            } else {
+                allow_dist = false;
+                warn!(
+                    "rustc native CPU profile did not contain an explicit CPU name; compiling locally"
+                );
+            }
+        }
+''')
 
-# Pure tests.
-needle='''    #[test_case(true ; "with preprocessor cache")]
-    #[test_case(false ; "without preprocessor cache")]
-    fn test_generate_hash_key(preprocessor_cache_mode: bool) {'''
-tests='''    #[test]
-    fn test_parse_native_cpu_name() {
-        let cpus = "native - Select the CPU of the current host (currently znver2).\\n";
-        assert_eq!(parse_native_cpu_name(cpus).as_deref(), Some("znver2"));
-    }
+replace(
+'''        if native_requested && (!may_dist || !target.starts_with("x86_64-")) {
+            if let Some(profile) = resolved_native_profile.as_ref() {
+                profile.hash(&mut HashToDigest { digest: &mut m });
+            } else {
+                effective_cache_control = CacheControl::ForceNoCache;
+            }
+        }
+''',
+'''        if native_requested && !native_rewritten_to_explicit {
+            if let Some(profile) = resolved_native_profile.as_ref() {
+                profile.hash(&mut HashToDigest { digest: &mut m });
+            } else {
+                effective_cache_control = CacheControl::ForceNoCache;
+            }
+        }
+''')
 
-    #[test]
-    fn test_cfg_target_features() {
-        let cfg = "target_feature=\\\"sse2\\\"\\ntarget_feature=\\\"avx2\\\"\\n";
-        assert_eq!(
-            cfg_target_features(cfg),
-            BTreeSet::from(["avx2".to_owned(), "sse2".to_owned()])
-        );
-    }
-
-    #[test_case(true ; "with preprocessor cache")]
-    #[test_case(false ; "without preprocessor cache")]
-    fn test_generate_hash_key(preprocessor_cache_mode: bool) {'''
-if needle not in s: raise SystemExit('tests needle missing')
-s=s.replace(needle,tests,1)
+replace('fn test_dist_native_normalizes_to_x86_64_v2() -> Result<()> {',
+        'fn test_dist_native_resolves_to_equivalent_explicit_cpu() -> Result<()> {')
+replace(
+'''            if profile.is_none() {
+                next_command(&creator, Err(anyhow!("native profile probe failed")));
+            }
+            mock_dep_info(&creator, &["foo.rs"]);
+''',
+'''            if profile.is_none() {
+                next_command(&creator, Err(anyhow!("native profile probe failed")));
+            } else if may_dist {
+                let (cpu, features) = profile.unwrap().split_once('|').unwrap();
+                let ir = format!(
+                    "attributes #0 = {{ \\\"target-cpu\\\"=\\\"{cpu}\\\" \\\"target-features\\\"=\\\"{features}\\\" }}\\n"
+                );
+                next_command(&creator, Ok(MockChild::new(exit_status(0), ir, "")));
+            }
+            mock_dep_info(&creator, &["foo.rs"]);
+''')
+replace('assert_eq!(dist_znver2.key, dist_znver5.key);',
+        'assert_ne!(dist_znver2.key, dist_znver5.key);')
+replace('assert!(local_args.iter().any(|arg| arg == "target-cpu=x86-64-v2"));',
+        'assert!(local_args.iter().any(|arg| arg == "target-cpu=znver2"));')
+replace('assert!(dist_args.iter().any(|arg| arg == "target-cpu=x86-64-v2"));',
+        'assert!(dist_args.iter().any(|arg| arg == "target-cpu=znver2"));')
 
 p.write_text(s)
