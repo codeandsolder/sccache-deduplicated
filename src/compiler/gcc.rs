@@ -48,7 +48,7 @@
 use crate::compiler::args::*;
 use crate::compiler::c::{
     ArtifactDescriptor, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
-    ParsedArguments,
+    ParsedArguments, is_native_codegen_arg,
 };
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
@@ -1102,7 +1102,14 @@ where
     //    output is parsed by tools like CMake and must reflect the local toolchain
     // 2. ClangCUDA cannot be dist-compiled because Clang has separate host and
     //    device preprocessor outputs and cannot compile preprocessed CUDA files.
-    let dist_command = if has_verbose_flag || parsed_args.language == Language::Cuda {
+    let dist_command = if has_verbose_flag
+        || parsed_args.language == Language::Cuda
+        // The compiler driver resolves `native` against the machine on which it
+        // runs. Sending it verbatim to a worker would silently change codegen.
+        // C/C++ native requests therefore stay local until the full driver
+        // expansion is transported explicitly; their cache key is host-safe.
+        || parsed_args.common_args.iter().any(|arg| is_native_codegen_arg(arg))
+    {
         None
     } else {
         (|| {
@@ -2916,6 +2923,37 @@ mod test {
         assert_eq!(Cacheable::Yes, cacheable);
         // Ensure that we ran all processes.
         assert_eq!(0, creator.lock().unwrap().children.len());
+    }
+
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_native_codegen_is_not_distributed() {
+        let f = TestFixture::new();
+        for flag in ["-march=native", "-mcpu=native", "-mtune=native"] {
+            let parsed_args =
+                match parse_arguments_(stringvec![flag, "-c", "foo.c", "-o", "foo.o"], false) {
+                    CompilerArguments::Ok(args) => args,
+                    other => panic!("Got unexpected parse result: {other:?}"),
+                };
+            let mut path_transformer = dist::PathTransformer::new();
+            let (_, dist_command, _) = generate_compile_commands(
+                &mut path_transformer,
+                &f.bins[0],
+                &parsed_args,
+                f.tempdir.path(),
+                &[],
+                GccCompileConfig {
+                    kind: CCompilerKind::Gcc,
+                    rewrite_includes_only: false,
+                    language_to_arg: language_to_gcc_arg,
+                },
+            )
+            .unwrap();
+            assert!(
+                dist_command.is_none(),
+                "{flag} must stay local unless resolved"
+            );
+        }
     }
 
     #[test]
