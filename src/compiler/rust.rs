@@ -927,35 +927,41 @@ fn rewrite_native_target_cpu(
     baseline_cpu: &str,
     feature_delta: &str,
 ) {
-    let mut index = 0;
-    while index < arguments.len() {
-        let is_native_cpu = matches!(
-            arguments[index].get_data(),
-            Some(CodeGen(ArgCodegen { opt, value }))
-                if opt == "target-cpu" && value.as_deref() == Some("native")
-        );
-        if is_native_cpu {
-            if let Argument::WithValue(_, CodeGen(ArgCodegen { value, .. }), _) =
-                &mut arguments[index]
-            {
-                *value = Some(baseline_cpu.to_owned());
-            }
-            if !feature_delta.is_empty() {
-                arguments.insert(
-                    index + 1,
-                    Argument::WithValue(
-                        "-C",
-                        CodeGen(ArgCodegen {
-                            opt: "target-feature".to_owned(),
-                            value: Some(feature_delta.to_owned()),
-                        }),
-                        ArgDisposition::Separated,
-                    ),
-                );
-                index += 1;
-            }
+    let first_user_target_feature = arguments.iter().position(|arg| {
+        matches!(
+            arg.get_data(),
+            Some(CodeGen(ArgCodegen { opt, .. })) if opt == "target-feature"
+        )
+    });
+    let mut last_rewritten_cpu = None;
+    for (index, arg) in arguments.iter_mut().enumerate() {
+        if let Argument::WithValue(_, CodeGen(ArgCodegen { opt, value }), _) = arg
+            && opt == "target-cpu"
+            && value.as_deref() == Some("native")
+        {
+            *value = Some(baseline_cpu.to_owned());
+            last_rewritten_cpu = Some(index);
         }
-        index += 1;
+    }
+
+    if !feature_delta.is_empty() {
+        // rustc accumulates target-feature options in command-line order, while
+        // target-cpu does not reset an earlier feature override. Put our
+        // synthesized baseline before every original target-feature option so
+        // the caller's +/- overrides always retain final authority.
+        let insert_at = first_user_target_feature
+            .unwrap_or_else(|| last_rewritten_cpu.map_or(0, |index| index + 1));
+        arguments.insert(
+            insert_at,
+            Argument::WithValue(
+                "-C",
+                CodeGen(ArgCodegen {
+                    opt: "target-feature".to_owned(),
+                    value: Some(feature_delta.to_owned()),
+                }),
+                ArgDisposition::Separated,
+            ),
+        );
     }
 }
 
@@ -2279,33 +2285,43 @@ where
                         None,
                     )
                     .await;
-                    let baseline_features = cached_cpu_cfg_features(
-                        (*creator).clone(),
-                        &self.executable,
-                        &self.version,
-                        &env_vars,
-                        None,
-                    )
-                    .await;
-                    match (native_features, baseline_profile, baseline_features) {
-                        (Ok(native_features), Ok(baseline_profile), Ok(baseline_features)) => {
+                    match (native_features, baseline_profile) {
+                        (Ok(native_features), Ok(baseline_profile)) => {
                             if let Some((baseline_cpu, _)) = native_profile_parts(&baseline_profile)
                             {
-                                // Do not send the resolved CPU model itself: a VM or
-                                // firmware can mask individual ISA features while LLVM
-                                // still names the physical CPU model. Instead start from
-                                // rustc's deterministic target baseline and explicitly
-                                // reproduce every rustc-recognized host feature. LLVM-only
-                                // model features remain disabled rather than guessed.
-                                let feature_delta = explicit_native_feature_delta(
-                                    &native_features,
-                                    &baseline_features,
-                                );
-                                rewrite_native_target_cpu(
-                                    &mut effective_arguments,
-                                    baseline_cpu,
-                                    &feature_delta,
-                                );
+                                match cached_cpu_cfg_features(
+                                    (*creator).clone(),
+                                    &self.executable,
+                                    &self.version,
+                                    &env_vars,
+                                    Some(baseline_cpu),
+                                )
+                                .await
+                                {
+                                    Ok(baseline_features) => {
+                                        // Do not send the resolved CPU model itself: a VM or
+                                        // firmware can mask individual ISA features while LLVM
+                                        // still names the physical CPU model. Instead start from
+                                        // rustc's deterministic target baseline and explicitly
+                                        // reproduce every rustc-recognized host feature. LLVM-only
+                                        // model features remain disabled rather than guessed.
+                                        let feature_delta = explicit_native_feature_delta(
+                                            &native_features,
+                                            &baseline_features,
+                                        );
+                                        rewrite_native_target_cpu(
+                                            &mut effective_arguments,
+                                            baseline_cpu,
+                                            &feature_delta,
+                                        );
+                                    }
+                                    Err(error) => {
+                                        allow_dist = false;
+                                        warn!(
+                                            "Failed to resolve rustc baseline target features for {baseline_cpu}; compiling native request locally: {error:#}"
+                                        );
+                                    }
+                                }
                             } else {
                                 allow_dist = false;
                                 warn!(
@@ -2313,7 +2329,7 @@ where
                                 );
                             }
                         }
-                        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                        (Err(error), _) | (_, Err(error)) => {
                             allow_dist = false;
                             warn!(
                                 "Failed to resolve a safe explicit rustc native feature set for {cpu}; compiling locally: {error:#}"
@@ -4242,6 +4258,47 @@ mod test {
                 OsString::from("target-feature=+avx2,+sse2")
             ]
         );
+    }
+
+    #[test]
+    fn test_rewrite_native_target_cpu_preserves_user_feature_override_order() {
+        let target_feature = |value: &str| {
+            Argument::WithValue(
+                "-C",
+                CodeGen(ArgCodegen {
+                    opt: "target-feature".into(),
+                    value: Some(value.into()),
+                }),
+                ArgDisposition::Separated,
+            )
+        };
+        let target_cpu_native = || {
+            Argument::WithValue(
+                "-C",
+                CodeGen(ArgCodegen {
+                    opt: "target-cpu".into(),
+                    value: Some("native".into()),
+                }),
+                ArgDisposition::Separated,
+            )
+        };
+
+        for mut args in [
+            vec![target_feature("-avx2"), target_cpu_native()],
+            vec![target_cpu_native(), target_feature("-avx2")],
+        ] {
+            rewrite_native_target_cpu(&mut args, "x86-64", "+avx2,+sse2");
+            let features = args
+                .iter()
+                .filter_map(|arg| match arg.get_data() {
+                    Some(CodeGen(ArgCodegen { opt, value })) if opt == "target-feature" => {
+                        value.clone()
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(features, ["+avx2,+sse2", "-avx2"]);
+        }
     }
 
     #[test]
