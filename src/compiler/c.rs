@@ -59,10 +59,10 @@ use crate::config::PreprocessorCacheModeConfig;
 use crate::dist;
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
-use crate::mock_command::CommandCreatorSync;
+use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::{
     Digest, HashToDigest, MetadataCtimeExt, TimeMacroFinder, Timestamp, decode_path, encode_path,
-    hash_all, strip_basedirs, strip_basedirs_from_arg,
+    hash_all, run_input_output, strip_basedirs, strip_basedirs_from_arg,
 };
 use async_trait::async_trait;
 use fs_err as fs;
@@ -155,6 +155,81 @@ pub struct ParsedArguments {
     pub suppress_rewrite_includes_only: bool,
     /// Arguments are incompatible with preprocessor cache mode
     pub too_hard_for_preprocessor_cache_mode: Option<OsString>,
+}
+
+pub fn is_native_codegen_arg(arg: &OsStr) -> bool {
+    matches!(
+        arg.to_str(),
+        Some("-march=native" | "-mcpu=native" | "-mtune=native")
+    )
+}
+
+fn native_codegen_args(parsed_args: &ParsedArguments) -> Vec<OsString> {
+    parsed_args
+        .common_args
+        .iter()
+        .filter(|arg| is_native_codegen_arg(arg))
+        .cloned()
+        .collect()
+}
+
+async fn native_codegen_fingerprint<T>(
+    creator: &T,
+    executable: &Path,
+    parsed_args: &ParsedArguments,
+    _cwd: &Path,
+    env_vars: &[(OsString, OsString)],
+) -> Result<Option<String>>
+where
+    T: CommandCreatorSync,
+{
+    let native_args = native_codegen_args(parsed_args);
+    if native_args.is_empty() {
+        return Ok(None);
+    }
+
+    // `-m{arch,cpu,tune}=native` is resolved by the compiler driver from the
+    // machine on which the driver runs. The literal command line is therefore
+    // not a sufficient cache identity when a cache is shared between hosts.
+    // Ask the *local* compiler what it would hand to cc1 and include that line
+    // in the cache identity. This mirrors ccache's fix for the same bug while
+    // leaving the actual local compile command untouched.
+    let mut cmd = creator.clone().new_command_sync(executable);
+    cmd.arg("-###")
+        .arg("-E")
+        .arg("-x")
+        .arg("c")
+        .arg("-")
+        .args(&native_args)
+        .env_clear()
+        .envs(env_vars.to_vec())
+        // The probe has no project inputs. A stable working directory keeps
+        // unrelated debug-compilation-dir flags from fragmenting the native
+        // host fingerprint across worktrees.
+        .current_dir(std::env::temp_dir());
+    let output = run_input_output(cmd, Some(Vec::new())).await?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let driver_line = stderr
+        .lines()
+        .find(|line| line.contains("-cc1") || line.contains("/cc1 ") || line.contains("/cc1plus "))
+        .context("compiler did not expose a native codegen expansion")?;
+    let still_native = driver_line.split_whitespace().any(|token| {
+        let token = token.trim_matches('"');
+        token == "native" || token.ends_with("=native")
+    });
+    if still_native {
+        bail!("compiler left native codegen unresolved in its driver expansion");
+    }
+
+    let mut digest = Digest::new();
+    digest.update(b"sccache-native-codegen-v1\0");
+    for arg in &native_args {
+        digest.update(arg.as_encoded_bytes());
+        digest.update(&[0xff]);
+    }
+    digest.update(driver_line.as_bytes());
+    Ok(Some(digest.finish()))
 }
 
 impl ParsedArguments {
@@ -425,7 +500,28 @@ where
         } = context;
         let start_of_compilation = std::time::SystemTime::now();
 
-        let extra_hashes = hash_all(&self.parsed_args.extra_hash_files, &pool.clone()).await?;
+        let mut extra_hashes = hash_all(&self.parsed_args.extra_hash_files, &pool.clone()).await?;
+        let cache_control = match native_codegen_fingerprint(
+            creator,
+            &self.executable,
+            &self.parsed_args,
+            &cwd,
+            &env_vars,
+        )
+        .await
+        {
+            Ok(Some(native_fingerprint)) => {
+                extra_hashes.push(native_fingerprint);
+                cache_control
+            }
+            Ok(None) => cache_control,
+            Err(error) => {
+                warn!(
+                    "Failed to resolve native C/C++ codegen identity; bypassing cache for this compile: {error:#}"
+                );
+                CacheControl::ForceNoCache
+            }
+        };
         // The assembler that turns the compiler's output into the object file is
         // as much a part of the result as the compiler itself.
         let assembler_digest = if self.parsed_args.uses_external_assembler {
@@ -1699,6 +1795,85 @@ mod test {
     use std::{collections::VecDeque, sync::Mutex};
 
     use super::*;
+    use crate::mock_command::*;
+    use crate::test::utils::*;
+
+    fn native_parsed_arguments() -> ParsedArguments {
+        ParsedArguments {
+            input: "foo.c".into(),
+            double_dash_input: false,
+            language: Language::C,
+            compilation_flag: "-c".into(),
+            depfile: None,
+            outputs: HashMap::new(),
+            dependency_args: vec![],
+            preprocessor_args: vec![],
+            common_args: ovec!["-march=native"],
+            arch_args: vec![],
+            unhashed_args: vec![],
+            extra_dist_files: vec![],
+            extra_hash_files: vec![],
+            uses_external_assembler: false,
+            msvc_show_includes: false,
+            profile_generate: false,
+            color_mode: ColorMode::Auto,
+            suppress_rewrite_includes_only: false,
+            too_hard_for_preprocessor_cache_mode: None,
+        }
+    }
+
+    #[test]
+    fn test_native_codegen_fingerprint_tracks_driver_expansion() {
+        fn fingerprint(driver_line: &str) -> String {
+            let creator = new_creator();
+            next_command(
+                &creator,
+                Ok(MockChild::new(exit_status(0), "", driver_line)),
+            );
+            single_threaded_runtime()
+                .block_on(native_codegen_fingerprint(
+                    &creator,
+                    Path::new("/usr/bin/cc"),
+                    &native_parsed_arguments(),
+                    Path::new("/project"),
+                    &[],
+                ))
+                .unwrap()
+                .unwrap()
+        }
+
+        let znver2 = fingerprint(r#"/usr/lib/gcc/cc1 -march=znver2 -mtune=znver2"#);
+        let znver2_again = fingerprint(r#"/usr/lib/gcc/cc1 -march=znver2 -mtune=znver2"#);
+        let skylake = fingerprint(r#"/usr/lib/gcc/cc1 -march=skylake -mtune=skylake"#);
+
+        assert_eq!(znver2, znver2_again);
+        assert_ne!(znver2, skylake);
+    }
+
+    #[test]
+    fn test_native_codegen_fingerprint_rejects_unresolved_driver() {
+        for driver_line in [
+            r#"/usr/lib/gcc/cc1 -march=native"#,
+            r#"/usr/bin/clang -cc1 -target-cpu native"#,
+        ] {
+            let creator = new_creator();
+            next_command(
+                &creator,
+                Ok(MockChild::new(exit_status(0), "", driver_line)),
+            );
+            let result = single_threaded_runtime().block_on(native_codegen_fingerprint(
+                &creator,
+                Path::new("/usr/bin/cc"),
+                &native_parsed_arguments(),
+                Path::new("/project"),
+                &[],
+            ));
+            assert!(
+                result.is_err(),
+                "unresolved driver line must not be cacheable: {driver_line}"
+            );
+        }
+    }
 
     #[test]
     fn test_same_content() {

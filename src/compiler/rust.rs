@@ -105,7 +105,7 @@ use std::borrow::Borrow;
 use std::borrow::Cow;
 #[cfg(feature = "dist-client")]
 use std::collections::hash_map::RandomState;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env::consts::DLL_EXTENSION;
 #[cfg(feature = "dist-client")]
 use std::env::consts::DLL_PREFIX;
@@ -861,21 +861,29 @@ fn append_rust_shadow_record(path: &Path, record: &RustShadowRecord) {
     }
 }
 
-static NATIVE_PROFILE_CACHE: LazyLock<std::sync::Mutex<HashMap<(PathBuf, String), String>>> =
+static CPU_PROFILE_CACHE: LazyLock<std::sync::Mutex<HashMap<(PathBuf, String, String), String>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
-static WARNED_DIST_NATIVE_PORTABLE: AtomicBool = AtomicBool::new(false);
+static CPU_CFG_FEATURE_CACHE: LazyLock<
+    std::sync::Mutex<HashMap<(PathBuf, String, String), BTreeSet<String>>>,
+> = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 fn native_target_requested(arguments: &[Argument<ArgData>]) -> bool {
-    arguments.iter().any(|arg| {
-        matches!(
-            arg.get_data(),
-            Some(CodeGen(ArgCodegen {
-                opt,
-                value: Some(value)
-            })) if opt == "target-cpu" && value == "native"
-        )
-    })
+    arguments.iter().rev().find_map(|arg| match arg.get_data() {
+        Some(CodeGen(ArgCodegen { opt, value })) if opt == "target-cpu" => {
+            Some(value.as_deref() == Some("native"))
+        }
+        _ => None,
+    }) == Some(true)
+}
+
+fn native_tune_requested(arguments: &[Argument<ArgData>]) -> bool {
+    arguments.iter().rev().find_map(|arg| match arg.get_data() {
+        Some(Unstable(ArgUnstable { opt, value })) if opt == "tune-cpu" => {
+            Some(value.as_deref() == Some("native"))
+        }
+        _ => None,
+    }) == Some(true)
 }
 
 fn compilation_target(arguments: &[Argument<ArgData>], host: &str) -> String {
@@ -914,17 +922,59 @@ fn dist_toolchain_weak_key(
     weak.finish()
 }
 
-fn rewrite_native_target_cpu(arguments: &mut [Argument<ArgData>], cpu: &str) {
-    for arg in arguments {
+fn rewrite_native_target_cpu(
+    arguments: &mut Vec<Argument<ArgData>>,
+    baseline_cpu: &str,
+    feature_delta: &str,
+) {
+    let first_user_target_feature = arguments.iter().position(|arg| {
+        matches!(
+            arg.get_data(),
+            Some(CodeGen(ArgCodegen { opt, .. })) if opt == "target-feature"
+        )
+    });
+    let mut last_rewritten_cpu = None;
+    for (index, arg) in arguments.iter_mut().enumerate() {
         if let Argument::WithValue(_, CodeGen(ArgCodegen { opt, value }), _) = arg
             && opt == "target-cpu"
+            && value.as_deref() == Some("native")
+        {
+            *value = Some(baseline_cpu.to_owned());
+            last_rewritten_cpu = Some(index);
+        }
+    }
+
+    if !feature_delta.is_empty() {
+        // rustc accumulates target-feature options in command-line order, while
+        // target-cpu does not reset an earlier feature override. Put our
+        // synthesized baseline before every original target-feature option so
+        // the caller's +/- overrides always retain final authority.
+        let insert_at = first_user_target_feature
+            .unwrap_or_else(|| last_rewritten_cpu.map_or(0, |index| index + 1));
+        arguments.insert(
+            insert_at,
+            Argument::WithValue(
+                "-C",
+                CodeGen(ArgCodegen {
+                    opt: "target-feature".to_owned(),
+                    value: Some(feature_delta.to_owned()),
+                }),
+                ArgDisposition::Separated,
+            ),
+        );
+    }
+}
+
+fn rewrite_native_tune_cpu(arguments: &mut [Argument<ArgData>], cpu: &str) {
+    for arg in arguments {
+        if let Argument::WithValue(_, Unstable(ArgUnstable { opt, value }), _) = arg
+            && opt == "tune-cpu"
             && value.as_deref() == Some("native")
         {
             *value = Some(cpu.to_owned());
         }
     }
 }
-
 fn remove_dep_info_emit(arguments: &mut [Argument<ArgData>]) {
     for arg in arguments {
         if let Argument::WithValue(_, Emit(value), _) = arg {
@@ -964,6 +1014,38 @@ fn parse_native_profile(llvm_ir: &str) -> Result<String> {
     Ok(format!("{cpu}|{features}"))
 }
 
+async fn cached_cpu_profile<T>(
+    creator: T,
+    executable: &Path,
+    rustc_verbose_version: &str,
+    env_vars: &[(OsString, OsString)],
+    cpu: Option<&str>,
+) -> Result<String>
+where
+    T: CommandCreatorSync,
+{
+    let cpu_key = cpu.unwrap_or("<default>").to_owned();
+    let key = (
+        executable.to_owned(),
+        rustc_verbose_version.to_owned(),
+        cpu_key,
+    );
+    if let Some(profile) = CPU_PROFILE_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .cloned()
+    {
+        return Ok(profile);
+    }
+
+    let profile = probe_cpu_profile(creator, executable, env_vars, cpu).await?;
+    let mut cache = CPU_PROFILE_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(cache.entry(key).or_insert_with(|| profile.clone()).clone())
+}
+
 async fn cached_native_profile<T>(
     creator: T,
     executable: &Path,
@@ -973,27 +1055,92 @@ async fn cached_native_profile<T>(
 where
     T: CommandCreatorSync,
 {
-    let key = (executable.to_owned(), rustc_verbose_version.to_owned());
-    if let Some(profile) = NATIVE_PROFILE_CACHE
+    cached_cpu_profile(
+        creator,
+        executable,
+        rustc_verbose_version,
+        env_vars,
+        Some("native"),
+    )
+    .await
+}
+
+fn parse_cfg_target_features(cfg: &str) -> BTreeSet<String> {
+    cfg.lines()
+        .filter_map(|line| {
+            line.strip_prefix("target_feature=\"")
+                .and_then(|feature| feature.strip_suffix('"'))
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+async fn cached_cpu_cfg_features<T>(
+    mut creator: T,
+    executable: &Path,
+    rustc_verbose_version: &str,
+    env_vars: &[(OsString, OsString)],
+    cpu: Option<&str>,
+) -> Result<BTreeSet<String>>
+where
+    T: CommandCreatorSync,
+{
+    let key = (
+        executable.to_owned(),
+        rustc_verbose_version.to_owned(),
+        cpu.unwrap_or("<default>").to_owned(),
+    );
+    if let Some(features) = CPU_CFG_FEATURE_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&key)
         .cloned()
     {
-        return Ok(profile);
+        return Ok(features);
     }
 
-    let profile = probe_native_profile(creator, executable, env_vars).await?;
-    let mut cache = NATIVE_PROFILE_CACHE
+    let mut cmd = creator.new_command_sync(executable);
+    cmd.args(&["--print", "cfg"]);
+    if let Some(cpu) = cpu {
+        cmd.args(&["-C"]).arg(format!("target-cpu={cpu}"));
+    }
+    cmd.env_clear().envs(env_vars.to_vec());
+    let output = run_input_output(cmd, None).await?;
+    let cfg = String::from_utf8(output.stdout).context("rustc --print cfg was not UTF-8")?;
+    let features = parse_cfg_target_features(&cfg);
+
+    let mut cache = CPU_CFG_FEATURE_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    Ok(cache.entry(key).or_insert_with(|| profile.clone()).clone())
+    Ok(cache.entry(key).or_insert_with(|| features.clone()).clone())
 }
 
-async fn probe_native_profile<T>(
+fn explicit_native_feature_delta(
+    native_features: &BTreeSet<String>,
+    baseline_features: &BTreeSet<String>,
+) -> String {
+    native_features
+        .iter()
+        .map(|feature| format!("+{feature}"))
+        .chain(
+            baseline_features
+                .difference(native_features)
+                .map(|feature| format!("-{feature}")),
+        )
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn native_profile_parts(profile: &str) -> Option<(&str, &str)> {
+    let (cpu, features) = profile.split_once('|')?;
+    (!cpu.is_empty()).then_some((cpu, features))
+}
+
+async fn probe_cpu_profile<T>(
     mut creator: T,
     executable: &Path,
     env_vars: &[(OsString, OsString)],
+    cpu: Option<&str>,
 ) -> Result<String>
 where
     T: CommandCreatorSync,
@@ -1010,12 +1157,13 @@ where
         "--crate-type",
         "lib",
         "--emit=llvm-ir=-",
-        "-C",
-        "target-cpu=native",
-    ])
-    .env_clear()
-    .envs(env_vars.to_vec())
-    .current_dir(temp_dir.path());
+    ]);
+    if let Some(cpu) = cpu {
+        cmd.args(&["-C"]).arg(format!("target-cpu={cpu}"));
+    }
+    cmd.env_clear()
+        .envs(env_vars.to_vec())
+        .current_dir(temp_dir.path());
 
     let source =
         b"pub fn sccache_native_probe(x:u64)->u64{x.wrapping_mul(17).rotate_left(9)}\n".to_vec();
@@ -2076,29 +2224,13 @@ where
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
         let mut effective_arguments = self.parsed_args.arguments.clone();
-        let native_requested = native_target_requested(&effective_arguments);
+        let native_target = native_target_requested(&effective_arguments);
+        let native_tune = native_tune_requested(&effective_arguments);
+        let native_requested = native_target || native_tune;
         let target = compilation_target(&effective_arguments, &self.host);
         let mut allow_dist = true;
         let mut effective_cache_control = cache_control;
-        let mut resolved_native_profile = None;
-        if native_requested && may_dist {
-            if target.starts_with("x86_64-") {
-                rewrite_native_target_cpu(&mut effective_arguments, "x86-64-v2");
-                resolved_native_profile = Some("x86-64-v2".to_owned());
-                if !WARNED_DIST_NATIVE_PORTABLE.swap(true, Ordering::Relaxed) {
-                    warn!(
-                        "distributed Rust compile requested -C target-cpu=native; using x86-64-v2 for deterministic heterogeneous-worker codegen (performance may be reduced)"
-                    );
-                }
-            } else {
-                allow_dist = false;
-                warn!(
-                    "distributed Rust compile requested -C target-cpu=native for {target}; compiling locally because no portable native policy is defined for this target"
-                );
-            }
-        }
-
-        if native_requested && (!may_dist || !allow_dist) {
+        let resolved_native_profile = if native_requested {
             let profile = if let Some(profile) = self.native_profile.as_ref() {
                 profile.clone()
             } else {
@@ -2113,14 +2245,110 @@ where
                     Ok(profile) => profile,
                     Err(error) => {
                         warn!(
-                            "Failed to resolve rustc native CPU profile; bypassing cache: {error:#}"
+                            "Failed to resolve rustc native CPU profile; bypassing cache and distributed compilation: {error:#}"
                         );
                         effective_cache_control = CacheControl::ForceNoCache;
+                        allow_dist = false;
                         format!("unresolved:{}", self.host)
                     }
                 }
             };
-            resolved_native_profile = Some(profile);
+            Some(profile)
+        } else {
+            None
+        };
+
+        if native_requested && may_dist && allow_dist {
+            if target != self.host {
+                allow_dist = false;
+                warn!(
+                    "distributed Rust native CPU request targets {target}; compiling locally because native resolution is only proven for host target {}",
+                    self.host
+                );
+            } else if let Some(profile) = resolved_native_profile.as_ref()
+                && let Some((cpu, _llvm_features)) = native_profile_parts(profile)
+            {
+                if native_target {
+                    let native_features = cached_cpu_cfg_features(
+                        (*creator).clone(),
+                        &self.executable,
+                        &self.version,
+                        &env_vars,
+                        Some("native"),
+                    )
+                    .await;
+                    let baseline_profile = cached_cpu_profile(
+                        (*creator).clone(),
+                        &self.executable,
+                        &self.version,
+                        &env_vars,
+                        None,
+                    )
+                    .await;
+                    match (native_features, baseline_profile) {
+                        (Ok(native_features), Ok(baseline_profile)) => {
+                            if let Some((baseline_cpu, _)) = native_profile_parts(&baseline_profile)
+                            {
+                                match cached_cpu_cfg_features(
+                                    (*creator).clone(),
+                                    &self.executable,
+                                    &self.version,
+                                    &env_vars,
+                                    Some(baseline_cpu),
+                                )
+                                .await
+                                {
+                                    Ok(baseline_features) => {
+                                        // Do not send the resolved CPU model itself: a VM or
+                                        // firmware can mask individual ISA features while LLVM
+                                        // still names the physical CPU model. Instead start from
+                                        // rustc's deterministic target baseline and explicitly
+                                        // reproduce every rustc-recognized host feature. LLVM-only
+                                        // model features remain disabled rather than guessed.
+                                        let feature_delta = explicit_native_feature_delta(
+                                            &native_features,
+                                            &baseline_features,
+                                        );
+                                        rewrite_native_target_cpu(
+                                            &mut effective_arguments,
+                                            baseline_cpu,
+                                            &feature_delta,
+                                        );
+                                    }
+                                    Err(error) => {
+                                        allow_dist = false;
+                                        warn!(
+                                            "Failed to resolve rustc baseline target features for {baseline_cpu}; compiling native request locally: {error:#}"
+                                        );
+                                    }
+                                }
+                            } else {
+                                allow_dist = false;
+                                warn!(
+                                    "rustc default CPU profile did not contain an explicit CPU name; compiling native request locally"
+                                );
+                            }
+                        }
+                        (Err(error), _) | (_, Err(error)) => {
+                            allow_dist = false;
+                            warn!(
+                                "Failed to resolve a safe explicit rustc native feature set for {cpu}; compiling locally: {error:#}"
+                            );
+                        }
+                    }
+                }
+                if allow_dist && native_tune {
+                    // `tune-cpu` changes scheduling choices rather than the ISA.
+                    // The native profile already gives us rustc/LLVM's local CPU
+                    // name, so use that exact explicit tuning model remotely.
+                    rewrite_native_tune_cpu(&mut effective_arguments, cpu);
+                }
+            } else {
+                allow_dist = false;
+                warn!(
+                    "rustc native CPU profile did not contain an explicit CPU name; compiling locally"
+                );
+            }
         }
 
         let mut canonical_paths = CanonicalRustPaths::from_env(&env_vars, &cwd, &self.sysroot);
@@ -2416,7 +2644,11 @@ where
                 })
         };
         args.hash(&mut HashToDigest { digest: &mut m });
-        if native_requested && (!may_dist || !target.starts_with("x86_64-")) {
+        if native_requested {
+            // Keep the resolved host profile in the cache identity even when
+            // `native` was rewritten to a proven-equivalent explicit CPU for
+            // distributed execution. This prevents cross-host cache aliasing if
+            // LLVM exposes host details not represented in rustc cfg features.
             if let Some(profile) = resolved_native_profile.as_ref() {
                 profile.hash(&mut HashToDigest { digest: &mut m });
             } else {
@@ -3984,6 +4216,25 @@ mod test {
     }
 
     #[test]
+    fn test_parse_cfg_target_features() {
+        let cfg = "target_arch=\"x86_64\"\ntarget_feature=\"sse2\"\ntarget_feature=\"avx2\"\n";
+        assert_eq!(
+            parse_cfg_target_features(cfg),
+            BTreeSet::from(["avx2".to_owned(), "sse2".to_owned()])
+        );
+    }
+
+    #[test]
+    fn test_explicit_native_feature_delta() {
+        let native = BTreeSet::from(["avx2".to_owned(), "sse2".to_owned()]);
+        let baseline = BTreeSet::from(["sse2".to_owned(), "sse3".to_owned()]);
+        assert_eq!(
+            explicit_native_feature_delta(&native, &baseline),
+            "+avx2,+sse2,-sse3"
+        );
+    }
+
+    #[test]
     fn test_rewrite_native_target_cpu() {
         let mut args = vec![Argument::WithValue(
             "-C",
@@ -3994,12 +4245,109 @@ mod test {
             ArgDisposition::Separated,
         )];
         assert!(native_target_requested(&args));
-        rewrite_native_target_cpu(&mut args, "x86-64-v2");
+        rewrite_native_target_cpu(&mut args, "x86-64", "+avx2,+sse2");
         assert!(!native_target_requested(&args));
         assert_eq!(
             args[0].iter_os_strings().collect::<Vec<_>>(),
-            vec![OsString::from("-C"), OsString::from("target-cpu=x86-64-v2")]
+            vec![OsString::from("-C"), OsString::from("target-cpu=x86-64")]
         );
+        assert_eq!(
+            args[1].iter_os_strings().collect::<Vec<_>>(),
+            vec![
+                OsString::from("-C"),
+                OsString::from("target-feature=+avx2,+sse2")
+            ]
+        );
+    }
+
+    #[test]
+    fn test_rewrite_native_target_cpu_preserves_user_feature_override_order() {
+        let target_feature = |value: &str| {
+            Argument::WithValue(
+                "-C",
+                CodeGen(ArgCodegen {
+                    opt: "target-feature".into(),
+                    value: Some(value.into()),
+                }),
+                ArgDisposition::Separated,
+            )
+        };
+        let target_cpu_native = || {
+            Argument::WithValue(
+                "-C",
+                CodeGen(ArgCodegen {
+                    opt: "target-cpu".into(),
+                    value: Some("native".into()),
+                }),
+                ArgDisposition::Separated,
+            )
+        };
+
+        for mut args in [
+            vec![target_feature("-avx2"), target_cpu_native()],
+            vec![target_cpu_native(), target_feature("-avx2")],
+        ] {
+            rewrite_native_target_cpu(&mut args, "x86-64", "+avx2,+sse2");
+            let features = args
+                .iter()
+                .filter_map(|arg| match arg.get_data() {
+                    Some(CodeGen(ArgCodegen { opt, value })) if opt == "target-feature" => {
+                        value.clone()
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(features, ["+avx2,+sse2", "-avx2"]);
+        }
+    }
+
+    #[test]
+    fn test_native_tune_requested() {
+        let args = vec![Argument::WithValue(
+            "-Z",
+            Unstable(ArgUnstable {
+                opt: "tune-cpu".into(),
+                value: Some("native".into()),
+            }),
+            ArgDisposition::Separated,
+        )];
+        assert!(native_tune_requested(&args));
+        assert!(!native_target_requested(&args));
+    }
+
+    #[test]
+    fn test_native_cpu_detection_uses_last_value() {
+        let codegen = |value: &str| {
+            Argument::WithValue(
+                "-C",
+                CodeGen(ArgCodegen {
+                    opt: "target-cpu".into(),
+                    value: Some(value.into()),
+                }),
+                ArgDisposition::Separated,
+            )
+        };
+        assert!(!native_target_requested(&[
+            codegen("native"),
+            codegen("znver2")
+        ]));
+        assert!(native_target_requested(&[
+            codegen("znver2"),
+            codegen("native")
+        ]));
+
+        let tune = |value: &str| {
+            Argument::WithValue(
+                "-Z",
+                Unstable(ArgUnstable {
+                    opt: "tune-cpu".into(),
+                    value: Some(value.into()),
+                }),
+                ArgDisposition::Separated,
+            )
+        };
+        assert!(!native_tune_requested(&[tune("native"), tune("znver2")]));
+        assert!(native_tune_requested(&[tune("znver2"), tune("native")]));
     }
 
     fn _parse_arguments(arguments: &[String]) -> CompilerArguments<ParsedArguments> {
@@ -5106,7 +5454,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
     }
 
     #[test]
-    fn test_dist_native_normalizes_to_x86_64_v2() -> Result<()> {
+    fn test_dist_native_resolves_to_equivalent_explicit_cpu() -> Result<()> {
         let f = TestFixture::new();
         f.touch("foo.rs")?;
 
@@ -5147,6 +5495,19 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             };
             if profile.is_none() {
                 next_command(&creator, Err(anyhow!("native profile probe failed")));
+            } else if may_dist {
+                let native_cfg = "target_feature=\"sse2\"\ntarget_feature=\"avx2\"\n";
+                next_command(&creator, Ok(MockChild::new(exit_status(0), native_cfg, "")));
+                let baseline_ir = r#"attributes #0 = { "target-cpu"="x86-64" }"#;
+                next_command(
+                    &creator,
+                    Ok(MockChild::new(exit_status(0), baseline_ir, "")),
+                );
+                let baseline_cfg = "target_feature=\"sse2\"\n";
+                next_command(
+                    &creator,
+                    Ok(MockChild::new(exit_status(0), baseline_cfg, "")),
+                );
             }
             mock_dep_info(&creator, &["foo.rs"]);
             mock_file_names(&creator, &["foo.rlib"]);
@@ -5171,10 +5532,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         assert_eq!(local_znver5.cache_control, CacheControl::Default);
 
         let dist_znver2 = run(Some("znver2|+avx2"), true)?;
-        let dist_znver5 = run(Some("znver5|+avx512f"), true)?;
-        assert_eq!(dist_znver2.key, dist_znver5.key);
         assert_eq!(dist_znver2.cache_control, CacheControl::Default);
-        assert_eq!(dist_znver5.cache_control, CacheControl::Default);
 
         let unresolved_native = run(None, false)?;
         assert_eq!(
@@ -5189,7 +5547,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             .generate_compile_commands(&mut transformer, false)?;
 
         let local_args = local_command.get_arguments();
-        assert!(local_args.iter().any(|arg| arg == "target-cpu=x86-64-v2"));
+        assert!(local_args.iter().any(|arg| arg == "target-cpu=x86-64"));
 
         #[cfg(feature = "dist-client")]
         {
@@ -5197,7 +5555,12 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 bail!("distributed native compilation did not produce a distributed command");
             };
             let dist_args = dist_command.arguments;
-            assert!(dist_args.iter().any(|arg| arg == "target-cpu=x86-64-v2"));
+            assert!(dist_args.iter().any(|arg| arg == "target-cpu=x86-64"));
+            assert!(
+                dist_args
+                    .iter()
+                    .any(|arg| arg == "target-feature=+avx2,+sse2")
+            );
             assert!(!dist_args.iter().any(|arg| arg == "target-cpu=native"));
         }
 
