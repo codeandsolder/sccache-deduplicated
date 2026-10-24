@@ -187,16 +187,21 @@ mod test {
     use std::net::{TcpListener, TcpStream};
 
     #[test]
-    fn test_read_one_response_server_hung_up() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        drop(listener.accept().unwrap());
-        let mut conn = ServerConnection::new(Box::new(stream)).unwrap();
+    fn test_read_one_response_server_hung_up() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let stream = TcpStream::connect(listener.local_addr()?)?;
+        drop(listener.accept()?);
+        let mut conn = ServerConnection::new(Box::new(stream))?;
         let err = conn.read_one_response().unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::UnexpectedEof)
+        );
         assert!(
             err.to_string()
                 .starts_with("the sccache server closed the connection without replying"),
             "{err:#}"
         );
+        Ok(())
     }
 }
