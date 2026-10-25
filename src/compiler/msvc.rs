@@ -132,45 +132,11 @@ fn from_local_codepage(multi_byte_str: &[u8]) -> io::Result<String> {
 
 #[cfg(windows)]
 pub fn from_local_codepage(multi_byte_str: &[u8]) -> io::Result<String> {
-    use windows_sys::Win32::Globalization::{CP_OEMCP, MB_ERR_INVALID_CHARS, MultiByteToWideChar};
+    use crate::util::multi_byte_to_wide_char;
+    use windows_sys::Win32::Globalization::{CP_OEMCP, MB_ERR_INVALID_CHARS};
 
-    let codepage = CP_OEMCP;
-    let flags = MB_ERR_INVALID_CHARS;
-
-    // Empty string
-    if multi_byte_str.is_empty() {
-        return Ok(String::new());
-    }
-    unsafe {
-        // Get length of UTF-16 string
-        let len = MultiByteToWideChar(
-            codepage,
-            flags,
-            multi_byte_str.as_ptr().cast(),
-            multi_byte_str.len() as i32,
-            std::ptr::null_mut(),
-            0,
-        );
-        if len > 0 {
-            // Convert to UTF-16
-            let mut wstr: Vec<u16> = Vec::with_capacity(len as usize);
-            let len = MultiByteToWideChar(
-                codepage,
-                flags,
-                multi_byte_str.as_ptr().cast(),
-                multi_byte_str.len() as i32,
-                wstr.as_mut_ptr().cast(),
-                len,
-            );
-            if len > 0 {
-                // wstr's contents have now been initialized
-                wstr.set_len(len as usize);
-                return String::from_utf16(&wstr[0..(len as usize)])
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e));
-            }
-        }
-        Err(io::Error::last_os_error())
-    }
+    let wide = multi_byte_to_wide_char(CP_OEMCP, MB_ERR_INVALID_CHARS, multi_byte_str)?;
+    String::from_utf16(&wide).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
 }
 
 /// Detect the prefix included in the output of MSVC's -showIncludes output.
@@ -963,15 +929,16 @@ fn normpath(path: &str) -> String {
     File::open(path)
         .and_then(|f| {
             let handle = f.as_raw_handle() as _;
+            // SAFETY: `handle` belongs to the live `File`; a null output buffer with
+            // length zero is the documented size-query form and stores no pointer.
             let size = unsafe { GetFinalPathNameByHandleW(handle, ptr::null_mut(), 0, 0) };
             if size == 0 {
                 return Err(io::Error::last_os_error());
             }
             let mut wchars = vec![0; size as usize];
-            if unsafe {
-                GetFinalPathNameByHandleW(handle, wchars.as_mut_ptr(), wchars.len() as u32, 0)
-            } == 0
-            {
+            // SAFETY: `wchars` is writable for exactly `size` UTF-16 code units,
+            // `handle` remains live for the call, and Windows does not retain either pointer.
+            if unsafe { GetFinalPathNameByHandleW(handle, wchars.as_mut_ptr(), size, 0) } == 0 {
                 return Err(io::Error::last_os_error());
             }
             // The return value of GetFinalPathNameByHandleW uses the
@@ -3299,6 +3266,7 @@ mod test {
         use crate::util::wide_char_to_multi_byte;
         use windows_sys::Win32::Globalization::GetOEMCP;
 
+        // SAFETY: GetOEMCP takes no pointers and has no caller-managed preconditions.
         let current_oemcp = unsafe { GetOEMCP() };
         // We don't control the local OEM codepage so test only if it is one of:
         // United Stats, Latin-1 and Latin-1 + euro symbol

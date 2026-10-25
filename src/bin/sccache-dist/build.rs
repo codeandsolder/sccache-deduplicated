@@ -53,7 +53,7 @@ impl CommandExt for Command {
         let mut stdin = process
             .stdin
             .take()
-            .expect("Requested piped stdin but not present");
+            .context("requested piped stdin but child did not expose it")?;
         pipe(&mut stdin).context("Failed to pipe input to process")?;
         let output = process
             .wait_with_output()
@@ -183,9 +183,9 @@ impl OverlayBuilder {
             let toolchain_dir = self.dir.join("toolchains").join(&tc.archive_id);
             if toolchain_dir_map.contains_key(tc) && toolchain_dir.exists() {
                 // TODO: use if let when sccache can use NLL
-                let entry = toolchain_dir_map
-                    .get_mut(tc)
-                    .expect("Key missing after checking");
+                let entry = toolchain_dir_map.get_mut(tc).ok_or_else(|| {
+                    anyhow!("toolchain disappeared from directory map while locked")
+                })?;
                 entry.build_count += 1;
                 entry.clone()
             } else {
@@ -834,7 +834,7 @@ impl DockerBuilder {
                 .context("Failed to start command to retrieve output file")?;
             if output.status.success() {
                 let output = OutputData::try_from_reader(&*output.stdout)
-                    .expect("Failed to read compress output stdout");
+                    .context("failed to decode compressed build output")?;
                 outputs.push((path, output))
             } else {
                 debug!("Missing output path {:?}", path)

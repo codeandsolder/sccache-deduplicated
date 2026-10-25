@@ -470,9 +470,10 @@ impl Scheduler {
                 "Server {} appears to be dead, pruning it in the scheduler",
                 server_id.addr()
             );
-            let server_details = servers
-                .remove(&server_id)
-                .expect("server went missing from map");
+            let Some(server_details) = servers.remove(&server_id) else {
+                error!("server {server_id:?} disappeared while pruning");
+                continue;
+            };
             for job_id in server_details.jobs_assigned {
                 warn!(
                     "Non-terminated job {} was cleaned up in server pruning",

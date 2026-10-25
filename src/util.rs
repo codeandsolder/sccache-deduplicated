@@ -724,52 +724,54 @@ pub fn decode_path(bytes: &[u8]) -> std::io::Result<PathBuf> {
 pub fn wide_char_to_multi_byte(wide_char_str: &[u16]) -> std::io::Result<Vec<u8>> {
     use windows_sys::Win32::Globalization::{CP_OEMCP, WideCharToMultiByte};
 
-    let codepage = CP_OEMCP;
-    let flags = 0;
-    // Empty string
     if wide_char_str.is_empty() {
         return Ok(Vec::new());
     }
-    // SAFETY: the input slice is valid for the supplied length. The first call
-    // only queries the required size; the second writes into a buffer allocated
-    // to exactly that size and Windows does not retain either pointer.
-    unsafe {
-        // Get length of multibyte string
-        let len = WideCharToMultiByte(
-            codepage,
-            flags,
+    let input_len = i32::try_from(wide_char_str.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "UTF-16 input is too large for WideCharToMultiByte",
+        )
+    })?;
+
+    // SAFETY: the input slice is valid for `input_len` elements; the null output
+    // buffer with length zero is the documented size-query form and is not retained.
+    let output_len = unsafe {
+        WideCharToMultiByte(
+            CP_OEMCP,
+            0,
             wide_char_str.as_ptr(),
-            wide_char_str.len() as i32,
+            input_len,
             std::ptr::null_mut(),
             0,
             std::ptr::null(),
             std::ptr::null_mut(),
-        );
-
-        if len > 0 {
-            // Convert from UTF-16 to multibyte
-            let mut astr: Vec<u8> = Vec::with_capacity(len as usize);
-            let len = WideCharToMultiByte(
-                codepage,
-                flags,
-                wide_char_str.as_ptr(),
-                wide_char_str.len() as i32,
-                astr.as_mut_ptr().cast(),
-                len,
-                std::ptr::null(),
-                std::ptr::null_mut(),
-            );
-            if len > 0 {
-                astr.set_len(len as usize);
-                if (len as usize) == astr.len() {
-                    return Ok(astr);
-                } else {
-                    return Ok(astr[0..(len as usize)].to_vec());
-                }
-            }
-        }
-        Err(std::io::Error::last_os_error())
+        )
+    };
+    if output_len <= 0 {
+        return Err(std::io::Error::last_os_error());
     }
+
+    let mut output = vec![0_u8; output_len as usize];
+    // SAFETY: `output` is writable for `output_len` bytes, the input remains live,
+    // and Windows does not retain either pointer.
+    let written = unsafe {
+        WideCharToMultiByte(
+            CP_OEMCP,
+            0,
+            wide_char_str.as_ptr(),
+            input_len,
+            output.as_mut_ptr(),
+            output_len,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        )
+    };
+    if written <= 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    output.truncate(written as usize);
+    Ok(output)
 }
 
 #[cfg(windows)]
@@ -787,37 +789,47 @@ pub fn multi_byte_to_wide_char(
     if multi_byte_str.is_empty() {
         return Ok(vec![]);
     }
-    // SAFETY: the input slice is valid for the supplied length. The first call
-    // only queries the required size; the second writes into a buffer allocated
-    // to exactly that size and Windows does not retain either pointer.
-    unsafe {
-        // Get length of UTF-16 string
-        let len = MultiByteToWideChar(
+    let input_len = i32::try_from(multi_byte_str.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "multibyte input is too large for MultiByteToWideChar",
+        )
+    })?;
+
+    // SAFETY: the input slice is valid for `input_len` bytes; the null output
+    // buffer with length zero is the documented size-query form and is not retained.
+    let output_len = unsafe {
+        MultiByteToWideChar(
             codepage,
             flags,
             multi_byte_str.as_ptr(),
-            multi_byte_str.len() as i32,
+            input_len,
             std::ptr::null_mut(),
             0,
-        );
-        if len > 0 {
-            // Convert to UTF-16
-            let mut wstr: Vec<u16> = Vec::with_capacity(len as usize);
-            let len = MultiByteToWideChar(
-                codepage,
-                flags,
-                multi_byte_str.as_ptr(),
-                multi_byte_str.len() as i32,
-                wstr.as_mut_ptr(),
-                len,
-            );
-            wstr.set_len(len as usize);
-            if len > 0 {
-                return Ok(wstr);
-            }
-        }
-        Err(std::io::Error::last_os_error())
+        )
+    };
+    if output_len <= 0 {
+        return Err(std::io::Error::last_os_error());
     }
+
+    let mut output = vec![0_u16; output_len as usize];
+    // SAFETY: `output` is writable for `output_len` UTF-16 code units, the input
+    // remains live for the call, and Windows does not retain either pointer.
+    let written = unsafe {
+        MultiByteToWideChar(
+            codepage,
+            flags,
+            multi_byte_str.as_ptr(),
+            input_len,
+            output.as_mut_ptr(),
+            output_len,
+        )
+    };
+    if written <= 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    output.truncate(written as usize);
+    Ok(output)
 }
 
 /// A Unix timestamp with nanoseconds precision

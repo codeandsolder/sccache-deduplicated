@@ -270,8 +270,12 @@ fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup
         dwProcessId: 0,
         dwThreadId: 0,
     };
+    // SAFETY: STARTUPINFOW is a plain Win32 data structure for which all-zero
+    // initialization is valid; `cb` is set to the required structure size immediately below.
     let mut si: STARTUPINFOW = unsafe { mem::zeroed() };
     si.cb = mem::size_of::<STARTUPINFOW>() as _;
+    // SAFETY: all UTF-16/environment buffers stay alive for the call, the output
+    // structure is writable, and no security-attribute pointers are supplied.
     if unsafe {
         CreateProcessW(
             exe.as_mut_ptr(),
@@ -286,6 +290,8 @@ fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup
             &mut pi,
         ) != 0
     } {
+        // SAFETY: a successful CreateProcessW call initialized both owned handles;
+        // neither handle is used after it is closed here.
         unsafe {
             CloseHandle(pi.hProcess);
             CloseHandle(pi.hThread);

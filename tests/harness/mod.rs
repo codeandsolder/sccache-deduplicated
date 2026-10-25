@@ -12,7 +12,7 @@ use std::io::Write;
 use std::net::{self, IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "dist-server")]
-use std::process::Output;
+use std::process::{Child, Output};
 use std::process::{Command, Stdio};
 #[cfg(feature = "dist-server")]
 use std::str::FromStr;
@@ -23,14 +23,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use assert_cmd::prelude::*;
-#[cfg(feature = "dist-server")]
-use nix::{
-    sys::{
-        signal::Signal,
-        wait::{WaitPidFlag, WaitStatus},
-    },
-    unistd::{ForkResult, Pid},
-};
 use predicates::prelude::*;
 use serde::Serialize;
 #[cfg(feature = "dist-server")]
@@ -50,6 +42,10 @@ const DIST_CACHE_RELPATH: &str = "client-dist-cache";
 
 #[cfg(feature = "dist-server")]
 const DIST_SERVER_TOKEN: &str = "THIS IS THE TEST TOKEN";
+
+pub const CUSTOM_SERVER_ADDR_ENV: &str = "SCCACHE_TEST_CUSTOM_SERVER_ADDR";
+pub const CUSTOM_SERVER_SCHEDULER_ENV: &str = "SCCACHE_TEST_CUSTOM_SERVER_SCHEDULER";
+pub const CUSTOM_SERVER_TOKEN_ENV: &str = "SCCACHE_TEST_CUSTOM_SERVER_TOKEN";
 
 #[cfg(feature = "dist-server")]
 const CONFIGS_CONTAINER_PATH: &str = "/sccache-bits";
@@ -268,7 +264,7 @@ fn create_server_token(server_id: ServerId, auth_token: &str) -> String {
 #[cfg(feature = "dist-server")]
 pub enum ServerHandle {
     Container { cid: String, url: HTTPUrl },
-    Process { pid: Pid, url: HTTPUrl },
+    Process { pid: u32, url: HTTPUrl },
 }
 
 #[cfg(feature = "dist-server")]
@@ -278,7 +274,7 @@ pub struct DistSystem {
 
     scheduler_name: Option<String>,
     server_names: Vec<String>,
-    server_pids: Vec<Pid>,
+    server_processes: Vec<Child>,
 }
 
 #[cfg(feature = "dist-server")]
@@ -324,7 +320,7 @@ impl DistSystem {
 
             scheduler_name: None,
             server_names: vec![],
-            server_pids: vec![],
+            server_processes: vec![],
         }
     }
 
@@ -468,37 +464,24 @@ impl DistSystem {
         handle
     }
 
-    pub fn add_custom_server<S: dist::ServerIncoming + 'static>(
-        &mut self,
-        handler: S,
-    ) -> ServerHandle {
+    pub fn add_custom_server_process(&mut self, test_name: &str) -> ServerHandle {
         let server_addr = {
             let ip = IpAddr::from_str("127.0.0.1").unwrap();
             let listener = net::TcpListener::bind(SocketAddr::from((ip, 0))).unwrap();
             listener.local_addr().unwrap()
         };
         let token = create_server_token(ServerId::new(server_addr), DIST_SERVER_TOKEN);
-        let server = dist::http::Server::new(
-            server_addr,
-            Some(SocketAddr::from(([0, 0, 0, 0], server_addr.port()))),
-            self.scheduler_url().to_url(),
-            token,
-            handler,
-        )
-        .unwrap();
-        let pid = match unsafe { nix::unistd::fork() }.unwrap() {
-            ForkResult::Parent { child } => {
-                self.server_pids.push(child);
-                child
-            }
-            ForkResult::Child => {
-                unsafe {
-                    env::set_var("SCCACHE_LOG", "sccache=trace");
-                }
-                env_logger::try_init().unwrap();
-                server.start().unwrap()
-            }
-        };
+        let scheduler_url = self.scheduler_url().to_url().to_string();
+        let child = Command::new(env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CUSTOM_SERVER_ADDR_ENV, server_addr.to_string())
+            .env(CUSTOM_SERVER_SCHEDULER_ENV, scheduler_url)
+            .env(CUSTOM_SERVER_TOKEN_ENV, token)
+            .env("SCCACHE_LOG", "sccache=trace")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        self.server_processes.push(child);
 
         let url =
             HTTPUrl::from_url(reqwest::Url::parse(&format!("https://{}", server_addr)).unwrap());
@@ -657,31 +640,20 @@ impl Drop for DistSystem {
                     .map(|o| outputs.push((server_name, o)))
             );
         }
-        for &pid in self.server_pids.iter() {
-            droperr!(nix::sys::signal::kill(pid, Signal::SIGINT));
-            thread::sleep(Duration::from_millis(100));
-            let mut killagain = true; // Default to trying to kill again, e.g. if there was an error waiting on the pid
-            droperr!(
-                nix::sys::wait::waitpid(pid, Some(WaitPidFlag::WNOHANG)).map(|ws| {
-                    if ws != WaitStatus::StillAlive {
-                        killagain = false;
-                        exits.push(ws)
-                    }
-                })
-            );
-            if killagain {
-                eprintln!("SIGINT didn't kill process, trying SIGKILL");
-                droperr!(nix::sys::signal::kill(pid, Signal::SIGKILL));
-                droperr!(
-                    nix::sys::wait::waitpid(pid, Some(WaitPidFlag::WNOHANG))
-                        .map_err(|e| e.to_string())
-                        .and_then(|ws| if ws == WaitStatus::StillAlive {
-                            Err("process alive after sigkill".to_owned())
-                        } else {
-                            exits.push(ws);
-                            Ok(())
-                        })
-                );
+        for child in &mut self.server_processes {
+            match child.try_wait() {
+                Ok(Some(status)) => exits.push(status),
+                Ok(None) => {
+                    droperr!(child.kill());
+                    droperr!(child.wait().map(|status| exits.push(status)));
+                }
+                Err(error) => {
+                    did_err = true;
+                    eprintln!(
+                        "Error checking custom server process {}: {error}",
+                        child.id()
+                    );
+                }
             }
         }
 

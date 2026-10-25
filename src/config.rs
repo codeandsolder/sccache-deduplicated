@@ -24,9 +24,8 @@ use serde::{
     Deserialize, Serialize,
     de::{self, DeserializeOwned, Deserializer},
 };
-#[cfg(test)]
-use serial_test::serial;
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
@@ -912,6 +911,36 @@ pub fn try_read_config_file<T: DeserializeOwned>(path: &Path) -> Result<Option<T
     Ok(Some(res))
 }
 
+#[derive(Debug, Clone, Default)]
+struct Environment {
+    vars: HashMap<String, OsString>,
+}
+
+impl Environment {
+    fn capture() -> Self {
+        Self {
+            vars: env::vars_os()
+                .filter_map(|(name, value)| name.into_string().ok().map(|name| (name, value)))
+                .collect(),
+        }
+    }
+
+    fn var_os(&self, name: &str) -> Option<&OsStr> {
+        self.vars.get(name).map(OsString::as_os_str)
+    }
+
+    #[cfg(test)]
+    fn set(&mut self, name: &str, value: impl AsRef<OsStr>) {
+        self.vars
+            .insert(name.to_owned(), value.as_ref().to_os_string());
+    }
+
+    #[cfg(test)]
+    fn remove(&mut self, name: &str) {
+        self.vars.remove(name);
+    }
+}
+
 #[derive(Debug)]
 pub struct EnvConfig {
     cache: CacheConfigs,
@@ -919,12 +948,16 @@ pub struct EnvConfig {
     client_side_mode: Option<bool>,
 }
 
-fn string_from_env_var(env_var_name: &str) -> Option<String> {
-    env::var(env_var_name).ok().filter(|s| !s.is_empty())
+fn string_from_env_var(environment: &Environment, env_var_name: &str) -> Option<String> {
+    environment
+        .var_os(env_var_name)
+        .and_then(OsStr::to_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
 }
 
-fn key_prefix_from_env_var(env_var_name: &str) -> String {
-    string_from_env_var(env_var_name)
+fn key_prefix_from_env_var(environment: &Environment, env_var_name: &str) -> String {
+    string_from_env_var(environment, env_var_name)
         .as_ref()
         .map(|s| s.trim_end_matches('/'))
         .filter(|s| !s.is_empty())
@@ -932,22 +965,30 @@ fn key_prefix_from_env_var(env_var_name: &str) -> String {
         .to_owned()
 }
 
-fn cache_mode_from_env_var(env_var_name: &str) -> Option<CacheModeConfig> {
-    string_from_env_var(env_var_name).and_then(|value| match value.to_uppercase().as_str() {
-        "READ_ONLY" => Some(CacheModeConfig::ReadOnly),
-        "READ_WRITE" => Some(CacheModeConfig::ReadWrite),
-        _ => {
-            warn!("{env_var_name} must be 'READ_ONLY' or 'READ_WRITE'");
-            None
+fn cache_mode_from_env_var(
+    environment: &Environment,
+    env_var_name: &str,
+) -> Option<CacheModeConfig> {
+    string_from_env_var(environment, env_var_name).and_then(|value| {
+        match value.to_uppercase().as_str() {
+            "READ_ONLY" => Some(CacheModeConfig::ReadOnly),
+            "READ_WRITE" => Some(CacheModeConfig::ReadWrite),
+            _ => {
+                warn!("{env_var_name} must be 'READ_ONLY' or 'READ_WRITE'");
+                None
+            }
         }
     })
 }
 
-fn number_from_env_var<A: std::str::FromStr>(env_var_name: &str) -> Option<Result<A>>
+fn number_from_env_var<A: std::str::FromStr>(
+    environment: &Environment,
+    env_var_name: &str,
+) -> Option<Result<A>>
 where
     <A as FromStr>::Err: std::fmt::Debug,
 {
-    let value = string_from_env_var(env_var_name)?;
+    let value = string_from_env_var(environment, env_var_name)?;
 
     value
         .parse::<A>()
@@ -955,8 +996,8 @@ where
         .into()
 }
 
-fn bool_from_env_var(env_var_name: &str) -> Result<Option<bool>> {
-    string_from_env_var(env_var_name)
+fn bool_from_env_var(environment: &Environment, env_var_name: &str) -> Result<Option<bool>> {
+    string_from_env_var(environment, env_var_name)
         .map(|value| match value.to_lowercase().as_str() {
             "true" | "on" | "1" => Ok(true),
             "false" | "off" | "0" => Ok(false),
@@ -965,55 +1006,74 @@ fn bool_from_env_var(env_var_name: &str) -> Result<Option<bool>> {
         .transpose()
 }
 
-fn skip_cache_check_from_env() -> Result<bool> {
-    Ok(bool_from_env_var("SCCACHE_SKIP_CACHE_CHECK")?.unwrap_or(false))
+fn skip_cache_check_from_env(environment: &Environment) -> Result<bool> {
+    Ok(bool_from_env_var(environment, "SCCACHE_SKIP_CACHE_CHECK")?.unwrap_or(false))
 }
 
-fn config_from_env() -> Result<EnvConfig> {
+fn config_from_environment(environment: &Environment) -> Result<EnvConfig> {
     // ======= AWS =======
-    let s3 = if let Some(bucket) = string_from_env_var("SCCACHE_BUCKET") {
-        let region = string_from_env_var("SCCACHE_REGION");
-        let no_credentials = bool_from_env_var("SCCACHE_S3_NO_CREDENTIALS")?.unwrap_or(false);
-        let use_ssl = bool_from_env_var("SCCACHE_S3_USE_SSL")?;
-        let server_side_encryption = bool_from_env_var("SCCACHE_S3_SERVER_SIDE_ENCRYPTION")?;
+    let s3 = if let Some(bucket) = string_from_env_var(environment, "SCCACHE_BUCKET") {
+        let region = string_from_env_var(environment, "SCCACHE_REGION");
+        let no_credentials =
+            bool_from_env_var(environment, "SCCACHE_S3_NO_CREDENTIALS")?.unwrap_or(false);
+        let use_ssl = bool_from_env_var(environment, "SCCACHE_S3_USE_SSL")?;
+        let server_side_encryption =
+            bool_from_env_var(environment, "SCCACHE_S3_SERVER_SIDE_ENCRYPTION")?;
         let server_side_encryption_aws_kms =
-            bool_from_env_var("SCCACHE_S3_SERVER_SIDE_ENCRYPTION_AWS_KMS")?;
+            bool_from_env_var(environment, "SCCACHE_S3_SERVER_SIDE_ENCRYPTION_AWS_KMS")?;
         let server_side_encryption_kms_key_id =
-            string_from_env_var("SCCACHE_S3_SERVER_SIDE_ENCRYPTION_KMS_KEY_ID");
-        let endpoint = string_from_env_var("SCCACHE_ENDPOINT");
-        let key_prefix = key_prefix_from_env_var("SCCACHE_S3_KEY_PREFIX");
-        let enable_virtual_host_style = bool_from_env_var("SCCACHE_S3_ENABLE_VIRTUAL_HOST_STYLE")?;
-        let rw_mode =
-            cache_mode_from_env_var("SCCACHE_S3_RW_MODE").unwrap_or(CacheModeConfig::ReadWrite);
+            string_from_env_var(environment, "SCCACHE_S3_SERVER_SIDE_ENCRYPTION_KMS_KEY_ID");
+        let endpoint = string_from_env_var(environment, "SCCACHE_ENDPOINT");
+        let key_prefix = key_prefix_from_env_var(environment, "SCCACHE_S3_KEY_PREFIX");
+        let enable_virtual_host_style =
+            bool_from_env_var(environment, "SCCACHE_S3_ENABLE_VIRTUAL_HOST_STYLE")?;
+        let rw_mode = cache_mode_from_env_var(environment, "SCCACHE_S3_RW_MODE")
+            .unwrap_or(CacheModeConfig::ReadWrite);
         let capacity = match (
-            number_from_env_var::<u64>("SCCACHE_S3_CAPACITY_HIGH_WATERMARK").transpose()?,
-            number_from_env_var::<u64>("SCCACHE_S3_CAPACITY_LOW_WATERMARK").transpose()?,
+            number_from_env_var::<u64>(environment, "SCCACHE_S3_CAPACITY_HIGH_WATERMARK")
+                .transpose()?,
+            number_from_env_var::<u64>(environment, "SCCACHE_S3_CAPACITY_LOW_WATERMARK")
+                .transpose()?,
         ) {
             (None, None) => None,
             (Some(high_watermark), Some(low_watermark)) => Some(S3CapacityConfig {
                 high_watermark,
                 low_watermark,
-                touch_interval_secs: number_from_env_var("SCCACHE_S3_CAPACITY_TOUCH_INTERVAL_SECS")
-                    .transpose()?
-                    .unwrap_or_else(default_s3_capacity_touch_interval_secs),
+                touch_interval_secs: number_from_env_var(
+                    environment,
+                    "SCCACHE_S3_CAPACITY_TOUCH_INTERVAL_SECS",
+                )
+                .transpose()?
+                .unwrap_or_else(default_s3_capacity_touch_interval_secs),
                 state_flush_interval_secs: number_from_env_var(
+                    environment,
                     "SCCACHE_S3_CAPACITY_STATE_FLUSH_INTERVAL_SECS",
                 )
                 .transpose()?
                 .unwrap_or_else(default_s3_capacity_state_flush_interval_secs),
-                heat_half_life_secs: number_from_env_var("SCCACHE_S3_CAPACITY_HEAT_HALF_LIFE_SECS")
-                    .transpose()?
-                    .unwrap_or_else(default_s3_capacity_heat_half_life_secs),
+                heat_half_life_secs: number_from_env_var(
+                    environment,
+                    "SCCACHE_S3_CAPACITY_HEAT_HALF_LIFE_SECS",
+                )
+                .transpose()?
+                .unwrap_or_else(default_s3_capacity_heat_half_life_secs),
                 eviction_concurrency: number_from_env_var(
+                    environment,
                     "SCCACHE_S3_CAPACITY_EVICTION_CONCURRENCY",
                 )
                 .transpose()?
                 .unwrap_or_else(default_s3_capacity_eviction_concurrency),
-                lease_ttl_secs: number_from_env_var("SCCACHE_S3_CAPACITY_LEASE_TTL_SECS")
-                    .transpose()?
-                    .unwrap_or_else(default_s3_capacity_lease_ttl_secs),
-                metadata_prefix: string_from_env_var("SCCACHE_S3_CAPACITY_METADATA_PREFIX")
-                    .unwrap_or_else(default_s3_capacity_metadata_prefix),
+                lease_ttl_secs: number_from_env_var(
+                    environment,
+                    "SCCACHE_S3_CAPACITY_LEASE_TTL_SECS",
+                )
+                .transpose()?
+                .unwrap_or_else(default_s3_capacity_lease_ttl_secs),
+                metadata_prefix: string_from_env_var(
+                    environment,
+                    "SCCACHE_S3_CAPACITY_METADATA_PREFIX",
+                )
+                .unwrap_or_else(default_s3_capacity_metadata_prefix),
             }),
             _ => bail!(
                 "SCCACHE_S3_CAPACITY_HIGH_WATERMARK and SCCACHE_S3_CAPACITY_LOW_WATERMARK must be set together"
@@ -1042,35 +1102,35 @@ fn config_from_env() -> Result<EnvConfig> {
     };
 
     if s3.as_ref().is_some_and(|s3| s3.no_credentials)
-        && (env::var_os("AWS_ACCESS_KEY_ID").is_some()
-            || env::var_os("AWS_SECRET_ACCESS_KEY").is_some())
+        && (environment.var_os("AWS_ACCESS_KEY_ID").is_some()
+            || environment.var_os("AWS_SECRET_ACCESS_KEY").is_some())
     {
         bail!("If setting S3 credentials, SCCACHE_S3_NO_CREDENTIALS must not be set.");
     }
 
     // ======= redis =======
     let redis = match (
-        string_from_env_var("SCCACHE_REDIS"),
-        string_from_env_var("SCCACHE_REDIS_ENDPOINT"),
-        string_from_env_var("SCCACHE_REDIS_CLUSTER_ENDPOINTS"),
+        string_from_env_var(environment, "SCCACHE_REDIS"),
+        string_from_env_var(environment, "SCCACHE_REDIS_ENDPOINT"),
+        string_from_env_var(environment, "SCCACHE_REDIS_CLUSTER_ENDPOINTS"),
     ) {
         (None, None, None) => None,
         (url, endpoint, cluster_endpoints) => {
-            let db = number_from_env_var("SCCACHE_REDIS_DB")
+            let db = number_from_env_var(environment, "SCCACHE_REDIS_DB")
                 .transpose()?
                 .unwrap_or(DEFAULT_REDIS_DB);
 
-            let username = string_from_env_var("SCCACHE_REDIS_USERNAME");
-            let password = string_from_env_var("SCCACHE_REDIS_PASSWORD");
+            let username = string_from_env_var(environment, "SCCACHE_REDIS_USERNAME");
+            let password = string_from_env_var(environment, "SCCACHE_REDIS_PASSWORD");
 
-            let ttl = number_from_env_var("SCCACHE_REDIS_EXPIRATION")
-                .or_else(|| number_from_env_var("SCCACHE_REDIS_TTL"))
+            let ttl = number_from_env_var(environment, "SCCACHE_REDIS_EXPIRATION")
+                .or_else(|| number_from_env_var(environment, "SCCACHE_REDIS_TTL"))
                 .transpose()?
                 .unwrap_or(DEFAULT_REDIS_CACHE_TTL);
 
-            let key_prefix = key_prefix_from_env_var("SCCACHE_REDIS_KEY_PREFIX");
+            let key_prefix = key_prefix_from_env_var(environment, "SCCACHE_REDIS_KEY_PREFIX");
 
-            let rw_mode = cache_mode_from_env_var("SCCACHE_REDIS_RW_MODE")
+            let rw_mode = cache_mode_from_env_var(environment, "SCCACHE_REDIS_RW_MODE")
                 .unwrap_or(CacheModeConfig::ReadWrite);
 
             Some(RedisCacheConfig {
@@ -1087,26 +1147,26 @@ fn config_from_env() -> Result<EnvConfig> {
         }
     };
 
-    if env::var_os("SCCACHE_REDIS_EXPIRATION").is_some()
-        && env::var_os("SCCACHE_REDIS_TTL").is_some()
+    if environment.var_os("SCCACHE_REDIS_EXPIRATION").is_some()
+        && environment.var_os("SCCACHE_REDIS_TTL").is_some()
     {
         bail!("You mustn't set both SCCACHE_REDIS_EXPIRATION and SCCACHE_REDIS_TTL. Use only one.");
     }
 
     // ======= memcached =======
-    let memcached = if let Some(url) = string_from_env_var("SCCACHE_MEMCACHED")
-        .or_else(|| string_from_env_var("SCCACHE_MEMCACHED_ENDPOINT"))
+    let memcached = if let Some(url) = string_from_env_var(environment, "SCCACHE_MEMCACHED")
+        .or_else(|| string_from_env_var(environment, "SCCACHE_MEMCACHED_ENDPOINT"))
     {
-        let username = string_from_env_var("SCCACHE_MEMCACHED_USERNAME");
-        let password = string_from_env_var("SCCACHE_MEMCACHED_PASSWORD");
+        let username = string_from_env_var(environment, "SCCACHE_MEMCACHED_USERNAME");
+        let password = string_from_env_var(environment, "SCCACHE_MEMCACHED_PASSWORD");
 
-        let expiration = number_from_env_var("SCCACHE_MEMCACHED_EXPIRATION")
+        let expiration = number_from_env_var(environment, "SCCACHE_MEMCACHED_EXPIRATION")
             .transpose()?
             .unwrap_or(DEFAULT_MEMCACHED_CACHE_EXPIRATION);
 
-        let key_prefix = key_prefix_from_env_var("SCCACHE_MEMCACHED_KEY_PREFIX");
+        let key_prefix = key_prefix_from_env_var(environment, "SCCACHE_MEMCACHED_KEY_PREFIX");
 
-        let rw_mode = cache_mode_from_env_var("SCCACHE_MEMCACHED_RW_MODE")
+        let rw_mode = cache_mode_from_env_var(environment, "SCCACHE_MEMCACHED_RW_MODE")
             .unwrap_or(CacheModeConfig::ReadWrite);
 
         Some(MemcachedCacheConfig {
@@ -1121,8 +1181,8 @@ fn config_from_env() -> Result<EnvConfig> {
         None
     };
 
-    if env::var_os("SCCACHE_MEMCACHED").is_some()
-        && env::var_os("SCCACHE_MEMCACHED_ENDPOINT").is_some()
+    if environment.var_os("SCCACHE_MEMCACHED").is_some()
+        && environment.var_os("SCCACHE_MEMCACHED_ENDPOINT").is_some()
     {
         bail!(
             "You mustn't set both SCCACHE_MEMCACHED and SCCACHE_MEMCACHED_ENDPOINT. Please, use only SCCACHE_MEMCACHED_ENDPOINT."
@@ -1130,30 +1190,30 @@ fn config_from_env() -> Result<EnvConfig> {
     }
 
     // ======= GCP/GCS =======
-    if (string_from_env_var("SCCACHE_GCS_CREDENTIALS_URL").is_some()
-        || string_from_env_var("SCCACHE_GCS_OAUTH_URL").is_some()
-        || string_from_env_var("SCCACHE_GCS_KEY_PATH").is_some())
-        && string_from_env_var("SCCACHE_GCS_BUCKET").is_none()
+    if (string_from_env_var(environment, "SCCACHE_GCS_CREDENTIALS_URL").is_some()
+        || string_from_env_var(environment, "SCCACHE_GCS_OAUTH_URL").is_some()
+        || string_from_env_var(environment, "SCCACHE_GCS_KEY_PATH").is_some())
+        && string_from_env_var(environment, "SCCACHE_GCS_BUCKET").is_none()
     {
         bail!(
             "If setting GCS credentials, SCCACHE_GCS_BUCKET and an auth mechanism need to be set."
         );
     }
 
-    let gcs = string_from_env_var("SCCACHE_GCS_BUCKET").map(|bucket| {
-        let key_prefix = key_prefix_from_env_var("SCCACHE_GCS_KEY_PREFIX");
+    let gcs = string_from_env_var(environment, "SCCACHE_GCS_BUCKET").map(|bucket| {
+        let key_prefix = key_prefix_from_env_var(environment, "SCCACHE_GCS_KEY_PREFIX");
 
-        if string_from_env_var("SCCACHE_GCS_OAUTH_URL").is_some() {
+        if string_from_env_var(environment, "SCCACHE_GCS_OAUTH_URL").is_some() {
             eprintln!("SCCACHE_GCS_OAUTH_URL has been deprecated");
             eprintln!("if you intend to use vm metadata for auth, please set correct service account instead");
         }
 
-        let credential_url = string_from_env_var("SCCACHE_GCS_CREDENTIALS_URL");
+        let credential_url = string_from_env_var(environment, "SCCACHE_GCS_CREDENTIALS_URL");
 
-        let cred_path = string_from_env_var("SCCACHE_GCS_KEY_PATH");
-        let service_account = string_from_env_var("SCCACHE_GCS_SERVICE_ACCOUNT");
+        let cred_path = string_from_env_var(environment, "SCCACHE_GCS_KEY_PATH");
+        let service_account = string_from_env_var(environment, "SCCACHE_GCS_SERVICE_ACCOUNT");
 
-        let rw_mode = cache_mode_from_env_var("SCCACHE_GCS_RW_MODE").unwrap_or_else(|| {
+        let rw_mode = cache_mode_from_env_var(environment, "SCCACHE_GCS_RW_MODE").unwrap_or_else(|| {
             warn!("No valid SCCACHE_GCS_RW_MODE value was found -- defaulting to READ_ONLY.");
             CacheModeConfig::ReadOnly
         });
@@ -1169,9 +1229,9 @@ fn config_from_env() -> Result<EnvConfig> {
     });
 
     // ======= GHA =======
-    let gha_rw_mode: CacheModeConfig =
-        cache_mode_from_env_var("SCCACHE_GHA_RW_MODE").unwrap_or(CacheModeConfig::ReadWrite);
-    let gha = if let Some(version) = string_from_env_var("SCCACHE_GHA_VERSION") {
+    let gha_rw_mode: CacheModeConfig = cache_mode_from_env_var(environment, "SCCACHE_GHA_RW_MODE")
+        .unwrap_or(CacheModeConfig::ReadWrite);
+    let gha = if let Some(version) = string_from_env_var(environment, "SCCACHE_GHA_VERSION") {
         // If SCCACHE_GHA_VERSION has been set, we don't need to check
         // SCCACHE_GHA_ENABLED's value anymore.
         Some(GHACacheConfig {
@@ -1179,7 +1239,7 @@ fn config_from_env() -> Result<EnvConfig> {
             version,
             rw_mode: gha_rw_mode,
         })
-    } else if bool_from_env_var("SCCACHE_GHA_ENABLED")?.unwrap_or(false) {
+    } else if bool_from_env_var(environment, "SCCACHE_GHA_ENABLED")?.unwrap_or(false) {
         // If only SCCACHE_GHA_ENABLED has been set to the true value, enable with
         // default version.
         Some(GHACacheConfig {
@@ -1196,13 +1256,15 @@ fn config_from_env() -> Result<EnvConfig> {
     // then selected by presence:
     //   * SCCACHE_AZURE_CONNECTION_STRING                     -> shared-key (legacy) path
     //   * SCCACHE_AZURE_STORAGE_ACCOUNT / SCCACHE_AZURE_ENDPOINT -> Entra ID (passwordless)
-    let azure = if let Some(container) = string_from_env_var("SCCACHE_AZURE_BLOB_CONTAINER") {
-        let connection_string = string_from_env_var("SCCACHE_AZURE_CONNECTION_STRING");
-        let storage_account = string_from_env_var("SCCACHE_AZURE_STORAGE_ACCOUNT");
-        let endpoint = string_from_env_var("SCCACHE_AZURE_ENDPOINT");
-        let key_prefix = key_prefix_from_env_var("SCCACHE_AZURE_KEY_PREFIX");
-        let rw_mode =
-            cache_mode_from_env_var("SCCACHE_AZURE_RW_MODE").unwrap_or(CacheModeConfig::ReadWrite);
+    let azure = if let Some(container) =
+        string_from_env_var(environment, "SCCACHE_AZURE_BLOB_CONTAINER")
+    {
+        let connection_string = string_from_env_var(environment, "SCCACHE_AZURE_CONNECTION_STRING");
+        let storage_account = string_from_env_var(environment, "SCCACHE_AZURE_STORAGE_ACCOUNT");
+        let endpoint = string_from_env_var(environment, "SCCACHE_AZURE_ENDPOINT");
+        let key_prefix = key_prefix_from_env_var(environment, "SCCACHE_AZURE_KEY_PREFIX");
+        let rw_mode = cache_mode_from_env_var(environment, "SCCACHE_AZURE_RW_MODE")
+            .unwrap_or(CacheModeConfig::ReadWrite);
 
         let has_entra_source = storage_account.is_some() || endpoint.is_some();
         if connection_string.is_some() && has_entra_source {
@@ -1242,15 +1304,16 @@ fn config_from_env() -> Result<EnvConfig> {
     };
 
     // ======= WebDAV =======
-    let webdav = if let Some(endpoint) = string_from_env_var("SCCACHE_WEBDAV_ENDPOINT") {
-        let key_prefix = key_prefix_from_env_var("SCCACHE_WEBDAV_KEY_PREFIX");
-        let username = string_from_env_var("SCCACHE_WEBDAV_USERNAME");
-        let password = string_from_env_var("SCCACHE_WEBDAV_PASSWORD");
-        let token = string_from_env_var("SCCACHE_WEBDAV_TOKEN");
-        let rw_mode =
-            cache_mode_from_env_var("SCCACHE_WEBDAV_RW_MODE").unwrap_or(CacheModeConfig::ReadWrite);
+    let webdav = if let Some(endpoint) = string_from_env_var(environment, "SCCACHE_WEBDAV_ENDPOINT")
+    {
+        let key_prefix = key_prefix_from_env_var(environment, "SCCACHE_WEBDAV_KEY_PREFIX");
+        let username = string_from_env_var(environment, "SCCACHE_WEBDAV_USERNAME");
+        let password = string_from_env_var(environment, "SCCACHE_WEBDAV_PASSWORD");
+        let token = string_from_env_var(environment, "SCCACHE_WEBDAV_TOKEN");
+        let rw_mode = cache_mode_from_env_var(environment, "SCCACHE_WEBDAV_RW_MODE")
+            .unwrap_or(CacheModeConfig::ReadWrite);
         let disable_create_dir =
-            bool_from_env_var("SCCACHE_WEBDAV_DISABLE_CREATE_DIR")?.unwrap_or(false);
+            bool_from_env_var(environment, "SCCACHE_WEBDAV_DISABLE_CREATE_DIR")?.unwrap_or(false);
 
         Some(WebdavCacheConfig {
             endpoint,
@@ -1266,14 +1329,15 @@ fn config_from_env() -> Result<EnvConfig> {
     };
 
     // ======= OSS =======
-    let oss = if let Some(bucket) = string_from_env_var("SCCACHE_OSS_BUCKET") {
-        let endpoint = string_from_env_var("SCCACHE_OSS_ENDPOINT");
-        let key_prefix = key_prefix_from_env_var("SCCACHE_OSS_KEY_PREFIX");
+    let oss = if let Some(bucket) = string_from_env_var(environment, "SCCACHE_OSS_BUCKET") {
+        let endpoint = string_from_env_var(environment, "SCCACHE_OSS_ENDPOINT");
+        let key_prefix = key_prefix_from_env_var(environment, "SCCACHE_OSS_KEY_PREFIX");
 
-        let no_credentials = bool_from_env_var("SCCACHE_OSS_NO_CREDENTIALS")?.unwrap_or(false);
+        let no_credentials =
+            bool_from_env_var(environment, "SCCACHE_OSS_NO_CREDENTIALS")?.unwrap_or(false);
 
-        let rw_mode =
-            cache_mode_from_env_var("SCCACHE_OSS_RW_MODE").unwrap_or(CacheModeConfig::ReadWrite);
+        let rw_mode = cache_mode_from_env_var(environment, "SCCACHE_OSS_RW_MODE")
+            .unwrap_or(CacheModeConfig::ReadWrite);
 
         Some(OSSCacheConfig {
             bucket,
@@ -1287,19 +1351,21 @@ fn config_from_env() -> Result<EnvConfig> {
     };
 
     if oss.as_ref().is_some_and(|oss| oss.no_credentials)
-        && (env::var_os("ALIBABA_CLOUD_ACCESS_KEY_ID").is_some()
-            || env::var_os("ALIBABA_CLOUD_ACCESS_KEY_SECRET").is_some())
+        && (environment.var_os("ALIBABA_CLOUD_ACCESS_KEY_ID").is_some()
+            || environment
+                .var_os("ALIBABA_CLOUD_ACCESS_KEY_SECRET")
+                .is_some())
     {
         bail!("If setting OSS credentials, SCCACHE_OSS_NO_CREDENTIALS must not be set.");
     }
 
     // ======= COS =======
-    let cos = if let Some(bucket) = string_from_env_var("SCCACHE_COS_BUCKET") {
-        let endpoint = string_from_env_var("SCCACHE_COS_ENDPOINT");
-        let key_prefix = key_prefix_from_env_var("SCCACHE_COS_KEY_PREFIX");
+    let cos = if let Some(bucket) = string_from_env_var(environment, "SCCACHE_COS_BUCKET") {
+        let endpoint = string_from_env_var(environment, "SCCACHE_COS_ENDPOINT");
+        let key_prefix = key_prefix_from_env_var(environment, "SCCACHE_COS_KEY_PREFIX");
 
-        let rw_mode =
-            cache_mode_from_env_var("SCCACHE_COS_RW_MODE").unwrap_or(CacheModeConfig::ReadWrite);
+        let rw_mode = cache_mode_from_env_var(environment, "SCCACHE_COS_RW_MODE")
+            .unwrap_or(CacheModeConfig::ReadWrite);
 
         Some(COSCacheConfig {
             bucket,
@@ -1312,19 +1378,21 @@ fn config_from_env() -> Result<EnvConfig> {
     };
 
     // ======= Local =======
-    let disk_dir = env::var_os("SCCACHE_DIR").map(PathBuf::from);
-    let disk_sz = string_from_env_var("SCCACHE_CACHE_SIZE").and_then(|v| parse_size(&v));
+    let disk_dir = environment.var_os("SCCACHE_DIR").map(PathBuf::from);
+    let disk_sz =
+        string_from_env_var(environment, "SCCACHE_CACHE_SIZE").and_then(|v| parse_size(&v));
 
     let mut preprocessor_mode_config = PreprocessorCacheModeConfig::activated();
-    let preprocessor_mode_overridden = if let Some(value) = bool_from_env_var("SCCACHE_DIRECT")? {
-        preprocessor_mode_config.use_preprocessor_cache_mode = value;
-        true
-    } else {
-        false
-    };
+    let preprocessor_mode_overridden =
+        if let Some(value) = bool_from_env_var(environment, "SCCACHE_DIRECT")? {
+            preprocessor_mode_config.use_preprocessor_cache_mode = value;
+            true
+        } else {
+            false
+        };
 
     let (disk_rw_mode, disk_rw_mode_overridden) =
-        match cache_mode_from_env_var("SCCACHE_LOCAL_RW_MODE") {
+        match cache_mode_from_env_var(environment, "SCCACHE_LOCAL_RW_MODE") {
             Some(mode) => (mode, true),
             _ => (CacheModeConfig::ReadWrite, false),
         };
@@ -1345,15 +1413,18 @@ fn config_from_env() -> Result<EnvConfig> {
     };
 
     // Parse multi-level cache configuration
-    let multilevel = if let Some(chain_str) = string_from_env_var("SCCACHE_MULTILEVEL_CHAIN") {
+    let multilevel = if let Some(chain_str) =
+        string_from_env_var(environment, "SCCACHE_MULTILEVEL_CHAIN")
+    {
         let chain: Vec<String> = chain_str.split(',').map(|s| s.trim().to_string()).collect();
 
-        let write_error_policy = string_from_env_var("SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY")
-            .and_then(|s| s.parse::<WriteErrorPolicy>().ok())
-            .unwrap_or_default();
+        let write_error_policy =
+            string_from_env_var(environment, "SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY")
+                .and_then(|s| s.parse::<WriteErrorPolicy>().ok())
+                .unwrap_or_default();
 
         let slow_write_concurrency =
-            number_from_env_var::<usize>("SCCACHE_MULTILEVEL_SLOW_WRITE_CONCURRENCY")
+            number_from_env_var::<usize>(environment, "SCCACHE_MULTILEVEL_SLOW_WRITE_CONCURRENCY")
                 .transpose()?
                 .unwrap_or_else(default_multilevel_slow_write_concurrency);
         if slow_write_concurrency == 0 {
@@ -1390,7 +1461,7 @@ fn config_from_env() -> Result<EnvConfig> {
     let split_symbol = ';';
     #[cfg(not(target_os = "windows"))]
     let split_symbol = ':';
-    let basedirs = env::var_os("SCCACHE_BASEDIRS").map(|s| {
+    let basedirs = environment.var_os("SCCACHE_BASEDIRS").map(|s| {
         s.to_string_lossy()
             .split(split_symbol)
             .filter(|s| !s.is_empty())
@@ -1398,7 +1469,7 @@ fn config_from_env() -> Result<EnvConfig> {
             .collect()
     });
 
-    let client_side_mode = bool_from_env_var("SCCACHE_CLIENT_SIDE")?;
+    let client_side_mode = bool_from_env_var(environment, "SCCACHE_CLIENT_SIDE")?;
 
     Ok(EnvConfig {
         cache,
@@ -1411,7 +1482,16 @@ fn config_from_env() -> Result<EnvConfig> {
 // so we also check the config in `preference_dir` (new in that version), which
 // corresponds to the old location, for compatibility with older setups.
 fn config_file(env_var: &str, leaf: &str) -> Result<PathBuf> {
-    if let Some(env_value) = env::var_os(env_var) {
+    let environment = Environment::capture();
+    config_file_with_environment(&environment, env_var, leaf)
+}
+
+fn config_file_with_environment(
+    environment: &Environment,
+    env_var: &str,
+    leaf: &str,
+) -> Result<PathBuf> {
+    if let Some(env_value) = environment.var_os(env_var) {
         return Ok(env_value.into());
     }
     let dirs = ProjectDirs::from("", ORGANIZATION, APP_NAME)
@@ -1446,17 +1526,24 @@ pub struct Config {
 
 impl Config {
     pub fn load() -> Result<Self> {
-        let env_conf = config_from_env()?;
-        let skip_cache_check = skip_cache_check_from_env()?;
+        let environment = Environment::capture();
+        Self::load_from_environment(&environment)
+    }
 
-        let file_conf_path = config_file("SCCACHE_CONF", "config")?;
+    fn load_from_environment(environment: &Environment) -> Result<Self> {
+        let env_conf = config_from_environment(environment)?;
+        let skip_cache_check = skip_cache_check_from_env(environment)?;
+
+        let file_conf_path = config_file_with_environment(environment, "SCCACHE_CONF", "config")?;
         let file_conf = try_read_config_file(&file_conf_path)
             .context("Failed to load config file")?
             .unwrap_or_default();
 
-        let mut config = Self::from_env_and_file_configs(env_conf, file_conf)?;
-        if let Some(cache_dir) =
-            env::var_os("SCCACHE_DIST_CLIENT_CACHE_DIR").filter(|value| !value.is_empty())
+        let mut config =
+            Self::from_env_and_file_configs_with_environment(env_conf, file_conf, environment)?;
+        if let Some(cache_dir) = environment
+            .var_os("SCCACHE_DIST_CLIENT_CACHE_DIR")
+            .filter(|value| !value.is_empty())
         {
             config.dist.cache_dir = cache_dir.into();
         }
@@ -1464,7 +1551,17 @@ impl Config {
         Ok(config)
     }
 
+    #[cfg(test)]
     fn from_env_and_file_configs(env_conf: EnvConfig, file_conf: FileConfig) -> Result<Self> {
+        let environment = Environment::capture();
+        Self::from_env_and_file_configs_with_environment(env_conf, file_conf, &environment)
+    }
+
+    fn from_env_and_file_configs_with_environment(
+        env_conf: EnvConfig,
+        file_conf: FileConfig,
+        environment: &Environment,
+    ) -> Result<Self> {
         let mut conf_caches: CacheConfigs = Default::default();
 
         let FileConfig {
@@ -1541,7 +1638,7 @@ impl Config {
             // SCCACHE_ERROR_LOG; Even if SCCACHE_ERROR_LOG was handled, there would
             // be write races from multiple processes. Until those are addressed, we
             // can't leave the client mode enabled alongside logging.
-            && std::env::var_os(crate::LOGGING_ENV).is_none()
+            && environment.var_os(crate::LOGGING_ENV).is_none()
             // Client-side mode is also not compatible with distributed compilation.
             && dist.scheduler_url.is_none();
 
@@ -1831,19 +1928,20 @@ fn test_parse_size() {
 
 #[test]
 fn test_string_from_env_var() {
+    let mut environment = Environment::default();
     let var_name = "TEST_SCCACHE_VAR";
     for value in [None, Some(""), Some("foo")] {
         match value {
-            None => unsafe {
-                std::env::remove_var(var_name);
-            },
-            Some(value) => unsafe {
-                std::env::set_var(var_name, value);
-            },
+            None => {
+                environment.remove(var_name);
+            }
+            Some(value) => {
+                environment.set(var_name, value);
+            }
         }
-        let result = string_from_env_var(var_name);
-        unsafe {
-            std::env::remove_var(var_name);
+        let result = string_from_env_var(&environment, var_name);
+        {
+            environment.remove(var_name);
         }
 
         let expected = match value {
@@ -1856,14 +1954,14 @@ fn test_string_from_env_var() {
 }
 
 #[test]
-#[serial(config_from_env)]
 fn test_skip_cache_check_from_env() {
+    let mut environment = Environment::default();
     const ENV_VAR: &str = "SCCACHE_SKIP_CACHE_CHECK";
 
-    unsafe {
-        std::env::remove_var(ENV_VAR);
+    {
+        environment.remove(ENV_VAR);
     }
-    assert!(!skip_cache_check_from_env().unwrap());
+    assert!(!skip_cache_check_from_env(&environment).unwrap());
 
     for (value, expected) in [
         ("true", true),
@@ -1873,22 +1971,24 @@ fn test_skip_cache_check_from_env() {
         ("off", false),
         ("0", false),
     ] {
-        unsafe {
-            std::env::set_var(ENV_VAR, value);
+        {
+            environment.set(ENV_VAR, value);
         }
-        assert_eq!(skip_cache_check_from_env().unwrap(), expected);
+        assert_eq!(skip_cache_check_from_env(&environment).unwrap(), expected);
     }
 
-    unsafe {
-        std::env::set_var(ENV_VAR, "invalid");
+    {
+        environment.set(ENV_VAR, "invalid");
     }
     assert_eq!(
-        skip_cache_check_from_env().unwrap_err().to_string(),
+        skip_cache_check_from_env(&environment)
+            .unwrap_err()
+            .to_string(),
         "SCCACHE_SKIP_CACHE_CHECK must be 'true', 'on', '1', 'false', 'off' or '0'."
     );
 
-    unsafe {
-        std::env::remove_var(ENV_VAR);
+    {
+        environment.remove(ENV_VAR);
     }
 }
 
@@ -2221,6 +2321,7 @@ fn test_deserialize_basedirs_missing() {
 
 #[test]
 fn test_cache_mode_from_env_var() {
+    let mut environment = Environment::default();
     struct CacheEnvCheckInfo {
         env_var_value: Option<String>,
         expected_cache_mode: Option<CacheModeConfig>,
@@ -2268,17 +2369,17 @@ fn test_cache_mode_from_env_var() {
     let var_name = "SCCACHE_ANY_CACHE_MODE_ENV_VAR";
 
     for info in env_check_infos {
-        unsafe {
+        {
             if let Some(env_var_value) = &info.env_var_value {
-                std::env::set_var(var_name, env_var_value);
+                environment.set(var_name, env_var_value);
             } else {
-                std::env::remove_var(var_name);
+                environment.remove(var_name);
             }
         }
-        let cache_mode = cache_mode_from_env_var(var_name);
+        let cache_mode = cache_mode_from_env_var(&environment, var_name);
 
-        unsafe {
-            std::env::remove_var(var_name);
+        {
+            environment.remove(var_name);
         }
 
         assert_eq!(cache_mode, info.expected_cache_mode);
@@ -2286,15 +2387,15 @@ fn test_cache_mode_from_env_var() {
 }
 
 #[test]
-#[serial(config_from_env)]
 #[cfg(not(target_os = "windows"))]
 fn test_env_basedirs_single() {
-    unsafe {
-        std::env::set_var("SCCACHE_BASEDIRS", "/home/user/project");
+    let mut environment = Environment::default();
+    {
+        environment.set("SCCACHE_BASEDIRS", "/home/user/project");
     }
-    let config = config_from_env().unwrap();
-    unsafe {
-        std::env::remove_var("SCCACHE_BASEDIRS");
+    let config = config_from_environment(&environment).unwrap();
+    {
+        environment.remove("SCCACHE_BASEDIRS");
     }
 
     assert_eq!(
@@ -2304,15 +2405,15 @@ fn test_env_basedirs_single() {
 }
 
 #[test]
-#[serial(config_from_env)]
 #[cfg(target_os = "windows")]
 fn test_env_basedirs_single() {
-    unsafe {
-        std::env::set_var("SCCACHE_BASEDIRS", "C:/home/user/project");
+    let mut environment = Environment::default();
+    {
+        environment.set("SCCACHE_BASEDIRS", "C:/home/user/project");
     }
-    let config = config_from_env().unwrap();
-    unsafe {
-        std::env::remove_var("SCCACHE_BASEDIRS");
+    let config = config_from_environment(&environment).unwrap();
+    {
+        environment.remove("SCCACHE_BASEDIRS");
     }
 
     assert_eq!(
@@ -2322,18 +2423,18 @@ fn test_env_basedirs_single() {
 }
 
 #[test]
-#[serial(config_from_env)]
 #[cfg(not(target_os = "windows"))]
 fn test_env_basedirs_multiple() {
-    unsafe {
-        std::env::set_var(
+    let mut environment = Environment::default();
+    {
+        environment.set(
             "SCCACHE_BASEDIRS",
             "/home/user/project:/home/user/workspace",
         );
     }
-    let config = config_from_env().unwrap();
-    unsafe {
-        std::env::remove_var("SCCACHE_BASEDIRS");
+    let config = config_from_environment(&environment).unwrap();
+    {
+        environment.remove("SCCACHE_BASEDIRS");
     }
 
     assert_eq!(
@@ -2346,18 +2447,18 @@ fn test_env_basedirs_multiple() {
 }
 
 #[test]
-#[serial(config_from_env)]
 #[cfg(target_os = "windows")]
 fn test_env_basedirs_multiple() {
-    unsafe {
-        std::env::set_var(
+    let mut environment = Environment::default();
+    {
+        environment.set(
             "SCCACHE_BASEDIRS",
             "C:/home/user/project;C:/home/user/workspace",
         );
     }
-    let config = config_from_env().unwrap();
-    unsafe {
-        std::env::remove_var("SCCACHE_BASEDIRS");
+    let config = config_from_environment(&environment).unwrap();
+    {
+        environment.remove("SCCACHE_BASEDIRS");
     }
 
     assert_eq!(
@@ -2370,19 +2471,19 @@ fn test_env_basedirs_multiple() {
 }
 
 #[test]
-#[serial(config_from_env)]
 #[cfg(not(target_os = "windows"))]
 fn test_env_basedirs_with_spaces() {
+    let mut environment = Environment::default();
     // Test that spaces around paths are not trimmed
-    unsafe {
-        std::env::set_var(
+    {
+        environment.set(
             "SCCACHE_BASEDIRS",
             " /home/user/project : /home/user/workspace ",
         );
     }
-    let env_conf = config_from_env().unwrap();
-    unsafe {
-        std::env::remove_var("SCCACHE_BASEDIRS");
+    let env_conf = config_from_environment(&environment).unwrap();
+    {
+        environment.remove("SCCACHE_BASEDIRS");
     }
 
     assert_eq!(
@@ -2405,19 +2506,19 @@ fn test_env_basedirs_with_spaces() {
 }
 
 #[test]
-#[serial(config_from_env)]
 #[cfg(target_os = "windows")]
 fn test_env_basedirs_with_spaces() {
+    let mut environment = Environment::default();
     // Test that spaces around paths are not trimmed
-    unsafe {
-        std::env::set_var(
+    {
+        environment.set(
             "SCCACHE_BASEDIRS",
             " C:/home/user/project ; C:/home/user/workspace ",
         );
     }
-    let env_conf = config_from_env().unwrap();
-    unsafe {
-        std::env::remove_var("SCCACHE_BASEDIRS");
+    let env_conf = config_from_environment(&environment).unwrap();
+    {
+        environment.remove("SCCACHE_BASEDIRS");
     }
 
     assert_eq!(
@@ -2440,19 +2541,19 @@ fn test_env_basedirs_with_spaces() {
 }
 
 #[test]
-#[serial(config_from_env)]
 #[cfg(not(target_os = "windows"))]
 fn test_env_basedirs_empty_entries() {
+    let mut environment = Environment::default();
     // Test that empty entries are filtered out
-    unsafe {
-        std::env::set_var(
+    {
+        environment.set(
             "SCCACHE_BASEDIRS",
             "/home/user/project::/home/user/workspace",
         );
     }
-    let config = config_from_env().unwrap();
-    unsafe {
-        std::env::remove_var("SCCACHE_BASEDIRS");
+    let config = config_from_environment(&environment).unwrap();
+    {
+        environment.remove("SCCACHE_BASEDIRS");
     }
 
     assert_eq!(
@@ -2465,19 +2566,19 @@ fn test_env_basedirs_empty_entries() {
 }
 
 #[test]
-#[serial(config_from_env)]
 #[cfg(target_os = "windows")]
 fn test_env_basedirs_empty_entries() {
+    let mut environment = Environment::default();
     // Test that empty entries are filtered out
-    unsafe {
-        std::env::set_var(
+    {
+        environment.set(
             "SCCACHE_BASEDIRS",
             "c:/home/user/project;;c:/home/user/workspace",
         );
     }
-    let config = config_from_env().unwrap();
-    unsafe {
-        std::env::remove_var("SCCACHE_BASEDIRS");
+    let config = config_from_environment(&environment).unwrap();
+    {
+        environment.remove("SCCACHE_BASEDIRS");
     }
 
     assert_eq!(
@@ -2490,12 +2591,12 @@ fn test_env_basedirs_empty_entries() {
 }
 
 #[test]
-#[serial(config_from_env)]
 fn test_env_basedirs_not_set() {
-    unsafe {
-        std::env::remove_var("SCCACHE_BASEDIRS");
+    let mut environment = Environment::default();
+    {
+        environment.remove("SCCACHE_BASEDIRS");
     }
-    let config = config_from_env().unwrap();
+    let config = config_from_environment(&environment).unwrap();
     assert!(config.basedirs.is_none());
 }
 
@@ -2556,20 +2657,20 @@ fn test_s3_capacity_rejects_inverted_watermarks() {
 }
 
 #[test]
-#[serial(config_from_env)]
 fn test_s3_capacity_from_env() {
-    unsafe {
-        env::set_var("SCCACHE_BUCKET", "cache");
-        env::set_var("SCCACHE_S3_CAPACITY_HIGH_WATERMARK", "1000");
-        env::set_var("SCCACHE_S3_CAPACITY_LOW_WATERMARK", "700");
-        env::set_var("SCCACHE_S3_CAPACITY_TOUCH_INTERVAL_SECS", "5");
+    let mut environment = Environment::default();
+    {
+        environment.set("SCCACHE_BUCKET", "cache");
+        environment.set("SCCACHE_S3_CAPACITY_HIGH_WATERMARK", "1000");
+        environment.set("SCCACHE_S3_CAPACITY_LOW_WATERMARK", "700");
+        environment.set("SCCACHE_S3_CAPACITY_TOUCH_INTERVAL_SECS", "5");
     }
-    let config = config_from_env().unwrap();
-    unsafe {
-        env::remove_var("SCCACHE_BUCKET");
-        env::remove_var("SCCACHE_S3_CAPACITY_HIGH_WATERMARK");
-        env::remove_var("SCCACHE_S3_CAPACITY_LOW_WATERMARK");
-        env::remove_var("SCCACHE_S3_CAPACITY_TOUCH_INTERVAL_SECS");
+    let config = config_from_environment(&environment).unwrap();
+    {
+        environment.remove("SCCACHE_BUCKET");
+        environment.remove("SCCACHE_S3_CAPACITY_HIGH_WATERMARK");
+        environment.remove("SCCACHE_S3_CAPACITY_LOW_WATERMARK");
+        environment.remove("SCCACHE_S3_CAPACITY_TOUCH_INTERVAL_SECS");
     }
     let capacity = config.cache.s3.unwrap().capacity.unwrap();
     assert_eq!(capacity.high_watermark, 1000);
@@ -2578,38 +2679,38 @@ fn test_s3_capacity_from_env() {
 }
 
 #[test]
-#[serial(config_from_env)]
 fn test_s3_capacity_env_requires_both_watermarks() {
-    unsafe {
-        env::set_var("SCCACHE_BUCKET", "cache");
-        env::set_var("SCCACHE_S3_CAPACITY_HIGH_WATERMARK", "1000");
+    let mut environment = Environment::default();
+    {
+        environment.set("SCCACHE_BUCKET", "cache");
+        environment.set("SCCACHE_S3_CAPACITY_HIGH_WATERMARK", "1000");
     }
-    let result = config_from_env();
-    unsafe {
-        env::remove_var("SCCACHE_BUCKET");
-        env::remove_var("SCCACHE_S3_CAPACITY_HIGH_WATERMARK");
+    let result = config_from_environment(&environment);
+    {
+        environment.remove("SCCACHE_BUCKET");
+        environment.remove("SCCACHE_S3_CAPACITY_HIGH_WATERMARK");
     }
     assert!(result.is_err());
 }
 
 #[test]
-#[serial(config_from_env)]
 #[cfg(feature = "s3")]
 fn test_s3_no_credentials_conflict() {
-    unsafe {
-        env::set_var("SCCACHE_S3_NO_CREDENTIALS", "true");
-        env::set_var("SCCACHE_BUCKET", "my-bucket");
-        env::set_var("AWS_ACCESS_KEY_ID", "aws-access-key-id");
-        env::set_var("AWS_SECRET_ACCESS_KEY", "aws-secret-access-key");
+    let mut environment = Environment::default();
+    {
+        environment.set("SCCACHE_S3_NO_CREDENTIALS", "true");
+        environment.set("SCCACHE_BUCKET", "my-bucket");
+        environment.set("AWS_ACCESS_KEY_ID", "aws-access-key-id");
+        environment.set("AWS_SECRET_ACCESS_KEY", "aws-secret-access-key");
     }
 
-    let cfg = config_from_env();
+    let cfg = config_from_environment(&environment);
 
-    unsafe {
-        env::remove_var("SCCACHE_S3_NO_CREDENTIALS");
-        env::remove_var("SCCACHE_BUCKET");
-        env::remove_var("AWS_ACCESS_KEY_ID");
-        env::remove_var("AWS_SECRET_ACCESS_KEY");
+    {
+        environment.remove("SCCACHE_S3_NO_CREDENTIALS");
+        environment.remove("SCCACHE_BUCKET");
+        environment.remove("AWS_ACCESS_KEY_ID");
+        environment.remove("AWS_SECRET_ACCESS_KEY");
     }
 
     let error = cfg.unwrap_err();
@@ -2620,18 +2721,18 @@ fn test_s3_no_credentials_conflict() {
 }
 
 #[test]
-#[serial(config_from_env)]
 fn test_s3_no_credentials_invalid() {
-    unsafe {
-        env::set_var("SCCACHE_S3_NO_CREDENTIALS", "yes");
-        env::set_var("SCCACHE_BUCKET", "my-bucket");
+    let mut environment = Environment::default();
+    {
+        environment.set("SCCACHE_S3_NO_CREDENTIALS", "yes");
+        environment.set("SCCACHE_BUCKET", "my-bucket");
     }
 
-    let cfg = config_from_env();
+    let cfg = config_from_environment(&environment);
 
-    unsafe {
-        env::remove_var("SCCACHE_S3_NO_CREDENTIALS");
-        env::remove_var("SCCACHE_BUCKET");
+    {
+        environment.remove("SCCACHE_S3_NO_CREDENTIALS");
+        environment.remove("SCCACHE_BUCKET");
     }
 
     let error = cfg.unwrap_err();
@@ -2642,18 +2743,18 @@ fn test_s3_no_credentials_invalid() {
 }
 
 #[test]
-#[serial(config_from_env)]
 fn test_s3_no_credentials_valid_true() {
-    unsafe {
-        env::set_var("SCCACHE_S3_NO_CREDENTIALS", "true");
-        env::set_var("SCCACHE_BUCKET", "my-bucket");
+    let mut environment = Environment::default();
+    {
+        environment.set("SCCACHE_S3_NO_CREDENTIALS", "true");
+        environment.set("SCCACHE_BUCKET", "my-bucket");
     }
 
-    let cfg = config_from_env();
+    let cfg = config_from_environment(&environment);
 
-    unsafe {
-        env::remove_var("SCCACHE_S3_NO_CREDENTIALS");
-        env::remove_var("SCCACHE_BUCKET");
+    {
+        environment.remove("SCCACHE_S3_NO_CREDENTIALS");
+        environment.remove("SCCACHE_BUCKET");
     }
 
     let env_cfg = cfg.unwrap();
@@ -2671,18 +2772,18 @@ fn test_s3_no_credentials_valid_true() {
 }
 
 #[test]
-#[serial(config_from_env)]
 fn test_s3_no_credentials_valid_false() {
-    unsafe {
-        env::set_var("SCCACHE_S3_NO_CREDENTIALS", "false");
-        env::set_var("SCCACHE_BUCKET", "my-bucket");
+    let mut environment = Environment::default();
+    {
+        environment.set("SCCACHE_S3_NO_CREDENTIALS", "false");
+        environment.set("SCCACHE_BUCKET", "my-bucket");
     }
 
-    let cfg = config_from_env();
+    let cfg = config_from_environment(&environment);
 
-    unsafe {
-        env::remove_var("SCCACHE_S3_NO_CREDENTIALS");
-        env::remove_var("SCCACHE_BUCKET");
+    {
+        environment.remove("SCCACHE_S3_NO_CREDENTIALS");
+        environment.remove("SCCACHE_BUCKET");
     }
 
     let env_cfg = cfg.unwrap();
@@ -2700,24 +2801,24 @@ fn test_s3_no_credentials_valid_false() {
 }
 
 #[test]
-#[serial(config_from_env)]
 #[cfg(feature = "s3")]
 fn test_s3_sse_kms_from_env() {
-    unsafe {
-        env::set_var("SCCACHE_BUCKET", "my-bucket");
-        env::set_var("SCCACHE_S3_SERVER_SIDE_ENCRYPTION_AWS_KMS", "true");
-        env::set_var(
+    let mut environment = Environment::default();
+    {
+        environment.set("SCCACHE_BUCKET", "my-bucket");
+        environment.set("SCCACHE_S3_SERVER_SIDE_ENCRYPTION_AWS_KMS", "true");
+        environment.set(
             "SCCACHE_S3_SERVER_SIDE_ENCRYPTION_KMS_KEY_ID",
             "arn:aws:kms:us-east-1:111:key/abc",
         );
     }
 
-    let cfg = config_from_env();
+    let cfg = config_from_environment(&environment);
 
-    unsafe {
-        env::remove_var("SCCACHE_BUCKET");
-        env::remove_var("SCCACHE_S3_SERVER_SIDE_ENCRYPTION_AWS_KMS");
-        env::remove_var("SCCACHE_S3_SERVER_SIDE_ENCRYPTION_KMS_KEY_ID");
+    {
+        environment.remove("SCCACHE_BUCKET");
+        environment.remove("SCCACHE_S3_SERVER_SIDE_ENCRYPTION_AWS_KMS");
+        environment.remove("SCCACHE_S3_SERVER_SIDE_ENCRYPTION_KMS_KEY_ID");
     }
 
     let env_cfg = cfg.unwrap();
@@ -2738,19 +2839,19 @@ fn test_s3_sse_kms_from_env() {
 }
 
 #[test]
-#[serial(config_from_env)]
 #[cfg(feature = "webdav")]
 fn test_webdav_disable_create_dir_from_env() {
-    unsafe {
-        env::set_var("SCCACHE_WEBDAV_ENDPOINT", "https://example.com/webdav");
-        env::set_var("SCCACHE_WEBDAV_DISABLE_CREATE_DIR", "true");
+    let mut environment = Environment::default();
+    {
+        environment.set("SCCACHE_WEBDAV_ENDPOINT", "https://example.com/webdav");
+        environment.set("SCCACHE_WEBDAV_DISABLE_CREATE_DIR", "true");
     }
 
-    let cfg = config_from_env();
+    let cfg = config_from_environment(&environment);
 
-    unsafe {
-        env::remove_var("SCCACHE_WEBDAV_ENDPOINT");
-        env::remove_var("SCCACHE_WEBDAV_DISABLE_CREATE_DIR");
+    {
+        environment.remove("SCCACHE_WEBDAV_ENDPOINT");
+        environment.remove("SCCACHE_WEBDAV_DISABLE_CREATE_DIR");
     }
 
     let env_cfg = cfg.unwrap();
@@ -2765,18 +2866,18 @@ fn test_webdav_disable_create_dir_from_env() {
 }
 
 #[test]
-#[serial(config_from_env)]
 #[cfg(feature = "webdav")]
 fn test_webdav_disable_create_dir_defaults_to_false() {
-    unsafe {
-        env::set_var("SCCACHE_WEBDAV_ENDPOINT", "https://example.com/webdav");
-        env::remove_var("SCCACHE_WEBDAV_DISABLE_CREATE_DIR");
+    let mut environment = Environment::default();
+    {
+        environment.set("SCCACHE_WEBDAV_ENDPOINT", "https://example.com/webdav");
+        environment.remove("SCCACHE_WEBDAV_DISABLE_CREATE_DIR");
     }
 
-    let cfg = config_from_env();
+    let cfg = config_from_environment(&environment);
 
-    unsafe {
-        env::remove_var("SCCACHE_WEBDAV_ENDPOINT");
+    {
+        environment.remove("SCCACHE_WEBDAV_ENDPOINT");
     }
 
     let env_cfg = cfg.unwrap();
@@ -2791,19 +2892,19 @@ fn test_webdav_disable_create_dir_defaults_to_false() {
 }
 
 #[test]
-#[serial(config_from_env)]
 #[cfg(feature = "azure")]
 fn test_azure_entra_storage_account_enables() {
-    unsafe {
-        env::set_var("SCCACHE_AZURE_BLOB_CONTAINER", "my-container");
-        env::set_var("SCCACHE_AZURE_STORAGE_ACCOUNT", "mystorageacct");
+    let mut environment = Environment::default();
+    {
+        environment.set("SCCACHE_AZURE_BLOB_CONTAINER", "my-container");
+        environment.set("SCCACHE_AZURE_STORAGE_ACCOUNT", "mystorageacct");
     }
 
-    let cfg = config_from_env();
+    let cfg = config_from_environment(&environment);
 
-    unsafe {
-        env::remove_var("SCCACHE_AZURE_BLOB_CONTAINER");
-        env::remove_var("SCCACHE_AZURE_STORAGE_ACCOUNT");
+    {
+        environment.remove("SCCACHE_AZURE_BLOB_CONTAINER");
+        environment.remove("SCCACHE_AZURE_STORAGE_ACCOUNT");
     }
 
     let env_cfg = cfg.unwrap();
@@ -2825,22 +2926,22 @@ fn test_azure_entra_storage_account_enables() {
 }
 
 #[test]
-#[serial(config_from_env)]
 #[cfg(feature = "azure")]
 fn test_azure_entra_endpoint_enables() {
-    unsafe {
-        env::set_var("SCCACHE_AZURE_BLOB_CONTAINER", "my-container");
-        env::set_var(
+    let mut environment = Environment::default();
+    {
+        environment.set("SCCACHE_AZURE_BLOB_CONTAINER", "my-container");
+        environment.set(
             "SCCACHE_AZURE_ENDPOINT",
             "https://acct.blob.core.usgovcloudapi.net",
         );
     }
 
-    let cfg = config_from_env();
+    let cfg = config_from_environment(&environment);
 
-    unsafe {
-        env::remove_var("SCCACHE_AZURE_BLOB_CONTAINER");
-        env::remove_var("SCCACHE_AZURE_ENDPOINT");
+    {
+        environment.remove("SCCACHE_AZURE_BLOB_CONTAINER");
+        environment.remove("SCCACHE_AZURE_ENDPOINT");
     }
 
     let env_cfg = cfg.unwrap();
@@ -2863,19 +2964,19 @@ fn test_azure_entra_endpoint_enables() {
 }
 
 #[test]
-#[serial(config_from_env)]
 #[cfg(feature = "azure")]
 fn test_azure_connection_string_still_works() {
-    unsafe {
-        env::set_var("SCCACHE_AZURE_BLOB_CONTAINER", "my-container");
-        env::set_var("SCCACHE_AZURE_CONNECTION_STRING", "some-connection-string");
+    let mut environment = Environment::default();
+    {
+        environment.set("SCCACHE_AZURE_BLOB_CONTAINER", "my-container");
+        environment.set("SCCACHE_AZURE_CONNECTION_STRING", "some-connection-string");
     }
 
-    let cfg = config_from_env();
+    let cfg = config_from_environment(&environment);
 
-    unsafe {
-        env::remove_var("SCCACHE_AZURE_BLOB_CONTAINER");
-        env::remove_var("SCCACHE_AZURE_CONNECTION_STRING");
+    {
+        environment.remove("SCCACHE_AZURE_BLOB_CONTAINER");
+        environment.remove("SCCACHE_AZURE_CONNECTION_STRING");
     }
 
     let env_cfg = cfg.unwrap();
@@ -2895,21 +2996,21 @@ fn test_azure_connection_string_still_works() {
 }
 
 #[test]
-#[serial(config_from_env)]
 #[cfg(feature = "azure")]
 fn test_azure_conflicting_auth_sources() {
-    unsafe {
-        env::set_var("SCCACHE_AZURE_BLOB_CONTAINER", "my-container");
-        env::set_var("SCCACHE_AZURE_CONNECTION_STRING", "some-connection-string");
-        env::set_var("SCCACHE_AZURE_STORAGE_ACCOUNT", "mystorageacct");
+    let mut environment = Environment::default();
+    {
+        environment.set("SCCACHE_AZURE_BLOB_CONTAINER", "my-container");
+        environment.set("SCCACHE_AZURE_CONNECTION_STRING", "some-connection-string");
+        environment.set("SCCACHE_AZURE_STORAGE_ACCOUNT", "mystorageacct");
     }
 
-    let cfg = config_from_env();
+    let cfg = config_from_environment(&environment);
 
-    unsafe {
-        env::remove_var("SCCACHE_AZURE_BLOB_CONTAINER");
-        env::remove_var("SCCACHE_AZURE_CONNECTION_STRING");
-        env::remove_var("SCCACHE_AZURE_STORAGE_ACCOUNT");
+    {
+        environment.remove("SCCACHE_AZURE_BLOB_CONTAINER");
+        environment.remove("SCCACHE_AZURE_CONNECTION_STRING");
+        environment.remove("SCCACHE_AZURE_STORAGE_ACCOUNT");
     }
 
     let error = cfg.unwrap_err();
@@ -2920,26 +3021,26 @@ fn test_azure_conflicting_auth_sources() {
 }
 
 #[test]
-#[serial(config_from_env)]
 #[cfg(feature = "azure")]
 fn test_azure_conflicting_connection_string_and_endpoint() {
+    let mut environment = Environment::default();
     // The other operand of the mutual-exclusivity check: connection string paired
     // with an endpoint (rather than a storage account) must also be rejected.
-    unsafe {
-        env::set_var("SCCACHE_AZURE_BLOB_CONTAINER", "my-container");
-        env::set_var("SCCACHE_AZURE_CONNECTION_STRING", "some-connection-string");
-        env::set_var(
+    {
+        environment.set("SCCACHE_AZURE_BLOB_CONTAINER", "my-container");
+        environment.set("SCCACHE_AZURE_CONNECTION_STRING", "some-connection-string");
+        environment.set(
             "SCCACHE_AZURE_ENDPOINT",
             "https://acct.blob.core.windows.net",
         );
     }
 
-    let cfg = config_from_env();
+    let cfg = config_from_environment(&environment);
 
-    unsafe {
-        env::remove_var("SCCACHE_AZURE_BLOB_CONTAINER");
-        env::remove_var("SCCACHE_AZURE_CONNECTION_STRING");
-        env::remove_var("SCCACHE_AZURE_ENDPOINT");
+    {
+        environment.remove("SCCACHE_AZURE_BLOB_CONTAINER");
+        environment.remove("SCCACHE_AZURE_CONNECTION_STRING");
+        environment.remove("SCCACHE_AZURE_ENDPOINT");
     }
 
     let error = cfg.unwrap_err();
@@ -2950,17 +3051,17 @@ fn test_azure_conflicting_connection_string_and_endpoint() {
 }
 
 #[test]
-#[serial(config_from_env)]
 #[cfg(feature = "azure")]
 fn test_azure_no_auth_source_disables_backend() {
-    unsafe {
-        env::set_var("SCCACHE_AZURE_BLOB_CONTAINER", "my-container");
+    let mut environment = Environment::default();
+    {
+        environment.set("SCCACHE_AZURE_BLOB_CONTAINER", "my-container");
     }
 
-    let cfg = config_from_env();
+    let cfg = config_from_environment(&environment);
 
-    unsafe {
-        env::remove_var("SCCACHE_AZURE_BLOB_CONTAINER");
+    {
+        environment.remove("SCCACHE_AZURE_BLOB_CONTAINER");
     }
 
     // A container with no auth source disables Azure (backwards compatible)
@@ -3039,21 +3140,21 @@ key_prefix = "p"
 }
 
 #[test]
-#[serial(config_from_env)]
 #[cfg(feature = "gcs")]
 fn test_gcs_service_account() {
-    unsafe {
-        env::set_var("SCCACHE_GCS_BUCKET", "my-bucket");
-        env::set_var("SCCACHE_GCS_SERVICE_ACCOUNT", "my@example.com");
-        env::set_var("SCCACHE_GCS_RW_MODE", "READ_WRITE");
+    let mut environment = Environment::default();
+    {
+        environment.set("SCCACHE_GCS_BUCKET", "my-bucket");
+        environment.set("SCCACHE_GCS_SERVICE_ACCOUNT", "my@example.com");
+        environment.set("SCCACHE_GCS_RW_MODE", "READ_WRITE");
     }
 
-    let cfg = config_from_env();
+    let cfg = config_from_environment(&environment);
 
-    unsafe {
-        env::remove_var("SCCACHE_GCS_BUCKET");
-        env::remove_var("SCCACHE_GCS_SERVICE_ACCOUNT");
-        env::remove_var("SCCACHE_GCS_RW_MODE");
+    {
+        environment.remove("SCCACHE_GCS_BUCKET");
+        environment.remove("SCCACHE_GCS_SERVICE_ACCOUNT");
+        environment.remove("SCCACHE_GCS_RW_MODE");
     }
 
     let env_cfg = cfg.unwrap();
@@ -3372,21 +3473,21 @@ size = "7g"
 }
 
 #[test]
-#[serial(config_from_env)]
 fn test_dist_client_cache_dir_env_overrides_file_config() -> Result<()> {
+    let mut environment = Environment::default();
     let temp = tempfile::tempdir()?;
     let config_path = temp.path().join("config");
     let env_cache_dir = temp.path().join("root-dist-cache");
     std::fs::write(&config_path, "[dist]\ncache_dir = \"/file-cache\"\n")?;
 
-    unsafe {
-        env::set_var("SCCACHE_CONF", &config_path);
-        env::set_var("SCCACHE_DIST_CLIENT_CACHE_DIR", &env_cache_dir);
+    {
+        environment.set("SCCACHE_CONF", &config_path);
+        environment.set("SCCACHE_DIST_CLIENT_CACHE_DIR", &env_cache_dir);
     }
-    let config = Config::load();
-    unsafe {
-        env::remove_var("SCCACHE_DIST_CLIENT_CACHE_DIR");
-        env::remove_var("SCCACHE_CONF");
+    let config = Config::load_from_environment(&environment);
+    {
+        environment.remove("SCCACHE_DIST_CLIENT_CACHE_DIR");
+        environment.remove("SCCACHE_CONF");
     }
 
     let config = config?;
@@ -3659,22 +3760,22 @@ fn test_integration_windows_mixed_slashes() {
 }
 
 #[test]
-#[serial(config_from_env)]
 #[cfg(not(target_os = "windows"))]
 fn test_integration_env_variable_to_strip() {
+    let mut environment = Environment::default();
     // Test full flow: SCCACHE_BASEDIRS env var -> Config -> strip_basedirs
     use crate::util::strip_basedirs;
 
-    unsafe {
-        env::set_var("SCCACHE_BASEDIRS", "/home/user/project:/tmp/build");
+    {
+        environment.set("SCCACHE_BASEDIRS", "/home/user/project:/tmp/build");
     }
 
-    let env_conf = config_from_env().unwrap();
+    let env_conf = config_from_environment(&environment).unwrap();
     let file_conf = FileConfig::default();
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
 
-    unsafe {
-        env::remove_var("SCCACHE_BASEDIRS");
+    {
+        environment.remove("SCCACHE_BASEDIRS");
     }
 
     // Should have two normalized basedirs

@@ -15,7 +15,9 @@ use sccache::dist::{
     AssignJobResult, CompileCommand, InputsReader, JobId, JobState, RunJobResult, ServerIncoming,
     ServerOutgoing, SubmitToolchainResult, Toolchain, ToolchainReader,
 };
+use std::env;
 use std::ffi::OsStr;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Output;
 
@@ -242,6 +244,31 @@ impl ServerIncoming for FailingServer {
 }
 
 #[test]
+fn failing_server_process() {
+    let Some(server_addr) = env::var_os(harness::CUSTOM_SERVER_ADDR_ENV) else {
+        return;
+    };
+    let server_addr: SocketAddr = server_addr
+        .to_string_lossy()
+        .parse()
+        .expect("custom server address should be valid");
+    let scheduler_url = env::var(harness::CUSTOM_SERVER_SCHEDULER_ENV)
+        .expect("custom server scheduler URL should be provided");
+    let token =
+        env::var(harness::CUSTOM_SERVER_TOKEN_ENV).expect("custom server token should be provided");
+    let server = sccache::dist::http::Server::new(
+        server_addr,
+        Some(SocketAddr::from(([0, 0, 0, 0], server_addr.port()))),
+        reqwest::Url::parse(&scheduler_url).expect("custom server scheduler URL should be valid"),
+        token,
+        FailingServer,
+    )
+    .expect("custom failing server should initialize");
+    env_logger::try_init().ok();
+    server.start().expect("custom failing server should run");
+}
+
+#[test]
 #[cfg_attr(not(feature = "dist-tests"), ignore)]
 fn test_dist_failingserver() {
     let tmpdir = tempfile::Builder::new()
@@ -253,7 +280,7 @@ fn test_dist_failingserver() {
 
     let mut system = harness::DistSystem::new(&sccache_dist, tmpdir);
     system.add_scheduler();
-    system.add_custom_server(FailingServer);
+    system.add_custom_server_process("failing_server_process");
 
     let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, system.scheduler_url());
     let sccache_cfg_path = tmpdir.join("sccache-cfg.json");

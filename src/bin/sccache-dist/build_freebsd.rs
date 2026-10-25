@@ -50,7 +50,7 @@ impl CommandExt for Command {
         let mut stdin = process
             .stdin
             .take()
-            .expect("Requested piped stdin but not present");
+            .context("requested piped stdin but child did not expose it")?;
         pipe(&mut stdin).context("Failed to pipe input to process")?;
         let output = process
             .wait_with_output()
@@ -381,7 +381,7 @@ impl PotBuilder {
                 .context("Failed to start command to retrieve output file")?;
             if output.status.success() {
                 let output = OutputData::try_from_reader(&*output.stdout)
-                    .expect("Failed to read compress output stdout");
+                    .context("failed to decode compressed build output")?;
                 outputs.push((path, output))
             } else {
                 debug!("Missing output path {:?}", path)

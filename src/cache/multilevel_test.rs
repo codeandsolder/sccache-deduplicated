@@ -16,11 +16,12 @@ use super::*;
 use crate::cache::CacheRead;
 use crate::cache::disk::DiskCache;
 use crate::cache::readonly::ReadOnlyStorage;
-use crate::config::Config;
-use crate::config::PreprocessorCacheModeConfig;
+use crate::config::{
+    CacheConfigs, Config, DiskCacheConfig, MultiLevelConfig, PreprocessorCacheModeConfig,
+    WriteErrorPolicy,
+};
 use bytes::Bytes;
 use std::collections::HashMap;
-use std::env;
 use std::fs;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -699,36 +700,36 @@ fn test_remote_to_remote_backfill() -> Result<()> {
 }
 
 #[test]
-#[serial_test::serial(multilevel_env)]
 fn test_config_validation_invalid_level_name() -> Result<()> {
-    // Test that invalid level names are rejected
     let runtime = RuntimeBuilder::new_multi_thread()
         .enable_all()
         .worker_threads(1)
         .build()?;
+    let tempdir = TempBuilder::new()
+        .prefix("sccache_test_invalid_level_")
+        .tempdir()?;
+    let config = Config {
+        cache_configs: CacheConfigs {
+            disk: Some(DiskCacheConfig {
+                dir: tempdir.path().join("cache"),
+                ..DiskCacheConfig::default()
+            }),
+            multilevel: Some(MultiLevelConfig {
+                chain: vec!["disk".into(), "invalid_backend".into(), "s3".into()],
+                write_error_policy: WriteErrorPolicy::default(),
+                slow_write_concurrency: 4,
+            }),
+            ..CacheConfigs::default()
+        },
+        ..Config::default()
+    };
 
-    // Set invalid level name
-    // SAFETY: this test is serialized on multilevel_env, so these process-wide env changes cannot race peer tests.
-    unsafe {
-        env::set_var("SCCACHE_MULTILEVEL_CHAIN", "disk,invalid_backend,s3");
-        env::set_var("SCCACHE_DIR", "/tmp/test-cache");
-    }
-
-    let config = Config::load()?;
     let result = MultiLevelStorage::from_config(&config, runtime.handle());
-
-    // Should error with unknown cache level
-    assert!(result.is_err());
-    if let Err(e) = result {
-        let err_msg = format!("{e}");
-        assert!(err_msg.contains("Unknown cache level") || err_msg.contains("invalid_backend"));
-    }
-
-    // SAFETY: this test is serialized on multilevel_env; restore the process-wide variables before releasing the lock.
-    unsafe {
-        env::remove_var("SCCACHE_MULTILEVEL_CHAIN");
-        env::remove_var("SCCACHE_DIR");
-    }
+    let Err(error) = result else {
+        panic!("invalid cache level should fail closed")
+    };
+    let err_msg = error.to_string();
+    assert!(err_msg.contains("Unknown cache level") || err_msg.contains("invalid_backend"));
     Ok(())
 }
 
@@ -784,41 +785,34 @@ fn test_config_validation_single_level() -> Result<()> {
 }
 
 #[test]
-#[serial_test::serial(multilevel_env)]
 fn test_config_level_not_configured() -> Result<()> {
     let runtime = RuntimeBuilder::new_multi_thread()
         .enable_all()
         .worker_threads(1)
         .build()?;
+    let config = Config {
+        cache_configs: CacheConfigs {
+            multilevel: Some(MultiLevelConfig {
+                chain: vec!["redis".into()],
+                write_error_policy: WriteErrorPolicy::default(),
+                slow_write_concurrency: 4,
+            }),
+            ..CacheConfigs::default()
+        },
+        ..Config::default()
+    };
 
-    // Set level without configuration
-    // SAFETY: this test is serialized on multilevel_env, so these process-wide env changes cannot race peer tests.
-    unsafe {
-        env::set_var("SCCACHE_MULTILEVEL_CHAIN", "redis");
-        // Don't set SCCACHE_REDIS_ENDPOINT
-        env::remove_var("SCCACHE_REDIS");
-        env::remove_var("SCCACHE_REDIS_ENDPOINT");
-    }
-
-    let config = Config::load()?;
     let result = MultiLevelStorage::from_config(&config, runtime.handle());
-
-    // Should error with "not configured" or "requires" (when feature disabled)
-    assert!(result.is_err());
-    if let Err(e) = result {
-        let err_msg = format!("{e}");
-        assert!(
-            err_msg.contains("not configured")
-                || err_msg.contains("missing")
-                || err_msg.contains("requires"),
-            "Expected error about missing config or feature, got: {err_msg}"
-        );
-    }
-
-    // SAFETY: this test is serialized on multilevel_env; restore the process-wide variable before releasing the lock.
-    unsafe {
-        env::remove_var("SCCACHE_MULTILEVEL_CHAIN");
-    }
+    let Err(error) = result else {
+        panic!("unconfigured cache level should fail closed")
+    };
+    let err_msg = error.to_string();
+    assert!(
+        err_msg.contains("not configured")
+            || err_msg.contains("missing")
+            || err_msg.contains("requires"),
+        "Expected error about missing config or feature, got: {err_msg}"
+    );
     Ok(())
 }
 

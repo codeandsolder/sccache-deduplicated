@@ -58,7 +58,6 @@ mod pkg {
 mod path_transform {
     use std::collections::HashMap;
     use std::path::{Component, Components, Path, PathBuf, Prefix, PrefixComponent};
-    use std::str;
 
     fn take_prefix<'a>(components: &'a mut Components<'_>) -> Option<PrefixComponent<'a>> {
         let prefix = components.next()?;
@@ -81,10 +80,7 @@ mod path_transform {
             Prefix::Disk(diskchar) | Prefix::VerbatimDisk(diskchar) => {
                 assert!(diskchar.is_ascii_alphabetic());
                 let diskchar = diskchar.to_ascii_uppercase();
-                Some(format!(
-                    "/prefix/disk-{}",
-                    str::from_utf8(&[diskchar]).expect("invalid disk char")
-                ))
+                Some(format!("/prefix/disk-{}", char::from(diskchar)))
             }
             Prefix::Verbatim(_)
             | Prefix::VerbatimUNC(_, _)
@@ -142,8 +138,7 @@ mod path_transform {
 
             // Extract the prefix (e.g. "C:/") if present
             let maybe_dist_prefix = if p.is_absolute() {
-                let pc =
-                    take_prefix(&mut components).expect("could not take prefix from absolute path");
+                let pc = take_prefix(&mut components)?;
                 Some(transform_prefix_component(pc)?)
             } else {
                 None
@@ -190,8 +185,9 @@ mod path_transform {
                     continue;
                 }
                 let mut components = local_path.components();
-                let local_prefix =
-                    take_prefix(&mut components).expect("could not take prefix from absolute path");
+                let Some(local_prefix) = take_prefix(&mut components) else {
+                    continue;
+                };
                 let local_prefix_component = Component::Prefix(local_prefix);
                 let local_prefix_path: &Path = local_prefix_component.as_ref();
                 let mappings = if let Prefix::VerbatimDisk(_) = local_prefix.kind() {
@@ -202,8 +198,9 @@ mod path_transform {
                 if mappings.contains_key(local_prefix_path) {
                     continue;
                 }
-                let dist_prefix = transform_prefix_component(local_prefix)
-                    .expect("prefix already in tracking map could not be transformed");
+                let Some(dist_prefix) = transform_prefix_component(local_prefix) else {
+                    continue;
+                };
                 mappings.insert(local_prefix_path.to_owned(), dist_prefix);
             }
             // Prioritise normal mappings for the same disk, as verbatim mappings can

@@ -15,7 +15,7 @@
 
 use std::{env, ffi::OsString, fmt, net::SocketAddr, path::PathBuf, str::FromStr};
 
-use anyhow::{anyhow, bail};
+use anyhow::{Context, anyhow, bail};
 use clap::{Arg, ArgGroup, Command as ClapCommand, ValueEnum};
 use sccache::{config, dist::ServerId};
 use syslog::Facility;
@@ -185,13 +185,13 @@ pub fn try_parse_from(
             Some(("generate-jwt-hs256-server-token", matches)) => {
                 let server_addr = matches
                     .get_one("server")
-                    .expect("`server` is required and it can be parsed to a `SocketAddr`");
+                    .context("clap did not provide required `server` value")?;
                 let server_id = ServerId::new(*server_addr);
 
                 let secret_key = if matches.contains_id("config") {
                     let config_path = matches
                         .get_one::<PathBuf>("config")
-                        .expect("`config` is required and it can be parsed to a `PathBuf`");
+                        .context("clap did not provide required `config` value")?;
                     if let Some(config) = config::scheduler::from_path(config_path)? {
                         match config.server_auth {
                             config::scheduler::ServerAuth::JwtHS256 { secret_key } => secret_key,
@@ -206,7 +206,7 @@ pub fn try_parse_from(
                 } else {
                     matches
                         .get_one::<String>("secret-key")
-                        .expect("`secret-key` is required")
+                        .context("clap did not provide required `secret-key` value")?
                         .to_string()
                 };
 
@@ -218,7 +218,7 @@ pub fn try_parse_from(
             Some(("generate-shared-token", matches)) => {
                 let token_bits = matches
                     .get_one::<TokenLength>("bits")
-                    .expect("clap provides default");
+                    .context("clap did not provide default `bits` value")?;
 
                 AuthSubcommand::Base64 {
                     num_bytes: token_bits.as_bytes(),
@@ -230,13 +230,13 @@ pub fn try_parse_from(
             if matches.contains_id("syslog") {
                 let log_level = matches
                     .get_one::<LogLevel>("syslog")
-                    .expect("`syslog` is required");
+                    .context("clap reported `syslog` present without a value")?;
                 check_init_syslog("sccache-scheduler", *log_level);
             }
 
             let config_path = matches
                 .get_one::<PathBuf>("config")
-                .expect("`config` is required");
+                .context("clap did not provide required `config` value")?;
             if let Some(config) = config::scheduler::from_path(config_path)? {
                 Command::Scheduler(config)
             } else {
@@ -247,13 +247,13 @@ pub fn try_parse_from(
             if matches.contains_id("syslog") {
                 let log_level = matches
                     .get_one::<LogLevel>("syslog")
-                    .expect("`syslog` is required");
+                    .context("clap reported `syslog` present without a value")?;
                 check_init_syslog("sccache-buildserver", *log_level);
             }
 
             let config_path = matches
                 .get_one::<PathBuf>("config")
-                .expect("`config` is required");
+                .context("clap did not provide required `config` value")?;
             if let Some(config) = config::server::from_path(config_path)? {
                 Command::Server(config)
             } else {
