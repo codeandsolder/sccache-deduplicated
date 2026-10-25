@@ -11,10 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-#![expect(
-    clippy::struct_field_names,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
 
 #[cfg(feature = "dist-client")]
 pub use self::client::Client;

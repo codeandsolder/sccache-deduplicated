@@ -18,23 +18,6 @@
 //! that `ccache` uses for its "direct mode", though the on-disk format is
 //! different.
 
-#![expect(
-    clippy::default_trait_access,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::manual_let_else,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::needless_pass_by_value,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::too_many_lines,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-
 use std::{
     collections::{BTreeMap, HashSet},
     ffi::{OsStr, OsString},

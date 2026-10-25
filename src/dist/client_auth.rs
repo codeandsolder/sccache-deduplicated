@@ -1,8 +1,3 @@
-#![expect(
-    clippy::significant_drop_tightening,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-
 use bytes::Bytes;
 use futures::channel::oneshot;
 use http::HeaderValue;

@@ -12,67 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![expect(
-    clippy::case_sensitive_file_extension_comparisons,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![allow(
-    clippy::enum_glob_use,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::items_after_statements,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::iter_on_single_items,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::manual_let_else,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::needless_pass_by_value,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::option_if_let_else,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::significant_drop_in_scrutinee,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::single_option_map,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::struct_excessive_bools,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::too_many_lines,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::type_complexity,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::unnecessary_debug_formatting,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::unnecessary_wraps,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![allow(
-    clippy::wildcard_imports,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-
 use crate::cache::FileObjectSource;
 #[cfg(target_os = "linux")]
 use crate::compiler::CompileCommandImpl;

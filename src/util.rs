@@ -12,55 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![expect(
-    clippy::cast_possible_truncation,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::cast_possible_wrap,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::default_trait_access,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::items_after_statements,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::large_stack_arrays,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::manual_let_else,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::option_if_let_else,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::redundant_else,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::single_match_else,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::unnecessary_debug_formatting,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![allow(
-    clippy::unnecessary_wraps,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![allow(
-    clippy::wildcard_imports,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-
 use crate::mock_command::{CommandChild, RunCommand};
 use blake3::Hasher as blake3_Hasher;
 use byteorder::{BigEndian, ByteOrder};

@@ -12,39 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![expect(
-    clippy::needless_continue,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::needless_pass_by_value,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::or_fun_call,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::struct_excessive_bools,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::too_many_lines,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::type_complexity,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![expect(
-    clippy::unnecessary_debug_formatting,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-#![allow(
-    clippy::wildcard_imports,
-    reason = "legacy implementation retained during strict-gate rollout to avoid unrelated semantic/API churn"
-)]
-
 use crate::cache::FileObjectSource;
 use crate::compiler::preprocessor_cache::{
     PreprocessorCacheKey, preprocessor_cache_entry_hash_key,
@@ -1842,9 +1809,9 @@ mod test {
                 .unwrap()
         }
 
-        let znver2 = fingerprint(r#"/usr/lib/gcc/cc1 -march=znver2 -mtune=znver2"#);
-        let znver2_again = fingerprint(r#"/usr/lib/gcc/cc1 -march=znver2 -mtune=znver2"#);
-        let skylake = fingerprint(r#"/usr/lib/gcc/cc1 -march=skylake -mtune=skylake"#);
+        let znver2 = fingerprint(r"/usr/lib/gcc/cc1 -march=znver2 -mtune=znver2");
+        let znver2_again = fingerprint(r"/usr/lib/gcc/cc1 -march=znver2 -mtune=znver2");
+        let skylake = fingerprint(r"/usr/lib/gcc/cc1 -march=skylake -mtune=skylake");
 
         assert_eq!(znver2, znver2_again);
         assert_ne!(znver2, skylake);
@@ -1853,8 +1820,8 @@ mod test {
     #[test]
     fn test_native_codegen_fingerprint_rejects_unresolved_driver() {
         for driver_line in [
-            r#"/usr/lib/gcc/cc1 -march=native"#,
-            r#"/usr/bin/clang -cc1 -target-cpu native"#,
+            r"/usr/lib/gcc/cc1 -march=native",
+            r"/usr/bin/clang -cc1 -target-cpu native",
         ] {
             let creator = new_creator();
             next_command(
