@@ -27,7 +27,7 @@ use crate::{
         },
     },
     counted_array, dist,
-    errors::*,
+    errors::{Result, anyhow},
     mock_command::{CommandCreatorSync, RunCommand},
     util::run_input_output,
 };
@@ -133,7 +133,10 @@ ArgData! { pub
     TooHard(OsString),
 }
 
-use self::ArgData::*;
+use self::ArgData::{
+    DepFile, DoCompilation, NotCompilation, NotCompilationFlag, Output, PassThrough,
+    PreprocessorArgument, PreprocessorArgumentPath, TooHard, TooHardFlag,
+};
 
 counted_array!(pub static ARGS: [ArgInfo<ArgData>; _] = [
     take_arg!("--define", OsString, Concatenated(b'='), PreprocessorArgument),
@@ -248,14 +251,11 @@ where
     if multiple_input {
         cannot_cache!("multiple input files");
     }
-    let input = match input_arg {
-        Some(i) => i,
-        // We can't cache compilation without an input.
-        None => cannot_cache!("no input file"),
+    let Some(input) = input_arg else {
+        cannot_cache!("no input file")
     };
-    let language = match Language::from_file_name(Path::new(&input)) {
-        Some(l) => l,
-        None => cannot_cache!("unknown source language"),
+    let Some(language) = Language::from_file_name(Path::new(&input)) else {
+        cannot_cache!("unknown source language")
     };
 
     // --dep-file without any argument is valid too and uses the source file name
@@ -377,9 +377,8 @@ fn generate_compile_commands(
 )> {
     trace!("compile");
 
-    let out_file = match parsed_args.outputs.get("obj") {
-        Some(obj) => obj,
-        None => return Err(anyhow!("Missing object file output")),
+    let Some(out_file) = parsed_args.outputs.get("obj") else {
+        return Err(anyhow!("Missing object file output"));
     };
 
     let mut arguments: Vec<OsString> = vec![

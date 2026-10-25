@@ -270,11 +270,8 @@ mod client {
             compiler_path: &Path,
         ) -> Option<Result<(Toolchain, String, PathBuf)>> {
             let new_toolchain = {
-                let mut custom_toolchain_paths = match self.custom_toolchain_paths.lock() {
-                    Ok(paths) => paths,
-                    Err(_) => {
-                        return Some(Err(anyhow::anyhow!("custom toolchain path mutex poisoned")));
-                    }
+                let Ok(mut custom_toolchain_paths) = self.custom_toolchain_paths.lock() else {
+                    return Some(Err(anyhow::anyhow!("custom toolchain path mutex poisoned")));
                 };
                 match custom_toolchain_paths.get_mut(compiler_path) {
                     Some((custom_tc, Some(tc))) => {

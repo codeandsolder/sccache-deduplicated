@@ -60,7 +60,7 @@ pub struct PreprocessorCacheEntry {
 
 impl PreprocessorCacheEntry {
     pub fn new() -> Self {
-        Default::default()
+        PreprocessorCacheEntry::default()
     }
 
     /// Tries to deserialize a preprocessor cache entry from `contents`
@@ -68,7 +68,7 @@ impl PreprocessorCacheEntry {
         if contents.is_empty() {
             Ok(Self {
                 number_of_entries: 0,
-                results: Default::default(),
+                results: BTreeMap::default(),
             })
         } else if contents[0] != FORMAT_VERSION {
             Err(Error::UnknownFormat(contents[0]))
@@ -323,9 +323,7 @@ impl PreprocessorCacheEntry {
                             return false;
                         }
                     };
-                    let mtime = if let Ok(mtime) = meta.modified() {
-                        mtime
-                    } else {
+                    let Ok(mtime) = meta.modified() else {
                         debug!(
                             "Couldn't get mtime of {} which contains __TIMESTAMP__",
                             path.display()

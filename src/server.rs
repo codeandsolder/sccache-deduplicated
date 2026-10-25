@@ -71,7 +71,7 @@ use tokio_serde::Framed;
 use tokio_util::codec::{LengthDelimitedCodec, length_delimited};
 use tower_service::Service;
 
-use crate::errors::*;
+use crate::errors::{Error, HttpClientError, ProcessError, Result, anyhow, bail};
 
 const NONCACHEABLE_LOG_ENV: &str = "SCCACHE_NONCACHEABLE_LOG";
 
@@ -197,10 +197,7 @@ fn notify_server_startup_internal<W: Write>(mut w: W, status: ServerStartup) -> 
 #[cfg(unix)]
 fn notify_server_startup(name: Option<&OsString>, status: ServerStartup) -> Result<()> {
     use std::os::unix::net::UnixStream;
-    let name = match name {
-        Some(s) => s,
-        None => return Ok(()),
-    };
+    let Some(name) = name else { return Ok(()) };
     debug!("notify_server_startup({status:?})");
     let stream = UnixStream::connect(name)?;
     notify_server_startup_internal(stream, status)
@@ -1290,9 +1287,8 @@ where
     ) -> Result<(CompileResponse, Option<CompileFinished>)> {
         match self.handle_compile(compile).await? {
             Message::WithBody(Response::Compile(resp), body) => {
-                let finished = match body.await? {
-                    Response::CompileFinished(f) => f,
-                    _ => bail!("unexpected body response from compile_direct"),
+                let Response::CompileFinished(finished) = body.await? else {
+                    bail!("unexpected body response from compile_direct")
                 };
                 Ok((resp, Some(finished)))
             }

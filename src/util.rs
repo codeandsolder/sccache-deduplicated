@@ -31,7 +31,7 @@ use std::str;
 use std::time::Duration;
 use std::time::{self, SystemTime};
 
-use crate::errors::*;
+use crate::errors::{Context, ProcessError, Result};
 
 /// The url safe engine for base64.
 pub const BASE64_URL_SAFE_ENGINE: base64::engine::GeneralPurpose =
@@ -349,7 +349,7 @@ impl TimeMacroFinder {
 
     #[must_use]
     pub fn new() -> Self {
-        Default::default()
+        TimeMacroFinder::default()
     }
 }
 
@@ -1571,9 +1571,8 @@ pub fn resolve_compiler_avoiding_wrapper(
     };
 
     // Get the compiler name to search for
-    let compiler_name = match executable.file_name() {
-        Some(name) => name,
-        None => return executable.to_path_buf(),
+    let Some(compiler_name) = executable.file_name() else {
+        return executable.to_path_buf();
     };
 
     // If the path is absolute and does not resolve to a wrapper, return it as-is.
@@ -1582,9 +1581,8 @@ pub fn resolve_compiler_avoiding_wrapper(
     }
 
     // Get PATH from env_vars
-    let path_value = match env_vars.iter().find(|(key, _)| key == "PATH") {
-        Some((_, value)) => value,
-        None => return executable.to_path_buf(),
+    let Some((_, path_value)) = env_vars.iter().find(|(key, _)| key == "PATH") else {
+        return executable.to_path_buf();
     };
 
     // Search PATH for a valid compiler, skipping wrapper candidates.

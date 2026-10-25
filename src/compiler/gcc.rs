@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::compiler::args::*;
+use crate::compiler::args::{
+    ArgDisposition, ArgInfo, ArgToStringResult, ArgsIter, Argument, FromArg, IntoArg,
+    NormalizedDisposition, PathTransformerFn, SearchableArgInfo,
+};
 use crate::compiler::c::{
     ArtifactDescriptor, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
     ParsedArguments, is_native_codegen_arg,
@@ -35,7 +38,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process;
 
-use crate::errors::*;
+use crate::errors::{Result, anyhow};
 
 /// A struct on which to implement `CCompilerImpl`.
 #[derive(Clone, Debug)]
@@ -190,7 +193,15 @@ ArgData! { pub
     NoIntegratedAs,
 }
 
-use self::ArgData::*;
+use self::ArgData::{
+    Arch, ClangModuleOutput, ClangProfileUse, Coverage, DepArgumentPath, DepTarget,
+    DiagnosticsColor, DiagnosticsColorFlag, DoCompilation, ExtraHashFile,
+    ExtraHashFileClangModuleFile, IntegratedAs, Language as LanguageArg, ModuleOnlyFlag,
+    NeedDepTarget, NoDiagnosticsColorFlag, NoIntegratedAs, Output, PassThrough, PassThroughFlag,
+    PassThroughPath, PedanticFlag, PreprocessorArgument, PreprocessorArgumentFlag,
+    PreprocessorArgumentPath, ProfileGenerate, SerializeDiagnostics, SplitDwarf, Standard,
+    TestCoverage, TooHard, TooHardFlag, Unhashed, UnhashedFlag, XClang,
+};
 
 const ARCH_FLAG: &str = "-arch";
 
@@ -283,7 +294,7 @@ counted_array!(pub static ARGS: [ArgInfo<ArgData>; _] = [
     take_arg!("-stdlib", OsString, Concatenated(b'='), PreprocessorArgument),
     flag!("-trigraphs", PreprocessorArgumentFlag),
     take_arg!("-u", OsString, CanBeSeparated, PassThrough),
-    take_arg!("-x", OsString, CanBeSeparated, Language),
+    take_arg!("-x", OsString, CanBeSeparated, LanguageArg),
     take_arg!("-z", OsString, CanBeSeparated, PassThrough),
     take_arg!("@", OsString, Concatenated, TooHard),
 ]);
@@ -473,7 +484,7 @@ where
                 | UnhashedFlag
                 | Unhashed(_),
             ) => {}
-            Some(Language(lang)) => {
+            Some(LanguageArg(lang)) => {
                 language = match lang.to_string_lossy().as_ref() {
                     // From https://gcc.gnu.org/onlinedocs/gcc/Overall-Options.html
                     // and https://github.com/llvm/llvm-project/blob/main/clang/include/clang/Driver/Types.def
@@ -572,7 +583,7 @@ where
             Some(DepArgumentPath(_) | NeedDepTarget) => &mut dependency_args,
             Some(
                 DoCompilation
-                | Language(_)
+                | LanguageArg(_)
                 | Output(_)
                 | XClang(_)
                 | DepTarget(_)
@@ -613,7 +624,7 @@ where
         let args = match arg.get_data() {
             Some(
                 SplitDwarf | ModuleOnlyFlag | PedanticFlag | Standard(_) | ProfileGenerate
-                | ClangProfileUse(_) | TestCoverage | Coverage | DoCompilation | Language(_)
+                | ClangProfileUse(_) | TestCoverage | Coverage | DoCompilation | LanguageArg(_)
                 | Output(_) | ClangModuleOutput(_) | TooHardFlag | XClang(_) | IntegratedAs
                 | NoIntegratedAs | TooHard(_),
             ) => cannot_cache!(
@@ -694,10 +705,8 @@ where
             format!("{:?}", multiple_input_files)
         );
     }
-    let input = match input_arg {
-        Some(i) => i,
-        // We can't cache compilation without an input.
-        None => cannot_cache!("no input file"),
+    let Some(input) = input_arg else {
+        cannot_cache!("no input file")
     };
     let language = match language {
         None => {
@@ -709,9 +718,8 @@ where
         }
         l => l,
     };
-    let language = match language {
-        Some(l) => l,
-        None => cannot_cache!("unknown source language"),
+    let Some(language) = language else {
+        cannot_cache!("unknown source language")
     };
     let mut outputs = HashMap::new();
     let output = if let Some(output) = output_arg {

@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::compiler::args::*;
+use crate::compiler::args::{
+    ArgDisposition, ArgInfo, ArgToStringResult, ArgsIter, Argument, FromArg, IntoArg,
+    NormalizedDisposition, PathTransformerFn,
+};
 use crate::compiler::c::{
     ArtifactDescriptor, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
     ParsedArguments,
@@ -34,7 +37,7 @@ use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
-use crate::errors::*;
+use crate::errors::{Context, Result, bail};
 
 /// A struct on which to implement `CCompilerImpl`.
 ///
@@ -246,7 +249,12 @@ ArgData! {
     ExternalIncludePath(PathBuf),
 }
 
-use self::ArgData::*;
+use self::ArgData::{
+    Clang, DebugInfo, DepFile, DoCompilation, ExternalIncludePath, ExtraHashFile, Ignore,
+    IgnoreWithSuffix, Output, PassThrough, PassThroughWithPath, PassThroughWithSuffix,
+    PreprocessorArgument, PreprocessorArgumentPath, ProgramDatabase, ShowIncludes,
+    SuppressCompilation, TooHard, TooHardFlag, TooHardPath, XClang,
+};
 
 macro_rules! msvc_args {
     (static ARGS: [$t:ty; _] = [$($macro:ident ! ($($v:tt)*),)*]) => {
@@ -692,7 +700,16 @@ pub fn parse_arguments(
         for arg in ArgsIter::new(it, (&gcc::ARGS[..], &clang::ARGS[..])) {
             let arg = try_or_cannot_cache!(arg, "argument parse");
             // Eagerly bail if it looks like we need to do more complicated work
-            use crate::compiler::gcc::ArgData::*;
+            use crate::compiler::gcc::ArgData::{
+                Arch, ClangModuleOutput, ClangProfileUse, Coverage, DepArgumentPath, DepTarget,
+                DiagnosticsColor, DiagnosticsColorFlag, DoCompilation, ExtraHashFile,
+                ExtraHashFileClangModuleFile, IntegratedAs, Language, ModuleOnlyFlag,
+                NeedDepTarget, NoDiagnosticsColorFlag, NoIntegratedAs, Output, PassThrough,
+                PassThroughFlag, PassThroughPath, PedanticFlag, PreprocessorArgument,
+                PreprocessorArgumentFlag, PreprocessorArgumentPath, ProfileGenerate,
+                SerializeDiagnostics, SplitDwarf, Standard, TestCoverage, TooHard, TooHardFlag,
+                Unhashed, UnhashedFlag, XClang,
+            };
             let args = match arg.get_data() {
                 Some(
                     SplitDwarf
@@ -1287,9 +1304,8 @@ impl Iterator for ExpandIncludeFile<'_> {
 
             // Visit the next argument provided by the original command iterator.
             let arg = self.args.pop()?;
-            let file_arg = match arg.split_prefix("@") {
-                Some(file_arg) => file_arg,
-                None => return Some(arg),
+            let Some(file_arg) = arg.split_prefix("@") else {
+                return Some(arg);
             };
             let file_path = self.cwd.join(file_arg);
             // Read the contents of the response file, accounting for non-utf8 encodings.

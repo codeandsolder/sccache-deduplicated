@@ -13,13 +13,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::compiler::args::*;
+use crate::compiler::args::{ArgDisposition, ArgInfo, FromArg};
 #[cfg(test)]
 use crate::compiler::c::ArtifactDescriptor;
 use crate::compiler::c::{
     CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext, ParsedArguments,
 };
-use crate::compiler::gcc::ArgData::*;
+use crate::compiler::gcc::ArgData::{
+    Language as LanguageArg, PassThrough, PassThroughFlag, PreprocessorArgument,
+    PreprocessorArgumentFlag, PreprocessorArgumentPath, Standard,
+};
 use crate::compiler::{
     CCompileCommand, Cacheable, CompileCommand, CompilerArguments, Language, gcc,
 };
@@ -32,7 +35,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process;
 
-use crate::errors::*;
+use crate::errors::{Result, anyhow};
 
 /// A unit struct on which to implement `CCompilerImpl`.
 #[derive(Clone, Debug)]
@@ -220,7 +223,7 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
     take_arg!("-ta", OsString, CanBeSeparated(b'='), PassThrough),
     take_arg!("-target", OsString, CanBeSeparated(b'='), PassThrough),
     take_arg!("-tp", OsString, CanBeSeparated(b'='), PassThrough),
-    take_arg!("-x", OsString, CanBeSeparated(b'='), Language)
+    take_arg!("-x", OsString, CanBeSeparated(b'='), LanguageArg)
 ]);
 
 #[cfg(test)]

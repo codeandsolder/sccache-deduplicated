@@ -14,7 +14,10 @@
 // limitations under the License.
 
 use crate::cache::{Cache, CacheWrite, DecompressionFailure, FileObjectSource, Storage};
-use crate::compiler::args::*;
+use crate::compiler::args::{
+    ArgDisposition, ArgInfo, ArgToStringResult, ArgsIter, Argument, FromArg, IntoArg,
+    NormalizedDisposition, PathTransformerFn,
+};
 use crate::compiler::c::{CCompiler, CCompilerKind};
 use crate::compiler::cicc::Cicc;
 use crate::compiler::clang::Clang;
@@ -59,7 +62,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-use crate::errors::*;
+use crate::errors::{Context, Error, HttpClientError, ProcessError, Result, anyhow, bail};
 
 /// Can dylibs (shared libraries or proc macros) be distributed on this platform?
 #[cfg(all(
@@ -893,9 +896,7 @@ where
         .generate_compile_commands(&mut path_transformer, rewrite_includes_only)
         .context("Failed to generate compile commands")?;
 
-    let dist_client = if let Some(dc) = dist_compile_cmd.clone().and(dist_client) {
-        dc
-    } else {
+    let Some(dist_client) = dist_compile_cmd.clone().and(dist_client) else {
         debug!("[{out_pretty}]: Compiling locally");
         return compile_cmd
             .execute(service, &creator)
@@ -1885,9 +1886,8 @@ compiler_version=__VERSION__
 
     drop(tempdir);
 
-    let stdout = match str::from_utf8(&output.stdout) {
-        Ok(s) => s,
-        Err(_) => bail!("Failed to parse output"),
+    let Ok(stdout) = str::from_utf8(&output.stdout) else {
+        bail!("Failed to parse output")
     };
     let mut lines = stdout.lines().filter_map(|line| {
         let line = line.trim();

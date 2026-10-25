@@ -13,7 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::compiler::args::*;
+use crate::compiler::args::{
+    ArgDisposition, ArgInfo, ArgToStringResult, ArgsIter, Argument, FromArg, IntoArg,
+    PathTransformerFn, SearchableArgInfo,
+};
 use crate::compiler::c::{
     ArtifactDescriptor, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
     ParsedArguments,
@@ -33,7 +36,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process;
 
-use crate::errors::*;
+use crate::errors::{Result, anyhow};
 
 /// A unit struct on which to implement `CCompilerImpl`.
 #[derive(Clone, Debug)]
@@ -354,7 +357,9 @@ ArgData! { pub
     UnhashedOutput(PathBuf),
 }
 
-use self::ArgData::*;
+use self::ArgData::{
+    GenModuleIdFileFlag, ModuleIdFileName, Output, PassThrough, UnhashedOutput, UnhashedPassThrough,
+};
 
 counted_array!(pub static ARGS: [ArgInfo<ArgData>; _] = [
     take_arg!("--gen_c_file_name", PathBuf, Separated, UnhashedOutput),

@@ -34,7 +34,7 @@ use std::sync::Mutex;
 use std::{collections::HashMap, fmt};
 use typed_path::Utf8TypedPathBuf;
 
-use crate::errors::*;
+use crate::errors::{Context, Result, anyhow, bail};
 
 /// Defines how the multi-level cache handles write failures.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -856,10 +856,10 @@ pub struct DistConfig {
 impl Default for DistConfig {
     fn default() -> Self {
         Self {
-            auth: Default::default(),
-            scheduler_url: Default::default(),
+            auth: DistAuth::default(),
+            scheduler_url: Option::default(),
             cache_dir: default_dist_cache_dir(),
-            toolchains: Default::default(),
+            toolchains: Vec::default(),
             toolchain_cache_size: default_toolchain_cache_size(),
             rewrite_includes_only: false,
         }
@@ -1562,7 +1562,7 @@ impl Config {
         file_conf: FileConfig,
         environment: &Environment,
     ) -> Result<Self> {
-        let mut conf_caches: CacheConfigs = Default::default();
+        let mut conf_caches: CacheConfigs = CacheConfigs::default();
 
         let FileConfig {
             cache,

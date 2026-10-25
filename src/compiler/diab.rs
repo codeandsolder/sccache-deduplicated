@@ -25,7 +25,7 @@ use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
     SingleCompileCommand,
 };
-use crate::errors::*;
+use crate::errors::{Result, anyhow};
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::{OsStrExt, run_input_output};
 use crate::{counted_array, dist};
@@ -120,7 +120,10 @@ ArgData! { pub
     TooHard(OsString),
 }
 
-use self::ArgData::*;
+use self::ArgData::{
+    DepArgument, DepArgumentFlag, DepArgumentPath, DoCompilation, Output, PassThrough,
+    PreprocessorArgument, PreprocessorArgumentPath, TooHard, TooHardFlag,
+};
 
 counted_array!(pub static ARGS: [ArgInfo<ArgData>; _] = [
     flag!("-", TooHardFlag),
@@ -282,14 +285,11 @@ where
     if multiple_input {
         cannot_cache!("multiple input files");
     }
-    let input = match input_arg {
-        Some(i) => i,
-        // We can't cache compilation without an input.
-        None => cannot_cache!("no input file"),
+    let Some(input) = input_arg else {
+        cannot_cache!("no input file")
     };
-    let language = match Language::from_file_name(Path::new(&input)) {
-        Some(l) => l,
-        None => cannot_cache!("unknown source language"),
+    let Some(language) = Language::from_file_name(Path::new(&input)) else {
+        cannot_cache!("unknown source language")
     };
 
     let output = output_arg.unwrap_or_else(|| Path::new(&input).with_extension("o"));
@@ -422,9 +422,8 @@ impl Iterator for ExpandAtArgs<'_> {
                 return Some(arg);
             }
 
-            let value = match arg.split_prefix("-@") {
-                Some(arg) => arg,
-                None => return Some(arg),
+            let Some(value) = arg.split_prefix("-@") else {
+                return Some(arg);
             };
 
             // Return options that produce additional output and are not cacheable

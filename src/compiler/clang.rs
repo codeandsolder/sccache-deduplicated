@@ -12,13 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::compiler::args::*;
+use crate::compiler::args::{ArgDisposition, ArgInfo, FromArg};
 #[cfg(test)]
 use crate::compiler::c::ArtifactDescriptor;
 use crate::compiler::c::{
     CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext, ParsedArguments,
 };
-use crate::compiler::gcc::ArgData::*;
+use crate::compiler::gcc::ArgData::{
+    ClangModuleOutput, ClangProfileUse, DepArgumentPath, DepTarget, DiagnosticsColorFlag,
+    ExtraHashFile, ExtraHashFileClangModuleFile, IntegratedAs, ModuleOnlyFlag,
+    NoDiagnosticsColorFlag, NoIntegratedAs, PassThrough, PassThroughFlag, PassThroughPath,
+    PreprocessorArgumentFlag, PreprocessorArgumentPath, ProfileGenerate, TooHard, TooHardFlag,
+    Unhashed, XClang,
+};
 use crate::compiler::{
     CCompileCommand, Cacheable, CompileCommand, CompilerArguments, Language, gcc,
 };
@@ -30,7 +36,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process;
 
-use crate::errors::*;
+use crate::errors::Result;
 
 /// A struct on which to implement `CCompilerImpl`.
 #[derive(Clone, Debug)]
@@ -52,19 +58,16 @@ impl Clang {
             return false;
         }
 
-        let version_val = match self.version.clone() {
-            Some(version_val) => version_val,
-            None => return false,
+        let Some(version_val) = self.version.clone() else {
+            return false;
         };
 
-        let version_str = match version_val.split(' ').find(|x| x.contains('.')) {
-            Some(version_str) => version_str,
-            None => return false,
+        let Some(version_str) = version_val.split(' ').find(|x| x.contains('.')) else {
+            return false;
         };
 
-        let parsed_version = match Version::parse(version_str.trim_end_matches('"')) {
-            Ok(parsed_version) => parsed_version,
-            Err(_) => return false,
+        let Ok(parsed_version) = Version::parse(version_str.trim_end_matches('"')) else {
+            return false;
         };
 
         parsed_version

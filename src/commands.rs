@@ -47,7 +47,7 @@ use tokio::runtime::{Builder, Runtime};
 use walkdir::WalkDir;
 use which::which_in;
 
-use crate::errors::*;
+use crate::errors::{Context, Result, anyhow, bail};
 
 /// The default sccache server port.
 pub const DEFAULT_PORT: u16 = 4226;
@@ -183,11 +183,8 @@ fn create_error_log() -> Result<File> {
         }
     };
 
-    let f = match OpenOptions::new().create(true).append(true).open(&name) {
-        Ok(f) => f,
-        Err(_) => {
-            bail!("Cannot open/write log file '{name}'");
-        }
+    let Ok(f) = OpenOptions::new().create(true).append(true).open(&name) else {
+        bail!("Cannot open/write log file '{name}'");
     };
     Ok(f)
 }

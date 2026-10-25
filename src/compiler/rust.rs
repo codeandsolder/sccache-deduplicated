@@ -15,7 +15,10 @@
 use crate::cache::FileObjectSource;
 #[cfg(target_os = "linux")]
 use crate::compiler::CompileCommandImpl;
-use crate::compiler::args::*;
+use crate::compiler::args::{
+    ArgDisposition, ArgInfo, ArgParseError, ArgParseResult, ArgToStringResult, ArgsIter, Argument,
+    FromArg, IntoArg, NormalizedDisposition, PathTransformerFn, split_os_string_arg,
+};
 use crate::compiler::canonical_paths::CanonicalRustPaths;
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, Compiler,
@@ -69,7 +72,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time;
 
-use crate::errors::*;
+use crate::errors::{Context, Result, anyhow, bail};
 
 #[cfg(feature = "dist-client")]
 const RLIB_PREFIX: &str = "lib";
@@ -396,13 +399,11 @@ where
     let cwd = cwd.as_ref();
     // Just parse the first line, which should have the dep-info file and all
     // source files.
-    let line = match dep_info.lines().next() {
-        None => return vec![],
-        Some(l) => l,
+    let Some(line) = dep_info.lines().next() else {
+        return vec![];
     };
-    let pos = match line.find(": ") {
-        None => return vec![],
-        Some(p) => p,
+    let Some(pos) = line.find(": ") else {
+        return vec![];
     };
 
     let mut deps = Vec::new();
@@ -1749,7 +1750,11 @@ ArgData! {
     Unstable(ArgUnstable),
 }
 
-use self::ArgData::*;
+use self::ArgData::{
+    CodeGen, Color, CrateName, CrateType, Emit, Extern, Json, LinkLibrary, LinkPath,
+    NotCompilation, NotCompilationFlag, OutDir, PassThrough, Target, TooHardFlag, TooHardPath,
+    Unstable,
+};
 
 use super::CacheControl;
 

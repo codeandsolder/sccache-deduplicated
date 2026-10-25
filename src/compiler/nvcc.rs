@@ -13,13 +13,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::compiler::args::*;
+use crate::compiler::args::{ArgDisposition, ArgInfo, FromArg, IntoArg};
 #[cfg(test)]
 use crate::compiler::c::ArtifactDescriptor;
 use crate::compiler::c::{
     CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext, ParsedArguments,
 };
-use crate::compiler::gcc::ArgData::*;
+use crate::compiler::gcc::ArgData::{
+    DepArgumentPath, DoCompilation, ExtraHashFile, Language as LanguageArg, NeedDepTarget,
+    PassThrough, PreprocessorArgument, PreprocessorArgumentFlag, PreprocessorArgumentPath, TooHard,
+    Unhashed, UnhashedFlag,
+};
 use crate::compiler::{
     CCompileCommand, Cacheable, CompileCommand, CompileCommandImpl, CompilerArguments, Language,
     cicc, gcc,
@@ -41,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use which::which_in;
 
-use crate::errors::*;
+use crate::errors::{Context, Error, ProcessError, Result, anyhow};
 
 const NVCC_GENERATED_FILENAME_SUFFIXES: &[&str] = &[
     cicc::CICC_INPUT_SUFFIX,
@@ -1003,11 +1007,8 @@ where
     for pair in reader.lines().enumerate() {
         let (idx, line) = pair;
         // Select lines that match the `#$ ` prefix from nvcc --dryrun
-        let line = match select_valid_dryrun_lines(&is_valid_line_re, &line?) {
-            Ok(line) => line,
-            // Ignore lines that don't start with `#$ `. For some reason, nvcc
-            // on Windows prints the name of the input file without the prefix
-            Err(_) => continue,
+        let Ok(line) = select_valid_dryrun_lines(&is_valid_line_re, &line?) else {
+            continue;
         };
 
         let maybe_exe_and_args = fold_env_vars_or_split_into_exe_and_args(
@@ -1019,9 +1020,8 @@ where
             host_compiler,
         )?;
 
-        let (exe, mut args) = match maybe_exe_and_args {
-            Some(exe_and_args) => exe_and_args,
-            _ => continue,
+        let Some((exe, mut args)) = maybe_exe_and_args else {
+            continue;
         };
 
         // Remap nvcc's generated file names to deterministic names
@@ -1132,14 +1132,12 @@ fn fold_env_vars_or_split_into_exe_and_args(
         }
     }
 
-    let args = match shlex::split(&line) {
-        Some(args) => args,
-        None => return Err(anyhow!("Could not parse shell line")),
+    let Some(args) = shlex::split(&line) else {
+        return Err(anyhow!("Could not parse shell line"));
     };
 
-    let (exe, args) = match args.split_first() {
-        Some(exe_and_args) => exe_and_args,
-        None => return Err(anyhow!("Could not split shell line")),
+    let Some((exe, args)) = args.split_first() else {
+        return Err(anyhow!("Could not split shell line"));
     };
 
     let env_path = env_vars
@@ -1447,7 +1445,7 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
     take_arg!("--threads", OsString, CanBeSeparated(b'='), Unhashed),
     take_arg!("--time", OsString, CanBeSeparated, TooHard),
     take_arg!("--time=", OsString, Concatenated, TooHard),
-    take_arg!("--x", OsString, CanBeSeparated(b'='), Language),
+    take_arg!("--x", OsString, CanBeSeparated(b'='), LanguageArg),
 
     take_arg!("-Werror", OsString, CanBeSeparated(b'='), PreprocessorArgument),
     take_arg!("-Xarchive", OsString, CanBeSeparated(b'='), PassThrough),
@@ -1485,7 +1483,7 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
     take_arg!("-t=", OsString, Concatenated, Unhashed),
     take_arg!("-time", OsString, CanBeSeparated, TooHard),
     take_arg!("-time=", OsString, Concatenated, TooHard),
-    take_arg!("-x", OsString, CanBeSeparated(b'='), Language),
+    take_arg!("-x", OsString, CanBeSeparated(b'='), LanguageArg),
 ]);
 
 #[cfg(test)]

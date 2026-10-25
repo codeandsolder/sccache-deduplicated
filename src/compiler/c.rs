@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::LazyLock;
 
-use crate::errors::*;
+use crate::errors::{Context, ProcessError, Result, bail};
 
 use super::CacheControl;
 use super::preprocessor_cache::PreprocessorCacheEntry;
