@@ -1692,6 +1692,7 @@ impl CachedConfig {
             .as_ref()
             .map(|(path, _)| path.clone())
             .context("cached config was not initialised")?;
+        drop(cached);
         Ok(Self { file_conf_path })
     }
 
@@ -1706,16 +1707,19 @@ impl CachedConfig {
     }
 
     pub fn with<F: FnOnce(&CachedFileConfig) -> T, T>(&self, f: F) -> Result<T> {
-        let cached = CACHED_CONFIG
-            .lock()
-            .map_err(|_| anyhow!("cached config lock is poisoned"))?;
-        let (path, config) = cached
-            .as_ref()
-            .context("cached config was not initialised")?;
-        if path != &self.file_conf_path {
-            bail!("cached config handle is stale after reload");
-        }
-        Ok(f(config))
+        let config = {
+            let cached = CACHED_CONFIG
+                .lock()
+                .map_err(|_| anyhow!("cached config lock is poisoned"))?;
+            let (path, config) = cached
+                .as_ref()
+                .context("cached config was not initialised")?;
+            if path != &self.file_conf_path {
+                bail!("cached config handle is stale after reload");
+            }
+            config.clone()
+        };
+        Ok(f(&config))
     }
 
     pub fn with_mut<F: FnOnce(&mut CachedFileConfig)>(&self, f: F) -> Result<()> {
@@ -1733,6 +1737,7 @@ impl CachedConfig {
         f(&mut new_config);
         Self::save_file_config(path, &new_config)?;
         *config = new_config;
+        drop(cached);
         Ok(())
     }
 
@@ -1745,12 +1750,14 @@ impl CachedConfig {
                 fs::create_dir_all(file_conf_dir)
                     .context("Failed to create dir to hold cached config")?;
             }
-            Self::save_file_config(file_conf_path, &Default::default()).with_context(|| {
-                format!(
-                    "Unable to create cached config file at {}",
-                    file_conf_path.display()
-                )
-            })?;
+            Self::save_file_config(file_conf_path, &CachedFileConfig::default()).with_context(
+                || {
+                    format!(
+                        "Unable to create cached config file at {}",
+                        file_conf_path.display()
+                    )
+                },
+            )?;
         }
         try_read_config_file(file_conf_path)
             .context("Failed to load cached config file")?

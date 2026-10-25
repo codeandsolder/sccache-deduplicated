@@ -80,7 +80,6 @@ log = "0.4"
 memchr = "2"
 memmap2 = "0.9.4"
 mime = "0.3"
-number_prefix = "0.4"
 object = "0.40"
 opendal = { version = "0.59.0", optional = true, default-features = false }
 opendal-http-transport-reqwest = { version = "0.59.0", optional = true }

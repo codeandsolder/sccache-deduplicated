@@ -78,7 +78,7 @@ impl CCompilerImpl for Cicc {
         let CPreprocessContext {
             parsed_args, cwd, ..
         } = context;
-        preprocess(cwd, parsed_args).await
+        preprocess(cwd, parsed_args)
     }
     fn generate_compile_commands<T>(
         &self,
@@ -245,7 +245,7 @@ where
     })
 }
 
-pub async fn preprocess(cwd: &Path, parsed_args: &ParsedArguments) -> Result<process::Output> {
+pub fn preprocess(cwd: &Path, parsed_args: &ParsedArguments) -> Result<process::Output> {
     // cicc and ptxas expect input to be an absolute path
     let input = if parsed_args.input.is_absolute() {
         parsed_args.input.clone()

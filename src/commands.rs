@@ -603,7 +603,7 @@ where
 /// or produced by a local `SccacheService` in client-side mode.
 fn handle_compile_result<T>(
     mut creator: T,
-    runtime: &mut Runtime,
+    runtime: &Runtime,
     response: CompileResponse,
     finished: Option<CompileFinished>,
     invocation: CompileInvocation<'_>,

@@ -85,18 +85,20 @@ impl Storage for DiskCache {
 
         self.pool
             .spawn_blocking(move || {
-                let mut guard = lru
-                    .lock()
-                    .map_err(|_| anyhow!("disk cache mutex poisoned"))?;
-                let io = match guard.get_or_init()?.get(&path) {
-                    Ok(f) => f,
-                    Err(LruError::FileNotInCache) => {
-                        trace!("DiskCache::get({key}): FileNotInCache");
-                        return Ok(Cache::Miss);
-                    }
-                    Err(e) => {
-                        trace!("DiskCache::get({key}): {e}");
-                        return Err(e.into());
+                let io = {
+                    let mut guard = lru
+                        .lock()
+                        .map_err(|_| anyhow!("disk cache mutex poisoned"))?;
+                    match guard.get_or_init()?.get(&path) {
+                        Ok(file) => file,
+                        Err(LruError::FileNotInCache) => {
+                            trace!("DiskCache::get({key}): FileNotInCache");
+                            return Ok(Cache::Miss);
+                        }
+                        Err(error) => {
+                            trace!("DiskCache::get({key}): {error}");
+                            return Err(error.into());
+                        }
                     }
                 };
                 let hit = CacheRead::from(io)?;
@@ -202,10 +204,12 @@ impl Storage for DiskCache {
                     guard.get_or_init()?.prepare_add(key, data.len() as u64)?
                 };
                 f.as_file_mut().write_all(&data)?;
-                let mut guard = lru
-                    .lock()
-                    .map_err(|_| anyhow!("disk cache mutex poisoned"))?;
-                guard.get_or_init()?.commit(f)?;
+                {
+                    let mut guard = lru
+                        .lock()
+                        .map_err(|_| anyhow!("disk cache mutex poisoned"))?;
+                    guard.get_or_init()?.commit(f)?;
+                }
                 Ok(start.elapsed())
             })
             .await?
@@ -216,11 +220,14 @@ impl Storage for DiskCache {
     }
 
     fn location(&self) -> String {
-        let guard = self
-            .lru
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        format!("Local disk: {}", guard.path().display())
+        let path = {
+            let guard = self
+                .lru
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.path().to_owned()
+        };
+        format!("Local disk: {}", path.display())
     }
 
     fn cache_type_name(&self) -> &'static str {
@@ -277,11 +284,13 @@ impl Storage for DiskCache {
             guard.get_or_init()?.prepare_add(key, 0)?
         };
         preprocessor_cache_entry.serialize_to(BufWriter::new(f.as_file_mut()))?;
-        let mut guard = self
-            .preprocessor_cache
-            .lock()
-            .map_err(|_| anyhow!("preprocessor cache mutex poisoned"))?;
-        guard.get_or_init()?.commit(f)?;
+        {
+            let mut guard = self
+                .preprocessor_cache
+                .lock()
+                .map_err(|_| anyhow!("preprocessor cache mutex poisoned"))?;
+            guard.get_or_init()?.commit(f)?;
+        }
         Ok(())
     }
 }

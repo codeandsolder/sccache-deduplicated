@@ -969,12 +969,13 @@ where
         rustc_verbose_version.to_owned(),
         cpu_key,
     );
-    if let Some(profile) = CPU_PROFILE_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&key)
-        .cloned()
-    {
+    let cached_profile = {
+        let cache = CPU_PROFILE_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.get(&key).cloned()
+    };
+    if let Some(profile) = cached_profile {
         return Ok(profile);
     }
 
@@ -1029,12 +1030,13 @@ where
         rustc_verbose_version.to_owned(),
         cpu.unwrap_or("<default>").to_owned(),
     );
-    if let Some(features) = CPU_CFG_FEATURE_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&key)
-        .cloned()
-    {
+    let cached_features = {
+        let cache = CPU_CFG_FEATURE_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.get(&key).cloned()
+    };
+    if let Some(features) = cached_features {
         return Ok(features);
     }
 

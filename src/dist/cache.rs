@@ -36,6 +36,7 @@ mod client {
     pub struct ClientToolchains {
         cache_dir: PathBuf,
         cache: Mutex<TcCache>,
+        toolchain_creation: Mutex<()>,
         // Lookup from dist toolchain -> path to custom toolchain archive
         custom_toolchain_archives: Mutex<HashMap<Toolchain, PathBuf>>,
         // Lookup from local path -> toolchain details
@@ -155,6 +156,7 @@ mod client {
             Ok(Self {
                 cache_dir,
                 cache,
+                toolchain_creation: Mutex::new(()),
                 custom_toolchain_archives: Mutex::new(HashMap::new()),
                 custom_toolchain_paths,
                 disabled_toolchains,
@@ -212,42 +214,53 @@ mod client {
                 let (tc, compiler_path, archive) = tc_and_paths?;
                 return Ok((tc, Some((compiler_path, archive))));
             }
-            // Only permit one toolchain creation at a time. Not an issue if there are multiple attempts
-            // to create the same toolchain, just a waste of time
-            let mut cache = self
-                .cache
+            // Only permit one toolchain creation at a time, without holding the LRU
+            // cache mutex across potentially slow packaging I/O.
+            let _creation_guard = self
+                .toolchain_creation
                 .lock()
-                .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?;
+                .map_err(|_| anyhow::anyhow!("toolchain creation mutex poisoned"))?;
             if let Some(archive_id) = self.weak_to_strong(weak_key)? {
                 let tc = Toolchain { archive_id };
-                match cache.get_file(&tc) {
-                    Ok(_) => {
-                        debug!("Using cached toolchain {weak_key} -> {}", tc.archive_id);
-                        return Ok((tc, None));
+                let cached = {
+                    let mut cache = self
+                        .cache
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?;
+                    match cache.get_file(&tc) {
+                        Ok(_) => true,
+                        Err(LruError::FileNotInCache) => false,
+                        Err(LruError::Io(error))
+                            if error.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            false
+                        }
+                        Err(error) => {
+                            return Err(error).context("error while validating cached toolchain");
+                        }
                     }
-                    Err(LruError::FileNotInCache) => {
-                        debug!(
-                            "Weak toolchain mapping {weak_key} -> {} is stale; repackaging",
-                            tc.archive_id
-                        );
-                    }
-                    Err(LruError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                        debug!(
-                            "Weak toolchain mapping {weak_key} -> {} is stale; repackaging",
-                            tc.archive_id
-                        );
-                    }
-                    Err(e) => {
-                        return Err(e).context("error while validating cached toolchain");
-                    }
+                };
+                if cached {
+                    debug!("Using cached toolchain {weak_key} -> {}", tc.archive_id);
+                    return Ok((tc, None));
                 }
+                debug!(
+                    "Weak toolchain mapping {weak_key} -> {} is stale; repackaging",
+                    tc.archive_id
+                );
             }
             debug!("Weak key {weak_key} requires toolchain packaging");
             let tmpfile = tempfile::NamedTempFile::new_in(self.cache_dir.join("toolchain_tmp"))?;
             toolchain_packager
                 .write_pkg(fs_err::File::from_parts(tmpfile.reopen()?, tmpfile.path()))
                 .context("Could not package toolchain")?;
-            let tc = cache.insert_file(tmpfile.path())?;
+            let tc = {
+                let mut cache = self
+                    .cache
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?;
+                cache.insert_file(tmpfile.path())?
+            };
             self.record_weak(weak_key.to_owned(), tc.archive_id.clone())?;
             Ok((tc, None))
         }
@@ -311,23 +324,26 @@ mod client {
         }
 
         fn weak_to_strong(&self, weak_key: &str) -> Result<Option<String>> {
-            let weak_map = self
-                .weak_map
-                .lock()
-                .map_err(|_| anyhow::anyhow!("toolchain weak-map mutex poisoned"))?;
-            Ok(weak_map.get(weak_key).map(String::to_owned))
+            let result = {
+                let weak_map = self
+                    .weak_map
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("toolchain weak-map mutex poisoned"))?;
+                weak_map.get(weak_key).cloned()
+            };
+            Ok(result)
         }
         fn record_weak(&self, weak_key: String, key: String) -> Result<()> {
-            let mut weak_map = self
-                .weak_map
-                .lock()
-                .map_err(|_| anyhow::anyhow!("toolchain weak-map mutex poisoned"))?;
-            weak_map.insert(weak_key, key);
+            let serialized = {
+                let mut weak_map = self
+                    .weak_map
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("toolchain weak-map mutex poisoned"))?;
+                weak_map.insert(weak_key, key);
+                serde_json::to_vec(&*weak_map).map_err(Error::from)?
+            };
             let weak_map_path = self.cache_dir.join("weak_map.json");
-            fs::File::create(weak_map_path)
-                .map_err(Error::from)
-                .and_then(|f| serde_json::to_writer(f, &*weak_map).map_err(Error::from))
-                .context("failed to enter toolchain in weak map")
+            fs::write(weak_map_path, serialized).context("failed to enter toolchain in weak map")
         }
     }
 

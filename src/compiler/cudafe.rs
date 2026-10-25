@@ -65,7 +65,7 @@ impl CCompilerImpl for CudaFE {
         let CPreprocessContext {
             parsed_args, cwd, ..
         } = context;
-        cicc::preprocess(cwd, parsed_args).await
+        cicc::preprocess(cwd, parsed_args)
     }
     fn generate_compile_commands<T>(
         &self,

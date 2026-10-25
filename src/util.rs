@@ -72,7 +72,7 @@ impl Digest {
         let mut m = Self::default();
         // A buffer of 128KB should give us the best performance.
         // See https://eklitzke.org/efficient-file-copying-on-linux.
-        let mut buffer = [0; HASH_BUFFER_SIZE];
+        let mut buffer = vec![0_u8; HASH_BUFFER_SIZE];
         loop {
             let count = reader.read(&mut buffer[..])?;
             if count == 0 {
@@ -125,7 +125,7 @@ impl Digest {
     fn update_from_file(&mut self, path: &Path) -> Result<()> {
         let mut file = File::open(path)
             .with_context(|| format!("Failed to open file for hashing: {path:?}"))?;
-        let mut buf = [0u8; HASH_BUFFER_SIZE];
+        let mut buf = vec![0_u8; HASH_BUFFER_SIZE];
         loop {
             let n = file.read(&mut buf)?;
             if n == 0 {
@@ -577,8 +577,10 @@ where
     S: Serialize,
 {
     let bytes = bincode::serialize(&data)?;
+    let byte_len =
+        u32::try_from(bytes.len()).context("serialized payload exceeds u32 length prefix")?;
     let mut len = [0; 4];
-    BigEndian::write_u32(&mut len, bytes.len() as u32);
+    BigEndian::write_u32(&mut len, byte_len);
     writer.write_all(&len)?;
     writer.write_all(&bytes)?;
     writer.flush()?;
@@ -853,7 +855,13 @@ impl From<std::time::SystemTime> for Timestamp {
         let nanoseconds;
         match system_time.duration_since(std::time::UNIX_EPOCH) {
             Ok(duration) => {
-                seconds = duration.as_secs() as i64;
+                let Ok(representable_seconds) = i64::try_from(duration.as_secs()) else {
+                    return Self {
+                        seconds: i64::MAX,
+                        nanoseconds: NSEC_PER_SEC - 1,
+                    };
+                };
+                seconds = representable_seconds;
                 nanoseconds = duration.subsec_nanos();
             }
             Err(error) => {
@@ -861,7 +869,12 @@ impl From<std::time::SystemTime> for Timestamp {
                 // We need to undo this algorithm:
                 // https://github.com/rust-lang/rust/blob/6bed1f0bc3cc50c10aab26d5f94b16a00776b8a5/library/std/src/sys/unix/time.rs#L40-L41
                 let negative = error.duration();
-                let negative_secs = negative.as_secs() as i64;
+                let Ok(negative_secs) = i64::try_from(negative.as_secs()) else {
+                    return Self {
+                        seconds: i64::MIN,
+                        nanoseconds: 0,
+                    };
+                };
                 let negative_nanos = negative.subsec_nanos();
                 if negative_nanos == 0 {
                     seconds = -negative_secs;

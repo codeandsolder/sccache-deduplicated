@@ -208,24 +208,36 @@ mod code_grant_pkce {
 
     pub fn serve(req: &Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>> {
         debug!("Handling {} {}", req.method(), req.uri());
-        let response = {
-            let mut state = STATE
-                .lock()
-                .map_err(|_| anyhow!("OAuth PKCE state lock is poisoned"))?;
-            let state = state
-                .as_mut()
-                .context("OAuth PKCE state is not initialized")?;
-            match (req.method(), req.uri().path()) {
-                (&Method::GET, "/") => html_response(REDIRECT_WITH_AUTH_JSON),
-                (&Method::GET, "/auth_detail.json") => json_response(&state.auth_url)?,
-                (&Method::GET, "/redirect") => {
-                    let query_pairs = query_pairs(&req.uri().to_string())?;
-                    let (code, auth_state) = handle_code_response(&query_pairs)
-                        .context("Failed to handle response from redirect")?;
+        match (req.method(), req.uri().path()) {
+            (&Method::GET, "/") => Ok(html_response(REDIRECT_WITH_AUTH_JSON)),
+            (&Method::GET, "/auth_detail.json") => {
+                let auth_url = {
+                    let guard = STATE
+                        .lock()
+                        .map_err(|_| anyhow!("OAuth PKCE state lock is poisoned"))?;
+                    guard
+                        .as_ref()
+                        .context("OAuth PKCE state is not initialized")?
+                        .auth_url
+                        .clone()
+                };
+                json_response(&auth_url)
+            }
+            (&Method::GET, "/redirect") => {
+                let query_pairs = query_pairs(&req.uri().to_string())?;
+                let (code, auth_state) = handle_code_response(&query_pairs)
+                    .context("Failed to handle response from redirect")?;
+                {
+                    let mut guard = STATE
+                        .lock()
+                        .map_err(|_| anyhow!("OAuth PKCE state lock is poisoned"))?;
+                    let state = guard
+                        .as_mut()
+                        .context("OAuth PKCE state is not initialized")?;
                     if auth_state != state.auth_state_value {
                         return Err(anyhow!("Mismatched auth states after redirect"));
                     }
-                    // Deliberately in reverse order for a 'happens-before' relationship
+                    // Deliberately in reverse order for a 'happens-before' relationship.
                     state
                         .code_tx
                         .try_send(code)
@@ -237,18 +249,16 @@ mod code_grant_pkce {
                     shutdown_tx
                         .send(())
                         .map_err(|()| anyhow!("OAuth server shutdown receiver was dropped"))?;
-                    html_response(SUCCESS_AFTER_REDIRECT)
                 }
-                _ => {
-                    warn!("Route not found");
-                    Response::builder()
-                        .status(StatusCode::NOT_FOUND)
-                        .body("".into())?
-                }
+                Ok(html_response(SUCCESS_AFTER_REDIRECT))
             }
-        };
-
-        Ok(response)
+            _ => {
+                warn!("Route not found");
+                Ok(Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body("".into())?)
+            }
+        }
     }
 
     pub fn code_to_token(
@@ -390,31 +400,43 @@ mod implicit {
 
     pub fn serve(req: &Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>> {
         debug!("Handling {} {}", req.method(), req.uri());
-        let response = {
-            let mut state = STATE
-                .lock()
-                .map_err(|_| anyhow!("OAuth implicit state lock is poisoned"))?;
-            let state = state
-                .as_mut()
-                .context("OAuth implicit state is not initialized")?;
-            match (req.method(), req.uri().path()) {
-                (&Method::GET, "/") => html_response(REDIRECT_WITH_AUTH_JSON),
-                (&Method::GET, "/auth_detail.json") => json_response(&state.auth_url)?,
-                (&Method::GET, "/redirect") => html_response(SAVE_AUTH_AFTER_REDIRECT),
-                (&Method::POST, "/save_auth") => {
-                    let query_pairs = query_pairs(&req.uri().to_string())?;
-                    let (token, expires_at, auth_state) = handle_response(&query_pairs)
-                        .context("Failed to save auth after redirect")?;
+        match (req.method(), req.uri().path()) {
+            (&Method::GET, "/") => Ok(html_response(REDIRECT_WITH_AUTH_JSON)),
+            (&Method::GET, "/auth_detail.json") => {
+                let auth_url = {
+                    let guard = STATE
+                        .lock()
+                        .map_err(|_| anyhow!("OAuth implicit state lock is poisoned"))?;
+                    guard
+                        .as_ref()
+                        .context("OAuth implicit state is not initialized")?
+                        .auth_url
+                        .clone()
+                };
+                json_response(&auth_url)
+            }
+            (&Method::GET, "/redirect") => Ok(html_response(SAVE_AUTH_AFTER_REDIRECT)),
+            (&Method::POST, "/save_auth") => {
+                let query_pairs = query_pairs(&req.uri().to_string())?;
+                let (token, expires_at, auth_state) =
+                    handle_response(&query_pairs).context("Failed to save auth after redirect")?;
+                if expires_at.saturating_duration_since(Instant::now()) < MIN_TOKEN_VALIDITY {
+                    warn!("Token retrieved expires in under {MIN_TOKEN_VALIDITY_WARNING}");
+                    eprintln!(
+                        "sccache: Token retrieved expires in under {MIN_TOKEN_VALIDITY_WARNING}"
+                    );
+                }
+                {
+                    let mut guard = STATE
+                        .lock()
+                        .map_err(|_| anyhow!("OAuth implicit state lock is poisoned"))?;
+                    let state = guard
+                        .as_mut()
+                        .context("OAuth implicit state is not initialized")?;
                     if auth_state != state.auth_state_value {
                         return Err(anyhow!("Mismatched auth states after redirect"));
                     }
-                    if expires_at.saturating_duration_since(Instant::now()) < MIN_TOKEN_VALIDITY {
-                        warn!("Token retrieved expires in under {MIN_TOKEN_VALIDITY_WARNING}");
-                        eprintln!(
-                            "sccache: Token retrieved expires in under {MIN_TOKEN_VALIDITY_WARNING}"
-                        );
-                    }
-                    // Deliberately in reverse order for a 'happens-before' relationship
+                    // Deliberately in reverse order for a 'happens-before' relationship.
                     state
                         .token_tx
                         .try_send(token)
@@ -426,18 +448,16 @@ mod implicit {
                     shutdown_tx
                         .send(())
                         .map_err(|()| anyhow!("OAuth server shutdown receiver was dropped"))?;
-                    json_response(&"")?
                 }
-                _ => {
-                    warn!("Route not found");
-                    Response::builder()
-                        .status(StatusCode::NOT_FOUND)
-                        .body("".into())?
-                }
+                json_response(&"")
             }
-        };
-
-        Ok(response)
+            _ => {
+                warn!("Route not found");
+                Ok(Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body("".into())?)
+            }
+        }
     }
 }
 

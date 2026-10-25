@@ -37,7 +37,6 @@ use fs_err as fs;
 use futures::channel::mpsc;
 use futures::future::FutureExt;
 use futures::{Sink, SinkExt, Stream, StreamExt, TryFutureExt, future};
-use number_prefix::NumberPrefix;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -338,6 +337,7 @@ impl DistClientContainer {
             }
             DistClientState::Disabled => (),
         }
+        drop(guard);
     }
 
     pub async fn get_status(&self) -> DistInfo {
@@ -363,6 +363,7 @@ impl DistClientContainer {
             }
             DistClientState::Some(cfg, client) => (Arc::clone(client), cfg.scheduler_url.clone()),
         };
+        drop(guard);
 
         match client.do_get_status().await {
             Ok(res) => DistInfo::SchedulerStatus(scheduler_url.clone(), res),
@@ -377,7 +378,7 @@ impl DistClientContainer {
         let mut guard = self.state.lock().await;
         let state = &mut *guard;
         Self::maybe_recreate_state(state).await;
-        match state {
+        let result = match state {
             DistClientState::Some(_, dc) => Ok(Some(dc.clone())),
             DistClientState::Disabled | DistClientState::RetryCreateAt(_, _) => Ok(None),
             DistClientState::FailWithMessage(_, msg) => {
@@ -392,7 +393,9 @@ impl DistClientContainer {
                 *state = DistClientState::RetryCreateAt(config, Instant::now());
                 Err(anyhow!(msg))
             }
-        }
+        };
+        drop(guard);
+        result
     }
 
     async fn maybe_recreate_state(state: &mut DistClientState) {
@@ -859,7 +862,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
 }
 
 /// Maps a compiler proxy path to a compiler proxy and it's last modification time
-type CompilerProxyMap<C> = HashMap<PathBuf, (Box<dyn CompilerProxy<C>>, FileTime)>;
+type CompilerProxyMap<C> = HashMap<PathBuf, (Arc<dyn CompilerProxy<C>>, FileTime)>;
 type CompilerMap<C> = HashMap<PathBuf, Option<CompilerCacheEntry<C>>>;
 
 /// entry of the compiler cache
@@ -1317,25 +1320,18 @@ where
         let path1 = path.clone();
         let env = env.to_vec();
 
-        let resolved_with_proxy = {
-            let compiler_proxies_borrow = self.compiler_proxies.read().await;
-            // Create an owned future - compiler proxy is not Send so we can't
-            // really await while borrowing the proxy since rustc is too conservative
-            let resolve_proxied_executable =
-                compiler_proxies_borrow
-                    .get(&path)
-                    .map(|(compiler_proxy, _filetime)| {
-                        compiler_proxy.resolve_proxied_executable(
-                            self.creator.clone(),
-                            cwd.clone(),
-                            env.as_slice(),
-                        )
-                    });
-
-            match resolve_proxied_executable {
-                Some(fut) => fut.await.ok(),
-                None => None,
-            }
+        let compiler_proxy = {
+            let compiler_proxies = self.compiler_proxies.read().await;
+            compiler_proxies
+                .get(&path)
+                .map(|(compiler_proxy, _filetime)| Arc::clone(compiler_proxy))
+        };
+        let resolved_with_proxy = match compiler_proxy {
+            Some(compiler_proxy) => compiler_proxy
+                .resolve_proxied_executable(self.creator.clone(), cwd.clone(), env.as_slice())
+                .await
+                .ok(),
+            None => None,
         };
 
         // use the supplied compiler path as fallback, lookup its modification time too
@@ -1427,7 +1423,7 @@ where
                 me.compiler_proxies
                     .write()
                     .await
-                    .insert(path, (proxy, mtime));
+                    .insert(path, (Arc::from(proxy), mtime));
             }
             // TODO add some safety checks in case a proxy exists, that the initial `path` is not
             // TODO the same as the resolved compiler binary
@@ -2233,9 +2229,37 @@ fn set_percentage_stat(
     if total == 0 {
         vec.push((name.to_string(), "-".to_string(), 0));
     } else {
-        let ratio = count_hits as f64 / total as f64;
-        vec.push((name.to_string(), format!("{:.2} %", ratio * 100.0), 2));
+        // Hundredths of a percent, rounded to nearest. u128 keeps the multiply exact
+        // even when the counters approach u64::MAX.
+        let total = u128::from(total);
+        let hundredths = (u128::from(count_hits) * 10_000 + total / 2) / total;
+        let whole = hundredths / 100;
+        let fraction = hundredths % 100;
+        vec.push((name.to_string(), format!("{whole}.{fraction:02} %"), 2));
     }
+}
+
+fn format_binary_size(bytes: u64) -> (String, &'static str) {
+    const UNITS: [(u64, &str); 7] = [
+        (1_u64 << 60, "EiB"),
+        (1_u64 << 50, "PiB"),
+        (1_u64 << 40, "TiB"),
+        (1_u64 << 30, "GiB"),
+        (1_u64 << 20, "MiB"),
+        (1_u64 << 10, "KiB"),
+        (1, "bytes"),
+    ];
+
+    let (unit, suffix) = UNITS
+        .into_iter()
+        .find(|(unit, _)| bytes >= *unit)
+        .unwrap_or((1, "bytes"));
+    if unit == 1 {
+        return (bytes.to_string(), suffix);
+    }
+    let unit = u128::from(unit);
+    let rounded = (u128::from(bytes) + unit / 2) / unit;
+    (rounded.to_string(), suffix)
 }
 
 impl ServerInfo {
@@ -2321,10 +2345,7 @@ impl ServerInfo {
             ("Max cache size", &self.max_cache_size),
         ] {
             if let Some(val) = *val {
-                let (val, suffix) = match NumberPrefix::binary(val as f64) {
-                    NumberPrefix::Standalone(bytes) => (bytes.to_string(), "bytes".to_string()),
-                    NumberPrefix::Prefixed(prefix, n) => (format!("{n:.0}"), format!("{prefix}B")),
-                };
+                let (val, suffix) = format_binary_size(val);
                 println!("{name:<name_width$} {val:>stat_width$} {suffix}");
             }
         }
