@@ -136,8 +136,7 @@ impl<T: ArgumentValue> Argument<T> {
 
     pub const fn get_data(&self) -> Option<&T> {
         match *self {
-            Self::Flag(_, ref d) => Some(d),
-            Self::WithValue(_, ref d, _) => Some(d),
+            Self::Flag(_, ref d) | Self::WithValue(_, ref d, _) => Some(d),
             _ => None,
         }
     }
@@ -553,8 +552,7 @@ impl<T: ArgumentValue> SearchableArgInfo<T> for (&'static [ArgInfo<T>], &'static
     fn search(&self, key: &str) -> Option<&ArgInfo<T>> {
         match (self.0.search(key), self.1.search(key)) {
             (None, None) => None,
-            (Some(a), None) => Some(a),
-            (None, Some(a)) => Some(a),
+            (Some(a), None) | (None, Some(a)) => Some(a),
             (Some(a), Some(b)) => {
                 if a.flag_str() > b.flag_str() {
                     Some(a)
@@ -628,14 +626,16 @@ where
             }
             let s = arg.to_string_lossy();
             let arguments = &mut self.arguments;
-            Some(match self.arg_info.search(&s[..]) {
-                Some(i) => i.clone().process(&s[..], || arguments.next()),
-                None => Ok(if s.starts_with('-') {
-                    Argument::UnknownFlag(arg.clone())
-                } else {
-                    Argument::Raw(arg.clone())
-                }),
-            })
+            Some(self.arg_info.search(&s[..]).map_or_else(
+                || {
+                    Ok(if s.starts_with('-') {
+                        Argument::UnknownFlag(arg.clone())
+                    } else {
+                        Argument::Raw(arg.clone())
+                    })
+                },
+                |i| i.clone().process(&s[..], || arguments.next()),
+            ))
         } else {
             None
         }

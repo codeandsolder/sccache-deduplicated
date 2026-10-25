@@ -499,9 +499,8 @@ where
                     "objective-c-header" => Some(Language::ObjectiveCHeader),
                     "objective-c++" => Some(Language::ObjectiveCxx),
                     "objective-c++-header" => Some(Language::ObjectiveCxxHeader),
-                    "cu" => Some(Language::Cuda),
+                    "cu" | "cuda" => Some(Language::Cuda),
                     "rs" => Some(Language::Rust),
-                    "cuda" => Some(Language::Cuda),
                     "hip" => Some(Language::Hip),
                     _ => cannot_cache!("-x"),
                 };
@@ -564,11 +563,10 @@ where
             Some(ExtraHashFileClangModuleFile(val)) => {
                 // -fmodule-file can be either "path" or "name=path"
                 let val_str = val.to_string_lossy();
-                let path = if let Some(idx) = val_str.find('=') {
-                    PathBuf::from(&val_str[idx + 1..])
-                } else {
-                    PathBuf::from(val)
-                };
+                let path = val_str.find('=').map_or_else(
+                    || PathBuf::from(val),
+                    |idx| PathBuf::from(&val_str[idx + 1..]),
+                );
                 extra_hash_files.push(cwd.join(path));
                 &mut common_args
             }
@@ -663,11 +661,10 @@ where
             Some(ExtraHashFileClangModuleFile(val)) => {
                 // -fmodule-file can be either "path" or "name=path"
                 let val_str = val.to_string_lossy();
-                let path = if let Some(idx) = val_str.find('=') {
-                    PathBuf::from(&val_str[idx + 1..])
-                } else {
-                    PathBuf::from(val)
-                };
+                let path = val_str.find('=').map_or_else(
+                    || PathBuf::from(val),
+                    |idx| PathBuf::from(&val_str[idx + 1..]),
+                );
                 extra_hash_files.push(cwd.join(path));
                 &mut common_args
             }
@@ -676,10 +673,7 @@ where
             ) => &mut preprocessor_args,
             Some(DepTarget(_) | DepArgumentPath(_) | NeedDepTarget) => &mut dependency_args,
         };
-        follows_plugin_arg = match arg.flag_str() {
-            Some(s) => s == "-plugin-arg",
-            _ => false,
-        };
+        follows_plugin_arg = arg.flag_str() == Some("-plugin-arg");
 
         // Normalize attributes such as "-I foo", "-D FOO=bar", as
         // "-Ifoo", "-DFOO=bar", etc. and "-includefoo", "idirafterbar" as

@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use which::which_in;
 
-use crate::errors::{Context, Error, ProcessError, Result, anyhow};
+use crate::errors::{Context, Error, ProcessError, Result, anyhow, bail};
 
 const NVCC_GENERATED_FILENAME_SUFFIXES: &[&str] = &[
     cicc::CICC_INPUT_SUFFIX,
@@ -1041,11 +1041,10 @@ where
 
     for pair in dryrun_env_vars {
         env_vars.splice(
-            if let Some(idx) = env_vars.iter().position(|(k, _)| *k == pair.0) {
-                idx..idx + 1
-            } else {
-                env_vars.len()..env_vars.len()
-            },
+            env_vars
+                .iter()
+                .position(|(k, _)| *k == pair.0)
+                .map_or(env_vars.len()..env_vars.len(), |idx| idx..idx + 1),
             [pair],
         );
     }
@@ -1054,13 +1053,13 @@ where
 }
 
 fn select_valid_dryrun_lines(re: &Regex, line: &str) -> Result<String> {
-    match re.captures(line) {
-        Some(caps) => {
+    re.captures(line).map_or_else(
+        || Err(anyhow!("nvcc error: {line:?}")),
+        |caps| {
             let (_, [rest]) = caps.extract();
             Ok(rest.to_string())
-        }
-        _ => Err(anyhow!("nvcc error: {line:?}")),
-    }
+        },
+    )
 }
 
 fn fold_env_vars_or_split_into_exe_and_args(
@@ -1196,7 +1195,7 @@ fn remap_generated_filenames(
                         // Return `/tmp/dir/x_{count}.{ext}` as the new name, i.e. `/tmp/dir/x_0.cudafe1.stub.c`
                         PathBuf::from(arg)
                             .parent()
-                            .unwrap_or(Path::new(""))
+                            .unwrap_or_else(|| Path::new(""))
                             // Don't use the count as the first character of the file name, because the file name
                             // may be used as an identifier (via the __FILE__ macro) and identifiers with leading
                             // digits are not valid in C/C++, i.e. `x_0.cudafe1.cpp` instead of `0.cudafe1.cpp`.
@@ -1389,7 +1388,7 @@ fn status_to_code(res: process::ExitStatus) -> ExitStatusValue {
     if res.success() {
         0 as ExitStatusValue
     } else {
-        res.signal().or(res.code()).unwrap_or(1) as ExitStatusValue
+        res.signal().or_else(|| res.code()).unwrap_or(1) as ExitStatusValue
     }
 }
 

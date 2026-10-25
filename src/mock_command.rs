@@ -45,7 +45,7 @@
 //! then create an `Arc<Mutex<MockCommandCreator>>` and safely provide
 //! `MockChild` outputs.
 
-use crate::errors::{Context, Result, bail};
+use crate::errors::{Context, Result, anyhow, bail};
 use crate::jobserver::{Acquired, Client};
 use async_trait::async_trait;
 use std::boxed::Box;

@@ -60,7 +60,7 @@ pub struct PreprocessorCacheEntry {
 
 impl PreprocessorCacheEntry {
     pub fn new() -> Self {
-        PreprocessorCacheEntry::default()
+        Self::default()
     }
 
     /// Tries to deserialize a preprocessor cache entry from `contents`

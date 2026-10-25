@@ -362,13 +362,15 @@ impl DistClientContainer {
         };
         drop(guard);
 
-        match client.do_get_status().await {
-            Ok(res) => DistInfo::SchedulerStatus(scheduler_url.clone(), res),
-            Err(_) => DistInfo::NotConnected(
-                scheduler_url.clone(),
-                "could not communicate with scheduler".to_string(),
-            ),
-        }
+        client.do_get_status().await.map_or_else(
+            |_| {
+                DistInfo::NotConnected(
+                    scheduler_url.clone(),
+                    "could not communicate with scheduler".to_string(),
+                )
+            },
+            |res| DistInfo::SchedulerStatus(scheduler_url.clone(), res),
+        )
     }
 
     async fn get_client(&self) -> Result<Option<Arc<dyn dist::Client>>> {
@@ -1605,8 +1607,7 @@ where
                             dist_type = dt;
 
                             match miss_type {
-                                MissType::Normal => {}
-                                MissType::ForcedNoCache => {}
+                                MissType::Normal | MissType::ForcedNoCache => {}
                                 MissType::ForcedRecache => {
                                     stats.forced_recaches += 1;
                                 }
@@ -1914,7 +1915,7 @@ impl std::ops::AddAssign for ServerStats {
 }
 
 /// Info and stats about the server.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug)]
 pub struct ServerInfo {
     pub stats: ServerStats,
     pub cache_location: String,
@@ -1923,6 +1924,35 @@ pub struct ServerInfo {
     pub use_preprocessor_cache_mode: bool,
     pub version: String,
     pub basedirs: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct ServerInfoWire {
+    stats: ServerStats,
+    cache_location: String,
+    cache_size: Option<u64>,
+    max_cache_size: Option<u64>,
+    use_preprocessor_cache_mode: bool,
+    version: String,
+    basedirs: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for ServerInfo {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ServerInfoWire::deserialize(deserializer)?;
+        Ok(Self {
+            stats: wire.stats,
+            cache_location: wire.cache_location,
+            cache_size: wire.cache_size,
+            max_cache_size: wire.max_cache_size,
+            use_preprocessor_cache_mode: wire.use_preprocessor_cache_mode,
+            version: wire.version,
+            basedirs: wire.basedirs,
+        })
+    }
 }
 
 /// Status of the dist client.
@@ -2375,8 +2405,7 @@ enum Message<R, B> {
 impl<R, B> Message<R, B> {
     fn into_inner(self) -> R {
         match self {
-            Self::WithBody(r, _) => r,
-            Self::WithoutBody(r) => r,
+            Self::WithBody(r, _) | Self::WithoutBody(r) => r,
         }
     }
 }
@@ -2486,20 +2515,19 @@ impl Future for ShutdownOrInactive {
             match Pin::new(&mut self.rx).poll_next(cx) {
                 Poll::Pending => break,
                 // Shutdown received!
-                Poll::Ready(Some(ServerMessage::Shutdown)) => return Poll::Ready(()),
+                Poll::Ready(Some(ServerMessage::Shutdown) | None) => {
+                    return Poll::Ready(());
+                }
                 Poll::Ready(Some(ServerMessage::Request)) => {
                     if self.timeout_dur != Duration::new(0, 0) {
                         self.timeout = Some(Box::pin(sleep(self.timeout_dur)));
                     }
-                }
-                // All services have shut down, in theory this isn't possible...
-                Poll::Ready(None) => return Poll::Ready(()),
+                } // All services have shut down, in theory this isn't possible...
             }
         }
-        match self.timeout {
-            None => Poll::Pending,
-            Some(ref mut timeout) => timeout.as_mut().poll(cx),
-        }
+        self.timeout
+            .as_mut()
+            .map_or(Poll::Pending, |timeout| timeout.as_mut().poll(cx))
     }
 }
 
@@ -2539,16 +2567,15 @@ impl std::future::Future for WaitUntilZero {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Self::Output> {
-        match self.info.upgrade() {
-            None => std::task::Poll::Ready(()),
-            Some(arc) => {
+        self.info
+            .upgrade()
+            .map_or(std::task::Poll::Ready(()), |arc| {
                 let mut info = arc
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 info.waker = Some(cx.waker().clone());
                 std::task::Poll::Pending
-            }
-        }
+            })
     }
 }
 

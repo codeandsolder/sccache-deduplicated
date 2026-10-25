@@ -1360,7 +1360,7 @@ fn config_from_environment(environment: &Environment) -> Result<EnvConfig> {
     }
 
     // ======= COS =======
-    let cos = if let Some(bucket) = string_from_env_var(environment, "SCCACHE_COS_BUCKET") {
+    let cos = string_from_env_var(environment, "SCCACHE_COS_BUCKET").and_then(|bucket| {
         let endpoint = string_from_env_var(environment, "SCCACHE_COS_ENDPOINT");
         let key_prefix = key_prefix_from_env_var(environment, "SCCACHE_COS_KEY_PREFIX");
 
@@ -1373,9 +1373,7 @@ fn config_from_environment(environment: &Environment) -> Result<EnvConfig> {
             endpoint,
             rw_mode,
         })
-    } else {
-        None
-    };
+    });
 
     // ======= Local =======
     let disk_dir = environment.var_os("SCCACHE_DIR").map(PathBuf::from);
@@ -1383,19 +1381,15 @@ fn config_from_environment(environment: &Environment) -> Result<EnvConfig> {
         string_from_env_var(environment, "SCCACHE_CACHE_SIZE").and_then(|v| parse_size(&v));
 
     let mut preprocessor_mode_config = PreprocessorCacheModeConfig::activated();
-    let preprocessor_mode_overridden =
-        if let Some(value) = bool_from_env_var(environment, "SCCACHE_DIRECT")? {
+    let preprocessor_mode_overridden = bool_from_env_var(environment, "SCCACHE_DIRECT")?
+        .is_some_and(|value| {
             preprocessor_mode_config.use_preprocessor_cache_mode = value;
             true
-        } else {
-            false
-        };
+        });
 
     let (disk_rw_mode, disk_rw_mode_overridden) =
-        match cache_mode_from_env_var(environment, "SCCACHE_LOCAL_RW_MODE") {
-            Some(mode) => (mode, true),
-            _ => (CacheModeConfig::ReadWrite, false),
-        };
+        cache_mode_from_env_var(environment, "SCCACHE_LOCAL_RW_MODE")
+            .map_or((CacheModeConfig::ReadWrite, false), |mode| (mode, true));
 
     let any_overridden = disk_dir.is_some()
         || disk_sz.is_some()
@@ -1584,11 +1578,7 @@ impl Config {
         conf_caches.merge(cache);
 
         // Environment variable takes precedence over file config if it is set
-        let basedirs_raw = if let Some(basedirs) = env_basedirs {
-            basedirs
-        } else {
-            file_basedirs
-        };
+        let basedirs_raw = env_basedirs.unwrap_or(file_basedirs);
 
         // Validate that all basedirs are absolute paths
         // basedirs_raw is Vec<PathBuf>
@@ -1717,7 +1707,9 @@ impl CachedConfig {
             if path != &self.file_conf_path {
                 bail!("cached config handle is stale after reload");
             }
-            config.clone()
+            let config = config.clone();
+            drop(cached);
+            config
         };
         Ok(f(&config))
     }

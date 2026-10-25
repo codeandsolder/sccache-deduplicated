@@ -2478,14 +2478,15 @@ where
         let hash_os_string_arguments = os_string_arguments
             .iter()
             .map(|(arg, val)| {
-                if let Some(canonical) = canonical_paths.as_ref() {
-                    (
-                        canonical.normalize_os_value(arg),
-                        val.as_ref().map(|val| canonical.normalize_os_value(val)),
-                    )
-                } else {
-                    (arg.clone(), val.clone())
-                }
+                canonical_paths.as_ref().map_or_else(
+                    || (arg.clone(), val.clone()),
+                    |canonical| {
+                        (
+                            canonical.normalize_os_value(arg),
+                            val.as_ref().map(|val| canonical.normalize_os_value(val)),
+                        )
+                    },
+                )
             })
             .collect::<Vec<_>>();
 
@@ -4116,11 +4117,7 @@ fn parse_rustc_z_ls(stdout: &str) -> Result<Vec<&str>> {
             let maybe_hash = libstring_splits
                 .next()
                 .context("Nothing in lib string from `rustc -Z ls`")?;
-            if let Some(name) = libstring_splits.next() {
-                name
-            } else {
-                maybe_hash
-            }
+            libstring_splits.next().map_or(maybe_hash, |name| name)
         };
         assert!(libstring_splits.next().is_none());
 

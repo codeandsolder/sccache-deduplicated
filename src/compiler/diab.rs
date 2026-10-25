@@ -233,7 +233,14 @@ where
                 cannot_cache!(flag)
             }
 
-            Some(DepArgument(_) | DepArgumentFlag | DepArgumentPath(_)) => {}
+            Some(
+                DepArgument(_)
+                | DepArgumentFlag
+                | DepArgumentPath(_)
+                | PreprocessorArgument(_)
+                | PreprocessorArgumentPath(_)
+                | PassThrough(_),
+            ) => {}
 
             Some(DoCompilation) => {
                 compilation = true;
@@ -243,7 +250,6 @@ where
                 compilation_flag = OsString::from(flag);
             }
             Some(Output(p)) => output_arg = Some(p.clone()),
-            Some(PreprocessorArgument(_) | PreprocessorArgumentPath(_) | PassThrough(_)) => {}
             None => match arg {
                 Argument::Raw(ref val) => {
                     if input_arg.is_some() {

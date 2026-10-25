@@ -363,10 +363,10 @@ where
 
         let hip_device_lib_path: PathBuf = hip_device_lib_path_arg
             .or(hip_device_lib_path_env)
-            .or(rocm_path_arg.map(|path| path.join("amdgcn").join("bitcode")))
-            .or(rocm_path_env.map(|path| path.join("amdgcn").join("bitcode")))
+            .or_else(|| rocm_path_arg.map(|path| path.join("amdgcn").join("bitcode")))
+            .or_else(|| rocm_path_env.map(|path| path.join("amdgcn").join("bitcode")))
             // This is the default location in official AMD packages and containers.
-            .unwrap_or(PathBuf::from("/opt/rocm/amdgcn/bitcode"));
+            .unwrap_or_else(|| PathBuf::from("/opt/rocm/amdgcn/bitcode"));
 
         hip_device_lib_path
             .read_dir()

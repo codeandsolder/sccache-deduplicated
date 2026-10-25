@@ -221,9 +221,8 @@ where
         }
         let args = match arg.get_data() {
             Some(PassThrough(_)) => &mut common_args,
-            Some(DepFile(_)) => continue,
+            Some(DepFile(_) | DoCompilation | Output(_)) => continue,
             Some(PreprocessorArgument(_) | PreprocessorArgumentPath(_)) => &mut preprocessor_args,
-            Some(DoCompilation | Output(_)) => continue,
             Some(TooHardFlag | TooHard(_) | NotCompilationFlag | NotCompilation(_)) => {
                 unreachable!()
             }

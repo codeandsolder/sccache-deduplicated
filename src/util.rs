@@ -349,7 +349,7 @@ impl TimeMacroFinder {
 
     #[must_use]
     pub fn new() -> Self {
-        TimeMacroFinder::default()
+        Self::default()
     }
 }
 
@@ -1404,13 +1404,10 @@ pub fn strip_basedirs_from_arg<'a>(arg: &'a [u8], basedirs: &[Vec<u8>]) -> Cow<'
         }
     }
 
-    match result {
-        Some(mut out) => {
-            out.extend_from_slice(&arg[copied..]);
-            Cow::Owned(out)
-        }
-        None => Cow::Borrowed(arg),
-    }
+    result.map_or(Cow::Borrowed(arg), |mut out| {
+        out.extend_from_slice(&arg[copied..]);
+        Cow::Owned(out)
+    })
 }
 
 /// The offsets in a compiler argument where a pathname can begin.

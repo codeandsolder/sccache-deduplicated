@@ -313,8 +313,7 @@ impl Language {
             Self::ObjectiveCPreprocessed => "objcPreprocessed",
             Self::ObjectiveCxx | Self::ObjectiveCxxHeader => "objc++",
             Self::ObjectiveCxxPreprocessed => "objc++Preprocessed",
-            Self::Cuda => "cuda",
-            Self::CudaFE => "cuda",
+            Self::Cuda | Self::CudaFE => "cuda",
             Self::Ptx => "ptx",
             Self::Cubin => "cubin",
             Self::Rust => "rust",
@@ -375,12 +374,10 @@ impl Language {
             Self::ObjectiveCxxHeader => Some("objective-c++-header"),
             Self::ObjectiveCxxPreprocessed => Some("objective-c++-cpp-output"),
             Self::Cuda => Some(cuda_arg),
-            Self::CudaFE => None,
-            Self::Ptx => None,
-            Self::Cubin => None,
-            Self::Rust => None, // Let the compiler decide
+            Self::CudaFE | Self::Ptx | Self::Cubin | Self::Rust | Self::GenericHeader => None,
+            // Let the compiler decide
             Self::Hip => Some("hip"),
-            Self::GenericHeader => None, // Let the compiler decide
+            // Let the compiler decide
             Self::CxxModule => Some("c++-module"),
         }
     }
@@ -569,10 +566,9 @@ where
         debug!("[{out_pretty}]: get_cached_or_compile: {arguments:?}");
         let start = Instant::now();
         let may_dist = dist_client.is_some();
-        let rewrite_includes_only = match dist_client {
-            Some(ref client) => client.rewrite_includes_only(),
-            _ => false,
-        };
+        let rewrite_includes_only = dist_client
+            .as_ref()
+            .is_some_and(|client| client.rewrite_includes_only());
         let result = self
             .generate_hash_key(GenerateHashKeyContext {
                 creator: &creator,
@@ -887,10 +883,9 @@ where
 {
     use std::io;
 
-    let rewrite_includes_only = match dist_client {
-        Some(ref client) => client.rewrite_includes_only(),
-        _ => false,
-    };
+    let rewrite_includes_only = dist_client
+        .as_ref()
+        .is_some_and(|client| client.rewrite_includes_only());
     let mut path_transformer = dist::PathTransformer::new();
     let (compile_cmd, dist_compile_cmd, cacheable) = compilation
         .generate_compile_commands(&mut path_transformer, rewrite_includes_only)
@@ -1049,10 +1044,7 @@ where
                 ))
             });
         }
-        let extra_inputs = match tc_archive {
-            Some(p) => vec![p],
-            None => vec![],
-        };
+        let extra_inputs = tc_archive.map_or_else(std::vec::Vec::new, |p| vec![p]);
         try_or_cleanup!(
             outputs_rewriter
                 .handle_outputs(&path_transformer, &output_paths, &extra_inputs)
@@ -1300,12 +1292,11 @@ impl fmt::Debug for CompileResult {
 impl PartialEq<Self> for CompileResult {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (&Self::Error, &Self::Error) => true,
-            (&Self::CacheHit(_), &Self::CacheHit(_)) => true,
+            (&Self::Error, &Self::Error) | (&Self::CacheHit(_), &Self::CacheHit(_)) => true,
             (Self::CacheMiss(m, dt, _, _), Self::CacheMiss(n, dt2, _, _)) => m == n && dt == dt2,
-            (Self::NotCached(dt, _), Self::NotCached(dt2, _)) => dt == dt2,
-            (Self::NotCacheable(dt, _), Self::NotCacheable(dt2, _)) => dt == dt2,
-            (Self::CompileFailed(dt, _), Self::CompileFailed(dt2, _)) => dt == dt2,
+            (Self::NotCached(dt, _), Self::NotCached(dt2, _))
+            | (Self::NotCacheable(dt, _), Self::NotCacheable(dt2, _))
+            | (Self::CompileFailed(dt, _), Self::CompileFailed(dt2, _)) => dt == dt2,
             _ => false,
         }
     }
@@ -1983,8 +1974,7 @@ compiler_version=__VERSION__
                 let host_compiler = match kind {
                     "nvcc-nvhpc" => NvccHostCompiler::Nvhpc,
                     "nvcc-msvc" => NvccHostCompiler::Msvc,
-                    "nvcc" => NvccHostCompiler::Gcc,
-                    &_ => NvccHostCompiler::Gcc,
+                    "nvcc" | &_ => NvccHostCompiler::Gcc,
                 };
                 let host_compiler_version = lines
                     .next()

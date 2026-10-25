@@ -227,7 +227,7 @@ mod code_grant_pkce {
                 let query_pairs = query_pairs(&req.uri().to_string())?;
                 let (code, auth_state) = handle_code_response(&query_pairs)
                     .context("Failed to handle response from redirect")?;
-                {
+                let (code_tx, shutdown_tx) = {
                     let mut guard = STATE
                         .lock()
                         .map_err(|_| anyhow!("OAuth PKCE state lock is poisoned"))?;
@@ -237,19 +237,22 @@ mod code_grant_pkce {
                     if auth_state != state.auth_state_value {
                         return Err(anyhow!("Mismatched auth states after redirect"));
                     }
-                    // Deliberately in reverse order for a 'happens-before' relationship.
-                    state
-                        .code_tx
-                        .try_send(code)
-                        .map_err(|error| anyhow!("Failed to deliver OAuth code: {error}"))?;
+                    let code_tx = state.code_tx.clone();
                     let shutdown_tx = state
                         .shutdown_tx
                         .take()
                         .context("OAuth PKCE shutdown was already requested")?;
-                    shutdown_tx
-                        .send(())
-                        .map_err(|()| anyhow!("OAuth server shutdown receiver was dropped"))?;
-                }
+                    let result = (code_tx, shutdown_tx);
+                    drop(guard);
+                    result
+                };
+                // Deliver after releasing the global state lock.
+                code_tx
+                    .try_send(code)
+                    .map_err(|error| anyhow!("Failed to deliver OAuth code: {error}"))?;
+                shutdown_tx
+                    .send(())
+                    .map_err(|()| anyhow!("OAuth server shutdown receiver was dropped"))?;
                 Ok(html_response(SUCCESS_AFTER_REDIRECT))
             }
             _ => {
@@ -426,7 +429,7 @@ mod implicit {
                         "sccache: Token retrieved expires in under {MIN_TOKEN_VALIDITY_WARNING}"
                     );
                 }
-                {
+                let (token_tx, shutdown_tx) = {
                     let mut guard = STATE
                         .lock()
                         .map_err(|_| anyhow!("OAuth implicit state lock is poisoned"))?;
@@ -436,19 +439,22 @@ mod implicit {
                     if auth_state != state.auth_state_value {
                         return Err(anyhow!("Mismatched auth states after redirect"));
                     }
-                    // Deliberately in reverse order for a 'happens-before' relationship.
-                    state
-                        .token_tx
-                        .try_send(token)
-                        .map_err(|error| anyhow!("Failed to deliver OAuth token: {error}"))?;
+                    let token_tx = state.token_tx.clone();
                     let shutdown_tx = state
                         .shutdown_tx
                         .take()
                         .context("OAuth implicit shutdown was already requested")?;
-                    shutdown_tx
-                        .send(())
-                        .map_err(|()| anyhow!("OAuth server shutdown receiver was dropped"))?;
-                }
+                    let result = (token_tx, shutdown_tx);
+                    drop(guard);
+                    result
+                };
+                // Deliver after releasing the global state lock.
+                token_tx
+                    .try_send(token)
+                    .map_err(|error| anyhow!("Failed to deliver OAuth token: {error}"))?;
+                shutdown_tx
+                    .send(())
+                    .map_err(|()| anyhow!("OAuth server shutdown receiver was dropped"))?;
                 json_response(&"")
             }
             _ => {
