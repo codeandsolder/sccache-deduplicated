@@ -219,12 +219,11 @@ jobs:
 
 
   shared-sccache:
-    name: Linux tests (shared sccache)
+    name: Linux tests (GHA sccache)
     if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     permissions:
       contents: read
-      id-token: write
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@cd2f464d6f8ff85fadf3669feb864cbaf4c01092 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@cd217b83653b06ad6e314182d0a6468f8fe9e4d3 # main
     with:
       command: |
         sudo apt-get update -qq
