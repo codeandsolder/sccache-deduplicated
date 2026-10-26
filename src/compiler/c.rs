@@ -371,7 +371,7 @@ where
         hip_device_lib_path
             .read_dir()
             .ok()
-            .map(|f| {
+            .map_or_else(Vec::new, |f| {
                 let mut device_libs = f
                     .flatten()
                     .filter(|f| f.path().extension().is_some_and(|ext| ext == "bc"))
@@ -380,7 +380,6 @@ where
                 device_libs.sort_unstable();
                 device_libs
             })
-            .unwrap_or_default()
     }
 }
 

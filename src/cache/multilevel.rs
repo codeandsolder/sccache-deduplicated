@@ -1019,10 +1019,9 @@ impl Storage for MultiLevelStorage {
     }
 
     fn preprocessor_cache_mode_config(&self) -> PreprocessorCacheModeConfig {
-        self.levels
-            .first()
-            .map(|level| level.preprocessor_cache_mode_config())
-            .unwrap_or_default()
+        self.levels.first().map_or_else(Default::default, |level| {
+            level.preprocessor_cache_mode_config()
+        })
     }
 
     fn basedirs(&self) -> &[Vec<u8>] {

@@ -41,6 +41,7 @@ mod mock_command;
 mod net;
 mod protocol;
 pub mod server;
+mod telemetry;
 #[doc(hidden)]
 pub mod util;
 

@@ -180,6 +180,31 @@ You can run `sccache --stop-server` to terminate the server. It will also termin
 
 Running `sccache --show-stats` will print a summary of cache statistics.
 
+### Direct metrics push
+
+The server can publish its in-memory statistics directly through
+[`lurkmoar`](https://github.com/codeandsolder/lurkmoar-rs) instead of requiring an
+external process to poll `--show-stats`. Set `SCCACHE_METRICS_URL` to an HTTP(S)
+Prometheus-import endpoint to enable it. Metrics delivery runs independently of
+compilation, suppresses unchanged samples, and uses the same `sccache_*` metric
+families exposed by `--show-stats`, including per-language, per-compiler-language,
+distributed-build, and multi-level-cache statistics.
+
+The producer adds `job="sccache"`, `resolution="raw"`, and an `instance` label from
+the OS hostname. Override only the instance label with `SCCACHE_METRICS_INSTANCE`
+when the host's metric identity differs from its hostname. Optional tuning:
+
+- `SCCACHE_METRICS_INTERVAL_MS` (default `2500`, minimum `100`)
+- `SCCACHE_METRICS_TIMEOUT_MS` (default `1000`)
+- `SCCACHE_METRICS_HEARTBEAT_MS` (default `60000`), which refreshes unchanged series
+  before normal Prometheus lookback windows can make them disappear
+- `SCCACHE_METRICS_SPILL_AFTER_SECONDS` (default `10`)
+- `SCCACHE_METRICS_SPOOL_DIR` to enable bounded outage spooling
+- `SCCACHE_METRICS_SPOOL_MAX_BYTES` (default `10485760` when spooling is enabled)
+
+If direct metrics cannot be configured or delivered, compilation continues; the
+server logs the telemetry error and keeps the compile/cache path independent.
+
 Some notes about using `sccache` with [Jenkins](https://jenkins.io) are [here](docs/Jenkins.md).
 
 To use sccache with cmake, provide the following command line arguments to cmake 3.4 or newer:
@@ -236,7 +261,7 @@ And you can build code as usual without any additional flags in the command line
 Build Requirements
 ------------------
 
-sccache is a [Rust](https://www.rust-lang.org/) program. Building it requires `cargo` (and thus`rustc`). sccache currently requires **Rust 1.91.0**. We recommend you install Rust via [Rustup](https://rustup.rs/).
+sccache is a [Rust](https://www.rust-lang.org/) program. Building it requires `cargo` (and thus`rustc`). sccache currently requires **Rust 1.99.0**. We recommend you install Rust via [Rustup](https://rustup.rs/).
 
 Build
 -----
