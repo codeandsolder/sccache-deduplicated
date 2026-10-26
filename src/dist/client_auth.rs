@@ -88,7 +88,7 @@ const REDIRECT_WITH_AUTH_JSON: &str = r#"<!doctype html>
 mod code_grant_pkce {
     use super::{
         MIN_TOKEN_VALIDITY, MIN_TOKEN_VALIDITY_WARNING, REDIRECT_WITH_AUTH_JSON, html_response,
-        json_response, query_pairs,
+        json_response, query_pairs, safe_request_path,
     };
     use crate::util::BASE64_URL_SAFE_ENGINE;
     use crate::util::new_reqwest_blocking_client;
@@ -207,7 +207,7 @@ mod code_grant_pkce {
     "#;
 
     pub fn serve(req: &Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>> {
-        debug!("Handling {} {}", req.method(), req.uri());
+        debug!("Handling {} {}", req.method(), safe_request_path(req.uri()));
         match (req.method(), req.uri().path()) {
             (&Method::GET, "/") => Ok(html_response(REDIRECT_WITH_AUTH_JSON)),
             (&Method::GET, "/auth_detail.json") => {
@@ -302,7 +302,7 @@ mod code_grant_pkce {
 mod implicit {
     use super::{
         MIN_TOKEN_VALIDITY, MIN_TOKEN_VALIDITY_WARNING, REDIRECT_WITH_AUTH_JSON, html_response,
-        json_response, query_pairs,
+        json_response, query_pairs, safe_request_path,
     };
     use bytes::Bytes;
     use futures::channel::oneshot;
@@ -402,7 +402,7 @@ mod implicit {
     "#;
 
     pub fn serve(req: &Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>> {
-        debug!("Handling {} {}", req.method(), req.uri());
+        debug!("Handling {} {}", req.method(), safe_request_path(req.uri()));
         match (req.method(), req.uri().path()) {
             (&Method::GET, "/") => Ok(html_response(REDIRECT_WITH_AUTH_JSON)),
             (&Method::GET, "/auth_detail.json") => {
@@ -522,12 +522,17 @@ impl HyperBuilderWrap {
     }
 }
 
+fn safe_request_path(uri: &hyper::Uri) -> &str {
+    uri.path()
+}
+
 fn error_code_response<E>(uri: &hyper::Uri, e: E) -> Response<Full<Bytes>>
 where
     E: std::fmt::Debug,
 {
     let body = format!("{e:?}");
-    eprintln!("sccache: Error during a request to {uri} on the client auth web server\n{body}");
+    let path = safe_request_path(uri);
+    eprintln!("sccache: Error during a request to {path} on the client auth web server\n{body}");
     response(
         StatusCode::INTERNAL_SERVER_ERROR,
         "text/plain; charset=utf-8",
@@ -716,4 +721,16 @@ pub fn get_token_oauth2_implicit(client_id: &str, mut auth_url: Url) -> Result<S
 
     info!("Server finished, returning token");
     token_result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_request_path;
+
+    #[test]
+    fn oauth_log_path_excludes_query_secrets() -> anyhow::Result<()> {
+        let uri: hyper::Uri = "/save_auth?access_token=super-secret&state=also-secret".parse()?;
+        assert_eq!(safe_request_path(&uri), "/save_auth");
+        Ok(())
+    }
 }

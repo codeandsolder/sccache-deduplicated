@@ -82,7 +82,10 @@ fn main() {
     target_os = "freebsd"
 ))]
 fn main() {
-    init_logging();
+    if let Err(error) = init_logging() {
+        eprintln!("sccache-dist: failed to initialize logging: {error:#}");
+        std::process::exit(2);
+    }
 
     let incr_env_strs = ["CARGO_BUILD_INCREMENTAL", "CARGO_INCREMENTAL"];
     incr_env_strs
@@ -344,7 +347,7 @@ fn run(command: Command) -> Result<i32> {
     }
 }
 
-fn init_logging() {
+fn init_logging() -> Result<()> {
     if env::var(sccache::LOGGING_ENV).is_ok() {
         let mut builder = env_logger::Builder::from_env(sccache::LOGGING_ENV);
 
@@ -353,11 +356,9 @@ fn init_logging() {
             builder.format_timestamp_millis();
         }
 
-        match builder.try_init() {
-            Ok(_) => (),
-            Err(e) => panic!("Failed to initialize logging: {:?}", e),
-        }
+        builder.try_init().context("logger initialization failed")?;
     }
+    Ok(())
 }
 
 const DEFAULT_JOB_SLACK_STATIC: usize = 1;
@@ -603,7 +604,10 @@ impl SchedulerIncoming for Scheduler {
         }
         let (job_id, server_id, auth) = {
             // LOCKS
-            let mut servers = self.servers.lock().unwrap();
+            let mut servers = self
+                .servers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
 
             let res = {
                 let mut best = None;
@@ -662,22 +666,26 @@ impl SchedulerIncoming for Scheduler {
                 // Assign the job to our best choice
                 if let Some((server_id, server_details)) = best.or(best_err) {
                     let job_id = self.next_job_id();
-                    assert!(server_details.jobs_assigned.insert(job_id));
-                    assert!(
-                        server_details
-                            .jobs_unclaimed
-                            .insert(job_id, Instant::now())
-                            .is_none()
-                    );
+                    let auth = server_details
+                        .job_authorizer
+                        .generate_token(job_id)
+                        .context("Could not create an auth token for this job")?;
+                    if !server_details.jobs_assigned.insert(job_id) {
+                        bail!("new job id {job_id} was already assigned");
+                    }
+                    if server_details
+                        .jobs_unclaimed
+                        .insert(job_id, Instant::now())
+                        .is_some()
+                    {
+                        server_details.jobs_assigned.remove(&job_id);
+                        bail!("new job id {job_id} was already tracked as unclaimed");
+                    }
 
                     info!(
                         "Job {} created and will be assigned to server {:?}",
                         job_id, server_id
                     );
-                    let auth = server_details
-                        .job_authorizer
-                        .generate_token(job_id)
-                        .context("Could not create an auth token for this job")?;
                     Some((job_id, server_id, auth))
                 } else {
                     None
@@ -697,27 +705,38 @@ impl SchedulerIncoming for Scheduler {
         let AssignJobResult {
             state,
             need_toolchain,
-        } = requester
-            .do_assign_job(server_id, job_id, tc, auth.clone())
-            .with_context(|| {
-                // LOCKS
-                let mut servers = self.servers.lock().unwrap();
-                if let Some(entry) = servers.get_mut(&server_id) {
-                    entry.last_error = Some(Instant::now());
-                    entry.jobs_unclaimed.remove(&job_id);
-                    if !entry.jobs_assigned.remove(&job_id) {
-                        "assign job failed and job not known to the server"
-                    } else {
-                        "assign job failed, job un-assigned from the server"
+        } = match requester.do_assign_job(server_id, job_id, tc, auth.clone()) {
+            Ok(result) => result,
+            Err(error) => {
+                let context = match self.servers.lock() {
+                    Ok(mut servers) => {
+                        if let Some(entry) = servers.get_mut(&server_id) {
+                            entry.last_error = Some(Instant::now());
+                            entry.jobs_unclaimed.remove(&job_id);
+                            if entry.jobs_assigned.remove(&job_id) {
+                                "assign job failed, job un-assigned from the server"
+                            } else {
+                                "assign job failed and job not known to the server"
+                            }
+                        } else {
+                            "assign job failed and server not known"
+                        }
                     }
-                } else {
-                    "assign job failed and server not known"
-                }
-            })?;
+                    Err(_) => "assign job failed and servers mutex was poisoned",
+                };
+                return Err(error).context(context);
+            }
+        };
         {
             // LOCKS
-            let mut jobs = self.jobs.lock().unwrap();
-            let servers = self.servers.lock().unwrap();
+            let mut jobs = self
+                .jobs
+                .lock()
+                .map_err(|_| anyhow::anyhow!("jobs mutex poisoned"))?;
+            let servers = self
+                .servers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
 
             if !servers
                 .get(&server_id)
@@ -735,10 +754,12 @@ impl SchedulerIncoming for Scheduler {
                 "Job {} successfully assigned and saved with state {:?}",
                 job_id, state
             );
-            assert!(
-                jobs.insert(job_id, JobDetail { server_id, state })
-                    .is_none()
-            );
+            if jobs
+                .insert(job_id, JobDetail { server_id, state })
+                .is_some()
+            {
+                bail!("newly allocated job {job_id} already existed in scheduler state");
+            }
         }
         let job_alloc = JobAlloc {
             auth,
@@ -759,8 +780,14 @@ impl SchedulerIncoming for Scheduler {
         job_authorizer: Box<dyn JobAuthorizer>,
     ) -> Result<HeartbeatServerResult> {
         // LOCKS
-        let mut jobs = self.jobs.lock().unwrap();
-        let mut servers = self.servers.lock().unwrap();
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("jobs mutex poisoned"))?;
+        let mut servers = self
+            .servers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
 
         self.prune_servers(&mut servers, &mut jobs);
 
@@ -928,48 +955,65 @@ impl SchedulerIncoming for Scheduler {
         job_state: JobState,
     ) -> Result<UpdateJobStateResult> {
         // LOCKS
-        let mut jobs = self.jobs.lock().unwrap();
-        let mut servers = self.servers.lock().unwrap();
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("jobs mutex poisoned"))?;
+        let mut servers = self
+            .servers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
 
-        if let btree_map::Entry::Occupied(mut entry) = jobs.entry(job_id) {
-            let job_detail = entry.get();
-            if job_detail.server_id != server_id {
-                bail!(
-                    "Job id {} is not registered on server {:?}",
-                    job_id,
-                    server_id
-                )
-            }
-
-            let now = Instant::now();
-            let mut server_details = servers.get_mut(&server_id);
-            if let Some(ref mut details) = server_details {
-                details.last_seen = now;
-            };
-
-            match (job_detail.state, job_state) {
-                (JobState::Pending, JobState::Ready) => entry.get_mut().state = job_state,
-                (JobState::Ready, JobState::Started) => {
-                    if let Some(details) = server_details {
-                        details.jobs_unclaimed.remove(&job_id);
-                    } else {
-                        warn!("Job state updated, but server is not known to scheduler")
-                    }
-                    entry.get_mut().state = job_state
+        match jobs.entry(job_id) {
+            btree_map::Entry::Occupied(mut entry) => {
+                let job_detail = entry.get();
+                if job_detail.server_id != server_id {
+                    bail!(
+                        "Job id {} is not registered on server {:?}",
+                        job_id,
+                        server_id
+                    )
                 }
-                (JobState::Started, JobState::Complete) => {
-                    let (job_id, _) = entry.remove_entry();
-                    if let Some(entry) = server_details {
-                        assert!(entry.jobs_assigned.remove(&job_id))
-                    } else {
-                        bail!("Job was marked as finished, but server is not known to scheduler")
-                    }
+
+                let now = Instant::now();
+                let mut server_details = servers.get_mut(&server_id);
+                if let Some(ref mut details) = server_details {
+                    details.last_seen = now;
                 }
-                (from, to) => bail!("Invalid job state transition from {} to {}", from, to),
+
+                match (job_detail.state, job_state) {
+                    (current, requested) if current == requested => {}
+                    (JobState::Pending, JobState::Ready) => entry.get_mut().state = job_state,
+                    (JobState::Ready, JobState::Started) => {
+                        if let Some(details) = server_details {
+                            details.jobs_unclaimed.remove(&job_id);
+                        } else {
+                            warn!("Job state updated, but server is not known to scheduler")
+                        }
+                        entry.get_mut().state = job_state
+                    }
+                    (JobState::Started, JobState::Complete) => {
+                        let (job_id, _) = entry.remove_entry();
+                        if let Some(details) = server_details {
+                            if !details.jobs_assigned.remove(&job_id) {
+                                bail!("completed job {job_id} was not assigned to its server")
+                            }
+                        } else {
+                            bail!(
+                                "Job was marked as finished, but server is not known to scheduler"
+                            )
+                        }
+                    }
+                    (from, to) => bail!("Invalid job state transition from {} to {}", from, to),
+                }
+                info!("Job {} updated state to {:?}", job_id, job_state);
             }
-            info!("Job {} updated state to {:?}", job_id, job_state);
-        } else {
-            bail!("Unknown job")
+            btree_map::Entry::Vacant(_) if job_state == JobState::Complete => {
+                // Completion is terminal. A retry after the scheduler applied the first request
+                // but the response was lost must be safe.
+                info!("Job {} was already complete", job_id);
+            }
+            btree_map::Entry::Vacant(_) => bail!("Unknown job"),
         }
         Ok(UpdateJobStateResult::Success)
     }
@@ -980,8 +1024,14 @@ impl SchedulerIncoming for Scheduler {
 
     fn handle_status(&self) -> Result<SchedulerStatusResult> {
         // LOCKS
-        let mut jobs = self.jobs.lock().unwrap();
-        let mut servers = self.servers.lock().unwrap();
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("jobs mutex poisoned"))?;
+        let mut servers = self
+            .servers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
 
         self.prune_servers(&mut servers, &mut jobs);
 
@@ -1017,14 +1067,18 @@ impl Server {
 
 impl ServerIncoming for Server {
     fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> Result<AssignJobResult> {
-        let need_toolchain = !self.cache.lock().unwrap().contains_toolchain(&tc);
-        assert!(
-            self.job_toolchains
-                .lock()
-                .unwrap()
-                .insert(job_id, tc)
-                .is_none()
-        );
+        let need_toolchain = !self
+            .cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?
+            .contains_toolchain(&tc);
+        let mut jobs = self
+            .job_toolchains
+            .lock()
+            .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?;
+        if jobs.insert(job_id, tc).is_some() {
+            bail!("job {job_id} was assigned to this server more than once");
+        }
         let state = if need_toolchain {
             JobState::Pending
         } else {
@@ -1042,26 +1096,39 @@ impl ServerIncoming for Server {
         job_id: JobId,
         tc_rdr: ToolchainReader,
     ) -> Result<SubmitToolchainResult> {
-        requester
-            .do_update_job_state(job_id, JobState::Ready)
-            .context("Updating job state failed")?;
-        // TODO: need to lock the toolchain until the container has started
-        // TODO: can start prepping container
-        let tc = match self.job_toolchains.lock().unwrap().get(&job_id).cloned() {
+        // Validate and persist the local prerequisite before publishing Ready to the scheduler.
+        let tc = match self
+            .job_toolchains
+            .lock()
+            .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?
+            .get(&job_id)
+            .cloned()
+        {
             Some(tc) => tc,
             None => return Ok(SubmitToolchainResult::JobNotFound),
         };
-        let mut cache = self.cache.lock().unwrap();
-        // TODO: this returns before reading all the data, is that valid?
-        if cache.contains_toolchain(&tc) {
-            return Ok(SubmitToolchainResult::Success);
+        let cached = {
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?;
+            if cache.contains_toolchain(&tc) {
+                true
+            } else {
+                cache
+                    .insert_with(&tc, |mut file| {
+                        io::copy(&mut { tc_rdr }, &mut file).map(|_| ())
+                    })
+                    .is_ok()
+            }
+        };
+        if !cached {
+            return Ok(SubmitToolchainResult::CannotCache);
         }
-        Ok(cache
-            .insert_with(&tc, |mut file| {
-                io::copy(&mut { tc_rdr }, &mut file).map(|_| ())
-            })
-            .map(|_| SubmitToolchainResult::Success)
-            .unwrap_or(SubmitToolchainResult::CannotCache))
+        requester
+            .do_update_job_state(job_id, JobState::Ready)
+            .context("Updating job state failed")?;
+        Ok(SubmitToolchainResult::Success)
     }
     fn handle_run_job(
         &self,
@@ -1071,25 +1138,36 @@ impl ServerIncoming for Server {
         outputs: Vec<String>,
         inputs_rdr: InputsReader,
     ) -> Result<RunJobResult> {
-        requester
-            .do_update_job_state(job_id, JobState::Started)
-            .context("Updating job state failed")?;
-        let tc = self.job_toolchains.lock().unwrap().remove(&job_id);
-        let res = match tc {
-            None => Ok(RunJobResult::JobNotFound),
-            Some(tc) => {
-                match self
-                    .builder
-                    .run_build(tc, command, outputs, inputs_rdr, &self.cache)
-                {
-                    Err(e) => Err(e.context("run build failed")),
-                    Ok(res) => Ok(RunJobResult::Complete(JobComplete {
-                        output: res.output,
-                        outputs: res.outputs,
-                    })),
-                }
-            }
+        let tc = self
+            .job_toolchains
+            .lock()
+            .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?
+            .remove(&job_id);
+        let Some(tc) = tc else {
+            return Ok(RunJobResult::JobNotFound);
         };
+
+        if let Err(error) = requester.do_update_job_state(job_id, JobState::Started) {
+            let mut jobs = self
+                .job_toolchains
+                .lock()
+                .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?;
+            if jobs.insert(job_id, tc).is_some() {
+                bail!("job {job_id} reappeared while restoring a failed start transition");
+            }
+            return Err(error).context("Updating job state failed");
+        }
+
+        let res = self
+            .builder
+            .run_build(tc, command, outputs, inputs_rdr, &self.cache)
+            .map(|res| {
+                RunJobResult::Complete(JobComplete {
+                    output: res.output,
+                    outputs: res.outputs,
+                })
+            })
+            .map_err(|e| e.context("run build failed"));
         requester
             .do_update_job_state(job_id, JobState::Complete)
             .context("Updating job state failed")?;
@@ -1262,6 +1340,135 @@ mod scheduler_tests {
         }
     }
 
+    struct FailingJobAuthorizer;
+
+    impl JobAuthorizer for FailingJobAuthorizer {
+        fn generate_token(&self, _job_id: JobId) -> Result<String> {
+            bail!("simulated token generation failure")
+        }
+
+        fn verify_token(&self, _job_id: JobId, _token: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct NeverAssign;
+
+    impl SchedulerOutgoing for NeverAssign {
+        fn do_assign_job(
+            &self,
+            _server_id: ServerId,
+            _job_id: JobId,
+            _tc: Toolchain,
+            _auth: String,
+        ) -> Result<AssignJobResult> {
+            bail!("assignment must not be attempted when token generation fails")
+        }
+    }
+
+    #[test]
+    fn token_generation_failure_does_not_consume_server_capacity() -> Result<()> {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse()?;
+        scheduler.handle_heartbeat_server(
+            server_id,
+            ServerNonce::new(),
+            1,
+            Box::new(FailingJobAuthorizer),
+        )?;
+
+        let result = scheduler.handle_alloc_job(
+            &NeverAssign,
+            Toolchain {
+                archive_id: "test-toolchain".to_owned(),
+            },
+        );
+        assert!(result.is_err());
+        assert!(
+            scheduler
+                .jobs
+                .lock()
+                .map_err(|_| anyhow::anyhow!("jobs mutex poisoned"))?
+                .is_empty()
+        );
+        let servers = scheduler
+            .servers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
+        let details = servers
+            .get(&server_id)
+            .ok_or_else(|| anyhow::anyhow!("server missing"))?;
+        assert!(details.jobs_assigned.is_empty());
+        assert!(details.jobs_unclaimed.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn job_state_updates_are_idempotent() -> Result<()> {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse()?;
+        let job_id = JobId(0x1234);
+        scheduler.handle_heartbeat_server(
+            server_id,
+            ServerNonce::new(),
+            1,
+            Box::new(TestJobAuthorizer),
+        )?;
+        {
+            let mut servers = scheduler
+                .servers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
+            let details = servers
+                .get_mut(&server_id)
+                .ok_or_else(|| anyhow::anyhow!("server missing"))?;
+            details.jobs_assigned.insert(job_id);
+            details.jobs_unclaimed.insert(job_id, Instant::now());
+        }
+        scheduler
+            .jobs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("jobs mutex poisoned"))?
+            .insert(
+                job_id,
+                JobDetail {
+                    server_id,
+                    state: JobState::Pending,
+                },
+            );
+
+        for state in [
+            JobState::Ready,
+            JobState::Ready,
+            JobState::Started,
+            JobState::Started,
+            JobState::Complete,
+            JobState::Complete,
+        ] {
+            assert!(matches!(
+                scheduler.handle_update_job_state(job_id, server_id, state)?,
+                UpdateJobStateResult::Success
+            ));
+        }
+        assert!(
+            scheduler
+                .jobs
+                .lock()
+                .map_err(|_| anyhow::anyhow!("jobs mutex poisoned"))?
+                .is_empty()
+        );
+        let servers = scheduler
+            .servers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
+        let details = servers
+            .get(&server_id)
+            .ok_or_else(|| anyhow::anyhow!("server missing"))?;
+        assert!(details.jobs_assigned.is_empty());
+        assert!(details.jobs_unclaimed.is_empty());
+        Ok(())
+    }
+
     #[test]
     fn worker_name_side_channel_is_optional_and_epoch_bound() {
         let scheduler = Scheduler::new();
@@ -1368,5 +1575,151 @@ mod scheduler_tests {
         let details = servers.get(&server_id).unwrap();
         assert!(details.jobs_assigned.is_empty());
         assert!(details.jobs_unclaimed.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod server_state_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    struct NoopBuilder;
+
+    impl BuilderIncoming for NoopBuilder {
+        fn run_build(
+            &self,
+            _toolchain: Toolchain,
+            _command: CompileCommand,
+            _outputs: Vec<String>,
+            _inputs_rdr: InputsReader<'_>,
+            _cache: &Mutex<TcCache>,
+        ) -> Result<sccache::dist::BuildResult> {
+            Ok(sccache::dist::BuildResult {
+                output: sccache::dist::ProcessOutput {
+                    code: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                },
+                outputs: Vec::new(),
+            })
+        }
+    }
+
+    struct RecordingRequester {
+        states: Mutex<Vec<JobState>>,
+        fail_started: bool,
+    }
+
+    impl RecordingRequester {
+        fn new(fail_started: bool) -> Self {
+            Self {
+                states: Mutex::new(Vec::new()),
+                fail_started,
+            }
+        }
+    }
+
+    impl ServerOutgoing for RecordingRequester {
+        fn do_update_job_state(
+            &self,
+            _job_id: JobId,
+            state: JobState,
+        ) -> Result<UpdateJobStateResult> {
+            self.states
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test state mutex poisoned"))?
+                .push(state);
+            if self.fail_started && state == JobState::Started {
+                bail!("simulated start update failure");
+            }
+            Ok(UpdateJobStateResult::Success)
+        }
+    }
+
+    fn server() -> Result<(tempfile::TempDir, Server)> {
+        let dir = tempfile::tempdir()?;
+        let server = Server::new(Box::new(NoopBuilder), dir.path(), 1024 * 1024)?;
+        Ok((dir, server))
+    }
+
+    #[test]
+    fn unknown_toolchain_submission_does_not_publish_ready() -> Result<()> {
+        let (_dir, server) = server()?;
+        let requester = RecordingRequester::new(false);
+        let result = server.handle_submit_toolchain(
+            &requester,
+            JobId(123),
+            ToolchainReader::new(Cursor::new(Vec::<u8>::new())),
+        )?;
+        assert!(matches!(result, SubmitToolchainResult::JobNotFound));
+        assert!(
+            requester
+                .states
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test state mutex poisoned"))?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_run_does_not_publish_started_or_complete() -> Result<()> {
+        let (_dir, server) = server()?;
+        let requester = RecordingRequester::new(false);
+        let result = server.handle_run_job(
+            &requester,
+            JobId(123),
+            CompileCommand {
+                executable: "cc".to_owned(),
+                arguments: Vec::new(),
+                env_vars: Vec::new(),
+                cwd: "/build".to_owned(),
+            },
+            Vec::new(),
+            InputsReader::new(Cursor::new(Vec::<u8>::new())),
+        )?;
+        assert!(matches!(result, RunJobResult::JobNotFound));
+        assert!(
+            requester
+                .states
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test state mutex poisoned"))?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_started_transition_restores_local_job() -> Result<()> {
+        let (_dir, server) = server()?;
+        let job_id = JobId(123);
+        server.handle_assign_job(
+            job_id,
+            Toolchain {
+                archive_id: "toolchain".to_owned(),
+            },
+        )?;
+        let requester = RecordingRequester::new(true);
+        let result = server.handle_run_job(
+            &requester,
+            job_id,
+            CompileCommand {
+                executable: "cc".to_owned(),
+                arguments: Vec::new(),
+                env_vars: Vec::new(),
+                cwd: "/build".to_owned(),
+            },
+            Vec::new(),
+            InputsReader::new(Cursor::new(Vec::<u8>::new())),
+        );
+        assert!(result.is_err());
+        assert!(
+            server
+                .job_toolchains
+                .lock()
+                .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?
+                .contains_key(&job_id)
+        );
+        Ok(())
     }
 }

@@ -148,7 +148,10 @@ impl PotBuilder {
     // the way)
     fn get_container(&self, tc: &Toolchain, tccache: &Mutex<TcCache>) -> Result<String> {
         let container = {
-            let mut map = self.container_lists.lock().unwrap();
+            let mut map = self
+                .container_lists
+                .lock()
+                .map_err(|_| anyhow!("container list mutex poisoned"))?;
             map.entry(tc.clone()).or_insert_with(Vec::new).pop()
         };
         match container {
@@ -157,7 +160,10 @@ impl PotBuilder {
                 // TODO: can improve parallelism (of creating multiple images at a time) by using another
                 // (more fine-grained) mutex around the entry value and checking if its empty a second time
                 let image = {
-                    let mut map = self.image_map.lock().unwrap();
+                    let mut map = self
+                        .image_map
+                        .lock()
+                        .map_err(|_| anyhow!("image map mutex poisoned"))?;
                     match map.entry(tc.clone()) {
                         hash_map::Entry::Occupied(e) => e.get().clone(),
                         hash_map::Entry::Vacant(e) => {
@@ -217,14 +223,27 @@ impl PotBuilder {
             return;
         }
 
-        // Good as new, add it back to the container list
-        if let Some(entry) = container_lists.lock().unwrap().get_mut(&tc) {
-            debug!("Reclaimed container {}", cid);
-            entry.push(cid)
-        } else {
+        // Good as new, add it back to the container list. If bookkeeping is poisoned,
+        // discard the container rather than panicking the cleanup thread.
+        let reclaimed = match container_lists.lock() {
+            Ok(mut containers) => {
+                if let Some(entry) = containers.get_mut(&tc) {
+                    debug!("Reclaimed container {}", cid);
+                    entry.push(cid.clone());
+                    true
+                } else {
+                    false
+                }
+            }
+            Err(_) => {
+                warn!("Container list mutex poisoned while reclaiming {}", cid);
+                false
+            }
+        };
+        if !reclaimed {
             warn!(
-                "Was ready to reclaim container {} but toolchain went missing",
-                cid
+                "Could not reclaim container {} for toolchain {}; removing it",
+                cid, tc.archive_id
             );
             if let Err(e) = pot_rm(&cid, pot_cmd) {
                 warn!("Failed to remove container {}: {}", cid, e);
@@ -249,7 +268,9 @@ impl PotBuilder {
             .check_run()
             .context("Failed to create pot container")?;
 
-        let mut tccache = tccache.lock().unwrap();
+        let mut tccache = tccache
+            .lock()
+            .map_err(|_| anyhow!("toolchain cache mutex poisoned"))?;
         let toolchain_rdr = match tccache.get(tc) {
             Ok(rdr) => rdr,
             Err(LruError::FileNotInCache) => {
@@ -305,11 +326,7 @@ impl PotBuilder {
         cid: &str,
         pot_fs_root: &Path,
     ) -> Result<BuildResult> {
-        trace!("Compile environment: {:?}", compile_command.env_vars);
-        trace!(
-            "Compile command: {:?} {:?}",
-            compile_command.executable, compile_command.arguments
-        );
+        trace!("Compile command: {:?}", compile_command);
 
         trace!("copying in inputs");
         // not elegant
@@ -326,7 +343,9 @@ impl PotBuilder {
         let cwd = Path::new(&cwd);
 
         trace!("creating output directories");
-        assert!(!output_paths.is_empty());
+        if output_paths.is_empty() {
+            bail!("build request must contain at least one output path");
+        }
         let mut cmd = Command::new("jexec");
         cmd.args(&[cid, "mkdir", "-p"]).arg(cwd);
         for path in output_paths.iter() {
@@ -413,15 +432,15 @@ impl BuilderIncoming for PotBuilder {
         debug!("Finishing with container {}", cid);
         let cloned = self.clone();
         let tc = tc;
-        while cloned.cleanup_thread_count.fetch_add(1, Ordering::SeqCst)
-            > self.max_cleanup_thread_count
+        while cloned.cleanup_thread_count.fetch_add(1, Ordering::Relaxed)
+            >= self.max_cleanup_thread_count
         {
-            cloned.cleanup_thread_count.fetch_sub(1, Ordering::SeqCst);
+            cloned.cleanup_thread_count.fetch_sub(1, Ordering::Relaxed);
             hint::spin_loop();
         }
         thread::spawn(move || {
             Self::finish_container(cloned.container_lists, tc, cid, &cloned.pot_cmd);
-            cloned.cleanup_thread_count.fetch_sub(1, Ordering::SeqCst);
+            cloned.cleanup_thread_count.fetch_sub(1, Ordering::Relaxed);
         });
         debug!("Returning result");
         Ok(res)
