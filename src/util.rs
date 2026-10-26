@@ -734,6 +734,13 @@ pub fn encode_path(dst: &mut dyn Write, path: &Path) -> std::io::Result<()> {
 #[cfg(unix)]
 pub fn decode_path(bytes: &[u8]) -> std::io::Result<PathBuf> {
     use std::os::unix::prelude::*;
+
+    if bytes.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains an embedded NUL byte",
+        ));
+    }
     Ok(OsStr::from_bytes(bytes).into())
 }
 
@@ -741,6 +748,12 @@ pub fn decode_path(bytes: &[u8]) -> std::io::Result<PathBuf> {
 pub fn decode_path(bytes: &[u8]) -> std::io::Result<PathBuf> {
     use windows_sys::Win32::Globalization::{CP_OEMCP, MB_ERR_INVALID_CHARS};
 
+    if bytes.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains an embedded NUL byte",
+        ));
+    }
     let codepage = CP_OEMCP;
     let flags = MB_ERR_INVALID_CHARS;
 
@@ -1632,6 +1645,16 @@ mod tests {
     use super::{Digest, OsStrExt, TimeMacroFinder, resolve_compiler_avoiding_wrapper};
     use std::ffi::{OsStr, OsString};
     use std::path::Path;
+    #[cfg(unix)]
+    #[test]
+    fn test_decode_path_rejects_embedded_nul() {
+        assert_eq!(
+            super::decode_path(b"valid/path").unwrap(),
+            Path::new("valid/path")
+        );
+        let error = super::decode_path(&[b'i', 0, b'p']).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
 
     #[test]
     fn test_resolve_compiler_avoiding_ccache_filters_path() {

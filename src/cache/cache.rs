@@ -688,7 +688,7 @@ pub fn build_single_cache(
         #[cfg(not(feature = "azure"))]
         CacheType::Azure(_) => bail!("Azure cache support is not enabled"),
         #[cfg(feature = "gcs")]
-        CacheType::GCS(c) => {
+        CacheType::Gcs(c) => {
             debug!(
                 "Init gcs cache with bucket {}, key_prefix {}",
                 c.bucket, c.key_prefix
@@ -696,14 +696,14 @@ pub fn build_single_cache(
             (build_gcs_operator(c)?, c.rw_mode.into(), None)
         }
         #[cfg(not(feature = "gcs"))]
-        CacheType::GCS(_) => bail!("GCS cache support is not enabled"),
+        CacheType::Gcs(_) => bail!("GCS cache support is not enabled"),
         #[cfg(feature = "gha")]
-        CacheType::GHA(c) => {
+        CacheType::Gha(c) => {
             debug!("Init gha cache with version {}", c.version);
             (build_gha_operator(c)?, c.rw_mode.into(), None)
         }
         #[cfg(not(feature = "gha"))]
-        CacheType::GHA(_) => bail!("GitHub Actions cache support is not enabled"),
+        CacheType::Gha(_) => bail!("GitHub Actions cache support is not enabled"),
         #[cfg(feature = "memcached")]
         CacheType::Memcached(c) => {
             debug!("Init memcached cache with url {}", c.url);
@@ -734,7 +734,7 @@ pub fn build_single_cache(
         #[cfg(not(feature = "webdav"))]
         CacheType::Webdav(_) => bail!("WebDAV cache support is not enabled"),
         #[cfg(feature = "oss")]
-        CacheType::OSS(c) => {
+        CacheType::Oss(c) => {
             debug!(
                 "Init oss cache with bucket {}, endpoint {}",
                 c.bucket,
@@ -743,9 +743,9 @@ pub fn build_single_cache(
             (build_oss_operator(c)?, c.rw_mode.into(), None)
         }
         #[cfg(not(feature = "oss"))]
-        CacheType::OSS(_) => bail!("OSS cache support is not enabled"),
+        CacheType::Oss(_) => bail!("OSS cache support is not enabled"),
         #[cfg(feature = "cos")]
-        CacheType::COS(c) => {
+        CacheType::Cos(c) => {
             debug!(
                 "Init cos cache with bucket {}, endpoint {}",
                 c.bucket,
@@ -754,7 +754,7 @@ pub fn build_single_cache(
             (build_cos_operator(c)?, c.rw_mode.into(), None)
         }
         #[cfg(not(feature = "cos"))]
-        CacheType::COS(_) => bail!("COS cache support is not enabled"),
+        CacheType::Cos(_) => bail!("COS cache support is not enabled"),
     };
 
     #[cfg(feature = "s3")]

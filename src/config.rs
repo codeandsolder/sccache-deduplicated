@@ -594,14 +594,14 @@ pub struct COSCacheConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CacheType {
     Azure(AzureCacheConfig),
-    GCS(GCSCacheConfig),
-    GHA(GHACacheConfig),
+    Gcs(GCSCacheConfig),
+    Gha(GHACacheConfig),
     Memcached(MemcachedCacheConfig),
     Redis(RedisCacheConfig),
     S3(S3CacheConfig),
     Webdav(WebdavCacheConfig),
-    OSS(OSSCacheConfig),
-    COS(COSCacheConfig),
+    Oss(OSSCacheConfig),
+    Cos(COSCacheConfig),
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -643,12 +643,12 @@ impl CacheConfigs {
             .map(CacheType::S3)
             .or_else(|| redis.map(CacheType::Redis))
             .or_else(|| memcached.map(CacheType::Memcached))
-            .or_else(|| gcs.map(CacheType::GCS))
-            .or_else(|| gha.map(CacheType::GHA))
+            .or_else(|| gcs.map(CacheType::Gcs))
+            .or_else(|| gha.map(CacheType::Gha))
             .or_else(|| azure.map(CacheType::Azure))
             .or_else(|| webdav.map(CacheType::Webdav))
-            .or_else(|| oss.map(CacheType::OSS))
-            .or_else(|| cos.map(CacheType::COS));
+            .or_else(|| oss.map(CacheType::Oss))
+            .or_else(|| cos.map(CacheType::Cos));
 
         let fallback = disk.unwrap_or_default();
 
@@ -683,10 +683,10 @@ impl CacheConfigs {
                         .ok_or_else(|| {
                             anyhow!("Memcached cache not configured but specified in levels")
                         })?,
-                    "gcs" => self.gcs.clone().map(CacheType::GCS).ok_or_else(|| {
+                    "gcs" => self.gcs.clone().map(CacheType::Gcs).ok_or_else(|| {
                         anyhow!("GCS cache not configured but specified in levels")
                     })?,
-                    "gha" => self.gha.clone().map(CacheType::GHA).ok_or_else(|| {
+                    "gha" => self.gha.clone().map(CacheType::Gha).ok_or_else(|| {
                         anyhow!("GHA cache not configured but specified in levels")
                     })?,
                     "azure" => self.azure.clone().map(CacheType::Azure).ok_or_else(|| {
@@ -695,7 +695,7 @@ impl CacheConfigs {
                     "webdav" => self.webdav.clone().map(CacheType::Webdav).ok_or_else(|| {
                         anyhow!("Webdav cache not configured but specified in levels")
                     })?,
-                    "oss" => self.oss.clone().map(CacheType::OSS).ok_or_else(|| {
+                    "oss" => self.oss.clone().map(CacheType::Oss).ok_or_else(|| {
                         anyhow!("OSS cache not configured but specified in levels")
                     })?,
                     "disk" => {

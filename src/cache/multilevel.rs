@@ -513,11 +513,11 @@ impl MultiLevelStorage {
                 "Cache level 'memcached' requires the 'memcached' feature"
             )),
             #[cfg(feature = "gcs")]
-            "gcs" => Ok(config.cache_configs.gcs.clone().map(CacheType::GCS)),
+            "gcs" => Ok(config.cache_configs.gcs.clone().map(CacheType::Gcs)),
             #[cfg(not(feature = "gcs"))]
             "gcs" => Err(anyhow!("Cache level 'gcs' requires the 'gcs' feature")),
             #[cfg(feature = "gha")]
-            "gha" => Ok(config.cache_configs.gha.clone().map(CacheType::GHA)),
+            "gha" => Ok(config.cache_configs.gha.clone().map(CacheType::Gha)),
             #[cfg(not(feature = "gha"))]
             "gha" => Err(anyhow!("Cache level 'gha' requires the 'gha' feature")),
             #[cfg(feature = "azure")]
@@ -531,11 +531,11 @@ impl MultiLevelStorage {
                 "Cache level 'webdav' requires the 'webdav' feature"
             )),
             #[cfg(feature = "oss")]
-            "oss" => Ok(config.cache_configs.oss.clone().map(CacheType::OSS)),
+            "oss" => Ok(config.cache_configs.oss.clone().map(CacheType::Oss)),
             #[cfg(not(feature = "oss"))]
             "oss" => Err(anyhow!("Cache level 'oss' requires the 'oss' feature")),
             #[cfg(feature = "cos")]
-            "cos" => Ok(config.cache_configs.cos.clone().map(CacheType::COS)),
+            "cos" => Ok(config.cache_configs.cos.clone().map(CacheType::Cos)),
             #[cfg(not(feature = "cos"))]
             "cos" => Err(anyhow!("Cache level 'cos' requires the 'cos' feature")),
             _ => Err(anyhow!("Unknown cache level: '{level_name}'")),
