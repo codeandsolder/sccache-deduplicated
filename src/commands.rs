@@ -1169,7 +1169,7 @@ mod test {
     /// local compilation rather than panic.
     #[test]
     fn test_handle_compile_response_disconnect_falls_back_to_local() {
-        let mut runtime = make_runtime();
+        let runtime = make_runtime();
         let client = Client::new_num(1);
         let creator = Arc::new(Mutex::new(MockCommandCreator::new(&client)));
         // exit_status takes a raw platform value: on Unix the wait(2) encoding
@@ -1199,7 +1199,7 @@ mod test {
         };
         let code = handle_compile_response(
             creator,
-            &mut runtime,
+            &runtime,
             &mut conn,
             CompileResponse::CompileStarted,
             &invocation,

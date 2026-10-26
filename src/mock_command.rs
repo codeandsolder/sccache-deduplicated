@@ -435,9 +435,12 @@ impl CommandChild for MockChild {
 }
 
 #[cfg(test)]
+pub type MockChildFactory = Box<dyn Fn(&[OsString]) -> Result<MockChild> + Send>;
+
+#[cfg(test)]
 pub enum ChildOrCall {
     Child(Result<MockChild>),
-    Call(Box<dyn Fn(&[OsString]) -> Result<MockChild> + Send>),
+    Call(MockChildFactory),
 }
 
 #[cfg(test)]
