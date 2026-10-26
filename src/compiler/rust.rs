@@ -71,6 +71,7 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time;
+use walkdir::WalkDir;
 
 use crate::errors::{Context, Result, anyhow, bail};
 
@@ -615,6 +616,60 @@ fn cargo_manifest_input(env_vars: &[(OsString, OsString)], cwd: &Path) -> Option
         .find_map(|(name, value)| (name == "CARGO_MANIFEST_DIR").then(|| resolve(value)))?;
     let manifest = manifest_dir.join("Cargo.toml");
     manifest.is_file().then_some(manifest)
+}
+
+fn cargo_manifest_tree_inputs(manifest: &Path, output_dir: &Path) -> Result<Vec<PathBuf>> {
+    let manifest_dir = manifest
+        .parent()
+        .context("Cargo manifest has no parent directory")?;
+
+    // A proc macro runs inside rustc and may open arbitrary package data relative
+    // to CARGO_MANIFEST_DIR without using proc_macro::tracked_path::path(). Such
+    // reads are invisible to rustc dep-info (wayland-scanner's wayland.xml is a
+    // real-world example), so include the package tree conservatively in both the
+    // cache key and distributed input archive.
+    //
+    // Do not recurse into Cargo's output tree if the package itself is the
+    // workspace root. Those files are compiler outputs, not source inputs, and
+    // including them would make the cache key self-referential.
+    let target_root = output_dir
+        .ancestors()
+        .find(|ancestor| {
+            ancestor.join("CACHEDIR.TAG").is_file() || ancestor.join(".rustc_info.json").is_file()
+        })
+        .map(Path::to_owned);
+
+    let mut inputs = Vec::new();
+    let walker = WalkDir::new(manifest_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            let path = entry.path();
+            if target_root
+                .as_ref()
+                .is_some_and(|target| path == target || path.starts_with(target))
+            {
+                return false;
+            }
+            !matches!(
+                entry.file_name().to_str(),
+                Some(".git" | ".hg" | ".svn" | ".jj")
+            )
+        });
+
+    for entry in walker {
+        let entry = entry.with_context(|| {
+            format!(
+                "Failed to walk Cargo manifest directory {}",
+                manifest_dir.display()
+            )
+        })?;
+        if entry.path().is_file() {
+            inputs.push(entry.into_path());
+        }
+    }
+    inputs.sort();
+    Ok(inputs)
 }
 
 fn rust_cache_hashes_cargo_env(name: &std::ffi::OsStr) -> bool {
@@ -2381,8 +2436,26 @@ where
             .flat_map(|(arg, val)| std::iter::once(arg).chain(val))
             .cloned()
             .collect::<Vec<_>>();
-        // Find all the source files and hash them
+        // Find all the source files and hash them.
         let cargo_manifest = cargo_manifest_input(&env_vars, &cwd);
+        let has_dynamic_extern = self
+            .parsed_args
+            .externs
+            .iter()
+            .any(|path| path.extension().is_some_and(|ext| ext == DLL_EXTENSION));
+        let output_dir = if self.parsed_args.output_dir.is_absolute() {
+            self.parsed_args.output_dir.clone()
+        } else {
+            cwd.join(&self.parsed_args.output_dir)
+        };
+        let cargo_manifest_tree_inputs = if has_dynamic_extern {
+            cargo_manifest
+                .as_deref()
+                .map(|manifest| cargo_manifest_tree_inputs(manifest, &output_dir))
+                .transpose()?
+        } else {
+            None
+        };
         let dep_info_copy = canonical_paths.as_ref().and_then(|_| {
             self.parsed_args.dep_info.as_ref().map(|dep_info| {
                 let out_dir = if self.parsed_args.output_dir.is_absolute() {
@@ -2406,13 +2479,21 @@ where
                 dep_info_copy: dep_info_copy.as_deref(),
             })
             .await?;
-            // Proc macros can read Cargo.toml through CARGO_MANIFEST_DIR while rustc
-            // is running, so the manifest is a real compiler input for both caching and dist.
+            // Cargo.toml is always a compiler input: proc macros and env macros can read
+            // package metadata even when rustc dep-info does not list the manifest itself.
             if let Some(manifest) = cargo_manifest.as_ref()
                 && !source_files.contains(manifest)
             {
                 source_files.push(manifest.clone());
             }
+            // A dynamic extern can be a proc macro loaded into rustc. Such a macro can read
+            // arbitrary package data through CARGO_MANIFEST_DIR without tracked_path(), so
+            // include the package tree conservatively for those compilations.
+            if let Some(manifest_inputs) = cargo_manifest_tree_inputs.as_ref() {
+                source_files.extend(manifest_inputs.iter().cloned());
+            }
+            source_files.sort();
+            source_files.dedup();
             let source_hashes = hash_all(&source_files, &source_hashes_pool).await?;
             Ok((source_files, source_hashes, env_deps))
         };
@@ -2547,6 +2628,11 @@ where
             // Keep the manifest-input schema scoped to Cargo builds so unrelated Rust cache
             // entries remain reusable while old Cargo entries cannot collide with this key.
             m.update(b"cargo-manifest-input-v1");
+            if has_dynamic_extern {
+                // Dynamic externs may be proc macros that perform untracked reads relative to
+                // CARGO_MANIFEST_DIR. Their package-tree inputs use a distinct key schema.
+                m.update(b"proc-macro-manifest-tree-v1");
+            }
         }
         // 2. compiler_shlibs_digests
         for d in &self.compiler_shlibs_digests {
@@ -3470,6 +3556,7 @@ fn test_rust_inputs_packager_preserves_manifest_at_canonical_path() -> Result<()
 
     let lib_rs = src_dir.join("lib.rs");
     let manifest = crate_dir.join("Cargo.toml");
+    let protocol = crate_dir.join("wayland.xml");
     fs::write(&lib_rs, b"pub fn marker() {}\n")?;
     fs::write(
         &manifest,
@@ -3478,9 +3565,15 @@ name = "fast_image_resize"
 version = "6.1.0"
 "#,
     )?;
+    fs::write(&protocol, b"<protocol name=\"wayland\"/>\n")?;
 
     let mut path_transformer = dist::PathTransformer::new();
     path_transformer.add_root_mapping(tempdir.path().to_owned(), "/cargo");
+
+    let inputs = cargo_manifest_tree_inputs(&manifest, &tempdir.path().join("target/debug"))?;
+    assert!(inputs.contains(&lib_rs));
+    assert!(inputs.contains(&manifest));
+    assert!(inputs.contains(&protocol));
 
     let packager = RustInputsPackager {
         env_vars: vec![(
@@ -3493,7 +3586,7 @@ version = "6.1.0"
             staticlib: false,
             cdylib: false,
         },
-        inputs: vec![lib_rs, manifest],
+        inputs,
         path_transformer,
         rlib_dep_reader: None,
     };
@@ -3513,6 +3606,9 @@ version = "6.1.0"
     )));
     assert!(paths.contains(&PathBuf::from(
         "cargo/registry/src/fast_image_resize-6.1.0/Cargo.toml"
+    )));
+    assert!(paths.contains(&PathBuf::from(
+        "cargo/registry/src/fast_image_resize-6.1.0/wayland.xml"
     )));
     Ok(())
 }
@@ -5994,6 +6090,83 @@ version='2.0.0'
         );
 
         assert_ne!(first, second);
+        Ok(())
+    }
+
+    #[test]
+    fn test_cargo_manifest_sidecar_contents_affect_hash_key() -> Result<()> {
+        let f = TestFixture::new();
+        let proc_macro_extern = if cfg!(windows) {
+            "macro_dep=macro_dep.dll"
+        } else if cfg!(target_os = "macos") {
+            "macro_dep=libmacro_dep.dylib"
+        } else {
+            "macro_dep=libmacro_dep.so"
+        };
+        let args = [
+            "--emit",
+            "link",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "--extern",
+            proc_macro_extern,
+        ];
+        let env = vec![(
+            OsString::from("CARGO_MANIFEST_DIR"),
+            f.tempdir.path().as_os_str().to_owned(),
+        )];
+
+        let make_inputs = |protocol: &'static [u8]| {
+            move |root: &Path| {
+                fs::write(
+                    root.join("Cargo.toml"),
+                    b"[package]\nname='foo'\nversion='1.0.0'\n",
+                )?;
+                fs::write(root.join("wayland.xml"), protocol)?;
+                Ok(())
+            }
+        };
+
+        let first = hash_key(&f, &args, &env, make_inputs(b"<protocol name='a'/>"), false);
+        let second = hash_key(&f, &args, &env, make_inputs(b"<protocol name='b'/>"), false);
+
+        assert_ne!(first, second);
+        Ok(())
+    }
+
+    #[test]
+    fn test_cargo_manifest_tree_inputs_excludes_target_and_vcs_metadata() -> Result<()> {
+        let f = TestFixture::new();
+        let root = f.tempdir.path();
+        let manifest = root.join("Cargo.toml");
+        let protocol = root.join("protocols/wayland.xml");
+        let target = root.join("target");
+        fs::create_dir_all(protocol.parent().context("protocol has no parent")?)?;
+        fs::create_dir_all(target.join("debug"))?;
+        fs::create_dir_all(root.join(".git/objects"))?;
+        fs::write(&manifest, b"[package]\nname='foo'\nversion='1.0.0'\n")?;
+        fs::write(&protocol, b"<protocol/>")?;
+        fs::write(
+            target.join("CACHEDIR.TAG"),
+            b"Signature: 8a477f597d28d172789f06886806bc55\n",
+        )?;
+        fs::write(target.join("debug/generated"), b"output")?;
+        fs::write(root.join(".git/objects/object"), b"git")?;
+
+        let inputs = cargo_manifest_tree_inputs(&manifest, &target.join("debug/deps"))?;
+        assert!(inputs.contains(&manifest));
+        assert!(inputs.contains(&protocol));
+        assert!(!inputs.iter().any(|path| path.starts_with(&target)));
+        assert!(
+            !inputs
+                .iter()
+                .any(|path| path.starts_with(root.join(".git")))
+        );
         Ok(())
     }
 
