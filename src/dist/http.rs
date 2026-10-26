@@ -1571,7 +1571,7 @@ mod client {
             compiler_path: PathBuf,
             weak_key: String,
             toolchain_packager: Box<dyn ToolchainPackager>,
-        ) -> Result<(Toolchain, Option<(String, PathBuf)>)> {
+        ) -> Result<(Toolchain, Option<crate::dist::CustomToolchainOverride>)> {
             let compiler_path = compiler_path.clone();
             let weak_key = weak_key.clone();
             let tc_cache = self.tc_cache.clone();
@@ -1588,7 +1588,7 @@ mod client {
         }
         fn get_custom_toolchain(&self, exe: &Path) -> Option<PathBuf> {
             match self.tc_cache.get_custom_toolchain(exe) {
-                Some(Ok((_, _, path))) => Some(path),
+                Some(Ok((_, toolchain_override))) => Some(toolchain_override.archive),
                 _ => None,
             }
         }

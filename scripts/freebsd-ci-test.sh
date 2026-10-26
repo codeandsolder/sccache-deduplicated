@@ -124,6 +124,7 @@ prepare_and_run_sccache_dist()
 	# create sccache client config
 	TC="$(rustup toolchain list | grep default | awk '{ print $1 }')"
 	RUSTC_PATH="$HOME/.rustup/toolchains/$TC/bin/rustc"
+	CARGO_PATH="$HOME/.rustup/toolchains/$TC/bin/cargo"
 	mkdir -p "$XDG_CONFIG_HOME/sccache"
 	cat >"$XDG_CONFIG_HOME/sccache/config" <<-EOF
 	[dist]
@@ -143,6 +144,7 @@ prepare_and_run_sccache_dist()
 	compiler_executable = "$RUSTC_PATH"
 	archive = "$TEST_TMPDIR/rust-toolchain.tgz"
 	archive_compiler_executable = "$RUSTC_PATH"
+	archive_cargo_executable = "$CARGO_PATH"
 	EOF
 
 	echo "Creating toolchain tarballs"

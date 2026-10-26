@@ -779,6 +779,7 @@ pub enum DistToolchainConfig {
         compiler_executable: PathBuf,
         archive: PathBuf,
         archive_compiler_executable: String,
+        archive_cargo_executable: Option<String>,
     },
 }
 
@@ -3229,6 +3230,48 @@ fn test_gcs_service_account() {
         }
         None => unreachable!(),
     }
+}
+
+#[test]
+fn dist_path_override_cargo_path_is_optional() {
+    let with_cargo: DistToolchainConfig = toml::from_str(
+        r#"
+type = "path_override"
+compiler_executable = "/local/rustc"
+archive = "/toolchains/rust.tar.gz"
+archive_compiler_executable = "/archive/rustc"
+archive_cargo_executable = "/archive/cargo"
+"#,
+    )
+    .expect("custom Rust toolchain config must parse");
+    assert_eq!(
+        with_cargo,
+        DistToolchainConfig::PathOverride {
+            compiler_executable: "/local/rustc".into(),
+            archive: "/toolchains/rust.tar.gz".into(),
+            archive_compiler_executable: "/archive/rustc".to_owned(),
+            archive_cargo_executable: Some("/archive/cargo".to_owned()),
+        }
+    );
+
+    let legacy: DistToolchainConfig = toml::from_str(
+        r#"
+type = "path_override"
+compiler_executable = "/local/clang"
+archive = "/toolchains/clang.tar.gz"
+archive_compiler_executable = "/archive/clang"
+"#,
+    )
+    .expect("legacy custom toolchain config must keep parsing");
+    assert_eq!(
+        legacy,
+        DistToolchainConfig::PathOverride {
+            compiler_executable: "/local/clang".into(),
+            archive: "/toolchains/clang.tar.gz".into(),
+            archive_compiler_executable: "/archive/clang".to_owned(),
+            archive_cargo_executable: None,
+        }
+    );
 }
 
 #[test]
