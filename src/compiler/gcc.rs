@@ -855,8 +855,7 @@ fn module_artifact_descriptor(
             let mut path = output.with_file_name(input_file_name);
             let mut ext = path
                 .extension()
-                .map(std::ffi::OsStr::to_os_string)
-                .unwrap_or_default();
+                .map_or_else(OsString::new, std::ffi::OsStr::to_os_string);
             ext.push(".pcm");
             path.set_extension(ext);
             path

@@ -711,7 +711,7 @@ impl CacheConfigs {
         } else {
             // No levels specified - use single cache (backward compatible)
             let (cache_type, _) = self.into_fallback();
-            Ok(cache_type.map(|ct| vec![ct]).unwrap_or_default())
+            Ok(cache_type.map_or_else(Vec::new, |ct| vec![ct]))
         }
     }
 
