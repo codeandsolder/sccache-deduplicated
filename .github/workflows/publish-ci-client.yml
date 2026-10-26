@@ -95,7 +95,7 @@ jobs:
           set -euo pipefail
           cargo +1.99.0 build --release --locked \
             --no-default-features \
-            --features s3,dist-client,dist-server \
+            --features s3,gha,dist-client,dist-server \
             --bin sccache --bin sccache-dist
 
           install -D -m 0755 target/release/sccache dist/sccache-linux-x86_64-v2
@@ -105,7 +105,7 @@ jobs:
             echo "source_sha=${{ steps.rev.outputs.sha }}"
             echo "rust_toolchain=1.99.0"
             echo "rustflags=-C target-cpu=x86-64-v2"
-            echo "features=s3,dist-client,dist-server"
+            echo "features=s3,gha,dist-client,dist-server"
           } > dist/build.txt
 
       - name: Publish immutable release
