@@ -52,6 +52,8 @@ use std::env::consts::DLL_EXTENSION;
 #[cfg(feature = "dist-client")]
 use std::env::consts::DLL_PREFIX;
 use std::env::consts::EXE_EXTENSION;
+#[cfg(feature = "dist-client")]
+use std::env::consts::EXE_SUFFIX;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::OpenOptions;
@@ -85,6 +87,17 @@ const RMETA_EXTENSION: &str = "rmeta";
 
 /// Directory in the sysroot containing binary to which rustc is linked.
 const BINS_DIR: &str = "bin";
+
+#[cfg(feature = "dist-client")]
+fn rust_dist_cargo_executable(sysroot: &Path) -> Option<PathBuf> {
+    let bin = sysroot.join(BINS_DIR);
+    let real_cargo = bin.join(format!("cargo.real{EXE_SUFFIX}"));
+    if real_cargo.is_file() {
+        return Some(real_cargo);
+    }
+    let cargo = bin.join(format!("cargo{EXE_SUFFIX}"));
+    cargo.is_file().then_some(cargo)
+}
 
 /// Directory in the sysroot containing shared libraries to which rustc is linked.
 #[cfg(not(windows))]
@@ -3244,7 +3257,21 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                         "TMPDIR" => {
                             *v = String::new();
                         }
-                        "CARGO" | "CARGO_MANIFEST_DIR" => {
+                        "CARGO" => {
+                            // Cargo can export a site wrapper or rustup proxy that is outside
+                            // the packaged sysroot. Proc macros may execute CARGO (for example,
+                            // proc-macro-crate runs `cargo locate-project`), so point workers at
+                            // the Cargo binary that is actually present in the toolchain archive.
+                            let Some(cargo) = rust_dist_cargo_executable(sysroot) else {
+                                debug!(
+                                    "Cannot distribute Rust compile: Cargo is missing from sysroot {}",
+                                    sysroot.display()
+                                );
+                                return None;
+                            };
+                            *v = path_transformer.as_dist(&cargo)?;
+                        }
+                        "CARGO_MANIFEST_DIR" => {
                             *v = path_transformer.as_dist(Path::new(v))?;
                         }
                         _ => (),
@@ -5673,6 +5700,152 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             assert!(!dist_args.iter().any(|arg| arg == "target-cpu=native"));
         }
 
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_rust_dist_cargo_executable_falls_back_to_cargo() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let bin = temp.path().join(BINS_DIR);
+        fs::create_dir_all(&bin)?;
+        let cargo = bin.join(format!("cargo{EXE_SUFFIX}"));
+        fs::write(&cargo, b"cargo")?;
+        assert_eq!(rust_dist_cargo_executable(temp.path()), Some(cargo));
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_noncanonical_dist_rewrites_cargo_to_packaged_sysroot_binary() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let sysroot = temp.path().join("sysroot");
+        let cargo = sysroot.join(BINS_DIR).join(format!("cargo{EXE_SUFFIX}"));
+        let real_cargo = sysroot
+            .join(BINS_DIR)
+            .join(format!("cargo.real{EXE_SUFFIX}"));
+        fs::create_dir_all(cargo.parent().context("Cargo path has no parent")?)?;
+        fs::write(&cargo, b"site-wrapper")?;
+        fs::write(&real_cargo, b"cargo")?;
+        assert_ne!(cargo, real_cargo);
+
+        let parsed = match parse_arguments(
+            &[
+                OsString::from("foo.rs"),
+                OsString::from("--emit"),
+                OsString::from("link"),
+                OsString::from("--crate-name"),
+                OsString::from("foo"),
+                OsString::from("--crate-type"),
+                OsString::from("lib"),
+                OsString::from("--out-dir"),
+                OsString::from("out"),
+            ],
+            temp.path(),
+        ) {
+            CompilerArguments::Ok(parsed) => parsed,
+            other => bail!("unexpected parse result: {other:?}"),
+        };
+
+        let compilation = RustCompilation {
+            executable: sysroot.join(BINS_DIR).join("rustc"),
+            host: "x86_64-unknown-linux-gnu".to_owned(),
+            sysroot: sysroot.clone(),
+            rlib_dep_reader: None,
+            arguments: parsed.arguments,
+            inputs: vec![temp.path().join("foo.rs")],
+            outputs: HashMap::new(),
+            crate_link_paths: vec![],
+            crate_name: "foo".to_owned(),
+            crate_types: parsed.crate_types,
+            dep_info: None,
+            cwd: temp.path().to_owned(),
+            env_vars: vec![(
+                OsString::from("CARGO"),
+                OsString::from("/usr/local/libexec/cargo-site-wrapper"),
+            )],
+            env_dep_names: HashSet::new(),
+            allow_dist: true,
+            canonical_paths: None,
+        };
+
+        let mut transformer = dist::PathTransformer::new();
+        let (_, dist_command, _) =
+            <RustCompilation as Compilation<ProcessCommandCreator>>::generate_compile_commands(
+                &compilation,
+                &mut transformer,
+                false,
+            )?;
+        let dist_command = dist_command.context("distributed command unexpectedly disabled")?;
+        let cargo_value = dist_command
+            .env_vars
+            .iter()
+            .find_map(|(name, value)| (name == "CARGO").then_some(value));
+        let expected_cargo = transformer
+            .as_dist(&real_cargo)
+            .context("sysroot real Cargo path is not distributable")?;
+        assert_eq!(
+            cargo_value.map(String::as_str),
+            Some(expected_cargo.as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_noncanonical_dist_without_packaged_cargo_falls_back_local() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let sysroot = temp.path().join("sysroot");
+        fs::create_dir_all(sysroot.join(BINS_DIR))?;
+
+        let parsed = match parse_arguments(
+            &[
+                OsString::from("foo.rs"),
+                OsString::from("--emit"),
+                OsString::from("link"),
+                OsString::from("--crate-name"),
+                OsString::from("foo"),
+                OsString::from("--crate-type"),
+                OsString::from("lib"),
+                OsString::from("--out-dir"),
+                OsString::from("out"),
+            ],
+            temp.path(),
+        ) {
+            CompilerArguments::Ok(parsed) => parsed,
+            other => bail!("unexpected parse result: {other:?}"),
+        };
+
+        let compilation = RustCompilation {
+            executable: sysroot.join(BINS_DIR).join("rustc"),
+            host: "x86_64-unknown-linux-gnu".to_owned(),
+            sysroot,
+            rlib_dep_reader: None,
+            arguments: parsed.arguments,
+            inputs: vec![temp.path().join("foo.rs")],
+            outputs: HashMap::new(),
+            crate_link_paths: vec![],
+            crate_name: "foo".to_owned(),
+            crate_types: parsed.crate_types,
+            dep_info: None,
+            cwd: temp.path().to_owned(),
+            env_vars: vec![(
+                OsString::from("CARGO"),
+                OsString::from("/usr/local/libexec/cargo-site-wrapper"),
+            )],
+            env_dep_names: HashSet::new(),
+            allow_dist: true,
+            canonical_paths: None,
+        };
+
+        let mut transformer = dist::PathTransformer::new();
+        let (_, dist_command, _) =
+            <RustCompilation as Compilation<ProcessCommandCreator>>::generate_compile_commands(
+                &compilation,
+                &mut transformer,
+                false,
+            )?;
+        assert!(dist_command.is_none());
         Ok(())
     }
 
