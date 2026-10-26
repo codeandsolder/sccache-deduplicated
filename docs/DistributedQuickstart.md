@@ -184,6 +184,10 @@ Where:
    when `compiler_executable` is matched
  - `archive_compiler_executable` is the path within the archive the distributed
    compilation should invoke
+ - `archive_cargo_executable` is optional. For custom Rust toolchains used by Cargo,
+   set it to the Cargo executable inside the archive. For a Cargo-driven Rust compile,
+   omitting this field makes sccache fall back to a local compile rather than guessing
+   a path that may not exist in the archive. Other compilers remain unaffected.
 
 A toolchain archive should be a Gzip compressed TAR archive, containing a filesystem
 sufficient to run the compiler without relying on any external files. If you have archives

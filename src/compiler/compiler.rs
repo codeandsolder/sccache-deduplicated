@@ -857,6 +857,39 @@ where
     fn language(&self) -> Language;
 }
 
+#[cfg(feature = "dist-client")]
+fn apply_selected_toolchain_override(
+    command: &mut dist::CompileCommand,
+    toolchain_override: Option<dist::CustomToolchainOverride>,
+    dist_command_uses_cargo: bool,
+    automatic_dist_toolchain_is_ready: bool,
+) -> Result<Option<PathBuf>> {
+    let Some(toolchain_override) = toolchain_override else {
+        if dist_command_uses_cargo && !automatic_dist_toolchain_is_ready {
+            bail!(
+                "automatic distributed Rust toolchain does not contain Cargo required by this compile"
+            )
+        }
+        return Ok(None);
+    };
+
+    command.executable = toolchain_override.compiler_executable;
+    if dist_command_uses_cargo {
+        let archive_cargo = toolchain_override.cargo_executable.ok_or_else(|| {
+            anyhow!(
+                "custom distributed Rust toolchain is used for a Cargo-driven compile, but archive_cargo_executable is not configured"
+            )
+        })?;
+        let Some((_, cargo)) = command.env_vars.iter_mut().find(|(key, _)| key == "CARGO") else {
+            bail!(
+                "Cargo-driven distributed Rust command did not contain a CARGO environment variable"
+            )
+        };
+        *cargo = archive_cargo;
+    }
+    Ok(Some(toolchain_override.archive))
+}
+
 #[cfg(not(feature = "dist-client"))]
 async fn dist_or_local_compile<T>(
     service: &server::SccacheService<T>,
@@ -932,6 +965,8 @@ where
             .map(|output| path_transformer.as_dist_abs(&cwd.join(output.path)))
             .collect::<Option<_>>()
             .context("Failed to adapt an output path for distributed compile")?;
+        let dist_command_uses_cargo = compilation.dist_command_uses_cargo();
+        let automatic_dist_toolchain_is_ready = compilation.automatic_dist_toolchain_is_ready();
         let (inputs_packager, toolchain_packager, outputs_rewriter) =
             compilation.into_dist_packagers(path_transformer)?;
 
@@ -939,16 +974,15 @@ where
             "[{out_pretty}]: Identifying dist toolchain for {}",
             crate::util::debug_display(&local_executable)
         );
-        let (dist_toolchain, maybe_dist_compile_executable) = dist_client
+        let (dist_toolchain, maybe_toolchain_override) = dist_client
             .put_toolchain(local_executable, weak_toolchain_key, toolchain_packager)
             .await?;
-        let tc_archive =
-            if let Some((dist_compile_executable, archive_path)) = maybe_dist_compile_executable {
-                dist_compile_cmd.executable = dist_compile_executable;
-                Some(archive_path)
-            } else {
-                None
-            };
+        let tc_archive = apply_selected_toolchain_override(
+            &mut dist_compile_cmd,
+            maybe_toolchain_override,
+            dist_command_uses_cargo,
+            automatic_dist_toolchain_is_ready,
+        )?;
 
         debug!("[{out_pretty}]: Requesting allocation");
         let allocation_result = dist_client.do_alloc_job(dist_toolchain.clone()).await?;
@@ -1132,6 +1166,18 @@ where
         path_transformer: &mut dist::PathTransformer,
         rewrite_includes_only: bool,
     ) -> GenerateCompileCommandsResult<T>;
+
+    /// Whether a custom distributed toolchain must provide a Cargo executable for this command.
+    #[cfg(feature = "dist-client")]
+    fn dist_command_uses_cargo(&self) -> bool {
+        false
+    }
+
+    /// Whether the automatically packaged toolchain contains everything this command needs.
+    #[cfg(feature = "dist-client")]
+    fn automatic_dist_toolchain_is_ready(&self) -> bool {
+        true
+    }
 
     /// Create a function that will create the inputs used to perform a distributed compilation
     #[cfg(feature = "dist-client")]
@@ -3620,6 +3666,113 @@ LLVM version: 6.0",
     }
 }
 
+#[cfg(all(test, feature = "dist-client"))]
+mod custom_toolchain_override_tests {
+    use super::apply_selected_toolchain_override;
+    use crate::dist::{CompileCommand, CustomToolchainOverride};
+    use crate::errors::Result;
+    use std::path::PathBuf;
+
+    fn command(env_vars: Vec<(String, String)>) -> CompileCommand {
+        CompileCommand {
+            executable: "/automatic/rustc".to_owned(),
+            arguments: Vec::new(),
+            env_vars,
+            cwd: "/build".to_owned(),
+        }
+    }
+
+    #[test]
+    fn custom_toolchain_rewrites_compiler_and_cargo() -> Result<()> {
+        let mut command = command(vec![("CARGO".to_owned(), "/automatic/cargo".to_owned())]);
+        let archive = apply_selected_toolchain_override(
+            &mut command,
+            Some(CustomToolchainOverride {
+                compiler_executable: "/custom/rustc".to_owned(),
+                archive: PathBuf::from("/custom/toolchain.tar.gz"),
+                cargo_executable: Some("/custom/cargo".to_owned()),
+            }),
+            true,
+            false,
+        )?;
+
+        assert_eq!(command.executable, "/custom/rustc");
+        assert_eq!(
+            command.env_vars,
+            vec![("CARGO".to_owned(), "/custom/cargo".to_owned())]
+        );
+        assert_eq!(archive, Some(PathBuf::from("/custom/toolchain.tar.gz")));
+        Ok(())
+    }
+
+    #[test]
+    fn custom_toolchain_without_cargo_rejects_cargo_command() {
+        let mut command = command(vec![("CARGO".to_owned(), "/automatic/cargo".to_owned())]);
+        let result = apply_selected_toolchain_override(
+            &mut command,
+            Some(CustomToolchainOverride {
+                compiler_executable: "/custom/rustc".to_owned(),
+                archive: PathBuf::from("/custom/toolchain.tar.gz"),
+                cargo_executable: None,
+            }),
+            true,
+            true,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn automatic_rust_toolchain_without_cargo_is_rejected() {
+        let mut command = command(vec![("CARGO".to_owned(), "/host/cargo".to_owned())]);
+        let result = apply_selected_toolchain_override(&mut command, None, true, false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn custom_rust_toolchain_can_supply_cargo_when_automatic_one_cannot() -> Result<()> {
+        let mut command = command(vec![("CARGO".to_owned(), "/host/cargo".to_owned())]);
+        let archive = apply_selected_toolchain_override(
+            &mut command,
+            Some(CustomToolchainOverride {
+                compiler_executable: "/custom/rustc".to_owned(),
+                archive: PathBuf::from("/custom/toolchain.tar.gz"),
+                cargo_executable: Some("/custom/cargo".to_owned()),
+            }),
+            true,
+            false,
+        )?;
+        assert_eq!(command.executable, "/custom/rustc");
+        assert_eq!(
+            command.env_vars,
+            vec![("CARGO".to_owned(), "/custom/cargo".to_owned())]
+        );
+        assert_eq!(archive, Some(PathBuf::from("/custom/toolchain.tar.gz")));
+        Ok(())
+    }
+
+    #[test]
+    fn non_rust_custom_toolchain_ignores_incidental_cargo_env() -> Result<()> {
+        let mut command = command(vec![("CARGO".to_owned(), "/host/cargo".to_owned())]);
+        let archive = apply_selected_toolchain_override(
+            &mut command,
+            Some(CustomToolchainOverride {
+                compiler_executable: "/custom/clang".to_owned(),
+                archive: PathBuf::from("/custom/toolchain.tar.gz"),
+                cargo_executable: None,
+            }),
+            false,
+            true,
+        )?;
+        assert_eq!(command.executable, "/custom/clang");
+        assert_eq!(
+            command.env_vars,
+            vec![("CARGO".to_owned(), "/host/cargo".to_owned())]
+        );
+        assert_eq!(archive, Some(PathBuf::from("/custom/toolchain.tar.gz")));
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 #[cfg(feature = "dist-client")]
 mod test_dist {
@@ -3670,7 +3823,7 @@ mod test_dist {
             _: PathBuf,
             _: String,
             _: Box<dyn pkg::ToolchainPackager>,
-        ) -> Result<(Toolchain, Option<(String, PathBuf)>)> {
+        ) -> Result<(Toolchain, Option<dist::CustomToolchainOverride>)> {
             Err(anyhow!("MOCK: put toolchain failure"))
         }
         fn rewrite_includes_only(&self) -> bool {
@@ -3723,7 +3876,7 @@ mod test_dist {
             _: PathBuf,
             _: String,
             _: Box<dyn pkg::ToolchainPackager>,
-        ) -> Result<(Toolchain, Option<(String, PathBuf)>)> {
+        ) -> Result<(Toolchain, Option<dist::CustomToolchainOverride>)> {
             Ok((self.tc.clone(), None))
         }
         fn rewrite_includes_only(&self) -> bool {
@@ -3793,7 +3946,7 @@ mod test_dist {
             _: PathBuf,
             _: String,
             _: Box<dyn pkg::ToolchainPackager>,
-        ) -> Result<(Toolchain, Option<(String, PathBuf)>)> {
+        ) -> Result<(Toolchain, Option<dist::CustomToolchainOverride>)> {
             Ok((self.tc.clone(), None))
         }
         fn rewrite_includes_only(&self) -> bool {
@@ -3865,13 +4018,14 @@ mod test_dist {
             _: PathBuf,
             _: String,
             _: Box<dyn pkg::ToolchainPackager>,
-        ) -> Result<(Toolchain, Option<(String, PathBuf)>)> {
+        ) -> Result<(Toolchain, Option<dist::CustomToolchainOverride>)> {
             Ok((
                 self.tc.clone(),
-                Some((
-                    "/overridden/compiler".to_owned(),
-                    PathBuf::from("somearchiveid"),
-                )),
+                Some(dist::CustomToolchainOverride {
+                    compiler_executable: "/overridden/compiler".to_owned(),
+                    archive: PathBuf::from("somearchiveid"),
+                    cargo_executable: None,
+                }),
             ))
         }
         fn rewrite_includes_only(&self) -> bool {
@@ -3963,13 +4117,14 @@ mod test_dist {
             _: PathBuf,
             _: String,
             _: Box<dyn pkg::ToolchainPackager>,
-        ) -> Result<(Toolchain, Option<(String, PathBuf)>)> {
+        ) -> Result<(Toolchain, Option<dist::CustomToolchainOverride>)> {
             Ok((
                 self.tc.clone(),
-                Some((
-                    "/overridden/compiler".to_owned(),
-                    PathBuf::from("somearchiveid"),
-                )),
+                Some(dist::CustomToolchainOverride {
+                    compiler_executable: "/overridden/compiler".to_owned(),
+                    archive: PathBuf::from("somearchiveid"),
+                    cargo_executable: None,
+                }),
             ))
         }
         fn rewrite_includes_only(&self) -> bool {

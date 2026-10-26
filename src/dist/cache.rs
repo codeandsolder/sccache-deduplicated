@@ -14,8 +14,8 @@ use std::io::Read;
 #[cfg(feature = "dist-client")]
 mod client {
     use crate::config;
-    use crate::dist::Toolchain;
     use crate::dist::pkg::ToolchainPackager;
+    use crate::dist::{CustomToolchainOverride, Toolchain};
     use crate::lru_disk_cache::Error as LruError;
     use anyhow::{Context, Error, Result, bail};
     use fs_err as fs;
@@ -30,6 +30,7 @@ mod client {
     pub struct CustomToolchain {
         archive: PathBuf,
         compiler_executable: String,
+        cargo_executable: Option<String>,
     }
 
     // TODO: possibly shouldn't be public
@@ -110,6 +111,7 @@ mod client {
                         compiler_executable,
                         archive,
                         archive_compiler_executable,
+                        archive_cargo_executable,
                     } => {
                         debug!(
                             "Registering custom toolchain for {}",
@@ -118,6 +120,7 @@ mod client {
                         let custom_tc = CustomToolchain {
                             archive: archive.clone(),
                             compiler_executable: archive_compiler_executable.clone(),
+                            cargo_executable: archive_cargo_executable.clone(),
                         };
                         if custom_toolchain_paths
                             .insert(compiler_executable.clone(), (custom_tc, None))
@@ -202,7 +205,7 @@ mod client {
             compiler_path: &Path,
             weak_key: &str,
             toolchain_packager: Box<dyn ToolchainPackager>,
-        ) -> Result<(Toolchain, Option<(String, PathBuf)>)> {
+        ) -> Result<(Toolchain, Option<CustomToolchainOverride>)> {
             if self.disabled_toolchains.contains(compiler_path) {
                 bail!(
                     "Toolchain distribution for {} is disabled",
@@ -211,8 +214,8 @@ mod client {
             }
             if let Some(tc_and_paths) = self.get_custom_toolchain(compiler_path) {
                 debug!("Using custom toolchain for {}", compiler_path.display());
-                let (tc, compiler_path, archive) = tc_and_paths?;
-                return Ok((tc, Some((compiler_path, archive))));
+                let (tc, toolchain_override) = tc_and_paths?;
+                return Ok((tc, Some(toolchain_override)));
             }
             // Only permit one toolchain creation at a time, without holding the LRU
             // cache mutex across potentially slow packaging I/O.
@@ -268,7 +271,7 @@ mod client {
         pub fn get_custom_toolchain(
             &self,
             compiler_path: &Path,
-        ) -> Option<Result<(Toolchain, String, PathBuf)>> {
+        ) -> Option<Result<(Toolchain, CustomToolchainOverride)>> {
             let new_toolchain = {
                 let Ok(mut custom_toolchain_paths) = self.custom_toolchain_paths.lock() else {
                     return Some(Err(anyhow::anyhow!("custom toolchain path mutex poisoned")));
@@ -277,8 +280,11 @@ mod client {
                     Some((custom_tc, Some(tc))) => {
                         return Some(Ok((
                             tc.clone(),
-                            custom_tc.compiler_executable.clone(),
-                            custom_tc.archive.clone(),
+                            CustomToolchainOverride {
+                                compiler_executable: custom_tc.compiler_executable.clone(),
+                                archive: custom_tc.archive.clone(),
+                                cargo_executable: custom_tc.cargo_executable.clone(),
+                            },
                         )));
                     }
                     Some((custom_tc, maybe_tc @ None)) => {
@@ -290,17 +296,20 @@ mod client {
                         *maybe_tc = Some(tc.clone());
                         (
                             tc,
-                            custom_tc.compiler_executable.clone(),
-                            custom_tc.archive.clone(),
+                            CustomToolchainOverride {
+                                compiler_executable: custom_tc.compiler_executable.clone(),
+                                archive: custom_tc.archive.clone(),
+                                cargo_executable: custom_tc.cargo_executable.clone(),
+                            },
                         )
                     }
                     None => return None,
                 }
             };
 
-            let (tc, compiler_executable, archive) = new_toolchain;
+            let (tc, toolchain_override) = new_toolchain;
             let old_path = match self.custom_toolchain_archives.lock() {
-                Ok(mut archives) => archives.insert(tc.clone(), archive.clone()),
+                Ok(mut archives) => archives.insert(tc.clone(), toolchain_override.archive.clone()),
                 Err(_) => {
                     return Some(Err(anyhow::anyhow!(
                         "custom toolchain archive mutex poisoned"
@@ -309,15 +318,15 @@ mod client {
             };
             // If this entry already exists, someone has two custom toolchains with the same strong hash.
             if let Some(old_path) = old_path
-                && old_path != archive
+                && old_path != toolchain_override.archive
             {
                 warn!(
                     "Detected interchangeable toolchain archives at {} and {}",
                     old_path.display(),
-                    archive.display()
+                    toolchain_override.archive.display()
                 );
             }
-            Some(Ok((tc, compiler_executable, archive)))
+            Some(Ok((tc, toolchain_override)))
         }
 
         fn weak_to_strong(&self, weak_key: &str) -> Result<Option<String>> {
@@ -351,7 +360,7 @@ mod client {
         use anyhow::{Result, anyhow};
         use std::io::Write;
 
-        use super::ClientToolchains;
+        use super::{ClientToolchains, CustomToolchainOverride};
 
         #[cfg(all(
             target_os = "linux",
@@ -469,6 +478,7 @@ mod client {
                     compiler_executable: "/my/compiler".into(),
                     archive: ct1.clone(),
                     archive_compiler_executable: "/my/compiler/in_archive".into(),
+                    archive_cargo_executable: Some("/my/cargo/in_archive".into()),
                 }],
             )?;
 
@@ -479,7 +489,11 @@ mod client {
             )?;
             assert_eq!(
                 newpath.ok_or_else(|| anyhow!("missing custom toolchain path"))?,
-                ("/my/compiler/in_archive".to_string(), ct1)
+                CustomToolchainOverride {
+                    compiler_executable: "/my/compiler/in_archive".to_owned(),
+                    archive: ct1,
+                    cargo_executable: Some("/my/cargo/in_archive".to_owned()),
+                }
             );
             Ok(())
         }
@@ -498,18 +512,21 @@ mod client {
                         compiler_executable: "/my/compiler".into(),
                         archive: ct1.clone(),
                         archive_compiler_executable: "/my/compiler/in_archive".into(),
+                        archive_cargo_executable: None,
                     },
                     // Uses the same archive, but a maps a different external compiler to a different archive compiler
                     config::DistToolchainConfig::PathOverride {
                         compiler_executable: "/my/compiler2".into(),
                         archive: ct1.clone(),
                         archive_compiler_executable: "/my/compiler2/in_archive".into(),
+                        archive_cargo_executable: None,
                     },
                     // Uses the same archive, but a maps a different external compiler to the same archive compiler as the first
                     config::DistToolchainConfig::PathOverride {
                         compiler_executable: "/my/compiler3".into(),
                         archive: ct1.clone(),
                         archive_compiler_executable: "/my/compiler/in_archive".into(),
+                        archive_cargo_executable: None,
                     },
                 ],
             )?;
@@ -521,7 +538,11 @@ mod client {
             )?;
             assert_eq!(
                 newpath.ok_or_else(|| anyhow!("missing custom toolchain path"))?,
-                ("/my/compiler/in_archive".to_string(), ct1.clone())
+                CustomToolchainOverride {
+                    compiler_executable: "/my/compiler/in_archive".to_owned(),
+                    archive: ct1.clone(),
+                    cargo_executable: None,
+                }
             );
             let (_tc, newpath) = client_toolchains.put_toolchain(
                 "/my/compiler2".as_ref(),
@@ -530,7 +551,11 @@ mod client {
             )?;
             assert_eq!(
                 newpath.ok_or_else(|| anyhow!("missing custom toolchain path"))?,
-                ("/my/compiler2/in_archive".to_string(), ct1.clone())
+                CustomToolchainOverride {
+                    compiler_executable: "/my/compiler2/in_archive".to_owned(),
+                    archive: ct1.clone(),
+                    cargo_executable: None,
+                }
             );
             let (_tc, newpath) = client_toolchains.put_toolchain(
                 "/my/compiler3".as_ref(),
@@ -539,7 +564,11 @@ mod client {
             )?;
             assert_eq!(
                 newpath.ok_or_else(|| anyhow!("missing custom toolchain path"))?,
-                ("/my/compiler/in_archive".to_string(), ct1)
+                CustomToolchainOverride {
+                    compiler_executable: "/my/compiler/in_archive".to_owned(),
+                    archive: ct1,
+                    cargo_executable: None,
+                }
             );
             Ok(())
         }
@@ -582,6 +611,7 @@ mod client {
                         compiler_executable: "/my/compiler".into(),
                         archive: ct1,
                         archive_compiler_executable: "/my/compiler".into(),
+                        archive_cargo_executable: None,
                     },
                     config::DistToolchainConfig::NoDist {
                         compiler_executable: "/my/compiler".into(),

@@ -3259,17 +3259,14 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                         }
                         "CARGO" => {
                             // Cargo can export a site wrapper or rustup proxy that is outside
-                            // the packaged sysroot. Proc macros may execute CARGO (for example,
-                            // proc-macro-crate runs `cargo locate-project`), so point workers at
-                            // the Cargo binary that is actually present in the toolchain archive.
-                            let Some(cargo) = rust_dist_cargo_executable(sysroot) else {
-                                debug!(
-                                    "Cannot distribute Rust compile: Cargo is missing from sysroot {}",
-                                    sysroot.display()
-                                );
-                                return None;
-                            };
-                            *v = path_transformer.as_dist(&cargo)?;
+                            // the packaged sysroot. Prefer the Cargo binary in the automatic
+                            // package when present. If it is absent, leave the value untouched
+                            // for now: a configured custom toolchain may replace it after
+                            // toolchain selection. The automatic path is rejected later if no
+                            // suitable custom override is selected.
+                            if let Some(cargo) = rust_dist_cargo_executable(sysroot) {
+                                *v = path_transformer.as_dist(&cargo)?;
+                            }
                         }
                         "CARGO_MANIFEST_DIR" => {
                             *v = path_transformer.as_dist(Path::new(v))?;
@@ -3326,6 +3323,22 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
         })();
 
         Ok((command, dist_command, Cacheable::Yes))
+    }
+
+    #[cfg(feature = "dist-client")]
+    fn dist_command_uses_cargo(&self) -> bool {
+        self.env_vars
+            .iter()
+            .any(|(key, _)| key == std::ffi::OsStr::new("CARGO"))
+    }
+
+    #[cfg(feature = "dist-client")]
+    fn automatic_dist_toolchain_is_ready(&self) -> bool {
+        let uses_cargo = self
+            .env_vars
+            .iter()
+            .any(|(key, _)| key == std::ffi::OsStr::new("CARGO"));
+        !uses_cargo || rust_dist_cargo_executable(&self.sysroot).is_some()
     }
 
     #[cfg(feature = "dist-client")]
@@ -5793,7 +5806,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
 
     #[test]
     #[cfg(feature = "dist-client")]
-    fn test_noncanonical_dist_without_packaged_cargo_falls_back_local() -> Result<()> {
+    fn test_noncanonical_dist_without_packaged_cargo_defers_toolchain_decision() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let sysroot = temp.path().join("sysroot");
         fs::create_dir_all(sysroot.join(BINS_DIR))?;
@@ -5845,7 +5858,17 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 &mut transformer,
                 false,
             )?;
-        assert!(dist_command.is_none());
+        assert!(dist_command.is_some());
+        assert!(
+            <RustCompilation as Compilation<ProcessCommandCreator>>::dist_command_uses_cargo(
+                &compilation,
+            )
+        );
+        assert!(
+            !<RustCompilation as Compilation<ProcessCommandCreator>>::automatic_dist_toolchain_is_ready(
+                &compilation,
+            )
+        );
         Ok(())
     }
 

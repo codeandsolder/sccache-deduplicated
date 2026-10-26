@@ -590,6 +590,13 @@ pub struct CompileCommand {
     pub cwd: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomToolchainOverride {
+    pub compiler_executable: String,
+    pub archive: PathBuf,
+    pub cargo_executable: Option<String>,
+}
+
 // process::Output is not serialize so we have a custom Output type. However,
 // we cannot encode all information in here, such as Unix signals, as the other
 // end may not understand them (e.g. if it's Windows)
@@ -928,7 +935,7 @@ pub trait Client: Send + Sync {
         compiler_path: PathBuf,
         weak_key: String,
         toolchain_packager: Box<dyn pkg::ToolchainPackager>,
-    ) -> Result<(Toolchain, Option<(String, PathBuf)>)>;
+    ) -> Result<(Toolchain, Option<CustomToolchainOverride>)>;
     fn rewrite_includes_only(&self) -> bool;
     fn get_custom_toolchain(&self, exe: &Path) -> Option<PathBuf>;
 }

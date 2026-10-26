@@ -100,6 +100,7 @@ type = "path_override"
 compiler_executable = "/usr/local/bin/rustc"
 archive = "/path/to/rust-toolchain.tgz"
 archive_compiler_executable = "/usr/local/bin/rustc"
+archive_cargo_executable = "/usr/local/bin/cargo"
 ```
 
 Creating toolchain archives
