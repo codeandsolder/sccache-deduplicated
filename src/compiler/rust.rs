@@ -902,13 +902,21 @@ fn compilation_target(arguments: &[Argument<ArgData>], host: &str) -> String {
     host.to_owned()
 }
 
-fn dist_toolchain_weak_key(
+// Bump this whenever RustToolchainPackager changes which files it archives or
+// where they appear. The weak map persists across sccache upgrades, so the
+// package format must participate in the weak key independently of compile
+// cache versioning.
+const RUST_DIST_TOOLCHAIN_PACKAGE_SCHEMA: &[u8] = b"rust-dist-toolchain-package-v1";
+
+fn dist_toolchain_weak_key_with_schema(
     base: &Digest,
+    package_schema: &[u8],
     target: &str,
     target_std_manifest_digest: Option<&str>,
     noncanonical_sysroot: Option<&Path>,
 ) -> String {
     let mut weak = base.clone();
+    weak.update(package_schema);
     weak.update(b"rust-dist-toolchain-target-v1");
     if let Some(sysroot) = noncanonical_sysroot {
         weak.update(b"noncanonical-sysroot-v1");
@@ -923,6 +931,21 @@ fn dist_toolchain_weak_key(
         None => weak.update(b"target-std-missing"),
     }
     weak.finish()
+}
+
+fn dist_toolchain_weak_key(
+    base: &Digest,
+    target: &str,
+    target_std_manifest_digest: Option<&str>,
+    noncanonical_sysroot: Option<&Path>,
+) -> String {
+    dist_toolchain_weak_key_with_schema(
+        base,
+        RUST_DIST_TOOLCHAIN_PACKAGE_SCHEMA,
+        target,
+        target_std_manifest_digest,
+        noncanonical_sysroot,
+    )
 }
 
 fn rewrite_native_target_cpu(
@@ -6557,6 +6580,15 @@ version='2.0.0'
         assert_ne!(host, wasm);
         assert_ne!(wasm_missing, wasm);
         assert_eq!(wasm, wasm_repeated);
+
+        let previous_package_schema = dist_toolchain_weak_key_with_schema(
+            &base,
+            b"rust-dist-toolchain-package-v0",
+            "x86_64-unknown-linux-gnu",
+            Some("host-std-digest"),
+            None,
+        );
+        assert_ne!(host, previous_package_schema);
 
         let root_toolchain = dist_toolchain_weak_key(
             &base,
