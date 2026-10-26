@@ -13,10 +13,11 @@ on:
         required: true
         type: string
   workflow_run:
-    workflows: ["ci"]
+    workflows: ["ci", "Strict Rust"]
     types: [completed]
 
 permissions:
+  actions: read
   contents: write
 
 concurrency:
@@ -24,11 +25,46 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-publish:
+  required-gates:
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' &&
+      (github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      ready: ${{ steps.gates.outputs.ready }}
+    steps:
+      - name: Check required workflow gates
+        id: gates
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          sha="${{ github.event.workflow_run.head_sha }}"
+          ready=true
+          for workflow in ci.yml rust-skills2-strict.yml; do
+            conclusion="$(
+              gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?head_sha=$sha&event=push&per_page=20" |
+                jq -r --arg sha "$sha" '[.workflow_runs[] | select(.head_sha == $sha)] | sort_by(.run_number) | last | .conclusion // ""'
+            )"
+            echo "$workflow: ${conclusion:-not completed}"
+            if [[ "$conclusion" != "success" ]]; then
+              ready=false
+            fi
+          done
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
+
+  build-publish:
+    needs: required-gates
+    if: needs.required-gates.outputs.ready == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
