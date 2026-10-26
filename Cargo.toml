@@ -261,7 +261,7 @@ dist-server = [
 dist-tests = ["dist-client", "dist-server"]
 
 [workspace]
-exclude = ["tests/test-crate"]
+exclude = ["tests/test-crate", "vendor/tiny_http"]
 members = ["tests/integration/randomize_readdir"]
 
 [[bench]]
@@ -282,3 +282,6 @@ ptr_as_ptr = "warn"
 ref_option = "warn"
 semicolon_if_nothing_returned = "warn"
 unnecessary_semicolon = "warn"
+
+[patch.crates-io]
+tiny_http = { path = "vendor/tiny_http" }
