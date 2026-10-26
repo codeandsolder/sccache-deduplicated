@@ -27,7 +27,9 @@ use std::sync::Mutex;
 
 #[cfg(feature = "dist-server")]
 use crate::errors::Error;
-use crate::errors::{Result, bail};
+use crate::errors::Result;
+#[cfg(unix)]
+use crate::errors::bail;
 
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 mod cache;
@@ -93,6 +95,12 @@ mod path_transform {
     pub struct PathTransformer {
         dist_to_local_path: HashMap<String, PathBuf>,
         root_mappings: Vec<(PathBuf, String)>,
+    }
+
+    impl Default for PathTransformer {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl PathTransformer {
@@ -180,7 +188,7 @@ mod path_transform {
         pub fn disk_mappings(&self) -> impl Iterator<Item = (PathBuf, String)> {
             let mut normal_mappings = HashMap::new();
             let mut verbatim_mappings = HashMap::new();
-            for (_dist_path, local_path) in self.dist_to_local_path.iter() {
+            for local_path in self.dist_to_local_path.values() {
                 if !local_path.is_absolute() {
                     continue;
                 }
@@ -339,6 +347,12 @@ mod path_transform {
         root_mappings: Vec<(PathBuf, String)>,
     }
 
+    impl Default for PathTransformer {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl PathTransformer {
         #[must_use]
         pub fn new() -> Self {
@@ -416,12 +430,6 @@ mod path_transform {
                 }
             }
             Ok(PathBuf::from(p))
-        }
-    }
-
-    impl Default for PathTransformer {
-        fn default() -> Self {
-            Self::new()
         }
     }
 

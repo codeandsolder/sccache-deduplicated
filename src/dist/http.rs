@@ -1314,7 +1314,7 @@ mod client {
         scheduler_url: reqwest::Url,
         // cert_digest -> cert_pem
         server_certs: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
-        http_client: Arc<Mutex<reqwest::Client>>,
+        http: Arc<Mutex<reqwest::Client>>,
         pool: tokio::runtime::Handle,
         tc_cache: Arc<cache::ClientToolchains>,
         rewrite_includes_only: bool,
@@ -1352,7 +1352,7 @@ mod client {
                 auth_token,
                 scheduler_url,
                 server_certs: Arc::default(),
-                http_client: Arc::new(Mutex::new(client)),
+                http: Arc::new(Mutex::new(client)),
                 pool: pool.clone(),
                 tc_cache: Arc::new(client_toolchains),
                 rewrite_includes_only,
@@ -1399,14 +1399,14 @@ mod client {
             let url = urls::scheduler_alloc_job(&scheduler_url)?;
             let mut req = {
                 let client = self
-                    .http_client
+                    .http
                     .lock()
                     .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
                 client.post(url)
             };
             req = req.bearer_auth(self.auth_token.clone()).bincode(&tc)?;
 
-            let http_client = self.http_client.clone();
+            let http_client = self.http.clone();
             let server_certs = self.server_certs.clone();
 
             match bincode_req_fut(req).await? {
@@ -1479,7 +1479,7 @@ mod client {
             let url = urls::scheduler_status(&scheduler_url)?;
             let req = {
                 let client = self
-                    .http_client
+                    .http
                     .lock()
                     .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
                 client.get(url)
@@ -1497,7 +1497,7 @@ mod client {
                     let url = urls::server_submit_toolchain(job_alloc.server_id, job_alloc.job_id)?;
                     let req = {
                         let client = self
-                            .http_client
+                            .http
                             .lock()
                             .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
                         client.post(url)
@@ -1555,7 +1555,7 @@ mod client {
                 .await??;
             let mut req = {
                 let client = self
-                    .http_client
+                    .http
                     .lock()
                     .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
                 client.post(url)

@@ -21,7 +21,10 @@ impl Display for ArgParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             Self::UnexpectedEndOfArgs => "Unexpected end of args".into(),
-            Self::InvalidUnicode(s) => format!("String {s:?} contained invalid unicode"),
+            Self::InvalidUnicode(s) => format!(
+                "String {} contained invalid unicode",
+                crate::util::debug_display(&s)
+            ),
             Self::Other(s) => format!("Arg-specific parsing failed: {s}"),
         };
         write!(f, "{s}")
@@ -44,10 +47,16 @@ impl Display for ArgToStringError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             Self::FailedPathTransform(p) => {
-                format!("Path {p:?} could not be transformed")
+                format!(
+                    "Path {} could not be transformed",
+                    crate::util::debug_display(&p)
+                )
             }
             Self::InvalidUnicode(s) => {
-                format!("String {s:?} contained invalid unicode")
+                format!(
+                    "String {} contained invalid unicode",
+                    crate::util::debug_display(&s)
+                )
             }
         };
         write!(f, "{s}")
@@ -102,6 +111,10 @@ pub enum NormalizedDisposition {
 impl<T: ArgumentValue> Argument<T> {
     /// For arguments that allow both a concatenated or separated disposition,
     /// normalize a parsed argument to a preferred disposition.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "normalization consumes and returns the parsed argument so owned payloads are reused without cloning"
+    )]
     pub fn normalize(self, disposition: NormalizedDisposition) -> Self {
         match self {
             Self::WithValue(

@@ -379,9 +379,14 @@ where
     })
 }
 
+type ParsedDepFile = (Vec<PathBuf>, Vec<(OsString, OsString)>);
+type CpuCacheKey = (PathBuf, String, String);
+type CpuProfileCache = std::sync::Mutex<HashMap<CpuCacheKey, String>>;
+type CpuCfgFeatureCache = std::sync::Mutex<HashMap<CpuCacheKey, BTreeSet<String>>>;
+
 /// Parse dependency info from `file` and return a Vec of files mentioned.
 /// Treat paths as relative to `cwd`.
-fn parse_dep_file<T, U>(file: T, cwd: U) -> Result<(Vec<PathBuf>, Vec<(OsString, OsString)>)>
+fn parse_dep_file<T, U>(file: T, cwd: U) -> Result<ParsedDepFile>
 where
     T: AsRef<Path>,
     U: AsRef<Path>,
@@ -546,6 +551,10 @@ struct RustShadowOutput {
     optional: bool,
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "shadow telemetry keeps independent boolean fields explicit because their serialized names are part of the diagnostic schema"
+)]
 #[derive(Serialize)]
 struct RustShadowRecord {
     schema: u32,
@@ -731,8 +740,8 @@ fn rust_shadow_args(args: &[(OsString, Option<OsString>)]) -> Vec<String> {
         .collect()
 }
 
-fn rust_shadow_roots(canonical: Option<&CanonicalRustPaths>) -> Option<RustShadowRoots> {
-    canonical.map(|canonical| RustShadowRoots {
+fn rust_shadow_root(canonical: &CanonicalRustPaths) -> RustShadowRoots {
+    RustShadowRoots {
         build_root: canonical.build_root.to_string_lossy().into_owned(),
         target_root: canonical.target_root.to_string_lossy().into_owned(),
         cargo_home: canonical
@@ -740,7 +749,7 @@ fn rust_shadow_roots(canonical: Option<&CanonicalRustPaths>) -> Option<RustShado
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned()),
         rust_root: canonical.rust_root.to_string_lossy().into_owned(),
-    })
+    }
 }
 
 fn append_rust_shadow_record(path: &Path, record: &RustShadowRecord) {
@@ -801,12 +810,11 @@ fn append_rust_shadow_record(path: &Path, record: &RustShadowRecord) {
     }
 }
 
-static CPU_PROFILE_CACHE: LazyLock<std::sync::Mutex<HashMap<(PathBuf, String, String), String>>> =
+static CPU_PROFILE_CACHE: LazyLock<CpuProfileCache> =
     LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
-static CPU_CFG_FEATURE_CACHE: LazyLock<
-    std::sync::Mutex<HashMap<(PathBuf, String, String), BTreeSet<String>>>,
-> = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+static CPU_CFG_FEATURE_CACHE: LazyLock<CpuCfgFeatureCache> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 fn native_target_requested(arguments: &[Argument<ArgData>]) -> bool {
     arguments.iter().rev().find_map(|arg| match arg.get_data() {
@@ -1164,7 +1172,12 @@ impl Rust {
             let sysroot = PathBuf::from(outstr.trim_end());
             let libs_path = sysroot.join(LIBS_DIR);
             let mut libs = fs::read_dir(&libs_path)
-                .with_context(|| format!("Failed to list rustc sysroot: `{libs_path:?}`"))?
+                .with_context(|| {
+                    format!(
+                        "Failed to list rustc sysroot: `{}`",
+                        crate::util::debug_display(&libs_path)
+                    )
+                })?
                 .filter_map(|e| {
                     e.ok().and_then(|e| {
                         e.file_type().ok().and_then(|t| {
@@ -1181,7 +1194,10 @@ impl Rust {
                 })
                 .collect::<Vec<_>>();
             if let Some(path) = dist_archive {
-                trace!("Hashing {path:?} along with rustc libs.");
+                trace!(
+                    "Hashing {} along with rustc libs.",
+                    crate::util::debug_display(&path)
+                );
                 libs.push(path);
             }
             libs.sort();
@@ -1315,7 +1331,10 @@ where
                 .context("Failed to parse output of rustup which rustc")?;
 
             let proxied_compiler = PathBuf::from(stdout.trim());
-            trace!("proxy: rustup which rustc produced: {proxied_compiler:?}");
+            trace!(
+                "proxy: rustup which rustc produced: {}",
+                crate::util::debug_display(&proxied_compiler)
+            );
             // TODO: Delegate FS access to a thread pool if possible
             let attr = fs::metadata(proxied_compiler.as_path())
                 .context("Failed to obtain metadata of the resolved, true rustc")?;
@@ -1337,12 +1356,12 @@ where
 }
 
 impl RustupProxy {
-    pub fn new<P>(proxy_executable: P) -> Result<Self>
+    pub fn new<P>(proxy_executable: P) -> Self
     where
         P: AsRef<Path>,
     {
         let proxy_executable = proxy_executable.as_ref().to_owned();
-        Ok(Self { proxy_executable })
+        Self { proxy_executable }
     }
 
     pub async fn find_proxy_executable<T>(
@@ -1399,8 +1418,9 @@ impl RustupProxy {
             Ok(ProxyPath::ToBeDiscovered) => {
                 // simple check: is there a rustup in the same parent dir as rustc?
                 // that would be the preferred one
-                Ok(match compiler_executable.parent().map(Path::to_owned) {
-                    Some(parent) => {
+                Ok(compiler_executable.parent().map(Path::to_owned).map_or(
+                    ProxyPath::ToBeDiscovered,
+                    |parent| {
                         let proxy_candidate = parent.join(proxy_name);
                         if proxy_candidate.exists() {
                             trace!(
@@ -1411,9 +1431,8 @@ impl RustupProxy {
                         } else {
                             ProxyPath::ToBeDiscovered
                         }
-                    }
-                    None => ProxyPath::ToBeDiscovered,
-                })
+                    },
+                ))
             }
             x => x,
         };
@@ -1453,7 +1472,7 @@ impl RustupProxy {
                     .map_err(|_e| anyhow!("Response of `rustup --version` is not valid UTF-8"))?;
                 Ok(if stdout.trim().starts_with("rustup ") {
                     trace!("PROXY rustup --version produced: {stdout}");
-                    Self::new(&proxy_executable).map(Some)
+                    Ok(Some(Self::new(&proxy_executable)))
                 } else {
                     Err(anyhow!("Unexpected output or `rustup --version`"))
                 })
@@ -1858,6 +1877,10 @@ impl Iterator for ExpandResponseFile<'_> {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass argument parser keeps interdependent flag state and ordering visible; splitting would require a state bag threaded through helpers"
+)]
 fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<ParsedArguments> {
     let mut args = vec![];
 
@@ -2038,9 +2061,7 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     // Unwrap required values.
     macro_rules! req {
         ($x:ident) => {
-            let $x = if let Some($x) = $x {
-                $x
-            } else {
+            let Some($x) = $x else {
                 debug!("Can't cache compilation, missing `{}`", stringify!($x));
                 cannot_cache!(concat!("missing ", stringify!($x)));
             };
@@ -2151,6 +2172,10 @@ impl<T> CompilerHasher<T> for RustHasher
 where
     T: CommandCreatorSync,
 {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Rust cache-key construction is an ordered cache-key ABI; keeping every hashed input in one pipeline makes omissions and reordering auditable"
+    )]
     async fn generate_hash_key(
         &mut self,
         context: GenerateHashKeyContext<'_, T>,
@@ -2353,7 +2378,7 @@ where
                     Some((arg, val))
                 }
             })
-            .flat_map(|(arg, val)| Some(arg).into_iter().chain(val))
+            .flat_map(|(arg, val)| std::iter::once(arg).chain(val))
             .cloned()
             .collect::<Vec<_>>();
         // Find all the source files and hash them
@@ -2702,7 +2727,11 @@ where
                 .all(|e| e == "metadata" || e == "dep-info");
 
         if emit_generates_only_metadata {
-            outputs.retain(|o| o.ends_with(".rlib") || o.ends_with(".rmeta"));
+            outputs.retain(|o| {
+                Path::new(o)
+                    .extension()
+                    .is_some_and(|ext| ext == "rlib" || ext == "rmeta")
+            });
         }
 
         if self.parsed_args.emit.contains("metadata") {
@@ -2711,7 +2740,7 @@ where
             // only the rlib is printed.
             let rlibs: HashSet<_> = outputs
                 .iter()
-                .filter(|&p| p.ends_with(".rlib"))
+                .filter(|&p| Path::new(p).extension().is_some_and(|ext| ext == "rlib"))
                 .cloned()
                 .collect();
             for lib in rlibs {
@@ -2873,7 +2902,7 @@ where
                     native_requested,
                     resolved_native_profile: resolved_native_profile.clone(),
                     canonical_enabled: canonical.is_some(),
-                    canonical_roots: rust_shadow_roots(canonical),
+                    canonical_roots: canonical.map(rust_shadow_root),
                     cwd_raw: cwd.to_string_lossy().into_owned(),
                     cwd_key: canonical
                         .map_or_else(|| cwd.clone(), |canonical| canonical.canonical_cwd(&cwd))
@@ -2948,6 +2977,10 @@ where
 }
 
 impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "local, canonical, and distributed Rust command construction share one argument transformation pipeline and ownership flow"
+    )]
     fn generate_compile_commands(
         &self,
         path_transformer: &mut dist::PathTransformer,
@@ -2971,6 +3004,9 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             ..
         } = *self;
 
+        #[cfg(not(target_os = "linux"))]
+        let _ = env_dep_names;
+
         // Ignore unused variables
         #[cfg(not(feature = "dist-client"))]
         {
@@ -2986,42 +3022,45 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             canonical.add_to_transformer(path_transformer);
         }
 
-        let command: Box<dyn CompileCommand<T>> = if let Some(canonical) = canonical_paths {
-            #[cfg(target_os = "linux")]
-            {
-                let sysroot_rustc = sysroot
-                    .join(BINS_DIR)
-                    .join("rustc")
-                    .with_extension(EXE_EXTENSION);
-                CCompileCommand::boxed(CanonicalRustCompileCommand {
-                    toolchain_executable: executable.to_owned(),
-                    runner_arguments: canonical_bwrap_arguments(
-                        canonical,
-                        &sysroot_rustc,
-                        arguments,
-                        cwd,
-                    ),
-                    env_vars: canonical.env_to_canonical_preserving(env_vars, env_dep_names),
-                    cwd: canonical.canonical_cwd(cwd),
-                })
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let _ = canonical;
-                bail!("experimental canonical Rust paths currently require Linux bubblewrap")
-            }
-        } else {
-            CCompileCommand::boxed(SingleCompileCommand {
-                executable: executable.to_owned(),
-                arguments: arguments
-                    .iter()
-                    .flat_map(|arg| arg.iter_os_strings())
-                    .collect(),
-                env_vars: env_vars.to_owned(),
-                cwd: cwd.to_owned(),
-                share_jobserver: true,
-            })
-        };
+        let command: Box<dyn CompileCommand<T>> = canonical_paths.as_ref().map_or_else(
+            || {
+                Ok::<_, anyhow::Error>(CCompileCommand::boxed(SingleCompileCommand {
+                    executable: executable.to_owned(),
+                    arguments: arguments
+                        .iter()
+                        .flat_map(|arg| arg.iter_os_strings())
+                        .collect(),
+                    env_vars: env_vars.to_owned(),
+                    cwd: cwd.to_owned(),
+                    share_jobserver: true,
+                }))
+            },
+            |canonical| {
+                #[cfg(target_os = "linux")]
+                {
+                    let sysroot_rustc = sysroot
+                        .join(BINS_DIR)
+                        .join("rustc")
+                        .with_extension(EXE_EXTENSION);
+                    Ok(CCompileCommand::boxed(CanonicalRustCompileCommand {
+                        toolchain_executable: executable.to_owned(),
+                        runner_arguments: canonical_bwrap_arguments(
+                            canonical,
+                            &sysroot_rustc,
+                            arguments,
+                            cwd,
+                        ),
+                        env_vars: canonical.env_to_canonical_preserving(env_vars, env_dep_names),
+                        cwd: canonical.canonical_cwd(cwd),
+                    }))
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = canonical;
+                    bail!("experimental canonical Rust paths currently require Linux bubblewrap")
+                }
+            },
+        )?;
 
         #[cfg(not(feature = "dist-client"))]
         let dist_command = None;
@@ -3217,7 +3256,10 @@ struct RustInputsPackager {
 
 #[cfg(feature = "dist-client")]
 fn can_trim_this(input_path: &Path) -> bool {
-    trace!("can_trim_this: input_path={input_path:?}");
+    trace!(
+        "can_trim_this: input_path={}",
+        crate::util::debug_display(input_path)
+    );
     // A dependency that also emits a linkable artifact is handed to its
     // dependents as a whole rlib rather than as metadata, so trimming it to
     // metadata strands the remote compile.
@@ -3477,6 +3519,10 @@ version = "6.1.0"
 
 #[cfg(feature = "dist-client")]
 impl pkg::InputsPackager for RustInputsPackager {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "toolchain input packaging is an ordered archive manifest; keeping path transforms beside emitted entries makes the archive contract auditable"
+    )]
     fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<dist::PathTransformer> {
         debug!("Packaging compile inputs for compile");
         let Self {
@@ -3869,6 +3915,8 @@ struct RlibDepReader {
 #[cfg(feature = "dist-client")]
 impl RlibDepReader {
     fn new_with_check(executable: PathBuf, env_vars: &[(OsString, OsString)]) -> Result<Self> {
+        const CACHE_SIZE: u64 = 3 * 1024 * 1024;
+
         let temp_dir = tempfile::Builder::new()
             .prefix("sccache-rlibreader")
             .tempdir()
@@ -3915,14 +3963,13 @@ impl RlibDepReader {
         //                 `2748` bytes per crate
         // Allowing for possible overhead of up to double (for unused space in allocated memory), this means we
         // can cache information from about 570 rlibs - easily enough for a single project.
-        const CACHE_SIZE: u64 = 3 * 1024 * 1024;
         let cache = LruCache::with_meter(CACHE_SIZE, DepsSize);
         let rustc_version = Self::get_rustc_version(&executable, env_vars)?;
 
         let rlib_dep_reader = Self {
             cache: Mutex::new(cache),
             executable,
-            ls_arg: Self::get_correct_ls_arg(rustc_version),
+            ls_arg: Self::get_correct_ls_arg(&rustc_version),
         };
         if let Err(e) = rlib_dep_reader.discover_rlib_deps(env_vars, &temp_rlib) {
             bail!("Failed to read deps from minimal rlib: {e}")
@@ -3973,7 +4020,7 @@ impl RlibDepReader {
         Ok(Version::parse(rustc_version[1])?)
     }
 
-    fn get_correct_ls_arg(version: Version) -> String {
+    fn get_correct_ls_arg(version: &Version) -> String {
         if version.major <= 1 && version.minor <= 74 {
             String::from("ls")
         } else {
@@ -5126,35 +5173,35 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
     #[test]
     fn test_rlib_dep_reader_get_correct_ls_arg() {
         assert_eq!(
-            RlibDepReader::get_correct_ls_arg(Version::new(0, 73, 0)),
+            RlibDepReader::get_correct_ls_arg(&Version::new(0, 73, 0)),
             "ls"
         );
         assert_eq!(
-            RlibDepReader::get_correct_ls_arg(Version::new(1, 73, 0)),
+            RlibDepReader::get_correct_ls_arg(&Version::new(1, 73, 0)),
             "ls"
         );
         assert_eq!(
-            RlibDepReader::get_correct_ls_arg(Version::new(1, 73, 1)),
+            RlibDepReader::get_correct_ls_arg(&Version::new(1, 73, 1)),
             "ls"
         );
         assert_eq!(
-            RlibDepReader::get_correct_ls_arg(Version::new(1, 74, 0)),
+            RlibDepReader::get_correct_ls_arg(&Version::new(1, 74, 0)),
             "ls"
         );
         assert_eq!(
-            RlibDepReader::get_correct_ls_arg(Version::new(1, 74, 1)),
+            RlibDepReader::get_correct_ls_arg(&Version::new(1, 74, 1)),
             "ls"
         );
         assert_eq!(
-            RlibDepReader::get_correct_ls_arg(Version::new(1, 75, 0)),
+            RlibDepReader::get_correct_ls_arg(&Version::new(1, 75, 0)),
             "ls=root"
         );
         assert_eq!(
-            RlibDepReader::get_correct_ls_arg(Version::new(2, 73, 0)),
+            RlibDepReader::get_correct_ls_arg(&Version::new(2, 73, 0)),
             "ls=root"
         );
         assert_eq!(
-            RlibDepReader::get_correct_ls_arg(Version::new(2, 74, 0)),
+            RlibDepReader::get_correct_ls_arg(&Version::new(2, 74, 0)),
             "ls=root"
         );
     }

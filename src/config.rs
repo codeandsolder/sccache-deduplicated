@@ -208,12 +208,13 @@ impl<'a> Deserialize<'a> for HTTPUrl {
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 fn parse_http_url(url: &str) -> Result<reqwest::Url> {
     use std::net::SocketAddr;
-    let url = if let Ok(sa) = url.parse::<SocketAddr>() {
-        warn!("Url {url} has no scheme, assuming http");
-        reqwest::Url::parse(&format!("http://{sa}"))
-    } else {
-        reqwest::Url::parse(url)
-    }?;
+    let url = url.parse::<SocketAddr>().map_or_else(
+        |_| reqwest::Url::parse(url),
+        |sa| {
+            warn!("Url {url} has no scheme, assuming http");
+            reqwest::Url::parse(&format!("http://{sa}"))
+        },
+    )?;
     if url.scheme() != "http" && url.scheme() != "https" {
         bail!("url not http or https")
     }
@@ -255,6 +256,10 @@ pub struct AzureCacheConfig {
 }
 
 /// Configuration switches for preprocessor cache mode.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each boolean is an independently named user configuration switch and must remain directly serializable"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(default)]
@@ -511,6 +516,12 @@ pub struct S3CapacityConfig {
 }
 
 impl S3CapacityConfig {
+    /// Validate managed S3 capacity settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when watermarks, intervals, heat decay, eviction
+    /// concurrency, or lease timing would make the capacity policy invalid.
     pub fn validate(&self) -> Result<()> {
         if self.low_watermark >= self.high_watermark {
             bail!("S3 managed cache low_watermark must be smaller than high_watermark");
@@ -648,6 +659,10 @@ impl CacheConfigs {
     /// If levels are specified, returns them in order with validation.
     /// If no levels specified and single remote cache, returns that single cache.
     /// If no levels and multiple caches, returns error.
+    /// # Errors
+    ///
+    /// Returns an error if the configured chain names an unknown or unconfigured
+    /// backend, or if a legacy single-cache configuration is ambiguous.
     pub fn get_cache_levels(self) -> Result<Vec<CacheType>> {
         if let Some(ml_config) = &self.multilevel {
             // Build caches in the order specified by multilevel chain
@@ -881,8 +896,18 @@ pub struct FileConfig {
 
 // If the file doesn't exist or we can't read it, log the issue and proceed. If the
 // config exists but doesn't parse then something is wrong - return an error.
+/// Read and parse a configuration file.
+///
+/// Missing or unreadable files are treated as absent and return `Ok(None)`.
+///
+/// # Errors
+///
+/// Returns an error when a present file cannot be parsed as the requested type.
 pub fn try_read_config_file<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
-    debug!("Attempting to read config file at {path:?}");
+    debug!(
+        "Attempting to read config file at {}",
+        crate::util::debug_display(path)
+    );
     let mut file = match File::open(path) {
         Ok(f) => f,
         Err(e) => {
@@ -1010,6 +1035,10 @@ fn skip_cache_check_from_env(environment: &Environment) -> Result<bool> {
     Ok(bool_from_env_var(environment, "SCCACHE_SKIP_CACHE_CHECK")?.unwrap_or(false))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "environment decoding mirrors the flat documented SCCACHE variable groups; keeping mappings contiguous makes names and defaults auditable"
+)]
 fn config_from_environment(environment: &Environment) -> Result<EnvConfig> {
     // ======= AWS =======
     let s3 = if let Some(bucket) = string_from_env_var(environment, "SCCACHE_BUCKET") {
@@ -1360,19 +1389,19 @@ fn config_from_environment(environment: &Environment) -> Result<EnvConfig> {
     }
 
     // ======= COS =======
-    let cos = string_from_env_var(environment, "SCCACHE_COS_BUCKET").and_then(|bucket| {
+    let cos = string_from_env_var(environment, "SCCACHE_COS_BUCKET").map(|bucket| {
         let endpoint = string_from_env_var(environment, "SCCACHE_COS_ENDPOINT");
         let key_prefix = key_prefix_from_env_var(environment, "SCCACHE_COS_KEY_PREFIX");
 
         let rw_mode = cache_mode_from_env_var(environment, "SCCACHE_COS_RW_MODE")
             .unwrap_or(CacheModeConfig::ReadWrite);
 
-        Some(COSCacheConfig {
+        COSCacheConfig {
             bucket,
             key_prefix,
             endpoint,
             rw_mode,
-        })
+        }
     });
 
     // ======= Local =======
@@ -1519,6 +1548,12 @@ pub struct Config {
 }
 
 impl Config {
+    /// Load the effective sccache configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid environment values or config-file contents,
+    /// an unresolvable config path, or an invalid base-directory configuration.
     pub fn load() -> Result<Self> {
         let environment = Environment::capture();
         Self::load_from_environment(&environment)
@@ -1666,6 +1701,12 @@ pub struct CachedConfig {
 }
 
 impl CachedConfig {
+    /// Load the persistent cached configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache lock is poisoned, the cached-config path
+    /// cannot be resolved, or the cached file cannot be created, read, or parsed.
     pub fn load() -> Result<Self> {
         let mut cached = CACHED_CONFIG
             .lock()
@@ -1686,6 +1727,12 @@ impl CachedConfig {
         Ok(Self { file_conf_path })
     }
 
+    /// Discard the in-process cached configuration and reload it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache lock is poisoned or loading the replacement
+    /// cached configuration fails.
     pub fn reload() -> Result<Self> {
         {
             let mut cached = CACHED_CONFIG
@@ -1696,6 +1743,12 @@ impl CachedConfig {
         Self::load()
     }
 
+    /// Run `f` against a stable snapshot of the cached configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache lock is poisoned, the cache is uninitialized,
+    /// or this handle was invalidated by a reload.
     pub fn with<F: FnOnce(&CachedFileConfig) -> T, T>(&self, f: F) -> Result<T> {
         let config = {
             let cached = CACHED_CONFIG
@@ -1714,6 +1767,12 @@ impl CachedConfig {
         Ok(f(&config))
     }
 
+    /// Mutate and persist the cached configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache lock is poisoned, the cache is uninitialized,
+    /// this handle was invalidated by a reload, or persisting the update fails.
     pub fn with_mut<F: FnOnce(&mut CachedFileConfig)>(&self, f: F) -> Result<()> {
         let mut cached = CACHED_CONFIG
             .lock()

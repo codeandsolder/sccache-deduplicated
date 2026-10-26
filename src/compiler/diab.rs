@@ -178,6 +178,10 @@ counted_array!(pub static ARGS: [ArgInfo<ArgData>; _] = [
 /// Otherwise, return `CompilerArguments::Ok(ParsedArguments)`, with
 /// the `ParsedArguments` struct containing information parsed from
 /// `arguments`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass argument parser keeps interdependent flag state and ordering visible; splitting would require a state bag threaded through helpers"
+)]
 pub fn parse_arguments<S>(
     arguments: &[OsString],
     cwd: &Path,

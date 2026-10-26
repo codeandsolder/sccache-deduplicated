@@ -45,7 +45,9 @@ use std::path::{Path, PathBuf};
 use std::process;
 use which::which_in;
 
-use crate::errors::{Context, Error, ProcessError, Result, anyhow, bail};
+#[cfg(test)]
+use crate::errors::bail;
+use crate::errors::{Context, Error, ProcessError, Result, anyhow};
 
 const NVCC_GENERATED_FILENAME_SUFFIXES: &[&str] = &[
     cicc::CICC_INPUT_SUFFIX,
@@ -290,6 +292,10 @@ impl CCompilerImpl for Nvcc {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "NVCC expands one logical compile into an ordered multi-stage command graph; keeping stage construction contiguous makes dependencies visible"
+)]
 pub fn generate_compile_commands(
     parsed_args: &ParsedArguments,
     executable: &Path,
@@ -644,6 +650,10 @@ struct NvccGroupContext<'a, T> {
     output_file_name: &'a OsStr,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "NVCC dry-run parsing carries stage/group state across lines; splitting would require duplicating the parser state machine"
+)]
 async fn group_nvcc_subcommands_by_compilation_stage<T>(
     context: NvccGroupContext<'_, T>,
 ) -> Result<Vec<Vec<NvccGeneratedSubcommand>>>
@@ -830,7 +840,7 @@ where
                 }
                 if args.contains(&preprocessor_flag) {
                     // Each preprocessor step represents the start of a new command group
-                    if let Some(out_file) = if cfg!(target_os = "windows") {
+                    if cfg!(target_os = "windows") {
                         args.iter()
                             .find(|x| x.starts_with("-Fi"))
                             .and_then(|x| x.strip_prefix("-Fi"))
@@ -850,21 +860,25 @@ where
                     // * .cpp1.ii - cicc/ptxas input
                     // * .cpp4.ii - cudafe++ input
                     .filter(|out_name| cicc::is_cicc_input(OsStr::new(out_name.as_str())))
-                    {
-                        let new_device_compile_group = vec![];
-                        device_compile_groups.insert(out_file.clone(), new_device_compile_group);
-                        (
-                            env_vars.clone(),
-                            Cacheable::No,
-                            device_compile_groups.get_mut(&out_file),
-                        )
-                    } else {
-                        (
-                            env_vars.clone(),
-                            Cacheable::No,
-                            Some(&mut cuda_front_end_group),
-                        )
-                    }
+                    .map_or_else(
+                        || {
+                            (
+                                env_vars.clone(),
+                                Cacheable::No,
+                                Some(&mut cuda_front_end_group),
+                            )
+                        },
+                        |out_file| {
+                            let new_device_compile_group = vec![];
+                            device_compile_groups
+                                .insert(out_file.clone(), new_device_compile_group);
+                            (
+                                env_vars.clone(),
+                                Cacheable::No,
+                                device_compile_groups.get_mut(&out_file),
+                            )
+                        },
+                    )
                 } else {
                     // Cache the host compiler calls, since we've marked the outer `nvcc` call
                     // as non-cacheable. This ensures `sccache nvcc ...` _always_ decomposes the
@@ -880,17 +894,15 @@ where
                     (
                         env_vars
                             .iter()
-                            .chain(
-                                [
-                                    // HACK: This compilation will look like a C/C++ compilation,
-                                    // but we want to report it in the stats as a CUDA compilation.
-                                    // The SccacheService API doesn't have a great way to specify this
-                                    // case, so we set a special envvar here that it can read when the
-                                    // compilation is finished.
-                                    ("__SCCACHE_THIS_IS_A_CUDA_COMPILATION__".into(), "".into()),
-                                ]
-                                .iter(),
-                            )
+                            .chain(std::iter::once(&(
+                                // HACK: This compilation will look like a C/C++ compilation,
+                                // but we want to report it in the stats as a CUDA compilation.
+                                // The SccacheService API doesn't have a great way to specify this
+                                // case, so we set a special envvar here that it can read when the
+                                // compilation is finished.
+                                "__SCCACHE_THIS_IS_A_CUDA_COMPILATION__".into(),
+                                "".into(),
+                            )))
                             .cloned()
                             .collect::<Vec<_>>(),
                         Cacheable::Yes,
@@ -1030,12 +1042,8 @@ where
         }
 
         match exe.file_stem().and_then(|s| s.to_str()) {
-            None => continue,
-            Some(exe_name) => {
-                if select_subcommand(exe_name) {
-                    lines.push((idx, exe, args));
-                }
-            }
+            Some(exe_name) if select_subcommand(exe_name) => lines.push((idx, exe, args)),
+            _ => {}
         }
     }
 
@@ -1264,8 +1272,9 @@ where
 
         if log_enabled!(log::Level::Trace) {
             trace!(
-                "[{}]: run_commands_sequential cwd={cwd:?}, cmd=\"{}\"",
+                "[{}]: run_commands_sequential cwd={}, cmd=\"{}\"",
                 output_file_name.to_string_lossy(),
+                crate::util::debug_display(cwd),
                 [vec![exe.to_string_lossy().into_owned()], args.clone()]
                     .concat()
                     .join(" ")
@@ -1301,10 +1310,16 @@ where
                         CompilerArguments::NotCompilation => Err(anyhow!("Not compilation")),
                         CompilerArguments::CannotCache(why, extra_info) => Err(extra_info
                             .map_or_else(
-                                || anyhow!("Cannot cache({why}): {resolved_exe:?} {args:?}"),
+                                || {
+                                    anyhow!(
+                                        "Cannot cache({why}): {} {args:?}",
+                                        crate::util::debug_display(&resolved_exe)
+                                    )
+                                },
                                 |desc| {
                                     anyhow!(
-                                        "Cannot cache({why}, {desc}): {resolved_exe:?} {args:?}"
+                                        "Cannot cache({why}, {desc}): {} {args:?}",
+                                        crate::util::debug_display(&resolved_exe)
                                     )
                                 },
                             )),
@@ -1316,7 +1331,10 @@ where
                                 cwd.to_owned(),
                                 env_vars
                                     .iter()
-                                    .chain([("SCCACHE_DIRECT".into(), "false".into())].iter())
+                                    .chain(std::iter::once(&(
+                                        "SCCACHE_DIRECT".into(),
+                                        "false".into(),
+                                    )))
                                     .cloned()
                                     .collect::<Vec<_>>(),
                             )

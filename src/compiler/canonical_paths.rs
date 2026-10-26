@@ -10,8 +10,8 @@ struct RootMapping {
 }
 
 impl RootMapping {
-    fn new(physical: PathBuf, canonical: &str) -> Self {
-        let mut aliases = vec![physical.clone()];
+    fn new(physical: &Path, canonical: &str) -> Self {
+        let mut aliases = vec![physical.to_path_buf()];
         if let Ok(real) = physical.canonicalize()
             && real != physical
         {
@@ -219,11 +219,11 @@ impl CanonicalRustPaths {
             .or_else(|| env_value(env, "HOME").map(|home| home.join(".cargo")));
 
         let mut roots = vec![
-            RootMapping::new(target_root.clone(), "/target"),
-            RootMapping::new(build_root.clone(), "/build"),
+            RootMapping::new(&target_root, "/target"),
+            RootMapping::new(&build_root, "/build"),
         ];
         if let Some(ref cargo_home) = cargo_home {
-            roots.push(RootMapping::new(cargo_home.clone(), "/cargo"));
+            roots.push(RootMapping::new(cargo_home, "/cargo"));
 
             // cargo-ephemeral can materialize registry sources outside
             // CARGO_HOME while keeping the persistent registry archives in
@@ -241,13 +241,13 @@ impl CanonicalRustPaths {
 
                 if physical_ephemeral != physical_persistent {
                     roots.push(RootMapping::new(
-                        ephemeral_registry_src,
+                        &ephemeral_registry_src,
                         "/cargo/registry/src",
                     ));
                 }
             }
         }
-        roots.push(RootMapping::new(rust_root.to_owned(), "/rust"));
+        roots.push(RootMapping::new(rust_root, "/rust"));
 
         Some(Self {
             roots,
@@ -437,11 +437,10 @@ impl CanonicalRustPaths {
                     push!("--ro-bind");
                 }
                 out.push(physical.as_os_str().to_owned());
-                out.push(virtual_path.as_os_str().to_owned());
             } else {
                 push!("--dir");
-                out.push(virtual_path.as_os_str().to_owned());
             }
+            out.push(virtual_path.as_os_str().to_owned());
         }
 
         // Set up the sandbox temporary filesystem before mounting declared

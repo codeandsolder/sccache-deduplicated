@@ -545,6 +545,10 @@ fn dash_clang_append(arg: OsString, args: &mut Vec<OsString>) {
     args.push(a);
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass argument parser keeps interdependent flag state and ordering visible; splitting would require a state bag threaded through helpers"
+)]
 pub fn parse_arguments(
     arguments: &[OsString],
     cwd: &Path,
@@ -952,7 +956,7 @@ fn normpath(path: &str) -> String {
     use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
     File::open(path)
         .and_then(|f| {
-            let handle = f.as_raw_handle() as _;
+            let handle = f.as_raw_handle();
             // SAFETY: `handle` belongs to the live `File`; a null output buffer with
             // length zero is the documented size-query form and stores no pointer.
             let size = unsafe { GetFinalPathNameByHandleW(handle, ptr::null_mut(), 0, 0) };
@@ -1091,11 +1095,19 @@ where
         let f = File::create(cwd.join(depfile))?;
         let mut f = BufWriter::new(f);
 
-        encode_path(&mut f, objfile)
-            .with_context(|| format!("Couldn't encode objfile filename: '{objfile:?}'"))?;
+        encode_path(&mut f, objfile).with_context(|| {
+            format!(
+                "Couldn't encode objfile filename: '{}'",
+                crate::util::debug_display(objfile)
+            )
+        })?;
         write!(f, ": ")?;
-        encode_path(&mut f, &parsed_args.input)
-            .with_context(|| format!("Couldn't encode input filename: '{objfile:?}'"))?;
+        encode_path(&mut f, &parsed_args.input).with_context(|| {
+            format!(
+                "Couldn't encode input filename: '{}'",
+                crate::util::debug_display(objfile)
+            )
+        })?;
         write!(f, " ")?;
         let process::Output {
             status,
@@ -1123,8 +1135,12 @@ where
         writeln!(f)?;
         // Write extra rules for each dependency to handle
         // removed files.
-        encode_path(&mut f, &parsed_args.input)
-            .with_context(|| format!("Couldn't encode filename: '{:?}'", parsed_args.input))?;
+        encode_path(&mut f, &parsed_args.input).with_context(|| {
+            format!(
+                "Couldn't encode filename: '{}'",
+                crate::util::debug_display(&parsed_args.input)
+            )
+        })?;
         writeln!(f, ":")?;
         let mut sorted = deps.into_iter().collect::<Vec<_>>();
         sorted.sort();
@@ -1325,7 +1341,10 @@ impl Iterator for ExpandIncludeFile<'_> {
                 }
             };
 
-            trace!("Expanded response file {file_path:?} to {content:?}");
+            trace!(
+                "Expanded response file {} to {content:?}",
+                crate::util::debug_display(&file_path)
+            );
 
             // Parse the response file contents, taking into account quote-wrapped strings and new-line separators.
             // Special implementation to account for MSVC response file format.

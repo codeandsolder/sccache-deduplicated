@@ -16,9 +16,11 @@ use crate::compiler::args::{
     ArgDisposition, ArgInfo, ArgToStringResult, ArgsIter, Argument, FromArg, IntoArg,
     NormalizedDisposition, PathTransformerFn, SearchableArgInfo,
 };
+#[cfg(feature = "dist-client")]
+use crate::compiler::c::is_native_codegen_arg;
 use crate::compiler::c::{
     ArtifactDescriptor, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
-    ParsedArguments, is_native_codegen_arg,
+    ParsedArguments,
 };
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
@@ -308,6 +310,10 @@ counted_array!(pub static ARGS: [ArgInfo<ArgData>; _] = [
 /// Otherwise, return `CompilerArguments::Ok(ParsedArguments)`, with
 /// the `ParsedArguments` struct containing information parsed from
 /// `arguments`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass argument parser keeps interdependent flag state and ordering visible; splitting would require a state bag threaded through helpers"
+)]
 pub fn parse_arguments<S>(
     arguments: &[OsString],
     cwd: &Path,
@@ -318,6 +324,12 @@ pub fn parse_arguments<S>(
 where
     S: SearchableArgInfo<ArgData>,
 {
+    enum DepArgumentRequirePath {
+        NotNeeded,
+        Missing,
+        Provided,
+    }
+
     let mut output_arg = None;
     let mut module_output_path = None;
     let mut module_only_flag = false;
@@ -339,11 +351,6 @@ where
     let mut split_dwarf = false;
     let mut need_explicit_dep_target = false;
     let mut dep_path = None;
-    enum DepArgumentRequirePath {
-        NotNeeded,
-        Missing,
-        Provided,
-    }
     let mut need_explicit_dep_argument_path = DepArgumentRequirePath::NotNeeded;
     let mut language = None;
     // Clang assembles in-process unless told otherwise; the other compilers

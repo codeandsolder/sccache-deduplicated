@@ -189,6 +189,10 @@ impl PreprocessorCacheEntry {
     }
 
     /// A result matches if all of its include files exist on disk and have not changed.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "preprocessor validation intentionally short-circuits metadata and content checks in policy order; one routine keeps that policy reviewable"
+    )]
     fn result_matches(
         digest: &str,
         includes: &mut [IncludeEntry],
@@ -363,6 +367,7 @@ static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
     .collect()
 });
 
+#[derive(Clone, Copy)]
 pub struct PreprocessorCacheKey<'a> {
     pub compiler_digest: &'a str,
     pub language: Language,

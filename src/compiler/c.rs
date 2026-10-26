@@ -18,7 +18,7 @@ use crate::compiler::preprocessor_cache::{
 };
 use crate::compiler::{
     Cacheable, ColorMode, Compilation, CompileCommand, Compiler, CompilerArguments, CompilerHasher,
-    CompilerKind, GenerateHashKeyContext, HashResult, Language,
+    CompilerKind, GenerateCompileCommandsResult, GenerateHashKeyContext, HashResult, Language,
 };
 #[cfg(feature = "dist-client")]
 use crate::compiler::{DistPackagers, NoopOutputsRewriter};
@@ -82,6 +82,10 @@ pub struct ArtifactDescriptor {
 }
 
 /// The results of parsing a compiler commandline.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "parsed compiler flags are independent command-line facts; packing them would obscure names and parser state"
+)]
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ParsedArguments {
     /// The input source file.
@@ -221,7 +225,7 @@ struct CCompilation<I: CCompilerImpl> {
 }
 
 /// Supported C compilers.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum CCompilerKind {
     /// GCC
     Gcc,
@@ -295,11 +299,7 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + Sync + 'static {
     fn generate_compile_commands<T>(
         &self,
         context: CCompileContext<'_>,
-    ) -> Result<(
-        Box<dyn CompileCommand<T>>,
-        Option<dist::CompileCommand>,
-        Cacheable,
-    )>
+    ) -> GenerateCompileCommandsResult<T>
     where
         T: CommandCreatorSync;
 }
@@ -451,6 +451,10 @@ where
     T: CommandCreatorSync,
     I: CCompilerImpl,
 {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "cache-key construction is an ordered pipeline; keeping hashing and preprocessing decisions contiguous makes key changes auditable"
+    )]
     async fn generate_hash_key(
         &mut self,
         context: GenerateHashKeyContext<'_, T>,
@@ -517,7 +521,10 @@ where
             .too_hard_for_preprocessor_cache_mode
             .is_some();
         if let Some(arg) = &self.parsed_args.too_hard_for_preprocessor_cache_mode {
-            debug!("generate_hash_key: Cannot use preprocessor cache because of {arg:?}");
+            debug!(
+                "generate_hash_key: Cannot use preprocessor cache because of {}",
+                crate::util::debug_display(arg)
+            );
         }
 
         let needs_preprocessing = self.parsed_args.language.needs_c_preprocessing();
@@ -704,7 +711,7 @@ where
                     &mut include_files,
                     preprocessor_cache_mode_config,
                     start_of_compilation,
-                    StandardFsAbstraction,
+                    &StandardFsAbstraction,
                 )? {
                     debug!("Disabling preprocessor cache mode");
                     preprocessor_key = None;
@@ -820,7 +827,7 @@ fn process_preprocessed_file(
     included_files: &mut HashMap<PathBuf, String>,
     config: PreprocessorCacheModeConfig,
     time_of_compilation: std::time::SystemTime,
-    fs_impl: impl PreprocessorFSAbstraction,
+    fs_impl: &impl PreprocessorFSAbstraction,
 ) -> Result<bool> {
     let mut start = 0;
     let mut hash_start = 0;
@@ -870,7 +877,7 @@ fn process_preprocessed_file(
                     bytes,
                     digest: &mut digest,
                     normalized_include_paths: &mut normalized_include_paths,
-                    fs_impl: &fs_impl,
+                    fs_impl,
                 },
                 start,
                 hash_start,
@@ -885,7 +892,6 @@ fn process_preprocessed_file(
                     }
                     start = s;
                     hash_start = h;
-                    continue;
                 }
             }
         } else if slice
@@ -918,7 +924,6 @@ fn process_preprocessed_file(
                 start += 1;
             }
             hash_start = start;
-            continue;
         } else {
             start += 1;
         }
@@ -1357,7 +1362,10 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
             compiler,
             ..
         } = *self;
-        trace!("Dist inputs: {:?}", parsed_args.input);
+        trace!(
+            "Dist inputs: {}",
+            crate::util::debug_display(&parsed_args.input)
+        );
 
         let input_path = cwd.join(&parsed_args.input);
         let inputs_packager = Box::new(CInputsPackager {
@@ -2170,7 +2178,7 @@ mod test {
             &mut include_files,
             config,
             std::time::SystemTime::now(),
-            StandardFsAbstraction,
+            &StandardFsAbstraction,
         )
         .unwrap();
         assert_eq!(&bytes, &original_bytes);
@@ -2217,7 +2225,7 @@ int value;
             &mut include_files,
             PreprocessorCacheModeConfig::activated(),
             std::time::SystemTime::now(),
-            fs_impl,
+            &fs_impl,
         )
         .unwrap();
 

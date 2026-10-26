@@ -118,7 +118,9 @@ impl SccacheTest<'_> {
 
 impl Drop for SccacheTest<'_> {
     fn drop(&mut self) {
-        stop_sccache().expect("Stopping Sccache server failed");
+        if let Err(error) = stop_sccache() {
+            eprintln!("failed to stop sccache test server during cleanup: {error:#}");
+        }
     }
 }
 

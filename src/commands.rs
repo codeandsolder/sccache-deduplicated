@@ -38,6 +38,8 @@ use std::os::unix::process::ExitStatusExt;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
+#[cfg(feature = "dist-client")]
+use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
 use std::time::Duration;
@@ -161,7 +163,7 @@ fn redirect_stderr(f: File) -> io::Result<()> {
 
     // SAFETY: `f` owns a valid OS handle while SetStdHandle reads it. The
     // handle is kept alive for the process lifetime on success below.
-    if unsafe { SetStdHandle(STD_ERROR_HANDLE, f.as_raw_handle() as _) } == 0 {
+    if unsafe { SetStdHandle(STD_ERROR_HANDLE, f.as_raw_handle()) } == 0 {
         return Err(io::Error::last_os_error());
     }
 
@@ -260,8 +262,8 @@ fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup
     // TODO: Expose `bInheritHandles` argument of `CreateProcessW` through the
     //       standard library's `Command` type and then use that instead.
     let mut pi = PROCESS_INFORMATION {
-        hProcess: 0,
-        hThread: 0,
+        hProcess: std::ptr::null_mut(),
+        hThread: std::ptr::null_mut(),
         dwProcessId: 0,
         dwThreadId: 0,
     };
@@ -474,13 +476,12 @@ fn status_signal(_status: process::ExitStatus) -> Option<i32> {
 /// Handle `response`, the output from running a compile on the server.
 /// Return the compiler exit status.
 fn handle_compile_finished(
-    response: CompileFinished,
+    response: &CompileFinished,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<i32> {
-    trace!("handle_compile_finished");
     fn write_output(
-        stream: impl IsTerminal,
+        stream: &impl IsTerminal,
         writer: &mut dyn Write,
         data: &[u8],
         color_mode: ColorMode,
@@ -502,32 +503,42 @@ fn handle_compile_finished(
         }
         Ok(())
     }
+
+    trace!("handle_compile_finished");
     // It might be nice if the server sent stdout/stderr as the process
     // ran, but then it would have to also save them in the cache as
     // interleaved streams to really make it work.
     write_output(
-        std::io::stdout(),
+        &std::io::stdout(),
         stdout,
         &response.stdout,
         response.color_mode,
     )?;
     write_output(
-        std::io::stderr(),
+        &std::io::stderr(),
         stderr,
         &response.stderr,
         response.color_mode,
     )?;
 
-    if let Some(ret) = response.retcode {
-        trace!("compiler exited with status {ret}");
-        Ok(ret)
-    } else if let Some(signal) = response.signal {
-        println!("sccache: Compiler killed by signal {signal}");
-        Ok(-2)
-    } else {
-        println!("sccache: Missing compiler exit status!");
-        Ok(-3)
-    }
+    response.retcode.map_or_else(
+        || {
+            response.signal.map_or_else(
+                || {
+                    println!("sccache: Missing compiler exit status!");
+                    Ok(-3)
+                },
+                |signal| {
+                    println!("sccache: Compiler killed by signal {signal}");
+                    Ok(-2)
+                },
+            )
+        },
+        |ret| {
+            trace!("compiler exited with status {ret}");
+            Ok(ret)
+        },
+    )
 }
 
 pub struct CompileInvocation<'a> {
@@ -544,10 +555,10 @@ pub struct CompileInvocation<'a> {
 /// unexpectedly.  Delegates to `handle_compile_result` for the final dispatch.
 fn handle_compile_response<T>(
     creator: T,
-    runtime: &mut Runtime,
+    runtime: &Runtime,
     conn: &mut ServerConnection,
     response: CompileResponse,
-    invocation: CompileInvocation<'_>,
+    invocation: &CompileInvocation<'_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<i32>
@@ -601,7 +612,7 @@ fn handle_compile_result<T>(
     runtime: &Runtime,
     response: CompileResponse,
     finished: Option<CompileFinished>,
-    invocation: CompileInvocation<'_>,
+    invocation: &CompileInvocation<'_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<i32>
@@ -617,13 +628,16 @@ where
     match response {
         CompileResponse::CompileStarted => {
             if let Some(finished) = finished {
-                return handle_compile_finished(finished, stdout, stderr);
+                return handle_compile_finished(&finished, stdout, stderr);
             }
             // Server disconnected before sending CompileFinished; fall back to local compilation.
         }
         CompileResponse::UnsupportedCompiler(s) => {
-            debug!("Server sent UnsupportedCompiler: {s:?}");
-            bail!("Compiler not supported: {s:?}");
+            debug!(
+                "Server sent UnsupportedCompiler: {}",
+                crate::util::debug_display(&s)
+            );
+            bail!("Compiler not supported: {}", crate::util::debug_display(&s));
         }
         CompileResponse::UnhandledCompile => {
             debug!("Server sent UnhandledCompile");
@@ -695,7 +709,7 @@ where
 /// See `request_compile` and `handle_compile_response`.
 pub fn do_compile<T>(
     creator: T,
-    runtime: &mut Runtime,
+    runtime: &Runtime,
     mut conn: ServerConnection,
     invocation: CompileInvocation<'_>,
     path: Option<OsString>,
@@ -726,7 +740,15 @@ where
         cwd,
         env_vars,
     };
-    handle_compile_response(creator, runtime, &mut conn, res, invocation, stdout, stderr)
+    handle_compile_response(
+        creator,
+        runtime,
+        &mut conn,
+        res,
+        &invocation,
+        stdout,
+        stderr,
+    )
 }
 
 /// Run a compile in client-side mode: the compile pipeline executes in this
@@ -736,7 +758,7 @@ where
 /// execution is not duplicated.
 pub fn do_compile_client_side<C>(
     jobserver: &Client,
-    runtime: &mut Runtime,
+    runtime: &Runtime,
     conn: ServerConnection,
     invocation: CompileInvocation<'_>,
     path: Option<OsString>,
@@ -777,7 +799,7 @@ where
         runtime,
         compile_resp,
         finished,
-        invocation,
+        &invocation,
         stdout,
         stderr,
     )?;
@@ -789,86 +811,217 @@ where
     Ok(exit_code)
 }
 
+fn show_stats(config: &Config, fmt: StatsFormat, advanced: bool) -> Result<()> {
+    trace!("Command::ShowStats({fmt:?})");
+    let stats = if let Ok(srv) = connect_to_server(&get_addr()) {
+        request_stats(srv).context("failed to get stats from server")?
+    } else {
+        let runtime = new_client_runtime()?;
+        let storage = storage_from_config(config, runtime.handle()).ok();
+        runtime.block_on(ServerInfo::new(ServerStats::default(), storage.as_deref()))?
+    };
+    match fmt {
+        StatsFormat::Text => stats.print(advanced),
+        StatsFormat::Json => serde_json::to_writer(&mut io::stdout(), &stats)?,
+    }
+    Ok(())
+}
+
+fn debug_preprocessor_cache_entries() -> Result<()> {
+    trace!("Command::DebugPreprocessorCacheEntries");
+    let entries_dir = default_disk_cache_dir().join("preprocessor");
+    for entry in WalkDir::new(entries_dir).sort_by_file_name() {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        println!("=========================");
+        println!("Showing preprocessor entry file {}", path.display());
+        let contents = std::fs::read(path)?;
+        let entry = crate::compiler::PreprocessorCacheEntry::read(&contents)?;
+        println!("{entry:#?}");
+        println!("=========================");
+    }
+    Ok(())
+}
+
+fn start_internal_server(config: &Config) -> Result<()> {
+    trace!("Command::InternalStartServer");
+    if env::var("SCCACHE_ERROR_LOG").is_ok() {
+        let file = create_error_log()?;
+        #[cfg(not(windows))]
+        let preserve = [file.as_raw_fd()];
+        #[cfg(windows)]
+        let preserve = [file.as_raw_handle()];
+        daemonize(&preserve)?;
+        redirect_error_log(file)?;
+    } else {
+        daemonize(&[])?;
+    }
+    server::start_server(config, &get_addr())
+}
+
+fn start_server_command(startup_timeout: Option<Duration>) -> Result<()> {
+    trace!("Command::StartServer");
+    println!("sccache: Starting the server...");
+    match run_server_process(startup_timeout).context("failed to start server process")? {
+        ServerStartup::Ok { addr } => println!("sccache: Listening on address {addr}"),
+        ServerStartup::TimedOut => bail!("Timed out waiting for server startup"),
+        ServerStartup::AddrInUse => bail!("Server startup failed: Address in use"),
+        ServerStartup::Err { reason } => bail!("Server startup failed: {reason}"),
+    }
+    Ok(())
+}
+
+#[cfg(feature = "dist-client")]
+fn authenticate_dist(config: &Config) -> Result<()> {
+    use crate::config;
+    use crate::dist;
+    use url::Url;
+
+    let save_token = |auth_url: &str, token: String| -> Result<()> {
+        config::CachedConfig::load()?
+            .with_mut(|cached| {
+                cached.dist.auth_tokens.insert(auth_url.to_owned(), token);
+            })
+            .context("Unable to save auth token")?;
+        println!("Saved token");
+        Ok(())
+    };
+
+    match &config.dist.auth {
+        config::DistAuth::Token { .. } => info!("No authentication needed for type 'token'"),
+        config::DistAuth::Oauth2CodeGrantPKCE {
+            client_id,
+            auth_url,
+            token_url,
+        } => {
+            let parsed =
+                Url::parse(auth_url).map_err(|_| anyhow!("Failed to parse URL {auth_url}"))?;
+            let token =
+                dist::client_auth::get_token_oauth2_code_grant_pkce(client_id, parsed, token_url)?;
+            save_token(auth_url, token)?;
+        }
+        config::DistAuth::Oauth2Implicit {
+            client_id,
+            auth_url,
+        } => {
+            let parsed =
+                Url::parse(auth_url).map_err(|_| anyhow!("Failed to parse URL {auth_url}"))?;
+            let token = dist::client_auth::get_token_oauth2_implicit(client_id, parsed)?;
+            save_token(auth_url, token)?;
+        }
+    }
+    Ok(())
+}
+
+fn show_dist_status(startup_timeout: Option<Duration>) -> Result<()> {
+    trace!("Command::DistStatus");
+    let server = connect_or_start_server(&get_addr(), startup_timeout)?;
+    let status = request_dist_status(server).context("failed to get dist-status from server")?;
+    serde_json::to_writer(&mut io::stdout(), &status)?;
+    println!();
+    Ok(())
+}
+
+#[cfg(feature = "dist-client")]
+fn package_toolchain(executable: PathBuf, out: PathBuf) -> Result<()> {
+    use crate::compiler;
+
+    trace!("Command::PackageToolchain({})", executable.display());
+    let runtime = new_client_runtime()?;
+    let jobserver = Client::new();
+    let creator = ProcessCommandCreator::new(&jobserver);
+    let args: Vec<_> = env::args_os().collect();
+    let env: Vec<_> = env::vars_os().collect();
+    let out_file = File::create(out)?;
+    let cwd = env::current_dir().context("failed to determine current directory")?;
+    let pool = runtime.handle().clone();
+    runtime.block_on(async move {
+        compiler::get_compiler_info(creator, &executable, &cwd, &args, &env, &pool, None)
+            .await
+            .map(|compiler| compiler.0.get_toolchain_packager())
+            .and_then(|packager| packager.write_pkg(out_file))
+    })
+}
+
+fn run_compile_command(
+    config: &Config,
+    startup_timeout: Option<Duration>,
+    exe: &Path,
+    cmdline: Vec<OsString>,
+    cwd: &Path,
+    env_vars: Vec<(OsString, OsString)>,
+) -> Result<i32> {
+    trace!(
+        "Command::Compile {{ {}, {cmdline:?}, {} }}",
+        crate::util::debug_display(&exe),
+        crate::util::debug_display(&cwd)
+    );
+
+    for incremental_var in ["CARGO_BUILD_INCREMENTAL", "CARGO_INCREMENTAL"] {
+        if matches!(env::var(incremental_var), Ok(value) if value == "1") {
+            println!(
+                "sccache: incremental compilation is prohibited: Unset {incremental_var} to continue."
+            );
+            return Ok(1);
+        }
+    }
+
+    let jobserver = Client::new();
+    let conn = connect_or_start_server(&get_addr(), startup_timeout)?;
+    let invocation = CompileInvocation {
+        exe,
+        cmdline,
+        cwd,
+        env_vars,
+    };
+    if config.client_side_mode {
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        return do_compile_client_side::<ProcessCommandCreator>(
+            &jobserver,
+            &runtime,
+            conn,
+            invocation,
+            env::var_os("PATH"),
+            &mut io::stdout(),
+            &mut io::stderr(),
+        )
+        .context("failed to execute compile");
+    }
+
+    let runtime = new_client_runtime()?;
+    do_compile(
+        ProcessCommandCreator::new(&jobserver),
+        &runtime,
+        conn,
+        invocation,
+        env::var_os("PATH"),
+        &mut io::stdout(),
+        &mut io::stderr(),
+    )
+    .context("failed to execute compile")
+}
+
 /// Run `cmd` and return the process exit status.
 pub fn run_command(cmd: Command) -> Result<i32> {
-    // Config isn't required for all commands, but if it's broken then we should flag
-    // it early and loudly.
     let config = &Config::load()?;
     let startup_timeout = config.server_startup_timeout;
 
     match cmd {
-        Command::ShowStats(fmt, advanced) => {
-            trace!("Command::ShowStats({fmt:?})");
-            let stats = match connect_to_server(&get_addr()) {
-                Ok(srv) => request_stats(srv).context("failed to get stats from server")?,
-                // If there is no server, spawning a new server would start with zero stats
-                // anyways, so we can just return (mostly) empty stats directly.
-                Err(_) => {
-                    let runtime = new_client_runtime()?;
-                    let storage = storage_from_config(config, runtime.handle()).ok();
-                    runtime.block_on(ServerInfo::new(ServerStats::default(), storage.as_deref()))?
-                }
-            };
-            match fmt {
-                StatsFormat::Text => stats.print(advanced),
-                StatsFormat::Json => serde_json::to_writer(&mut io::stdout(), &stats)?,
-            }
-        }
-        Command::DebugPreprocessorCacheEntries => {
-            trace!("Command::DebugPreprocessorCacheEntries");
-            let entries_dir = default_disk_cache_dir().join("preprocessor");
-            for entry in WalkDir::new(entries_dir).sort_by_file_name() {
-                let preprocessor_cache_entry_file = entry?;
-                let path = preprocessor_cache_entry_file.path();
-                if !path.is_file() {
-                    continue;
-                }
-                println!("=========================");
-                println!("Showing preprocessor entry file {}", path.display());
-                let contents = std::fs::read(path)?;
-                let preprocessor_cache_entry =
-                    crate::compiler::PreprocessorCacheEntry::read(&contents)?;
-                println!("{preprocessor_cache_entry:#?}");
-                println!("=========================");
-            }
-        }
-        Command::InternalStartServer => {
-            trace!("Command::InternalStartServer");
-            if env::var("SCCACHE_ERROR_LOG").is_ok() {
-                let f = create_error_log()?;
-                #[cfg(not(windows))]
-                let preserve = [f.as_raw_fd()];
-                #[cfg(windows)]
-                let preserve = [f.as_raw_handle()];
-                // Can't report failure here, we're already daemonized.
-                daemonize(&preserve)?;
-                redirect_error_log(f)?;
-            } else {
-                // We aren't asking for a log file
-                daemonize(&[])?;
-            }
-            server::start_server(config, &get_addr())?;
-        }
-        Command::StartServer => {
-            trace!("Command::StartServer");
-            println!("sccache: Starting the server...");
-            let startup =
-                run_server_process(startup_timeout).context("failed to start server process")?;
-            match startup {
-                ServerStartup::Ok { addr } => {
-                    println!("sccache: Listening on address {addr}");
-                }
-                ServerStartup::TimedOut => bail!("Timed out waiting for server startup"),
-                ServerStartup::AddrInUse => bail!("Server startup failed: Address in use"),
-                ServerStartup::Err { reason } => bail!("Server startup failed: {reason}"),
-            }
-        }
+        Command::ShowStats(fmt, advanced) => show_stats(config, fmt, advanced)?,
+        Command::DebugPreprocessorCacheEntries => debug_preprocessor_cache_entries()?,
+        Command::InternalStartServer => start_internal_server(config)?,
+        Command::StartServer => start_server_command(startup_timeout)?,
         Command::StopServer => {
             trace!("Command::StopServer");
             println!("Stopping sccache server...");
             let server = connect_to_server(&get_addr()).context("couldn't connect to server")?;
-            let stats = request_shutdown(server)?;
-            stats.print(false);
+            request_shutdown(server)?.print(false);
         }
         Command::ZeroStats => {
             trace!("Command::ZeroStats");
@@ -877,90 +1030,14 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             eprintln!("Statistics zeroed.");
         }
         #[cfg(feature = "dist-client")]
-        Command::DistAuth => {
-            use crate::config;
-            use crate::dist;
-            use url::Url;
-
-            match &config.dist.auth {
-                config::DistAuth::Token { .. } => {
-                    info!("No authentication needed for type 'token'");
-                }
-                config::DistAuth::Oauth2CodeGrantPKCE {
-                    client_id,
-                    auth_url,
-                    token_url,
-                } => {
-                    let cached_config = config::CachedConfig::load()?;
-
-                    let parsed_auth_url = Url::parse(auth_url)
-                        .map_err(|_| anyhow!("Failed to parse URL {auth_url}"))?;
-                    let token = dist::client_auth::get_token_oauth2_code_grant_pkce(
-                        client_id,
-                        parsed_auth_url,
-                        token_url,
-                    )?;
-
-                    cached_config
-                        .with_mut(|c| {
-                            c.dist.auth_tokens.insert(auth_url.to_owned(), token);
-                        })
-                        .context("Unable to save auth token")?;
-                    println!("Saved token");
-                }
-                config::DistAuth::Oauth2Implicit {
-                    client_id,
-                    auth_url,
-                } => {
-                    let cached_config = config::CachedConfig::load()?;
-
-                    let parsed_auth_url = Url::parse(auth_url)
-                        .map_err(|_| anyhow!("Failed to parse URL {auth_url}"))?;
-                    let token =
-                        dist::client_auth::get_token_oauth2_implicit(client_id, parsed_auth_url)?;
-
-                    cached_config
-                        .with_mut(|c| {
-                            c.dist.auth_tokens.insert(auth_url.to_owned(), token);
-                        })
-                        .context("Unable to save auth token")?;
-                    println!("Saved token");
-                }
-            }
-        }
+        Command::DistAuth => authenticate_dist(config)?,
         #[cfg(not(feature = "dist-client"))]
         Command::DistAuth => bail!(
             "Distributed compilation not compiled in, please rebuild with the dist-client feature"
         ),
-        Command::DistStatus => {
-            trace!("Command::DistStatus");
-            let srv = connect_or_start_server(&get_addr(), startup_timeout)?;
-            let status =
-                request_dist_status(srv).context("failed to get dist-status from server")?;
-            serde_json::to_writer(&mut io::stdout(), &status)?;
-            println!();
-        }
+        Command::DistStatus => show_dist_status(startup_timeout)?,
         #[cfg(feature = "dist-client")]
-        Command::PackageToolchain(executable, out) => {
-            use crate::compiler;
-
-            trace!("Command::PackageToolchain({})", executable.display());
-            let runtime = new_client_runtime()?;
-            let jobserver = Client::new();
-            let creator = ProcessCommandCreator::new(&jobserver);
-            let args: Vec<_> = env::args_os().collect();
-            let env: Vec<_> = env::vars_os().collect();
-            let out_file = File::create(out)?;
-            let cwd = env::current_dir().context("failed to determine current directory")?;
-
-            let pool = runtime.handle().clone();
-            runtime.block_on(async move {
-                compiler::get_compiler_info(creator, &executable, &cwd, &args, &env, &pool, None)
-                    .await
-                    .map(|compiler| compiler.0.get_toolchain_packager())
-                    .and_then(|packager| packager.write_pkg(out_file))
-            })?;
-        }
+        Command::PackageToolchain(executable, out) => package_toolchain(executable, out)?,
         #[cfg(not(feature = "dist-client"))]
         Command::PackageToolchain(_executable, _out) => bail!(
             "Toolchain packaging not compiled in, please rebuild with the dist-client feature"
@@ -971,65 +1048,14 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             cwd,
             env_vars,
         } => {
-            trace!("Command::Compile {{ {exe:?}, {cmdline:?}, {cwd:?} }}");
-
-            let incr_env_strs = ["CARGO_BUILD_INCREMENTAL", "CARGO_INCREMENTAL"];
-            incr_env_strs
-                .iter()
-                .for_each(|incr_str| match env::var(incr_str) {
-                    Ok(incr_val) if incr_val == "1" => {
-                        println!(
-                            "sccache: incremental compilation is prohibited: Unset {incr_str} to continue."
-                        );
-                        std::process::exit(1);
-                    }
-                    _ => (),
-                });
-
-            let jobserver = Client::new();
-            let conn = connect_or_start_server(&get_addr(), startup_timeout)?;
-            if config.client_side_mode {
-                // Under make -jN each CLI process gets only 2 worker threads;
-                // one for preprocessing/compilation and one for IPC.  The
-                // blocking thread pool absorbs zstd/zip work.
-                let mut runtime = Builder::new_multi_thread()
-                    .worker_threads(2)
-                    .enable_all()
-                    .build()?;
-                let invocation = CompileInvocation {
-                    exe: exe.as_ref(),
-                    cmdline,
-                    cwd: &cwd,
-                    env_vars,
-                };
-                let res = do_compile_client_side::<ProcessCommandCreator>(
-                    &jobserver,
-                    &mut runtime,
-                    conn,
-                    invocation,
-                    env::var_os("PATH"),
-                    &mut io::stdout(),
-                    &mut io::stderr(),
-                );
-                return res.context("failed to execute compile");
-            }
-            let mut runtime = new_client_runtime()?;
-            let invocation = CompileInvocation {
-                exe: exe.as_ref(),
+            return run_compile_command(
+                config,
+                startup_timeout,
+                Path::new(&exe),
                 cmdline,
-                cwd: &cwd,
+                &cwd,
                 env_vars,
-            };
-            let res = do_compile(
-                ProcessCommandCreator::new(&jobserver),
-                &mut runtime,
-                conn,
-                invocation,
-                env::var_os("PATH"),
-                &mut io::stdout(),
-                &mut io::stderr(),
             );
-            return res.context("failed to execute compile");
         }
     }
 
@@ -1081,7 +1107,7 @@ mod test {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_unhandled_rust_compile_falls_back_with_physical_arguments() -> Result<()> {
-        let mut runtime = tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         let client = Client::new_num(1);
@@ -1126,10 +1152,10 @@ mod test {
 
         let code = handle_compile_result(
             creator,
-            &mut runtime,
+            &runtime,
             CompileResponse::UnhandledCompile,
             None,
-            invocation,
+            &invocation,
             &mut stdout,
             &mut stderr,
         )?;
@@ -1176,7 +1202,7 @@ mod test {
             &mut runtime,
             &mut conn,
             CompileResponse::CompileStarted,
-            invocation,
+            &invocation,
             &mut stdout,
             &mut stderr,
         )

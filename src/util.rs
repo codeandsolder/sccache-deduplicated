@@ -23,11 +23,14 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::hash::Hasher;
 use std::io::prelude::*;
 use std::path::{Path, PathBuf};
 use std::process::{self, Stdio};
 use std::str;
+#[cfg(not(windows))]
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::time::Duration;
 use std::time::{self, SystemTime};
 
@@ -38,6 +41,23 @@ pub const BASE64_URL_SAFE_ENGINE: base64::engine::GeneralPurpose =
     base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 pub const HASH_BUFFER_SIZE: usize = 128 * 1024;
+
+/// Display adapter that deliberately preserves `Debug` escaping and quoting.
+///
+/// This is used for paths and OS strings in diagnostics where lossy `Display`
+/// formatting would hide non-Unicode bytes or make boundaries ambiguous.
+pub struct DebugDisplay<'a, T: ?Sized>(&'a T);
+
+impl<T: fmt::Debug + ?Sized> fmt::Display for DebugDisplay<'_, T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.0, formatter)
+    }
+}
+
+#[must_use]
+pub const fn debug_display<T: fmt::Debug + ?Sized>(value: &T) -> DebugDisplay<'_, T> {
+    DebugDisplay(value)
+}
 
 #[derive(Clone)]
 pub struct Digest {
@@ -123,8 +143,9 @@ impl Digest {
 
     /// Open `path` and stream its contents into `self`.
     fn update_from_file(&mut self, path: &Path) -> Result<()> {
-        let mut file = File::open(path)
-            .with_context(|| format!("Failed to open file for hashing: {path:?}"))?;
+        let mut file = File::open(path).with_context(|| {
+            format!("Failed to open file for hashing: {}", debug_display(&path))
+        })?;
         let mut buf = vec![0_u8; HASH_BUFFER_SIZE];
         loop {
             let n = file.read(&mut buf)?;
@@ -138,9 +159,12 @@ impl Digest {
 
     /// Recursively collect all file paths within a directory.
     fn collect_dir_entries(dir: &Path, entries: &mut Vec<PathBuf>) -> Result<()> {
-        for entry in std::fs::read_dir(dir)
-            .with_context(|| format!("Failed to read directory for hashing: {dir:?}"))?
-        {
+        for entry in std::fs::read_dir(dir).with_context(|| {
+            format!(
+                "Failed to read directory for hashing: {}",
+                debug_display(&dir)
+            )
+        })? {
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {
@@ -287,17 +311,17 @@ impl TimeMacroFinder {
                 // ...and the overlap buffer
                 self.find_macros(&self.overlap_buffer);
                 return;
-            } else {
-                // Copy the left side of the visit to the right of the buffer
-                let left_half = MAX_HAYSTACK_LEN;
-                self.overlap_buffer[left_half..].copy_from_slice(&visit[..left_half]);
-                self.find_macros(&self.overlap_buffer);
-                // zero the buffer
-                self.overlap_buffer = Default::default();
-                // Copy the right side of the visit to the left of the buffer
-                let right_half = visit.len() - MAX_HAYSTACK_LEN;
-                self.overlap_buffer[..MAX_HAYSTACK_LEN].copy_from_slice(&visit[right_half..]);
             }
+
+            // Copy the left side of the visit to the right of the buffer
+            let left_half = MAX_HAYSTACK_LEN;
+            self.overlap_buffer[left_half..].copy_from_slice(&visit[..left_half]);
+            self.find_macros(&self.overlap_buffer);
+            // zero the buffer
+            self.overlap_buffer = Default::default();
+            // Copy the right side of the visit to the left of the buffer
+            let right_half = visit.len() - MAX_HAYSTACK_LEN;
+            self.overlap_buffer[..MAX_HAYSTACK_LEN].copy_from_slice(&visit[right_half..]);
             self.find_macros(&self.overlap_buffer);
         }
         // Also check the concatenation with the previous small read
@@ -353,21 +377,21 @@ impl TimeMacroFinder {
     }
 }
 
+const fn hex_nibble(byte: u8) -> char {
+    match byte {
+        0..=9 => (b'0' + byte) as char,
+        _ => (b'a' + byte - 10) as char,
+    }
+}
+
 #[must_use]
 pub fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
-        s.push(hex(byte & 0xf));
-        s.push(hex((byte >> 4) & 0xf));
+        s.push(hex_nibble(byte & 0xf));
+        s.push(hex_nibble((byte >> 4) & 0xf));
     }
-    return s;
-
-    const fn hex(byte: u8) -> char {
-        match byte {
-            0..=9 => (b'0' + byte) as char,
-            _ => (b'a' + byte - 10) as char,
-        }
-    }
+    s
 }
 
 /// Calculate the digest of each file in `files` on background threads in
@@ -413,24 +437,25 @@ pub async fn hash_all_archives(
         let path = path.clone();
         pool.spawn_blocking(move || -> Result<String> {
             let mut m = Digest::new();
-            let archive_file = File::open(&path)
-                .with_context(|| format!("Failed to open file for hashing: {path:?}"))?;
-            // SAFETY: the mapping is private/read-only, the file handle outlives the
-            // mapping, and this code never mutates or truncates the mapped archive.
-            let archive_mmap =
-                unsafe { memmap2::MmapOptions::new().map_copy_read_only(&archive_file)? };
+            // Read into owned memory rather than mmap the archive. File-backed mappings
+            // cannot prove that another process will not truncate or rewrite the file
+            // while Rust holds a slice into it; an owned buffer removes that unsafe
+            // lifetime/aliasing boundary entirely.
+            let archive = fs::read(&path).with_context(|| {
+                format!("Failed to read file for hashing: {}", debug_display(&path))
+            })?;
 
-            if let Ok(fat) = MachOFatFile32::parse(&*archive_mmap) {
+            if let Ok(fat) = MachOFatFile32::parse(&*archive) {
                 for arch in fat.arches() {
-                    hash_regular_archive(&mut m, arch.data(&*archive_mmap)?)?;
+                    hash_regular_archive(&mut m, arch.data(&*archive)?)?;
                 }
-            } else if let Ok(fat) = MachOFatFile64::parse(&*archive_mmap) {
+            } else if let Ok(fat) = MachOFatFile64::parse(&*archive) {
                 for arch in fat.arches() {
-                    hash_regular_archive(&mut m, arch.data(&*archive_mmap)?)?;
+                    hash_regular_archive(&mut m, arch.data(&*archive)?)?;
                 }
             } else {
                 // Not a FatHeader at all, regular archive.
-                hash_regular_archive(&mut m, &archive_mmap)?;
+                hash_regular_archive(&mut m, &archive)?;
             }
 
             Ok(m.finish())
@@ -461,11 +486,11 @@ fn hash_regular_archive(m: &mut Digest, data: &[u8]) -> Result<()> {
 /// a 64-bit sample count to the `u32` divisor supported by `Duration`.
 #[must_use]
 pub fn average_duration(total: Duration, samples: u64) -> Duration {
+    const NANOS_PER_SECOND: u128 = 1_000_000_000;
+
     if samples == 0 {
         return Duration::ZERO;
     }
-
-    const NANOS_PER_SECOND: u128 = 1_000_000_000;
     let average_nanos = total.as_nanos() / u128::from(samples);
     let seconds = u64::try_from(average_nanos / NANOS_PER_SECOND).unwrap_or(u64::MAX);
     let nanos = u32::try_from(average_nanos % NANOS_PER_SECOND).unwrap_or(999_999_999);
@@ -968,34 +993,79 @@ fn close_inherited_fds(preserve: &[std::os::unix::io::RawFd]) {
             .collect()
     });
 
-    match victims {
-        Some(fds) => {
-            for fd in fds {
-                // SAFETY: these descriptor numbers came from the process fd table,
-                // and preserved descriptors were filtered out above.
-                unsafe { libc::close(fd) };
-            }
+    if let Some(fds) = victims {
+        for fd in fds {
+            // SAFETY: these descriptor numbers came from the process fd table,
+            // and preserved descriptors were filtered out above.
+            unsafe { libc::close(fd) };
         }
+    } else {
         // No fd directory to enumerate, so fall back to sweeping the whole
         // range. Bounded by the soft limit rather than the hard one to keep
         // this from turning into a million syscalls.
-        None => {
-            // SAFETY: sysconf with _SC_OPEN_MAX takes no pointers and has no
-            // memory-safety preconditions.
-            let max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
-            let max = if max < 0 {
-                4096
-            } else {
-                max.min(65536) as RawFd
-            };
-            for fd in (libc::STDERR_FILENO + 1)..max {
-                if !keep(fd) {
-                    // SAFETY: close accepts any integer descriptor; invalid or
-                    // already-closed descriptors are reported as an OS error.
-                    unsafe { libc::close(fd) };
-                }
+        // SAFETY: sysconf with _SC_OPEN_MAX takes no pointers and has no
+        // memory-safety preconditions.
+        let max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+        let max = if max < 0 {
+            4096
+        } else {
+            max.min(65536) as RawFd
+        };
+        for fd in (libc::STDERR_FILENO + 1)..max {
+            if !keep(fd) {
+                // SAFETY: close accepts any integer descriptor; invalid or
+                // already-closed descriptors are reported as an OS error.
+                unsafe { libc::close(fd) };
             }
         }
+    }
+}
+
+#[cfg(not(windows))]
+static PREV_SIGSEGV: AtomicPtr<libc::sigaction> = AtomicPtr::new(std::ptr::null_mut());
+#[cfg(not(windows))]
+static PREV_SIGBUS: AtomicPtr<libc::sigaction> = AtomicPtr::new(std::ptr::null_mut());
+#[cfg(not(windows))]
+static PREV_SIGILL: AtomicPtr<libc::sigaction> = AtomicPtr::new(std::ptr::null_mut());
+
+#[cfg(not(windows))]
+extern "C" fn crash_signal_handler(
+    signum: libc::c_int,
+    _info: *mut libc::siginfo_t,
+    _ptr: *mut libc::c_void,
+) {
+    use std::fmt::{Result, Write};
+
+    struct Stderr;
+
+    impl Write for Stderr {
+        fn write_str(&mut self, s: &str) -> Result {
+            // SAFETY: s owns a valid byte slice for the duration of write;
+            // libc::write does not retain the pointer.
+            unsafe {
+                let bytes = s.as_bytes();
+                libc::write(libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len());
+            }
+            Ok(())
+        }
+    }
+
+    let previous = match signum {
+        libc::SIGBUS => PREV_SIGBUS.load(Ordering::Relaxed),
+        libc::SIGILL => PREV_SIGILL.load(Ordering::Relaxed),
+        _ => PREV_SIGSEGV.load(Ordering::Relaxed),
+    };
+
+    let _ = writeln!(Stderr, "signal {signum} received");
+    if previous.is_null() {
+        return;
+    }
+
+    // SAFETY: daemonize stores pointers to intentionally leaked sigaction values
+    // before installing this handler. The selected pointer therefore remains valid
+    // for the lifetime of the process, and sigaction does not retain our output ptr.
+    unsafe {
+        libc::sigaction(signum, previous, std::ptr::null_mut());
     }
 }
 
@@ -1018,10 +1088,6 @@ pub fn daemonize(preserve_fds: &[std::os::unix::io::RawFd]) -> Result<()> {
 
     close_inherited_fds(preserve_fds);
 
-    static mut PREV_SIGSEGV: *mut libc::sigaction = std::ptr::null_mut();
-    static mut PREV_SIGBUS: *mut libc::sigaction = std::ptr::null_mut();
-    static mut PREV_SIGILL: *mut libc::sigaction = std::ptr::null_mut();
-
     // We don't have a parent process any more once we've reached this point,
     // which means that no one's probably listening for our exit status.
     // In order to assist with debugging crashes of the server we configure our
@@ -1042,60 +1108,22 @@ pub fn daemonize(preserve_fds: &[std::os::unix::io::RawFd]) -> Result<()> {
             _ => {}
         }
 
-        PREV_SIGSEGV = Box::into_raw(Box::new(mem::zeroed::<libc::sigaction>()));
-        PREV_SIGBUS = Box::into_raw(Box::new(mem::zeroed::<libc::sigaction>()));
-        PREV_SIGILL = Box::into_raw(Box::new(mem::zeroed::<libc::sigaction>()));
+        let prev_sigsegv = Box::into_raw(Box::new(mem::zeroed::<libc::sigaction>()));
+        let prev_sigbus = Box::into_raw(Box::new(mem::zeroed::<libc::sigaction>()));
+        let prev_sigill = Box::into_raw(Box::new(mem::zeroed::<libc::sigaction>()));
+        PREV_SIGSEGV.store(prev_sigsegv, Ordering::Relaxed);
+        PREV_SIGBUS.store(prev_sigbus, Ordering::Relaxed);
+        PREV_SIGILL.store(prev_sigill, Ordering::Relaxed);
+
         let mut new: libc::sigaction = mem::zeroed();
-        new.sa_sigaction = (handler as *const libc::c_void).expose_provenance();
+        new.sa_sigaction = (crash_signal_handler as *const libc::c_void).expose_provenance();
         new.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
-        libc::sigaction(libc::SIGSEGV, &raw const new, &raw mut *PREV_SIGSEGV);
-        libc::sigaction(libc::SIGBUS, &raw const new, &raw mut *PREV_SIGBUS);
-        libc::sigaction(libc::SIGILL, &raw const new, &raw mut *PREV_SIGILL);
+        libc::sigaction(libc::SIGSEGV, &raw const new, prev_sigsegv);
+        libc::sigaction(libc::SIGBUS, &raw const new, prev_sigbus);
+        libc::sigaction(libc::SIGILL, &raw const new, prev_sigill);
     }
 
-    return Ok(());
-
-    extern "C" fn handler(
-        signum: libc::c_int,
-        _info: *mut libc::siginfo_t,
-        _ptr: *mut libc::c_void,
-    ) {
-        use std::fmt::{Result, Write};
-
-        struct Stderr;
-
-        impl Write for Stderr {
-            fn write_str(&mut self, s: &str) -> Result {
-                // SAFETY: s owns a valid byte slice for the duration of write;
-                // libc::write does not retain the pointer.
-                unsafe {
-                    let bytes = s.as_bytes();
-                    libc::write(libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len());
-                    Ok(())
-                }
-            }
-        }
-
-        // SAFETY: daemonize initialized and intentionally leaked each previous
-        // sigaction before installing this handler, so the selected pointer is
-        // valid for the sigaction call.
-        unsafe {
-            let _ = writeln!(Stderr, "signal {signum} received");
-
-            // Configure the old handler and then resume the program. This'll
-            // likely go on to create a runtime dump if one's configured to be
-            // created.
-            match signum {
-                libc::SIGBUS => {
-                    libc::sigaction(signum, &raw const *PREV_SIGBUS, std::ptr::null_mut())
-                }
-                libc::SIGILL => {
-                    libc::sigaction(signum, &raw const *PREV_SIGILL, std::ptr::null_mut())
-                }
-                _ => libc::sigaction(signum, &raw const *PREV_SIGSEGV, std::ptr::null_mut()),
-            };
-        }
-    }
+    Ok(())
 }
 
 /// This is a no-op on Windows.

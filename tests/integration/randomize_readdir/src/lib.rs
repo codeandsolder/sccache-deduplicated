@@ -113,7 +113,7 @@ impl State {
         );
     }
 
-    fn wrapped_readdir_inner<Dirent, GetIter, Readdir>(
+    unsafe fn wrapped_readdir_inner<Dirent, GetIter, Readdir>(
         &self,
         dirp: *mut DIR,
         get_iter: GetIter,
@@ -157,32 +157,38 @@ impl State {
             .unwrap_or(std::ptr::null_mut())
     }
 
-    fn wrapped_readdir(&self, dirp: *mut DIR) -> *mut dirent {
-        self.wrapped_readdir_inner(
-            dirp,
-            |dirstate| &mut dirstate.iter,
-            || {
-                // SAFETY: `dirp` is the live directory handle supplied by the caller.
-                unsafe { (self.readdir)(dirp) }
-            },
-        )
+    unsafe fn wrapped_readdir(&self, dirp: *mut DIR) -> *mut dirent {
+        // SAFETY: this method inherits the caller guarantee that `dirp` is a live DIR*.
+        unsafe {
+            self.wrapped_readdir_inner(
+                dirp,
+                |dirstate| &mut dirstate.iter,
+                || {
+                    // SAFETY: `dirp` is the live directory handle supplied by the caller.
+                    (self.readdir)(dirp)
+                },
+            )
+        }
     }
 
-    fn wrapped_readdir64(&self, dirp: *mut DIR) -> *mut dirent64 {
-        self.wrapped_readdir_inner(
-            dirp,
-            |dirstate| &mut dirstate.iter64,
-            || {
-                // SAFETY: `dirp` is the live directory handle supplied by the caller.
-                unsafe { (self.readdir64)(dirp) }
-            },
-        )
+    unsafe fn wrapped_readdir64(&self, dirp: *mut DIR) -> *mut dirent64 {
+        // SAFETY: this method inherits the caller guarantee that `dirp` is a live DIR*.
+        unsafe {
+            self.wrapped_readdir_inner(
+                dirp,
+                |dirstate| &mut dirstate.iter64,
+                || {
+                    // SAFETY: `dirp` is the live directory handle supplied by the caller.
+                    (self.readdir64)(dirp)
+                },
+            )
+        }
     }
 }
 
 static STATE: OnceLock<State> = OnceLock::new();
 
-fn load_next<Prototype: Copy>(name: &'static [u8]) -> Prototype {
+unsafe fn load_next<Prototype: Copy>(name: &'static [u8]) -> Prototype {
     let name = match CStr::from_bytes_with_nul(name) {
         Ok(name) => name,
         Err(error) => {
@@ -225,11 +231,16 @@ fn init() {
     }
 
     // Force loading on module init.
-    let opendir = load_next::<Opendir>(b"opendir\0");
-    let fdopendir = load_next::<Fdopendir>(b"fdopendir\0");
-    let readdir = load_next::<Readdir>(b"readdir\0");
-    let readdir64 = load_next::<Readdir64>(b"readdir64\0");
-    let closedir = load_next::<Closedir>(b"closedir\0");
+    // SAFETY: each symbol name is paired with its exact libc function-pointer ABI.
+    let opendir = unsafe { load_next::<Opendir>(b"opendir\0") };
+    // SAFETY: exact libc function-pointer ABI for fdopendir.
+    let fdopendir = unsafe { load_next::<Fdopendir>(b"fdopendir\0") };
+    // SAFETY: exact libc function-pointer ABI for readdir.
+    let readdir = unsafe { load_next::<Readdir>(b"readdir\0") };
+    // SAFETY: exact libc function-pointer ABI for readdir64.
+    let readdir64 = unsafe { load_next::<Readdir64>(b"readdir64\0") };
+    // SAFETY: exact libc function-pointer ABI for closedir.
+    let closedir = unsafe { load_next::<Closedir>(b"closedir\0") };
 
     _ = STATE.get_or_init(|| State {
         opendir,
@@ -267,10 +278,17 @@ pub unsafe extern "C" fn opendir(dirname: *const c_char) -> *mut DIR {
     dirp
 }
 
+/// Converts an open directory file descriptor into a directory stream.
+///
+/// # Safety
+///
+/// `dirfd` must be an open directory descriptor whose ownership may be
+/// transferred to the returned stream; after success the caller must not close
+/// or otherwise treat the original descriptor as independently owned.
 #[no_mangle]
-pub extern "C" fn fdopendir(dirfd: c_int) -> *mut DIR {
+pub unsafe extern "C" fn fdopendir(dirfd: c_int) -> *mut DIR {
     let state = STATE.wait();
-    // SAFETY: `dirfd` is forwarded unchanged to libc, which validates it.
+    // SAFETY: guaranteed by this exported function's descriptor-ownership contract.
     let dirp = unsafe { (state.fdopendir)(dirfd) };
 
     info!("{dirp:p}: opening directory fd {dirfd}");
@@ -282,14 +300,28 @@ pub extern "C" fn fdopendir(dirfd: c_int) -> *mut DIR {
     dirp
 }
 
+/// Reads the next directory entry.
+///
+/// # Safety
+///
+/// `dirp` must point to a live directory stream and must not be concurrently
+/// closed while this call is in progress.
 #[no_mangle]
-pub extern "C" fn readdir(dirp: *mut DIR) -> *mut dirent {
-    STATE.wait().wrapped_readdir(dirp)
+pub unsafe extern "C" fn readdir(dirp: *mut DIR) -> *mut dirent {
+    // SAFETY: guaranteed by this exported function's contract.
+    unsafe { STATE.wait().wrapped_readdir(dirp) }
 }
 
+/// Reads the next directory entry using the 64-bit dirent ABI.
+///
+/// # Safety
+///
+/// `dirp` must point to a live directory stream and must not be concurrently
+/// closed while this call is in progress.
 #[no_mangle]
-pub extern "C" fn readdir64(dirp: *mut DIR) -> *mut dirent64 {
-    STATE.wait().wrapped_readdir64(dirp)
+pub unsafe extern "C" fn readdir64(dirp: *mut DIR) -> *mut dirent64 {
+    // SAFETY: guaranteed by this exported function's contract.
+    unsafe { STATE.wait().wrapped_readdir64(dirp) }
 }
 
 /// Closes a directory stream.

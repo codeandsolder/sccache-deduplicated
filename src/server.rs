@@ -23,6 +23,8 @@ use crate::compiler::{
 use crate::config;
 use crate::config::Config;
 use crate::dist;
+#[cfg(feature = "dist-client")]
+use crate::dist::Client as _;
 use crate::jobserver::Client;
 use crate::mock_command::{CommandCreatorSync, ProcessCommandCreator};
 use crate::protocol::{
@@ -42,6 +44,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::future::Future;
 use std::io::{self, Write};
@@ -72,6 +75,13 @@ use tokio_util::codec::{LengthDelimitedCodec, length_delimited};
 use tower_service::Service;
 
 use crate::errors::{Error, HttpClientError, ProcessError, Result, anyhow, bail};
+
+type ServerRunner<F> = Box<dyn FnOnce(F) -> io::Result<()>>;
+type StartupRunner = ServerRunner<future::Pending<()>>;
+type ByteTransport<I> = tokio_util::codec::Framed<I, LengthDelimitedCodec>;
+type ResponseSink<I> = futures::sink::SinkErrInto<ByteTransport<I>, Bytes, Error>;
+type RequestStream<I> = futures::stream::ErrInto<ResponseSink<I>, Error>;
+type BincodeTransport<I> = Framed<RequestStream<I>, Request, Response, BincodeCodec>;
 
 const NONCACHEABLE_LOG_ENV: &str = "SCCACHE_NONCACHEABLE_LOG";
 
@@ -162,6 +172,7 @@ fn append_noncacheable_record(
 
 /// If the server is idle for this many seconds, shut down.
 const DEFAULT_IDLE_TIMEOUT: u64 = 600;
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// If the dist client couldn't be created, retry creation at this number
 /// of seconds from now (or later)
@@ -216,12 +227,12 @@ fn notify_server_startup(name: Option<&OsString>, status: ServerStartup) -> Resu
 }
 
 #[cfg(unix)]
-fn get_signal(status: &ExitStatus) -> Option<i32> {
+fn get_signal(status: ExitStatus) -> Option<i32> {
     use std::os::unix::prelude::*;
     status.signal()
 }
 #[cfg(windows)]
-fn get_signal(_status: &ExitStatus) -> Option<i32> {
+fn get_signal(_status: ExitStatus) -> Option<i32> {
     None
 }
 
@@ -263,7 +274,7 @@ impl DistClientContainer {
         if config.dist.scheduler_url.is_some() {
             warn!(
                 "Scheduler address configured but dist feature disabled, disabling distributed sccache"
-            )
+            );
         }
         Self {}
     }
@@ -471,7 +482,6 @@ impl DistClientContainer {
             );
             let dist_client =
                 try_or_retry_later!(dist_client.context("failure during dist client creation"));
-            use crate::dist::Client;
             if let Ok(res) = dist_client.do_get_status().await {
                 info!(
                     "Successfully created dist client with {:?} cores across {:?} servers",
@@ -500,28 +510,163 @@ impl DistClientContainer {
 }
 
 thread_local! {
-    /// catch_unwind doesn't provide panic location, so we store that
-    /// information via a panic hook to be used when catch_unwind
+    /// `catch_unwind` does not provide panic location, so we store that
+    /// information via a panic hook to be used when `catch_unwind`
     /// catches a panic.
     static PANIC_LOCATION: Cell<Option<(String, u32, u32)>> = const { Cell::new(None) };
 }
 
-/// Start an sccache server, listening on `addr`.
-///
-/// Spins an event loop handling client connections until a client
-/// requests a shutdown.
-pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()> {
-    info!("start_server: {addr}");
+fn install_panic_location_hook() {
     let panic_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        PANIC_LOCATION.with(|l| {
-            l.set(
+        PANIC_LOCATION.with(|location| {
+            location.set(
                 info.location()
                     .map(|loc| (loc.file().to_string(), loc.line(), loc.column())),
             );
         });
         panic_hook(info);
     }));
+}
+
+fn initialize_server_storage(
+    config: &Config,
+    pool: &tokio::runtime::Handle,
+    runtime: &Runtime,
+    notify: Option<&OsString>,
+) -> Result<Arc<dyn Storage>> {
+    let raw_storage = match storage_from_config(config, pool) {
+        Ok(storage) => storage,
+        Err(error) => {
+            error!("storage init failed for: {error:?}");
+            notify_server_startup(
+                notify,
+                ServerStartup::Err {
+                    reason: error.to_string(),
+                },
+            )?;
+            return Err(error);
+        }
+    };
+
+    let cache_mode = runtime.block_on(async {
+        match raw_storage.check().await {
+            Ok(mode) => Ok(mode),
+            Err(error) => {
+                error!("storage check failed for: {error:?}");
+                notify_server_startup(
+                    notify,
+                    ServerStartup::Err {
+                        reason: error.to_string(),
+                    },
+                )?;
+                Err(error)
+            }
+        }
+    })?;
+    info!("server has setup with {cache_mode:?}");
+
+    Ok(match cache_mode {
+        CacheMode::ReadOnly => Arc::new(ReadOnlyStorage(raw_storage)),
+        CacheMode::ReadWrite => raw_storage,
+    })
+}
+
+fn bind_server(
+    addr: &crate::net::SocketAddr,
+    runtime: Runtime,
+    client: &Client,
+    dist_client: DistClientContainer,
+    storage: Arc<dyn Storage>,
+) -> io::Result<(crate::net::SocketAddr, StartupRunner)> {
+    match addr {
+        crate::net::SocketAddr::Net(addr) => {
+            trace!("binding TCP {addr}");
+            let listener = runtime.block_on(tokio::net::TcpListener::bind(addr))?;
+            let server =
+                SccacheServer::<_>::with_listener(listener, runtime, client, dist_client, storage);
+            let bound_addr = server.try_local_addr()?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "TCP listener has no local address",
+                )
+            })?;
+            Ok((bound_addr, Box::new(move |shutdown| server.run(shutdown))))
+        }
+        #[cfg(unix)]
+        crate::net::SocketAddr::Unix(path) => {
+            trace!("binding unix socket {}", path.display());
+            let _ = std::fs::remove_file(path);
+            let listener = {
+                let _guard = runtime.enter();
+                tokio::net::UnixListener::bind(path)?
+            };
+            let server =
+                SccacheServer::<_>::with_listener(listener, runtime, client, dist_client, storage);
+            let bound_addr = server.try_local_addr()?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "Unix listener has no local address",
+                )
+            })?;
+            Ok((bound_addr, Box::new(move |shutdown| server.run(shutdown))))
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        crate::net::SocketAddr::UnixAbstract(path) => {
+            trace!("binding abstract unix socket {}", path.escape_ascii());
+            let abstract_addr = std::os::unix::net::SocketAddr::from_abstract_name(path)?;
+            let listener = std::os::unix::net::UnixListener::bind_addr(&abstract_addr)?;
+            listener.set_nonblocking(true)?;
+            let listener = {
+                let _guard = runtime.enter();
+                tokio::net::UnixListener::from_std(listener)?
+            };
+            let server =
+                SccacheServer::<_>::with_listener(listener, runtime, client, dist_client, storage);
+            let bound_addr = server
+                .try_local_addr()?
+                .unwrap_or_else(|| crate::net::SocketAddr::UnixAbstract(path.clone()));
+            Ok((bound_addr, Box::new(move |shutdown| server.run(shutdown))))
+        }
+    }
+}
+
+fn notify_server_bind_error(notify: Option<&OsString>, error: &io::Error) -> Result<()> {
+    if io::ErrorKind::AddrInUse == error.kind() {
+        notify_server_startup(notify, ServerStartup::AddrInUse)
+    } else if cfg!(windows) && Some(10013) == error.raw_os_error() {
+        // 10013 is WSAEACCES and can indicate a Windows port exclusion
+        // allocated by winNAT, Hyper-V, or another system component.
+        let help = "A Windows port exclusion is blocking use of the configured port.\nTry setting SCCACHE_SERVER_PORT to a new value.";
+        notify_server_startup(
+            notify,
+            ServerStartup::Err {
+                reason: format!("{help}\n{error}"),
+            },
+        )
+    } else {
+        notify_server_startup(
+            notify,
+            ServerStartup::Err {
+                reason: error.to_string(),
+            },
+        )
+    }
+}
+
+/// Start an sccache server, listening on `addr`.
+///
+/// Spins an event loop handling client connections until a client
+/// requests a shutdown.
+///
+/// # Errors
+///
+/// Returns an error if cache/storage initialization, listener setup, or the
+/// server runtime fails.
+pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()> {
+    info!("start_server: {addr}");
+    install_panic_location_hook();
+
     let client = Client::new();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -529,136 +674,25 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
         .build()?;
     let pool = runtime.handle().clone();
     let dist_client = DistClientContainer::new(config, &pool);
-
     let notify = env::var_os("SCCACHE_STARTUP_NOTIFY");
+    let storage = initialize_server_storage(config, &pool, &runtime, notify.as_ref())?;
 
-    let raw_storage = match storage_from_config(config, &pool) {
-        Ok(storage) => storage,
-        Err(err) => {
-            error!("storage init failed for: {err:?}");
-
-            notify_server_startup(
-                notify.as_ref(),
-                ServerStartup::Err {
-                    reason: err.to_string(),
-                },
-            )?;
-
-            return Err(err);
-        }
-    };
-
-    let cache_mode = runtime.block_on(async {
-        match raw_storage.check().await {
-            Ok(mode) => Ok(mode),
-            Err(err) => {
-                error!("storage check failed for: {err:?}");
-
-                notify_server_startup(
-                    notify.as_ref(),
-                    ServerStartup::Err {
-                        reason: err.to_string(),
-                    },
-                )?;
-
-                Err(err)
-            }
-        }
-    })?;
-    info!("server has setup with {cache_mode:?}");
-
-    let storage = match cache_mode {
-        CacheMode::ReadOnly => Arc::new(ReadOnlyStorage(raw_storage)),
-        _ => raw_storage,
-    };
-
-    let res: io::Result<(crate::net::SocketAddr, Box<dyn FnOnce(_) -> io::Result<()>>)> = (|| {
-        match addr {
-            crate::net::SocketAddr::Net(addr) => {
-                trace!("binding TCP {addr}");
-                let l = runtime.block_on(tokio::net::TcpListener::bind(addr))?;
-                let srv =
-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
-                let bound_addr = srv.try_local_addr()?.ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::AddrNotAvailable,
-                        "TCP listener has no local address",
-                    )
-                })?;
-                Ok((
-                    bound_addr,
-                    Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
-                ))
-            }
-            #[cfg(unix)]
-            crate::net::SocketAddr::Unix(path) => {
-                trace!("binding unix socket {}", path.display());
-                // Unix socket will report addr in use on any unlink file.
-                let _ = std::fs::remove_file(path);
-                let l = {
-                    let _guard = runtime.enter();
-                    tokio::net::UnixListener::bind(path)?
-                };
-                let srv =
-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
-                let bound_addr = srv.try_local_addr()?.ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::AddrNotAvailable,
-                        "Unix listener has no local address",
-                    )
-                })?;
-                Ok((
-                    bound_addr,
-                    Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
-                ))
-            }
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            crate::net::SocketAddr::UnixAbstract(p) => {
-                trace!("binding abstract unix socket {}", p.escape_ascii());
-                let abstract_addr = std::os::unix::net::SocketAddr::from_abstract_name(p)?;
-                let l = std::os::unix::net::UnixListener::bind_addr(&abstract_addr)?;
-                l.set_nonblocking(true)?;
-                let l = {
-                    let _guard = runtime.enter();
-                    tokio::net::UnixListener::from_std(l)?
-                };
-                let srv =
-                    SccacheServer::<_>::with_listener(l, runtime, client, dist_client, storage);
-                Ok((
-                    srv.try_local_addr()?
-                        .unwrap_or_else(|| crate::net::SocketAddr::UnixAbstract(p.clone())),
-                    Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
-                ))
-            }
-        }
-    })();
-    match res {
-        Ok((addr, run)) => {
-            info!("server started, listening on {addr}");
+    match bind_server(addr, runtime, &client, dist_client, storage) {
+        Ok((bound_addr, run)) => {
+            info!("server started, listening on {bound_addr}");
             notify_server_startup(
                 notify.as_ref(),
                 ServerStartup::Ok {
-                    addr: addr.to_string(),
+                    addr: bound_addr.to_string(),
                 },
             )?;
-            run(future::pending::<()>()).map_err(anyhow::Error::from)?;
+            run(future::pending())?;
             Ok(())
         }
-        Err(e) => {
-            error!("failed to start server: {e}");
-            if io::ErrorKind::AddrInUse == e.kind() {
-                notify_server_startup(notify.as_ref(), ServerStartup::AddrInUse)?;
-            } else if cfg!(windows) && Some(10013) == e.raw_os_error() {
-                // 10013 is the "WSAEACCES" error, which can occur if the requested port
-                // has been allocated for other purposes, such as winNAT or Hyper-V.
-                let windows_help_message = "A Windows port exclusion is blocking use of the configured port.\nTry setting SCCACHE_SERVER_PORT to a new value.";
-                let reason: String = format!("{windows_help_message}\n{e}");
-                notify_server_startup(notify.as_ref(), ServerStartup::Err { reason })?;
-            } else {
-                let reason = e.to_string();
-                notify_server_startup(notify.as_ref(), ServerStartup::Err { reason })?;
-            }
-            Err(e.into())
+        Err(error) => {
+            error!("failed to start server: {error}");
+            notify_server_bind_error(notify.as_ref(), &error)?;
+            Err(error.into())
         }
     }
 }
@@ -673,10 +707,16 @@ pub struct SccacheServer<A: crate::net::Acceptor, C: CommandCreatorSync = Proces
 }
 
 impl<C: CommandCreatorSync> SccacheServer<tokio::net::TcpListener, C> {
+    /// Create a TCP sccache server bound to `port`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the address cannot be represented as a network address
+    /// or the TCP listener cannot be bound.
     pub fn new(
         port: u16,
         runtime: Runtime,
-        client: Client,
+        client: &Client,
         dist_client: DistClientContainer,
         storage: Arc<dyn Storage>,
     ) -> Result<Self> {
@@ -700,7 +740,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
     pub fn with_listener(
         listener: A,
         runtime: Runtime,
-        client: Client,
+        client: &Client,
         dist_client: DistClientContainer,
         storage: Arc<dyn Storage>,
     ) -> Self {
@@ -709,7 +749,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         let (tx, rx) = mpsc::channel(1);
         let (wait, info) = WaitUntilZero::new();
         let pool = runtime.handle().clone();
-        let service = SccacheService::new(dist_client, storage, &client, pool, tx, info);
+        let service = SccacheService::new(dist_client, storage, client, pool, tx, info);
 
         Self {
             runtime,
@@ -742,6 +782,9 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
     }
 
     /// Returns the port that this server is bound to
+    /// # Errors
+    ///
+    /// Returns an I/O error if the listener cannot report its local address.
     pub fn try_local_addr(&self) -> io::Result<Option<crate::net::SocketAddr>> {
         self.listener.local_addr()
     }
@@ -757,6 +800,10 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
     /// If the `shutdown` future resolves then the server will be shut down,
     /// otherwise the server may naturally shut down if it becomes idle for too
     /// long anyway.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the server listener or runtime loop fails.
     pub fn run<F>(self, shutdown: F) -> io::Result<()>
     where
         F: Future,
@@ -827,7 +874,6 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
             }
         })?;
 
-        const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
         info!(
             "moving into the shutdown phase now, waiting at most {} seconds \
              for all client requests to complete",
@@ -957,6 +1003,10 @@ where
     type Error = Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response>> + Send + 'static>>;
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the service dispatcher mirrors the request enum in one exhaustive match so protocol-to-handler mapping stays visible"
+    )]
     fn call(&mut self, req: SccacheRequest) -> Self::Future {
         trace!("handle_client");
 
@@ -1283,6 +1333,11 @@ where
     ///
     /// Returns the `CompileResponse` variant and, when compilation started, the
     /// accompanying `CompileFinished` result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if compilation handling fails, a body response cannot be
+    /// read, or the in-process protocol produces an unexpected response variant.
     pub async fn compile_direct(
         &self,
         compile: Compile,
@@ -1299,8 +1354,70 @@ where
         }
     }
 
+    async fn detect_and_cache_compiler(
+        &self,
+        path: PathBuf,
+        cwd: &Path,
+        args: &[OsString],
+        env: &[(OsString, OsString)],
+        resolved: (PathBuf, FileTime, Option<(PathBuf, FileTime)>),
+    ) -> Result<Box<dyn Compiler<C>>> {
+        let (resolved_compiler_path, mtime, dist_info) = resolved;
+        let info = get_compiler_info::<C>(
+            self.creator.clone(),
+            &path,
+            cwd,
+            args,
+            env,
+            &self.rt,
+            dist_info.clone().map(|(archive, _)| archive),
+        )
+        .await;
+
+        let (compiler, proxy) = match info {
+            Ok((compiler, proxy)) => (compiler.clone(), proxy.clone()),
+            Err(error) => {
+                trace!(
+                    "Inserting PLAIN cache map info for {}",
+                    util::debug_display(&path)
+                );
+                self.compilers.write().await.insert(path, None);
+                return Err(error);
+            }
+        };
+
+        if let Some(proxy) = proxy {
+            trace!(
+                "Inserting new path proxy {} @ {} -> {}",
+                util::debug_display(&path),
+                util::debug_display(cwd),
+                util::debug_display(&resolved_compiler_path)
+            );
+            self.compiler_proxies
+                .write()
+                .await
+                .insert(path, (Arc::from(proxy), mtime));
+        }
+
+        let map_info = CompilerCacheEntry::new(compiler.clone(), mtime, dist_info);
+        trace!(
+            "Inserting POSSIBLY PROXIED cache map info for {}",
+            util::debug_display(&resolved_compiler_path)
+        );
+        self.compilers
+            .write()
+            .await
+            .insert(resolved_compiler_path, Some(map_info));
+        Ok(compiler)
+    }
+
     /// Look up compiler info from the cache for the compiler `path`.
     /// If not cached, determine the compiler type and cache the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if compiler proxy resolution, metadata lookup, compiler
+    /// detection, or compiler-cache population fails.
     pub async fn compiler_info(
         &self,
         path: PathBuf,
@@ -1310,133 +1427,68 @@ where
     ) -> Result<Box<dyn Compiler<C>>> {
         trace!("compiler_info");
 
-        let me = self.clone();
-        let me1 = self.clone();
-        // lookup if compiler proxy exists for the current compiler path
-
-        let path2 = path.clone();
-        let path1 = path.clone();
-        let env = env.to_vec();
-
         let compiler_proxy = {
             let compiler_proxies = self.compiler_proxies.read().await;
             compiler_proxies
                 .get(&path)
-                .map(|(compiler_proxy, _filetime)| Arc::clone(compiler_proxy))
+                .map(|(compiler_proxy, _)| Arc::clone(compiler_proxy))
         };
         let resolved_with_proxy = match compiler_proxy {
             Some(compiler_proxy) => compiler_proxy
-                .resolve_proxied_executable(self.creator.clone(), cwd.clone(), env.as_slice())
+                .resolve_proxied_executable(self.creator.clone(), cwd.clone(), env)
                 .await
                 .ok(),
             None => None,
         };
 
-        // use the supplied compiler path as fallback, lookup its modification time too
-        let (resolved_compiler_path, mtime) = match resolved_with_proxy {
-            Some(x) => x, // TODO resolve the path right away
-            _ => {
-                // fallback to using the path directly
-                let attr = metadata(&path2).with_context(|| {
-                    format!("failed to read compiler metadata at {}", path2.display())
-                })?;
-                (path2, FileTime::from_last_modification_time(&attr))
-            }
+        let (resolved_compiler_path, mtime) = if let Some(resolved) = resolved_with_proxy {
+            resolved
+        } else {
+            let attr = metadata(&path).with_context(|| {
+                format!("failed to read compiler metadata at {}", path.display())
+            })?;
+            (path.clone(), FileTime::from_last_modification_time(&attr))
         };
 
-        // canonicalize the path to follow symlinks
-        // don't canonicalize if the file name differs so it works with clang's multicall
+        // Follow symlinks without breaking clang-style multicall names.
         let resolved_compiler_path = match resolved_compiler_path.canonicalize() {
-            Ok(path) if matches!(path.file_name(), Some(name) if resolved_compiler_path.file_name() == Some(name)) => {
-                path
+            Ok(canonical) if matches!(canonical.file_name(), Some(name) if resolved_compiler_path.file_name() == Some(name)) => {
+                canonical
             }
             _ => resolved_compiler_path,
         };
 
-        let dist_info = match me1.dist_client.get_client().await {
-            Ok(Some(ref client)) => {
-                if let Some(archive) = client.get_custom_toolchain(&resolved_compiler_path) {
-                    match metadata(&archive)
-                        .map(|attr| FileTime::from_last_modification_time(&attr))
-                    {
-                        Ok(mtime) => Some((archive, mtime)),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            }
+        let dist_info = match self.dist_client.get_client().await {
+            Ok(Some(ref client)) => client
+                .get_custom_toolchain(&resolved_compiler_path)
+                .and_then(|archive| {
+                    metadata(&archive)
+                        .ok()
+                        .map(|attr| (archive, FileTime::from_last_modification_time(&attr)))
+                }),
             _ => None,
         };
 
-        let opt = match me1.compilers.read().await.get(&resolved_compiler_path) {
-            // It's a hit only if the mtime and dist archive data matches.
-            Some(Some(entry)) => {
-                if entry.mtime == mtime && entry.dist_info == dist_info {
-                    Some(entry.compiler.box_clone())
-                } else {
-                    None
-                }
+        let cached = match self.compilers.read().await.get(&resolved_compiler_path) {
+            Some(Some(entry)) if entry.mtime == mtime && entry.dist_info == dist_info => {
+                Some(entry.compiler.box_clone())
             }
             _ => None,
         };
-
-        if let Some(info) = opt {
+        if let Some(compiler) = cached {
             trace!("compiler_info cache hit");
-            Ok(info)
-        } else {
-            trace!("compiler_info cache miss");
-            // Check the compiler type and return the result when
-            // finished. This generally involves invoking the compiler,
-            // so do it asynchronously.
-
-            // the compiler path might be compiler proxy, so it is important to use
-            // `path` (or its clone `path1`) to resolve using that one, not using `resolved_compiler_path`
-            let info = get_compiler_info::<C>(
-                me.creator.clone(),
-                &path1,
-                &cwd,
-                args,
-                env.as_slice(),
-                &me.rt,
-                dist_info.clone().map(|(p, _)| p),
-            )
-            .await;
-
-            let (c, proxy) = match info {
-                Ok((c, proxy)) => (c.clone(), proxy.clone()),
-                Err(err) => {
-                    trace!("Inserting PLAIN cache map info for {path:?}");
-                    me.compilers.write().await.insert(path, None);
-
-                    return Err(err);
-                }
-            };
-
-            // register the proxy for this compiler, so it will be used directly from now on
-            // and the true/resolved compiler will create table hits in the hash map
-            // based on the resolved path
-            if let Some(proxy) = proxy {
-                trace!("Inserting new path proxy {path:?} @ {cwd:?} -> {resolved_compiler_path:?}");
-                me.compiler_proxies
-                    .write()
-                    .await
-                    .insert(path, (Arc::from(proxy), mtime));
-            }
-            // TODO add some safety checks in case a proxy exists, that the initial `path` is not
-            // TODO the same as the resolved compiler binary
-
-            // cache
-            let map_info = CompilerCacheEntry::new(c.clone(), mtime, dist_info);
-            trace!("Inserting POSSIBLY PROXIED cache map info for {resolved_compiler_path:?}");
-            me.compilers
-                .write()
-                .await
-                .insert(resolved_compiler_path, Some(map_info));
-
-            // drop the proxy information, response is compiler only
-            Ok(c)
+            return Ok(compiler);
         }
+
+        trace!("compiler_info cache miss");
+        self.detect_and_cache_compiler(
+            path,
+            &cwd,
+            args,
+            env,
+            (resolved_compiler_path, mtime, dist_info),
+        )
+        .await
     }
 
     /// Check that we can handle and cache `cmd` when run with `compiler`.
@@ -1500,6 +1552,15 @@ where
     /// Given compiler arguments `arguments`, look up
     /// a compile result in the cache or execute the compilation and store
     /// the result in the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when hashing/preprocessing, cache I/O, distributed
+    /// compilation, or local compiler execution fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "compile lifecycle handling keeps result mapping, statistics lock scope, cache errors, and dist status in one ordered state machine"
+    )]
     pub async fn start_compile_task(
         self,
         compiler: Box<dyn Compiler<C>>,
@@ -1587,19 +1648,19 @@ where
             let mut stats = me.stats.lock().await;
 
             match result {
-                Ok((compiled, out)) => {
+                Ok((compile_result, out)) => {
                     let mut dist_type = DistType::NoDist;
 
-                    match compiled {
+                    match compile_result {
                         CompileResult::Error => {
                             debug!("[{out_pretty}]: compile result: cache error");
 
-                            stats.cache_errors.increment(&kind, &lang);
+                            stats.cache_errors.increment(&kind, lang);
                         }
                         CompileResult::CacheHit(duration) => {
                             debug!("[{out_pretty}]: compile result: cache hit");
 
-                            stats.cache_hits.increment(&kind, &lang);
+                            stats.cache_hits.increment(&kind, lang);
                             stats.cache_read_hit_duration += duration;
                         }
                         CompileResult::CacheMiss(miss_type, dt, duration, future) => {
@@ -1615,11 +1676,11 @@ where
                                     stats.cache_timeouts += 1;
                                 }
                                 MissType::CacheReadError => {
-                                    stats.cache_errors.increment(&kind, &lang);
+                                    stats.cache_errors.increment(&kind, lang);
                                 }
                             }
                             stats.compilations += 1;
-                            stats.cache_misses.increment(&kind, &lang);
+                            stats.cache_misses.increment(&kind, lang);
                             stats.compiler_write_duration += duration;
                             debug!("stats after compile result: {stats:?}");
                             cache_write = Some(future);
@@ -1670,7 +1731,7 @@ where
                     match status.code() {
                         Some(code) => res.retcode = Some(code),
                         None => {
-                            if let Some(signal) = get_signal(&status) {
+                            if let Some(signal) = get_signal(status) {
                                 res.signal = Some(signal);
                             } else {
                                 error!("process exited without an exit code or signal");
@@ -1693,7 +1754,7 @@ where
                             match output.status.code() {
                                 Some(code) => res.retcode = Some(code),
                                 None => {
-                                    if let Some(signal) = get_signal(&output.status) {
+                                    if let Some(signal) = get_signal(output.status) {
                                         res.signal = Some(signal);
                                     } else {
                                         error!(
@@ -1717,11 +1778,9 @@ where
                                 res.stderr = errmsg.as_bytes().to_vec();
                             }
                             Err(err) => {
-                                stats.cache_errors.increment(&kind, &lang);
+                                stats.cache_errors.increment(&kind, lang);
                                 // Make sure the write guard has been dropped ASAP.
                                 drop(stats);
-
-                                use std::fmt::Write;
 
                                 error!("[{out_pretty:?}] fatal error: {err}");
 
@@ -1774,12 +1833,12 @@ pub struct PerLanguageCount {
 }
 
 impl PerLanguageCount {
-    fn increment(&mut self, kind: &CompilerKind, lang: &Language) {
+    fn increment(&mut self, kind: &CompilerKind, lang: Language) {
         let lang_comp_key = kind.lang_comp_kind(lang);
         let adv_count = self.adv_counts.entry(lang_comp_key).or_insert(0);
         *adv_count += 1;
 
-        let lang_key = kind.lang_kind(lang);
+        let lang_key = CompilerKind::lang_kind(lang);
         let count = self.counts.entry(lang_key).or_insert(0);
         *count += 1;
     }
@@ -2008,6 +2067,64 @@ impl ServerStatsWriter for StdoutServerStatsWriter {
     }
 }
 
+type StatsRow = (String, String, usize);
+
+fn push_stat(rows: &mut Vec<StatsRow>, value: u64, name: &str) {
+    rows.push((name.to_string(), value.to_string(), 0));
+}
+
+fn push_language_stat(
+    rows: &mut Vec<StatsRow>,
+    counts: &PerLanguageCount,
+    name: &str,
+    advanced: bool,
+) {
+    rows.push((name.to_string(), counts.all().to_string(), 0));
+    let mut sorted: Vec<_> = if advanced {
+        counts.adv_counts.iter().collect()
+    } else {
+        counts.counts.iter().collect()
+    };
+    sorted.sort_by_key(|(label, _)| *label);
+    for (label, count) in sorted {
+        rows.push((format!("{name} ({label})"), count.to_string(), 0));
+    }
+}
+
+fn push_duration_stat(rows: &mut Vec<StatsRow>, duration: Duration, samples: u64, name: &str) {
+    let average = util::average_duration(duration, samples);
+    rows.push((name.to_string(), util::fmt_duration_as_secs(&average), 2));
+}
+
+fn write_count_breakdown<T: ServerStatsWriter>(
+    writer: &mut T,
+    title: &str,
+    counts: &HashMap<String, usize>,
+    name_width: usize,
+    stat_width: usize,
+    indent: usize,
+    trailing_blank: bool,
+) {
+    if counts.is_empty() {
+        return;
+    }
+    writer.write(title);
+    let mut sorted: Vec<_> = counts.iter().collect();
+    sorted.sort_by(|(key_a, value_a), (key_b, value_b)| {
+        value_b.cmp(value_a).then_with(|| key_a.cmp(key_b))
+    });
+    let label_width = name_width.saturating_sub(indent);
+    let padding = " ".repeat(indent);
+    for (label, count) in sorted {
+        writer.write(&format!(
+            "{padding}{label:<label_width$} {count:>stat_width$}"
+        ));
+    }
+    if trailing_blank {
+        writer.write("");
+    }
+}
+
 impl ServerStats {
     fn record_not_cacheable(&mut self, why: &str, extra_info: Option<&str>) {
         self.requests_not_cacheable += 1;
@@ -2023,174 +2140,122 @@ impl ServerStats {
         }
     }
 
+    fn stats_rows(&self, advanced: bool) -> Vec<StatsRow> {
+        let mut rows = Vec::new();
+        push_stat(&mut rows, self.compile_requests, "Compile requests");
+        push_stat(
+            &mut rows,
+            self.requests_executed,
+            "Compile requests executed",
+        );
+        push_language_stat(&mut rows, &self.cache_hits, "Cache hits", advanced);
+        push_language_stat(&mut rows, &self.cache_misses, "Cache misses", advanced);
+        self.set_percentage_stats(&mut rows, advanced);
+        push_stat(&mut rows, self.cache_timeouts, "Cache timeouts");
+        push_stat(&mut rows, self.cache_read_errors, "Cache read errors");
+        push_stat(&mut rows, self.forced_recaches, "Forced recaches");
+        push_stat(&mut rows, self.cache_write_errors, "Cache write errors");
+        push_language_stat(&mut rows, &self.cache_errors, "Cache errors", advanced);
+        push_stat(&mut rows, self.compilations, "Compilations");
+        push_stat(&mut rows, self.compile_fails, "Compilation failures");
+        push_stat(
+            &mut rows,
+            self.non_cacheable_compilations,
+            "Non-cacheable compilations",
+        );
+        push_stat(
+            &mut rows,
+            self.requests_not_cacheable,
+            "Non-cacheable calls",
+        );
+        push_stat(
+            &mut rows,
+            self.requests_not_compile,
+            "Non-compilation calls",
+        );
+        push_stat(
+            &mut rows,
+            self.requests_unsupported_compiler,
+            "Unsupported compiler calls",
+        );
+        push_duration_stat(
+            &mut rows,
+            self.cache_write_duration,
+            self.cache_writes,
+            "Average cache write",
+        );
+        push_duration_stat(
+            &mut rows,
+            self.compiler_write_duration,
+            self.compilations,
+            "Average compiler",
+        );
+        push_duration_stat(
+            &mut rows,
+            self.cache_read_hit_duration,
+            self.cache_hits.all(),
+            "Average cache read hit",
+        );
+        push_stat(
+            &mut rows,
+            self.dist_errors,
+            "Failed distributed compilations",
+        );
+        if let Some(multi_level) = &self.multi_level {
+            rows.extend(multi_level.format_stats());
+        }
+        rows
+    }
+
     /// Print stats in a human-readable format.
     ///
     /// Return the formatted width of each of the (name, value) columns.
     fn print<T: ServerStatsWriter>(&self, writer: &mut T, advanced: bool) -> (usize, usize) {
-        macro_rules! set_stat {
-            ($vec:ident, $var:expr, $name:expr) => {{
-                // name, value, suffix length
-                $vec.push(($name.to_string(), $var.to_string(), 0));
-            }};
-        }
-
-        macro_rules! set_lang_stat {
-            ($vec:ident, $var:expr, $name:expr) => {{
-                $vec.push(($name.to_string(), $var.all().to_string(), 0));
-                let mut sorted_stats: Vec<_> = $var.counts.iter().collect();
-                sorted_stats.sort_by_key(|v| v.0);
-                for (lang, count) in sorted_stats.iter() {
-                    $vec.push((format!("{} ({})", $name, lang), count.to_string(), 0));
-                }
-            }};
-        }
-        macro_rules! set_compiler_stat {
-            ($vec:ident, $var:expr, $name:expr) => {{
-                $vec.push(($name.to_string(), $var.all().to_string(), 0));
-                let mut sorted_stats: Vec<_> = $var.adv_counts.iter().collect();
-                sorted_stats.sort_by_key(|v| v.0);
-                for (lang, count) in sorted_stats.iter() {
-                    $vec.push((format!("{} ({})", $name, lang), count.to_string(), 0));
-                }
-            }};
-        }
-
-        macro_rules! set_duration_stat {
-            ($vec:ident, $dur:expr, $num:expr, $name:expr) => {{
-                let s = util::average_duration($dur, $num);
-                // name, value, suffix length
-                $vec.push(($name.to_string(), util::fmt_duration_as_secs(&s), 2));
-            }};
-        }
-
-        let mut stats_vec = vec![];
-        //TODO: this would be nice to replace with a custom derive implementation.
-        set_stat!(stats_vec, self.compile_requests, "Compile requests");
-        set_stat!(
-            stats_vec,
-            self.requests_executed,
-            "Compile requests executed"
-        );
-        if advanced {
-            set_compiler_stat!(stats_vec, self.cache_hits, "Cache hits");
-            set_compiler_stat!(stats_vec, self.cache_misses, "Cache misses");
-        } else {
-            set_lang_stat!(stats_vec, self.cache_hits, "Cache hits");
-            set_lang_stat!(stats_vec, self.cache_misses, "Cache misses");
-        }
-
-        self.set_percentage_stats(&mut stats_vec, advanced);
-
-        set_stat!(stats_vec, self.cache_timeouts, "Cache timeouts");
-        set_stat!(stats_vec, self.cache_read_errors, "Cache read errors");
-        set_stat!(stats_vec, self.forced_recaches, "Forced recaches");
-        set_stat!(stats_vec, self.cache_write_errors, "Cache write errors");
-        if advanced {
-            set_compiler_stat!(stats_vec, self.cache_errors, "Cache errors");
-        } else {
-            set_lang_stat!(stats_vec, self.cache_errors, "Cache errors");
-        }
-
-        set_stat!(stats_vec, self.compilations, "Compilations");
-        set_stat!(stats_vec, self.compile_fails, "Compilation failures");
-
-        set_stat!(
-            stats_vec,
-            self.non_cacheable_compilations,
-            "Non-cacheable compilations"
-        );
-        set_stat!(
-            stats_vec,
-            self.requests_not_cacheable,
-            "Non-cacheable calls"
-        );
-        set_stat!(
-            stats_vec,
-            self.requests_not_compile,
-            "Non-compilation calls"
-        );
-        set_stat!(
-            stats_vec,
-            self.requests_unsupported_compiler,
-            "Unsupported compiler calls"
-        );
-        set_duration_stat!(
-            stats_vec,
-            self.cache_write_duration,
-            self.cache_writes,
-            "Average cache write"
-        );
-        set_duration_stat!(
-            stats_vec,
-            self.compiler_write_duration,
-            self.compilations,
-            "Average compiler"
-        );
-        set_duration_stat!(
-            stats_vec,
-            self.cache_read_hit_duration,
-            self.cache_hits.all(),
-            "Average cache read hit"
-        );
-        set_stat!(
-            stats_vec,
-            self.dist_errors,
-            "Failed distributed compilations"
-        );
-
-        // Add multi-level cache statistics if available
-        if let Some(ref ml_stats) = self.multi_level {
-            for (name, value, suffix_type) in ml_stats.format_stats() {
-                stats_vec.push((name, value, suffix_type));
-            }
-        }
-
-        let name_width = stats_vec.iter().map(|(n, _, _)| n.len()).max().unwrap_or(0);
-        let stat_width = stats_vec.iter().map(|(_, s, _)| s.len()).max().unwrap_or(0);
-        for (name, stat, suffix_len) in stats_vec {
+        let rows = self.stats_rows(advanced);
+        let name_width = rows
+            .iter()
+            .map(|(name, _, _)| name.len())
+            .max()
+            .unwrap_or(0);
+        let stat_width = rows
+            .iter()
+            .map(|(_, value, _)| value.len())
+            .max()
+            .unwrap_or(0);
+        for (name, stat, suffix_len) in rows {
             writer.write(&format!(
                 "{name:<name_width$} {stat:>stat_width$}",
                 stat_width = stat_width + suffix_len
             ));
         }
 
-        // Compare values. If equal, compare keys to have a fully deterministic order.
-        let sort_func =
-            |(k1, v1): &(&String, &usize), (k2, v2): &(&String, &usize)| match v1.cmp(v2).reverse()
-            {
-                std::cmp::Ordering::Equal => k1.cmp(k2),
-                other => other,
-            };
-
-        if !self.dist_compiles.is_empty() {
-            writer.write("\nSuccessful distributed compiles");
-            let mut counts: Vec<_> = self.dist_compiles.iter().collect();
-            counts.sort_by(sort_func);
-            for (reason, count) in counts {
-                writer.write(&format!(
-                    "  {reason:<name_width$} {count:>stat_width$}",
-                    name_width = name_width.saturating_sub(2),
-                ));
-            }
-        }
-        if !self.not_cached.is_empty() {
-            writer.write("\nNon-cacheable reasons:");
-            let mut counts: Vec<_> = self.not_cached.iter().collect();
-            counts.sort_by(sort_func);
-            for (reason, count) in counts {
-                writer.write(&format!("{reason:<name_width$} {count:>stat_width$}"));
-            }
-            writer.write("");
-        }
-        if !self.not_cached_crate_types.is_empty() {
-            writer.write("Non-cacheable crate types:");
-            let mut counts: Vec<_> = self.not_cached_crate_types.iter().collect();
-            counts.sort_by(sort_func);
-            for (crate_type, count) in counts {
-                writer.write(&format!("{crate_type:<name_width$} {count:>stat_width$}"));
-            }
-            writer.write("");
-        }
+        write_count_breakdown(
+            writer,
+            "\nSuccessful distributed compiles",
+            &self.dist_compiles,
+            name_width,
+            stat_width,
+            2,
+            false,
+        );
+        write_count_breakdown(
+            writer,
+            "\nNon-cacheable reasons:",
+            &self.not_cached,
+            name_width,
+            stat_width,
+            0,
+            true,
+        );
+        write_count_breakdown(
+            writer,
+            "Non-cacheable crate types:",
+            &self.not_cached_crate_types,
+            name_width,
+            stat_width,
+            0,
+            true,
+        );
         (name_width, stat_width)
     }
 
@@ -2289,34 +2354,40 @@ fn format_binary_size(bytes: u64) -> (String, &'static str) {
 }
 
 impl ServerInfo {
+    /// Build a server-information snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configured storage cannot report its current or
+    /// maximum cache size.
     pub async fn new(stats: ServerStats, storage: Option<&dyn Storage>) -> Result<Self> {
-        let cache_location;
-        let use_preprocessor_cache_mode;
-        let cache_size;
-        let max_cache_size;
-        let basedirs;
-        let multi_level;
-        if let Some(storage) = storage {
-            cache_location = storage.location();
-            use_preprocessor_cache_mode = storage
-                .preprocessor_cache_mode_config()
-                .use_preprocessor_cache_mode;
-            (cache_size, max_cache_size) =
+        let (
+            cache_location,
+            use_preprocessor_cache_mode,
+            cache_size,
+            max_cache_size,
+            basedirs,
+            multi_level,
+        ) = if let Some(storage) = storage {
+            let (cache_size, max_cache_size) =
                 futures::try_join!(storage.current_size(), storage.max_size())?;
-            basedirs = storage
-                .basedirs()
-                .iter()
-                .map(|p| String::from_utf8_lossy(p).to_string())
-                .collect();
-            multi_level = storage.multilevel_stats();
+            (
+                storage.location(),
+                storage
+                    .preprocessor_cache_mode_config()
+                    .use_preprocessor_cache_mode,
+                cache_size,
+                max_cache_size,
+                storage
+                    .basedirs()
+                    .iter()
+                    .map(|p| String::from_utf8_lossy(p).to_string())
+                    .collect(),
+                storage.multilevel_stats(),
+            )
         } else {
-            cache_location = String::new();
-            use_preprocessor_cache_mode = false;
-            cache_size = None;
-            max_cache_size = None;
-            basedirs = Vec::new();
-            multi_level = None;
-        }
+            (String::new(), false, None, None, Vec::new(), None)
+        };
         let version = env!("CARGO_PKG_VERSION").to_string();
         Ok(Self {
             stats: ServerStats {
@@ -2452,19 +2523,7 @@ where
 ///   all `Response` types pushed in will be converted to `BytesMut` and pushed
 ///   below.
 struct SccacheTransport<I: AsyncRead + AsyncWrite + Unpin> {
-    inner: Framed<
-        futures::stream::ErrInto<
-            futures::sink::SinkErrInto<
-                tokio_util::codec::Framed<I, LengthDelimitedCodec>,
-                Bytes,
-                Error,
-            >,
-            Error,
-        >,
-        Request,
-        Response,
-        BincodeCodec,
-    >,
+    inner: BincodeTransport<I>,
 }
 
 impl<I: AsyncRead + AsyncWrite + Unpin> Stream for SccacheTransport<I> {

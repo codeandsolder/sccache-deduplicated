@@ -46,6 +46,7 @@ use async_trait::async_trait;
 use filetime::FileTime;
 use fs::File;
 use fs_err as fs;
+use futures::TryFutureExt;
 use itertools::Itertools as _;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -396,7 +397,7 @@ impl Language {
 }
 
 impl CompilerKind {
-    pub fn lang_kind(&self, lang: &Language) -> String {
+    pub fn lang_kind(lang: Language) -> String {
         match lang {
             Language::AssemblerToPreprocess | Language::Assembler => "Assembler",
             Language::C
@@ -422,7 +423,7 @@ impl CompilerKind {
         }
         .to_string()
     }
-    pub fn lang_comp_kind(&self, lang: &Language) -> String {
+    pub fn lang_comp_kind(&self, lang: Language) -> String {
         let textual_lang = lang.as_str().to_owned();
         match self {
             Self::C(CCompilerKind::Clang) => textual_lang + " [clang]",
@@ -439,6 +440,15 @@ impl CompilerKind {
         }
     }
 }
+
+pub type GenerateCompileCommandsResult<T> = Result<(
+    Box<dyn CompileCommand<T>>,
+    Option<dist::CompileCommand>,
+    Cacheable,
+)>;
+
+pub type CompilerProxyFuture =
+    Pin<Box<dyn Future<Output = Result<(PathBuf, FileTime)>> + Send + 'static>>;
 
 #[cfg(feature = "dist-client")]
 pub type DistPackagers = (
@@ -492,7 +502,7 @@ where
         creator: T,
         cwd: PathBuf,
         env_vars: &[(OsString, OsString)],
-    ) -> Pin<Box<dyn Future<Output = Result<(PathBuf, FileTime)>> + Send + 'static>>;
+    ) -> CompilerProxyFuture;
 
     /// Create a clone of `Self` and puts it in a `Box`
     fn box_clone(&self) -> Box<dyn CompilerProxy<T>>;
@@ -547,6 +557,10 @@ where
 
     /// Look up a cached compile result in `storage`. If not found, run the
     /// compile and store the result.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "cache lookup, fallback compilation, and writeback form one ownership-heavy state machine with ordered statistics and error handling"
+    )]
     async fn get_cached_or_compile(
         &mut self,
         context: CacheCompileContext<'_, T>,
@@ -863,12 +877,16 @@ where
 
     debug!("[{}]: Compiling locally", out_pretty);
     compile_cmd
-        .execute(&service, &creator)
+        .execute(service, &creator)
         .await
         .map(move |o| (cacheable, DistType::NoDist, o))
 }
 
 #[cfg(feature = "dist-client")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "distributed execution and local fallback share cleanup, ownership, and retry state that is clearer as one linear state machine"
+)]
 async fn dist_or_local_compile<T>(
     service: &server::SccacheService<T>,
     dist_client: Option<Arc<dyn dist::Client>>,
@@ -917,19 +935,24 @@ where
         let (inputs_packager, toolchain_packager, outputs_rewriter) =
             compilation.into_dist_packagers(path_transformer)?;
 
-        debug!("[{out_pretty}]: Identifying dist toolchain for {local_executable:?}");
+        debug!(
+            "[{out_pretty}]: Identifying dist toolchain for {}",
+            crate::util::debug_display(&local_executable)
+        );
         let (dist_toolchain, maybe_dist_compile_executable) = dist_client
             .put_toolchain(local_executable, weak_toolchain_key, toolchain_packager)
             .await?;
-        let mut tc_archive = None;
-        if let Some((dist_compile_executable, archive_path)) = maybe_dist_compile_executable {
-            dist_compile_cmd.executable = dist_compile_executable;
-            tc_archive = Some(archive_path);
-        }
+        let tc_archive =
+            if let Some((dist_compile_executable, archive_path)) = maybe_dist_compile_executable {
+                dist_compile_cmd.executable = dist_compile_executable;
+                Some(archive_path)
+            } else {
+                None
+            };
 
         debug!("[{out_pretty}]: Requesting allocation");
-        let jares = dist_client.do_alloc_job(dist_toolchain.clone()).await?;
-        let job_alloc = match jares {
+        let allocation_result = dist_client.do_alloc_job(dist_toolchain.clone()).await?;
+        let job_alloc = match allocation_result {
             dist::AllocJobResult::Success {
                 job_alloc,
                 need_toolchain: true,
@@ -965,7 +988,7 @@ where
         let job_id = job_alloc.job_id;
         let server_id = job_alloc.server_id;
         debug!("[{out_pretty}]: Running job");
-        let ((job_id, server_id), (jres, path_transformer)) = dist_client
+        let ((job_id, server_id), (job_result, path_transformer)) = dist_client
             .do_run_job(
                 job_alloc,
                 dist_compile_cmd,
@@ -978,7 +1001,7 @@ where
                 format!("could not run distributed compilation job on {server_id:?}")
             })?;
 
-        let mut jc = match jres {
+        let mut jc = match job_result {
             dist::RunJobResult::Complete(jc) => jc,
             dist::RunJobResult::JobNotFound => bail!("Job {job_id} not found on server"),
         };
@@ -1063,7 +1086,6 @@ where
         Ok((DistType::Ok(server_id), jc.output.into()))
     };
 
-    use futures::TryFutureExt;
     do_dist_compile
         .or_else(move |e| async move {
             if let Some(HttpClientError(_)) = e.downcast_ref::<HttpClientError>() {
@@ -1071,8 +1093,9 @@ where
             } else if matches!(e.downcast_ref::<lru_disk_cache::Error>(), Some(lru_disk_cache::Error::FileTooLarge))
             {
                 Err(anyhow!(
-                    "Could not cache dist toolchain for {local_executable2:?} locally.
-                 Increase `toolchain_cache_size` or decrease the toolchain archive size."
+                    "Could not cache dist toolchain for {} locally.
+                 Increase `toolchain_cache_size` or decrease the toolchain archive size.",
+                    crate::util::debug_display(&local_executable2)
                 ))
             } else {
                 // `{:#}` prints the error and the causes in a single line.
@@ -1108,11 +1131,7 @@ where
         &self,
         path_transformer: &mut dist::PathTransformer,
         rewrite_includes_only: bool,
-    ) -> Result<(
-        Box<dyn CompileCommand<T>>,
-        Option<dist::CompileCommand>,
-        Cacheable,
-    )>;
+    ) -> GenerateCompileCommandsResult<T>;
 
     /// Create a function that will create the inputs used to perform a distributed compilation
     #[cfg(feature = "dist-client")]
@@ -1566,7 +1585,6 @@ where
                 creator.clone(),
                 env,
             );
-            use futures::TryFutureExt;
             let creator1 = creator.clone();
             let res = proxy.and_then(move |proxy| async move {
                 match proxy {
@@ -1575,7 +1593,10 @@ where
                         // take the pathbuf for rustc as resolved by the proxy
                         match proxy.resolve_proxied_executable(creator1, cwd, env).await {
                             Ok((resolved_path, _time)) => {
-                                trace!("Resolved path with rustup proxy {resolved_path:?}");
+                                trace!(
+                                    "Resolved path with rustup proxy {}",
+                                    crate::util::debug_display(&resolved_path)
+                                );
                                 Ok((Some(proxy), resolved_path))
                             }
                             Err(e) => {
@@ -1610,7 +1631,10 @@ where
                 },
             );
 
-            debug!("Using rustc at path: {resolved_rustc:?}");
+            debug!(
+                "Using rustc at path: {}",
+                crate::util::debug_display(&resolved_rustc)
+            );
 
             Rust::new(
                 creator,
@@ -1782,6 +1806,10 @@ where
     Some(m.finish())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "compiler detection is an ordered probe sequence; keeping priority and fallback rules contiguous prevents accidental reordering"
+)]
 async fn detect_c_compiler<T, P>(
     creator: T,
     executable: P,

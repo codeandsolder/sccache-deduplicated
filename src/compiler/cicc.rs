@@ -110,6 +110,10 @@ impl CCompilerImpl for Cicc {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "single-pass argument parser keeps interdependent flag state and ordering visible; splitting would require a state bag threaded through helpers"
+)]
 pub fn parse_arguments<S>(
     arguments: &[OsString],
     cwd: &Path,
@@ -141,74 +145,72 @@ where
     let mut unhashed_args = vec![];
 
     for arg in ArgsIter::new(args.iter().cloned(), arg_info) {
-        match arg {
-            Ok(arg) => {
-                let args = match arg.get_data() {
-                    Some(PassThrough(_)) => {
+        let Ok(arg) = arg else {
+            continue;
+        };
+        let args = match arg.get_data() {
+            Some(PassThrough(_)) => {
+                take_next = false;
+                &mut common_args
+            }
+            Some(Output(o)) => {
+                take_next = false;
+                let path = cwd.join(o);
+                outputs.insert(
+                    "obj",
+                    ArtifactDescriptor {
+                        path,
+                        optional: false,
+                    },
+                );
+                continue;
+            }
+            Some(GenModuleIdFileFlag) => {
+                take_next = false;
+                gen_module_id_file = true;
+                &mut common_args
+            }
+            Some(ModuleIdFileName(o)) => {
+                take_next = false;
+                module_id_file_name = Some(cwd.join(o));
+                &mut common_args
+            }
+            Some(UnhashedPassThrough(_)) => {
+                take_next = false;
+                &mut unhashed_args
+            }
+            Some(UnhashedOutput(o)) => {
+                take_next = false;
+                let path = cwd.join(o);
+                if let Some(flag) = arg.flag_str() {
+                    outputs.insert(
+                        flag,
+                        ArtifactDescriptor {
+                            path,
+                            optional: false,
+                        },
+                    );
+                }
+                &mut unhashed_args
+            }
+            None => match arg {
+                Argument::Raw(_) => {
+                    if take_next {
                         take_next = false;
                         &mut common_args
-                    }
-                    Some(Output(o)) => {
-                        take_next = false;
-                        let path = cwd.join(o);
-                        outputs.insert(
-                            "obj",
-                            ArtifactDescriptor {
-                                path,
-                                optional: false,
-                            },
-                        );
+                    } else {
                         continue;
                     }
-                    Some(GenModuleIdFileFlag) => {
-                        take_next = false;
-                        gen_module_id_file = true;
-                        &mut common_args
-                    }
-                    Some(ModuleIdFileName(o)) => {
-                        take_next = false;
-                        module_id_file_name = Some(cwd.join(o));
-                        &mut common_args
-                    }
-                    Some(UnhashedPassThrough(_)) => {
-                        take_next = false;
-                        &mut unhashed_args
-                    }
-                    Some(UnhashedOutput(o)) => {
-                        take_next = false;
-                        let path = cwd.join(o);
-                        if let Some(flag) = arg.flag_str() {
-                            outputs.insert(
-                                flag,
-                                ArtifactDescriptor {
-                                    path,
-                                    optional: false,
-                                },
-                            );
-                        }
-                        &mut unhashed_args
-                    }
-                    None => match arg {
-                        Argument::Raw(_) => {
-                            if take_next {
-                                take_next = false;
-                                &mut common_args
-                            } else {
-                                continue;
-                            }
-                        }
-                        Argument::UnknownFlag(ref p) => {
-                            let s = p.to_string_lossy();
-                            take_next = s.starts_with('-');
-                            &mut common_args
-                        }
-                        _ => unreachable!(),
-                    },
-                };
-                args.extend(arg.iter_os_strings());
-            }
-            _ => continue,
-        }
+                }
+                Argument::UnknownFlag(ref p) => {
+                    let s = p.to_string_lossy();
+                    take_next = s.starts_with('-');
+                    &mut common_args
+                }
+                _ => unreachable!(),
+            },
+        };
+        args.extend(arg.iter_os_strings());
     }
 
     if let Some(module_id_path) = module_id_file_name {

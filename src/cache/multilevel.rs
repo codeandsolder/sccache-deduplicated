@@ -776,6 +776,107 @@ impl MultiLevelStorage {
             });
         }
     }
+
+    async fn put_raw_l0(&self, key: &str, data: &Bytes) -> Result<Duration> {
+        let Some(l0) = self.levels.first() else {
+            return Ok(Duration::ZERO);
+        };
+
+        if matches!(l0.check().await, Ok(CacheMode::ReadOnly)) {
+            debug!("Level 0 is read-only, skipping L0 write");
+        } else {
+            let start = Instant::now();
+            match Self::write_entry_from_bytes(l0, key, data).await {
+                Ok(()) => {
+                    let duration = start.elapsed();
+                    trace!("Stored in cache level 0 in {duration:?}");
+                    inc_stat!(self.atomic_stats.first(), writes, 1);
+                    inc_stat!(
+                        self.atomic_stats.first(),
+                        write_duration_nanos,
+                        duration_nanos_u64(duration)
+                    );
+                }
+                Err(error) => {
+                    inc_stat!(self.atomic_stats.first(), write_failures, 1);
+                    return Err(error);
+                }
+            }
+        }
+
+        self.write_remaining_levels_async(key, data, 1).await;
+        Ok(Duration::ZERO)
+    }
+
+    async fn finish_required_write(
+        idx: usize,
+        result: Result<()>,
+        level: &Arc<dyn Storage>,
+        duration: Duration,
+        stats: Option<&AtomicLevelStats>,
+    ) -> Result<()> {
+        if let Err(error) = result {
+            if !matches!(level.check().await, Ok(CacheMode::ReadOnly)) {
+                inc_stat!(stats, write_failures, 1);
+                return Err(anyhow!("Failed to write to cache level {idx}: {error}"));
+            }
+        } else {
+            inc_stat!(stats, writes, 1);
+            inc_stat!(stats, write_duration_nanos, duration_nanos_u64(duration));
+        }
+        Ok(())
+    }
+
+    async fn put_raw_all(&self, key: &str, data: &Bytes) -> Result<Duration> {
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::channel(self.levels.len());
+        for (idx, level) in self.levels.iter().enumerate() {
+            let data = data.clone();
+            let key = key.to_string();
+            let level = Arc::clone(level);
+            let tx = tx.clone();
+            let stats = self.atomic_stats.get(idx).map(Arc::clone);
+            let semaphore = (idx > 0).then(|| Arc::clone(&self.slow_level_semaphore));
+
+            let write_task = async move {
+                let _permit = if let Some(semaphore) = semaphore {
+                    Some(
+                        semaphore
+                            .acquire_owned()
+                            .await
+                            .map_err(|_| anyhow!("slow-level write semaphore closed"))?,
+                    )
+                } else {
+                    None
+                };
+                let start = Instant::now();
+                let result = Self::write_entry_from_bytes(&level, &key, &data).await;
+                Ok::<_, anyhow::Error>((idx, result, level, start.elapsed(), stats))
+            };
+
+            if idx == 0 {
+                let (idx, result, level, duration, stats) = write_task.await?;
+                Self::finish_required_write(idx, result, &level, duration, stats.as_deref())
+                    .await?;
+            } else {
+                tokio::spawn(async move {
+                    match write_task.await {
+                        Ok(result) => {
+                            let _ = tx.send(result).await;
+                        }
+                        Err(error) => debug!("Slow-level write setup failed: {error}"),
+                    }
+                });
+            }
+        }
+        drop(tx);
+
+        while let Some((idx, result, level, duration, stats)) = rx.recv().await {
+            Self::finish_required_write(idx, result, &level, duration, stats.as_deref()).await?;
+        }
+        Ok(Duration::ZERO)
+    }
 }
 
 #[async_trait]
@@ -835,129 +936,13 @@ impl Storage for MultiLevelStorage {
             return Err(anyhow!("No cache levels configured"));
         }
 
-        let key_str = key.to_string();
-
         match self.write_error_policy {
             WriteErrorPolicy::Ignore => {
-                // Never fail, log warnings only
-                self.write_remaining_levels_async(&key_str, &data, 0).await;
+                self.write_remaining_levels_async(key, &data, 0).await;
                 Ok(Duration::ZERO)
             }
-
-            WriteErrorPolicy::L0 => {
-                // Fail only if L0 write fails (unless L0 is read-only)
-                if let Some(l0) = self.levels.first() {
-                    // Check if L0 is read-only before attempting write
-                    if matches!(l0.check().await, Ok(CacheMode::ReadOnly)) {
-                        debug!("Level 0 is read-only, skipping L0 write");
-                    } else {
-                        // Attempt write and propagate errors
-                        let start = Instant::now();
-                        match Self::write_entry_from_bytes(l0, &key_str, &data).await {
-                            Ok(()) => {
-                                let duration = start.elapsed();
-                                trace!("Stored in cache level 0 in {duration:?}");
-                                inc_stat!(self.atomic_stats.first(), writes, 1);
-                                inc_stat!(
-                                    self.atomic_stats.first(),
-                                    write_duration_nanos,
-                                    duration_nanos_u64(duration)
-                                );
-                            }
-                            Err(e) => {
-                                inc_stat!(self.atomic_stats.first(), write_failures, 1);
-                                return Err(e);
-                            }
-                        }
-                    }
-
-                    // Background writes for L1+ (best-effort)
-                    self.write_remaining_levels_async(&key_str, &data, 1).await;
-                }
-                Ok(Duration::ZERO)
-            }
-
-            WriteErrorPolicy::All => {
-                // Fail if any RW level fails
-                use tokio::sync::mpsc;
-                let (tx, mut rx) = mpsc::channel(self.levels.len());
-
-                for (idx, level) in self.levels.iter().enumerate() {
-                    let data = data.clone();
-                    let key_str = key_str.clone();
-                    let level = Arc::clone(level);
-                    let tx = tx.clone();
-                    let stats_arc = self.atomic_stats.get(idx).map(Arc::clone);
-                    let semaphore = (idx > 0).then(|| Arc::clone(&self.slow_level_semaphore));
-
-                    let write_task = async move {
-                        let _permit = if let Some(semaphore) = semaphore {
-                            Some(
-                                semaphore
-                                    .acquire_owned()
-                                    .await
-                                    .map_err(|_| anyhow!("slow-level write semaphore closed"))?,
-                            )
-                        } else {
-                            None
-                        };
-                        let start = Instant::now();
-                        let result = Self::write_entry_from_bytes(&level, &key_str, &data).await;
-                        let duration = start.elapsed();
-                        Ok::<_, anyhow::Error>((idx, result, level, duration, stats_arc))
-                    };
-
-                    if idx == 0 {
-                        // L0 synchronous
-                        let (idx, result, level, duration, stats_arc) = write_task.await?;
-                        if let Err(e) = result {
-                            // Check if read-only before failing
-                            if !matches!(level.check().await, Ok(CacheMode::ReadOnly)) {
-                                inc_stat!(stats_arc.as_deref(), write_failures, 1);
-                                return Err(anyhow!("Failed to write to cache level {idx}: {e}"));
-                            }
-                        } else {
-                            inc_stat!(stats_arc.as_deref(), writes, 1);
-                            inc_stat!(
-                                stats_arc.as_deref(),
-                                write_duration_nanos,
-                                duration_nanos_u64(duration)
-                            );
-                        }
-                    } else {
-                        // L1+ async
-                        tokio::spawn(async move {
-                            match write_task.await {
-                                Ok(result) => {
-                                    let _ = tx.send(result).await;
-                                }
-                                Err(error) => debug!("Slow-level write setup failed: {error}"),
-                            }
-                        });
-                    }
-                }
-                drop(tx);
-
-                // Check async results
-                while let Some((idx, result, level, duration, stats_arc)) = rx.recv().await {
-                    if let Err(e) = result {
-                        // Check if read-only before failing
-                        if !matches!(level.check().await, Ok(CacheMode::ReadOnly)) {
-                            inc_stat!(stats_arc.as_deref(), write_failures, 1);
-                            return Err(anyhow!("Failed to write to cache level {idx}: {e}"));
-                        }
-                    } else {
-                        inc_stat!(stats_arc.as_deref(), writes, 1);
-                        inc_stat!(
-                            stats_arc.as_deref(),
-                            write_duration_nanos,
-                            duration_nanos_u64(duration)
-                        );
-                    }
-                }
-
-                Ok(Duration::ZERO)
-            }
+            WriteErrorPolicy::L0 => self.put_raw_l0(key, &data).await,
+            WriteErrorPolicy::All => self.put_raw_all(key, &data).await,
         }
     }
 

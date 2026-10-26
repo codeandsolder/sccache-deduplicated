@@ -244,28 +244,30 @@ impl ServerIncoming for FailingServer {
 }
 
 #[test]
-fn failing_server_process() {
+fn failing_server_process() -> Result<()> {
     let Some(server_addr) = env::var_os(harness::CUSTOM_SERVER_ADDR_ENV) else {
-        return;
+        return Ok(());
     };
     let server_addr: SocketAddr = server_addr
         .to_string_lossy()
         .parse()
-        .expect("custom server address should be valid");
+        .context("custom server address should be valid")?;
     let scheduler_url = env::var(harness::CUSTOM_SERVER_SCHEDULER_ENV)
-        .expect("custom server scheduler URL should be provided");
-    let token =
-        env::var(harness::CUSTOM_SERVER_TOKEN_ENV).expect("custom server token should be provided");
+        .context("custom server scheduler URL should be provided")?;
+    let token = env::var(harness::CUSTOM_SERVER_TOKEN_ENV)
+        .context("custom server token should be provided")?;
     let server = sccache::dist::http::Server::new(
         server_addr,
         Some(SocketAddr::from(([0, 0, 0, 0], server_addr.port()))),
-        reqwest::Url::parse(&scheduler_url).expect("custom server scheduler URL should be valid"),
+        reqwest::Url::parse(&scheduler_url)
+            .context("custom server scheduler URL should be valid")?,
         token,
         FailingServer,
     )
-    .expect("custom failing server should initialize");
+    .context("custom failing server should initialize")?;
     env_logger::try_init().ok();
-    server.start().expect("custom failing server should run");
+    server.start().context("custom failing server should run")?;
+    Ok(())
 }
 
 #[test]

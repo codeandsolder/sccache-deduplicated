@@ -105,8 +105,14 @@ pub fn get_stats<F: 'static + Fn(ServerInfo)>(f: F) {
         .assert()
         .success()
         .stdout(predicate::function(move |output: &[u8]| {
-            let s = str::from_utf8(output).expect("Output not UTF-8");
-            let stats = serde_json::from_str(s).expect("Failed to parse JSON stats");
+            let Ok(text) = str::from_utf8(output) else {
+                eprintln!("sccache stats output was not UTF-8: {output:?}");
+                return false;
+            };
+            let Ok(stats) = serde_json::from_str(text) else {
+                eprintln!("failed to parse sccache JSON stats: {text}");
+                return false;
+            };
             eprintln!("get server stats: {stats:?}");
             f(stats);
             true

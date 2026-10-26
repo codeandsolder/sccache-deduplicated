@@ -22,7 +22,7 @@ use which::which_in;
 
 const ENV_VAR_INTERNAL_START_SERVER: &str = "SCCACHE_START_SERVER";
 
-#[derive(Debug, Clone, ValueEnum, Default)]
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
 pub enum StatsFormat {
     #[default]
     Text,
@@ -30,7 +30,7 @@ pub enum StatsFormat {
 }
 
 impl StatsFormat {
-    const fn as_str(&self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Text => "text",
             Self::Json => "json",
@@ -186,7 +186,7 @@ fn get_clap_command() -> clap::Command {
 fn stats_format(matches: &clap::ArgMatches) -> Result<StatsFormat> {
     matches
         .get_one::<StatsFormat>("stats-format")
-        .cloned()
+        .copied()
         .ok_or_else(|| anyhow!("stats format missing despite clap default"))
 }
 
