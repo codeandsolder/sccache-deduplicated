@@ -223,7 +223,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     permissions:
       contents: read
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@9af51be157b7f8124ec847f9a5413d64ad34c320 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@352e20a341d8c2550163951ab9e418eb5083a46a # main
     with:
       command: |
         sudo apt-get update -qq
