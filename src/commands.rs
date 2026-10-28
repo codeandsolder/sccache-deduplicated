@@ -1073,10 +1073,18 @@ fn run_compile_command(
 
 /// Run `cmd` and return the process exit status.
 pub fn run_command(cmd: Command) -> Result<i32> {
+    if matches!(&cmd, Command::Capabilities) {
+        for capability in crate::BUILD_CAPABILITIES {
+            println!("{capability}");
+        }
+        return Ok(0);
+    }
+
     let config = &Config::load()?;
     let startup_timeout = config.server_startup_timeout;
 
     match cmd {
+        Command::Capabilities => unreachable!("capabilities returned before config loading"),
         Command::ShowStats(fmt, advanced) => show_stats(config, fmt, advanced)?,
         Command::DebugPreprocessorCacheEntries => debug_preprocessor_cache_entries()?,
         Command::InternalStartServer => start_internal_server(config)?,

@@ -819,6 +819,8 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
             wait,
         } = self;
         let storage = Arc::clone(&service.storage);
+        #[cfg(feature = "direct-metrics")]
+        let telemetry_task = crate::telemetry::spawn(runtime.handle(), service.clone());
 
         // Create our "server future" which will simply handle all incoming
         // connections in separate tasks.
@@ -873,6 +875,12 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
                 _res = shutdown_idle.fuse() => Ok::<_, io::Error>(()),
             }
         })?;
+
+        #[cfg(feature = "direct-metrics")]
+        if let Some(task) = telemetry_task {
+            task.abort();
+            let _ = runtime.block_on(task);
+        }
 
         info!(
             "moving into the shutdown phase now, waiting at most {} seconds \
@@ -1286,12 +1294,12 @@ where
     }
 
     /// Get dist status.
-    async fn get_dist_status(&self) -> Result<DistInfo> {
+    pub(crate) async fn get_dist_status(&self) -> Result<DistInfo> {
         Ok(self.dist_client.get_status().await)
     }
 
     /// Get info and stats about the cache.
-    async fn get_info(&self) -> Result<ServerInfo> {
+    pub(crate) async fn get_info(&self) -> Result<ServerInfo> {
         let stats = self.stats.lock().await.clone();
         ServerInfo::new(stats, Some(&*self.storage)).await
     }
@@ -1851,6 +1859,16 @@ impl PerLanguageCount {
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&u64> {
         self.counts.get(key)
+    }
+
+    #[cfg(feature = "direct-metrics")]
+    pub(crate) const fn counts(&self) -> &HashMap<String, u64> {
+        &self.counts
+    }
+
+    #[cfg(feature = "direct-metrics")]
+    pub(crate) const fn advanced_counts(&self) -> &HashMap<String, u64> {
+        &self.adv_counts
     }
 
     #[must_use]

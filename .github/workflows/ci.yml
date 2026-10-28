@@ -52,7 +52,7 @@ jobs:
       RUSTFLAGS: ${{ startsWith(github.ref, 'refs/tags/') && '' || '-C target-cpu=x86-64-v2' }}
     strategy:
       matrix:
-        feature: [ azure, gcs, gha, memcached, redis, s3, webdav, dist-server, "dist-client,s3" ]
+        feature: [ azure, direct-metrics, gcs, gha, memcached, redis, s3, webdav, dist-server, "dist-client,s3" ]
     steps:
       - name: Clone repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -68,6 +68,22 @@ jobs:
       - name: Test scheduler unit tests
         if: ${{ matrix.feature == 'dist-server' }}
         run: cargo test --locked --no-default-features --features=dist-server --bin sccache-dist scheduler_tests
+
+  host_tools:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Validate managed host scripts
+        run: |
+          bash -n contrib/codeandsolder/sccache-release-update
+          shellcheck -x contrib/codeandsolder/sccache-release-update
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("contrib/codeandsolder/sccache-release-update")
+          assert b"\0" not in path.read_bytes(), f"{path} contains embedded NUL bytes"
+          PY
 
   toml_format:
     runs-on: ubuntu-latest
