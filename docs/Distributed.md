@@ -297,6 +297,11 @@ Use the `--config` argument to pass the path to its configuration file to `sccac
 # to listen on localhost and put a HTTPS server in front of it.
 public_addr = "127.0.0.1:10600"
 
+# Optional maintenance admission gate. While this file exists, the scheduler
+# keeps heartbeats and job-state updates working but refuses new allocations.
+# Existing distributed jobs can therefore drain without being interrupted.
+maintenance_drain_file = "/run/sccache-scheduler-maintenance-drain"
+
 [client_auth]
 type = "token"
 token = "my client token"
@@ -306,6 +311,12 @@ type = "jwt_hs256"
 secret_key = "my secret key"
 ```
 
+
+#### Maintenance drain
+
+If `maintenance_drain_file` is configured, creating that file makes the scheduler refuse new job allocations with the normal allocation-failure response while continuing to accept worker heartbeats and job-state transitions for already assigned jobs. Clients therefore fall back to local compilation while the existing distributed queue drains. Removing the file immediately restores allocations. The additive `GET /api/v1/scheduler/drain_status` endpoint returns `1` while draining and `0` otherwise; the existing scheduler status response is unchanged.
+
+The drain file path must be absolute. The scheduler only checks for its existence; a privileged service manager or deployment tool should create and remove it.
 
 #### [client_auth]
 
