@@ -12,6 +12,7 @@ These are the source-of-truth copies of the machine-wide Cargo/sccache wrappers 
 - Canonical Rust inside sccache is fail-open: if the discovered cwd, output, source, extern, staticlib, or target-JSON path cannot be represented safely by the canonical map, that compilation uses ordinary sccache instead of failing the build.
 - The maintenance-drain marker remains `/dev/shm/sccache-maintenance-drain`; a marker older than 15 minutes is ignored.
 - `sccache-release-update` validates release metadata against `sccache --capabilities` and requires `direct-metrics` by default, so a canonical rollout cannot silently remove production telemetry again.
+- Canonical bundles carry an explicit `dist_protocol` version. When the live dist binary is hash-bound to the same protocol version, the updater may roll the client ahead under the local maintenance drain while distributed jobs remain active; the full `release_tag` advances only after client and dist halves converge on the same immutable bundle. A protocol-version change still requires the old all-at-once idle window. `sccache-release-update --plan-only` runs this decision logic without changing services.
 
 ## Acer installation
 

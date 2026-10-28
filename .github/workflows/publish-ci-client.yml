@@ -106,6 +106,7 @@ jobs:
             echo "rust_toolchain=1.99.0"
             echo "rustflags=-C target-cpu=x86-64-v2"
             echo "features=s3,gha,dist-client,dist-server,direct-metrics"
+            echo "dist_protocol=1"
             echo "capabilities=$(target/release/sccache --capabilities | paste -sd, -)"
           } > dist/build.txt
 

@@ -92,6 +92,14 @@ jobs:
           }
           assert '"$OPENWRT_ROOT_SERVICE"' in assignments["CLIENT_SERVICES"]
           assert '"$OPENWRT_ROOT_PORT"' in assignments["CLIENT_PORTS"]
+          assert 'client_source_sha' in source
+          assert 'dist_sha256' in source
+          assert 'current_dist_protocol' in source
+          assert 'trap rollback EXIT INT TERM' in source
+          assert 'trap rollback EXIT ERR' not in source
+          assert '--plan-only' in source
+          publisher = Path(".github/workflows/publish-ci-client.yml").read_text()
+          assert 'echo "dist_protocol=1"' in publisher
           PY
 
   toml_format:
