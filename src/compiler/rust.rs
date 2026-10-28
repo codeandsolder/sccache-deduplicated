@@ -2534,21 +2534,6 @@ where
             Ok((source_files, source_hashes, env_deps))
         };
 
-        // Calculate rustc's output names concurrently with the dep-info invocation and file hashing.
-        // These compiler queries are independent and serializing them adds directly to cache-key latency.
-        let flat_os_string_arguments: Vec<OsString> = os_string_arguments
-            .iter()
-            .flat_map(|(arg, val)| iter::once(arg).chain(val.as_ref()))
-            .cloned()
-            .collect();
-        let outputs = get_compiler_outputs(
-            creator,
-            &self.executable,
-            flat_os_string_arguments,
-            &cwd,
-            &env_vars,
-        );
-
         // Hash the contents of the externs listed on the commandline.
         trace!(
             "[{}]: hashing {} externs",
@@ -2596,13 +2581,11 @@ where
             extern_hashes,
             staticlib_hashes,
             target_json_hash,
-            mut outputs,
         ) = futures::try_join!(
             source_files_and_hashes_and_env_deps,
             extern_hashes,
             staticlib_hashes,
             target_json_hash,
-            outputs,
         )?;
 
         if let Some(canonical) = canonical_paths.as_ref()
@@ -2634,6 +2617,20 @@ where
                 )
             })
             .collect();
+        let flat_os_string_arguments: Vec<OsString> = os_string_arguments
+            .iter()
+            .flat_map(|(arg, val)| iter::once(arg).chain(val.as_ref()))
+            .cloned()
+            .collect();
+        let mut outputs = get_compiler_outputs(
+            creator,
+            &self.executable,
+            flat_os_string_arguments,
+            &cwd,
+            &env_vars,
+        )
+        .await?;
+
         let hash_os_string_arguments = os_string_arguments
             .iter()
             .map(|(arg, val)| {

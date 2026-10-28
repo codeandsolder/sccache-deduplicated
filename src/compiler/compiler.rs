@@ -3643,7 +3643,12 @@ LLVM version: 6.0",
             Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
         );
         const COMPILER_STDERR: &[u8] = b"foo.c:1: error: expected ';'";
-        let dist_client = test_dist::OneshotClient::new(1, vec![], COMPILER_STDERR.to_owned());
+        let dist_client = test_dist::OneshotClient::client(
+            1,
+            vec![],
+            COMPILER_STDERR.to_owned(),
+            "failed-compile-worker".to_owned(),
+        );
         let service = server::SccacheService::mock_with_dist_client(
             dist_client.clone(),
             storage.clone(),
@@ -3657,17 +3662,17 @@ LLVM version: 6.0",
         let (cached, res) = runtime
             .block_on(async {
                 hasher
-                    .get_cached_or_compile(
-                        &service,
-                        Some(dist_client.clone()),
-                        creator.clone(),
-                        storage.clone(),
-                        arguments.clone(),
-                        f.tempdir.path().to_path_buf(),
-                        vec![],
-                        CacheControl::Default,
-                        pool.clone(),
-                    )
+                    .get_cached_or_compile(CacheCompileContext {
+                        service: &service,
+                        dist_client: Some(dist_client.clone()),
+                        creator: creator.clone(),
+                        storage: storage.clone(),
+                        arguments: arguments.clone(),
+                        cwd: f.tempdir.path().to_path_buf(),
+                        env_vars: vec![],
+                        cache_control: CacheControl::Default,
+                        pool: pool.clone(),
+                    })
                     .await
             })
             .unwrap();

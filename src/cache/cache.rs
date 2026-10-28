@@ -73,6 +73,7 @@ use crate::compiler::PreprocessorCacheEntry;
 ))]
 use crate::config::{self, CacheType};
 use crate::config::{Config, PreprocessorCacheModeConfig};
+use anyhow::Context as _;
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};

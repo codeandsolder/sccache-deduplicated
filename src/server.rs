@@ -44,7 +44,6 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
-use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::future::Future;
 use std::io::{self, Write};

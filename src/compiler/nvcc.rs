@@ -41,8 +41,6 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::BufRead;
-#[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process;
 use which::which_in;
