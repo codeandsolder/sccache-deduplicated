@@ -234,6 +234,8 @@ fn test_toolchain_package_through_symlinked_libdir() {
     // A real ELF, so that `add_executable_and_deps` can run ldd against it.
     fs::create_dir_all(sysroot.join("bin")).unwrap();
     fs::copy("/bin/true", sysroot.join("bin/rustc")).unwrap();
+    fs::copy("/bin/true", sysroot.join(format!("cargo.real{EXE_SUFFIX}"))).unwrap();
+    fs::copy("/bin/true", sysroot.join("bin/rustdoc")).unwrap();
 
     let rustlib = sysroot.join("lib/rustlib");
     fs::create_dir_all(rustlib.join("fake-target/lib")).unwrap();
@@ -277,6 +279,10 @@ fn test_toolchain_package_through_symlinked_libdir() {
     assert!(has(&rustlib.join("fake-target/lib/libstd.so")));
     assert!(has(&rustlib.join("components")));
     assert!(has(&sysroot.join("bin/rustc")));
+    // The fork executes packaged Cargo on the server, so keep the exact Cargo
+    // binary selected by rust_dist_cargo_executable, but not unrelated tools.
+    assert!(has(&sysroot.join(format!("cargo.real{EXE_SUFFIX}"))));
+    assert!(!has(&sysroot.join("bin/rustdoc")));
     // ... and `lib64` is recorded as a symlink, so both spellings resolve on
     // the server.
     assert!(entries.iter().any(|(name, link)| {
@@ -5653,6 +5659,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             host: "x86-64-unknown-unknown-unknown".to_owned(),
             version: TEST_RUSTC_VERSION.to_string(),
             sysroot: f.tempdir.path().join("sysroot"),
+            #[cfg(feature = "dist-client")]
+            target_libdir: f.tempdir.path().join("sysroot/lib/rustlib/fake-target/lib"),
             compiler_shlibs_digests: vec![],
             dist_archive: Some("/toolchains/rust.tar.gz".into()),
             #[cfg(feature = "dist-client")]
@@ -5948,6 +5956,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 host: "x86_64-unknown-linux-gnu".to_owned(),
                 version: TEST_RUSTC_VERSION.to_string(),
                 sysroot: f.tempdir.path().join("sysroot"),
+                #[cfg(feature = "dist-client")]
+                target_libdir: f.tempdir.path().join("sysroot/lib/rustlib/fake-target/lib"),
                 compiler_shlibs_digests: vec![],
                 dist_archive: None,
                 #[cfg(feature = "dist-client")]
@@ -6077,6 +6087,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             executable: sysroot.join(BINS_DIR).join("rustc"),
             host: "x86_64-unknown-linux-gnu".to_owned(),
             sysroot: sysroot.clone(),
+            target_libdir: sysroot.join("lib/rustlib/x86_64-unknown-linux-gnu/lib"),
             rlib_dep_reader: None,
             arguments: parsed.arguments,
             inputs: vec![temp.path().join("foo.rs")],
@@ -6144,6 +6155,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         let compilation = RustCompilation {
             executable: sysroot.join(BINS_DIR).join("rustc"),
             host: "x86_64-unknown-linux-gnu".to_owned(),
+            target_libdir: sysroot.join("lib/rustlib/x86_64-unknown-linux-gnu/lib"),
             sysroot,
             rlib_dep_reader: None,
             arguments: parsed.arguments,
@@ -6213,6 +6225,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 host: "x86-64-unknown-unknown-unknown".to_owned(),
                 version: TEST_RUSTC_VERSION.to_string(),
                 sysroot: f.tempdir.path().join("sysroot"),
+                #[cfg(feature = "dist-client")]
+                target_libdir: f.tempdir.path().join("sysroot/lib/rustlib/fake-target/lib"),
                 compiler_shlibs_digests: vec![],
                 dist_archive: None,
                 #[cfg(feature = "dist-client")]
@@ -6342,6 +6356,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             host: "x86_64-unknown-linux-gnu".to_owned(),
             version: TEST_RUSTC_VERSION.to_string(),
             sysroot: f.tempdir.path().join("sysroot"),
+            #[cfg(feature = "dist-client")]
+            target_libdir: f.tempdir.path().join("sysroot/lib/rustlib/fake-target/lib"),
             compiler_shlibs_digests: vec![],
             dist_archive: None,
             #[cfg(feature = "dist-client")]
@@ -6429,6 +6445,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             host: "x86_64-unknown-linux-gnu".to_owned(),
             version: TEST_RUSTC_VERSION.to_string(),
             sysroot: f.tempdir.path().join("sysroot"),
+            #[cfg(feature = "dist-client")]
+            target_libdir: f.tempdir.path().join("sysroot/lib/rustlib/fake-target/lib"),
             compiler_shlibs_digests: vec![],
             dist_archive: None,
             #[cfg(feature = "dist-client")]
