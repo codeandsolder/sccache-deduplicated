@@ -370,16 +370,19 @@ fn compile_dep(
         "--emit=dep-info,metadata,link".into(),
     ];
     let mut stdout = Cursor::new(Vec::new());
-    let mut runtime = Runtime::new().unwrap();
+    let runtime = Runtime::new().unwrap();
+    let invocation = CompileInvocation {
+        exe: &rustc,
+        cmdline,
+        cwd: f.tempdir.path(),
+        env_vars: vec![],
+    };
     do_compile(
         creator,
-        &mut runtime,
+        &runtime,
         conn,
-        &rustc,
-        cmdline,
-        f.tempdir.path(),
+        invocation,
         Some(f.paths.clone()),
-        vec![],
         &mut stdout,
         &mut stderr.clone(),
     )

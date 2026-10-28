@@ -19,6 +19,7 @@ use crate::cmdline::{Command, StatsFormat};
 use crate::compiler::canonical_paths::CanonicalRustPaths;
 use crate::compiler::{ColorMode, is_rmeta_artifact_notification};
 use crate::config::{Config, default_disk_cache_dir};
+use crate::errors::ProcessError;
 use crate::jobserver::Client;
 use crate::mock_command::{CommandChild, CommandCreatorSync, ProcessCommandCreator, RunCommand};
 use crate::protocol::{Compile, CompileFinished, CompileResponse, Request, Response};
@@ -1308,6 +1309,7 @@ mod test {
             &runtime,
             CompileResponse::UnhandledCompile,
             None,
+            false,
             &invocation,
             &mut stdout,
             &mut stderr,
