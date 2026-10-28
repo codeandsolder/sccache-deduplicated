@@ -234,7 +234,11 @@ fn test_toolchain_package_through_symlinked_libdir() {
     // A real ELF, so that `add_executable_and_deps` can run ldd against it.
     fs::create_dir_all(sysroot.join("bin")).unwrap();
     fs::copy("/bin/true", sysroot.join("bin/rustc")).unwrap();
-    fs::copy("/bin/true", sysroot.join(format!("cargo.real{EXE_SUFFIX}"))).unwrap();
+    fs::copy(
+        "/bin/true",
+        sysroot.join("bin").join(format!("cargo.real{EXE_SUFFIX}")),
+    )
+    .unwrap();
     fs::copy("/bin/true", sysroot.join("bin/rustdoc")).unwrap();
 
     let rustlib = sysroot.join("lib/rustlib");
@@ -281,7 +285,9 @@ fn test_toolchain_package_through_symlinked_libdir() {
     assert!(has(&sysroot.join("bin/rustc")));
     // The fork executes packaged Cargo on the server, so keep the exact Cargo
     // binary selected by rust_dist_cargo_executable, but not unrelated tools.
-    assert!(has(&sysroot.join(format!("cargo.real{EXE_SUFFIX}"))));
+    assert!(has(&sysroot
+        .join("bin")
+        .join(format!("cargo.real{EXE_SUFFIX}"))));
     assert!(!has(&sysroot.join("bin/rustdoc")));
     // ... and `lib64` is recorded as a symlink, so both spellings resolve on
     // the server.
