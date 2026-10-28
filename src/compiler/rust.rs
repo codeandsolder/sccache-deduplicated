@@ -2759,6 +2759,24 @@ where
             .flat_map(|(arg, val)| std::iter::once(arg).chain(val))
             .cloned()
             .collect::<Vec<_>>();
+        // Output discovery is independent of dep-info: `.d` is derived locally from
+        // the prepass and never participates in the cached output set. Strip dep-info
+        // from a cloned query argument set now so `--print file-names` can run in
+        // parallel even before canonical-mode eligibility is known.
+        let mut output_query_arguments = effective_arguments.clone();
+        remove_dep_info_emit(&mut output_query_arguments);
+        let output_query_arguments = output_query_arguments
+            .iter()
+            .flat_map(|arg| arg.iter_os_strings())
+            .collect::<Vec<_>>();
+        let outputs = get_compiler_outputs(
+            creator,
+            &self.executable,
+            output_query_arguments,
+            &cwd,
+            &env_vars,
+        );
+
         // Find all the source files and hash them.
         let cargo_manifest = cargo_manifest_input(&env_vars, &cwd);
         let has_dynamic_extern = self
@@ -2852,17 +2870,19 @@ where
 
         let target_json_hash = hash_all(&target_json_files, pool);
 
-        // Perform all hashing operations on the files.
+        // Run output discovery and all file hashing concurrently.
         let (
             (source_files, source_hashes, mut env_deps, dep_info_text),
             extern_hashes,
             staticlib_hashes,
             target_json_hash,
+            mut outputs,
         ) = futures::try_join!(
             source_files_and_hashes_and_env_deps,
             extern_hashes,
             staticlib_hashes,
             target_json_hash,
+            outputs,
         )?;
 
         if let Some(canonical) = canonical_paths.as_ref()
@@ -2894,20 +2914,6 @@ where
                 )
             })
             .collect();
-        let flat_os_string_arguments: Vec<OsString> = os_string_arguments
-            .iter()
-            .flat_map(|(arg, val)| iter::once(arg).chain(val.as_ref()))
-            .cloned()
-            .collect();
-        let mut outputs = get_compiler_outputs(
-            creator,
-            &self.executable,
-            flat_os_string_arguments,
-            &cwd,
-            &env_vars,
-        )
-        .await?;
-
         let hash_os_string_arguments = os_string_arguments
             .iter()
             .map(|(arg, val)| {
@@ -5690,7 +5696,11 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             rlib_dep_reader: None,
             native_profile: Some("test-native".into()),
             parsed_args: ParsedArguments {
-                arguments: vec![],
+                arguments: vec![Argument::WithValue(
+                    "--emit",
+                    ArgData::Emit("dep-info,link,metadata".into()),
+                    ArgDisposition::Separated,
+                )],
                 output_dir: "out".into(),
                 externs: vec![],
                 crate_link_paths: vec![],
@@ -5712,7 +5722,15 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         });
         let creator = new_creator();
         mock_dep_info(&creator, &["foo.rs"]);
-        mock_file_names(&creator, &["libfoo-abc.rlib"]);
+        next_command_calls(&creator, |args| {
+            assert!(
+                !args
+                    .iter()
+                    .any(|arg| arg.to_string_lossy().contains("dep-info")),
+                "output query must not include dep-info: {args:?}"
+            );
+            Ok(MockChild::new(exit_status(0), "libfoo-abc.rlib", ""))
+        });
         let runtime = single_threaded_runtime();
         let pool = runtime.handle().clone();
         let res = hasher
