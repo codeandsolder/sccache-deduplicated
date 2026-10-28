@@ -1861,10 +1861,12 @@ impl PerLanguageCount {
         self.counts.get(key)
     }
 
+    #[cfg(feature = "direct-metrics")]
     pub(crate) const fn counts(&self) -> &HashMap<String, u64> {
         &self.counts
     }
 
+    #[cfg(feature = "direct-metrics")]
     pub(crate) const fn advanced_counts(&self) -> &HashMap<String, u64> {
         &self.adv_counts
     }
