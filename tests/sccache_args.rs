@@ -4,17 +4,13 @@
 //! <http://creativecommons.org/publicdomain/zero/1.0>/
 pub mod helpers;
 
-#[cfg(any(feature = "gcs", feature = "s3"))]
 use anyhow::Result;
-#[cfg(any(feature = "gcs", feature = "s3"))]
 use assert_cmd::prelude::*;
-#[cfg(any(feature = "gcs", feature = "s3"))]
+use fs_err as fs;
 use helpers::{SCCACHE_BIN, stop_sccache};
-#[cfg(any(feature = "gcs", feature = "s3"))]
 use predicates::prelude::*;
-#[cfg(any(feature = "gcs", feature = "s3"))]
 use serial_test::serial;
-#[cfg(any(feature = "gcs", feature = "s3"))]
+use std::path::Path;
 use std::process::Command;
 
 #[test]
@@ -78,5 +74,66 @@ fn test_s3_invalid_args() -> Result<()> {
         .failure()
         .stderr(predicate::str::contains("cache storage failed to read"));
 
+    Ok(())
+}
+
+/// An empty entry file reads as a valid, empty entry.
+fn write_empty_preprocessor_entry(cache_dir: &Path) -> Result<String> {
+    let entries_dir = cache_dir.join("preprocessor");
+    fs::create_dir_all(&entries_dir)?;
+    let entry = entries_dir.join("entry");
+    fs::write(&entry, b"")?;
+    Ok(format!(
+        "Showing preprocessor entry file {}",
+        entry.display()
+    ))
+}
+
+fn debug_preprocessor_cache_cmd(tempdir: &Path) -> Command {
+    let mut cmd = Command::new(SCCACHE_BIN.as_os_str());
+    cmd.arg("--debug-preprocessor-cache")
+        .env_remove("SCCACHE_DIR")
+        .env("SCCACHE_CONF", tempdir.join("missing-config"))
+        .env("XDG_CACHE_HOME", tempdir.join("xdg-cache"));
+    cmd
+}
+
+#[test]
+#[serial]
+fn test_debug_preprocessor_cache_uses_sccache_dir() -> Result<()> {
+    let tempdir = tempfile::tempdir()?;
+    let cache_dir = tempdir.path().join("cache");
+    let expected = write_empty_preprocessor_entry(&cache_dir)?;
+
+    debug_preprocessor_cache_cmd(tempdir.path())
+        .env("SCCACHE_DIR", &cache_dir)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(expected));
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_debug_preprocessor_cache_uses_config_disk_dir() -> Result<()> {
+    let tempdir = tempfile::tempdir()?;
+    let cache_dir = tempdir.path().join("cache");
+    let expected = write_empty_preprocessor_entry(&cache_dir)?;
+    let config = tempdir.path().join("config");
+    fs::write(
+        &config,
+        format!(
+            "[cache.disk]
+dir = '{}'
+",
+            cache_dir.display()
+        ),
+    )?;
+
+    debug_preprocessor_cache_cmd(tempdir.path())
+        .env("SCCACHE_CONF", &config)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(expected));
     Ok(())
 }

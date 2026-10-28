@@ -18,7 +18,7 @@ use crate::cmdline::{Command, StatsFormat};
 #[cfg(target_os = "linux")]
 use crate::compiler::canonical_paths::CanonicalRustPaths;
 use crate::compiler::{ColorMode, is_rmeta_artifact_notification};
-use crate::config::{Config, default_disk_cache_dir};
+use crate::config::Config;
 use crate::errors::ProcessError;
 use crate::jobserver::Client;
 use crate::mock_command::{CommandChild, CommandCreatorSync, ProcessCommandCreator, RunCommand};
@@ -971,9 +971,9 @@ fn show_stats(config: &Config, fmt: StatsFormat, advanced: bool) -> Result<()> {
     Ok(())
 }
 
-fn debug_preprocessor_cache_entries() -> Result<()> {
+fn debug_preprocessor_cache_entries(config: &Config) -> Result<()> {
     trace!("Command::DebugPreprocessorCacheEntries");
-    let entries_dir = default_disk_cache_dir().join("preprocessor");
+    let entries_dir = config.fallback_cache.dir.join("preprocessor");
     for entry in WalkDir::new(entries_dir).sort_by_file_name() {
         let entry = entry?;
         let path = entry.path();
@@ -1170,7 +1170,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
     match cmd {
         Command::Capabilities => unreachable!("capabilities returned before config loading"),
         Command::ShowStats(fmt, advanced) => show_stats(config, fmt, advanced)?,
-        Command::DebugPreprocessorCacheEntries => debug_preprocessor_cache_entries()?,
+        Command::DebugPreprocessorCacheEntries => debug_preprocessor_cache_entries(config)?,
         Command::InternalStartServer => start_internal_server(config)?,
         Command::StartServer => start_server_command(startup_timeout)?,
         Command::StopServer => {
