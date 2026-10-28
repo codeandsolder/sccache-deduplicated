@@ -5,6 +5,8 @@ These are the source-of-truth copies of the machine-wide Cargo/sccache wrappers 
 ## Contract
 
 - `cargo-wrapper` preserves Cargo's own target-directory semantics. It never invents or exports `CARGO_TARGET_DIR` merely for cache normalization.
+- `cargo-wrapper` exports `EPHEMERAL_CARGO_WRAPPER`/`CARGO` so nested Cargo invocations return through the site launcher instead of exposing the underlying Cargo binary.
+- `rustup-wrapper` is a narrow policy guard: `rustup run <toolchain> cargo ...` is translated to the equivalent site `cargo +<toolchain> ...` path, while non-Cargo rustup commands pass through untouched. `CODEANDSOLDER_RUSTUP_STOCK_CARGO=1` explicitly restores stock Cargo for compatibility testing.
 - For compilation subcommands it resolves the effective target root with Cargo precedence (`--target-dir`, existing `CARGO_TARGET_DIR`, then `cargo metadata`) and exports only `SCCACHE_CANONICAL_TARGET_ROOT` for child compiler processes. Wrapper-derived roots are marked and recomputed by nested Cargo invocations so a child build cannot inherit a stale parent target root.
 - `sccache-client` selects the managed daemon by EUID and only opts into experimental canonical Rust when target-layout context is available (`SCCACHE_CANONICAL_TARGET_ROOT`, `CARGO_TARGET_DIR`, or `OUT_DIR`). Direct rustc without Cargo target context remains ordinary sccache.
 - Canonical Rust inside sccache is fail-open: if the discovered cwd, output, source, extern, staticlib, or target-JSON path cannot be represented safely by the canonical map, that compilation uses ordinary sccache instead of failing the build.
@@ -17,6 +19,7 @@ The live paths are:
 
 ```text
 /usr/local/bin/cargo
+/usr/local/bin/rustup
 /usr/local/libexec/sccache-client
 /usr/local/libexec/sccache-release-update
 ```

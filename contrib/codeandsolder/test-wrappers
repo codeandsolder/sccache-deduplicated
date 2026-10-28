@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(mktemp -d "${TMPDIR:-/tmp}/codeandsolder-wrapper-test.XXXXXXXX")"
+trap 'rm -rf -- "$root"' EXIT HUP INT TERM
+mkdir -p "$root/bin"
+: >"$root/rustup.log"
+: >"$root/cargo.log"
+: >"$root/cargo-real.log"
+
+cat >"$root/bin/rustup" <<'SH'
+#!/usr/bin/env bash
+printf '%q ' "$@" >>"$RUSTUP_LOG"
+printf '\n' >>"$RUSTUP_LOG"
+SH
+cat >"$root/bin/cargo" <<'SH'
+#!/usr/bin/env bash
+printf 'args=' >>"$CARGO_LOG"
+printf '%q ' "$@" >>"$CARGO_LOG"
+printf '\n' >>"$CARGO_LOG"
+SH
+cat >"$root/bin/cargo-real" <<'SH'
+#!/usr/bin/env bash
+printf 'toolchain=%s wrapper=%s cargo=%s args=' "${RUSTUP_TOOLCHAIN:-}" "${EPHEMERAL_CARGO_WRAPPER:-}" "${CARGO:-}" >>"$CARGO_REAL_LOG"
+printf '%q ' "$@" >>"$CARGO_REAL_LOG"
+printf '\n' >>"$CARGO_REAL_LOG"
+SH
+chmod +x "$root/bin/rustup" "$root/bin/cargo" "$root/bin/cargo-real"
+
+export RUSTUP_LOG="$root/rustup.log"
+export CARGO_LOG="$root/cargo.log"
+export CARGO_REAL_LOG="$root/cargo-real.log"
+export CODEANDSOLDER_REAL_RUSTUP="$root/bin/rustup"
+export CODEANDSOLDER_CARGO_WRAPPER="$root/bin/cargo"
+
+contrib/codeandsolder/rustup-wrapper show active-toolchain
+contrib/codeandsolder/rustup-wrapper run nightly rustc --version
+contrib/codeandsolder/rustup-wrapper run 1.99.0 cargo test --locked
+contrib/codeandsolder/rustup-wrapper run --install nightly cargo check
+CODEANDSOLDER_RUSTUP_STOCK_CARGO=1 contrib/codeandsolder/rustup-wrapper run stable cargo build
+
+grep -Fxq 'show active-toolchain ' "$RUSTUP_LOG"
+grep -Fxq 'run nightly rustc --version ' "$RUSTUP_LOG"
+grep -Fxq 'toolchain install nightly ' "$RUSTUP_LOG"
+grep -Fxq 'run stable cargo build ' "$RUSTUP_LOG"
+[[ "$(wc -l <"$RUSTUP_LOG")" -eq 4 ]]
+grep -Fxq 'args=+1.99.0 test --locked ' "$CARGO_LOG"
+grep -Fxq 'args=+nightly check ' "$CARGO_LOG"
+[[ "$(wc -l <"$CARGO_LOG")" -eq 2 ]]
+
+CODEANDSOLDER_REAL_CARGO="$root/bin/cargo-real" contrib/codeandsolder/cargo-wrapper +1.99.0 probe
+wrapper_path="$(readlink -f contrib/codeandsolder/cargo-wrapper)"
+expected="toolchain=1.99.0 wrapper=$wrapper_path cargo=$wrapper_path args=probe "
+grep -Fxq "$expected" "$CARGO_REAL_LOG"
+
+echo 'codeandsolder wrapper routing tests passed'

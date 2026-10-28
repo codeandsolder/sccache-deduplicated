@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REAL=/usr/local/libexec/cargo-codeandsolder-real
+REAL="${CODEANDSOLDER_REAL_CARGO:-/usr/local/libexec/cargo-codeandsolder-real}"
 args=("$@")
 
 if (( ${#args[@]} )) && [[ "${args[0]}" == +* ]]; then
@@ -10,6 +10,12 @@ if (( ${#args[@]} )) && [[ "${args[0]}" == +* ]]; then
 fi
 
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+
+# Keep nested Cargo invocations (build scripts and external subcommands) on
+# this launcher rather than exposing the underlying real Cargo binary. The
+# cargo-ephemeral fork consumes this variable in GlobalContext::cargo_exe().
+export EPHEMERAL_CARGO_WRAPPER="${EPHEMERAL_CARGO_WRAPPER:-$(readlink -f "$0")}"
+export CARGO="$EPHEMERAL_CARGO_WRAPPER"
 
 # The real Cargo binary below is not the rustup proxy. Resolve the active
 # toolchain once in the caller's working directory so rustc invocations run
