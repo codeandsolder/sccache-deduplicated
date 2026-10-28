@@ -863,6 +863,19 @@ pub trait SchedulerIncoming: Send + Sync {
         num_cpus: usize,
         job_authorizer: Box<dyn JobAuthorizer>,
     ) -> ExtResult<HeartbeatServerResult, Error>;
+    // From Server, best-effort observability metadata.
+    fn handle_update_worker_name(
+        &self,
+        _server_id: ServerId,
+        _server_nonce: ServerNonce,
+        _worker_name: String,
+    ) -> ExtResult<(), Error> {
+        Ok(())
+    }
+    // From Client, best-effort observability metadata.
+    fn handle_get_worker_name(&self, _server_id: ServerId) -> ExtResult<Option<String>, Error> {
+        Ok(None)
+    }
     // From Server
     fn handle_update_job_state(
         &self,
@@ -930,6 +943,9 @@ pub trait Client: Send + Sync {
         outputs: Vec<String>,
         inputs_packager: Box<dyn pkg::InputsPackager>,
     ) -> Result<(RunJobResult, PathTransformer)>;
+    async fn worker_label(&self, server_id: ServerId) -> String {
+        server_id.addr().to_string()
+    }
     async fn put_toolchain(
         &self,
         compiler_path: PathBuf,

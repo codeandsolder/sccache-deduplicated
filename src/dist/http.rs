@@ -142,6 +142,12 @@ mod common {
         pub cert_pem: Vec<u8>,
     }
 
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct WorkerNameHttpResponse {
+        pub worker_name: Option<String>,
+    }
+
     #[cfg(feature = "dist-server")]
     #[derive(Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -199,6 +205,21 @@ pub mod urls {
     ) -> Result<reqwest::Url> {
         Ok(scheduler_url.join(&format!(
             "/api/v1/scheduler/server_certificate/{}",
+            server_id.addr()
+        ))?)
+    }
+
+    /// Build the scheduler worker-name lookup endpoint for `server_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `scheduler_url` cannot be used as a base URL.
+    pub fn scheduler_worker_name(
+        scheduler_url: &reqwest::Url,
+        server_id: ServerId,
+    ) -> Result<reqwest::Url> {
+        Ok(scheduler_url.join(&format!(
+            "/api/v1/scheduler/worker_name/{}",
             server_id.addr()
         ))?)
     }
@@ -294,7 +315,7 @@ mod server {
 
     use super::common::{
         AllocJobHttpResponse, HeartbeatServerHttpRequest, ReqwestRequestBuilderExt,
-        RunJobHttpRequest, ServerCertificateHttpResponse,
+        RunJobHttpRequest, ServerCertificateHttpResponse, WorkerNameHttpResponse,
     };
     use super::urls;
     use crate::dist::{
@@ -983,8 +1004,26 @@ mod server {
                         };
                         prepare_response(request, &res)
                     },
+                    (GET) (/api/v1/scheduler/worker_name/{server_id: ServerId}) => {
+                        let bearer_auth = match bearer_http_auth(request) {
+                            Some(auth) => auth,
+                            None => return make_401("no_bearer_auth"),
+                        };
+                        if let Err(client_msg) = check_client_auth.check(bearer_auth) {
+                            warn!("Bearer auth failed: {:?}", client_msg);
+                            return make_401_with_body("bearer_auth_failed", client_msg)
+                        }
+                        let worker_name = try_or_500_log!(
+                            req_id,
+                            handler.handle_get_worker_name(server_id)
+                        );
+                        prepare_response(request, &WorkerNameHttpResponse { worker_name })
+                    },
                     (POST) (/api/v1/scheduler/heartbeat_server) => {
                         let server_id = check_server_auth_or_err!(request);
+                        let worker_name = request
+                            .header("X-Sccache-Worker-Name")
+                            .map(ToOwned::to_owned);
                         let heartbeat_server = try_or_400_log!(req_id, bincode_input(request));
                         trace!(target: "sccache_heartbeat", "Req {}: heartbeat_server: {:?}", req_id, heartbeat_server);
 
@@ -1008,11 +1047,22 @@ mod server {
                             server_id, cert_digest, cert_pem
                         ));
                         let job_authorizer = JWTJobAuthorizer::boxed(jwt_key);
+                        let worker_name_nonce = server_nonce.clone();
                         let res: HeartbeatServerResult = try_or_500_log!(req_id, handler.handle_heartbeat_server(
                             server_id, server_nonce,
                             num_cpus,
                             job_authorizer
                         ));
+                        if let Some(worker_name) = worker_name
+                            && let Err(error) = handler.handle_update_worker_name(
+                                server_id,
+                                worker_name_nonce,
+                                worker_name,
+                            )
+                        {
+                            // Display metadata must never take a healthy worker offline.
+                            warn!("Could not register display name for {server_id:?}: {error:#}");
+                        }
                         prepare_response(request, &res)
                     },
                     (POST) (/api/v1/scheduler/job_state/{job_id: JobId}) => {
@@ -1085,6 +1135,7 @@ mod server {
         jwt_key: Vec<u8>,
         // Randomly generated nonce to allow the scheduler to detect server restarts
         server_nonce: ServerNonce,
+        worker_name: Option<String>,
         handler: S,
     }
 
@@ -1094,6 +1145,45 @@ mod server {
             bind_address: Option<SocketAddr>,
             scheduler_url: reqwest::Url,
             scheduler_auth: String,
+            handler: S,
+        ) -> Result<Self> {
+            Self::new_inner(
+                public_addr,
+                bind_address,
+                scheduler_url,
+                scheduler_auth,
+                None,
+                handler,
+            )
+        }
+
+        /// Create a distributed worker that advertises a stable display name.
+        pub fn new_with_worker_name(
+            public_addr: SocketAddr,
+            bind_address: Option<SocketAddr>,
+            scheduler_url: reqwest::Url,
+            scheduler_auth: String,
+            worker_name: String,
+            handler: S,
+        ) -> Result<Self> {
+            reqwest::header::HeaderValue::from_str(&worker_name)
+                .context("distributed worker name is not a valid HTTP header value")?;
+            Self::new_inner(
+                public_addr,
+                bind_address,
+                scheduler_url,
+                scheduler_auth,
+                Some(worker_name),
+                handler,
+            )
+        }
+
+        fn new_inner(
+            public_addr: SocketAddr,
+            bind_address: Option<SocketAddr>,
+            scheduler_url: reqwest::Url,
+            scheduler_auth: String,
+            worker_name: Option<String>,
             handler: S,
         ) -> Result<Self> {
             let (cert_digest, cert_pem, privkey_pem) =
@@ -1112,6 +1202,7 @@ mod server {
                 privkey_pem,
                 jwt_key,
                 server_nonce,
+                worker_name,
                 handler,
             })
         }
@@ -1126,6 +1217,7 @@ mod server {
                 privkey_pem,
                 jwt_key,
                 server_nonce,
+                worker_name,
                 handler,
             } = self;
             let mut load_aware_capacity = LoadAwareCapacity::from_env()?;
@@ -1160,9 +1252,14 @@ mod server {
                         cert_digest: cert_digest.clone(),
                         cert_pem: heartbeat_cert_pem.clone(),
                     };
-                    let heartbeat_result = client
+                    let mut heartbeat_request = client
                         .post(heartbeat_url.clone())
-                        .bearer_auth(scheduler_auth.clone())
+                        .bearer_auth(scheduler_auth.clone());
+                    if let Some(worker_name) = worker_name.as_ref() {
+                        heartbeat_request =
+                            heartbeat_request.header("X-Sccache-Worker-Name", worker_name);
+                    }
+                    let heartbeat_result = heartbeat_request
                         .bincode(&heartbeat_req)
                         .and_then(bincode_req);
                     match heartbeat_result {
@@ -1284,7 +1381,7 @@ mod client {
     use crate::dist::pkg::{InputsPackager, ToolchainPackager};
     use crate::dist::{
         self, AllocJobResult, CompileCommand, JobAlloc, PathTransformer, RunJobResult,
-        SchedulerStatusResult, SubmitToolchainResult, Toolchain,
+        SchedulerStatusResult, ServerId, SubmitToolchainResult, Toolchain,
     };
 
     use async_trait::async_trait;
@@ -1297,23 +1394,31 @@ mod client {
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::common::{
         AllocJobHttpResponse, ReqwestRequestBuilderExt, RunJobHttpRequest,
-        ServerCertificateHttpResponse, bincode_req_fut,
+        ServerCertificateHttpResponse, WorkerNameHttpResponse, bincode_req_fut,
     };
     use super::urls;
     use crate::errors::{Context, Result, anyhow};
 
     const REQUEST_TIMEOUT_SECS: u64 = 1200;
     const CONNECT_TIMEOUT_SECS: u64 = 5;
+    const WORKER_NAME_LOOKUP_TIMEOUT: Duration = Duration::from_secs(1);
+    const WORKER_NAME_CACHE_TTL: Duration = Duration::from_secs(300);
+    const WORKER_NAME_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
+
+    type WorkerNameCache = HashMap<ServerId, (Option<String>, Instant)>;
 
     pub struct Client {
         auth_token: String,
         scheduler_url: reqwest::Url,
         // cert_digest -> cert_pem
         server_certs: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
+        // server_id -> (optional display name, lookup time). Successful names are
+        // stable for a server identity; negative/legacy results are retried later.
+        server_names: Arc<Mutex<WorkerNameCache>>,
         http: Arc<Mutex<reqwest::Client>>,
         pool: tokio::runtime::Handle,
         tc_cache: Arc<cache::ClientToolchains>,
@@ -1352,6 +1457,7 @@ mod client {
                 auth_token,
                 scheduler_url,
                 server_certs: Arc::default(),
+                server_names: Arc::default(),
                 http: Arc::new(Mutex::new(client)),
                 pool: pool.clone(),
                 tc_cache: Arc::new(client_toolchains),
@@ -1471,6 +1577,65 @@ mod client {
                     alloc_job_res
                 }
                 AllocJobHttpResponse::Fail { msg } => Ok(AllocJobResult::Fail { msg }),
+            }
+        }
+
+        async fn worker_label(&self, server_id: ServerId) -> String {
+            let fallback = server_id.addr().to_string();
+            {
+                let Ok(names) = self.server_names.lock() else {
+                    debug!("worker-name cache mutex poisoned; using {fallback}");
+                    return fallback;
+                };
+                if let Some((worker_name, checked_at)) = names.get(&server_id) {
+                    let ttl = if worker_name.is_some() {
+                        WORKER_NAME_CACHE_TTL
+                    } else {
+                        WORKER_NAME_NEGATIVE_CACHE_TTL
+                    };
+                    if checked_at.elapsed() < ttl {
+                        return worker_name.clone().unwrap_or(fallback);
+                    }
+                }
+            }
+
+            let url = match urls::scheduler_worker_name(&self.scheduler_url, server_id) {
+                Ok(url) => url,
+                Err(error) => {
+                    debug!("could not build worker-name lookup URL: {error}");
+                    return fallback;
+                }
+            };
+            let req = {
+                let Ok(client) = self.http.lock() else {
+                    debug!("HTTP client mutex poisoned during worker-name lookup");
+                    return fallback;
+                };
+                client
+                    .get(url)
+                    .bearer_auth(self.auth_token.clone())
+                    .timeout(WORKER_NAME_LOOKUP_TIMEOUT)
+            };
+
+            let checked_at = Instant::now();
+            match bincode_req_fut::<WorkerNameHttpResponse>(req).await {
+                Ok(response) => {
+                    let worker_name = response.worker_name;
+                    if let Ok(mut names) = self.server_names.lock() {
+                        names.insert(server_id, (worker_name.clone(), checked_at));
+                    }
+                    worker_name.unwrap_or(fallback)
+                }
+                Err(error) => {
+                    // This is intentionally non-fatal: old schedulers do not expose
+                    // the metadata endpoint. Cache the fallback briefly, then retry
+                    // so a rolling scheduler upgrade converges without daemon restart.
+                    trace!("worker-name lookup unavailable for {server_id:?}: {error}");
+                    if let Ok(mut names) = self.server_names.lock() {
+                        names.insert(server_id, (None, checked_at));
+                    }
+                    fallback
+                }
             }
         }
 

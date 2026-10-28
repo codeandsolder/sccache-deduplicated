@@ -259,6 +259,7 @@ dist-server = [
   "syslog",
   "version-compare",
   "rustls-native-certs",
+  "dep:hostname",
 ]
 # Enables dist tests with external requirements
 dist-tests = ["dist-client", "dist-server"]
