@@ -84,6 +84,14 @@ jobs:
           from pathlib import Path
           path = Path("contrib/codeandsolder/sccache-release-update")
           assert b"\0" not in path.read_bytes(), f"{path} contains embedded NUL bytes"
+          source = path.read_text()
+          assignments = {
+              line.split("=", 1)[0]: line
+              for line in source.splitlines()
+              if line.startswith(("CLIENT_SERVICES=", "CLIENT_PORTS="))
+          }
+          assert '"$OPENWRT_ROOT_SERVICE"' in assignments["CLIENT_SERVICES"]
+          assert '"$OPENWRT_ROOT_PORT"' in assignments["CLIENT_PORTS"]
           PY
 
   toml_format:
