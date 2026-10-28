@@ -77,8 +77,9 @@ jobs:
 
       - name: Validate managed host scripts
         run: |
-          bash -n contrib/codeandsolder/sccache-release-update
-          shellcheck -x contrib/codeandsolder/sccache-release-update
+          bash -n contrib/codeandsolder/sccache-release-update contrib/codeandsolder/cargo-wrapper contrib/codeandsolder/rustup-wrapper contrib/codeandsolder/test-wrappers
+          shellcheck -x contrib/codeandsolder/sccache-release-update contrib/codeandsolder/cargo-wrapper contrib/codeandsolder/rustup-wrapper contrib/codeandsolder/test-wrappers
+          contrib/codeandsolder/test-wrappers
           python3 - <<'PY'
           from pathlib import Path
           path = Path("contrib/codeandsolder/sccache-release-update")

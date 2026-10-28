@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REAL_RUSTUP="${CODEANDSOLDER_REAL_RUSTUP:-/usr/bin/rustup}"
+CARGO_WRAPPER="${CODEANDSOLDER_CARGO_WRAPPER:-/usr/local/bin/cargo}"
+
+# `rustup run TOOLCHAIN cargo ...` normally executes rustup's stock Cargo from
+# the selected toolchain, bypassing the machine-wide cargo-ephemeral policy.
+# Route only that exact case through the maintained Cargo launcher. Everything
+# else remains ordinary rustup behavior. Set CODEANDSOLDER_RUSTUP_STOCK_CARGO=1
+# when intentionally testing the stock Cargo binary.
+if [[ "${CODEANDSOLDER_RUSTUP_STOCK_CARGO:-0}" != 1 && "${1:-}" == run ]]; then
+    if [[ "${2:-}" == --install && -n "${3:-}" && "${4:-}" == cargo ]]; then
+        "$REAL_RUSTUP" toolchain install "$3"
+        exec "$CARGO_WRAPPER" "+$3" "${@:5}"
+    elif [[ -n "${2:-}" && "${3:-}" == cargo ]]; then
+        exec "$CARGO_WRAPPER" "+$2" "${@:4}"
+    fi
+fi
+
+exec "$REAL_RUSTUP" "$@"
