@@ -254,8 +254,16 @@ mod toolchain_imp {
                 dir_set,
                 file_set,
                 symlinks,
-                root_mappings: _,
+                root_mappings,
             } = self;
+            let remap_root = |path: PathBuf| {
+                for (local_root, archive_root) in &root_mappings {
+                    if let Ok(suffix) = path.strip_prefix(local_root) {
+                        return archive_root.join(suffix);
+                    }
+                }
+                path
+            };
             let par: ParCompress<'_, Gzip, W> = ParCompressBuilder::new()
                 .compression_level(Compression::default())
                 .from_writer(writer);
@@ -273,8 +281,12 @@ mod toolchain_imp {
                 let mut header = tar::Header::new_gnu();
                 header.set_entry_type(tar::EntryType::Symlink);
                 header.set_size(0);
-                // Leave `to_path` as absolute, assuming the tar will be used in a chroot-like
-                // environment.
+                // Symlink paths participate in root mappings just like ordinary files.
+                // Otherwise a canonical toolchain rooted at /rust could archive a link at
+                // its physical client path (for example /usr/lib64 -> /usr/lib), making
+                // the link unreachable inside the server chroot.
+                let from_path = remap_root(from_path);
+                let to_path = remap_root(to_path);
                 builder.append_link(&mut header, tar_safe_path(from_path), to_path)?;
             }
             builder.finish().map_err(Into::into)
@@ -319,6 +331,48 @@ mod toolchain_imp {
             builder.tarify_path(&rustc)?,
             PathBuf::from("rust/bin/rustc")
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn toolchain_root_mapping_rewrites_symlink_entries() -> Result<()> {
+        use std::io::Read as _;
+
+        let temp = tempfile::tempdir()?;
+        let sysroot = temp
+            .path()
+            .join("toolchain")
+            .canonicalize()
+            .unwrap_or_else(|_| temp.path().join("toolchain"));
+        std::fs::create_dir_all(sysroot.join("lib"))?;
+        std::fs::write(sysroot.join("lib/libstd.so"), b"std")?;
+        std::os::unix::fs::symlink(sysroot.join("lib"), sysroot.join("lib64"))?;
+
+        let mut builder = ToolchainPackageBuilder::new();
+        builder.add_root_mapping(sysroot.clone(), PathBuf::from("/rust"));
+        builder.add_file(sysroot.join("lib64/libstd.so"))?;
+
+        let pkg = temp.path().join("toolchain.tar.gz");
+        builder.into_compressed_tar(fs::File::create(&pkg)?)?;
+        let mut bytes = Vec::new();
+        flate2::read::GzDecoder::new(fs::File::open(&pkg)?).read_to_end(&mut bytes)?;
+        let mut archive = tar::Archive::new(bytes.as_slice());
+        let mut saw_link = false;
+        let mut saw_file = false;
+        for entry in archive.entries()? {
+            let entry = entry?;
+            let path = entry.path()?.into_owned();
+            if path == Path::new("rust/lib64") {
+                assert_eq!(entry.link_name()?.as_deref(), Some(Path::new("/rust/lib")));
+                saw_link = true;
+            }
+            if path == Path::new("rust/lib/libstd.so") {
+                saw_file = true;
+            }
+        }
+        assert!(saw_link, "root-mapped symlink entry was not archived");
+        assert!(saw_file, "file behind root-mapped symlink was not archived");
         Ok(())
     }
 
