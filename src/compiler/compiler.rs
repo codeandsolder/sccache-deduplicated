@@ -1021,7 +1021,8 @@ where
         }?;
         let job_id = job_alloc.job_id;
         let server_id = job_alloc.server_id;
-        debug!("[{out_pretty}]: Running job");
+        let worker_label = dist_client.worker_label(server_id).await;
+        debug!("[{out_pretty}]: Running job on {worker_label}");
         let ((job_id, server_id), (job_result, path_transformer)) = dist_client
             .do_run_job(
                 job_alloc,
@@ -1111,13 +1112,18 @@ where
         if jc.output.code != 0 {
             // Add server info to help diagnose host-specific failures, e.g. due to flaky hardware.
             // Failed builds are not cached so this tampering should not cause too much trouble.
-            let server_info = format!("sccache: Job failed on server {}:\n", server_id.addr());
+            let server_addr = server_id.addr();
+            let server_info = if worker_label == server_addr.to_string() {
+                format!("sccache: Job failed on server {server_addr}:\n")
+            } else {
+                format!("sccache: Job failed on worker {worker_label} ({server_addr}):\n")
+            };
             jc.output
                 .stderr
                 .splice(0..0, server_info.as_bytes().to_vec());
         }
 
-        Ok((DistType::Ok(server_id), jc.output.into()))
+        Ok((DistType::Ok(worker_label), jc.output.into()))
     };
 
     do_dist_compile
@@ -1272,7 +1278,7 @@ pub enum DistType {
     /// Distribution was not enabled.
     NoDist,
     /// Distributed compile success.
-    Ok(dist::ServerId),
+    Ok(String),
     /// Distributed compile failed.
     Error,
 }
@@ -3026,10 +3032,14 @@ LLVM version: 6.0",
         Ok(())
     }
 
-    #[test_case(true ; "with preprocessor cache")]
-    #[test_case(false ; "without preprocessor cache")]
+    #[test_case(true, "worker-a" ; "named worker with preprocessor cache")]
+    #[test_case(false, "worker-a" ; "named worker without preprocessor cache")]
+    #[test_case(false, "0.0.0.0:1" ; "legacy worker address fallback")]
     #[cfg(feature = "dist-client")]
-    fn test_compiler_get_cached_or_compile_dist(preprocessor_cache_mode: bool) -> Result<()> {
+    fn test_compiler_get_cached_or_compile_dist(
+        preprocessor_cache_mode: bool,
+        worker_label: &str,
+    ) -> Result<()> {
         drop(env_logger::try_init());
         let creator = new_creator();
         let f = TestFixture::new();
@@ -3081,6 +3091,7 @@ LLVM version: 6.0",
             0,
             COMPILER_STDOUT.to_owned(),
             COMPILER_STDERR.to_owned(),
+            worker_label.to_owned(),
         );
         let service = server::SccacheService::mock_with_dist_client(
             dist_client.clone(),
@@ -3112,7 +3123,8 @@ LLVM version: 6.0",
         // Ensure that the object file was created.
         assert!(fs::metadata(&obj).map(|m| m.len() > 0)?);
         match cached {
-            CompileResult::CacheMiss(MissType::Normal, DistType::Ok(_), _, f) => {
+            CompileResult::CacheMiss(MissType::Normal, DistType::Ok(actual_label), _, f) => {
+                assert_eq!(actual_label, worker_label);
                 // wait on cache write future so we don't race with it!
                 f.wait()?;
             }
@@ -4040,16 +4052,23 @@ mod test_dist {
         has_started: AtomicBool,
         tc: Toolchain,
         output: ProcessOutput,
+        worker_label: String,
     }
 
     impl OneshotClient {
-        pub fn client(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Arc<dyn dist::Client> {
+        pub fn client(
+            code: i32,
+            stdout: Vec<u8>,
+            stderr: Vec<u8>,
+            worker_label: String,
+        ) -> Arc<dyn dist::Client> {
             Arc::new(Self {
                 has_started: AtomicBool::default(),
                 tc: Toolchain {
                     archive_id: "somearchiveid".to_owned(),
                 },
                 output: ProcessOutput::fake_output(code, stdout, stderr),
+                worker_label,
             })
         }
     }
@@ -4111,6 +4130,9 @@ mod test_dist {
                 outputs,
             });
             Ok((result, path_transformer))
+        }
+        async fn worker_label(&self, _server_id: ServerId) -> String {
+            self.worker_label.clone()
         }
         async fn put_toolchain(
             &self,

@@ -1717,9 +1717,8 @@ where
 
                     match dist_type {
                         DistType::NoDist => {}
-                        DistType::Ok(id) => {
-                            let server = id.addr().to_string();
-                            let server_count = stats.dist_compiles.entry(server).or_insert(0);
+                        DistType::Ok(worker_label) => {
+                            let server_count = stats.dist_compiles.entry(worker_label).or_insert(0);
                             *server_count += 1;
                         }
                         DistType::Error => stats.dist_errors += 1,

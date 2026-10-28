@@ -33,6 +33,38 @@ mod token_check;
 use cmdline::{AuthSubcommand, Command};
 
 pub const INSECURE_DIST_SERVER_TOKEN: &str = "dangerously_insecure_server";
+const DIST_WORKER_NAME_ENV: &str = "SCCACHE_DIST_WORKER_NAME";
+
+fn validate_worker_name(name: String) -> Result<String> {
+    if name.is_empty() {
+        bail!("distributed worker name must not be empty")
+    }
+    if name.len() > 253 {
+        bail!("distributed worker name must be at most 253 bytes")
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        bail!("distributed worker name may contain only ASCII letters, digits, '.', '-' and '_'")
+    }
+    Ok(name)
+}
+
+fn dist_worker_name() -> Result<String> {
+    if let Some(name) = env::var_os(DIST_WORKER_NAME_ENV) {
+        let name = name
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("{DIST_WORKER_NAME_ENV} is not valid UTF-8"))?;
+        return validate_worker_name(name);
+    }
+
+    let name = hostname::get()
+        .context("could not read distributed worker hostname")?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("distributed worker hostname is not valid UTF-8"))?;
+    validate_worker_name(name)
+}
 
 #[cfg(not(any(
     all(target_os = "linux", target_arch = "x86_64"),
@@ -289,11 +321,13 @@ fn run(command: Command) -> Result<i32> {
 
             let server = Server::new(builder, &cache_dir, toolchain_cache_size)
                 .context("Failed to create sccache server instance")?;
-            let http_server = dist::http::Server::new(
+            let worker_name = dist_worker_name()?;
+            let http_server = dist::http::Server::new_with_worker_name(
                 public_addr,
                 bind_address,
                 scheduler_url.to_url(),
                 scheduler_auth,
+                worker_name,
                 server,
             )
             .context("Failed to create sccache HTTP server instance")?;
@@ -408,6 +442,7 @@ struct ServerDetails {
     last_error: Option<Instant>,
     num_cpus: usize,
     server_nonce: ServerNonce,
+    worker_name: Option<String>,
     job_authorizer: Box<dyn JobAuthorizer>,
 }
 
@@ -764,10 +799,74 @@ impl SchedulerIncoming for Scheduler {
                 jobs_unclaimed: HashMap::new(),
                 num_cpus,
                 server_nonce,
+                worker_name: None,
                 job_authorizer,
             },
         );
         Ok(HeartbeatServerResult { is_new: true })
+    }
+
+    fn handle_update_worker_name(
+        &self,
+        server_id: ServerId,
+        server_nonce: ServerNonce,
+        worker_name: String,
+    ) -> Result<()> {
+        let worker_name = validate_worker_name(worker_name)?;
+        // Match heartbeat lock ordering so a stale named worker cannot reserve
+        // a display name after it has stopped heartbeating.
+        let mut jobs = self.jobs.lock().unwrap();
+        let mut servers = self.servers.lock().unwrap();
+        self.prune_servers(&mut servers, &mut jobs);
+        drop(jobs);
+        let details = servers.get(&server_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "worker name update from unknown server {}",
+                server_id.addr()
+            )
+        })?;
+        if details.server_nonce != server_nonce {
+            bail!(
+                "worker name update from stale server epoch {}",
+                server_id.addr()
+            )
+        }
+        if let Some(existing) = details.worker_name.as_ref() {
+            if existing == &worker_name {
+                return Ok(());
+            }
+            bail!(
+                "distributed worker {} changed name from {:?} to {:?} without restarting",
+                server_id.addr(),
+                existing,
+                worker_name
+            )
+        }
+        if servers.iter().any(|(&id, details)| {
+            id != server_id && details.worker_name.as_ref() == Some(&worker_name)
+        }) {
+            bail!(
+                "distributed worker name {worker_name:?} is already registered by another active server"
+            )
+        }
+        servers
+            .get_mut(&server_id)
+            .expect("server disappeared while scheduler lock was held")
+            .worker_name = Some(worker_name.clone());
+        info!(
+            "Server {:?} registered worker name {:?}",
+            server_id, worker_name
+        );
+        Ok(())
+    }
+
+    fn handle_get_worker_name(&self, server_id: ServerId) -> Result<Option<String>> {
+        Ok(self
+            .servers
+            .lock()
+            .unwrap()
+            .get(&server_id)
+            .and_then(|details| details.worker_name.clone()))
     }
 
     fn handle_update_job_state(
@@ -1028,6 +1127,76 @@ mod scheduler_tests {
                 need_toolchain: false,
             })
         }
+    }
+
+    #[test]
+    fn worker_name_side_channel_is_optional_and_epoch_bound() {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let nonce = ServerNonce::new();
+        scheduler
+            .handle_heartbeat_server(server_id, nonce.clone(), 8, Box::new(TestJobAuthorizer))
+            .unwrap();
+        assert_eq!(scheduler.handle_get_worker_name(server_id).unwrap(), None);
+
+        scheduler
+            .handle_update_worker_name(server_id, nonce.clone(), "worker-a".to_owned())
+            .unwrap();
+        assert_eq!(
+            scheduler
+                .handle_get_worker_name(server_id)
+                .unwrap()
+                .as_deref(),
+            Some("worker-a")
+        );
+        scheduler
+            .handle_update_worker_name(server_id, nonce, "worker-a".to_owned())
+            .unwrap();
+
+        let replacement_nonce = ServerNonce::new();
+        let heartbeat = scheduler
+            .handle_heartbeat_server(server_id, replacement_nonce, 8, Box::new(TestJobAuthorizer))
+            .unwrap();
+        assert!(heartbeat.is_new);
+        assert_eq!(scheduler.handle_get_worker_name(server_id).unwrap(), None);
+    }
+
+    #[test]
+    fn duplicate_active_worker_names_are_rejected() {
+        let scheduler = Scheduler::new();
+        let first: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let second: ServerId = "127.0.0.2:10501".parse().unwrap();
+        let first_nonce = ServerNonce::new();
+        let second_nonce = ServerNonce::new();
+        for (server_id, nonce) in [(first, first_nonce.clone()), (second, second_nonce.clone())] {
+            scheduler
+                .handle_heartbeat_server(server_id, nonce, 8, Box::new(TestJobAuthorizer))
+                .unwrap();
+        }
+        scheduler
+            .handle_update_worker_name(first, first_nonce, "worker-a".to_owned())
+            .unwrap();
+        let error = scheduler
+            .handle_update_worker_name(second, second_nonce, "worker-a".to_owned())
+            .unwrap_err();
+        assert!(error.to_string().contains("already registered"));
+    }
+
+    #[test]
+    fn worker_name_is_stable_within_server_epoch() {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let nonce = ServerNonce::new();
+        scheduler
+            .handle_heartbeat_server(server_id, nonce.clone(), 8, Box::new(TestJobAuthorizer))
+            .unwrap();
+        scheduler
+            .handle_update_worker_name(server_id, nonce.clone(), "worker-a".to_owned())
+            .unwrap();
+        let error = scheduler
+            .handle_update_worker_name(server_id, nonce, "worker-b".to_owned())
+            .unwrap_err();
+        assert!(error.to_string().contains("changed name"));
     }
 
     #[test]
