@@ -54,6 +54,8 @@ impl FromStr for StatsFormat {
 pub enum Command {
     /// Show cache statistics and exit.
     ShowStats(StatsFormat, bool),
+    /// Print machine-readable build capabilities and exit.
+    Capabilities,
     /// Run background server.
     InternalStartServer,
     /// Start background server as a subprocess.
@@ -126,6 +128,9 @@ fn get_clap_command() -> clap::Command {
             "\n"
         ))
         .args(&[
+            flag_infer_long("capabilities")
+                .help("print machine-readable build capabilities")
+                .action(ArgAction::SetTrue),
             flag_long_and_short("show-stats", 's')
                 .help("show cache statistics")
                 .action(ArgAction::SetTrue),
@@ -168,6 +173,7 @@ fn get_clap_command() -> clap::Command {
         .group(
             ArgGroup::new("one_and_only_one")
                 .args([
+                    "capabilities",
                     "dist-auth",
                     "debug-preprocessor-cache",
                     "dist-status",
@@ -245,7 +251,9 @@ fn compile_command(matches: &clap::ArgMatches, cwd: PathBuf) -> Result<Command> 
 }
 
 fn command_from_matches(matches: &clap::ArgMatches, cwd: PathBuf) -> Result<Command> {
-    if matches.get_flag("show-stats") {
+    if matches.get_flag("capabilities") {
+        Ok(Command::Capabilities)
+    } else if matches.get_flag("show-stats") {
         Ok(Command::ShowStats(stats_format(matches)?, false))
     } else if matches.get_flag("show-adv-stats") {
         Ok(Command::ShowStats(stats_format(matches)?, true))
@@ -346,5 +354,21 @@ pub fn try_parse() -> Result<Command> {
             bail!("`{ENV_VAR_INTERNAL_START_SERVER}=1` can't be used with other commands");
         }
         (false, Ok(matches)) => command_from_matches(&matches, cwd),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Command, command_from_matches, get_clap_command};
+    use std::path::PathBuf;
+
+    #[test]
+    fn capabilities_is_a_control_command() {
+        let matches = get_clap_command()
+            .try_get_matches_from(["sccache", "--capabilities"])
+            .expect("capabilities should parse");
+        let command = command_from_matches(&matches, PathBuf::from("."))
+            .expect("capabilities should map to a command");
+        assert!(matches!(command, Command::Capabilities));
     }
 }

@@ -180,6 +180,33 @@ You can run `sccache --stop-server` to terminate the server. It will also termin
 
 Running `sccache --show-stats` will print a summary of cache statistics.
 
+### Direct metrics push
+
+Build with the `direct-metrics` feature (Rust 1.99 or newer) to let the server
+publish its in-memory statistics directly through [`lurkmoar`](https://github.com/codeandsolder/lurkmoar-rs)
+instead of requiring an external process to poll `--show-stats`. Set
+`SCCACHE_METRICS_URL` to an HTTP(S) Prometheus-import endpoint to enable it.
+Metrics delivery is independent of compilation, suppresses unchanged samples,
+and uses the same `sccache_*` metric families exposed by `--show-stats`, including
+per-language, distributed-build, and multi-level-cache statistics.
+
+The producer adds `job="sccache"`, `resolution="raw"`, and an `instance` label from
+the OS hostname. Override the instance with `SCCACHE_METRICS_INSTANCE`. On hosts
+with multiple telemetry-enabled daemons, set `SCCACHE_METRICS_SERVICE` to add a
+stable `service` label and keep their series distinct. Optional tuning:
+
+- `SCCACHE_METRICS_INTERVAL_MS` (default `2500`, minimum `100`)
+- `SCCACHE_METRICS_TIMEOUT_MS` (default `1000`)
+- `SCCACHE_METRICS_HEARTBEAT_MS` (default `60000`)
+- `SCCACHE_METRICS_SPILL_AFTER_SECONDS` (default `10`)
+- `SCCACHE_METRICS_SPOOL_DIR` to enable bounded outage spooling
+- `SCCACHE_METRICS_SPOOL_MAX_BYTES` (default `10485760` with spooling)
+
+If direct metrics cannot be configured or delivered, compilation continues and
+the server logs the telemetry error. `sccache --capabilities` prints one
+machine-readable capability per line; managed production releases use this to
+reject binaries that lose `direct-metrics`.
+
 Some notes about using `sccache` with [Jenkins](https://jenkins.io) are [here](docs/Jenkins.md).
 
 To use sccache with cmake, provide the following command line arguments to cmake 3.4 or newer:

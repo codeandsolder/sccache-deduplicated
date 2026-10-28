@@ -41,8 +41,19 @@ mod mock_command;
 mod net;
 mod protocol;
 pub mod server;
+#[cfg(feature = "direct-metrics")]
+mod telemetry;
 #[doc(hidden)]
 pub mod util;
+
+/// Machine-readable capabilities compiled into this binary.
+///
+/// Keep this list tied to the modules that implement each capability so release
+/// tooling can reject binaries that silently lose required production features.
+pub static BUILD_CAPABILITIES: &[&str] = &[
+    #[cfg(feature = "direct-metrics")]
+    telemetry::CAPABILITY,
+];
 
 use std::env;
 
