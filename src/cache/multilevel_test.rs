@@ -1210,6 +1210,10 @@ impl Storage for CheckFailingStorage {
         Err(anyhow!("intentional check failure"))
     }
 
+    async fn get_raw(&self, _key: &str) -> Result<Option<Bytes>> {
+        Err(anyhow!("intentional raw read failure"))
+    }
+
     fn location(&self) -> String {
         "CheckFailingStorage".to_owned()
     }
@@ -1298,6 +1302,27 @@ fn test_unavailable_l0_remains_fatal() -> Result<()> {
     runtime.block_on(async {
         assert!(storage.check().await.is_err());
     });
+    Ok(())
+}
+
+#[test]
+fn test_multilevel_get_raw_continues_after_level_error_and_backfills() -> Result<()> {
+    let runtime = RuntimeBuilder::new_current_thread().enable_all().build()?;
+    let l0 = Arc::new(CheckFailingStorage);
+    let l1 = Arc::new(InMemoryStorage::new());
+    let storage =
+        MultiLevelStorage::new(vec![l0 as Arc<dyn Storage>, l1.clone() as Arc<dyn Storage>]);
+
+    runtime.block_on(async {
+        l1.put("hit", CacheWrite::default()).await?;
+        assert!(storage.get_raw("hit").await?.is_some());
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    let stats = storage.stats();
+    assert_eq!(stats.0[0].hits, 0);
+    assert_eq!(stats.0[0].misses, 1);
+    assert_eq!(stats.0[1].hits, 1);
     Ok(())
 }
 

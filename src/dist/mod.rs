@@ -14,7 +14,7 @@
 
 use crate::compiler;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Read};
@@ -505,11 +505,21 @@ pub fn try_compile_command_to_dist(
 
 // TODO: Clone by assuming immutable/no GC for now
 // TODO: make fields non-public?
-// TODO: make archive_id validate that it's just a bunch of hex chars
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Toolchain {
+    #[serde(deserialize_with = "deserialize_archive_id")]
     pub archive_id: String,
+}
+
+fn deserialize_archive_id<'de, D>(deserializer: D) -> ::std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let archive_id = String::deserialize(deserializer)?;
+    blake3::Hash::from_hex(&archive_id)
+        .map(|hash| hash.to_hex().to_string())
+        .map_err(serde::de::Error::custom)
 }
 
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug, Ord, PartialOrd, Serialize, Deserialize)]
@@ -638,23 +648,11 @@ impl ProcessOutput {
 }
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
-#[cfg(windows)]
-use std::os::windows::process::ExitStatusExt;
-#[cfg(unix)]
-fn exit_status(code: i32) -> process::ExitStatus {
-    process::ExitStatus::from_raw(code)
-}
-#[cfg(windows)]
-fn exit_status(code: i32) -> process::ExitStatus {
-    // TODO: this is probably a subideal conversion - it's not clear how Unix exit codes map to
-    // Windows exit codes (other than 0 being a success)
-    process::ExitStatus::from_raw(code as u32)
-}
 impl From<ProcessOutput> for process::Output {
     fn from(o: ProcessOutput) -> Self {
         // TODO: handle signals, i.e. None code
         Self {
-            status: exit_status(o.code),
+            status: crate::util::exit_status_from_code(o.code),
             stdout: o.stdout,
             stderr: o.stderr,
         }

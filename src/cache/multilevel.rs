@@ -918,10 +918,29 @@ impl Storage for MultiLevelStorage {
     }
 
     async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {
-        for level in &self.levels {
-            if let Some(bytes) = level.get_raw(key).await? {
-                return Ok(Some(bytes));
+        for (idx, level) in self.levels.iter().enumerate() {
+            let start = Instant::now();
+            match level.get_raw(key).await {
+                Ok(Some(bytes)) => {
+                    self.record_hit_and_schedule_backfills(
+                        key,
+                        idx,
+                        start.elapsed(),
+                        Some(bytes.clone()),
+                    );
+                    return Ok(Some(bytes));
+                }
+                Ok(None) => {
+                    trace!("Raw cache miss at level {idx}, trying next level");
+                }
+                Err(error) => {
+                    warn!("Error checking raw cache level {idx}: {error}, trying next level");
+                }
             }
+        }
+
+        for idx in 0..self.levels.len() {
+            inc_stat!(self.atomic_stats.get(idx), misses, 1);
         }
         Ok(None)
     }

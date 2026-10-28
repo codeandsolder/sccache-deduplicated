@@ -42,6 +42,25 @@ pub const BASE64_URL_SAFE_ENGINE: base64::engine::GeneralPurpose =
 
 pub const HASH_BUFFER_SIZE: usize = 128 * 1024;
 
+/// Read `reader` to EOF and pass each chunk to `f` without allocating or zeroing a large buffer.
+fn read_chunks<R: Read + ?Sized>(reader: &mut R, f: impl FnMut(&[u8])) -> Result<()> {
+    struct Chunks<F>(F);
+
+    impl<F: FnMut(&[u8])> Write for Chunks<F> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            (self.0)(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    std::io::copy(reader, &mut Chunks(f))?;
+    Ok(())
+}
+
 /// Display adapter that deliberately preserves `Debug` escaping and quoting.
 ///
 /// This is used for paths and OS strings in diagnostics where lossy `Display`
@@ -90,17 +109,10 @@ impl Digest {
     /// `each` before each time the digest is updated.
     pub fn reader_sync_with<R: Read, F: FnMut(&[u8])>(mut reader: R, mut each: F) -> Result<Self> {
         let mut m = Self::default();
-        // A buffer of 128KB should give us the best performance.
-        // See https://eklitzke.org/efficient-file-copying-on-linux.
-        let mut buffer = vec![0_u8; HASH_BUFFER_SIZE];
-        loop {
-            let count = reader.read(&mut buffer[..])?;
-            if count == 0 {
-                break;
-            }
-            each(&buffer[..count]);
-            m.update(&buffer[..count]);
-        }
+        read_chunks(&mut reader, |chunk| {
+            each(chunk);
+            m.update(chunk);
+        })?;
         Ok(m)
     }
 
@@ -146,14 +158,7 @@ impl Digest {
         let mut file = File::open(path).with_context(|| {
             format!("Failed to open file for hashing: {}", debug_display(&path))
         })?;
-        let mut buf = vec![0_u8; HASH_BUFFER_SIZE];
-        loop {
-            let n = file.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            self.update(&buf[..n]);
-        }
+        read_chunks(&mut file, |chunk| self.update(chunk))?;
         Ok(())
     }
 
@@ -593,6 +598,20 @@ where
                 Err(ProcessError(output).into())
             }
         })
+}
+
+/// The `ExitStatus` of a process that exited with `code`.
+#[cfg(unix)]
+pub fn exit_status_from_code(code: i32) -> process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    process::ExitStatus::from_raw((code & 0xff) << 8)
+}
+
+/// The `ExitStatus` of a process that exited with `code`.
+#[cfg(windows)]
+pub fn exit_status_from_code(code: i32) -> process::ExitStatus {
+    use std::os::windows::process::ExitStatusExt;
+    process::ExitStatus::from_raw(code as u32)
 }
 
 /// Write `data` to `writer` with bincode serialization, prefixed by a `u32` length.
@@ -1645,6 +1664,41 @@ mod tests {
     use super::{Digest, OsStrExt, TimeMacroFinder, resolve_compiler_avoiding_wrapper};
     use std::ffi::{OsStr, OsString};
     use std::path::Path;
+
+    #[test]
+    fn test_reader_sync_across_copy_boundaries() {
+        const COPY_CHUNK: usize = 8 * 1024;
+        for boundary in [COPY_CHUNK, 2 * COPY_CHUNK, super::HASH_BUFFER_SIZE] {
+            for len in [boundary - 1, boundary, boundary + 1] {
+                let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+                let mut expected = Digest::new();
+                expected.update(&data);
+                assert_eq!(
+                    Digest::reader_sync(data.as_slice()).unwrap(),
+                    expected.finish()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_exit_status_from_code() {
+        assert!(super::exit_status_from_code(0).success());
+        assert_eq!(super::exit_status_from_code(1).code(), Some(1));
+        assert_eq!(super::exit_status_from_code(255).code(), Some(255));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_exit_status_from_code_is_not_a_signal() {
+        use std::os::unix::process::ExitStatusExt;
+        for code in [1, 2, 126, 127, 255, -2] {
+            let status = super::exit_status_from_code(code);
+            assert_eq!(status.signal(), None, "exit code {code}");
+            assert_eq!(status.code(), Some(code & 0xff), "exit code {code}");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_decode_path_rejects_embedded_nul() {

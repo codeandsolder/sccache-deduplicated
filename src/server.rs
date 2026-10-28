@@ -1790,16 +1790,12 @@ where
                                 drop(stats);
 
                                 error!("[{out_pretty:?}] fatal error: {err}");
-
-                                let mut error = "sccache: encountered fatal error\n".to_string();
-                                let _ = writeln!(error, "sccache: error: {err}");
-                                for e in err.chain() {
-                                    error!("[{out_pretty:?}] \t{e}");
-                                    let _ = writeln!(error, "sccache: caused by: {e}");
+                                for cause in err.chain().skip(1) {
+                                    error!("[{out_pretty:?}] \t{cause}");
                                 }
                                 //TODO: figure out a better way to communicate this?
                                 res.retcode = Some(-2);
-                                res.stderr = error.into_bytes();
+                                res.stderr = fatal_error_message(&err).into_bytes();
                             }
                         },
                     }
@@ -2675,6 +2671,17 @@ fn waits_until_zero() {
     assert_eq!(wait.now_or_never(), Some(()));
 }
 
+fn fatal_error_message(error: &anyhow::Error) -> String {
+    use std::fmt::Write;
+
+    let mut message = "sccache: encountered fatal error\n".to_string();
+    let _ = writeln!(message, "sccache: error: {error}");
+    for cause in error.chain().skip(1) {
+        let _ = writeln!(message, "sccache: caused by: {cause}");
+    }
+    message
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2699,6 +2706,15 @@ mod tests {
         fn write(&mut self, text: &str) {
             self.buffer.push_str(&format!("{text}\n"));
         }
+    }
+
+    #[test]
+    fn test_fatal_error_message_does_not_repeat_the_error() {
+        let error = anyhow::anyhow!("inner").context("outer");
+        assert_eq!(
+            fatal_error_message(&error),
+            "sccache: encountered fatal error\nsccache: error: outer\nsccache: caused by: inner\n"
+        );
     }
 
     #[test]

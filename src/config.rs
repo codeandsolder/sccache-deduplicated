@@ -1571,10 +1571,7 @@ impl Config {
 
         let mut config =
             Self::from_env_and_file_configs_with_environment(env_conf, file_conf, environment)?;
-        if let Some(cache_dir) = environment
-            .var_os("SCCACHE_DIST_CLIENT_CACHE_DIR")
-            .filter(|value| !value.is_empty())
-        {
+        if let Some(cache_dir) = environment.var_os("SCCACHE_DIST_CLIENT_CACHE_DIR") {
             config.dist.cache_dir = cache_dir.into();
         }
         config.skip_cache_check = skip_cache_check;
@@ -3595,6 +3592,23 @@ fn test_dist_client_cache_dir_env_overrides_file_config() -> Result<()> {
 
     let config = config?;
     assert_eq!(config.dist.cache_dir, env_cache_dir);
+    Ok(())
+}
+
+#[test]
+fn test_empty_dist_client_cache_dir_env_overrides_file_config() -> Result<()> {
+    let mut environment = Environment::default();
+    let temp = tempfile::tempdir()?;
+    let config_path = temp.path().join("config-empty-dist-cache");
+    std::fs::write(&config_path, "[dist]\ncache_dir = \"/file-cache\"\n")?;
+
+    environment.set("SCCACHE_CONF", &config_path);
+    environment.set("SCCACHE_DIST_CLIENT_CACHE_DIR", "");
+    let config = Config::load_from_environment(&environment);
+    environment.remove("SCCACHE_DIST_CLIENT_CACHE_DIR");
+    environment.remove("SCCACHE_CONF");
+
+    assert_eq!(config?.dist.cache_dir, PathBuf::new());
     Ok(())
 }
 

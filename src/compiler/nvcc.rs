@@ -29,7 +29,9 @@ use crate::compiler::{
     cicc, gcc,
 };
 use crate::mock_command::{CommandCreatorSync, ExitStatusValue, RunCommand, exit_status};
-use crate::util::{OsStrExt, resolve_compiler_avoiding_wrapper, run_input_output};
+use crate::util::{
+    OsStrExt, exit_status_from_code, resolve_compiler_avoiding_wrapper, run_input_output,
+};
 use crate::{counted_array, dist, protocol, server};
 use async_trait::async_trait;
 use fs_err as fs;
@@ -1358,10 +1360,11 @@ where
 
 fn aggregate_output(lhs: process::Output, rhs: process::Output) -> process::Output {
     process::Output {
-        status: exit_status(
-            std::cmp::max(status_to_code(lhs.status), status_to_code(rhs.status))
-                as ExitStatusValue,
-        ),
+        status: if lhs.status.success() {
+            rhs.status
+        } else {
+            lhs.status
+        },
         stdout: [lhs.stdout, rhs.stdout].concat(),
         stderr: [lhs.stderr, rhs.stderr].concat(),
     }
@@ -1371,7 +1374,7 @@ fn error_to_output(err: Error) -> process::Output {
     match err.downcast::<ProcessError>() {
         Ok(ProcessError(out)) => out,
         Err(err) => process::Output {
-            status: exit_status(1 as ExitStatusValue),
+            status: exit_status_from_code(1),
             stdout: vec![],
             stderr: err.to_string().into_bytes(),
         },
@@ -1395,27 +1398,9 @@ fn compile_result_to_output(exe: &Path, res: protocol::CompileFinished) -> proce
         };
     }
     process::Output {
-        status: exit_status(res.retcode.unwrap_or(0) as ExitStatusValue),
+        status: exit_status_from_code(res.retcode.unwrap_or(0)),
         stdout: res.stdout,
         stderr: res.stderr,
-    }
-}
-
-#[cfg(unix)]
-fn status_to_code(res: process::ExitStatus) -> ExitStatusValue {
-    if res.success() {
-        0 as ExitStatusValue
-    } else {
-        res.signal().or_else(|| res.code()).unwrap_or(1) as ExitStatusValue
-    }
-}
-
-#[cfg(windows)]
-fn status_to_code(res: process::ExitStatus) -> ExitStatusValue {
-    if res.success() {
-        0 as ExitStatusValue
-    } else {
-        res.code().unwrap_or(1) as ExitStatusValue
     }
 }
 
