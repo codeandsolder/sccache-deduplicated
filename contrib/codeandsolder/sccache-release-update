@@ -73,7 +73,8 @@ managed_dist_processes_match() {
 case "${1:-}" in
     "") ;;
     --check-only) MODE=check ;;
-    *) echo "usage: $0 [--check-only]" >&2; exit 2 ;;
+    --plan-only) MODE=plan ;;
+    *) echo "usage: $0 [--check-only|--plan-only]" >&2; exit 2 ;;
 esac
 
 if [[ "$MODE" == check ]]; then
@@ -186,6 +187,7 @@ source_sha="$(sed -n 's/^source_sha=//p' "$release_dir/build.txt")"
 rust_toolchain="$(sed -n 's/^rust_toolchain=//p' "$release_dir/build.txt")"
 rustflags="$(sed -n 's/^rustflags=//p' "$release_dir/build.txt")"
 features="$(sed -n 's/^features=//p' "$release_dir/build.txt")"
+dist_protocol="$(sed -n 's/^dist_protocol=//p' "$release_dir/build.txt")"
 declared_capabilities="$(sed -n 's/^capabilities=//p' "$release_dir/build.txt")"
 [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || {
     echo "sccache-release-update: invalid source SHA in build.txt" >&2
@@ -208,6 +210,10 @@ tag_sha="${tag#"$TAG_PREFIX"}"
     echo "sccache-release-update: release is missing required features: $features" >&2
     exit 1
 }
+[[ "$dist_protocol" =~ ^[1-9][0-9]*$ ]] || {
+    echo "sccache-release-update: invalid distributed protocol version: $dist_protocol" >&2
+    exit 1
+}
 
 chmod 0755 "$release_dir/sccache-linux-x86_64-v2" "$release_dir/sccache-dist-linux-x86_64-v2"
 ln -sfn "sccache-linux-x86_64-v2" "$release_dir/sccache"
@@ -228,7 +234,13 @@ if ! capabilities_satisfy_requirements "$candidate_capabilities"; then
 fi
 
 current_sha=""
-[[ -r "$STATE_DIR/source_sha" ]] && current_sha="$(cat "$STATE_DIR/source_sha")"
+# A client-only rollout is still a forward deployment. Prefer its source SHA
+# when enforcing monotonic updates; fall back to the last fully converged bundle.
+if [[ -r "$STATE_DIR/client_source_sha" ]]; then
+    current_sha="$(cat "$STATE_DIR/client_source_sha")"
+elif [[ -r "$STATE_DIR/source_sha" ]]; then
+    current_sha="$(cat "$STATE_DIR/source_sha")"
+fi
 
 if [[ -z "$published_at" ]]; then
     published_at="$(
@@ -262,6 +274,34 @@ live_dist_sha=""
 echo "release=$tag source_sha=$source_sha published_at=$published_at"
 echo "candidate_sha256=$candidate_sha live_sha256=${live_sha:-missing}"
 echo "candidate_dist_sha256=$candidate_dist_sha live_dist_sha256=${live_dist_sha:-missing}"
+
+record_client_state() {
+    printf '%s\n' "$tag" > "$STATE_DIR/client_release_tag"
+    printf '%s\n' "$source_sha" > "$STATE_DIR/client_source_sha"
+    printf '%s\n' "$candidate_sha" > "$STATE_DIR/client_sha256"
+    printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATE_DIR/client_updated_at"
+}
+
+record_dist_state() {
+    printf '%s\n' "$tag" > "$STATE_DIR/dist_release_tag"
+    printf '%s\n' "$source_sha" > "$STATE_DIR/dist_source_sha"
+    printf '%s\n' "$candidate_dist_sha" > "$STATE_DIR/dist_sha256"
+    printf '%s\n' "$dist_protocol" > "$STATE_DIR/dist_protocol"
+    printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATE_DIR/dist_updated_at"
+}
+
+record_full_state() {
+    record_client_state
+    record_dist_state
+    printf '%s\n' "$tag" > "$STATE_DIR/release_tag"
+    printf '%s\n' "$source_sha" > "$STATE_DIR/source_sha"
+    printf '%s\n' "$published_at" > "$STATE_DIR/published_at"
+    cp -f "$release_dir/build.txt" "$STATE_DIR/build.txt"
+    cp -f "$release_dir/SHA256SUMS" "$STATE_DIR/SHA256SUMS"
+    printf '%s\n' "$candidate_sha" > "$STATE_DIR/binary_sha256"
+    printf '%s\n' "$candidate_dist_sha" > "$STATE_DIR/dist_binary_sha256"
+    printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATE_DIR/updated_at"
+}
 
 if [[ "$MODE" == check ]]; then
     exit 0
@@ -387,19 +427,21 @@ d=json.load(sys.stdin).get("stats",{})
 print(sum(int(v) for v in d.get("dist_compiles",{}).values()))'
 }
 
-if [[ "$candidate_sha" == "$live_sha" && "$candidate_dist_sha" == "$live_dist_sha" ]]; then
-    if managed_dist_processes_match "$candidate_dist_sha" &&
-       managed_client_processes_match "$candidate_sha"; then
-        printf '%s\n' "$tag" > "$STATE_DIR/release_tag"
-        printf '%s\n' "$source_sha" > "$STATE_DIR/source_sha"
-        printf '%s\n' "$published_at" > "$STATE_DIR/published_at"
-        cp -f "$release_dir/build.txt" "$STATE_DIR/build.txt"
-        cp -f "$release_dir/SHA256SUMS" "$STATE_DIR/SHA256SUMS"
-        printf '%s\n' "$candidate_sha" > "$STATE_DIR/binary_sha256"
-        printf '%s\n' "$candidate_dist_sha" > "$STATE_DIR/dist_binary_sha256"
-        echo "sccache-release-update: already running desired release"
-        exit 0
-    fi
+client_update_required=1
+if [[ "$candidate_sha" == "$live_sha" ]] && managed_client_processes_match "$candidate_sha"; then
+    client_update_required=0
+fi
+
+dist_update_required=1
+if [[ "$candidate_dist_sha" == "$live_dist_sha" ]] &&
+   managed_dist_processes_match "$candidate_dist_sha"; then
+    dist_update_required=0
+fi
+
+if (( client_update_required == 0 && dist_update_required == 0 )); then
+    record_full_state
+    echo "sccache-release-update: already running desired release"
+    exit 0
 fi
 
 active_clients() {
@@ -441,24 +483,34 @@ for service in "${DIST_SERVICES[@]}"; do
     fi
 done
 dist_was_active=0
-dist_update_required=1
-if [[ "$candidate_dist_sha" == "$live_dist_sha" ]] &&
-   managed_dist_processes_match "$candidate_dist_sha"; then
-    dist_update_required=0
+dist_deferred=0
+apply_dist_update=$dist_update_required
+current_dist_protocol=""
+if [[ -r "$STATE_DIR/dist_protocol" && -r "$STATE_DIR/dist_sha256" ]] &&
+   [[ "$(cat "$STATE_DIR/dist_sha256")" == "$live_dist_sha" ]]; then
+    current_dist_protocol="$(cat "$STATE_DIR/dist_protocol")"
+elif [[ -r "$STATE_DIR/release_tag" && -r "$STATE_DIR/source_sha" &&
+        -r "$STATE_DIR/dist_binary_sha256" ]] &&
+     [[ "$(cat "$STATE_DIR/dist_binary_sha256")" == "$live_dist_sha" ]]; then
+    # Canonical releases predating explicit protocol metadata all used v1.
+    current_dist_protocol=1
 fi
 if (( ${#ACTIVE_DIST_SERVICES[@]} > 0 )); then
     dist_was_active=1
-    # A client-only release cannot interrupt jobs already running on the
-    # scheduler/worker processes, so do not make unrelated global dist activity
-    # block a client update when the dist binary is already exactly right.
     if (( dist_update_required )); then
         if ! dist_busy="$(dist_in_progress)"; then
             echo "sccache-release-update: cannot verify scheduler activity; deferring dist update" >&2
             exit 0
         fi
         if (( dist_busy > 0 )); then
-            echo "sccache-release-update: $dist_busy distributed compile(s) active; deferring dist update"
-            exit 0
+            if [[ -n "$current_dist_protocol" && "$current_dist_protocol" == "$dist_protocol" ]]; then
+                dist_deferred=1
+                apply_dist_update=0
+                echo "sccache-release-update: $dist_busy distributed compile(s) active; rolling compatible client independently and deferring dist update"
+            else
+                echo "sccache-release-update: $dist_busy distributed compile(s) active and protocol changes ${current_dist_protocol:-unknown} -> $dist_protocol; deferring full update"
+                exit 0
+            fi
         fi
     fi
     # Keep this check even for client-only releases: the freshly installed
@@ -473,6 +525,13 @@ if (( ${#ACTIVE_DIST_SERVICES[@]} > 0 )); then
             exit 0
         fi
     fi
+fi
+
+if [[ "$MODE" == plan ]]; then
+    printf 'plan client_update_required=%d dist_update_required=%d dist_deferred=%d apply_dist_update=%d dist_was_active=%d current_dist_protocol=%s candidate_dist_protocol=%s\n' \
+        "$client_update_required" "$dist_update_required" "$dist_deferred" \
+        "$apply_dist_update" "$dist_was_active" "${current_dist_protocol:-unknown}" "$dist_protocol"
+    exit 0
 fi
 
 stop_dist_services() {
@@ -492,6 +551,11 @@ start_dist_services() {
         systemctl is-active --quiet "$service"
     done
 }
+if (( client_update_required == 0 && dist_deferred == 1 )); then
+    record_client_state
+    echo "sccache-release-update: client already at $tag; distributed binary remains deferred"
+    exit 0
+fi
 if active_clients; then
     echo "sccache-release-update: active compiler clients; deferring update"
     exit 0
@@ -507,33 +571,40 @@ mkdir -p "$backup_dir"
 
 rollback() {
     rc=$?
-    trap - EXIT ERR INT TERM
+    trap - EXIT INT TERM
     echo "sccache-release-update: update failed (rc=$rc), rolling back" >&2
-    if (( root_local_was_active )); then
-        systemctl stop "$ROOT_LOCAL_SERVICE" >/dev/null 2>&1 || true
+
+    if (( client_update_required )); then
+        if (( root_local_was_active )); then
+            systemctl stop "$ROOT_LOCAL_SERVICE" >/dev/null 2>&1 || true
+        fi
+        if (( native_root_was_active )); then
+            systemctl stop "$NATIVE_ROOT_SERVICE" >/dev/null 2>&1 || true
+        fi
+        if (( openwrt_root_was_active )); then
+            systemctl stop "$OPENWRT_ROOT_SERVICE" >/dev/null 2>&1 || true
+        fi
+        if (( strict_local_was_active )); then
+            systemctl stop "$STRICT_LOCAL_SERVICE" >/dev/null 2>&1 || true
+        fi
+        systemctl stop "$LOCAL_SERVICE" >/dev/null 2>&1 || true
     fi
-    if (( native_root_was_active )); then
-        systemctl stop "$NATIVE_ROOT_SERVICE" >/dev/null 2>&1 || true
-    fi
-    if (( openwrt_root_was_active )); then
-        systemctl stop "$OPENWRT_ROOT_SERVICE" >/dev/null 2>&1 || true
-    fi
-    if (( strict_local_was_active )); then
-        systemctl stop "$STRICT_LOCAL_SERVICE" >/dev/null 2>&1 || true
-    fi
-    systemctl stop "$LOCAL_SERVICE" >/dev/null 2>&1 || true
-    if (( dist_was_active && dist_update_required )); then
+    if (( dist_was_active && apply_dist_update )); then
         for service in "${ACTIVE_DIST_SERVICES[@]}"; do
             systemctl stop "$service" >/dev/null 2>&1 || true
         done
     fi
-    [[ -e "$backup_dir/sccache" ]] && install -o root -g root -m 0755 "$backup_dir/sccache" "$LIVE"
-    if (( dist_update_required )) && [[ -e "$backup_dir/sccache-dist" ]]; then
+
+    if (( client_update_required )) && [[ -e "$backup_dir/sccache" ]]; then
+        install -o root -g root -m 0755 "$backup_dir/sccache" "$LIVE"
+    fi
+    if (( apply_dist_update )) && [[ -e "$backup_dir/sccache-dist" ]]; then
         install -o root -g root -m 0755 "$backup_dir/sccache-dist" "$DIST_LIVE"
     fi
-    # Restore the scheduler before the local daemon so the reverted client
-    # does not enter reconnect backoff against a scheduler that is still down.
-    if (( dist_was_active && dist_update_required )); then
+
+    # Restore the scheduler before a reverted client so the client does not
+    # enter reconnect backoff against a scheduler that is still down.
+    if (( dist_was_active && apply_dist_update )); then
         for ((i=${#ACTIVE_DIST_SERVICES[@]}-1; i>=0; i--)); do
             systemctl start "${ACTIVE_DIST_SERVICES[i]}" >/dev/null 2>&1 || true
         done
@@ -542,24 +613,26 @@ rollback() {
             sleep 0.05
         done
     fi
-    systemctl start "$LOCAL_SERVICE" >/dev/null 2>&1 || true
-    if (( root_local_was_active )); then
-        systemctl start "$ROOT_LOCAL_SERVICE" >/dev/null 2>&1 || true
-    fi
-    if (( native_root_was_active )); then
-        systemctl start "$NATIVE_ROOT_SERVICE" >/dev/null 2>&1 || true
-    fi
-    if (( openwrt_root_was_active )); then
-        systemctl start "$OPENWRT_ROOT_SERVICE" >/dev/null 2>&1 || true
-    fi
-    if (( strict_local_was_active )); then
-        systemctl start "$STRICT_LOCAL_SERVICE" >/dev/null 2>&1 || true
+    if (( client_update_required )); then
+        systemctl start "$LOCAL_SERVICE" >/dev/null 2>&1 || true
+        if (( root_local_was_active )); then
+            systemctl start "$ROOT_LOCAL_SERVICE" >/dev/null 2>&1 || true
+        fi
+        if (( native_root_was_active )); then
+            systemctl start "$NATIVE_ROOT_SERVICE" >/dev/null 2>&1 || true
+        fi
+        if (( openwrt_root_was_active )); then
+            systemctl start "$OPENWRT_ROOT_SERVICE" >/dev/null 2>&1 || true
+        fi
+        if (( strict_local_was_active )); then
+            systemctl start "$STRICT_LOCAL_SERVICE" >/dev/null 2>&1 || true
+        fi
     fi
     [[ -z "$smoke" ]] || rm -rf -- "$smoke"
     rm -f "$DRAIN"
     exit "$rc"
 }
-trap rollback EXIT ERR INT TERM
+trap rollback EXIT INT TERM
 
 touch "$DRAIN"
 # A client may have crossed the idle check just before the marker appeared.
@@ -570,30 +643,30 @@ done
 if active_clients; then
     echo "sccache-release-update: client did not drain within 30s; deferring" >&2
     rm -f "$DRAIN"
-    trap - EXIT ERR INT TERM
+    trap - EXIT INT TERM
     exit 0
 fi
 
 # Recheck distributed activity immediately before stopping the scheduler. This
 # closes the normal timer race as far as possible without interrupting a known
 # in-flight remote compilation.
-if (( dist_was_active && dist_update_required )); then
+if (( dist_was_active && apply_dist_update )); then
     if ! dist_busy="$(dist_in_progress)"; then
         echo "sccache-release-update: cannot recheck scheduler activity; deferring update" >&2
         rm -f "$DRAIN"
-        trap - EXIT ERR INT TERM
+        trap - EXIT INT TERM
         exit 0
     fi
     if (( dist_busy > 0 )); then
         echo "sccache-release-update: $dist_busy distributed compile(s) became active; deferring update"
         rm -f "$DRAIN"
-        trap - EXIT ERR INT TERM
+        trap - EXIT INT TERM
         exit 0
     fi
     stop_dist_services
 fi
 
-if (( dist_update_required )); then
+if (( apply_dist_update )); then
     install -o root -g root -m 0755 "$release_dir/sccache-dist-linux-x86_64-v2" "$DIST_LIVE.new"
     mv -f "$DIST_LIVE.new" "$DIST_LIVE"
 
@@ -610,28 +683,29 @@ fi
 # The pre-managed local daemon predates deterministic background-task draining.
 # Once no compiler clients remain, give any legacy detached Garage write a
 # final quiet window. Managed e5d3+ daemons drain background work on shutdown.
-if [[ ! -r "$STATE_DIR/source_sha" ]]; then
+if (( client_update_required )) && [[ ! -r "$STATE_DIR/source_sha" ]]; then
     sleep 5
 fi
 
-if (( root_local_was_active )); then
-    systemctl stop "$ROOT_LOCAL_SERVICE"
-fi
-if (( native_root_was_active )); then
-    systemctl stop "$NATIVE_ROOT_SERVICE"
-fi
-if (( openwrt_root_was_active )); then
-    systemctl stop "$OPENWRT_ROOT_SERVICE"
-fi
-if (( strict_local_was_active )); then
-    systemctl stop "$STRICT_LOCAL_SERVICE"
-fi
-systemctl stop "$LOCAL_SERVICE"
-install -o root -g root -m 0755 "$release_dir/sccache-linux-x86_64-v2" "$LIVE.new"
-mv -f "$LIVE.new" "$LIVE"
+if (( client_update_required )); then
+    if (( root_local_was_active )); then
+        systemctl stop "$ROOT_LOCAL_SERVICE"
+    fi
+    if (( native_root_was_active )); then
+        systemctl stop "$NATIVE_ROOT_SERVICE"
+    fi
+    if (( openwrt_root_was_active )); then
+        systemctl stop "$OPENWRT_ROOT_SERVICE"
+    fi
+    if (( strict_local_was_active )); then
+        systemctl stop "$STRICT_LOCAL_SERVICE"
+    fi
+    systemctl stop "$LOCAL_SERVICE"
+    install -o root -g root -m 0755 "$release_dir/sccache-linux-x86_64-v2" "$LIVE.new"
+    mv -f "$LIVE.new" "$LIVE"
 
-metrics_not_before="$(date +%s)"
-systemctl start "$LOCAL_SERVICE"
+    metrics_not_before="$(date +%s)"
+    systemctl start "$LOCAL_SERVICE"
 for _ in $(seq 1 100); do
     [[ -S "$CLIENT_UDS" ]] && break
     sleep 0.05
@@ -677,18 +751,19 @@ if (( strict_local_was_active )); then
     tcp_ready 127.0.0.1 "$STRICT_LOCAL_PORT"
 fi
 
-# Restore all managed client endpoints before waiting on the observability
-# proof so a broken telemetry rollout does not unnecessarily extend client
-# downtime during the rollback window.
-verify_metrics_heartbeat "$metrics_not_before"
+    # Restore all managed client endpoints before waiting on the observability
+    # proof so a broken telemetry rollout does not unnecessarily extend client
+    # downtime during the rollback window.
+    verify_metrics_heartbeat "$metrics_not_before"
+fi
 
 dist_smoke_before=""
 if [[ "$VERIFY_DIST_SMOKE" == 1 && $dist_was_active -eq 1 ]]; then
     dist_servers=0
     for _ in $(seq 1 240); do
-        # This check must come from the freshly restarted local daemon itself;
-        # the direct scheduler fallback only proves the scheduler is healthy,
-        # not that the new client has authenticated and connected.
+        # This check must come from the managed local daemon itself; the direct
+        # scheduler fallback only proves the scheduler is healthy, not that the
+        # client has authenticated and connected after the changed component.
         if dist_servers="$(local_dist_status_value num_servers 2>/dev/null)" && (( dist_servers > 0 )); then
             break
         fi
@@ -734,15 +809,15 @@ if [[ "$VERIFY_DIST_SMOKE" == 1 && $dist_was_active -eq 1 ]]; then
 fi
 rm -rf "$smoke"
 
-printf '%s\n' "$tag" > "$STATE_DIR/release_tag"
-printf '%s\n' "$source_sha" > "$STATE_DIR/source_sha"
-printf '%s\n' "$published_at" > "$STATE_DIR/published_at"
-cp -f "$release_dir/build.txt" "$STATE_DIR/build.txt"
-cp -f "$release_dir/SHA256SUMS" "$STATE_DIR/SHA256SUMS"
-printf '%s\n' "$candidate_sha" > "$STATE_DIR/binary_sha256"
-printf '%s\n' "$candidate_dist_sha" > "$STATE_DIR/dist_binary_sha256"
-printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STATE_DIR/updated_at"
+if (( dist_deferred )); then
+    record_client_state
+    rm -f "$DRAIN"
+    trap - EXIT INT TERM
+    echo "sccache-release-update: installed client $tag ($source_sha); distributed binary deferred"
+    exit 0
+fi
 
+record_full_state
 rm -f "$DRAIN"
-trap - EXIT ERR INT TERM
+trap - EXIT INT TERM
 echo "sccache-release-update: installed $tag ($source_sha)"
