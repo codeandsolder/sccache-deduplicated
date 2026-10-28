@@ -885,6 +885,11 @@ pub trait SchedulerIncoming: Send + Sync {
     ) -> ExtResult<UpdateJobStateResult, Error>;
     // From anyone
     fn handle_status(&self) -> ExtResult<SchedulerStatusResult, Error>;
+    // Additive maintenance metadata. Existing scheduler implementations remain
+    // non-draining unless they explicitly opt into a drain source.
+    fn handle_is_draining(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(feature = "dist-server")]

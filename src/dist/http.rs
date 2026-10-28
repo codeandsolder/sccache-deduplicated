@@ -1079,6 +1079,10 @@ mod server {
                         let res: SchedulerStatusResult = try_or_500_log!(req_id, handler.handle_status());
                         prepare_response(request, &res)
                     },
+                    (GET) (/api/v1/scheduler/drain_status) => {
+                        let draining = u8::from(handler.handle_is_draining());
+                        rouille::Response::text(format!("{draining}\n"))
+                    },
                     _ => {
                         warn!("Unknown request {:?}", request);
                         rouille::Response::empty_404()

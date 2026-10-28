@@ -1828,7 +1828,7 @@ impl CachedConfig {
 #[cfg(feature = "dist-server")]
 pub mod scheduler {
     use std::net::SocketAddr;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use crate::errors::*;
 
@@ -1873,6 +1873,8 @@ pub mod scheduler {
         pub public_addr: SocketAddr,
         pub client_auth: ClientAuth,
         pub server_auth: ServerAuth,
+        #[serde(default)]
+        pub maintenance_drain_file: Option<PathBuf>,
     }
 
     pub fn from_path(conf_path: &Path) -> Result<Option<Config>> {

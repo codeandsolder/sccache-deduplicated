@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, btree_map};
 use std::env;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -192,6 +192,7 @@ fn run(command: Command) -> Result<i32> {
             public_addr,
             client_auth,
             server_auth,
+            maintenance_drain_file,
         }) => {
             let check_client_auth: Box<dyn dist::http::ClientAuthCheck> = match client_auth {
                 scheduler_config::ClientAuth::Insecure => Box::new(token_check::EqCheck::new(
@@ -242,8 +243,14 @@ fn run(command: Command) -> Result<i32> {
                 }
             };
 
+            if maintenance_drain_file
+                .as_deref()
+                .is_some_and(|path| !path.is_absolute())
+            {
+                bail!("scheduler maintenance_drain_file must be absolute")
+            }
             daemonize(&[])?;
-            let scheduler = Scheduler::from_env()?;
+            let scheduler = Scheduler::from_env(maintenance_drain_file)?;
             let http_scheduler = dist::http::Scheduler::new(
                 public_addr,
                 scheduler,
@@ -426,6 +433,7 @@ pub struct Scheduler {
     job_id_base: u64,
     job_count: AtomicUsize,
     job_slack: JobSlackConfig,
+    maintenance_drain_file: Option<PathBuf>,
 
     // Currently running jobs, can never be Complete
     jobs: Mutex<BTreeMap<JobId, JobDetail>>,
@@ -451,19 +459,33 @@ impl Scheduler {
         Self::new_with_job_slack(JobSlackConfig::default())
     }
 
-    fn from_env() -> Result<Self> {
+    fn from_env(maintenance_drain_file: Option<PathBuf>) -> Result<Self> {
         let job_slack = JobSlackConfig::from_env()?;
         info!(
             "Distributed scheduler job slack: static={} percent={}%",
             job_slack.static_jobs, job_slack.percent
         );
-        Ok(Self::new_with_job_slack(job_slack))
+        Ok(Self::new_with_job_slack_and_drain(
+            job_slack,
+            maintenance_drain_file,
+        ))
     }
 
     fn new_with_job_slack(job_slack: JobSlackConfig) -> Self {
+        Self::new_with_job_slack_and_drain(job_slack, None)
+    }
+
+    fn new_with_job_slack_and_drain(
+        job_slack: JobSlackConfig,
+        maintenance_drain_file: Option<PathBuf>,
+    ) -> Self {
         let mut bytes = [0u8; size_of::<u64>()];
         rand::fill(&mut bytes);
-        Self::with_job_id_base_and_slack(u64::from_le_bytes(bytes), job_slack)
+        Self::with_job_id_base_and_slack_and_drain(
+            u64::from_le_bytes(bytes),
+            job_slack,
+            maintenance_drain_file,
+        )
     }
 
     fn with_job_id_base(job_id_base: u64) -> Self {
@@ -471,12 +493,37 @@ impl Scheduler {
     }
 
     fn with_job_id_base_and_slack(job_id_base: u64, job_slack: JobSlackConfig) -> Self {
+        Self::with_job_id_base_and_slack_and_drain(job_id_base, job_slack, None)
+    }
+
+    fn with_job_id_base_and_slack_and_drain(
+        job_id_base: u64,
+        job_slack: JobSlackConfig,
+        maintenance_drain_file: Option<PathBuf>,
+    ) -> Self {
         Scheduler {
             job_id_base,
             job_count: AtomicUsize::new(0),
             job_slack,
+            maintenance_drain_file,
             jobs: Mutex::new(BTreeMap::new()),
             servers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn is_draining(&self) -> bool {
+        let Some(path) = self.maintenance_drain_file.as_deref() else {
+            return false;
+        };
+        match path.try_exists() {
+            Ok(exists) => exists,
+            Err(error) => {
+                error!(
+                    "Could not inspect scheduler maintenance drain file {}: {error}; failing closed",
+                    path.display()
+                );
+                true
+            }
         }
     }
 
@@ -549,6 +596,11 @@ impl SchedulerIncoming for Scheduler {
         requester: &dyn SchedulerOutgoing,
         tc: Toolchain,
     ) -> Result<AllocJobResult> {
+        if self.is_draining() {
+            return Ok(AllocJobResult::Fail {
+                msg: "scheduler is draining for maintenance".to_owned(),
+            });
+        }
         let (job_id, server_id, auth) = {
             // LOCKS
             let mut servers = self.servers.lock().unwrap();
@@ -922,6 +974,10 @@ impl SchedulerIncoming for Scheduler {
         Ok(UpdateJobStateResult::Success)
     }
 
+    fn handle_is_draining(&self) -> bool {
+        self.is_draining()
+    }
+
     fn handle_status(&self) -> Result<SchedulerStatusResult> {
         // LOCKS
         let mut jobs = self.jobs.lock().unwrap();
@@ -1088,6 +1144,83 @@ mod scheduler_tests {
         fn verify_token(&self, _job_id: JobId, _token: &str) -> Result<()> {
             Ok(())
         }
+    }
+
+    struct AcceptAssign;
+
+    impl SchedulerOutgoing for AcceptAssign {
+        fn do_assign_job(
+            &self,
+            _server_id: ServerId,
+            _job_id: JobId,
+            _tc: Toolchain,
+            _auth: String,
+        ) -> Result<AssignJobResult> {
+            Ok(AssignJobResult {
+                state: JobState::Pending,
+                need_toolchain: false,
+            })
+        }
+    }
+
+    #[test]
+    fn maintenance_drain_refuses_new_allocations_without_creating_job_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let drain = dir.path().join("scheduler-drain");
+        let scheduler =
+            Scheduler::new_with_job_slack_and_drain(JobSlackConfig::default(), Some(drain.clone()));
+        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        scheduler
+            .handle_heartbeat_server(
+                server_id,
+                ServerNonce::new(),
+                1,
+                Box::new(TestJobAuthorizer),
+            )
+            .unwrap();
+
+        std::fs::write(&drain, b"drain").unwrap();
+        assert!(scheduler.handle_is_draining());
+        let allocation = scheduler
+            .handle_alloc_job(
+                &AcceptAssign,
+                Toolchain {
+                    archive_id: "test-toolchain".to_owned(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(allocation, AllocJobResult::Fail { .. }));
+        assert!(scheduler.jobs.lock().unwrap().is_empty());
+        let servers = scheduler.servers.lock().unwrap();
+        let details = servers.get(&server_id).unwrap();
+        assert!(details.jobs_assigned.is_empty());
+        assert!(details.jobs_unclaimed.is_empty());
+        drop(servers);
+
+        std::fs::remove_file(&drain).unwrap();
+        assert!(!scheduler.handle_is_draining());
+        let allocation = scheduler
+            .handle_alloc_job(
+                &AcceptAssign,
+                Toolchain {
+                    archive_id: "test-toolchain".to_owned(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(allocation, AllocJobResult::Success { .. }));
+    }
+
+    #[test]
+    fn maintenance_drain_fails_closed_when_marker_lookup_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_directory = dir.path().join("not-a-directory");
+        std::fs::write(&not_a_directory, b"file").unwrap();
+        let scheduler = Scheduler::new_with_job_slack_and_drain(
+            JobSlackConfig::default(),
+            Some(not_a_directory.join("drain")),
+        );
+
+        assert!(scheduler.handle_is_draining());
     }
 
     struct ReapDuringAssign<'a> {
