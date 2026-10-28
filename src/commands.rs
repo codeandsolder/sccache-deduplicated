@@ -57,6 +57,65 @@ pub const DEFAULT_PORT: u16 = 4226;
 /// The number of milliseconds to wait for server startup.
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_millis(10000);
 
+#[cfg(target_os = "linux")]
+const REQUIRE_ROOT_MANAGED_SERVER_START: &str = "/etc/sccache/require-root-managed-server-start";
+
+#[cfg(target_os = "linux")]
+fn root_managed_sccache_service_cgroup(cgroups: &str) -> bool {
+    cgroups.lines().any(|line| {
+        let Some((_, path)) = line.rsplit_once(':') else {
+            return false;
+        };
+
+        // A user can create arbitrary delegated cgroups below user.slice, so a
+        // service-looking component there is not proof that the system manager
+        // started the process. Cgroups outside user.slice are not delegated to
+        // an ordinary login session.
+        if path == "/user.slice" || path.starts_with("/user.slice/") {
+            return false;
+        }
+
+        path.split('/').any(|component| {
+            component
+                .strip_prefix("sccache-")
+                .is_some_and(|name| name.ends_with(".service") && name.len() > ".service".len())
+        })
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn require_server_start_authority() -> Result<()> {
+    match fs::metadata(REQUIRE_ROOT_MANAGED_SERVER_START) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect server-start policy {REQUIRE_ROOT_MANAGED_SERVER_START}")
+            });
+        }
+    }
+
+    // SAFETY: geteuid has no preconditions and only reads process credentials.
+    if unsafe { libc::geteuid() } == 0 {
+        return Ok(());
+    }
+
+    let cgroups = fs::read_to_string("/proc/self/cgroup")
+        .context("failed to inspect process cgroup for sccache server-start authorization")?;
+    if root_managed_sccache_service_cgroup(&cgroups) {
+        return Ok(());
+    }
+
+    bail!(
+        "sccache server startup is restricted by {REQUIRE_ROOT_MANAGED_SERVER_START}; start it as root or through a root-managed sccache systemd service"
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn require_server_start_authority() -> Result<()> {
+    Ok(())
+}
+
 /// Get the port on which the server should listen.
 fn get_addr() -> crate::net::SocketAddr {
     #[cfg(unix)]
@@ -97,6 +156,7 @@ async fn read_server_startup_status<R: AsyncReadExt + Unpin>(
 #[cfg(not(windows))]
 fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup> {
     trace!("run_server_process");
+    require_server_start_authority()?;
     let tempdir = tempfile::Builder::new().prefix("sccache").tempdir()?;
     let socket_path = tempdir.path().join("sock");
     let runtime = new_client_runtime()?;
@@ -848,6 +908,10 @@ fn debug_preprocessor_cache_entries() -> Result<()> {
 
 fn start_internal_server(config: &Config) -> Result<()> {
     trace!("Command::InternalStartServer");
+    // Check again in the re-executed server process. This prevents callers from
+    // bypassing the public command path by invoking the managed ELF directly
+    // with SCCACHE_START_SERVER=1.
+    require_server_start_authority()?;
     if env::var("SCCACHE_ERROR_LOG").is_ok() {
         let file = create_error_log()?;
         #[cfg(not(windows))]
@@ -1077,6 +1141,35 @@ mod test {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn root_managed_sccache_cgroup_accepts_system_services() {
+        assert!(root_managed_sccache_service_cgroup(
+            "0::/system.slice/sccache-local.service\n"
+        ));
+        assert!(root_managed_sccache_service_cgroup(
+            "0::/system.slice/build.slice/sccache-strict-local.service/client\n"
+        ));
+        assert!(root_managed_sccache_service_cgroup(
+            "8:cpu:/sccachebg.slice/sccache-native-root.service\n"
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn root_managed_sccache_cgroup_rejects_user_and_unrelated_cgroups() {
+        assert!(!root_managed_sccache_service_cgroup(
+            "0::/user.slice/user-1000.slice/session-42.scope\n"
+        ));
+        assert!(!root_managed_sccache_service_cgroup(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/sccache-fake.service\n"
+        ));
+        assert!(!root_managed_sccache_service_cgroup(
+            "0::/system.slice/ssh.service\n"
+        ));
+        assert!(!root_managed_sccache_service_cgroup("malformed\n"));
     }
 
     /// A `Connection` that immediately returns EOF on reads and discards writes.
