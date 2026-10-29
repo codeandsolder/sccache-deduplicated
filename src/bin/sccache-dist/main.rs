@@ -528,7 +528,7 @@ impl Scheduler {
     }
 
     fn next_job_id(&self) -> JobId {
-        let job_count = self.job_count.fetch_add(1, Ordering::SeqCst) as u64;
+        let job_count = self.job_count.fetch_add(1, Ordering::Relaxed) as u64;
         JobId(self.job_id_base.wrapping_add(job_count))
     }
 

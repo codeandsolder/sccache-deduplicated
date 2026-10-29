@@ -450,13 +450,13 @@ mod server {
     struct RunningJobGuard(Arc<atomic::AtomicUsize>);
     impl RunningJobGuard {
         fn new(counter: &Arc<atomic::AtomicUsize>) -> Self {
-            counter.fetch_add(1, atomic::Ordering::SeqCst);
+            counter.fetch_add(1, atomic::Ordering::Relaxed);
             Self(Arc::clone(counter))
         }
     }
     impl Drop for RunningJobGuard {
         fn drop(&mut self) {
-            self.0.fetch_sub(1, atomic::Ordering::SeqCst);
+            self.0.fetch_sub(1, atomic::Ordering::Relaxed);
         }
     }
 
@@ -957,7 +957,7 @@ mod server {
                 Default::default();
 
             let server = rouille::Server::new(public_addr, move |request| {
-                let req_id = request_count.fetch_add(1, atomic::Ordering::SeqCst);
+                let req_id = request_count.fetch_add(1, atomic::Ordering::Relaxed);
                 trace!(target: "sccache_http", "Req {} ({}): {:?}", req_id, request.remote_addr(), request);
                 let response = (|| router!(request,
                     (POST) (/api/v1/scheduler/alloc_job) => {
@@ -1246,7 +1246,7 @@ mod server {
                     let advertised_cpus =
                         load_aware_capacity.as_mut().map_or_else(num_cpus, |state| {
                             state.advertised_cpus(
-                                heartbeat_running_jobs.load(atomic::Ordering::SeqCst),
+                                heartbeat_running_jobs.load(atomic::Ordering::Relaxed),
                             )
                         });
                     let heartbeat_req = HeartbeatServerHttpRequest {
@@ -1287,7 +1287,7 @@ mod server {
             let request_count = atomic::AtomicUsize::new(0);
 
             let server = rouille::Server::new_ssl(bind_address, move |request| {
-                let req_id = request_count.fetch_add(1, atomic::Ordering::SeqCst);
+                let req_id = request_count.fetch_add(1, atomic::Ordering::Relaxed);
                 trace!("Req {} ({}): {:?}", req_id, request.remote_addr(), request);
                 let response = (|| router!(request,
                     (POST) (/api/v1/distserver/assign_job/{job_id: JobId}) => {
