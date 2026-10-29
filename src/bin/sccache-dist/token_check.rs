@@ -59,7 +59,7 @@ impl ClientAuthCheck for EqCheck {
         if self.s == token {
             Ok(())
         } else {
-            warn!("User token {} != expected token {}", token, self.s);
+            warn!("User token did not match expected token");
             Err(ClientVisibleMsg::from_nonsensitive(
                 "Fixed token mismatch".to_owned(),
             ))
