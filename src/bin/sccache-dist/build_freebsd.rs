@@ -277,11 +277,7 @@ impl PotBuilder {
         Ok(imagename)
     }
 
-    fn start_container(
-        image: &str,
-        pot_cmd: &Path,
-        pot_clone_args: &[String],
-    ) -> Result<String> {
+    fn start_container(image: &str, pot_cmd: &Path, pot_clone_args: &[String]) -> Result<String> {
         let cid = format!("sccache-builder-{}", Uuid::new_v4());
         let mut clone_args: Vec<&str> = ["clone", "-p", &cid, "-P", image].to_vec();
         clone_args.append(&mut pot_clone_args.iter().map(|s| s as &str).collect());
