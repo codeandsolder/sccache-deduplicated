@@ -76,7 +76,7 @@ fn check_output(output: &Output) -> Result<()> {
 }
 
 // Force remove the container
-fn pot_rm(cid: &str, pot_cmd: &PathBuf) -> Result<()> {
+fn pot_rm(cid: &str, pot_cmd: &Path) -> Result<()> {
     Command::new(pot_cmd)
         .args(&["destroy", "-F", "-p", cid])
         .check_run()
@@ -204,7 +204,7 @@ impl PotBuilder {
         container_lists: Arc<Mutex<HashMap<Toolchain, Vec<String>>>>,
         tc: Toolchain,
         cid: String,
-        pot_cmd: &PathBuf,
+        pot_cmd: &Path,
     ) {
         if let Err(e) = Self::clean_container(&cid) {
             info!("Failed to clean container {}: {}", cid, e);
@@ -237,7 +237,7 @@ impl PotBuilder {
         tccache: &Mutex<TcCache>,
         pot_fs_root: &Path,
         clone_from: &str,
-        pot_cmd: &PathBuf,
+        pot_cmd: &Path,
         pot_clone_args: &[String],
     ) -> Result<String> {
         let imagename = format!("sccache-image-{}", &tc.archive_id);
@@ -277,11 +277,7 @@ impl PotBuilder {
         Ok(imagename)
     }
 
-    fn start_container(
-        image: &str,
-        pot_cmd: &PathBuf,
-        pot_clone_args: &[String],
-    ) -> Result<String> {
+    fn start_container(image: &str, pot_cmd: &Path, pot_clone_args: &[String]) -> Result<String> {
         let cid = format!("sccache-builder-{}", Uuid::new_v4());
         let mut clone_args: Vec<&str> = ["clone", "-p", &cid, "-P", image].to_vec();
         clone_args.append(&mut pot_clone_args.iter().map(|s| s as &str).collect());
