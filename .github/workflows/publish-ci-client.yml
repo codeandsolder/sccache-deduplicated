@@ -31,7 +31,7 @@ jobs:
       (github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.head_branch == 'main')
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     outputs:
       ready: ${{ steps.gates.outputs.ready }}
@@ -65,7 +65,7 @@ jobs:
   build-publish:
     needs: required-gates
     if: needs.required-gates.outputs.ready == 'true'
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

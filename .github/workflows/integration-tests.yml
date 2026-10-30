@@ -22,7 +22,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - name: Clone repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -36,13 +36,13 @@ jobs:
         run: |
           cargo build --all-features
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: integration-tests
           path: ./target/debug/sccache
 
   integration-tests:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     strategy:
       matrix:
         type: [backends, tools]
@@ -84,7 +84,7 @@ jobs:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   gha:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     needs: build
 
     env:
@@ -107,7 +107,7 @@ jobs:
         with:
           toolchain: "1.99.0"
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests
           path: /home/runner/.cargo/bin/
@@ -134,7 +134,7 @@ jobs:
 
   test-mock-msvc:
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: windows-2022
+    runs-on: windows-2025
     env:
       TARGET: x86_64-pc-windows-msvc
       SCCACHE_EXE: ${{ github.workspace }}\\target\\x86_64-pc-windows-msvc\\debug\\sccache.exe
@@ -223,7 +223,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     # Probably wouldn't matter anyway since we run in a container, but staying
     # close to the version is better than not.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     needs: build
     container:
       image: rocm/dev-ubuntu-24.04:7.2
@@ -271,7 +271,7 @@ jobs:
         run: |
           cargo build -p randomize_readdir
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: integration-tests
           path: /home/runner/.cargo/bin/
