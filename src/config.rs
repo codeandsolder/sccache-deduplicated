@@ -493,7 +493,7 @@ const fn default_s3_capacity_lease_ttl_secs() -> u64 {
     10 * 60
 }
 fn default_s3_capacity_metadata_prefix() -> String {
-    ".sccache-meta/v1".to_owned()
+    ".sccache-meta/v2".to_owned()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2683,7 +2683,7 @@ heat_half_life_secs = 3600
     assert_eq!(capacity.heat_half_life_secs, 3600);
     assert_eq!(capacity.eviction_concurrency, 16);
     assert_eq!(capacity.lease_ttl_secs, 600);
-    assert_eq!(capacity.metadata_prefix, ".sccache-meta/v1");
+    assert_eq!(capacity.metadata_prefix, ".sccache-meta/v2");
     capacity.validate().unwrap();
 }
 
