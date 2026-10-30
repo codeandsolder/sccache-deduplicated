@@ -98,6 +98,8 @@ jobs:
           assert 'trap rollback EXIT INT TERM' in source
           assert 'trap rollback EXIT ERR' not in source
           assert '--plan-only' in source
+          assert 'SCCACHE_AUTOUPDATE_CLIENT_PORT' in source
+          assert 'local_client_ready' in source
           publisher = Path(".github/workflows/publish-ci-client.yml").read_text()
           assert 'echo "dist_protocol=1"' in publisher
           PY
