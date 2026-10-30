@@ -139,7 +139,7 @@ endpoint = "s3-us-east-1.amazonaws.com"
 use_ssl = true
 key_prefix = "s3prefix"
 # Optional cooperative capacity management for a dedicated/shared sccache namespace.
-# Cache objects remain immutable; compact sidecars hold shared heat metadata.
+# Cache objects remain immutable; compact CAS shards hold shared heat metadata.
 # Multiple users/hosts can safely contribute touches, while a distributed lease ensures
 # only one process reconciles/prunes the namespace at a time.
 # [cache.s3.capacity]
@@ -150,7 +150,7 @@ key_prefix = "s3prefix"
 # heat_half_life_secs = 21600  # 6 hours
 # eviction_concurrency = 16
 # lease_ttl_secs = 600
-# metadata_prefix = ".sccache-meta/v1"
+# metadata_prefix = ".sccache-meta/v2"
 # SSE-S3 with an S3-managed key (AES256).
 server_side_encryption = false
 # SSE-KMS with the AWS-managed KMS key (aws/s3).
@@ -279,9 +279,9 @@ export SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY="all"
 * `SCCACHE_S3_CAPACITY_HEAT_HALF_LIFE_SECS` half-life for the shared decaying hit counter (default `21600`, six hours)
 * `SCCACHE_S3_CAPACITY_EVICTION_CONCURRENCY` bounds concurrent metadata reads/deletes during pruning (default `16`)
 * `SCCACHE_S3_CAPACITY_LEASE_TTL_SECS` distributed controller lease lifetime (default `600`)
-* `SCCACHE_S3_CAPACITY_METADATA_PREFIX` sidecar namespace inside the configured S3 key prefix (default `.sccache-meta/v1`)
+* `SCCACHE_S3_CAPACITY_METADATA_PREFIX` managed metadata namespace inside the configured S3 key prefix (default `.sccache-meta/v2`)
 
-Managed capacity is intended for an sccache-owned namespace, not an arbitrary mixed-use bucket. Artifact bytes are never rewritten merely to refresh access state. Instead, every cache key has a tiny metadata sidecar whose S3 user metadata stores a decaying heat score, last-access time, and artifact size. Each sidecar/control mutation also changes a tiny generation-token body, ensuring its S3 ETag changes; ETag-conditional writes can therefore merge activity from independent sccache daemons and users without a central process. Hot entries receive a logarithmic recency bonus during eviction; the heat score decays over time so historical bursts cannot pin objects indefinitely. A short optimistic recheck immediately before deletion prevents stale eviction decisions in normal races.
+Managed capacity is intended for an sccache-owned namespace, not an arbitrary mixed-use bucket. Artifact bytes are never rewritten merely to refresh access state. Shared access state is stored in 4096 deterministic metadata shards keyed by the leading bits of the existing 256-bit cache key. Each compact shard maps cache keys to last-access time, decaying heat, and artifact size, and is updated with ETag-conditional compare-and-swap writes so independent sccache daemons and hosts merge activity without a central process. Cache-key bytes are stored directly rather than normalized object-path strings, keeping shard bodies small enough for efficient object-store metadata handling. Hot entries receive a logarithmic recency bonus during eviction; the heat score decays over time so historical bursts cannot pin objects indefinitely. Pruning loads each shard once, scores entries locally, and rechecks the selected entry inside its current shard immediately before deleting an immutable artifact.
 
 
 The endpoint used then becomes `${SCCACHE_BUCKET}.s3-{SCCACHE_REGION}.amazonaws.com`.

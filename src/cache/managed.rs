@@ -12,16 +12,16 @@
 
 //! Cooperative capacity management for shared object-store caches.
 //!
-//! Cache artifacts stay immutable. Tiny sidecars hold shared temperature
-//! metadata and a separate tiny state object tracks an approximate namespace
-//! size. Every metadata mutation writes a per-process generation token as the
-//! object body, so the S3 `ETag` changes even when only metadata values changed.
-//! `ETag`-guarded writes therefore provide real cross-process CAS, allowing many
-//! sccache processes, users, and hosts to contribute without a central daemon.
-//! Expensive full listings happen only when the shared estimate crosses the
-//! high watermark, the shared state is missing/corrupt, or a cache write fails.
+//! Cache artifacts stay immutable. Shared temperature metadata is packed into
+//! deterministic CAS-protected shards instead of one sidecar object per cache
+//! entry. A separate tiny state object tracks an approximate namespace size.
+//! `ETag`-guarded shard writes merge touches from many sccache processes, users,
+//! and hosts without a central daemon, while keeping metadata object count
+//! bounded. Expensive full listings happen only when the shared estimate crosses
+//! the high watermark, the shared state is missing/corrupt, or a cache write
+//! fails.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -30,16 +30,14 @@ use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 use log::{debug, warn};
 use opendal::{EntryMode, ErrorKind, Metadata, Operator};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::config::S3CapacityConfig;
 
-const META_VERSION: &str = "1";
+const META_VERSION: &str = "2";
 const META_VERSION_KEY: &str = "sccache-version";
-const META_LAST_ACCESS_KEY: &str = "sccache-last-access";
-const META_HEAT_MILLI_KEY: &str = "sccache-heat-milli";
-const META_SIZE_KEY: &str = "sccache-size";
 const STATE_ESTIMATED_SIZE_KEY: &str = "sccache-estimated-size";
 const STATE_UPDATED_KEY: &str = "sccache-state-updated";
 const STATE_RECONCILED_KEY: &str = "sccache-state-reconciled";
@@ -47,6 +45,9 @@ const LEASE_EXPIRES_KEY: &str = "sccache-lease-expires";
 const LEASE_OWNER_KEY: &str = "sccache-lease-owner";
 const CAPACITY_STATE_BASENAME: &str = ".capacity-state";
 const PRUNE_LEASE_BASENAME: &str = ".prune-lease";
+const METADATA_SHARD_DIR: &str = "shards";
+const METADATA_SHARD_FORMAT_VERSION: u8 = 1;
+const METADATA_SHARD_BITS: u32 = 12;
 const MAX_TOUCH_ENTRIES: usize = 65_536;
 const CAS_ATTEMPTS: usize = 8;
 
@@ -60,15 +61,81 @@ struct PendingTouch {
 #[derive(Debug)]
 struct Candidate {
     path: String,
+    key: Option<CacheObjectKey>,
     size: u64,
     listed_last_access: u64,
+    metadata: Option<EntryMetadata>,
 }
 
 #[derive(Debug)]
 struct ScoredCandidate {
     candidate: Candidate,
-    metadata_etag: Option<String>,
+    expected_metadata: Option<EntryMetadata>,
     virtual_last_access: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+struct CacheObjectKey([u8; 32]);
+
+impl CacheObjectKey {
+    fn from_data_path(data_path: &str) -> Option<Self> {
+        let mut parts = data_path.split('/');
+        let first = parts.next()?;
+        let second = parts.next()?;
+        let third = parts.next()?;
+        let key = parts.next()?;
+        if parts.next().is_some()
+            || key.len() != 64
+            || first.len() != 1
+            || second.len() != 1
+            || third.len() != 1
+            || first.as_bytes()[0] != key.as_bytes()[0]
+            || second.as_bytes()[0] != key.as_bytes()[1]
+            || third.as_bytes()[0] != key.as_bytes()[2]
+        {
+            return None;
+        }
+        let (pairs, []) = key.as_bytes().as_chunks::<2>() else {
+            return None;
+        };
+        let mut bytes = [0_u8; 32];
+        for (byte, pair) in bytes.iter_mut().zip(pairs) {
+            *byte = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+        }
+        Some(Self(bytes))
+    }
+
+    const fn shard_index(self) -> u16 {
+        u16::from_be_bytes([self.0[0], self.0[1]]) >> (u16::BITS - METADATA_SHARD_BITS)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct EntryMetadata {
+    last_access: u64,
+    heat_milli: u64,
+    size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MetadataShard {
+    version: u8,
+    entries: BTreeMap<CacheObjectKey, EntryMetadata>,
+}
+
+impl MetadataShard {
+    const fn new() -> Self {
+        Self {
+            version: METADATA_SHARD_FORMAT_VERSION,
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MetadataShardSnapshot {
+    etag: String,
+    shard: MetadataShard,
 }
 
 #[derive(Debug, Clone)]
@@ -309,66 +376,79 @@ impl ManagedRemoteCache {
     }
 
     async fn touch_remote(&self, data_path: &str, size: u64, hits: u32) -> anyhow::Result<()> {
-        let metadata_path = self.metadata_path(data_path);
+        let key = CacheObjectKey::from_data_path(data_path)
+            .ok_or_else(|| anyhow::anyhow!("invalid managed cache data path {data_path}"))?;
+        let shard_path = self.metadata_shard_path(key);
         let now = unix_seconds();
 
         for _ in 0..CAS_ATTEMPTS {
-            match self.operator.stat(&metadata_path).await {
-                Ok(metadata) => {
-                    let previous_last =
-                        metadata_u64(&metadata, META_LAST_ACCESS_KEY).unwrap_or(now);
-                    let previous_heat = metadata_u64(&metadata, META_HEAT_MILLI_KEY).unwrap_or(0);
-                    let stored_size = metadata_u64(&metadata, META_SIZE_KEY).unwrap_or(size);
-                    let heat = decayed_heat_milli(
-                        previous_heat,
-                        previous_last,
-                        now,
-                        self.config.heat_half_life_secs,
-                    )
-                    .saturating_add(u64::from(hits) * 1000);
-                    let values =
-                        entry_metadata(now.max(previous_last), heat, size.max(stored_size));
-                    let Some(etag) = metadata.etag() else {
-                        // ETag-less services cannot merge concurrent heat exactly. Managed
-                        // capacity itself requires ETags, but keep this fallback defensive.
-                        self.operator
-                            .write_with(&metadata_path, self.mutation_body())
-                            .user_metadata(values)
-                            .await?;
-                        return Ok(());
-                    };
-                    match self
-                        .operator
-                        .write_with(&metadata_path, self.mutation_body())
-                        .if_match(etag)
-                        .user_metadata(values)
-                        .await
-                    {
-                        Ok(_) => return Ok(()),
-                        Err(error) if error.kind() == ErrorKind::ConditionNotMatch => {}
-                        Err(error) => return Err(error.into()),
-                    }
+            if let Some(mut snapshot) = self.read_metadata_shard(&shard_path).await? {
+                let previous = snapshot.shard.entries.get(&key).copied();
+                let next = updated_entry_metadata(
+                    previous,
+                    now,
+                    size,
+                    hits,
+                    self.config.heat_half_life_secs,
+                );
+                snapshot.shard.entries.insert(key, next);
+                let body = serialize_metadata_shard(&snapshot.shard)?;
+                match self
+                    .operator
+                    .write_with(&shard_path, body)
+                    .if_match(&snapshot.etag)
+                    .await
+                {
+                    Ok(_) => return Ok(()),
+                    Err(error) if error.kind() == ErrorKind::ConditionNotMatch => {}
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) if error.kind() == ErrorKind::NotFound => {
-                    let values = entry_metadata(now, u64::from(hits) * 1000, size);
-                    match self
-                        .operator
-                        .write_with(&metadata_path, self.mutation_body())
-                        .if_not_exists(true)
-                        .user_metadata(values)
-                        .await
-                    {
-                        Ok(_) => return Ok(()),
-                        Err(error) if error.kind() == ErrorKind::ConditionNotMatch => {}
-                        Err(error) => return Err(error.into()),
-                    }
+            } else {
+                let mut shard = MetadataShard::new();
+                shard.entries.insert(
+                    key,
+                    updated_entry_metadata(None, now, size, hits, self.config.heat_half_life_secs),
+                );
+                let body = serialize_metadata_shard(&shard)?;
+                match self
+                    .operator
+                    .write_with(&shard_path, body)
+                    .if_not_exists(true)
+                    .await
+                {
+                    Ok(_) => return Ok(()),
+                    Err(error) if error.kind() == ErrorKind::ConditionNotMatch => {}
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) => return Err(error.into()),
             }
         }
 
-        debug!("managed cache touch for {data_path} lost repeated metadata races");
+        debug!("managed cache touch for {data_path} lost repeated metadata shard races");
         Ok(())
+    }
+
+    async fn read_metadata_shard(
+        &self,
+        shard_path: &str,
+    ) -> anyhow::Result<Option<MetadataShardSnapshot>> {
+        let reader = match self.operator.reader(shard_path).await {
+            Ok(reader) => reader,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let body = match reader.read(..).await {
+            Ok(body) => body.to_bytes(),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let Some(metadata) = reader.metadata() else {
+            anyhow::bail!("managed cache metadata shard {shard_path} read returned no metadata");
+        };
+        let Some(etag) = metadata.etag().map(str::to_owned) else {
+            anyhow::bail!("managed cache metadata shard {shard_path} has no ETag");
+        };
+        let shard = deserialize_metadata_shard(&body)?;
+        Ok(Some(MetadataShardSnapshot { etag, shard }))
     }
 
     fn schedule_reconcile(self: &Arc<Self>) {
@@ -465,7 +545,9 @@ impl ManagedRemoteCache {
         let entries = self.operator.list_with("").recursive(true).await?;
         ensure_prune_lease_valid(lease_valid)?;
         let metadata_prefix = format!("{}/", self.metadata_prefix());
-        let mut metadata_modified = HashMap::new();
+        let shard_prefix = format!("{metadata_prefix}{METADATA_SHARD_DIR}/");
+        let mut shard_paths = Vec::new();
+        let mut unrecognized_metadata_paths = Vec::new();
         let mut candidates = Vec::new();
         let mut total = 0_u64;
 
@@ -475,17 +557,16 @@ impl ManagedRemoteCache {
             }
             let path = entry.path();
             if path.starts_with(&metadata_prefix) {
-                if let Some(data_path) = path.strip_prefix(&metadata_prefix) {
-                    if matches!(data_path, PRUNE_LEASE_BASENAME | CAPACITY_STATE_BASENAME) {
-                        continue;
-                    }
-                    metadata_modified.insert(
-                        data_path.to_owned(),
-                        entry
-                            .metadata()
-                            .last_modified()
-                            .map_or(0, timestamp_seconds),
-                    );
+                if matches!(
+                    path.strip_prefix(&metadata_prefix),
+                    Some(PRUNE_LEASE_BASENAME | CAPACITY_STATE_BASENAME)
+                ) {
+                    continue;
+                }
+                if path.starts_with(&shard_prefix) {
+                    shard_paths.push(path.to_owned());
+                } else {
+                    unrecognized_metadata_paths.push(path.to_owned());
                 }
                 continue;
             }
@@ -497,21 +578,29 @@ impl ManagedRemoteCache {
             total = total.saturating_add(size);
             candidates.push(Candidate {
                 path: path.to_owned(),
+                key: CacheObjectKey::from_data_path(path),
                 size,
                 listed_last_access: entry
                     .metadata()
                     .last_modified()
                     .map_or(0, timestamp_seconds),
+                metadata: None,
             });
         }
 
+        let metadata_entries = self.load_metadata_entries(shard_paths).await;
         for candidate in &mut candidates {
-            if let Some(last) = metadata_modified.get(&candidate.path) {
-                candidate.listed_last_access = *last;
+            if let Some(key) = candidate.key
+                && let Some(metadata) = metadata_entries.get(&key).copied()
+            {
+                candidate.listed_last_access = metadata.last_access;
+                candidate.metadata = Some(metadata);
             }
         }
 
-        self.cleanup_orphan_sidecars(&metadata_modified, &candidates)
+        self.cleanup_unrecognized_metadata(unrecognized_metadata_paths)
+            .await;
+        self.cleanup_orphan_metadata_entries(&metadata_entries, &candidates)
             .await;
         ensure_prune_lease_valid(lease_valid)?;
 
@@ -535,27 +624,81 @@ impl ManagedRemoteCache {
         Ok(())
     }
 
-    async fn cleanup_orphan_sidecars(
+    async fn load_metadata_entries(
         &self,
-        metadata_modified: &HashMap<String, u64>,
-        candidates: &[Candidate],
-    ) {
-        let data_paths: HashSet<&str> = candidates
-            .iter()
-            .map(|candidate| candidate.path.as_str())
-            .collect();
-        let orphan_sidecars: Vec<String> = metadata_modified
-            .keys()
-            .filter(|path| !data_paths.contains(path.as_str()))
-            .map(|path| self.metadata_path(path))
-            .collect();
+        shard_paths: Vec<String>,
+    ) -> HashMap<CacheObjectKey, EntryMetadata> {
         let concurrency = self.config.eviction_concurrency.max(1);
-        stream::iter(orphan_sidecars)
-            .for_each_concurrent(concurrency, |path: String| async move {
+        let shards: Vec<(String, MetadataShard)> = stream::iter(shard_paths)
+            .map(|path| async move {
+                match self.operator.read(&path).await {
+                    Ok(body) => match deserialize_metadata_shard(&body.to_bytes()) {
+                        Ok(shard) => Some((path, shard)),
+                        Err(error) => {
+                            warn!(
+                                "managed cache metadata shard decode failed for {path}: {error:#}"
+                            );
+                            None
+                        }
+                    },
+                    Err(error) if error.kind() == ErrorKind::NotFound => None,
+                    Err(error) => {
+                        warn!("managed cache metadata shard read failed for {path}: {error}");
+                        None
+                    }
+                }
+            })
+            .buffer_unordered(concurrency)
+            .filter_map(|shard| async move { shard })
+            .collect()
+            .await;
+
+        let entry_count = shards.iter().map(|(_, shard)| shard.entries.len()).sum();
+        let mut entries = HashMap::with_capacity(entry_count);
+        for (shard_path, shard) in shards {
+            for (key, metadata) in shard.entries {
+                if self.metadata_shard_path(key) != shard_path {
+                    warn!("managed cache metadata entry is stored in the wrong shard {shard_path}");
+                    continue;
+                }
+                entries.insert(key, metadata);
+            }
+        }
+        entries
+    }
+
+    async fn cleanup_unrecognized_metadata(&self, paths: Vec<String>) {
+        let concurrency = self.config.eviction_concurrency.max(1);
+        stream::iter(paths)
+            .for_each_concurrent(concurrency, |path| async move {
                 if let Err(error) = self.operator.delete(&path).await
                     && error.kind() != ErrorKind::NotFound
                 {
-                    warn!("managed cache orphan sidecar cleanup failed for {path}: {error}");
+                    warn!("managed cache unrecognized metadata cleanup failed for {path}: {error}");
+                }
+            })
+            .await;
+    }
+
+    async fn cleanup_orphan_metadata_entries(
+        &self,
+        metadata_entries: &HashMap<CacheObjectKey, EntryMetadata>,
+        candidates: &[Candidate],
+    ) {
+        let data_keys: HashSet<CacheObjectKey> = candidates
+            .iter()
+            .filter_map(|candidate| candidate.key)
+            .collect();
+        let orphans: Vec<(CacheObjectKey, EntryMetadata)> = metadata_entries
+            .iter()
+            .filter(|(key, _)| !data_keys.contains(key))
+            .map(|(key, metadata)| (*key, *metadata))
+            .collect();
+        let concurrency = self.config.eviction_concurrency.max(1);
+        stream::iter(orphans)
+            .for_each_concurrent(concurrency, |(key, expected)| async move {
+                if let Err(error) = self.remove_metadata_entry_if_unchanged(key, expected).await {
+                    warn!("managed cache orphan metadata cleanup failed: {error:#}");
                 }
             })
             .await;
@@ -564,65 +707,32 @@ impl ManagedRemoteCache {
     async fn prune_candidates(
         &self,
         mut total: u64,
-        mut candidates: Vec<Candidate>,
+        candidates: Vec<Candidate>,
         lease_valid: &AtomicBool,
     ) -> anyhow::Result<u64> {
-        candidates.sort_unstable_by_key(|candidate| candidate.listed_last_access);
-        let mut candidates = VecDeque::from(candidates);
         let now = unix_seconds();
+        let mut scored: Vec<ScoredCandidate> = candidates
+            .into_iter()
+            .map(|candidate| self.score_candidate(candidate, now))
+            .collect();
+        scored.sort_unstable_by(|a, b| {
+            a.virtual_last_access
+                .cmp(&b.virtual_last_access)
+                .then_with(|| a.candidate.path.cmp(&b.candidate.path))
+        });
 
-        while total > self.config.low_watermark && !candidates.is_empty() {
-            ensure_prune_lease_valid(lease_valid)?;
-            let need = total - self.config.low_watermark;
-            let mut selected = Vec::new();
-            let mut selected_bytes = 0_u64;
-            while !candidates.is_empty()
-                && (selected_bytes < need.saturating_mul(2) || selected.len() < 128)
-            {
-                let Some(candidate) = candidates.pop_front() else {
-                    break;
-                };
-                selected_bytes = selected_bytes.saturating_add(candidate.size);
-                selected.push(candidate);
+        for scored_candidate in scored {
+            if total <= self.config.low_watermark {
+                break;
             }
-
-            let concurrency = self.config.eviction_concurrency.max(1);
-            let mut scored: Vec<ScoredCandidate> = stream::iter(selected)
-                .map(|candidate| async move { self.score_candidate(candidate, now).await })
-                .buffer_unordered(concurrency)
-                .filter_map(|result| async move {
-                    match result {
-                        Ok(value) => value,
-                        Err(error) => {
-                            warn!("managed cache candidate metadata read failed: {error:#}");
-                            None
-                        }
-                    }
-                })
-                .collect()
-                .await;
-
-            scored.sort_unstable_by(|a, b| {
-                a.virtual_last_access
-                    .cmp(&b.virtual_last_access)
-                    .then_with(|| a.candidate.path.cmp(&b.candidate.path))
-            });
-
-            for scored_candidate in scored {
-                if total <= self.config.low_watermark {
-                    break;
-                }
-                ensure_prune_lease_valid(lease_valid)?;
-                match self.evict_candidate(&scored_candidate).await {
-                    Ok(true) => {
-                        total = total.saturating_sub(scored_candidate.candidate.size);
-                    }
-                    Ok(false) => {}
-                    Err(error) => warn!(
-                        "managed cache eviction failed for {}: {error:#}",
-                        scored_candidate.candidate.path
-                    ),
-                }
+            ensure_prune_lease_valid(lease_valid)?;
+            match self.evict_candidate(&scored_candidate).await {
+                Ok(true) => total = total.saturating_sub(scored_candidate.candidate.size),
+                Ok(false) => {}
+                Err(error) => warn!(
+                    "managed cache eviction failed for {}: {error:#}",
+                    scored_candidate.candidate.path
+                ),
             }
         }
 
@@ -637,85 +747,87 @@ impl ManagedRemoteCache {
         Ok(total)
     }
 
-    async fn score_candidate(
-        &self,
-        candidate: Candidate,
-        now: u64,
-    ) -> anyhow::Result<Option<ScoredCandidate>> {
-        let metadata_path = self.metadata_path(&candidate.path);
-        match self.operator.stat(&metadata_path).await {
-            Ok(metadata) => {
-                let last_access = metadata_u64(&metadata, META_LAST_ACCESS_KEY)
-                    .unwrap_or(candidate.listed_last_access);
-                let stored_heat = metadata_u64(&metadata, META_HEAT_MILLI_KEY).unwrap_or(0);
-                let effective_heat = decayed_heat_milli(
-                    stored_heat,
-                    last_access,
+    fn score_candidate(&self, candidate: Candidate, now: u64) -> ScoredCandidate {
+        let expected_metadata = candidate.metadata;
+        let (last_access, effective_heat) = match expected_metadata {
+            Some(metadata) => (
+                metadata.last_access,
+                decayed_heat_milli(
+                    metadata.heat_milli,
+                    metadata.last_access,
                     now,
                     self.config.heat_half_life_secs,
-                );
-                // Integer fixed-point logarithmic heat bonus. Exact powers retain
-                // the intuitive mapping: 1 hit ~= 1 half-life, 15 hits ~= 4, and
-                // 255 hits ~= 8. Linear interpolation inside each power-of-two
-                // interval avoids floating-point precision/cast issues and keeps
-                // the score monotonic.
-                let bonus = heat_bonus_seconds(effective_heat, self.config.heat_half_life_secs);
-                let virtual_last_access = last_access.saturating_add(bonus);
-                Ok(Some(ScoredCandidate {
-                    candidate,
-                    metadata_etag: metadata.etag().map(str::to_owned),
-                    virtual_last_access,
-                }))
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(Some(ScoredCandidate {
-                virtual_last_access: candidate.listed_last_access,
-                candidate,
-                metadata_etag: None,
-            })),
-            Err(error) => Err(error.into()),
+                ),
+            ),
+            None => (candidate.listed_last_access, 0),
+        };
+        let bonus = heat_bonus_seconds(effective_heat, self.config.heat_half_life_secs);
+        ScoredCandidate {
+            candidate,
+            expected_metadata,
+            virtual_last_access: last_access.saturating_add(bonus),
         }
     }
 
     async fn evict_candidate(&self, candidate: &ScoredCandidate) -> anyhow::Result<bool> {
-        let metadata_path = self.metadata_path(&candidate.candidate.path);
-
-        // Optimistic multi-user guard: if anybody touched the entry after we
-        // scored it, its metadata ETag changed and it is no longer our victim.
-        match candidate.metadata_etag.as_deref() {
-            Some(expected_etag) => {
-                let current = match self.operator.stat(&metadata_path).await {
-                    Ok(metadata) => metadata,
-                    Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
-                    Err(error) => return Err(error.into()),
-                };
-                if current.etag() != Some(expected_etag) {
-                    return Ok(false);
-                }
+        if let Some(key) = candidate.candidate.key {
+            let shard_path = self.metadata_shard_path(key);
+            let current_metadata = self
+                .read_metadata_shard(&shard_path)
+                .await?
+                .and_then(|snapshot| snapshot.shard.entries.get(&key).copied());
+            if current_metadata != candidate.expected_metadata {
+                return Ok(false);
             }
-            None => match self.operator.stat(&metadata_path).await {
-                Ok(_) => return Ok(false),
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            },
+        } else if candidate.expected_metadata.is_some() {
+            return Ok(false);
         }
 
-        // Artifact bytes are immutable, so removal itself is simple. There is
-        // an intentionally tiny race between the ETag recheck and this delete;
-        // a concurrent touch in that window can lose one cache entry, but it
-        // cannot corrupt the cache and the next compile repopulates it.
+        // Artifact bytes are immutable. A touch in the narrow interval between
+        // this metadata recheck and deletion can still lose one cache entry;
+        // it cannot corrupt the cache and the next compile repopulates it.
         self.operator.delete(&candidate.candidate.path).await?;
-        if let Some(etag) = candidate.metadata_etag.as_deref()
-            && let Err(error) = self
-                .operator
-                .delete_with(&metadata_path)
-                .if_match(etag)
-                .await
-            && error.kind() != ErrorKind::ConditionNotMatch
-            && error.kind() != ErrorKind::NotFound
+        if let (Some(key), Some(expected)) = (candidate.candidate.key, candidate.expected_metadata)
+            && let Err(error) = self.remove_metadata_entry_if_unchanged(key, expected).await
         {
-            return Err(error.into());
+            // The artifact deletion already succeeded, so metadata cleanup must
+            // not make capacity accounting pretend the victim survived.
+            warn!(
+                "managed cache evicted {} but could not remove its metadata entry: {error:#}",
+                candidate.candidate.path
+            );
         }
         Ok(true)
+    }
+
+    async fn remove_metadata_entry_if_unchanged(
+        &self,
+        key: CacheObjectKey,
+        expected: EntryMetadata,
+    ) -> anyhow::Result<()> {
+        let shard_path = self.metadata_shard_path(key);
+        for _ in 0..CAS_ATTEMPTS {
+            let Some(mut snapshot) = self.read_metadata_shard(&shard_path).await? else {
+                return Ok(());
+            };
+            if snapshot.shard.entries.get(&key).copied() != Some(expected) {
+                return Ok(());
+            }
+            snapshot.shard.entries.remove(&key);
+            let body = serialize_metadata_shard(&snapshot.shard)?;
+            match self
+                .operator
+                .write_with(&shard_path, body)
+                .if_match(&snapshot.etag)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(error) if error.kind() == ErrorKind::ConditionNotMatch => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        debug!("managed cache metadata removal lost repeated shard races");
+        Ok(())
     }
 
     async fn read_capacity_state(&self) -> anyhow::Result<Option<CapacityStateSnapshot>> {
@@ -957,11 +1069,11 @@ impl ManagedRemoteCache {
             .trim_matches(char::from(0x2f_u8))
     }
 
-    fn metadata_path(&self, data_path: &str) -> String {
+    fn metadata_shard_path(&self, key: CacheObjectKey) -> String {
         format!(
-            "{}/{}",
+            "{}/{METADATA_SHARD_DIR}/{:03x}",
             self.metadata_prefix(),
-            data_path.trim_start_matches(char::from(0x2f_u8))
+            key.shard_index()
         )
     }
 
@@ -991,23 +1103,62 @@ fn validate_operator_capabilities(operator: &Operator) -> anyhow::Result<()> {
         && capability.write_with_if_match
         && capability.write_with_if_not_exists
         && capability.write_with_user_metadata
-        && capability.delete
-        && capability.delete_with_if_match;
+        && capability.delete;
     if !supported {
         anyhow::bail!(
-            "managed remote cache requires stat, recursive list, user metadata, conditional writes, and conditional deletes"
+            "managed remote cache requires stat, recursive list, user metadata, conditional writes, and delete"
         );
     }
     Ok(())
 }
 
-fn entry_metadata(last_access: u64, heat_milli: u64, size: u64) -> Vec<(String, String)> {
-    vec![
-        (META_VERSION_KEY.to_owned(), META_VERSION.to_owned()),
-        (META_LAST_ACCESS_KEY.to_owned(), last_access.to_string()),
-        (META_HEAT_MILLI_KEY.to_owned(), heat_milli.to_string()),
-        (META_SIZE_KEY.to_owned(), size.to_string()),
-    ]
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn serialize_metadata_shard(shard: &MetadataShard) -> anyhow::Result<Bytes> {
+    Ok(Bytes::from(bincode::serialize(shard)?))
+}
+
+fn deserialize_metadata_shard(bytes: &[u8]) -> anyhow::Result<MetadataShard> {
+    let shard: MetadataShard = bincode::deserialize(bytes)?;
+    anyhow::ensure!(
+        shard.version == METADATA_SHARD_FORMAT_VERSION,
+        "unsupported managed cache metadata shard version {}",
+        shard.version
+    );
+    Ok(shard)
+}
+
+fn updated_entry_metadata(
+    previous: Option<EntryMetadata>,
+    now: u64,
+    size: u64,
+    hits: u32,
+    half_life_secs: u64,
+) -> EntryMetadata {
+    let previous = previous.unwrap_or(EntryMetadata {
+        last_access: now,
+        heat_milli: 0,
+        size,
+    });
+    let heat_milli = decayed_heat_milli(
+        previous.heat_milli,
+        previous.last_access,
+        now,
+        half_life_secs,
+    )
+    .saturating_add(u64::from(hits) * MILLI_HIT);
+    EntryMetadata {
+        last_access: now.max(previous.last_access),
+        heat_milli,
+        size: size.max(previous.size),
+    }
 }
 
 fn capacity_state_metadata(estimated_size: u64, reconciled_at: u64) -> Vec<(String, String)> {
@@ -1102,6 +1253,184 @@ fn unix_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_object_key_parses_normalized_paths_and_maps_all_shards() {
+        let key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let key = CacheObjectKey::from_data_path(&format!("0/1/2/{key_hex}"))
+            .expect("normalized test key should parse");
+        assert_eq!(key.0[0], 0x01);
+        assert_eq!(key.0[1], 0x23);
+        assert_eq!(key.0[31], 0xef);
+        assert!(CacheObjectKey::from_data_path(&format!("f/1/2/{key_hex}")).is_none());
+        assert!(CacheObjectKey::from_data_path("not/a/cache/key").is_none());
+
+        let occupied: HashSet<u16> = (0_u16..(1_u16 << METADATA_SHARD_BITS))
+            .map(|index| {
+                let mut bytes = [0_u8; 32];
+                let prefix = index << (u16::BITS - METADATA_SHARD_BITS);
+                bytes[..2].copy_from_slice(&prefix.to_be_bytes());
+                CacheObjectKey(bytes).shard_index()
+            })
+            .collect();
+        assert_eq!(occupied.len(), 1_usize << METADATA_SHARD_BITS);
+    }
+
+    #[test]
+    fn metadata_shard_encoding_is_deterministic() -> anyhow::Result<()> {
+        let a = EntryMetadata {
+            last_access: 10,
+            heat_milli: 2_000,
+            size: 30,
+        };
+        let b = EntryMetadata {
+            last_access: 20,
+            heat_milli: 3_000,
+            size: 40,
+        };
+        let key_a = CacheObjectKey([1; 32]);
+        let key_b = CacheObjectKey([2; 32]);
+        let mut first = MetadataShard::new();
+        first.entries.insert(key_b, b);
+        first.entries.insert(key_a, a);
+        let mut second = MetadataShard::new();
+        second.entries.insert(key_a, a);
+        second.entries.insert(key_b, b);
+
+        let encoded = serialize_metadata_shard(&first)?;
+        assert_eq!(encoded, serialize_metadata_shard(&second)?);
+        let decoded = deserialize_metadata_shard(&encoded)?;
+        assert_eq!(decoded.entries.get(&key_a), Some(&a));
+        assert_eq!(decoded.entries.get(&key_b), Some(&b));
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_shard_remains_small_at_above_expected_occupancy() -> anyhow::Result<()> {
+        let mut shard = MetadataShard::new();
+        for index in 0_u8..40 {
+            let mut bytes = [0_u8; 32];
+            // All entries deliberately share the same 12-bit shard prefix.
+            bytes[0] = 0xab;
+            bytes[1] = 0xc0 | (index & 0x0f);
+            bytes[31] = index;
+            shard.entries.insert(
+                CacheObjectKey(bytes),
+                EntryMetadata {
+                    last_access: 1_800_000_000 + u64::from(index),
+                    heat_milli: 1_000 + u64::from(index),
+                    size: 100_000 + u64::from(index),
+                },
+            );
+        }
+        let encoded = serialize_metadata_shard(&shard)?;
+        assert!(
+            encoded.len() < 3 * 1024,
+            "40-entry shard unexpectedly grew to {} bytes",
+            encoded.len()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an S3 backend with conditional writes"]
+    async fn s3_metadata_shard_cas_merges_distinct_entries() -> anyhow::Result<()> {
+        use crate::cache::s3::S3Cache;
+        use crate::cache::utils::normalize_key;
+
+        let bucket = std::env::var("SCCACHE_BUCKET")?;
+        let endpoint = std::env::var("SCCACHE_ENDPOINT")?;
+        let region = std::env::var("SCCACHE_REGION").ok();
+        let use_ssl = std::env::var("SCCACHE_S3_USE_SSL")
+            .ok()
+            .and_then(|value| value.parse().ok());
+        let root = format!("__sccache-managed-shard-test/{}", Uuid::new_v4());
+        let operator = S3Cache::new(bucket, root, false)
+            .with_region(region)
+            .with_endpoint(Some(endpoint))
+            .with_use_ssl(use_ssl)
+            .build()?;
+        let manager = ManagedRemoteCache::new(
+            operator.clone(),
+            S3CapacityConfig {
+                high_watermark: 1 << 30,
+                low_watermark: 1 << 29,
+                touch_interval_secs: 60,
+                state_flush_interval_secs: 5,
+                heat_half_life_secs: 1_000_000,
+                eviction_concurrency: 4,
+                lease_ttl_secs: 60,
+                metadata_prefix: ".sccache-meta/v2".to_owned(),
+            },
+        )?;
+
+        let key_a = "0120000000000000000000000000000000000000000000000000000000000000";
+        let key_b = "012fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let path_a = normalize_key(key_a);
+        let path_b = normalize_key(key_b);
+        let object_a = CacheObjectKey::from_data_path(&path_a)
+            .expect("first normalized test key should parse");
+        let object_b = CacheObjectKey::from_data_path(&path_b)
+            .expect("second normalized test key should parse");
+        anyhow::ensure!(object_a.shard_index() == object_b.shard_index());
+        let shard_path = manager.metadata_shard_path(object_a);
+
+        let outcome: anyhow::Result<()> = async {
+            for _ in 0..8 {
+                let (a, b) = tokio::join!(
+                    manager.touch_remote(&path_a, 111, 1),
+                    manager.touch_remote(&path_b, 222, 1)
+                );
+                a?;
+                b?;
+            }
+            let snapshot = manager
+                .read_metadata_shard(&shard_path)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("metadata shard disappeared"))?;
+            let a = snapshot
+                .shard
+                .entries
+                .get(&object_a)
+                .ok_or_else(|| anyhow::anyhow!("first racing entry was lost"))?;
+            let b = snapshot
+                .shard
+                .entries
+                .get(&object_b)
+                .ok_or_else(|| anyhow::anyhow!("second racing entry was lost"))?;
+            anyhow::ensure!(a.heat_milli >= 7_900, "first heat was {}", a.heat_milli);
+            anyhow::ensure!(b.heat_milli >= 7_900, "second heat was {}", b.heat_milli);
+            anyhow::ensure!(a.size == 111 && b.size == 222);
+            Ok(())
+        }
+        .await;
+        let cleanup = operator.delete(&shard_path).await;
+        outcome?;
+        cleanup?;
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_touch_decays_and_merges_hits() {
+        let initial = updated_entry_metadata(None, 100, 40, 2, 10);
+        assert_eq!(
+            initial,
+            EntryMetadata {
+                last_access: 100,
+                heat_milli: 2_000,
+                size: 40,
+            }
+        );
+        let updated = updated_entry_metadata(Some(initial), 110, 30, 1, 10);
+        assert_eq!(
+            updated,
+            EntryMetadata {
+                last_access: 110,
+                heat_milli: 2_000,
+                size: 40,
+            }
+        );
+    }
 
     #[test]
     fn heat_decay_is_monotonic_and_halves() {
