@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   strict-rust:
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@94a3b140fac9fc0b2d413871c247951afc660eff # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@260a48d4b1cf65252f892b067fe41f44f05e653a # main
     with:
       python-ci-paths: tools
       allow-test-panics: true
