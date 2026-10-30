@@ -30,6 +30,7 @@ SCHEDULER_URL="${SCCACHE_AUTOUPDATE_SCHEDULER_URL:-https://sccache.onhir.eu}"
 LOCK="${SCCACHE_AUTOUPDATE_LOCK:-/run/lock/sccache-autoupdate.lock}"
 MODE=apply
 EXPECTED_RUST_TOOLCHAIN="${SCCACHE_AUTOUPDATE_EXPECTED_RUST_TOOLCHAIN:-1.99.0}"
+EXPECTED_ROLLOUT_EPOCH="${SCCACHE_AUTOUPDATE_EXPECTED_ROLLOUT_EPOCH:-2}"
 SMOKE_RUSTC="${SCCACHE_AUTOUPDATE_SMOKE_RUSTC:-/opt/toolchains/rustup/toolchains/1.99.0-x86_64-unknown-linux-gnu/bin/rustc}"
 VERIFY_DIST_SMOKE="${SCCACHE_AUTOUPDATE_VERIFY_DIST_SMOKE:-0}"
 REQUIRED_CAPABILITIES="${SCCACHE_AUTOUPDATE_REQUIRED_CAPABILITIES:-direct-metrics}"
@@ -188,6 +189,7 @@ rust_toolchain="$(sed -n 's/^rust_toolchain=//p' "$release_dir/build.txt")"
 rustflags="$(sed -n 's/^rustflags=//p' "$release_dir/build.txt")"
 features="$(sed -n 's/^features=//p' "$release_dir/build.txt")"
 dist_protocol="$(sed -n 's/^dist_protocol=//p' "$release_dir/build.txt")"
+rollout_epoch="$(sed -n 's/^rollout_epoch=//p' "$release_dir/build.txt")"
 declared_capabilities="$(sed -n 's/^capabilities=//p' "$release_dir/build.txt")"
 [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || {
     echo "sccache-release-update: invalid source SHA in build.txt" >&2
@@ -212,6 +214,14 @@ tag_sha="${tag#"$TAG_PREFIX"}"
 }
 [[ "$dist_protocol" =~ ^[1-9][0-9]*$ ]] || {
     echo "sccache-release-update: invalid distributed protocol version: $dist_protocol" >&2
+    exit 1
+}
+[[ "$rollout_epoch" =~ ^[1-9][0-9]*$ ]] || {
+    echo "sccache-release-update: invalid or missing rollout epoch: ${rollout_epoch:-missing}" >&2
+    exit 1
+}
+[[ "$rollout_epoch" == "$EXPECTED_ROLLOUT_EPOCH" ]] || {
+    echo "sccache-release-update: rollout epoch $rollout_epoch does not match host epoch $EXPECTED_ROLLOUT_EPOCH; coordinated migration required" >&2
     exit 1
 }
 

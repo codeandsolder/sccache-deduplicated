@@ -13,6 +13,7 @@ These are the source-of-truth copies of the machine-wide Cargo/sccache wrappers 
 - The maintenance-drain marker remains `/dev/shm/sccache-maintenance-drain`; a marker older than 15 minutes is ignored.
 - `sccache-release-update` validates release metadata against `sccache --capabilities` and requires `direct-metrics` by default, so a canonical rollout cannot silently remove production telemetry again.
 - Canonical bundles carry an explicit `dist_protocol` version. When the live dist binary is hash-bound to the same protocol version, the updater may roll the client ahead under the local maintenance drain while distributed jobs remain active; the full `release_tag` advances only after client and dist halves converge on the same immutable bundle. A protocol-version change still requires the old all-at-once idle window. `sccache-release-update --plan-only` runs this decision logic without changing services.
+- Canonical bundles also carry a `rollout_epoch`. The updater requires it to match `SCCACHE_AUTOUPDATE_EXPECTED_ROLLOUT_EPOCH` (default `2`) before touching live binaries. Increment the release epoch for any change that needs coordinated host-side migration; old hosts then refuse the release until the migration is performed and their expected epoch is advanced.
 
 ## Acer installation
 
