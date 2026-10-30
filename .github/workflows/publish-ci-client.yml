@@ -107,6 +107,8 @@ jobs:
             echo "rustflags=-C target-cpu=x86-64-v2"
             echo "features=s3,gha,dist-client,dist-server,direct-metrics"
             echo "dist_protocol=1"
+            # Bump when a release requires coordinated host-side migration before deployment.
+            echo "rollout_epoch=2"
             echo "capabilities=$(target/release/sccache --capabilities | paste -sd, -)"
           } > dist/build.txt
 
