@@ -673,14 +673,6 @@ impl SchedulerIncoming for Scheduler {
                     if !server_details.jobs_assigned.insert(job_id) {
                         bail!("new job id {job_id} was already assigned");
                     }
-                    if server_details
-                        .jobs_unclaimed
-                        .insert(job_id, Instant::now())
-                        .is_some()
-                    {
-                        server_details.jobs_assigned.remove(&job_id);
-                        bail!("new job id {job_id} was already tracked as unclaimed");
-                    }
 
                     info!(
                         "Job {} created and will be assigned to server {:?}",
@@ -712,7 +704,6 @@ impl SchedulerIncoming for Scheduler {
                     Ok(mut servers) => {
                         if let Some(entry) = servers.get_mut(&server_id) {
                             entry.last_error = Some(Instant::now());
-                            entry.jobs_unclaimed.remove(&job_id);
                             if entry.jobs_assigned.remove(&job_id) {
                                 "assign job failed, job un-assigned from the server"
                             } else {
@@ -733,33 +724,38 @@ impl SchedulerIncoming for Scheduler {
                 .jobs
                 .lock()
                 .map_err(|_| anyhow::anyhow!("jobs mutex poisoned"))?;
-            let servers = self
+            let mut servers = self
                 .servers
                 .lock()
                 .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
 
-            if !servers
-                .get(&server_id)
-                .is_some_and(|details| details.jobs_assigned.contains(&job_id))
-            {
+            let Some(details) = servers.get_mut(&server_id) else {
                 let msg = format!(
-                    "Job {} assignment was cleaned up before allocation completed",
-                    job_id
+                    "Job {job_id} assignment completed after server {server_id:?} disappeared"
                 );
-                warn!("{}", msg);
+                warn!("{msg}");
                 return Ok(AllocJobResult::Fail { msg });
+            };
+            if !details.jobs_assigned.contains(&job_id) {
+                let msg = format!(
+                    "Job {job_id} assignment reservation disappeared before allocation completed"
+                );
+                warn!("{msg}");
+                return Ok(AllocJobResult::Fail { msg });
+            }
+            if jobs.contains_key(&job_id) {
+                bail!("newly allocated job {job_id} already existed in scheduler state");
+            }
+            if details.jobs_unclaimed.contains_key(&job_id) {
+                bail!("newly allocated job {job_id} was already tracked as unclaimed");
             }
 
             info!(
                 "Job {} successfully assigned and saved with state {:?}",
                 job_id, state
             );
-            if jobs
-                .insert(job_id, JobDetail { server_id, state })
-                .is_some()
-            {
-                bail!("newly allocated job {job_id} already existed in scheduler state");
-            }
+            jobs.insert(job_id, JobDetail { server_id, state });
+            details.jobs_unclaimed.insert(job_id, Instant::now());
         }
         let job_alloc = JobAlloc {
             auth,
@@ -1301,13 +1297,13 @@ mod scheduler_tests {
         assert!(scheduler.handle_is_draining());
     }
 
-    struct ReapDuringAssign<'a> {
+    struct HeartbeatDuringAssign<'a> {
         scheduler: &'a Scheduler,
         server_id: ServerId,
         server_nonce: ServerNonce,
     }
 
-    impl SchedulerOutgoing for ReapDuringAssign<'_> {
+    impl SchedulerOutgoing for HeartbeatDuringAssign<'_> {
         fn do_assign_job(
             &self,
             server_id: ServerId,
@@ -1316,15 +1312,18 @@ mod scheduler_tests {
             _auth: String,
         ) -> Result<AssignJobResult> {
             assert_eq!(server_id, self.server_id);
-
             {
-                let mut servers = self.scheduler.servers.lock().unwrap();
-                let details = servers.get_mut(&server_id).unwrap();
-                *details.jobs_unclaimed.get_mut(&job_id).unwrap() = Instant::now()
-                    .checked_sub(UNCLAIMED_PENDING_TIMEOUT + Duration::from_secs(1))
-                    .unwrap();
+                let servers = self
+                    .scheduler
+                    .servers
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
+                let details = servers
+                    .get(&server_id)
+                    .ok_or_else(|| anyhow::anyhow!("server missing"))?;
+                assert!(details.jobs_assigned.contains(&job_id));
+                assert!(!details.jobs_unclaimed.contains_key(&job_id));
             }
-
             let heartbeat = self.scheduler.handle_heartbeat_server(
                 server_id,
                 self.server_nonce.clone(),
@@ -1332,7 +1331,6 @@ mod scheduler_tests {
                 Box::new(TestJobAuthorizer),
             )?;
             assert!(!heartbeat.is_new);
-
             Ok(AssignJobResult {
                 state: JobState::Pending,
                 need_toolchain: false,
@@ -1540,41 +1538,46 @@ mod scheduler_tests {
     }
 
     #[test]
-    fn allocation_fails_if_assignment_is_cleaned_up() {
+    fn heartbeat_during_assignment_does_not_reap_reservation() -> Result<()> {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = "127.0.0.1:10501".parse()?;
         let server_nonce = ServerNonce::new();
-
-        scheduler
-            .handle_heartbeat_server(
-                server_id,
-                server_nonce.clone(),
-                1,
-                Box::new(TestJobAuthorizer),
-            )
-            .unwrap();
-
-        let requester = ReapDuringAssign {
+        scheduler.handle_heartbeat_server(
+            server_id,
+            server_nonce.clone(),
+            1,
+            Box::new(TestJobAuthorizer),
+        )?;
+        let requester = HeartbeatDuringAssign {
             scheduler: &scheduler,
             server_id,
             server_nonce,
         };
-        let allocation = scheduler
-            .handle_alloc_job(
-                &requester,
-                Toolchain {
-                    archive_id: "test-toolchain".to_owned(),
-                },
-            )
-            .unwrap();
-
-        assert!(matches!(allocation, AllocJobResult::Fail { .. }));
-        assert!(scheduler.jobs.lock().unwrap().is_empty());
-
-        let servers = scheduler.servers.lock().unwrap();
-        let details = servers.get(&server_id).unwrap();
-        assert!(details.jobs_assigned.is_empty());
-        assert!(details.jobs_unclaimed.is_empty());
+        let allocation = scheduler.handle_alloc_job(
+            &requester,
+            Toolchain {
+                archive_id: "test-toolchain".to_owned(),
+            },
+        )?;
+        let AllocJobResult::Success { job_alloc, .. } = allocation else {
+            bail!("assignment was incorrectly reaped while its RPC was in flight");
+        };
+        let jobs = scheduler
+            .jobs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("jobs mutex poisoned"))?;
+        assert!(jobs.contains_key(&job_alloc.job_id));
+        drop(jobs);
+        let servers = scheduler
+            .servers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
+        let details = servers
+            .get(&server_id)
+            .ok_or_else(|| anyhow::anyhow!("server missing"))?;
+        assert!(details.jobs_assigned.contains(&job_alloc.job_id));
+        assert!(details.jobs_unclaimed.contains_key(&job_alloc.job_id));
+        Ok(())
     }
 }
 
