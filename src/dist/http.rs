@@ -163,7 +163,6 @@ mod common {
     impl std::fmt::Debug for HeartbeatServerHttpRequest {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("HeartbeatServerHttpRequest")
-                .field("jwt_key", &BASE64_URL_SAFE_ENGINE.encode(&self.jwt_key))
                 .field("num_cpus", &self.num_cpus)
                 .field("server_nonce", &self.server_nonce)
                 .field(
@@ -173,6 +172,27 @@ mod common {
                 .finish()
         }
     }
+    #[cfg(all(test, feature = "dist-server"))]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn heartbeat_debug_redacts_jwt_signing_key() {
+            let jwt_key = b"jwt-signing-secret".to_vec();
+            let encoded_secret = BASE64_URL_SAFE_ENGINE.encode(&jwt_key);
+            let heartbeat = HeartbeatServerHttpRequest {
+                jwt_key,
+                num_cpus: 4,
+                server_nonce: dist::ServerNonce::new(),
+                cert_digest: vec![1, 2, 3],
+                cert_pem: b"certificate".to_vec(),
+            };
+            let debug = format!("{heartbeat:?}");
+            assert!(!debug.contains(&encoded_secret));
+            assert!(!debug.contains("jwt-signing-secret"));
+        }
+    }
+
     #[derive(Clone, Debug, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct RunJobHttpRequest {
@@ -306,7 +326,7 @@ mod server {
     use std::env;
     use std::fs;
     use std::io::Read;
-    use std::net::SocketAddr;
+    use std::net::{IpAddr, SocketAddr};
     use std::result::Result as StdResult;
     use std::sync::atomic;
     use std::sync::{Arc, LazyLock, Mutex};
@@ -457,6 +477,31 @@ mod server {
     impl Drop for RunningJobGuard {
         fn drop(&mut self) {
             self.0.fetch_sub(1, atomic::Ordering::Relaxed);
+        }
+    }
+
+    struct SafeRequest<'a>(&'a rouille::Request);
+
+    impl std::fmt::Debug for SafeRequest<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Request")
+                .field("method", &self.0.method())
+                .field("url", &self.0.url())
+                .field("remote_addr", &self.0.remote_addr())
+                .finish()
+        }
+    }
+
+    fn request_origin_ip(request: &rouille::Request) -> Result<IpAddr> {
+        let peer_ip = request.remote_addr().ip();
+        if !peer_ip.is_loopback() {
+            return Ok(peer_ip);
+        }
+        match request.header("X-Real-IP") {
+            Some(value) => value
+                .parse()
+                .context("invalid X-Real-IP value from loopback proxy"),
+            None => Ok(peer_ip),
         }
     }
 
@@ -881,24 +926,16 @@ mod server {
                 ($request:ident) => {{
                     match bearer_http_auth($request).and_then(&*check_server_auth) {
                         Some(server_id) => {
-                            let origin_ip = if let Some(header_val) = $request.header("X-Real-IP") {
-                                trace!("X-Real-IP: {:?}", header_val);
-                                match header_val.parse() {
-                                    Ok(ip) => ip,
-                                    Err(err) => {
-                                        warn!(
-                                            "X-Real-IP value {:?} could not be parsed: {:?}",
-                                            header_val, err
-                                        );
-                                        return rouille::Response::empty_400();
-                                    }
+                            let origin_ip = match request_origin_ip($request) {
+                                Ok(ip) => ip,
+                                Err(err) => {
+                                    warn!("Could not determine server origin IP: {err}");
+                                    return rouille::Response::empty_400();
                                 }
-                            } else {
-                                $request.remote_addr().ip()
                             };
                             if server_id.addr().ip() != origin_ip {
                                 trace!("server ip: {:?}", server_id.addr().ip());
-                                trace!("request ip: {:?}", $request.remote_addr().ip());
+                                trace!("request origin ip: {:?}", origin_ip);
                                 return make_401("invalid_bearer_token_mismatched_address");
                             } else {
                                 server_id
@@ -958,7 +995,7 @@ mod server {
 
             let server = rouille::Server::new(public_addr, move |request| {
                 let req_id = request_count.fetch_add(1, atomic::Ordering::Relaxed);
-                trace!(target: "sccache_http", "Req {} ({}): {:?}", req_id, request.remote_addr(), request);
+                trace!(target: "sccache_http", "Req {}: {:?}", req_id, SafeRequest(request));
                 let response = (|| router!(request,
                     (POST) (/api/v1/scheduler/alloc_job) => {
                         let bearer_auth = match bearer_http_auth(request) {
@@ -1084,7 +1121,7 @@ mod server {
                         rouille::Response::text(format!("{draining}\n"))
                     },
                     _ => {
-                        warn!("Unknown request {:?}", request);
+                        warn!("Unknown request {:?}", SafeRequest(request));
                         rouille::Response::empty_404()
                     },
                 ))();
@@ -1288,7 +1325,7 @@ mod server {
 
             let server = rouille::Server::new_ssl(bind_address, move |request| {
                 let req_id = request_count.fetch_add(1, atomic::Ordering::Relaxed);
-                trace!("Req {} ({}): {:?}", req_id, request.remote_addr(), request);
+                trace!("Req {}: {:?}", req_id, SafeRequest(request));
                 let response = (|| router!(request,
                     (POST) (/api/v1/distserver/assign_job/{job_id: JobId}) => {
                         job_auth_or_401!(request, &job_authorizer, job_id);
@@ -1336,7 +1373,7 @@ mod server {
                         prepare_response(request, &res)
                     },
                     _ => {
-                        warn!("Unknown request {:?}", request);
+                        warn!("Unknown request {:?}", SafeRequest(request));
                         rouille::Response::empty_404()
                     },
                 ))();
@@ -1367,13 +1404,76 @@ mod server {
             state: JobState,
         ) -> Result<UpdateJobStateResult> {
             let url = urls::scheduler_job_state(&self.scheduler_url, job_id)?;
-            bincode_req(
-                self.client
-                    .post(url)
-                    .bearer_auth(self.scheduler_auth.clone())
-                    .bincode(&state)?,
+            let send = || {
+                bincode_req(
+                    self.client
+                        .post(url.clone())
+                        .bearer_auth(self.scheduler_auth.clone())
+                        .bincode(&state)?,
+                )
+                .context("POST to scheduler job_state failed")
+            };
+            match send() {
+                Ok(result) => Ok(result),
+                Err(first_error) => send().with_context(|| {
+                    format!("retrying job-state update after first failure: {first_error:#}")
+                }),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::net::{Ipv4Addr, SocketAddrV4};
+
+        fn request_from(ip: Ipv4Addr, headers: Vec<(String, String)>) -> rouille::Request {
+            rouille::Request::fake_http_from(
+                SocketAddr::V4(SocketAddrV4::new(ip, 12345)),
+                "POST",
+                "/api/test?access_token=query-secret",
+                headers,
+                Vec::new(),
             )
-            .context("POST to scheduler job_state failed")
+        }
+
+        #[test]
+        fn safe_request_debug_excludes_headers_and_query() {
+            let request = request_from(
+                Ipv4Addr::LOCALHOST,
+                vec![(
+                    "Authorization".to_owned(),
+                    "Bearer header-secret".to_owned(),
+                )],
+            );
+            let debug = format!("{:?}", SafeRequest(&request));
+            assert!(debug.contains("/api/test"));
+            assert!(!debug.contains("header-secret"));
+            assert!(!debug.contains("query-secret"));
+        }
+
+        #[test]
+        fn direct_request_cannot_spoof_x_real_ip() -> Result<()> {
+            let remote_ip = Ipv4Addr::new(198, 51, 100, 7);
+            let request = request_from(
+                remote_ip,
+                vec![("X-Real-IP".to_owned(), "203.0.113.9".to_owned())],
+            );
+            assert_eq!(request_origin_ip(&request)?, IpAddr::V4(remote_ip));
+            Ok(())
+        }
+
+        #[test]
+        fn loopback_proxy_can_supply_x_real_ip() -> Result<()> {
+            let request = request_from(
+                Ipv4Addr::LOCALHOST,
+                vec![("X-Real-IP".to_owned(), "203.0.113.9".to_owned())],
+            );
+            assert_eq!(
+                request_origin_ip(&request)?,
+                "203.0.113.9".parse::<IpAddr>()?
+            );
+            Ok(())
         }
     }
 }

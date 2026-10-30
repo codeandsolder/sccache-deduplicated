@@ -581,13 +581,24 @@ impl fmt::Display for JobState {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompileCommand {
     pub executable: String,
     pub arguments: Vec<String>,
     pub env_vars: Vec<(String, String)>,
     pub cwd: String,
+}
+impl fmt::Debug for CompileCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let env_var_names: Vec<_> = self.env_vars.iter().map(|(name, _)| name).collect();
+        f.debug_struct("CompileCommand")
+            .field("executable", &self.executable)
+            .field("argument_count", &self.arguments.len())
+            .field("env_var_names", &env_var_names)
+            .field("cwd", &self.cwd)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -806,6 +817,11 @@ pub struct BuildResult {
 // structs
 
 pub struct ToolchainReader<'a>(Box<dyn Read + 'a>);
+impl<'a> ToolchainReader<'a> {
+    pub fn new(reader: impl Read + 'a) -> Self {
+        Self(Box::new(reader))
+    }
+}
 impl Read for ToolchainReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)
@@ -813,6 +829,11 @@ impl Read for ToolchainReader<'_> {
 }
 
 pub struct InputsReader<'a>(Box<dyn Read + Send + 'a>);
+impl<'a> InputsReader<'a> {
+    pub fn new(reader: impl Read + Send + 'a) -> Self {
+        Self(Box::new(reader))
+    }
+}
 impl Read for InputsReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)

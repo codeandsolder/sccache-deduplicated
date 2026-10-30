@@ -178,7 +178,10 @@ impl OverlayBuilder {
             build_count: id,
             ctime: _,
         } = {
-            let mut toolchain_dir_map = self.toolchain_dir_map.lock().unwrap();
+            let mut toolchain_dir_map = self
+                .toolchain_dir_map
+                .lock()
+                .map_err(|_| anyhow!("toolchain directory map mutex poisoned"))?;
             // Create the toolchain dir (if necessary) while we have an exclusive lock
             let toolchain_dir = self.dir.join("toolchains").join(&tc.archive_id);
             if toolchain_dir_map.contains_key(tc) && toolchain_dir.exists() {
@@ -192,7 +195,9 @@ impl OverlayBuilder {
                 trace!("Creating toolchain directory for {}", tc.archive_id);
                 fs::create_dir(&toolchain_dir)?;
 
-                let mut tccache = tccache.lock().unwrap();
+                let mut tccache = tccache
+                    .lock()
+                    .map_err(|_| anyhow!("toolchain cache mutex poisoned"))?;
                 let toolchain_rdr = match tccache.get(tc) {
                     Ok(rdr) => rdr,
                     Err(LruError::FileNotInCache) => {
@@ -233,7 +238,9 @@ impl OverlayBuilder {
                     entries.truncate(entries.len() / 2);
                     for (tc, _) in entries {
                         warn!("Removing old un-compressed toolchain: {:?}", tc);
-                        assert!(toolchain_dir_map.remove(tc).is_some());
+                        if toolchain_dir_map.remove(tc).is_none() {
+                            bail!("toolchain disappeared from directory map during cleanup");
+                        }
                         fs::remove_dir_all(self.dir.join("toolchains").join(&tc.archive_id))
                             .context("Failed to remove old toolchain directory")?;
                     }
@@ -261,11 +268,7 @@ impl OverlayBuilder {
         output_paths: Vec<String>,
         overlay: &OverlaySpec,
     ) -> Result<BuildResult> {
-        trace!("Compile environment: {:?}", compile_command.env_vars);
-        trace!(
-            "Compile command: {:?} {:?}",
-            compile_command.executable, compile_command.arguments
-        );
+        trace!("Compile command: {:?}", compile_command);
 
         std::thread::scope(|scope| {
             scope
@@ -576,7 +579,10 @@ impl DockerBuilder {
     // the way)
     fn get_container(&self, tc: &Toolchain, tccache: &Mutex<TcCache>) -> Result<String> {
         let container = {
-            let mut map = self.container_lists.lock().unwrap();
+            let mut map = self
+                .container_lists
+                .lock()
+                .map_err(|_| anyhow!("container list mutex poisoned"))?;
             map.entry(tc.clone()).or_default().pop()
         };
         match container {
@@ -585,7 +591,10 @@ impl DockerBuilder {
                 // TODO: can improve parallelism (of creating multiple images at a time) by using another
                 // (more fine-grained) mutex around the entry value and checking if its empty a second time
                 let image = {
-                    let mut map = self.image_map.lock().unwrap();
+                    let mut map = self
+                        .image_map
+                        .lock()
+                        .map_err(|_| anyhow!("image map mutex poisoned"))?;
                     match map.entry(tc.clone()) {
                         hash_map::Entry::Occupied(e) => e.get().clone(),
                         hash_map::Entry::Vacant(e) => {
@@ -680,14 +689,27 @@ impl DockerBuilder {
             return;
         }
 
-        // Good as new, add it back to the container list
-        if let Some(entry) = self.container_lists.lock().unwrap().get_mut(tc) {
-            debug!("Reclaimed container {}", cid);
-            entry.push(cid)
-        } else {
+        // Good as new, add it back to the container list. If the bookkeeping lock is poisoned,
+        // discard the container rather than turning cleanup into a process-wide panic.
+        let reclaimed = match self.container_lists.lock() {
+            Ok(mut containers) => {
+                if let Some(entry) = containers.get_mut(tc) {
+                    debug!("Reclaimed container {}", cid);
+                    entry.push(cid.clone());
+                    true
+                } else {
+                    false
+                }
+            }
+            Err(_) => {
+                warn!("Container list mutex poisoned while reclaiming {}", cid);
+                false
+            }
+        };
+        if !reclaimed {
             warn!(
-                "Was ready to reclaim container {} but toolchain went missing",
-                cid
+                "Could not reclaim container {} for toolchain {}; removing it",
+                cid, tc.archive_id
             );
             if let Err(e) = docker_rm(&cid) {
                 warn!("Failed to remove container {}: {}", cid, e);
@@ -701,7 +723,9 @@ impl DockerBuilder {
             .check_stdout_trim()
             .context("Failed to create docker container")?;
 
-        let mut tccache = tccache.lock().unwrap();
+        let mut tccache = tccache
+            .lock()
+            .map_err(|_| anyhow!("toolchain cache mutex poisoned"))?;
         let mut toolchain_rdr = match tccache.get(tc) {
             Ok(rdr) => rdr,
             Err(LruError::FileNotInCache) => bail!(
@@ -759,11 +783,7 @@ impl DockerBuilder {
         output_paths: Vec<String>,
         cid: &str,
     ) -> Result<BuildResult> {
-        trace!("Compile environment: {:?}", compile_command.env_vars);
-        trace!(
-            "Compile command: {:?} {:?}",
-            compile_command.executable, compile_command.arguments
-        );
+        trace!("Compile command: {:?}", compile_command);
 
         trace!("copying in inputs");
         Command::new("docker")
@@ -784,7 +804,9 @@ impl DockerBuilder {
         let cwd = Path::new(&cwd);
 
         trace!("creating output directories");
-        assert!(!output_paths.is_empty());
+        if output_paths.is_empty() {
+            bail!("build request must contain at least one output path");
+        }
         let mut cmd = Command::new("docker");
         cmd.args(["exec", cid, "/busybox", "mkdir", "-p"]).arg(cwd);
         for path in output_paths.iter() {
