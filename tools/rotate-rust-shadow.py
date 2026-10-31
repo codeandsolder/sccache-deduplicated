@@ -48,7 +48,9 @@ def main() -> None:
         print(json.dumps({"rotated": False, "reason": "empty"}))
         return
     if size < args.min_bytes and not args.force:
-        print(json.dumps({"rotated": False, "reason": "below-threshold", "bytes": size}))
+        print(
+            json.dumps({"rotated": False, "reason": "below-threshold", "bytes": size})
+        )
         return
 
     args.archive_dir.mkdir(parents=True, exist_ok=True)
