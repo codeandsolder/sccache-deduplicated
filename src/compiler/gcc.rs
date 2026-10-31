@@ -217,9 +217,9 @@ counted_array!(pub static ARGS: [ArgInfo<ArgData>; _] = [
     flag!("--save-temps=obj", TooHardFlag),
     take_arg!("--serialize-diagnostics", PathBuf, Separated, SerializeDiagnostics),
     take_arg!("--sysroot", PathBuf, Separated, PassThroughPath),
-    take_arg!("-A", OsString, Separated, PassThrough),
+    take_arg!("-A", OsString, Separated, PreprocessorArgument),
     take_arg!("-B", PathBuf, CanBeSeparated, PassThroughPath),
-    take_arg!("-D", OsString, CanBeSeparated, PassThrough),
+    take_arg!("-D", OsString, CanBeSeparated, PreprocessorArgument),
     flag!("-E", TooHardFlag),
     take_arg!("-F", PathBuf, CanBeSeparated, PreprocessorArgumentPath),
     take_arg!("-G", OsString, Separated, PassThrough),
@@ -234,7 +234,7 @@ counted_array!(pub static ARGS: [ArgInfo<ArgData>; _] = [
     take_arg!("-MQ", OsString, Separated, DepTarget),
     take_arg!("-MT", OsString, Separated, DepTarget),
     flag!("-P", TooHardFlag),
-    take_arg!("-U", OsString, CanBeSeparated, PassThrough),
+    take_arg!("-U", OsString, CanBeSeparated, PreprocessorArgument),
     take_arg!("-V", OsString, Separated, PassThrough),
     flag!("-Werror=pedantic", PedanticFlag),
     take_arg!("-Wp", OsString, Concatenated(b','), PreprocessorArgument),
@@ -1092,7 +1092,9 @@ where
             // https://gcc.gnu.org/onlinedocs/gcc-4.9.0/gcc/Overall-Options.html
             let mut language: Option<String> =
                 language_to_arg(parsed_args.language).map(std::convert::Into::into);
-            if rewrite_includes_only || parsed_args.language.is_c_like_header() {
+            let worker_reprocesses =
+                rewrite_includes_only && !parsed_args.suppress_rewrite_includes_only;
+            if worker_reprocesses || parsed_args.language.is_c_like_header() {
             } else if let Some(processed_lang) = parsed_args.language.to_c_preprocessed_language() {
                 language = Some(language_to_arg(processed_lang)?.into());
             } else if parsed_args.language.needs_c_preprocessing() {
@@ -1783,7 +1785,11 @@ mod test {
             "foo.o",
             "-MQ",
             "abc",
-            "-nostdinc"
+            "-nostdinc",
+            "-A",
+            "machine=begonia",
+            "-DMAGIC=1",
+            "-UOLD_MAGIC"
         ];
         let ParsedArguments {
             input,
@@ -1818,7 +1824,16 @@ mod test {
             )
         );
         assert_eq!(ovec!["-MF", "foo.o.d"], dependency_args);
-        assert_eq!(ovec!["-nostdinc"], preprocessor_args);
+        assert_eq!(
+            ovec![
+                "-nostdinc",
+                "-A",
+                "machine=begonia",
+                "-DMAGIC=1",
+                "-UOLD_MAGIC"
+            ],
+            preprocessor_args
+        );
         assert_eq!(ovec!["-fabc"], common_args);
         assert!(!msvc_show_includes);
     }
@@ -2692,6 +2707,7 @@ mod test {
             input,
             language,
             outputs,
+            preprocessor_args,
             common_args,
             ..
         } = match parse_arguments_(vec![arg], false) {
@@ -2710,7 +2726,118 @@ mod test {
                 }
             )
         );
-        assert_eq!(ovec!["-DGREETING=hello world"], common_args);
+        assert_eq!(ovec!["-DGREETING=hello world"], preprocessor_args);
+        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
+    }
+
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_dist_preprocessed_assembler_drops_preprocessor_args() {
+        let parsed_args = match parse_arguments_clang(
+            stringvec!["-DMAGIC=1", "-UOLD_MAGIC", "-c", "probe.S", "-o", "probe.o"],
+            false,
+        ) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("Got unexpected parse result: {other:?}"),
+        };
+        assert_eq!(
+            ovec!["-DMAGIC=1", "-UOLD_MAGIC"],
+            parsed_args.preprocessor_args
+        );
+
+        let f = TestFixture::new();
+        let mut path_transformer = dist::PathTransformer::new();
+        let (_, dist_command, _) = generate_compile_commands(
+            &mut path_transformer,
+            &f.bins[0],
+            &parsed_args,
+            f.tempdir.path(),
+            &[],
+            GccCompileConfig {
+                kind: CCompilerKind::Clang,
+                rewrite_includes_only: false,
+                language_to_arg: language_to_gcc_arg,
+            },
+        )
+        .unwrap();
+        let arguments = dist_command
+            .expect("assembler compile should distribute")
+            .arguments;
+        assert!(arguments.windows(2).any(|w| w == ["-x", "assembler"]));
+        assert!(!arguments.iter().any(|arg| arg == "-DMAGIC=1"));
+        assert!(!arguments.iter().any(|arg| arg == "-UOLD_MAGIC"));
+    }
+
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_dist_rewrite_includes_drops_preprocessor_args() {
+        let parsed_args = match parse_arguments_clang(
+            stringvec!["-DMAGIC=1", "-UOLD_MAGIC", "-c", "probe.S", "-o", "probe.o"],
+            false,
+        ) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("Got unexpected parse result: {other:?}"),
+        };
+
+        let f = TestFixture::new();
+        let mut path_transformer = dist::PathTransformer::new();
+        let (_, dist_command, _) = generate_compile_commands(
+            &mut path_transformer,
+            &f.bins[0],
+            &parsed_args,
+            f.tempdir.path(),
+            &[],
+            GccCompileConfig {
+                kind: CCompilerKind::Clang,
+                rewrite_includes_only: true,
+                language_to_arg: language_to_gcc_arg,
+            },
+        )
+        .unwrap();
+        let arguments = dist_command
+            .expect("assembler compile should distribute")
+            .arguments;
+        assert!(
+            arguments
+                .windows(2)
+                .any(|w| w == ["-x", "assembler-with-cpp"])
+        );
+        assert!(!arguments.iter().any(|arg| arg == "-DMAGIC=1"));
+        assert!(!arguments.iter().any(|arg| arg == "-UOLD_MAGIC"));
+    }
+
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_dist_suppressed_rewrite_uses_preprocessed_language() {
+        let mut parsed_args = match parse_arguments_clang(
+            stringvec!["-DMAGIC=1", "-pedantic", "-c", "probe.S", "-o", "probe.o"],
+            false,
+        ) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("Got unexpected parse result: {other:?}"),
+        };
+        parsed_args.suppress_rewrite_includes_only = true;
+
+        let f = TestFixture::new();
+        let mut path_transformer = dist::PathTransformer::new();
+        let (_, dist_command, _) = generate_compile_commands(
+            &mut path_transformer,
+            &f.bins[0],
+            &parsed_args,
+            f.tempdir.path(),
+            &[],
+            GccCompileConfig {
+                kind: CCompilerKind::Clang,
+                rewrite_includes_only: true,
+                language_to_arg: language_to_gcc_arg,
+            },
+        )
+        .unwrap();
+        let arguments = dist_command
+            .expect("assembler compile should distribute")
+            .arguments;
+        assert!(arguments.windows(2).any(|w| w == ["-x", "assembler"]));
+        assert!(!arguments.iter().any(|arg| arg == "-DMAGIC=1"));
     }
 
     #[test]
