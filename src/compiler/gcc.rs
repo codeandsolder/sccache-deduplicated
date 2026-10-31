@@ -207,6 +207,37 @@ use self::ArgData::{
 
 const ARCH_FLAG: &str = "-arch";
 
+// When `.S` input is preprocessed locally, the worker sees plain assembler.
+// Driver options for compiler-generated unwind tables are valid for the original
+// assembler-with-cpp pipeline but cannot affect an already-preprocessed assembly
+// stream; Clang therefore diagnoses them as unused under `-x assembler`.
+#[cfg(feature = "dist-client")]
+fn common_arg_is_unused_after_assembler_preprocessing(arg: &OsStr) -> bool {
+    matches!(
+        arg.to_str(),
+        Some(
+            "-fasynchronous-unwind-tables"
+                | "-fno-asynchronous-unwind-tables"
+                | "-funwind-tables"
+                | "-fno-unwind-tables"
+        )
+    )
+}
+
+#[cfg(feature = "dist-client")]
+fn dist_common_args(parsed_args: &ParsedArguments, worker_reprocesses: bool) -> Vec<OsString> {
+    if !worker_reprocesses && parsed_args.language == Language::AssemblerToPreprocess {
+        parsed_args
+            .common_args
+            .iter()
+            .filter(|arg| !common_arg_is_unused_after_assembler_preprocessing(arg))
+            .cloned()
+            .collect()
+    } else {
+        parsed_args.common_args.clone()
+    }
+}
+
 // Mostly taken from https://github.com/ccache/ccache/blob/master/src/ccache/compopt.cpp#L52-L183
 counted_array!(pub static ARGS: [ArgInfo<ArgData>; _] = [
     flag!("-", TooHardFlag),
@@ -1131,7 +1162,8 @@ where
                 }
                 arguments.push("-fpreprocessed".into());
             }
-            arguments.extend(dist::osstrings_to_strings(&parsed_args.common_args)?);
+            let common_args = dist_common_args(parsed_args, worker_reprocesses);
+            arguments.extend(dist::osstrings_to_strings(&common_args)?);
             Some(dist::CompileCommand {
                 executable: path_transformer.as_dist(executable)?,
                 arguments,
@@ -2732,9 +2764,39 @@ mod test {
 
     #[test]
     #[cfg(feature = "dist-client")]
+    fn test_assembler_preprocessed_unused_common_args() {
+        for flag in [
+            "-fasynchronous-unwind-tables",
+            "-fno-asynchronous-unwind-tables",
+            "-funwind-tables",
+            "-fno-unwind-tables",
+        ] {
+            assert!(common_arg_is_unused_after_assembler_preprocessing(
+                OsStr::new(flag)
+            ));
+        }
+        assert!(!common_arg_is_unused_after_assembler_preprocessing(
+            OsStr::new("-fno-PIE")
+        ));
+        assert!(!common_arg_is_unused_after_assembler_preprocessing(
+            OsStr::new("-gdwarf-5")
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "dist-client")]
     fn test_dist_preprocessed_assembler_drops_preprocessor_args() {
         let parsed_args = match parse_arguments_clang(
-            stringvec!["-DMAGIC=1", "-UOLD_MAGIC", "-c", "probe.S", "-o", "probe.o"],
+            stringvec![
+                "-DMAGIC=1",
+                "-UOLD_MAGIC",
+                "-fno-asynchronous-unwind-tables",
+                "-fno-unwind-tables",
+                "-c",
+                "probe.S",
+                "-o",
+                "probe.o"
+            ],
             false,
         ) {
             CompilerArguments::Ok(args) => args,
@@ -2743,6 +2805,16 @@ mod test {
         assert_eq!(
             ovec!["-DMAGIC=1", "-UOLD_MAGIC"],
             parsed_args.preprocessor_args
+        );
+        assert!(
+            parsed_args
+                .common_args
+                .contains(&OsString::from("-fno-asynchronous-unwind-tables"))
+        );
+        assert!(
+            parsed_args
+                .common_args
+                .contains(&OsString::from("-fno-unwind-tables"))
         );
 
         let f = TestFixture::new();
@@ -2766,13 +2838,28 @@ mod test {
         assert!(arguments.windows(2).any(|w| w == ["-x", "assembler"]));
         assert!(!arguments.iter().any(|arg| arg == "-DMAGIC=1"));
         assert!(!arguments.iter().any(|arg| arg == "-UOLD_MAGIC"));
+        assert!(
+            !arguments
+                .iter()
+                .any(|arg| arg == "-fno-asynchronous-unwind-tables")
+        );
+        assert!(!arguments.iter().any(|arg| arg == "-fno-unwind-tables"));
     }
 
     #[test]
     #[cfg(feature = "dist-client")]
     fn test_dist_rewrite_includes_drops_preprocessor_args() {
         let parsed_args = match parse_arguments_clang(
-            stringvec!["-DMAGIC=1", "-UOLD_MAGIC", "-c", "probe.S", "-o", "probe.o"],
+            stringvec![
+                "-DMAGIC=1",
+                "-UOLD_MAGIC",
+                "-fno-asynchronous-unwind-tables",
+                "-fno-unwind-tables",
+                "-c",
+                "probe.S",
+                "-o",
+                "probe.o"
+            ],
             false,
         ) {
             CompilerArguments::Ok(args) => args,
@@ -2804,6 +2891,12 @@ mod test {
         );
         assert!(!arguments.iter().any(|arg| arg == "-DMAGIC=1"));
         assert!(!arguments.iter().any(|arg| arg == "-UOLD_MAGIC"));
+        assert!(
+            arguments
+                .iter()
+                .any(|arg| arg == "-fno-asynchronous-unwind-tables")
+        );
+        assert!(arguments.iter().any(|arg| arg == "-fno-unwind-tables"));
     }
 
     #[test]
