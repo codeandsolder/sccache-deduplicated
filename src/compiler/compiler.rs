@@ -2757,8 +2757,8 @@ LLVM version: 6.0",
         let pool = runtime.handle();
         let output = "compiler_id=clang\ncompiler_version=\"16.0.0\"";
         let arguments = [
-            ovec!["-c", "foo.c", "-o", "foo.o", "-DHELLO"],
-            ovec!["-c", "foo.c", "-o", "foo.o", "-DHI"],
+            ovec!["-c", "foo.c", "-o", "foo.o", "-fPIC"],
+            ovec!["-c", "foo.c", "-o", "foo.o", "-fno-pic"],
             ovec!["-c", "foo.c", "-o", "foo.o"],
         ];
         let cwd = f.tempdir.path();
@@ -2816,6 +2816,77 @@ LLVM version: 6.0",
         assert_ne!(results[0].key, results[1].key);
         assert_ne!(results[1].key, results[2].key);
         assert_ne!(results[0].key, results[2].key);
+        Ok(())
+    }
+
+    #[test_case(true ; "with preprocessor cache")]
+    #[test_case(false ; "without preprocessor cache")]
+    fn test_preprocessor_only_args_do_not_salt_hash_when_output_is_identical(
+        preprocessor_cache_mode: bool,
+    ) -> Result<()> {
+        let f = TestFixture::new();
+        let creator = new_creator();
+        let runtime = single_threaded_runtime();
+        let pool = runtime.handle();
+        let output = "compiler_id=clang\ncompiler_version=\"16.0.0\"";
+        let arguments = [
+            ovec!["-c", "foo.c", "-o", "foo.o", "-DHELLO"],
+            ovec!["-c", "foo.c", "-o", "foo.o", "-DHI"],
+            ovec!["-c", "foo.c", "-o", "foo.o"],
+        ];
+        let cwd = f.tempdir.path();
+        std::fs::write(f.tempdir.path().join("foo.c"), "whatever")?;
+
+        let results = arguments
+            .iter()
+            .map(|argument| -> Result<_> {
+                next_command(
+                    &creator,
+                    Ok(MockChild::new(
+                        exit_status(1),
+                        "",
+                        "clang: error: unknown argument: '-vV'",
+                    )),
+                );
+                next_command(&creator, Ok(MockChild::new(exit_status(0), output, "")));
+                next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
+                let c = detect_compiler(
+                    creator.clone(),
+                    &f.bins[0],
+                    f.tempdir.path(),
+                    &[],
+                    &[],
+                    pool,
+                    None,
+                )
+                .wait()?
+                .0;
+                next_command(
+                    &creator,
+                    Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+                );
+                let mut hasher = match c.parse_arguments(argument, ".".as_ref(), &[]) {
+                    CompilerArguments::Ok(h) => h,
+                    o => bail!("Bad result from parse_arguments: {o:?}"),
+                };
+                hasher
+                    .generate_hash_key(GenerateHashKeyContext {
+                        creator: &creator,
+                        cwd: cwd.to_path_buf(),
+                        env_vars: vec![],
+                        may_dist: false,
+                        pool,
+                        rewrite_includes_only: false,
+                        storage: Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
+                        cache_control: CacheControl::Default,
+                    })
+                    .wait()
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].key, results[1].key);
+        assert_eq!(results[1].key, results[2].key);
         Ok(())
     }
 
