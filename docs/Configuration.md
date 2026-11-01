@@ -41,6 +41,11 @@ toolchains = []
 # the maximum size of the toolchain cache in bytes
 toolchain_cache_size = 5368709120
 cache_dir = "/home/user/.cache/sccache-dist-client"
+# Preserve macro directives in distributed C/C++ inputs so worker compilation
+# retains source-level diagnostic semantics. Defaults to true. Set false only
+# for toolchains or system headers that are incompatible with GCC
+# -fdirectives-only / Clang -frewrite-includes.
+rewrite_includes_only = true
 
 [dist.auth]
 type = "token"

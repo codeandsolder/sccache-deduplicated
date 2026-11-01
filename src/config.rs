@@ -877,7 +877,7 @@ impl Default for DistConfig {
             cache_dir: default_dist_cache_dir(),
             toolchains: Vec::default(),
             toolchain_cache_size: default_toolchain_cache_size(),
-            rewrite_includes_only: false,
+            rewrite_includes_only: true,
         }
     }
 }
@@ -3472,13 +3472,24 @@ key_prefix = "cosprefix"
                 cache_dir: PathBuf::from("/home/user/.cache/sccache-dist-client"),
                 toolchains: vec![],
                 toolchain_cache_size: 5_368_709_120,
-                rewrite_includes_only: false,
+                rewrite_includes_only: true,
             },
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],
             client_side_mode: false,
         }
     );
+}
+
+#[test]
+fn dist_rewrite_includes_only_defaults_on_and_can_be_disabled() {
+    let default_config: FileConfig =
+        toml::from_str("[dist]\n").expect("default dist config parses");
+    assert!(default_config.dist.rewrite_includes_only);
+
+    let disabled: FileConfig = toml::from_str("[dist]\nrewrite_includes_only = false\n")
+        .expect("explicit rewrite-includes opt-out parses");
+    assert!(!disabled.dist.rewrite_includes_only);
 }
 
 #[test]
