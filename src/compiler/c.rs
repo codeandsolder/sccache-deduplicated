@@ -823,14 +823,6 @@ where
             storage.basedirs()
         };
 
-        // The inputs of nvcc's device-code steps are its own temporaries, named
-        // after the source, and identical device code from different sources
-        // is meant to be shared.
-        let input_file_name = match self.parsed_args.language {
-            Language::CudaFE | Language::Ptx | Language::Cubin => None,
-            _ => self.parsed_args.input.file_name(),
-        };
-
         let key = HashKeyParams::new(
             &self.executable_digest,
             parsed_args.language,
@@ -842,7 +834,10 @@ where
         .with_plusplus(self.compiler.plusplus())
         .with_basedirs(basedirs)
         .with_assembler_digest(assembler_digest.as_deref())
-        .with_input_file_name(input_file_name)
+        .with_input_file_name(hashed_input_file_name(
+            self.parsed_args.language,
+            &self.parsed_args.input,
+        ))
         .compute();
 
         // Cache the preprocessing step
@@ -2467,6 +2462,18 @@ impl pkg::ToolchainPackager for CToolchainPackager {
     }
 }
 
+/// The file name of `input` to put in the hash key, if any.
+///
+/// The inputs of nvcc's device-code steps are its own temporaries, named after
+/// the source, and identical device code from different sources is meant to be
+/// shared.
+fn hashed_input_file_name(language: Language, input: &Path) -> Option<&OsStr> {
+    match language {
+        Language::CudaFE | Language::Ptx | Language::Cubin => None,
+        _ => input.file_name(),
+    }
+}
+
 /// The cache is versioned by the inputs to `HashKeyParams::compute`.
 pub const CACHE_VERSION: &[u8] = b"14";
 
@@ -3119,6 +3126,39 @@ mod test {
         assert_neq!(hash_for("alpha.c"), hash_for("beta.c"));
         assert_eq!(hash_for("alpha.c"), hash_for("src/alpha.c"));
         assert_eq!(hash_for("/a/alpha.c"), hash_for("/b/alpha.c"));
+    }
+
+    #[test]
+    fn test_device_code_input_file_name_ignored() {
+        let args = ovec!["a", "b", "c"];
+        let hash_for = |language: Language, input: &str| {
+            HashKeyParams::new("abcd", language, &args, b"device code")
+                .with_input_file_name(hashed_input_file_name(language, Path::new(input)))
+                .compute()
+        };
+        // nvcc names the inputs of its device-code steps after the source, so
+        // two sources with the same device code must still share these entries.
+        assert_eq!(
+            hash_for(Language::CudaFE, "alpha.cpp1.ii"),
+            hash_for(Language::CudaFE, "beta.cpp1.ii")
+        );
+        assert_eq!(
+            hash_for(Language::Ptx, "alpha.cpp1.ii"),
+            hash_for(Language::Ptx, "beta.cpp1.ii")
+        );
+        assert_eq!(
+            hash_for(Language::Cubin, "alpha.ptx"),
+            hash_for(Language::Cubin, "beta.ptx")
+        );
+        // Everything else keeps the file name in the key.
+        assert_neq!(
+            hash_for(Language::C, "alpha.c"),
+            hash_for(Language::C, "beta.c")
+        );
+        assert_neq!(
+            hash_for(Language::Cuda, "alpha.cu"),
+            hash_for(Language::Cuda, "beta.cu")
+        );
     }
 
     #[test]
