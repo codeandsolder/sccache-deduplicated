@@ -27,6 +27,7 @@ use fs::File;
 use fs_err as fs;
 use predicates::prelude::*;
 use regex::Regex;
+use sccache::lru_disk_cache::CACHEDIR_TAG_FILE_NAME;
 use serial_test::serial;
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -2121,7 +2122,9 @@ fn test_unreadable_preprocessor_cache_entry_is_a_miss() {
         walkdir::WalkDir::new(sccache_cfg.cache.disk.unwrap().dir.join("preprocessor"))
             .into_iter()
             .map(|entry| entry.unwrap())
-            .filter(|entry| entry.file_type().is_file())
+            .filter(|entry| {
+                entry.file_type().is_file() && entry.file_name() != CACHEDIR_TAG_FILE_NAME
+            })
             .collect();
     assert!(
         !entries.is_empty(),
