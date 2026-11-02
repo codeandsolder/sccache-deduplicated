@@ -149,7 +149,7 @@ predicates = "=3.1.4"
 serial_test = "4.0"
 temp-env = "0.3.6"
 test-case = "3.3.1"
-thirtyfour = "0.37"
+thirtyfour = "0.38"
 
 [target.'cfg(unix)'.dependencies]
 daemonix = "0.1"
