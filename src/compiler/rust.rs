@@ -441,8 +441,7 @@ where
                 }
             }
             Some(' ') => {
-                deps.push(current_dep);
-                current_dep = String::new();
+                deps.push(std::mem::take(&mut current_dep));
             }
             Some(c) => current_dep.push(c),
             None => {
@@ -3255,7 +3254,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                             *v = dist_out_dir;
                         }
                         "TMPDIR" => {
-                            *v = String::new();
+                            v.clear();
                         }
                         "CARGO" => {
                             // Cargo can export a site wrapper or rustup proxy that is outside
