@@ -1025,6 +1025,36 @@ where
     run_input_output(cmd, None).await
 }
 
+fn local_compile_arguments(
+    parsed_args: &ParsedArguments,
+    out_file: &Path,
+    language: Option<&str>,
+) -> Vec<OsString> {
+    let mut arguments = Vec::new();
+    if let Some(lang) = language {
+        arguments.extend([OsString::from("-x"), lang.into()]);
+    }
+    arguments.extend([
+        parsed_args.compilation_flag.clone(),
+        OsString::from("-o"),
+        out_file.into(),
+    ]);
+    arguments.extend_from_slice(&parsed_args.preprocessor_args);
+    arguments.extend_from_slice(&parsed_args.dependency_args);
+    arguments.extend_from_slice(&parsed_args.unhashed_args);
+    arguments.extend_from_slice(&parsed_args.common_args);
+    arguments.extend_from_slice(&parsed_args.arch_args);
+
+    if matches!(parsed_args.color_mode, ColorMode::On | ColorMode::Auto) {
+        arguments.push("-fdiagnostics-color=always".into());
+    }
+    if parsed_args.double_dash_input {
+        arguments.push("--".into());
+    }
+    arguments.push(parsed_args.input.clone().into());
+    arguments
+}
+
 #[cfg(feature = "dist-client")]
 fn dist_assembler_include_args(
     path_transformer: &mut dist::PathTransformer,
@@ -1084,28 +1114,7 @@ where
     // Pass the language explicitly as we might have gotten it from the
     // command line.
     let language = language_to_arg(parsed_args.language);
-    let mut arguments: Vec<OsString> = vec![];
-    if let Some(lang) = &language {
-        arguments.extend(vec!["-x".into(), lang.into()]);
-    }
-    arguments.extend(vec![
-        parsed_args.compilation_flag.clone(),
-        "-o".into(),
-        out_file.into(),
-    ]);
-    arguments.extend_from_slice(&parsed_args.preprocessor_args);
-    arguments.extend_from_slice(&parsed_args.dependency_args);
-    arguments.extend_from_slice(&parsed_args.unhashed_args);
-    arguments.extend_from_slice(&parsed_args.common_args);
-    arguments.extend_from_slice(&parsed_args.arch_args);
-
-    if matches!(parsed_args.color_mode, ColorMode::On | ColorMode::Auto) {
-        arguments.push("-fdiagnostics-color=always".into());
-    }
-    if parsed_args.double_dash_input {
-        arguments.push("--".into());
-    }
-    arguments.push(parsed_args.input.clone().into());
+    let arguments = local_compile_arguments(parsed_args, out_file, language);
 
     trace!(
         "compile: {} {}",
