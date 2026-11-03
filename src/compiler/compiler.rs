@@ -2750,6 +2750,62 @@ LLVM version: 6.0",
 
     #[test_case(true ; "with preprocessor cache")]
     #[test_case(false ; "without preprocessor cache")]
+    fn test_assembler_incbin_payload_affects_hash(preprocessor_cache_mode: bool) -> Result<()> {
+        let f = TestFixture::new();
+        let clang = f.mk_bin("clang")?;
+        let creator = new_creator();
+        let runtime = single_threaded_runtime();
+        let pool = runtime.handle();
+        let cwd = f.tempdir.path();
+        std::fs::write(cwd.join("foo.S"), ".incbin \"blob.bin\"\n")?;
+
+        next_command(
+            &creator,
+            Ok(MockChild::new(
+                exit_status(0),
+                "compiler_id=clang\ncompiler_version=\"16.0.0\"",
+                "",
+            )),
+        );
+        next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
+        let compiler = detect_compiler(creator.clone(), &clang, cwd, &[], &[], pool, None)
+            .wait()?
+            .0;
+        let arguments = ovec!["-c", "foo.S", "-o", "foo.o"];
+
+        let key_for = |payload: &[u8]| -> Result<String> {
+            std::fs::write(cwd.join("blob.bin"), payload)?;
+            next_command(
+                &creator,
+                Ok(MockChild::new(exit_status(0), ".incbin \"blob.bin\"\n", "")),
+            );
+            let mut hasher = match compiler.parse_arguments(&arguments, cwd, &[]) {
+                CompilerArguments::Ok(hasher) => hasher,
+                other => bail!("Bad result from parse_arguments: {other:?}"),
+            };
+            Ok(hasher
+                .generate_hash_key(GenerateHashKeyContext {
+                    creator: &creator,
+                    cwd: cwd.to_path_buf(),
+                    env_vars: vec![],
+                    may_dist: true,
+                    pool,
+                    rewrite_includes_only: false,
+                    storage: Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
+                    cache_control: CacheControl::Default,
+                })
+                .wait()?
+                .key)
+        };
+
+        let first = key_for(b"payload-one")?;
+        let second = key_for(b"payload-two")?;
+        assert_ne!(first, second);
+        Ok(())
+    }
+
+    #[test_case(true ; "with preprocessor cache")]
+    #[test_case(false ; "without preprocessor cache")]
     fn test_common_args_affects_hash(preprocessor_cache_mode: bool) -> Result<()> {
         let f = TestFixture::new();
         let creator = new_creator();

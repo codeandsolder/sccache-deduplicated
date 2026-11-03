@@ -20,7 +20,7 @@ use crate::compiler::args::{
 use crate::compiler::c::is_native_codegen_arg;
 use crate::compiler::c::{
     ArtifactDescriptor, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
-    ParsedArguments,
+    ParsedArguments, assembler_include_dirs,
 };
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
@@ -1164,6 +1164,14 @@ where
             }
             let common_args = dist_common_args(parsed_args, worker_reprocesses);
             arguments.extend(dist::osstrings_to_strings(&common_args)?);
+            if matches!(
+                parsed_args.language,
+                Language::Assembler | Language::AssemblerToPreprocess
+            ) {
+                for include_dir in assembler_include_dirs(parsed_args, cwd) {
+                    arguments.push(format!("-I{}", path_transformer.as_dist_abs(&include_dir)?));
+                }
+            }
             Some(dist::CompileCommand {
                 executable: path_transformer.as_dist(executable)?,
                 arguments,
@@ -2844,6 +2852,55 @@ mod test {
                 .any(|arg| arg == "-fno-asynchronous-unwind-tables")
         );
         assert!(!arguments.iter().any(|arg| arg == "-fno-unwind-tables"));
+    }
+
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_dist_assembler_preserves_transformed_include_search_path() {
+        for args in [
+            stringvec!["-Iincludes", "-c", "probe.S", "-o", "probe.o"],
+            stringvec!["-Wa,-I,includes", "-c", "probe.S", "-o", "probe.o"],
+            stringvec![
+                "-Xassembler",
+                "-Iincludes",
+                "-c",
+                "probe.S",
+                "-o",
+                "probe.o"
+            ],
+        ] {
+            let parsed_args = match parse_arguments_clang(args, false) {
+                CompilerArguments::Ok(args) => args,
+                other => panic!("Got unexpected parse result: {other:?}"),
+            };
+
+            let f = TestFixture::new();
+            let mut path_transformer = dist::PathTransformer::new();
+            path_transformer.add_root_mapping(f.tempdir.path().to_owned(), "/work");
+            let (_, dist_command, _) = generate_compile_commands(
+                &mut path_transformer,
+                &f.bins[0],
+                &parsed_args,
+                f.tempdir.path(),
+                &[],
+                GccCompileConfig {
+                    kind: CCompilerKind::Clang,
+                    rewrite_includes_only: false,
+                    language_to_arg: language_to_gcc_arg,
+                },
+            )
+            .unwrap();
+            let dist_command = dist_command.expect("assembler compile should distribute");
+            assert!(
+                dist_command
+                    .arguments
+                    .iter()
+                    .any(|arg| arg == "-I/work/includes"),
+                "{:?}",
+                dist_command.arguments
+            );
+            assert_eq!(dist_command.cwd, "/work");
+        }
     }
 
     #[test]

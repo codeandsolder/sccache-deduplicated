@@ -216,6 +216,7 @@ impl ParsedArguments {
 struct CCompilation<I: CCompilerImpl> {
     parsed_args: ParsedArguments,
     is_locally_preprocessed: bool,
+    allow_dist: bool,
     #[cfg(feature = "dist-client")]
     preprocessed_input: Vec<u8>,
     executable: PathBuf,
@@ -472,7 +473,7 @@ where
         let start_of_compilation = std::time::SystemTime::now();
 
         let mut extra_hashes = hash_all(&self.parsed_args.extra_hash_files, &pool.clone()).await?;
-        let cache_control = match native_codegen_fingerprint(
+        let mut cache_control = match native_codegen_fingerprint(
             creator,
             &self.executable,
             &self.parsed_args,
@@ -628,6 +629,7 @@ where
                             compilation: Box::new(CCompilation {
                                 parsed_args: self.parsed_args.clone(),
                                 is_locally_preprocessed: false,
+                                allow_dist: true,
                                 #[cfg(feature = "dist-client")]
                                 preprocessed_input: PREPROCESSING_SKIPPED_COMPILE_POISON.to_vec(),
                                 executable: self.executable.clone(),
@@ -733,6 +735,58 @@ where
             )
         };
 
+        let mut allow_dist = true;
+        let has_assembler_external_input = if matches!(
+            self.parsed_args.language,
+            Language::Assembler | Language::AssemblerToPreprocess
+        ) {
+            contains_assembler_file_directive(&preprocessor_output)
+        } else {
+            contains_inline_assembler_file_directive(&preprocessor_output)
+        };
+        if matches!(
+            self.compiler.kind(),
+            CCompilerKind::Gcc | CCompilerKind::Clang
+        ) && has_assembler_external_input
+        {
+            // GCC/Clang do not report assembler .include/.incbin inputs in -M/-MD
+            // dependencies. For actual assembly inputs, discover the literal file
+            // graph ourselves so its contents participate in the object key and the
+            // same files are available to distributed workers. Other languages can
+            // contain assembler directives inside inline-asm strings; decoding those
+            // through the front-end is intentionally left to the compiler, so keep
+            // such compilations local and uncached rather than risking stale objects.
+            if matches!(
+                self.parsed_args.language,
+                Language::Assembler | Language::AssemblerToPreprocess
+            ) {
+                match assembler_file_dependencies(&preprocessor_output, &cwd, &self.parsed_args) {
+                    AssemblerDependencyScan::Complete(paths) => {
+                        let paths: Vec<_> = paths
+                            .into_iter()
+                            .filter(|path| !self.parsed_args.extra_hash_files.contains(path))
+                            .collect();
+                        extra_hashes.extend(hash_all(&paths, &pool.clone()).await?);
+                        self.parsed_args.extra_hash_files.extend(paths);
+                    }
+                    AssemblerDependencyScan::Incomplete(reason) => {
+                        debug!("assembler external-input scan incomplete: {reason}");
+                        cache_control = CacheControl::ForceNoCache;
+                        allow_dist = false;
+                    }
+                }
+            } else {
+                debug!(
+                    "assembler file directive outside an assembly input; disabling cache and dist"
+                );
+                cache_control = CacheControl::ForceNoCache;
+                allow_dist = false;
+            }
+            // Assembler-owned files are invisible to the C preprocessor. Never
+            // store a preprocessor-cache result that could bypass this scan.
+            preprocessor_key = None;
+        }
+
         // Create an argument vector containing both common and arch args, to
         // use in creating a hash key
         let mut common_and_arch_args = self.parsed_args.common_args.clone();
@@ -784,6 +838,7 @@ where
             compilation: Box::new(CCompilation {
                 parsed_args: self.parsed_args.clone(),
                 is_locally_preprocessed: true,
+                allow_dist,
                 #[cfg(feature = "dist-client")]
                 preprocessed_input: preprocessor_output,
                 executable: self.executable.clone(),
@@ -813,10 +868,491 @@ where
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum AssemblerDependencyScan {
+    Complete(Vec<PathBuf>),
+    Incomplete(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AssemblerFileDirective {
+    Include,
+    Incbin,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AssemblerDependency {
+    File(AssemblerFileDirective, PathBuf),
+    Unparsable,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AssemblerFileOperand {
+    Name(Vec<u8>),
+    Unparsable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AssemblerOperandQuoting {
+    Plain,
+    Escaped,
+}
+
+const ASSEMBLER_OPERAND_MAX_LEN: usize = 4096;
+
+fn skip_assembler_whitespace(bytes: &[u8]) -> (&[u8], bool) {
+    let mut rest = bytes;
+    let mut skipped = false;
+    loop {
+        rest = match rest {
+            [b' ' | b'\t', tail @ ..] => tail,
+            [b'\\', b't' | b'n' | b'r' | b'f' | b'v' | b' ', tail @ ..] => tail,
+            _ => return (rest, skipped),
+        };
+        skipped = true;
+    }
+}
+
+fn parse_assembler_file_operand(after_directive: &[u8]) -> Option<(AssemblerFileOperand, usize)> {
+    if after_directive
+        .first()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'$'))
+    {
+        return None;
+    }
+
+    let (rest, skipped_whitespace) = skip_assembler_whitespace(after_directive);
+    let (quoting, body) = if let Some(body) = rest.strip_prefix(b"\\\"") {
+        (AssemblerOperandQuoting::Escaped, body)
+    } else if let Some(body) = rest.strip_prefix(b"\"") {
+        (AssemblerOperandQuoting::Plain, body)
+    } else if skipped_whitespace {
+        return Some((AssemblerFileOperand::Unparsable, 0));
+    } else {
+        return None;
+    };
+
+    let terminator: &[u8] = match quoting {
+        AssemblerOperandQuoting::Plain => b"\"",
+        AssemblerOperandQuoting::Escaped => b"\\\"",
+    };
+    let window = &body[..body.len().min(ASSEMBLER_OPERAND_MAX_LEN)];
+    let mut end = None;
+    let mut i = 0;
+    while i < window.len() {
+        if window[i..].starts_with(terminator) {
+            end = Some(i);
+            break;
+        }
+        if matches!(window[i], b'"' | b'\\' | b'\n' | b'\r') {
+            break;
+        }
+        i += 1;
+    }
+
+    Some(match end {
+        Some(0) | None => (AssemblerFileOperand::Unparsable, 0),
+        Some(end) => {
+            let spanned = after_directive.len() - body.len() + end + terminator.len();
+            (AssemblerFileOperand::Name(window[..end].to_vec()), spanned)
+        }
+    })
+}
+
+fn assembler_dependency_at(slice: &[u8]) -> Option<(AssemblerDependency, usize)> {
+    let (directive, directive_len, after_directive) =
+        if let Some(rest) = slice.strip_prefix(INCBIN_DIRECTIVE) {
+            (AssemblerFileDirective::Incbin, INCBIN_DIRECTIVE.len(), rest)
+        } else {
+            let rest = slice.strip_prefix(INCLUDE_DIRECTIVE)?;
+            (
+                AssemblerFileDirective::Include,
+                INCLUDE_DIRECTIVE.len(),
+                rest,
+            )
+        };
+
+    Some(match parse_assembler_file_operand(after_directive)? {
+        (AssemblerFileOperand::Name(name), spanned) => {
+            let path = match decode_path(&name) {
+                Ok(path) => path,
+                Err(_) => return Some((AssemblerDependency::Unparsable, directive_len)),
+            };
+            (
+                AssemblerDependency::File(directive, path),
+                directive_len + spanned,
+            )
+        }
+        (AssemblerFileOperand::Unparsable, _) => (AssemblerDependency::Unparsable, directive_len),
+    })
+}
+
+/// Return true when a recognized assembler directive may begin at `pos`.
+///
+/// A preceding identifier character makes `.include`/`.incbin` a member or
+/// symbol suffix, not an assembler statement. Everything else remains eligible:
+/// line starts, whitespace, statement separators, labels, and C-string escape
+/// sequences used by inline assembly.
+fn starts_assembler_statement(bytes: &[u8], pos: usize) -> bool {
+    let before = &bytes[..pos];
+    let identifier_start = before
+        .iter()
+        .rposition(|c| !(c.is_ascii_alphanumeric() || matches!(c, b'_' | b'$')))
+        .map_or(0, |end| end + 1);
+    if identifier_start == before.len() {
+        return true;
+    }
+
+    identifier_start > 0 && before[identifier_start - 1] == b'\\'
+}
+
+fn assembler_dependencies_in(bytes: &[u8]) -> Vec<AssemblerDependency> {
+    let mut dependencies = Vec::new();
+    let mut offset = 0;
+    while let Some(pos) = memchr::memchr(b'.', &bytes[offset..]) {
+        let start = offset + pos;
+        match assembler_dependency_at(&bytes[start..]) {
+            Some((dependency, spanned)) if starts_assembler_statement(bytes, start) => {
+                dependencies.push(dependency);
+                offset = start + spanned;
+            }
+            _ => offset = start + 1,
+        }
+    }
+    dependencies
+}
+
+fn contains_assembler_file_directive(bytes: &[u8]) -> bool {
+    !assembler_dependencies_in(bytes).is_empty()
+}
+
+fn is_c_identifier_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn skip_c_space_and_comments(bytes: &[u8], mut pos: usize) -> usize {
+    loop {
+        while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+            pos += 1;
+        }
+        if bytes.get(pos..pos + 2) == Some(b"/*") {
+            pos += 2;
+            while pos + 1 < bytes.len() && bytes.get(pos..pos + 2) != Some(b"*/") {
+                pos += 1;
+            }
+            pos = (pos + 2).min(bytes.len());
+            continue;
+        }
+        if bytes.get(pos..pos + 2) == Some(b"//") {
+            pos += 2;
+            while bytes.get(pos).is_some_and(|byte| *byte != b'\n') {
+                pos += 1;
+            }
+            continue;
+        }
+        return pos;
+    }
+}
+
+fn skip_c_quoted(bytes: &[u8], mut pos: usize, quote: u8) -> usize {
+    debug_assert_eq!(bytes.get(pos), Some(&quote));
+    pos += 1;
+    while let Some(&byte) = bytes.get(pos) {
+        if byte == b'\\' {
+            pos = (pos + 2).min(bytes.len());
+        } else {
+            pos += 1;
+            if byte == quote {
+                break;
+            }
+        }
+    }
+    pos
+}
+
+fn matching_c_paren(bytes: &[u8], open: usize) -> Option<usize> {
+    if bytes.get(open) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 1usize;
+    let mut pos = open + 1;
+    while pos < bytes.len() {
+        match bytes[pos] {
+            b'"' | b'\'' => pos = skip_c_quoted(bytes, pos, bytes[pos]),
+            b'/' if bytes.get(pos + 1) == Some(&b'*') || bytes.get(pos + 1) == Some(&b'/') => {
+                pos = skip_c_space_and_comments(bytes, pos);
+            }
+            b'(' => {
+                depth += 1;
+                pos += 1;
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(pos);
+                }
+                pos += 1;
+            }
+            _ => pos += 1,
+        }
+    }
+    None
+}
+
+/// Detect assembler file directives only inside GNU C/C++ inline-asm statements.
+///
+/// Searching arbitrary C strings causes false positives for ordinary text such as
+/// `".include %s"`. GNU inline asm is syntactically anchored by `asm`, `__asm` or
+/// `__asm__`, optionally followed by the standard qualifiers, and a parenthesized
+/// operand list. Restrict the expensive/correctness fallback to those regions.
+fn contains_inline_assembler_file_directive(bytes: &[u8]) -> bool {
+    let mut pos = 0;
+    while pos < bytes.len() {
+        match bytes[pos] {
+            b'"' | b'\'' => {
+                pos = skip_c_quoted(bytes, pos, bytes[pos]);
+                continue;
+            }
+            b'/' if bytes.get(pos + 1) == Some(&b'*') || bytes.get(pos + 1) == Some(&b'/') => {
+                pos = skip_c_space_and_comments(bytes, pos);
+                continue;
+            }
+            byte if byte == b'_' || byte.is_ascii_alphabetic() => {
+                let start = pos;
+                pos += 1;
+                while bytes
+                    .get(pos)
+                    .is_some_and(|byte| is_c_identifier_char(*byte))
+                {
+                    pos += 1;
+                }
+                let ident = &bytes[start..pos];
+                if !matches!(ident, b"asm" | b"__asm" | b"__asm__") {
+                    continue;
+                }
+
+                let mut cursor = skip_c_space_and_comments(bytes, pos);
+                loop {
+                    let qualifier_start = cursor;
+                    while bytes
+                        .get(cursor)
+                        .is_some_and(|byte| is_c_identifier_char(*byte))
+                    {
+                        cursor += 1;
+                    }
+                    let qualifier = &bytes[qualifier_start..cursor];
+                    if matches!(
+                        qualifier,
+                        b"volatile" | b"__volatile" | b"__volatile__" | b"inline" | b"goto"
+                    ) {
+                        cursor = skip_c_space_and_comments(bytes, cursor);
+                    } else {
+                        cursor = qualifier_start;
+                        break;
+                    }
+                }
+                if bytes.get(cursor) != Some(&b'(') {
+                    continue;
+                }
+                let Some(close) = matching_c_paren(bytes, cursor) else {
+                    // Malformed C is the compiler's problem; it cannot yield a valid
+                    // stale cache entry, so there is no external-input dependency to track.
+                    continue;
+                };
+                if contains_assembler_file_directive(&bytes[cursor + 1..close]) {
+                    return true;
+                }
+                pos = close + 1;
+            }
+            _ => pos += 1,
+        }
+    }
+    false
+}
+
+/// Return GCC/Clang `-I` directories in assembler search order.
+///
+/// GCC argument parsing normalizes the two-token spelling (`-I dir`) to a
+/// single `-Idir` argument before this point.
+fn absolutize_assembler_include_dir(path: PathBuf, cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn preprocessor_assembler_include_dirs(parsed_args: &ParsedArguments, cwd: &Path) -> Vec<PathBuf> {
+    parsed_args
+        .preprocessor_args
+        .iter()
+        .filter_map(|arg| {
+            arg.as_encoded_bytes()
+                .strip_prefix(b"-I")
+                .filter(|path| !path.is_empty())
+                .and_then(|path| decode_path(path).ok())
+        })
+        .map(|path| absolutize_assembler_include_dir(path, cwd))
+        .collect()
+}
+
+fn driver_assembler_include_dirs(
+    parsed_args: &ParsedArguments,
+    cwd: &Path,
+) -> Result<Vec<PathBuf>> {
+    let mut assembler_args = Vec::<Vec<u8>>::new();
+    let mut i = 0;
+    while i < parsed_args.common_args.len() {
+        let arg = parsed_args.common_args[i].as_encoded_bytes();
+        if let Some(rest) = arg.strip_prefix(b"-Wa,") {
+            assembler_args.extend(rest.split(|byte| *byte == b',').map(<[u8]>::to_vec));
+        } else if arg == b"-Xassembler" {
+            i += 1;
+            let value = parsed_args
+                .common_args
+                .get(i)
+                .context("-Xassembler is missing its argument")?;
+            assembler_args.push(value.as_encoded_bytes().to_vec());
+        }
+        i += 1;
+    }
+
+    let mut include_dirs = Vec::new();
+    let mut i = 0;
+    while i < assembler_args.len() {
+        let arg = &assembler_args[i];
+        let path = if arg == b"-I" {
+            i += 1;
+            let value = assembler_args
+                .get(i)
+                .context("assembler -I is missing its directory")?;
+            decode_path(value).context("assembler -I directory is not a valid path")?
+        } else if let Some(value) = arg.strip_prefix(b"-I").filter(|value| !value.is_empty()) {
+            decode_path(value).context("assembler -I directory is not a valid path")?
+        } else {
+            i += 1;
+            continue;
+        };
+        include_dirs.push(absolutize_assembler_include_dir(path, cwd));
+        i += 1;
+    }
+
+    Ok(include_dirs)
+}
+
+pub(crate) fn assembler_include_dirs(parsed_args: &ParsedArguments, cwd: &Path) -> Vec<PathBuf> {
+    let mut include_dirs = preprocessor_assembler_include_dirs(parsed_args, cwd);
+    if let Ok(driver_dirs) = driver_assembler_include_dirs(parsed_args, cwd) {
+        include_dirs.extend(driver_dirs);
+    }
+    include_dirs
+}
+
+fn assembler_dependency_include_dirs(
+    parsed_args: &ParsedArguments,
+    cwd: &Path,
+) -> std::result::Result<Vec<PathBuf>, String> {
+    let preprocessor_dirs = preprocessor_assembler_include_dirs(parsed_args, cwd);
+    let driver_dirs =
+        driver_assembler_include_dirs(parsed_args, cwd).map_err(|error| error.to_string())?;
+
+    // ParsedArguments keeps preprocessor and pass-through arguments in separate
+    // vectors, so their original interleaving is no longer recoverable. If both
+    // forms contribute assembler search paths, choosing either concatenation could
+    // resolve a duplicate file name differently from the compiler. Preserve
+    // correctness by keeping such a translation unit local and uncached.
+    if !preprocessor_dirs.is_empty() && !driver_dirs.is_empty() {
+        return Err(
+            "assembler include path mixes -I with -Wa/-Xassembler -I; original search order is unavailable"
+                .to_owned(),
+        );
+    }
+
+    Ok(if driver_dirs.is_empty() {
+        preprocessor_dirs
+    } else {
+        driver_dirs
+    })
+}
+
+fn resolve_assembler_file(path: &Path, cwd: &Path, include_dirs: &[PathBuf]) -> Option<PathBuf> {
+    if path.is_absolute() {
+        return path.is_file().then(|| path.to_path_buf());
+    }
+    let direct = cwd.join(path);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    include_dirs
+        .iter()
+        .map(|dir| dir.join(path))
+        .find(|candidate| candidate.is_file())
+}
+
+fn assembler_file_dependencies(
+    bytes: &[u8],
+    cwd: &Path,
+    parsed_args: &ParsedArguments,
+) -> AssemblerDependencyScan {
+    let include_dirs = match assembler_dependency_include_dirs(parsed_args, cwd) {
+        Ok(include_dirs) => include_dirs,
+        Err(reason) => return AssemblerDependencyScan::Incomplete(reason),
+    };
+    let mut pending = vec![(None, bytes.to_vec())];
+    let mut visited_includes = HashSet::new();
+    let mut dependencies = Vec::new();
+    let mut seen_dependencies = HashSet::new();
+
+    while let Some((source, contents)) = pending.pop() {
+        for dependency in assembler_dependencies_in(&contents) {
+            let (directive, filename) = match dependency {
+                AssemblerDependency::File(directive, filename) => (directive, filename),
+                AssemblerDependency::Unparsable => {
+                    return AssemblerDependencyScan::Incomplete(format!(
+                        "assembler directive has a non-literal or unsupported file operand in {}",
+                        source.as_deref().map_or_else(
+                            || "preprocessed input".to_owned(),
+                            |p: &Path| p.display().to_string()
+                        )
+                    ));
+                }
+            };
+            let Some(path) = resolve_assembler_file(&filename, cwd, &include_dirs) else {
+                return AssemblerDependencyScan::Incomplete(format!(
+                    "cannot resolve assembler file {} referenced from {}",
+                    filename.display(),
+                    source.as_deref().map_or_else(
+                        || "preprocessed input".to_owned(),
+                        |p: &Path| p.display().to_string()
+                    )
+                ));
+            };
+            if seen_dependencies.insert(path.clone()) {
+                dependencies.push(path.clone());
+            }
+            if directive == AssemblerFileDirective::Include && visited_includes.insert(path.clone())
+            {
+                match fs::read(&path) {
+                    Ok(contents) => pending.push((Some(path), contents)),
+                    Err(error) => {
+                        return AssemblerDependencyScan::Incomplete(format!(
+                            "cannot read assembler include {}: {error}",
+                            path.display()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    AssemblerDependencyScan::Complete(dependencies)
+}
+
 const PRAGMA_GCC_PCH_PREPROCESS: &[u8] = b"pragma GCC pch_preprocess";
 const HASH_31_COMMAND_LINE_NEWLINE: &[u8] = b"# 31 \"<command-line>\"\n";
 const HASH_32_COMMAND_LINE_2_NEWLINE: &[u8] = b"# 32 \"<command-line>\" 2\n";
 const INCBIN_DIRECTIVE: &[u8] = b".incbin";
+const INCLUDE_DIRECTIVE: &[u8] = b".include";
 
 /// Remember the include files in the preprocessor output if it can be cached.
 /// Returns `false` if preprocessor cache mode should be disabled.
@@ -894,19 +1430,6 @@ fn process_preprocessed_file(
                     hash_start = h;
                 }
             }
-        } else if slice
-            .strip_prefix(INCBIN_DIRECTIVE)
-            .as_ref()
-            .is_some_and(|slice| {
-                slice.starts_with(b"\"") || slice.starts_with(b" \"") || slice.starts_with(b" \\\"")
-            })
-        {
-            // An assembler .inc bin (without the space) statement, which could be
-            // part of inline assembly, refers to an external file. If the file
-            // changes, the hash should change as well, but finding out what file to
-            // hash is too hard for sccache, so just bail out.
-            debug!("Found potential unsupported .inc bin directive in source code");
-            return Ok(false);
         } else if slice.starts_with(b"___________") && (start == 0 || bytes[start - 1] == b'\n') {
             // Unfortunately the distcc-pump wrapper outputs standard output lines:
             // __________Using distcc-pump from /usr/bin
@@ -1339,14 +1862,19 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
         Option<dist::CompileCommand>,
         Cacheable,
     )> {
-        self.compiler.generate_compile_commands(CCompileContext {
-            path_transformer,
-            executable: &self.executable,
-            parsed_args: &self.parsed_args,
-            cwd: &self.cwd,
-            env_vars: &self.env_vars,
-            rewrite_includes_only,
-        })
+        let (command, mut dist_command, cacheable) =
+            self.compiler.generate_compile_commands(CCompileContext {
+                path_transformer,
+                executable: &self.executable,
+                parsed_args: &self.parsed_args,
+                cwd: &self.cwd,
+                env_vars: &self.env_vars,
+                rewrite_includes_only,
+            })?;
+        if !self.allow_dist {
+            dist_command = None;
+        }
+        Ok((command, dist_command, cacheable))
     }
 
     #[cfg(feature = "dist-client")]
@@ -1600,7 +2128,7 @@ impl pkg::ToolchainPackager for CToolchainPackager {
 }
 
 /// The cache is versioned by the inputs to `HashKeyParams::compute`.
-pub const CACHE_VERSION: &[u8] = b"13";
+pub const CACHE_VERSION: &[u8] = b"14";
 
 /// Environment variables that are factored into the cache key.
 static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
@@ -1795,6 +2323,152 @@ mod test {
             suppress_rewrite_includes_only: false,
             too_hard_for_preprocessor_cache_mode: None,
         }
+    }
+
+    fn assembler_parsed_arguments(preprocessor_args: Vec<OsString>) -> ParsedArguments {
+        let mut args = native_parsed_arguments();
+        args.language = Language::AssemblerToPreprocess;
+        args.common_args.clear();
+        args.preprocessor_args = preprocessor_args;
+        args
+    }
+
+    #[test]
+    fn test_assembler_dependency_statement_boundaries() {
+        assert!(assembler_dependencies_in(b"opts.include = 1;\n").is_empty());
+        assert!(assembler_dependencies_in(b"x = y.incbin + 1;\n").is_empty());
+        assert!(assembler_dependencies_in(b"cfg->opts.incbin(path);\n").is_empty());
+        assert!(assembler_dependencies_in(b".incbinary \"blob.bin\"\n").is_empty());
+
+        assert_eq!(
+            assembler_dependencies_in(b"nop;.incbin \"blob.bin\"\n"),
+            vec![AssemblerDependency::File(
+                AssemblerFileDirective::Incbin,
+                PathBuf::from("blob.bin")
+            )]
+        );
+        assert_eq!(
+            assembler_dependencies_in(b"payload:.incbin \"blob.bin\"\n"),
+            vec![AssemblerDependency::File(
+                AssemblerFileDirective::Incbin,
+                PathBuf::from("blob.bin")
+            )]
+        );
+        assert_eq!(
+            assembler_dependencies_in(b"__asm__(\".incbin \\\"blob.bin\\\"\");\n"),
+            vec![AssemblerDependency::File(
+                AssemblerFileDirective::Incbin,
+                PathBuf::from("blob.bin")
+            )]
+        );
+        for line_break in [b"\\n".as_slice(), b"\\012".as_slice(), b"\\x0a".as_slice()] {
+            let mut source = b"\"nop".to_vec();
+            source.extend_from_slice(line_break);
+            source.extend_from_slice(b".incbin \\\"blob.bin\\\"\"");
+            assert_eq!(
+                assembler_dependencies_in(&source),
+                vec![AssemblerDependency::File(
+                    AssemblerFileDirective::Incbin,
+                    PathBuf::from("blob.bin")
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn test_inline_assembler_dependency_classifier_ignores_ordinary_c_strings() {
+        assert!(!contains_inline_assembler_file_directive(
+            b"const char *fmt = \".include %s\";"
+        ));
+        assert!(!contains_inline_assembler_file_directive(
+            b"log(\".incbin \\\"blob.bin\\\"\");"
+        ));
+        assert!(!contains_inline_assembler_file_directive(
+            b"struct opts { int include; }; opts.include = 1;"
+        ));
+
+        assert!(contains_inline_assembler_file_directive(
+            b"__asm__(\".incbin \\\"blob.bin\\\"\");"
+        ));
+        assert!(contains_inline_assembler_file_directive(
+            b"asm volatile (\"nop\\n.incbin \\\"blob.bin\\\"\" : : : \"memory\");"
+        ));
+        assert!(contains_inline_assembler_file_directive(
+            b"__asm__ goto (\".include \\\"inner.s\\\"\" : : : : target);"
+        ));
+    }
+
+    #[test]
+    fn test_assembler_dependency_unparsable_is_not_silently_ignored() {
+        for source in [
+            b".incbin BLOB_PATH\n".as_slice(),
+            b".include MACRO_PATH\n".as_slice(),
+            b".incbin \"\"\n".as_slice(),
+            b".incbin \"unterminated\n".as_slice(),
+        ] {
+            assert_eq!(
+                assembler_dependencies_in(source),
+                vec![AssemblerDependency::Unparsable]
+            );
+        }
+    }
+
+    #[test]
+    fn test_assembler_dependency_scan_resolves_cwd_include_path_and_nested_include() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("cwd");
+        let include = temp.path().join("include");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&include).unwrap();
+
+        std::fs::write(cwd.join("same.bin"), b"cwd").unwrap();
+        std::fs::write(include.join("same.bin"), b"include").unwrap();
+        std::fs::write(include.join("nested.bin"), b"nested").unwrap();
+        std::fs::write(include.join("inner.s"), b"\t.incbin \"nested.bin\"\n").unwrap();
+
+        let args =
+            assembler_parsed_arguments(vec![OsString::from(format!("-I{}", include.display()))]);
+        assert_eq!(
+            assembler_file_dependencies(
+                b"\t.incbin \"same.bin\"\n\t.include \"inner.s\"\n",
+                &cwd,
+                &args,
+            ),
+            AssemblerDependencyScan::Complete(vec![
+                cwd.join("same.bin"),
+                include.join("inner.s"),
+                include.join("nested.bin"),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_assembler_dependency_include_dirs_support_driver_forms_and_reject_mixed_order() {
+        let cwd = Path::new("/work");
+        let mut args = assembler_parsed_arguments(Vec::new());
+        args.common_args = ovec!["-Wa,-I,wa", "-Xassembler", "-Ixa"];
+        assert_eq!(
+            assembler_dependency_include_dirs(&args, cwd).unwrap(),
+            vec![cwd.join("wa"), cwd.join("xa")]
+        );
+
+        args.preprocessor_args = ovec!["-Icpp"];
+        assert!(assembler_dependency_include_dirs(&args, cwd).is_err());
+    }
+
+    #[test]
+    fn test_assembler_dependency_scan_rejects_unresolved_or_dynamic_inputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let args = assembler_parsed_arguments(Vec::new());
+
+        assert!(matches!(
+            assembler_file_dependencies(b".incbin \"missing.bin\"\n", temp.path(), &args),
+            AssemblerDependencyScan::Incomplete(_)
+        ));
+        assert!(matches!(
+            assembler_file_dependencies(b".incbin BLOB_PATH\n", temp.path(), &args),
+            AssemblerDependencyScan::Incomplete(_)
+        ));
     }
 
     #[test]
