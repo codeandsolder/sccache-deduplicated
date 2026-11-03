@@ -2934,6 +2934,47 @@ mod test {
 
     #[test]
     #[cfg(feature = "dist-client")]
+    fn test_dist_preserves_parent_components_in_input_argument() {
+        let mut parsed_args =
+            match parse_arguments_clang(stringvec!["-c", "eventfd.c", "-o", "eventfd.o"], false) {
+                CompilerArguments::Ok(args) => args,
+                other => panic!("Got unexpected parse result: {other:?}"),
+            };
+
+        let f = TestFixture::new();
+        parsed_args.input = f
+            .tempdir
+            .path()
+            .join("arch/arm64/kvm/../../../virt/kvm/eventfd.c");
+        let mut path_transformer = dist::PathTransformer::new();
+        path_transformer.add_root_mapping(f.tempdir.path().to_owned(), "/work");
+        let (_, dist_command, _) = generate_compile_commands(
+            &mut path_transformer,
+            &f.bins[0],
+            &parsed_args,
+            f.tempdir.path(),
+            &[],
+            GccCompileConfig {
+                kind: CCompilerKind::Clang,
+                rewrite_includes_only: false,
+                language_to_arg: language_to_gcc_arg,
+            },
+        )
+        .unwrap();
+        let dist_command = dist_command.expect("C compile should distribute");
+
+        assert!(
+            dist_command
+                .arguments
+                .iter()
+                .any(|arg| arg == "/work/arch/arm64/kvm/../../../virt/kvm/eventfd.c"),
+            "{:?}",
+            dist_command.arguments
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "dist-client")]
     fn test_dist_rewrite_includes_drops_preprocessor_args() {
         let parsed_args = match parse_arguments_clang(
             stringvec![

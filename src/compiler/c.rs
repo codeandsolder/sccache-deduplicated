@@ -1927,6 +1927,40 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
 }
 
 #[cfg(feature = "dist-client")]
+fn append_transient_input_directories<W: io::Write>(
+    builder: &mut tar::Builder<W>,
+    path_transformer: &mut dist::PathTransformer,
+    input_path: &Path,
+    seen_dist_directories: &mut HashSet<String>,
+) -> Result<()> {
+    let mut traversal_dirs = pkg::lexical_parent_traversal_dirs(input_path);
+    traversal_dirs.reverse();
+    for directory in traversal_dirs {
+        if !directory.is_dir() {
+            bail!(
+                "distributed C-family input requires missing traversal directory {}",
+                directory.display()
+            );
+        }
+        let dist_directory = path_transformer.as_dist(&directory).with_context(|| {
+            format!(
+                "unable to transform input directory {}",
+                directory.display()
+            )
+        })?;
+        if !seen_dist_directories.insert(dist_directory.clone()) {
+            continue;
+        }
+        let mut directory_header = pkg::make_tar_header(&directory, &dist_directory)?;
+        directory_header.set_entry_type(tar::EntryType::Directory);
+        directory_header.set_size(0);
+        directory_header.set_cksum();
+        builder.append(&directory_header, io::empty())?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "dist-client")]
 struct CInputsPackager {
     input_path: PathBuf,
     path_transformer: dist::PathTransformer,
@@ -1947,42 +1981,66 @@ impl pkg::InputsPackager for CInputsPackager {
         } = *self;
 
         let mut builder = tar::Builder::new(wtr);
+        let mut seen_dist_directories = HashSet::new();
 
         {
-            let input_path = pkg::simplify_path(&input_path)?;
-            let dist_input_path = path_transformer.as_dist(&input_path).with_context(|| {
-                format!("unable to transform input path {}", input_path.display())
-            })?;
+            let simplified_input_path = pkg::simplify_path(&input_path)?;
+            append_transient_input_directories(
+                &mut builder,
+                &mut path_transformer,
+                &input_path,
+                &mut seen_dist_directories,
+            )?;
 
-            let mut file_header = pkg::make_tar_header(&input_path, &dist_input_path)?;
+            let dist_input_path = path_transformer
+                .as_dist(&simplified_input_path)
+                .with_context(|| {
+                    format!(
+                        "unable to transform input path {}",
+                        simplified_input_path.display()
+                    )
+                })?;
+
+            let mut file_header = pkg::make_tar_header(&simplified_input_path, &dist_input_path)?;
             file_header.set_size(preprocessed_input.len() as u64); // The metadata is from non-preprocessed
             file_header.set_cksum();
             builder.append(&file_header, preprocessed_input.as_slice())?;
         }
 
         for input_path in extra_hash_files.iter().chain(extra_dist_files.iter()) {
-            let input_path = pkg::simplify_path(input_path)?;
+            let simplified_input_path = pkg::simplify_path(input_path)?;
+            append_transient_input_directories(
+                &mut builder,
+                &mut path_transformer,
+                input_path,
+                &mut seen_dist_directories,
+            )?;
 
             if !super::CAN_DIST_DYLIBS
-                && input_path
+                && simplified_input_path
                     .extension()
                     .is_some_and(|ext| ext == std::env::consts::DLL_EXTENSION)
             {
                 bail!(
                     "Cannot distribute dylib input {} on this platform",
-                    input_path.display()
+                    simplified_input_path.display()
                 )
             }
 
-            let dist_input_path = path_transformer.as_dist(&input_path).with_context(|| {
-                format!("unable to transform input path {}", input_path.display())
-            })?;
+            let dist_input_path = path_transformer
+                .as_dist(&simplified_input_path)
+                .with_context(|| {
+                    format!(
+                        "unable to transform input path {}",
+                        simplified_input_path.display()
+                    )
+                })?;
 
-            let mut file = io::BufReader::new(fs::File::open(&input_path)?);
+            let mut file = io::BufReader::new(fs::File::open(&simplified_input_path)?);
             let mut output = vec![];
             io::copy(&mut file, &mut output)?;
 
-            let mut file_header = pkg::make_tar_header(&input_path, &dist_input_path)?;
+            let mut file_header = pkg::make_tar_header(&simplified_input_path, &dist_input_path)?;
             file_header.set_size(output.len() as u64);
             file_header.set_cksum();
             builder.append(&file_header, &*output)?;
@@ -2328,6 +2386,73 @@ mod test {
         args.common_args.clear();
         args.preprocessor_args = preprocessor_args;
         args
+    }
+
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_dist_input_packager_preserves_parent_path_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("arch/arm64/kvm")).unwrap();
+        std::fs::create_dir_all(root.join("virt/kvm")).unwrap();
+        std::fs::write(
+            root.join("virt/kvm/eventfd.c"),
+            b"int f(void) { return 0; }\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("asm/a/b")).unwrap();
+        std::fs::write(root.join("asm/blob.bin"), b"blob").unwrap();
+
+        let input_path = root.join("arch/arm64/kvm/../../../virt/kvm/eventfd.c");
+        let extra_input_path = root.join("asm/a/b/../../blob.bin");
+        let mut path_transformer = dist::PathTransformer::new();
+        path_transformer.add_root_mapping(root.to_owned(), "/work");
+        let packager = CInputsPackager {
+            input_path,
+            path_transformer,
+            preprocessed_input: b"int f(void) { return 0; }\n".to_vec(),
+            extra_dist_files: Vec::new(),
+            extra_hash_files: vec![extra_input_path],
+        };
+        let mut package = Vec::new();
+        pkg::InputsPackager::write_inputs(Box::new(packager), &mut package).unwrap();
+
+        let mut archive = tar::Archive::new(std::io::Cursor::new(&package));
+        let paths: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .map(|entry| entry.unwrap().path().unwrap().into_owned())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("work/arch"),
+                PathBuf::from("work/arch/arm64"),
+                PathBuf::from("work/arch/arm64/kvm"),
+                PathBuf::from("work/virt/kvm/eventfd.c"),
+                PathBuf::from("work/asm/a"),
+                PathBuf::from("work/asm/a/b"),
+                PathBuf::from("work/asm/blob.bin"),
+            ]
+        );
+        assert!(paths.iter().all(|path| {
+            !path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        }));
+
+        let worker_root = tempfile::tempdir().unwrap();
+        let mut archive = tar::Archive::new(std::io::Cursor::new(package));
+        archive.unpack(worker_root.path()).unwrap();
+        let worker_input = worker_root
+            .path()
+            .join("work/arch/arm64/kvm/../../../virt/kvm/eventfd.c");
+        assert_eq!(
+            std::fs::read(worker_input).unwrap(),
+            b"int f(void) { return 0; }\n"
+        );
+        let worker_extra = worker_root.path().join("work/asm/a/b/../../blob.bin");
+        assert_eq!(std::fs::read(worker_extra).unwrap(), b"blob");
     }
 
     #[test]

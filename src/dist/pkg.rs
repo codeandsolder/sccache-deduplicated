@@ -546,6 +546,32 @@ pub fn make_tar_header(src: &Path, dest: &str) -> io::Result<tar::Header> {
     Ok(file_header)
 }
 
+/// Return the directory prefixes that must exist to preserve lexical `..` traversal.
+///
+/// Distributed input archives normally store simplified paths, but compiler arguments may
+/// intentionally retain their original lexical spelling. Every parent step requires the
+/// directory immediately before it to exist on the worker, even when that directory is not
+/// part of the simplified target path.
+pub fn lexical_parent_traversal_dirs(path: &Path) -> Vec<PathBuf> {
+    let mut current = PathBuf::new();
+    let mut required = Vec::new();
+
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                if !current.as_os_str().is_empty() {
+                    required.push(current.clone());
+                    current.pop();
+                }
+            }
+            Component::CurDir => {}
+            _ => current.push(component.as_os_str()),
+        }
+    }
+
+    required
+}
+
 /// Simplify a path to remove relative components while preserving meaningful symlink paths.
 ///
 /// Resolving every symlink can make an archived path disappear in favor of its canonical path,

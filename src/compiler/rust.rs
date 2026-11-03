@@ -3556,30 +3556,6 @@ fn test_crate_name_and_ext_from_lib_path() {
     );
 }
 
-#[cfg(feature = "dist-client")]
-fn lexical_parent_traversal_dirs(path: &Path) -> Vec<PathBuf> {
-    let mut current = PathBuf::new();
-    let mut required = Vec::new();
-
-    for component in path.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                // Path lookup must enter the preceding component before a parent
-                // step. A tar containing only the normalized target file may omit
-                // that directory entirely, causing rustc to get ENOENT.
-                if !current.as_os_str().is_empty() {
-                    required.push(current.clone());
-                    current.pop();
-                }
-            }
-            std::path::Component::CurDir => {}
-            _ => current.push(component.as_os_str()),
-        }
-    }
-
-    required
-}
-
 #[test]
 #[cfg(feature = "dist-client")]
 fn test_lexical_parent_traversal_dirs() {
@@ -3587,7 +3563,7 @@ fn test_lexical_parent_traversal_dirs() {
         "/cargo/libc/src/new/glibc/sysdeps/nptl/bits/../../x86/nptl/bits/struct_mutex.rs",
     );
     assert_eq!(
-        lexical_parent_traversal_dirs(path),
+        pkg::lexical_parent_traversal_dirs(path),
         vec![
             PathBuf::from("/cargo/libc/src/new/glibc/sysdeps/nptl/bits"),
             PathBuf::from("/cargo/libc/src/new/glibc/sysdeps/nptl"),
@@ -3595,7 +3571,7 @@ fn test_lexical_parent_traversal_dirs() {
     );
 
     assert_eq!(
-        lexical_parent_traversal_dirs(Path::new("/cargo/libc/src/lib.rs")),
+        pkg::lexical_parent_traversal_dirs(Path::new("/cargo/libc/src/lib.rs")),
         [] as [std::path::PathBuf; 0]
     );
 }
@@ -3707,7 +3683,7 @@ impl pkg::InputsPackager for RustInputsPackager {
         let mut tar_inputs = vec![];
         let mut tar_traversal_dirs = vec![];
         for input_path in inputs {
-            for traversal_dir in lexical_parent_traversal_dirs(&input_path) {
+            for traversal_dir in pkg::lexical_parent_traversal_dirs(&input_path) {
                 if !traversal_dir.is_dir() {
                     bail!(
                         "distributed Rust input requires missing traversal directory {}",
