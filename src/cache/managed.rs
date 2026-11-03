@@ -516,6 +516,16 @@ impl ManagedRemoteCache {
                 }
             }
             this.prune_running.store(false, Ordering::Release);
+            // A write may cross the high watermark after our final shared
+            // state check while this worker still owns prune_running.
+            // Re-arm only for that transition; normal over-capacity retries
+            // stay inside the throttled loop above.
+            if this
+                .current_size()
+                .is_some_and(|size| size > this.config.high_watermark)
+            {
+                this.schedule_reconcile();
+            }
         });
     }
 
