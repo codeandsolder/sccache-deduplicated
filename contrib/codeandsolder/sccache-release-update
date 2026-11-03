@@ -37,7 +37,7 @@ VERIFY_DIST_SMOKE="${SCCACHE_AUTOUPDATE_VERIFY_DIST_SMOKE:-0}"
 REQUIRED_CAPABILITIES="${SCCACHE_AUTOUPDATE_REQUIRED_CAPABILITIES:-direct-metrics}"
 VERIFY_METRICS="${SCCACHE_AUTOUPDATE_VERIFY_METRICS:-1}"
 METRICS_QUERY_URL="${SCCACHE_AUTOUPDATE_METRICS_QUERY_URL:-}"
-METRICS_VERIFY_SECONDS="${SCCACHE_AUTOUPDATE_METRICS_VERIFY_SECONDS:-20}"
+METRICS_VERIFY_SECONDS="${SCCACHE_AUTOUPDATE_METRICS_VERIFY_SECONDS:-}"
 
 capabilities_satisfy_requirements() {
     local capabilities="$1"
@@ -342,9 +342,34 @@ local_sccache() {
     fi
 }
 
+metrics_verify_seconds() {
+    local heartbeat_ms="$1"
+    local verify_seconds
+
+    if [[ -n "$METRICS_VERIFY_SECONDS" ]]; then
+        [[ "$METRICS_VERIFY_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+            echo "sccache-release-update: invalid SCCACHE_AUTOUPDATE_METRICS_VERIFY_SECONDS: $METRICS_VERIFY_SECONDS" >&2
+            return 1
+        }
+        printf '%s\n' "$METRICS_VERIFY_SECONDS"
+        return 0
+    fi
+
+    if [[ "$heartbeat_ms" =~ ^[1-9][0-9]*$ ]]; then
+        # Observe at least one full configured heartbeat interval, plus enough
+        # slack for ingestion/query latency. Keep the historical 20s floor for
+        # daemons that emit more frequently than that.
+        verify_seconds=$(( (heartbeat_ms + 999) / 1000 + 15 ))
+        (( verify_seconds >= 20 )) || verify_seconds=20
+    else
+        verify_seconds=20
+    fi
+    printf '%s\n' "$verify_seconds"
+}
+
 verify_metrics_heartbeat() {
     local not_before="$1"
-    local pid metrics_url instance service query_url query deadline response
+    local pid metrics_url heartbeat_ms instance service query_url query verify_seconds deadline response
     (( VERIFY_METRICS == 1 )) || return 0
 
     pid="$(systemctl show -p MainPID --value "$LOCAL_SERVICE")"
@@ -353,6 +378,7 @@ verify_metrics_heartbeat() {
         return 1
     }
     metrics_url="$(tr '\0' '\n' <"/proc/$pid/environ" | sed -n 's/^SCCACHE_METRICS_URL=//p' | head -n1)"
+    heartbeat_ms="$(tr '\0' '\n' <"/proc/$pid/environ" | sed -n 's/^SCCACHE_METRICS_HEARTBEAT_MS=//p' | head -n1)"
     instance="$(tr '\0' '\n' <"/proc/$pid/environ" | sed -n 's/^SCCACHE_METRICS_INSTANCE=//p' | head -n1)"
     service="$(tr '\0' '\n' <"/proc/$pid/environ" | sed -n 's/^SCCACHE_METRICS_SERVICE=//p' | head -n1)"
     [[ -n "$instance" ]] || instance="$(hostname)"
@@ -379,7 +405,8 @@ if service:
 print('timestamp(sccache_info{' + ','.join(labels) + '})')
 PYQ
 )"
-    deadline=$((SECONDS + METRICS_VERIFY_SECONDS))
+    verify_seconds="$(metrics_verify_seconds "$heartbeat_ms")"
+    deadline=$((SECONDS + verify_seconds))
     while (( SECONDS <= deadline )); do
         if response="$(curl -fsS --connect-timeout 2 --max-time 3 --get --data-urlencode "query=$query" "$query_url" 2>/dev/null)" &&
            printf '%s' "$response" | python3 -c 'import json,sys
@@ -391,7 +418,7 @@ raise SystemExit(0 if values and max(values) >= not_before else 1)' "$not_before
         fi
         sleep 0.25
     done
-    echo "sccache-release-update: no fresh direct-metrics heartbeat after restart" >&2
+    echo "sccache-release-update: no fresh direct-metrics heartbeat after restart within ${verify_seconds}s" >&2
     return 1
 }
 

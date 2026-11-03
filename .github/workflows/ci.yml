@@ -100,6 +100,8 @@ jobs:
           assert '--plan-only' in source
           assert 'SCCACHE_AUTOUPDATE_CLIENT_PORT' in source
           assert 'local_client_ready' in source
+          assert 'SCCACHE_METRICS_HEARTBEAT_MS' in source
+          assert '(heartbeat_ms + 999) / 1000 + 15' in source
           publisher = Path(".github/workflows/publish-ci-client.yml").read_text()
           assert 'echo "dist_protocol=1"' in publisher
           PY
