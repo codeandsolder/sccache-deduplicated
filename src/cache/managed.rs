@@ -475,13 +475,13 @@ impl ManagedRemoteCache {
                 if let Err(error) = &attempt {
                     warn!("managed cache reconciliation failed: {error:#}");
                 }
-                // A controller can be asked to reconcile before it has a
-                // usable capacity estimate (e.g. after a failed cache PUT).
-                // In that case lease contention and errors still need a retry.
-                let needs_retry = this.current_size().map_or_else(
-                    || !matches!(attempt, Ok(ReconcileAttempt::Completed)),
-                    |size| size > this.config.high_watermark,
-                );
+                // A controller may lack a usable capacity estimate after a
+                // failed cache PUT. Lease contention and errors must still be
+                // retried, even if the cached size is unknown or below high.
+                let needs_retry = !matches!(attempt, Ok(ReconcileAttempt::Completed))
+                    || this
+                        .current_size()
+                        .is_some_and(|size| size > this.config.high_watermark);
                 if !needs_retry {
                     break;
                 }
