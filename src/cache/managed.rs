@@ -152,6 +152,12 @@ struct PruneLease {
     owner: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileAttempt {
+    Completed,
+    LeaseHeld,
+}
+
 #[derive(Debug)]
 pub struct ManagedRemoteCache {
     operator: Operator,
@@ -465,13 +471,18 @@ impl ManagedRemoteCache {
         tokio::spawn(async move {
             let mut retries = 0_u32;
             loop {
-                if let Err(error) = this.reconcile_and_prune().await {
+                let attempt = this.reconcile_and_prune().await;
+                if let Err(error) = &attempt {
                     warn!("managed cache reconciliation failed: {error:#}");
                 }
-                if !this
-                    .current_size()
-                    .is_some_and(|size| size > this.config.high_watermark)
-                {
+                // A controller can be asked to reconcile before it has a
+                // usable capacity estimate (e.g. after a failed cache PUT).
+                // In that case lease contention and errors still need a retry.
+                let needs_retry = this.current_size().map_or_else(
+                    || !matches!(attempt, Ok(ReconcileAttempt::Completed)),
+                    |size| size > this.config.high_watermark,
+                );
+                if !needs_retry {
                     break;
                 }
 
@@ -508,10 +519,10 @@ impl ManagedRemoteCache {
         });
     }
 
-    async fn reconcile_and_prune(self: &Arc<Self>) -> anyhow::Result<()> {
+    async fn reconcile_and_prune(self: &Arc<Self>) -> anyhow::Result<ReconcileAttempt> {
         let Some(acquired_lease) = self.acquire_prune_lease().await? else {
             debug!("managed cache reconciliation skipped: another controller owns the lease");
-            return Ok(());
+            return Ok(ReconcileAttempt::LeaseHeld);
         };
         let lease = Arc::new(Mutex::new(acquired_lease));
         let lease_valid = Arc::new(AtomicBool::new(true));
@@ -568,7 +579,7 @@ impl ManagedRemoteCache {
         if !lease_still_valid && result.is_ok() {
             anyhow::bail!("managed cache prune lease was lost during reconciliation");
         }
-        result
+        result.map(|()| ReconcileAttempt::Completed)
     }
 
     async fn reconcile_and_prune_while_leased(
