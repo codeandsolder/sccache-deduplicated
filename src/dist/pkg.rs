@@ -552,6 +552,7 @@ pub fn make_tar_header(src: &Path, dest: &str) -> io::Result<tar::Header> {
 /// intentionally retain their original lexical spelling. Every parent step requires the
 /// directory immediately before it to exist on the worker, even when that directory is not
 /// part of the simplified target path.
+#[must_use]
 pub fn lexical_parent_traversal_dirs(path: &Path) -> Vec<PathBuf> {
     let mut current = PathBuf::new();
     let mut required = Vec::new();
