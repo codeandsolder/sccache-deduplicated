@@ -50,6 +50,8 @@ const METADATA_SHARD_FORMAT_VERSION: u8 = 1;
 const METADATA_SHARD_BITS: u32 = 12;
 const MAX_TOUCH_ENTRIES: usize = 65_536;
 const CAS_ATTEMPTS: usize = 8;
+const RECONCILE_RETRY_BASE_SECS: u64 = 5;
+const RECONCILE_RETRY_MAX_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Copy)]
 struct PendingTouch {
@@ -461,16 +463,48 @@ impl ManagedRemoteCache {
         }
         let this = Arc::clone(self);
         tokio::spawn(async move {
-            if let Err(error) = this.reconcile_and_prune().await {
-                warn!("managed cache reconciliation failed: {error:#}");
+            let mut retries = 0_u32;
+            loop {
+                if let Err(error) = this.reconcile_and_prune().await {
+                    warn!("managed cache reconciliation failed: {error:#}");
+                }
+                if !this
+                    .current_size()
+                    .is_some_and(|size| size > this.config.high_watermark)
+                {
+                    break;
+                }
+
+                // Another controller may own the lease, or pruning may be
+                // unable to make progress. Never immediately retry: that
+                // produces an unbounded HEAD storm against the shared lease.
+                tokio::time::sleep(reconcile_retry_delay(retries, rand::random_range(75..=125)))
+                    .await;
+                retries = retries.saturating_add(1);
+
+                // A different controller may have finished pruning while we
+                // waited. Refresh shared capacity instead of repeatedly
+                // acting on this controller's stale high-water estimate.
+                match this.read_capacity_state().await {
+                    Ok(Some(state)) => {
+                        this.known_size
+                            .store(state.estimated_size, Ordering::Relaxed);
+                        this.size_known.store(true, Ordering::Relaxed);
+                        if state
+                            .estimated_size
+                            .saturating_add(this.pending_write_bytes.load(Ordering::Relaxed))
+                            <= this.config.high_watermark
+                        {
+                            break;
+                        }
+                    }
+                    Ok(None) => {} // Missing state still requires reconciliation.
+                    Err(error) => {
+                        warn!("managed cache capacity-state refresh failed: {error:#}");
+                    }
+                }
             }
             this.prune_running.store(false, Ordering::Release);
-            if this
-                .current_size()
-                .is_some_and(|size| size > this.config.high_watermark)
-            {
-                this.schedule_reconcile();
-            }
         });
     }
 
@@ -1180,6 +1214,15 @@ fn prune_lease_metadata(owner: &str, expires: u64) -> Vec<(String, String)> {
     ]
 }
 
+// Exponential backoff with per-attempt jitter avoids synchronizing cache
+// controllers after lease contention or a transient backend failure.
+fn reconcile_retry_delay(retries: u32, jitter_percent: u64) -> Duration {
+    let base_secs = RECONCILE_RETRY_BASE_SECS
+        .saturating_mul(1_u64 << retries.min(4))
+        .min(RECONCILE_RETRY_MAX_SECS);
+    Duration::from_millis(base_secs.saturating_mul(10).saturating_mul(jitter_percent))
+}
+
 fn prune_lease_renewal_interval(ttl_secs: u64) -> Duration {
     Duration::from_secs((ttl_secs / 3).max(1))
 }
@@ -1449,6 +1492,30 @@ mod tests {
         assert_eq!(heat_bonus_seconds(255_000, half_life), 8 * half_life);
         assert!(heat_bonus_seconds(500, half_life) > 0);
         assert!(heat_bonus_seconds(500, half_life) < half_life);
+    }
+
+    #[test]
+    fn reconcile_retry_is_bounded_and_never_immediate() {
+        let expected = [5, 10, 20, 40, 60, 60];
+        for (attempt, seconds) in expected.into_iter().enumerate() {
+            let attempt = u32::try_from(attempt).expect("small retry index");
+            assert_eq!(
+                reconcile_retry_delay(attempt, 100),
+                Duration::from_secs(seconds)
+            );
+            assert_eq!(
+                reconcile_retry_delay(attempt, 75),
+                Duration::from_millis(seconds * 750)
+            );
+            assert_eq!(
+                reconcile_retry_delay(attempt, 125),
+                Duration::from_millis(seconds * 1250)
+            );
+        }
+        assert_eq!(
+            reconcile_retry_delay(u32::MAX, 100),
+            Duration::from_secs(60)
+        );
     }
 
     #[test]
