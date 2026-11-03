@@ -1025,6 +1025,29 @@ where
     run_input_output(cmd, None).await
 }
 
+#[cfg(feature = "dist-client")]
+fn dist_assembler_include_args(
+    path_transformer: &mut dist::PathTransformer,
+    parsed_args: &ParsedArguments,
+    cwd: &Path,
+) -> Option<Vec<String>> {
+    if !matches!(
+        parsed_args.language,
+        Language::Assembler | Language::AssemblerToPreprocess
+    ) {
+        return Some(Vec::new());
+    }
+
+    assembler_include_dirs(parsed_args, cwd)
+        .into_iter()
+        .map(|include_dir| {
+            path_transformer
+                .as_dist_abs(&include_dir)
+                .map(|path| format!("-I{path}"))
+        })
+        .collect()
+}
+
 pub fn generate_compile_commands<F>(
     path_transformer: &mut dist::PathTransformer,
     executable: &Path,
@@ -1164,14 +1187,11 @@ where
             }
             let common_args = dist_common_args(parsed_args, worker_reprocesses);
             arguments.extend(dist::osstrings_to_strings(&common_args)?);
-            if matches!(
-                parsed_args.language,
-                Language::Assembler | Language::AssemblerToPreprocess
-            ) {
-                for include_dir in assembler_include_dirs(parsed_args, cwd) {
-                    arguments.push(format!("-I{}", path_transformer.as_dist_abs(&include_dir)?));
-                }
-            }
+            arguments.extend(dist_assembler_include_args(
+                path_transformer,
+                parsed_args,
+                cwd,
+            )?);
             Some(dist::CompileCommand {
                 executable: path_transformer.as_dist(executable)?,
                 arguments,

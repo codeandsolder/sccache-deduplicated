@@ -900,13 +900,13 @@ enum AssemblerOperandQuoting {
 
 const ASSEMBLER_OPERAND_MAX_LEN: usize = 4096;
 
-fn skip_assembler_whitespace(bytes: &[u8]) -> (&[u8], bool) {
+const fn skip_assembler_whitespace(bytes: &[u8]) -> (&[u8], bool) {
     let mut rest = bytes;
     let mut skipped = false;
     loop {
         rest = match rest {
-            [b' ' | b'\t', tail @ ..] => tail,
-            [b'\\', b't' | b'n' | b'r' | b'f' | b'v' | b' ', tail @ ..] => tail,
+            [b' ' | b'\t', tail @ ..]
+            | [b'\\', b't' | b'n' | b'r' | b'f' | b'v' | b' ', tail @ ..] => tail,
             _ => return (rest, skipped),
         };
         skipped = true;
@@ -974,9 +974,8 @@ fn assembler_dependency_at(slice: &[u8]) -> Option<(AssemblerDependency, usize)>
 
     Some(match parse_assembler_file_operand(after_directive)? {
         (AssemblerFileOperand::Name(name), spanned) => {
-            let path = match decode_path(&name) {
-                Ok(path) => path,
-                Err(_) => return Some((AssemblerDependency::Unparsable, directive_len)),
+            let Ok(path) = decode_path(&name) else {
+                return Some((AssemblerDependency::Unparsable, directive_len));
             };
             (
                 AssemblerDependency::File(directive, path),
@@ -1026,7 +1025,7 @@ fn contains_assembler_file_directive(bytes: &[u8]) -> bool {
     !assembler_dependencies_in(bytes).is_empty()
 }
 
-fn is_c_identifier_char(byte: u8) -> bool {
+const fn is_c_identifier_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
@@ -1111,11 +1110,9 @@ fn contains_inline_assembler_file_directive(bytes: &[u8]) -> bool {
         match bytes[pos] {
             b'"' | b'\'' => {
                 pos = skip_c_quoted(bytes, pos, bytes[pos]);
-                continue;
             }
             b'/' if bytes.get(pos + 1) == Some(&b'*') || bytes.get(pos + 1) == Some(&b'/') => {
                 pos = skip_c_space_and_comments(bytes, pos);
-                continue;
             }
             byte if byte == b'_' || byte.is_ascii_alphabetic() => {
                 let start = pos;
@@ -1240,7 +1237,7 @@ fn driver_assembler_include_dirs(
     Ok(include_dirs)
 }
 
-pub(crate) fn assembler_include_dirs(parsed_args: &ParsedArguments, cwd: &Path) -> Vec<PathBuf> {
+pub(super) fn assembler_include_dirs(parsed_args: &ParsedArguments, cwd: &Path) -> Vec<PathBuf> {
     let mut include_dirs = preprocessor_assembler_include_dirs(parsed_args, cwd);
     if let Ok(driver_dirs) = driver_assembler_include_dirs(parsed_args, cwd) {
         include_dirs.extend(driver_dirs);
