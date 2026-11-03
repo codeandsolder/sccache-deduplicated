@@ -3624,7 +3624,7 @@ dependencies = [
  "walkdir",
  "which",
  "windows-sys 0.61.2",
- "zip 8.6.0",
+ "zip",
  "zstd",
 ]
 
@@ -4190,7 +4190,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "url",
- "zip 9.1.2",
+ "zip",
 ]
 
 [[package]]
@@ -5173,18 +5173,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
-]
-
-[[package]]
-name = "zip"
-version = "8.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
-dependencies = [
- "crc32fast",
- "indexmap",
- "memchr",
- "typed-path 0.12.4",
 ]
 
 [[package]]

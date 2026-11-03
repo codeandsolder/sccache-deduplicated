@@ -122,7 +122,7 @@ uuid = { version = "1.9", features = ["v4"] }
 walkdir = "2"
 # by default which pulls in an outdated failure version
 which = { version = "8", default-features = false, features = ["real-sys"] }
-zip = { version = "8", default-features = false }
+zip = { version = "9", default-features = false }
 zstd = "0.14"
 
 # dist-server only
