@@ -73,18 +73,6 @@ use crate::compiler::PreprocessorCacheEntry;
 ))]
 use crate::config::{self, CacheType};
 use crate::config::{Config, PreprocessorCacheModeConfig};
-#[cfg(any(
-    feature = "azure",
-    feature = "cos",
-    feature = "gcs",
-    feature = "gha",
-    feature = "memcached",
-    feature = "oss",
-    feature = "redis",
-    feature = "s3",
-    feature = "webdav",
-))]
-use anyhow::Context as _;
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
