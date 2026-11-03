@@ -3617,7 +3617,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tower-service",
- "typed-path 0.12.4",
+ "typed-path 0.13.0",
  "url",
  "uuid",
  "version-compare",
