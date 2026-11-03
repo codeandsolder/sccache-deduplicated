@@ -409,6 +409,8 @@ where
 /// Normal dep-info starts with `<target>: <prerequisites>`. With
 /// `-Zdep-info-omit-d-target`, rustc emits only leading phony prerequisite rules.
 fn dep_info_prerequisites(dep_info: &str) -> Result<Vec<String>> {
+    const MAX_LEN: usize = 200;
+
     if dep_info.trim().is_empty() {
         bail!("dep-info written by rustc is empty");
     }
@@ -424,7 +426,6 @@ fn dep_info_prerequisites(dep_info: &str) -> Result<Vec<String>> {
             .collect());
     }
 
-    const MAX_LEN: usize = 200;
     let first_line = match first.char_indices().nth(MAX_LEN) {
         Some((i, _)) => format!("{}...", &first[..i]),
         None => first.to_owned(),
@@ -438,7 +439,7 @@ fn dep_info_prerequisites(dep_info: &str) -> Result<Vec<String>> {
 fn split_make_prerequisite_spellings(prerequisites: &str) -> Vec<String> {
     let mut deps = Vec::new();
     let mut current = String::new();
-    let mut iter = prerequisites.chars().peekable();
+    let mut iter = prerequisites.chars();
     loop {
         match iter.next() {
             Some('\\') => {
