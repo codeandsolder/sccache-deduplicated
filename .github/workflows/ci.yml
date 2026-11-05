@@ -41,7 +41,7 @@ jobs:
           toolchain: ${{ startsWith(github.ref, 'refs/tags/') && '1.91.0' || '1.99.0' }}
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@0188eacbbff0836d0b5eca53b6cad4355adecd9e # main
         with:
           rust-toolchain: ${{ startsWith(github.ref, 'refs/tags/') && '1.91.0' || '1.99.0' }}
 
@@ -54,7 +54,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@0188eacbbff0836d0b5eca53b6cad4355adecd9e # main
 
   check_features:
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
@@ -74,7 +74,7 @@ jobs:
           toolchain: "1.99.0"
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@0188eacbbff0836d0b5eca53b6cad4355adecd9e # main
         with:
           rust-toolchain: "1.99.0"
 
@@ -87,7 +87,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@0188eacbbff0836d0b5eca53b6cad4355adecd9e # main
 
   host_tools:
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
@@ -172,7 +172,7 @@ jobs:
           components: llvm-tools-preview
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@0188eacbbff0836d0b5eca53b6cad4355adecd9e # main
         with:
           rust-toolchain: ${{ matrix.rustc || 'stable' }}
 
@@ -282,14 +282,14 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@0188eacbbff0836d0b5eca53b6cad4355adecd9e # main
 
   shared-sccache:
     name: Linux tests (runner-local sccache)
     # Single current-Rust Linux lane on every PR and main push.
     permissions:
       contents: read
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@0188eacbbff0836d0b5eca53b6cad4355adecd9e # main
     with:
       isolate-public-sccache-server: true
       command: |
@@ -320,7 +320,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@0188eacbbff0836d0b5eca53b6cad4355adecd9e # main
         with:
           rust-toolchain: ${{ matrix.target == 'aarch64-apple-darwin' && 'beta' || matrix.target == 's390x-unknown-linux-musl' && 'nightly' || '1.99.0' }}
 
@@ -383,7 +383,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@0188eacbbff0836d0b5eca53b6cad4355adecd9e # main
 
       # Workaround for the lack of substring() function in github actions expressions.
       - name: Id
