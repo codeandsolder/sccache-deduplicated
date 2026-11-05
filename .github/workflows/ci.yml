@@ -265,14 +265,25 @@ jobs:
     # Single current-Rust Linux lane on every PR and main push.
     permissions:
       contents: read
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@c820b3993f7628611d84cfeb678898212463f3fd # main
     with:
+      isolate-public-sccache-server: true
       command: |
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends gcc clang
-        # Preserve the previous routine Linux unit/binary/integration test coverage.
-        # Full external-backend integration workflows remain release-only.
-        cargo +1.99.1 test --locked --lib --bins --tests
+        # Compile with the canonical CI sccache daemon on its isolated Unix socket.
+        # Run test executables without that socket variable: the sccache system
+        # tests must manage their own independent test daemon.
+        test_runner="$RUNNER_TEMP/sccache-test-runner"
+        cat > "$test_runner" <<'RUNNER'
+        #!/usr/bin/env bash
+        set -euo pipefail
+        unset SCCACHE_SERVER_UDS SCCACHE_SERVER_PORT
+        exec "$@"
+        RUNNER
+        chmod +x "$test_runner"
+        export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$test_runner"
+        cargo +1.99.1 test --locked --target x86_64-unknown-linux-gnu --lib --bins --tests
       rust-toolchain: "1.99.1"
       rustflags: "-C target-cpu=x86-64-v2"
 
