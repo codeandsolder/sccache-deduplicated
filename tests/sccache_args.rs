@@ -9,7 +9,7 @@ use anyhow::Result;
 #[cfg(any(feature = "gcs", feature = "s3"))]
 use assert_cmd::prelude::*;
 #[cfg(any(feature = "gcs", feature = "s3"))]
-use helpers::{SCCACHE_BIN, stop_sccache};
+use helpers::stop_sccache;
 #[cfg(any(feature = "gcs", feature = "s3"))]
 use predicates::prelude::*;
 #[cfg(any(feature = "gcs", feature = "s3"))]
@@ -24,7 +24,7 @@ fn test_gcp_arg_check() -> Result<()> {
     log::trace!("sccache with log");
     stop_sccache()?;
 
-    let mut cmd = Command::new(SCCACHE_BIN.as_os_str());
+    let mut cmd = helpers::test_sccache_command();
     cmd.arg("--start-server")
         .env("SCCACHE_LOG", "debug")
         .env("SCCACHE_GCS_KEY_PATH", "foo.json");
@@ -35,7 +35,7 @@ fn test_gcp_arg_check() -> Result<()> {
 
     stop_sccache()?;
 
-    let mut cmd = Command::new(SCCACHE_BIN.as_os_str());
+    let mut cmd = helpers::test_sccache_command();
     cmd.arg("--start-server")
         .env("SCCACHE_LOG", "debug")
         .env("SCCACHE_GCS_OAUTH_URL", "http://127.0.0.1");
@@ -45,7 +45,7 @@ fn test_gcp_arg_check() -> Result<()> {
     ));
 
     stop_sccache()?;
-    let mut cmd = Command::new(SCCACHE_BIN.as_os_str());
+    let mut cmd = helpers::test_sccache_command();
     cmd.arg("--start-server")
         .env("SCCACHE_LOG", "debug")
         .env("SCCACHE_GCS_BUCKET", "b")
@@ -66,7 +66,7 @@ fn test_gcp_arg_check() -> Result<()> {
 fn test_s3_invalid_args() -> Result<()> {
     stop_sccache()?;
 
-    let mut cmd = Command::new(SCCACHE_BIN.as_os_str());
+    let mut cmd = helpers::test_sccache_command();
     cmd.arg("--start-server")
         .env("SCCACHE_LOG", "debug")
         .env("SCCACHE_BUCKET", "test")
