@@ -275,12 +275,7 @@ jobs:
         # Run test executables without that socket variable: the sccache system
         # tests must manage their own independent test daemon.
         test_runner="$RUNNER_TEMP/sccache-test-runner"
-        cat > "$test_runner" <<'RUNNER'
-        #!/usr/bin/env bash
-        set -euo pipefail
-        unset SCCACHE_SERVER_UDS SCCACHE_SERVER_PORT
-        exec "$@"
-        RUNNER
+        printf '%s\\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'unset SCCACHE_SERVER_UDS SCCACHE_SERVER_PORT' 'exec "$@"' > "$test_runner"
         chmod +x "$test_runner"
         export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$test_runner"
         cargo +1.99.1 test --locked --target x86_64-unknown-linux-gnu --lib --bins --tests
