@@ -689,10 +689,10 @@ rollback() {
         worker_draining=0
     fi
 
-    if (( client_update_required )) && [[ -e "$backup_dir/sccache" ]]; then
+    if (( client_services_touched )) && [[ -e "$backup_dir/sccache" ]]; then
         install -o root -g root -m 0755 "$backup_dir/sccache" "$LIVE"
     fi
-    if (( apply_dist_update )) && [[ -e "$backup_dir/sccache-dist" ]]; then
+    if (( dist_services_touched )) && [[ -e "$backup_dir/sccache-dist" ]]; then
         install -o root -g root -m 0755 "$backup_dir/sccache-dist" "$DIST_LIVE"
     fi
 
