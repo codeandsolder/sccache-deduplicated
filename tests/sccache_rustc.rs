@@ -18,9 +18,14 @@ use std::{
 struct StopServer;
 impl Drop for StopServer {
     fn drop(&mut self) {
-        let _ = Command::from_std(std::process::Command::new(env!("CARGO_BIN_EXE_sccache")))
-            .arg("--stop-server")
-            .ok();
+        let _ = Command::from_std({
+            let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_sccache"));
+            cmd.env_remove("SCCACHE_SERVER_PORT")
+                .env_remove("SCCACHE_SERVER_UDS");
+            cmd
+        })
+        .arg("--stop-server")
+        .ok();
     }
 }
 
@@ -147,6 +152,8 @@ fn run_sccache(root: &Path, path: &Path) {
         .current_dir(root)
         .env("PATH", paths)
         .env("SCCACHE_DIR", root.join("sccache"))
+        .env_remove("SCCACHE_SERVER_PORT")
+        .env_remove("SCCACHE_SERVER_UDS")
         .arg("rustc")
         .arg("RUST_FILE.rs")
         .arg("--crate-name=sccache_rustc_tests")

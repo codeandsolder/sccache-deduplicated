@@ -5,8 +5,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 # If you want to add integration tests for linux-based binary,
 # please, use the following files:
 # - tests/integration/Makefile
@@ -31,10 +31,19 @@ jobs:
         uses: ./.github/actions/rust-toolchain
         with:
           toolchain: "1.99.0"
+      - name: Setup mandatory compiler sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
+        with:
+          rust-toolchain: "1.99.0"
 
       - name: Build
         run: |
           cargo build --all-features
+
+      - name: Finalize mandatory compiler sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
+
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -89,7 +98,7 @@ jobs:
 
     env:
       SCCACHE_GHA_ENABLED: "on"
-      RUSTC_WRAPPER: /home/runner/.cargo/bin/sccache
+      SCCACHE_SERVER_PORT: "44226"
 
     steps:
       - name: Clone repository
@@ -106,6 +115,10 @@ jobs:
         uses: ./.github/actions/rust-toolchain
         with:
           toolchain: "1.99.0"
+      - name: Setup mandatory compiler sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
+        with:
+          rust-toolchain: "1.99.0"
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -113,24 +126,39 @@ jobs:
           path: /home/runner/.cargo/bin/
       - name: Chmod for binary
         run: chmod +x ${SCCACHE_PATH}
+      - name: Select the test-built GHA cache wrapper
+        shell: bash
+        run: echo "RUSTC_WRAPPER=$SCCACHE_PATH" >> "$GITHUB_ENV"
 
       - name: Test
+        env:
+          SCCACHE_SERVER_PORT: "4226"
         run: cargo clean && cargo build
 
       - name: Output
+        env:
+          SCCACHE_SERVER_PORT: "4226"
         run: |
           ${SCCACHE_PATH} --show-stats
 
           ${SCCACHE_PATH} --show-stats | grep gha
 
       - name: Test Twice for Cache Read
+        env:
+          SCCACHE_SERVER_PORT: "4226"
         run: cargo clean && cargo build
 
       - name: Output
+        env:
+          SCCACHE_SERVER_PORT: "4226"
         run: |
           ${SCCACHE_PATH} --show-stats
 
           ${SCCACHE_PATH} --show-stats | grep -e "Cache hits\s*[1-9]"
+
+      - name: Finalize mandatory compiler sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
 
   test-mock-msvc:
     if: startsWith(github.ref, 'refs/tags/')
@@ -139,6 +167,7 @@ jobs:
       TARGET: x86_64-pc-windows-msvc
       SCCACHE_EXE: ${{ github.workspace }}\\target\\x86_64-pc-windows-msvc\\debug\\sccache.exe
       SCCACHE_LOG: "debug"
+      SCCACHE_SERVER_PORT: "44226"
       SCCACHE_ERROR_LOG: "${{ github.workspace }}\\server_log.txt"
 
     steps:
@@ -152,9 +181,20 @@ jobs:
         with:
           toolchain: "1.99.0"
           target: $TARGET
+      - name: Setup mandatory compiler sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
+        with:
+          rust-toolchain: "1.99.0"
 
       - name: Build
         run: cargo build --bin sccache --target $env:TARGET --features=vendored-openssl
+
+      - name: Finalize mandatory compiler sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
+      - name: Use test-owned Windows cache daemon port
+        shell: pwsh
+        run: '"SCCACHE_SERVER_PORT=4226" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
 
       - name: Compile MSVC (no cache)
         shell: bash
@@ -231,6 +271,7 @@ jobs:
     env:
       # SCCACHE_GHA_ENABLED: "on"
       ROCM_PATH: "/opt/rocm"
+      SCCACHE_SERVER_PORT: "44226"
       RANDOMIZE_READDIR_LOG: "/tmp/readdir.log"
 
     steps:
@@ -253,6 +294,11 @@ jobs:
       #     script: |
       #       core.exportVariable('ROCM_PATH', process.env.ROCM_PATH || '');
 
+      - name: Setup mandatory compiler sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
+        with:
+          rust-toolchain: "1.99.0"
+
       - name: Install dependencies
         shell: bash
         run: |
@@ -270,6 +316,13 @@ jobs:
       - name: Build & setup librandomize_readdir
         run: |
           cargo build -p randomize_readdir
+
+      - name: Finalize mandatory compiler sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
+      - name: Switch to test-owned HIP compiler cache daemon port
+        shell: bash
+        run: echo "SCCACHE_SERVER_PORT=4226" >> "$GITHUB_ENV"
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -323,6 +376,7 @@ jobs:
     runs-on: macos-latest
     env:
       SCCACHE_PATH: target/debug/sccache
+      SCCACHE_SERVER_PORT: "44226"
     steps:
       - name: Clone repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -331,10 +385,21 @@ jobs:
         uses: ./.github/actions/rust-toolchain
         with:
           toolchain: "1.99.0"
+      - name: Setup mandatory compiler sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
+        with:
+          rust-toolchain: "1.99.0"
 
       - name: Build sccache
         run: |
           cargo build
+
+      - name: Finalize mandatory compiler sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
+      - name: Switch to test-owned Xcode compiler cache daemon port
+        shell: bash
+        run: echo "SCCACHE_SERVER_PORT=4226" >> "$GITHUB_ENV"
 
       - name: Start server
         run: ${SCCACHE_PATH} --start-server
