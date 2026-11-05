@@ -67,6 +67,8 @@ jobs:
     if: needs.required-gates.outputs.ready == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 45
+    env:
+      RUSTFLAGS: "-C target-cpu=x86-64-v2"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -86,11 +88,13 @@ jobs:
         run: |
           set -euo pipefail
           rustup toolchain install 1.99.0 --profile minimal
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
+        with:
+          rust-toolchain: "1.99.0"
 
       - name: Build CI client + dist worker
         shell: bash
-        env:
-          RUSTFLAGS: "-C target-cpu=x86-64-v2"
         run: |
           set -euo pipefail
           cargo +1.99.0 build --release --locked \
@@ -111,6 +115,10 @@ jobs:
             echo "rollout_epoch=2"
             echo "capabilities=$(target/release/sccache --capabilities | paste -sd, -)"
           } > dist/build.txt
+
+      - name: Finalize mandatory sccache before publishing binaries
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
 
       - name: Publish immutable release
         shell: bash
