@@ -16,6 +16,19 @@ pub static CARGO: LazyLock<OsString> = LazyLock::new(|| std::env::var_os("CARGO"
 pub static SCCACHE_BIN: LazyLock<&Path> =
     LazyLock::new(|| Path::new(env!("CARGO_BIN_EXE_sccache")));
 
+/// Use the test-owned server endpoint, not an inherited CI compiler-cache daemon.
+///
+/// The canonical CI compiler cache can use a separate TCP port or Unix socket.
+/// System tests deliberately start and stop their own daemon and must never
+/// accidentally stop that externally managed compiler cache.
+#[must_use]
+pub fn test_sccache_command() -> Command {
+    let mut cmd = Command::new(SCCACHE_BIN.as_os_str());
+    cmd.env_remove("SCCACHE_SERVER_PORT")
+        .env_remove("SCCACHE_SERVER_UDS");
+    cmd
+}
+
 /// Ensures the logger is only initialized once. Panics if initialization fails.
 static LOGGER: LazyLock<Result<(), Infallible>> = LazyLock::new(|| {
     env_logger::Builder::new()
@@ -61,7 +74,7 @@ impl SccacheTest<'_> {
 
         trace!("sccache --start-server");
 
-        Command::new(SCCACHE_BIN.as_os_str())
+        test_sccache_command()
             .arg("--start-server")
             .env("SCCACHE_DIR", &cache_dir)
             .assert()
@@ -92,7 +105,7 @@ impl SccacheTest<'_> {
     pub fn show_stats(&self) -> Result<assert_cmd::assert::Assert> {
         trace!("sccache --show-stats");
 
-        Command::new(SCCACHE_BIN.as_os_str())
+        test_sccache_command()
             .args(["--show-stats", "--stats-format=json"])
             .assert()
             .try_success()
@@ -108,7 +121,7 @@ impl SccacheTest<'_> {
 
         trace!("sccache {cmd}");
 
-        Command::new(SCCACHE_BIN.as_os_str())
+        test_sccache_command()
             .args([cmd, "--stats-format=text"])
             .assert()
             .try_success()
@@ -127,7 +140,7 @@ impl Drop for SccacheTest<'_> {
 pub fn stop_sccache() -> Result<()> {
     trace!("sccache --stop-server");
 
-    Command::new(SCCACHE_BIN.as_os_str())
+    test_sccache_command()
         .arg("--stop-server")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
