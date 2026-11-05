@@ -24,8 +24,8 @@ impl Drop for StopServer {
                 .env_remove("SCCACHE_SERVER_UDS");
             cmd
         })
-            .arg("--stop-server")
-            .ok();
+        .arg("--stop-server")
+        .ok();
     }
 }
 
