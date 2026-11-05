@@ -7,12 +7,13 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
     name: ${{ matrix.component }} ${{ matrix.os }}
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ${{ matrix.os }}
     env:
       RUSTFLAGS: ${{ startsWith(github.ref, 'refs/tags/') && '' || '-C target-cpu=x86-64-v2' }}
@@ -47,6 +48,7 @@ jobs:
         run: cargo ${{ matrix.cargo_cmd }}
 
   check_features:
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: ${{ startsWith(github.ref, 'refs/tags/') && '' || '-C target-cpu=x86-64-v2' }}
@@ -70,6 +72,7 @@ jobs:
         run: cargo test --locked --no-default-features --features=dist-server --bin sccache-dist scheduler_tests
 
   host_tools:
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     steps:
       - name: Clone repository
@@ -107,6 +110,7 @@ jobs:
           PY
 
   toml_format:
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     steps:
       - name: Clone repository
@@ -119,6 +123,7 @@ jobs:
 
   test:
     name: test ${{ matrix.os }} rust ${{ matrix.rustc || 'stable' }} ${{ matrix.extra_desc }}
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.allow_failure || false }}
     timeout-minutes: 30
@@ -257,22 +262,29 @@ jobs:
 
   shared-sccache:
     name: Linux tests (runner-local sccache)
-    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    # Single current-Rust Linux lane on every PR and main push.
     permissions:
       contents: read
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@b2414c5358d1061e9b442656298506e98c9d13e7 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@23b86d2eeed31f7893c34e942c32cf6555299dbb # main
     with:
+      isolate-public-sccache-server: true
       command: |
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends gcc clang
-        # Integration tests start/stop their own sccache server and are covered by the
-        # normal CI test job; keep this lane focused on cacheable compilation/unit tests.
-        cargo +1.99.0 test --locked --lib --bins
-      rust-toolchain: "1.99.0"
+        # Compile with the canonical CI sccache daemon on its isolated Unix socket.
+        # Run test executables without that socket variable: the sccache system
+        # tests must manage their own independent test daemon.
+        test_runner="$RUNNER_TEMP/sccache-test-runner"
+        printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'unset SCCACHE_SERVER_UDS SCCACHE_SERVER_PORT' 'exec "$@"' > "$test_runner"
+        chmod +x "$test_runner"
+        export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$test_runner"
+        cargo +1.99.1 test --locked --target x86_64-unknown-linux-gnu --lib --bins --tests
+      rust-toolchain: "1.99.1"
       rustflags: "-C target-cpu=x86-64-v2"
 
   build:
     name: build ${{ matrix.binary || 'sccache' }} ${{ matrix.target }}
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ${{ matrix.os }}
     container: ${{ fromJson(matrix.container || '{"image":null}') }}
     timeout-minutes: 30

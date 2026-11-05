@@ -2,7 +2,8 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended",
-    "helpers:pinGitHubActionDigests"
+    "helpers:pinGitHubActionDigests",
+    "github>codeandsolder/ci-workflows:renovate-ci-trust-root"
   ],
   "forkProcessing": "enabled",
   "dependencyDashboard": true,
@@ -100,6 +101,19 @@
       ],
       "groupName": "GitHub Actions tooling",
       "groupSlug": "github-actions-tooling",
+      "automerge": false
+    },
+    {
+      "description": "Shared CI trust roots remain independent of generic GitHub Actions grouping and age policy",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchPackageNames": [
+        "/^codeandsolder\\/(?:ci-workflows|rust-skills2)(?:\\/|$)/"
+      ],
+      "minimumReleaseAge": null,
+      "groupName": "Shared CI trust roots",
+      "groupSlug": "shared-ci-trust-roots",
       "automerge": false
     }
   ]
