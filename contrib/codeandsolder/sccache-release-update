@@ -13,6 +13,8 @@ NATIVE_ROOT_SERVICE="${SCCACHE_AUTOUPDATE_NATIVE_ROOT_SERVICE:-sccache-native-ro
 OPENWRT_ROOT_SERVICE="${SCCACHE_AUTOUPDATE_OPENWRT_ROOT_SERVICE:-sccache-openwrt-root.service}"
 STRICT_LOCAL_SERVICE="${SCCACHE_AUTOUPDATE_STRICT_LOCAL_SERVICE:-sccache-strict-local.service}"
 DIST_SERVICE="${SCCACHE_AUTOUPDATE_DIST_SERVICE:-sccache-dist-worker.service}"
+DIST_WORKER_CONFIG="${SCCACHE_AUTOUPDATE_DIST_WORKER_CONFIG:-/etc/sccache-dist/server.conf}"
+WORKER_DRAIN_SECONDS="${SCCACHE_AUTOUPDATE_WORKER_DRAIN_SECONDS:-180}"
 SCHEDULER_SERVICE="${SCCACHE_AUTOUPDATE_SCHEDULER_SERVICE:-sccache-dist-scheduler.service}"
 DIST_SERVICES=("$DIST_SERVICE")
 if [[ "$SCHEDULER_SERVICE" != "$DIST_SERVICE" ]]; then
@@ -470,6 +472,21 @@ dist_num_servers() {
     dist_status_value num_servers
 }
 
+# A future compatible scheduler accepts authenticated worker-scoped drains.
+# The candidate binary knows its own worker identity and auth; do not parse
+# credentials from a config file in shell or expose them in process argv.
+worker_drain() {
+    local mode="$1"
+    "$release_dir/sccache-dist-linux-x86_64-v2" worker-drain         --config "$DIST_WORKER_CONFIG" "$mode"
+}
+
+worker_drain_remaining() {
+    local status
+    status="$(worker_drain status)" || return 1
+    [[ "$status" =~ ^draining=true[[:space:]]in_progress=([0-9]+)$ ]] || return 1
+    printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
 dist_success_total() {
     local_sccache --show-stats --stats-format=json 2>/dev/null |
         python3 -c 'import json,sys
@@ -538,6 +555,8 @@ for service in "${DIST_SERVICES[@]}"; do
 done
 dist_was_active=0
 dist_deferred=0
+worker_only_dist_update=0
+worker_draining=0
 apply_dist_update=$dist_update_required
 current_dist_protocol=""
 if [[ -r "$STATE_DIR/dist_protocol" && -r "$STATE_DIR/dist_sha256" ]] &&
@@ -552,18 +571,33 @@ fi
 if (( ${#ACTIVE_DIST_SERVICES[@]} > 0 )); then
     dist_was_active=1
     if (( dist_update_required )); then
-        if ! dist_busy="$(dist_in_progress)"; then
-            echo "sccache-release-update: cannot verify scheduler activity; deferring dist update" >&2
+        if [[ -n "$current_dist_protocol" && "$current_dist_protocol" != "$dist_protocol" ]]; then
+            echo "sccache-release-update: incompatible distributed protocol requires a coordinated fleet drain" >&2
             exit 0
         fi
-        if (( dist_busy > 0 )); then
-            if [[ -n "$current_dist_protocol" && "$current_dist_protocol" == "$dist_protocol" ]]; then
+        if systemctl is-active --quiet "$DIST_SERVICE" &&
+           ! systemctl is-active --quiet "$SCHEDULER_SERVICE"; then
+            # A worker-only host can update without waiting for unrelated
+            # scheduler jobs. Confirm the candidate's authenticated
+            # per-worker status endpoint is available before planning.
+            if worker_drain status >/dev/null 2>&1; then
+                worker_only_dist_update=1
+            else
                 dist_deferred=1
                 apply_dist_update=0
-                echo "sccache-release-update: $dist_busy distributed compile(s) active; rolling compatible client independently and deferring dist update"
-            else
-                echo "sccache-release-update: $dist_busy distributed compile(s) active and protocol changes ${current_dist_protocol:-unknown} -> $dist_protocol; deferring full update"
+                echo "sccache-release-update: worker-scoped drain unavailable; deferring worker update"
+            fi
+        else
+            # Updating the scheduler still needs a *global* zero-job barrier.
+            # Never replace its state while any distributed work is active.
+            if ! dist_busy="$(dist_in_progress)"; then
+                echo "sccache-release-update: cannot verify scheduler activity; deferring dist update" >&2
                 exit 0
+            fi
+            if (( dist_busy > 0 )); then
+                dist_deferred=1
+                apply_dist_update=0
+                echo "sccache-release-update: $dist_busy distributed compile(s) active; deferring scheduler update"
             fi
         fi
     fi
@@ -610,13 +644,15 @@ if (( client_update_required == 0 && dist_deferred == 1 )); then
     echo "sccache-release-update: client already at $tag; distributed binary remains deferred"
     exit 0
 fi
-if active_clients; then
+if (( client_update_required )) && active_clients; then
     echo "sccache-release-update: active compiler clients; deferring update"
     exit 0
 fi
 
 backup_dir="$STATE_DIR/backups/$(date -u +%Y%m%dT%H%M%SZ)-${live_sha:-none}"
 smoke=""
+client_services_touched=0
+dist_services_touched=0
 mkdir -p "$backup_dir"
 [[ -e "$LIVE" ]] && cp -a "$LIVE" "$backup_dir/sccache"
 [[ -e "$DIST_LIVE" ]] && cp -a "$DIST_LIVE" "$backup_dir/sccache-dist"
@@ -628,7 +664,7 @@ rollback() {
     trap - EXIT INT TERM
     echo "sccache-release-update: update failed (rc=$rc), rolling back" >&2
 
-    if (( client_update_required )); then
+    if (( client_services_touched )); then
         if (( root_local_was_active )); then
             systemctl stop "$ROOT_LOCAL_SERVICE" >/dev/null 2>&1 || true
         fi
@@ -643,22 +679,26 @@ rollback() {
         fi
         systemctl stop "$LOCAL_SERVICE" >/dev/null 2>&1 || true
     fi
-    if (( dist_was_active && apply_dist_update )); then
+    if (( dist_services_touched )); then
         for service in "${ACTIVE_DIST_SERVICES[@]}"; do
             systemctl stop "$service" >/dev/null 2>&1 || true
         done
     fi
+    if (( worker_draining )); then
+        worker_drain cancel >/dev/null 2>&1 || true
+        worker_draining=0
+    fi
 
-    if (( client_update_required )) && [[ -e "$backup_dir/sccache" ]]; then
+    if (( client_services_touched )) && [[ -e "$backup_dir/sccache" ]]; then
         install -o root -g root -m 0755 "$backup_dir/sccache" "$LIVE"
     fi
-    if (( apply_dist_update )) && [[ -e "$backup_dir/sccache-dist" ]]; then
+    if (( dist_services_touched )) && [[ -e "$backup_dir/sccache-dist" ]]; then
         install -o root -g root -m 0755 "$backup_dir/sccache-dist" "$DIST_LIVE"
     fi
 
     # Restore the scheduler before a reverted client so the client does not
     # enter reconnect backoff against a scheduler that is still down.
-    if (( dist_was_active && apply_dist_update )); then
+    if (( dist_services_touched )); then
         for ((i=${#ACTIVE_DIST_SERVICES[@]}-1; i>=0; i--)); do
             systemctl start "${ACTIVE_DIST_SERVICES[i]}" >/dev/null 2>&1 || true
         done
@@ -667,7 +707,7 @@ rollback() {
             sleep 0.05
         done
     fi
-    if (( client_update_required )); then
+    if (( client_services_touched )); then
         systemctl start "$LOCAL_SERVICE" >/dev/null 2>&1 || true
         if (( root_local_was_active )); then
             systemctl start "$ROOT_LOCAL_SERVICE" >/dev/null 2>&1 || true
@@ -688,35 +728,66 @@ rollback() {
 }
 trap rollback EXIT INT TERM
 
-touch "$DRAIN"
-# A client may have crossed the idle check just before the marker appeared.
-for _ in $(seq 1 120); do
-    active_clients || break
-    sleep 0.25
-done
-if active_clients; then
-    echo "sccache-release-update: client did not drain within 30s; deferring" >&2
-    rm -f "$DRAIN"
-    trap - EXIT INT TERM
-    exit 0
+if (( client_update_required )); then
+    touch "$DRAIN"
+    # A client may have crossed the idle check just before the marker appeared.
+    for _ in $(seq 1 120); do
+        active_clients || break
+        sleep 0.25
+    done
+    if active_clients; then
+        echo "sccache-release-update: client did not drain within 30s; deferring" >&2
+        rm -f "$DRAIN"
+        trap - EXIT INT TERM
+        exit 0
+    fi
 fi
 
 # Recheck distributed activity immediately before stopping the scheduler. This
 # closes the normal timer race as far as possible without interrupting a known
 # in-flight remote compilation.
 if (( dist_was_active && apply_dist_update )); then
-    if ! dist_busy="$(dist_in_progress)"; then
-        echo "sccache-release-update: cannot recheck scheduler activity; deferring update" >&2
-        rm -f "$DRAIN"
-        trap - EXIT INT TERM
-        exit 0
+    if (( worker_only_dist_update )); then
+        # A request can take effect even if its HTTP response is lost.
+        # Arm cancellation *before* sending it; rollback must not stop
+        # services that have not been touched.
+        worker_draining=1
+        worker_drain start >/dev/null
+        # Every reservation belongs to the worker before it is handed out.
+        # The scheduler now rejects new reservations on this worker, so zero
+        # is stable even with ongoing traffic on the remaining workers.
+        deadline=$((SECONDS + WORKER_DRAIN_SECONDS))
+        while true; do
+            remaining="$(worker_drain_remaining)" || {
+                echo "sccache-release-update: lost worker drain status" >&2
+                exit 1
+            }
+            (( remaining == 0 )) && break
+            if (( SECONDS >= deadline )); then
+                echo "sccache-release-update: timed out draining $remaining worker job(s); restoring admission"
+                worker_drain cancel >/dev/null 2>&1 || true
+                worker_draining=0
+                rm -f "$DRAIN"
+                trap - EXIT INT TERM
+                exit 0
+            fi
+            sleep 1
+        done
+    else
+        if ! dist_busy="$(dist_in_progress)"; then
+            echo "sccache-release-update: cannot recheck scheduler activity; deferring update" >&2
+            rm -f "$DRAIN"
+            trap - EXIT INT TERM
+            exit 0
+        fi
+        if (( dist_busy > 0 )); then
+            echo "sccache-release-update: $dist_busy distributed compile(s) became active; deferring update"
+            rm -f "$DRAIN"
+            trap - EXIT INT TERM
+            exit 0
+        fi
     fi
-    if (( dist_busy > 0 )); then
-        echo "sccache-release-update: $dist_busy distributed compile(s) became active; deferring update"
-        rm -f "$DRAIN"
-        trap - EXIT INT TERM
-        exit 0
-    fi
+    dist_services_touched=1
     stop_dist_services
 fi
 
@@ -726,6 +797,18 @@ if (( apply_dist_update )); then
 
     if (( dist_was_active )); then
         start_dist_services
+        if (( worker_only_dist_update )); then
+            # A new worker nonce replaces the drained registration. Poll
+            # admission state until its heartbeat has reached the scheduler.
+            for _ in $(seq 1 100); do
+                if [[ "$(worker_drain status 2>/dev/null || true)" == "draining=false in_progress=0" ]]; then
+                    break
+                fi
+                sleep 0.1
+            done
+            [[ "$(worker_drain status)" == "draining=false in_progress=0" ]]
+            worker_draining=0
+        fi
         for _ in $(seq 1 100); do
             scheduler_ready >/dev/null 2>&1 && break
             sleep 0.05
@@ -742,6 +825,7 @@ if (( client_update_required )) && [[ ! -r "$STATE_DIR/source_sha" ]]; then
 fi
 
 if (( client_update_required )); then
+    client_services_touched=1
     if (( root_local_was_active )); then
         systemctl stop "$ROOT_LOCAL_SERVICE"
     fi
