@@ -270,9 +270,9 @@ jobs:
       command: |
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends gcc clang
-        # Integration tests start/stop their own sccache server and are covered by the
-        # normal CI test job; keep this lane focused on cacheable compilation/unit tests.
-        cargo +1.99.1 test --locked --lib --bins
+        # Preserve the previous routine Linux unit/binary/integration test coverage.
+        # Full external-backend integration workflows remain release-only.
+        cargo +1.99.1 test --locked --lib --bins --tests
       rust-toolchain: "1.99.1"
       rustflags: "-C target-cpu=x86-64-v2"
 
