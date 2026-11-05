@@ -29,6 +29,16 @@ pub fn test_sccache_command() -> Command {
     cmd
 }
 
+/// Test Cargo invocations compile through the test-built sccache binary,
+/// not an inherited CI compiler-cache endpoint.
+#[must_use]
+pub fn test_cargo_command() -> Command {
+    let mut cmd = Command::new(CARGO.as_os_str());
+    cmd.env_remove("SCCACHE_SERVER_PORT")
+        .env_remove("SCCACHE_SERVER_UDS");
+    cmd
+}
+
 /// Ensures the logger is only initialized once. Panics if initialization fails.
 static LOGGER: LazyLock<Result<(), Infallible>> = LazyLock::new(|| {
     env_logger::Builder::new()
@@ -150,7 +160,7 @@ pub fn stop_sccache() -> Result<()> {
 }
 
 pub fn cargo_clean(test_info: &SccacheTest) -> Result<()> {
-    Command::new(CARGO.as_os_str())
+    test_cargo_command()
         .args(["clean"])
         .envs(test_info.env.iter().cloned())
         .current_dir(CRATE_DIR.as_os_str())
