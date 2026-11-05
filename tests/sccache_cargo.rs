@@ -14,7 +14,6 @@ use helpers::SccacheTest;
 use predicates::prelude::*;
 use serial_test::serial;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 #[macro_use]
 extern crate log;
