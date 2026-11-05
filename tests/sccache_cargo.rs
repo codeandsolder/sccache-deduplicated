@@ -10,7 +10,7 @@ use helpers::{CARGO, CRATE_DIR, cargo_clean, stop_sccache};
 
 use assert_cmd::prelude::*;
 use fs_err as fs;
-use helpers::{SCCACHE_BIN, SccacheTest};
+use helpers::SccacheTest;
 use predicates::prelude::*;
 use serial_test::serial;
 use std::path::{Path, PathBuf};
@@ -49,7 +49,7 @@ fn test_rust_cargo_build_readonly() -> Result<()> {
 fn test_run_log_no_perm() -> Result<()> {
     trace!("sccache with log");
     stop_sccache()?;
-    let mut cmd = Command::new(SCCACHE_BIN.as_os_str());
+    let mut cmd = helpers::test_sccache_command();
     cmd.arg("gcc")
         .env("SCCACHE_ERROR_LOG", "/no-perm.log") // Should not work
         .env("SCCACHE_LOG", "debug");
@@ -71,7 +71,7 @@ fn test_run_log() -> Result<()> {
         .tempdir()
         .context("Failed to create tempdir")?;
     let tmppath = tempdir.path().join("perm.log");
-    let mut cmd = Command::new(SCCACHE_BIN.as_os_str());
+    let mut cmd = helpers::test_sccache_command();
     cmd.arg("--start-server")
         .env("SCCACHE_ERROR_LOG", &tmppath) // Should not work
         .env("SCCACHE_LOG", "debug");
@@ -198,7 +198,7 @@ fn restart_sccache(
 
     trace!("sccache --start-server");
 
-    let mut cmd = Command::new(SCCACHE_BIN.as_os_str());
+    let mut cmd = helpers::test_sccache_command();
     cmd.arg("--start-server");
     cmd.env("SCCACHE_DIR", &cache_dir);
 
