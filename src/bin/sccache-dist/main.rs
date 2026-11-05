@@ -11,7 +11,7 @@ use sccache::dist::{
     InputsReader, JobAlloc, JobAuthorizer, JobComplete, JobId, JobState, RunJobResult,
     SchedulerIncoming, SchedulerOutgoing, SchedulerStatusResult, ServerId, ServerIncoming,
     ServerNonce, ServerOutgoing, SubmitToolchainResult, TcCache, Toolchain, ToolchainReader,
-    UpdateJobStateResult,
+    UpdateJobStateResult, WorkerDrainStatus,
 };
 use sccache::util::BASE64_URL_SAFE_ENGINE;
 use sccache::util::daemonize;
@@ -261,6 +261,49 @@ fn run(command: Command) -> Result<i32> {
             unreachable!();
         }
 
+        Command::WorkerDrain(
+            server_config::Config {
+                public_addr,
+                scheduler_url,
+                scheduler_auth,
+                ..
+            },
+            mode,
+        ) => {
+            let server_id = ServerId::new(public_addr);
+            let token = match scheduler_auth {
+                server_config::SchedulerAuth::Insecure => {
+                    create_server_token(server_id, INSECURE_DIST_SERVER_TOKEN)
+                }
+                server_config::SchedulerAuth::Token { token } => {
+                    create_server_token(server_id, &token)
+                }
+                server_config::SchedulerAuth::JwtToken { token } => {
+                    let embedded_id = dangerous_insecure_extract_jwt_server_token(&token)
+                        .context("Could not decode scheduler auth jwt")?;
+                    if embedded_id != server_id {
+                        bail!("Worker JWT identity does not match configured public address");
+                    }
+                    token
+                }
+            };
+            let url = scheduler_url
+                .to_url()
+                .join(&format!("/api/v1/scheduler/worker_drain/{mode}"))?;
+            let status = reqwest::blocking::Client::new()
+                .post(url)
+                .bearer_auth(token)
+                .timeout(Duration::from_secs(8))
+                .send()?
+                .error_for_status()?
+                .json::<WorkerDrainStatus>()?;
+            println!(
+                "draining={} in_progress={}",
+                status.draining, status.in_progress
+            );
+            Ok(0)
+        }
+
         Command::Server(server_config::Config {
             builder,
             cache_dir,
@@ -449,6 +492,7 @@ struct ServerDetails {
     last_seen: Instant,
     last_error: Option<Instant>,
     num_cpus: usize,
+    draining: bool,
     server_nonce: ServerNonce,
     worker_name: Option<String>,
     job_authorizer: Box<dyn JobAuthorizer>,
@@ -611,6 +655,9 @@ impl SchedulerIncoming for Scheduler {
                 let mut best_load = f64::INFINITY;
                 let now = Instant::now();
                 for (&server_id, details) in servers.iter_mut() {
+                    if details.draining {
+                        continue;
+                    }
                     let Some(load) = load_weight(
                         details.jobs_assigned.len(),
                         details.num_cpus,
@@ -850,6 +897,7 @@ impl SchedulerIncoming for Scheduler {
                 jobs_assigned: HashSet::new(),
                 jobs_unclaimed: HashMap::new(),
                 num_cpus,
+                draining: false,
                 server_nonce,
                 worker_name: None,
                 job_authorizer,
@@ -974,6 +1022,28 @@ impl SchedulerIncoming for Scheduler {
         Ok(UpdateJobStateResult::Success)
     }
 
+    fn handle_set_worker_draining(
+        &self,
+        server_id: ServerId,
+        draining: Option<bool>,
+    ) -> Result<WorkerDrainStatus> {
+        let mut jobs = self.jobs.lock().unwrap();
+        let mut servers = self.servers.lock().unwrap();
+        self.prune_servers(&mut servers, &mut jobs);
+        let details = servers.get_mut(&server_id).ok_or_else(|| {
+            anyhow::anyhow!("worker {server_id:?} is not registered with the scheduler")
+        })?;
+        if let Some(draining) = draining {
+            details.draining = draining;
+        }
+        Ok(WorkerDrainStatus {
+            draining: details.draining,
+            // This includes in-flight reservations before their state is
+            // inserted into the job map, so zero is a safe restart barrier.
+            in_progress: details.jobs_assigned.len(),
+        })
+    }
+
     fn handle_is_draining(&self) -> bool {
         self.is_draining()
     }
@@ -987,7 +1057,11 @@ impl SchedulerIncoming for Scheduler {
 
         Ok(SchedulerStatusResult {
             num_servers: servers.len(),
-            num_cpus: servers.values().map(|v| v.num_cpus).sum(),
+            num_cpus: servers
+                .values()
+                .filter(|v| !v.draining)
+                .map(|v| v.num_cpus)
+                .sum(),
             in_progress: jobs.len(),
         })
     }
@@ -1208,6 +1282,98 @@ mod scheduler_tests {
             )
             .unwrap();
         assert!(matches!(allocation, AllocJobResult::Success { .. }));
+    }
+
+    #[test]
+    fn worker_drain_preserves_existing_job_and_other_workers() {
+        let scheduler = Scheduler::new();
+        let first: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let second: ServerId = "127.0.0.2:10501".parse().unwrap();
+        let old_nonce = ServerNonce::new();
+        scheduler
+            .handle_heartbeat_server(first, old_nonce, 8, Box::new(TestJobAuthorizer))
+            .unwrap();
+
+        let allocated = scheduler
+            .handle_alloc_job(
+                &AcceptAssign,
+                Toolchain {
+                    archive_id: "first".to_owned(),
+                },
+            )
+            .unwrap();
+        let AllocJobResult::Success { job_alloc, .. } = allocated else {
+            panic!("initial job was not allocated");
+        };
+        assert_eq!(job_alloc.server_id, first);
+
+        scheduler
+            .handle_heartbeat_server(second, ServerNonce::new(), 8, Box::new(TestJobAuthorizer))
+            .unwrap();
+        let drain = scheduler
+            .handle_set_worker_draining(first, Some(true))
+            .unwrap();
+        assert!(drain.draining);
+        assert_eq!(drain.in_progress, 1);
+        assert_eq!(scheduler.handle_status().unwrap().num_cpus, 8);
+        assert_eq!(
+            scheduler
+                .handle_set_worker_draining(first, None)
+                .unwrap()
+                .in_progress,
+            1
+        );
+
+        let next = scheduler
+            .handle_alloc_job(
+                &AcceptAssign,
+                Toolchain {
+                    archive_id: "second".to_owned(),
+                },
+            )
+            .unwrap();
+        let AllocJobResult::Success {
+            job_alloc: next_job,
+            ..
+        } = next
+        else {
+            panic!("other worker should remain available");
+        };
+        assert_eq!(next_job.server_id, second);
+
+        scheduler
+            .handle_update_job_state(job_alloc.job_id, first, JobState::Ready)
+            .unwrap();
+        scheduler
+            .handle_update_job_state(job_alloc.job_id, first, JobState::Started)
+            .unwrap();
+        scheduler
+            .handle_update_job_state(job_alloc.job_id, first, JobState::Complete)
+            .unwrap();
+        assert_eq!(
+            scheduler
+                .handle_set_worker_draining(first, None)
+                .unwrap()
+                .in_progress,
+            0
+        );
+
+        let replacement = ServerNonce::new();
+        scheduler
+            .handle_heartbeat_server(first, replacement, 8, Box::new(TestJobAuthorizer))
+            .unwrap();
+        assert!(
+            !scheduler
+                .handle_set_worker_draining(first, None)
+                .unwrap()
+                .draining
+        );
+        assert_eq!(scheduler.handle_status().unwrap().num_cpus, 16);
+        assert!(
+            scheduler
+                .handle_set_worker_draining("127.0.0.3:10501".parse().unwrap(), Some(true))
+                .is_err()
+        );
     }
 
     #[test]

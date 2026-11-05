@@ -779,6 +779,16 @@ pub struct SchedulerStatusResult {
     pub in_progress: usize,
 }
 
+/// An authenticated worker's drain state and all its assigned jobs,
+/// including reservations not yet sent to the worker.
+#[cfg(feature = "dist-server")]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerDrainStatus {
+    pub draining: bool,
+    pub in_progress: usize,
+}
+
 // SubmitToolchain
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -883,6 +893,15 @@ pub trait SchedulerIncoming: Send + Sync {
         server_id: ServerId,
         job_state: JobState,
     ) -> ExtResult<UpdateJobStateResult, Error>;
+    /// Called only for the bearer-authenticated worker matching the request IP.
+    /// Setting draining prevents new job reservations; the returned count
+    /// includes already-reserved and running jobs and must reach zero before
+    /// stopping or replacing that worker.
+    fn handle_set_worker_draining(
+        &self,
+        server_id: ServerId,
+        draining: Option<bool>,
+    ) -> ExtResult<WorkerDrainStatus, Error>;
     // From anyone
     fn handle_status(&self) -> ExtResult<SchedulerStatusResult, Error>;
     // Additive maintenance metadata. Existing scheduler implementations remain

@@ -24,6 +24,7 @@ pub enum Command {
     Auth(AuthSubcommand),
     Scheduler(config::scheduler::Config),
     Server(config::server::Config),
+    WorkerDrain(config::server::Config, String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
