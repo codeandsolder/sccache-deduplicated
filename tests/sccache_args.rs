@@ -14,7 +14,6 @@ use helpers::stop_sccache;
 use predicates::prelude::*;
 #[cfg(any(feature = "gcs", feature = "s3"))]
 use serial_test::serial;
-#[cfg(any(feature = "gcs", feature = "s3"))]
 
 #[test]
 #[serial]
