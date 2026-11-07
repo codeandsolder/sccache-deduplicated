@@ -620,12 +620,12 @@ where
     W: Write,
     S: Serialize,
 {
-    let bytes = bincode::serialize(&data)?;
-    let byte_len =
-        u32::try_from(bytes.len()).context("serialized payload exceeds u32 length prefix")?;
-    let mut len = [0; 4];
-    BigEndian::write_u32(&mut len, byte_len);
-    writer.write_all(&len)?;
+    // One write: with TCP_NODELAY, writing the length on its own would send it
+    // as a separate packet whenever the body overflows the caller's BufWriter.
+    let mut bytes = vec![0; 4];
+    bincode::serialize_into(&mut bytes, &data)?;
+    let len = u32::try_from(bytes.len() - 4).context("serialized payload exceeds u32 length prefix")?;
+    BigEndian::write_u32(&mut bytes[..4], len);
     writer.write_all(&bytes)?;
     writer.flush()?;
     Ok(())
@@ -2404,5 +2404,34 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_write_length_prefixed_bincode_single_write() {
+        use super::write_length_prefixed_bincode;
+        use byteorder::{BigEndian, ByteOrder};
+        use std::io::Write;
+
+        #[derive(Default)]
+        struct Writes(Vec<Vec<u8>>);
+        impl Write for Writes {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.push(buf.to_vec());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let data = vec![7u8; 20_000];
+        let mut writes = Writes::default();
+        write_length_prefixed_bincode(&mut writes, &data).unwrap();
+
+        assert_eq!(writes.0.len(), 1);
+        let frame = &writes.0[0];
+        let body = bincode::serialize(&data).unwrap();
+        assert_eq!(BigEndian::read_u32(&frame[..4]) as usize, body.len());
+        assert_eq!(&frame[4..], &body[..]);
     }
 }
