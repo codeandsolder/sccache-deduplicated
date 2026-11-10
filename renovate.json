@@ -1,19 +1,11 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended",
-    "helpers:pinGitHubActionDigests",
-    "github>codeandsolder/ci-workflows:renovate-ci-trust-root"
+    "github>codeandsolder/ci-workflows:renovate-fleet"
   ],
   "forkProcessing": "enabled",
-  "dependencyDashboard": true,
-  "minimumReleaseAge": "3 days",
-  "minimumReleaseAgeBehaviour": "timestamp-required",
-  "internalChecksFilter": "strict",
   "separateMajorMinor": false,
   "separateMultipleMajor": false,
-  "prConcurrentLimit": 6,
-  "prHourlyLimit": 3,
   "rebaseWhen": "conflicted",
   "lockFileMaintenance": {
     "enabled": true,
@@ -48,41 +40,6 @@
       "enabled": false
     },
     {
-      "description": "Group routine compatible stable Rust dependency updates",
-      "matchManagers": [
-        "cargo"
-      ],
-      "matchUpdateTypes": [
-        "minor",
-        "patch",
-        "pin",
-        "pinDigest",
-        "digest"
-      ],
-      "matchCurrentVersion": "!/^0/",
-      "groupName": "routine stable Rust dependencies",
-      "automerge": true,
-      "automergeType": "pr"
-    },
-    {
-      "description": "Pre-1.0 Rust dependency updates are reviewed individually",
-      "matchManagers": [
-        "cargo"
-      ],
-      "matchCurrentVersion": "/^0\\./",
-      "automerge": false
-    },
-    {
-      "description": "Latest major Rust dependency updates are attempted individually",
-      "matchManagers": [
-        "cargo"
-      ],
-      "matchUpdateTypes": [
-        "major"
-      ],
-      "automerge": false
-    },
-    {
       "description": "Cargo lockfile maintenance is age-gated by repository CI",
       "matchManagers": [
         "cargo"
@@ -93,28 +50,6 @@
       "minimumReleaseAge": null,
       "automerge": true,
       "automergeType": "pr"
-    },
-    {
-      "description": "Group all GitHub Actions maintenance into one reviewed PR",
-      "matchManagers": [
-        "github-actions"
-      ],
-      "groupName": "GitHub Actions tooling",
-      "groupSlug": "github-actions-tooling",
-      "automerge": false
-    },
-    {
-      "description": "Shared CI trust roots remain independent of generic GitHub Actions grouping and age policy",
-      "matchManagers": [
-        "github-actions"
-      ],
-      "matchPackageNames": [
-        "/^codeandsolder\\/(?:ci-workflows|rust-skills2)(?:\\/|$)/"
-      ],
-      "minimumReleaseAge": null,
-      "groupName": "Shared CI trust roots",
-      "groupSlug": "shared-ci-trust-roots",
-      "automerge": false
     }
   ]
 }
