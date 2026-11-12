@@ -22,7 +22,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - name: Clone repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -51,7 +51,7 @@ jobs:
           path: ./target/debug/sccache
 
   integration-tests:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     strategy:
       matrix:
         type: [backends, tools]
@@ -93,7 +93,7 @@ jobs:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   gha:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     needs: build
 
     env:
@@ -263,7 +263,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     # Probably wouldn't matter anyway since we run in a container, but staying
     # close to the version is better than not.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     needs: build
     container:
       image: rocm/dev-ubuntu-24.04:7.2
