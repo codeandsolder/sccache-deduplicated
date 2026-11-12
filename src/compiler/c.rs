@@ -1559,10 +1559,7 @@ where
     // hash and since we need to deduplicate the include files.
     // We cache the results since they are often quite a bit repeated.
     let include_path: &[u8] = if let Some(opt) = normalized_include_paths.get(include_path) {
-        match opt {
-            Some(normalized) => normalized,
-            None => include_path,
-        }
+        opt.as_ref().map_or(include_path, |normalized| normalized)
     } else {
         let path_buf = decode_path(include_path)?;
         let normalized = normalize_path(&path_buf);
