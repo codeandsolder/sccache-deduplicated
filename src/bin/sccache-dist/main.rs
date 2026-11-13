@@ -442,6 +442,9 @@ pub struct Scheduler {
 
 struct ServerDetails {
     jobs_assigned: HashSet<JobId>,
+    // Scheduler-local sequence of the last assignment. Used to rotate equally
+    // loaded workers; HashMap iteration order must not decide idle-worker use.
+    last_assignment: Option<usize>,
     // Jobs assigned that haven't seen a state change. Can only be pending
     // or ready.
     jobs_unclaimed: HashMap<JobId, Instant>,
@@ -608,6 +611,7 @@ impl SchedulerIncoming for Scheduler {
                 let mut best = None;
                 let mut best_err = None;
                 let mut best_load = f64::INFINITY;
+                let mut best_last_assignment = None;
                 let now = Instant::now();
                 for (&server_id, details) in servers.iter_mut() {
                     let Some(load) = load_weight(
@@ -648,19 +652,22 @@ impl SchedulerIncoming for Scheduler {
                                 best_err = Some((server_id, details));
                             }
                         }
-                    } else if load < best_load {
+                    } else if load < best_load
+                        || (load == best_load && details.last_assignment < best_last_assignment)
+                    {
+                        best_last_assignment = details.last_assignment;
                         best = Some((server_id, details));
                         trace!("Selected {:?} as the server with the best load", server_id);
                         best_load = load;
-                        if load == 0f64 {
-                            break;
-                        }
                     }
                 }
 
                 // Assign the job to our best choice
                 if let Some((server_id, server_details)) = best.or(best_err) {
                     let job_id = self.next_job_id();
+                    // Unique while holding the servers lock: every allocation
+                    // advances job_count, including assignments that later fail.
+                    server_details.last_assignment = Some(self.job_count.load(Ordering::Relaxed));
                     assert!(server_details.jobs_assigned.insert(job_id));
                     assert!(
                         server_details
@@ -847,6 +854,7 @@ impl SchedulerIncoming for Scheduler {
                 last_seen: Instant::now(),
                 last_error: None,
                 jobs_assigned: HashSet::new(),
+                last_assignment: None,
                 jobs_unclaimed: HashMap::new(),
                 num_cpus,
                 server_nonce,
@@ -1171,6 +1179,53 @@ mod scheduler_tests {
                 state: JobState::Pending,
                 need_toolchain: false,
             })
+        }
+    }
+
+    #[test]
+    fn equally_loaded_workers_rotate_after_each_completed_job() {
+        let scheduler = Scheduler::new();
+        let ids: Vec<ServerId> = ["127.0.0.1:10501", "127.0.0.2:10501", "127.0.0.3:10501"]
+            .into_iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+
+        for &id in &ids {
+            scheduler
+                .handle_heartbeat_server(id, ServerNonce::new(), 4, Box::new(TestJobAuthorizer))
+                .unwrap();
+        }
+
+        let mut observed = Vec::new();
+        for _ in 0..12 {
+            let result = scheduler
+                .handle_alloc_job(
+                    &AcceptAssign,
+                    Toolchain {
+                        archive_id: "same-toolchain".to_owned(),
+                    },
+                )
+                .unwrap();
+            let AllocJobResult::Success { job_alloc, .. } = result else {
+                panic!("eligible idle workers must accept a job");
+            };
+            observed.push(job_alloc.server_id);
+            for state in [JobState::Ready, JobState::Started, JobState::Complete] {
+                scheduler
+                    .handle_update_job_state(job_alloc.job_id, job_alloc.server_id, state)
+                    .unwrap();
+            }
+        }
+
+        // Under serial, short jobs every worker is equally idle on every
+        // allocation. Previously the first zero-load HashMap entry won every
+        // time, starving all others despite full capacity.
+        for id in ids {
+            assert_eq!(
+                observed.iter().filter(|&&selected| selected == id).count(),
+                4,
+                "worker {id:?} should receive an equal share of idle jobs"
+            );
         }
     }
 
