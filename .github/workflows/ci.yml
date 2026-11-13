@@ -298,6 +298,11 @@ jobs:
         # Canonical Rust integration tests execute the bundled compiler through
         # bwrap, just like the managed Linux hosts.
         command -v bwrap
+        # Ubuntu 24.04's AppArmor profile blocks unprivileged user namespaces
+        # by default. The ephemeral CI VM permits this setting via sudo;
+        # canonical Rust's bwrap sandbox requires a user namespace to run.
+        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        bwrap --ro-bind / / --proc /proc --dev-bind /dev /dev -- /usr/bin/true
         # Compile with the canonical CI sccache daemon on its isolated Unix socket.
         # Run test executables without that socket variable: the sccache system
         # tests must manage their own independent test daemon.
