@@ -103,4 +103,32 @@ if (( compile )) && [[ -z "${SCCACHE_CANONICAL_TARGET_ROOT:-}" ]]; then
     fi
 fi
 
+# Enable native provider only after the managed rollout marker is installed.
+native_marker="${CODEANDSOLDER_NATIVE_PREBUILT_MARKER:-/etc/sccache/native-prebuilt-enabled}"
+if (( compile )) && [[ -f "$native_marker" ]]; then
+    native_root="${CODEANDSOLDER_NATIVE_PREBUILT_ROOT:-/usr/local/libexec/native-boringssl}"
+    native_env="${CODEANDSOLDER_NATIVE_PREBUILT_GARAGE_ENV:-/etc/sccache/native-prebuilt-garage.env}"
+    for name in boringssl-build-provider boringssl-prebuilt native-garage-store; do
+        [[ -x "$native_root/$name" ]] || {
+            echo "cargo-wrapper: native provider component missing: $native_root/$name" >&2
+            exit 1
+        }
+    done
+    [[ -r "$native_env" ]] || {
+        echo "cargo-wrapper: native Garage config unreadable: $native_env" >&2
+        exit 1
+    }
+    export CARGO_NATIVE_PREBUILT_PROVIDER="$native_root/boringssl-build-provider"
+    export CARGO_NATIVE_PREBUILT_PACKAGES=boring-sys,btls-sys
+    native_revision="$(
+        sha256sum "$native_root/boringssl-build-provider" \
+                  "$native_root/boringssl-prebuilt" \
+                  "$native_root/native-garage-store" | sha256sum | cut -d ' ' -f1
+    )"
+    export CARGO_NATIVE_PREBUILT_PROVIDER_REVISION="$native_revision"
+    export BORING_BSSL_STORE_BACKEND=garage
+    export BORING_BSSL_GARAGE_ENV="$native_env"
+    export SENTINELX_CARGO_WRAPPER_PATH="$EPHEMERAL_CARGO_WRAPPER"
+fi
+
 exec "$REAL" "${args[@]}"

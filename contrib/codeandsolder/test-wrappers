@@ -53,4 +53,16 @@ wrapper_path="$(readlink -f contrib/codeandsolder/cargo-wrapper)"
 expected="toolchain=1.99.0 wrapper=$wrapper_path cargo=$wrapper_path args=probe "
 grep -Fxq "$expected" "$CARGO_REAL_LOG"
 
+mkdir -p "$root/native"
+for name in boringssl-build-provider boringssl-prebuilt native-garage-store; do
+    printf '#!/bin/sh\nexit 0\n' >"$root/native/$name"
+    chmod 0755 "$root/native/$name"
+done
+touch "$root/native-garage.env" "$root/native-enabled"
+CODEANDSOLDER_NATIVE_PREBUILT_MARKER="$root/native-enabled" \
+CODEANDSOLDER_NATIVE_PREBUILT_ROOT="$root/native" \
+CODEANDSOLDER_NATIVE_PREBUILT_GARAGE_ENV="$root/native-garage.env" \
+CODEANDSOLDER_REAL_CARGO="$root/bin/cargo-real" \
+    contrib/codeandsolder/cargo-wrapper +1.99.0 check
+
 echo 'codeandsolder wrapper routing tests passed'
