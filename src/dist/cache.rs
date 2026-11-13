@@ -692,11 +692,10 @@ impl TcCache {
     ///
     /// Returns an error if the cache cannot install the archive.
     pub fn insert_staged(&mut self, staged: StagedToolchainArchive) -> Result<()> {
-        if !self.contains_toolchain(&staged.toolchain) {
-            self.inner.insert_file(
-                make_lru_key_path(&staged.toolchain.archive_id),
-                staged.file.path(),
-            )?;
+        let StagedToolchainArchive { toolchain, file } = staged;
+        if !self.contains_toolchain(&toolchain) {
+            self.inner
+                .insert_file(make_lru_key_path(&toolchain.archive_id), file.path())?;
         }
         Ok(())
     }

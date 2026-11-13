@@ -808,6 +808,7 @@ pub struct BuildResult {
 pub struct ToolchainReader<'a>(Box<dyn Read + 'a>);
 impl<'a> ToolchainReader<'a> {
     /// Wrap a reader for a distributed toolchain upload.
+    #[must_use]
     pub fn new(reader: Box<dyn Read + 'a>) -> Self {
         Self(reader)
     }
