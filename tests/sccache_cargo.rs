@@ -485,7 +485,17 @@ fn test_rust_cargo_generated_out_dir_reuses_cache_across_build_dirs() -> Result<
     fs::create_dir_all(project.join("src"))?;
     fs::write(
         project.join("Cargo.toml"),
-        "[package]\nname = \"generated-source\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        "[package]\nname = \"generated-source\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nstable-dep = { path = \"stable-dep\" }\n",
+    )?;
+    let stable_dep = project.join("stable-dep");
+    fs::create_dir_all(stable_dep.join("src"))?;
+    fs::write(
+        stable_dep.join("Cargo.toml"),
+        "[package]\nname = \"stable-dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )?;
+    fs::write(
+        stable_dep.join("src/lib.rs"),
+        "pub fn value() -> u32 { 2 }\n",
     )?;
     fs::write(
         project.join("build.rs"),
@@ -493,7 +503,7 @@ fn test_rust_cargo_generated_out_dir_reuses_cache_across_build_dirs() -> Result<
     )?;
     fs::write(
         project.join("src/lib.rs"),
-        "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\npub fn answer() -> u32 { ANSWER }\n",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\npub fn answer() -> u32 { stable_dep::value() + ANSWER }\n",
     )?;
 
     let mut hit_counts = Vec::new();
@@ -529,7 +539,7 @@ fn test_rust_cargo_generated_out_dir_reuses_cache_across_build_dirs() -> Result<
     assert_eq!(hit_counts.len(), 2, "expected two independent Cargo builds");
     assert!(
         hit_counts[1] > hit_counts[0],
-        "second build reused no Rust cache entry across build roots: {hit_counts:?}"
+        "the stable dependency did not hit across build roots: {hit_counts:?}; the generated-source crate may legitimately miss because env!(OUT_DIR) exposes the physical directory"
     );
     Ok(())
 }
