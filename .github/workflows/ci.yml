@@ -41,7 +41,7 @@ jobs:
           toolchain: ${{ startsWith(github.ref, 'refs/tags/') && '1.91.0' || '1.99.0' }}
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@7c04e549f943d270978b0302b278771ae6e2e40d # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@e7e29ed9109c2450c2a9f1f0310de9bd0000de3d # main
         with:
           rust-toolchain: ${{ startsWith(github.ref, 'refs/tags/') && '1.91.0' || '1.99.0' }}
 
@@ -54,7 +54,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@7c04e549f943d270978b0302b278771ae6e2e40d # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@e7e29ed9109c2450c2a9f1f0310de9bd0000de3d # main
 
   check_features:
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
@@ -74,7 +74,7 @@ jobs:
           toolchain: "1.99.0"
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@7c04e549f943d270978b0302b278771ae6e2e40d # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@e7e29ed9109c2450c2a9f1f0310de9bd0000de3d # main
         with:
           rust-toolchain: "1.99.0"
 
@@ -87,7 +87,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@7c04e549f943d270978b0302b278771ae6e2e40d # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@e7e29ed9109c2450c2a9f1f0310de9bd0000de3d # main
 
   host_tools:
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
@@ -172,7 +172,7 @@ jobs:
           components: llvm-tools-preview
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@7c04e549f943d270978b0302b278771ae6e2e40d # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@e7e29ed9109c2450c2a9f1f0310de9bd0000de3d # main
         with:
           rust-toolchain: ${{ matrix.rustc || 'stable' }}
 
@@ -282,14 +282,14 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@7c04e549f943d270978b0302b278771ae6e2e40d # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@e7e29ed9109c2450c2a9f1f0310de9bd0000de3d # main
 
   shared-sccache:
     name: Linux tests (runner-local sccache)
     # Single current-Rust Linux lane on every PR and main push.
     permissions:
       contents: read
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@7c04e549f943d270978b0302b278771ae6e2e40d # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@e7e29ed9109c2450c2a9f1f0310de9bd0000de3d # main
     with:
       isolate-public-sccache-server: true
       command: |
@@ -328,7 +328,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@7c04e549f943d270978b0302b278771ae6e2e40d # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@e7e29ed9109c2450c2a9f1f0310de9bd0000de3d # main
         with:
           rust-toolchain: ${{ matrix.target == 'aarch64-apple-darwin' && 'beta' || matrix.target == 's390x-unknown-linux-musl' && 'nightly' || '1.99.0' }}
 
@@ -391,7 +391,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@7c04e549f943d270978b0302b278771ae6e2e40d # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@e7e29ed9109c2450c2a9f1f0310de9bd0000de3d # main
 
       # Workaround for the lack of substring() function in github actions expressions.
       - name: Id
@@ -422,7 +422,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Prepare, build and test
-        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1
+        uses: vmactions/freebsd-vm@811efaaac0668df8bfb8308c3ec997b5ab50037b # v1
         with:
           mem: 8192
           usesh: true
