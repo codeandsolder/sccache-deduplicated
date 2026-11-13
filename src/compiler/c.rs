@@ -2214,7 +2214,7 @@ static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
 /// The arguments are hashed verbatim, so any that spell out an absolute path -
 /// `-ffile-prefix-map=/home/user/project=.` above all - would tie the cache
 /// entry to one checkout of the tree. See [`strip_basedirs_from_arg`].
-/// Relocate OUT_DIR sources only when a matching file-prefix map makes
+/// Relocate `OUT_DIR` sources only when a matching file-prefix map makes
 /// compiled object paths equivalent, and no unremapped literal paths remain.
 fn relocatable_native_basedir(
     env_vars: &[(OsString, OsString)],
