@@ -10,15 +10,14 @@ use sccache::dist::{
     self, AllocJobResult, AssignJobResult, BuilderIncoming, CompileCommand, HeartbeatServerResult,
     InputsReader, JobAlloc, JobAuthorizer, JobComplete, JobId, JobState, RunJobResult,
     SchedulerIncoming, SchedulerOutgoing, SchedulerStatusResult, ServerId, ServerIncoming,
-    ServerNonce, ServerOutgoing, SubmitToolchainResult, TcCache, Toolchain, ToolchainReader,
-    UpdateJobStateResult,
+    ServerNonce, ServerOutgoing, StagedToolchainArchive, SubmitToolchainResult, TcCache, Toolchain,
+    ToolchainReader, UpdateJobStateResult,
 };
 use sccache::util::BASE64_URL_SAFE_ENGINE;
 use sccache::util::daemonize;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, btree_map};
 use std::env;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -996,6 +995,8 @@ impl SchedulerIncoming for Scheduler {
 pub struct Server {
     builder: Box<dyn BuilderIncoming>,
     cache: Mutex<TcCache>,
+    staging_dir: PathBuf,
+    toolchain_cache_size: u64,
     job_toolchains: Mutex<HashMap<JobId, Toolchain>>,
 }
 
@@ -1010,6 +1011,8 @@ impl Server {
         Ok(Server {
             builder,
             cache: Mutex::new(cache),
+            staging_dir: cache_dir.join("tc"),
+            toolchain_cache_size,
             job_toolchains: Mutex::new(HashMap::new()),
         })
     }
@@ -1042,26 +1045,34 @@ impl ServerIncoming for Server {
         job_id: JobId,
         tc_rdr: ToolchainReader,
     ) -> Result<SubmitToolchainResult> {
-        requester
-            .do_update_job_state(job_id, JobState::Ready)
-            .context("Updating job state failed")?;
-        // TODO: need to lock the toolchain until the container has started
-        // TODO: can start prepping container
         let tc = match self.job_toolchains.lock().unwrap().get(&job_id).cloned() {
             Some(tc) => tc,
             None => return Ok(SubmitToolchainResult::JobNotFound),
         };
-        let mut cache = self.cache.lock().unwrap();
-        // TODO: this returns before reading all the data, is that valid?
-        if cache.contains_toolchain(&tc) {
-            return Ok(SubmitToolchainResult::Success);
+        // Streaming and hashing large archives must not hold the cache mutex:
+        // other toolchains still need to be assigned while uploads are slow.
+        let staged = match StagedToolchainArchive::receive(
+            &self.staging_dir,
+            tc,
+            tc_rdr,
+            self.toolchain_cache_size,
+        ) {
+            Ok(staged) => staged,
+            Err(error) => {
+                warn!("Could not receive or verify toolchain archive: {error:#}");
+                return Ok(SubmitToolchainResult::CannotCache);
+            }
+        };
+        let inserted = self.cache.lock().unwrap().insert_staged(staged);
+        if let Err(error) = inserted {
+            warn!("Could not install verified toolchain archive: {error:#}");
+            return Ok(SubmitToolchainResult::CannotCache);
         }
-        Ok(cache
-            .insert_with(&tc, |mut file| {
-                io::copy(&mut { tc_rdr }, &mut file).map(|_| ())
-            })
-            .map(|_| SubmitToolchainResult::Success)
-            .unwrap_or(SubmitToolchainResult::CannotCache))
+        // A Pending job cannot become Ready before its toolchain exists.
+        requester
+            .do_update_job_state(job_id, JobState::Ready)
+            .context("Updating job state failed")?;
+        Ok(SubmitToolchainResult::Success)
     }
     fn handle_run_job(
         &self,
@@ -1368,5 +1379,154 @@ mod scheduler_tests {
         let details = servers.get(&server_id).unwrap();
         assert!(details.jobs_assigned.is_empty());
         assert!(details.jobs_unclaimed.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod server_upload_tests {
+    use super::*;
+    use sccache::util::Digest;
+    use std::io::{self, Cursor, Read};
+    use std::sync::{Arc, mpsc};
+    use std::thread;
+
+    struct NoopBuilder;
+
+    impl BuilderIncoming for NoopBuilder {
+        fn run_build(
+            &self,
+            _toolchain: Toolchain,
+            _command: CompileCommand,
+            _outputs: Vec<String>,
+            _inputs_rdr: InputsReader<'_>,
+            _cache: &Mutex<TcCache>,
+        ) -> Result<sccache::dist::BuildResult> {
+            unreachable!("upload tests must never execute a compile");
+        }
+    }
+
+    struct RecordingRequester(Mutex<Vec<JobState>>);
+
+    impl ServerOutgoing for RecordingRequester {
+        fn do_update_job_state(
+            &self,
+            _job_id: JobId,
+            state: JobState,
+        ) -> Result<UpdateJobStateResult> {
+            self.0.lock().unwrap().push(state);
+            Ok(UpdateJobStateResult::Success)
+        }
+    }
+
+    fn test_server() -> Result<(tempfile::TempDir, Arc<Server>)> {
+        let dir = tempfile::tempdir()?;
+        let server = Server::new(Box::new(NoopBuilder), dir.path(), 1024 * 1024)?;
+        Ok((dir, Arc::new(server)))
+    }
+
+    fn tc(contents: &[u8]) -> Result<Toolchain> {
+        Ok(Toolchain {
+            archive_id: Digest::reader_sync(contents)?,
+        })
+    }
+
+    struct PausingReader {
+        sent: bool,
+        started: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+        inner: Cursor<Vec<u8>>,
+    }
+
+    impl Read for PausingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.sent {
+                self.sent = true;
+                self.started.send(()).unwrap();
+                self.resume.recv().unwrap();
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    #[test]
+    fn assignments_are_not_blocked_by_in_progress_toolchain_uploads() -> Result<()> {
+        let (_dir, server) = test_server()?;
+        let first = b"first valid toolchain archive";
+        server.handle_assign_job(JobId(41), tc(first)?)?;
+        let (started_tx, started_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let uploader = Arc::clone(&server);
+        let upload = thread::spawn(move || {
+            let requester = RecordingRequester(Mutex::new(Vec::new()));
+            let reader = PausingReader {
+                sent: false,
+                started: started_tx,
+                resume: resume_rx,
+                inner: Cursor::new(first.to_vec()),
+            };
+            let outcome = uploader.handle_submit_toolchain(
+                &requester,
+                JobId(41),
+                ToolchainReader::new(Box::new(reader)),
+            );
+            (outcome, requester.0.lock().unwrap().clone())
+        });
+        started_rx.recv_timeout(Duration::from_secs(5))?;
+
+        let second_server = Arc::clone(&server);
+        let (assignment_tx, assignment_rx) = mpsc::channel();
+        let assignment = thread::spawn(move || {
+            let result =
+                second_server.handle_assign_job(JobId(42), tc(b"second toolchain").unwrap());
+            assignment_tx.send(result).unwrap();
+        });
+        // Release the upload after checking the other assignment, even when
+        // the assertion fails, so the test never leaves a blocked thread.
+        let not_blocked = assignment_rx.recv_timeout(Duration::from_secs(2));
+        resume_tx.send(())?;
+        assignment.join().unwrap();
+        let (upload_result, states) = upload.join().unwrap();
+        assert!(
+            not_blocked.is_ok(),
+            "assignment was blocked by another toolchain's upload"
+        );
+        assert!(matches!(upload_result?, SubmitToolchainResult::Success));
+        assert_eq!(states, vec![JobState::Ready]);
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_toolchain_is_not_published_as_ready_or_cached() -> Result<()> {
+        let (_dir, server) = test_server()?;
+        let expected = tc(b"expected")?;
+        server.handle_assign_job(JobId(43), expected.clone())?;
+        let requester = RecordingRequester(Mutex::new(Vec::new()));
+        let result = server.handle_submit_toolchain(
+            &requester,
+            JobId(43),
+            ToolchainReader::new(Box::new(Cursor::new(b"wrong".to_vec()))),
+        )?;
+        assert!(matches!(result, SubmitToolchainResult::CannotCache));
+        assert!(requester.0.lock().unwrap().is_empty());
+        assert!(!server.cache.lock().unwrap().contains_toolchain(&expected));
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_archive_is_rejected_without_publishing_ready() -> Result<()> {
+        let (_dir, server) = test_server()?;
+        let bytes = vec![7; 1024 * 1024 + 1];
+        let expected = tc(&bytes)?;
+        server.handle_assign_job(JobId(44), expected.clone())?;
+        let requester = RecordingRequester(Mutex::new(Vec::new()));
+        let result = server.handle_submit_toolchain(
+            &requester,
+            JobId(44),
+            ToolchainReader::new(Box::new(Cursor::new(bytes))),
+        )?;
+        assert!(matches!(result, SubmitToolchainResult::CannotCache));
+        assert!(requester.0.lock().unwrap().is_empty());
+        assert!(!server.cache.lock().unwrap().contains_toolchain(&expected));
+        Ok(())
     }
 }

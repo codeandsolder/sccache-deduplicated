@@ -41,7 +41,7 @@ pub mod http;
 mod test;
 
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
-pub use crate::dist::cache::TcCache;
+pub use crate::dist::cache::{StagedToolchainArchive, TcCache};
 
 // TODO: paths (particularly outputs, which are accessed by an unsandboxed program)
 // should be some pre-sanitised AbsPath type
@@ -806,6 +806,12 @@ pub struct BuildResult {
 // structs
 
 pub struct ToolchainReader<'a>(Box<dyn Read + 'a>);
+impl<'a> ToolchainReader<'a> {
+    /// Wrap a reader for a distributed toolchain upload.
+    pub fn new(reader: Box<dyn Read + 'a>) -> Self {
+        Self(reader)
+    }
+}
 impl Read for ToolchainReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)

@@ -628,6 +628,45 @@ pub struct TcCache {
     inner: LruDiskCache,
 }
 
+/// A received, hash-verified archive that can be installed without holding
+/// the cache mutex across network I/O or archive hashing.
+pub struct StagedToolchainArchive {
+    toolchain: Toolchain,
+    file: tempfile::NamedTempFile,
+}
+
+impl StagedToolchainArchive {
+    /// Receive and validate an archive in the cache filesystem.
+    ///
+    /// The temporary file is removed on any failure, and remains invisible
+    /// to the LRU index until installation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for failed, oversized, or corrupted transfers.
+    pub fn receive<R: Read>(
+        directory: &Path,
+        toolchain: Toolchain,
+        reader: R,
+        max_size: u64,
+    ) -> Result<Self> {
+        let mut file = tempfile::Builder::new()
+            .prefix(".sccachetmp")
+            .tempfile_in(directory)?;
+        let written = io::copy(
+            &mut reader.take(max_size.saturating_add(1)),
+            file.as_file_mut(),
+        )?;
+        if written > max_size {
+            return Err(anyhow!("toolchain archive exceeds cache capacity"));
+        }
+        if file_key(file.reopen()?)? != toolchain.archive_id {
+            return Err(anyhow!("toolchain archive digest mismatch"));
+        }
+        Ok(Self { toolchain, file })
+    }
+}
+
 impl TcCache {
     /// Create a toolchain cache rooted at `cache_dir`.
     ///
@@ -644,6 +683,22 @@ impl TcCache {
     #[must_use]
     pub fn contains_toolchain(&self, tc: &Toolchain) -> bool {
         self.inner.contains_key(make_lru_key_path(&tc.archive_id))
+    }
+
+    /// Commit a verified archive, or discard it if another concurrent upload
+    /// installed the same toolchain first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache cannot install the archive.
+    pub fn insert_staged(&mut self, staged: StagedToolchainArchive) -> Result<()> {
+        if !self.contains_toolchain(&staged.toolchain) {
+            self.inner.insert_file(
+                make_lru_key_path(&staged.toolchain.archive_id),
+                staged.file.path(),
+            )?;
+        }
+        Ok(())
     }
 
     /// Insert a toolchain archive produced by `with` and verify its content hash.
