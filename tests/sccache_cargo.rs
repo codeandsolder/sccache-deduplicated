@@ -472,6 +472,78 @@ fn read_itoa_dep_info(target_dir: &Path) -> Result<String> {
     }
 }
 
+/// Rebuild generated Rust sources in different Cargo build-dir roots while
+/// keeping final targets separate. This exercises the real compiler protocol,
+/// canonical sandbox mounts, source/extern hashing, and restored output files,
+/// not just the in-memory path mapper.
+#[cfg(target_os = "linux")]
+#[test]
+#[serial]
+fn test_rust_cargo_generated_out_dir_reuses_cache_across_build_dirs() -> Result<()> {
+    let test_info = SccacheTest::new(None)?;
+    let project = test_info.tempdir.path().join("generated-source");
+    fs::create_dir_all(project.join("src"))?;
+    fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"generated-source\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nstable-dep = { path = \"stable-dep\" }\n",
+    )?;
+    let stable_dep = project.join("stable-dep");
+    fs::create_dir_all(stable_dep.join("src"))?;
+    fs::write(
+        stable_dep.join("Cargo.toml"),
+        "[package]\nname = \"stable-dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )?;
+    fs::write(
+        stable_dep.join("src/lib.rs"),
+        "pub fn value() -> u32 { 2 }\n",
+    )?;
+    fs::write(
+        project.join("build.rs"),
+        "fn main() { std::fs::write(std::path::Path::new(&std::env::var(\"OUT_DIR\").unwrap()).join(\"generated.rs\"), \"pub const ANSWER: u32 = 42;\\n\").unwrap(); }\n",
+    )?;
+    fs::write(
+        project.join("src/lib.rs"),
+        "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\npub fn answer() -> u32 { stable_dep::value() + ANSWER }\n",
+    )?;
+
+    let mut hit_counts = Vec::new();
+    for name in ["first", "second"] {
+        let target = test_info.tempdir.path().join(name).join("target");
+        let intermediate = test_info.tempdir.path().join(name).join("intermediate");
+        let build_dir_config = format!("build.build-dir='{}'", intermediate.display());
+        helpers::test_cargo_command()
+            .args(["build", "--offline", "--color=never", "--config"])
+            .arg(&build_dir_config)
+            .arg("--target-dir")
+            .arg(&target)
+            .envs(test_info.env.iter().cloned())
+            .env("CARGO_TARGET_DIR", &target)
+            .env("SCCACHE_EXPERIMENTAL_CANONICAL_RUST", "1")
+            .env("SCCACHE_CANONICAL_TARGET_ROOT", &target)
+            .env("CARGO_BUILD_EPHEMERAL_INTERMEDIATES", "false")
+            .current_dir(&project)
+            .assert()
+            .try_success()?;
+
+        let stats = helpers::test_sccache_command()
+            .args(["--show-stats", "--stats-format=json"])
+            .output()?;
+        assert!(stats.status.success(), "sccache stats failed: {stats:?}");
+        let stats: serde_json::Value = serde_json::from_slice(&stats.stdout)?;
+        let hits = stats["stats"]["cache_hits"]["counts"]["Rust"]
+            .as_u64()
+            .unwrap_or(0);
+        hit_counts.push(hits);
+    }
+
+    assert_eq!(hit_counts.len(), 2, "expected two independent Cargo builds");
+    assert!(
+        hit_counts[1] > hit_counts[0],
+        "the stable dependency did not hit across build roots: {hit_counts:?}; the generated-source crate may legitimately miss because env!(OUT_DIR) exposes the physical directory"
+    );
+    Ok(())
+}
+
 /// The same dependency built from two checkouts, the second one being a cache hit.
 /// Whose paths does the second checkout's dep-info name? (mozilla/sccache#984)
 #[test]
