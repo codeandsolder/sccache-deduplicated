@@ -1075,6 +1075,19 @@ mod server {
                         ));
                         prepare_response(request, &res)
                     },
+                    (POST) (/api/v1/scheduler/worker_drain/{mode: String}) => {
+                        let server_id = check_server_auth_or_err!(request);
+                        let draining = match mode.as_str() {
+                            "start" => Some(true),
+                            "status" => None,
+                            "cancel" => Some(false),
+                            _ => return rouille::Response::empty_400(),
+                        };
+                        let status = try_or_500_log!(
+                            req_id, handler.handle_set_worker_draining(server_id, draining)
+                        );
+                        rouille::Response::json(&status)
+                    },
                     (GET) (/api/v1/scheduler/status) => {
                         let res: SchedulerStatusResult = try_or_500_log!(req_id, handler.handle_status());
                         prepare_response(request, &res)

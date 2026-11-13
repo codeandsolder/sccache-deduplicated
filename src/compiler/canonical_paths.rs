@@ -199,6 +199,19 @@ impl CanonicalRustPaths {
         cwd: &Path,
         rust_root: &Path,
     ) -> Option<Self> {
+        Self::from_env_with_output_dir(env, cwd, rust_root, None)
+    }
+
+    /// The compiler's actual output directory is authoritative when Cargo's
+    /// target marker proves that a caller-provided target root is stale.
+    /// This occurs with isolated build frontends that relocate Cargo outputs
+    /// without updating their inherited canonical-target environment.
+    pub(crate) fn from_env_with_output_dir(
+        env: &[(OsString, OsString)],
+        cwd: &Path,
+        rust_root: &Path,
+        output_dir: Option<&Path>,
+    ) -> Option<Self> {
         if !enabled(env) {
             return None;
         }
@@ -210,10 +223,32 @@ impl CanonicalRustPaths {
                     .and_then(|manifest_dir| topmost_cargo_root(&manifest_dir))
             })?;
 
-        let target_root = env_value(env, "SCCACHE_CANONICAL_TARGET_ROOT")
+        let configured_target = env_value(env, "SCCACHE_CANONICAL_TARGET_ROOT")
             .or_else(|| env_value(env, "CARGO_TARGET_DIR"))
-            .or_else(|| target_root_from_out_dir(env))
-            .unwrap_or_else(|| build_root.join("target"));
+            .or_else(|| target_root_from_out_dir(env));
+        let observed_target = output_dir
+            .filter(|path| path.is_absolute())
+            .and_then(|path| {
+                // Do not guess target roots from arbitrary output locations.
+                // An actual Cargo marker is unambiguous, including when the
+                // compilation is inside a relocated cross-target directory.
+                path.ancestors()
+                    .find(|ancestor| {
+                        ancestor.join("CACHEDIR.TAG").is_file()
+                            || ancestor.join(".rustc_info.json").is_file()
+                    })
+                    .map(Path::to_owned)
+            });
+        let target_root = match (configured_target, observed_target, output_dir) {
+            (Some(configured), Some(observed), Some(output))
+                if !output.starts_with(&configured) =>
+            {
+                observed
+            }
+            (Some(configured), _, _) => configured,
+            (None, Some(observed), _) => observed,
+            (None, None, _) => build_root.join("target"),
+        };
         let cargo_home = env_value(env, "SCCACHE_CANONICAL_CARGO_HOME")
             .or_else(|| env_value(env, "CARGO_HOME"))
             .or_else(|| env_value(env, "HOME").map(|home| home.join(".cargo")));
@@ -546,6 +581,62 @@ mod tests {
             roots.to_physical(Path::new("/build/src/lib.rs")),
             PathBuf::from("/work/a/src/lib.rs")
         );
+    }
+
+    #[test]
+    fn relocated_output_overrides_stale_explicit_target_only_with_cargo_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let build = temp.path().join("project");
+        let stale = build.join("target");
+        let observed = temp.path().join("cargo-ephemeral-build-id/target");
+        let output = observed.join("x86_64-unknown-linux-gnu/debug/deps");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(observed.join("CACHEDIR.TAG"), "Cargo target marker").unwrap();
+        let env = vec![
+            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+            (
+                "SCCACHE_CANONICAL_BUILD_ROOT".into(),
+                build.clone().into_os_string(),
+            ),
+            (
+                "SCCACHE_CANONICAL_TARGET_ROOT".into(),
+                stale.clone().into_os_string(),
+            ),
+        ];
+        let mapped = CanonicalRustPaths::from_env_with_output_dir(
+            &env,
+            &build,
+            Path::new("/rust"),
+            Some(&output),
+        )
+        .unwrap();
+        assert_eq!(mapped.target_root, observed);
+        assert_eq!(
+            mapped.to_canonical(&output.join("generated.rmeta")),
+            PathBuf::from("/target/x86_64-unknown-linux-gnu/debug/deps/generated.rmeta")
+        );
+
+        let arbitrary_output = temp.path().join("random/outputs");
+        std::fs::create_dir_all(&arbitrary_output).unwrap();
+        let untouched = CanonicalRustPaths::from_env_with_output_dir(
+            &env,
+            &build,
+            Path::new("/rust"),
+            Some(&arbitrary_output),
+        )
+        .unwrap();
+        assert_eq!(untouched.target_root, stale);
+
+        let normal = CanonicalRustPaths::from_env_with_output_dir(
+            &env,
+            &build,
+            Path::new("/rust"),
+            Some(&stale.join("debug/deps")),
+        )
+        .unwrap();
+        assert_eq!(normal.target_root, stale);
     }
 
     #[test]

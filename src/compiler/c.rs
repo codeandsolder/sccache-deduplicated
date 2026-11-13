@@ -49,6 +49,19 @@ use crate::errors::{Context, ProcessError, Result, bail};
 use super::CacheControl;
 use super::preprocessor_cache::PreprocessorCacheEntry;
 
+/// Only native ELF executables can be automatically packaged for Linux
+/// distributed C compilation. Arbitrary scripts may alter arguments,
+/// environment and filesystem; running them elsewhere is not equivalent.
+#[cfg(all(feature = "dist-client", target_os = "linux"))]
+fn automatic_dist_compiler_is_elf(path: &Path) -> bool {
+    use std::io::Read;
+    let mut magic = [0_u8; 4];
+    fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .is_ok()
+        && magic == *b"\x7fELF"
+}
+
 /// A generic implementation of the `Compiler` trait for C/C++ compilers.
 #[derive(Clone)]
 pub struct CCompiler<I>
@@ -58,6 +71,11 @@ where
     executable: PathBuf,
     executable_digest: String,
     compiler: I,
+    // Only a directly runnable ELF is suitable for automatic Linux
+    // toolchain packaging. Arbitrary wrapper scripts can change argv,
+    // environment and filesystem state, and must execute locally.
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    executable_is_elf: bool,
 }
 
 /// A generic implementation of the `CompilerHasher` trait for C/C++ compilers.
@@ -70,6 +88,8 @@ where
     executable: PathBuf,
     executable_digest: String,
     compiler: I,
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    executable_is_elf: bool,
 }
 
 /// Artifact produced by a C/C++ compiler.
@@ -317,6 +337,8 @@ where
         let digest = Digest::file(executable.clone(), pool).await?;
 
         Ok(Self {
+            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+            executable_is_elf: automatic_dist_compiler_is_elf(&executable),
             executable,
             executable_digest: {
                 if let Some(version) = compiler.version() {
@@ -432,6 +454,8 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
                     executable: self.executable.clone(),
                     executable_digest: self.executable_digest.clone(),
                     compiler: self.compiler.clone(),
+                    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                    executable_is_elf: self.executable_is_elf,
                 }))
             }
             CompilerArguments::CannotCache(why, extra_info) => {
@@ -736,6 +760,18 @@ where
         };
 
         let mut allow_dist = true;
+        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+        if !self.executable_is_elf {
+            // The cache and local compiler still run through the *original*
+            // wrapper. Do not repeatedly feed a script to the ELF/ldd packager.
+            // Supplying a generic wrapper's transitive execution environment
+            // remotely is not well-defined without explicit toolchain support.
+            allow_dist = false;
+            debug!(
+                "Disabling automatic distributed compilation for non-ELF compiler {}",
+                self.executable.display()
+            );
+        }
         let has_assembler_external_input = if matches!(
             self.parsed_args.language,
             Language::Assembler | Language::AssemblerToPreprocess
@@ -2352,6 +2388,29 @@ mod test {
     use super::*;
     use crate::mock_command::*;
     use crate::test::utils::*;
+
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    #[test]
+    fn automatic_dist_rejects_scripts_without_affecting_native_elf() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir()?;
+        let wrapper = dir.path().join("cc");
+        let elf = dir.path().join("compiler");
+        let linked = dir.path().join("compiler-link");
+        let empty = dir.path().join("empty");
+        std::fs::write(&wrapper, b"#!/bin/sh\nexec /usr/bin/cc \"$@\"\n")?;
+        std::fs::write(&elf, b"\x7fELFpayload")?;
+        std::fs::write(&empty, b"")?;
+        symlink(&elf, &linked)?;
+
+        assert!(!automatic_dist_compiler_is_elf(&wrapper));
+        assert!(automatic_dist_compiler_is_elf(&elf));
+        assert!(automatic_dist_compiler_is_elf(&linked));
+        assert!(!automatic_dist_compiler_is_elf(&empty));
+        assert!(!automatic_dist_compiler_is_elf(&dir.path().join("missing")));
+        Ok(())
+    }
 
     fn native_parsed_arguments() -> ParsedArguments {
         ParsedArguments {

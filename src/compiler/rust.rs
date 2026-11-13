@@ -2493,13 +2493,19 @@ where
             }
         }
 
-        let mut canonical_paths = CanonicalRustPaths::from_env(&env_vars, &cwd, &self.sysroot);
+        let compiler_output_dir = if self.parsed_args.output_dir.is_absolute() {
+            self.parsed_args.output_dir.clone()
+        } else {
+            cwd.join(&self.parsed_args.output_dir)
+        };
+        let mut canonical_paths = CanonicalRustPaths::from_env_with_output_dir(
+            &env_vars,
+            &cwd,
+            &self.sysroot,
+            Some(&compiler_output_dir),
+        );
         if let Some(canonical) = canonical_paths.as_ref() {
-            let output_dir = if self.parsed_args.output_dir.is_absolute() {
-                self.parsed_args.output_dir.clone()
-            } else {
-                cwd.join(&self.parsed_args.output_dir)
-            };
+            let output_dir = &compiler_output_dir;
             // The canonical sandbox mounts /build read-only and /target writable.
             // Validate the paths we already know before the dep-info pre-pass so
             // a bad mapping cannot make that discovery step mutate/fail under a
@@ -2510,7 +2516,7 @@ where
                 .to_canonical(&output_dir)
                 .starts_with(Path::new("/target"))
             {
-                Some(&output_dir)
+                Some(output_dir)
             } else {
                 None
             };

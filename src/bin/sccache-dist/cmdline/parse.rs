@@ -158,6 +158,16 @@ fn get_clap_command() -> ClapCommand {
                 ]),
         )
         .subcommand(
+            ClapCommand::new("worker-drain")
+                .about("Safely drain this authenticated worker before a managed upgrade")
+                .arg(config_with_help_message("Use the server config file at PATH").required(true))
+                .arg(
+                    Arg::new("mode")
+                        .required(true)
+                        .value_parser(["start", "status", "cancel"]),
+                ),
+        )
+        .subcommand(
             ClapCommand::new("server")
                 .about("Launch as a server, to handle distributed builds assigned by the scheduler")
                 .args(&[
@@ -242,6 +252,18 @@ pub fn try_parse_from(
             } else {
                 bail!("Could not load config")
             }
+        }
+        Some(("worker-drain", matches)) => {
+            let config_path = matches
+                .get_one::<PathBuf>("config")
+                .context("clap did not provide required `config` value")?;
+            let config = config::server::from_path(config_path)?
+                .context("Could not load worker configuration")?;
+            let mode = matches
+                .get_one::<String>("mode")
+                .context("clap did not provide required drain mode")?
+                .clone();
+            Command::WorkerDrain(config, mode)
         }
         Some(("server", matches)) => {
             if matches.contains_id("syslog") {
