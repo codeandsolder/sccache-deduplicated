@@ -45,6 +45,24 @@ else
 fi
 
 args=("$@")
+# Generated native code under Cargo OUT_DIR is cache-shareable after its
+# observable source/debug paths are rewritten by the compiler.
+if (( ${#args[@]} > 1 )) && [[ -n "${OUT_DIR:-}" && "$OUT_DIR" == /* && "$OUT_DIR" != */ && "$OUT_DIR" != *=* ]]; then
+    case "${args[0]##*/}" in
+        cc|c++|gcc|g++|clang|clang++)
+            native_compile=0
+            prefix_map_present=0
+            for arg in "${args[@]:1}"; do
+                [[ "$arg" != -c ]] || native_compile=1
+                [[ "$arg" != "-ffile-prefix-map=$OUT_DIR="* ]] || prefix_map_present=1
+            done
+            if (( native_compile && ! prefix_map_present )); then
+                args+=("-ffile-prefix-map=$OUT_DIR=.")
+            fi
+            ;;
+    esac
+fi
+
 if (( ${#args[@]} )) && [[ "${args[0]}" == "rustc" ]]; then
     resolved_rustc="$(/usr/bin/rustup which rustc)"
     args[0]="$resolved_rustc"
