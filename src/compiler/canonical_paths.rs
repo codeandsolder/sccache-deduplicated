@@ -44,6 +44,7 @@ pub struct CanonicalRustPaths {
     roots: Vec<RootMapping>,
     pub(crate) build_root: PathBuf,
     pub(crate) target_root: PathBuf,
+    pub(crate) intermediate_root: Option<PathBuf>,
     pub(crate) cargo_home: Option<PathBuf>,
     pub(crate) rust_root: PathBuf,
 }
@@ -70,9 +71,7 @@ fn topmost_cargo_root(start: &Path) -> Option<PathBuf> {
         .map(Path::to_owned)
 }
 
-fn target_root_from_out_dir(env: &[(OsString, OsString)]) -> Option<PathBuf> {
-    let out_dir = env_value(env, "OUT_DIR")?;
-
+fn target_root_from_out_dir_path(out_dir: &Path) -> Option<PathBuf> {
     // Cargo writes CACHEDIR.TAG (and normally .rustc_info.json) at the actual
     // target root. Prefer that marker so cross-target layouts such as
     // target/<triple>/<profile>/build/... still map to the whole target tree.
@@ -91,6 +90,22 @@ fn target_root_from_out_dir(env: &[(OsString, OsString)]) -> Option<PathBuf> {
     (build_dir.file_name() == Some(OsStr::new("build")))
         .then(|| build_dir.parent().map(Path::to_owned))
         .flatten()
+}
+
+fn target_root_from_out_dir(env: &[(OsString, OsString)]) -> Option<PathBuf> {
+    target_root_from_out_dir_path(&env_value(env, "OUT_DIR")?)
+}
+
+fn target_root_from_output_dir(output_dir: &Path) -> Option<PathBuf> {
+    // --out-dir is not restricted to Cargo's OUT_DIR shape: it can be
+    // deps/, examples/, a cross-target directory, or the build-script tree.
+    // Require a Cargo root marker instead of guessing from path components.
+    output_dir
+        .ancestors()
+        .find(|ancestor| {
+            ancestor.join("CACHEDIR.TAG").is_file() || ancestor.join(".rustc_info.json").is_file()
+        })
+        .map(Path::to_owned)
 }
 
 fn path_env(name: &OsStr) -> bool {
@@ -189,15 +204,47 @@ impl CanonicalRustPaths {
         env: &[(OsString, OsString)],
         cwd: &Path,
         executable: &Path,
+        arguments: &[OsString],
     ) -> Option<Self> {
         let rust_root = executable.parent()?.parent()?;
-        Self::from_env(env, cwd, rust_root)
+        // An IPC failure must run rustc with the same sandbox roots as the
+        // daemon would have used, including its ephemeral --out-dir. OUT_DIR
+        // alone is absent for many dependency crates.
+        let mut parsed_output_dir = None;
+        let mut args = arguments.iter();
+        while let Some(argument) = args.next() {
+            if argument == "--out-dir" {
+                parsed_output_dir = args.next().map(PathBuf::from);
+            } else if let Some(path) = argument
+                .to_str()
+                .and_then(|value| value.strip_prefix("--out-dir="))
+            {
+                parsed_output_dir = Some(PathBuf::from(path));
+            }
+        }
+        let output_dir = parsed_output_dir.map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
+        });
+        Self::from_env_with_output_dir(env, cwd, rust_root, output_dir.as_deref())
     }
 
     pub(crate) fn from_env(
         env: &[(OsString, OsString)],
         cwd: &Path,
         rust_root: &Path,
+    ) -> Option<Self> {
+        Self::from_env_with_output_dir(env, cwd, rust_root, None)
+    }
+
+    pub(crate) fn from_env_with_output_dir(
+        env: &[(OsString, OsString)],
+        cwd: &Path,
+        rust_root: &Path,
+        output_dir: Option<&Path>,
     ) -> Option<Self> {
         if !enabled(env) {
             return None;
@@ -210,18 +257,27 @@ impl CanonicalRustPaths {
                     .and_then(|manifest_dir| topmost_cargo_root(&manifest_dir))
             })?;
 
+        let actual_build_root = target_root_from_out_dir(env)
+            .or_else(|| output_dir.and_then(target_root_from_output_dir));
         let target_root = env_value(env, "SCCACHE_CANONICAL_TARGET_ROOT")
             .or_else(|| env_value(env, "CARGO_TARGET_DIR"))
-            .or_else(|| target_root_from_out_dir(env))
+            .or_else(|| actual_build_root.clone())
             .unwrap_or_else(|| build_root.join("target"));
+        // Cargo can keep final deliverables under target_directory while its
+        // compiler outputs and generated OUT_DIR inputs live in a separate
+        // per-invocation build-dir. Mapping only target_directory makes those
+        // compiler inputs unstable or rejects them outright.
+        let intermediate_root = actual_build_root
+            .filter(|root| root != &target_root && !root.starts_with(&target_root));
         let cargo_home = env_value(env, "SCCACHE_CANONICAL_CARGO_HOME")
             .or_else(|| env_value(env, "CARGO_HOME"))
             .or_else(|| env_value(env, "HOME").map(|home| home.join(".cargo")));
 
-        let mut roots = vec![
-            RootMapping::new(&target_root, "/target"),
-            RootMapping::new(&build_root, "/build"),
-        ];
+        let mut roots = vec![RootMapping::new(&target_root, "/target")];
+        if let Some(root) = intermediate_root.as_ref() {
+            roots.push(RootMapping::new(root, "/intermediate"));
+        }
+        roots.push(RootMapping::new(&build_root, "/build"));
         if let Some(ref cargo_home) = cargo_home {
             roots.push(RootMapping::new(cargo_home, "/cargo"));
 
@@ -253,6 +309,7 @@ impl CanonicalRustPaths {
             roots,
             build_root,
             target_root,
+            intermediate_root,
             cargo_home,
             rust_root: rust_root.to_owned(),
         })
@@ -431,7 +488,7 @@ impl CanonicalRustPaths {
 
         for (physical, virtual_path) in self.mappings() {
             if physical.exists() {
-                if virtual_path == Path::new("/target") {
+                if matches!(virtual_path.to_str(), Some("/target" | "/intermediate")) {
                     push!("--bind");
                 } else {
                     push!("--ro-bind");
@@ -468,7 +525,7 @@ impl CanonicalRustPaths {
             .collect::<Vec<_>>();
         let mut physical_aliases = Vec::new();
         for root in &self.roots {
-            let writable = root.canonical == Path::new("/target");
+            let writable = matches!(root.canonical.to_str(), Some("/target" | "/intermediate"));
             for alias in &root.aliases {
                 if !alias.exists() || canonical_mounts.contains(&alias.as_path()) {
                     continue;
@@ -581,6 +638,186 @@ mod tests {
         assert_eq!(
             roots.to_canonical(&generated),
             PathBuf::from("/target/debug/build/serde_core-hash/out/private.rs")
+        );
+    }
+
+    #[test]
+    fn canonicalizes_separate_persistent_and_ephemeral_cargo_output_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry_crate = temp.path().join("registry/crate");
+        let persistent_target = temp.path().join("workspace/target");
+        std::fs::create_dir_all(&registry_crate).unwrap();
+        std::fs::create_dir_all(&persistent_target).unwrap();
+        std::fs::write(
+            registry_crate.join("Cargo.toml"),
+            "[package]\nname='crate'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+
+        let mut normalized = Vec::new();
+        for temporary_name in [
+            "cargo-ephemeral-build-first",
+            "cargo-ephemeral-build-second",
+        ] {
+            let intermediate = temp.path().join(temporary_name).join("cargo-target-hash");
+            let out_dir = intermediate.join("debug/build/some-crate-hash/out");
+            let dep = intermediate.join("debug/deps/libsome_crate-hash.rmeta");
+            let compiler_output = intermediate.join("debug/deps");
+            std::fs::create_dir_all(&out_dir).unwrap();
+            std::fs::create_dir_all(&compiler_output).unwrap();
+            std::fs::write(
+                intermediate.join("CACHEDIR.TAG"),
+                "Signature: 8a477f597d28d172789f06886806bc55",
+            )
+            .unwrap();
+            let env = vec![
+                ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+                (
+                    "SCCACHE_CANONICAL_TARGET_ROOT".into(),
+                    persistent_target.clone().into_os_string(),
+                ),
+                (
+                    "SCCACHE_CANONICAL_TARGET_ROOT_ORIGIN".into(),
+                    "codeandsolder-cargo-wrapper".into(),
+                ),
+                ("OUT_DIR".into(), out_dir.clone().into_os_string()),
+            ];
+            let roots = CanonicalRustPaths::from_env_with_output_dir(
+                &env,
+                &registry_crate,
+                Path::new("/rust"),
+                Some(&compiler_output),
+            )
+            .unwrap();
+            assert_eq!(roots.target_root, persistent_target);
+            assert_eq!(
+                roots.intermediate_root.as_deref(),
+                Some(intermediate.as_path())
+            );
+            assert_eq!(
+                roots.to_canonical(&compiler_output),
+                Path::new("/intermediate/debug/deps")
+            );
+            assert_eq!(
+                roots.to_canonical(&dep),
+                Path::new("/intermediate/debug/deps/libsome_crate-hash.rmeta")
+            );
+            assert_eq!(
+                roots.to_canonical(&out_dir),
+                Path::new("/intermediate/debug/build/some-crate-hash/out")
+            );
+            assert!(roots.root_is_known(&dep));
+            assert!(roots.root_is_known(&out_dir));
+            assert_eq!(
+                roots.to_canonical(&persistent_target.join("release/final.rlib")),
+                Path::new("/target/release/final.rlib"),
+            );
+            let canonical_out_dir =
+                roots.env_value_to_canonical(OsStr::new("OUT_DIR"), out_dir.as_os_str());
+            normalized.push(canonical_out_dir.clone());
+            assert_eq!(
+                canonical_out_dir,
+                OsStr::new("/intermediate/debug/build/some-crate-hash/out")
+            );
+
+            #[cfg(target_os = "linux")]
+            {
+                let args =
+                    roots.bwrap_arguments(Path::new("/rust/bin/rustc"), &[], &registry_crate);
+                assert!(args.windows(3).any(|three| {
+                    three[0] == "--bind"
+                        && three[1] == intermediate.as_os_str()
+                        && three[2] == "/intermediate"
+                }));
+                assert!(args.windows(3).any(|three| {
+                    three[0] == "--bind"
+                        && three[1] == persistent_target.as_os_str()
+                        && three[2] == "/target"
+                }));
+            }
+        }
+        assert_eq!(normalized[0], normalized[1]);
+    }
+
+    #[test]
+    fn infers_ephemeral_build_dir_from_rustc_output_without_out_dir_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("workspace");
+        let persistent_target = source.join("target");
+        let intermediate = temp.path().join("cargo-ephemeral-build-RANDOM/hash");
+        let output_dir = intermediate.join("wasm32-unknown-unknown/debug/deps");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&persistent_target).unwrap();
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(source.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(
+            intermediate.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        let env = vec![
+            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+            (
+                "SCCACHE_CANONICAL_TARGET_ROOT".into(),
+                persistent_target.into_os_string(),
+            ),
+        ];
+        let roots = CanonicalRustPaths::from_env_with_output_dir(
+            &env,
+            &source,
+            Path::new("/rust"),
+            Some(&output_dir),
+        )
+        .unwrap();
+        assert_eq!(
+            roots.intermediate_root.as_deref(),
+            Some(intermediate.as_path())
+        );
+        assert_eq!(
+            roots.to_canonical(&output_dir),
+            Path::new("/intermediate/wasm32-unknown-unknown/debug/deps")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rustc_fallback_uses_same_ephemeral_output_root_without_out_dir_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let persistent = source.join("target");
+        let intermediate = temp.path().join("cargo-ephemeral-build-FALLBACK/hash");
+        let output_dir = intermediate.join("debug/deps");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::create_dir_all(&persistent).unwrap();
+        std::fs::write(source.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(
+            intermediate.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        let env = vec![
+            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+            (
+                "SCCACHE_CANONICAL_TARGET_ROOT".into(),
+                persistent.into_os_string(),
+            ),
+        ];
+        let arguments = vec![
+            OsString::from("--crate-name"),
+            OsString::from("foo"),
+            OsString::from("--out-dir"),
+            output_dir.clone().into_os_string(),
+        ];
+        let roots = CanonicalRustPaths::from_rustc_executable(
+            &env,
+            &source,
+            Path::new("/rust/bin/rustc"),
+            &arguments,
+        )
+        .unwrap();
+        assert_eq!(
+            roots.to_canonical(&output_dir),
+            Path::new("/intermediate/debug/deps")
         );
     }
 

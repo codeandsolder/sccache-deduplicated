@@ -2493,23 +2493,30 @@ where
             }
         }
 
-        let mut canonical_paths = CanonicalRustPaths::from_env(&env_vars, &cwd, &self.sysroot);
+        let output_dir = if self.parsed_args.output_dir.is_absolute() {
+            self.parsed_args.output_dir.clone()
+        } else {
+            cwd.join(&self.parsed_args.output_dir)
+        };
+        let mut canonical_paths = CanonicalRustPaths::from_env_with_output_dir(
+            &env_vars,
+            &cwd,
+            &self.sysroot,
+            Some(&output_dir),
+        );
         if let Some(canonical) = canonical_paths.as_ref() {
-            let output_dir = if self.parsed_args.output_dir.is_absolute() {
-                self.parsed_args.output_dir.clone()
-            } else {
-                cwd.join(&self.parsed_args.output_dir)
-            };
-            // The canonical sandbox mounts /build read-only and /target writable.
+            // The sandbox mounts /build read-only and both output roots writable.
             // Validate the paths we already know before the dep-info pre-pass so
             // a bad mapping cannot make that discovery step mutate/fail under a
             // location that canonical execution could not safely use anyway.
             let invalid_known_path = if !canonical.root_is_known(&cwd) {
                 Some(&cwd)
-            } else if !canonical
-                .to_canonical(&output_dir)
-                .starts_with(Path::new("/target"))
-            {
+            } else if {
+                let mapped = canonical.to_canonical(&output_dir);
+                !mapped.starts_with(Path::new("/target"))
+                    && !(canonical.intermediate_root.is_some()
+                        && mapped.starts_with(Path::new("/intermediate")))
+            } {
                 Some(&output_dir)
             } else {
                 None

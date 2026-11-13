@@ -710,6 +710,7 @@ where
             &invocation.env_vars,
             invocation.cwd,
             invocation.exe,
+            &invocation.cmdline,
         )
     } else {
         // The daemon rejected this invocation before canonical compilation began.
