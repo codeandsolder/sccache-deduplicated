@@ -294,7 +294,10 @@ jobs:
       isolate-public-sccache-server: true
       command: |
         sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends gcc clang
+        sudo apt-get install -y --no-install-recommends gcc clang bubblewrap
+        # Canonical Rust integration tests execute the bundled compiler through
+        # bwrap, just like the managed Linux hosts.
+        command -v bwrap
         # Compile with the canonical CI sccache daemon on its isolated Unix socket.
         # Run test executables without that socket variable: the sccache system
         # tests must manage their own independent test daemon.
