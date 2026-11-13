@@ -2873,6 +2873,7 @@ int native() {{ return 42; }}
         );
     }
 
+    #[test]
     fn test_hash_key_basedirs() {
         let args = ovec!["a", "b", "c"];
         let preprocessed1 = b"# 1 \"/home/user1/project/src/main.c\"\nint main() { return 0; }";
