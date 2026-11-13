@@ -2509,14 +2509,13 @@ where
             // Validate the paths we already know before the dep-info pre-pass so
             // a bad mapping cannot make that discovery step mutate/fail under a
             // location that canonical execution could not safely use anyway.
+            let mapped_output = canonical.to_canonical(&output_dir);
+            let writable_output = mapped_output.starts_with(Path::new("/target"))
+                || (canonical.intermediate_root.is_some()
+                    && mapped_output.starts_with(Path::new("/intermediate")));
             let invalid_known_path = if !canonical.root_is_known(&cwd) {
                 Some(&cwd)
-            } else if {
-                let mapped = canonical.to_canonical(&output_dir);
-                !mapped.starts_with(Path::new("/target"))
-                    && !(canonical.intermediate_root.is_some()
-                        && mapped.starts_with(Path::new("/intermediate")))
-            } {
+            } else if !writable_output {
                 Some(&output_dir)
             } else {
                 None

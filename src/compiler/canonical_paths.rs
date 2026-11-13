@@ -232,6 +232,7 @@ impl CanonicalRustPaths {
         Self::from_env_with_output_dir(env, cwd, rust_root, output_dir.as_deref())
     }
 
+    #[cfg(test)]
     pub(crate) fn from_env(
         env: &[(OsString, OsString)],
         cwd: &Path,
