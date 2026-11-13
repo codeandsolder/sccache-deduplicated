@@ -610,8 +610,10 @@ if (( client_update_required == 0 && dist_deferred == 1 )); then
     echo "sccache-release-update: client already at $tag; distributed binary remains deferred"
     exit 0
 fi
-if active_clients; then
-    echo "sccache-release-update: active compiler clients; deferring update"
+# A worker-only update must not wait for unrelated jobs using the *client*.
+# The shared client daemon is left running and its maintenance gate is untouched.
+if (( client_update_required )) && active_clients; then
+    echo "sccache-release-update: active compiler clients; deferring client update"
     exit 0
 fi
 
@@ -683,22 +685,32 @@ rollback() {
         fi
     fi
     [[ -z "$smoke" ]] || rm -rf -- "$smoke"
-    rm -f "$DRAIN"
+    if (( client_drain_owned )); then
+        rm -f "$DRAIN"
+    fi
     exit "$rc"
 }
 trap rollback EXIT INT TERM
 
-touch "$DRAIN"
-# A client may have crossed the idle check just before the marker appeared.
-for _ in $(seq 1 120); do
-    active_clients || break
-    sleep 0.25
-done
-if active_clients; then
-    echo "sccache-release-update: client did not drain within 30s; deferring" >&2
-    rm -f "$DRAIN"
-    trap - EXIT INT TERM
-    exit 0
+client_drain_owned=0
+if (( client_update_required )); then
+    # Only local client replacement needs a maintenance drain. A managed
+    # offline worker may be updated while the client is compiling.
+    touch "$DRAIN"
+    client_drain_owned=1
+    # A client may have crossed the idle check just before the marker appeared.
+    for _ in $(seq 1 120); do
+        active_clients || break
+        sleep 0.25
+    done
+    if active_clients; then
+        echo "sccache-release-update: client did not drain within 30s; deferring" >&2
+        if (( client_drain_owned )); then
+            rm -f "$DRAIN"
+        fi
+        trap - EXIT INT TERM
+        exit 0
+    fi
 fi
 
 # Recheck distributed activity immediately before stopping the scheduler. This
@@ -707,13 +719,17 @@ fi
 if (( dist_was_active && apply_dist_update )); then
     if ! dist_busy="$(dist_in_progress)"; then
         echo "sccache-release-update: cannot recheck scheduler activity; deferring update" >&2
-        rm -f "$DRAIN"
+        if (( client_drain_owned )); then
+            rm -f "$DRAIN"
+        fi
         trap - EXIT INT TERM
         exit 0
     fi
     if (( dist_busy > 0 )); then
         echo "sccache-release-update: $dist_busy distributed compile(s) became active; deferring update"
-        rm -f "$DRAIN"
+        if (( client_drain_owned )); then
+            rm -f "$DRAIN"
+        fi
         trap - EXIT INT TERM
         exit 0
     fi
@@ -872,6 +888,8 @@ if (( dist_deferred )); then
 fi
 
 record_full_state
-rm -f "$DRAIN"
+if (( client_drain_owned )); then
+    rm -f "$DRAIN"
+fi
 trap - EXIT INT TERM
 echo "sccache-release-update: installed $tag ($source_sha)"
