@@ -192,14 +192,21 @@ impl OverlayBuilder {
                 trace!("Creating toolchain directory for {}", tc.archive_id);
                 fs::create_dir(&toolchain_dir)?;
 
-                let mut tccache = tccache.lock().unwrap();
-                let toolchain_rdr = match tccache.get(tc) {
-                    Ok(rdr) => rdr,
-                    Err(LruError::FileNotInCache) => {
-                        bail!("expected toolchain {}, but not available", tc.archive_id)
-                    }
-                    Err(e) => {
-                        return Err(Error::from(e).context("failed to get toolchain from cache"));
+                // Once the archive file has been opened, extraction must not
+                // hold the global LRU mutex. The open descriptor remains valid
+                // even if another cache operation evicts the directory entry.
+                let toolchain_rdr = {
+                    let mut cache = tccache.lock().unwrap();
+                    match cache.get(tc) {
+                        Ok(rdr) => rdr,
+                        Err(LruError::FileNotInCache) => {
+                            bail!("expected toolchain {}, but not available", tc.archive_id)
+                        }
+                        Err(e) => {
+                            return Err(
+                                Error::from(e).context("failed to get toolchain from cache")
+                            );
+                        }
                     }
                 };
 
@@ -210,6 +217,8 @@ impl OverlayBuilder {
                         fs::remove_dir_all(&toolchain_dir)
                             .context("Failed to remove unpacked toolchain")?;
                         tccache
+                            .lock()
+                            .unwrap()
                             .remove(tc)
                             .context("Failed to remove corrupt toolchain")?;
                         Err(Error::from(e))
@@ -222,7 +231,7 @@ impl OverlayBuilder {
                 };
 
                 toolchain_dir_map.insert(tc.clone(), entry.clone());
-                if toolchain_dir_map.len() > tccache.len() {
+                if toolchain_dir_map.len() > tccache.lock().unwrap().len() {
                     let dir_map = toolchain_dir_map.clone();
                     let mut entries: Vec<_> = dir_map.iter().collect();
                     // In the pathological case, creation time for unpacked
