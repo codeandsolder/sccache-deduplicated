@@ -29,3 +29,13 @@ The live paths are:
 ```
 
 Install atomically as root after validating these repository copies. Keep the prior live files as timestamped backups; binary rollouts are handled by the tracked `sccache-release-update`.
+
+## General native C/C++ build-root caching
+
+Native object builds under Cargo OUT_DIR get a GCC/Clang file-prefix-map
+to a stable relative logical path, making the actual object bytes
+reproducible across unrelated workspace roots. The sccache C-family
+hasher normalizes the same path in compiler arguments and line markers
+only when the exact prefix map is present and no raw path literal
+remains in preprocessed source. No BoringSSL-specific build-script provider,
+alternate Garage bucket, native package archive or rollout marker is needed.
