@@ -81,7 +81,7 @@ log = "0.4"
 lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "02cdce163271e3e0aa64a0c933a6b19909fbeb2f", optional = true }
 memchr = "2"
 mime = "0.3"
-object = "0.40"
+object = "0.41"
 opendal = { version = "0.59.0", optional = true, default-features = false }
 opendal-http-transport-reqwest = { version = "0.59.0", optional = true }
 opendal-layer-logging = { version = "0.59.0", optional = true }
