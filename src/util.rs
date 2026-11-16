@@ -595,9 +595,9 @@ where
         })
 }
 
-/// Convert an ordinary numeric process exit code into an ExitStatus.
+/// Convert an ordinary numeric process exit code into an `ExitStatus`.
 ///
-/// Unix from_raw expects a wait status, not an exit code. Passing 1 directly
+/// Unix `from_raw` expects a wait status, not an exit code. Passing 1 directly
 /// would incorrectly report termination by SIGHUP instead of exit code 1.
 #[cfg(unix)]
 #[must_use]
@@ -606,7 +606,7 @@ pub fn exit_status_from_code(code: i32) -> process::ExitStatus {
     process::ExitStatus::from_raw((code & 0xff) << 8)
 }
 
-/// Convert an ordinary numeric process exit code into an ExitStatus.
+/// Convert an ordinary numeric process exit code into an `ExitStatus`.
 #[cfg(windows)]
 #[must_use]
 pub fn exit_status_from_code(code: i32) -> process::ExitStatus {
