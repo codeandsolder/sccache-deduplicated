@@ -1002,7 +1002,7 @@ fn compilation_target(arguments: &[Argument<ArgData>], host: &str) -> String {
 // where they appear. The weak map persists across sccache upgrades, so the
 // package format must participate in the weak key independently of compile
 // cache versioning.
-const RUST_DIST_TOOLCHAIN_PACKAGE_SCHEMA: &[u8] = b"rust-dist-toolchain-package-v1";
+const RUST_DIST_TOOLCHAIN_PACKAGE_SCHEMA: &[u8] = b"rust-dist-toolchain-package-v2";
 
 fn dist_toolchain_weak_key_with_schema(
     base: &Digest,
@@ -1439,6 +1439,8 @@ where
         Box::new(RustToolchainPackager {
             sysroot: self.sysroot.clone(),
             canonical: false,
+            host: None,
+            target: None,
         })
     }
     /// Parse `arguments` as rustc command-line arguments, determine if
@@ -3453,6 +3455,8 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             rlib_dep_reader,
             env_vars,
             canonical_paths,
+            host,
+            arguments,
             ..
         } = *{ self };
         trace!("Dist inputs: inputs={inputs:?} crate_link_paths={crate_link_paths:?}");
@@ -3466,7 +3470,13 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             rlib_dep_reader,
         });
         let canonical = canonical_paths.is_some();
-        let toolchain_packager = Box::new(RustToolchainPackager { sysroot, canonical });
+        let target = compilation_target(&arguments, &host);
+        let toolchain_packager = Box::new(RustToolchainPackager {
+            sysroot,
+            canonical,
+            host: Some(host),
+            target: Some(target),
+        });
         let outputs_rewriter = Box::new(NoopOutputsRewriter);
 
         Ok((inputs_packager, toolchain_packager, outputs_rewriter))
@@ -3949,6 +3959,155 @@ impl pkg::InputsPackager for RustInputsPackager {
 struct RustToolchainPackager {
     sysroot: PathBuf,
     canonical: bool,
+    // Compiler-wide callers have no target; preserve full-package semantics.
+    host: Option<String>,
+    target: Option<String>,
+}
+
+// Keep the runtime and unknown rustlib extensions. Only remove directories
+// explicitly identified as standard libraries for other installed targets.
+#[cfg(all(feature = "dist-client", target_os = "linux"))]
+fn rustlib_entries_for_target(rustlib: &Path, host: &str, target: &str) -> Result<Vec<PathBuf>> {
+    let mut selected = Vec::new();
+    for entry in fs::read_dir(rustlib)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_str();
+
+        if matches!(name_str, Some("src" | "etc")) {
+            continue;
+        }
+
+        let is_other_target = name_str
+            .and_then(|name| {
+                name.strip_prefix("manifest-rust-std-").or_else(|| {
+                    (path.is_dir() && rustlib.join(format!("manifest-rust-std-{name}")).is_file())
+                        .then_some(name)
+                })
+            })
+            .is_some_and(|triple| triple != host && triple != target);
+        if is_other_target {
+            continue;
+        }
+        selected.push(path);
+    }
+    selected.sort();
+    Ok(selected)
+}
+
+#[cfg(all(test, feature = "dist-client", target_os = "linux"))]
+#[test]
+fn test_rustlib_entries_keep_host_requested_target_and_unknown_extensions() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let rustlib = temp.path();
+    let host = "x86_64-unknown-linux-gnu";
+    let target = "wasm32-wasip2";
+    let unused = "aarch64-unknown-linux-musl";
+    for dir in [host, target, unused, "src", "etc", "custom-extension"] {
+        fs::create_dir_all(rustlib.join(dir))?;
+        fs::write(rustlib.join(dir).join("file"), b"important")?;
+    }
+    for triple in [host, target, unused] {
+        fs::write(
+            rustlib.join(format!("manifest-rust-std-{triple}")),
+            b"installed",
+        )?;
+    }
+    fs::write(rustlib.join("components"), b"rustc")?;
+    let selected = rustlib_entries_for_target(rustlib, host, target)?;
+    let names: HashSet<_> = selected
+        .iter()
+        .filter_map(|path| path.file_name().and_then(std::ffi::OsStr::to_str))
+        .collect();
+    for keep in [
+        host,
+        target,
+        "custom-extension",
+        "components",
+        "manifest-rust-std-x86_64-unknown-linux-gnu",
+        "manifest-rust-std-wasm32-wasip2",
+    ] {
+        assert!(
+            names.contains(keep),
+            "required rustlib entry missing: {keep}"
+        );
+    }
+    for skip in [
+        unused,
+        "src",
+        "etc",
+        "manifest-rust-std-aarch64-unknown-linux-musl",
+    ] {
+        assert!(
+            !names.contains(skip),
+            "unneeded rustlib entry retained: {skip}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    test,
+    feature = "dist-client",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn test_dist_toolchain_archive_contains_only_required_installed_targets() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let sysroot = temp.path().join("sysroot");
+    let bin = sysroot.join(BINS_DIR);
+    let lib = sysroot.join(LIBS_DIR);
+    let rustlib = lib.join("rustlib");
+    fs::create_dir_all(&bin)?;
+    let host = "x86_64-unknown-linux-gnu";
+    let target = "wasm32-wasip2";
+    let unused = "aarch64-unknown-linux-musl";
+    for triple in [host, target, unused] {
+        let folder = rustlib.join(triple).join("lib");
+        fs::create_dir_all(&folder)?;
+        fs::write(folder.join("libstd.rlib"), triple.as_bytes())?;
+        fs::write(
+            rustlib.join(format!("manifest-rust-std-{triple}")),
+            b"installed",
+        )?;
+    }
+    fs::write(lib.join("other_runtime"), b"needed")?;
+    fs::copy("/bin/true", bin.join("rustc"))?;
+    fs::copy("/bin/true", bin.join("clippy-driver"))?;
+    let archive_path = temp.path().join("toolchain.tar.gz");
+    let writer = fs::File::create(&archive_path)?;
+    let packager = RustToolchainPackager {
+        sysroot,
+        canonical: true,
+        host: Some(host.to_owned()),
+        target: Some(target.to_owned()),
+    };
+    pkg::ToolchainPackager::write_pkg(Box::new(packager), writer)?;
+    let reader = fs::File::open(archive_path)?;
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(reader));
+    let paths = archive
+        .entries()?
+        .map(|entry| -> Result<PathBuf> { Ok(entry?.path()?.into_owned()) })
+        .collect::<Result<Vec<_>>>()?;
+    let includes = |fragment: &str| {
+        paths
+            .iter()
+            .any(|path| path.to_string_lossy().ends_with(fragment))
+    };
+    assert!(includes("rust/bin/clippy-driver"));
+    assert!(includes("rust/lib/other_runtime"));
+    assert!(includes(&format!(
+        "rust/lib/rustlib/{host}/lib/libstd.rlib"
+    )));
+    assert!(includes(&format!(
+        "rust/lib/rustlib/{target}/lib/libstd.rlib"
+    )));
+    assert!(!includes(&format!(
+        "rust/lib/rustlib/{unused}/lib/libstd.rlib"
+    )));
+    Ok(())
 }
 
 #[cfg(feature = "dist-client")]
@@ -3962,7 +4121,12 @@ impl pkg::ToolchainPackager for RustToolchainPackager {
             "Packaging Rust compiler for sysroot {}",
             self.sysroot.display()
         );
-        let Self { sysroot, canonical } = *self;
+        let Self {
+            sysroot,
+            canonical,
+            host,
+            target,
+        } = *self;
 
         let mut package_builder = pkg::ToolchainPackageBuilder::new();
         if canonical {
@@ -3977,7 +4141,33 @@ impl pkg::ToolchainPackager for RustToolchainPackager {
         package_builder.add_dir_contents(&bins_path)?;
         if BINS_DIR != LIBS_DIR {
             let libs_path = sysroot.join(LIBS_DIR);
-            package_builder.add_dir_contents(&libs_path)?;
+            let rustlib = libs_path.join("rustlib");
+            if let (Some(host), Some(target)) = (host.as_deref(), target.as_deref())
+                && target != "custom-target"
+                && rustlib.join(host).is_dir()
+                && rustlib.join(target).is_dir()
+            {
+                for entry in fs::read_dir(&libs_path)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    let entries = if path == rustlib {
+                        rustlib_entries_for_target(&rustlib, host, target)?
+                    } else {
+                        vec![path]
+                    };
+                    for path in entries {
+                        if path.is_dir() {
+                            package_builder.add_dir_contents(&path)?;
+                        } else if path.is_file() {
+                            package_builder.add_file(path)?;
+                        }
+                    }
+                }
+            } else {
+                // Unknown/custom target, incomplete sysroot, or compiler-wide
+                // packaging: preserve all potentially required runtimes.
+                package_builder.add_dir_contents(&libs_path)?;
+            }
         }
 
         package_builder.into_compressed_tar(f)
@@ -7009,7 +7199,7 @@ version='2.0.0'
 
         let previous_package_schema = dist_toolchain_weak_key_with_schema(
             &base,
-            b"rust-dist-toolchain-package-v0",
+            b"rust-dist-toolchain-package-v1",
             "x86_64-unknown-linux-gnu",
             Some("host-std-digest"),
             None,
