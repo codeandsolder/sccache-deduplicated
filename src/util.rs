@@ -595,6 +595,25 @@ where
         })
 }
 
+/// Convert an ordinary numeric process exit code into an ExitStatus.
+///
+/// Unix from_raw expects a wait status, not an exit code. Passing 1 directly
+/// would incorrectly report termination by SIGHUP instead of exit code 1.
+#[cfg(unix)]
+#[must_use]
+pub fn exit_status_from_code(code: i32) -> process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    process::ExitStatus::from_raw((code & 0xff) << 8)
+}
+
+/// Convert an ordinary numeric process exit code into an ExitStatus.
+#[cfg(windows)]
+#[must_use]
+pub fn exit_status_from_code(code: i32) -> process::ExitStatus {
+    use std::os::windows::process::ExitStatusExt;
+    process::ExitStatus::from_raw(code as u32)
+}
+
 /// Write `data` to `writer` with bincode serialization, prefixed by a `u32` length.
 pub fn write_length_prefixed_bincode<W, S>(mut writer: W, data: S) -> Result<()>
 where
