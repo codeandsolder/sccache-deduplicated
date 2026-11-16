@@ -47,6 +47,7 @@ pub struct CanonicalRustPaths {
     pub(crate) intermediate_root: Option<PathBuf>,
     pub(crate) cargo_home: Option<PathBuf>,
     pub(crate) rust_root: PathBuf,
+    clippy_config_dir: Option<PathBuf>,
 }
 
 fn env_value(env: &[(OsString, OsString)], name: &str) -> Option<PathBuf> {
@@ -119,6 +120,7 @@ fn path_env(name: &OsStr) -> bool {
                 | "CARGO_MANIFEST_PATH"
                 | "CARGO_TARGET_DIR"
                 | "CARGO_TARGET_TMPDIR"
+                | "CLIPPY_CONF_DIR"
                 | "OUT_DIR"
                 | "PWD"
                 | "RUSTC"
@@ -306,6 +308,30 @@ impl CanonicalRustPaths {
         }
         roots.push(RootMapping::new(rust_root, "/rust"));
 
+        // Strict Clippy may be configured by a separate policy checkout, not
+        // located under the crate's /build root. Make it visible to both the
+        // local canonical sandbox and the distributed worker at a stable path.
+        let clippy_config_dir = env_value(env, "CLIPPY_CONF_DIR").map(|path| {
+            let absolute = if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            };
+            absolute.canonicalize().unwrap_or(absolute)
+        });
+        if let Some(config_dir) = clippy_config_dir.as_ref()
+            && config_dir.is_dir()
+            && !roots.iter().any(|root| {
+                root.to_canonical(config_dir).is_some()
+                    || config_dir
+                        .canonicalize()
+                        .ok()
+                        .is_some_and(|real| root.to_canonical(&real).is_some())
+            })
+        {
+            roots.push(RootMapping::new(config_dir, "/clippy-config"));
+        }
+
         Some(Self {
             roots,
             build_root,
@@ -313,6 +339,7 @@ impl CanonicalRustPaths {
             intermediate_root,
             cargo_home,
             rust_root: rust_root.to_owned(),
+            clippy_config_dir,
         })
     }
 
@@ -422,6 +449,11 @@ impl CanonicalRustPaths {
             OsString::from("/tmp")
         } else if name == "HOME" {
             OsString::from("/tmp/home")
+        } else if name == "CLIPPY_CONF_DIR" {
+            self.clippy_config_dir.as_ref().map_or_else(
+                || self.normalize_os_value(value),
+                |dir| self.to_canonical(dir).into_os_string(),
+            )
         } else if name == "CARGO" {
             // Cargo may invoke procedural macros that call Cargo again (for
             // example proc-macro-crate uses `cargo locate-project`). The
@@ -1051,6 +1083,65 @@ mod tests {
                 OsStr::new("/home/user/.cargo/bin/cargo"),
             ),
             OsString::from("/rust/bin/cargo")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_clippy_configuration_is_mounted_and_canonicalized() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let build = temp.path().join("build");
+        let policy = temp.path().join("external-policy");
+        let rust_root = temp.path().join("rust");
+        for dir in [&build, &policy, &rust_root] {
+            std::fs::create_dir_all(dir)?;
+        }
+        let env = vec![
+            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+            (
+                "SCCACHE_CANONICAL_BUILD_ROOT".into(),
+                build.clone().into_os_string(),
+            ),
+            ("CLIPPY_CONF_DIR".into(), policy.clone().into_os_string()),
+        ];
+        let roots = CanonicalRustPaths::from_env(&env, &build, &rust_root)
+            .ok_or_else(|| anyhow::anyhow!("canonical paths disabled"))?;
+        assert!(roots.root_is_known(&policy.join("clippy.toml")));
+        assert_eq!(
+            roots.env_value_to_canonical(OsStr::new("CLIPPY_CONF_DIR"), policy.as_os_str()),
+            OsString::from("/clippy-config/")
+        );
+        let args = roots.bwrap_arguments(
+            Path::new("/rust/bin/clippy-driver"),
+            &[OsString::from("--version")],
+            &build,
+        );
+        assert!(args.windows(3).any(|a| {
+            a[0] == "--ro-bind" && a[1] == policy.as_os_str() && a[2] == "/clippy-config"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn relative_external_clippy_configuration_resolves_from_compiler_cwd() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let build = temp.path().join("build");
+        let policy = temp.path().join("policy");
+        std::fs::create_dir_all(&build)?;
+        std::fs::create_dir_all(&policy)?;
+        let env = vec![
+            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+            (
+                "SCCACHE_CANONICAL_BUILD_ROOT".into(),
+                build.clone().into_os_string(),
+            ),
+            ("CLIPPY_CONF_DIR".into(), OsString::from("../policy")),
+        ];
+        let roots = CanonicalRustPaths::from_env(&env, &build, Path::new("/rust"))
+            .ok_or_else(|| anyhow::anyhow!("canonical paths disabled"))?;
+        assert_eq!(
+            roots.env_value_to_canonical(OsStr::new("CLIPPY_CONF_DIR"), OsStr::new("../policy")),
+            OsString::from("/clippy-config/")
         );
         Ok(())
     }

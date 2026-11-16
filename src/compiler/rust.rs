@@ -85,6 +85,39 @@ const RLIB_EXTENSION: &str = "rlib";
 #[cfg(feature = "dist-client")]
 const RMETA_EXTENSION: &str = "rmeta";
 
+/// Resolve Clippy's explicit policy directory relative to the compiler cwd.
+fn clippy_config_dir(
+    executable: &Path,
+    env_vars: &[(OsString, OsString)],
+    cwd: &Path,
+) -> Option<PathBuf> {
+    if !is_clippy_driver(executable) {
+        return None;
+    }
+    let value = env_vars
+        .iter()
+        .find_map(|(name, value)| (name == "CLIPPY_CONF_DIR").then_some(value))?;
+    if value.is_empty() {
+        return None;
+    }
+    let path = Path::new(value);
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        cwd.join(path)
+    };
+    Some(absolute.canonicalize().unwrap_or(absolute))
+}
+
+/// Both supported Clippy policy filenames affect diagnostics and cache reuse.
+fn clippy_config_inputs(directory: &Path) -> Vec<PathBuf> {
+    ["clippy.toml", ".clippy.toml"]
+        .into_iter()
+        .map(|name| directory.join(name))
+        .filter(|file| file.is_file())
+        .collect()
+}
+
 /// Directory in the sysroot containing binary to which rustc is linked.
 const BINS_DIR: &str = "bin";
 
@@ -2600,6 +2633,9 @@ where
                     pool,
                 })
                 .await?;
+            if let Some(config_dir) = clippy_config_dir(&self.executable, &env_vars, &cwd) {
+                source_files.extend(clippy_config_inputs(&config_dir));
+            }
             // Cargo.toml is always a compiler input: proc macros and env macros can read
             // package metadata even when rustc dep-info does not list the manifest itself.
             if let Some(manifest) = cargo_manifest.as_ref()
@@ -2748,6 +2784,10 @@ where
         if is_clippy_driver(&self.executable) {
             // Separate correctly executed Clippy from old rustc-substituted results.
             m.update(b"clippy-driver-correct-execution-v1");
+        }
+        if clippy_config_dir(&self.executable, &env_vars, &cwd).is_some() {
+            // Never reuse earlier entries that omitted external Clippy policy files.
+            m.update(b"clippy-config-inputs-v1");
         }
         if cargo_manifest.is_some() {
             // Keep the manifest-input schema scoped to Cargo builds so unrelated Rust cache
@@ -3375,6 +3415,10 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                         "CARGO_MANIFEST_DIR" => {
                             *v = path_transformer.as_dist(Path::new(v))?;
                         }
+                        "CLIPPY_CONF_DIR" if is_clippy_driver(executable) => {
+                            let local_dir = clippy_config_dir(executable, &self.env_vars, cwd)?;
+                            *v = path_transformer.as_dist(&local_dir)?;
+                        }
                         _ => (),
                     }
                 }
@@ -3457,8 +3501,11 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             canonical_paths,
             host,
             arguments,
+            executable,
+            cwd,
             ..
         } = *{ self };
+        let clippy_dir = clippy_config_dir(&executable, &env_vars, &cwd);
         trace!("Dist inputs: inputs={inputs:?} crate_link_paths={crate_link_paths:?}");
 
         let inputs_packager = Box::new(RustInputsPackager {
@@ -3468,6 +3515,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             inputs,
             path_transformer,
             rlib_dep_reader,
+            clippy_dir,
         });
         let canonical = canonical_paths.is_some();
         let target = compilation_target(&arguments, &host);
@@ -3504,6 +3552,7 @@ fn get_path_mappings(
 #[cfg(feature = "dist-client")]
 struct RustInputsPackager {
     env_vars: Vec<(OsString, OsString)>,
+    clippy_dir: Option<PathBuf>,
     crate_link_paths: Vec<PathBuf>,
     crate_types: CrateTypes,
     inputs: Vec<PathBuf>,
@@ -3736,6 +3785,7 @@ version = "6.1.0"
         inputs,
         path_transformer,
         rlib_dep_reader: None,
+        clippy_dir: None,
     };
 
     let mut package = Vec::new();
@@ -3760,6 +3810,62 @@ version = "6.1.0"
     Ok(())
 }
 
+#[test]
+#[cfg(feature = "dist-client")]
+fn test_dist_archive_includes_clippy_config_files_and_empty_directory() -> Result<()> {
+    use crate::dist::pkg::InputsPackager;
+    let temp = tempfile::tempdir()?;
+    let policy = temp.path().join("policy");
+    fs::create_dir_all(&policy)?;
+    fs::write(policy.join("clippy.toml"), b"disallowed-names = []\n")?;
+    fs::write(
+        policy.join(".clippy.toml"),
+        b"avoid-breaking-exported-api = true\n",
+    )?;
+
+    for empty in [false, true] {
+        if empty {
+            for name in ["clippy.toml", ".clippy.toml"] {
+                fs::remove_file(policy.join(name))?;
+            }
+            assert!(clippy_config_inputs(&policy).is_empty());
+        }
+        let mut transformer = dist::PathTransformer::new();
+        transformer.add_root_mapping(policy.clone(), "/clippy-config");
+        let packager = RustInputsPackager {
+            env_vars: vec![],
+            clippy_dir: Some(policy.clone()),
+            crate_link_paths: vec![],
+            crate_types: CrateTypes {
+                rlib: true,
+                staticlib: false,
+                cdylib: false,
+            },
+            inputs: if empty {
+                vec![]
+            } else {
+                clippy_config_inputs(&policy)
+            },
+            path_transformer: transformer,
+            rlib_dep_reader: None,
+        };
+        let mut bytes = Vec::new();
+        Box::new(packager).write_inputs(&mut bytes)?;
+        let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
+        let paths = archive
+            .entries()?
+            .map(|entry| Ok(entry?.path()?.into_owned()))
+            .collect::<Result<Vec<_>>>()?;
+        assert!(paths.iter().any(|p| p == Path::new("clippy-config")));
+        if !empty {
+            for name in ["clippy.toml", ".clippy.toml"] {
+                assert!(paths.contains(&PathBuf::from("clippy-config").join(name)));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "dist-client")]
 impl pkg::InputsPackager for RustInputsPackager {
     #[expect(
@@ -3775,6 +3881,7 @@ impl pkg::InputsPackager for RustInputsPackager {
             mut path_transformer,
             rlib_dep_reader,
             env_vars,
+            clippy_dir,
         } = *{ self };
 
         // If this is a cargo build, we can assume all immediate `extern crate` dependencies
@@ -3912,6 +4019,19 @@ impl pkg::InputsPackager for RustInputsPackager {
         );
 
         let mut builder = tar::Builder::new(wtr);
+
+        // Clippy checks that CLIPPY_CONF_DIR exists even when it has no
+        // configuration files. Include the directory and its tracked files.
+        if let Some(config_dir) = clippy_dir {
+            let dist_dir = path_transformer
+                .as_dist(&config_dir)
+                .context("Clippy config directory is not distributable")?;
+            let tar_dir = dist_dir.trim_start_matches('/');
+            if tar_dir.is_empty() || tar_dir.split('/').any(|part| part == "..") {
+                bail!("unsafe distributed Clippy config directory {dist_dir}");
+            }
+            builder.append_dir(tar_dir, config_dir)?;
+        }
 
         for (local_dir, dist_dir) in tar_traversal_dirs {
             let tar_dir = dist_dir.trim_start_matches('/');
@@ -5895,6 +6015,35 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
     }
 
     #[test]
+    fn test_external_clippy_config_file_contents_change_cache_key() -> Result<()> {
+        let f = TestFixture::new();
+        let policy = f.tempdir.path().join("policy");
+        fs::create_dir_all(&policy)?;
+        let file = policy.join("clippy.toml");
+        fs::write(&file, b"disallowed-names = [\"bad_one\"]\n")?;
+        let env = vec![(OsString::from("CLIPPY_CONF_DIR"), policy.into_os_string())];
+        let args = [
+            "--emit",
+            "metadata",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+        ];
+        let first = hash_key_for_compiler(&f, &args, &env, |_| Ok(()), false, "clippy-driver");
+        fs::write(&file, b"disallowed-names = [\"bad_two\"]\n")?;
+        let second = hash_key_for_compiler(&f, &args, &env, |_| Ok(()), false, "clippy-driver");
+        assert_ne!(
+            first, second,
+            "changing the external Clippy policy must invalidate cache"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_clippy_lint_flags_change_the_cache_key() {
         let f = TestFixture::new();
         let args = [
@@ -5943,6 +6092,9 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             build.join("Cargo.toml"),
             "[package]\nname='foo'\nversion='0.0.0'\n",
         )?;
+        let policy = temp.path().join("external-policy");
+        fs::create_dir_all(&policy)?;
+        fs::write(policy.join("clippy.toml"), b"disallowed-names = []\n")?;
         let clippy = bin.join(format!("clippy-driver{}", std::env::consts::EXE_SUFFIX));
         let rustc = bin.join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
         fs::write(&clippy, b"clippy-driver")?;
@@ -5975,6 +6127,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 "SCCACHE_CANONICAL_TARGET_ROOT".into(),
                 build.join("target").into_os_string(),
             ),
+            ("CLIPPY_CONF_DIR".into(), policy.clone().into_os_string()),
         ];
         let canonical = CanonicalRustPaths::from_env(&env, &build, &sysroot)
             .context("canonical Rust paths are unavailable")?;
@@ -6014,6 +6167,37 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         {
             let distributed = dist_command.context("distributed Clippy command not generated")?;
             assert_eq!(distributed.executable, "/rust/bin/clippy-driver");
+            assert_eq!(
+                distributed.env_vars.iter().find_map(|(name, value)| {
+                    (name == "CLIPPY_CONF_DIR").then_some(value.trim_end_matches('/'))
+                }),
+                Some("/clippy-config")
+            );
+
+            // Legacy/noncanonical distributed commands must not forward a
+            // relative host path; resolve it against the *local* crate cwd.
+            let mut noncanonical = compilation.clone();
+            noncanonical.canonical_paths = None;
+            let (_, config_value) = noncanonical
+                .env_vars
+                .iter_mut()
+                .find(|(name, _)| name == "CLIPPY_CONF_DIR")
+                .context("expected Clippy config variable")?;
+            *config_value = OsString::from("../external-policy");
+            let mut legacy_transformer = dist::PathTransformer::new();
+            let (_, legacy_dist, _) =
+                <RustCompilation as Compilation<ProcessCommandCreator>>::generate_compile_commands(
+                    &noncanonical,
+                    &mut legacy_transformer,
+                    false,
+                )?;
+            let legacy_dist = legacy_dist.context("noncanonical distributed command missing")?;
+            assert_eq!(
+                legacy_dist.env_vars.iter().find_map(|(name, value)| {
+                    (name == "CLIPPY_CONF_DIR").then_some(value.as_str())
+                }),
+                Some(policy.to_str().context("non-UTF8 policy path")?)
+            );
         }
         #[cfg(not(feature = "dist-client"))]
         assert!(dist_command.is_none());
