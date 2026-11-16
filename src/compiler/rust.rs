@@ -5753,8 +5753,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             build.join("Cargo.toml"),
             "[package]\nname='foo'\nversion='0.0.0'\n",
         )?;
-        let clippy = bin.join(format!("clippy-driver{EXE_SUFFIX}"));
-        let rustc = bin.join(format!("rustc{EXE_SUFFIX}"));
+        let clippy = bin.join(format!("clippy-driver{}", std::env::consts::EXE_SUFFIX));
+        let rustc = bin.join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
         fs::write(&clippy, b"clippy-driver")?;
         fs::write(&rustc, b"rustc")?;
         let parsed = match parse_arguments(

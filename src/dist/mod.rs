@@ -638,26 +638,33 @@ impl ProcessOutput {
 }
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
-#[cfg(windows)]
-use std::os::windows::process::ExitStatusExt;
-#[cfg(unix)]
-fn exit_status(code: i32) -> process::ExitStatus {
-    process::ExitStatus::from_raw(code)
-}
-#[cfg(windows)]
-fn exit_status(code: i32) -> process::ExitStatus {
-    // TODO: this is probably a subideal conversion - it's not clear how Unix exit codes map to
-    // Windows exit codes (other than 0 being a success)
-    process::ExitStatus::from_raw(code as u32)
-}
 impl From<ProcessOutput> for process::Output {
     fn from(o: ProcessOutput) -> Self {
         // TODO: handle signals, i.e. None code
         Self {
-            status: exit_status(o.code),
+            status: crate::util::exit_status_from_code(o.code),
             stdout: o.stdout,
             stderr: o.stderr,
         }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn test_distributed_process_output_preserves_exit_codes() {
+    for code in [0, 1, 2, 101, 126, 127, 254, 255] {
+        let output: process::Output =
+            ProcessOutput::fake_output(code, b"stdout".to_vec(), b"stderr".to_vec()).into();
+        assert_eq!(output.status.code(), Some(code), "exit code {code}");
+        assert_eq!(output.status.success(), code == 0);
+        assert_eq!(output.stdout, b"stdout");
+        assert_eq!(output.stderr, b"stderr");
+        #[cfg(unix)]
+        assert_eq!(
+            output.status.signal(),
+            None,
+            "exit code {code} misread as signal"
+        );
     }
 }
 
