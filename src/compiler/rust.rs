@@ -811,6 +811,13 @@ fn rust_cargo_env_for_hash(
     hashed
 }
 
+fn is_clippy_driver(executable: &Path) -> bool {
+    executable
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case("clippy-driver"))
+}
+
 fn rust_shadow_plain_env(name: &std::ffi::OsStr) -> bool {
     matches!(
         name.to_str(),
@@ -2736,6 +2743,10 @@ where
         // Hash inputs:
         // 1. A version
         m.update(CACHE_VERSION);
+        if is_clippy_driver(&self.executable) {
+            // Separate correctly executed Clippy from old rustc-substituted results.
+            m.update(b"clippy-driver-correct-execution-v1");
+        }
         if cargo_manifest.is_some() {
             // Keep the manifest-input schema scoped to Cargo builds so unrelated Rust cache
             // entries remain reusable while old Cargo entries cannot collide with this key.
@@ -2881,6 +2892,14 @@ where
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(b"=");
             val.hash(&mut HashToDigest { digest: &mut m });
+        }
+        if is_clippy_driver(&self.executable) {
+            // Clippy lint flags arrive through CLIPPY_ARGS, not rustc argv.
+            for (var, val) in env_vars.iter().filter(|(k, _)| k.starts_with("CLIPPY_")) {
+                var.hash(&mut HashToDigest { digest: &mut m });
+                m.update(b"=");
+                val.hash(&mut HashToDigest { digest: &mut m });
+            }
         }
         // 9. The cwd of the compile. This will wind up in the rlib.
         let hash_cwd = canonical_paths
@@ -3244,15 +3263,14 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             |canonical| {
                 #[cfg(target_os = "linux")]
                 {
-                    let sysroot_rustc = sysroot
+                    let sysroot_compiler = sysroot
                         .join(BINS_DIR)
-                        .join("rustc")
-                        .with_extension(EXE_EXTENSION);
+                        .join(executable.file_name().context("compiler has no filename")?);
                     Ok(CCompileCommand::boxed(CanonicalRustCompileCommand {
                         toolchain_executable: executable.to_owned(),
                         runner_arguments: canonical_bwrap_arguments(
                             canonical,
-                            &sysroot_rustc,
+                            &sysroot_compiler,
                             arguments,
                             cwd,
                         ),
@@ -3393,10 +3411,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                 remapped_disks.insert(dist_path);
             }
 
-            let sysroot_executable = sysroot
-                .join(BINS_DIR)
-                .join("rustc")
-                .with_extension(EXE_EXTENSION);
+            let sysroot_executable = sysroot.join(BINS_DIR).join(executable.file_name()?);
 
             Some(dist::CompileCommand {
                 executable: path_transformer.as_dist(&sysroot_executable)?,
@@ -5616,6 +5631,27 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
     where
         F: Fn(&Path) -> Result<()>,
     {
+        hash_key_for_compiler(
+            f,
+            args,
+            env_vars,
+            pre_func,
+            preprocessor_cache_mode,
+            "rustc",
+        )
+    }
+
+    fn hash_key_for_compiler<F>(
+        f: &TestFixture,
+        args: &[&'static str],
+        env_vars: &[(OsString, OsString)],
+        pre_func: F,
+        preprocessor_cache_mode: bool,
+        executable: &str,
+    ) -> String
+    where
+        F: Fn(&Path) -> Result<()>,
+    {
         let oargs = args.iter().map(OsString::from).collect::<Vec<OsString>>();
         let parsed_args = match parse_arguments(&oargs, f.tempdir.path()) {
             CompilerArguments::Ok(parsed_args) => parsed_args,
@@ -5634,7 +5670,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         }
         pre_func(f.tempdir.path()).expect("Failed to execute pre_func");
         let mut hasher = Box::new(RustHasher {
-            executable: "rustc".into(),
+            executable: executable.into(),
             host: "x86-64-unknown-unknown-unknown".to_owned(),
             version: TEST_RUSTC_VERSION.to_string(),
             sysroot: f.tempdir.path().join("sysroot"),
@@ -5666,6 +5702,132 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             .wait()
             .unwrap()
             .key
+    }
+
+    #[test]
+    fn test_clippy_lint_flags_change_the_cache_key() {
+        let f = TestFixture::new();
+        let args = [
+            "--emit",
+            "metadata",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+        ];
+        let deny = vec![(
+            "CLIPPY_ARGS".into(),
+            "-Dclippy::unwrap_used__CLIPPY_HACKERY__".into(),
+        )];
+        let allow = vec![(
+            "CLIPPY_ARGS".into(),
+            "-Aclippy::unwrap_used__CLIPPY_HACKERY__".into(),
+        )];
+        let deny_key = hash_key_for_compiler(&f, &args, &deny, |_| Ok(()), false, "clippy-driver");
+        let allow_key =
+            hash_key_for_compiler(&f, &args, &allow, |_| Ok(()), false, "clippy-driver");
+        let rustc_key = hash_key_for_compiler(&f, &args, &deny, |_| Ok(()), false, "rustc");
+        assert_ne!(
+            deny_key, allow_key,
+            "different Clippy lint levels must not reuse diagnostics"
+        );
+        assert_ne!(
+            deny_key, rustc_key,
+            "Clippy results must not reuse rustc cache entries"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_cached_clippy_uses_driver_for_canonical_and_distributed_compilation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let build = temp.path().join("project");
+        let sysroot = temp.path().join("toolchain");
+        let bin = sysroot.join(BINS_DIR);
+        fs::create_dir_all(&bin)?;
+        fs::create_dir_all(&build)?;
+        fs::write(
+            build.join("Cargo.toml"),
+            "[package]\nname='foo'\nversion='0.0.0'\n",
+        )?;
+        let clippy = bin.join(format!("clippy-driver{EXE_SUFFIX}"));
+        let rustc = bin.join(format!("rustc{EXE_SUFFIX}"));
+        fs::write(&clippy, b"clippy-driver")?;
+        fs::write(&rustc, b"rustc")?;
+        let parsed = match parse_arguments(
+            &[
+                "rustc".into(),
+                "foo.rs".into(),
+                "--emit".into(),
+                "metadata".into(),
+                "--crate-name".into(),
+                "foo".into(),
+                "--crate-type".into(),
+                "lib".into(),
+                "--out-dir".into(),
+                "out".into(),
+            ],
+            &build,
+        ) {
+            CompilerArguments::Ok(parsed) => parsed,
+            other => bail!("unexpected parse result: {other:?}"),
+        };
+        let env = vec![
+            ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+            (
+                "SCCACHE_CANONICAL_BUILD_ROOT".into(),
+                build.as_os_str().to_owned(),
+            ),
+            (
+                "SCCACHE_CANONICAL_TARGET_ROOT".into(),
+                build.join("target").into_os_string(),
+            ),
+        ];
+        let canonical = CanonicalRustPaths::from_env(&env, &build, &sysroot)
+            .context("canonical Rust paths are unavailable")?;
+        let compilation = RustCompilation {
+            executable: clippy,
+            host: "x86_64-unknown-linux-gnu".into(),
+            sysroot,
+            #[cfg(feature = "dist-client")]
+            rlib_dep_reader: None,
+            arguments: parsed.arguments,
+            inputs: vec![build.join("foo.rs")],
+            outputs: HashMap::new(),
+            crate_link_paths: vec![],
+            crate_name: "foo".into(),
+            crate_types: parsed.crate_types,
+            cwd: build,
+            env_vars: env,
+            env_dep_names: HashSet::new(),
+            allow_dist: true,
+            canonical_paths: Some(canonical),
+        };
+        let mut transformer = dist::PathTransformer::new();
+        let (local, dist_command, _) =
+            <RustCompilation as Compilation<ProcessCommandCreator>>::generate_compile_commands(
+                &compilation,
+                &mut transformer,
+                false,
+            )?;
+        let local_args = local.get_arguments();
+        assert!(
+            local_args
+                .iter()
+                .any(|arg| arg == "/rust/bin/clippy-driver")
+        );
+        assert!(!local_args.iter().any(|arg| arg == "/rust/bin/rustc"));
+        #[cfg(feature = "dist-client")]
+        {
+            let distributed = dist_command.context("distributed Clippy command not generated")?;
+            assert_eq!(distributed.executable, "/rust/bin/clippy-driver");
+        }
+        #[cfg(not(feature = "dist-client"))]
+        assert!(dist_command.is_none());
+        Ok(())
     }
 
     #[test]
