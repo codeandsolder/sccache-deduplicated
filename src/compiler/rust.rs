@@ -3979,19 +3979,15 @@ fn rustlib_entries_for_target(rustlib: &Path, host: &str, target: &str) -> Resul
             continue;
         }
 
-        let installed_target = name_str.and_then(|name| {
-            if let Some(triple) = name.strip_prefix("manifest-rust-std-") {
-                Some(triple.to_owned())
-            } else if path.is_dir() && rustlib.join(format!("manifest-rust-std-{name}")).is_file() {
-                Some(name.to_owned())
-            } else {
-                None
-            }
-        });
-        if installed_target
-            .as_deref()
-            .is_some_and(|triple| triple != host && triple != target)
-        {
+        let is_other_target = name_str
+            .and_then(|name| {
+                name.strip_prefix("manifest-rust-std-").or_else(|| {
+                    (path.is_dir() && rustlib.join(format!("manifest-rust-std-{name}")).is_file())
+                        .then_some(name)
+                })
+            })
+            .is_some_and(|triple| triple != host && triple != target);
+        if is_other_target {
             continue;
         }
         selected.push(path);
