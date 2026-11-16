@@ -325,8 +325,7 @@ impl CanonicalRustPaths {
                 root.to_canonical(config_dir).is_some()
                     || config_dir
                         .canonicalize()
-                        .ok()
-                        .is_some_and(|real| root.to_canonical(&real).is_some())
+                        .is_ok_and(|real| root.to_canonical(&real).is_some())
             })
         {
             roots.push(RootMapping::new(config_dir, "/clippy-config"));

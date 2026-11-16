@@ -3510,12 +3510,12 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
 
         let inputs_packager = Box::new(RustInputsPackager {
             env_vars,
+            clippy_dir,
             crate_link_paths,
             crate_types,
             inputs,
             path_transformer,
             rlib_dep_reader,
-            clippy_dir,
         });
         let canonical = canonical_paths.is_some();
         let target = compilation_target(&arguments, &host);
