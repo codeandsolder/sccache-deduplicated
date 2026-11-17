@@ -3347,11 +3347,16 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                 };
             }
 
+            // Dependency files are derived from the local source-discovery
+            // pass. Never make a worker write them to the client's --out-dir,
+            // which need not exist in the worker sandbox.
+            let mut worker_arguments = arguments.clone();
+            remove_dep_info_emit(&mut worker_arguments);
             let mut dist_arguments = vec![];
             let mut saw_target = false;
 
             // flat_map would be nice but the lifetimes don't work out
-            for argument in arguments {
+            for argument in &worker_arguments {
                 let path_transformer_fn = &mut |p: &Path| path_transformer.as_dist(p);
                 if let Argument::Raw(input_path) = argument {
                     // Need to explicitly handle the input argument as it's not parsed as a path
@@ -6077,6 +6082,94 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             deny_key, rustc_key,
             "Clippy results must not reuse rustc cache entries"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_noncanonical_distributed_clippy_staticlib_omits_dep_info() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cwd = temp.path().join("source");
+        let output_dir = temp.path().join("external-target/debug/build/ffi/out");
+        fs::create_dir_all(&cwd)?;
+        let sysroot = temp.path().join("sysroot");
+        let clippy = sysroot.join(BINS_DIR).join("clippy-driver");
+
+        for (requested, worker_emit) in [
+            ("dep-info,metadata", "metadata"),
+            ("metadata,dep-info", "metadata"),
+            ("dep-info,link", "link"),
+            ("link,dep-info", "link"),
+        ] {
+            let requested_arguments = [
+                "rustc",
+                "--crate-name",
+                "model_alb_xspice_ffi",
+                "--crate-type",
+                "staticlib",
+                "--emit",
+                requested,
+                "--out-dir",
+                output_dir.to_str().context("non-UTF8 target path")?,
+                "src/lib.rs",
+            ]
+            .map(OsString::from);
+            let parsed = match parse_arguments(&requested_arguments, &cwd) {
+                CompilerArguments::Ok(parsed) => parsed,
+                other => bail!("unexpected parse result: {other:?}"),
+            };
+            let compilation = RustCompilation {
+                executable: clippy.clone(),
+                host: "x86_64-unknown-linux-gnu".into(),
+                sysroot: sysroot.clone(),
+                rlib_dep_reader: None,
+                arguments: parsed.arguments,
+                inputs: vec![cwd.join("src/lib.rs")],
+                outputs: HashMap::new(),
+                crate_link_paths: vec![],
+                crate_name: "model_alb_xspice_ffi".into(),
+                crate_types: parsed.crate_types,
+                cwd: cwd.clone(),
+                env_vars: Vec::new(),
+                env_dep_names: HashSet::new(),
+                allow_dist: true,
+                canonical_paths: None,
+            };
+            let mut transformer = dist::PathTransformer::new();
+            let (local, distributed, _) = <RustCompilation as Compilation<
+                ProcessCommandCreator,
+            >>::generate_compile_commands(
+                &compilation, &mut transformer, false
+            )?;
+            let local_arguments = local.get_arguments();
+            assert!(
+                local_arguments
+                    .windows(2)
+                    .any(|pair| { pair[0] == "--emit" && pair[1] == requested }),
+                "local compiler must retain the caller's --emit request: {requested}"
+            );
+            let distributed = distributed.context("missing distributed Clippy command")?;
+            assert!(
+                distributed
+                    .arguments
+                    .windows(2)
+                    .any(|pair| { pair[0] == "--emit" && pair[1] == worker_emit }),
+                "worker must omit locally synthesized dep-info: {requested}"
+            );
+            assert!(
+                !distributed
+                    .arguments
+                    .iter()
+                    .any(|arg| arg.contains("dep-info")),
+                "worker must not write a client-local .d output"
+            );
+            assert!(
+                distributed.arguments.windows(2).any(|pair| {
+                    pair[0] == "--out-dir" && pair[1] == output_dir.to_string_lossy()
+                }),
+                "preserve the independent client output directory in legacy mode"
+            );
+        }
+        Ok(())
     }
 
     #[test]
