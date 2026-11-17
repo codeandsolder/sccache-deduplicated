@@ -1982,10 +1982,13 @@ mod test {
         assert!(msvc_show_includes);
     }
 
-    #[test]
     #[cfg(windows)]
-    fn parse_argument_output_file_trailing_backslash() {
-        let args = ovec!["-c", "foo.c", "/Fomyrelease\\folder\\"];
+    fn assert_trailing_output_file(
+        compilation_flag: &str,
+        input_file: &str,
+        output_arg: &str,
+        expected_output: &str,
+    ) {
         let ParsedArguments {
             input,
             language,
@@ -1994,18 +1997,18 @@ mod test {
             msvc_show_includes,
             common_args,
             ..
-        } = match parse_arguments(args) {
+        } = match parse_arguments(ovec![compilation_flag, input_file, output_arg]) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            other => panic!("Got unexpected parse result: {other:?}"),
         };
-        assert_eq!(Some("foo.c"), input.to_str());
+        assert_eq!(Some(input_file), input.to_str());
         assert_eq!(Language::C, language);
         assert_map_contains!(
             outputs,
             (
                 "obj",
                 ArtifactDescriptor {
-                    path: PathBuf::from("myrelease/folder/foo.obj"),
+                    path: PathBuf::from(expected_output),
                     optional: false
                 }
             )
@@ -2017,35 +2020,24 @@ mod test {
 
     #[test]
     #[cfg(windows)]
-    fn parse_argument_output_file_trailing_slash_multi_extension() {
-        let args = ovec!["/c", "foo.pb.c", "-Fomyrelease\\folder/"];
-        let ParsedArguments {
-            input,
-            language,
-            outputs,
-            preprocessor_args,
-            msvc_show_includes,
-            common_args,
-            ..
-        } = match parse_arguments(args) {
-            CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
-        };
-        assert_eq!(Some("foo.pb.c"), input.to_str());
-        assert_eq!(Language::C, language);
-        assert_map_contains!(
-            outputs,
-            (
-                "obj",
-                ArtifactDescriptor {
-                    path: PathBuf::from("myrelease/folder/foo.pb.obj"),
-                    optional: false
-                }
-            )
+    fn parse_argument_output_file_trailing_backslash() {
+        assert_trailing_output_file(
+            "-c",
+            "foo.c",
+            "/Fomyrelease\\folder\\",
+            "myrelease/folder/foo.obj",
         );
-        assert!(preprocessor_args.is_empty());
-        assert!(common_args.is_empty());
-        assert!(!msvc_show_includes);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parse_argument_output_file_trailing_slash_multi_extension() {
+        assert_trailing_output_file(
+            "/c",
+            "foo.pb.c",
+            "-Fomyrelease\\folder/",
+            "myrelease/folder/foo.pb.obj",
+        );
     }
 
     // All PDB variants must preserve the same compiler arguments and produce
