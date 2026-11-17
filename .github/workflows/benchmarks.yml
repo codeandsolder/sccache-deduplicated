@@ -33,7 +33,7 @@ jobs:
           toolchain: "1.100.0"
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@77dd7bb7dcbb8450e335bbbd1c47591733dc79a4 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@47aa3c1b587f9933f56310f82427ff86539b3ac9 # main
         with:
           rust-toolchain: "1.99.1"
 
@@ -56,4 +56,4 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@77dd7bb7dcbb8450e335bbbd1c47591733dc79a4 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@47aa3c1b587f9933f56310f82427ff86539b3ac9 # main
