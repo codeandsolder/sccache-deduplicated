@@ -18,9 +18,7 @@ use crate::compiler::c::{
     CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext, ParsedArguments,
 };
 use crate::compiler::cicc;
-use crate::compiler::{
-    CCompileCommand, Cacheable, CompileCommand, CompilerArguments, Language, SingleCompileCommand,
-};
+use crate::compiler::{CCompileCommand, Cacheable, CompileCommand, CompilerArguments, Language};
 use crate::{counted_array, dist};
 
 use crate::mock_command::CommandCreatorSync;
@@ -31,7 +29,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process;
 
-use crate::errors::{Result, anyhow};
+use crate::errors::Result;
 
 /// A unit struct on which to implement `CCompilerImpl`.
 #[derive(Clone, Debug)]
@@ -86,96 +84,18 @@ impl CCompilerImpl for CudaFE {
             env_vars,
             ..
         } = context;
-        generate_compile_commands(path_transformer, executable, parsed_args, cwd, env_vars).map(
-            |(command, dist_command, cacheable)| {
-                (CCompileCommand::boxed(command), dist_command, cacheable)
-            },
+        cicc::generate_compile_commands(
+            path_transformer,
+            executable,
+            parsed_args,
+            cwd,
+            env_vars,
+            cicc::OutputStyle::ModuleIdFile,
         )
-    }
-}
-
-pub fn generate_compile_commands(
-    path_transformer: &mut dist::PathTransformer,
-    executable: &Path,
-    parsed_args: &ParsedArguments,
-    cwd: &Path,
-    env_vars: &[(OsString, OsString)],
-) -> Result<(
-    SingleCompileCommand,
-    Option<dist::CompileCommand>,
-    Cacheable,
-)> {
-    // Unused arguments
-    #[cfg(not(feature = "dist-client"))]
-    {
-        let _ = path_transformer;
-    }
-
-    let lang_str = &parsed_args.language.as_str();
-    let out_file = match parsed_args.outputs.get("obj") {
-        Some(obj) => &obj.path,
-        None => return Err(anyhow!("Missing {lang_str:?} file output")),
-    };
-
-    let mut arguments: Vec<OsString> = vec![];
-    arguments.extend_from_slice(&parsed_args.common_args);
-    arguments.extend_from_slice(&parsed_args.unhashed_args);
-    arguments.extend(vec![
-        "--module_id_file_name".into(),
-        out_file.into(),
-        (&parsed_args.input).into(),
-    ]);
-
-    if log_enabled!(log::Level::Trace) {
-        trace!(
-            "[{}]: {} command: {:?}",
-            out_file
-                .file_name()
-                .unwrap_or(out_file.as_os_str())
-                .to_string_lossy(),
-            executable
-                .file_name()
-                .unwrap_or(executable.as_os_str())
-                .to_string_lossy(),
-            [
-                &[format!("cd {} &&", cwd.to_string_lossy())],
-                &[executable.to_str().unwrap_or_default().to_string()][..],
-                &dist::osstrings_to_strings(&arguments).unwrap_or_default()[..]
-            ]
-            .concat()
-            .join(" ")
-        );
-    }
-
-    let command = SingleCompileCommand {
-        executable: executable.to_owned(),
-        arguments,
-        env_vars: env_vars.to_owned(),
-        cwd: cwd.to_owned(),
-        share_jobserver: false,
-    };
-
-    #[cfg(not(feature = "dist-client"))]
-    let dist_command = None;
-    #[cfg(feature = "dist-client")]
-    let dist_command = (|| {
-        let mut arguments: Vec<String> = vec![];
-        arguments.extend(dist::osstrings_to_strings(&parsed_args.common_args)?);
-        arguments.extend(dist::osstrings_to_strings(&parsed_args.unhashed_args)?);
-        arguments.extend(vec![
-            "--module_id_file_name".into(),
-            path_transformer.as_dist(out_file)?,
-            path_transformer.as_dist(&parsed_args.input)?,
-        ]);
-        Some(dist::CompileCommand {
-            executable: path_transformer.as_dist(&executable.canonicalize().ok()?)?,
-            arguments,
-            env_vars: dist::osstring_tuples_to_strings(env_vars)?,
-            cwd: path_transformer.as_dist_abs(cwd)?,
+        .map(|(command, dist_command, cacheable)| {
+            (CCompileCommand::boxed(command), dist_command, cacheable)
         })
-    })();
-
-    Ok((command, dist_command, Cacheable::Yes))
+    }
 }
 
 use cicc::ArgData::{GenModuleIdFileFlag, Output, UnhashedOutput, UnhashedPassThrough};

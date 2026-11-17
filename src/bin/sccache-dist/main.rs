@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 mod build;
 
 mod cmdline;
+mod command_helpers;
 mod token_check;
 
 use cmdline::{AuthSubcommand, Command};

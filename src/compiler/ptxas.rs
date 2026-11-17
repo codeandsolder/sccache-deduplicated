@@ -84,10 +84,17 @@ impl CCompilerImpl for Ptxas {
             env_vars,
             ..
         } = context;
-        cicc::generate_compile_commands(path_transformer, executable, parsed_args, cwd, env_vars)
-            .map(|(command, dist_command, cacheable)| {
-                (CCompileCommand::boxed(command), dist_command, cacheable)
-            })
+        cicc::generate_compile_commands(
+            path_transformer,
+            executable,
+            parsed_args,
+            cwd,
+            env_vars,
+            cicc::OutputStyle::ObjectFile,
+        )
+        .map(|(command, dist_command, cacheable)| {
+            (CCompileCommand::boxed(command), dist_command, cacheable)
+        })
     }
 }
 
