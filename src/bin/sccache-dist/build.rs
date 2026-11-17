@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::command_helpers::CommandExt;
 use anyhow::{Context, Error, Result, anyhow, bail};
 use flate2::read::GzDecoder;
 use fs_err as fs;
@@ -25,58 +26,10 @@ use std::collections::{HashMap, hash_map};
 use std::io;
 use std::iter;
 use std::path::{self, Path, PathBuf};
-use std::process::{ChildStdin, Command, Output, Stdio};
+use std::process::Command;
 use std::sync::Mutex;
 use std::time::Instant;
 use version_compare::Version;
-
-trait CommandExt {
-    fn check_stdout_trim(&mut self) -> Result<String>;
-    fn check_piped(&mut self, pipe: &mut dyn FnMut(&mut ChildStdin) -> Result<()>) -> Result<()>;
-    fn check_run(&mut self) -> Result<()>;
-}
-
-impl CommandExt for Command {
-    fn check_stdout_trim(&mut self) -> Result<String> {
-        let output = self.output().context("Failed to start command")?;
-        check_output(&output)?;
-        let stdout =
-            String::from_utf8(output.stdout).context("Output from listing containers not UTF8")?;
-        Ok(stdout.trim().to_owned())
-    }
-    // Should really take a FnOnce/FnBox
-    fn check_piped(&mut self, pipe: &mut dyn FnMut(&mut ChildStdin) -> Result<()>) -> Result<()> {
-        let mut process = self
-            .stdin(Stdio::piped())
-            .spawn()
-            .context("Failed to start command")?;
-        let mut stdin = process
-            .stdin
-            .take()
-            .context("requested piped stdin but child did not expose it")?;
-        pipe(&mut stdin).context("Failed to pipe input to process")?;
-        let output = process
-            .wait_with_output()
-            .context("Failed to wait for process to return")?;
-        check_output(&output)
-    }
-    fn check_run(&mut self) -> Result<()> {
-        let output = self.output().context("Failed to start command")?;
-        check_output(&output)
-    }
-}
-
-fn check_output(output: &Output) -> Result<()> {
-    if !output.status.success() {
-        warn!(
-            "===========\n{}\n==========\n\n\n\n=========\n{}\n===============\n\n\n",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        bail!("Command failed with status {}", output.status)
-    }
-    Ok(())
-}
 
 fn join_suffix<P: AsRef<Path>>(path: &Path, suffix: P) -> PathBuf {
     let suffixpath = suffix.as_ref();
