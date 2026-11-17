@@ -2048,9 +2048,9 @@ mod test {
         assert!(!msvc_show_includes);
     }
 
-    #[test]
-    fn test_parse_arguments_pdb() {
-        let args = ovec!["-c", "foo.c", "-Zi", "-Fdfoo.pdb", "-Fofoo.obj"];
+    // All PDB variants must preserve the same compiler arguments and produce
+    // both the object and PDB cache artifacts; only the PDB path varies.
+    fn assert_pdb_outputs(fd_arg: &str, expected_path: &str) {
         let ParsedArguments {
             input,
             language,
@@ -2059,9 +2059,9 @@ mod test {
             msvc_show_includes,
             common_args,
             ..
-        } = match parse_arguments(args) {
+        } = match parse_arguments(ovec!["-c", "foo.c", "-Zi", fd_arg, "-Fofoo.obj"]) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {o:?}"),
+            other => panic!("Got unexpected parse result: {other:?}"),
         };
         assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
@@ -2077,174 +2077,48 @@ mod test {
             (
                 "pdb",
                 ArtifactDescriptor {
-                    path: PathBuf::from("foo.pdb"),
+                    path: PathBuf::from(expected_path),
                     optional: false
                 }
             )
         );
         assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
-        assert_eq!(common_args, ovec!["-Zi", "-Fdfoo.pdb"]);
+        assert_eq!(common_args, ovec!["-Zi", fd_arg]);
         assert!(!msvc_show_includes);
+    }
+
+    #[test]
+    fn test_parse_arguments_pdb() {
+        assert_pdb_outputs("-Fdfoo.pdb", "foo.pdb");
     }
 
     #[test]
     fn test_parse_arguments_pdb_no_extension() {
-        // Test that .pdb extension is appended when /Fd argument lacks an extension
-        let args = ovec!["-c", "foo.c", "-Zi", "-Fdfoo", "-Fofoo.obj"];
-        let ParsedArguments {
-            input,
-            language,
-            outputs,
-            preprocessor_args,
-            msvc_show_includes,
-            common_args,
-            ..
-        } = match parse_arguments(args) {
-            CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {o:?}"),
-        };
-        assert_eq!(Some("foo.c"), input.to_str());
-        assert_eq!(Language::C, language);
-        assert_map_contains!(
-            outputs,
-            (
-                "obj",
-                ArtifactDescriptor {
-                    path: PathBuf::from("foo.obj"),
-                    optional: false
-                }
-            ),
-            (
-                "pdb",
-                ArtifactDescriptor {
-                    path: PathBuf::from("foo.pdb"),
-                    optional: false
-                }
-            )
-        );
-        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
-        assert_eq!(common_args, ovec!["-Zi", "-Fdfoo"]);
-        assert!(!msvc_show_includes);
+        // The .pdb extension is added when /Fd lacks an extension.
+        assert_pdb_outputs("-Fdfoo", "foo.pdb");
     }
 
     #[test]
     fn test_parse_arguments_pdb_with_extension() {
-        // Test that .pdb extension is NOT duplicated when already present
-        let args = ovec!["-c", "foo.c", "-Zi", "-Fdfoo.pdb", "-Fofoo.obj"];
-        let ParsedArguments {
-            input,
-            language,
-            outputs,
-            preprocessor_args,
-            msvc_show_includes,
-            common_args,
-            ..
-        } = match parse_arguments(args) {
-            CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {o:?}"),
-        };
-        assert_eq!(Some("foo.c"), input.to_str());
-        assert_eq!(Language::C, language);
-        assert_map_contains!(
-            outputs,
-            (
-                "obj",
-                ArtifactDescriptor {
-                    path: PathBuf::from("foo.obj"),
-                    optional: false
-                }
-            ),
-            (
-                "pdb",
-                ArtifactDescriptor {
-                    path: PathBuf::from("foo.pdb"),
-                    optional: false
-                }
-            )
-        );
-        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
-        assert_eq!(common_args, ovec!["-Zi", "-Fdfoo.pdb"]);
-        assert!(!msvc_show_includes);
+        // The .pdb extension must not be duplicated.
+        assert_pdb_outputs("-Fdfoo.pdb", "foo.pdb");
     }
 
     #[test]
     fn test_parse_arguments_pdb_custom_extension() {
-        // Test that custom extensions are preserved
-        let args = ovec!["-c", "foo.c", "-Zi", "-Fdfoo.db", "-Fofoo.obj"];
-        let ParsedArguments {
-            input,
-            language,
-            outputs,
-            preprocessor_args,
-            msvc_show_includes,
-            common_args,
-            ..
-        } = match parse_arguments(args) {
-            CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {o:?}"),
-        };
-        assert_eq!(Some("foo.c"), input.to_str());
-        assert_eq!(Language::C, language);
-        assert_map_contains!(
-            outputs,
-            (
-                "obj",
-                ArtifactDescriptor {
-                    path: PathBuf::from("foo.obj"),
-                    optional: false
-                }
-            ),
-            (
-                "pdb",
-                ArtifactDescriptor {
-                    path: PathBuf::from("foo.db"),
-                    optional: false
-                }
-            )
-        );
-        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
-        assert_eq!(common_args, ovec!["-Zi", "-Fdfoo.db"]);
-        assert!(!msvc_show_includes);
+        // Custom extensions must be preserved.
+        assert_pdb_outputs("-Fdfoo.db", "foo.db");
     }
 
     #[test]
     fn test_parse_arguments_pdb_path_with_extension() {
-        // Test that .pdb is appended only to the filename when path is given
-        let args = ovec!["-c", "foo.c", "-Zi", "-Fdoutput/foo", "-Fofoo.obj"];
-        let ParsedArguments {
-            input,
-            language,
-            outputs,
-            preprocessor_args,
-            msvc_show_includes,
-            common_args,
-            ..
-        } = match parse_arguments(args) {
-            CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {o:?}"),
-        };
-        assert_eq!(Some("foo.c"), input.to_str());
-        assert_eq!(Language::C, language);
-        assert_map_contains!(
-            outputs,
-            (
-                "obj",
-                ArtifactDescriptor {
-                    path: PathBuf::from("foo.obj"),
-                    optional: false
-                }
-            ),
-            (
-                "pdb",
-                ArtifactDescriptor {
-                    path: PathBuf::from("output/foo.pdb"),
-                    optional: false
-                }
-            )
-        );
-        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
-        assert_eq!(common_args, ovec!["-Zi", "-Fdoutput/foo"]);
-        assert!(!msvc_show_includes);
+        // The .pdb extension applies to the basename within a directory.
+        assert_pdb_outputs("-Fdoutput/foo", "output/foo.pdb");
+    }
+
+    #[test]
+    fn test_parse_arguments_pdb_custom_extension_in_directory() {
+        assert_pdb_outputs("-Fdoutput/foo.db", "output/foo.db");
     }
 
     #[test]
