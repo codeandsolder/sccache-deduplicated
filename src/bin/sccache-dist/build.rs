@@ -444,6 +444,28 @@ fn docker_rm(cid: &str) -> Result<()> {
         .context("Failed to force delete container")
 }
 
+/// Return the IDs of sccache-owned Docker resources from an ID/name listing.
+///
+/// Both Docker container and image listings provide exactly two
+/// whitespace-separated columns; reject malformed output rather than silently
+/// ignoring an unexpected Docker response.
+fn builder_resource_ids(listing: &str) -> Result<Vec<&str>> {
+    let mut ids = Vec::new();
+    for (index, line) in listing.lines().enumerate() {
+        let mut columns = line.split_ascii_whitespace();
+        let (Some(id), Some(name), None) = (columns.next(), columns.next(), columns.next()) else {
+            bail!(
+                "Malformed Docker resource listing at line {}: {line:?}",
+                index + 1
+            );
+        };
+        if name.starts_with("sccache-builder-") {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
 pub struct DockerBuilder {
     image_map: Mutex<HashMap<Toolchain, String>>,
     container_lists: Mutex<HashMap<Toolchain, Vec<String>>>,
@@ -473,62 +495,29 @@ impl DockerBuilder {
             .args(["ps", "-a", "--format", "{{.ID}} {{.Image}}"])
             .check_stdout_trim()
             .context("Unable to list all Docker containers")?;
-        if !containers.is_empty() {
-            let mut containers_to_rm = vec![];
-            for line in containers.split('\n') {
-                let mut iter = line.splitn(2, ' ');
-                let container_id = iter
-                    .next()
-                    .context("Malformed container listing - no container ID")?;
-                let image_name = iter
-                    .next()
-                    .context("Malformed container listing - no image name")?;
-                if iter.next().is_some() {
-                    bail!("Malformed container listing - third field on row")
-                }
-                if image_name.starts_with("sccache-builder-") {
-                    containers_to_rm.push(container_id)
-                }
-            }
-            if !containers_to_rm.is_empty() {
-                Command::new("docker")
-                    .args(["rm", "-f"])
-                    .args(containers_to_rm)
-                    .check_run()
-                    .context("Failed to start command to remove old containers")?;
-            }
+        let containers_to_rm =
+            builder_resource_ids(&containers).context("Malformed Docker container listing")?;
+        if !containers_to_rm.is_empty() {
+            Command::new("docker")
+                .args(["rm", "-f"])
+                .args(containers_to_rm)
+                .check_run()
+                .context("Failed to start command to remove old containers")?;
         }
 
         let images = Command::new("docker")
             .args(["images", "--format", "{{.ID}} {{.Repository}}"])
             .check_stdout_trim()
             .context("Failed to list all docker images")?;
-        if !images.is_empty() {
-            let mut images_to_rm = vec![];
-            for line in images.split('\n') {
-                let mut iter = line.splitn(2, ' ');
-                let image_id = iter
-                    .next()
-                    .context("Malformed image listing - no image ID")?;
-                let image_name = iter
-                    .next()
-                    .context("Malformed image listing - no image name")?;
-                if iter.next().is_some() {
-                    bail!("Malformed image listing - third field on row")
-                }
-                if image_name.starts_with("sccache-builder-") {
-                    images_to_rm.push(image_id)
-                }
-            }
-            if !images_to_rm.is_empty() {
-                Command::new("docker")
-                    .args(["rmi"])
-                    .args(images_to_rm)
-                    .check_run()
-                    .context("Failed to remove image")?
-            }
+        let images_to_rm =
+            builder_resource_ids(&images).context("Malformed Docker image listing")?;
+        if !images_to_rm.is_empty() {
+            Command::new("docker")
+                .args(["rmi"])
+                .args(images_to_rm)
+                .check_run()
+                .context("Failed to remove image")?;
         }
-
         info!("Completed initial Docker cleanup");
         Ok(())
     }
@@ -833,5 +822,40 @@ impl BuilderIncoming for DockerBuilder {
         self.finish_container(&tc, cid);
         debug!("Returning result");
         Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod docker_listing_tests {
+    use super::*;
+
+    #[test]
+    fn selects_only_owned_container_and_image_ids() -> Result<()> {
+        let containers = "a1 some-other-image\nb2 sccache-builder-123:latest\nc3 sha256:abc";
+        assert_eq!(builder_resource_ids(containers)?, vec!["b2"]);
+
+        let images = "sha256:one sccache-builder-xyz\nsha256:two other-image\nsha256:three sccache-builder-abc";
+        assert_eq!(
+            builder_resource_ids(images)?,
+            vec!["sha256:one", "sha256:three"]
+        );
+        assert!(builder_resource_ids("")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_malformed_resource_listings() {
+        for listing in [
+            "missing-name",
+            "id name extra",
+            "id  ",
+            "  ",
+            "id name\nno-name",
+        ] {
+            assert!(
+                builder_resource_ids(listing).is_err(),
+                "incorrectly accepted malformed listing {listing:?}"
+            );
+        }
     }
 }
