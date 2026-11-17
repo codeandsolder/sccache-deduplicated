@@ -275,7 +275,7 @@ pub fn preprocess(cwd: &Path, parsed_args: &ParsedArguments) -> Result<process::
 /// Output operands used by the CUDA device compilation stages.
 /// The two forms differ only in the order and spelling of the last three arguments.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum OutputStyle {
+pub enum OutputStyle {
     ObjectFile,
     ModuleIdFile,
 }
@@ -318,7 +318,7 @@ impl OutputStyle {
     }
 }
 
-pub(crate) fn generate_compile_commands(
+pub fn generate_compile_commands(
     path_transformer: &mut dist::PathTransformer,
     executable: &Path,
     parsed_args: &ParsedArguments,
