@@ -1,6 +1,7 @@
+use crate::util::OsStrExt as _;
 use std::cmp::Ordering;
 use std::error::Error;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Debug, Display};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
@@ -412,21 +413,22 @@ pub enum ArgInfo<T> {
 }
 
 impl<T: ArgumentValue> ArgInfo<T> {
-    /// Transform an argument description into a parsed Argument, given a
-    /// string. For arguments with a value, where the value is separate, the
+    /// Transform an argument description into a parsed Argument using the
+    /// original OS argument bytes. For a value that is separate, the
     /// `get_next_arg` function returns the next argument, in raw `OsString`
     /// form.
-    fn process<F>(self, arg: &str, get_next_arg: F) -> ArgParseResult<Argument<T>>
+    fn process<F>(self, arg: impl AsRef<OsStr>, get_next_arg: F) -> ArgParseResult<Argument<T>>
     where
         F: FnOnce() -> Option<OsString>,
     {
+        let arg = arg.as_ref();
         Ok(match self {
             Self::Flag(s, variant) => {
-                debug_assert_eq!(s, arg);
+                debug_assert_eq!(OsStr::new(s), arg);
                 Argument::Flag(s, variant)
             }
             Self::TakeArg(s, create, ArgDisposition::Separated) => {
-                debug_assert_eq!(s, arg);
+                debug_assert_eq!(OsStr::new(s), arg);
                 if let Some(a) = get_next_arg() {
                     Argument::WithValue(s, create(a)?, ArgDisposition::Separated)
                 } else {
@@ -434,25 +436,22 @@ impl<T: ArgumentValue> ArgInfo<T> {
                 }
             }
             Self::TakeArg(s, create, ArgDisposition::Concatenated(d)) => {
-                let mut len = s.len();
-                debug_assert_eq!(&arg[..len], s);
+                let mut value = arg
+                    .split_prefix(s)
+                    .expect("matched argument must start with its flag");
                 if let Some(d) = d
-                    && arg.as_bytes().get(len) == Some(&d)
+                    && let Some(stripped) = value.split_prefix(&char::from(d).to_string())
                 {
-                    len += 1;
+                    value = stripped;
                 }
-                Argument::WithValue(
-                    s,
-                    create(arg[len..].into())?,
-                    ArgDisposition::Concatenated(d),
-                )
+                Argument::WithValue(s, create(value)?, ArgDisposition::Concatenated(d))
             }
             Self::TakeArg(
                 s,
                 create,
                 ArgDisposition::CanBeSeparated(d) | ArgDisposition::CanBeConcatenated(d),
             ) => {
-                let derived = if arg == s {
+                let derived = if arg == OsStr::new(s) {
                     Self::TakeArg(s, create, ArgDisposition::Separated)
                 } else {
                     Self::TakeArg(s, create, ArgDisposition::Concatenated(d))
@@ -647,7 +646,7 @@ where
                         Argument::Raw(arg.clone())
                     })
                 },
-                |i| i.clone().process(&s[..], || arguments.next()),
+                |i| i.clone().process(&arg, || arguments.next()),
             ))
         } else {
             None
@@ -1086,6 +1085,36 @@ mod tests {
 
         let arg = arg!(WithValue("-foo", Foo("bar"), Separated));
         assert_eq!(arg.iter_os_strings().collect_vec(), ovec!["-foo", "bar"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_arginfo_process_preserves_non_unicode_concatenated_value() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw_value = OsString::from_vec(b"subdir/real=\xff.o".to_vec());
+        let mut arg = OsString::from("-foo=");
+        arg.push(&raw_value);
+
+        let info = take_arg!("-foo", OsString, Concatenated(b'='), Foo);
+        assert_eq!(
+            info.process(&arg, || None).unwrap(),
+            Argument::WithValue(
+                "-foo",
+                Foo(raw_value.clone()),
+                ArgDisposition::Concatenated(Some(b'='))
+            )
+        );
+
+        let info = take_arg!("-foo", OsString, CanBeSeparated(b'='), Foo);
+        assert_eq!(
+            info.process(&arg, || None).unwrap(),
+            Argument::WithValue(
+                "-foo",
+                Foo(raw_value),
+                ArgDisposition::CanBeSeparated(Some(b'='))
+            )
+        );
     }
 
     #[test]
