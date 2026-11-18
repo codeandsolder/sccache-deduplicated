@@ -437,9 +437,11 @@ impl<T: ArgumentValue> ArgInfo<T> {
             }
             Self::TakeArg(s, create, ArgDisposition::Concatenated(d)) => {
                 debug_assert!(arg.starts_with(s));
-                let mut value = arg
-                    .split_prefix(s)
-                    .expect("matched argument must start with its flag");
+                let Some(mut value) = arg.split_prefix(s) else {
+                    return Err(ArgParseError::Other(
+                        "argument does not start with its flag",
+                    ));
+                };
                 if let Some(d) = d
                     && let Some(stripped) = value.split_prefix(&char::from(d).to_string())
                 {
