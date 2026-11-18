@@ -647,46 +647,62 @@ impl DockerBuilder {
     }
 
     fn make_image(tc: &Toolchain, tccache: &Mutex<TcCache>) -> Result<String> {
+        // The open archive remains readable after we release the LRU lock.
+        // Docker operations must not block other toolchain-cache users.
+        let mut toolchain_rdr = {
+            let mut cache = tccache.lock().unwrap();
+            match cache.get(tc) {
+                Ok(rdr) => rdr,
+                Err(LruError::FileNotInCache) => bail!(
+                    "Expected to find toolchain {}, but not available",
+                    tc.archive_id
+                ),
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("Failed to use toolchain {}", tc.archive_id));
+                }
+            }
+        };
+
         let cid = Command::new("docker")
             .args(["create", BASE_DOCKER_IMAGE, "/busybox", "true"])
             .check_stdout_trim()
             .context("Failed to create docker container")?;
 
-        let mut tccache = tccache.lock().unwrap();
-        let mut toolchain_rdr = match tccache.get(tc) {
-            Ok(rdr) => rdr,
-            Err(LruError::FileNotInCache) => bail!(
-                "Expected to find toolchain {}, but not available",
-                tc.archive_id
-            ),
-            Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("Failed to use toolchain {}", tc.archive_id));
-            }
-        };
-
-        trace!("Copying in toolchain");
-        Command::new("docker")
-            .args(["cp", "-", &format!("{}:/", cid)])
-            .check_piped(&mut |stdin| {
-                io::copy(&mut toolchain_rdr, stdin)?;
-                Ok(())
-            })
-            .context("Failed to copy toolchain tar into container")?;
-        drop(toolchain_rdr);
-
+        // Once a temporary container exists, remove it even when copying or
+        // committing the image fails. Keep the original failure as the result.
         let imagename = format!("sccache-builder-{}", &tc.archive_id);
-        Command::new("docker")
-            .args(["commit", &cid, &imagename])
-            .check_run()
-            .context("Failed to commit container after build")?;
+        let image_result = (|| -> Result<()> {
+            trace!("Copying in toolchain");
+            Command::new("docker")
+                .args(["cp", "-", &format!("{}:/", cid)])
+                .check_piped(&mut |stdin| {
+                    io::copy(&mut toolchain_rdr, stdin)?;
+                    Ok(())
+                })
+                .context("Failed to copy toolchain tar into container")?;
+            drop(toolchain_rdr);
 
-        Command::new("docker")
-            .args(["rm", "-f", &cid])
-            .check_run()
-            .context("Failed to remove temporary build container")?;
-
-        Ok(imagename)
+            Command::new("docker")
+                .args(["commit", &cid, &imagename])
+                .check_run()
+                .context("Failed to commit container after build")
+        })();
+        let cleanup_result = docker_rm(&cid);
+        match (image_result, cleanup_result) {
+            (Ok(()), Ok(())) => Ok(imagename),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => {
+                Err(error.context("Failed to remove temporary build container"))
+            }
+            (Err(error), Err(cleanup_error)) => {
+                warn!(
+                    "Failed to remove temporary container {} after image creation failed: {cleanup_error:#}",
+                    cid
+                );
+                Err(error)
+            }
+        }
     }
 
     fn start_container(image: &str) -> Result<String> {
@@ -735,7 +751,9 @@ impl DockerBuilder {
         let cwd = Path::new(&cwd);
 
         trace!("creating output directories");
-        assert!(!output_paths.is_empty());
+        if output_paths.is_empty() {
+            bail!("Docker build requires at least one output path");
+        }
         let mut cmd = Command::new("docker");
         cmd.args(["exec", cid, "/busybox", "mkdir", "-p"]).arg(cwd);
         for path in output_paths.iter() {
@@ -816,18 +834,35 @@ impl BuilderIncoming for DockerBuilder {
             .get_container(&tc, tccache)
             .context("Failed to get a container for build")?;
         debug!("Performing build with container {}", cid);
-        let res = Self::perform_build(command, inputs_rdr, outputs, &cid)
-            .context("Failed to perform build")?;
+        let result = Self::perform_build(command, inputs_rdr, outputs, &cid)
+            .context("Failed to perform build");
         debug!("Finishing with container {}", cid);
         self.finish_container(&tc, cid);
         debug!("Returning result");
-        Ok(res)
+        result
     }
 }
 
 #[cfg(test)]
 mod docker_listing_tests {
     use super::*;
+
+    #[test]
+    fn missing_toolchain_is_checked_before_creating_docker_container() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cache = Mutex::new(TcCache::new(&dir.path().join("toolchains"), 1024 * 1024)?);
+        let tc = Toolchain {
+            archive_id: "not-present".to_owned(),
+        };
+        let error = DockerBuilder::make_image(&tc, &cache).expect_err("missing archive");
+        assert!(
+            error
+                .to_string()
+                .contains("Expected to find toolchain not-present"),
+            "unexpected error: {error:#}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn selects_only_owned_container_and_image_ids() -> Result<()> {
