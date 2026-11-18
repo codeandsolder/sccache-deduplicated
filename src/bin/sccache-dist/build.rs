@@ -142,9 +142,6 @@ impl OverlayBuilder {
                 entry.build_count += 1;
                 entry.clone()
             } else {
-                trace!("Creating toolchain directory for {}", tc.archive_id);
-                fs::create_dir(&toolchain_dir)?;
-
                 // Once the archive file has been opened, extraction must not
                 // hold the global LRU mutex. The open descriptor remains valid
                 // even if another cache operation evicts the directory entry.
@@ -163,19 +160,28 @@ impl OverlayBuilder {
                     }
                 };
 
-                tar::Archive::new(GzDecoder::new(toolchain_rdr))
-                    .unpack(&toolchain_dir)
-                    .or_else(|e| {
-                        warn!("Failed to unpack toolchain: {:?}", e);
-                        fs::remove_dir_all(&toolchain_dir)
-                            .context("Failed to remove unpacked toolchain")?;
-                        tccache
-                            .lock()
-                            .unwrap()
-                            .remove(tc)
-                            .context("Failed to remove corrupt toolchain")?;
-                        Err(Error::from(e))
-                    })?;
+                // Do not leave an empty extraction directory behind when the
+                // toolchain is missing: the next request must be able to retry.
+                trace!("Creating toolchain directory for {}", tc.archive_id);
+                fs::create_dir(&toolchain_dir)?;
+                if let Err(error) =
+                    tar::Archive::new(GzDecoder::new(toolchain_rdr)).unpack(&toolchain_dir)
+                {
+                    warn!("Failed to unpack toolchain: {error:?}");
+                    if let Err(cleanup_error) = fs::remove_dir_all(&toolchain_dir) {
+                        warn!(
+                            "Failed to remove incomplete toolchain directory {}: {cleanup_error:#}",
+                            toolchain_dir.display()
+                        );
+                    }
+                    if let Err(cache_error) = tccache.lock().unwrap().remove(tc) {
+                        warn!(
+                            "Failed to remove corrupt toolchain {} from cache: {cache_error:#}",
+                            tc.archive_id
+                        );
+                    }
+                    return Err(Error::from(error).context("Failed to unpack toolchain"));
+                }
 
                 let entry = DeflatedToolchain {
                     path: toolchain_dir,
@@ -840,6 +846,46 @@ impl BuilderIncoming for DockerBuilder {
         self.finish_container(&tc, cid);
         debug!("Returning result");
         result
+    }
+}
+
+#[cfg(test)]
+mod overlay_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn missing_toolchain_does_not_leave_extraction_directory() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        fs::create_dir(tempdir.path().join("toolchains"))?;
+        fs::create_dir(tempdir.path().join("builds"))?;
+
+        let builder = OverlayBuilder {
+            bubblewrap: PathBuf::from("unused-bubblewrap"),
+            dir: tempdir.path().to_path_buf(),
+            toolchain_dir_map: Mutex::new(HashMap::new()),
+        };
+        let tc = Toolchain {
+            archive_id: "missing-archive".to_owned(),
+        };
+        let cache = Mutex::new(TcCache::new(&tempdir.path().join("tc-cache"), 1024 * 1024)?);
+        let error = builder
+            .prepare_overlay_dirs(&tc, &cache)
+            .expect_err("missing toolchain must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("expected toolchain missing-archive"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            !tempdir
+                .path()
+                .join("toolchains")
+                .join("missing-archive")
+                .exists(),
+            "missing archive must not poison subsequent extraction attempts"
+        );
+        Ok(())
     }
 }
 
