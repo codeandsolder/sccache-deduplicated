@@ -343,7 +343,7 @@ fn clang_module_file_path(cwd: &Path, value: &OsStr) -> PathBuf {
 
     // SAFETY: the slice comes from this OsStr's encoded bytes and is split
     // immediately after an ASCII '=' byte, which is a valid encoding boundary.
-    cwd.join(unsafe { OsStr::from_encoded_bytes(path_bytes) })
+    cwd.join(unsafe { OsStr::from_encoded_bytes_unchecked(path_bytes) })
 }
 
 /// Parse `arguments`, determining whether it is supported.
