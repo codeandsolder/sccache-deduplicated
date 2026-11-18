@@ -27,8 +27,7 @@ use std::io;
 use std::iter;
 use std::path::{self, Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
 use version_compare::Version;
 
 fn join_suffix<P: AsRef<Path>>(path: &Path, suffix: P) -> PathBuf {
@@ -44,13 +43,16 @@ fn join_suffix<P: AsRef<Path>>(path: &Path, suffix: P) -> PathBuf {
 struct OverlaySpec {
     build_dir: PathBuf,
     toolchain_dir: PathBuf,
+    // Keep the extracted toolchain alive through the complete build and its
+    // filesystem cleanup. The map owns the other reference to this lease.
+    _active_lease: Arc<()>,
 }
 
 #[derive(Debug, Clone)]
 struct DeflatedToolchain {
     path: PathBuf,
     build_count: u64,
-    ctime: Instant,
+    active_lease: Arc<()>,
 }
 
 pub struct OverlayBuilder {
@@ -121,6 +123,45 @@ impl OverlayBuilder {
         Ok(())
     }
 
+    /// Reclaim extracted toolchains whose archives have been evicted, but
+    /// never while a running build still references their lower directory.
+    /// The caller holds the directory-map mutex, preventing new build leases
+    /// from being acquired during the check and filesystem deletion.
+    fn prune_unused_toolchain_dirs(
+        &self,
+        dir_map: &mut HashMap<Toolchain, DeflatedToolchain>,
+        tccache: &Mutex<TcCache>,
+    ) {
+        // Inspect the actual cache membership rather than comparing collection
+        // sizes: eviction order need not match directory creation order.
+        // Release the cache lock before potentially slow directory deletion.
+        let candidates: Vec<_> = {
+            let cache = tccache.lock().unwrap();
+            dir_map
+                .iter()
+                .filter(|(tc, entry)| {
+                    Arc::strong_count(&entry.active_lease) == 1 && !cache.contains_toolchain(tc)
+                })
+                .map(|(tc, entry)| (tc.clone(), entry.path.clone()))
+                .collect()
+        };
+        for (tc, path) in candidates {
+            match fs::remove_dir_all(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    warn!(
+                        "Failed to prune inactive toolchain directory {}: {error:#}",
+                        path.display()
+                    );
+                    continue;
+                }
+            }
+            debug!("Pruned inactive uncompressed toolchain {}", tc.archive_id);
+            dir_map.remove(&tc);
+        }
+    }
+
     fn prepare_overlay_dirs(
         &self,
         tc: &Toolchain,
@@ -129,7 +170,7 @@ impl OverlayBuilder {
         let DeflatedToolchain {
             path: toolchain_dir,
             build_count: id,
-            ctime: _,
+            active_lease,
         } = {
             let mut toolchain_dir_map = self.toolchain_dir_map.lock().unwrap();
             // Create the toolchain dir (if necessary) while we have an exclusive lock
@@ -186,26 +227,11 @@ impl OverlayBuilder {
                 let entry = DeflatedToolchain {
                     path: toolchain_dir,
                     build_count: 1,
-                    ctime: Instant::now(),
+                    active_lease: Arc::new(()),
                 };
 
                 toolchain_dir_map.insert(tc.clone(), entry.clone());
-                if toolchain_dir_map.len() > tccache.lock().unwrap().len() {
-                    let dir_map = toolchain_dir_map.clone();
-                    let mut entries: Vec<_> = dir_map.iter().collect();
-                    // In the pathological case, creation time for unpacked
-                    // toolchains could be the opposite of the least recently
-                    // recently used, so we clear out half of the accumulated
-                    // toolchains to prevent repeated sort/delete cycles.
-                    entries.sort_by(|a, b| (a.1).ctime.cmp(&(b.1).ctime));
-                    entries.truncate(entries.len() / 2);
-                    for (tc, _) in entries {
-                        warn!("Removing old un-compressed toolchain: {:?}", tc);
-                        assert!(toolchain_dir_map.remove(tc).is_some());
-                        fs::remove_dir_all(self.dir.join("toolchains").join(&tc.archive_id))
-                            .context("Failed to remove old toolchain directory")?;
-                    }
-                }
+                self.prune_unused_toolchain_dirs(&mut toolchain_dir_map, tccache);
                 entry
             }
         };
@@ -219,6 +245,7 @@ impl OverlayBuilder {
         Ok(OverlaySpec {
             build_dir,
             toolchain_dir,
+            _active_lease: active_lease,
         })
     }
 
@@ -389,20 +416,22 @@ impl OverlayBuilder {
 
     // Failing during cleanup is pretty unexpected, but we can still return the successful compile
     // TODO: if too many of these fail, we should mark this builder as faulty
-    fn finish_overlay(&self, _tc: &Toolchain, overlay: OverlaySpec) {
-        // TODO: collect toolchain directories
-
-        let OverlaySpec {
-            build_dir,
-            toolchain_dir: _,
-        } = overlay;
-        if let Err(e) = fs::remove_dir_all(&build_dir) {
+    fn finish_overlay(&self, _tc: &Toolchain, overlay: OverlaySpec, tccache: &Mutex<TcCache>) {
+        // Deleting the temporary build directory may fail, but the compile
+        // result should still be returned to the client.
+        if let Err(e) = fs::remove_dir_all(&overlay.build_dir) {
             error!(
                 "Failed to remove build directory {}: {}",
-                build_dir.display(),
+                overlay.build_dir.display(),
                 e
             );
         }
+        // The compile and mount namespace have finished. Release the lease
+        // before pruning so this toolchain can be collected if its archive is
+        // no longer cached and no other builds are using it.
+        drop(overlay);
+        let mut dir_map = self.toolchain_dir_map.lock().unwrap();
+        self.prune_unused_toolchain_dirs(&mut dir_map, tccache);
     }
 }
 
@@ -422,7 +451,7 @@ impl BuilderIncoming for OverlayBuilder {
         debug!("Performing build in {:?}", overlay);
         let res = Self::perform_build(&self.bubblewrap, command, inputs_rdr, outputs, &overlay);
         debug!("Finishing with overlay");
-        self.finish_overlay(&tc, overlay);
+        self.finish_overlay(&tc, overlay, tccache);
         debug!("Returning result");
         res.context("Compilation execution failed")
     }
@@ -885,6 +914,106 @@ mod overlay_lifecycle_tests {
                 .exists(),
             "missing archive must not poison subsequent extraction attempts"
         );
+        Ok(())
+    }
+    #[test]
+    fn active_extracted_toolchain_is_pruned_only_after_last_build_finishes() -> Result<()> {
+        use std::io::Write as _;
+
+        let tempdir = tempfile::tempdir()?;
+        let toolchains_dir = tempdir.path().join("toolchains");
+        fs::create_dir(&toolchains_dir)?;
+        let builder = OverlayBuilder {
+            bubblewrap: PathBuf::from("unused-bubblewrap"),
+            dir: tempdir.path().to_path_buf(),
+            toolchain_dir_map: Mutex::new(HashMap::new()),
+        };
+        let active_tc = Toolchain {
+            archive_id: "active".to_owned(),
+        };
+        let idle_tc = Toolchain {
+            archive_id: "idle".to_owned(),
+        };
+        let archive = b"cached toolchain bytes";
+        let cached_tc = Toolchain {
+            archive_id: sccache::util::Digest::reader_sync(&archive[..])?,
+        };
+        let active_path = toolchains_dir.join("active");
+        let idle_path = toolchains_dir.join("idle");
+        let cached_path = toolchains_dir.join(&cached_tc.archive_id);
+        fs::create_dir(&active_path)?;
+        fs::create_dir(&idle_path)?;
+        fs::create_dir(&cached_path)?;
+
+        let lease = Arc::new(());
+        let in_flight: Vec<_> = (0..2)
+            .map(|_| OverlaySpec {
+                build_dir: tempdir.path().join("unused-build"),
+                toolchain_dir: active_path.clone(),
+                _active_lease: Arc::clone(&lease),
+            })
+            .collect();
+        let mut tc_cache = TcCache::new(&tempdir.path().join("tc-cache"), 1024 * 1024)?;
+        tc_cache.insert_with(&cached_tc, |mut file| file.write_all(archive))?;
+        let cache = Mutex::new(tc_cache);
+        let mut dir_map = builder.toolchain_dir_map.lock().unwrap();
+        dir_map.insert(
+            active_tc.clone(),
+            DeflatedToolchain {
+                path: active_path.clone(),
+                build_count: 2,
+                active_lease: lease,
+            },
+        );
+        dir_map.insert(
+            idle_tc.clone(),
+            DeflatedToolchain {
+                path: idle_path.clone(),
+                build_count: 1,
+                active_lease: Arc::new(()),
+            },
+        );
+
+        dir_map.insert(
+            cached_tc.clone(),
+            DeflatedToolchain {
+                path: cached_path.clone(),
+                build_count: 1,
+                active_lease: Arc::new(()),
+            },
+        );
+
+        builder.prune_unused_toolchain_dirs(&mut dir_map, &cache);
+        assert!(
+            cached_path.exists(),
+            "cached toolchain must not be evicted by unrelated cache churn"
+        );
+        assert!(dir_map.contains_key(&cached_tc));
+        assert!(
+            active_path.exists(),
+            "active toolchain must survive pruning"
+        );
+        assert!(!idle_path.exists(), "idle toolchain should be reclaimed");
+        assert!(dir_map.contains_key(&active_tc));
+        assert!(!dir_map.contains_key(&idle_tc));
+
+        let mut active_builds = in_flight.into_iter();
+        drop(active_builds.next());
+        builder.prune_unused_toolchain_dirs(&mut dir_map, &cache);
+        assert!(
+            active_path.exists(),
+            "another ongoing build must keep the toolchain alive"
+        );
+
+        drop(active_builds.next());
+        builder.prune_unused_toolchain_dirs(&mut dir_map, &cache);
+        assert!(!active_path.exists(), "last build release allows pruning");
+        assert!(
+            cached_path.exists(),
+            "cached toolchain must remain available"
+        );
+        assert_eq!(dir_map.len(), 1);
+        assert!(dir_map.contains_key(&cached_tc));
         Ok(())
     }
 }
