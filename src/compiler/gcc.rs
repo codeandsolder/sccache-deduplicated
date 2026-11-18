@@ -332,6 +332,20 @@ counted_array!(pub static ARGS: [ArgInfo<ArgData>; _] = [
     take_arg!("@", OsString, Concatenated, TooHard),
 ]);
 
+/// Resolve the file operand in Clang's -fmodule-file=path and
+/// -fmodule-file=name=path forms without losing non-Unicode path bytes.
+fn clang_module_file_path(cwd: &Path, value: &OsStr) -> PathBuf {
+    let bytes = value.as_encoded_bytes();
+    let path_bytes = bytes
+        .iter()
+        .position(|byte| *byte == b'=')
+        .map_or(bytes, |index| &bytes[index + 1..]);
+
+    // SAFETY: the slice comes from this OsStr's encoded bytes and is split
+    // immediately after an ASCII '=' byte, which is a valid encoding boundary.
+    cwd.join(unsafe { OsStr::from_encoded_bytes_unchecked(path_bytes) })
+}
+
 /// Parse `arguments`, determining whether it is supported.
 ///
 /// If any of the entries in `arguments` result in a compilation that
@@ -599,13 +613,7 @@ where
                 &mut common_args
             }
             Some(ExtraHashFileClangModuleFile(val)) => {
-                // -fmodule-file can be either "path" or "name=path"
-                let val_str = val.to_string_lossy();
-                let path = val_str.find('=').map_or_else(
-                    || PathBuf::from(val),
-                    |idx| PathBuf::from(&val_str[idx + 1..]),
-                );
-                extra_hash_files.push(cwd.join(path));
+                extra_hash_files.push(clang_module_file_path(cwd, val));
                 &mut common_args
             }
             Some(PreprocessorArgument(_)) => {
@@ -697,13 +705,7 @@ where
                 &mut common_args
             }
             Some(ExtraHashFileClangModuleFile(val)) => {
-                // -fmodule-file can be either "path" or "name=path"
-                let val_str = val.to_string_lossy();
-                let path = val_str.find('=').map_or_else(
-                    || PathBuf::from(val),
-                    |idx| PathBuf::from(&val_str[idx + 1..]),
-                );
-                extra_hash_files.push(cwd.join(path));
+                extra_hash_files.push(clang_module_file_path(cwd, val));
                 &mut common_args
             }
             Some(

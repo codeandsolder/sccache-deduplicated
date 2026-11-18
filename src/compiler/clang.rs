@@ -1486,41 +1486,68 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_parse_arguments_cxx20_module_fmodule_file() {
-        // Test -fmodule-file= for importing precompiled modules
-        let a = parses!("-c", "foo.cpp", "-o", "foo.o", "-fmodule-file=mymodule.pcm");
-        assert_eq!(Some("foo.cpp"), a.input.to_str());
-        assert_eq!(ovec!["-fmodule-file=mymodule.pcm"], a.common_args);
+    // The path part is hashed, while the complete argument remains part of the
+    // compiler command. Named and unnamed modules share these invariants.
+    fn assert_module_file_path(flag: &str, expected_path: &str) {
+        let parsed = parses!("-c", "foo.cpp", "-o", "foo.o", flag);
+        assert_eq!(Some("foo.cpp"), parsed.input.to_str());
+        assert_eq!(ovec![flag], parsed.common_args);
         assert_eq!(
-            ovec![std::env::current_dir().unwrap().join("mymodule.pcm")],
-            a.extra_hash_files
+            vec![std::env::current_dir().unwrap().join(expected_path)],
+            parsed.extra_hash_files
         );
     }
 
     #[test]
+    fn test_parse_arguments_cxx20_module_fmodule_file() {
+        assert_module_file_path("-fmodule-file=mymodule.pcm", "mymodule.pcm");
+    }
+
+    #[test]
     fn test_parse_arguments_cxx20_module_fmodule_file_with_name() {
-        // Test -fmodule-file=name=path syntax
-        let a = parses!(
-            "-c",
-            "foo.cpp",
-            "-o",
-            "foo.o",
-            "-fmodule-file=mymodule=path/to/mymodule.pcm"
+        assert_module_file_path(
+            "-fmodule-file=mymodule=path/to/mymodule.pcm",
+            "path/to/mymodule.pcm",
         );
-        assert_eq!(Some("foo.cpp"), a.input.to_str());
-        assert_eq!(
-            ovec!["-fmodule-file=mymodule=path/to/mymodule.pcm"],
-            a.common_args
+    }
+
+    #[test]
+    fn test_parse_arguments_cxx20_module_file_path_containing_equals() {
+        assert_module_file_path(
+            "-fmodule-file=mymodule=path/mod=foo.pcm",
+            "path/mod=foo.pcm",
         );
-        assert_eq!(
-            ovec![
-                std::env::current_dir()
-                    .unwrap()
-                    .join("path/to/mymodule.pcm")
-            ],
-            a.extra_hash_files
-        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_arguments_cxx20_module_file_preserves_non_unicode_path() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let cwd = std::env::current_dir().unwrap();
+        let raw_path = OsString::from_vec(b"modules/mod=\xff.pcm".to_vec());
+        let mut flag = OsString::from("-fmodule-file=named=");
+        flag.push(&raw_path);
+
+        // Exercise both the direct argument and the -Xclang forwarding path.
+        for forwarded in [false, true] {
+            let mut arguments = ovec!["-c", "consumer.cpp", "-o", "consumer.o"];
+            if forwarded {
+                arguments.push("-Xclang".into());
+            }
+            arguments.push(flag.clone());
+            let parsed = Clang {
+                clangplusplus: false,
+                is_appleclang: false,
+                version: None,
+                assembler_digest: None,
+            }
+            .parse_arguments(&arguments, &cwd, &[]);
+            let CompilerArguments::Ok(parsed) = parsed else {
+                panic!("failed to parse non-Unicode module file argument: {parsed:?}");
+            };
+            assert_eq!(parsed.extra_hash_files, vec![cwd.join(&raw_path)]);
+        }
     }
 
     #[test]
