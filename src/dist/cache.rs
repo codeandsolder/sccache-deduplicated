@@ -454,6 +454,36 @@ mod client {
             any(target_arch = "x86_64", target_arch = "aarch64")
         ))]
         #[test]
+        fn malformed_weak_mapping_repackages_and_repairs_disk_index() -> Result<()> {
+            let (_td, cache_dir, first, toolchain) = cached_toolchain()?;
+            drop(first);
+
+            std::fs::write(
+                cache_dir.join("weak_map.json"),
+                br#"{"weak_key":"../malformed"}"#,
+            )?;
+            let recovered = ClientToolchains::new(&cache_dir, 1024 * 1024, &[])?;
+            let (repacked, _) = recovered.put_toolchain(
+                "/my/compiler".as_ref(),
+                "weak_key",
+                Box::new(StaticToolchainPackager),
+            )?;
+            assert_eq!(repacked, toolchain);
+            assert_eq!(
+                recovered.weak_to_strong("weak_key")?,
+                Some(toolchain.archive_id.clone())
+            );
+            let persisted: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(cache_dir.join("weak_map.json"))?)?;
+            assert_eq!(persisted["weak_key"], toolchain.archive_id.to_string());
+            Ok(())
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        #[test]
         fn missing_archive_file_repackages_without_restart() -> Result<()> {
             let (_td, cache_dir, client, toolchain) = cached_toolchain()?;
 
@@ -721,13 +751,25 @@ impl TcCache {
     ) -> Result<()> {
         self.inner
             .insert_with(make_lru_key_path(&tc.archive_id), with)?;
-        let verified_archive_id = file_key(self.get(tc)?)?;
-        // TODO: remove created toolchain?
-        if verified_archive_id == tc.archive_id.as_str() {
-            Ok(())
-        } else {
-            Err(anyhow!("written file does not match expected hash key"))
+        let verified = (|| -> Result<()> {
+            let verified_archive_id = file_key(self.get(tc)?)?;
+            if verified_archive_id == tc.archive_id.as_str() {
+                Ok(())
+            } else {
+                Err(anyhow!("written file does not match expected hash key"))
+            }
+        })();
+        if verified.is_err() {
+            // Never retain an incorrectly keyed archive in the LRU index,
+            // including when validation failed because of a read error.
+            if let Err(error) = self.remove(tc) {
+                log::warn!(
+                    "Failed to remove invalid toolchain archive {}: {error}",
+                    tc.archive_id
+                );
+            }
         }
+        verified
     }
 
     /// Open a cached toolchain archive as a file.
@@ -787,4 +829,29 @@ fn file_key<R: Read>(rdr: R) -> Result<String> {
 /// Make a path to the cache entry with key `key`.
 fn make_lru_key_path(key: &ArchiveId) -> PathBuf {
     Path::new(&key[0..1]).join(&key[1..2]).join(key.as_str())
+}
+
+#[cfg(test)]
+mod cache_validation_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn rejected_digest_does_not_leave_a_cached_archive() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let tc = Toolchain {
+            archive_id: ArchiveId::try_from(Digest::reader_sync(b"expected".as_slice())?)?,
+        };
+        let mut cache = TcCache::new(tempdir.path(), 1024 * 1024)?;
+        let failure = cache
+            .insert_with(&tc, |mut file| file.write_all(b"not the expected archive"))
+            .expect_err("mismatched archive digest must fail");
+        assert!(failure.to_string().contains("written file does not match"));
+        assert!(!cache.contains_toolchain(&tc));
+        assert!(matches!(
+            cache.get(&tc),
+            Err(crate::lru_disk_cache::Error::FileNotInCache)
+        ));
+        Ok(())
+    }
 }
