@@ -3927,6 +3927,12 @@ mod test_dist {
 
     use crate::errors::*;
 
+    fn mock_toolchain() -> Toolchain {
+        Toolchain {
+            archive_id: crate::dist::ArchiveId::try_from("a".repeat(64)).unwrap(),
+        }
+    }
+
     pub struct ErrorPutToolchainClient;
     impl ErrorPutToolchainClient {
         pub fn client() -> Arc<dyn dist::Client> {
@@ -3979,9 +3985,7 @@ mod test_dist {
     impl ErrorAllocJobClient {
         pub fn client() -> Arc<dyn dist::Client> {
             Arc::new(Self {
-                tc: Toolchain {
-                    archive_id: "somearchiveid".to_owned(),
-                },
+                tc: mock_toolchain(),
             })
         }
     }
@@ -4034,9 +4038,7 @@ mod test_dist {
         pub fn client() -> Arc<dyn dist::Client> {
             Arc::new(Self {
                 has_started: AtomicBool::default(),
-                tc: Toolchain {
-                    archive_id: "somearchiveid".to_owned(),
-                },
+                tc: mock_toolchain(),
             })
         }
     }
@@ -4104,9 +4106,7 @@ mod test_dist {
         pub fn client() -> Arc<dyn dist::Client> {
             Arc::new(Self {
                 has_started: AtomicBool::default(),
-                tc: Toolchain {
-                    archive_id: "somearchiveid".to_owned(),
-                },
+                tc: mock_toolchain(),
             })
         }
     }
@@ -4191,9 +4191,7 @@ mod test_dist {
         ) -> Arc<dyn dist::Client> {
             Arc::new(Self {
                 has_started: AtomicBool::default(),
-                tc: Toolchain {
-                    archive_id: "somearchiveid".to_owned(),
-                },
+                tc: mock_toolchain(),
                 output: ProcessOutput::fake_output(code, stdout, stderr),
                 worker_label,
             })

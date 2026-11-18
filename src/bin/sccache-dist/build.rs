@@ -852,13 +852,11 @@ mod docker_listing_tests {
         let dir = tempfile::tempdir()?;
         let cache = Mutex::new(TcCache::new(&dir.path().join("toolchains"), 1024 * 1024)?);
         let tc = Toolchain {
-            archive_id: "not-present".to_owned(),
+            archive_id: sccache::dist::ArchiveId::try_from("d".repeat(64)).unwrap(),
         };
         let error = DockerBuilder::make_image(&tc, &cache).expect_err("missing archive");
         assert!(
-            error
-                .to_string()
-                .contains("Expected to find toolchain not-present"),
+            error.to_string().contains("Expected to find toolchain"),
             "unexpected error: {error:#}"
         );
         Ok(())

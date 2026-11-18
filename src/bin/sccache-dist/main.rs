@@ -1121,6 +1121,12 @@ impl ServerIncoming for Server {
 mod scheduler_tests {
     use super::*;
 
+    fn test_toolchain(marker: char) -> Toolchain {
+        Toolchain {
+            archive_id: sccache::dist::ArchiveId::try_from(marker.to_string().repeat(64)).unwrap(),
+        }
+    }
+
     #[test]
     fn scheduler_instances_namespace_job_ids() {
         let scheduler0 = Scheduler::with_job_id_base(0x1000);
@@ -1166,6 +1172,20 @@ mod scheduler_tests {
         }
     }
 
+    fn register_test_server(scheduler: &Scheduler, server_id: ServerId, nonce: ServerNonce) {
+        scheduler
+            .handle_heartbeat_server(server_id, nonce, 1, Box::new(TestJobAuthorizer))
+            .unwrap();
+    }
+
+    fn assert_no_assigned_jobs(scheduler: &Scheduler, server_id: &ServerId) {
+        assert!(scheduler.jobs.lock().unwrap().is_empty());
+        let servers = scheduler.servers.lock().unwrap();
+        let details = servers.get(server_id).unwrap();
+        assert!(details.jobs_assigned.is_empty());
+        assert!(details.jobs_unclaimed.is_empty());
+    }
+
     struct AcceptAssign;
 
     impl SchedulerOutgoing for AcceptAssign {
@@ -1200,12 +1220,7 @@ mod scheduler_tests {
         let mut observed = Vec::new();
         for _ in 0..12 {
             let result = scheduler
-                .handle_alloc_job(
-                    &AcceptAssign,
-                    Toolchain {
-                        archive_id: "same-toolchain".to_owned(),
-                    },
-                )
+                .handle_alloc_job(&AcceptAssign, test_toolchain('b'))
                 .unwrap();
             let AllocJobResult::Success { job_alloc, .. } = result else {
                 panic!("eligible idle workers must accept a job");
@@ -1237,42 +1252,20 @@ mod scheduler_tests {
         let scheduler =
             Scheduler::new_with_job_slack_and_drain(JobSlackConfig::default(), Some(drain.clone()));
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
-        scheduler
-            .handle_heartbeat_server(
-                server_id,
-                ServerNonce::new(),
-                1,
-                Box::new(TestJobAuthorizer),
-            )
-            .unwrap();
+        register_test_server(&scheduler, server_id, ServerNonce::new());
 
         std::fs::write(&drain, b"drain").unwrap();
         assert!(scheduler.handle_is_draining());
         let allocation = scheduler
-            .handle_alloc_job(
-                &AcceptAssign,
-                Toolchain {
-                    archive_id: "test-toolchain".to_owned(),
-                },
-            )
+            .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
             .unwrap();
         assert!(matches!(allocation, AllocJobResult::Fail { .. }));
-        assert!(scheduler.jobs.lock().unwrap().is_empty());
-        let servers = scheduler.servers.lock().unwrap();
-        let details = servers.get(&server_id).unwrap();
-        assert!(details.jobs_assigned.is_empty());
-        assert!(details.jobs_unclaimed.is_empty());
-        drop(servers);
+        assert_no_assigned_jobs(&scheduler, &server_id);
 
         std::fs::remove_file(&drain).unwrap();
         assert!(!scheduler.handle_is_draining());
         let allocation = scheduler
-            .handle_alloc_job(
-                &AcceptAssign,
-                Toolchain {
-                    archive_id: "test-toolchain".to_owned(),
-                },
-            )
+            .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
             .unwrap();
         assert!(matches!(allocation, AllocJobResult::Success { .. }));
     }
@@ -1405,14 +1398,7 @@ mod scheduler_tests {
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
         let server_nonce = ServerNonce::new();
 
-        scheduler
-            .handle_heartbeat_server(
-                server_id,
-                server_nonce.clone(),
-                1,
-                Box::new(TestJobAuthorizer),
-            )
-            .unwrap();
+        register_test_server(&scheduler, server_id, server_nonce.clone());
 
         let requester = ReapDuringAssign {
             scheduler: &scheduler,
@@ -1420,21 +1406,11 @@ mod scheduler_tests {
             server_nonce,
         };
         let allocation = scheduler
-            .handle_alloc_job(
-                &requester,
-                Toolchain {
-                    archive_id: "test-toolchain".to_owned(),
-                },
-            )
+            .handle_alloc_job(&requester, test_toolchain('c'))
             .unwrap();
 
         assert!(matches!(allocation, AllocJobResult::Fail { .. }));
-        assert!(scheduler.jobs.lock().unwrap().is_empty());
-
-        let servers = scheduler.servers.lock().unwrap();
-        let details = servers.get(&server_id).unwrap();
-        assert!(details.jobs_assigned.is_empty());
-        assert!(details.jobs_unclaimed.is_empty());
+        assert_no_assigned_jobs(&scheduler, &server_id);
     }
 }
 
@@ -1482,7 +1458,7 @@ mod server_upload_tests {
 
     fn tc(contents: &[u8]) -> Result<Toolchain> {
         Ok(Toolchain {
-            archive_id: Digest::reader_sync(contents)?,
+            archive_id: sccache::dist::ArchiveId::try_from(Digest::reader_sync(contents)?)?,
         })
     }
 

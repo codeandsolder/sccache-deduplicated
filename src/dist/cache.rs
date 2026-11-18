@@ -1,4 +1,4 @@
-use crate::dist::Toolchain;
+use crate::dist::{ArchiveId, Toolchain};
 use crate::lru_disk_cache::Result as LruResult;
 use crate::lru_disk_cache::{LruDiskCache, ReadSeek};
 use anyhow::{Result, anyhow};
@@ -15,7 +15,7 @@ use std::io::Read;
 mod client {
     use crate::config;
     use crate::dist::pkg::ToolchainPackager;
-    use crate::dist::{CustomToolchainOverride, Toolchain};
+    use crate::dist::{ArchiveId, CustomToolchainOverride, Toolchain};
     use crate::lru_disk_cache::Error as LruError;
     use anyhow::{Context, Error, Result, bail};
     use fs_err as fs;
@@ -264,7 +264,7 @@ mod client {
                     .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?;
                 cache.insert_file(tmpfile.path())?
             };
-            self.record_weak(weak_key.to_owned(), tc.archive_id.clone())?;
+            self.record_weak(weak_key.to_owned(), tc.archive_id.to_string())?;
             Ok((tc, None))
         }
 
@@ -329,7 +329,7 @@ mod client {
             Some(Ok((tc, toolchain_override)))
         }
 
-        fn weak_to_strong(&self, weak_key: &str) -> Result<Option<String>> {
+        fn weak_to_strong(&self, weak_key: &str) -> Result<Option<ArchiveId>> {
             let result = {
                 let weak_map = self
                     .weak_map
@@ -337,7 +337,16 @@ mod client {
                     .map_err(|_| anyhow::anyhow!("toolchain weak-map mutex poisoned"))?;
                 weak_map.get(weak_key).cloned()
             };
-            Ok(result)
+            match result {
+                Some(value) => match ArchiveId::try_from(value) {
+                    Ok(id) => Ok(Some(id)),
+                    Err(error) => {
+                        warn!("Ignoring malformed weak toolchain mapping for {weak_key}: {error}");
+                        Ok(None)
+                    }
+                },
+                None => Ok(None),
+            }
         }
         fn record_weak(&self, weak_key: String, key: String) -> Result<()> {
             let serialized = {
@@ -660,7 +669,7 @@ impl StagedToolchainArchive {
         if written > max_size {
             return Err(anyhow!("toolchain archive exceeds cache capacity"));
         }
-        if file_key(file.reopen()?)? != toolchain.archive_id {
+        if file_key(file.reopen()?)? != toolchain.archive_id.as_str() {
             return Err(anyhow!("toolchain archive digest mismatch"));
         }
         Ok(Self { toolchain, file })
@@ -714,7 +723,7 @@ impl TcCache {
             .insert_with(make_lru_key_path(&tc.archive_id), with)?;
         let verified_archive_id = file_key(self.get(tc)?)?;
         // TODO: remove created toolchain?
-        if verified_archive_id == tc.archive_id {
+        if verified_archive_id == tc.archive_id.as_str() {
             Ok(())
         } else {
             Err(anyhow!("written file does not match expected hash key"))
@@ -768,14 +777,14 @@ impl TcCache {
 }
 
 #[cfg(feature = "dist-client")]
-fn path_key(path: &Path) -> Result<String> {
-    file_key(fs::File::open(path)?)
+fn path_key(path: &Path) -> Result<ArchiveId> {
+    Ok(ArchiveId::try_from(file_key(fs::File::open(path)?)?)?)
 }
 
 fn file_key<R: Read>(rdr: R) -> Result<String> {
     Digest::reader_sync(rdr)
 }
 /// Make a path to the cache entry with key `key`.
-fn make_lru_key_path(key: &str) -> PathBuf {
-    Path::new(&key[0..1]).join(&key[1..2]).join(key)
+fn make_lru_key_path(key: &ArchiveId) -> PathBuf {
+    Path::new(&key[0..1]).join(&key[1..2]).join(key.as_str())
 }

@@ -503,13 +503,132 @@ pub fn try_compile_command_to_dist(
     })
 }
 
-// TODO: Clone by assuming immutable/no GC for now
-// TODO: make fields non-public?
-// TODO: make archive_id validate that it's just a bunch of hex chars
+/// A BLAKE3 archive digest in the canonical lowercase hexadecimal wire format.
+///
+/// Validating at deserialization and construction prevents malformed archive
+/// IDs from becoming filesystem components or container image names.
+#[derive(Debug, Hash, Eq, PartialEq, Clone, Serialize)]
+#[serde(transparent)]
+pub struct ArchiveId(String);
+
+impl ArchiveId {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct InvalidArchiveId;
+
+impl fmt::Display for InvalidArchiveId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("toolchain archive ID must be 64 lowercase hexadecimal characters")
+    }
+}
+
+impl std::error::Error for InvalidArchiveId {}
+
+impl TryFrom<String> for ArchiveId {
+    type Error = InvalidArchiveId;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        if value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            Ok(Self(value))
+        } else {
+            Err(InvalidArchiveId)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ArchiveId {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::try_from(value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Display for ArchiveId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::ops::Deref for ArchiveId {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<str> for ArchiveId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for ArchiveId {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_ref()
+    }
+}
+
+impl AsRef<Path> for ArchiveId {
+    fn as_ref(&self) -> &Path {
+        self.0.as_ref()
+    }
+}
+
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Toolchain {
-    pub archive_id: String,
+    pub archive_id: ArchiveId,
+}
+
+#[cfg(test)]
+mod archive_id_tests {
+    use super::*;
+
+    #[test]
+    fn accepted_archive_ids_round_trip_through_toolchain_json() -> anyhow::Result<()> {
+        let digest = crate::util::Digest::reader_sync(b"test archive".as_slice())?;
+        let tc = Toolchain {
+            archive_id: ArchiveId::try_from(digest.clone())?,
+        };
+        let encoded = serde_json::to_string(&tc)?;
+        assert_eq!(encoded, format!(r#"{{"archive_id":"{digest}"}}"#));
+        assert_eq!(serde_json::from_str::<Toolchain>(&encoded)?, tc);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_archive_ids_are_rejected() {
+        for value in [
+            "",
+            "a",
+            "../escape",
+            "/absolute",
+            "é",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(ArchiveId::try_from(value.to_owned()).is_err(), "{value:?}");
+            let encoded = serde_json::json!({"archive_id": value});
+            assert!(
+                serde_json::from_value::<Toolchain>(encoded).is_err(),
+                "{value:?}"
+            );
+        }
+    }
 }
 
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug, Ord, PartialOrd, Serialize, Deserialize)]
