@@ -337,16 +337,13 @@ mod client {
                     .map_err(|_| anyhow::anyhow!("toolchain weak-map mutex poisoned"))?;
                 weak_map.get(weak_key).cloned()
             };
-            match result {
-                Some(value) => match ArchiveId::try_from(value) {
-                    Ok(id) => Ok(Some(id)),
-                    Err(error) => {
-                        warn!("Ignoring malformed weak toolchain mapping for {weak_key}: {error}");
-                        Ok(None)
-                    }
-                },
-                None => Ok(None),
-            }
+            Ok(result.and_then(|value| match ArchiveId::try_from(value) {
+                Ok(id) => Some(id),
+                Err(error) => {
+                    warn!("Ignoring malformed weak toolchain mapping for {weak_key}: {error}");
+                    None
+                }
+            }))
         }
         fn record_weak(&self, weak_key: String, key: String) -> Result<()> {
             let serialized = {
