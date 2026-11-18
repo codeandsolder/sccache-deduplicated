@@ -411,8 +411,8 @@ impl ManagedRemoteCache {
         Ok(())
     }
 
-    /// Write a complete shard with optimistic concurrency control. The ETag
-    /// protects an existing snapshot; an absent ETag means the shard must not
+    /// Write a complete shard with optimistic concurrency control. The `ETag`
+    /// protects an existing snapshot; an absent `ETag` means the shard must not
     /// have appeared since it was read. A failed condition is a retryable race.
     async fn write_metadata_shard_if_unchanged(
         &self,
