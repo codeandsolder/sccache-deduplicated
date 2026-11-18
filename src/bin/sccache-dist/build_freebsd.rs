@@ -133,18 +133,18 @@ impl PotBuilder {
         }
     }
 
-    fn clean_container(cid: &str) -> Result<()> {
-        Command::new("pot")
+    fn clean_container(cid: &str, pot_cmd: &Path) -> Result<()> {
+        Command::new(pot_cmd)
             .args(&["stop", "-p", cid])
             .check_run()
             .context("Failed to stop container")?;
 
-        Command::new("pot")
+        Command::new(pot_cmd)
             .args(&["revert", "-p", cid])
             .check_run()
             .context("Failed to revert container")?;
 
-        Command::new("pot")
+        Command::new(pot_cmd)
             .args(&["start", "-p", cid])
             .check_run()
             .context("Failed to (re)start container")?;
@@ -159,7 +159,7 @@ impl PotBuilder {
         cid: String,
         pot_cmd: &Path,
     ) {
-        if let Err(e) = Self::clean_container(&cid) {
+        if let Err(e) = Self::clean_container(&cid, pot_cmd) {
             info!("Failed to clean container {}: {}", cid, e);
             if let Err(e) = pot_rm(&cid, pot_cmd) {
                 warn!(
@@ -193,62 +193,91 @@ impl PotBuilder {
         pot_cmd: &Path,
         pot_clone_args: &[String],
     ) -> Result<String> {
+        // Hold the LRU mutex only long enough to open the archive. Extraction
+        // may be slow, and the open descriptor remains valid after eviction.
+        let toolchain_rdr = {
+            let mut cache = tccache.lock().unwrap();
+            match cache.get(tc) {
+                Ok(rdr) => rdr,
+                Err(LruError::FileNotInCache) => {
+                    bail!("expected toolchain {}, but not available", tc.archive_id)
+                }
+                Err(e) => return Err(Error::from(e).context("failed to get toolchain from cache")),
+            }
+        };
+
         let imagename = format!("sccache-image-{}", &tc.archive_id);
         trace!("Creating toolchain image: {}", imagename);
         let mut clone_args: Vec<&str> = ["clone", "-p", &imagename, "-P", clone_from].to_vec();
-        clone_args.append(&mut pot_clone_args.iter().map(|s| s as &str).collect());
+        clone_args.extend(pot_clone_args.iter().map(String::as_str));
         Command::new(pot_cmd)
             .args(clone_args)
             .check_run()
             .context("Failed to create pot container")?;
 
-        let mut tccache = tccache.lock().unwrap();
-        let toolchain_rdr = match tccache.get(tc) {
-            Ok(rdr) => rdr,
-            Err(LruError::FileNotInCache) => {
-                bail!("expected toolchain {}, but not available", tc.archive_id)
+        // A cloned image must be destroyed if either extraction or snapshot
+        // fails, otherwise subsequent image creation can collide with it.
+        let image_result = (|| -> Result<()> {
+            trace!("Copying in toolchain");
+            if let Err(error) = tar::Archive::new(GzDecoder::new(toolchain_rdr))
+                .unpack(pot_fs_root.join("jails").join(&imagename).join("m"))
+            {
+                warn!("Failed to unpack toolchain: {error:?}");
+                if let Err(cache_error) = tccache.lock().unwrap().remove(tc) {
+                    warn!(
+                        "Failed to remove corrupt toolchain {} from cache: {cache_error:#}",
+                        tc.archive_id
+                    );
+                }
+                return Err(Error::from(error).context("Failed to unpack toolchain"));
             }
-            Err(e) => return Err(Error::from(e).context("failed to get toolchain from cache")),
-        };
 
-        trace!("Copying in toolchain");
-        tar::Archive::new(GzDecoder::new(toolchain_rdr))
-            .unpack(pot_fs_root.join("jails").join(&imagename).join("m"))
-            .or_else(|e| {
-                warn!("Failed to unpack toolchain: {:?}", e);
-                tccache
-                    .remove(tc)
-                    .context("Failed to remove corrupt toolchain")?;
-                Err(Error::from(e))
-            })?;
-
-        Command::new(pot_cmd)
-            .args(&["snapshot", "-p", &imagename])
-            .check_run()
-            .context("Failed to snapshot container after build")?;
-
+            Command::new(pot_cmd)
+                .args(["snapshot", "-p", &imagename])
+                .check_run()
+                .context("Failed to snapshot container after build")
+        })();
+        if let Err(error) = image_result {
+            if let Err(cleanup_error) = pot_rm(&imagename, pot_cmd) {
+                warn!(
+                    "Failed to remove pot image {} after creation failed: {cleanup_error:#}",
+                    imagename
+                );
+            }
+            return Err(error);
+        }
         Ok(imagename)
     }
 
     fn start_container(image: &str, pot_cmd: &Path, pot_clone_args: &[String]) -> Result<String> {
         let cid = format!("sccache-builder-{}", Uuid::new_v4());
         let mut clone_args: Vec<&str> = ["clone", "-p", &cid, "-P", image].to_vec();
-        clone_args.append(&mut pot_clone_args.iter().map(|s| s as &str).collect());
+        clone_args.extend(pot_clone_args.iter().map(String::as_str));
         Command::new(pot_cmd)
             .args(&clone_args)
             .check_run()
             .context("Failed to create pot container")?;
 
-        Command::new(pot_cmd)
-            .args(&["snapshot", "-p", &cid])
-            .check_run()
-            .context("Failed to snapshotpot container")?;
-
-        Command::new(pot_cmd)
-            .args(&["start", "-p", &cid])
-            .check_run()
-            .context("Failed to start container")?;
-        Ok(cid.to_string())
+        let start_result = (|| -> Result<()> {
+            Command::new(pot_cmd)
+                .args(["snapshot", "-p", &cid])
+                .check_run()
+                .context("Failed to snapshot pot container")?;
+            Command::new(pot_cmd)
+                .args(["start", "-p", &cid])
+                .check_run()
+                .context("Failed to start container")
+        })();
+        if let Err(error) = start_result {
+            if let Err(cleanup_error) = pot_rm(&cid, pot_cmd) {
+                warn!(
+                    "Failed to remove pot container {} after startup failed: {cleanup_error:#}",
+                    cid
+                );
+            }
+            return Err(error);
+        }
+        Ok(cid)
     }
 
     fn perform_build(
@@ -279,7 +308,9 @@ impl PotBuilder {
         let cwd = Path::new(&cwd);
 
         trace!("creating output directories");
-        assert!(!output_paths.is_empty());
+        if output_paths.is_empty() {
+            bail!("Pot build requires at least one output path");
+        }
         let mut cmd = Command::new("jexec");
         cmd.args(&[cid, "mkdir", "-p"]).arg(cwd);
         for path in output_paths.iter() {
@@ -361,11 +392,10 @@ impl BuilderIncoming for PotBuilder {
             .get_container(&tc, tccache)
             .context("Failed to get a container for build")?;
         debug!("Performing build with container {}", cid);
-        let res = Self::perform_build(command, inputs_rdr, outputs, &cid, &self.pot_fs_root)
-            .context("Failed to perform build")?;
+        let result = Self::perform_build(command, inputs_rdr, outputs, &cid, &self.pot_fs_root)
+            .context("Failed to perform build");
         debug!("Finishing with container {}", cid);
         let cloned = self.clone();
-        let tc = tc;
         loop {
             let active = cloned.cleanup_thread_count.load(Ordering::Relaxed);
             if active < self.max_cleanup_thread_count
@@ -383,6 +413,40 @@ impl BuilderIncoming for PotBuilder {
             cloned.cleanup_thread_count.fetch_sub(1, Ordering::Release);
         });
         debug!("Returning result");
-        Ok(res)
+        result
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn missing_toolchain_is_rejected_before_cloning_pot() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cache = Mutex::new(TcCache::new(&dir.path().join("toolchains"), 1024 * 1024)?);
+        let tc = Toolchain {
+            archive_id: "missing-archive".to_owned(),
+        };
+        let error = PotBuilder::make_image(
+            &tc,
+            &cache,
+            dir.path(),
+            "base",
+            Path::new("/missing-pot-command"),
+            &[],
+        )
+        .expect_err("missing archive must not launch pot");
+        assert!(
+            error
+                .to_string()
+                .contains("expected toolchain missing-archive")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_uses_configured_pot_command() -> Result<()> {
+        PotBuilder::clean_container("test-container", Path::new("/usr/bin/true"))
     }
 }
