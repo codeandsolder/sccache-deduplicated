@@ -17,6 +17,9 @@ use anyhow::{Context, Error, Result, anyhow, bail};
 use flate2::read::GzDecoder;
 use fs_err as fs;
 use libmount::Overlay;
+use nix::errno::Errno;
+use nix::fcntl::{OFlag, OpenHow, ResolveFlag, openat2};
+use nix::sys::stat::{Mode, mkdirat};
 use sccache::dist::{
     BuildResult, BuilderIncoming, CompileCommand, InputsReader, OutputData, ProcessOutput, TcCache,
     Toolchain,
@@ -25,18 +28,93 @@ use sccache::lru_disk_cache::Error as LruError;
 use std::collections::{HashMap, hash_map};
 use std::io;
 use std::iter;
-use std::path::{self, Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use version_compare::Version;
 
-fn join_suffix<P: AsRef<Path>>(path: &Path, suffix: P) -> PathBuf {
-    let suffixpath = suffix.as_ref();
-    let mut components = suffixpath.components();
-    if suffixpath.has_root() {
-        assert_eq!(components.next(), Some(path::Component::RootDir));
+/// Host-side filesystem operations on a build's temporary root must obey
+/// the same root boundary as the compiler running under bubblewrap. In
+/// particular, normal host paths would otherwise follow absolute symlinks in
+/// uploaded inputs outside the build directory.
+struct RootedBuildFs {
+    root: std::fs::File,
+}
+
+impl RootedBuildFs {
+    fn new(root: &Path) -> io::Result<Self> {
+        Ok(Self {
+            root: std::fs::File::open(root)?,
+        })
     }
-    path.join(components)
+
+    fn open_dir(&self, path: &Path) -> io::Result<std::os::fd::OwnedFd> {
+        // RESOLVE_IN_ROOT interprets absolute paths and absolute symlinks
+        // relative to the build root. NO_MAGICLINKS also forbids procfs-like
+        // special links that are not ordinary filesystem symlinks.
+        let how = OpenHow::new()
+            .flags(OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
+            .resolve(ResolveFlag::RESOLVE_IN_ROOT | ResolveFlag::RESOLVE_NO_MAGICLINKS);
+        openat2(&self.root, path, how).map_err(Into::into)
+    }
+
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        // For missing segments, obtain a safely resolved parent directory fd
+        // and mkdirat *only* the single new component. A normal host mkdir
+        // against a multi-component path could follow a symlink outside root.
+        let mut prefix = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::RootDir | Component::CurDir => {}
+                Component::ParentDir => prefix.push(".."),
+                Component::Normal(name) => {
+                    let parent = prefix.clone();
+                    prefix.push(name);
+                    match self.open_dir(&prefix) {
+                        Ok(_) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            let parent = if parent.as_os_str().is_empty() {
+                                Path::new(".")
+                            } else {
+                                parent.as_path()
+                            };
+                            let parent_fd = self.open_dir(parent)?;
+                            match mkdirat(&parent_fd, name, Mode::from_bits_truncate(0o755)) {
+                                Ok(()) | Err(Errno::EEXIST) => {}
+                                Err(error) => return Err(error.into()),
+                            }
+                            // Verify the created/existing entry is a directory
+                            // and resolves inside root, even under contention.
+                            drop(self.open_dir(&prefix)?);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Component::Prefix(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "unsupported build path prefix",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn open_output(&self, path: &Path) -> io::Result<std::fs::File> {
+        let how = OpenHow::new()
+            .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)
+            .resolve(ResolveFlag::RESOLVE_IN_ROOT | ResolveFlag::RESOLVE_NO_MAGICLINKS);
+        let fd = openat2(&self.root, path, how)?;
+        let file = std::fs::File::from(fd);
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compiler output is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
 }
 
 #[derive(Debug)]
@@ -318,8 +396,11 @@ impl OverlayBuilder {
                     } = compile_command;
                     let cwd = Path::new(&cwd);
 
+                    let build_fs = RootedBuildFs::new(&target_dir)
+                        .context("Failed to open overlay build root")?;
                     trace!("creating output directories");
-                    fs::create_dir_all(join_suffix(&target_dir, cwd))
+                    build_fs
+                        .create_dir_all(cwd)
                         .context("Failed to create cwd")?;
                     for path in output_paths.iter() {
                         // If it doesn't have a parent, nothing needs creating
@@ -328,7 +409,8 @@ impl OverlayBuilder {
                         } else {
                             continue;
                         };
-                        fs::create_dir_all(join_suffix(&target_dir, cwd.join(output_parent)))
+                        build_fs
+                            .create_dir_all(&cwd.join(output_parent))
                             .context("Failed to create an output directory")?;
                     }
 
@@ -383,8 +465,9 @@ impl OverlayBuilder {
                     let mut outputs = vec![];
                     trace!("retrieving {:?}", output_paths);
                     for path in output_paths {
-                        let abspath = join_suffix(&target_dir, cwd.join(&path)); // Resolve in case it's relative since we copy it from the root level
-                        match fs::File::open(abspath) {
+                        // Follow output symlinks with the same root semantics
+                        // as bubblewrap, never against the host filesystem.
+                        match build_fs.open_output(&cwd.join(&path)) {
                             Ok(file) => {
                                 let output = OutputData::try_from_reader(file)
                                     .context("Failed to read output file")?;
@@ -881,6 +964,55 @@ impl BuilderIncoming for DockerBuilder {
 #[cfg(test)]
 mod overlay_lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn output_paths_follow_symlinks_only_within_build_root() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir()?;
+        let root = tempdir.path().join("root");
+        fs::create_dir(&root)?;
+        fs::create_dir(root.join("inside"))?;
+        symlink("/inside", root.join("alias"))?;
+
+        let build_fs = RootedBuildFs::new(&root)?;
+        build_fs.create_dir_all(Path::new("/alias/../alias/outputs"))?;
+        assert!(
+            root.join("inside/outputs").is_dir(),
+            "absolute symlinks must resolve inside the build root"
+        );
+        fs::write(root.join("inside/outputs/object.o"), b"valid output")?;
+        let mut result = Vec::new();
+        use std::io::Read as _;
+        build_fs
+            .open_output(Path::new("/alias/outputs/object.o"))?
+            .read_to_end(&mut result)?;
+        assert_eq!(result, b"valid output");
+
+        let host_secret = tempdir.path().join("outside-root");
+        fs::write(&host_secret, b"host secret")?;
+        symlink(&host_secret, root.join("host-link"))?;
+        assert!(
+            build_fs.open_output(Path::new("/host-link")).is_err(),
+            "absolute symlinks must not expose host files"
+        );
+        let host_directory = tempdir.path().join("host-directory");
+        fs::create_dir(&host_directory)?;
+        symlink(&host_directory, root.join("host-dir-link"))?;
+        assert!(
+            build_fs
+                .create_dir_all(Path::new("/host-dir-link/unwanted"))
+                .is_err(),
+            "absolute symlinks must not create directories on the host"
+        );
+        assert!(!host_directory.join("unwanted").exists());
+
+        // .. is interpreted as it would be inside the compiler's chroot.
+        build_fs.create_dir_all(Path::new("/../../relative-to-root"))?;
+        assert!(root.join("relative-to-root").is_dir());
+        assert!(!tempdir.path().join("relative-to-root").exists());
+        Ok(())
+    }
 
     #[test]
     fn missing_toolchain_does_not_leave_extraction_directory() -> Result<()> {
