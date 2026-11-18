@@ -258,7 +258,6 @@ fn run(command: Command) -> Result<i32> {
                 check_server_auth,
             );
             http_scheduler.start()?;
-            unreachable!();
         }
 
         Command::Server(server_config::Config {
@@ -339,7 +338,6 @@ fn run(command: Command) -> Result<i32> {
             )
             .context("Failed to create sccache HTTP server instance")?;
             http_server.start()?;
-            unreachable!();
         }
     }
 }

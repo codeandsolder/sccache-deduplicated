@@ -17,6 +17,9 @@ use anyhow::{Context, Error, Result, anyhow, bail};
 use flate2::read::GzDecoder;
 use fs_err as fs;
 use libmount::Overlay;
+use nix::errno::Errno;
+use nix::fcntl::{OFlag, OpenHow, ResolveFlag, openat2};
+use nix::sys::stat::{Mode, mkdirat};
 use sccache::dist::{
     BuildResult, BuilderIncoming, CompileCommand, InputsReader, OutputData, ProcessOutput, TcCache,
     Toolchain,
@@ -25,32 +28,109 @@ use sccache::lru_disk_cache::Error as LruError;
 use std::collections::{HashMap, hash_map};
 use std::io;
 use std::iter;
-use std::path::{self, Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
 use version_compare::Version;
 
-fn join_suffix<P: AsRef<Path>>(path: &Path, suffix: P) -> PathBuf {
-    let suffixpath = suffix.as_ref();
-    let mut components = suffixpath.components();
-    if suffixpath.has_root() {
-        assert_eq!(components.next(), Some(path::Component::RootDir));
+/// Host-side filesystem operations on a build's temporary root must obey
+/// the same root boundary as the compiler running under bubblewrap. In
+/// particular, normal host paths would otherwise follow absolute symlinks in
+/// uploaded inputs outside the build directory.
+struct RootedBuildFs {
+    root: std::fs::File,
+}
+
+impl RootedBuildFs {
+    fn new(root: &Path) -> io::Result<Self> {
+        Ok(Self {
+            root: std::fs::File::open(root)?,
+        })
     }
-    path.join(components)
+
+    fn open_dir(&self, path: &Path) -> io::Result<std::os::fd::OwnedFd> {
+        // RESOLVE_IN_ROOT interprets absolute paths and absolute symlinks
+        // relative to the build root. NO_MAGICLINKS also forbids procfs-like
+        // special links that are not ordinary filesystem symlinks.
+        let how = OpenHow::new()
+            .flags(OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
+            .resolve(ResolveFlag::RESOLVE_IN_ROOT | ResolveFlag::RESOLVE_NO_MAGICLINKS);
+        openat2(&self.root, path, how).map_err(Into::into)
+    }
+
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        // For missing segments, obtain a safely resolved parent directory fd
+        // and mkdirat *only* the single new component. A normal host mkdir
+        // against a multi-component path could follow a symlink outside root.
+        let mut prefix = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::RootDir | Component::CurDir => {}
+                Component::ParentDir => prefix.push(".."),
+                Component::Normal(name) => {
+                    let parent = prefix.clone();
+                    prefix.push(name);
+                    match self.open_dir(&prefix) {
+                        Ok(_) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            let parent = if parent.as_os_str().is_empty() {
+                                Path::new(".")
+                            } else {
+                                parent.as_path()
+                            };
+                            let parent_fd = self.open_dir(parent)?;
+                            match mkdirat(&parent_fd, name, Mode::from_bits_truncate(0o755)) {
+                                Ok(()) | Err(Errno::EEXIST) => {}
+                                Err(error) => return Err(error.into()),
+                            }
+                            // Verify the created/existing entry is a directory
+                            // and resolves inside root, even under contention.
+                            drop(self.open_dir(&prefix)?);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Component::Prefix(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "unsupported build path prefix",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn open_output(&self, path: &Path) -> io::Result<std::fs::File> {
+        let how = OpenHow::new()
+            .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)
+            .resolve(ResolveFlag::RESOLVE_IN_ROOT | ResolveFlag::RESOLVE_NO_MAGICLINKS);
+        let fd = openat2(&self.root, path, how)?;
+        let file = std::fs::File::from(fd);
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compiler output is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
 }
 
 #[derive(Debug)]
 struct OverlaySpec {
     build_dir: PathBuf,
     toolchain_dir: PathBuf,
+    // Keep the extracted toolchain alive through the complete build and its
+    // filesystem cleanup. The map owns the other reference to this lease.
+    _active_lease: Arc<()>,
 }
 
 #[derive(Debug, Clone)]
 struct DeflatedToolchain {
     path: PathBuf,
     build_count: u64,
-    ctime: Instant,
+    active_lease: Arc<()>,
 }
 
 pub struct OverlayBuilder {
@@ -121,6 +201,45 @@ impl OverlayBuilder {
         Ok(())
     }
 
+    /// Reclaim extracted toolchains whose archives have been evicted, but
+    /// never while a running build still references their lower directory.
+    /// The caller holds the directory-map mutex, preventing new build leases
+    /// from being acquired during the check and filesystem deletion.
+    fn prune_unused_toolchain_dirs(
+        &self,
+        dir_map: &mut HashMap<Toolchain, DeflatedToolchain>,
+        tccache: &Mutex<TcCache>,
+    ) {
+        // Inspect the actual cache membership rather than comparing collection
+        // sizes: eviction order need not match directory creation order.
+        // Release the cache lock before potentially slow directory deletion.
+        let candidates: Vec<_> = {
+            let cache = tccache.lock().unwrap();
+            dir_map
+                .iter()
+                .filter(|(tc, entry)| {
+                    Arc::strong_count(&entry.active_lease) == 1 && !cache.contains_toolchain(tc)
+                })
+                .map(|(tc, entry)| (tc.clone(), entry.path.clone()))
+                .collect()
+        };
+        for (tc, path) in candidates {
+            match fs::remove_dir_all(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    warn!(
+                        "Failed to prune inactive toolchain directory {}: {error:#}",
+                        path.display()
+                    );
+                    continue;
+                }
+            }
+            debug!("Pruned inactive uncompressed toolchain {}", tc.archive_id);
+            dir_map.remove(&tc);
+        }
+    }
+
     fn prepare_overlay_dirs(
         &self,
         tc: &Toolchain,
@@ -129,7 +248,7 @@ impl OverlayBuilder {
         let DeflatedToolchain {
             path: toolchain_dir,
             build_count: id,
-            ctime: _,
+            active_lease,
         } = {
             let mut toolchain_dir_map = self.toolchain_dir_map.lock().unwrap();
             // Create the toolchain dir (if necessary) while we have an exclusive lock
@@ -142,9 +261,6 @@ impl OverlayBuilder {
                 entry.build_count += 1;
                 entry.clone()
             } else {
-                trace!("Creating toolchain directory for {}", tc.archive_id);
-                fs::create_dir(&toolchain_dir)?;
-
                 // Once the archive file has been opened, extraction must not
                 // hold the global LRU mutex. The open descriptor remains valid
                 // even if another cache operation evicts the directory entry.
@@ -163,43 +279,37 @@ impl OverlayBuilder {
                     }
                 };
 
-                tar::Archive::new(GzDecoder::new(toolchain_rdr))
-                    .unpack(&toolchain_dir)
-                    .or_else(|e| {
-                        warn!("Failed to unpack toolchain: {:?}", e);
-                        fs::remove_dir_all(&toolchain_dir)
-                            .context("Failed to remove unpacked toolchain")?;
-                        tccache
-                            .lock()
-                            .unwrap()
-                            .remove(tc)
-                            .context("Failed to remove corrupt toolchain")?;
-                        Err(Error::from(e))
-                    })?;
+                // Do not leave an empty extraction directory behind when the
+                // toolchain is missing: the next request must be able to retry.
+                trace!("Creating toolchain directory for {}", tc.archive_id);
+                fs::create_dir(&toolchain_dir)?;
+                if let Err(error) =
+                    tar::Archive::new(GzDecoder::new(toolchain_rdr)).unpack(&toolchain_dir)
+                {
+                    warn!("Failed to unpack toolchain: {error:?}");
+                    if let Err(cleanup_error) = fs::remove_dir_all(&toolchain_dir) {
+                        warn!(
+                            "Failed to remove incomplete toolchain directory {}: {cleanup_error:#}",
+                            toolchain_dir.display()
+                        );
+                    }
+                    if let Err(cache_error) = tccache.lock().unwrap().remove(tc) {
+                        warn!(
+                            "Failed to remove corrupt toolchain {} from cache: {cache_error:#}",
+                            tc.archive_id
+                        );
+                    }
+                    return Err(Error::from(error).context("Failed to unpack toolchain"));
+                }
 
                 let entry = DeflatedToolchain {
                     path: toolchain_dir,
                     build_count: 1,
-                    ctime: Instant::now(),
+                    active_lease: Arc::new(()),
                 };
 
                 toolchain_dir_map.insert(tc.clone(), entry.clone());
-                if toolchain_dir_map.len() > tccache.lock().unwrap().len() {
-                    let dir_map = toolchain_dir_map.clone();
-                    let mut entries: Vec<_> = dir_map.iter().collect();
-                    // In the pathological case, creation time for unpacked
-                    // toolchains could be the opposite of the least recently
-                    // recently used, so we clear out half of the accumulated
-                    // toolchains to prevent repeated sort/delete cycles.
-                    entries.sort_by(|a, b| (a.1).ctime.cmp(&(b.1).ctime));
-                    entries.truncate(entries.len() / 2);
-                    for (tc, _) in entries {
-                        warn!("Removing old un-compressed toolchain: {:?}", tc);
-                        assert!(toolchain_dir_map.remove(tc).is_some());
-                        fs::remove_dir_all(self.dir.join("toolchains").join(&tc.archive_id))
-                            .context("Failed to remove old toolchain directory")?;
-                    }
-                }
+                self.prune_unused_toolchain_dirs(&mut toolchain_dir_map, tccache);
                 entry
             }
         };
@@ -213,6 +323,7 @@ impl OverlayBuilder {
         Ok(OverlaySpec {
             build_dir,
             toolchain_dir,
+            _active_lease: active_lease,
         })
     }
 
@@ -285,8 +396,11 @@ impl OverlayBuilder {
                     } = compile_command;
                     let cwd = Path::new(&cwd);
 
+                    let build_fs = RootedBuildFs::new(&target_dir)
+                        .context("Failed to open overlay build root")?;
                     trace!("creating output directories");
-                    fs::create_dir_all(join_suffix(&target_dir, cwd))
+                    build_fs
+                        .create_dir_all(cwd)
                         .context("Failed to create cwd")?;
                     for path in output_paths.iter() {
                         // If it doesn't have a parent, nothing needs creating
@@ -295,7 +409,8 @@ impl OverlayBuilder {
                         } else {
                             continue;
                         };
-                        fs::create_dir_all(join_suffix(&target_dir, cwd.join(output_parent)))
+                        build_fs
+                            .create_dir_all(&cwd.join(output_parent))
                             .context("Failed to create an output directory")?;
                     }
 
@@ -350,8 +465,9 @@ impl OverlayBuilder {
                     let mut outputs = vec![];
                     trace!("retrieving {:?}", output_paths);
                     for path in output_paths {
-                        let abspath = join_suffix(&target_dir, cwd.join(&path)); // Resolve in case it's relative since we copy it from the root level
-                        match fs::File::open(abspath) {
+                        // Follow output symlinks with the same root semantics
+                        // as bubblewrap, never against the host filesystem.
+                        match build_fs.open_output(&cwd.join(&path)) {
                             Ok(file) => {
                                 let output = OutputData::try_from_reader(file)
                                     .context("Failed to read output file")?;
@@ -383,20 +499,22 @@ impl OverlayBuilder {
 
     // Failing during cleanup is pretty unexpected, but we can still return the successful compile
     // TODO: if too many of these fail, we should mark this builder as faulty
-    fn finish_overlay(&self, _tc: &Toolchain, overlay: OverlaySpec) {
-        // TODO: collect toolchain directories
-
-        let OverlaySpec {
-            build_dir,
-            toolchain_dir: _,
-        } = overlay;
-        if let Err(e) = fs::remove_dir_all(&build_dir) {
+    fn finish_overlay(&self, _tc: &Toolchain, overlay: OverlaySpec, tccache: &Mutex<TcCache>) {
+        // Deleting the temporary build directory may fail, but the compile
+        // result should still be returned to the client.
+        if let Err(e) = fs::remove_dir_all(&overlay.build_dir) {
             error!(
                 "Failed to remove build directory {}: {}",
-                build_dir.display(),
+                overlay.build_dir.display(),
                 e
             );
         }
+        // The compile and mount namespace have finished. Release the lease
+        // before pruning so this toolchain can be collected if its archive is
+        // no longer cached and no other builds are using it.
+        drop(overlay);
+        let mut dir_map = self.toolchain_dir_map.lock().unwrap();
+        self.prune_unused_toolchain_dirs(&mut dir_map, tccache);
     }
 }
 
@@ -416,7 +534,7 @@ impl BuilderIncoming for OverlayBuilder {
         debug!("Performing build in {:?}", overlay);
         let res = Self::perform_build(&self.bubblewrap, command, inputs_rdr, outputs, &overlay);
         debug!("Finishing with overlay");
-        self.finish_overlay(&tc, overlay);
+        self.finish_overlay(&tc, overlay, tccache);
         debug!("Returning result");
         res.context("Compilation execution failed")
     }
@@ -840,6 +958,195 @@ impl BuilderIncoming for DockerBuilder {
         self.finish_container(&tc, cid);
         debug!("Returning result");
         result
+    }
+}
+
+#[cfg(test)]
+mod overlay_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn output_paths_follow_symlinks_only_within_build_root() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir()?;
+        let root = tempdir.path().join("root");
+        fs::create_dir(&root)?;
+        fs::create_dir(root.join("inside"))?;
+        symlink("/inside", root.join("alias"))?;
+
+        let build_fs = RootedBuildFs::new(&root)?;
+        build_fs.create_dir_all(Path::new("/alias/../alias/outputs"))?;
+        assert!(
+            root.join("inside/outputs").is_dir(),
+            "absolute symlinks must resolve inside the build root"
+        );
+        fs::write(root.join("inside/outputs/object.o"), b"valid output")?;
+        let mut result = Vec::new();
+        use std::io::Read as _;
+        build_fs
+            .open_output(Path::new("/alias/outputs/object.o"))?
+            .read_to_end(&mut result)?;
+        assert_eq!(result, b"valid output");
+
+        let host_secret = tempdir.path().join("outside-root");
+        fs::write(&host_secret, b"host secret")?;
+        symlink(&host_secret, root.join("host-link"))?;
+        assert!(
+            build_fs.open_output(Path::new("/host-link")).is_err(),
+            "absolute symlinks must not expose host files"
+        );
+        let host_directory = tempdir.path().join("host-directory");
+        fs::create_dir(&host_directory)?;
+        symlink(&host_directory, root.join("host-dir-link"))?;
+        assert!(
+            build_fs
+                .create_dir_all(Path::new("/host-dir-link/unwanted"))
+                .is_err(),
+            "absolute symlinks must not create directories on the host"
+        );
+        assert!(!host_directory.join("unwanted").exists());
+
+        // .. is interpreted as it would be inside the compiler's chroot.
+        build_fs.create_dir_all(Path::new("/../../relative-to-root"))?;
+        assert!(root.join("relative-to-root").is_dir());
+        assert!(!tempdir.path().join("relative-to-root").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_toolchain_does_not_leave_extraction_directory() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        fs::create_dir(tempdir.path().join("toolchains"))?;
+        fs::create_dir(tempdir.path().join("builds"))?;
+
+        let builder = OverlayBuilder {
+            bubblewrap: PathBuf::from("unused-bubblewrap"),
+            dir: tempdir.path().to_path_buf(),
+            toolchain_dir_map: Mutex::new(HashMap::new()),
+        };
+        let tc = Toolchain {
+            archive_id: "missing-archive".to_owned(),
+        };
+        let cache = Mutex::new(TcCache::new(&tempdir.path().join("tc-cache"), 1024 * 1024)?);
+        let error = builder
+            .prepare_overlay_dirs(&tc, &cache)
+            .expect_err("missing toolchain must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("expected toolchain missing-archive"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            !tempdir
+                .path()
+                .join("toolchains")
+                .join("missing-archive")
+                .exists(),
+            "missing archive must not poison subsequent extraction attempts"
+        );
+        Ok(())
+    }
+    #[test]
+    fn active_extracted_toolchain_is_pruned_only_after_last_build_finishes() -> Result<()> {
+        use std::io::Write as _;
+
+        let tempdir = tempfile::tempdir()?;
+        let toolchains_dir = tempdir.path().join("toolchains");
+        fs::create_dir(&toolchains_dir)?;
+        let builder = OverlayBuilder {
+            bubblewrap: PathBuf::from("unused-bubblewrap"),
+            dir: tempdir.path().to_path_buf(),
+            toolchain_dir_map: Mutex::new(HashMap::new()),
+        };
+        let active_tc = Toolchain {
+            archive_id: "active".to_owned(),
+        };
+        let idle_tc = Toolchain {
+            archive_id: "idle".to_owned(),
+        };
+        let archive = b"cached toolchain bytes";
+        let cached_tc = Toolchain {
+            archive_id: sccache::util::Digest::reader_sync(&archive[..])?,
+        };
+        let active_path = toolchains_dir.join("active");
+        let idle_path = toolchains_dir.join("idle");
+        let cached_path = toolchains_dir.join(&cached_tc.archive_id);
+        fs::create_dir(&active_path)?;
+        fs::create_dir(&idle_path)?;
+        fs::create_dir(&cached_path)?;
+
+        let lease = Arc::new(());
+        let in_flight: Vec<_> = (0..2)
+            .map(|_| OverlaySpec {
+                build_dir: tempdir.path().join("unused-build"),
+                toolchain_dir: active_path.clone(),
+                _active_lease: Arc::clone(&lease),
+            })
+            .collect();
+        let mut tc_cache = TcCache::new(&tempdir.path().join("tc-cache"), 1024 * 1024)?;
+        tc_cache.insert_with(&cached_tc, |mut file| file.write_all(archive))?;
+        let cache = Mutex::new(tc_cache);
+        let mut dir_map = builder.toolchain_dir_map.lock().unwrap();
+        dir_map.insert(
+            active_tc.clone(),
+            DeflatedToolchain {
+                path: active_path.clone(),
+                build_count: 2,
+                active_lease: lease,
+            },
+        );
+        dir_map.insert(
+            idle_tc.clone(),
+            DeflatedToolchain {
+                path: idle_path.clone(),
+                build_count: 1,
+                active_lease: Arc::new(()),
+            },
+        );
+
+        dir_map.insert(
+            cached_tc.clone(),
+            DeflatedToolchain {
+                path: cached_path.clone(),
+                build_count: 1,
+                active_lease: Arc::new(()),
+            },
+        );
+
+        builder.prune_unused_toolchain_dirs(&mut dir_map, &cache);
+        assert!(
+            cached_path.exists(),
+            "cached toolchain must not be evicted by unrelated cache churn"
+        );
+        assert!(dir_map.contains_key(&cached_tc));
+        assert!(
+            active_path.exists(),
+            "active toolchain must survive pruning"
+        );
+        assert!(!idle_path.exists(), "idle toolchain should be reclaimed");
+        assert!(dir_map.contains_key(&active_tc));
+        assert!(!dir_map.contains_key(&idle_tc));
+
+        let mut active_builds = in_flight.into_iter();
+        drop(active_builds.next());
+        builder.prune_unused_toolchain_dirs(&mut dir_map, &cache);
+        assert!(
+            active_path.exists(),
+            "another ongoing build must keep the toolchain alive"
+        );
+
+        drop(active_builds.next());
+        builder.prune_unused_toolchain_dirs(&mut dir_map, &cache);
+        assert!(!active_path.exists(), "last build release allows pruning");
+        assert!(
+            cached_path.exists(),
+            "cached toolchain must remain available"
+        );
+        assert_eq!(dir_map.len(), 1);
+        assert!(dir_map.contains_key(&cached_tc));
+        Ok(())
     }
 }
 
