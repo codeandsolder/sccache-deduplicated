@@ -965,6 +965,12 @@ impl BuilderIncoming for DockerBuilder {
 mod overlay_lifecycle_tests {
     use super::*;
 
+    fn fixture_toolchain(marker: char) -> Toolchain {
+        Toolchain {
+            archive_id: sccache::dist::ArchiveId::try_from(marker.to_string().repeat(64)).unwrap(),
+        }
+    }
+
     #[test]
     fn output_paths_follow_symlinks_only_within_build_root() -> Result<()> {
         use std::os::unix::fs::symlink;
@@ -1025,9 +1031,7 @@ mod overlay_lifecycle_tests {
             dir: tempdir.path().to_path_buf(),
             toolchain_dir_map: Mutex::new(HashMap::new()),
         };
-        let tc = Toolchain {
-            archive_id: "missing-archive".to_owned(),
-        };
+        let tc = fixture_toolchain('d');
         let cache = Mutex::new(TcCache::new(&tempdir.path().join("tc-cache"), 1024 * 1024)?);
         let error = builder
             .prepare_overlay_dirs(&tc, &cache)
@@ -1035,14 +1039,14 @@ mod overlay_lifecycle_tests {
         assert!(
             error
                 .to_string()
-                .contains("expected toolchain missing-archive"),
+                .contains(&format!("expected toolchain {}", tc.archive_id)),
             "unexpected error: {error:#}"
         );
         assert!(
             !tempdir
                 .path()
                 .join("toolchains")
-                .join("missing-archive")
+                .join(&tc.archive_id)
                 .exists(),
             "missing archive must not poison subsequent extraction attempts"
         );
@@ -1060,18 +1064,16 @@ mod overlay_lifecycle_tests {
             dir: tempdir.path().to_path_buf(),
             toolchain_dir_map: Mutex::new(HashMap::new()),
         };
-        let active_tc = Toolchain {
-            archive_id: "active".to_owned(),
-        };
-        let idle_tc = Toolchain {
-            archive_id: "idle".to_owned(),
-        };
+        let active_tc = fixture_toolchain('a');
+        let idle_tc = fixture_toolchain('b');
         let archive = b"cached toolchain bytes";
         let cached_tc = Toolchain {
-            archive_id: sccache::util::Digest::reader_sync(&archive[..])?,
+            archive_id: sccache::dist::ArchiveId::try_from(sccache::util::Digest::reader_sync(
+                &archive[..],
+            )?)?,
         };
-        let active_path = toolchains_dir.join("active");
-        let idle_path = toolchains_dir.join("idle");
+        let active_path = toolchains_dir.join(&active_tc.archive_id);
+        let idle_path = toolchains_dir.join(&idle_tc.archive_id);
         let cached_path = toolchains_dir.join(&cached_tc.archive_id);
         fs::create_dir(&active_path)?;
         fs::create_dir(&idle_path)?;

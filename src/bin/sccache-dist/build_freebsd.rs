@@ -426,7 +426,7 @@ mod lifecycle_tests {
         let dir = tempfile::tempdir()?;
         let cache = Mutex::new(TcCache::new(&dir.path().join("toolchains"), 1024 * 1024)?);
         let tc = Toolchain {
-            archive_id: "missing-archive".to_owned(),
+            archive_id: sccache::dist::ArchiveId::try_from("d".repeat(64))?,
         };
         let error = PotBuilder::make_image(
             &tc,
@@ -440,7 +440,7 @@ mod lifecycle_tests {
         assert!(
             error
                 .to_string()
-                .contains("expected toolchain missing-archive")
+                .contains(&format!("expected toolchain {}", tc.archive_id))
         );
         Ok(())
     }
