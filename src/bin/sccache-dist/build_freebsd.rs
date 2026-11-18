@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::{hint, thread};
+use std::thread;
 use uuid::Uuid;
 
 // Force remove the container
@@ -366,15 +366,21 @@ impl BuilderIncoming for PotBuilder {
         debug!("Finishing with container {}", cid);
         let cloned = self.clone();
         let tc = tc;
-        while cloned.cleanup_thread_count.fetch_add(1, Ordering::SeqCst)
-            > self.max_cleanup_thread_count
-        {
-            cloned.cleanup_thread_count.fetch_sub(1, Ordering::SeqCst);
-            hint::spin_loop();
+        loop {
+            let active = cloned.cleanup_thread_count.load(Ordering::Relaxed);
+            if active < self.max_cleanup_thread_count
+                && cloned
+                    .cleanup_thread_count
+                    .compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                break;
+            }
+            thread::yield_now();
         }
         thread::spawn(move || {
             Self::finish_container(cloned.container_lists, tc, cid, &cloned.pot_cmd);
-            cloned.cleanup_thread_count.fetch_sub(1, Ordering::SeqCst);
+            cloned.cleanup_thread_count.fetch_sub(1, Ordering::Release);
         });
         debug!("Returning result");
         Ok(res)
