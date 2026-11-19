@@ -27,6 +27,19 @@ use crate::errors::{Result, anyhow, bail};
 pub use self::toolchain_imp::ToolchainPackageBuilder;
 
 pub trait ToolchainPackager: Send {
+    /// Additional identity of files and search paths used to build this package.
+    ///
+    /// Toolchains such as GCC depend on executables outside the compiler binary.
+    /// Their changes must invalidate a previously stored weak-to-strong mapping.
+    /// The default leaves other toolchain packagers' existing keys unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the package dependencies cannot be inspected.
+    fn cache_key_extension(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Write the packaged toolchain to `f`.
     ///
     /// # Errors
@@ -127,6 +140,17 @@ mod toolchain_imp {
             self.add_dir(PathBuf::from("/tmp"))
         }
 
+        // The stored path is normalized, but GCC can execute helpers using paths
+        // like lib/gcc/<target>/<version>/../../../../<target>/bin/as. Linux
+        // resolves each intermediate directory before applying parent traversal;
+        // omitting an otherwise empty prefix makes the executable inaccessible.
+        fn add_lexical_parent_dirs(&mut self, path: &Path) -> Result<()> {
+            for dir in super::lexical_parent_traversal_dirs(path) {
+                self.add_dir(dir)?;
+            }
+            Ok(())
+        }
+
         /// Add an executable and the dynamic libraries required to run it.
         ///
         /// # Errors
@@ -145,6 +169,7 @@ mod toolchain_imp {
                 // This is important because ld-linux may not be configured to look in the resolved
                 // or non-resolved directory (i.e., both directories must work at runtime).
                 //
+                self.add_lexical_parent_dirs(&obj_path)?;
                 let tar_path = self.tarify_path(&obj_path)?;
                 // If file already in the set, assume we've analysed all deps
                 if self.file_set.contains_key(&tar_path) {
@@ -203,6 +228,7 @@ mod toolchain_imp {
                     file_path.to_string_lossy()
                 ))
             }
+            self.add_lexical_parent_dirs(&file_path)?;
             let tar_path = self.tarify_path(&file_path)?;
             self.file_set.insert(tar_path, file_path);
             Ok(())
@@ -303,6 +329,40 @@ mod toolchain_imp {
         fn default() -> Self {
             Self::new()
         }
+    }
+
+    #[test]
+    fn packaged_cross_toolchain_preserves_gcc_lexical_helper_paths() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let toolchain = temp.path().join("toolchain");
+        std::fs::create_dir_all(toolchain.join("bin"))?;
+        std::fs::create_dir_all(toolchain.join("lib/gcc/cross-target/1"))?;
+        std::fs::create_dir_all(toolchain.join("cross-target/bin"))?;
+        std::fs::write(toolchain.join("cross-target/bin/as"), b"fake assembler")?;
+
+        // GCC resolves this exact spelling at runtime, not its normalized path.
+        // No specs/headers in the archived tree should be needed to materialize
+        // the intermediate lib/gcc directory.
+        let reported =
+            toolchain.join("bin/../lib/gcc/cross-target/1/../../../../cross-target/bin/as");
+        assert!(reported.is_file());
+
+        let mut builder = ToolchainPackageBuilder::new();
+        builder.add_file(reported.clone())?;
+        let archive_path = temp.path().join("toolchain.tar.gz");
+        builder.into_compressed_tar(fs::File::create(&archive_path)?)?;
+
+        let root = temp.path().join("unpacked");
+        tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(&archive_path)?))
+            .unpack(&root)?;
+        assert!(root.join(reported.strip_prefix("/")?).is_file());
+        assert!(
+            root.join(toolchain.strip_prefix("/")?)
+                .join("lib/gcc/cross-target/1")
+                .is_dir(),
+            "the compiler's lexical search directory must exist after extraction"
+        );
+        Ok(())
     }
 
     #[test]
