@@ -155,6 +155,12 @@ jobs:
             echo "$binary requires at most ${max_required:-no GLIBC symbols}; fleet maximum $max_supported"
           done
 
+      - name: Reject unsupported fleet native shared library ABIs
+        shell: bash
+        run: >-
+          bash contrib/codeandsolder/verify-release-native-abi.sh
+          dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2
+
       - name: Finalize mandatory sccache before publishing binaries
         if: always()
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@50c4dbb544f008f87ba479324b43a1bd807672bd # main
