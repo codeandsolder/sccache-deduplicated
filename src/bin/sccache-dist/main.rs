@@ -16,7 +16,7 @@ use sccache::dist::{
 use sccache::util::BASE64_URL_SAFE_ENGINE;
 use sccache::util::daemonize;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet, btree_map};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque, btree_map};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -446,6 +446,44 @@ impl JobDetail {
     }
 }
 
+const COMPLETION_ACK_RETRY_WINDOW: Duration = Duration::from_secs(600);
+const MAX_COMPLETION_ACKS: usize = 16_384;
+
+// Keep only terminal acknowledgments, not a second copy of active job state.
+// A lost response to Complete can be retried, but an arbitrary unknown job
+// must never be accepted as having completed.
+#[derive(Default)]
+struct CompletedJobAcks {
+    recent: VecDeque<(JobId, ServerId, Instant)>,
+}
+
+impl CompletedJobAcks {
+    fn prune(&mut self, now: Instant) {
+        while self
+            .recent
+            .front()
+            .is_some_and(|&(_, _, when)| now.duration_since(when) > COMPLETION_ACK_RETRY_WINDOW)
+        {
+            self.recent.pop_front();
+        }
+    }
+
+    fn record(&mut self, job_id: JobId, server_id: ServerId, now: Instant) {
+        self.prune(now);
+        if self.recent.len() == MAX_COMPLETION_ACKS {
+            self.recent.pop_front();
+        }
+        self.recent.push_back((job_id, server_id, now));
+    }
+
+    fn contains(&mut self, job_id: JobId, server_id: ServerId, now: Instant) -> bool {
+        self.prune(now);
+        self.recent
+            .iter()
+            .any(|&(id, owner, _)| id == job_id && owner == server_id)
+    }
+}
+
 // To avoid deadlicking, make sure to do all locking at once (i.e. no further locking in a downward scope),
 // in alphabetical order
 pub struct Scheduler {
@@ -459,8 +497,8 @@ pub struct Scheduler {
 
     // Currently running jobs, can never be Complete
     jobs: Mutex<BTreeMap<JobId, JobDetail>>,
-
     servers: Mutex<HashMap<ServerId, ServerDetails>>,
+    completed_acks: Mutex<CompletedJobAcks>,
 }
 
 struct ServerDetails {
@@ -533,6 +571,7 @@ impl Scheduler {
             maintenance_drain_file,
             jobs: Mutex::new(BTreeMap::new()),
             servers: Mutex::new(HashMap::new()),
+            completed_acks: Mutex::new(CompletedJobAcks::default()),
         }
     }
 
@@ -1003,18 +1042,25 @@ impl SchedulerIncoming for Scheduler {
                     entry.get_mut().transition_to(job_state, now);
                 }
                 (JobState::Started, JobState::Complete) => {
+                    let mut acks = self.completed_acks.lock().unwrap();
                     details.jobs_assigned.remove(&job_id);
                     entry.remove_entry();
+                    acks.record(job_id, server_id, now);
                 }
                 (from, to) => bail!("Invalid job state transition from {} to {}", from, to),
             }
             info!("Job {} updated state to {:?}", job_id, job_state);
-        } else if job_state == JobState::Complete {
-            // The first terminal update may have succeeded while its HTTP
-            // response was lost. A repeated completion is a successful no-op.
-            info!("Job {job_id} was already removed");
+        } else if job_state == JobState::Complete
+            && self
+                .completed_acks
+                .lock()
+                .unwrap()
+                .contains(job_id, server_id, Instant::now())
+        {
+            // The scheduler applied a prior completion, but its reply was lost.
+            info!("Job {job_id} completion acknowledged again");
         } else {
-            bail!("Unknown job")
+            bail!("Unknown job {job_id} for server {server_id:?}")
         }
         Ok(UpdateJobStateResult::Success)
     }
@@ -1772,13 +1818,72 @@ mod scheduler_tests {
             .handle_heartbeat_server(server_id, nonce, 1, &[], Box::new(TestJobAuthorizer))
             .unwrap();
         assert_no_assigned_jobs(&scheduler, &server_id);
-        // A lost completion acknowledgment must not fail on retry.
-        assert!(matches!(
+        // Reconciliation is not a successful completion. A late terminal
+        // message must not be disguised as a replayed acknowledgment.
+        assert!(
             scheduler
                 .handle_update_job_state(job_id, server_id, JobState::Complete)
-                .unwrap(),
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn only_the_completing_worker_can_retry_a_known_completion() -> Result<()> {
+        let scheduler = Scheduler::new();
+        let owner: ServerId = "127.0.0.1:10501".parse()?;
+        let other: ServerId = "127.0.0.1:10502".parse()?;
+        register_test_server(&scheduler, owner, ServerNonce::new());
+        let AllocJobResult::Success { job_alloc, .. } =
+            scheduler.handle_alloc_job(&AcceptAssign, test_toolchain('f'))?
+        else {
+            panic!("expected job");
+        };
+        let id = job_alloc.job_id;
+        assert!(
+            scheduler
+                .handle_update_job_state(id, owner, JobState::Complete)
+                .is_err()
+        );
+        assert!(
+            scheduler
+                .handle_update_job_state(JobId(id.0.wrapping_add(1)), owner, JobState::Complete)
+                .is_err()
+        );
+
+        for state in [JobState::Ready, JobState::Started, JobState::Complete] {
+            scheduler.handle_update_job_state(id, owner, state)?;
+        }
+        assert!(matches!(
+            scheduler.handle_update_job_state(id, owner, JobState::Complete)?,
             UpdateJobStateResult::Success
         ));
+        assert!(
+            scheduler
+                .handle_update_job_state(id, other, JobState::Complete)
+                .is_err()
+        );
+        assert_no_assigned_jobs(&scheduler, &owner);
+        Ok(())
+    }
+
+    #[test]
+    fn recent_completion_acknowledgments_expire_and_are_bounded() -> Result<()> {
+        let now = Instant::now();
+        let owner: ServerId = "127.0.0.1:10501".parse()?;
+        let mut acks = CompletedJobAcks::default();
+        for id in 0..MAX_COMPLETION_ACKS as u64 {
+            acks.record(JobId(id), owner, now);
+        }
+        assert_eq!(acks.recent.len(), MAX_COMPLETION_ACKS);
+        acks.record(JobId(MAX_COMPLETION_ACKS as u64), owner, now);
+        assert_eq!(acks.recent.len(), MAX_COMPLETION_ACKS);
+        assert!(!acks.contains(JobId(0), owner, now));
+        assert!(acks.contains(JobId(1), owner, now));
+
+        let expired = now + COMPLETION_ACK_RETRY_WINDOW + Duration::from_secs(1);
+        assert!(!acks.contains(JobId(1), owner, expired));
+        assert!(acks.recent.is_empty());
+        Ok(())
     }
 
     #[test]

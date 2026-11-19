@@ -54,7 +54,9 @@ The HTTP implementation of sccache has the following API, where all HTTP body co
         heartbeat request started.
    - `POST /api/v1/scheduler/job_state`
       - Called by servers to inform the scheduler of the state of the job.
-      - Repeated state updates and terminal completion acknowledgments are idempotent.
+      - Repeated state updates are idempotent. A terminal completion may be
+        acknowledged again for the same worker if the scheduler already
+        completed that job, within its bounded acknowledgment retry window.
    - `GET /api/v1/scheduler/status`
       - Returns information about the scheduler.
  - `server`
