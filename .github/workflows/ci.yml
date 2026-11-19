@@ -127,7 +127,9 @@ jobs:
           protocol = Path("contrib/codeandsolder/release-protocol.env").read_text()
           assert "dist_protocol=2" in protocol
           assert "rollout_epoch=3" in protocol
+          assert "glibc_abi_max=2.39" in protocol
           assert "source contrib/codeandsolder/release-protocol.env" in publisher
+          assert "Reject binaries requiring a newer GNU libc ABI" in publisher
           assert "steps.protocol.outputs.dist_protocol" in publisher
           assert "steps.protocol.outputs.rollout_epoch" in publisher
           assert "Skipping superseded main revision" in publisher

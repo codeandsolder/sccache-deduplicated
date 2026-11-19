@@ -71,7 +71,8 @@ jobs:
   build-publish:
     needs: required-gates
     if: needs.required-gates.outputs.ready == 'true'
-    runs-on: ubuntu-26.04
+    # 24.04 ships GLIBC 2.39; the oldest managed host must stay compatible.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       RUSTFLAGS: "-C target-cpu=x86-64-v2"
@@ -109,8 +110,10 @@ jobs:
           source contrib/codeandsolder/release-protocol.env
           [[ "$dist_protocol" =~ ^[1-9][0-9]*$ ]]
           [[ "$rollout_epoch" =~ ^[1-9][0-9]*$ ]]
+          [[ "$glibc_abi_max" =~ ^[0-9]+\.[0-9]+$ ]]
           echo "dist_protocol=$dist_protocol" >> "$GITHUB_OUTPUT"
           echo "rollout_epoch=$rollout_epoch" >> "$GITHUB_OUTPUT"
+          echo "glibc_abi_max=$glibc_abi_max" >> "$GITHUB_OUTPUT"
 
       - name: Build CI client + dist worker
         shell: bash
@@ -131,8 +134,26 @@ jobs:
             echo "features=s3,gha,dist-client,dist-server,direct-metrics"
             echo "dist_protocol=${{ steps.protocol.outputs.dist_protocol }}"
             echo "rollout_epoch=${{ steps.protocol.outputs.rollout_epoch }}"
+            echo "glibc_abi_max=${{ steps.protocol.outputs.glibc_abi_max }}"
             echo "capabilities=$(target/release/sccache --capabilities | paste -sd, -)"
           } > dist/build.txt
+
+      - name: Reject binaries requiring a newer GNU libc ABI
+        shell: bash
+        run: |
+          set -euo pipefail
+          max_supported="GLIBC_${{ steps.protocol.outputs.glibc_abi_max }}"
+          for binary in dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2; do
+            abi_report="$RUNNER_TEMP/$(basename "$binary").glibc-versions"
+            readelf -W --version-info "$binary" > "$abi_report"
+            max_required="$(rg -o 'GLIBC_[0-9]+\.[0-9]+' "$abi_report" | sort -Vu | tail -n 1 || true)"
+            if [[ -n "$max_required" &&
+                  "$(printf '%s\n%s\n' "$max_supported" "$max_required" | sort -V | tail -n 1)" != "$max_supported" ]]; then
+              echo "::error::$binary requires $max_required, newer than $max_supported"
+              exit 1
+            fi
+            echo "$binary requires at most ${max_required:-no GLIBC symbols}; fleet maximum $max_supported"
+          done
 
       - name: Finalize mandatory sccache before publishing binaries
         if: always()
