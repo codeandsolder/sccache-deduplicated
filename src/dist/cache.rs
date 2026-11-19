@@ -346,6 +346,7 @@ mod client {
                 if let Some(tc) = &custom.identity {
                     return Ok(Some((tc.clone(), custom.to_override())));
                 }
+                drop(registry);
             }
             let candidate = Toolchain {
                 archive_id: path_key(&archive)?,
