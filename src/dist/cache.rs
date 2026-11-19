@@ -17,7 +17,7 @@ mod client {
     use crate::dist::pkg::ToolchainPackager;
     use crate::dist::{ArchiveId, CustomToolchainOverride, Toolchain};
     use crate::lru_disk_cache::Error as LruError;
-    use anyhow::{Context, Error, Result, bail};
+    use anyhow::{Context, Error, Result, anyhow, bail};
     use fs_err as fs;
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
@@ -27,22 +27,62 @@ mod client {
     use super::{TcCache, path_key};
 
     #[derive(Clone, Debug)]
-    pub struct CustomToolchain {
+    struct CustomToolchain {
         archive: PathBuf,
         compiler_executable: String,
         cargo_executable: Option<String>,
+        identity: Option<Toolchain>,
     }
 
-    // TODO: possibly shouldn't be public
+    impl CustomToolchain {
+        fn to_override(&self) -> CustomToolchainOverride {
+            CustomToolchainOverride {
+                compiler_executable: self.compiler_executable.clone(),
+                archive: self.archive.clone(),
+                cargo_executable: self.cargo_executable.clone(),
+            }
+        }
+    }
+
+    // Both indexes must be updated under one lock: returning a resolved toolchain
+    // without registering its archive makes get_toolchain() miss that toolchain.
+    struct CustomToolchainRegistry {
+        configured: HashMap<PathBuf, CustomToolchain>,
+        archives: HashMap<Toolchain, PathBuf>,
+    }
+
+    impl CustomToolchainRegistry {
+        fn register(
+            &mut self,
+            compiler_path: &Path,
+            candidate: Toolchain,
+        ) -> Result<(Toolchain, CustomToolchainOverride)> {
+            let custom = self
+                .configured
+                .get_mut(compiler_path)
+                .ok_or_else(|| anyhow!("configured toolchain disappeared during registration"))?;
+            // Another caller may have completed hashing and registered the path.
+            let tc = custom.identity.get_or_insert(candidate).clone();
+            let override_ = custom.to_override();
+            let previous = self.archives.insert(tc.clone(), override_.archive.clone());
+            if let Some(previous) = previous
+                && previous != override_.archive
+            {
+                warn!(
+                    "Detected interchangeable toolchain archives at {} and {}",
+                    previous.display(),
+                    override_.archive.display()
+                );
+            }
+            Ok((tc, override_))
+        }
+    }
+
     pub struct ClientToolchains {
         cache_dir: PathBuf,
         cache: Mutex<TcCache>,
         toolchain_creation: Mutex<()>,
-        // Lookup from dist toolchain -> path to custom toolchain archive
-        custom_toolchain_archives: Mutex<HashMap<Toolchain, PathBuf>>,
-        // Lookup from local path -> toolchain details
-        // The Option<Toolchain> could be populated on startup, but it's lazy for efficiency
-        custom_toolchain_paths: Mutex<HashMap<PathBuf, (CustomToolchain, Option<Toolchain>)>>,
+        custom_toolchains: Mutex<CustomToolchainRegistry>,
         // Toolchains configured to not be distributed
         disabled_toolchains: HashSet<PathBuf>,
         // Local machine mapping from 'weak' hashes to strong toolchain hashes
@@ -121,9 +161,10 @@ mod client {
                             archive: archive.clone(),
                             compiler_executable: archive_compiler_executable.clone(),
                             cargo_executable: archive_cargo_executable.clone(),
+                            identity: None,
                         };
                         if custom_toolchain_paths
-                            .insert(compiler_executable.clone(), (custom_tc, None))
+                            .insert(compiler_executable.clone(), custom_tc)
                             .is_some()
                         {
                             bail!("Multiple toolchains for {}", compiler_executable.display())
@@ -154,14 +195,14 @@ mod client {
                     }
                 }
             }
-            let custom_toolchain_paths = Mutex::new(custom_toolchain_paths);
-
             Ok(Self {
                 cache_dir,
                 cache,
                 toolchain_creation: Mutex::new(()),
-                custom_toolchain_archives: Mutex::new(HashMap::new()),
-                custom_toolchain_paths,
+                custom_toolchains: Mutex::new(CustomToolchainRegistry {
+                    configured: custom_toolchain_paths,
+                    archives: HashMap::new(),
+                }),
                 disabled_toolchains,
                 // TODO: shouldn't clear on restart, but also should have some
                 // form of pruning
@@ -174,9 +215,10 @@ mod client {
         pub fn get_toolchain(&self, tc: &Toolchain) -> Result<Option<fs::File>> {
             // TODO: be more relaxed about path casing and slashes on Windows
             let custom_tc_archive = self
-                .custom_toolchain_archives
+                .custom_toolchains
                 .lock()
-                .map_err(|_| anyhow::anyhow!("custom toolchain archive mutex poisoned"))?
+                .map_err(|_| anyhow::anyhow!("custom toolchain registry mutex poisoned"))?
+                .archives
                 .get(tc)
                 .cloned();
             let file = if let Some(custom_tc_archive) = custom_tc_archive {
@@ -212,9 +254,8 @@ mod client {
                     compiler_path.display()
                 )
             }
-            if let Some(tc_and_paths) = self.get_custom_toolchain(compiler_path) {
+            if let Some((tc, toolchain_override)) = self.get_custom_toolchain(compiler_path)? {
                 debug!("Using custom toolchain for {}", compiler_path.display());
-                let (tc, toolchain_override) = tc_and_paths?;
                 return Ok((tc, Some(toolchain_override)));
             }
             // Only permit one toolchain creation at a time, without holding the LRU
@@ -268,65 +309,33 @@ mod client {
             Ok((tc, None))
         }
 
-        pub fn get_custom_toolchain(
+        pub(crate) fn get_custom_toolchain(
             &self,
             compiler_path: &Path,
-        ) -> Option<Result<(Toolchain, CustomToolchainOverride)>> {
-            let new_toolchain = {
-                let Ok(mut custom_toolchain_paths) = self.custom_toolchain_paths.lock() else {
-                    return Some(Err(anyhow::anyhow!("custom toolchain path mutex poisoned")));
+        ) -> Result<Option<(Toolchain, CustomToolchainOverride)>> {
+            let archive = {
+                let registry = self
+                    .custom_toolchains
+                    .lock()
+                    .map_err(|_| anyhow!("custom toolchain registry mutex poisoned"))?;
+                let Some(custom) = registry.configured.get(compiler_path) else {
+                    return Ok(None);
                 };
-                match custom_toolchain_paths.get_mut(compiler_path) {
-                    Some((custom_tc, Some(tc))) => {
-                        return Some(Ok((
-                            tc.clone(),
-                            CustomToolchainOverride {
-                                compiler_executable: custom_tc.compiler_executable.clone(),
-                                archive: custom_tc.archive.clone(),
-                                cargo_executable: custom_tc.cargo_executable.clone(),
-                            },
-                        )));
-                    }
-                    Some((custom_tc, maybe_tc @ None)) => {
-                        let archive_id = match path_key(&custom_tc.archive) {
-                            Ok(archive_id) => archive_id,
-                            Err(error) => return Some(Err(error)),
-                        };
-                        let tc = Toolchain { archive_id };
-                        *maybe_tc = Some(tc.clone());
-                        (
-                            tc,
-                            CustomToolchainOverride {
-                                compiler_executable: custom_tc.compiler_executable.clone(),
-                                archive: custom_tc.archive.clone(),
-                                cargo_executable: custom_tc.cargo_executable.clone(),
-                            },
-                        )
-                    }
-                    None => return None,
+                if let Some(tc) = &custom.identity {
+                    return Ok(Some((tc.clone(), custom.to_override())));
                 }
+                custom.archive.clone()
             };
-
-            let (tc, toolchain_override) = new_toolchain;
-            let old_path = match self.custom_toolchain_archives.lock() {
-                Ok(mut archives) => archives.insert(tc.clone(), toolchain_override.archive.clone()),
-                Err(_) => {
-                    return Some(Err(anyhow::anyhow!(
-                        "custom toolchain archive mutex poisoned"
-                    )));
-                }
+            // Hashing toolchain archives may take seconds; do not block unrelated
+            // archive lookups while computing a new toolchain's identity.
+            let candidate = Toolchain {
+                archive_id: path_key(&archive)?,
             };
-            // If this entry already exists, someone has two custom toolchains with the same strong hash.
-            if let Some(old_path) = old_path
-                && old_path != toolchain_override.archive
-            {
-                warn!(
-                    "Detected interchangeable toolchain archives at {} and {}",
-                    old_path.display(),
-                    toolchain_override.archive.display()
-                );
-            }
-            Some(Ok((tc, toolchain_override)))
+            let mut registry = self
+                .custom_toolchains
+                .lock()
+                .map_err(|_| anyhow!("custom toolchain registry mutex poisoned"))?;
+            registry.register(compiler_path, candidate).map(Some)
         }
 
         fn weak_to_strong(&self, weak_key: &str) -> Result<Option<ArchiveId>> {
@@ -510,6 +519,74 @@ mod client {
             )?;
             assert_eq!(repacked, toolchain);
             assert!(client.get_toolchain(&repacked)?.is_some());
+            Ok(())
+        }
+
+        #[test]
+        fn custom_toolchain_registration_is_atomic_across_both_indexes() -> Result<()> {
+            let directory = tempfile::tempdir()?;
+            let archive = create_file(directory.path(), "custom.tar", |mut file| {
+                file.write_all(b"custom archive")
+            })?;
+            let client = std::sync::Arc::new(ClientToolchains::new(
+                &directory.path().join("cache"),
+                1024 * 1024,
+                &[config::DistToolchainConfig::PathOverride {
+                    compiler_executable: "/my/compiler".into(),
+                    archive,
+                    archive_compiler_executable: "/my/compiler".into(),
+                    archive_cargo_executable: None,
+                }],
+            )?);
+
+            let workers: Vec<_> = (0..16)
+                .map(|_| {
+                    let client = std::sync::Arc::clone(&client);
+                    std::thread::spawn(move || -> Result<crate::dist::Toolchain> {
+                        let (tc, _) = client
+                            .get_custom_toolchain("/my/compiler".as_ref())?
+                            .ok_or_else(|| anyhow!("configured toolchain was not found"))?;
+                        assert!(client.get_toolchain(&tc)?.is_some());
+                        Ok(tc)
+                    })
+                })
+                .collect();
+            let mut expected = None;
+            for worker in workers {
+                let tc = worker.join().expect("worker panicked")?;
+                if let Some(expected) = &expected {
+                    assert_eq!(expected, &tc);
+                } else {
+                    expected = Some(tc);
+                }
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn custom_toolchain_failed_hash_can_be_retried() -> Result<()> {
+            let directory = tempfile::tempdir()?;
+            let archive = directory.path().join("custom.tar");
+            let client = ClientToolchains::new(
+                &directory.path().join("cache"),
+                1024 * 1024,
+                &[config::DistToolchainConfig::PathOverride {
+                    compiler_executable: "/my/compiler".into(),
+                    archive: archive.clone(),
+                    archive_compiler_executable: "/my/compiler".into(),
+                    archive_cargo_executable: None,
+                }],
+            )?;
+            assert!(
+                client
+                    .get_custom_toolchain("/my/compiler".as_ref())
+                    .is_err()
+            );
+            std::fs::write(&archive, b"restored archive")?;
+            let (tc, _) = client
+                .get_custom_toolchain("/my/compiler".as_ref())?
+                .ok_or_else(|| anyhow!("configured toolchain was not found"))?;
+            assert!(client.get_toolchain(&tc)?.is_some());
             Ok(())
         }
 
