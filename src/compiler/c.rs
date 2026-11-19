@@ -792,6 +792,13 @@ where
         let mut common_and_arch_args = self.parsed_args.common_args.clone();
         common_and_arch_args.extend(self.parsed_args.arch_args.clone());
 
+        let mut effective_native_basedirs = storage.basedirs().to_vec();
+        if let Some(native_root) =
+            relocatable_native_basedir(&env_vars, &common_and_arch_args, &preprocessor_output)
+        {
+            effective_native_basedirs.push(native_root);
+        }
+
         let key = HashKeyParams::new(
             &self.executable_digest,
             self.parsed_args.language,
@@ -801,7 +808,7 @@ where
         .with_extra_hashes(&extra_hashes)
         .with_env_vars(&env_vars)
         .with_plusplus(self.compiler.plusplus())
-        .with_basedirs(storage.basedirs())
+        .with_basedirs(&effective_native_basedirs)
         .with_assembler_digest(assembler_digest.as_deref())
         .compute();
 
@@ -2207,6 +2214,53 @@ static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
 /// The arguments are hashed verbatim, so any that spell out an absolute path -
 /// `-ffile-prefix-map=/home/user/project=.` above all - would tie the cache
 /// entry to one checkout of the tree. See [`strip_basedirs_from_arg`].
+/// Relocate `OUT_DIR` sources only when a matching file-prefix map makes
+/// compiled object paths equivalent, and no unremapped literal paths remain.
+fn relocatable_native_basedir(
+    env_vars: &[(OsString, OsString)],
+    arguments: &[OsString],
+    preprocessed: &[u8],
+) -> Option<Vec<u8>> {
+    let out_dir = env_vars
+        .iter()
+        .find(|(name, _)| name == "OUT_DIR")
+        .map(|(_, value)| value.as_encoded_bytes())?;
+    if !out_dir.starts_with(b"/") || out_dir.len() <= 1 || out_dir.ends_with(b"/") {
+        return None;
+    }
+    let mapped = arguments.iter().any(|arg| {
+        let Some(rest) = arg.as_encoded_bytes().strip_prefix(b"-ffile-prefix-map=") else {
+            return false;
+        };
+        rest.starts_with(out_dir) && rest.get(out_dir.len()) == Some(&b'=')
+    });
+    if !mapped {
+        return None;
+    }
+    // A generated path string can affect object bytes. Require that any raw
+    // OUT_DIR occurrence is solely in a compiler-generated source linemarker.
+    if preprocessed.split(|&byte| byte == b'\n').any(|line| {
+        memchr::memmem::find(line, out_dir).is_some() && !is_preprocessor_linemarker(line)
+    }) {
+        return None;
+    }
+    let mut root = Vec::with_capacity(out_dir.len() + 1);
+    root.extend_from_slice(out_dir);
+    root.push(b'/');
+    Some(root)
+}
+
+fn is_preprocessor_linemarker(line: &[u8]) -> bool {
+    let Some(rest) = line
+        .strip_prefix(b"# ")
+        .or_else(|| line.strip_prefix(b"#line "))
+    else {
+        return false;
+    };
+    let n = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    n > 0 && rest.get(n) == Some(&b' ') && rest.get(n + 1) == Some(&b'"')
+}
+
 pub fn hash_arguments(m: &mut Digest, arguments: &[OsString], basedirs: &[Vec<u8>]) {
     for arg in arguments {
         // Same shape as OsString's own Hash impl: the bytes, then a separator
@@ -2766,6 +2820,57 @@ mod test {
         let h2 = HashKeyParams::new("abcd", Language::C, &args, b"hello world").compute();
 
         assert_neq!(h1, h2);
+    }
+
+    #[test]
+    fn test_relocatable_native_out_dir_cache_keys() {
+        let key_for = |root: &str, literal: bool, flags: bool| {
+            let environment = vec![("OUT_DIR".into(), root.into())];
+            let mut args: Vec<OsString> = vec![format!("-I{root}/boringssl/include").into()];
+            if flags {
+                args.push(format!("-ffile-prefix-map={root}=/VIRTUAL").into());
+            }
+            let preprocessed = if literal {
+                format!(
+                    r#"# 1 "{root}/boringssl/crypto/aes/aes.cc"
+const char* path = "{root}/literal";
+"#
+                )
+            } else {
+                format!(
+                    r#"# 1 "{root}/boringssl/crypto/aes/aes.cc"
+int native() {{ return 42; }}
+"#
+                )
+            };
+            let basedirs = relocatable_native_basedir(&environment, &args, preprocessed.as_bytes());
+            let key = HashKeyParams::new(
+                "same-native-compiler",
+                Language::Cxx,
+                &args,
+                preprocessed.as_bytes(),
+            )
+            .with_basedirs(basedirs.as_ref().map_or(&[][..], std::slice::from_ref))
+            .compute();
+            (key, basedirs)
+        };
+
+        let (a, a_root) = key_for("/tmp/native/a/out", false, true);
+        let (b, b_root) = key_for("/tmp/native/b/out", false, true);
+        assert!(a_root.is_some() && b_root.is_some());
+        assert_eq!(a, b, "same mapped native source must share its cache key");
+
+        let (no_map, no_map_root) = key_for("/tmp/native/b/out", false, false);
+        assert!(no_map_root.is_none());
+        assert_ne!(a, no_map, "missing prefix-map cannot reuse an object");
+
+        let (literal_a, literal_root_a) = key_for("/tmp/native/a/out", true, true);
+        let (literal_b, literal_root_b) = key_for("/tmp/native/b/out", true, true);
+        assert!(literal_root_a.is_none() && literal_root_b.is_none());
+        assert_ne!(
+            literal_a, literal_b,
+            "absolute native path strings affect output"
+        );
     }
 
     #[test]
