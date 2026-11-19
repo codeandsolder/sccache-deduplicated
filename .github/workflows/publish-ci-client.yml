@@ -49,6 +49,12 @@ jobs:
           fi
 
           sha="${{ github.event.workflow_run.head_sha }}"
+          latest="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')"
+          if [[ "$sha" != "$latest" ]]; then
+            echo "Skipping superseded main revision $sha (current: $latest)"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           ready=true
           for workflow in ci.yml rust-skills2-strict.yml; do
             conclusion="$(
@@ -93,6 +99,19 @@ jobs:
         with:
           rust-toolchain: "1.99.0"
 
+      - name: Read release protocol and rollout epoch
+        id: protocol
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Read from the checked-out source revision, never from the
+          # current workflow revision for a separately pinned release.
+          source contrib/codeandsolder/release-protocol.env
+          [[ "$dist_protocol" =~ ^[1-9][0-9]*$ ]]
+          [[ "$rollout_epoch" =~ ^[1-9][0-9]*$ ]]
+          echo "dist_protocol=$dist_protocol" >> "$GITHUB_OUTPUT"
+          echo "rollout_epoch=$rollout_epoch" >> "$GITHUB_OUTPUT"
+
       - name: Build CI client + dist worker
         shell: bash
         run: |
@@ -110,9 +129,8 @@ jobs:
             echo "rust_toolchain=1.99.0"
             echo "rustflags=-C target-cpu=x86-64-v2"
             echo "features=s3,gha,dist-client,dist-server,direct-metrics"
-            echo "dist_protocol=1"
-            # Bump when a release requires coordinated host-side migration before deployment.
-            echo "rollout_epoch=2"
+            echo "dist_protocol=${{ steps.protocol.outputs.dist_protocol }}"
+            echo "rollout_epoch=${{ steps.protocol.outputs.rollout_epoch }}"
             echo "capabilities=$(target/release/sccache --capabilities | paste -sd, -)"
           } > dist/build.txt
 
@@ -127,6 +145,15 @@ jobs:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || format('sccache-ci-{0}', github.event.workflow_run.head_sha) }}
         run: |
           set -euo pipefail
+          # Completed older main runs must not publish a downgrade after a
+          # newer revision became the default branch.
+          if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
+            latest="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')"
+            if [[ "$latest" != "${{ steps.rev.outputs.sha }}" ]]; then
+              echo "Skipping superseded main release (latest: $latest)"
+              exit 0
+            fi
+          fi
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             echo "Release $RELEASE_TAG already exists; immutable release is already published."
             exit 0

@@ -1261,6 +1261,8 @@ mod server {
                 handler,
             } = self;
             let mut load_aware_capacity = LoadAwareCapacity::from_env()?;
+            let handler = Arc::new(handler);
+            let heartbeat_handler = Arc::clone(&handler);
             let running_jobs = Arc::new(Mutex::new(HashSet::<JobId>::new()));
             let heartbeat_running_jobs = Arc::clone(&running_jobs);
             let heartbeat_jwt_key = jwt_key.clone();
@@ -1278,6 +1280,9 @@ mod server {
             thread::spawn(move || {
                 let client = heartbeat_client;
                 loop {
+                    // A new assignment can arrive after this request starts but
+                    // before its response. Never prune that assignment.
+                    let heartbeat_started_at = Instant::now();
                     trace!(target: "sccache_heartbeat", "Performing heartbeat");
                     let running_job_ids: Vec<_> = heartbeat_running_jobs
                         .lock()
@@ -1310,8 +1315,23 @@ mod server {
                         .bincode(&heartbeat_req)
                         .and_then(bincode_req);
                     match heartbeat_result {
-                        Ok(HeartbeatServerResult { is_new }) => {
+                        Ok(HeartbeatServerResult {
+                            is_new,
+                            assigned_job_ids,
+                        }) => {
                             trace!(target: "sccache_heartbeat", "Heartbeat success is_new={}", is_new);
+                            match heartbeat_handler.handle_reconcile_assignments(
+                                &assigned_job_ids,
+                                heartbeat_started_at,
+                            ) {
+                                Ok(removed) if removed > 0 => {
+                                    info!("Discarded {removed} stale unclaimed worker assignments")
+                                }
+                                Err(error) => {
+                                    warn!("Unable to reconcile worker assignments: {error:#}")
+                                }
+                                _ => {}
+                            }
                             // TODO: if is_new, terminate all running jobs
                             if is_new {
                                 info!("Server connected to scheduler");

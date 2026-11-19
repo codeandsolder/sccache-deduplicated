@@ -124,7 +124,14 @@ jobs:
           assert 'SCCACHE_METRICS_HEARTBEAT_MS' in source
           assert '(heartbeat_ms + 999) / 1000 + 15' in source
           publisher = Path(".github/workflows/publish-ci-client.yml").read_text()
-          assert 'echo "dist_protocol=1"' in publisher
+          protocol = Path("contrib/codeandsolder/release-protocol.env").read_text()
+          assert "dist_protocol=2" in protocol
+          assert "rollout_epoch=3" in protocol
+          assert "source contrib/codeandsolder/release-protocol.env" in publisher
+          assert "steps.protocol.outputs.dist_protocol" in publisher
+          assert "steps.protocol.outputs.rollout_epoch" in publisher
+          assert "Skipping superseded main revision" in publisher
+          assert "Skipping superseded main release" in publisher
           PY
 
   toml_format:
