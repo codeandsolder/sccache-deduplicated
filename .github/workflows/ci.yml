@@ -314,6 +314,22 @@ jobs:
       rust-toolchain: "1.99.1"
       rustflags: "-C target-cpu=x86-64-v2"
 
+  ci-bundle-release-profile:
+    name: CI bundle release profile (Rust 1.99.0)
+    # Reuse shared sccache setup, and check the exact pinned publisher features
+    # on every PR and main push (not only tag builds).
+    permissions:
+      contents: read
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@50c4dbb544f008f87ba479324b43a1bd807672bd # main
+    with:
+      isolate-public-sccache-server: true
+      rust-toolchain: "1.99.0"
+      rustflags: "-C target-cpu=x86-64-v2"
+      command: >-
+        cargo +1.99.0 check --release --locked --no-default-features
+        --features s3,gha,dist-client,dist-server,direct-metrics
+        --bin sccache --bin sccache-dist
+
   build:
     name: build ${{ matrix.binary || 'sccache' }} ${{ matrix.target }}
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
