@@ -154,6 +154,7 @@ mod common {
     pub struct HeartbeatServerHttpRequest {
         pub jwt_key: Vec<u8>,
         pub num_cpus: usize,
+        pub running_job_ids: Vec<dist::JobId>,
         pub server_nonce: dist::ServerNonce,
         pub cert_digest: Vec<u8>,
         pub cert_pem: Vec<u8>,
@@ -165,6 +166,7 @@ mod common {
             f.debug_struct("HeartbeatServerHttpRequest")
                 .field("jwt_key", &BASE64_URL_SAFE_ENGINE.encode(&self.jwt_key))
                 .field("num_cpus", &self.num_cpus)
+                .field("running_job_ids", &self.running_job_ids)
                 .field("server_nonce", &self.server_nonce)
                 .field(
                     "cert_digest",
@@ -301,7 +303,7 @@ mod server {
     use flate2::read::ZlibDecoder as ZlibReadDecoder;
     use rouille::accept;
     use serde::{Deserialize, Serialize};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::convert::Infallible;
     use std::env;
     use std::fs;
@@ -447,17 +449,51 @@ mod server {
         None
     }
 
-    struct RunningJobGuard(Arc<atomic::AtomicUsize>);
+    // The running set has one owner for both load-advertisement and scheduler
+    // reconciliation. A guard clears its ID even if a build request unwinds.
+    struct RunningJobGuard {
+        jobs: Arc<Mutex<HashSet<JobId>>>,
+        job_id: JobId,
+    }
     impl RunningJobGuard {
-        fn new(counter: &Arc<atomic::AtomicUsize>) -> Self {
-            counter.fetch_add(1, atomic::Ordering::Relaxed);
-            Self(Arc::clone(counter))
+        fn new(jobs: &Arc<Mutex<HashSet<JobId>>>, job_id: JobId) -> Result<Self> {
+            let mut active = jobs
+                .lock()
+                .map_err(|_| anyhow!("running jobs mutex poisoned"))?;
+            if !active.insert(job_id) {
+                return Err(anyhow!("job {job_id} is already running"));
+            }
+            drop(active);
+            Ok(Self {
+                jobs: Arc::clone(jobs),
+                job_id,
+            })
         }
     }
     impl Drop for RunningJobGuard {
         fn drop(&mut self) {
-            self.0.fetch_sub(1, atomic::Ordering::Relaxed);
+            // Never leak a running entry if a different thread poisoned the lock.
+            let mut jobs = self.jobs.lock().unwrap_or_else(|error| error.into_inner());
+            jobs.remove(&self.job_id);
         }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn running_job_guard_tracks_exact_ownership_and_rejects_duplicates() -> Result<()> {
+        let active = Arc::new(Mutex::new(HashSet::<JobId>::new()));
+        let first = RunningJobGuard::new(&active, JobId(5))?;
+        let second = RunningJobGuard::new(&active, JobId(6))?;
+        assert!(RunningJobGuard::new(&active, JobId(5)).is_err());
+        assert_eq!(active.lock().unwrap().len(), 2);
+        drop(first);
+        assert_eq!(
+            active.lock().unwrap().iter().copied().collect::<Vec<_>>(),
+            vec![JobId(6)]
+        );
+        drop(second);
+        assert!(active.lock().unwrap().is_empty());
+        Ok(())
     }
 
     pub fn bincode_req<T: serde::de::DeserializeOwned + 'static>(
@@ -1027,7 +1063,7 @@ mod server {
                         let heartbeat_server = try_or_400_log!(req_id, bincode_input(request));
                         trace!(target: "sccache_heartbeat", "Req {}: heartbeat_server: {:?}", req_id, heartbeat_server);
 
-                        let HeartbeatServerHttpRequest { num_cpus, jwt_key, server_nonce, cert_digest, cert_pem } = heartbeat_server;
+                        let HeartbeatServerHttpRequest { num_cpus, running_job_ids, jwt_key, server_nonce, cert_digest, cert_pem } = heartbeat_server;
                         let mut requester_client = try_or_500_log!(
                             req_id,
                             requester
@@ -1050,7 +1086,7 @@ mod server {
                         let worker_name_nonce = server_nonce.clone();
                         let res: HeartbeatServerResult = try_or_500_log!(req_id, handler.handle_heartbeat_server(
                             server_id, server_nonce,
-                            num_cpus,
+                            num_cpus, &running_job_ids,
                             job_authorizer
                         ));
                         if let Some(worker_name) = worker_name
@@ -1225,7 +1261,7 @@ mod server {
                 handler,
             } = self;
             let mut load_aware_capacity = LoadAwareCapacity::from_env()?;
-            let running_jobs = Arc::new(atomic::AtomicUsize::new(0));
+            let running_jobs = Arc::new(Mutex::new(HashSet::<JobId>::new()));
             let heartbeat_running_jobs = Arc::clone(&running_jobs);
             let heartbeat_jwt_key = jwt_key.clone();
             let heartbeat_cert_pem = cert_pem.clone();
@@ -1243,14 +1279,19 @@ mod server {
                 let client = heartbeat_client;
                 loop {
                     trace!(target: "sccache_heartbeat", "Performing heartbeat");
+                    let running_job_ids: Vec<_> = heartbeat_running_jobs
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .iter()
+                        .copied()
+                        .collect();
                     let advertised_cpus =
                         load_aware_capacity.as_mut().map_or_else(num_cpus, |state| {
-                            state.advertised_cpus(
-                                heartbeat_running_jobs.load(atomic::Ordering::Relaxed),
-                            )
+                            state.advertised_cpus(running_job_ids.len())
                         });
                     let heartbeat_req = HeartbeatServerHttpRequest {
                         num_cpus: advertised_cpus,
+                        running_job_ids,
                         jwt_key: heartbeat_jwt_key.clone(),
                         server_nonce: server_nonce.clone(),
                         cert_digest: cert_digest.clone(),
@@ -1331,7 +1372,7 @@ mod server {
                         let inputs_rdr = InputsReader(Box::new(ZlibReadDecoder::new(body)));
                         let outputs = outputs.into_iter().collect();
 
-                        let _running_job = RunningJobGuard::new(&running_jobs);
+                        let _running_job = try_or_500_log!(req_id, RunningJobGuard::new(&running_jobs, job_id));
                         let res: RunJobResult = try_or_500_log!(req_id, handler.handle_run_job(&requester, job_id, command, outputs, inputs_rdr));
                         prepare_response(request, &res)
                     },
@@ -1367,13 +1408,24 @@ mod server {
             state: JobState,
         ) -> Result<UpdateJobStateResult> {
             let url = urls::scheduler_job_state(&self.scheduler_url, job_id)?;
-            bincode_req(
-                self.client
-                    .post(url)
-                    .bearer_auth(self.scheduler_auth.clone())
-                    .bincode(&state)?,
-            )
-            .context("POST to scheduler job_state failed")
+            let publish = || {
+                bincode_req(
+                    self.client
+                        .post(url.clone())
+                        .bearer_auth(self.scheduler_auth.clone())
+                        .bincode(&state)?,
+                )
+            };
+            // A lost response may follow a successful scheduler transition.
+            // The scheduler accepts repeated state updates and terminal acks.
+            publish().or_else(|first_error| {
+                warn!(
+                    "Retrying job {job_id} state {state} after scheduler response failure: {first_error:#}"
+                );
+                publish().with_context(|| {
+                    format!("POST to scheduler job_state failed; first attempt: {first_error:#}")
+                })
+            })
         }
     }
 }

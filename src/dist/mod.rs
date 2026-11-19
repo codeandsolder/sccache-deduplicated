@@ -994,6 +994,7 @@ pub trait SchedulerIncoming: Send + Sync {
         server_id: ServerId,
         server_nonce: ServerNonce,
         num_cpus: usize,
+        running_job_ids: &[JobId],
         job_authorizer: Box<dyn JobAuthorizer>,
     ) -> ExtResult<HeartbeatServerResult, Error>;
     // From Server, best-effort observability metadata.
