@@ -260,13 +260,20 @@ mod client {
                 debug!("Using custom toolchain for {}", compiler_path.display());
                 return Ok((tc, Some(toolchain_override)));
             }
+            // Include package-specific dependencies in the weak cache identity.
+            // A GCC executable can stay byte-identical while its assembler,
+            // linker or other helper is rebuilt in place.
+            let weak_key = toolchain_packager.cache_key_extension()?.map_or_else(
+                || weak_key.to_owned(),
+                |extra| format!("{weak_key}:{extra}"),
+            );
             // Only permit one toolchain creation at a time, without holding the LRU
             // cache mutex across potentially slow packaging I/O.
             let _creation_guard = self
                 .toolchain_creation
                 .lock()
                 .map_err(|_| anyhow::anyhow!("toolchain creation mutex poisoned"))?;
-            if let Some(archive_id) = self.weak_to_strong(weak_key)? {
+            if let Some(archive_id) = self.weak_to_strong(&weak_key)? {
                 let tc = Toolchain { archive_id };
                 let cached = {
                     let mut cache = self
@@ -307,7 +314,7 @@ mod client {
                     .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?;
                 cache.insert_file(tmpfile.path())?
             };
-            self.record_weak(weak_key.to_owned(), tc.archive_id.to_string())?;
+            self.record_weak(weak_key, tc.archive_id.to_string())?;
             Ok((tc, None))
         }
 
@@ -427,6 +434,52 @@ mod client {
                 f.write_all(b"toolchain_contents")?;
                 Ok(())
             }
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        struct DependencyVersionedPackage(&'static str);
+
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        impl crate::dist::pkg::ToolchainPackager for DependencyVersionedPackage {
+            fn cache_key_extension(&self) -> Result<Option<String>> {
+                Ok(Some(self.0.to_owned()))
+            }
+
+            fn write_pkg(self: Box<Self>, mut f: super::fs::File) -> crate::errors::Result<()> {
+                f.write_all(self.0.as_bytes())?;
+                Ok(())
+            }
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        #[test]
+        fn toolchain_repackages_when_external_helper_changes() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let client = ClientToolchains::new(temp.path(), 1024 * 1024, &[])?;
+            let path = std::path::Path::new("/compiler/whose-binary-did-not-change");
+            let (first, _) = client.put_toolchain(
+                path,
+                "same-compiler-executable-digest",
+                Box::new(DependencyVersionedPackage("binutils-v1")),
+            )?;
+            let (second, _) = client.put_toolchain(
+                path,
+                "same-compiler-executable-digest",
+                Box::new(DependencyVersionedPackage("binutils-v2")),
+            )?;
+            assert_ne!(first.archive_id, second.archive_id);
+            assert!(client.get_toolchain(&first)?.is_some());
+            assert!(client.get_toolchain(&second)?.is_some());
+            Ok(())
         }
 
         #[cfg(all(
