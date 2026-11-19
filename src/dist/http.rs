@@ -1299,6 +1299,8 @@ mod server {
                     };
                     let mut heartbeat_request = client
                         .post(heartbeat_url.clone())
+                        // A stalled scheduler must not permanently stop heartbeats.
+                        .timeout(HEARTBEAT_INTERVAL)
                         .bearer_auth(scheduler_auth.clone());
                     if let Some(worker_name) = worker_name.as_ref() {
                         heartbeat_request =
@@ -1412,6 +1414,8 @@ mod server {
                 bincode_req(
                     self.client
                         .post(url.clone())
+                        // Never retain an execution slot forever on a stalled ACK.
+                        .timeout(HEARTBEAT_TIMEOUT)
                         .bearer_auth(self.scheduler_auth.clone())
                         .bincode(&state)?,
                 )
