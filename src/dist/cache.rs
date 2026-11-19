@@ -22,7 +22,7 @@ mod client {
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use super::{TcCache, path_key};
 
@@ -32,6 +32,7 @@ mod client {
         compiler_executable: String,
         cargo_executable: Option<String>,
         identity: Option<Toolchain>,
+        hash_lock: Arc<Mutex<()>>,
     }
 
     impl CustomToolchain {
@@ -162,6 +163,7 @@ mod client {
                             compiler_executable: archive_compiler_executable.clone(),
                             cargo_executable: archive_cargo_executable.clone(),
                             identity: None,
+                            hash_lock: Arc::new(Mutex::new(())),
                         };
                         if custom_toolchain_paths
                             .insert(compiler_executable.clone(), custom_tc)
@@ -313,7 +315,7 @@ mod client {
             &self,
             compiler_path: &Path,
         ) -> Result<Option<(Toolchain, CustomToolchainOverride)>> {
-            let archive = {
+            let (archive, hash_lock) = {
                 let registry = self
                     .custom_toolchains
                     .lock()
@@ -324,12 +326,27 @@ mod client {
                 if let Some(tc) = &custom.identity {
                     return Ok(Some((tc.clone(), custom.to_override())));
                 }
-                let archive = custom.archive.clone();
+                let values = (custom.archive.clone(), Arc::clone(&custom.hash_lock));
                 drop(registry);
-                archive
+                values
             };
-            // Hashing toolchain archives may take seconds; do not block unrelated
-            // archive lookups while computing a new toolchain's identity.
+            // Only one caller hashes an uninitialized archive. Other toolchains
+            // and archive lookups remain independent of this slow I/O.
+            let hash_guard = hash_lock
+                .lock()
+                .map_err(|_| anyhow!("custom toolchain hash mutex poisoned"))?;
+            {
+                let registry = self
+                    .custom_toolchains
+                    .lock()
+                    .map_err(|_| anyhow!("custom toolchain registry mutex poisoned"))?;
+                let Some(custom) = registry.configured.get(compiler_path) else {
+                    return Err(anyhow!("configured toolchain disappeared during hashing"));
+                };
+                if let Some(tc) = &custom.identity {
+                    return Ok(Some((tc.clone(), custom.to_override())));
+                }
+            }
             let candidate = Toolchain {
                 archive_id: path_key(&archive)?,
             };
@@ -337,7 +354,10 @@ mod client {
                 .custom_toolchains
                 .lock()
                 .map_err(|_| anyhow!("custom toolchain registry mutex poisoned"))?;
-            registry.register(compiler_path, candidate).map(Some)
+            let result = registry.register(compiler_path, candidate).map(Some);
+            drop(registry);
+            drop(hash_guard);
+            result
         }
 
         fn weak_to_strong(&self, weak_key: &str) -> Result<Option<ArchiveId>> {
