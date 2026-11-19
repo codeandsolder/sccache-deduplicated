@@ -1952,7 +1952,7 @@ mod server_upload_tests {
                 cwd: "/tmp".to_owned(),
             },
             Vec::new(),
-            InputsReader::new(Cursor::new(Vec::new())),
+            InputsReader::new(Box::new(Cursor::new(Vec::new()))),
         )?;
         assert!(matches!(result, RunJobResult::JobNotFound));
         assert!(requester.0.lock().unwrap().is_empty());
@@ -1986,7 +1986,7 @@ mod server_upload_tests {
                 cwd: "/tmp".to_owned(),
             },
             Vec::new(),
-            InputsReader::new(Cursor::new(Vec::new())),
+            InputsReader::new(Box::new(Cursor::new(Vec::new()))),
         );
         assert!(failed.is_err());
         assert_eq!(

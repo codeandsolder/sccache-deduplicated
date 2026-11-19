@@ -1369,7 +1369,7 @@ mod server {
                         trace!("Req {}: run_job({}): {:?}", req_id, job_id, runjob);
                         let RunJobHttpRequest { command, outputs } = runjob;
                         let body = bincode_reader.into_inner();
-                        let inputs_rdr = InputsReader(Box::new(ZlibReadDecoder::new(body)));
+                        let inputs_rdr = InputsReader::new(Box::new(ZlibReadDecoder::new(body)));
                         let outputs = outputs.into_iter().collect();
 
                         let _running_job = try_or_500_log!(req_id, RunningJobGuard::new(&running_jobs, job_id));

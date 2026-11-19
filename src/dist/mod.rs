@@ -946,6 +946,13 @@ impl Read for ToolchainReader<'_> {
 }
 
 pub struct InputsReader<'a>(Box<dyn Read + Send + 'a>);
+impl<'a> InputsReader<'a> {
+    /// Wrap a reader for a distributed compilation's input stream.
+    #[must_use]
+    pub fn new(reader: Box<dyn Read + Send + 'a>) -> Self {
+        Self(reader)
+    }
+}
 impl Read for InputsReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)
