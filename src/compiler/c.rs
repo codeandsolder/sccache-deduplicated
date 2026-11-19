@@ -394,6 +394,8 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
         Box::new(CToolchainPackager {
             executable: self.executable.clone(),
             kind: self.compiler.kind(),
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            env_vars: Vec::new(),
         })
     }
     fn parse_arguments(
@@ -1882,6 +1884,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
             preprocessed_input,
             executable,
             compiler,
+            env_vars,
             ..
         } = *self;
         trace!(
@@ -1900,6 +1903,8 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
         let toolchain_packager = Box::new(CToolchainPackager {
             executable,
             kind: compiler.kind(),
+            cwd,
+            env_vars,
         });
         let outputs_rewriter = Box::new(NoopOutputsRewriter);
         Ok((inputs_packager, toolchain_packager, outputs_rewriter))
@@ -2053,6 +2058,190 @@ impl pkg::InputsPackager for CInputsPackager {
 struct CToolchainPackager {
     executable: PathBuf,
     kind: CCompilerKind,
+    cwd: PathBuf,
+    env_vars: Vec<(OsString, OsString)>,
+}
+
+#[cfg(all(
+    feature = "dist-client",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn gcc_program_search_fingerprint(
+    search_output: &[u8],
+    cwd: &Path,
+    path_env: Option<&OsStr>,
+) -> Result<String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    fn record_path(digest: &mut Digest, path: &Path) -> Result<bool> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+
+        digest.delimiter(path.as_os_str().as_bytes());
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                digest.update(b"absent");
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Could not inspect GCC helper {}", path.display()));
+            }
+        };
+        digest.update(b"present");
+        for field in [
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mode().into(),
+            metadata.mtime().cast_unsigned(),
+            metadata.mtime_nsec().cast_unsigned(),
+            metadata.ctime().cast_unsigned(),
+            metadata.ctime_nsec().cast_unsigned(),
+        ] {
+            digest.update(&field.to_le_bytes());
+        }
+        Ok(metadata.is_dir())
+    }
+
+    let program_line = search_output
+        .split(|&byte| byte == b'\n')
+        .find_map(|line| line.strip_prefix(b"programs: "))
+        .context("GCC -print-search-dirs omitted program search paths")?;
+    let installation_directory = search_output
+        .split(|&byte| byte == b'\n')
+        .find_map(|line| line.strip_prefix(b"install: "));
+    let mut digest = Digest::new();
+    digest.delimiter(b"gcc-toolchain-helper-search-v2");
+    for bytes in program_line
+        .split(|&byte| byte == b':')
+        .chain(installation_directory)
+    {
+        let bytes = bytes.strip_prefix(b"=").unwrap_or(bytes);
+        if bytes.is_empty() {
+            continue;
+        }
+        let directory = PathBuf::from(OsStr::from_bytes(bytes));
+        let directory = if directory.is_absolute() {
+            directory
+        } else {
+            cwd.join(directory)
+        };
+        if !record_path(&mut digest, &directory)? {
+            continue;
+        }
+        let mut entries = fs::read_dir(&directory)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<io::Result<Vec<_>>>()?;
+        entries.sort_unstable();
+        for entry in entries {
+            record_path(&mut digest, &entry)?;
+        }
+    }
+    // GCC may fall back to PATH after its own program search directories.
+    // Include all known helper names without enumerating an entire /usr/bin.
+    if let Some(path_env) = path_env {
+        for dir in std::env::split_paths(path_env) {
+            let dir = if dir.is_absolute() {
+                dir
+            } else {
+                cwd.join(dir)
+            };
+            for helper in [
+                "as",
+                "objcopy",
+                "ld",
+                "cc1",
+                "cc1plus",
+                "collect2",
+                "lto-wrapper",
+                "lto1",
+            ] {
+                record_path(&mut digest, &dir.join(helper))?;
+            }
+        }
+    }
+    Ok(digest.finish())
+}
+
+#[cfg(all(
+    test,
+    feature = "dist-client",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn gcc_program_search_fingerprint_tracks_helper_changes() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path().join("gcc-tools");
+    fs::create_dir(&dir)?;
+    let search = format!(
+        "install: ignored\nprograms: ={}\nlibraries: ignored\n",
+        dir.display()
+    );
+    let fingerprint = || gcc_program_search_fingerprint(search.as_bytes(), temp.path(), None);
+
+    let initial = fingerprint()?;
+    assert_eq!(initial, fingerprint()?);
+    fs::write(dir.join("as"), b"assembler version 1")?;
+    let with_assembler = fingerprint()?;
+    assert_ne!(initial, with_assembler);
+    fs::write(dir.join("as"), b"assembler version 2 with new size")?;
+    let with_new_assembler = fingerprint()?;
+    assert_ne!(with_assembler, with_new_assembler);
+    fs::write(dir.join("ld"), b"linker")?;
+    assert_ne!(with_new_assembler, fingerprint()?);
+    Ok(())
+}
+
+#[cfg(all(
+    test,
+    feature = "dist-client",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn real_cross_gcc_package_preserves_executable_helper_search_path() -> Result<()> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let Some(executable) = std::env::var_os("SCCACHE_TEST_CROSS_GCC") else {
+        return Ok(());
+    };
+    let executable = PathBuf::from(executable);
+    let output = process::Command::new(&executable)
+        .arg("-print-prog-name=as")
+        .output()?;
+    if !output.status.success() {
+        bail!("GCC failed while identifying its assembler");
+    }
+    let assembler = PathBuf::from(OsString::from_vec(output.stdout.trim_ascii_end().to_vec()));
+    assert!(assembler.is_absolute() && assembler.is_file());
+
+    let temp = tempfile::tempdir()?;
+    let archive_path = temp.path().join("toolchain.tar.gz");
+    let packager = CToolchainPackager {
+        executable,
+        kind: CCompilerKind::Gcc,
+        cwd: temp.path().to_owned(),
+        env_vars: Vec::new(),
+    };
+    let cache_key = pkg::ToolchainPackager::cache_key_extension(&packager)?;
+    assert_eq!(
+        cache_key,
+        pkg::ToolchainPackager::cache_key_extension(&packager)?,
+        "unchanged GCC helper dependencies must have a stable cache key"
+    );
+    pkg::ToolchainPackager::write_pkg(Box::new(packager), fs::File::create(&archive_path)?)?;
+
+    let root = temp.path().join("unpacked");
+    tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(archive_path)?)).unpack(&root)?;
+    assert!(
+        root.join(assembler.strip_prefix("/")?).is_file(),
+        "packaged GCC assembler must resolve using the driver's original path"
+    );
+    Ok(())
 }
 
 #[cfg(feature = "dist-client")]
@@ -2061,6 +2250,36 @@ struct CToolchainPackager {
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 impl pkg::ToolchainPackager for CToolchainPackager {
+    fn cache_key_extension(&self) -> Result<Option<String>> {
+        // The compiler binary can be unchanged while its assembler, linker,
+        // internal phases or search directories are being installed or updated.
+        // One GCC driver query and metadata checks are cheaper than repackaging
+        // on every distributed compile.
+        if self.kind != CCompilerKind::Gcc {
+            return Ok(Some("c-toolchain-lexical-paths-v2".to_owned()));
+        }
+        let output = process::Command::new(&self.executable)
+            .arg("-print-search-dirs")
+            .current_dir(&self.cwd)
+            .envs(self.env_vars.iter().cloned())
+            .output()
+            .with_context(|| format!("Could not inspect GCC {}", self.executable.display()))?;
+        if !output.status.success() {
+            bail!("GCC failed while reporting toolchain search directories");
+        }
+        let path_env = self
+            .env_vars
+            .iter()
+            .find(|(key, _)| key.as_os_str() == OsStr::new("PATH"))
+            .map(|(_, value)| value.clone())
+            .or_else(|| std::env::var_os("PATH"));
+        Ok(Some(gcc_program_search_fingerprint(
+            &output.stdout,
+            &self.cwd,
+            path_env.as_deref(),
+        )?))
+    }
+
     fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()> {
         use std::os::unix::ffi::OsStringExt;
 
@@ -2074,6 +2293,8 @@ impl pkg::ToolchainPackager for CToolchainPackager {
         let named_file = |kind: &str, name: &str| -> Option<PathBuf> {
             let mut output = process::Command::new(&self.executable)
                 .arg(format!("-print-{kind}-name={name}"))
+                .current_dir(&self.cwd)
+                .envs(self.env_vars.iter().cloned())
                 .output()
                 .ok()?;
             debug!(
@@ -2097,7 +2318,14 @@ impl pkg::ToolchainPackager for CToolchainPackager {
             if path.is_absolute() {
                 Some(path)
             } else {
-                which::which(path).ok()
+                let paths = self
+                    .env_vars
+                    .iter()
+                    .find(|(key, _)| key.as_os_str() == OsStr::new("PATH"))
+                    .map(|(_, value)| value.clone())
+                    .or_else(|| std::env::var_os("PATH"))
+                    .unwrap_or_default();
+                which::which_in(path, Some(paths), &self.cwd).ok()
             }
         };
 
@@ -2146,6 +2374,10 @@ impl pkg::ToolchainPackager for CToolchainPackager {
 
             CCompilerKind::Gcc => {
                 // Various external programs / files which may be needed by gcc
+                add_named_prog(&mut package_builder, "ld")?;
+                add_named_prog(&mut package_builder, "collect2")?;
+                add_named_prog(&mut package_builder, "lto-wrapper")?;
+                add_named_prog(&mut package_builder, "lto1")?;
                 add_named_prog(&mut package_builder, "cc1")?;
                 add_named_prog(&mut package_builder, "cc1plus")?;
                 add_named_file(&mut package_builder, "specs")?;
