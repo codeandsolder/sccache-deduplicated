@@ -324,7 +324,9 @@ mod client {
                 if let Some(tc) = &custom.identity {
                     return Ok(Some((tc.clone(), custom.to_override())));
                 }
-                custom.archive.clone()
+                let archive = custom.archive.clone();
+                drop(registry);
+                archive
             };
             // Hashing toolchain archives may take seconds; do not block unrelated
             // archive lookups while computing a new toolchain's identity.
@@ -367,7 +369,6 @@ mod client {
             let weak_map_path = self.cache_dir.join("weak_map.json");
             let mut temporary = tempfile::NamedTempFile::new_in(&self.cache_dir)
                 .context("failed to create temporary toolchain weak map")?;
-            use std::io::Write;
             temporary
                 .write_all(&serialized)
                 .context("failed to write temporary toolchain weak map")?;
@@ -376,6 +377,7 @@ mod client {
                 .map_err(|error| error.error)
                 .context("failed to publish toolchain weak map")?;
             *weak_map = updated;
+            drop(weak_map);
             Ok(())
         }
     }
