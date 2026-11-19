@@ -17,32 +17,73 @@ mod client {
     use crate::dist::pkg::ToolchainPackager;
     use crate::dist::{ArchiveId, CustomToolchainOverride, Toolchain};
     use crate::lru_disk_cache::Error as LruError;
-    use anyhow::{Context, Error, Result, bail};
+    use anyhow::{Context, Error, Result, anyhow, bail};
     use fs_err as fs;
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use super::{TcCache, path_key};
 
     #[derive(Clone, Debug)]
-    pub struct CustomToolchain {
+    struct CustomToolchain {
         archive: PathBuf,
         compiler_executable: String,
         cargo_executable: Option<String>,
+        identity: Option<Toolchain>,
+        hash_lock: Arc<Mutex<()>>,
     }
 
-    // TODO: possibly shouldn't be public
+    impl CustomToolchain {
+        fn to_override(&self) -> CustomToolchainOverride {
+            CustomToolchainOverride {
+                compiler_executable: self.compiler_executable.clone(),
+                archive: self.archive.clone(),
+                cargo_executable: self.cargo_executable.clone(),
+            }
+        }
+    }
+
+    // Both indexes must be updated under one lock: returning a resolved toolchain
+    // without registering its archive makes get_toolchain() miss that toolchain.
+    struct CustomToolchainRegistry {
+        configured: HashMap<PathBuf, CustomToolchain>,
+        archives: HashMap<Toolchain, PathBuf>,
+    }
+
+    impl CustomToolchainRegistry {
+        fn register(
+            &mut self,
+            compiler_path: &Path,
+            candidate: Toolchain,
+        ) -> Result<(Toolchain, CustomToolchainOverride)> {
+            let custom = self
+                .configured
+                .get_mut(compiler_path)
+                .ok_or_else(|| anyhow!("configured toolchain disappeared during registration"))?;
+            // Another caller may have completed hashing and registered the path.
+            let tc = custom.identity.get_or_insert(candidate).clone();
+            let override_ = custom.to_override();
+            let previous = self.archives.insert(tc.clone(), override_.archive.clone());
+            if let Some(previous) = previous
+                && previous != override_.archive
+            {
+                warn!(
+                    "Detected interchangeable toolchain archives at {} and {}",
+                    previous.display(),
+                    override_.archive.display()
+                );
+            }
+            Ok((tc, override_))
+        }
+    }
+
     pub struct ClientToolchains {
         cache_dir: PathBuf,
         cache: Mutex<TcCache>,
         toolchain_creation: Mutex<()>,
-        // Lookup from dist toolchain -> path to custom toolchain archive
-        custom_toolchain_archives: Mutex<HashMap<Toolchain, PathBuf>>,
-        // Lookup from local path -> toolchain details
-        // The Option<Toolchain> could be populated on startup, but it's lazy for efficiency
-        custom_toolchain_paths: Mutex<HashMap<PathBuf, (CustomToolchain, Option<Toolchain>)>>,
+        custom_toolchains: Mutex<CustomToolchainRegistry>,
         // Toolchains configured to not be distributed
         disabled_toolchains: HashSet<PathBuf>,
         // Local machine mapping from 'weak' hashes to strong toolchain hashes
@@ -121,9 +162,11 @@ mod client {
                             archive: archive.clone(),
                             compiler_executable: archive_compiler_executable.clone(),
                             cargo_executable: archive_cargo_executable.clone(),
+                            identity: None,
+                            hash_lock: Arc::new(Mutex::new(())),
                         };
                         if custom_toolchain_paths
-                            .insert(compiler_executable.clone(), (custom_tc, None))
+                            .insert(compiler_executable.clone(), custom_tc)
                             .is_some()
                         {
                             bail!("Multiple toolchains for {}", compiler_executable.display())
@@ -154,14 +197,14 @@ mod client {
                     }
                 }
             }
-            let custom_toolchain_paths = Mutex::new(custom_toolchain_paths);
-
             Ok(Self {
                 cache_dir,
                 cache,
                 toolchain_creation: Mutex::new(()),
-                custom_toolchain_archives: Mutex::new(HashMap::new()),
-                custom_toolchain_paths,
+                custom_toolchains: Mutex::new(CustomToolchainRegistry {
+                    configured: custom_toolchain_paths,
+                    archives: HashMap::new(),
+                }),
                 disabled_toolchains,
                 // TODO: shouldn't clear on restart, but also should have some
                 // form of pruning
@@ -174,9 +217,10 @@ mod client {
         pub fn get_toolchain(&self, tc: &Toolchain) -> Result<Option<fs::File>> {
             // TODO: be more relaxed about path casing and slashes on Windows
             let custom_tc_archive = self
-                .custom_toolchain_archives
+                .custom_toolchains
                 .lock()
-                .map_err(|_| anyhow::anyhow!("custom toolchain archive mutex poisoned"))?
+                .map_err(|_| anyhow::anyhow!("custom toolchain registry mutex poisoned"))?
+                .archives
                 .get(tc)
                 .cloned();
             let file = if let Some(custom_tc_archive) = custom_tc_archive {
@@ -212,9 +256,8 @@ mod client {
                     compiler_path.display()
                 )
             }
-            if let Some(tc_and_paths) = self.get_custom_toolchain(compiler_path) {
+            if let Some((tc, toolchain_override)) = self.get_custom_toolchain(compiler_path)? {
                 debug!("Using custom toolchain for {}", compiler_path.display());
-                let (tc, toolchain_override) = tc_and_paths?;
                 return Ok((tc, Some(toolchain_override)));
             }
             // Only permit one toolchain creation at a time, without holding the LRU
@@ -268,65 +311,54 @@ mod client {
             Ok((tc, None))
         }
 
-        pub fn get_custom_toolchain(
+        pub(crate) fn get_custom_toolchain(
             &self,
             compiler_path: &Path,
-        ) -> Option<Result<(Toolchain, CustomToolchainOverride)>> {
-            let new_toolchain = {
-                let Ok(mut custom_toolchain_paths) = self.custom_toolchain_paths.lock() else {
-                    return Some(Err(anyhow::anyhow!("custom toolchain path mutex poisoned")));
+        ) -> Result<Option<(Toolchain, CustomToolchainOverride)>> {
+            let (archive, hash_lock) = {
+                let registry = self
+                    .custom_toolchains
+                    .lock()
+                    .map_err(|_| anyhow!("custom toolchain registry mutex poisoned"))?;
+                let Some(custom) = registry.configured.get(compiler_path) else {
+                    return Ok(None);
                 };
-                match custom_toolchain_paths.get_mut(compiler_path) {
-                    Some((custom_tc, Some(tc))) => {
-                        return Some(Ok((
-                            tc.clone(),
-                            CustomToolchainOverride {
-                                compiler_executable: custom_tc.compiler_executable.clone(),
-                                archive: custom_tc.archive.clone(),
-                                cargo_executable: custom_tc.cargo_executable.clone(),
-                            },
-                        )));
-                    }
-                    Some((custom_tc, maybe_tc @ None)) => {
-                        let archive_id = match path_key(&custom_tc.archive) {
-                            Ok(archive_id) => archive_id,
-                            Err(error) => return Some(Err(error)),
-                        };
-                        let tc = Toolchain { archive_id };
-                        *maybe_tc = Some(tc.clone());
-                        (
-                            tc,
-                            CustomToolchainOverride {
-                                compiler_executable: custom_tc.compiler_executable.clone(),
-                                archive: custom_tc.archive.clone(),
-                                cargo_executable: custom_tc.cargo_executable.clone(),
-                            },
-                        )
-                    }
-                    None => return None,
+                if let Some(tc) = &custom.identity {
+                    return Ok(Some((tc.clone(), custom.to_override())));
                 }
+                let values = (custom.archive.clone(), Arc::clone(&custom.hash_lock));
+                drop(registry);
+                values
             };
-
-            let (tc, toolchain_override) = new_toolchain;
-            let old_path = match self.custom_toolchain_archives.lock() {
-                Ok(mut archives) => archives.insert(tc.clone(), toolchain_override.archive.clone()),
-                Err(_) => {
-                    return Some(Err(anyhow::anyhow!(
-                        "custom toolchain archive mutex poisoned"
-                    )));
-                }
-            };
-            // If this entry already exists, someone has two custom toolchains with the same strong hash.
-            if let Some(old_path) = old_path
-                && old_path != toolchain_override.archive
+            // Only one caller hashes an uninitialized archive. Other toolchains
+            // and archive lookups remain independent of this slow I/O.
+            let hash_guard = hash_lock
+                .lock()
+                .map_err(|_| anyhow!("custom toolchain hash mutex poisoned"))?;
             {
-                warn!(
-                    "Detected interchangeable toolchain archives at {} and {}",
-                    old_path.display(),
-                    toolchain_override.archive.display()
-                );
+                let registry = self
+                    .custom_toolchains
+                    .lock()
+                    .map_err(|_| anyhow!("custom toolchain registry mutex poisoned"))?;
+                let Some(custom) = registry.configured.get(compiler_path) else {
+                    return Err(anyhow!("configured toolchain disappeared during hashing"));
+                };
+                if let Some(tc) = &custom.identity {
+                    return Ok(Some((tc.clone(), custom.to_override())));
+                }
+                drop(registry);
             }
-            Some(Ok((tc, toolchain_override)))
+            let candidate = Toolchain {
+                archive_id: path_key(&archive)?,
+            };
+            let mut registry = self
+                .custom_toolchains
+                .lock()
+                .map_err(|_| anyhow!("custom toolchain registry mutex poisoned"))?;
+            let result = registry.register(compiler_path, candidate).map(Some);
+            drop(registry);
+            drop(hash_guard);
+            result
         }
 
         fn weak_to_strong(&self, weak_key: &str) -> Result<Option<ArchiveId>> {
@@ -346,16 +378,28 @@ mod client {
             }))
         }
         fn record_weak(&self, weak_key: String, key: String) -> Result<()> {
-            let serialized = {
-                let mut weak_map = self
-                    .weak_map
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("toolchain weak-map mutex poisoned"))?;
-                weak_map.insert(weak_key, key);
-                serde_json::to_vec(&*weak_map).map_err(Error::from)?
-            };
+            let mut weak_map = self
+                .weak_map
+                .lock()
+                .map_err(|_| anyhow::anyhow!("toolchain weak-map mutex poisoned"))?;
+            // Keep serialization and persistence under the same lock so concurrent
+            // updates cannot publish an older snapshot over a newer one.
+            let mut updated = weak_map.clone();
+            updated.insert(weak_key, key);
+            let serialized = serde_json::to_vec(&updated).map_err(Error::from)?;
             let weak_map_path = self.cache_dir.join("weak_map.json");
-            fs::write(weak_map_path, serialized).context("failed to enter toolchain in weak map")
+            let mut temporary = tempfile::NamedTempFile::new_in(&self.cache_dir)
+                .context("failed to create temporary toolchain weak map")?;
+            temporary
+                .write_all(&serialized)
+                .context("failed to write temporary toolchain weak map")?;
+            temporary
+                .persist(&weak_map_path)
+                .map_err(|error| error.error)
+                .context("failed to publish toolchain weak map")?;
+            *weak_map = updated;
+            drop(weak_map);
+            Ok(())
         }
     }
 
@@ -498,6 +542,113 @@ mod client {
             )?;
             assert_eq!(repacked, toolchain);
             assert!(client.get_toolchain(&repacked)?.is_some());
+            Ok(())
+        }
+
+        #[test]
+        fn custom_toolchain_registration_is_atomic_across_both_indexes() -> Result<()> {
+            let directory = tempfile::tempdir()?;
+            let archive = create_file(directory.path(), "custom.tar", |mut file| {
+                file.write_all(b"custom archive")
+            })?;
+            let client = std::sync::Arc::new(ClientToolchains::new(
+                &directory.path().join("cache"),
+                1024 * 1024,
+                &[config::DistToolchainConfig::PathOverride {
+                    compiler_executable: "/my/compiler".into(),
+                    archive,
+                    archive_compiler_executable: "/my/compiler".into(),
+                    archive_cargo_executable: None,
+                }],
+            )?);
+
+            let workers: Vec<_> = (0..16)
+                .map(|_| {
+                    let client = std::sync::Arc::clone(&client);
+                    std::thread::spawn(move || -> Result<crate::dist::Toolchain> {
+                        let (tc, _) = client
+                            .get_custom_toolchain("/my/compiler".as_ref())?
+                            .ok_or_else(|| anyhow!("configured toolchain was not found"))?;
+                        assert!(client.get_toolchain(&tc)?.is_some());
+                        Ok(tc)
+                    })
+                })
+                .collect();
+            let mut expected = None;
+            for worker in workers {
+                let tc = worker.join().expect("worker panicked")?;
+                if let Some(expected) = &expected {
+                    assert_eq!(expected, &tc);
+                } else {
+                    expected = Some(tc);
+                }
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn custom_toolchain_failed_hash_can_be_retried() -> Result<()> {
+            let directory = tempfile::tempdir()?;
+            let archive = directory.path().join("custom.tar");
+            let client = ClientToolchains::new(
+                &directory.path().join("cache"),
+                1024 * 1024,
+                &[config::DistToolchainConfig::PathOverride {
+                    compiler_executable: "/my/compiler".into(),
+                    archive: archive.clone(),
+                    archive_compiler_executable: "/my/compiler".into(),
+                    archive_cargo_executable: None,
+                }],
+            )?;
+            assert!(
+                client
+                    .get_custom_toolchain("/my/compiler".as_ref())
+                    .is_err()
+            );
+            std::fs::write(&archive, b"restored archive")?;
+            let (tc, _) = client
+                .get_custom_toolchain("/my/compiler".as_ref())?
+                .ok_or_else(|| anyhow!("configured toolchain was not found"))?;
+            assert!(client.get_toolchain(&tc)?.is_some());
+            Ok(())
+        }
+
+        #[test]
+        fn weak_map_failed_publish_does_not_mutate_memory() -> Result<()> {
+            let directory = tempfile::tempdir()?;
+            let client = ClientToolchains::new(directory.path(), 1024 * 1024, &[])?;
+            let index = directory.path().join("weak_map.json");
+            std::fs::remove_file(&index)?;
+            std::fs::create_dir(&index)?;
+            assert!(client.record_weak("weak".into(), "strong".into()).is_err());
+            assert!(client.weak_map.lock().unwrap().get("weak").is_none());
+            Ok(())
+        }
+
+        #[test]
+        fn concurrent_weak_map_updates_are_all_persisted() -> Result<()> {
+            let directory = tempfile::tempdir()?;
+            let client =
+                std::sync::Arc::new(ClientToolchains::new(directory.path(), 1024 * 1024, &[])?);
+            let threads: Vec<_> = (0..8)
+                .map(|index| {
+                    let client = std::sync::Arc::clone(&client);
+                    std::thread::spawn(move || {
+                        client.record_weak(format!("weak-{index}"), format!("strong-{index}"))
+                    })
+                })
+                .collect();
+            for thread in threads {
+                thread.join().expect("worker panicked")?;
+            }
+            let persisted: std::collections::HashMap<String, String> =
+                serde_json::from_slice(&std::fs::read(directory.path().join("weak_map.json"))?)?;
+            for index in 0..8 {
+                assert_eq!(
+                    persisted.get(&format!("weak-{index}")),
+                    Some(&format!("strong-{index}"))
+                );
+            }
             Ok(())
         }
 

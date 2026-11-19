@@ -1757,7 +1757,7 @@ mod client {
         }
         fn get_custom_toolchain(&self, exe: &Path) -> Option<PathBuf> {
             match self.tc_cache.get_custom_toolchain(exe) {
-                Some(Ok((_, toolchain_override))) => Some(toolchain_override.archive),
+                Ok(Some((_, toolchain_override))) => Some(toolchain_override.archive),
                 _ => None,
             }
         }
