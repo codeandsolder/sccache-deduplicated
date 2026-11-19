@@ -257,7 +257,8 @@ fn run(command: Command) -> Result<i32> {
                 check_client_auth,
                 check_server_auth,
             );
-            http_scheduler.start()?;
+            // A running server never exits successfully (Result<Infallible>).
+            match http_scheduler.start()? {}
         }
 
         Command::Server(server_config::Config {
@@ -337,7 +338,8 @@ fn run(command: Command) -> Result<i32> {
                 server,
             )
             .context("Failed to create sccache HTTP server instance")?;
-            http_server.start()?;
+            // A running server never exits successfully (Result<Infallible>).
+            match http_server.start()? {}
         }
     }
 }
