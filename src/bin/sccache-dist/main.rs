@@ -1000,7 +1000,9 @@ impl SchedulerIncoming for Scheduler {
         Ok(SchedulerStatusResult {
             num_servers: servers.len(),
             num_cpus: servers.values().map(|v| v.num_cpus).sum(),
-            in_progress: jobs.len(),
+            // Reservations are already consuming capacity while the assignment
+            // RPC runs. Count them too, especially for maintenance drain checks.
+            in_progress: servers.values().map(|v| v.jobs_assigned.len()).sum(),
         })
     }
 }
@@ -1205,6 +1207,45 @@ mod scheduler_tests {
                 need_toolchain: false,
             })
         }
+    }
+
+    struct StatusDuringAssign<'a>(&'a Scheduler);
+
+    impl SchedulerOutgoing for StatusDuringAssign<'_> {
+        fn do_assign_job(
+            &self,
+            _server_id: ServerId,
+            _job_id: JobId,
+            _tc: Toolchain,
+            _auth: String,
+        ) -> Result<AssignJobResult> {
+            // Status must include reservations even before a JobDetail exists.
+            assert_eq!(self.0.handle_status()?.in_progress, 1);
+            Ok(AssignJobResult {
+                state: JobState::Pending,
+                need_toolchain: false,
+            })
+        }
+    }
+
+    #[test]
+    fn status_counts_assignment_rpc_reservations() {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        register_test_server(&scheduler, server_id, ServerNonce::new());
+        let AllocJobResult::Success { job_alloc, .. } = scheduler
+            .handle_alloc_job(&StatusDuringAssign(&scheduler), test_toolchain('c'))
+            .unwrap()
+        else {
+            panic!("worker should accept job");
+        };
+        assert_eq!(scheduler.handle_status().unwrap().in_progress, 1);
+        for state in [JobState::Ready, JobState::Started, JobState::Complete] {
+            scheduler
+                .handle_update_job_state(job_alloc.job_id, server_id, state)
+                .unwrap();
+        }
+        assert_eq!(scheduler.handle_status().unwrap().in_progress, 0);
     }
 
     #[test]
