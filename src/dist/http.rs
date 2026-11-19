@@ -1261,6 +1261,8 @@ mod server {
                 handler,
             } = self;
             let mut load_aware_capacity = LoadAwareCapacity::from_env()?;
+            let handler = Arc::new(handler);
+            let heartbeat_handler = Arc::clone(&handler);
             let running_jobs = Arc::new(Mutex::new(HashSet::<JobId>::new()));
             let heartbeat_running_jobs = Arc::clone(&running_jobs);
             let heartbeat_jwt_key = jwt_key.clone();
@@ -1318,7 +1320,7 @@ mod server {
                             assigned_job_ids,
                         }) => {
                             trace!(target: "sccache_heartbeat", "Heartbeat success is_new={}", is_new);
-                            match handler.handle_reconcile_assignments(
+                            match heartbeat_handler.handle_reconcile_assignments(
                                 &assigned_job_ids,
                                 heartbeat_started_at,
                             ) {
