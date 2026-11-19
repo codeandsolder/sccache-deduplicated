@@ -878,6 +878,8 @@ pub enum UpdateJobStateResult {
 #[serde(deny_unknown_fields)]
 pub struct HeartbeatServerResult {
     pub is_new: bool,
+    // Includes accepted jobs and assignment RPC reservations.
+    pub assigned_job_ids: Vec<JobId>,
 }
 
 // RunJob
@@ -1037,6 +1039,13 @@ pub trait SchedulerIncoming: Send + Sync {
 pub trait ServerIncoming: Send + Sync {
     // From Scheduler
     fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> ExtResult<AssignJobResult, Error>;
+    // Reconcile scheduler-side reservations against local unclaimed jobs.
+    // The cutoff predates the heartbeat request; later assignments must survive.
+    fn handle_reconcile_assignments(
+        &self,
+        assigned_job_ids: &[JobId],
+        heartbeat_started_at: std::time::Instant,
+    ) -> ExtResult<usize, Error>;
     // From Client
     fn handle_submit_toolchain(
         &self,

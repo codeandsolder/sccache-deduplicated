@@ -48,6 +48,10 @@ The HTTP implementation of sccache has the following API, where all HTTP body co
       - Includes active `run_job` IDs. A `Started` job absent for a full
         heartbeat timeout is released, while long compilations remain
         assigned as long as the worker reports them running.
+      - The response includes the scheduler's assigned-job IDs, including
+        in-flight assignment reservations. Workers discard obsolete local
+        Pending/Ready assignments while retaining jobs received after the
+        heartbeat request started.
    - `POST /api/v1/scheduler/job_state`
       - Called by servers to inform the scheduler of the state of the job.
       - Repeated state updates and terminal completion acknowledgments are idempotent.
