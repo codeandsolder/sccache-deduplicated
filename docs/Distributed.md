@@ -45,8 +45,12 @@ The HTTP implementation of sccache has the following API, where all HTTP body co
       - Returns a digest and PEM for the temporary server HTTPS certificate.
    - `POST /api/v1/scheduler/heartbeat_server`
       - Called (repeatedly) by servers to register as available for jobs.
+      - Includes active `run_job` IDs. A `Started` job absent for a full
+        heartbeat timeout is released, while long compilations remain
+        assigned as long as the worker reports them running.
    - `POST /api/v1/scheduler/job_state`
       - Called by servers to inform the scheduler of the state of the job.
+      - Repeated state updates and terminal completion acknowledgments are idempotent.
    - `GET /api/v1/scheduler/status`
       - Returns information about the scheduler.
  - `server`
@@ -58,6 +62,10 @@ The HTTP implementation of sccache has the following API, where all HTTP body co
    - `POST /api/v1/distserver/run_job`
       - Called by the client to run a job.
       - Returns the compilation stdout along with files created.
+
+The heartbeat body uses a binary protocol shared by schedulers and workers.
+Changes to the active-job inventory therefore require deploying compatible
+scheduler and worker binaries together while the cluster is drained.
 
 There are three axes of security in this setup:
 
