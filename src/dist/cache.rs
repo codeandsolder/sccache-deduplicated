@@ -346,16 +346,28 @@ mod client {
             }))
         }
         fn record_weak(&self, weak_key: String, key: String) -> Result<()> {
-            let serialized = {
-                let mut weak_map = self
-                    .weak_map
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("toolchain weak-map mutex poisoned"))?;
-                weak_map.insert(weak_key, key);
-                serde_json::to_vec(&*weak_map).map_err(Error::from)?
-            };
+            let mut weak_map = self
+                .weak_map
+                .lock()
+                .map_err(|_| anyhow::anyhow!("toolchain weak-map mutex poisoned"))?;
+            // Keep serialization and persistence under the same lock so concurrent
+            // updates cannot publish an older snapshot over a newer one.
+            let mut updated = weak_map.clone();
+            updated.insert(weak_key, key);
+            let serialized = serde_json::to_vec(&updated).map_err(Error::from)?;
             let weak_map_path = self.cache_dir.join("weak_map.json");
-            fs::write(weak_map_path, serialized).context("failed to enter toolchain in weak map")
+            let mut temporary = tempfile::NamedTempFile::new_in(&self.cache_dir)
+                .context("failed to create temporary toolchain weak map")?;
+            use std::io::Write;
+            temporary
+                .write_all(&serialized)
+                .context("failed to write temporary toolchain weak map")?;
+            temporary
+                .persist(&weak_map_path)
+                .map_err(|error| error.error)
+                .context("failed to publish toolchain weak map")?;
+            *weak_map = updated;
+            Ok(())
         }
     }
 
@@ -498,6 +510,45 @@ mod client {
             )?;
             assert_eq!(repacked, toolchain);
             assert!(client.get_toolchain(&repacked)?.is_some());
+            Ok(())
+        }
+
+        #[test]
+        fn weak_map_failed_publish_does_not_mutate_memory() -> Result<()> {
+            let directory = tempfile::tempdir()?;
+            let client = ClientToolchains::new(directory.path(), 1024 * 1024, &[])?;
+            let index = directory.path().join("weak_map.json");
+            std::fs::remove_file(&index)?;
+            std::fs::create_dir(&index)?;
+            assert!(client.record_weak("weak".into(), "strong".into()).is_err());
+            assert!(client.weak_map.lock().unwrap().get("weak").is_none());
+            Ok(())
+        }
+
+        #[test]
+        fn concurrent_weak_map_updates_are_all_persisted() -> Result<()> {
+            let directory = tempfile::tempdir()?;
+            let client =
+                std::sync::Arc::new(ClientToolchains::new(directory.path(), 1024 * 1024, &[])?);
+            let threads: Vec<_> = (0..8)
+                .map(|index| {
+                    let client = std::sync::Arc::clone(&client);
+                    std::thread::spawn(move || {
+                        client.record_weak(format!("weak-{index}"), format!("strong-{index}"))
+                    })
+                })
+                .collect();
+            for thread in threads {
+                thread.join().expect("worker panicked")?;
+            }
+            let persisted: std::collections::HashMap<String, String> =
+                serde_json::from_slice(&std::fs::read(directory.path().join("weak_map.json"))?)?;
+            for index in 0..8 {
+                assert_eq!(
+                    persisted.get(&format!("weak-{index}")),
+                    Some(&format!("strong-{index}"))
+                );
+            }
             Ok(())
         }
 
