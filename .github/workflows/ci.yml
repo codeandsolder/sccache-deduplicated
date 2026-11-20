@@ -129,6 +129,9 @@ jobs:
           assert "rollout_epoch=3" in protocol
           assert "glibc_abi_max=2.39" in protocol
           assert "source contrib/codeandsolder/release-protocol.env" in publisher
+          assert "vendored-openssl" in publisher
+          assert "openssl_linkage=vendored-static" in publisher
+          assert "Reject unsupported fleet native shared library ABIs" in publisher
           assert "Reject binaries requiring a newer GNU libc ABI" in publisher
           assert "steps.protocol.outputs.dist_protocol" in publisher
           assert "steps.protocol.outputs.rollout_epoch" in publisher
@@ -336,7 +339,7 @@ jobs:
       rustflags: "-C target-cpu=x86-64-v2"
       command: >-
         cargo +1.99.0 check --release --locked --no-default-features
-        --features s3,gha,dist-client,dist-server,direct-metrics
+        --features s3,gha,dist-client,dist-server,direct-metrics,vendored-openssl
         --bin sccache --bin sccache-dist
 
   build:

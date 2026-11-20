@@ -15,6 +15,17 @@ Background:
    tokens), be aware that a lack of entropy is possible in cloud or
    virtualized environments in some scenarios.
 
+## Managed release native portability
+
+The managed Linux x86-64-v2 release includes distributed worker TLS support.
+Build it with the vendored-openssl Cargo feature so the worker embeds
+OpenSSL rather than depending on a particular host's libssl/libcrypto
+SONAME. The immutable release validator rejects all external OpenSSL
+dependencies and requires GLIBC no newer than 2.39; the release metadata
+records openssl_linkage=vendored-static. The older published protocol-v2
+canary e266a04e demonstrated why both checks matter: it passed GLIBC
+verification but required OpenSSL 4 on an OpenSSL 3 worker host.
+
 ## Overview
 
 Distributed sccache consists of three parts:
