@@ -269,6 +269,7 @@ fn run(command: Command) -> Result<i32> {
             scheduler_url,
             scheduler_auth,
             toolchain_cache_size,
+            toolchain_archive_sources,
         }) => {
             let builder: Box<dyn dist::BuilderIncoming> = match builder {
                 #[cfg(not(target_os = "freebsd"))]
@@ -326,8 +327,13 @@ fn run(command: Command) -> Result<i32> {
                 }
             };
 
-            let server = Server::new(builder, &cache_dir, toolchain_cache_size)
-                .context("Failed to create sccache server instance")?;
+            let server = Server::new(
+                builder,
+                &cache_dir,
+                toolchain_cache_size,
+                toolchain_archive_sources,
+            )
+            .context("Failed to create sccache server instance")?;
             let worker_name = dist_worker_name()?;
             let http_server = dist::http::Server::new_with_worker_name(
                 public_addr,
@@ -1097,6 +1103,8 @@ pub struct Server {
     cache: Mutex<TcCache>,
     staging_dir: PathBuf,
     toolchain_cache_size: u64,
+    #[cfg(target_os = "linux")]
+    toolchain_archive_sources: Vec<PathBuf>,
     job_toolchains: Mutex<HashMap<JobId, LocalAssignment>>,
 }
 
@@ -1105,7 +1113,18 @@ impl Server {
         builder: Box<dyn BuilderIncoming>,
         cache_dir: &Path,
         toolchain_cache_size: u64,
+        toolchain_archive_sources: Vec<PathBuf>,
     ) -> Result<Server> {
+        if toolchain_archive_sources
+            .iter()
+            .any(|path| !path.is_absolute())
+        {
+            bail!("toolchain archive sources must be absolute paths");
+        }
+        #[cfg(not(target_os = "linux"))]
+        if !toolchain_archive_sources.is_empty() {
+            bail!("local toolchain archive reflinks require Linux");
+        }
         let cache = TcCache::new(&cache_dir.join("tc"), toolchain_cache_size)
             .context("Failed to create toolchain cache")?;
         Ok(Server {
@@ -1113,8 +1132,43 @@ impl Server {
             cache: Mutex::new(cache),
             staging_dir: cache_dir.join("tc"),
             toolchain_cache_size,
+            #[cfg(target_os = "linux")]
+            toolchain_archive_sources,
             job_toolchains: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Try local archive sources before asking the client to upload. The
+    /// cache mutex is not held while cloning or verifying archive contents.
+    fn has_or_reuse_toolchain(&self, tc: &Toolchain) -> bool {
+        if self.cache.lock().unwrap().contains_toolchain(tc) {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        for source in &self.toolchain_archive_sources {
+            match StagedToolchainArchive::clone_verified(
+                &self.staging_dir,
+                source,
+                tc.clone(),
+                self.toolchain_cache_size,
+            ) {
+                Ok(staged) => {
+                    let mut cache = self.cache.lock().unwrap();
+                    match cache.insert_staged(staged) {
+                        Ok(()) => {
+                            debug!("Reused local toolchain archive {}", tc.archive_id);
+                            return true;
+                        }
+                        Err(error) => debug!("Could not install cloned archive: {error:#}"),
+                    }
+                }
+                Err(error) => trace!(
+                    "Local archive source {} unavailable: {error:#}",
+                    source.display()
+                ),
+            }
+        }
+        self.cache.lock().unwrap().contains_toolchain(tc)
     }
 }
 
@@ -1138,7 +1192,7 @@ impl ServerIncoming for Server {
     }
 
     fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> Result<AssignJobResult> {
-        let need_toolchain = !self.cache.lock().unwrap().contains_toolchain(&tc);
+        let need_toolchain = !self.has_or_reuse_toolchain(&tc);
         assert!(
             self.job_toolchains
                 .lock()
@@ -2129,7 +2183,7 @@ mod server_upload_tests {
 
     fn test_server() -> Result<(tempfile::TempDir, Arc<Server>)> {
         let dir = tempfile::tempdir()?;
-        let server = Server::new(Box::new(NoopBuilder), dir.path(), 1024 * 1024)?;
+        let server = Server::new(Box::new(NoopBuilder), dir.path(), 1024 * 1024, vec![])?;
         Ok((dir, Arc::new(server)))
     }
 

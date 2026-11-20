@@ -257,6 +257,7 @@ fn sccache_server_cfg(
             token: DIST_SERVER_TOKEN.to_owned(),
         },
         toolchain_cache_size: TC_CACHE_SIZE,
+        toolchain_archive_sources: vec![],
     }
 }
 
