@@ -139,11 +139,23 @@ if [[ "$MODE" == apply &&
     managed_dist_hash="$(cat "$STATE_DIR/dist_binary_sha256")"
     live_hash="$(sha256sum "$LIVE" | awk '{print $1}')"
     live_dist_hash="$(sha256sum "$DIST_LIVE" | awk '{print $1}')"
-    live_capabilities="$("$LIVE" --capabilities 2>/dev/null | paste -sd, - || true)"
     managed_kind="$(sed -n 's/^build_kind=//p' "$STATE_DIR/build.txt" 2>/dev/null || true)"
     desired_kind=portable
-    [[ -z "$NATIVE_BUNDLE_ROOT" ]] || desired_kind="host-native"
-    if [[ "${managed_kind:-portable}" == "$desired_kind" &&
+    native_identity_matches=1
+    if [[ -n "$NATIVE_BUNDLE_ROOT" ]]; then
+        desired_kind="host-native"
+        native_metadata="$(dirname -- "$(realpath -- "$0")")/host-native-metadata"
+        if [[ "$managed_kind" != "host-native" ]] ||
+           ! current_fingerprint="$("$native_metadata" fingerprint)" ||
+           [[ "$(sed -n 's/^host_fingerprint=//p' "$STATE_DIR/build.txt" 2>/dev/null || true)" != "$current_fingerprint" ]]; then
+            native_identity_matches=0
+        fi
+    fi
+    live_capabilities=""
+    if (( native_identity_matches )); then
+        live_capabilities="$("$LIVE" --capabilities 2>/dev/null | paste -sd, - || true)"
+    fi
+    if (( native_identity_matches )) && [[ "${managed_kind:-portable}" == "$desired_kind" &&
           "$managed_tag" == "$tag" &&
           "$managed_hash" == "$live_hash" &&
           "$managed_dist_hash" == "$live_dist_hash" ]] &&

@@ -3,7 +3,7 @@ set -euo pipefail
 
 [[ $EUID == 0 ]] || { echo "test-host-native-metadata requires root for trusted-path fixtures" >&2; exit 2; }
 here="$(cd -- "$(dirname -- "$0")" && pwd -P)"
-work="$(mktemp -d /run/sccache-host-native-test.XXXXXX)"
+work="$(mktemp -d /var/lib/sccache-host-native-test.XXXXXX)"
 trap 'rm -rf -- "$work"' EXIT
 chmod 0700 "$work"
 source_sha=0123456789abcdef0123456789abcdef01234567
@@ -61,6 +61,10 @@ cp "$work/valid-build.txt" "$bundle/build.txt"
 sed -i 's/^source_sha=.*/source_sha=wrong-source/' "$bundle/build.txt"
 refresh_hashes
 reject "different source revision"
+cp "$work/valid-build.txt" "$bundle/build.txt"
+printf 'source_sha=%s\n' "$source_sha" >> "$bundle/build.txt"
+refresh_hashes
+reject "duplicate manifest field"
 cp "$work/valid-build.txt" "$bundle/build.txt"
 refresh_hashes
 chmod g+w "$bundle"
