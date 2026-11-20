@@ -1967,6 +1967,9 @@ pub mod server {
         pub scheduler_auth: SchedulerAuth,
         #[serde(default = "default_toolchain_cache_size")]
         pub toolchain_cache_size: u64,
+        /// Other local archive-cache roots eligible for hash-verified reflink reuse.
+        #[serde(default)]
+        pub toolchain_archive_sources: Vec<PathBuf>,
     }
 
     pub fn from_path(conf_path: &Path) -> Result<Option<Config>> {
@@ -3539,6 +3542,7 @@ fn server_toml_parse() {
                 token: "my server's token".to_owned()
             },
             toolchain_cache_size: 10737418240,
+            toolchain_archive_sources: vec![],
         }
     )
 }

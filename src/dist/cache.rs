@@ -876,6 +876,66 @@ pub struct StagedToolchainArchive {
 }
 
 impl StagedToolchainArchive {
+    /// Clone an immutable snapshot of an archive from another local cache,
+    /// without sharing writable names or LRU state. Verify the cloned bytes,
+    /// rather than trusting a filename or a mutable source file.
+    /// A missing/unsupported/corrupt source is a normal cache miss.
+    ///
+    /// # Errors
+    /// Returns an error for invalid paths, unsupported clones, oversized
+    /// archives, I/O failures, or digest mismatches.
+    #[cfg(all(target_os = "linux", feature = "dist-server"))]
+    pub fn clone_verified(
+        directory: &Path,
+        source_root: &Path,
+        toolchain: Toolchain,
+        max_size: u64,
+    ) -> Result<Self> {
+        use nix::fcntl::{OFlag, OpenHow, ResolveFlag, openat2};
+        use std::os::fd::AsRawFd;
+
+        if !source_root.is_absolute() {
+            return Err(anyhow!("local toolchain source must be an absolute path"));
+        }
+        // Reject symlinks in all components, including user-owned source
+        // directories. NONBLOCK avoids waiting on a malicious FIFO.
+        let root = std::fs::File::open("/")?;
+        let path = source_root.join(make_lru_key_path(&toolchain.archive_id));
+        let how = OpenHow::new()
+            .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK)
+            .resolve(ResolveFlag::RESOLVE_IN_ROOT | ResolveFlag::RESOLVE_NO_SYMLINKS);
+        let source = std::fs::File::from(openat2(&root, &path, how)?);
+        let meta = source.metadata()?;
+        if !meta.is_file() || meta.len() > max_size {
+            return Err(anyhow!(
+                "local archive is not a regular file within cache capacity"
+            ));
+        }
+        let file = tempfile::Builder::new()
+            .prefix(".sccachetmp")
+            .tempfile_in(directory)?;
+        // SAFETY: FICLONE takes a valid writable destination file descriptor
+        // and the live readable source file descriptor by value. It snapshots
+        // the file's data into independent copy-on-write extents.
+        if unsafe {
+            libc::ioctl(
+                file.as_file().as_raw_fd(),
+                libc::FICLONE,
+                source.as_raw_fd(),
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+        if file.as_file().metadata()?.len() > max_size {
+            return Err(anyhow!("cloned archive exceeds cache capacity"));
+        }
+        if file_key(file.reopen()?)? != toolchain.archive_id.as_str() {
+            return Err(anyhow!("local cloned archive digest mismatch"));
+        }
+        Ok(Self { toolchain, file })
+    }
+
     /// Receive and validate an archive in the cache filesystem.
     ///
     /// The temporary file is removed on any failure, and remains invisible
@@ -1036,6 +1096,72 @@ fn make_lru_key_path(key: &ArchiveId) -> PathBuf {
 mod cache_validation_tests {
     use super::*;
     use std::io::Write;
+
+    #[cfg(all(target_os = "linux", feature = "dist-server"))]
+    #[test]
+    fn cloned_archive_is_verified_and_independent_of_mutable_source() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let root = tempdir.path().canonicalize()?;
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(&destination)?;
+        let payload = vec![42_u8; 128 * 1024];
+        let tc = Toolchain {
+            archive_id: ArchiveId::try_from(Digest::reader_sync(payload.as_slice())?)?,
+        };
+        let source_file = source.join(make_lru_key_path(&tc.archive_id));
+        fs::create_dir_all(source_file.parent().unwrap())?;
+        fs::write(&source_file, &payload)?;
+
+        // Oversize and symlink inputs must be rejected before cloning.
+        assert!(
+            StagedToolchainArchive::clone_verified(&destination, &source, tc.clone(), 1,).is_err()
+        );
+        let symlink = root.join("symlink-source");
+        std::os::unix::fs::symlink(&source, &symlink)?;
+        assert!(StagedToolchainArchive::clone_verified(
+            &destination, &symlink, tc.clone(), 1024 * 1024,
+        ).is_err());
+        let staged = match StagedToolchainArchive::clone_verified(
+            &destination,
+            &source,
+            tc.clone(),
+            1024 * 1024,
+        ) {
+            Ok(staged) => staged,
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .and_then(io::Error::raw_os_error)
+                    .is_some_and(|code| {
+                        matches!(
+                            code,
+                            libc::EOPNOTSUPP | libc::EXDEV | libc::EINVAL | libc::ENOTTY
+                        )
+                    }) =>
+            {
+                // Not all CI filesystems support FICLONE. Rejection paths
+                // above still execute; the live ZFS validation must clone.
+                eprintln!("filesystem does not support reflinks: {error:#}");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        // A writer in the other LRU namespace cannot mutate our cloned bytes.
+        fs::write(&source_file, vec![0_u8; payload.len()])?;
+        assert!(
+            StagedToolchainArchive::clone_verified(&destination, &source, tc.clone(), 1024 * 1024,)
+                .is_err()
+        );
+        let mut cache = TcCache::new(&root.join("cache"), 1024 * 1024)?;
+        cache.insert_staged(staged)?;
+        let mut actual = Vec::new();
+        cache.get(&tc)?.read_to_end(&mut actual)?;
+        assert_eq!(actual, payload);
+        fs::remove_file(&source_file)?;
+        assert!(cache.contains_toolchain(&tc));
+        Ok(())
+    }
 
     #[test]
     fn rejected_digest_does_not_leave_a_cached_archive() -> Result<()> {
