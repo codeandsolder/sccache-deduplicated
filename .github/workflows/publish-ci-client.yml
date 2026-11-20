@@ -138,6 +138,15 @@ jobs:
             echo "capabilities=$(target/release/sccache --capabilities | paste -sd, -)"
           } > dist/build.txt
 
+      - name: Install native release validation tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ripgrep
+          rg --version
+          readelf --version
+
       - name: Reject binaries requiring a newer GNU libc ABI
         shell: bash
         run: |
@@ -146,7 +155,16 @@ jobs:
           for binary in dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2; do
             abi_report="$RUNNER_TEMP/$(basename "$binary").glibc-versions"
             readelf -W --version-info "$binary" > "$abi_report"
-            max_required="$(rg -o 'GLIBC_[0-9]+\.[0-9]+' "$abi_report" | sort -Vu | tail -n 1 || true)"
+            # rg exit 1 means no matches (valid for a fully static binary);
+            # all other errors, including a missing rg executable, are fatal.
+            matches=""
+            search_status=0
+            matches="$(rg -o 'GLIBC_[0-9]+\.[0-9]+' "$abi_report")" || search_status=$?
+            if (( search_status > 1 )); then
+              echo "::error::failed to inspect GLIBC symbols in $binary (rg exit $search_status)"
+              exit "$search_status"
+            fi
+            max_required="$(printf '%s\n' "$matches" | sort -Vu | tail -n 1)"
             if [[ -n "$max_required" &&
                   "$(printf '%s\n%s\n' "$max_supported" "$max_required" | sort -V | tail -n 1)" != "$max_supported" ]]; then
               echo "::error::$binary requires $max_required, newer than $max_supported"
