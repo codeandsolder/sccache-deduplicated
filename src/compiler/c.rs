@@ -2235,7 +2235,7 @@ fn real_cross_gcc_package_preserves_executable_helper_search_path() -> Result<()
     pkg::ToolchainPackager::write_pkg(Box::new(packager), fs::File::create(&archive_path)?)?;
 
     let root = temp.path().join("unpacked");
-    tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(archive_path)?)).unpack(&root)?;
+    crate::compression::deflate::unpack_gzip(fs::File::open(archive_path)?, &root)?;
     assert!(
         root.join(assembler.strip_prefix("/")?).is_file(),
         "packaged GCC assembler must resolve using the driver's original path"

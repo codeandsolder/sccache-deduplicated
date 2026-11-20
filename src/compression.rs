@@ -14,6 +14,9 @@
 
 //! Shared, cache-compatible compression for distributed compiler artifacts.
 
+#[cfg(any(feature = "dist-client", feature = "dist-server"))]
+pub mod deflate;
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io::{self, Read};

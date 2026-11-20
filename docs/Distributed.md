@@ -28,14 +28,15 @@ verification but required OpenSSL 4 on an OpenSSL 3 worker host.
 
 ## Distributed compression backend
 
-The input and toolchain DEFLATE streams use flate2's zlib-rs backend,
-pinned to codeandsolder/zlib-rs-fast through the workspace Cargo patch.
-The parallel gzip toolchain packager uses the same backend and enables
-cross-block dictionaries. Compiler output is Zstandard, as described below.
+Input transport uses the direct fallible zlib-rs-fast streaming API.
+Toolchains use standard multi-member gzip with fixed-size members and the
+fork's bounded parallel batch compressor. Decoders are created on the
+consuming thread, and cached archives can be read in either single-member or
+multi-member gzip form. No flate2 compatibility adapter is required. Compiler output is Zstandard, as described below.
 
 For host-local builds use `contrib/codeandsolder/build-host-native`;
 it compiles the client and worker specifically for the executing CPU.
-Published shared fleet bundles retain their portable x86-64-v2 ABI.
+Both builds use the pinned nightly Rust toolchain required by zlib-rs-fast's portable SIMD implementation. Published shared fleet bundles retain their portable x86-64-v2 ABI.
 
 ## Distributed output transport and cache storage
 

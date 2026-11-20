@@ -914,7 +914,9 @@ impl Read for ToolchainReader<'_> {
     }
 }
 
+#[cfg(feature = "dist-server")]
 pub struct InputsReader<'a>(Box<dyn Read + Send + 'a>);
+#[cfg(feature = "dist-server")]
 impl<'a> InputsReader<'a> {
     /// Wrap a reader for a distributed compilation's input stream.
     #[must_use]
@@ -922,9 +924,27 @@ impl<'a> InputsReader<'a> {
         Self(reader)
     }
 }
-impl Read for InputsReader<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
+#[cfg(feature = "dist-server")]
+impl<'a> InputsReader<'a> {
+    /// Create the decoder on the thread consuming the transport stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the codec cannot be initialized.
+    pub fn into_decoded(self) -> io::Result<impl Read + 'a> {
+        crate::compression::deflate::InflateReader::zlib(self.0)
+    }
+
+    /// Extract input files, including validation of the compressed stream trailer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if decoding or extraction fails.
+    pub fn unpack(self, path: &Path) -> io::Result<()> {
+        let mut archive = tar::Archive::new(self.into_decoded()?);
+        archive.unpack(path)?;
+        io::copy(&mut archive.into_inner(), &mut io::sink())?;
+        Ok(())
     }
 }
 

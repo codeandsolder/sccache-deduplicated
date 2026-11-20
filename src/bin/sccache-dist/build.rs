@@ -14,13 +14,13 @@
 
 use super::command_helpers::CommandExt;
 use anyhow::{Context, Error, Result, anyhow, bail};
-use flate2::read::GzDecoder;
 use fs_err as fs;
 use libmount::Overlay;
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, OpenHow, ResolveFlag, openat2};
 use nix::sys::stat::{Mode, mkdirat};
 use sccache::compression::ZstdFrame;
+use sccache::compression::deflate::unpack_gzip;
 use sccache::dist::{
     BuildResult, BuilderIncoming, CompileCommand, InputsReader, OutputRequest, ProcessOutput,
     TcCache, Toolchain,
@@ -284,9 +284,7 @@ impl OverlayBuilder {
                 // toolchain is missing: the next request must be able to retry.
                 trace!("Creating toolchain directory for {}", tc.archive_id);
                 fs::create_dir(&toolchain_dir)?;
-                if let Err(error) =
-                    tar::Archive::new(GzDecoder::new(toolchain_rdr)).unpack(&toolchain_dir)
-                {
+                if let Err(error) = unpack_gzip(toolchain_rdr, &toolchain_dir) {
                     warn!("Failed to unpack toolchain: {error:?}");
                     if let Err(cleanup_error) = fs::remove_dir_all(&toolchain_dir) {
                         warn!(
@@ -389,7 +387,7 @@ impl OverlayBuilder {
                     trace!("copying in inputs");
                     // Note that we don't unpack directly into the upperdir since there overlayfs has some
                     // special marker files that we don't want to create by accident (or malicious intent)
-                    tar::Archive::new(inputs_rdr)
+                    inputs_rdr
                         .unpack(&target_dir)
                         .context("Failed to unpack inputs to overlay")?;
 
@@ -845,7 +843,7 @@ impl DockerBuilder {
 
     fn perform_build(
         compile_command: CompileCommand,
-        mut inputs_rdr: InputsReader,
+        inputs_rdr: InputsReader,
         outputs: OutputRequest,
         cid: &str,
     ) -> Result<BuildResult> {
@@ -860,6 +858,7 @@ impl DockerBuilder {
         );
 
         trace!("copying in inputs");
+        let mut inputs_rdr = inputs_rdr.into_decoded()?;
         Command::new("docker")
             .args(["cp", "-", &format!("{}:/", cid)])
             .check_piped(&mut |stdin| {

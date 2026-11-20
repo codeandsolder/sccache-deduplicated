@@ -30,11 +30,11 @@ jobs:
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: "1.99.0"
+          toolchain: "nightly-2026-11-20"
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
         with:
-          rust-toolchain: "1.99.0"
+          rust-toolchain: "nightly-2026-11-20"
 
       - name: Build
         run: |
@@ -114,11 +114,11 @@ jobs:
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: "1.99.0"
+          toolchain: "nightly-2026-11-20"
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
         with:
-          rust-toolchain: "1.99.0"
+          rust-toolchain: "nightly-2026-11-20"
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -179,12 +179,12 @@ jobs:
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: "1.99.0"
+          toolchain: "nightly-2026-11-20"
           target: $TARGET
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
         with:
-          rust-toolchain: "1.99.0"
+          rust-toolchain: "nightly-2026-11-20"
 
       - name: Build
         run: cargo build --bin sccache --target $env:TARGET --features=vendored-openssl
@@ -297,7 +297,7 @@ jobs:
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
         with:
-          rust-toolchain: "1.99.0"
+          rust-toolchain: "nightly-2026-11-20"
 
       - name: Install dependencies
         shell: bash
@@ -311,7 +311,7 @@ jobs:
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: "1.99.0"
+          toolchain: "nightly-2026-11-20"
 
       - name: Build & setup librandomize_readdir
         run: |
@@ -384,11 +384,11 @@ jobs:
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: "1.99.0"
+          toolchain: "nightly-2026-11-20"
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
         with:
-          rust-toolchain: "1.99.0"
+          rust-toolchain: "nightly-2026-11-20"
 
       - name: Build sccache
         run: |

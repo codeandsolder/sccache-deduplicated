@@ -4210,7 +4210,7 @@ fn test_dist_toolchain_archive_contains_only_required_installed_targets() -> Res
     };
     pkg::ToolchainPackager::write_pkg(Box::new(packager), writer)?;
     let reader = fs::File::open(archive_path)?;
-    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(reader));
+    let mut archive = tar::Archive::new(crate::compression::deflate::InflateReader::gzip(reader)?);
     let paths = archive
         .entries()?
         .map(|entry| -> Result<PathBuf> { Ok(entry?.path()?.into_owned()) })

@@ -300,7 +300,6 @@ pub mod urls {
 mod server {
     use crate::util::{new_reqwest_blocking_client, num_cpus};
     use byteorder::{BigEndian, ReadBytesExt};
-    use flate2::read::ZlibDecoder as ZlibReadDecoder;
     use rouille::accept;
     use serde::{Deserialize, Serialize};
     use std::collections::{HashMap, HashSet};
@@ -1391,7 +1390,7 @@ mod server {
                         trace!("Req {}: run_job({}): {:?}", req_id, job_id, runjob);
                         let RunJobHttpRequest { command, outputs } = runjob;
                         let body = bincode_reader.into_inner();
-                        let inputs_rdr = InputsReader::new(Box::new(ZlibReadDecoder::new(body)));
+                        let inputs_rdr = InputsReader::new(Box::new(body));
 
                         let _running_job = try_or_500_log!(req_id, RunningJobGuard::new(&running_jobs, job_id));
                         let res: RunJobResult = try_or_500_log!(req_id, handler.handle_run_job(&requester, job_id, command, outputs, inputs_rdr));
@@ -1463,10 +1462,9 @@ mod client {
         ServerId, SubmitToolchainResult, Toolchain,
     };
 
+    use crate::compression::deflate::ZlibWriter;
     use async_trait::async_trait;
     use byteorder::{BigEndian, WriteBytesExt};
-    use flate2::Compression;
-    use flate2::write::ZlibEncoder as ZlibWriteEncoder;
     use reqwest::Body;
     use std::collections::HashMap;
     use std::io::Write;
@@ -1784,7 +1782,7 @@ mod client {
                         .context("failed to encode run job request metadata")?;
                     {
                         let header_size = body.len();
-                        let mut compressor = ZlibWriteEncoder::new(&mut body, Compression::fast());
+                        let mut compressor = ZlibWriter::new(&mut body)?;
                         inputs_packager
                             .write_inputs(&mut compressor)
                             .context("Could not write inputs for compilation")?;

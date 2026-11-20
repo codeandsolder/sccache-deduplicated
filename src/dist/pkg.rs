@@ -260,11 +260,7 @@ mod toolchain_imp {
         ///
         /// Returns an error if archive construction or compression fails.
         pub fn into_compressed_tar<W: Write + Send + 'static>(self, writer: W) -> Result<()> {
-            use gzp::{
-                ZWriter,
-                deflate::Gzip,
-                par::compress::{Compression, ParCompress, ParCompressBuilder},
-            };
+            use crate::compression::deflate::ParallelGzipWriter;
 
             let Self {
                 dir_set,
@@ -272,10 +268,7 @@ mod toolchain_imp {
                 symlinks,
                 root_mappings: _,
             } = self;
-            let par: ParCompress<'_, Gzip, W> = ParCompressBuilder::new()
-                .compression_level(Compression::default())
-                .from_writer(writer);
-            let mut builder = tar::Builder::new(par);
+            let mut builder = tar::Builder::new(ParallelGzipWriter::new(writer)?);
             builder.mode(tar::HeaderMode::Deterministic);
 
             for (tar_path, dir_path) in dir_set {
@@ -344,8 +337,7 @@ mod toolchain_imp {
         builder.into_compressed_tar(fs::File::create(&archive_path)?)?;
 
         let root = temp.path().join("unpacked");
-        tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(&archive_path)?))
-            .unpack(&root)?;
+        crate::compression::deflate::unpack_gzip(fs::File::open(&archive_path)?, &root)?;
         assert!(root.join(reported.strip_prefix("/")?).is_file());
         assert!(
             root.join(toolchain.strip_prefix("/")?)
@@ -376,8 +368,7 @@ mod toolchain_imp {
         builder.add_file(artifact.clone())?;
         builder.into_compressed_tar(fs::File::create(&archive_path)?)?;
         let root = temp.path().join("unpacked");
-        tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(&archive_path)?))
-            .unpack(&root)?;
+        crate::compression::deflate::unpack_gzip(fs::File::open(&archive_path)?, &root)?;
         assert_eq!(fs::read(root.join(artifact.strip_prefix("/")?))?, data);
         Ok(())
     }

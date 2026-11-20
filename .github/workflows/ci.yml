@@ -37,13 +37,13 @@ jobs:
         uses: ./.github/actions/rust-toolchain
         with:
           components: ${{ matrix.component }}
-          # Oldest supported version, keep in sync with README.md
-          toolchain: ${{ startsWith(github.ref, 'refs/tags/') && '1.91.0' || '1.99.0' }}
+          # Optimized DEFLATE backend requires portable SIMD.
+          toolchain: "nightly-2026-11-20"
 
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
         with:
-          rust-toolchain: ${{ startsWith(github.ref, 'refs/tags/') && '1.91.0' || '1.99.0' }}
+          rust-toolchain: "nightly-2026-11-20"
 
       - name: clippy version
         run: cargo clippy --version
@@ -68,15 +68,15 @@ jobs:
       - name: Clone repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - name: Install Rust 1.99.0
+      - name: Install Rust nightly-2026-11-20
         uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: "1.99.0"
+          toolchain: "nightly-2026-11-20"
 
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
         with:
-          rust-toolchain: "1.99.0"
+          rust-toolchain: "nightly-2026-11-20"
 
       - name: Check feature ${{ matrix.feature }}
         run: cargo check --no-default-features --features ${{ matrix.feature }}
@@ -152,14 +152,14 @@ jobs:
 
 
   test:
-    name: test ${{ matrix.os }} rust ${{ matrix.rustc || 'stable' }} ${{ matrix.extra_desc }}
+    name: test ${{ matrix.os }} rust ${{ matrix.rustc || 'nightly-2026-11-20' }} ${{ matrix.extra_desc }}
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.allow_failure || false }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(startsWith(github.ref, 'refs/tags/') && '{"include":[{"os":"ubuntu-22.04","rustc":"1.91.0","extra_desc":"dist-tests","extra_args":"--no-default-features --features=dist-tests test_dist_ -- --test-threads 1"},{"os":"ubuntu-22.04","rustc":"stable","extra_desc":"dist-server","extra_args":"--features=dist-server"},{"os":"ubuntu-22.04","rustc":"stable"},{"os":"ubuntu-22.04","rustc":"beta"},{"os":"ubuntu-22.04","rustc":"nightly","allow_failure":true,"extra_args":"--features=unstable"},{"os":"ubuntu-22.04","extra_desc":"no-default-features","extra_args":"--no-default-features","allow_failure":true},{"os":"ubuntu-22.04","cuda":"11.8","extra_desc":"cuda11.8"},{"os":"ubuntu-24.04","cuda":"12.8","rustc":"1.91.0","extra_desc":"cuda12.8"},{"os":"macos-14"},{"os":"macos-15-intel"},{"os":"windows-2022","cuda":"12.8","rustc":"1.91.0","extra_args":"--no-fail-fast","notest_cuda_compilers":"clang++","extra_desc":"cuda12.8"},{"os":"windows-2022","cuda":"12.8","rustc":"nightly","allow_failure":true,"extra_args":"--features=unstable","notest_cuda_compilers":"clang++","extra_desc":"cuda12.8"},{"os":"windows-2022","cuda":"12.8","rustc":"beta","notest_cuda_compilers":"clang++","extra_desc":"cuda12.8","no_coverage":true}]}' || '{"include":[{"os":"ubuntu-22.04","rustc":"1.99.0","rustflags":"-C target-cpu=x86-64-v2"}]}') }}
+      matrix: ${{ fromJSON(startsWith(github.ref, 'refs/tags/') && '{"include":[{"os":"ubuntu-22.04","rustc":"nightly-2026-11-20","extra_desc":"dist-tests","extra_args":"--no-default-features --features=dist-tests test_dist_ -- --test-threads 1"},{"os":"ubuntu-22.04","rustc":"nightly-2026-11-20","extra_desc":"dist-server","extra_args":"--features=dist-server"},{"os":"ubuntu-22.04","rustc":"nightly-2026-11-20"},{"os":"ubuntu-22.04","rustc":"nightly-2026-11-20","allow_failure":true,"extra_args":"--features=unstable"},{"os":"ubuntu-22.04","extra_desc":"no-default-features","extra_args":"--no-default-features","allow_failure":true},{"os":"ubuntu-22.04","cuda":"11.8","extra_desc":"cuda11.8"},{"os":"ubuntu-24.04","cuda":"12.8","rustc":"nightly-2026-11-20","extra_desc":"cuda12.8"},{"os":"macos-14"},{"os":"macos-15-intel"},{"os":"windows-2022","cuda":"12.8","rustc":"nightly-2026-11-20","extra_args":"--no-fail-fast","notest_cuda_compilers":"clang++","extra_desc":"cuda12.8"},{"os":"windows-2022","cuda":"12.8","rustc":"nightly-2026-11-20","allow_failure":true,"extra_args":"--features=unstable","notest_cuda_compilers":"clang++","extra_desc":"cuda12.8"},{"os":"windows-2022","cuda":"12.8","rustc":"nightly-2026-11-20","notest_cuda_compilers":"clang++","extra_desc":"cuda12.8","no_coverage":true}]}' || '{"include":[{"os":"ubuntu-22.04","rustc":"nightly-2026-11-20","rustflags":"-C target-cpu=x86-64-v2"}]}') }}
     env:
       RUST_BACKTRACE: 1
       COVERAGE_REPORT_DIR: "target/debug"
@@ -180,13 +180,13 @@ jobs:
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: ${{ matrix.rustc }}
+          toolchain: ${{ matrix.rustc || 'nightly-2026-11-20' }}
           components: llvm-tools-preview
 
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
         with:
-          rust-toolchain: ${{ matrix.rustc || 'stable' }}
+          rust-toolchain: ${{ matrix.rustc || 'nightly-2026-11-20' }}
 
       - if: ${{ contains(matrix.os, 'ubuntu') }}
         name: Install gcc & clang for tests
@@ -260,7 +260,7 @@ jobs:
         if: failure()
         uses: ./.github/actions/artifact_failure
         with:
-          name: test-${{ matrix.os }}-${{ matrix.rustc || 'stable' }}-${{ matrix.extra_desc }}
+          name: test-${{ matrix.os }}-${{ matrix.rustc || 'nightly-2026-11-20' }}-${{ matrix.extra_desc }}
 
   # coverage:
       - name: Display coverage files
@@ -286,7 +286,7 @@ jobs:
           files: ${{ steps.coverage.outputs.report }}
           ## flags: IntegrationTests, UnitTests, ${{ steps.vars.outputs.CODECOV_FLAGS }}
           flags: ${{ steps.vars.outputs.CODECOV_FLAGS }}
-          name: codecov-umbrella-${{ matrix.os }}-rust_${{ matrix.rustc || 'stable' }}-${{ matrix.extra_desc }}
+          name: codecov-umbrella-${{ matrix.os }}-rust_${{ matrix.rustc || 'nightly-2026-11-20' }}-${{ matrix.extra_desc }}
           fail_ci_if_error: true
           # verbose: true
         env:
@@ -322,12 +322,12 @@ jobs:
         printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'unset SCCACHE_SERVER_UDS SCCACHE_SERVER_PORT' 'exec "$@"' > "$test_runner"
         chmod +x "$test_runner"
         export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$test_runner"
-        cargo +1.99.1 test --locked --target x86_64-unknown-linux-gnu --lib --bins --tests
-      rust-toolchain: "1.99.1"
+        cargo +nightly-2026-11-20 test --locked --target x86_64-unknown-linux-gnu --lib --bins --tests
+      rust-toolchain: "nightly-2026-11-20"
       rustflags: "-C target-cpu=x86-64-v2"
 
   ci-bundle-release-profile:
-    name: CI bundle release profile (Rust 1.99.0)
+    name: CI bundle release profile (Rust nightly-2026-11-20)
     # Reuse shared sccache setup, and check the exact pinned publisher features
     # on every PR and main push (not only tag builds).
     permissions:
@@ -335,10 +335,10 @@ jobs:
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
     with:
       isolate-public-sccache-server: true
-      rust-toolchain: "1.99.0"
+      rust-toolchain: "nightly-2026-11-20"
       rustflags: "-C target-cpu=x86-64-v2"
       command: >-
-        cargo +1.99.0 check --release --locked --no-default-features
+        cargo +nightly-2026-11-20 check --release --locked --no-default-features
         --features s3,gha,dist-client,dist-server,direct-metrics,vendored-openssl
         --bin sccache --bin sccache-dist
 
@@ -358,14 +358,14 @@ jobs:
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
         with:
-          rust-toolchain: ${{ matrix.target == 'aarch64-apple-darwin' && 'beta' || matrix.target == 's390x-unknown-linux-musl' && 'nightly' || '1.99.0' }}
+          rust-toolchain: "nightly-2026-11-20"
 
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: ${{ matrix.target == 'aarch64-apple-darwin' && 'beta' || '1.99.0' }}
+          toolchain: "nightly-2026-11-20"
           target: ${{ matrix.target }}
-        if: ${{ !matrix.container }}
+        if: ${{ matrix.target != 's390x-unknown-linux-musl' }}
 
       - name: Install s390x cross-compilation toolchain
         if: ${{ matrix.target == 's390x-unknown-linux-gnu' }}
@@ -381,13 +381,8 @@ jobs:
       - name: Install rust-src for s390x-musl
         if: ${{ matrix.target == 's390x-unknown-linux-musl' }}
         run: |
-          # Remove corrupted nightly toolchain if it exists
-          rustup toolchain uninstall nightly || true
-          # Clean up any leftover files
-          rm -rf ~/.rustup/toolchains/nightly-* || true
-          # Install fresh nightly with minimal profile
-          rustup toolchain install nightly --profile minimal
-          rustup component add rust-src --toolchain nightly
+          rustup toolchain install nightly-2026-11-20 --profile minimal
+          rustup component add rust-src --toolchain nightly-2026-11-20
 
       - name: fix build openssl error on s390x
         if: ${{  matrix.target  == 's390x-unknown-linux-musl' }}
@@ -399,7 +394,7 @@ jobs:
 
       - name: Build (s390x-musl with build-std)
         if: ${{ matrix.target == 's390x-unknown-linux-musl' }}
-        run: cargo +nightly build --locked --release --bin ${{ matrix.binary || 'sccache' }} --target ${{ matrix.target }} --features=openssl/vendored ${{ matrix.extra_args }} -Zbuild-std
+        run: cargo +nightly-2026-11-20 build --locked --release --bin ${{ matrix.binary || 'sccache' }} --target ${{ matrix.target }} --features=openssl/vendored ${{ matrix.extra_args }} -Zbuild-std
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx_deployment_target }}
           DEVELOPER_DIR: ${{ matrix.developer_dir }}

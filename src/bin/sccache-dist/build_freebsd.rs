@@ -14,8 +14,8 @@
 
 use super::command_helpers::CommandExt;
 use anyhow::{Context, Error, Result, bail};
-use flate2::read::GzDecoder;
 use sccache::compression::ZstdFrame;
+use sccache::compression::deflate::unpack_gzip;
 use sccache::dist::{
     BuildResult, BuilderIncoming, CompileCommand, InputsReader, OutputRequest, ProcessOutput,
     TcCache, Toolchain,
@@ -220,9 +220,10 @@ impl PotBuilder {
         // fails, otherwise subsequent image creation can collide with it.
         let image_result = (|| -> Result<()> {
             trace!("Copying in toolchain");
-            if let Err(error) = tar::Archive::new(GzDecoder::new(toolchain_rdr))
-                .unpack(pot_fs_root.join("jails").join(&imagename).join("m"))
-            {
+            if let Err(error) = unpack_gzip(
+                toolchain_rdr,
+                &pot_fs_root.join("jails").join(&imagename).join("m"),
+            ) {
                 warn!("Failed to unpack toolchain: {error:?}");
                 if let Err(cache_error) = tccache.lock().unwrap().remove(tc) {
                     warn!(
@@ -300,8 +301,8 @@ impl PotBuilder {
 
         trace!("copying in inputs");
         // not elegant
-        tar::Archive::new(inputs_rdr)
-            .unpack(pot_fs_root.join("jails").join(cid).join("m"))
+        inputs_rdr
+            .unpack(&pot_fs_root.join("jails").join(cid).join("m"))
             .context("Failed to unpack inputs to pot")?;
 
         let CompileCommand {
