@@ -26,6 +26,17 @@ records openssl_linkage=vendored-static. The older published protocol-v2
 canary e266a04e demonstrated why both checks matter: it passed GLIBC
 verification but required OpenSSL 4 on an OpenSSL 3 worker host.
 
+## Distributed compression backend
+
+The input and toolchain DEFLATE streams use flate2's zlib-rs backend,
+pinned to codeandsolder/zlib-rs-fast through the workspace Cargo patch.
+The parallel gzip toolchain packager uses the same backend and enables
+cross-block dictionaries. Compiler output is Zstandard, as described below.
+
+For host-local builds use `contrib/codeandsolder/build-host-native`;
+it compiles the client and worker specifically for the executing CPU.
+Published shared fleet bundles retain their portable x86-64-v2 ABI.
+
 ## Distributed output transport and cache storage
 
 Protocol 3 / rollout epoch 4 sends each compiler output as a checksummed

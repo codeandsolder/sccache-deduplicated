@@ -22,6 +22,10 @@ pub(in crate::cache) fn normalize_key(key: &str) -> String {
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "Windows shares the Option-based file mode contract"
+)]
 pub(in crate::cache) fn get_file_mode(metadata: &std::fs::Metadata) -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
     Some(metadata.mode())

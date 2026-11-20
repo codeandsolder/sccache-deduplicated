@@ -48,7 +48,6 @@ use async_trait::async_trait;
 use filetime::FileTime;
 use fs::File;
 use fs_err as fs;
-#[cfg(feature = "dist-client")]
 use futures::TryFutureExt;
 use itertools::Itertools as _;
 use serde::{Deserialize, Serialize};

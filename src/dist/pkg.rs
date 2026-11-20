@@ -261,6 +261,7 @@ mod toolchain_imp {
         /// Returns an error if archive construction or compression fails.
         pub fn into_compressed_tar<W: Write + Send + 'static>(self, writer: W) -> Result<()> {
             use gzp::{
+                ZWriter,
                 deflate::Gzip,
                 par::compress::{Compression, ParCompress, ParCompressBuilder},
             };
@@ -292,7 +293,8 @@ mod toolchain_imp {
                 // environment.
                 builder.append_link(&mut header, tar_safe_path(from_path), to_path)?;
             }
-            builder.finish().map_err(Into::into)
+            builder.into_inner()?.finish()?;
+            Ok(())
         }
 
         /// Simplify the path and strip the leading slash.
@@ -351,6 +353,32 @@ mod toolchain_imp {
                 .is_dir(),
             "the compiler's lexical search directory must exist after extraction"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_gzip_toolchain_round_trips_multiple_blocks() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let artifact = temp.path().join("compiler.bin");
+        // Mix incompressible regions and repeated regions across block boundaries.
+        let mut state = 0x1234_5678_u32;
+        let mut data = Vec::with_capacity(2 * 1024 * 1024);
+        for _ in 0..(1024 * 1024) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            data.push(state.to_le_bytes()[0]);
+        }
+        data.extend_from_within(..);
+        fs::write(&artifact, &data)?;
+        let archive_path = temp.path().join("toolchain.tar.gz");
+        let mut builder = ToolchainPackageBuilder::new();
+        builder.add_file(artifact.clone())?;
+        builder.into_compressed_tar(fs::File::create(&archive_path)?)?;
+        let root = temp.path().join("unpacked");
+        tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(&archive_path)?))
+            .unpack(&root)?;
+        assert_eq!(fs::read(root.join(artifact.strip_prefix("/")?))?, data);
         Ok(())
     }
 

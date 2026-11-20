@@ -1790,11 +1790,8 @@ mod client {
                             .context("Could not write inputs for compilation")?;
                         let input_size = compressor.total_in();
                         let body = compressor.finish().context("failed to finish compressor")?;
-                        trace!(
-                            "Compressed inputs from {} -> {}",
-                            input_size,
-                            body.len() - header_size,
-                        );
+                        let compressed_size = body.len() - header_size;
+                        trace!("Compressed inputs from {input_size} -> {compressed_size}");
                     }
 
                     Ok(body)
