@@ -72,7 +72,7 @@ jobs:
     needs: required-gates
     if: needs.required-gates.outputs.ready == 'true'
     # 24.04 ships GLIBC 2.39; the oldest managed host must stay compatible.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     env:
       RUSTFLAGS: "-C target-cpu=x86-64-v2"
