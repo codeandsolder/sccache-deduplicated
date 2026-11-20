@@ -26,12 +26,14 @@ use sccache::dist::{
     TcCache, Toolchain,
 };
 use sccache::lru_disk_cache::Error as LruError;
-use std::collections::{HashMap, hash_map};
+use std::collections::{HashMap, HashSet, hash_map};
 use std::io;
 use std::iter;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use version_compare::Version;
 
 /// Host-side filesystem operations on a build's temporary root must obey
@@ -132,16 +134,45 @@ struct DeflatedToolchain {
     path: PathBuf,
     build_count: u64,
     active_lease: Arc<()>,
+    size_bytes: u64,
+    last_used: Instant,
+}
+
+/// Measure logical regular-file bytes once, without following symlinks or
+/// counting hard-linked files more than once. Unlike filesystem block counts,
+/// this budget is independent of compression and delayed allocation.
+fn extracted_toolchain_size(path: &Path) -> Result<u64> {
+    let mut hard_links = HashSet::new();
+    let mut size = 0_u64;
+    for entry in walkdir::WalkDir::new(path) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        if metadata.nlink() > 1 && !hard_links.insert((metadata.dev(), metadata.ino())) {
+            continue;
+        }
+        size = size
+            .checked_add(metadata.len())
+            .context("extracted toolchain size overflow")?;
+    }
+    Ok(size)
 }
 
 pub struct OverlayBuilder {
     bubblewrap: PathBuf,
     dir: PathBuf,
     toolchain_dir_map: Mutex<HashMap<Toolchain, DeflatedToolchain>>,
+    extracted_toolchain_cache_size: u64,
 }
 
 impl OverlayBuilder {
-    pub fn new(bubblewrap: PathBuf, dir: PathBuf) -> Result<Self> {
+    pub fn new(
+        bubblewrap: PathBuf,
+        dir: PathBuf,
+        extracted_toolchain_cache_size: u64,
+    ) -> Result<Self> {
         info!("Creating overlay builder");
 
         if !nix::unistd::getuid().is_root() || !nix::unistd::geteuid().is_root() {
@@ -185,6 +216,7 @@ impl OverlayBuilder {
             bubblewrap,
             dir,
             toolchain_dir_map: Mutex::new(HashMap::new()),
+            extracted_toolchain_cache_size,
         };
         ret.cleanup()?;
         fs::create_dir(&ret.dir).context("Failed to create base directory for builder")?;
@@ -202,29 +234,42 @@ impl OverlayBuilder {
         Ok(())
     }
 
-    /// Reclaim extracted toolchains whose archives have been evicted, but
-    /// never while a running build still references their lower directory.
-    /// The caller holds the directory-map mutex, preventing new build leases
-    /// from being acquired during the check and filesystem deletion.
+    /// Reclaim uncached extractions first, then evict least-recently-used
+    /// idle extractions until the independent byte budget is met. Active
+    /// builds may temporarily exceed the budget; the last lease release
+    /// triggers another prune. The directory-map lock excludes new leases.
     fn prune_unused_toolchain_dirs(
         &self,
         dir_map: &mut HashMap<Toolchain, DeflatedToolchain>,
         tccache: &Mutex<TcCache>,
     ) {
-        // Inspect the actual cache membership rather than comparing collection
-        // sizes: eviction order need not match directory creation order.
-        // Release the cache lock before potentially slow directory deletion.
-        let candidates: Vec<_> = {
+        let mut total: u128 = dir_map
+            .values()
+            .map(|entry| u128::from(entry.size_bytes))
+            .sum();
+        let capacity = u128::from(self.extracted_toolchain_cache_size);
+        let mut candidates: Vec<_> = {
             let cache = tccache.lock().unwrap();
             dir_map
                 .iter()
-                .filter(|(tc, entry)| {
-                    Arc::strong_count(&entry.active_lease) == 1 && !cache.contains_toolchain(tc)
+                .filter(|(_, entry)| Arc::strong_count(&entry.active_lease) == 1)
+                .map(|(tc, entry)| {
+                    (
+                        cache.contains_toolchain(tc),
+                        entry.last_used,
+                        tc.clone(),
+                        entry.path.clone(),
+                        entry.size_bytes,
+                    )
                 })
-                .map(|(tc, entry)| (tc.clone(), entry.path.clone()))
                 .collect()
         };
-        for (tc, path) in candidates {
+        // false (no archive) sorts before true; then oldest first.
+        candidates.sort_unstable_by_key(|candidate| (candidate.0, candidate.1));
+        for (archive_cached, _, tc, path, size) in candidates {
+            if archive_cached && total <= capacity {
+                break;
+            }
             match fs::remove_dir_all(&path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -238,6 +283,7 @@ impl OverlayBuilder {
             }
             debug!("Pruned inactive uncompressed toolchain {}", tc.archive_id);
             dir_map.remove(&tc);
+            total -= u128::from(size);
         }
     }
 
@@ -250,6 +296,7 @@ impl OverlayBuilder {
             path: toolchain_dir,
             build_count: id,
             active_lease,
+            ..
         } = {
             let mut toolchain_dir_map = self.toolchain_dir_map.lock().unwrap();
             // Create the toolchain dir (if necessary) while we have an exclusive lock
@@ -260,6 +307,7 @@ impl OverlayBuilder {
                     anyhow!("toolchain disappeared from directory map while locked")
                 })?;
                 entry.build_count += 1;
+                entry.last_used = Instant::now();
                 entry.clone()
             } else {
                 // Once the archive file has been opened, extraction must not
@@ -301,10 +349,24 @@ impl OverlayBuilder {
                     return Err(Error::from(error).context("Failed to unpack toolchain"));
                 }
 
+                let size_bytes = match extracted_toolchain_size(&toolchain_dir) {
+                    Ok(size) => size,
+                    Err(error) => {
+                        if let Err(cleanup_error) = fs::remove_dir_all(&toolchain_dir) {
+                            warn!(
+                                "Failed to clean unmeasured toolchain directory {}: {cleanup_error:#}",
+                                toolchain_dir.display()
+                            );
+                        }
+                        return Err(error.context("failed to measure extracted toolchain"));
+                    }
+                };
                 let entry = DeflatedToolchain {
                     path: toolchain_dir,
                     build_count: 1,
                     active_lease: Arc::new(()),
+                    size_bytes,
+                    last_used: Instant::now(),
                 };
 
                 toolchain_dir_map.insert(tc.clone(), entry.clone());
@@ -1038,6 +1100,7 @@ mod overlay_lifecycle_tests {
             bubblewrap: PathBuf::from("unused-bubblewrap"),
             dir: tempdir.path().to_path_buf(),
             toolchain_dir_map: Mutex::new(HashMap::new()),
+            extracted_toolchain_cache_size: u64::MAX,
         };
         let tc = fixture_toolchain('d');
         let cache = Mutex::new(TcCache::new(&tempdir.path().join("tc-cache"), 1024 * 1024)?);
@@ -1061,6 +1124,77 @@ mod overlay_lifecycle_tests {
         Ok(())
     }
     #[test]
+    fn extracted_size_counts_hard_links_once_and_does_not_follow_symlinks() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir()?;
+        let tree = tempdir.path().join("toolchain");
+        fs::create_dir(&tree)?;
+        fs::write(tree.join("compiler"), [0_u8; 16])?;
+        fs::hard_link(tree.join("compiler"), tree.join("alias"))?;
+        fs::write(tempdir.path().join("outside"), [0_u8; 100])?;
+        symlink(tempdir.path().join("outside"), tree.join("outside"))?;
+        assert_eq!(extracted_toolchain_size(&tree)?, 16);
+        Ok(())
+    }
+
+    #[test]
+    fn extracted_byte_budget_evicts_oldest_idle_cache_entries() -> Result<()> {
+        use std::io::Write as _;
+        use std::time::Duration;
+
+        let tempdir = tempfile::tempdir()?;
+        let builder = OverlayBuilder {
+            bubblewrap: PathBuf::from("unused-bubblewrap"),
+            dir: tempdir.path().to_path_buf(),
+            toolchain_dir_map: Mutex::new(HashMap::new()),
+            extracted_toolchain_cache_size: 20,
+        };
+        let mut tc_cache = TcCache::new(&tempdir.path().join("archives"), 1024)?;
+        let mut map = builder.toolchain_dir_map.lock().unwrap();
+        let now = Instant::now();
+        let mut ids = Vec::new();
+        for (index, size) in [10, 10, 10].into_iter().enumerate() {
+            let bytes = [index as u8];
+            let tc = Toolchain {
+                archive_id: sccache::dist::ArchiveId::try_from(
+                    sccache::util::Digest::reader_sync(bytes.as_slice())?,
+                )?,
+            };
+            tc_cache.insert_with(&tc, |mut file| file.write_all(&bytes))?;
+            let path = tempdir.path().join(tc.archive_id.as_str());
+            fs::create_dir(&path)?;
+            map.insert(
+                tc.clone(),
+                DeflatedToolchain {
+                    path,
+                    build_count: 1,
+                    active_lease: Arc::new(()),
+                    size_bytes: size,
+                    last_used: now - Duration::from_secs(3 - index as u64),
+                },
+            );
+            ids.push(tc);
+        }
+        let lease = Arc::clone(&map[&ids[0]].active_lease);
+        let cache = Mutex::new(tc_cache);
+        builder.prune_unused_toolchain_dirs(&mut map, &cache);
+        assert!(map.contains_key(&ids[0]), "active oldest entry survives");
+        assert!(!map.contains_key(&ids[1]), "idle older entry evicted first");
+        assert!(map.contains_key(&ids[2]), "recent idle entry retained");
+        assert_eq!(cache.lock().unwrap().len(), 3, "archives remain cached");
+        // In-flight oversize extraction survives, then is evicted upon release.
+        map.get_mut(&ids[0]).unwrap().size_bytes = 25;
+        builder.prune_unused_toolchain_dirs(&mut map, &cache);
+        assert!(map.contains_key(&ids[0]));
+        assert!(!map.contains_key(&ids[2]));
+        drop(lease);
+        builder.prune_unused_toolchain_dirs(&mut map, &cache);
+        assert!(map.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn active_extracted_toolchain_is_pruned_only_after_last_build_finishes() -> Result<()> {
         use std::io::Write as _;
 
@@ -1071,6 +1205,7 @@ mod overlay_lifecycle_tests {
             bubblewrap: PathBuf::from("unused-bubblewrap"),
             dir: tempdir.path().to_path_buf(),
             toolchain_dir_map: Mutex::new(HashMap::new()),
+            extracted_toolchain_cache_size: u64::MAX,
         };
         let active_tc = fixture_toolchain('a');
         let idle_tc = fixture_toolchain('b');
@@ -1105,6 +1240,8 @@ mod overlay_lifecycle_tests {
                 path: active_path.clone(),
                 build_count: 2,
                 active_lease: lease,
+                size_bytes: 1,
+                last_used: Instant::now(),
             },
         );
         dir_map.insert(
@@ -1113,6 +1250,8 @@ mod overlay_lifecycle_tests {
                 path: idle_path.clone(),
                 build_count: 1,
                 active_lease: Arc::new(()),
+                size_bytes: 1,
+                last_used: Instant::now(),
             },
         );
 
@@ -1122,6 +1261,8 @@ mod overlay_lifecycle_tests {
                 path: cached_path.clone(),
                 build_count: 1,
                 active_lease: Arc::new(()),
+                size_bytes: 1,
+                last_used: Instant::now(),
             },
         );
 
