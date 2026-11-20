@@ -1896,6 +1896,10 @@ pub mod server {
         TEN_GIGS
     }
 
+    const fn default_extracted_toolchain_cache_size() -> u64 {
+        8 * 1024 * 1024 * 1024
+    }
+
     const DEFAULT_POT_CLONE_FROM: &str = "sccache-template";
     const DEFAULT_POT_FS_ROOT: &str = "/opt/pot";
     const DEFAULT_POT_CMD: &str = "pot";
@@ -1930,6 +1934,8 @@ pub mod server {
         Overlay {
             build_dir: PathBuf,
             bwrap_path: PathBuf,
+            #[serde(default = "default_extracted_toolchain_cache_size")]
+            extracted_toolchain_cache_size: u64,
         },
         #[serde(rename = "pot")]
         Pot {
@@ -3521,6 +3527,7 @@ fn server_toml_parse() {
             builder: BuilderType::Overlay {
                 build_dir: PathBuf::from("/tmp/build"),
                 bwrap_path: PathBuf::from("/usr/bin/bwrap"),
+                extracted_toolchain_cache_size: 8 * 1024 * 1024 * 1024,
             },
             cache_dir: PathBuf::from("/tmp/toolchains"),
             public_addr: "192.168.1.1:10501"
