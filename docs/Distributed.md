@@ -442,6 +442,10 @@ type = "overlay"
 build_dir = "/tmp/build"
 # The path to the bubblewrap version 0.3.0+ `bwrap` binary.
 bwrap_path = "/usr/bin/bwrap"
+# Maximum retained extracted-toolchain logical bytes (default 8 GiB).
+# Active builds may exceed the limit; idle extractions are reclaimed in
+# LRU order, while compressed archives remain cached.
+# extracted_toolchain_cache_size = 8589934592
 
 [scheduler_auth]
 type = "jwt_token"
@@ -464,6 +468,10 @@ type = "overlay"
 build_dir = "/tmp/build"
 # The path to the bubblewrap version 0.3.0+ `bwrap` binary.
 bwrap_path = "/usr/bin/bwrap"
+# Maximum retained extracted-toolchain logical bytes (default 8 GiB).
+# Active builds may exceed the limit; idle extractions are reclaimed in
+# LRU order, while compressed archives remain cached.
+# extracted_toolchain_cache_size = 8589934592
 
 [builder]
 type = "pot"
