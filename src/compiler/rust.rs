@@ -5612,27 +5612,27 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
     #[cfg(feature = "dist-client")]
     #[test]
     fn test_rlib_dep_reader_call() {
-        let mut env_vars = vec![];
-        if let Some(rustup_home) = std::env::var_os("RUSTUP_HOME") {
-            env_vars.push(("RUSTUP_HOME".into(), rustup_home));
-        }
-
-        // Try to find rustc via which first, then check CARGO_HOME.
-        // This handles both standard development setups (rustc in PATH)
-        // and CI environments (rustc only in CARGO_HOME/bin).
-        let rustc_path = if let Ok(path) = which::which("rustc") {
-            path
-        } else if let Ok(cargo_home) = std::env::var("CARGO_HOME") {
-            PathBuf::from(cargo_home).join("bin").join("rustc")
-        } else {
-            panic!("rustc not found in PATH or CARGO_HOME")
-        };
+        // Use the compiler Cargo/CI selected, not a rustup proxy that could
+        // install a different toolchain while this test is executing.
+        let rustc_path = std::env::var_os("RUSTC")
+            .or_else(|| option_env!("RUSTC").map(OsString::from))
+            .map(PathBuf::from)
+            .or_else(|| which::which("rustc").ok())
+            .expect("rustc not found");
+        let mut env_vars: Vec<_> = [
+            "RUSTUP_HOME",
+            "RUSTUP_TOOLCHAIN",
+            "HOME",
+            "USERPROFILE",
+            "PATH",
+        ]
+        .into_iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (name.into(), value)))
+        .collect();
+        env_vars.push(("RUSTUP_AUTO_INSTALL".into(), "0".into()));
 
         let rlib_dep_reader = RlibDepReader::new_with_check(rustc_path, &env_vars);
-        let is_ok = rlib_dep_reader.is_ok();
-        // Unwrap so the error is reported in the test output
-        let _ = rlib_dep_reader.unwrap();
-        assert!(is_ok);
+        rlib_dep_reader.expect("selected rustc must support rlib dependency reading");
     }
 
     #[cfg(feature = "dist-client")]
