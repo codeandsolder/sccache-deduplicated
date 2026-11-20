@@ -52,9 +52,30 @@ pub struct Acquired {
     _token: Option<jobserver::Acquired>,
 }
 
+const DEFAULT_MIN_JOBS: u32 = 12;
+
+fn effective_jobs(cpus: usize, minimum: Option<&str>) -> Result<usize> {
+    let minimum = minimum
+        .map(str::parse::<u32>)
+        .transpose()
+        .context("SCCACHE_MIN_JOBS must be a non-negative integer")?
+        .unwrap_or(DEFAULT_MIN_JOBS);
+    Ok(cpus.max(minimum as usize))
+}
+
 impl Client {
     pub fn new() -> Self {
-        Self::new_num(crate::util::num_cpus())
+        let jobs = match std::env::var("SCCACHE_MIN_JOBS") {
+            Ok(value) => effective_jobs(crate::util::num_cpus(), Some(&value)),
+            Err(std::env::VarError::NotPresent) => effective_jobs(crate::util::num_cpus(), None),
+            Err(error) => Err(error).context("invalid SCCACHE_MIN_JOBS"),
+        };
+        match jobs {
+            Ok(jobs) => Self::new_num(jobs),
+            Err(error) => Self {
+                state: ClientState::Failed(Arc::from(format!("{error:#}"))),
+            },
+        }
     }
 
     pub fn new_num(num: usize) -> Self {
@@ -128,5 +149,21 @@ impl Client {
         Ok(Acquired {
             _token: Some(acquired),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_jobs;
+
+    #[test]
+    fn minimum_job_capacity() -> crate::errors::Result<()> {
+        assert_eq!(effective_jobs(4, None)?, 12);
+        assert_eq!(effective_jobs(24, None)?, 24);
+        assert_eq!(effective_jobs(8, Some("16"))?, 16);
+        assert_eq!(effective_jobs(8, Some("0"))?, 8);
+        assert!(effective_jobs(8, Some("-1")).is_err());
+        assert!(effective_jobs(8, Some("bad")).is_err());
+        Ok(())
     }
 }

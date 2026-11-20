@@ -4,6 +4,7 @@ These are the source-of-truth copies of the machine-wide Cargo/sccache wrappers 
 
 ## Contract
 
+- `cargo-wrapper` exports `SCCACHE_MIN_JOBS` (default 12). The managed cargo-ephemeral binary clamps the resolved build job count to this floor, preserving higher values and inherited jobservers. Set it to 0 to disable the floor.
 - `cargo-wrapper` preserves Cargo's own target-directory semantics. It never invents or exports `CARGO_TARGET_DIR` merely for cache normalization.
 - `cargo-wrapper` exports `EPHEMERAL_CARGO_WRAPPER`/`CARGO` so nested Cargo invocations return through the site launcher instead of exposing the underlying Cargo binary.
 - `rustup-wrapper` is a narrow policy guard: `rustup run <toolchain> cargo ...` is translated to the equivalent site `cargo +<toolchain> ...` path, while non-Cargo rustup commands pass through untouched. `CODEANDSOLDER_RUSTUP_STOCK_CARGO=1` explicitly restores stock Cargo for compatibility testing.
