@@ -125,8 +125,8 @@ jobs:
           assert '(heartbeat_ms + 999) / 1000 + 15' in source
           publisher = Path(".github/workflows/publish-ci-client.yml").read_text()
           protocol = Path("contrib/codeandsolder/release-protocol.env").read_text()
-          assert "dist_protocol=2" in protocol
-          assert "rollout_epoch=3" in protocol
+          assert "dist_protocol=3" in protocol
+          assert "rollout_epoch=4" in protocol
           assert "glibc_abi_max=2.39" in protocol
           assert "source contrib/codeandsolder/release-protocol.env" in publisher
           assert "vendored-openssl" in publisher

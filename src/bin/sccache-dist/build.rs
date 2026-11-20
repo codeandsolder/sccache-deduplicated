@@ -20,9 +20,10 @@ use libmount::Overlay;
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, OpenHow, ResolveFlag, openat2};
 use nix::sys::stat::{Mode, mkdirat};
+use sccache::compression::ZstdFrame;
 use sccache::dist::{
-    BuildResult, BuilderIncoming, CompileCommand, InputsReader, OutputData, ProcessOutput, TcCache,
-    Toolchain,
+    BuildResult, BuilderIncoming, CompileCommand, InputsReader, OutputRequest, ProcessOutput,
+    TcCache, Toolchain,
 };
 use sccache::lru_disk_cache::Error as LruError;
 use std::collections::{HashMap, hash_map};
@@ -331,9 +332,13 @@ impl OverlayBuilder {
         bubblewrap: &Path,
         compile_command: CompileCommand,
         inputs_rdr: InputsReader,
-        output_paths: Vec<String>,
+        outputs: OutputRequest,
         overlay: &OverlaySpec,
     ) -> Result<BuildResult> {
+        let OutputRequest {
+            paths: output_paths,
+            compression_level,
+        } = outputs;
         trace!("Compile environment: {:?}", compile_command.env_vars);
         trace!(
             "Compile command: {:?} {:?}",
@@ -469,7 +474,7 @@ impl OverlayBuilder {
                         // as bubblewrap, never against the host filesystem.
                         match build_fs.open_output(&cwd.join(&path)) {
                             Ok(file) => {
-                                let output = OutputData::try_from_reader(file)
+                                let output = ZstdFrame::try_from_reader(file, compression_level)
                                     .context("Failed to read output file")?;
                                 outputs.push((path, output))
                             }
@@ -523,7 +528,7 @@ impl BuilderIncoming for OverlayBuilder {
         &self,
         tc: Toolchain,
         command: CompileCommand,
-        outputs: Vec<String>,
+        outputs: OutputRequest,
         inputs_rdr: InputsReader,
         tccache: &Mutex<TcCache>,
     ) -> Result<BuildResult> {
@@ -841,9 +846,13 @@ impl DockerBuilder {
     fn perform_build(
         compile_command: CompileCommand,
         mut inputs_rdr: InputsReader,
-        output_paths: Vec<String>,
+        outputs: OutputRequest,
         cid: &str,
     ) -> Result<BuildResult> {
+        let OutputRequest {
+            paths: output_paths,
+            compression_level,
+        } = outputs;
         trace!("Compile environment: {:?}", compile_command.env_vars);
         trace!(
             "Compile command: {:?} {:?}",
@@ -920,8 +929,8 @@ impl DockerBuilder {
                 .output()
                 .context("Failed to start command to retrieve output file")?;
             if output.status.success() {
-                let output = OutputData::try_from_reader(&*output.stdout)
-                    .context("failed to decode compressed build output")?;
+                let output = ZstdFrame::try_from_reader(&*output.stdout, compression_level)
+                    .context("failed to compress build output")?;
                 outputs.push((path, output))
             } else {
                 debug!("Missing output path {:?}", path)
@@ -943,7 +952,7 @@ impl BuilderIncoming for DockerBuilder {
         &self,
         tc: Toolchain,
         command: CompileCommand,
-        outputs: Vec<String>,
+        outputs: OutputRequest,
         inputs_rdr: InputsReader,
         tccache: &Mutex<TcCache>,
     ) -> Result<BuildResult> {

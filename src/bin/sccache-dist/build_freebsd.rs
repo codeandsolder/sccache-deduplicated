@@ -15,9 +15,10 @@
 use super::command_helpers::CommandExt;
 use anyhow::{Context, Error, Result, bail};
 use flate2::read::GzDecoder;
+use sccache::compression::ZstdFrame;
 use sccache::dist::{
-    BuildResult, BuilderIncoming, CompileCommand, InputsReader, OutputData, ProcessOutput, TcCache,
-    Toolchain,
+    BuildResult, BuilderIncoming, CompileCommand, InputsReader, OutputRequest, ProcessOutput,
+    TcCache, Toolchain,
 };
 use sccache::lru_disk_cache::Error as LruError;
 use std::collections::{HashMap, hash_map};
@@ -283,10 +284,14 @@ impl PotBuilder {
     fn perform_build(
         compile_command: CompileCommand,
         inputs_rdr: InputsReader,
-        output_paths: Vec<String>,
+        outputs: OutputRequest,
         cid: &str,
         pot_fs_root: &Path,
     ) -> Result<BuildResult> {
+        let OutputRequest {
+            paths: output_paths,
+            compression_level,
+        } = outputs;
         trace!("Compile environment: {:?}", compile_command.env_vars);
         trace!(
             "Compile command: {:?} {:?}",
@@ -360,8 +365,8 @@ impl PotBuilder {
                 .output()
                 .context("Failed to start command to retrieve output file")?;
             if output.status.success() {
-                let output = OutputData::try_from_reader(&*output.stdout)
-                    .context("failed to decode compressed build output")?;
+                let output = ZstdFrame::try_from_reader(&*output.stdout, compression_level)
+                    .context("failed to compress build output")?;
                 outputs.push((path, output))
             } else {
                 debug!("Missing output path {:?}", path)
@@ -383,7 +388,7 @@ impl BuilderIncoming for PotBuilder {
         &self,
         tc: Toolchain,
         command: CompileCommand,
-        outputs: Vec<String>,
+        outputs: OutputRequest,
         inputs_rdr: InputsReader,
         tccache: &Mutex<TcCache>,
     ) -> Result<BuildResult> {

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::dist;
 use fs_err as fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -49,22 +48,12 @@ pub trait ToolchainPackager: Send {
 }
 
 pub trait InputsPackager: Send {
-    /// Write packaged compiler inputs and return the corresponding path transformer.
+    /// Write packaged compiler inputs.
     ///
     /// # Errors
     ///
     /// Returns an error if packaging or writing an input fails.
-    fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<dist::PathTransformer>;
-}
-
-pub trait OutputsRepackager {
-    /// Repackage compiler outputs and return the corresponding path transformer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if reading or writing an output fails.
-    fn repackage_outputs(self: Box<Self>, wtr: &mut dyn io::Write)
-    -> Result<dist::PathTransformer>;
+    fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<()>;
 }
 
 #[cfg(not(all(

@@ -22,14 +22,14 @@ pub(in crate::cache) fn normalize_key(key: &str) -> String {
 }
 
 #[cfg(unix)]
-pub(in crate::cache) fn get_file_mode(file: &fs::File) -> Result<Option<u32>> {
+pub(in crate::cache) fn get_file_mode(metadata: &std::fs::Metadata) -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
-    Ok(Some(file.metadata()?.mode()))
+    Some(metadata.mode())
 }
 
 #[cfg(windows)]
-pub(in crate::cache) fn get_file_mode(_file: &fs::File) -> Result<Option<u32>> {
-    Ok(None)
+pub(in crate::cache) const fn get_file_mode(_metadata: &std::fs::Metadata) -> Option<u32> {
+    None
 }
 
 #[cfg(unix)]

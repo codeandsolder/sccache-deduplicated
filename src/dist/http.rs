@@ -179,7 +179,7 @@ mod common {
     #[serde(deny_unknown_fields)]
     pub struct RunJobHttpRequest {
         pub command: dist::CompileCommand,
-        pub outputs: Vec<String>,
+        pub outputs: dist::OutputRequest,
     }
 }
 
@@ -289,7 +289,7 @@ pub mod urls {
     /// Returns an error if the generated server URL is invalid.
     pub fn server_run_job(server_id: ServerId, job_id: JobId) -> Result<reqwest::Url> {
         let url = format!(
-            "https://{}/api/v1/distserver/run_job/{job_id}",
+            "https://{}/api/v2/distserver/run_job/{job_id}",
             server_id.addr()
         );
         Ok(reqwest::Url::parse(&url)?)
@@ -1375,7 +1375,7 @@ mod server {
                         let res: SubmitToolchainResult = try_or_500_log!(req_id, handler.handle_submit_toolchain(&requester, job_id, toolchain_rdr));
                         prepare_response(request, &res)
                     },
-                    (POST) (/api/v1/distserver/run_job/{job_id: JobId}) => {
+                    (POST) (/api/v2/distserver/run_job/{job_id: JobId}) => {
                         job_auth_or_401!(request, &job_authorizer, job_id);
 
                         let mut body = try_or_400_log!(
@@ -1392,7 +1392,6 @@ mod server {
                         let RunJobHttpRequest { command, outputs } = runjob;
                         let body = bincode_reader.into_inner();
                         let inputs_rdr = InputsReader::new(Box::new(ZlibReadDecoder::new(body)));
-                        let outputs = outputs.into_iter().collect();
 
                         let _running_job = try_or_500_log!(req_id, RunningJobGuard::new(&running_jobs, job_id));
                         let res: RunJobResult = try_or_500_log!(req_id, handler.handle_run_job(&requester, job_id, command, outputs, inputs_rdr));
@@ -1460,15 +1459,14 @@ mod client {
     use crate::config;
     use crate::dist::pkg::{InputsPackager, ToolchainPackager};
     use crate::dist::{
-        self, AllocJobResult, CompileCommand, JobAlloc, PathTransformer, RunJobResult,
-        SchedulerStatusResult, ServerId, SubmitToolchainResult, Toolchain,
+        self, AllocJobResult, CompileCommand, JobAlloc, RunJobResult, SchedulerStatusResult,
+        ServerId, SubmitToolchainResult, Toolchain,
     };
 
     use async_trait::async_trait;
     use byteorder::{BigEndian, WriteBytesExt};
     use flate2::Compression;
     use flate2::write::ZlibEncoder as ZlibWriteEncoder;
-    use futures::TryFutureExt;
     use reqwest::Body;
     use std::collections::HashMap;
     use std::io::Write;
@@ -1764,12 +1762,16 @@ mod client {
             command: CompileCommand,
             outputs: Vec<String>,
             inputs_packager: Box<dyn InputsPackager>,
-        ) -> Result<(RunJobResult, PathTransformer)> {
+        ) -> Result<RunJobResult> {
             let url = urls::server_run_job(job_alloc.server_id, job_alloc.job_id)?;
 
-            let (body, path_transformer) = self
+            let body = self
                 .pool
                 .spawn_blocking(move || -> Result<_> {
+                    let outputs = dist::OutputRequest {
+                        paths: outputs,
+                        compression_level: crate::compression::cache_level(),
+                    };
                     let bincode = bincode::serialize(&RunJobHttpRequest { command, outputs })
                         .context("failed to serialize run job request")?;
                     let bincode_length = u32::try_from(bincode.len())
@@ -1780,22 +1782,22 @@ mod client {
                         .context("failed to encode run job request length")?;
                     body.write_all(&bincode)
                         .context("failed to encode run job request metadata")?;
-                    let path_transformer;
                     {
+                        let header_size = body.len();
                         let mut compressor = ZlibWriteEncoder::new(&mut body, Compression::fast());
-                        path_transformer = inputs_packager
+                        inputs_packager
                             .write_inputs(&mut compressor)
                             .context("Could not write inputs for compilation")?;
-                        compressor.flush().context("failed to flush compressor")?;
+                        let input_size = compressor.total_in();
+                        let body = compressor.finish().context("failed to finish compressor")?;
                         trace!(
                             "Compressed inputs from {} -> {}",
-                            compressor.total_in(),
-                            compressor.total_out()
+                            input_size,
+                            body.len() - header_size,
                         );
-                        compressor.finish().context("failed to finish compressor")?;
                     }
 
-                    Ok((body, path_transformer))
+                    Ok(body)
                 })
                 .await??;
             let mut req = {
@@ -1806,9 +1808,7 @@ mod client {
                 client.post(url)
             };
             req = req.bearer_auth(job_alloc.auth.clone()).bytes(body);
-            bincode_req_fut(req)
-                .map_ok(|res| (res, path_transformer))
-                .await
+            bincode_req_fut(req).await
         }
 
         async fn put_toolchain(

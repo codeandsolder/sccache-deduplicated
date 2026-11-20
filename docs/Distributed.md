@@ -26,6 +26,22 @@ records openssl_linkage=vendored-static. The older published protocol-v2
 canary e266a04e demonstrated why both checks matter: it passed GLIBC
 verification but required OpenSSL 4 on an OpenSSL 3 worker host.
 
+## Distributed output transport and cache storage
+
+Protocol 3 / rollout epoch 4 sends each compiler output as a checksummed
+Zstandard frame and its original byte length. The client supplies its cache
+compression level in the run-job request. The frame is validated during
+the single decompression needed to materialize the output file. The same
+compressed bytes are inserted verbatim into the cache ZIP's stored entry,
+rather than reading the output file and compressing it again. Local outputs
+such as preprocessor dependency files still use ordinary cache compression.
+If another output has overwritten or replaced a materialized file, only
+that file is compressed again. Local and remote cache entries use the same
+checksummed Zstandard encoder.
+The cache entry format is unchanged, including support for reading already
+stored Zstandard entries. The run-job endpoint is versioned separately to
+reject the old wire format; upgrade clients and workers together.
+
 ## Overview
 
 Distributed sccache consists of three parts:

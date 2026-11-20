@@ -15,6 +15,8 @@
 use crate::cache::FileObjectSource;
 #[cfg(target_os = "linux")]
 use crate::compiler::CompileCommandImpl;
+#[cfg(feature = "dist-client")]
+use crate::compiler::DistPackagers;
 use crate::compiler::args::{
     ArgDisposition, ArgInfo, ArgParseError, ArgParseResult, ArgToStringResult, ArgsIter, Argument,
     FromArg, IntoArg, NormalizedDisposition, PathTransformerFn, split_os_string_arg,
@@ -25,8 +27,6 @@ use crate::compiler::{
     CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, GenerateHashKeyContext,
     HashResult, Language, SingleCompileCommand, c::ArtifactDescriptor,
 };
-#[cfg(feature = "dist-client")]
-use crate::compiler::{DistPackagers, NoopOutputsRewriter};
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
 #[cfg(feature = "dist-client")]
@@ -3530,9 +3530,8 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             host: Some(host),
             target: Some(target),
         });
-        let outputs_rewriter = Box::new(NoopOutputsRewriter);
 
-        Ok((inputs_packager, toolchain_packager, outputs_rewriter))
+        Ok((inputs_packager, toolchain_packager))
     }
 
     fn outputs<'a>(&'a self) -> Box<dyn Iterator<Item = FileObjectSource> + 'a> {
@@ -3877,7 +3876,7 @@ impl pkg::InputsPackager for RustInputsPackager {
         clippy::too_many_lines,
         reason = "toolchain input packaging is an ordered archive manifest; keeping path transforms beside emitted entries makes the archive contract auditable"
     )]
-    fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<dist::PathTransformer> {
+    fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<()> {
         debug!("Packaging compile inputs for compile");
         let Self {
             crate_link_paths,
@@ -4075,8 +4074,8 @@ impl pkg::InputsPackager for RustInputsPackager {
         }
 
         // Finish archive
-        let _ = builder.into_inner()?;
-        Ok(path_transformer)
+        builder.into_inner()?;
+        Ok(())
     }
 }
 

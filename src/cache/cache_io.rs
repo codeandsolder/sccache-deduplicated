@@ -11,9 +11,12 @@
 // limitations under the License.
 
 use super::utils::{get_file_mode, set_file_mode};
+use crate::compression::{VerifiedZstdFrame, cache_level, encode};
 use crate::errors::{Context, Result, bail};
+use crate::util::MetadataCtimeExt;
 use fs_err as fs;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -31,6 +34,60 @@ pub struct FileObjectSource {
     pub path: PathBuf,
     /// Whether the file must be present on disk and is essential for the compilation.
     pub optional: bool,
+}
+
+/// A validated worker frame corresponding to a materialized local output file.
+/// Preserve the final file's semantics if another output aliases or replaces it
+/// before the cache archive is assembled.
+pub struct MaterializedOutput {
+    frame: VerifiedZstdFrame,
+    metadata: std::fs::Metadata,
+}
+
+impl MaterializedOutput {
+    /// Associate the validated frame with the file it was materialized into.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the file's metadata cannot be read.
+    pub fn new(frame: VerifiedZstdFrame, file: &fs::File) -> std::io::Result<Self> {
+        Ok(Self {
+            frame,
+            metadata: file.metadata()?,
+        })
+    }
+
+    fn frame_for(&self, metadata: &std::fs::Metadata) -> Option<&VerifiedZstdFrame> {
+        let old = &self.metadata;
+        let unchanged = old.is_file()
+            && metadata.is_file()
+            && old.len() == metadata.len()
+            && old
+                .modified()
+                .ok()
+                .zip(metadata.modified().ok())
+                .is_some_and(|(a, b)| a == b)
+            && old
+                .ctime_or_creation()
+                .ok()
+                .zip(metadata.ctime_or_creation().ok())
+                .is_some_and(|(a, b)| a == b)
+            && same_file_identity(old, metadata);
+        unchanged.then_some(&self.frame)
+    }
+}
+
+#[cfg(unix)]
+fn same_file_identity(old: &std::fs::Metadata, new: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    old.dev() == new.dev() && old.ino() == new.ino()
+}
+
+#[cfg(windows)]
+fn same_file_identity(_old: &std::fs::Metadata, _new: &std::fs::Metadata) -> bool {
+    // Windows' stable Rust metadata exposes creation/modification times rather
+    // than file IDs; those timestamps are checked above.
+    true
 }
 
 /// Result of a cache lookup.
@@ -251,7 +308,11 @@ impl CacheWrite {
     /// # Errors
     ///
     /// Returns an error if a required input cannot be opened, read, or added to the archive.
-    pub async fn from_objects<T>(objects: T, pool: &tokio::runtime::Handle) -> Result<Self>
+    pub async fn from_objects<T>(
+        objects: T,
+        remote_outputs: HashMap<PathBuf, MaterializedOutput>,
+        pool: &tokio::runtime::Handle,
+    ) -> Result<Self>
     where
         T: IntoIterator<Item = FileObjectSource> + Send + Sync + 'static,
     {
@@ -267,8 +328,17 @@ impl CacheWrite {
                     .with_context(|| format!("failed to open file `{}`", path.display()));
                 match (f, optional) {
                     (Ok(mut f), _) => {
-                        let mode = get_file_mode(&f)?;
-                        entry.put_object(&key, &mut f, mode).with_context(|| {
+                        let metadata = f.metadata()?;
+                        let mode = get_file_mode(&metadata);
+                        let stored = if let Some(frame) = remote_outputs
+                            .get(&path)
+                            .and_then(|output| output.frame_for(&metadata))
+                        {
+                            entry.put_compressed_object(&key, frame, mode)
+                        } else {
+                            entry.put_object(&key, &mut f, mode)
+                        };
+                        stored.with_context(|| {
                             format!("failed to put object `{}` in cache entry", path.display())
                         })?;
                     }
@@ -291,20 +361,31 @@ impl CacheWrite {
     where
         T: Read,
     {
-        // We're going to declare the compression method as "stored",
-        // but we're actually going to store zstd-compressed blobs.
+        self.start_object(name, mode)?;
+        encode(from, &mut self.zip, cache_level())?;
+        Ok(())
+    }
+
+    /// The worker's frame was validated while materializing the compiler output.
+    /// Copy it verbatim into the cache, without reading or recompressing the file.
+    fn put_compressed_object(
+        &mut self,
+        name: &str,
+        output: &VerifiedZstdFrame,
+        mode: Option<u32>,
+    ) -> Result<()> {
+        self.start_object(name, mode)?;
+        self.zip.write_all(output.compressed_bytes())?;
+        Ok(())
+    }
+
+    fn start_object(&mut self, name: &str, mode: Option<u32>) -> Result<()> {
+        // The entry stores a Zstandard frame, not a ZIP-compressed payload.
         let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
         let opts = mode.map_or(opts, |mode| opts.unix_permissions(mode));
         self.zip
             .start_file(name, opts)
-            .context("Failed to start cache entry object")?;
-
-        let compression_level = std::env::var("SCCACHE_CACHE_ZSTD_LEVEL")
-            .ok()
-            .and_then(|value| value.parse::<i32>().ok())
-            .unwrap_or(3);
-        zstd::stream::copy_encode(from, &mut self.zip, compression_level)?;
-        Ok(())
+            .context("Failed to start cache entry object")
     }
 
     /// Store compiler stdout in this cache entry.
@@ -354,6 +435,99 @@ impl Default for CacheWrite {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stores_verified_worker_frame_verbatim_and_compresses_local_outputs() -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let temp = tempfile::tempdir()?;
+        let remote_path = temp.path().join("remote.o");
+        let local_path = temp.path().join("local.d");
+        let optional_path = temp.path().join("missing");
+        let remote = b"large remote artifact".repeat(1024);
+        let local = b"preprocessed dependency file";
+        let frame = crate::compression::ZstdFrame::try_from_reader(remote.as_slice(), 10)?;
+        let mut output = fs::File::create(&remote_path)?;
+        let verified = frame.materialize(&mut output)?;
+        let expected_frame = verified.compressed_bytes().to_vec();
+        let materialized = MaterializedOutput::new(verified, &output)?;
+        drop(output);
+        fs::write(&local_path, local)?;
+
+        let objects = vec![
+            FileObjectSource {
+                key: "remote".into(),
+                path: remote_path.clone(),
+                optional: false,
+            },
+            FileObjectSource {
+                key: "local".into(),
+                path: local_path,
+                optional: false,
+            },
+            FileObjectSource {
+                key: "optional".into(),
+                path: optional_path,
+                optional: true,
+            },
+        ];
+        let entry = runtime.block_on(CacheWrite::from_objects(
+            objects,
+            HashMap::from([(remote_path, materialized)]),
+            runtime.handle(),
+        ))?;
+        let encoded = entry.finish()?;
+        let mut zip = ZipArchive::new(Cursor::new(&encoded))?;
+        let mut zip_file = zip.by_name("remote")?;
+        let mut frame_bytes = Vec::new();
+        zip_file.read_to_end(&mut frame_bytes)?;
+        assert_eq!(zip_file.compression(), CompressionMethod::Stored);
+        assert_eq!(frame_bytes, expected_frame);
+        drop(zip_file);
+        assert!(zip.by_name("optional").is_err());
+        let mut read = CacheRead::from(Cursor::new(encoded))?;
+        let mut result = Vec::new();
+        read.get_object("remote", &mut result)?;
+        assert_eq!(result, remote);
+        result.clear();
+        read.get_object("local", &mut result)?;
+        assert_eq!(result, local);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialized_worker_output_is_recompressed_if_replaced() -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("out.o");
+        let frame = crate::compression::ZstdFrame::try_from_reader(&b"first"[..], 3)?;
+        let mut output = fs::File::create(&path)?;
+        let frame = MaterializedOutput::new(frame.materialize(&mut output)?, &output)?;
+        drop(output);
+
+        let replacement = temp.path().join("replacement");
+        fs::write(&replacement, b"other")?;
+        fs::rename(replacement, &path)?;
+        let objects = vec![FileObjectSource {
+            key: "obj".into(),
+            path: path.clone(),
+            optional: false,
+        }];
+        let entry = runtime.block_on(CacheWrite::from_objects(
+            objects,
+            HashMap::from([(path, frame)]),
+            runtime.handle(),
+        ))?;
+        let mut read = CacheRead::from(Cursor::new(entry.finish()?))?;
+        let mut bytes = Vec::new();
+        read.get_object("obj", &mut bytes)?;
+        assert_eq!(bytes, b"other");
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]
