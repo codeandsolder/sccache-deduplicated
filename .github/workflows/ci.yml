@@ -95,6 +95,11 @@ jobs:
       - name: Clone repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      - name: Install host validation dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ripgrep
+
       - name: Validate managed host scripts
         run: |
           bash -n contrib/codeandsolder/sccache-release-update contrib/codeandsolder/cargo-wrapper contrib/codeandsolder/rustup-wrapper contrib/codeandsolder/test-wrappers
