@@ -32,7 +32,7 @@ jobs:
         with:
           toolchain: "nightly-2026-11-20"
       - name: Setup mandatory compiler sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@079cb96347f3dee5a628baaed46e63055c80efa5 # main
         with:
           rust-toolchain: "nightly-2026-11-20"
 
@@ -42,7 +42,7 @@ jobs:
 
       - name: Finalize mandatory compiler sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@079cb96347f3dee5a628baaed46e63055c80efa5 # main
 
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -116,7 +116,7 @@ jobs:
         with:
           toolchain: "nightly-2026-11-20"
       - name: Setup mandatory compiler sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@079cb96347f3dee5a628baaed46e63055c80efa5 # main
         with:
           rust-toolchain: "nightly-2026-11-20"
 
@@ -158,7 +158,7 @@ jobs:
 
       - name: Finalize mandatory compiler sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@079cb96347f3dee5a628baaed46e63055c80efa5 # main
 
   test-mock-msvc:
     if: startsWith(github.ref, 'refs/tags/')
@@ -182,7 +182,7 @@ jobs:
           toolchain: "nightly-2026-11-20"
           target: $TARGET
       - name: Setup mandatory compiler sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@079cb96347f3dee5a628baaed46e63055c80efa5 # main
         with:
           rust-toolchain: "nightly-2026-11-20"
 
@@ -191,7 +191,7 @@ jobs:
 
       - name: Finalize mandatory compiler sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@079cb96347f3dee5a628baaed46e63055c80efa5 # main
       - name: Use test-owned Windows cache daemon port
         shell: pwsh
         run: '"SCCACHE_SERVER_PORT=4226" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
@@ -295,7 +295,7 @@ jobs:
       #       core.exportVariable('ROCM_PATH', process.env.ROCM_PATH || '');
 
       - name: Setup mandatory compiler sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@079cb96347f3dee5a628baaed46e63055c80efa5 # main
         with:
           rust-toolchain: "nightly-2026-11-20"
 
@@ -319,7 +319,7 @@ jobs:
 
       - name: Finalize mandatory compiler sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@079cb96347f3dee5a628baaed46e63055c80efa5 # main
       - name: Switch to test-owned HIP compiler cache daemon port
         shell: bash
         run: echo "SCCACHE_SERVER_PORT=4226" >> "$GITHUB_ENV"
@@ -386,7 +386,7 @@ jobs:
         with:
           toolchain: "nightly-2026-11-20"
       - name: Setup mandatory compiler sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@079cb96347f3dee5a628baaed46e63055c80efa5 # main
         with:
           rust-toolchain: "nightly-2026-11-20"
 
@@ -396,7 +396,7 @@ jobs:
 
       - name: Finalize mandatory compiler sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@079cb96347f3dee5a628baaed46e63055c80efa5 # main
       - name: Switch to test-owned Xcode compiler cache daemon port
         shell: bash
         run: echo "SCCACHE_SERVER_PORT=4226" >> "$GITHUB_ENV"
