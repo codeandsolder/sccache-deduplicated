@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use crate::cache::FileObjectSource;
+#[cfg(feature = "dist-client")]
+use crate::compiler::DistPackagers;
 use crate::compiler::preprocessor_cache::{
     PreprocessorCacheKey, preprocessor_cache_entry_hash_key,
 };
@@ -20,8 +22,6 @@ use crate::compiler::{
     Cacheable, ColorMode, Compilation, CompileCommand, Compiler, CompilerArguments, CompilerHasher,
     CompilerKind, GenerateCompileCommandsResult, GenerateHashKeyContext, HashResult, Language,
 };
-#[cfg(feature = "dist-client")]
-use crate::compiler::{DistPackagers, NoopOutputsRewriter};
 use crate::config::PreprocessorCacheModeConfig;
 use crate::dist;
 #[cfg(feature = "dist-client")]
@@ -1906,8 +1906,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
             cwd,
             env_vars,
         });
-        let outputs_rewriter = Box::new(NoopOutputsRewriter);
-        Ok((inputs_packager, toolchain_packager, outputs_rewriter))
+        Ok((inputs_packager, toolchain_packager))
     }
 
     fn is_locally_preprocessed(&self) -> bool {
@@ -1973,7 +1972,7 @@ struct CInputsPackager {
 
 #[cfg(feature = "dist-client")]
 impl pkg::InputsPackager for CInputsPackager {
-    fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<dist::PathTransformer> {
+    fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<()> {
         let Self {
             input_path,
             mut path_transformer,
@@ -2049,8 +2048,8 @@ impl pkg::InputsPackager for CInputsPackager {
         }
 
         // Finish archive
-        let _ = builder.into_inner();
-        Ok(path_transformer)
+        builder.into_inner()?;
+        Ok(())
     }
 }
 
@@ -2236,7 +2235,7 @@ fn real_cross_gcc_package_preserves_executable_helper_search_path() -> Result<()
     pkg::ToolchainPackager::write_pkg(Box::new(packager), fs::File::create(&archive_path)?)?;
 
     let root = temp.path().join("unpacked");
-    tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(archive_path)?)).unpack(&root)?;
+    crate::compression::deflate::unpack_gzip(fs::File::open(archive_path)?, &root)?;
     assert!(
         root.join(assembler.strip_prefix("/")?).is_file(),
         "packaged GCC assembler must resolve using the driver's original path"

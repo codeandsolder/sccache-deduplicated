@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::dist;
 use fs_err as fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -49,22 +48,12 @@ pub trait ToolchainPackager: Send {
 }
 
 pub trait InputsPackager: Send {
-    /// Write packaged compiler inputs and return the corresponding path transformer.
+    /// Write packaged compiler inputs.
     ///
     /// # Errors
     ///
     /// Returns an error if packaging or writing an input fails.
-    fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<dist::PathTransformer>;
-}
-
-pub trait OutputsRepackager {
-    /// Repackage compiler outputs and return the corresponding path transformer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if reading or writing an output fails.
-    fn repackage_outputs(self: Box<Self>, wtr: &mut dyn io::Write)
-    -> Result<dist::PathTransformer>;
+    fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<()>;
 }
 
 #[cfg(not(all(
@@ -271,10 +260,7 @@ mod toolchain_imp {
         ///
         /// Returns an error if archive construction or compression fails.
         pub fn into_compressed_tar<W: Write + Send + 'static>(self, writer: W) -> Result<()> {
-            use gzp::{
-                deflate::Gzip,
-                par::compress::{Compression, ParCompress, ParCompressBuilder},
-            };
+            use crate::compression::deflate::ParallelGzipWriter;
 
             let Self {
                 dir_set,
@@ -282,10 +268,7 @@ mod toolchain_imp {
                 symlinks,
                 root_mappings: _,
             } = self;
-            let par: ParCompress<'_, Gzip, W> = ParCompressBuilder::new()
-                .compression_level(Compression::default())
-                .from_writer(writer);
-            let mut builder = tar::Builder::new(par);
+            let mut builder = tar::Builder::new(ParallelGzipWriter::new(writer)?);
             builder.mode(tar::HeaderMode::Deterministic);
 
             for (tar_path, dir_path) in dir_set {
@@ -303,7 +286,8 @@ mod toolchain_imp {
                 // environment.
                 builder.append_link(&mut header, tar_safe_path(from_path), to_path)?;
             }
-            builder.finish().map_err(Into::into)
+            builder.into_inner()?.finish()?;
+            Ok(())
         }
 
         /// Simplify the path and strip the leading slash.
@@ -353,8 +337,7 @@ mod toolchain_imp {
         builder.into_compressed_tar(fs::File::create(&archive_path)?)?;
 
         let root = temp.path().join("unpacked");
-        tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(&archive_path)?))
-            .unpack(&root)?;
+        crate::compression::deflate::unpack_gzip(fs::File::open(&archive_path)?, &root)?;
         assert!(root.join(reported.strip_prefix("/")?).is_file());
         assert!(
             root.join(toolchain.strip_prefix("/")?)
@@ -362,6 +345,31 @@ mod toolchain_imp {
                 .is_dir(),
             "the compiler's lexical search directory must exist after extraction"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_gzip_toolchain_round_trips_multiple_blocks() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let artifact = temp.path().join("compiler.bin");
+        // Mix incompressible regions and repeated regions across block boundaries.
+        let mut state = 0x1234_5678_u32;
+        let mut data = Vec::with_capacity(2 * 1024 * 1024);
+        for _ in 0..(1024 * 1024) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            data.push(state.to_le_bytes()[0]);
+        }
+        data.extend_from_within(..);
+        fs::write(&artifact, &data)?;
+        let archive_path = temp.path().join("toolchain.tar.gz");
+        let mut builder = ToolchainPackageBuilder::new();
+        builder.add_file(artifact.clone())?;
+        builder.into_compressed_tar(fs::File::create(&archive_path)?)?;
+        let root = temp.path().join("unpacked");
+        crate::compression::deflate::unpack_gzip(fs::File::open(&archive_path)?, &root)?;
+        assert_eq!(fs::read(root.join(artifact.strip_prefix("/")?))?, data);
         Ok(())
     }
 

@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cache::{Cache, CacheWrite, DecompressionFailure, FileObjectSource, Storage};
+use crate::cache::{
+    Cache, CacheWrite, DecompressionFailure, FileObjectSource, MaterializedOutput, Storage,
+};
 use crate::compiler::args::{
     ArgDisposition, ArgInfo, ArgToStringResult, ArgsIter, Argument, FromArg, IntoArg,
     NormalizedDisposition, PathTransformerFn,
@@ -50,6 +52,7 @@ use futures::TryFutureExt;
 use itertools::Itertools as _;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -454,8 +457,25 @@ pub type CompilerProxyFuture =
 pub type DistPackagers = (
     Box<dyn pkg::InputsPackager>,
     Box<dyn pkg::ToolchainPackager>,
-    Box<dyn OutputsRewriter>,
 );
+
+struct CompilationOutcome {
+    cacheable: Cacheable,
+    dist_type: DistType,
+    output: process::Output,
+    remote_outputs: HashMap<PathBuf, MaterializedOutput>,
+}
+
+impl CompilationOutcome {
+    fn local(cacheable: Cacheable, dist_type: DistType, output: process::Output) -> Self {
+        Self {
+            cacheable,
+            dist_type,
+            output,
+            remote_outputs: HashMap::new(),
+        }
+    }
+}
 
 enum CacheLookupResult {
     Success(CompileResult, process::Output),
@@ -761,7 +781,12 @@ where
                         .await;
                 }
 
-                let (cacheable, dist_type, compiler_result) = dist_or_local_compile(
+                let CompilationOutcome {
+                    cacheable,
+                    dist_type,
+                    output: compiler_result,
+                    remote_outputs,
+                } = dist_or_local_compile(
                     service,
                     dist_client,
                     creator,
@@ -809,7 +834,7 @@ where
                     fmt_duration_as_secs(&duration_compilation)
                 );
                 let start_create_artifact = Instant::now();
-                let mut entry = CacheWrite::from_objects(outputs, &pool)
+                let mut entry = CacheWrite::from_objects(outputs, remote_outputs, &pool)
                     .await
                     .context("failed to zip up compiler outputs")?;
 
@@ -863,14 +888,14 @@ fn apply_selected_toolchain_override(
     toolchain_override: Option<dist::CustomToolchainOverride>,
     dist_command_uses_cargo: bool,
     automatic_dist_toolchain_is_ready: bool,
-) -> Result<Option<PathBuf>> {
+) -> Result<()> {
     let Some(toolchain_override) = toolchain_override else {
         if dist_command_uses_cargo && !automatic_dist_toolchain_is_ready {
             bail!(
                 "automatic distributed Rust toolchain does not contain Cargo required by this compile"
             )
         }
-        return Ok(None);
+        return Ok(());
     };
 
     command.executable = toolchain_override.compiler_executable;
@@ -887,7 +912,7 @@ fn apply_selected_toolchain_override(
         };
         *cargo = archive_cargo;
     }
-    Ok(Some(toolchain_override.archive))
+    Ok(())
 }
 
 #[cfg(not(feature = "dist-client"))]
@@ -899,7 +924,7 @@ async fn dist_or_local_compile<T>(
     compilation: Box<dyn Compilation<T>>,
     _weak_toolchain_key: String,
     out_pretty: String,
-) -> Result<(Cacheable, DistType, process::Output)>
+) -> Result<CompilationOutcome>
 where
     T: CommandCreatorSync,
 {
@@ -912,7 +937,7 @@ where
     compile_cmd
         .execute(service, &creator)
         .await
-        .map(move |o| (cacheable, DistType::NoDist, o))
+        .map(move |o| CompilationOutcome::local(cacheable, DistType::NoDist, o))
 }
 
 #[cfg(feature = "dist-client")]
@@ -928,7 +953,7 @@ async fn dist_or_local_compile<T>(
     compilation: Box<dyn Compilation<T>>,
     weak_toolchain_key: String,
     out_pretty: String,
-) -> Result<(Cacheable, DistType, process::Output)>
+) -> Result<CompilationOutcome>
 where
     T: CommandCreatorSync,
 {
@@ -947,7 +972,7 @@ where
         return compile_cmd
             .execute(service, &creator)
             .await
-            .map(move |o| (cacheable, DistType::NoDist, o));
+            .map(move |o| CompilationOutcome::local(cacheable, DistType::NoDist, o));
     };
 
     debug!("[{out_pretty}]: Attempting distributed compilation");
@@ -960,14 +985,29 @@ where
         let mut dist_compile_cmd =
             dist_compile_cmd.context("Could not create distributed compile command")?;
         debug!("[{out_pretty}]: Creating distributed compile request");
-        let dist_output_paths = compilation
-            .outputs()
-            .map(|output| path_transformer.as_dist_abs(&cwd.join(output.path)))
-            .collect::<Option<_>>()
-            .context("Failed to adapt an output path for distributed compile")?;
+        // Preserve the exact local output paths before packaging consumes the
+        // transformer. Duplicate requests for the same file need only one frame.
+        let mut requested_outputs = HashMap::new();
+        let mut dist_output_paths = Vec::new();
+        for output in compilation.outputs() {
+            let local = cwd.join(output.path);
+            let remote = path_transformer
+                .as_dist_abs(&local)
+                .context("Failed to adapt an output path for distributed compile")?;
+            match requested_outputs.entry(remote.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(local);
+                    dist_output_paths.push(remote);
+                }
+                std::collections::hash_map::Entry::Occupied(entry) if entry.get() == &local => {}
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    bail!("multiple local outputs map to distributed path {remote}");
+                }
+            }
+        }
         let dist_command_uses_cargo = compilation.dist_command_uses_cargo();
         let automatic_dist_toolchain_is_ready = compilation.automatic_dist_toolchain_is_ready();
-        let (inputs_packager, toolchain_packager, outputs_rewriter) =
+        let (inputs_packager, toolchain_packager) =
             compilation.into_dist_packagers(path_transformer)?;
 
         debug!(
@@ -977,7 +1017,7 @@ where
         let (dist_toolchain, maybe_toolchain_override) = dist_client
             .put_toolchain(local_executable, weak_toolchain_key, toolchain_packager)
             .await?;
-        let tc_archive = apply_selected_toolchain_override(
+        apply_selected_toolchain_override(
             &mut dist_compile_cmd,
             maybe_toolchain_override,
             dist_command_uses_cargo,
@@ -1023,7 +1063,7 @@ where
         let server_id = job_alloc.server_id;
         let worker_label = dist_client.worker_label(server_id).await;
         debug!("[{out_pretty}]: Running job on {worker_label}");
-        let ((job_id, server_id), (job_result, path_transformer)) = dist_client
+        let job_result = dist_client
             .do_run_job(
                 job_alloc,
                 dist_compile_cmd,
@@ -1031,7 +1071,6 @@ where
                 inputs_packager,
             )
             .await
-            .map(move |res| ((job_id, server_id), res))
             .with_context(|| {
                 format!("could not run distributed compilation job on {server_id:?}")
             })?;
@@ -1048,6 +1087,7 @@ where
                 .collect::<Vec<_>>()
         );
         let mut output_paths: Vec<PathBuf> = vec![];
+        let mut remote_outputs = HashMap::new();
         macro_rules! try_or_cleanup {
             ($v:expr) => {{
                 match $v {
@@ -1069,12 +1109,9 @@ where
         }
 
         for (path, output_data) in jc.outputs {
-            let len = output_data.lens().actual;
-            let local_path = try_or_cleanup!(
-                path_transformer
-                    .to_local(&path)
-                    .with_context(|| format!("unable to transform output path {path}"))
-            );
+            let local_path = try_or_cleanup!(requested_outputs.remove(&path).with_context(
+                || format!("worker returned an unrequested or duplicate output path {path}")
+            ));
             output_paths.push(local_path);
             // Do this first so cleanup works correctly.
             let local_path = try_or_cleanup!(
@@ -1088,26 +1125,15 @@ where
                     "Failed to create output file {}",
                     local_path.display()
                 )));
-            let count = try_or_cleanup!(
-                io::copy(&mut output_data.into_reader(), &mut file)
+            let verified = try_or_cleanup!(
+                output_data
+                    .materialize(&mut file)
                     .with_context(|| format!("Failed to write output to {}", local_path.display()))
             );
-
-            try_or_cleanup!(if count == len {
-                Ok(())
-            } else {
-                Err(anyhow!(
-                    "distributed output length mismatch for {}: expected {len} bytes, wrote {count}",
-                    local_path.display()
-                ))
-            });
+            if let Ok(output) = MaterializedOutput::new(verified, &file) {
+                remote_outputs.insert(local_path.clone(), output);
+            }
         }
-        let extra_inputs = tc_archive.map_or_else(std::vec::Vec::new, |p| vec![p]);
-        try_or_cleanup!(
-            outputs_rewriter
-                .handle_outputs(&path_transformer, &output_paths, &extra_inputs)
-                .with_context(|| "failed to rewrite outputs from compile")
-        );
 
         if jc.output.code != 0 {
             // Add server info to help diagnose host-specific failures, e.g. due to flaky hardware.
@@ -1123,7 +1149,12 @@ where
                 .splice(0..0, server_info.as_bytes().to_vec());
         }
 
-        Ok((DistType::Ok(worker_label), jc.output.into()))
+        Ok(CompilationOutcome {
+            cacheable,
+            dist_type: DistType::Ok(worker_label),
+            output: jc.output.into(),
+            remote_outputs,
+        })
     };
 
     do_dist_compile
@@ -1147,10 +1178,9 @@ where
                 compile_cmd
                     .execute(service, &creator)
                     .await
-                    .map(|o| (DistType::Error, o))
+                    .map(|o| CompilationOutcome::local(cacheable, DistType::Error, o))
             }
         })
-        .map_ok(move |(dt, o)| (cacheable, dt, o))
         .await
 }
 
@@ -1201,31 +1231,6 @@ where
     /// Each item is a descriptive (and unique) name of the output paired with
     /// the path where it'll show up.
     fn outputs<'a>(&'a self) -> Box<dyn Iterator<Item = FileObjectSource> + 'a>;
-}
-
-#[cfg(feature = "dist-client")]
-pub trait OutputsRewriter: Send {
-    /// Perform any post-compilation handling of outputs, given a Vec of the `dist_path` and `local_path`
-    fn handle_outputs(
-        self: Box<Self>,
-        path_transformer: &dist::PathTransformer,
-        output_paths: &[PathBuf],
-        extra_inputs: &[PathBuf],
-    ) -> Result<()>;
-}
-
-#[cfg(feature = "dist-client")]
-pub struct NoopOutputsRewriter;
-#[cfg(feature = "dist-client")]
-impl OutputsRewriter for NoopOutputsRewriter {
-    fn handle_outputs(
-        self: Box<Self>,
-        _path_transformer: &dist::PathTransformer,
-        _output_paths: &[PathBuf],
-        _extra_inputs: &[PathBuf],
-    ) -> Result<()> {
-        Ok(())
-    }
 }
 
 /// Result of generating a hash from a compiler command.
@@ -3824,7 +3829,7 @@ mod custom_toolchain_override_tests {
     #[test]
     fn custom_toolchain_rewrites_compiler_and_cargo() -> Result<()> {
         let mut command = command(vec![("CARGO".to_owned(), "/automatic/cargo".to_owned())]);
-        let archive = apply_selected_toolchain_override(
+        apply_selected_toolchain_override(
             &mut command,
             Some(CustomToolchainOverride {
                 compiler_executable: "/custom/rustc".to_owned(),
@@ -3840,7 +3845,6 @@ mod custom_toolchain_override_tests {
             command.env_vars,
             vec![("CARGO".to_owned(), "/custom/cargo".to_owned())]
         );
-        assert_eq!(archive, Some(PathBuf::from("/custom/toolchain.tar.gz")));
         Ok(())
     }
 
@@ -3870,7 +3874,7 @@ mod custom_toolchain_override_tests {
     #[test]
     fn custom_rust_toolchain_can_supply_cargo_when_automatic_one_cannot() -> Result<()> {
         let mut command = command(vec![("CARGO".to_owned(), "/host/cargo".to_owned())]);
-        let archive = apply_selected_toolchain_override(
+        apply_selected_toolchain_override(
             &mut command,
             Some(CustomToolchainOverride {
                 compiler_executable: "/custom/rustc".to_owned(),
@@ -3885,14 +3889,13 @@ mod custom_toolchain_override_tests {
             command.env_vars,
             vec![("CARGO".to_owned(), "/custom/cargo".to_owned())]
         );
-        assert_eq!(archive, Some(PathBuf::from("/custom/toolchain.tar.gz")));
         Ok(())
     }
 
     #[test]
     fn non_rust_custom_toolchain_ignores_incidental_cargo_env() -> Result<()> {
         let mut command = command(vec![("CARGO".to_owned(), "/host/cargo".to_owned())]);
-        let archive = apply_selected_toolchain_override(
+        apply_selected_toolchain_override(
             &mut command,
             Some(CustomToolchainOverride {
                 compiler_executable: "/custom/clang".to_owned(),
@@ -3907,7 +3910,6 @@ mod custom_toolchain_override_tests {
             command.env_vars,
             vec![("CARGO".to_owned(), "/host/cargo".to_owned())]
         );
-        assert_eq!(archive, Some(PathBuf::from("/custom/toolchain.tar.gz")));
         Ok(())
     }
 }
@@ -3915,11 +3917,11 @@ mod custom_toolchain_override_tests {
 #[cfg(test)]
 #[cfg(feature = "dist-client")]
 mod test_dist {
+    use crate::compression::ZstdFrame;
     use crate::dist::pkg;
     use crate::dist::{
-        self, AllocJobResult, CompileCommand, JobAlloc, JobComplete, JobId, OutputData,
-        PathTransformer, ProcessOutput, RunJobResult, SchedulerStatusResult, ServerId,
-        SubmitToolchainResult, Toolchain,
+        self, AllocJobResult, CompileCommand, JobAlloc, JobComplete, JobId, ProcessOutput,
+        RunJobResult, SchedulerStatusResult, ServerId, SubmitToolchainResult, Toolchain,
     };
     use async_trait::async_trait;
     use std::path::{Path, PathBuf};
@@ -3960,7 +3962,7 @@ mod test_dist {
             _: CompileCommand,
             _: Vec<String>,
             _: Box<dyn pkg::InputsPackager>,
-        ) -> Result<(RunJobResult, PathTransformer)> {
+        ) -> Result<RunJobResult> {
             return Err(anyhow!("unexpected mock client call"));
         }
         async fn put_toolchain(
@@ -4011,7 +4013,7 @@ mod test_dist {
             _: CompileCommand,
             _: Vec<String>,
             _: Box<dyn pkg::InputsPackager>,
-        ) -> Result<(RunJobResult, PathTransformer)> {
+        ) -> Result<RunJobResult> {
             return Err(anyhow!("unexpected mock client call"));
         }
         async fn put_toolchain(
@@ -4079,7 +4081,7 @@ mod test_dist {
             _: CompileCommand,
             _: Vec<String>,
             _: Box<dyn pkg::InputsPackager>,
-        ) -> Result<(RunJobResult, PathTransformer)> {
+        ) -> Result<RunJobResult> {
             return Err(anyhow!("fn do_run_job is not used for this test. qed"));
         }
         async fn put_toolchain(
@@ -4147,7 +4149,7 @@ mod test_dist {
             command: CompileCommand,
             _: Vec<String>,
             _: Box<dyn pkg::InputsPackager>,
-        ) -> Result<(RunJobResult, PathTransformer)> {
+        ) -> Result<RunJobResult> {
             assert_eq!(job_alloc.job_id, JobId(0));
             assert_eq!(command.executable, "/overridden/compiler");
             Err(anyhow!("MOCK: run job failure"))
@@ -4236,17 +4238,20 @@ mod test_dist {
             command: CompileCommand,
             outputs: Vec<String>,
             inputs_packager: Box<dyn pkg::InputsPackager>,
-        ) -> Result<(RunJobResult, PathTransformer)> {
+        ) -> Result<RunJobResult> {
             assert_eq!(job_alloc.job_id, JobId(0));
             assert_eq!(command.executable, "/overridden/compiler");
 
             let mut inputs = vec![];
-            let path_transformer = inputs_packager.write_inputs(&mut inputs)?;
+            inputs_packager.write_inputs(&mut inputs)?;
             let outputs = outputs
                 .into_iter()
                 .map(|name| -> Result<_> {
                     let data = format!("some data in {name}");
-                    let data = OutputData::try_from_reader(data.as_bytes())?;
+                    let data = ZstdFrame::try_from_reader(
+                        data.as_bytes(),
+                        crate::compression::cache_level(),
+                    )?;
                     Ok((name, data))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -4254,7 +4259,7 @@ mod test_dist {
                 output: self.output.clone(),
                 outputs,
             });
-            Ok((result, path_transformer))
+            Ok(result)
         }
         async fn worker_label(&self, _server_id: ServerId) -> String {
             self.worker_label.clone()

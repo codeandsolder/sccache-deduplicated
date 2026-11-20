@@ -56,12 +56,8 @@ directories = "6.0"
 encoding_rs = "0.8"
 env_logger = "0.11"
 filetime = "0.2"
-flate2 = { version = "1.0", optional = true, default-features = false, features = [
-  "rust_backend",
-] }
 fs-err = "3"
 futures = "0.3"
-gzp = { version = "2", default-features = false, features = ["deflate_rust"] }
 hostname = { version = "0.4", optional = true }
 http = "1.0"
 http-body-util = { version = "0.1", optional = true }
@@ -124,6 +120,7 @@ walkdir = "2"
 which = { version = "8", default-features = false, features = ["real-sys"] }
 zip = { version = "9", default-features = false }
 zstd = "0.14"
+zlib-rs-fast = { package = "zlib-rs", git = "https://github.com/codeandsolder/zlib-rs-fast", rev = "3f36dcd214ae6ac765210d1c46ec786b68fbcf15", optional = true, default-features = false, features = ["std"] }
 
 # dist-server only
 nix = { version = "0.31.0", optional = true, features = [
@@ -239,7 +236,8 @@ vendored-openssl = ["openssl?/vendored", "reqwest?/native-tls-vendored"]
 unstable = []
 # Enables distributed support in the sccache client
 dist-client = [
-  "flate2",
+  "zlib-rs-fast",
+  "zlib-rs-fast/parallel",
   "hyper",
   "http-body-util",
   "hyper-util",
@@ -251,7 +249,7 @@ dist-client = [
 # Enables the sccache-dist binary
 dist-server = [
   "jwt",
-  "flate2",
+  "zlib-rs-fast",
   "libmount",
   "nix",
   "openssl",

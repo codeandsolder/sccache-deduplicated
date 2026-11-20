@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::compiler;
+use crate::compression::ZstdFrame;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -787,46 +788,12 @@ fn test_distributed_process_output_preserves_exit_codes() {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+/// Requested output paths and the receiving client's cache compression level.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OutputData(Vec<u8>, u64);
-impl OutputData {
-    /// Compress output data read from `r`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error if reading or compression fails.
-    #[cfg(any(feature = "dist-server", all(feature = "dist-client", test)))]
-    pub fn try_from_reader<R: Read>(r: R) -> io::Result<Self> {
-        use flate2::Compression;
-        use flate2::read::ZlibEncoder as ZlibReadEncoder;
-        let mut compressor = ZlibReadEncoder::new(r, Compression::fast());
-        let mut res = vec![];
-        io::copy(&mut compressor, &mut res)?;
-        Ok(Self(res, compressor.total_in()))
-    }
-    #[must_use]
-    pub const fn lens(&self) -> OutputDataLens {
-        OutputDataLens {
-            actual: self.1,
-            compressed: self.0.len() as u64,
-        }
-    }
-    #[cfg(feature = "dist-client")]
-    #[must_use]
-    pub fn into_reader(self) -> impl Read {
-        use flate2::read::ZlibDecoder as ZlibReadDecoder;
-        ZlibReadDecoder::new(io::Cursor::new(self.0))
-    }
-}
-pub struct OutputDataLens {
-    pub actual: u64,
-    pub compressed: u64,
-}
-impl fmt::Display for OutputDataLens {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Size: {}->{}", self.actual, self.compressed)
-    }
+pub struct OutputRequest {
+    pub paths: Vec<String>,
+    pub compression_level: i32,
 }
 
 // TODO: standardise on compressed or not for inputs and toolchain
@@ -894,7 +861,7 @@ pub enum RunJobResult {
 #[serde(deny_unknown_fields)]
 pub struct JobComplete {
     pub output: ProcessOutput,
-    pub outputs: Vec<(String, OutputData)>,
+    pub outputs: Vec<(String, ZstdFrame)>,
 }
 
 // Status
@@ -923,7 +890,7 @@ pub enum SubmitToolchainResult {
 
 pub struct BuildResult {
     pub output: ProcessOutput,
-    pub outputs: Vec<(String, OutputData)>,
+    pub outputs: Vec<(String, ZstdFrame)>,
 }
 
 ///////////////////
@@ -947,7 +914,9 @@ impl Read for ToolchainReader<'_> {
     }
 }
 
+#[cfg(feature = "dist-server")]
 pub struct InputsReader<'a>(Box<dyn Read + Send + 'a>);
+#[cfg(feature = "dist-server")]
 impl<'a> InputsReader<'a> {
     /// Wrap a reader for a distributed compilation's input stream.
     #[must_use]
@@ -955,9 +924,27 @@ impl<'a> InputsReader<'a> {
         Self(reader)
     }
 }
-impl Read for InputsReader<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
+#[cfg(feature = "dist-server")]
+impl<'a> InputsReader<'a> {
+    /// Create the decoder on the thread consuming the transport stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the codec cannot be initialized.
+    pub fn into_decoded(self) -> io::Result<impl Read + 'a> {
+        crate::compression::deflate::InflateReader::zlib(self.0)
+    }
+
+    /// Extract input files, including validation of the compressed stream trailer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if decoding or extraction fails.
+    pub fn unpack(self, path: &Path) -> io::Result<()> {
+        let mut archive = tar::Archive::new(self.into_decoded()?);
+        archive.unpack(path)?;
+        io::copy(&mut archive.into_inner(), &mut io::sink())?;
+        Ok(())
     }
 }
 
@@ -1059,7 +1046,7 @@ pub trait ServerIncoming: Send + Sync {
         requester: &dyn ServerOutgoing,
         job_id: JobId,
         command: CompileCommand,
-        outputs: Vec<String>,
+        outputs: OutputRequest,
         inputs_rdr: InputsReader<'_>,
     ) -> ExtResult<RunJobResult, Error>;
 }
@@ -1071,7 +1058,7 @@ pub trait BuilderIncoming: Send + Sync {
         &self,
         toolchain: Toolchain,
         command: CompileCommand,
-        outputs: Vec<String>,
+        outputs: OutputRequest,
         inputs_rdr: InputsReader<'_>,
         cache: &Mutex<TcCache>,
     ) -> ExtResult<BuildResult, Error>;
@@ -1097,7 +1084,7 @@ pub trait Client: Send + Sync {
         command: CompileCommand,
         outputs: Vec<String>,
         inputs_packager: Box<dyn pkg::InputsPackager>,
-    ) -> Result<(RunJobResult, PathTransformer)>;
+    ) -> Result<RunJobResult>;
     async fn worker_label(&self, server_id: ServerId) -> String {
         server_id.addr().to_string()
     }

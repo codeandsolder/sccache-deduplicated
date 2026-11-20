@@ -15,6 +15,8 @@
 use crate::cache::FileObjectSource;
 #[cfg(target_os = "linux")]
 use crate::compiler::CompileCommandImpl;
+#[cfg(feature = "dist-client")]
+use crate::compiler::DistPackagers;
 use crate::compiler::args::{
     ArgDisposition, ArgInfo, ArgParseError, ArgParseResult, ArgToStringResult, ArgsIter, Argument,
     FromArg, IntoArg, NormalizedDisposition, PathTransformerFn, split_os_string_arg,
@@ -25,8 +27,6 @@ use crate::compiler::{
     CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, GenerateHashKeyContext,
     HashResult, Language, SingleCompileCommand, c::ArtifactDescriptor,
 };
-#[cfg(feature = "dist-client")]
-use crate::compiler::{DistPackagers, NoopOutputsRewriter};
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
 #[cfg(feature = "dist-client")]
@@ -3530,9 +3530,8 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             host: Some(host),
             target: Some(target),
         });
-        let outputs_rewriter = Box::new(NoopOutputsRewriter);
 
-        Ok((inputs_packager, toolchain_packager, outputs_rewriter))
+        Ok((inputs_packager, toolchain_packager))
     }
 
     fn outputs<'a>(&'a self) -> Box<dyn Iterator<Item = FileObjectSource> + 'a> {
@@ -3877,7 +3876,7 @@ impl pkg::InputsPackager for RustInputsPackager {
         clippy::too_many_lines,
         reason = "toolchain input packaging is an ordered archive manifest; keeping path transforms beside emitted entries makes the archive contract auditable"
     )]
-    fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<dist::PathTransformer> {
+    fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<()> {
         debug!("Packaging compile inputs for compile");
         let Self {
             crate_link_paths,
@@ -4075,8 +4074,8 @@ impl pkg::InputsPackager for RustInputsPackager {
         }
 
         // Finish archive
-        let _ = builder.into_inner()?;
-        Ok(path_transformer)
+        builder.into_inner()?;
+        Ok(())
     }
 }
 
@@ -4211,7 +4210,7 @@ fn test_dist_toolchain_archive_contains_only_required_installed_targets() -> Res
     };
     pkg::ToolchainPackager::write_pkg(Box::new(packager), writer)?;
     let reader = fs::File::open(archive_path)?;
-    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(reader));
+    let mut archive = tar::Archive::new(crate::compression::deflate::InflateReader::gzip(reader)?);
     let paths = archive
         .entries()?
         .map(|entry| -> Result<PathBuf> { Ok(entry?.path()?.into_owned()) })
@@ -5613,27 +5612,27 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
     #[cfg(feature = "dist-client")]
     #[test]
     fn test_rlib_dep_reader_call() {
-        let mut env_vars = vec![];
-        if let Some(rustup_home) = std::env::var_os("RUSTUP_HOME") {
-            env_vars.push(("RUSTUP_HOME".into(), rustup_home));
-        }
-
-        // Try to find rustc via which first, then check CARGO_HOME.
-        // This handles both standard development setups (rustc in PATH)
-        // and CI environments (rustc only in CARGO_HOME/bin).
-        let rustc_path = if let Ok(path) = which::which("rustc") {
-            path
-        } else if let Ok(cargo_home) = std::env::var("CARGO_HOME") {
-            PathBuf::from(cargo_home).join("bin").join("rustc")
-        } else {
-            panic!("rustc not found in PATH or CARGO_HOME")
-        };
+        // Use the compiler Cargo/CI selected, not a rustup proxy that could
+        // install a different toolchain while this test is executing.
+        let rustc_path = std::env::var_os("RUSTC")
+            .or_else(|| option_env!("RUSTC").map(OsString::from))
+            .map(PathBuf::from)
+            .or_else(|| which::which("rustc").ok())
+            .expect("rustc not found");
+        let mut env_vars: Vec<_> = [
+            "RUSTUP_HOME",
+            "RUSTUP_TOOLCHAIN",
+            "HOME",
+            "USERPROFILE",
+            "PATH",
+        ]
+        .into_iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (name.into(), value)))
+        .collect();
+        env_vars.push(("RUSTUP_AUTO_INSTALL".into(), "0".into()));
 
         let rlib_dep_reader = RlibDepReader::new_with_check(rustc_path, &env_vars);
-        let is_ok = rlib_dep_reader.is_ok();
-        // Unwrap so the error is reported in the test output
-        let _ = rlib_dep_reader.unwrap();
-        assert!(is_ok);
+        rlib_dep_reader.expect("selected rustc must support rlib dependency reading");
     }
 
     #[cfg(feature = "dist-client")]

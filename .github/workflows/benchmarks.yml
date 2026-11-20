@@ -30,12 +30,12 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
-          toolchain: "1.100.0"
+          toolchain: "nightly-2026-11-20"
 
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
         with:
-          rust-toolchain: "1.99.1"
+          rust-toolchain: "nightly-2026-11-20"
 
       - name: Install cargo-codspeed
         shell: bash

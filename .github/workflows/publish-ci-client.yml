@@ -90,16 +90,6 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "source SHA: $sha"
 
-      - name: Install Rust 1.99.0
-        shell: bash
-        run: |
-          set -euo pipefail
-          rustup toolchain install 1.99.0 --profile minimal
-      - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
-        with:
-          rust-toolchain: "1.99.0"
-
       - name: Read release protocol and rollout epoch
         id: protocol
         shell: bash
@@ -114,12 +104,24 @@ jobs:
           echo "dist_protocol=$dist_protocol" >> "$GITHUB_OUTPUT"
           echo "rollout_epoch=$rollout_epoch" >> "$GITHUB_OUTPUT"
           echo "glibc_abi_max=$glibc_abi_max" >> "$GITHUB_OUTPUT"
+          [[ "$rust_toolchain" =~ ^nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
+          echo "rust_toolchain=$rust_toolchain" >> "$GITHUB_OUTPUT"
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install ${{ steps.protocol.outputs.rust_toolchain }} --profile minimal
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@44b5080c6771a2b91fdda295e1d43886b53a4af5 # main
+        with:
+          rust-toolchain: "${{ steps.protocol.outputs.rust_toolchain }}"
 
       - name: Build CI client + dist worker
         shell: bash
         run: |
           set -euo pipefail
-          cargo +1.99.0 build --release --locked \
+          cargo +${{ steps.protocol.outputs.rust_toolchain }} build --release --locked \
             --no-default-features \
             --features s3,gha,dist-client,dist-server,direct-metrics,vendored-openssl \
             --bin sccache --bin sccache-dist
@@ -129,7 +131,7 @@ jobs:
           sha256sum dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2 > dist/SHA256SUMS
           {
             echo "source_sha=${{ steps.rev.outputs.sha }}"
-            echo "rust_toolchain=1.99.0"
+            echo "rust_toolchain=${{ steps.protocol.outputs.rust_toolchain }}"
             echo "rustflags=-C target-cpu=x86-64-v2"
             echo "features=s3,gha,dist-client,dist-server,direct-metrics,vendored-openssl"
             echo "dist_protocol=${{ steps.protocol.outputs.dist_protocol }}"

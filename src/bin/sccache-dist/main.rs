@@ -8,10 +8,10 @@ use sccache::config::{
 };
 use sccache::dist::{
     self, AllocJobResult, AssignJobResult, BuilderIncoming, CompileCommand, HeartbeatServerResult,
-    InputsReader, JobAlloc, JobAuthorizer, JobComplete, JobId, JobState, RunJobResult,
-    SchedulerIncoming, SchedulerOutgoing, SchedulerStatusResult, ServerId, ServerIncoming,
-    ServerNonce, ServerOutgoing, StagedToolchainArchive, SubmitToolchainResult, TcCache, Toolchain,
-    ToolchainReader, UpdateJobStateResult,
+    InputsReader, JobAlloc, JobAuthorizer, JobComplete, JobId, JobState, OutputRequest,
+    RunJobResult, SchedulerIncoming, SchedulerOutgoing, SchedulerStatusResult, ServerId,
+    ServerIncoming, ServerNonce, ServerOutgoing, StagedToolchainArchive, SubmitToolchainResult,
+    TcCache, Toolchain, ToolchainReader, UpdateJobStateResult,
 };
 use sccache::util::BASE64_URL_SAFE_ENGINE;
 use sccache::util::daemonize;
@@ -1207,7 +1207,7 @@ impl ServerIncoming for Server {
         requester: &dyn ServerOutgoing,
         job_id: JobId,
         command: CompileCommand,
-        outputs: Vec<String>,
+        outputs: OutputRequest,
         inputs_rdr: InputsReader,
     ) -> Result<RunJobResult> {
         // Claim the local job before sending any scheduler transition. A
@@ -2106,7 +2106,7 @@ mod server_upload_tests {
             &self,
             _toolchain: Toolchain,
             _command: CompileCommand,
-            _outputs: Vec<String>,
+            _outputs: OutputRequest,
             _inputs_rdr: InputsReader<'_>,
             _cache: &Mutex<TcCache>,
         ) -> Result<sccache::dist::BuildResult> {
@@ -2239,7 +2239,10 @@ mod server_upload_tests {
                 env_vars: Vec::new(),
                 cwd: "/tmp".to_owned(),
             },
-            Vec::new(),
+            OutputRequest {
+                paths: Vec::new(),
+                compression_level: 3,
+            },
             InputsReader::new(Box::new(Cursor::new(Vec::new()))),
         )?;
         assert!(matches!(result, RunJobResult::JobNotFound));
@@ -2273,7 +2276,10 @@ mod server_upload_tests {
                 env_vars: Vec::new(),
                 cwd: "/tmp".to_owned(),
             },
-            Vec::new(),
+            OutputRequest {
+                paths: Vec::new(),
+                compression_level: 3,
+            },
             InputsReader::new(Box::new(Cursor::new(Vec::new()))),
         );
         assert!(failed.is_err());

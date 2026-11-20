@@ -14,15 +14,16 @@
 
 use super::command_helpers::CommandExt;
 use anyhow::{Context, Error, Result, anyhow, bail};
-use flate2::read::GzDecoder;
 use fs_err as fs;
 use libmount::Overlay;
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, OpenHow, ResolveFlag, openat2};
 use nix::sys::stat::{Mode, mkdirat};
+use sccache::compression::ZstdFrame;
+use sccache::compression::deflate::unpack_gzip;
 use sccache::dist::{
-    BuildResult, BuilderIncoming, CompileCommand, InputsReader, OutputData, ProcessOutput, TcCache,
-    Toolchain,
+    BuildResult, BuilderIncoming, CompileCommand, InputsReader, OutputRequest, ProcessOutput,
+    TcCache, Toolchain,
 };
 use sccache::lru_disk_cache::Error as LruError;
 use std::collections::{HashMap, hash_map};
@@ -283,9 +284,7 @@ impl OverlayBuilder {
                 // toolchain is missing: the next request must be able to retry.
                 trace!("Creating toolchain directory for {}", tc.archive_id);
                 fs::create_dir(&toolchain_dir)?;
-                if let Err(error) =
-                    tar::Archive::new(GzDecoder::new(toolchain_rdr)).unpack(&toolchain_dir)
-                {
+                if let Err(error) = unpack_gzip(toolchain_rdr, &toolchain_dir) {
                     warn!("Failed to unpack toolchain: {error:?}");
                     if let Err(cleanup_error) = fs::remove_dir_all(&toolchain_dir) {
                         warn!(
@@ -331,9 +330,13 @@ impl OverlayBuilder {
         bubblewrap: &Path,
         compile_command: CompileCommand,
         inputs_rdr: InputsReader,
-        output_paths: Vec<String>,
+        outputs: OutputRequest,
         overlay: &OverlaySpec,
     ) -> Result<BuildResult> {
+        let OutputRequest {
+            paths: output_paths,
+            compression_level,
+        } = outputs;
         trace!("Compile environment: {:?}", compile_command.env_vars);
         trace!(
             "Compile command: {:?} {:?}",
@@ -384,7 +387,7 @@ impl OverlayBuilder {
                     trace!("copying in inputs");
                     // Note that we don't unpack directly into the upperdir since there overlayfs has some
                     // special marker files that we don't want to create by accident (or malicious intent)
-                    tar::Archive::new(inputs_rdr)
+                    inputs_rdr
                         .unpack(&target_dir)
                         .context("Failed to unpack inputs to overlay")?;
 
@@ -469,7 +472,7 @@ impl OverlayBuilder {
                         // as bubblewrap, never against the host filesystem.
                         match build_fs.open_output(&cwd.join(&path)) {
                             Ok(file) => {
-                                let output = OutputData::try_from_reader(file)
+                                let output = ZstdFrame::try_from_reader(file, compression_level)
                                     .context("Failed to read output file")?;
                                 outputs.push((path, output))
                             }
@@ -523,7 +526,7 @@ impl BuilderIncoming for OverlayBuilder {
         &self,
         tc: Toolchain,
         command: CompileCommand,
-        outputs: Vec<String>,
+        outputs: OutputRequest,
         inputs_rdr: InputsReader,
         tccache: &Mutex<TcCache>,
     ) -> Result<BuildResult> {
@@ -840,10 +843,14 @@ impl DockerBuilder {
 
     fn perform_build(
         compile_command: CompileCommand,
-        mut inputs_rdr: InputsReader,
-        output_paths: Vec<String>,
+        inputs_rdr: InputsReader,
+        outputs: OutputRequest,
         cid: &str,
     ) -> Result<BuildResult> {
+        let OutputRequest {
+            paths: output_paths,
+            compression_level,
+        } = outputs;
         trace!("Compile environment: {:?}", compile_command.env_vars);
         trace!(
             "Compile command: {:?} {:?}",
@@ -851,6 +858,7 @@ impl DockerBuilder {
         );
 
         trace!("copying in inputs");
+        let mut inputs_rdr = inputs_rdr.into_decoded()?;
         Command::new("docker")
             .args(["cp", "-", &format!("{}:/", cid)])
             .check_piped(&mut |stdin| {
@@ -920,8 +928,8 @@ impl DockerBuilder {
                 .output()
                 .context("Failed to start command to retrieve output file")?;
             if output.status.success() {
-                let output = OutputData::try_from_reader(&*output.stdout)
-                    .context("failed to decode compressed build output")?;
+                let output = ZstdFrame::try_from_reader(&*output.stdout, compression_level)
+                    .context("failed to compress build output")?;
                 outputs.push((path, output))
             } else {
                 debug!("Missing output path {:?}", path)
@@ -943,7 +951,7 @@ impl BuilderIncoming for DockerBuilder {
         &self,
         tc: Toolchain,
         command: CompileCommand,
-        outputs: Vec<String>,
+        outputs: OutputRequest,
         inputs_rdr: InputsReader,
         tccache: &Mutex<TcCache>,
     ) -> Result<BuildResult> {
