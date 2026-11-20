@@ -38,18 +38,6 @@
         ".github/workflows/ci.yml"
       ],
       "enabled": false
-    },
-    {
-      "description": "Cargo lockfile maintenance is age-gated by repository CI",
-      "matchManagers": [
-        "cargo"
-      ],
-      "matchUpdateTypes": [
-        "lockFileMaintenance"
-      ],
-      "minimumReleaseAge": null,
-      "automerge": true,
-      "automergeType": "pr"
     }
   ]
 }
