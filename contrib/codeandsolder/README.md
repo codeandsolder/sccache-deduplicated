@@ -29,3 +29,24 @@ The live paths are:
 ```
 
 Install atomically as root after validating these repository copies. Keep the prior live files as timestamped backups; binary rollouts are handled by the tracked `sccache-release-update`.
+
+## Host-native release policy
+
+The portable GitHub release is the source-revision and protocol authority.
+Run the checked-out revision's build-host-native as the normal managed
+build user, with the existing sccache wrappers (never as an unmanaged
+root Cargo invocation). This stages both binaries with native Rust and
+C/C++ code generation, the machine/CPU fingerprint and checksums.
+
+After verifying the build, an administrator copies its four regular files
+(sccache, sccache-dist, build.txt, SHA256SUMS) into a root-owned,
+non-group/world-writable directory /var/lib/sccache-native-bundles/<full source SHA>.
+Install host-native-metadata beside the managed sccache-release-update.
+Set SCCACHE_AUTOUPDATE_NATIVE_BUNDLE_ROOT=/var/lib/sccache-native-bundles
+in the updater service environment, and coordinate the protocol epoch separately.
+The updater waits for a matching native build rather than reverting to
+the portable binary. It checks the local checksum manifest, source SHA,
+protocol, toolchain, feature set, capabilities and machine/CPU identity
+against the published release before using its existing drain/rollback logic.
+Build provisioning is separate from the root updater: no automatic root
+compilation and no extra cache daemons.

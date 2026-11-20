@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Fingerprint stable machine/CPU identity, not clocks, load or CPU availability.
+fingerprint() {
+    [[ -s /etc/machine-id && -r /proc/cpuinfo ]]
+    {
+        sha256sum /etc/machine-id | cut -d ' ' -f1
+        uname -m
+        LC_ALL=C awk -F: '
+            $1 ~ /^(vendor_id|cpu family|model|model name|stepping|flags|Features|CPU implementer|CPU architecture|CPU variant|CPU part|CPU revision)[[:space:]]*$/ {
+                sub(/[[:space:]]+$/, "", $1)
+                sub(/^[[:space:]]+/, "", $2)
+                print $1 ":" $2
+            }' /proc/cpuinfo | LC_ALL=C sort -u
+    } | sha256sum | cut -d ' ' -f1
+}
+
+manifest_value() {
+    local manifest="$1" key="$2" value
+    value="$(sed -n "s/^$key=//p" "$manifest")"
+    [[ -n "$value" && "$value" != *$'\n'* ]] || {
+        echo "host-native-metadata: invalid or missing $key in $manifest" >&2
+        return 1
+    }
+    printf '%s\n' "$value"
+}
+
+# Every component must be trusted for a root service to execute local binaries.
+trusted_path() {
+    local path="$1" mode owner
+    [[ "$path" == /* && "$path" == "$(realpath -e -- "$path")" ]] || return 1
+    while :; do
+        [[ ! -L "$path" ]] || return 1
+        read -r owner mode < <(stat -c '%u %a' -- "$path")
+        [[ "$owner" == 0 && "$mode" =~ ^[0-7]+$ ]] || return 1
+        (( (8#$mode & 022) == 0 )) || return 1
+        [[ "$path" != / ]] || return 0
+        path="$(dirname -- "$path")"
+    done
+}
+
+verify() {
+    local directory="$1" published="$2" field native official file
+    for file in sccache sccache-dist build.txt SHA256SUMS; do
+        if ! [[ -f "$directory/$file" ]] || ! trusted_path "$directory/$file"; then
+            echo "host-native-metadata: untrusted bundle file $directory/$file" >&2
+            return 1
+        fi
+    done
+
+    # Only accept the exact immutable payloads emitted by the builder.
+    [[ "$(wc -l < "$directory/SHA256SUMS")" == 3 ]]
+    for file in sccache sccache-dist build.txt; do
+        [[ "$(rg -c "^[0-9a-f]{64}  $file\$" "$directory/SHA256SUMS")" == 1 ]]
+    done
+    (cd "$directory" && sha256sum --strict -c SHA256SUMS >&2)
+
+    [[ "$(manifest_value "$directory/build.txt" build_kind)" == host-native ]]
+    [[ "$(manifest_value "$directory/build.txt" rustflags)" == '-C target-cpu=native' ]]
+    [[ "$(manifest_value "$directory/build.txt" host_fingerprint)" == "$(fingerprint)" ]] || {
+        echo "host-native-metadata: bundle was built for a different machine/CPU" >&2
+        return 1
+    }
+    for field in source_sha rust_toolchain features dist_protocol rollout_epoch openssl_linkage capabilities; do
+        native="$(manifest_value "$directory/build.txt" "$field")"
+        official="$(manifest_value "$published" "$field")"
+        [[ "$native" == "$official" ]] || {
+            echo "host-native-metadata: $field differs from the published source release" >&2
+            return 1
+        }
+    done
+    [[ -x "$directory/sccache" && -x "$directory/sccache-dist" ]]
+}
+
+case "${1:-}" in
+    fingerprint) [[ $# == 1 ]]; fingerprint ;;
+    verify) [[ $# == 3 ]]; verify "$2" "$3" ;;
+    *) echo "usage: $0 fingerprint | verify ABSOLUTE_BUNDLE_DIRECTORY PUBLISHED_BUILD_TXT" >&2; exit 2 ;;
+esac
+
