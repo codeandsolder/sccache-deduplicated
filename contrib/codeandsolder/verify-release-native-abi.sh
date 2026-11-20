@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Enforce native DSO compatibility with all managed sccache workers.
-# A GLIBC symbol ceiling alone does not detect libssl.so.4 vs libssl.so.3.
+# Release OpenSSL is vendored/static, so no shared OpenSSL SONAME is permitted.
+# A GLIBC symbol ceiling alone does not detect OpenSSL runtime dependencies.
 set -euo pipefail
 
 if (($# == 0)); then
@@ -33,8 +34,7 @@ for binary in "$@"; do
         # machine. A new SONAME requires an explicit fleet compatibility review.
         case "$library" in
             libc.so.6|libm.so.6|libgcc_s.so.1|\
-            libpthread.so.0|libdl.so.2|librt.so.1|\
-            libssl.so.3|libcrypto.so.3)
+            libpthread.so.0|libdl.so.2|librt.so.1)
                 ;;
             *)
                 echo "::error::$binary requires unsupported fleet DSO $library" >&2
