@@ -120,7 +120,7 @@ walkdir = "2"
 which = { version = "8", default-features = false, features = ["real-sys"] }
 zip = { version = "9", default-features = false }
 zstd = "0.14"
-zlib-rs-fast = { package = "zlib-rs", git = "https://github.com/codeandsolder/zlib-rs-fast", rev = "3f36dcd214ae6ac765210d1c46ec786b68fbcf15", optional = true, default-features = false, features = ["std"] }
+zlib-rs-fast = { package = "zlib-rs", git = "https://github.com/codeandsolder/zlib-rs-fast", rev = "1d211992de007dc58b97ed56d3065b4c72ef640b", optional = true, default-features = false, features = ["std"] }
 
 # dist-server only
 nix = { version = "0.31.0", optional = true, features = [
