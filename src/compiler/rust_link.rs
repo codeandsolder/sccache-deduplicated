@@ -258,8 +258,9 @@ fn restore_root(archive: &Path, destination: &Path, budget: &mut Budget) -> Resu
         let entry = entry?;
         let kind = entry.header().entry_type();
         ensure!(
-            kind.is_file() || kind.is_dir() || kind.is_symlink(),
-            "invalid generated snapshot entry type"
+            kind.is_file() || kind.is_gnu_sparse() || kind.is_dir() || kind.is_symlink(),
+            "invalid generated snapshot entry type {kind:?} for {}",
+            entry.path()?.display()
         );
         ensure!(
             entry
@@ -268,6 +269,8 @@ fn restore_root(archive: &Path, destination: &Path, budget: &mut Budget) -> Resu
                 .all(|part| matches!(part, Component::Normal(_) | Component::CurDir)),
             "invalid generated snapshot path"
         );
+        // tar resolves GNU sparse and PAX size fields to the actual logical
+        // size, not the stored extent length. Charge the full restored size.
         budget.consume(entry.size())?;
     }
     file.seek(SeekFrom::Start(0))?;
@@ -357,7 +360,9 @@ impl LinkInvocation {
     }
 }
 
-/// A compiler-owned split-link invocation. Both stages retain the complete
+/// A compiler-owned split-link invocation.
+///
+/// Both stages retain the complete
 /// compiler option list, changing only the source operand and stage selector.
 /// The caller executes them in namespaces with identical logical paths.
 pub struct RustLinkStages {
@@ -396,7 +401,7 @@ impl RustLinkStages {
         arguments.extend([OsString::from("-Z"), OsString::from(stage)]);
         arguments.extend(self.arguments.iter().cloned());
         if let Some(path) = artifact {
-            arguments[self.input + 2] = path.as_os_str().to_owned();
+            path.as_os_str().clone_into(&mut arguments[self.input + 2]);
         }
         arguments
     }

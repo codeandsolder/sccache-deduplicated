@@ -477,7 +477,9 @@ fn native_split_link_covers_library_types_lto_and_post_link_debug_output() -> Re
         let archive = root.join("generated.tar");
         codegen.archive(&archive, LIMITS)?;
         let replay = PrivateOutputTree::new(&root)?;
-        replay.restore(&archive, LIMITS)?;
+        replay
+            .restore(&archive, LIMITS)
+            .with_context(|| format!("restore {flags:?}"))?;
         let mut command = Command::new(&rustc);
         command
             .current_dir(&src_mount)
@@ -503,5 +505,41 @@ fn native_split_link_covers_library_types_lto_and_post_link_debug_output() -> Re
         }
         assert_eq!(fs::read_dir(&out)?.count(), 0);
     }
+    Ok(())
+}
+
+#[test]
+fn generated_tree_round_trips_sparse_files_and_charges_logical_size() -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let tree = PrivateOutputTree::new(root)?;
+    let path = tree.generated_root().join("sparse.o");
+    let size = 8 * 1024 * 1024;
+    let mut file = fs::File::create(&path)?;
+    file.write_all(b"first")?;
+    file.seek(SeekFrom::Start(size - 4))?;
+    file.write_all(b"last")?;
+    let archive = root.join("sparse.tar");
+    tree.archive(&archive, LIMITS)?;
+    let restored = PrivateOutputTree::new(root)?;
+    restored.restore(&archive, LIMITS)?;
+    assert_eq!(
+        fs::read(restored.generated_root().join("sparse.o"))?,
+        fs::read(path)?
+    );
+    let too_small = PrivateOutputTree::new(root)?;
+    assert!(
+        too_small
+            .restore(
+                &archive,
+                CaptureLimits {
+                    bytes: size - 1,
+                    ..LIMITS
+                }
+            )
+            .is_err()
+    );
+    assert_eq!(fs::read_dir(too_small.generated_root())?.count(), 0);
     Ok(())
 }
