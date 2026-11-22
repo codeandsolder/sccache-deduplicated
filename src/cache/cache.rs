@@ -102,7 +102,7 @@ use std::time::Duration;
     feature = "oss",
     feature = "cos"
 ))]
-use crate::errors::bail;
+use crate::errors::{Context, bail};
 use crate::errors::{Result, anyhow};
 
 /// An interface to cache storage.
@@ -295,6 +295,31 @@ impl RemoteStorage {
     }
 }
 
+#[cfg(any(
+    feature = "azure",
+    feature = "gcs",
+    feature = "gha",
+    feature = "memcached",
+    feature = "redis",
+    feature = "s3",
+    feature = "webdav",
+    feature = "oss",
+    feature = "cos"
+))]
+fn decode_remote_cache_read(
+    result: opendal::Result<opendal::Buffer>,
+) -> Result<(Cache, Option<Bytes>)> {
+    match result {
+        Ok(res) => {
+            let data = res.to_bytes();
+            let hit = CacheRead::from(io::Cursor::new(data.clone()))?;
+            Ok((Cache::Hit(hit), Some(data)))
+        }
+        Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok((Cache::Miss, None)),
+        Err(e) => Err(e).context("failed to read remote cache entry"),
+    }
+}
+
 /// Implement storage for operator.
 #[cfg(any(
     feature = "azure",
@@ -315,22 +340,12 @@ impl Storage for RemoteStorage {
 
     async fn get_with_raw(&self, key: &str) -> Result<(Cache, Option<Bytes>)> {
         let path = normalize_key(key);
-        match self.operator.read(&path).await {
-            Ok(res) => {
-                let data = res.to_bytes();
-                #[cfg(feature = "s3")]
-                if let Some(manager) = &self.managed_capacity {
-                    manager.record_access(&path, data.len() as u64);
-                }
-                let hit = CacheRead::from(io::Cursor::new(data.clone()))?;
-                Ok((Cache::Hit(hit), Some(data)))
-            }
-            Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok((Cache::Miss, None)),
-            Err(e) => {
-                warn!("Got unexpected error: {e:?}");
-                Ok((Cache::Miss, None))
-            }
+        let (cache, bytes) = decode_remote_cache_read(self.operator.read(&path).await)?;
+        #[cfg(feature = "s3")]
+        if let (Some(manager), Some(data)) = (&self.managed_capacity, &bytes) {
+            manager.record_access(&path, data.len() as u64);
         }
+        Ok((cache, bytes))
     }
 
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
@@ -812,6 +827,36 @@ mod test {
     use crate::config::{CacheModeConfig, Config};
     use crate::errors::{Result, anyhow};
     use fs_err as fs;
+
+    #[cfg(any(
+        feature = "azure",
+        feature = "gcs",
+        feature = "gha",
+        feature = "memcached",
+        feature = "redis",
+        feature = "s3",
+        feature = "webdav",
+        feature = "oss",
+        feature = "cos"
+    ))]
+    mod remote_storage {
+        use super::super::decode_remote_cache_read;
+        use opendal::{Error, ErrorKind};
+
+        #[test]
+        fn get_propagates_unexpected_backend_errors() {
+            let error = decode_remote_cache_read(Err(Error::new(
+                ErrorKind::Unexpected,
+                "injected read failure",
+            )))
+            .unwrap_err();
+
+            assert_eq!(
+                error.downcast_ref::<Error>().map(Error::kind),
+                Some(ErrorKind::Unexpected)
+            );
+        }
+    }
 
     #[test]
     fn test_read_write_mode_local() -> Result<()> {

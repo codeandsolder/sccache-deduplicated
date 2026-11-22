@@ -179,6 +179,39 @@ fn test_multi_level_storage_backfill_on_hit() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn lookup_errors_are_not_misses_and_do_not_block_later_hits() -> Result<()> {
+    use crate::test::mock_storage::MockStorage;
+
+    let runtime = RuntimeBuilder::new_current_thread().enable_all().build()?;
+    runtime.block_on(async {
+        for mode in [LookupMode::Parsed, LookupMode::Raw, LookupMode::Both] {
+            let failed = Arc::new(MockStorage::new(None, false));
+            let empty = Arc::new(InMemoryStorage::new());
+            let later = Arc::new(InMemoryStorage::new());
+            let storage = MultiLevelStorage::new(vec![failed.clone(), empty, later.clone()]);
+            failed.next_get(Err(anyhow!("injected backend failure")));
+            let error = storage.lookup("missing", mode).await.unwrap_err();
+            assert!(format!("{error:#}").contains("injected backend failure"));
+            let stats = storage.stats();
+            assert_eq!((stats.0[0].misses, stats.0[0].read_errors), (0, 1));
+            assert_eq!((stats.0[1].misses, stats.0[2].misses), (1, 1));
+
+            later.put("present", CacheWrite::default()).await?;
+            failed.next_get(Err(anyhow!("injected backend failure")));
+            let (result, bytes) = storage.lookup("present", mode).await?;
+            assert!(matches!(result, Cache::Hit(_)));
+            assert_eq!(bytes.is_some(), mode != LookupMode::Parsed);
+            storage.drain_background().await;
+            let stats = storage.stats();
+            assert_eq!((stats.0[0].misses, stats.0[0].read_errors), (0, 2));
+            assert_eq!(stats.0[1].misses, 2);
+            assert_eq!((stats.0[2].misses, stats.0[2].hits), (1, 1));
+        }
+        Ok(())
+    })
+}
+
 /// In-memory storage mock for testing multi-level backfill with remote-like backends.
 ///
 /// This is used to test multi-level cache backfill logic without requiring:

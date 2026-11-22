@@ -59,7 +59,7 @@ pub enum Response {
 /// Maximum application payload in a transfer frame. The framing envelope
 /// stays well below the default 8 MiB IPC frame limit.
 pub const TRANSFER_CHUNK_BYTES: usize = 1024 * 1024;
-pub const NAMESPACE_PROTOCOL_VERSION: u32 = 1;
+pub const NAMESPACE_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum StorageBlob {
