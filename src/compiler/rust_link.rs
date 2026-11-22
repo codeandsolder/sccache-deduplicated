@@ -392,14 +392,14 @@ impl RustLinkStages {
         ensure!(cwd.is_absolute(), "compiler cwd must be absolute");
         let directory = output_file.map_or_else(
             || out_dir.unwrap_or(cwd),
-            |path| path.parent().unwrap_or(Path::new("")),
+            |path| path.parent().unwrap_or_else(|| Path::new("")),
         );
         let codegen_directory = resolve_output_directory(cwd, directory)?;
         let mut roots = vec![codegen_directory.clone()];
         for path in explicit_outputs {
             roots.push(resolve_output_directory(
                 cwd,
-                path.parent().unwrap_or(Path::new("")),
+                path.parent().unwrap_or_else(|| Path::new("")),
             )?);
         }
         // Parent roots already contain any nested output directory. Keep
