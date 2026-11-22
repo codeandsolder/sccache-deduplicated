@@ -608,60 +608,41 @@ where
                         debug!("Preprocessor cache lookup failed for {preprocessor_key}: {error}");
                         None
                     })
-                && let Some(mut preprocessor_cache_entry) =
+                && let Some(preprocessor_cache_entry) =
                     read_preprocessor_cache_entry(&mut seekable, preprocessor_key)
             {
-                let mut updated = false;
-                let hit = preprocessor_cache_entry
-                    .lookup_result_digest(preprocessor_cache_mode_config, &mut updated);
-
-                let mut update_failed = false;
-                if updated {
-                    // Time macros have been found, we need to update
-                    // the preprocessor cache entry. See [`PreprocessorCacheEntry::result_matches`].
-                    debug!("Preprocessor cache updated because of time macros: {preprocessor_key}");
-
-                    if let Err(e) = storage
-                        .put_preprocessor_cache_entry(preprocessor_key, preprocessor_cache_entry)
-                        .await
-                    {
-                        debug!("Failed to update preprocessor cache: {e}");
-                        update_failed = true;
-                    }
+                if let Some(key) =
+                    preprocessor_cache_entry.lookup_result_digest(preprocessor_cache_mode_config)
+                {
+                    debug!("Preprocessor cache hit: {preprocessor_key}");
+                    // A compiler binary may be a symlink to another and
+                    // so has the same digest, but that means
+                    // the toolchain will not contain the correct path
+                    // to invoke the compiler! Add the compiler
+                    // executable path to try and prevent this
+                    let weak_toolchain_key = format!(
+                        "{}-{}",
+                        self.executable.to_string_lossy(),
+                        self.executable_digest
+                    );
+                    return Ok(HashResult {
+                        key,
+                        compilation: Box::new(CCompilation {
+                            parsed_args: parsed_args.clone(),
+                            is_locally_preprocessed: false,
+                            allow_dist: true,
+                            #[cfg(feature = "dist-client")]
+                            preprocessed_input: PREPROCESSING_SKIPPED_COMPILE_POISON.to_vec(),
+                            executable: self.executable.clone(),
+                            compiler: self.compiler.to_owned(),
+                            cwd: cwd.clone(),
+                            env_vars: env_vars.clone(),
+                        }),
+                        weak_toolchain_key,
+                        cache_control,
+                    });
                 }
-
-                if !update_failed {
-                    if let Some(key) = hit {
-                        debug!("Preprocessor cache hit: {preprocessor_key}");
-                        // A compiler binary may be a symlink to another and
-                        // so has the same digest, but that means
-                        // the toolchain will not contain the correct path
-                        // to invoke the compiler! Add the compiler
-                        // executable path to try and prevent this
-                        let weak_toolchain_key = format!(
-                            "{}-{}",
-                            self.executable.to_string_lossy(),
-                            self.executable_digest
-                        );
-                        return Ok(HashResult {
-                            key,
-                            compilation: Box::new(CCompilation {
-                                parsed_args: parsed_args.clone(),
-                                is_locally_preprocessed: false,
-                                allow_dist: true,
-                                #[cfg(feature = "dist-client")]
-                                preprocessed_input: PREPROCESSING_SKIPPED_COMPILE_POISON.to_vec(),
-                                executable: self.executable.clone(),
-                                compiler: self.compiler.to_owned(),
-                                cwd: cwd.clone(),
-                                env_vars: env_vars.clone(),
-                            }),
-                            weak_toolchain_key,
-                            cache_control,
-                        });
-                    }
-                    debug!("Preprocessor cache miss: {preprocessor_key}");
-                }
+                debug!("Preprocessor cache miss: {preprocessor_key}");
             }
 
             let result = self
@@ -1859,8 +1840,8 @@ where
         }
     };
 
-    if finder.found_time() {
-        debug!("Found __TIME__ in header file {}", path.display());
+    if finder.found_time_macros() {
+        debug!("Time macro in header file {}", path.display());
         return Ok(false);
     }
 

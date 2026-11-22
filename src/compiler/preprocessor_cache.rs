@@ -30,7 +30,6 @@ use std::{
 };
 
 use anyhow::Context;
-use chrono::Datelike;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -177,32 +176,14 @@ impl PreprocessorCacheEntry {
 
     /// Returns the digest of the first result whose expected included files
     /// are already on disk and have not changed.
-    pub fn lookup_result_digest(
-        &mut self,
-        config: PreprocessorCacheModeConfig,
-        updated: &mut bool,
-    ) -> Option<String> {
-        // Check newest result first since it's more likely to match.
-        for (digest, includes) in self.results.iter_mut().rev() {
-            let result_matches = Self::result_matches(digest, includes, config, updated);
-            if result_matches {
-                return Some(digest.clone());
-            }
-        }
-        None
+    pub fn lookup_result_digest(&self, config: PreprocessorCacheModeConfig) -> Option<String> {
+        self.results.iter().rev().find_map(|(digest, includes)| {
+            Self::result_matches(includes, config).then(|| digest.clone())
+        })
     }
 
-    /// A result matches if all of its include files exist on disk and have not changed.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "preprocessor validation intentionally short-circuits metadata and content checks in policy order; one routine keeps that policy reviewable"
-    )]
-    fn result_matches(
-        digest: &str,
-        includes: &mut [IncludeEntry],
-        config: PreprocessorCacheModeConfig,
-        updated: &mut bool,
-    ) -> bool {
+    /// A result matches if all included files still have the recorded contents.
+    fn result_matches(includes: &[IncludeEntry], config: PreprocessorCacheModeConfig) -> bool {
         for include in includes {
             let path = Path::new(include.path.as_os_str());
             let meta = match std::fs::symlink_metadata(path) {
@@ -221,7 +202,7 @@ impl PreprocessorCacheEntry {
                 }
             };
 
-            if config.file_stat_matches {
+            if config.file_stat_matches && !meta.file_type().is_symlink() {
                 match (include.mtime, include.ctime) {
                     (Some(mtime), Some(ctime)) if config.use_ctime_for_stat => {
                         let mtime_matches = meta.modified().map(Into::into).ok() == Some(mtime);
@@ -255,75 +236,15 @@ impl PreprocessorCacheEntry {
                 }
             };
 
-            if config.ignore_time_macros {
-                if include.digest != new_digest {
-                    return false;
-                }
-            } else {
-                if !finder.found_time_macros() && include.digest != new_digest {
-                    return false;
-                }
-                if finder.found_time() {
-                    // We don't know for sure that the program actually uses the __TIME__ macro,
-                    // but we have to assume it anyway and hash the time stamp. However, that's
-                    // not very useful since the chance that we get a cache hit later the same
-                    // second should be quite slim... So, just signal back to the caller that
-                    // __TIME__ has been found so that the preprocessor cache mode can be disabled.
-                    debug!("Found __TIME__ in {}", path.display());
-                    return false;
-                }
-
-                // __DATE__ or __TIMESTAMP__ found. We now make sure that the digest changes
-                // if the (potential) expansion of those macros changes by computing a new
-                // digest comprising the file digest and time information that represents the
-                // macro expansions.
-                let mut new_digest = Digest::new();
-                new_digest.update(digest.as_bytes());
-
-                if finder.found_date() {
-                    debug!("found __DATE__ in {}", path.display());
-                    new_digest.delimiter(b"date");
-                    let date = chrono::Local::now().date_naive();
-                    new_digest.update(&date.year().to_le_bytes());
-                    new_digest.update(&date.month().to_le_bytes());
-                    new_digest.update(&date.day().to_le_bytes());
-
-                    // If the compiler has support for it, the expansion of __DATE__ will change
-                    // according to the value of SOURCE_DATE_EPOCH. Note: We have to hash both
-                    // SOURCE_DATE_EPOCH and the current date since we can't be sure that the
-                    // compiler honors SOURCE_DATE_EPOCH.
-                    if let Ok(source_date_epoch) = std::env::var("SOURCE_DATE_EPOCH") {
-                        new_digest.update(source_date_epoch.as_bytes());
-                    }
-                }
-
-                if finder.found_timestamp() {
-                    debug!("found __TIMESTAMP__ in {}", path.display());
-                    let meta = match std::fs::symlink_metadata(path) {
-                        Ok(meta) => meta,
-                        Err(e) => {
-                            debug!(
-                                "{} is in a preprocessor cache entry but can't be read ({e})",
-                                path.display()
-                            );
-                            return false;
-                        }
-                    };
-                    let Ok(mtime) = meta.modified() else {
-                        debug!(
-                            "Couldn't get mtime of {} which contains __TIMESTAMP__",
-                            path.display()
-                        );
-                        return false;
-                    };
-                    let mtime: chrono::DateTime<chrono::Local> = chrono::DateTime::from(mtime);
-                    new_digest.delimiter(b"timestamp");
-                    new_digest.update(&mtime.naive_local().and_utc().timestamp().to_le_bytes());
-                    include.digest = new_digest.finish();
-                    // Signal that the preprocessor cache entry has been updated and needs to be
-                    // written to disk.
-                    *updated = true;
-                }
+            if !config.ignore_time_macros && finder.found_time_macros() {
+                // The compiler owns the expansion semantics (including its
+                // environment and clock). Only the preprocessed bytes can
+                // establish equivalence in this case. A direct hit cannot.
+                debug!("Time macro in {}", path.display());
+                return false;
+            }
+            if include.digest != new_digest {
+                return false;
             }
         }
         true
@@ -386,6 +307,8 @@ pub fn preprocessor_cache_entry_hash_key(
     // we have to incorporate that into the hash as well.
     m.update(&[u8::from(plusplus)]);
     m.update(&[FORMAT_VERSION]);
+    m.delimiter(b"direct-time-policy-v1");
+    m.update(&[u8::from(config.ignore_time_macros)]);
     m.update(language.as_str().as_bytes());
     hash_arguments(&mut m, arguments, basedirs);
     for hash in extra_hashes {
@@ -421,9 +344,9 @@ pub fn preprocessor_cache_entry_hash_key(
     m.update(&buf_to_hash);
     let (digest, finder) = file_digest(input_file, None)
         .with_context(|| format!("while hashing the input file '{}'", input_file.display()))?;
-    if !config.ignore_time_macros && finder.found_time() {
+    if !config.ignore_time_macros && finder.found_time_macros() {
         // Disable preprocessor cache mode
-        debug!("Found __TIME__ in {}", input_file.display());
+        debug!("Time macro in {}", input_file.display());
         return Ok(None);
     }
     m.update(digest.as_bytes());
@@ -451,18 +374,18 @@ fn file_digest(
 #[cfg(unix)]
 mod digest_cache {
     use super::*;
-    use std::collections::HashMap;
+    use crate::lru_disk_cache::lru_cache::LruCache;
     use std::os::unix::fs::MetadataExt;
     use std::sync::Mutex;
     use std::time::Duration;
 
     /// Digests of the files hashed for the preprocessor cache, so that a
     /// direct-mode hit does not re-read and re-hash every header.
-    pub(super) static FILE_DIGESTS: LazyLock<Mutex<HashMap<PathBuf, CachedFileDigest>>> =
-        LazyLock::new(Default::default);
+    pub(super) static FILE_DIGESTS: LazyLock<Mutex<LruCache<PathBuf, CachedFileDigest>>> =
+        LazyLock::new(|| Mutex::new(LruCache::new(MAX_CACHED_FILE_DIGESTS)));
 
-    /// Bound on the files remembered in [`FILE_DIGESTS`]; it is cleared when reached.
-    const MAX_CACHED_FILE_DIGESTS: usize = 100_000;
+    /// Maximum number of memoized paths; cold entries are evicted individually.
+    const MAX_CACHED_FILE_DIGESTS: u64 = 100_000;
 
     /// How old a file's mtime and ctime must be for its digest to be remembered.
     /// File timestamps come from a coarse clock, so a file rewritten right after
@@ -524,8 +447,11 @@ mod digest_cache {
                 &target_meta
             }
         };
+        if !meta.is_file() {
+            return None;
+        }
         let stat = FileStat::new(meta);
-        let digests = FILE_DIGESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut digests = FILE_DIGESTS.lock().unwrap_or_else(|e| e.into_inner());
         let cached = digests.get(path).filter(|cached| cached.stat == stat)?;
         let finder = TimeMacroFinder::with_found(
             cached.found_date,
@@ -548,14 +474,12 @@ mod digest_cache {
 
         let file = std::fs::File::open(path)?;
         // From the open file rather than the path, so that it describes what is read.
-        let stat = FileStat::new(&file.metadata()?);
+        let metadata = file.metadata()?;
+        let stat = FileStat::new(&metadata);
         let (digest, finder) = Digest::reader_sync_time_macros(&file)?;
         // Not remembered if it changed while being read.
-        if stat.is_settled(now) && FileStat::new(&file.metadata()?) == stat {
+        if metadata.is_file() && stat.is_settled(now) && FileStat::new(&file.metadata()?) == stat {
             let mut digests = FILE_DIGESTS.lock().unwrap_or_else(|e| e.into_inner());
-            if digests.len() >= MAX_CACHED_FILE_DIGESTS {
-                digests.clear();
-            }
             digests.insert(
                 path.to_owned(),
                 CachedFileDigest {
@@ -845,7 +769,7 @@ mod test {
         fs::write(&first_path, first_contents).unwrap();
         fs::write(&second_path, second_contents).unwrap();
 
-        let mut includes = vec![
+        let includes = vec![
             IncludeEntry {
                 path: first_path.into_os_string(),
                 digest: Digest::reader_sync(first_contents.as_slice()).unwrap(),
@@ -868,14 +792,76 @@ mod test {
             ignore_time_macros: true,
             ..PreprocessorCacheModeConfig::activated()
         };
-        let mut updated = false;
+        assert!(!PreprocessorCacheEntry::result_matches(&includes, config));
+    }
 
-        assert!(!PreprocessorCacheEntry::result_matches(
-            "result-digest",
-            &mut includes,
-            config,
-            &mut updated
-        ));
+    #[test_case::test_case("__DATE__"; "date")]
+    #[test_case::test_case("__TIME__"; "time")]
+    #[test_case::test_case("__TIMESTAMP__"; "timestamp")]
+    fn time_macros_require_the_actual_preprocessor(token: &str) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("header.h");
+        let source = format!("const char *value = {token};");
+        std::fs::write(&file, &source)?;
+        let config = PreprocessorCacheModeConfig::activated();
+        let ignored = PreprocessorCacheModeConfig {
+            ignore_time_macros: true,
+            ..config
+        };
+        let key = |config| {
+            preprocessor_cache_entry_hash_key(PreprocessorCacheKey {
+                compiler_digest: "compiler",
+                language: Language::C,
+                arguments: &[],
+                extra_hashes: &[],
+                assembler_digest: None,
+                env_vars: &[],
+                input_file: &file,
+                plusplus: false,
+                config,
+                basedirs: &[],
+            })
+        };
+
+        assert!(key(config)?.is_none());
+        assert!(key(ignored)?.is_some());
+
+        let includes = [IncludeEntry {
+            path: file.into_os_string(),
+            digest: Digest::reader_sync(source.as_bytes())?,
+            file_size: source.len() as u64,
+            mtime: None,
+            ctime: None,
+        }];
+        assert!(!PreprocessorCacheEntry::result_matches(&includes, config));
+        assert!(PreprocessorCacheEntry::result_matches(&includes, ignored));
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn metadata_shortcut_never_trusts_the_symlink_instead_of_the_target() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("real.h");
+        let link = dir.path().join("link.h");
+        std::fs::write(&target, b"int a;")?;
+        std::os::unix::fs::symlink(&target, &link)?;
+        let meta = std::fs::symlink_metadata(&link)?;
+        let includes = [IncludeEntry {
+            path: link.into_os_string(),
+            digest: Digest::reader_sync(&b"int a;"[..])?,
+            file_size: meta.len(),
+            mtime: Some(meta.modified()?.into()),
+            ctime: Some(meta.ctime_or_creation()?),
+        }];
+        let config = PreprocessorCacheModeConfig {
+            file_stat_matches: true,
+            ..PreprocessorCacheModeConfig::activated()
+        };
+        assert!(PreprocessorCacheEntry::result_matches(&includes, config));
+        std::fs::write(&target, b"int b;")?;
+        assert!(!PreprocessorCacheEntry::result_matches(&includes, config));
+        Ok(())
     }
 
     #[test]
@@ -1002,7 +988,12 @@ mod test {
         // Same size, different contents, mtime put back: the ctime still changes.
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
         rewrite_with_new_ctime(&path, b"#define B __TIME__\n");
-        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(mtime)).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
 
         let (new_digest, new_finder) = file_digest_at(&path, None, later).unwrap();
         assert_ne!(digest, new_digest);

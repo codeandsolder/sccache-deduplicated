@@ -16,8 +16,7 @@ Preprocessor cache mode is controlled by a configuration option which is true by
 
 To ensure that the cached preprocessor results for a source file correspond to the un-preprocessed inputs, sccache needs
 to remember, among other things, all files included by the source file. sccache also needs to recognize
-when "external factors" may change the results, such as system time if the `__TIME__` macro is used
-in a source file. How conservative sccache is about some of these external factors is configurable, see below.
+when external factors may change the results, such as time macros in the source or headers. How conservative sccache is about some of these external factors is configurable, see below.
 
 Preprocessor cache mode will be disabled in any of the following cases:
 
@@ -27,7 +26,7 @@ Preprocessor cache mode will be disabled in any of the following cases:
 - Not using local storage for the cache
 - Any of the compiler options `-MP`, `-Xpreprocessor`, `-Wp,` are present
 - The modification time of one of the header files is too new (avoids a race condition)
-- Certain strings such as `__DATE__`, `__TIME__`, `__TIMESTAMP__` are present in the source code,
+- Certain strings such as `__DATE__`, `__TIME__`, `__TIMESTAMP__` are present in the source or included headers,
   indicating that the preprocessor result may change based on external factors
 
 The preprocessor cache may silently produce stale results in any of the following cases:
@@ -39,7 +38,8 @@ The preprocessor cache may silently produce stale results in any of the followin
 
 On Linux and macOS, the server remembers the digest of each file it hashes for this mode and reuses it while the file's size,
 mtime, ctime, device and inode are unchanged, so a cache hit does not re-read unchanged headers. Files changed less than two
-seconds before being hashed are not remembered, as their timestamps may not tell a quick rewrite apart.
+seconds before being hashed are not remembered, as their timestamps may not tell a quick rewrite apart. Cold memoized entries
+are evicted individually with a bounded LRU.
 
 Configuration options and their default values:
 
