@@ -88,7 +88,6 @@ reqwest = { version = "0.13", features = [
   "blocking",
   "stream",
   "rustls",
-  "hickory-dns",
 ], optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
 semver = "1.0"
