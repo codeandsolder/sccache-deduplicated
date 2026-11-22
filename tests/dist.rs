@@ -212,6 +212,15 @@ fn test_dist_nobuilder() {
 
 struct FailingServer;
 impl ServerIncoming for FailingServer {
+    fn handle_reconcile_assignments(
+        &self,
+        _assigned_job_ids: &[JobId],
+        _heartbeat_started_at: std::time::Instant,
+    ) -> Result<usize> {
+        // This mock stores no pending assignments.
+        Ok(0)
+    }
+
     fn handle_assign_job(&self, _job_id: JobId, _tc: Toolchain) -> Result<AssignJobResult> {
         let need_toolchain = false;
         let state = JobState::Ready;
@@ -497,7 +506,10 @@ use proc_macro::TokenStream;
     let expected = cases.len();
     get_stats(move |info| {
         assert_eq!(expected, info.stats.dist_compiles.values().sum::<usize>());
-        assert_eq!(expected, info.stats.cache_hits.all());
+        assert_eq!(
+            u64::try_from(expected).unwrap(),
+            info.stats.cache_hits.all()
+        );
         assert_eq!(0, info.stats.dist_errors);
     });
     Ok(())
