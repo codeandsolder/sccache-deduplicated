@@ -1,6 +1,6 @@
 # codeandsolder host wrappers
 
-These are the source-of-truth copies of the machine-wide Cargo/sccache wrappers and release updater used on the codeandsolder build nodes.
+These are the source-of-truth copies of the machine-wide Cargo/sccache wrappers, release updater, and service provisioning templates used on the codeandsolder build nodes.
 
 ## Contract
 
@@ -31,6 +31,21 @@ The live paths are:
 ```
 
 Install atomically as root after validating these repository copies. Keep the prior live files as timestamped backups; binary rollouts are handled by the tracked `sccache-release-update`.
+
+## Service provisioning
+
+Install the release updater service and timer from this directory under
+`/etc/systemd/system/`. Use systemd drop-ins for host-specific settings such
+as managed endpoints; keep the service and timer templates shared.
+
+On hosts that need the distributed-client startup preflight, install
+`sccache-dist-client-preflight` under `/usr/local/libexec/` and call it as an
+`ExecStartPre` for the managed local daemon with the same
+`SCCACHE_DIST_CLIENT_CACHE_DIR` as the service. The preflight only removes
+the disposable `client/toolchain_tmp` directory documented by
+`ClientToolchains::new`; it rejects unexpected files and symlinks. Run
+`test-dist-client-preflight` for the filesystem contract. Do not invoke
+the preflight against a running daemon.
 
 ## Host-native release policy
 

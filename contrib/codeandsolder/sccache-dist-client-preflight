@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cache_root="${SCCACHE_DIST_CLIENT_CACHE_DIR:-/var/cache/sccache-dist-client}"
+scratch="$cache_root/client/toolchain_tmp"
+
+# ClientToolchains::new() recreates this disposable directory on startup.
+# A stale directory with incompatible ownership can prevent initialization.
+# Preserve every other part of the distributed client cache.
+if [[ -L "$scratch" || ( -e "$scratch" && ! -d "$scratch" ) ]]; then
+    printf 'sccache-dist-client-preflight: refusing unexpected path: %s\n' "$scratch" >&2
+    exit 1
+fi
+if [[ -d "$scratch" ]]; then
+    rm -rf -- "$scratch"
+fi
