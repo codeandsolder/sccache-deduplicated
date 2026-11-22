@@ -142,6 +142,97 @@ fn test_dist_basic() {
     });
 }
 
+/// The daemon sees deliberately different sources at the exact paths used by
+/// the caller. Cold misses must execute on a worker, not on the host.
+#[cfg(target_os = "linux")]
+#[test]
+#[cfg_attr(not(feature = "dist-tests"), ignore)]
+fn test_dist_rust_and_c_namespace_broker() -> Result<()> {
+    use std::fs;
+
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), &root);
+    system.add_scheduler();
+    let _worker = system.add_server(&[]);
+    let mut cfg = harness::sccache_client_cfg(&root, false);
+    cfg.dist.scheduler_url = Some(system.scheduler_url());
+    let config = root.join("sccache-cfg.json");
+    write_json_cfg(&root, "sccache-cfg.json", &cfg);
+    let cached_config = root.join("sccache-cached-cfg");
+    let _ = stop_local_daemon();
+    start_local_daemon(&config, &cached_config);
+
+    let visible = root.join("visible");
+    let private = root.join("private");
+    fs::create_dir(&visible)?;
+    fs::create_dir(&private)?;
+    fs::write(visible.join("probe.c"), "#error wrong host source")?;
+    fs::write(
+        visible.join("probe.rs"),
+        "compile_error!(\"wrong host source\");",
+    )?;
+    fs::write(
+        private.join("probe.c"),
+        "int namespace_probe(void) { return 42; }",
+    )?;
+    fs::write(
+        private.join("probe.rs"),
+        "pub fn namespace_probe() -> u32 { 42 }",
+    )?;
+    fs::write(private.join("config.json"), "{}")?;
+    let script = r#"
+set -eu
+"$1" "$2" -c probe.c -o probe.o
+"$1" "$3" --crate-name probe --crate-type rlib --edition=2021 --emit=metadata,dep-info --out-dir . probe.rs
+cp probe.o initial.o
+cp libprobe.rmeta initial.rmeta
+rm probe.o libprobe.rmeta
+"$1" "$2" -c probe.c -o probe.o
+"$1" "$3" --crate-name probe --crate-type rlib --edition=2021 --emit=metadata,dep-info --out-dir . probe.rs
+cmp initial.o probe.o
+cmp initial.rmeta libprobe.rmeta
+"#;
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let gcc = which::which("gcc")?;
+    let mut command = harness::prune_command(std::process::Command::new("bwrap"));
+    command
+        .args(["--bind", "/", "/", "--bind"])
+        .arg(&private)
+        .arg(&visible)
+        .arg("--ro-bind")
+        .arg("/dev/null")
+        .arg(&config)
+        .arg("--tmpfs")
+        .arg(root.join("client-cache"))
+        .arg("--chdir")
+        .arg(&visible)
+        .args(["--", "/bin/sh", "-c", script, "namespace-test"])
+        .arg(env!("CARGO_BIN_EXE_sccache"))
+        .arg(gcc)
+        .arg(rustc)
+        .env("SCCACHE_CLIENT_SIDE", "1")
+        .env("SCCACHE_CONF", visible.join("config.json"))
+        .env("SCCACHE_CACHED_CONF", visible.join("cached-config"))
+        .env_remove("SCCACHE_ERROR_LOG")
+        .env_remove("CARGO_INCREMENTAL")
+        .env_remove("CARGO_BUILD_INCREMENTAL")
+        .env("CARGO_PKG_NAME", "probe")
+        .assert()
+        .success();
+    assert!(private.join("probe.o").is_file());
+    assert!(private.join("libprobe.rmeta").is_file());
+    assert!(!visible.join("probe.o").exists());
+    assert!(!visible.join("libprobe.rmeta").exists());
+    get_stats(|info| {
+        assert_eq!(2, info.stats.dist_compiles.values().sum::<usize>());
+        assert_eq!(2, info.stats.cache_hits.all());
+        assert_eq!(2, info.stats.cache_misses.all());
+        assert_eq!(0, info.stats.dist_errors);
+    });
+    Ok(())
+}
+
 /// Actual compiler scripts: only an explicitly attested transparent launcher
 /// shares the real GCC cache identity and remote toolchain. An arbitrary
 /// script that changes flags must retain its own local compilation semantics.

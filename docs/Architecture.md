@@ -102,72 +102,57 @@ stderr) and the exit code travel back to the CLI.
 
 ### Client-side mode (`SCCACHE_CLIENT_SIDE`)
 
-The compile pipeline runs **in the CLI process itself**; the daemon is used only
-as a shared gateway to the storage backend (and as a place to aggregate stats).
+The compile pipeline runs **in the CLI process itself**. The existing daemon
+owns storage, statistics, toolchain caching and distributed scheduler
+credentials. Compiler discovery, dependency scanning, hashing, and output
+materialization run in the caller's filesystem namespace.
 
-On startup the CLI performs a one-shot `StorageHandshake` to fetch the cache
-metadata (cache mode, max size, basedirs, preprocessor-cache config). It then
-runs the same pipeline locally — including direct mode — and forwards each
-individual cache operation to the daemon over IPC. On the client side this is
-implemented by `IpcStorage`, which implements the same `Storage` trait as every
-other backend, so the rest of the compile pipeline is unchanged.
+On startup the CLI connects to the existing daemon (it never starts one in
+client-side mode) and negotiates the namespace IPC protocol and bounded
+transfer chunk size. Cache operations use `IpcStorage` and transfer bytes,
+not daemon-local filesystem paths. This also works when the caller and daemon
+have different files mounted at the same path.
+
+On an eligible cache miss, the namespace client constructs the actual
+compiler package and input archive. The daemon reserves each missing
+toolchain identity once, imports the package into its existing toolchain
+store, and allocates and submits the remote job. The caller receives an opaque
+job identifier, never the scheduler credential or signed worker authorization.
+The daemon relays the worker result; the caller materializes and caches it.
+Transfer staging and toolchain reservations are connection-owned and dropped
+on disconnect. A failed remote compilation can fall back to the compiler in
+the caller's namespace.
 
 ```mermaid
-  sequenceDiagram
-      participant B as Build (make -jN)
-      participant C as sccache CLI (IpcStorage)
-      participant D as sccache daemon
-      participant S as Storage backend
-      B->>C: sccache cc -c foo.c
-      C->>D: StorageHandshake (IPC)
-      D-->>C: cache metadata (mode, max_size, basedirs, …)
-      rect rgba(33, 150, 243, 0.18)
-          note over C,S: Direct mode — preprocessor cache (C/C++)
-          C->>D: StorageGetPreprocessorEntry (key)
-          D->>S: lookup
-          alt entry found & included files unchanged
-              D-->>C: manifest → reuse, skip preprocessing
-          else miss / stale / disabled
-              D-->>C: miss
-              C->>C: run preprocessor
-              C->>D: StoragePutPreprocessorEntry (key, bytes)
-              D->>S: store
-          end
-      end
-      rect rgba(76, 175, 80, 0.18)
-          note over C,S: Object cache
-          C->>C: compute hash
-          C->>D: StorageGetPath / StorageGetRaw (key)
-          D->>S: lookup
-          alt cache hit
-              S-->>D: path / bytes
-              D-->>C: path / bytes
-          else cache miss
-              D-->>C: miss
-              C->>C: run compiler
-              C->>D: StoragePutRaw (key, bytes)
-              D->>S: store
-          end
-      end
-      C->>D: RecordStats (delta)
-      C-->>B: exit code + outputs
+sequenceDiagram
+    participant C as Namespace CLI
+    participant D as Existing daemon
+    participant S as Storage
+    participant W as Distributed worker
+    C->>D: StorageHandshake
+    D-->>C: Protocol, cache and distribution policy
+    C->>C: Discover compiler and hash inputs
+    C->>D: Read cache entry
+    D->>S: Lookup
+    alt Hit
+        D-->>C: Bounded byte chunks
+    else Miss
+        C->>D: Lookup toolchain
+        opt Package missing
+            C->>D: Upload package
+        end
+        C->>D: Allocate job and upload inputs
+        D->>W: Submit authenticated compilation
+        W-->>D: Result
+        D-->>C: Bounded result chunks
+        C->>D: Store cache entry
+        D->>S: Store
+    end
+    C->>C: Materialize outputs
+    C->>D: RecordStats
 ```
 
-`StorageGetPath` lets the CLI read a cached entry straight off disk when the
-backend exposes a local path; for backends that don't (S3, Redis, …) the CLI
-falls back to fetching the raw bytes with `StorageGetRaw`. Direct-mode entries
-are exchanged with `StorageGetPreprocessorEntry` / `StoragePutPreprocessorEntry`.
-Because each CLI process accumulates its own statistics, it flushes them to the
-daemon with `RecordStats` before exiting.
-
-Client-side mode is enabled with the `SCCACHE_CLIENT_SIDE` environment variable
-(or the `client_side_mode` config key). It is expected to become the only
-supported configuration in the future, with server-side mode eventually
-removed. It is currently mutually exclusive with:
-
-- **error logging** (`SCCACHE_ERROR_LOG`): the client always logs to stderr, and
-  multiple concurrent CLI processes would race on the log file, and
-- **distributed compilation** (a configured scheduler URL).
-
-If either is in use, the setting is ignored and sccache stays in server-side
-mode.
+Client-side mode is selected by `SCCACHE_CLIENT_SIDE` or the
+`client_side_mode` configuration key. Error logging to a common file remains
+incompatible with this mode. Both ends must implement the same namespace IPC
+protocol; deployment must update the daemon and its clients together.

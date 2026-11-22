@@ -14,7 +14,6 @@
 
 use crate::cache::readonly::ReadOnlyStorage;
 use crate::cache::{CacheMode, Storage, storage_from_config};
-use crate::compiler::PreprocessorCacheEntry;
 use crate::compiler::{
     CacheCompileContext, CacheControl, CompileResult, Compiler, CompilerArguments, CompilerHasher,
     CompilerKind, CompilerProxy, DistType, Language, MissType, get_compiler_info,
@@ -71,7 +70,6 @@ use tokio::{
 };
 use tokio_serde::Framed;
 use tokio_util::codec::{LengthDelimitedCodec, length_delimited};
-use tower_service::Service;
 
 use crate::errors::{Error, HttpClientError, ProcessError, Result, anyhow, bail};
 
@@ -259,6 +257,7 @@ pub struct DistClientConfig {
 pub enum DistClientState {
     #[cfg(feature = "dist-client")]
     Some(Box<DistClientConfig>, Arc<dyn dist::Client>),
+    Broker(Arc<dyn dist::Client>),
     #[cfg(feature = "dist-client")]
     FailWithMessage(Box<DistClientConfig>, String),
     #[cfg(feature = "dist-client")]
@@ -342,6 +341,7 @@ impl DistClientContainer {
                 warn!("State reset. Will recreate");
                 *state = DistClientState::RetryCreateAt(cfg, Instant::now());
             }
+            DistClientState::Broker(client) => *state = DistClientState::Broker(client),
             DistClientState::Disabled => (),
         }
         drop(guard);
@@ -369,6 +369,7 @@ impl DistClientContainer {
                 );
             }
             DistClientState::Some(cfg, client) => (Arc::clone(client), cfg.scheduler_url.clone()),
+            DistClientState::Broker(client) => (Arc::clone(client), None),
         };
         drop(guard);
 
@@ -388,7 +389,7 @@ impl DistClientContainer {
         let state = &mut *guard;
         Self::maybe_recreate_state(state).await;
         let result = match state {
-            DistClientState::Some(_, dc) => Ok(Some(dc.clone())),
+            DistClientState::Some(_, dc) | DistClientState::Broker(dc) => Ok(Some(dc.clone())),
             DistClientState::Disabled | DistClientState::RetryCreateAt(_, _) => Ok(None),
             DistClientState::FailWithMessage(_, msg) => {
                 let msg = msg.clone();
@@ -988,6 +989,8 @@ where
 
     /// Distributed sccache client
     dist_client: Arc<DistClientContainer>,
+    #[cfg(feature = "dist-client")]
+    namespace_reservations: Arc<namespace::ToolchainReservations>,
 
     /// Cache storage.
     storage: Arc<dyn Storage>,
@@ -1042,151 +1045,87 @@ pub enum ServerMessage {
     Shutdown,
 }
 
-impl<C> Service<SccacheRequest> for Arc<SccacheService<C>>
+mod namespace;
+use namespace::TransferSession;
+
+impl<C> SccacheService<C>
 where
-    C: CommandCreatorSync + Send + Sync + 'static,
+    C: CommandCreatorSync + Clone + Send + Sync + 'static,
 {
-    type Response = SccacheResponse;
-    type Error = Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response>> + Send + 'static>>;
-
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the service dispatcher mirrors the request enum in one exhaustive match so protocol-to-handler mapping stays visible"
-    )]
-    fn call(&mut self, req: SccacheRequest) -> Self::Future {
+    async fn dispatch(
+        &self,
+        req: SccacheRequest,
+        transfers: &mut TransferSession,
+    ) -> Result<SccacheResponse> {
         trace!("handle_client");
-
-        // Opportunistically let channel know that we've received a request. We
-        // ignore failures here as well as backpressure as it's not imperative
-        // that every message is received.
         drop(self.tx.clone().start_send(ServerMessage::Request));
-
-        let me = self.clone();
-        Box::pin(async move {
-            match req.into_inner() {
-                Request::Compile(compile) => {
-                    debug!("handle_client: compile");
-                    me.stats.lock().await.compile_requests += 1;
-                    me.handle_compile(compile).await
-                }
-                Request::GetStats => {
-                    debug!("handle_client: get_stats");
-                    me.get_info()
-                        .await
-                        .map(|i| Response::Stats(Box::new(i)))
-                        .map(Message::WithoutBody)
-                }
-                Request::DistStatus => {
-                    debug!("handle_client: dist_status");
-                    me.get_dist_status()
-                        .await
-                        .map(Response::DistStatus)
-                        .map(Message::WithoutBody)
-                }
-                Request::ZeroStats => {
-                    debug!("handle_client: zero_stats");
-                    me.zero_stats().await;
-                    Ok(Message::WithoutBody(Response::ZeroStats))
-                }
-                Request::Shutdown => {
-                    debug!("handle_client: shutdown");
-                    // Drain detached cache work already registered while the
-                    // shutdown request is being handled. The server performs a
-                    // second drain after active client services finish, covering
-                    // work registered by compile requests that were already in flight.
-                    me.storage.drain_background().await;
-                    let info = me.get_info().await?;
-                    let mut tx = me.tx.clone();
-                    if tx.send(ServerMessage::Shutdown).await.is_err() {
-                        debug!("shutdown notification receiver dropped");
-                    }
-                    Ok(Message::WithoutBody(Response::ShuttingDown(Box::new(info))))
-                }
-                Request::StorageHandshake => {
-                    debug!("handle_client: storage_handshake");
-                    let info = StorageHandshakeInfo {
-                        location: me.storage.location(),
-                        cache_type_name: me.storage.cache_type_name().to_owned(),
-                        basedirs: me.storage.basedirs().to_vec(),
-                        preprocessor_cache_mode_config: me.storage.preprocessor_cache_mode_config(),
-                        cache_mode: me.storage.check().await.unwrap_or(CacheMode::ReadWrite),
-                        max_size: me.storage.max_size().await.unwrap_or(None),
-                    };
-                    Ok(Message::WithoutBody(Response::StorageHandshake(info)))
-                }
-                Request::StorageGetPath { key } => {
-                    debug!("handle_client: storage_get_path key={key}");
-                    Ok(Message::WithoutBody(Response::StorageGetPath(
-                        me.storage.get_path(&key).await,
-                    )))
-                }
-                Request::StorageGetRaw { key } => {
-                    debug!("handle_client: storage_get_raw key={key}");
-                    let resp = match me.storage.get_raw(&key).await {
-                        Ok(opt) => Response::StorageGetRaw(opt.map(|b| b.to_vec())),
-                        Err(e) => {
-                            warn!("storage_get_raw error: {e:#}");
-                            Response::StorageGetRaw(None)
-                        }
-                    };
-                    Ok(Message::WithoutBody(resp))
-                }
-                Request::StoragePutRaw { key, data } => {
-                    debug!("handle_client: storage_put_raw key={key}");
-                    let result = me
-                        .storage
-                        .put_raw(&key, data.into())
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| format!("{e:#}"));
-                    Ok(Message::WithoutBody(Response::StoragePutRaw(result)))
-                }
-                Request::StorageGetPreprocessorEntry { key } => {
-                    debug!("handle_client: storage_get_preprocessor_entry key={key}");
-                    let result = me
-                        .storage
-                        .get_preprocessor_cache_entry(&key)
-                        .await
-                        .map(|opt| {
-                            opt.and_then(|mut seekable| {
-                                use std::io::Read;
-                                let mut buf = vec![];
-                                seekable.read_to_end(&mut buf).ok()?;
-                                Some(buf)
-                            })
-                        })
-                        .map_err(|e| format!("{e:#}"));
-                    Ok(Message::WithoutBody(Response::StorageGetPreprocessorEntry(
-                        result,
-                    )))
-                }
-                Request::StoragePutPreprocessorEntry { key, entry_bytes } => {
-                    debug!("handle_client: storage_put_preprocessor_entry key={key}");
-                    let result = async {
-                        let entry = PreprocessorCacheEntry::read(&entry_bytes)
-                            .map_err(|e| format!("{e:#}"))?;
-                        me.storage
-                            .put_preprocessor_cache_entry(&key, entry)
-                            .await
-                            .map_err(|e| format!("{e:#}"))
-                    }
-                    .await;
-                    Ok(Message::WithoutBody(Response::StoragePutPreprocessorEntry(
-                        result,
-                    )))
-                }
-                Request::RecordStats(delta) => {
-                    debug!("handle_client: record_stats");
-                    me.merge_stats(*delta).await;
-                    Ok(Message::WithoutBody(Response::RecordStats))
-                }
+        match req.into_inner() {
+            Request::Compile(compile) => {
+                debug!("handle_client: compile");
+                self.stats.lock().await.compile_requests += 1;
+                self.handle_compile(compile).await
             }
-        })
-    }
-
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<()>> {
-        Poll::Ready(Ok(()))
+            Request::GetStats => {
+                debug!("handle_client: get_stats");
+                self.get_info()
+                    .await
+                    .map(|i| Response::Stats(Box::new(i)))
+                    .map(Message::WithoutBody)
+            }
+            Request::DistStatus => {
+                debug!("handle_client: dist_status");
+                self.get_dist_status()
+                    .await
+                    .map(Response::DistStatus)
+                    .map(Message::WithoutBody)
+            }
+            Request::ZeroStats => {
+                debug!("handle_client: zero_stats");
+                self.zero_stats().await;
+                Ok(Message::WithoutBody(Response::ZeroStats))
+            }
+            Request::Shutdown => {
+                debug!("handle_client: shutdown");
+                // Drain detached cache work already registered while the
+                // shutdown request is being handled. The server performs a
+                // second drain after active client services finish, covering
+                // work registered by compile requests that were already in flight.
+                self.storage.drain_background().await;
+                let info = self.get_info().await?;
+                let mut tx = self.tx.clone();
+                if tx.send(ServerMessage::Shutdown).await.is_err() {
+                    debug!("shutdown notification receiver dropped");
+                }
+                Ok(Message::WithoutBody(Response::ShuttingDown(Box::new(info))))
+            }
+            Request::StorageHandshake => {
+                debug!("handle_client: storage_handshake");
+                let info = StorageHandshakeInfo {
+                    location: self.storage.location(),
+                    cache_type_name: self.storage.cache_type_name().to_owned(),
+                    basedirs: self.storage.basedirs().to_vec(),
+                    preprocessor_cache_mode_config: self.storage.preprocessor_cache_mode_config(),
+                    cache_mode: self.storage.check().await.unwrap_or(CacheMode::ReadWrite),
+                    max_size: self.storage.max_size().await.unwrap_or(None),
+                    namespace_protocol: crate::protocol::NAMESPACE_PROTOCOL_VERSION,
+                    transfer_chunk_bytes: transfers.chunk_bytes(),
+                    dist_rewrite_includes_only: transfers
+                        .initialize_distribution(&self.dist_client)
+                        .await,
+                };
+                Ok(Message::WithoutBody(Response::StorageHandshake(info)))
+            }
+            Request::Transfer(request) => {
+                let result = transfers.handle(request, self.storage.as_ref()).await;
+                Ok(Message::WithoutBody(Response::Transfer(
+                    result.map_err(|error| format!("{error:#}")),
+                )))
+            }
+            Request::RecordStats(delta) => {
+                self.merge_stats(*delta).await;
+                Ok(Message::WithoutBody(Response::RecordStats))
+            }
+        }
     }
 }
 
@@ -1212,6 +1151,8 @@ where
             compiler_aliases: Arc::new(compiler_aliases),
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
+            #[cfg(feature = "dist-client")]
+            namespace_reservations: Arc::default(),
             rt,
             creator: C::new(client),
             tx,
@@ -1231,6 +1172,8 @@ where
             compiler_aliases: Arc::default(),
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
+            #[cfg(feature = "dist-client")]
+            namespace_reservations: Arc::default(),
             rt,
             creator: C::new(&client),
             tx,
@@ -1267,6 +1210,8 @@ where
             compiler_aliases: Arc::default(),
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
+            #[cfg(feature = "dist-client")]
+            namespace_reservations: Arc::default(),
             rt,
             creator: C::new(&client),
             tx,
@@ -1286,6 +1231,9 @@ where
                 warn!("Content of SCCACHE_MAX_FRAME_LENGTH is not a valid number, using default");
             }
         }
+        let frame_limit = builder.new_codec().max_frame_length();
+        let chunk_bytes =
+            crate::protocol::TRANSFER_CHUNK_BYTES.min(frame_limit.saturating_sub(1024));
         let io = builder.new_framed(socket);
 
         let (sink, mut stream) = SccacheTransport {
@@ -1294,7 +1242,7 @@ where
         .split();
         let mut sink = sink.sink_err_into::<Error>();
 
-        let (reqs_tx, mut reqs_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reqs_tx, mut reqs_rx) = tokio::sync::mpsc::channel(1);
 
         let me = Arc::new(self);
 
@@ -1307,8 +1255,13 @@ where
         // is the cancellation we want once the client disconnects and the reader
         // loop below exits.
         let _handle = util::spawn(async move {
+            let mut transfers = TransferSession::new(
+                chunk_bytes,
+                #[cfg(feature = "dist-client")]
+                Arc::clone(&me.namespace_reservations),
+            );
             while let Some(req) = reqs_rx.recv().await {
-                match util::spawn(me.clone().call(req)).await?? {
+                match me.dispatch(req, &mut transfers).await? {
                     Message::WithoutBody(message) => {
                         sink.send(Frame::Message { message }).await?;
                     }
@@ -1330,7 +1283,7 @@ where
         // stream errors. A send error means the handler task above has ended,
         // so we stop reading in that case too.
         while let Some(req) = stream.next().await {
-            reqs_tx.send(req?)?;
+            reqs_tx.send(req?).await?;
         }
 
         Ok(())

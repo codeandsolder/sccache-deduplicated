@@ -267,55 +267,98 @@ mod client {
                 || weak_key.to_owned(),
                 |extra| format!("{weak_key}:{extra}"),
             );
-            // Only permit one toolchain creation at a time, without holding the LRU
-            // cache mutex across potentially slow packaging I/O.
+            self.get_or_create(&weak_key, |file| toolchain_packager.write_pkg(file))
+                .map(|toolchain| (toolchain, None))
+        }
+
+        fn check_namespace_policy(&self, compiler_path: &Path) -> Result<()> {
+            if self.disabled_toolchains.contains(compiler_path) {
+                bail!(
+                    "Toolchain distribution for {} is disabled",
+                    compiler_path.display()
+                );
+            }
+            // A host path override does not identify a compiler in a different
+            // namespace. Only the namespace caller may resolve its own override.
+            Ok(())
+        }
+
+        pub(crate) fn lookup_namespace_toolchain(
+            &self,
+            compiler_path: &Path,
+            key: &str,
+        ) -> Result<(Option<Toolchain>, u64)> {
+            self.check_namespace_policy(compiler_path)?;
+            let tc = self.lookup_toolchain(&format!("namespace:{key}"))?;
+            let max_size = self
+                .cache
+                .lock()
+                .map_err(|_| anyhow!("toolchain cache mutex poisoned"))?
+                .inner
+                .capacity();
+            Ok((tc, max_size))
+        }
+
+        pub(crate) fn import_namespace_toolchain(
+            &self,
+            compiler_path: &Path,
+            key: &str,
+            mut package: std::fs::File,
+        ) -> Result<Toolchain> {
+            self.check_namespace_policy(compiler_path)?;
+            self.get_or_create(&format!("namespace:{key}"), move |mut file| {
+                std::io::copy(&mut package, &mut file)?;
+                Ok(())
+            })
+        }
+
+        fn lookup_toolchain(&self, weak_key: &str) -> Result<Option<Toolchain>> {
+            let Some(archive_id) = self.weak_to_strong(weak_key)? else {
+                return Ok(None);
+            };
+            let tc = Toolchain { archive_id };
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|_| anyhow!("toolchain cache mutex poisoned"))?;
+            match cache.get_file(&tc) {
+                Ok(_) => Ok(Some(tc)),
+                Err(LruError::FileNotInCache) => Ok(None),
+                Err(LruError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(None)
+                }
+                Err(error) => Err(error).context("error while validating cached toolchain"),
+            }
+        }
+
+        fn get_or_create(
+            &self,
+            weak_key: &str,
+            create: impl FnOnce(fs::File) -> Result<()>,
+        ) -> Result<Toolchain> {
+            // Only permit one toolchain creation at a time, without holding the
+            // LRU cache mutex across potentially slow packaging I/O.
             let _creation_guard = self
                 .toolchain_creation
                 .lock()
-                .map_err(|_| anyhow::anyhow!("toolchain creation mutex poisoned"))?;
-            if let Some(archive_id) = self.weak_to_strong(&weak_key)? {
-                let tc = Toolchain { archive_id };
-                let cached = {
-                    let mut cache = self
-                        .cache
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?;
-                    match cache.get_file(&tc) {
-                        Ok(_) => true,
-                        Err(LruError::FileNotInCache) => false,
-                        Err(LruError::Io(error))
-                            if error.kind() == std::io::ErrorKind::NotFound =>
-                        {
-                            false
-                        }
-                        Err(error) => {
-                            return Err(error).context("error while validating cached toolchain");
-                        }
-                    }
-                };
-                if cached {
-                    debug!("Using cached toolchain {weak_key} -> {}", tc.archive_id);
-                    return Ok((tc, None));
-                }
-                debug!(
-                    "Weak toolchain mapping {weak_key} -> {} is stale; repackaging",
-                    tc.archive_id
-                );
+                .map_err(|_| anyhow!("toolchain creation mutex poisoned"))?;
+            if let Some(tc) = self.lookup_toolchain(weak_key)? {
+                debug!("Using cached toolchain {weak_key} -> {}", tc.archive_id);
+                return Ok(tc);
             }
             debug!("Weak key {weak_key} requires toolchain packaging");
             let tmpfile = tempfile::NamedTempFile::new_in(self.cache_dir.join("toolchain_tmp"))?;
-            toolchain_packager
-                .write_pkg(fs_err::File::from_parts(tmpfile.reopen()?, tmpfile.path()))
+            create(fs_err::File::from_parts(tmpfile.reopen()?, tmpfile.path()))
                 .context("Could not package toolchain")?;
             let tc = {
                 let mut cache = self
                     .cache
                     .lock()
-                    .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?;
+                    .map_err(|_| anyhow!("toolchain cache mutex poisoned"))?;
                 cache.insert_file(tmpfile.path())?
             };
-            self.record_weak(weak_key, tc.archive_id.to_string())?;
-            Ok((tc, None))
+            self.record_weak(weak_key.to_owned(), tc.archive_id.to_string())?;
+            Ok(tc)
         }
 
         pub(crate) fn get_custom_toolchain(

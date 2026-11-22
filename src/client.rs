@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::errors::{Context, Result};
+use crate::errors::{Context, Result, anyhow, bail};
 use crate::net::Connection;
-use crate::protocol::{Request, Response};
+use crate::protocol::{Request, Response, TransferReply, TransferRequest};
 use crate::util;
+use anyhow::ensure;
 use backon::BlockingRetryable;
 use byteorder::{BigEndian, ByteOrder};
-use std::io::{self, BufReader, BufWriter, Read};
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::sync::{Arc, Mutex};
 
 /// A connection to an sccache server.
 pub struct ServerConnection {
@@ -46,6 +48,72 @@ impl ServerConnection {
         self.read_one_response()
     }
 
+    pub(crate) fn transfer(&mut self, request: TransferRequest) -> Result<TransferReply> {
+        match self.request(Request::Transfer(request))? {
+            Response::Transfer(reply) => reply.map_err(|error| anyhow!("{error}")),
+            other => bail!("unexpected transfer response: {other:?}"),
+        }
+    }
+
+    /// Read exactly the advertised number of bytes using bounded frames.
+    pub(crate) fn download(
+        &mut self,
+        mut remaining: u64,
+        chunk_bytes: usize,
+        mut output: impl Write,
+    ) -> Result<()> {
+        let result = (|| {
+            while remaining > 0 {
+                let TransferReply::Chunk(chunk) = self.transfer(TransferRequest::ReadChunk)? else {
+                    bail!("expected a download chunk");
+                };
+                ensure!(
+                    !chunk.is_empty()
+                        && chunk.len() <= chunk_bytes
+                        && chunk.len() as u64 <= remaining,
+                    "invalid download chunk size"
+                );
+                output.write_all(&chunk)?;
+                remaining -= chunk.len() as u64;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = self.transfer(TransferRequest::Abort);
+        }
+        result
+    }
+
+    /// Upload exactly the advertised number of bytes. The caller commits a
+    /// complete upload with the operation appropriate for its content type.
+    pub(crate) fn upload(
+        &mut self,
+        mut remaining: u64,
+        chunk_bytes: usize,
+        mut input: impl Read,
+    ) -> Result<()> {
+        let result = (|| {
+            let mut chunk = vec![0; chunk_bytes];
+            while remaining > 0 {
+                let len = usize::try_from(remaining.min(chunk_bytes as u64))?;
+                input.read_exact(&mut chunk[..len])?;
+                ensure!(
+                    matches!(
+                        self.transfer(TransferRequest::WriteChunk(chunk[..len].to_vec()))?,
+                        TransferReply::Ack
+                    ),
+                    "expected upload acknowledgment"
+                );
+                remaining -= len as u64;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = self.transfer(TransferRequest::Abort);
+        }
+        result
+    }
+
     /// Read a single `Response` from the server.
     pub fn read_one_response(&mut self) -> Result<Response> {
         trace!("ServerConnection::read_one_response");
@@ -60,6 +128,22 @@ impl ServerConnection {
         trace!("Done reading");
         Ok(bincode::deserialize(&data)?)
     }
+}
+
+pub(crate) type SharedConnection = Arc<Mutex<ServerConnection>>;
+
+pub(crate) async fn connection_task<T: Send + 'static>(
+    connection: SharedConnection,
+    task: impl FnOnce(&mut ServerConnection) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(move || {
+        let mut connection = connection
+            .lock()
+            .map_err(|_| anyhow!("IPC connection lock poisoned"))?;
+        task(&mut connection)
+    })
+    .await
+    .context("IPC connection task failed")?
 }
 
 /// Establish a TCP connection to an sccache server listening on `addr`.
