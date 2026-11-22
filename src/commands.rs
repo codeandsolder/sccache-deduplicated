@@ -834,6 +834,19 @@ fn show_active_compiles() -> Result<()> {
     Ok(())
 }
 
+fn cancel_compile(id: String) -> Result<()> {
+    let mut conn = connect_to_server(&get_addr()).context("could not connect to managed daemon")?;
+    conn.set_compile_timeout()?;
+    match conn.request(Request::CancelCompile(id))? {
+        Response::CompileCancellationRequested(true) => println!("Cancellation requested."),
+        Response::CompileCancellationRequested(false) => {
+            bail!("request is no longer active on this daemon")
+        }
+        _ => bail!("unexpected cancel compile response"),
+    }
+    Ok(())
+}
+
 fn show_stats(config: &Config, fmt: StatsFormat, advanced: bool) -> Result<()> {
     trace!("Command::ShowStats({fmt:?})");
     let stats = match connect_to_server(&get_addr()) {
@@ -1060,6 +1073,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         Command::Capabilities => unreachable!("capabilities returned before config loading"),
         Command::ShowStats(fmt, advanced) => show_stats(config, fmt, advanced)?,
         Command::ActiveCompiles => show_active_compiles()?,
+        Command::CancelCompile(id) => cancel_compile(id)?,
         Command::DebugPreprocessorCacheEntries => debug_preprocessor_cache_entries()?,
         Command::InternalStartServer => start_internal_server(config)?,
         Command::StartServer => start_server_command(startup_timeout)?,

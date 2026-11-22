@@ -56,6 +56,8 @@ pub enum Command {
     ShowStats(StatsFormat, bool),
     /// List active daemon-owned compile requests as JSON.
     ActiveCompiles,
+    /// Request cancellation of one active daemon-owned compile.
+    CancelCompile(String),
     /// Print machine-readable build capabilities and exit.
     Capabilities,
     /// Run background server.
@@ -139,6 +141,10 @@ fn get_clap_command() -> clap::Command {
             flag_infer_long("active-compiles")
                 .help("list active compiler requests with phases and ages as JSON")
                 .action(ArgAction::SetTrue),
+            flag_infer_long("cancel-compile")
+                .help("request cancellation of one active compiler request")
+                .value_name("REQUEST-ID")
+                .value_parser(clap::value_parser!(String)),
             flag_infer_long("show-adv-stats")
                 .help("show advanced cache statistics")
                 .action(ArgAction::SetTrue),
@@ -184,6 +190,7 @@ fn get_clap_command() -> clap::Command {
                     "dist-status",
                     "show-stats",
                     "active-compiles",
+                    "cancel-compile",
                     "show-adv-stats",
                     "start-server",
                     "stop-server",
@@ -263,6 +270,8 @@ fn command_from_matches(matches: &clap::ArgMatches, cwd: PathBuf) -> Result<Comm
         Ok(Command::ShowStats(stats_format(matches)?, false))
     } else if matches.get_flag("active-compiles") {
         Ok(Command::ActiveCompiles)
+    } else if let Some(id) = matches.get_one::<String>("cancel-compile") {
+        Ok(Command::CancelCompile(id.clone()))
     } else if matches.get_flag("show-adv-stats") {
         Ok(Command::ShowStats(stats_format(matches)?, true))
     } else if matches.get_flag("start-server") {

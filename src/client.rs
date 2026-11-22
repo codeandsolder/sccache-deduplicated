@@ -223,12 +223,13 @@ mod test {
         let stream = TcpStream::connect(listener.local_addr()?)?;
         let (mut server, _) = listener.accept()?;
         let progress = CompileActivity {
-            id: 7,
+            id: "generation-7".into(),
             client_pid: 123,
             output: Some("crate".into()),
             compiler: "rustc".into(),
             cwd: "/build".into(),
             phase: Phase::RunDistributed,
+            cancellation_requested: false,
             elapsed_ms: 15000,
             phase_age_ms: 15000,
             waiting_for_jobserver: 0,

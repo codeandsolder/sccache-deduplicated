@@ -1135,6 +1135,9 @@ where
                     result.map_err(|error| format!("{error:#}")),
                 )))
             }
+            Request::CancelCompile(id) => Ok(Message::WithoutBody(
+                Response::CompileCancellationRequested(self.activities.cancel(&id)),
+            )),
             Request::ActiveCompiles => Ok(Message::WithoutBody(Response::ActiveCompiles(
                 self.activities.snapshots(),
             ))),
@@ -1381,6 +1384,10 @@ where
         loop {
             tokio::select! {
                 biased;
+                _ = activity.cancellation.cancelled() => {
+                    let snapshot = activity.snapshot();
+                    bail!("compile request {} cancellation requested during {:?}; outcome unknown", snapshot.id, snapshot.phase);
+                }
                 result = &mut work => return result,
                 _ = ticker.tick() => {
                     let snapshot = activity.snapshot();
@@ -2851,21 +2858,34 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].client_pid, 123);
         assert_eq!(active[0].phase, Phase::WriteCache);
+        client
+            .send(Bytes::from(bincode::serialize(&Request::CancelCompile(
+                active[0].id.clone(),
+            ))?))
+            .await?;
+        let frame = time::timeout(Duration::from_secs(2), client.next())
+            .await?
+            .context("cancel reply missing")??;
+        assert!(matches!(
+            bincode::deserialize::<Response>(&frame)?,
+            Response::CompileCancellationRequested(true)
+        ));
+        assert!(registration.activity.snapshot().cancellation_requested);
+
         drop(registration);
         drop(client);
         time::timeout(Duration::from_secs(2), handler).await???;
         Ok(())
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn heartbeat_reports_age_without_resetting_phase_deadline() -> Result<()> {
+    fn watchdog_fixture(
+        phase_timeout_secs: u64,
+    ) -> (SccacheService<ProcessCommandCreator>, Compile) {
         let storage = crate::test::mock_storage::MockStorage::new(None, false);
-        let mut service = SccacheService::<ProcessCommandCreator>::mock_with_storage(
-            Arc::new(storage),
-            tokio::runtime::Handle::current(),
-        );
+        let mut service =
+            SccacheService::mock_with_storage(Arc::new(storage), tokio::runtime::Handle::current());
         service.compile_limits = CompileLimits {
-            phase_timeout_secs: 31,
+            phase_timeout_secs,
             execution_timeout_secs: 120,
         };
         let request = Compile {
@@ -2875,11 +2895,18 @@ mod tests {
             args: vec![],
             env_vars: vec![],
         };
+        (service, request)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_reports_age_without_resetting_phase_deadline() -> Result<()> {
+        let (service, request) = watchdog_fixture(31);
         let registration = service.activities.begin(&request);
-        let activity = &registration.activity;
+        let activity = Arc::clone(&registration.activity);
         let (tx, mut rx) = mpsc::unbounded();
         let mut sink = tx.sink_err_into::<Error>();
-        let monitor = service.monitor_compile(activity, &mut sink, future::pending::<Result<()>>());
+        let monitor =
+            service.monitor_compile(&activity, &mut sink, future::pending::<Result<()>>());
         tokio::pin!(monitor);
         for elapsed in [15_000, 30_000] {
             let frame = tokio::select! {
@@ -2905,22 +2932,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn real_phase_transition_allows_long_compilation_and_completion() -> Result<()> {
-        let storage = crate::test::mock_storage::MockStorage::new(None, false);
-        let mut service = SccacheService::<ProcessCommandCreator>::mock_with_storage(
-            Arc::new(storage),
-            tokio::runtime::Handle::current(),
-        );
-        service.compile_limits = CompileLimits {
-            phase_timeout_secs: 20,
-            execution_timeout_secs: 120,
-        };
-        let request = Compile {
-            client_pid: std::process::id(),
-            exe: "rustc".into(),
-            cwd: "/build".into(),
-            args: vec![],
-            env_vars: vec![],
-        };
+        let (service, request) = watchdog_fixture(20);
         let registration = service.activities.begin(&request);
         let activity = &registration.activity;
         let (tx, mut rx) = mpsc::unbounded();
@@ -2948,6 +2960,32 @@ mod tests {
             assert_eq!(snapshot.phase_age_ms, age);
         }
         assert_eq!(monitor.await?, 42);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_aborts_only_the_selected_request() -> Result<()> {
+        let (service, request) = watchdog_fixture(30);
+        let selected = service.activities.begin(&request);
+        let other = service.activities.begin(&request);
+        let id = selected.activity.snapshot().id;
+        assert!(!service.activities.cancel("unknown-request"));
+        let (tx, _rx) = mpsc::unbounded();
+        let mut sink = tx.sink_err_into::<Error>();
+        let monitor = service.monitor_compile(
+            &selected.activity,
+            &mut sink,
+            future::pending::<Result<()>>(),
+        );
+        let cancel = async {
+            time::sleep(Duration::from_secs(1)).await;
+            assert!(service.activities.cancel(&id));
+        };
+        let (result, ()) = tokio::join!(monitor, cancel);
+        let error = result.expect_err("selected request must be cancelled");
+        assert!(error.to_string().contains("cancellation requested"));
+        assert!(!other.activity.snapshot().cancellation_requested);
+        assert_eq!(selected.activity.snapshot().elapsed_ms, 1000);
         Ok(())
     }
 

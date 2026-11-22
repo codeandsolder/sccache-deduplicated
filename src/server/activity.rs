@@ -15,6 +15,7 @@ use std::{
 };
 
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 pub const IPC_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(90);
@@ -84,12 +85,13 @@ pub enum Phase {
 /// No command arguments or environment variables are exposed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompileActivity {
-    pub id: u64,
+    pub id: String,
     pub client_pid: u32,
     pub output: Option<String>,
     pub compiler: String,
     pub cwd: String,
     pub phase: Phase,
+    pub cancellation_requested: bool,
     pub elapsed_ms: u64,
     pub phase_age_ms: u64,
     pub waiting_for_jobserver: usize,
@@ -109,11 +111,12 @@ struct State {
 }
 
 pub(super) struct Activity {
-    id: u64,
+    id: String,
     client_pid: u32,
     compiler: String,
     cwd: String,
     started: Instant,
+    pub(super) cancellation: CancellationToken,
     state: Mutex<State>,
 }
 
@@ -140,12 +143,13 @@ impl Activity {
         let state = lock(&self.state);
         let now = Instant::now();
         CompileActivity {
-            id: self.id,
+            id: self.id.clone(),
             client_pid: self.client_pid,
             output: state.output.clone(),
             compiler: self.compiler.clone(),
             cwd: self.cwd.clone(),
             phase: state.phase,
+            cancellation_requested: self.cancellation.is_cancelled(),
             elapsed_ms: millis(now.duration_since(self.started)),
             phase_age_ms: millis(now.duration_since(state.changed)),
             waiting_for_jobserver: state.waiting_for_jobserver,
@@ -156,18 +160,29 @@ impl Activity {
     }
 }
 
-#[derive(Default)]
 pub(super) struct Registry {
+    generation: u64,
     next: AtomicU64,
-    active: Mutex<BTreeMap<u64, Arc<Activity>>>,
+    active: Mutex<BTreeMap<String, Arc<Activity>>>,
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self {
+            generation: rand::random(),
+            next: AtomicU64::default(),
+            active: Mutex::default(),
+        }
+    }
 }
 
 impl Registry {
     pub(super) fn begin(&self, compile: &Compile) -> Registration<'_> {
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        let sequence = self.next.fetch_add(1, Ordering::Relaxed);
+        let id = format!("{:016x}-{sequence:x}", self.generation);
         let now = Instant::now();
         let activity = Arc::new(Activity {
-            id,
+            id: id.clone(),
             client_pid: compile.client_pid,
             compiler: Path::new(&compile.exe)
                 .file_name()
@@ -176,6 +191,7 @@ impl Registry {
                 .into_owned(),
             cwd: compile.cwd.to_string_lossy().into_owned(),
             started: now,
+            cancellation: CancellationToken::new(),
             state: Mutex::new(State {
                 output: None,
                 phase: Phase::DetectCompiler,
@@ -190,6 +206,16 @@ impl Registry {
         Registration {
             registry: self,
             activity,
+        }
+    }
+
+    pub(super) fn cancel(&self, id: &str) -> bool {
+        let activity = lock(&self.active).get(id).cloned();
+        if let Some(activity) = activity {
+            activity.cancellation.cancel();
+            true
+        } else {
+            false
         }
     }
 

@@ -31,6 +31,8 @@ pub enum Request {
     RecordStats(Box<ServerStats>),
     /// List active daemon-owned compile requests without accessing cache storage.
     ActiveCompiles,
+    /// Request cancellation of one active daemon-owned compile.
+    CancelCompile(String),
 }
 
 /// A server response.
@@ -62,6 +64,7 @@ pub enum Response {
     CompileAborted(String),
     /// Active daemon-owned compiler requests.
     ActiveCompiles(Vec<crate::server::activity::CompileActivity>),
+    CompileCancellationRequested(bool),
 }
 
 /// Maximum application payload in a transfer frame. The framing envelope
