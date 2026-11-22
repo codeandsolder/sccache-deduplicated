@@ -837,6 +837,10 @@ where
         .with_plusplus(self.compiler.plusplus())
         .with_basedirs(basedirs)
         .with_assembler_digest(assembler_digest.as_deref())
+        .with_input_file_name(hashed_input_file_name(
+            self.parsed_args.language,
+            &self.parsed_args.input,
+        ))
         .compute();
 
         // Cache the preprocessing step
@@ -2502,6 +2506,20 @@ impl CToolchainPackager {
     }
 }
 
+pub(super) const INPUT_FILE_NAME_DOMAIN: &[u8] = b"c-input-file-name-v1";
+
+/// The file name of `input` to put in the hash key, if any.
+///
+/// The inputs of nvcc's device-code steps are its own temporaries, named after
+/// the source, and identical device code from different sources is meant to be
+/// shared.
+pub(super) fn hashed_input_file_name(language: Language, input: &Path) -> Option<&OsStr> {
+    match language {
+        Language::CudaFE | Language::Ptx | Language::Cubin => None,
+        _ => input.file_name(),
+    }
+}
+
 /// The cache is versioned by the inputs to `HashKeyParams::compute`.
 pub const CACHE_VERSION: &[u8] = b"14";
 
@@ -2567,6 +2585,7 @@ pub struct HashKeyParams<'a> {
     plusplus: bool,
     basedirs: &'a [Vec<u8>],
     assembler_digest: Option<&'a str>,
+    input_file_name: Option<&'a OsStr>,
 }
 
 impl<'a> HashKeyParams<'a> {
@@ -2595,6 +2614,7 @@ impl<'a> HashKeyParams<'a> {
             plusplus: false,
             basedirs: &[],
             assembler_digest: None,
+            input_file_name: None,
         }
     }
 
@@ -2628,6 +2648,12 @@ impl<'a> HashKeyParams<'a> {
         self
     }
 
+    /// Sets the file name, without its directory, of the source being compiled.
+    pub const fn with_input_file_name(mut self, input_file_name: Option<&'a OsStr>) -> Self {
+        self.input_file_name = input_file_name;
+        self
+    }
+
     /// Computes the hash key based on the configured parameters.
     ///
     /// If `basedirs` are provided, paths in the preprocessor output will be normalized by
@@ -2650,6 +2676,16 @@ impl<'a> HashKeyParams<'a> {
         }
         if let Some(assembler_digest) = self.assembler_digest {
             m.update(assembler_digest.as_bytes());
+        }
+        // The compiler writes the source's file name into the object (the
+        // STT_FILE symbol on ELF), and -P leaves it out of the preprocessed
+        // output, so two sources that preprocess the same would share an
+        // object naming only one of them. The directory is left out: the
+        // symbol does not record it, and keeping it would cost cache hits
+        // across checkouts.
+        if let Some(input_file_name) = self.input_file_name {
+            m.delimiter(INPUT_FILE_NAME_DOMAIN);
+            input_file_name.hash(&mut HashToDigest { digest: &mut m });
         }
 
         for (var, val) in self.env_vars {
@@ -3124,6 +3160,52 @@ mod test {
             .with_assembler_digest(None)
             .compute();
         assert_eq!(h1, h4);
+    }
+
+    #[test]
+    fn test_input_file_name_differs() {
+        let args = ovec!["a", "b", "c"];
+        let hash_for = |input: &str| {
+            HashKeyParams::new("abcd", Language::C, &args, b"")
+                .with_input_file_name(Path::new(input).file_name())
+                .compute()
+        };
+        assert_neq!(hash_for("alpha.c"), hash_for("beta.c"));
+        assert_eq!(hash_for("alpha.c"), hash_for("src/alpha.c"));
+        assert_eq!(hash_for("/a/alpha.c"), hash_for("/b/alpha.c"));
+    }
+
+    #[test]
+    fn test_device_code_input_file_name_ignored() {
+        let args = ovec!["a", "b", "c"];
+        let hash_for = |language: Language, input: &str| {
+            HashKeyParams::new("abcd", language, &args, b"device code")
+                .with_input_file_name(hashed_input_file_name(language, Path::new(input)))
+                .compute()
+        };
+        // nvcc names the inputs of its device-code steps after the source, so
+        // two sources with the same device code must still share these entries.
+        assert_eq!(
+            hash_for(Language::CudaFE, "alpha.cpp1.ii"),
+            hash_for(Language::CudaFE, "beta.cpp1.ii")
+        );
+        assert_eq!(
+            hash_for(Language::Ptx, "alpha.cpp1.ii"),
+            hash_for(Language::Ptx, "beta.cpp1.ii")
+        );
+        assert_eq!(
+            hash_for(Language::Cubin, "alpha.ptx"),
+            hash_for(Language::Cubin, "beta.ptx")
+        );
+        // Everything else keeps the file name in the key.
+        assert_neq!(
+            hash_for(Language::C, "alpha.c"),
+            hash_for(Language::C, "beta.c")
+        );
+        assert_neq!(
+            hash_for(Language::Cuda, "alpha.cu"),
+            hash_for(Language::Cuda, "beta.cu")
+        );
     }
 
     #[test]
