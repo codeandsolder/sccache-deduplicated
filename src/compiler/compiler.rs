@@ -2383,71 +2383,37 @@ mod test {
         Ok(())
     }
 
-    #[test]
-    fn test_detect_compiler_kind_gcc() -> Result<()> {
+    #[test_case("gcc: error: unrecognized command-line option '-vV'; did you mean '-v'?", "\n\ncompiler_id=gcc", CCompilerKind::Gcc, true; "gcc")]
+    #[test_case("clang: error: unknown argument: '-vV'", "compiler_id=clang\n", CCompilerKind::Clang, true; "clang")]
+    #[test_case("no -vV", "compiler_id=nvcc\n", CCompilerKind::Nvcc, false; "nvcc")]
+    #[test_case("no -vV", "compiler_id=nvhpc\n", CCompilerKind::Nvhpc, false; "nvhpc")]
+    #[test_case("no -vV", "\ncompiler_id=diab\n", CCompilerKind::Diab, false; "diab")]
+    fn test_detect_c_kind(
+        stderr: &str,
+        probe: &str,
+        expected: CCompilerKind,
+        assembler: bool,
+    ) -> Result<()> {
         let f = TestFixture::new();
         let creator = new_creator();
         let runtime = single_threaded_runtime();
-        let pool = runtime.handle();
-        next_command(
-            &creator,
-            Ok(MockChild::new(
-                exit_status(1),
-                "",
-                "gcc: error: unrecognized command-line option '-vV'; did you mean '-v'?",
-            )),
-        );
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "\n\ncompiler_id=gcc", "")),
-        );
-        next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
+        next_command(&creator, Ok(MockChild::new(exit_status(1), "", stderr)));
+        next_command(&creator, Ok(MockChild::new(exit_status(0), probe, "")));
+        if assembler {
+            next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
+        }
         let c = detect_compiler(
             creator,
             &f.bins[0],
             f.tempdir.path(),
             &[],
             &[],
-            pool,
+            runtime.handle(),
             CompilerDiscovery::default(),
         )
         .wait()?
         .0;
-        assert_eq!(CompilerKind::C(CCompilerKind::Gcc), c.kind());
-        Ok(())
-    }
-
-    #[test]
-    fn test_detect_compiler_kind_clang() -> Result<()> {
-        let f = TestFixture::new();
-        let creator = new_creator();
-        let runtime = single_threaded_runtime();
-        let pool = runtime.handle();
-        next_command(
-            &creator,
-            Ok(MockChild::new(
-                exit_status(1),
-                "",
-                "clang: error: unknown argument: '-vV'",
-            )),
-        );
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "compiler_id=clang\n", "")),
-        );
-        next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = detect_compiler(
-            creator,
-            &f.bins[0],
-            f.tempdir.path(),
-            &[],
-            &[],
-            pool,
-            CompilerDiscovery::default(),
-        )
-        .wait()?
-        .0;
-        assert_eq!(CompilerKind::C(CCompilerKind::Clang), c.kind());
+        assert_eq!(CompilerKind::C(expected), c.kind());
         Ok(())
     }
 
@@ -2604,58 +2570,6 @@ mod test {
     }
 
     #[test]
-    fn test_detect_compiler_kind_nvcc() -> Result<()> {
-        let f = TestFixture::new();
-        let creator = new_creator();
-        let runtime = single_threaded_runtime();
-        let pool = runtime.handle();
-        next_command(&creator, Ok(MockChild::new(exit_status(1), "", "no -vV")));
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "compiler_id=nvcc\n", "")),
-        );
-        let c = detect_compiler(
-            creator,
-            &f.bins[0],
-            f.tempdir.path(),
-            &[],
-            &[],
-            pool,
-            CompilerDiscovery::default(),
-        )
-        .wait()?
-        .0;
-        assert_eq!(CompilerKind::C(CCompilerKind::Nvcc), c.kind());
-        Ok(())
-    }
-
-    #[test]
-    fn test_detect_compiler_kind_nvhpc() -> Result<()> {
-        let f = TestFixture::new();
-        let creator = new_creator();
-        let runtime = single_threaded_runtime();
-        let pool = runtime.handle();
-        next_command(&creator, Ok(MockChild::new(exit_status(1), "", "no -vV")));
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "compiler_id=nvhpc\n", "")),
-        );
-        let c = detect_compiler(
-            creator,
-            &f.bins[0],
-            f.tempdir.path(),
-            &[],
-            &[],
-            pool,
-            CompilerDiscovery::default(),
-        )
-        .wait()?
-        .0;
-        assert_eq!(CompilerKind::C(CCompilerKind::Nvhpc), c.kind());
-        Ok(())
-    }
-
-    #[test]
     fn test_detect_compiler_kind_rustc() -> Result<()> {
         let f = TestFixture::new();
         // Windows uses bin, everything else uses lib. Just create both.
@@ -2789,32 +2703,6 @@ LLVM version: 6.0",
             .wait()
             .is_ok()
         );
-        Ok(())
-    }
-
-    #[test]
-    fn test_detect_compiler_kind_diab() -> Result<()> {
-        let f = TestFixture::new();
-        let creator = new_creator();
-        let runtime = single_threaded_runtime();
-        let pool = runtime.handle();
-        next_command(&creator, Ok(MockChild::new(exit_status(1), "", "no -vV")));
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "\ncompiler_id=diab\n", "")),
-        );
-        let c = detect_compiler(
-            creator,
-            &f.bins[0],
-            f.tempdir.path(),
-            &[],
-            &[],
-            pool,
-            CompilerDiscovery::default(),
-        )
-        .wait()?
-        .0;
-        assert_eq!(CompilerKind::C(CCompilerKind::Diab), c.kind());
         Ok(())
     }
 
@@ -3078,17 +2966,24 @@ LLVM version: 6.0",
         Ok(())
     }
 
-    #[test_case(true ; "with preprocessor cache")]
-    #[test_case(false ; "without preprocessor cache")]
-    fn test_common_args_affects_hash(preprocessor_cache_mode: bool) -> Result<()> {
+    #[test_case(true, "-fPIC", "-fno-pic", false; "common args with preprocessor cache")]
+    #[test_case(false, "-fPIC", "-fno-pic", false; "common args without preprocessor cache")]
+    #[test_case(true, "-DHELLO", "-DHI", true; "preprocessor args with preprocessor cache")]
+    #[test_case(false, "-DHELLO", "-DHI", true; "preprocessor args without preprocessor cache")]
+    fn test_argument_hash_equivalence(
+        preprocessor_cache_mode: bool,
+        first: &str,
+        second: &str,
+        equivalent: bool,
+    ) -> Result<()> {
         let f = TestFixture::new();
         let creator = new_creator();
         let runtime = single_threaded_runtime();
         let pool = runtime.handle();
         let output = "compiler_id=clang\ncompiler_version=\"16.0.0\"";
         let arguments = [
-            ovec!["-c", "foo.c", "-o", "foo.o", "-fPIC"],
-            ovec!["-c", "foo.c", "-o", "foo.o", "-fno-pic"],
+            ovec!["-c", "foo.c", "-o", "foo.o", first],
+            ovec!["-c", "foo.c", "-o", "foo.o", second],
             ovec!["-c", "foo.c", "-o", "foo.o"],
         ];
         let cwd = f.tempdir.path();
@@ -3143,80 +3038,9 @@ LLVM version: 6.0",
             .collect::<Result<Vec<_>>>()?;
 
         assert_eq!(results.len(), 3);
-        assert_ne!(results[0].key, results[1].key);
-        assert_ne!(results[1].key, results[2].key);
-        assert_ne!(results[0].key, results[2].key);
-        Ok(())
-    }
-
-    #[test_case(true ; "with preprocessor cache")]
-    #[test_case(false ; "without preprocessor cache")]
-    fn test_preprocessor_only_args_do_not_salt_hash_when_output_is_identical(
-        preprocessor_cache_mode: bool,
-    ) -> Result<()> {
-        let f = TestFixture::new();
-        let creator = new_creator();
-        let runtime = single_threaded_runtime();
-        let pool = runtime.handle();
-        let output = "compiler_id=clang\ncompiler_version=\"16.0.0\"";
-        let arguments = [
-            ovec!["-c", "foo.c", "-o", "foo.o", "-DHELLO"],
-            ovec!["-c", "foo.c", "-o", "foo.o", "-DHI"],
-            ovec!["-c", "foo.c", "-o", "foo.o"],
-        ];
-        let cwd = f.tempdir.path();
-        std::fs::write(f.tempdir.path().join("foo.c"), "whatever")?;
-
-        let results = arguments
-            .iter()
-            .map(|argument| -> Result<_> {
-                next_command(
-                    &creator,
-                    Ok(MockChild::new(
-                        exit_status(1),
-                        "",
-                        "clang: error: unknown argument: '-vV'",
-                    )),
-                );
-                next_command(&creator, Ok(MockChild::new(exit_status(0), output, "")));
-                next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-                let c = detect_compiler(
-                    creator.clone(),
-                    &f.bins[0],
-                    f.tempdir.path(),
-                    &[],
-                    &[],
-                    pool,
-                    CompilerDiscovery::default(),
-                )
-                .wait()?
-                .0;
-                next_command(
-                    &creator,
-                    Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
-                );
-                let mut hasher = match c.parse_arguments(argument, ".".as_ref(), &[]) {
-                    CompilerArguments::Ok(h) => h,
-                    o => bail!("Bad result from parse_arguments: {o:?}"),
-                };
-                hasher
-                    .generate_hash_key(GenerateHashKeyContext {
-                        creator: &creator,
-                        cwd: cwd.to_path_buf(),
-                        env_vars: vec![],
-                        may_dist: false,
-                        pool,
-                        rewrite_includes_only: false,
-                        storage: Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
-                        cache_control: CacheControl::Default,
-                    })
-                    .wait()
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[0].key, results[1].key);
-        assert_eq!(results[1].key, results[2].key);
+        for (left, right) in [(0, 1), (1, 2), (0, 2)] {
+            assert_eq!(results[left].key == results[right].key, equivalent);
+        }
         Ok(())
     }
 
@@ -3314,6 +3138,32 @@ LLVM version: 6.0",
         Ok(())
     }
 
+    type TestCompiler = Box<dyn Compiler<Arc<std::sync::Mutex<MockCommandCreator>>>>;
+
+    fn mock_gcc_for_compile(
+        creator: &Arc<std::sync::Mutex<MockCommandCreator>>,
+        gcc: &Path,
+        cwd: &Path,
+        pool: &tokio::runtime::Handle,
+    ) -> Result<TestCompiler> {
+        next_command(
+            creator,
+            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
+        );
+        next_assembler(creator, "GNU assembler (GNU Binutils) 2.42", "");
+        Ok(get_compiler_info(
+            creator.clone(),
+            gcc,
+            cwd,
+            &[],
+            &[],
+            pool,
+            CompilerDiscovery::default(),
+        )
+        .wait()?
+        .0)
+    }
+
     #[test_case(true ; "with preprocessor cache")]
     #[test_case(false ; "without preprocessor cache")]
     fn test_compiler_get_cached_or_compile(preprocessor_cache_mode: bool) -> Result<()> {
@@ -3340,22 +3190,7 @@ LLVM version: 6.0",
         let service = server::SccacheService::mock_with_storage(storage.clone(), pool.clone());
 
         // Pretend to be GCC.
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
-        );
-        next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = get_compiler_info(
-            creator.clone(),
-            &gcc,
-            f.tempdir.path(),
-            &[],
-            &[],
-            &pool,
-            CompilerDiscovery::default(),
-        )
-        .wait()?
-        .0;
+        let c = mock_gcc_for_compile(&creator, &gcc, f.tempdir.path(), &pool)?;
         // The preprocessor invocation.
         next_command(
             &creator,
@@ -3470,22 +3305,7 @@ LLVM version: 6.0",
         std::fs::write(f.tempdir.path().join("foo.c"), "whatever")?;
         let storage = Arc::new(storage);
         // Pretend to be GCC.
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
-        );
-        next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = get_compiler_info(
-            creator.clone(),
-            &gcc,
-            f.tempdir.path(),
-            &[],
-            &[],
-            &pool,
-            CompilerDiscovery::default(),
-        )
-        .wait()?
-        .0;
+        let c = mock_gcc_for_compile(&creator, &gcc, f.tempdir.path(), &pool)?;
         // The preprocessor invocation.
         next_command(
             &creator,
@@ -3594,22 +3414,7 @@ LLVM version: 6.0",
         // Write a dummy input file so the preprocessor cache mode can work
         std::fs::write(f.tempdir.path().join("foo.c"), "whatever")?;
         // Pretend to be GCC.
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
-        );
-        next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = get_compiler_info(
-            creator.clone(),
-            &gcc,
-            f.tempdir.path(),
-            &[],
-            &[],
-            &pool,
-            CompilerDiscovery::default(),
-        )
-        .wait()?
-        .0;
+        let c = mock_gcc_for_compile(&creator, &gcc, f.tempdir.path(), &pool)?;
         // The preprocessor invocation.
         next_command(
             &creator,
@@ -3686,22 +3491,7 @@ LLVM version: 6.0",
         let storage: Arc<MockStorage> = Arc::new(storage);
         let service = server::SccacheService::mock_with_storage(storage.clone(), pool.clone());
         // Pretend to be GCC.
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
-        );
-        next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = get_compiler_info(
-            creator.clone(),
-            &gcc,
-            f.tempdir.path(),
-            &[],
-            &[],
-            &pool,
-            CompilerDiscovery::default(),
-        )
-        .wait()?
-        .0;
+        let c = mock_gcc_for_compile(&creator, &gcc, f.tempdir.path(), &pool)?;
         // The preprocessor invocation.
         next_command(
             &creator,
@@ -3774,22 +3564,7 @@ LLVM version: 6.0",
         // Write a dummy input file so the preprocessor cache mode can work
         std::fs::write(f.tempdir.path().join("foo.c"), "whatever")?;
         // Pretend to be GCC.
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
-        );
-        next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = get_compiler_info(
-            creator.clone(),
-            &gcc,
-            f.tempdir.path(),
-            &[],
-            &[],
-            &pool,
-            CompilerDiscovery::default(),
-        )
-        .wait()?
-        .0;
+        let c = mock_gcc_for_compile(&creator, &gcc, f.tempdir.path(), &pool)?;
         const COMPILER_STDOUT: &[u8] = b"compiler stdout";
         const COMPILER_STDERR: &[u8] = b"compiler stderr";
         // The compiler should be invoked twice, since we're forcing
@@ -3999,22 +3774,7 @@ LLVM version: 6.0",
         );
         let storage = Arc::new(storage);
         // Pretend to be GCC.
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
-        );
-        next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = get_compiler_info(
-            creator.clone(),
-            &gcc,
-            f.tempdir.path(),
-            &[],
-            &[],
-            &pool,
-            CompilerDiscovery::default(),
-        )
-        .wait()?
-        .0;
+        let c = mock_gcc_for_compile(&creator, &gcc, f.tempdir.path(), &pool)?;
         const COMPILER_STDOUT: &[u8] = b"compiler stdout";
         const COMPILER_STDERR: &[u8] = b"compiler stderr";
         // The compiler should be invoked twice, since we're forcing

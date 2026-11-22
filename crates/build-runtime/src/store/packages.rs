@@ -241,7 +241,7 @@ struct ImportedTree {
 }
 
 impl ImportedTree {
-    fn new(policy: PackagePolicy) -> Self {
+    const fn new(policy: PackagePolicy) -> Self {
         Self {
             manifest: TreeManifest {
                 root: policy.directory,
@@ -392,7 +392,7 @@ impl ImportedTree {
             })
             .collect::<Vec<_>>();
         for path in paths {
-            let mut current = path.clone();
+            let mut current = path;
             let mut visited = BTreeSet::new();
             loop {
                 ensure!(visited.insert(current.clone()), "cyclic archive hardlink");

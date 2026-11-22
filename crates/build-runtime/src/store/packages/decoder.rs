@@ -73,7 +73,7 @@ impl PackageDecoder<'_> {
     }
 }
 
-/// Unlike Read::take, reaching the limit cannot masquerade as a valid end
+/// Unlike `Read::take`, reaching the limit cannot masquerade as a valid end
 /// of archive. Check one extra byte to distinguish an exact fit from overflow.
 struct BoundedTar<R> {
     reader: R,
@@ -170,7 +170,7 @@ fn read_tar(
     }
 }
 
-fn write_frame(writer: &mut impl Write, entry: Option<ArchiveEntry>) -> Result<()> {
+fn write_frame(writer: &mut impl Write, entry: Option<&ArchiveEntry>) -> Result<()> {
     let frame = encoding().with_limit(FRAME_LIMIT).serialize(&entry)?;
     writer.write_all(&u32::try_from(frame.len())?.to_le_bytes())?;
     writer.write_all(&frame)?;
@@ -344,7 +344,7 @@ pub fn decode_package_process(
                 EntryKind::File(size) => *size,
                 _ => 0,
             };
-            write_frame(&mut output, Some(entry))?;
+            write_frame(&mut output, Some(&entry))?;
             ensure!(
                 io::copy(&mut data.take(size), &mut output)? == size,
                 "truncated decoded package member"
