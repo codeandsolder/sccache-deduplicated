@@ -3153,6 +3153,29 @@ LLVM version: 6.0",
         });
     }
 
+    type TestHasher = Box<dyn CompilerHasher<Arc<std::sync::Mutex<MockCommandCreator>>>>;
+
+    fn mock_local_compile(
+        creator: &Arc<std::sync::Mutex<MockCommandCreator>>,
+        gcc: &Path,
+        cwd: &Path,
+        pool: &tokio::runtime::Handle,
+    ) -> Result<(TestHasher, Vec<OsString>, PathBuf)> {
+        let c = mock_gcc_for_compile(creator, gcc, cwd, pool)?;
+        next_command(
+            creator,
+            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+        );
+        let obj = cwd.join("foo.o");
+        queue_mock_compile(creator, &obj);
+        let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
+        let hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
+            CompilerArguments::Ok(h) => h,
+            o => bail!("Bad result from parse_arguments: {o:?}"),
+        };
+        Ok((hasher, arguments, obj))
+    }
+
     type TestCompiler = Box<dyn Compiler<Arc<std::sync::Mutex<MockCommandCreator>>>>;
 
     fn mock_gcc_for_compile(
@@ -3204,21 +3227,8 @@ LLVM version: 6.0",
         let storage = Arc::new(storage);
         let service = server::SccacheService::mock_with_storage(storage.clone(), pool.clone());
 
-        // Pretend to be GCC.
-        let c = mock_gcc_for_compile(&creator, &gcc, f.tempdir.path(), &pool)?;
-        // The preprocessor invocation.
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
-        );
-        let obj = f.tempdir.path().join("foo.o");
-        queue_mock_compile(&creator, &obj);
         let cwd = f.tempdir.path();
-        let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
-        let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
-            CompilerArguments::Ok(h) => h,
-            o => bail!("Bad result from parse_arguments: {o:?}"),
-        };
+        let (mut hasher, arguments, obj) = mock_local_compile(&creator, &gcc, cwd, &pool)?;
         let (cached, res) = runtime.block_on(async {
             hasher
                 .get_cached_or_compile(CacheCompileContext {
@@ -3415,21 +3425,8 @@ LLVM version: 6.0",
 
         // Write a dummy input file so the preprocessor cache mode can work
         std::fs::write(f.tempdir.path().join("foo.c"), "whatever")?;
-        // Pretend to be GCC.
-        let c = mock_gcc_for_compile(&creator, &gcc, f.tempdir.path(), &pool)?;
-        // The preprocessor invocation.
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
-        );
-        let obj = f.tempdir.path().join("foo.o");
-        queue_mock_compile(&creator, &obj);
         let cwd = f.tempdir.path();
-        let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
-        let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
-            CompilerArguments::Ok(h) => h,
-            o => bail!("Bad result from parse_arguments: {o:?}"),
-        };
+        let (mut hasher, arguments, obj) = mock_local_compile(&creator, &gcc, cwd, &pool)?;
         // The cache will return an error.
         storage.next_get(Err(anyhow!("Some Error")));
         let (cached, res) =
