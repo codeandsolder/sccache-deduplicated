@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, io::Read, sync::Barrier, thread};
 use anyhow::{Context, Result};
 
 use super::*;
-use crate::build_store::Artifact;
+use crate::Artifact;
 
 fn action(name: &str) -> ActionFingerprint {
     ActionFingerprint {
@@ -44,7 +44,9 @@ fn aliases_and_shared_artifacts_reclaim_only_last_reference() -> Result<()> {
             actions: 2,
             results: 1,
             blobs: 1,
-            logical_bytes: 6
+            logical_bytes: 6,
+            pending_gc_blobs: 0,
+            pending_gc_bytes: 0
         }
     );
 
@@ -59,7 +61,9 @@ fn aliases_and_shared_artifacts_reclaim_only_last_reference() -> Result<()> {
             actions: 3,
             results: 2,
             blobs: 2,
-            logical_bytes: 13
+            logical_bytes: 13,
+            pending_gc_blobs: 0,
+            pending_gc_bytes: 0
         }
     );
 
@@ -70,13 +74,13 @@ fn aliases_and_shared_artifacts_reclaim_only_last_reference() -> Result<()> {
     assert_eq!(
         store.evict(a.action)?,
         Eviction::Removed {
-            reclaimed_logical_bytes: 0
+            unreferenced_logical_bytes: 0
         }
     );
     assert_eq!(
         store.evict(c.action)?,
         Eviction::Removed {
-            reclaimed_logical_bytes: 7
+            unreferenced_logical_bytes: 7
         }
     );
     let mut bytes = Vec::new();
@@ -89,7 +93,7 @@ fn aliases_and_shared_artifacts_reclaim_only_last_reference() -> Result<()> {
     assert_eq!(
         store.evict(b.action)?,
         Eviction::Removed {
-            reclaimed_logical_bytes: 6
+            unreferenced_logical_bytes: 6
         }
     );
     assert_eq!(store.evict(b.action)?, Eviction::Missing);
@@ -99,9 +103,19 @@ fn aliases_and_shared_artifacts_reclaim_only_last_reference() -> Result<()> {
             actions: 0,
             results: 0,
             blobs: 0,
-            logical_bytes: 0
+            logical_bytes: 0,
+            pending_gc_blobs: 2,
+            pending_gc_bytes: 13
         }
     );
+    assert!(store.inner.blob_path(object.id).exists());
+    let gc = store.collect_garbage(1)?;
+    assert_eq!(gc.blobs, 1);
+    assert!(gc.failed.is_empty());
+    let gc = store.collect_garbage(1)?;
+    assert_eq!(gc.blobs, 1);
+    assert!(gc.failed.is_empty());
+    assert_eq!(store.stats()?.pending_gc_bytes, 0);
     assert!(!store.inner.blob_path(object.id).exists());
     Ok(())
 }
@@ -247,8 +261,136 @@ fn concurrent_publishers_share_content_and_result() -> Result<()> {
             actions: 4,
             results: 1,
             blobs: 1,
-            logical_bytes: 9
+            logical_bytes: 9,
+            pending_gc_blobs: 0,
+            pending_gc_bytes: 0
         }
     );
+    Ok(())
+}
+
+#[test]
+fn negotiated_content_survives_eviction_and_is_reused_without_upload() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let stage = store.stage(&b"shared"[..])?;
+    let manifest = result(stage.reference());
+    let before = store.reserve_upload(&manifest)?;
+    assert_eq!(before.missing(), &[stage.reference()]);
+    drop(before);
+    let first = store.publish(&action("first"), &manifest, vec![stage])?;
+
+    let reserved = store.reserve_upload(&manifest)?;
+    assert!(reserved.missing().is_empty());
+    assert_eq!(
+        store.evict(first.action)?,
+        Eviction::Removed {
+            unreferenced_logical_bytes: 6
+        }
+    );
+    assert_eq!(store.stats()?.pending_gc_bytes, 6);
+    assert_eq!(store.collect_garbage(32)?.blobs, 0);
+    let second = store.publish(&action("second"), &manifest, vec![])?;
+    assert_eq!(first.result, second.result);
+    assert_eq!(store.stats()?.pending_gc_bytes, 0);
+    assert_eq!(store.stats()?.logical_bytes, 6);
+    drop(reserved);
+    assert_eq!(
+        store.evict(second.action)?,
+        Eviction::Removed {
+            unreferenced_logical_bytes: 6
+        }
+    );
+    assert_eq!(store.collect_garbage(32)?.logical_bytes, 6);
+    Ok(())
+}
+
+#[test]
+fn expected_upload_validates_digest_and_bounds_input() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let expected = BlobRef {
+        id: ContentId::of(b"abc"),
+        size: 3,
+    };
+    assert!(store.stage_expected(expected, &b"ab"[..]).is_err());
+    assert!(store.stage_expected(expected, &b"xyz"[..]).is_err());
+    assert!(store.stage_expected(expected, io::repeat(b'a')).is_err());
+    let staged = store.stage_expected(expected, &b"abc"[..])?;
+    assert_eq!(staged.reference(), expected);
+    Ok(())
+}
+
+#[test]
+fn restart_reclaims_pending_garbage_including_empty_files() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let stage = store.stage(&b""[..])?;
+    let content = stage.reference();
+    let published = store.publish(&action("empty"), &result(content), vec![stage])?;
+    assert_eq!(
+        store.evict(published.action)?,
+        Eviction::Removed {
+            unreferenced_logical_bytes: 0
+        }
+    );
+    assert_eq!(store.stats()?.pending_gc_blobs, 1);
+    let path = store.inner.blob_path(content.id);
+    assert!(path.exists());
+    drop(store);
+    let store = NativeStore::open(dir.path())?;
+    assert_eq!(store.stats()?.pending_gc_blobs, 0);
+    assert!(!path.exists());
+    Ok(())
+}
+
+#[test]
+fn garbage_collection_failures_remain_queued() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let stage = store.stage(&b"data"[..])?;
+    let content = stage.reference();
+    let published = store.publish(&action("remove"), &result(content), vec![stage])?;
+    store.evict(published.action)?;
+    let path = store.inner.blob_path(content.id);
+    fs::remove_file(&path)?;
+    fs::create_dir(&path)?;
+    let failed = store.collect_garbage(1)?;
+    assert_eq!(failed.failed, vec![content.id]);
+    assert_eq!(store.stats()?.pending_gc_bytes, 4);
+    fs::remove_dir(&path)?;
+    assert_eq!(store.collect_garbage(1)?.logical_bytes, 4);
+    assert_eq!(store.stats()?.pending_gc_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn opening_a_nonempty_unowned_directory_is_rejected() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("unrelated");
+    fs::write(&path, b"keep me")?;
+    assert!(NativeStore::open(dir.path()).is_err());
+    assert_eq!(fs::read(&path)?, b"keep me");
+    Ok(())
+}
+
+#[test]
+fn lookups_do_not_wait_on_publication_lock() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let stage = store.stage(&b"data"[..])?;
+    let published = store.publish(&action("lookup"), &result(stage.reference()), vec![stage])?;
+    let mutation = store.inner.lock_mutations()?;
+    thread::scope(|scope| -> Result<()> {
+        let (send, receive) = std::sync::mpsc::channel();
+        let store = &store;
+        let handle = scope
+            .spawn(move || send.send(store.lookup(published.action).map(|lease| lease.is_some())));
+        let observed = receive.recv_timeout(std::time::Duration::from_secs(2));
+        drop(mutation);
+        handle.join().map_err(|_| anyhow!("reader panicked"))??;
+        assert!(observed??);
+        Ok(())
+    })?;
     Ok(())
 }

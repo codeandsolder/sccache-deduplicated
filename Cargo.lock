@@ -3539,11 +3539,11 @@ dependencies = [
  "openssl",
  "predicates",
  "rand 0.10.4",
- "redb",
  "regex",
  "reqwest",
  "rouille",
  "rustls-native-certs",
+ "sccache-build",
  "semver",
  "serde",
  "serde_json",
@@ -3572,6 +3572,19 @@ dependencies = [
  "zip",
  "zlib-rs 0.6.8 (git+https://github.com/codeandsolder/zlib-rs-fast?rev=746fd05382458d6962f86b453615d6ad51163375)",
  "zstd",
+]
+
+[[package]]
+name = "sccache-build"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "blake3",
+ "log",
+ "redb",
+ "serde",
+ "tempfile",
 ]
 
 [[package]]

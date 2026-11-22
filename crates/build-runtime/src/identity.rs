@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub struct ContentId(pub [u8; 32]);
 
 impl ContentId {
-    #[must_use]
+    #[must_use = "the digest identifies the content"]
     pub fn of(data: &[u8]) -> Self {
         Self(*blake3::hash(data).as_bytes())
     }
@@ -49,7 +49,7 @@ impl ActionFingerprint {
 
     /// Report added, removed or changed input components. A schema change must
     /// be compared separately because it may change their interpretation.
-    #[must_use]
+    #[must_use = "the returned set reports the differences"]
     pub fn differing_components<'a>(&'a self, other: &'a Self) -> BTreeSet<&'a str> {
         self.components
             .keys()
@@ -122,7 +122,7 @@ impl ResultManifest {
     }
 }
 
-fn typed_digest(domain: &[u8], value: &impl Serialize) -> Result<[u8; 32]> {
+pub fn typed_digest(domain: &[u8], value: &impl Serialize) -> Result<[u8; 32]> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(domain);
     encoding()
@@ -131,7 +131,7 @@ fn typed_digest(domain: &[u8], value: &impl Serialize) -> Result<[u8; 32]> {
     Ok(*hasher.finalize().as_bytes())
 }
 
-pub(super) fn encoding() -> impl Options {
+pub fn encoding() -> impl Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .with_little_endian()

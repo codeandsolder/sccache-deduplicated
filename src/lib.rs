@@ -28,7 +28,6 @@ mod test;
 #[macro_use]
 pub mod errors;
 
-pub mod build_store;
 pub mod cache;
 mod client;
 mod cmdline;

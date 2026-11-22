@@ -4,12 +4,20 @@
 //! The storage API works with ordinary files so ZFS can compress and clone them
 //! without an application-specific compressed filesystem.
 
+#![deny(rust_2018_idioms)]
+
 mod identity;
 pub use identity::{
     ActionFingerprint, ActionKey, Artifact, BlobRef, ContentId, ResultId, ResultManifest,
 };
 
-#[cfg(all(unix, feature = "native-store"))]
+#[cfg(all(unix, feature = "store"))]
 mod store;
-#[cfg(all(unix, feature = "native-store"))]
-pub use store::{CacheStats, Eviction, NativeStore, Published, ResultLease, StagedBlob};
+#[cfg(all(unix, feature = "store"))]
+pub use store::{
+    CacheStats, Eviction, GarbageCollected, NativeStore, Published, ResultLease, StagedBlob,
+    UploadReservation,
+};
+
+#[cfg(target_os = "linux")]
+pub mod sandbox;
