@@ -58,23 +58,61 @@ impl MaterializedOutput {
     }
 
     fn frame_for(&self, metadata: &std::fs::Metadata) -> Option<&VerifiedZstdFrame> {
-        let old = &self.metadata;
-        let unchanged = old.is_file()
-            && metadata.is_file()
-            && old.len() == metadata.len()
-            && old
-                .modified()
-                .ok()
-                .zip(metadata.modified().ok())
-                .is_some_and(|(a, b)| a == b)
-            && old
-                .ctime_or_creation()
-                .ok()
-                .zip(metadata.ctime_or_creation().ok())
-                .is_some_and(|(a, b)| a == b)
-            && same_file_identity(old, metadata);
-        unchanged.then_some(&self.frame)
+        same_output_metadata(&self.metadata, metadata).then_some(&self.frame)
     }
+}
+
+/// Compare the identity and timestamps rather than assuming an existing output
+/// was produced by the last successful invocation.
+fn same_output_metadata(old: &std::fs::Metadata, new: &std::fs::Metadata) -> bool {
+    old.is_file()
+        && new.is_file()
+        && old.len() == new.len()
+        && old
+            .modified()
+            .ok()
+            .zip(new.modified().ok())
+            .is_some_and(|(a, b)| a == b)
+        && old
+            .ctime_or_creation()
+            .ok()
+            .zip(new.ctime_or_creation().ok())
+            .is_some_and(|(a, b)| a == b)
+        && same_file_identity(old, new)
+}
+
+fn output_provably_changed(old: &std::fs::Metadata, new: &std::fs::Metadata) -> bool {
+    !old.is_file()
+        || !new.is_file()
+        || old.len() != new.len()
+        || !same_file_identity(old, new)
+        || old
+            .modified()
+            .ok()
+            .zip(new.modified().ok())
+            .is_some_and(|(a, b)| a != b)
+        || old
+            .ctime_or_creation()
+            .ok()
+            .zip(new.ctime_or_creation().ok())
+            .is_some_and(|(a, b)| a != b)
+}
+
+/// Files present before the actual compiler runs. A locally generated depfile
+/// is already an output of this invocation, so exclude it from the snapshot.
+pub(crate) fn snapshot_existing_outputs(
+    objects: &[FileObjectSource],
+    locally_preprocessed: bool,
+) -> HashMap<PathBuf, std::fs::Metadata> {
+    objects
+        .iter()
+        .filter(|object| !(locally_preprocessed && object.key == "d"))
+        .filter_map(|object| {
+            fs::metadata(&object.path)
+                .ok()
+                .map(|metadata| (object.path.clone(), metadata))
+        })
+        .collect()
 }
 
 #[cfg(unix)]
@@ -307,12 +345,15 @@ impl CacheWrite {
     ///
     /// # Errors
     ///
-    /// Returns an error if a required input cannot be opened, read, or added to the archive.
+    /// Returns `None` when a successful compiler invocation omitted a required
+    /// output or left an old output untouched. Such invocations must not be
+    /// cached as full compilations. Other archive I/O errors are reported.
     pub async fn from_objects<T>(
         objects: T,
         remote_outputs: HashMap<PathBuf, MaterializedOutput>,
+        existing_outputs: HashMap<PathBuf, std::fs::Metadata>,
         pool: &tokio::runtime::Handle,
-    ) -> Result<Self>
+    ) -> Result<Option<Self>>
     where
         T: IntoIterator<Item = FileObjectSource> + Send + Sync + 'static,
     {
@@ -324,11 +365,19 @@ impl CacheWrite {
                 optional,
             } in objects
             {
-                let f = fs::File::open(&path)
-                    .with_context(|| format!("failed to open file `{}`", path.display()));
-                match (f, optional) {
-                    (Ok(mut f), _) => {
+                match fs::File::open(&path) {
+                    Ok(mut f) => {
                         let metadata = f.metadata()?;
+                        if existing_outputs
+                            .get(&path)
+                            .is_some_and(|old| !output_provably_changed(old, &metadata))
+                        {
+                            debug!(
+                                "Compiler left an existing output unchanged: {}",
+                                path.display()
+                            );
+                            return Ok(None);
+                        }
                         let mode = get_file_mode(&metadata);
                         let stored = if let Some(frame) = remote_outputs
                             .get(&path)
@@ -342,11 +391,23 @@ impl CacheWrite {
                             format!("failed to put object `{}` in cache entry", path.display())
                         })?;
                     }
-                    (Err(e), false) => return Err(e),
-                    (Err(_), true) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        if !optional {
+                            debug!(
+                                "Successful compiler omitted required output: {}",
+                                path.display()
+                            );
+                            return Ok(None);
+                        }
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("failed to open output `{}`", path.display())
+                        });
+                    }
                 }
             }
-            Ok(entry)
+            Ok(Some(entry))
         })
         .await?
     }
@@ -472,11 +533,14 @@ mod tests {
                 optional: true,
             },
         ];
-        let entry = runtime.block_on(CacheWrite::from_objects(
-            objects,
-            HashMap::from([(remote_path, materialized)]),
-            runtime.handle(),
-        ))?;
+        let entry = runtime
+            .block_on(CacheWrite::from_objects(
+                objects,
+                HashMap::from([(remote_path, materialized)]),
+                HashMap::new(),
+                runtime.handle(),
+            ))?
+            .context("expected complete compiler outputs")?;
         let encoded = entry.finish()?;
         let mut zip = ZipArchive::new(Cursor::new(&encoded))?;
         let mut zip_file = zip.by_name("remote")?;
@@ -517,15 +581,67 @@ mod tests {
             path: path.clone(),
             optional: false,
         }];
-        let entry = runtime.block_on(CacheWrite::from_objects(
-            objects,
-            HashMap::from([(path, frame)]),
-            runtime.handle(),
-        ))?;
+        let entry = runtime
+            .block_on(CacheWrite::from_objects(
+                objects,
+                HashMap::from([(path, frame)]),
+                HashMap::new(),
+                runtime.handle(),
+            ))?
+            .context("expected complete compiler outputs")?;
         let mut read = CacheRead::from(Cursor::new(entry.finish()?))?;
         let mut bytes = Vec::new();
         read.get_object("obj", &mut bytes)?;
         assert_eq!(bytes, b"other");
+        Ok(())
+    }
+
+    #[test]
+    fn missing_or_unchanged_compiler_outputs_are_not_cacheable() -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("output.o");
+        let depfile = temp.path().join("output.d");
+        fs::write(&depfile, b"locally generated dependencies")?;
+        let objects = vec![
+            FileObjectSource {
+                key: "obj".into(),
+                path: path.clone(),
+                optional: false,
+            },
+            FileObjectSource {
+                key: "d".into(),
+                path: depfile,
+                optional: false,
+            },
+        ];
+        let package = |snapshot| {
+            runtime.block_on(CacheWrite::from_objects(
+                objects.clone(),
+                HashMap::new(),
+                snapshot,
+                runtime.handle(),
+            ))
+        };
+        assert!(package(snapshot_existing_outputs(&objects, true))?.is_none());
+
+        fs::write(&path, b"old output")?;
+        let snapshot = snapshot_existing_outputs(&objects, true);
+        assert!(package(snapshot)?.is_none());
+        assert_eq!(fs::read(&path)?, b"old output");
+
+        let snapshot = snapshot_existing_outputs(&objects, true);
+        fs::write(&path, b"new artifact with different length")?;
+        let entry = package(snapshot)?.context("expected complete compiler outputs")?;
+        let mut cache = CacheRead::from(Cursor::new(entry.finish()?))?;
+        let mut contents = Vec::new();
+        cache.get_object("obj", &mut contents)?;
+        assert_eq!(contents, b"new artifact with different length");
+        contents.clear();
+        cache.get_object("d", &mut contents)?;
+        assert_eq!(contents, b"locally generated dependencies");
         Ok(())
     }
 
