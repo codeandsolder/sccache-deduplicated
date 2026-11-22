@@ -336,6 +336,30 @@ jobs:
       rust-toolchain: "nightly-2026-11-22"
       rustflags: "-C target-cpu=x86-64-v2"
 
+  windows-rust-response-files:
+    name: Windows Rust response-file regression
+    runs-on: windows-2022
+    timeout-minutes: 20
+    env:
+      SCCACHE_SERVER_PORT: "44226"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install pinned Rust
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: "nightly-2026-11-20"
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
+        with:
+          rust-toolchain: "nightly-2026-11-20"
+      - name: Verify long Rust compiler arguments with actual rustc
+        run: cargo +nightly-2026-11-20 test --locked --no-default-features --test sccache_cargo test_rust_response_file_long_command -- --test-threads 1
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
+
   ci-bundle-release-profile:
     name: CI bundle release profile (Rust nightly-2026-11-22)
     # Reuse shared sccache setup, and check the exact pinned publisher features
