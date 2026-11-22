@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::command_helpers::CommandExt;
+use super::command_helpers::{CommandExt, run_with_environment};
 use anyhow::{Context, Error, Result, anyhow, bail};
 use fs_err as fs;
 use libmount::Overlay;
@@ -903,19 +903,7 @@ impl DockerBuilder {
         cmd.args(["exec", "--workdir"])
             .arg(cwd)
             .args([cid, "/busybox", "env", "-i", "--"]);
-        for (k, v) in env_vars {
-            if k.contains('=') {
-                warn!("Skipping environment variable: {:?}", k);
-                continue;
-            }
-            let mut env = k;
-            env.push('=');
-            env.push_str(&v);
-            cmd.arg(env);
-        }
-        cmd.arg(executable);
-        cmd.args(arguments);
-        let compile_output = cmd.output().context("Failed to start executing compile")?;
+        let compile_output = run_with_environment(&mut cmd, env_vars, executable, arguments)?;
         trace!("compile_output: {:?}", compile_output);
 
         let mut outputs = vec![];

@@ -64,6 +64,27 @@ impl CommandExt for Command {
     }
 }
 
+/// Append a compiler invocation after a container's clean-environment command.
+pub(super) fn run_with_environment(
+    command: &mut Command,
+    environment: Vec<(String, String)>,
+    executable: String,
+    arguments: Vec<String>,
+) -> Result<Output> {
+    for (mut key, value) in environment {
+        if key.contains('=') {
+            bail!("invalid compiler environment variable name {key:?}");
+        }
+        key.push('=');
+        key.push_str(&value);
+        command.arg(key);
+    }
+    command.arg(executable).args(arguments);
+    command
+        .output()
+        .context("Failed to start executing compile")
+}
+
 fn check_output(output: &Output) -> Result<()> {
     if !output.status.success() {
         warn!(
