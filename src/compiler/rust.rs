@@ -3918,6 +3918,165 @@ fn test_dist_archive_includes_clippy_config_files_and_empty_directory() -> Resul
     Ok(())
 }
 
+/// Dependency metadata inspection is a transfer-size optimization, not a
+/// prerequisite for compiling in the worker. If any input cannot be inspected,
+/// the complete search directory candidate set must be preserved.
+#[cfg(feature = "dist-client")]
+fn rust_dependency_names(
+    inputs: &[PathBuf],
+    env_vars: &[(OsString, OsString)],
+    reader: Option<&RlibDepReader>,
+) -> Option<HashSet<String>> {
+    let reader = reader?;
+    if !env_vars.iter().any(|(key, _)| key == "CARGO_PKG_NAME") {
+        return None;
+    }
+    let mut names = HashSet::new();
+    for input in inputs {
+        if !input.extension().is_some_and(|extension| {
+            extension == RLIB_EXTENSION
+                || extension == RMETA_EXTENSION
+                || extension == DLL_EXTENSION
+        }) {
+            continue;
+        }
+        match reader.discover_rlib_deps(env_vars, input) {
+            Ok(dependencies) => names.extend(dependencies),
+            Err(error) => {
+                debug!(
+                    "Unable to inspect Rust dependencies of {}: {error:#}; including all search-path candidates",
+                    input.display()
+                );
+                return None;
+            }
+        }
+    }
+    trace!("Identified dependency crate names: {names:?}");
+    Some(names)
+}
+
+#[cfg(feature = "dist-client")]
+fn rust_dependency_candidates(
+    crate_link_paths: &[PathBuf],
+    names: Option<&HashSet<String>>,
+) -> Result<Vec<PathBuf>> {
+    let mut candidates = Vec::new();
+    for directory in crate_link_paths {
+        let directory = pkg::simplify_path(directory)?;
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("Failed to read Rust crate search directory"),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            let Some((name, extension)) = crate_name_and_ext_from_lib_path(&path) else {
+                continue;
+            };
+            if names.is_some_and(|names| !names.contains(name)) || !path.is_file() {
+                continue;
+            }
+            if !super::CAN_DIST_DYLIBS && extension == DLL_EXTENSION {
+                bail!("Cannot distribute dylib input {}", path.display());
+            }
+            candidates.push(path);
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    Ok(candidates)
+}
+
+#[test]
+#[cfg(feature = "dist-client")]
+fn test_dist_dependency_inspection_failure_keeps_all_candidates() -> Result<()> {
+    use crate::dist::pkg::InputsPackager as _;
+    let tmp = tempfile::tempdir()?;
+    let deps = tmp.path().join("deps");
+    fs::create_dir(&deps)?;
+    let explicit = deps.join("libdirect-abc.rlib");
+    let transitive = deps.join("libtransitive-def.rmeta");
+    let metadata = b"metadata payload";
+    let plain_archive = {
+        let mut bytes = Vec::new();
+        ar::Builder::new(&mut bytes)
+            .append(&ar::Header::new(b"object.o".to_vec(), 3), &b"obj"[..])?;
+        bytes
+    };
+    fs::write(&explicit, &plain_archive)?;
+    fs::write(&transitive, metadata)?;
+    fs::write(deps.join("unrelated.txt"), b"not a crate")?;
+    // Metadata reader unavailable for this individual input, even though
+    // discovery was enabled when the server initialized the compiler.
+    let reader = Arc::new(RlibDepReader {
+        cache: Mutex::new(LruCache::with_meter(1024, DepsSize)),
+        executable: tmp.path().join("missing-rustc"),
+        ls_arg: "ls=root".into(),
+    });
+    let env_vars = vec![("CARGO_PKG_NAME".into(), "test".into())];
+    let inputs = vec![explicit];
+    let mut transformer = dist::PathTransformer::new();
+    transformer.add_root_mapping(tmp.path().to_owned(), "/target");
+    let packager = RustInputsPackager {
+        env_vars,
+        clippy_dir: None,
+        crate_link_paths: vec![deps],
+        can_trim_rlibs: true,
+        inputs,
+        path_transformer: transformer,
+        rlib_dep_reader: Some(reader),
+    };
+    let mut bytes = Vec::new();
+    Box::new(packager).write_inputs(&mut bytes)?;
+    let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
+    let mut packaged = HashMap::new();
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes)?;
+        assert!(packaged.insert(path, bytes).is_none());
+    }
+    assert_eq!(packaged.len(), 2);
+    assert_eq!(
+        packaged[Path::new("target/deps/libdirect-abc.rlib")],
+        plain_archive
+    );
+    assert_eq!(
+        packaged[Path::new("target/deps/libtransitive-def.rmeta")],
+        metadata
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "dist-client")]
+fn test_dist_rlib_trimming_preserves_recognized_metadata() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let path = tmp.path().join("libtest.rlib");
+    {
+        let file = fs::File::create(&path)?;
+        let mut builder = ar::Builder::new(file);
+        builder.append(&ar::Header::new(b"code.o".to_vec(), 4), &b"code"[..])?;
+        builder.append(
+            &ar::Header::new(b"rust.metadata.bin".to_vec(), 4),
+            &b"meta"[..],
+        )?;
+    }
+    let payload = rlib_metadata_archive(&mut fs::File::open(&path)?)?
+        .context("expected to trim recognized metadata")?;
+    let mut trimmed = ar::Archive::new(std::io::Cursor::new(payload));
+    {
+        let mut entry = trimmed.next_entry().context("missing metadata member")??;
+        assert_eq!(entry.header().identifier(), b"rust.metadata.bin");
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data)?;
+        assert_eq!(data, b"meta");
+    }
+    assert!(trimmed.next_entry().is_none());
+    Ok(())
+}
+
 #[cfg(feature = "dist-client")]
 impl pkg::InputsPackager for RustInputsPackager {
     #[expect(
@@ -3936,17 +4095,10 @@ impl pkg::InputsPackager for RustInputsPackager {
             clippy_dir,
         } = *{ self };
 
-        // If this is a cargo build, we can assume all immediate `extern crate` dependencies
-        // have been passed on the command line, allowing us to scan them all and find the
-        // complete list of crates we might need.
-        // If it's not a cargo build, we can't to extract the `extern crate` statements and
-        // so have no way to build a list of necessary crates - send all rlibs.
-        let is_cargo = env_vars.iter().any(|(k, _)| k == "CARGO_PKG_NAME");
-        let mut rlib_dep_reader_and_names = if is_cargo {
-            rlib_dep_reader.map(|r| (r, HashSet::new()))
-        } else {
-            None
-        };
+        let dependency_names =
+            rust_dependency_names(&inputs, &env_vars, rlib_dep_reader.as_deref());
+        let crate_libraries =
+            rust_dependency_candidates(&crate_link_paths, dependency_names.as_ref())?;
 
         let mut tar_inputs = vec![];
         let mut tar_traversal_dirs = vec![];
@@ -3975,17 +4127,6 @@ impl pkg::InputsPackager for RustInputsPackager {
                         "Cannot distribute dylib input {} on this platform",
                         input_path.display()
                     )
-                } else if (ext == RLIB_EXTENSION || ext == RMETA_EXTENSION)
-                    && let Some((ref rlib_dep_reader, ref mut dep_crate_names)) =
-                        rlib_dep_reader_and_names
-                {
-                    dep_crate_names.extend(
-                        rlib_dep_reader
-                            .discover_rlib_deps(&env_vars, &input_path)
-                            .with_context(|| {
-                                format!("Failed to read deps of {}", input_path.display())
-                            })?,
-                    );
                 }
             }
 
@@ -3996,59 +4137,12 @@ impl pkg::InputsPackager for RustInputsPackager {
             tar_inputs.push((input_path, dist_input_path));
         }
 
-        if log_enabled!(Trace)
-            && let Some((_, ref dep_crate_names)) = rlib_dep_reader_and_names
-        {
-            trace!("Identified dependency crate names: {dep_crate_names:?}");
-        }
-
-        // Given the link paths, find the things we need to send over the wire to the remote machine. If
-        // we've been able to use a dependency searcher then we can filter down just candidates for that
-        // crate, otherwise we need to send everything.
-        let mut tar_crate_libs = vec![];
-        for crate_link_path in crate_link_paths {
-            let crate_link_path = pkg::simplify_path(&crate_link_path)?;
-            let dir_entries = match fs::read_dir(crate_link_path) {
-                Ok(iter) => iter,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e).context("Failed to read dir entries in crate link path"),
-            };
-            for entry in dir_entries {
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(e) => return Err(e).context("Error during iteration over crate link path"),
-                };
-                let path = entry.path();
-
-                {
-                    // Take a look at the path and see if it's something we care about
-                    let (crate_name, ext): (&str, &str) =
-                        match crate_name_and_ext_from_lib_path(&path) {
-                            Some(c) => c,
-                            None => continue,
-                        };
-                    if let Some((_, ref dep_crate_names)) = rlib_dep_reader_and_names {
-                        // We have a list of crate names we care about, see if this lib is a candidate
-                        if !dep_crate_names.contains(crate_name) {
-                            continue;
-                        }
-                    }
-                    if !path.is_file() {
-                        continue;
-                    } else if !super::CAN_DIST_DYLIBS && ext == DLL_EXTENSION {
-                        bail!(
-                            "Cannot distribute dylib input {} on this platform",
-                            path.display()
-                        )
-                    }
-                }
-
-                // This is a lib that may be of interest during compilation
-                let dist_path = path_transformer
-                    .as_dist(&path)
-                    .with_context(|| format!("unable to transform lib path {}", path.display()))?;
-                tar_crate_libs.push((path, dist_path));
-            }
+        let mut tar_crate_libs = Vec::with_capacity(crate_libraries.len());
+        for path in crate_libraries {
+            let dist_path = path_transformer
+                .as_dist(&path)
+                .with_context(|| format!("unable to transform lib path {}", path.display()))?;
+            tar_crate_libs.push((path, dist_path));
         }
 
         let mut all_tar_inputs: Vec<_> = tar_inputs.into_iter().chain(tar_crate_libs).collect();
@@ -4084,36 +4178,52 @@ impl pkg::InputsPackager for RustInputsPackager {
 
         for (input_path, dist_input_path) in &all_tar_inputs {
             let mut file_header = pkg::make_tar_header(input_path, dist_input_path)?;
-            let file = fs::File::open(input_path)?;
+            let mut file = fs::File::open(input_path)?;
             if can_trim_rlibs && can_trim_this(input_path) {
-                let mut archive = ar::Archive::new(file);
-
-                while let Some(entry_result) = archive.next_entry() {
-                    let mut entry = entry_result?;
-                    if entry.header().identifier() != b"rust.metadata.bin" {
+                match rlib_metadata_archive(&mut file) {
+                    Ok(Some(metadata_ar)) => {
+                        file_header.set_size(metadata_ar.len() as u64);
+                        file_header.set_cksum();
+                        builder.append(&file_header, metadata_ar.as_slice())?;
                         continue;
                     }
-                    let mut metadata_ar = vec![];
-                    {
-                        let mut ar_builder = ar::Builder::new(&mut metadata_ar);
-                        let header = entry.header().clone();
-                        ar_builder.append(&header, &mut entry)?;
-                    }
-                    file_header.set_size(metadata_ar.len() as u64);
-                    file_header.set_cksum();
-                    builder.append(&file_header, metadata_ar.as_slice())?;
-                    break;
+                    Ok(None) => debug!(
+                        "No recognized metadata member in {}; transferring full rlib",
+                        input_path.display()
+                    ),
+                    Err(error) => debug!(
+                        "Unable to trim {}: {error:#}; transferring full rlib",
+                        input_path.display()
+                    ),
                 }
-            } else {
-                file_header.set_cksum();
-                builder.append(&file_header, file)?;
+                use std::io::Seek;
+                file.rewind()?;
             }
+            file_header.set_cksum();
+            builder.append(&file_header, file)?;
         }
 
         // Finish archive
         builder.into_inner()?;
         Ok(())
     }
+}
+
+#[cfg(feature = "dist-client")]
+fn rlib_metadata_archive(file: &mut fs::File) -> Result<Option<Vec<u8>>> {
+    let mut archive = ar::Archive::new(file);
+    while let Some(entry) = archive.next_entry() {
+        let mut entry = entry?;
+        if entry.header().identifier() == b"rust.metadata.bin" {
+            let mut metadata = Vec::new();
+            {
+                let mut builder = ar::Builder::new(&mut metadata);
+                builder.append(&entry.header().clone(), &mut entry)?;
+            }
+            return Ok(Some(metadata));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(feature = "dist-client")]
@@ -4618,7 +4728,6 @@ fn parse_rustc_z_ls(stdout: &str) -> Result<Vec<&str>> {
         if num != dep_names.len() + 1 {
             bail!("Unexpected numbering of {libstring} in rustc -Z ls output")
         }
-        assert!(line_splits.next().is_none());
 
         let mut libstring_splits = libstring.rsplitn(2, '-');
         // Most things get printed as ${LIBNAME}-${HASH} but for some things
@@ -4629,7 +4738,6 @@ fn parse_rustc_z_ls(stdout: &str) -> Result<Vec<&str>> {
                 .context("Nothing in lib string from `rustc -Z ls`")?;
             libstring_splits.next().map_or(maybe_hash, |name| name)
         };
-        assert!(libstring_splits.next().is_none());
 
         dep_names.push(libname);
     }
