@@ -2195,6 +2195,11 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
                 }
             }
             Some(Unstable(ArgUnstable { opt, value })) => match value.as_deref() {
+                _ if matches!(opt.as_ref(), "no-link" | "link-only") => {
+                    // An explicit stage invocation has a different output
+                    // contract from an ordinary --emit=link compilation.
+                    cannot_cache!("explicit Rust link stage", opt.to_string());
+                }
                 Some("y" | "yes" | "on") | None if opt == "profile" => {
                     gcno = true;
                 }
@@ -5460,6 +5465,31 @@ LLVM version: 15.0.2
             custom_linker,
             CompilerArguments::CannotCache("crate-type", Some("cdylib".to_string()))
         );
+    }
+
+    #[test]
+    fn explicit_rust_link_stages_do_not_use_completed_library_cache() {
+        for option in ["no-link", "link-only", "no-link=yes", "link-only=yes"] {
+            let result = fails!(
+                "--emit=link",
+                "foo.rs",
+                "--out-dir",
+                "out",
+                "--crate-name",
+                "foo",
+                "--crate-type",
+                "rlib",
+                "-Z",
+                option
+            );
+            assert_eq!(
+                result,
+                CompilerArguments::CannotCache(
+                    "explicit Rust link stage",
+                    Some(option.split('=').next().unwrap().to_owned())
+                )
+            );
+        }
     }
 
     #[test]
