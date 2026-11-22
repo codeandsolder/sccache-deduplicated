@@ -3404,7 +3404,7 @@ mod test {
             &mut include_files,
             config,
             std::time::SystemTime::now(),
-            PanicFs,
+            &PanicFs,
         )
         .unwrap();
 
