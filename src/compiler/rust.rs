@@ -23,7 +23,7 @@ use crate::compiler::args::{
 };
 use crate::compiler::canonical_paths::CanonicalRustPaths;
 use crate::compiler::{
-    CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, Compiler,
+    CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, CompileTransport, Compiler,
     CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, GenerateHashKeyContext,
     HashResult, Language, SingleCompileCommand, c::ArtifactDescriptor,
 };
@@ -3375,7 +3375,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
     fn generate_compile_commands(
         &self,
         path_transformer: &mut dist::PathTransformer,
-        _rewrite_includes_only: bool,
+        transport: CompileTransport,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
         Option<dist::CompileCommand>,
@@ -3405,6 +3405,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             let _ = host;
             let _ = sysroot;
             let _ = allow_dist;
+            let _ = transport;
         }
 
         trace!("[{crate_name}]: compile");
@@ -3472,10 +3473,14 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             }
 
             // Dependency files are derived from the local source-discovery
-            // pass. Never make a worker write them to the client's --out-dir,
-            // which need not exist in the worker sandbox.
+            // pass. Archive workers omit this emission because their output
+            // directory need not exist. Native workers preserve the original
+            // emission flags (which affect rlib metadata), but never publish
+            // the private dependency file.
             let mut worker_arguments = arguments.clone();
-            remove_dep_info_emit(&mut worker_arguments);
+            if transport != CompileTransport::Native {
+                remove_dep_info_emit(&mut worker_arguments);
+            }
             let mut dist_arguments = vec![];
             let mut saw_target = false;
 
@@ -3498,8 +3503,6 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                 }
             }
 
-            // We can't rely on the packaged toolchain necessarily having the same default target triple
-            // as us (typically host triple), so make sure to always explicitly specify a target.
             if let Some(canonical) = canonical_paths {
                 for value in &mut dist_arguments {
                     *value = canonical
@@ -3509,7 +3512,9 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                 }
             }
 
-            if !saw_target {
+            // Archive workers historically require an explicit target. Native
+            // workers use the exact packaged compiler under its platform contract.
+            if !saw_target && transport != CompileTransport::Native {
                 dist_arguments.push(format!("--target={host}"));
             }
 
@@ -4495,26 +4500,7 @@ fn test_dist_toolchain_archive_contains_only_required_installed_targets() -> Res
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-impl pkg::ToolchainPackager for RustToolchainPackager {
-    fn prepare_namespace(self: Box<Self>) -> Result<(String, Box<dyn pkg::ToolchainPackager>)> {
-        self.package_builder()?.prepare_namespace()
-    }
-
-    fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()> {
-        self.package_builder()?.write_compressed_tar(f)
-    }
-
-    fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
-        self.package_builder()?.into_native_mapping()
-    }
-}
-
-#[cfg(all(
-    feature = "dist-client",
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-impl RustToolchainPackager {
+impl pkg::DiscoverToolchain for RustToolchainPackager {
     fn package_builder(self) -> Result<pkg::ToolchainPackageBuilder> {
         info!(
             "Packaging Rust compiler for sysroot {}",
@@ -6156,9 +6142,12 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             #[cfg(feature = "dist-client")]
             {
                 let mut transformer = dist::PathTransformer::new();
-                let (_, command, _) = result
-                    .compilation
-                    .generate_compile_commands(&mut transformer, false)?;
+                let (_, command, _) = result.compilation.generate_compile_commands(
+                    &mut transformer,
+                    CompileTransport::Archive {
+                        rewrite_includes_only: false,
+                    },
+                )?;
                 let command = command.context("metadata-only command should be distributable")?;
                 assert!(
                     command
@@ -6585,11 +6574,14 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 canonical_paths: None,
             };
             let mut transformer = dist::PathTransformer::new();
-            let (local, distributed, _) = <RustCompilation as Compilation<
-                ProcessCommandCreator,
-            >>::generate_compile_commands(
-                &compilation, &mut transformer, false
-            )?;
+            let (local, distributed, _) =
+                <RustCompilation as Compilation<ProcessCommandCreator>>::generate_compile_commands(
+                    &compilation,
+                    &mut transformer,
+                    CompileTransport::Archive {
+                        rewrite_includes_only: false,
+                    },
+                )?;
             let local_arguments = local.get_arguments();
             assert!(
                 local_arguments
@@ -6698,7 +6690,9 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             <RustCompilation as Compilation<ProcessCommandCreator>>::generate_compile_commands(
                 &compilation,
                 &mut transformer,
-                false,
+                CompileTransport::Archive {
+                    rewrite_includes_only: false,
+                },
             )?;
         let local_args = local.get_arguments();
         assert!(
@@ -6733,7 +6727,9 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 <RustCompilation as Compilation<ProcessCommandCreator>>::generate_compile_commands(
                     &noncanonical,
                     &mut legacy_transformer,
-                    false,
+                    CompileTransport::Archive {
+                        rewrite_includes_only: false,
+                    },
                 )?;
             let legacy_dist = legacy_dist.context("noncanonical distributed command missing")?;
             assert_eq!(
@@ -6842,9 +6838,12 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         );
 
         let mut transformer = dist::PathTransformer::new();
-        let (local_command, dist_command, _) = dist_znver2
-            .compilation
-            .generate_compile_commands(&mut transformer, false)?;
+        let (local_command, dist_command, _) = dist_znver2.compilation.generate_compile_commands(
+            &mut transformer,
+            CompileTransport::Archive {
+                rewrite_includes_only: false,
+            },
+        )?;
 
         let local_args = local_command.get_arguments();
         assert!(local_args.iter().any(|arg| arg == "target-cpu=x86-64"));
@@ -6938,7 +6937,9 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             <RustCompilation as Compilation<ProcessCommandCreator>>::generate_compile_commands(
                 &compilation,
                 &mut transformer,
-                false,
+                CompileTransport::Archive {
+                    rewrite_includes_only: false,
+                },
             )?;
         let dist_command = dist_command.context("distributed command unexpectedly disabled")?;
         let cargo_value = dist_command
@@ -7007,7 +7008,9 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             <RustCompilation as Compilation<ProcessCommandCreator>>::generate_compile_commands(
                 &compilation,
                 &mut transformer,
-                false,
+                CompileTransport::Archive {
+                    rewrite_includes_only: false,
+                },
             )?;
         assert!(dist_command.is_some());
         assert!(
@@ -7119,7 +7122,12 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             let mut transformer = dist::PathTransformer::new();
             let (command, distributed, _) = result
                 .compilation
-                .generate_compile_commands(&mut transformer, false)
+                .generate_compile_commands(
+                    &mut transformer,
+                    CompileTransport::Archive {
+                        rewrite_includes_only: false,
+                    },
+                )
                 .unwrap();
             let manifest_env = command
                 .get_env_vars()
@@ -7240,9 +7248,12 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             .wait()?;
 
         let mut transformer = dist::PathTransformer::new();
-        let (command, _, _) = result
-            .compilation
-            .generate_compile_commands(&mut transformer, false)?;
+        let (command, _, _) = result.compilation.generate_compile_commands(
+            &mut transformer,
+            CompileTransport::Archive {
+                rewrite_includes_only: false,
+            },
+        )?;
         let arguments = command.get_arguments();
 
         assert!(
@@ -7327,9 +7338,12 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             .wait()?;
 
         let mut transformer = dist::PathTransformer::new();
-        let (command, _, _) = result
-            .compilation
-            .generate_compile_commands(&mut transformer, false)?;
+        let (command, _, _) = result.compilation.generate_compile_commands(
+            &mut transformer,
+            CompileTransport::Archive {
+                rewrite_includes_only: false,
+            },
+        )?;
         let arguments = command.get_arguments();
         assert!(
             !arguments.iter().any(|arg| arg == "--die-with-parent"),

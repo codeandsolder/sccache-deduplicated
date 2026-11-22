@@ -73,12 +73,44 @@ pub trait ToolchainPackager: Send {
     ///
     /// # Errors
     /// Returns an error if discovery fails or this packager has no native mapping.
-    #[cfg(all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
+    #[cfg(target_os = "linux")]
     fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
         bail!("native mapping not supported by this toolchain packager")
+    }
+}
+
+/// Compiler-specific discovery shared by the archive and native transports.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) trait DiscoverToolchain: Send + Sized {
+    fn key_extension(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn package_builder(self) -> Result<ToolchainPackageBuilder>;
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+impl<T: DiscoverToolchain> ToolchainPackager for T {
+    fn cache_key_extension(&self) -> Result<Option<String>> {
+        self.key_extension()
+    }
+
+    fn prepare_namespace(self: Box<Self>) -> Result<(String, Box<dyn ToolchainPackager>)> {
+        self.package_builder()?.prepare_namespace()
+    }
+
+    fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()> {
+        self.package_builder()?.write_compressed_tar(f)
+    }
+
+    fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
+        self.package_builder()?.into_native_mapping()
     }
 }
 
@@ -949,13 +981,15 @@ impl InputArchivePaths {
         Ok((path, remote))
     }
 
-    pub(crate) fn directory(&mut self, path: &Path) -> Result<()> {
+    pub(crate) fn directory(&mut self, path: &Path) -> Result<String> {
         #[cfg(unix)]
         if let Some(physical) = self.physical.as_mut() {
-            return physical.add_directory(path);
+            let resolved = physical.add_directory(path)?;
+            return self.archive_path(&resolved);
         }
         let path = self.resolve(path)?;
-        self.add_mapped_directory(path)
+        self.add_mapped_directory(path.clone())?;
+        self.archive_path(&path)
     }
 
     /// Emit supporting entries after all files, so extraction never writes
@@ -1057,7 +1091,7 @@ impl PhysicalInputLayout {
         Ok(current)
     }
 
-    fn add_directory(&mut self, path: &Path) -> Result<()> {
+    fn add_directory(&mut self, path: &Path) -> Result<PathBuf> {
         let resolved = self.resolve(path)?;
         if !resolved.is_dir() {
             bail!(
@@ -1066,9 +1100,9 @@ impl PhysicalInputLayout {
             );
         }
         if resolved != Path::new("/") {
-            self.directories.insert(resolved);
+            self.directories.insert(resolved.clone());
         }
-        Ok(())
+        Ok(resolved)
     }
 
     /// Add the empty traversal directories and the original symlink spellings.

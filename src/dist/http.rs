@@ -21,7 +21,7 @@ pub use self::server::{
     ClientAuthCheck, ClientVisibleMsg, HEARTBEAT_TIMEOUT, Scheduler, ServerAuthCheck,
 };
 
-mod common {
+pub(crate) mod common {
     use reqwest::header;
     use serde::{Deserialize, Serialize};
     #[cfg(feature = "dist-server")]

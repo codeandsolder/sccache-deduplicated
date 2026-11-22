@@ -853,6 +853,47 @@ impl Default for DistAuth {
     }
 }
 
+/// Explicit scheduler-owned cache and execution policy for a native client.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeClientConfig {
+    #[cfg(any(feature = "dist-client", feature = "dist-server"))]
+    pub endpoint: HTTPUrl,
+    #[cfg(not(any(feature = "dist-client", feature = "dist-server")))]
+    pub endpoint: String,
+    pub platform_contract: String,
+    pub request_timeout_secs: u64,
+    pub build_timeout_secs: u64,
+    pub renewal_interval_secs: u64,
+    pub max_metadata_bytes: u64,
+    pub max_result_bytes: u64,
+}
+
+impl NativeClientConfig {
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            cfg!(all(
+                feature = "dist-client",
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )),
+            "native compiler mode requires a Linux distributed client"
+        );
+        anyhow::ensure!(
+            !self.platform_contract.is_empty()
+                && self.request_timeout_secs > 0
+                && self.build_timeout_secs > 0
+                && self.renewal_interval_secs > 0
+                && self.max_metadata_bytes > 0
+                && self.max_metadata_bytes < u64::MAX
+                && self.max_result_bytes > 0
+                && self.max_result_bytes < u64::MAX,
+            "invalid native compiler client limits or platform contract"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 #[serde(deny_unknown_fields)]
@@ -867,6 +908,7 @@ pub struct DistConfig {
     #[serde(deserialize_with = "deserialize_size_from_str")]
     pub toolchain_cache_size: u64,
     pub rewrite_includes_only: bool,
+    pub native: Option<NativeClientConfig>,
 }
 
 impl Default for DistConfig {
@@ -878,6 +920,7 @@ impl Default for DistConfig {
             toolchains: Vec::default(),
             toolchain_cache_size: default_toolchain_cache_size(),
             rewrite_includes_only: false,
+            native: None,
         }
     }
 }
@@ -1769,6 +1812,17 @@ impl Config {
 
         // Logging must never change the filesystem namespace used to compile.
         let client_side_mode = env_client_side_mode.unwrap_or(file_client_side_mode);
+        if let Some(native) = &dist.native {
+            native.validate()?;
+            anyhow::ensure!(
+                !client_side_mode,
+                "native compiler mode does not yet support the namespace broker"
+            );
+            anyhow::ensure!(
+                dist.scheduler_url.is_some(),
+                "native compiler mode requires the scheduler status URL"
+            );
+        }
 
         let (caches, fallback_cache) = conf_caches.clone().into_fallback();
         Ok(Self {
@@ -3575,6 +3629,7 @@ key_prefix = "cosprefix"
                 toolchains: vec![],
                 toolchain_cache_size: 5_368_709_120,
                 rewrite_includes_only: false,
+                native: None,
             },
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],
@@ -4000,4 +4055,43 @@ fn test_get_cache_levels_missing_config() {
             .to_string()
             .contains("S3 cache not configured")
     );
+}
+
+#[test]
+#[cfg(all(
+    feature = "dist-client",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn native_compiler_config_is_validated() -> Result<()> {
+    let input = r#"
+[dist]
+scheduler_url = "http://127.0.0.1:10500"
+
+[dist.native]
+endpoint = "http://127.0.0.1:10502"
+platform_contract = "test-platform"
+request_timeout_secs = 120
+build_timeout_secs = 600
+renewal_interval_secs = 15
+max_metadata_bytes = 67108864
+max_result_bytes = 1073741824
+"#;
+    let make = |text: &str| -> Result<Config> {
+        Config::from_env_and_file_configs(EnvConfig::default(), toml::from_str(text)?)
+    };
+    assert_eq!(
+        make(input)?
+            .dist
+            .native
+            .context("native configuration missing")?
+            .platform_contract,
+        "test-platform"
+    );
+    assert!(
+        make(&input.replace("renewal_interval_secs = 15", "renewal_interval_secs = 0")).is_err()
+    );
+    assert!(make(&input.replace("scheduler_url = \"http://127.0.0.1:10500\"", "")).is_err());
+    assert!(make(&format!("client_side_mode = true\n{input}")).is_err());
+    Ok(())
 }

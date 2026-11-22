@@ -237,6 +237,8 @@ pub struct DistClientContainer {
     // The actual dist client state
     #[cfg(feature = "dist-client")]
     state: futures::lock::Mutex<DistClientState>,
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    native: Option<Arc<crate::compiler::NativeCompilerClient>>,
 }
 
 #[cfg(feature = "dist-client")]
@@ -300,6 +302,19 @@ impl DistClientContainer {
 #[cfg(feature = "dist-client")]
 impl DistClientContainer {
     fn new(config: &Config, pool: &tokio::runtime::Handle) -> Self {
+        #[cfg(target_os = "linux")]
+        if let Some(native) = &config.dist.native {
+            return Self {
+                state: futures::lock::Mutex::new(DistClientState::Disabled),
+                native: Some(Arc::new(crate::compiler::NativeCompilerClient::new(
+                    native.clone(),
+                    config.dist.scheduler_url.clone(),
+                    config.dist.auth.clone(),
+                    config.dist.toolchains.clone(),
+                ))),
+            };
+        }
+
         let config = DistClientConfig {
             pool: pool.clone(),
             scheduler_url: config.dist.scheduler_url.clone(),
@@ -313,6 +328,8 @@ impl DistClientContainer {
         let state = pool.block_on(state);
         Self {
             state: futures::lock::Mutex::new(state),
+            #[cfg(target_os = "linux")]
+            native: None,
         }
     }
 
@@ -321,6 +338,8 @@ impl DistClientContainer {
     pub const fn new_with_state(state: DistClientState) -> Self {
         Self {
             state: futures::lock::Mutex::new(state),
+            #[cfg(target_os = "linux")]
+            native: None,
         }
     }
 
@@ -328,6 +347,8 @@ impl DistClientContainer {
     pub const fn new_disabled() -> Self {
         Self {
             state: futures::lock::Mutex::new(DistClientState::Disabled),
+            #[cfg(target_os = "linux")]
+            native: None,
         }
     }
 
@@ -348,6 +369,11 @@ impl DistClientContainer {
     }
 
     pub async fn get_status(&self) -> DistInfo {
+        #[cfg(target_os = "linux")]
+        if let Some(native) = &self.native {
+            return native.status().await;
+        }
+
         let mut guard = self.state.lock().await;
         let state = &mut *guard;
         Self::maybe_recreate_state(state).await;
@@ -501,7 +527,7 @@ impl DistClientContainer {
         }
     }
 
-    fn get_cached_config_auth_token(auth_url: &str) -> Result<String> {
+    pub(crate) fn get_cached_config_auth_token(auth_url: &str) -> Result<String> {
         let cached_config = config::CachedConfig::reload()?;
         cached_config
             .with(|c| c.dist.auth_tokens.get(auth_url).map(String::to_owned))?
@@ -1100,6 +1126,13 @@ where
             }
             Request::StorageHandshake => {
                 debug!("handle_client: storage_handshake");
+                #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                if self.dist_client.native.is_some() {
+                    bail!(
+                        "native compiler mode does not yet support namespace-local compiler requests"
+                    );
+                }
+
                 let info = StorageHandshakeInfo {
                     location: self.storage.location(),
                     cache_type_name: self.storage.cache_type_name().to_owned(),
@@ -1295,6 +1328,11 @@ where
     }
 
     /// Get info and stats about the cache.
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    pub(crate) fn native_compiler(&self) -> Option<Arc<crate::compiler::NativeCompilerClient>> {
+        self.dist_client.native.clone()
+    }
+
     pub(crate) async fn get_info(&self) -> Result<ServerInfo> {
         let stats = self.stats.lock().await.clone();
         ServerInfo::new(stats, Some(&*self.storage)).await
@@ -1698,6 +1736,13 @@ where
                             stats.compiler_write_duration += duration;
                             debug!("stats after compile result: {stats:?}");
                             cache_write = Some(future);
+                        }
+                        CompileResult::NativeMiss(dt, duration) => {
+                            dist_type = dt;
+                            stats.compilations += 1;
+                            stats.cache_misses.increment(&kind, lang);
+                            stats.compiler_write_duration += duration;
+                            stats.cache_writes += 1;
                         }
                         CompileResult::NotCached(dt, duration) => {
                             debug!("[{out_pretty}]: compile result: not cached");

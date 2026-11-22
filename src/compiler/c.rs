@@ -19,8 +19,9 @@ use crate::compiler::preprocessor_cache::{
     PreprocessorCacheKey, preprocessor_cache_entry_hash_key,
 };
 use crate::compiler::{
-    Cacheable, ColorMode, Compilation, CompileCommand, Compiler, CompilerArguments, CompilerHasher,
-    CompilerKind, GenerateCompileCommandsResult, GenerateHashKeyContext, HashResult, Language,
+    Cacheable, ColorMode, Compilation, CompileCommand, CompileTransport, Compiler,
+    CompilerArguments, CompilerHasher, CompilerKind, GenerateCompileCommandsResult,
+    GenerateHashKeyContext, HashResult, Language,
 };
 use crate::config::PreprocessorCacheModeConfig;
 use crate::dist;
@@ -1887,7 +1888,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
     fn generate_compile_commands(
         &self,
         path_transformer: &mut dist::PathTransformer,
-        rewrite_includes_only: bool,
+        transport: CompileTransport,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
         Option<dist::CompileCommand>,
@@ -1900,7 +1901,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
                 parsed_args: &self.parsed_args,
                 cwd: &self.cwd,
                 env_vars: &self.env_vars,
-                rewrite_includes_only,
+                rewrite_includes_only: transport.rewrite_includes_only(),
             })?;
         if !self.allow_dist {
             dist_command = None;
@@ -2217,8 +2218,8 @@ fn real_cross_gcc_package_preserves_executable_helper_search_path() -> Result<()
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-impl pkg::ToolchainPackager for CToolchainPackager {
-    fn cache_key_extension(&self) -> Result<Option<String>> {
+impl pkg::DiscoverToolchain for CToolchainPackager {
+    fn key_extension(&self) -> Result<Option<String>> {
         // The compiler binary can be unchanged while its assembler, linker,
         // internal phases or search directories are being installed or updated.
         // One GCC driver query and metadata checks are cheaper than repackaging
@@ -2248,25 +2249,6 @@ impl pkg::ToolchainPackager for CToolchainPackager {
         )?))
     }
 
-    fn prepare_namespace(self: Box<Self>) -> Result<(String, Box<dyn pkg::ToolchainPackager>)> {
-        self.package_builder()?.prepare_namespace()
-    }
-
-    fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()> {
-        self.package_builder()?.write_compressed_tar(f)
-    }
-
-    fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
-        self.package_builder()?.into_native_mapping()
-    }
-}
-
-#[cfg(all(
-    feature = "dist-client",
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-impl CToolchainPackager {
     fn package_builder(self) -> Result<pkg::ToolchainPackageBuilder> {
         use std::os::unix::ffi::OsStringExt;
 
@@ -2669,7 +2651,7 @@ mod test {
                 assert!(deps.contains(input.to_str().context("UTF-8 input")?));
                 assert!(!deps.contains("/__sccache/"));
                 let (command, remote, _) =
-                    hash.compilation.generate_compile_commands(&mut dist::PathTransformer::new(), false)?;
+                    hash.compilation.generate_compile_commands(&mut dist::PathTransformer::new(), CompileTransport::Archive { rewrite_includes_only: false })?;
                 #[cfg(feature = "dist-client")]
                 assert!(remote.context("distributed command")?.arguments.iter().any(|arg| arg.starts_with("-ffile-prefix-map=")));
                 #[cfg(not(feature = "dist-client"))]

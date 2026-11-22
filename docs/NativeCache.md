@@ -7,8 +7,8 @@ listener nor enabling a worker changes ordinary archive assignments.
 
 ## Action and storage contract
 
-A client captures a quiescent filesystem snapshot (or imports verified
-upstream packages and composes a tree) into a local native store. Tree
+A client describes quiescent files directly, or a store imports verified
+upstream packages and composes a tree. Tree
 manifests preserve byte paths, executable modes, timestamps, symbolic links
 and hardlink topology. Source capture uses descriptor-relative no-follow
 traversal and before/after stat checks; it is not a substitute for a
@@ -65,7 +65,7 @@ other nondeterministic process behavior are not automatically normalized.
 
 ## Configuration
 
-Both sections below are opt-in. Use an authenticated private transport for
+The native scheduler, worker and compiler client are opt-in. Use an authenticated private transport for
 the dedicated HTTP cache listener (e.g. the managed private network);
 the listener does not terminate TLS itself. Worker job claiming uses the
 existing HTTPS job service with the scheduler-provided certificate and job
@@ -147,17 +147,60 @@ A separate quota-controlled scratch filesystem is still required; per-job
 scratch limits and fleet-level capacity policy remain outstanding. The native store is not
 an additional production sccache cache tier.
 
+### Ordinary compiler client
+
+On a supported Linux client built with the distributed-client feature,
+select native mode in the normal sccache configuration:
+
+```toml
+[dist]
+scheduler_url = "http://127.0.0.1:10500"
+
+[dist.auth]
+type = "token"
+token = "<scheduler client token>"
+
+[dist.native]
+endpoint = "http://127.0.0.1:10502"
+platform_contract = "site-defined-linux-execution-contract-v1"
+request_timeout_secs = 120
+build_timeout_secs = 600
+renewal_interval_secs = 15
+max_metadata_bytes = 67108864
+max_result_bytes = 1073741824
+```
+
+The contract must match an eligible worker. Native mode bypasses archive
+cache initialization, lookup and publication; it also bypasses the archive
+toolchain cache. The existing compiler frontend still performs cacheability
+analysis and source discovery. Cacheable supported commands produce an
+exact native execution specification. Dependency files remain locally
+generated; the worker's private Rust dep-info emission is retained where
+needed for identical rlib metadata.
+
+Unavailable native execution, unsupported custom toolchains, non-cacheable
+commands and forced-cache policy requests currently execute locally without
+archive caching. Forced recache does not yet replace a native action. Native
+mode rejects namespace-broker/client-side mode until that path uses the
+native protocol.
+
 ## Toolchain discovery and mapped trees
 
 The Linux C and Rust toolchain packagers share their existing dependency and
 path discovery between archive emission and native mapping. Native mapping
-reads selected files into verified CAS staging, normalizes toolchain modes
+hashes selected files without staging, normalizes toolchain modes
 and timestamps, and rebases both symlink names and targets when a logical
 sysroot mapping is applied. No archive or intermediate materialized root is
 created. Mappings also support generated file bytes and explicit directories.
+The client shares a bounded, process-local digest memo for installed
+toolchain files. Inventory discovery still runs on each preparation.
+A matching device, inode, mode, link count, size, mtime and ctime allow
+a toolchain digest to be reused without reading file contents. Concurrent
+preparations of the same path share a slot. The memo retains no bytes,
+does not survive daemon restart, and is not used for project sources.
 The caller must keep sources stable during capture; per-file stat checks
 detect changes but are not a filesystem snapshot. This API is available when
-the distributed client and native store features are enabled.
+the distributed client enables the mapping feature, even without a local store.
 
 ### Compiler inputs
 
@@ -177,5 +220,8 @@ The native HTTP tests exercise actual wire transfers and a Bubblewrap
 execution with a captured shell root and a separate mounted source tree.
 The scheduler unit test checks platform matching and shared capacity.
 A subprocess integration test uses real assembler dependency discovery, direct CAS transfer, the scheduler, HTTPS job claiming and a native-only Bubblewrap worker; it compares object bytes against local assembly and verifies cache reuse and failed-action handling.
-The ordinary compiler frontend, production deployment, real multi-host
-benchmarking and hard scratch quotas remain separate integration work.
+Real GCC and Rust compiler-plan tests compare native sandbox outputs
+byte-for-byte against direct compiler invocations, including local dep-info
+generation. Full ordinary-client network integration, namespace brokering,
+production deployment, multi-host benchmarking and hard scratch quotas
+remain separate integration work.

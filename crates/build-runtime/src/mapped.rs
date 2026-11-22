@@ -5,7 +5,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fs::File,
     io::{Cursor, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -13,9 +13,12 @@ use anyhow::{Context, Result, ensure};
 use rustix::fs::{CWD, FileType, Mode, OFlags, Stat, fstat, openat};
 
 use crate::source::{metadata, unchanged};
+
+mod digest_cache;
 use crate::{
     BlobRef, ContentId, TreeEntry, TreeId, TreeManifest, TreeMetadata, TreePath, TreeTimestamp,
 };
+pub use digest_cache::SourceDigestCache;
 
 /// File metadata contract for a mapped build tree. Normalization is explicit
 /// and affects the actual materialized inode, not merely its cache key.
@@ -155,7 +158,20 @@ impl MappedTree {
     /// operation. Metadata checks detect changes but do not replace a snapshot.
     /// # Errors
     /// Returns an error for invalid topology, changed or unreadable sources.
-    pub fn prepare(mut self) -> Result<PreparedTree> {
+    pub fn prepare(self) -> Result<PreparedTree> {
+        self.prepare_inner(None)
+    }
+
+    /// Capture a trusted installed toolchain using a process-local digest
+    /// memo. Fresh discovery still determines the entire tree topology.
+    /// Only a matching regular-file stat version permits digest reuse.
+    /// # Errors
+    /// Returns an error for invalid topology, changed or unreadable sources.
+    pub fn prepare_with_cache(self, cache: &SourceDigestCache) -> Result<PreparedTree> {
+        self.prepare_inner(Some(cache))
+    }
+
+    fn prepare_inner(mut self, cache: Option<&SourceDigestCache>) -> Result<PreparedTree> {
         self.add_parents()?;
         let mut entries = BTreeMap::new();
         let mut sources = BTreeMap::new();
@@ -177,7 +193,11 @@ impl MappedTree {
                     path,
                     metadata: policy,
                 } => {
-                    let (blob, stat) = hash_source(&path)?;
+                    let (file, stat) = open_source(&path)?;
+                    let blob = match cache {
+                        Some(cache) => cache.digest(&path, &file, &stat)?,
+                        None => hash_open_source(&file, &stat)?,
+                    };
                     let metadata = match policy {
                         MappedMetadata::Preserve => metadata(&stat)?,
                         MappedMetadata::Normalize(modified) => TreeMetadata {
@@ -210,7 +230,7 @@ impl MappedTree {
     }
 }
 
-fn open_source(path: &std::path::Path) -> Result<(File, Stat)> {
+fn open_source(path: &Path) -> Result<(File, Stat)> {
     let file = File::from(openat(
         CWD,
         path,
@@ -225,21 +245,17 @@ fn open_source(path: &std::path::Path) -> Result<(File, Stat)> {
     Ok((file, stat))
 }
 
-fn hash_source(path: &std::path::Path) -> Result<(BlobRef, Stat)> {
-    let (file, stat) = open_source(path)?;
+fn hash_open_source(file: &File, stat: &Stat) -> Result<BlobRef> {
     let size = u64::try_from(stat.st_size)?;
-    let mut reader = (&file).take(size.checked_add(1).context("mapped file length overflow")?);
+    let mut reader = file.take(size.checked_add(1).context("mapped file length overflow")?);
     let mut hash = blake3::Hasher::new();
     hash.update_reader(&mut reader)?;
     ensure!(reader.limit() == 1, "file size changed during capture");
-    unchanged(&stat, &fstat(&file)?)?;
-    Ok((
-        BlobRef {
-            id: ContentId(*hash.finalize().as_bytes()),
-            size,
-        },
-        stat,
-    ))
+    unchanged(stat, &fstat(file)?)?;
+    Ok(BlobRef {
+        id: ContentId(*hash.finalize().as_bytes()),
+        size,
+    })
 }
 
 enum PreparedSource {

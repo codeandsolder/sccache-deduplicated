@@ -21,24 +21,24 @@ struct InputFile {
     generated: Option<Vec<u8>>,
 }
 
-pub(crate) struct CompilerInputs {
+pub struct CompilerInputs {
     paths: InputArchivePaths,
     files: BTreeMap<String, InputFile>,
 }
 
 impl CompilerInputs {
-    pub(crate) fn new(transformer: PathTransformer) -> Self {
+    pub fn new(transformer: PathTransformer) -> Self {
         Self {
             paths: InputArchivePaths::new(transformer),
             files: BTreeMap::new(),
         }
     }
 
-    pub(crate) fn directory(&mut self, path: &Path) -> Result<()> {
+    pub fn directory(&mut self, path: &Path) -> Result<String> {
         self.paths.directory(path)
     }
 
-    pub(crate) fn file(&mut self, path: &Path, generated: Option<Vec<u8>>) -> Result<()> {
+    pub fn file(&mut self, path: &Path, generated: Option<Vec<u8>>) -> Result<()> {
         let (source, destination) = self.paths.file(path)?;
         let input = InputFile { source, generated };
         match self.files.entry(destination) {
@@ -57,7 +57,7 @@ impl CompilerInputs {
         Ok(())
     }
 
-    pub(crate) fn write_archive(
+    pub fn write_archive(
         self,
         writer: &mut dyn io::Write,
         mut transform: impl FnMut(&Path, &mut fs::File) -> Result<Option<Vec<u8>>>,
@@ -89,7 +89,7 @@ impl CompilerInputs {
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) fn into_native_mapping(self) -> Result<crate::build_runtime::MappedTree> {
+    pub fn into_native_mapping(self) -> Result<crate::build_runtime::MappedTree> {
         use crate::build_runtime::{
             MappedMetadata, MappedTree, TreeMetadata, TreePath, TreeTimestamp,
         };

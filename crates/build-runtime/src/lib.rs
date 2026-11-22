@@ -50,4 +50,4 @@ mod mapped;
 #[cfg(all(target_os = "linux", feature = "mapping"))]
 mod source;
 #[cfg(all(target_os = "linux", feature = "mapping"))]
-pub use mapped::{MappedMetadata, MappedTree, PreparedTree};
+pub use mapped::{MappedMetadata, MappedTree, PreparedTree, SourceDigestCache};

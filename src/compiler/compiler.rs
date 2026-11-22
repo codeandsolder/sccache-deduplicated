@@ -454,6 +454,26 @@ impl CompilerKind {
     }
 }
 
+/// Select the remote execution representation before compiler-specific
+/// argument rewriting. Native workers preserve the declared path topology.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompileTransport {
+    Archive { rewrite_includes_only: bool },
+    Native,
+}
+
+impl CompileTransport {
+    #[must_use = "this controls compiler preprocessing"]
+    pub const fn rewrite_includes_only(self) -> bool {
+        matches!(
+            self,
+            Self::Archive {
+                rewrite_includes_only: true
+            }
+        )
+    }
+}
+
 pub type GenerateCompileCommandsResult<T> = Result<(
     Box<dyn CompileCommand<T>>,
     Option<dist::CompileCommand>,
@@ -609,7 +629,11 @@ where
         let out_pretty = self.output_pretty().into_owned();
         debug!("[{out_pretty}]: get_cached_or_compile: {arguments:?}");
         let start = Instant::now();
+        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+        let native = service.native_compiler();
         let may_dist = dist_client.is_some();
+        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+        let may_dist = may_dist || native.is_some();
         let rewrite_includes_only = dist_client
             .as_ref()
             .is_some_and(|client| client.rewrite_includes_only());
@@ -646,6 +670,19 @@ where
                 cache_control,
             }) => (key, compilation, weak_toolchain_key, cache_control),
         };
+        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+        if let Some(native) = native {
+            return super::native::compile(
+                native,
+                service,
+                creator,
+                cwd,
+                compilation,
+                cache_control,
+                &pool,
+            )
+            .await;
+        }
         debug!("[{out_pretty}]: Hash key: {key}");
         // If `ForceRecache` is enabled, we won't check the cache.
         let start = Instant::now();
@@ -937,7 +974,7 @@ fn apply_selected_toolchain_override(
 }
 
 #[cfg(feature = "dist-client")]
-fn validate_dist_environment_dependencies(
+pub(super) fn validate_dist_environment_dependencies(
     command: &dist::CompileCommand,
     dependencies: &[(OsString, Option<OsString>)],
 ) -> Result<()> {
@@ -974,7 +1011,12 @@ where
 {
     let mut path_transformer = dist::PathTransformer::new();
     let (compile_cmd, _dist_compile_cmd, cacheable) = compilation
-        .generate_compile_commands(&mut path_transformer, true)
+        .generate_compile_commands(
+            &mut path_transformer,
+            CompileTransport::Archive {
+                rewrite_includes_only: true,
+            },
+        )
         .context("Failed to generate compile commands")?;
 
     debug!("[{}]: Compiling locally", out_pretty);
@@ -1008,7 +1050,12 @@ where
         .is_some_and(|client| client.rewrite_includes_only());
     let mut path_transformer = dist::PathTransformer::new();
     let (compile_cmd, dist_compile_cmd, cacheable) = compilation
-        .generate_compile_commands(&mut path_transformer, rewrite_includes_only)
+        .generate_compile_commands(
+            &mut path_transformer,
+            CompileTransport::Archive {
+                rewrite_includes_only,
+            },
+        )
         .context("Failed to generate compile commands")?;
 
     let Some(dist_client) = dist_compile_cmd.clone().and(dist_client) else {
@@ -1259,7 +1306,7 @@ where
     fn generate_compile_commands(
         &self,
         path_transformer: &mut dist::PathTransformer,
-        rewrite_includes_only: bool,
+        transport: CompileTransport,
     ) -> GenerateCompileCommandsResult<T>;
 
     /// Exact environment observations that the final distributed command must preserve.
@@ -1390,6 +1437,8 @@ pub enum CompileResult {
         Duration, // Compilation time
         Pin<Box<dyn Future<Output = Result<CacheWriteInfo>> + Send>>,
     ),
+    /// A native worker already published a result to the scheduler.
+    NativeMiss(DistType, Duration),
     /// Not in cache and do not cache the results of the compilation.
     NotCached(DistType, Duration),
     /// Not in cache, but the compilation result was determined to be not cacheable.
@@ -1416,6 +1465,9 @@ impl fmt::Debug for CompileResult {
             Self::CacheMiss(ref m, ref dt, ref d, _) => {
                 write!(f, "CompileResult::CacheMiss({d:?}, {m:?}, {dt:?}, _)")
             }
+            Self::NativeMiss(ref dt, ref d) => {
+                write!(f, "CompileResult::NativeMiss({dt:?}, {d:?})")
+            }
             Self::NotCached(ref dt, ref d) => {
                 write!(f, "CompileResult::NotCached({dt:?}, {d:?}_")
             }
@@ -1435,7 +1487,8 @@ impl PartialEq<Self> for CompileResult {
         match (self, other) {
             (&Self::Error, &Self::Error) | (&Self::CacheHit(_), &Self::CacheHit(_)) => true,
             (Self::CacheMiss(m, dt, _, _), Self::CacheMiss(n, dt2, _, _)) => m == n && dt == dt2,
-            (Self::NotCached(dt, _), Self::NotCached(dt2, _))
+            (Self::NativeMiss(dt, _), Self::NativeMiss(dt2, _))
+            | (Self::NotCached(dt, _), Self::NotCached(dt2, _))
             | (Self::NotCacheable(dt, _), Self::NotCacheable(dt2, _))
             | (Self::CompileFailed(dt, _), Self::CompileFailed(dt2, _)) => dt == dt2,
             _ => false,
