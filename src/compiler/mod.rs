@@ -15,6 +15,7 @@
 #[macro_use]
 mod args;
 mod c;
+mod canonical_native;
 pub mod canonical_paths;
 mod cicc;
 mod clang;
