@@ -316,6 +316,10 @@ mod toolchain_imp {
             Ok(digest.finish())
         }
 
+        /// Freeze the selected package inventory for an IPC reservation.
+        ///
+        /// # Errors
+        /// A selected file or its metadata cannot be read.
         pub fn prepare_namespace(self) -> Result<(String, Box<dyn super::ToolchainPackager>)> {
             let identity = self.identity()?;
             Ok((
@@ -332,7 +336,7 @@ mod toolchain_imp {
         /// # Errors
         ///
         /// Returns an error if archive construction or compression fails.
-        pub fn into_compressed_tar<W: Write + Send + 'static>(&self, writer: W) -> Result<()> {
+        pub fn write_compressed_tar<W: Write + Send + 'static>(&self, writer: W) -> Result<()> {
             use crate::compression::deflate::ParallelGzipWriter;
 
             let mut builder = tar::Builder::new(ParallelGzipWriter::new(writer)?);
@@ -388,7 +392,7 @@ mod toolchain_imp {
                 self.builder.identity()? == self.identity,
                 "toolchain changed before packaging"
             );
-            self.builder.into_compressed_tar(file)?;
+            self.builder.write_compressed_tar(file)?;
             ensure!(
                 self.builder.identity()? == self.identity,
                 "toolchain changed during packaging"
@@ -454,7 +458,7 @@ mod toolchain_imp {
         let mut builder = ToolchainPackageBuilder::new();
         builder.add_file(reported.clone())?;
         let archive_path = temp.path().join("toolchain.tar.gz");
-        builder.into_compressed_tar(fs::File::create(&archive_path)?)?;
+        builder.write_compressed_tar(fs::File::create(&archive_path)?)?;
 
         let root = temp.path().join("unpacked");
         crate::compression::deflate::unpack_gzip(fs::File::open(&archive_path)?, &root)?;
@@ -486,7 +490,7 @@ mod toolchain_imp {
         let archive_path = temp.path().join("toolchain.tar.gz");
         let mut builder = ToolchainPackageBuilder::new();
         builder.add_file(artifact.clone())?;
-        builder.into_compressed_tar(fs::File::create(&archive_path)?)?;
+        builder.write_compressed_tar(fs::File::create(&archive_path)?)?;
         let root = temp.path().join("unpacked");
         crate::compression::deflate::unpack_gzip(fs::File::open(&archive_path)?, &root)?;
         assert_eq!(fs::read(root.join(artifact.strip_prefix("/")?))?, data);

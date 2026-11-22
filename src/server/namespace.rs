@@ -425,16 +425,21 @@ impl TransferSession {
 
     #[cfg(feature = "dist-client")]
     fn validate_reservation(&self, compiler: &std::path::Path, key: &str, len: u64) -> Result<()> {
-        let reservation = self
+        let Reservation {
+            compiler: reserved_compiler,
+            key: reserved_key,
+            max_size,
+            ..
+        } = self
             .reservation
             .as_ref()
             .context("toolchain upload was not reserved")?;
         ensure!(
-            reservation.key == key && reservation.compiler == compiler,
+            reserved_key == key && reserved_compiler == compiler,
             "toolchain reservation mismatch"
         );
         ensure!(
-            len <= reservation.max_size,
+            len <= *max_size,
             "toolchain exceeds daemon archive capacity"
         );
         Ok(())

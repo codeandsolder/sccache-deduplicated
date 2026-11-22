@@ -2332,7 +2332,7 @@ impl pkg::ToolchainPackager for CToolchainPackager {
     }
 
     fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()> {
-        self.package_builder()?.into_compressed_tar(f)
+        self.package_builder()?.write_compressed_tar(f)
     }
 }
 
