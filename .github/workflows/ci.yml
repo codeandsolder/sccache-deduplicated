@@ -104,6 +104,8 @@ jobs:
         run: |
           bash -n contrib/codeandsolder/sccache-release-update contrib/codeandsolder/cargo-wrapper contrib/codeandsolder/rustup-wrapper contrib/codeandsolder/test-wrappers
           shellcheck -x contrib/codeandsolder/sccache-release-update contrib/codeandsolder/cargo-wrapper contrib/codeandsolder/rustup-wrapper contrib/codeandsolder/test-wrappers contrib/codeandsolder/build-host-native contrib/codeandsolder/host-native-metadata contrib/codeandsolder/test-host-native-metadata contrib/codeandsolder/test-release-update-plan
+          shellcheck -x contrib/codeandsolder/sccache-dist-client-preflight contrib/codeandsolder/test-dist-client-preflight
+          contrib/codeandsolder/test-dist-client-preflight
           contrib/codeandsolder/test-release-update-plan
           contrib/codeandsolder/test-wrappers
           sudo contrib/codeandsolder/test-host-native-metadata

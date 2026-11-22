@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodically check for approved sccache releases
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+RandomizedDelaySec=3min
+AccuracySec=1min
+Persistent=true
+Unit=sccache-release-update.service
+
+[Install]
+WantedBy=timers.target
