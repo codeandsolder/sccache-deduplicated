@@ -80,6 +80,7 @@ impl Renewals {
             .lock()
             .map_err(|_| anyhow!("native renewal state poisoned"))?;
         state.tickets.insert(ticket);
+        drop(state);
         Ok(())
     }
 
@@ -89,6 +90,7 @@ impl Renewals {
             .lock()
             .map_err(|_| anyhow!("native renewal state poisoned"))?;
         state.tickets.remove(&ticket);
+        drop(state);
         Ok(())
     }
 
@@ -98,6 +100,7 @@ impl Renewals {
             .lock()
             .map_err(|_| anyhow!("native renewal state poisoned"))?;
         state.tickets.clear();
+        drop(state);
         Ok(())
     }
 
@@ -109,6 +112,7 @@ impl Renewals {
         if let Some(error) = &state.failure {
             return Err(anyhow!("native scheduler lease renewal failed: {error}"));
         }
+        drop(state);
         Ok(())
     }
 
