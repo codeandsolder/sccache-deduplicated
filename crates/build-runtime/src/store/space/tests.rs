@@ -19,7 +19,7 @@ fn publish(store: &NativeStore, name: &str) -> Result<ActionKey> {
     let stage = store.stage(Cursor::new(name.as_bytes()))?;
     let blob: BlobRef = stage.reference();
     let manifest = ResultManifest {
-        outputs: BTreeMap::from([("obj".into(), Artifact { blob, mode: None })]),
+        outputs: BTreeMap::from([("obj".into(), Artifact::File { blob, mode: None })]),
         stdout: None,
         stderr: None,
     };

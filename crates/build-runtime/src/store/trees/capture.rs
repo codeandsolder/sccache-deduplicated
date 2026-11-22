@@ -1,15 +1,12 @@
 //! Import a stable local source/toolchain snapshot without archive creation.
 
-use std::{collections::BTreeMap, ffi::OsStr, fs::File, os::unix::ffi::OsStrExt, path::Path};
+use std::{collections::BTreeMap, fs::File, path::Path};
 
 use anyhow::{Result, ensure};
-use rustix::{
-    fd::AsFd,
-    fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, Stat, fstat, openat, readlinkat, statat},
-};
+use rustix::fs::{CWD, FileType, Mode, OFlags, Stat, fstat, openat};
 
-use crate::source::{metadata, timestamp, unchanged};
-use crate::{ContentId, NativeStore, StagedBlob, TreeEntry, TreeLease, TreeManifest, TreePath};
+use crate::source::unchanged;
+use crate::{NativeStore, StagedBlob, TreeLease};
 
 impl NativeStore {
     /// Capture one stable caller-owned snapshot as a normalized tree.
@@ -29,104 +26,14 @@ impl NativeStore {
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
-        let stat = fstat(&fd)?;
-        let mut capture = Capture {
-            store: self,
-            entries: BTreeMap::new(),
-            blobs: BTreeMap::new(),
-            links: BTreeMap::new(),
-        };
-        capture.directory(&fd, b"")?;
-        unchanged(&stat, &fstat(&fd)?)?;
-        let manifest = TreeManifest {
-            root: metadata(&stat)?,
-            entries: capture.entries,
-        };
-        self.publish_tree_pinned(&manifest, capture.blobs.into_values().collect())
-    }
-}
-
-struct Capture<'a> {
-    store: &'a NativeStore,
-    entries: BTreeMap<TreePath, TreeEntry>,
-    blobs: BTreeMap<ContentId, StagedBlob>,
-    links: BTreeMap<(u64, u64), TreePath>,
-}
-
-impl Capture<'_> {
-    fn directory(&mut self, dir: &impl AsFd, prefix: &[u8]) -> Result<()> {
-        let mut names = Vec::new();
-        for entry in Dir::read_from(dir)? {
-            let entry = entry?;
-            let name = entry.file_name().to_bytes();
-            if name != b"." && name != b".." {
-                names.push(name.to_vec());
-            }
-        }
-        names.sort_unstable();
-        for name in names {
-            let mut path = prefix.to_vec();
-            if !path.is_empty() {
-                path.push(b'/');
-            }
-            path.extend_from_slice(&name);
-            let relative = TreePath::new(path)?;
-            let name = OsStr::from_bytes(&name);
-            let stat = statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
-            let entry = match FileType::from_raw_mode(stat.st_mode) {
-                FileType::Directory => {
-                    let child = openat(
-                        dir,
-                        name,
-                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                        Mode::empty(),
-                    )?;
-                    unchanged(&stat, &fstat(&child)?)?;
-                    self.directory(&child, relative.as_bytes())?;
-                    unchanged(&stat, &fstat(&child)?)?;
-                    TreeEntry::Directory(metadata(&stat)?)
-                }
-                FileType::RegularFile => self.regular(dir, name, &relative, &stat)?,
-                FileType::Symlink => TreeEntry::Symlink {
-                    target: readlinkat(dir, name, Vec::new())?.into_bytes(),
-                    modified: timestamp(&stat)?,
-                },
-                _ => anyhow::bail!("unsupported entry in native snapshot"),
-            };
-            unchanged(&stat, &statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)?)?;
-            self.entries.insert(relative, entry);
-        }
-        Ok(())
-    }
-
-    fn regular(
-        &mut self,
-        dir: &impl AsFd,
-        name: &OsStr,
-        path: &TreePath,
-        stat: &Stat,
-    ) -> Result<TreeEntry> {
-        let identity = (stat.st_dev, stat.st_ino);
-        if let Some(target) = self.links.get(&identity) {
-            return Ok(TreeEntry::Hardlink(target.clone()));
-        }
-        let file = File::from(openat(
-            dir,
-            name,
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-            Mode::empty(),
-        )?);
-        unchanged(stat, &fstat(&file)?)?;
-        let blob = capture_regular(self.store, &file, stat)?;
-        let reference = blob.reference();
-        self.blobs.entry(reference.id).or_insert(blob);
-        if stat.st_nlink > 1 {
-            self.links.insert(identity, path.clone());
-        }
-        Ok(TreeEntry::File {
-            blob: reference,
-            metadata: metadata(stat)?,
-        })
+        let mut blobs = BTreeMap::new();
+        let manifest = crate::source::capture_tree(&fd, |file, stat| {
+            let blob = capture_regular(self, &file, stat)?;
+            let reference = blob.reference();
+            blobs.entry(reference.id).or_insert(blob);
+            Ok(reference)
+        })?;
+        self.publish_tree_pinned(&manifest, blobs.into_values().collect())
     }
 }
 
@@ -147,6 +54,7 @@ pub(super) fn capture_regular(store: &NativeStore, file: &File, stat: &Stat) -> 
 
 #[cfg(test)]
 mod tests {
+    use crate::TreeEntry;
     use std::{
         fs,
         os::unix::{

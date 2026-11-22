@@ -272,7 +272,5 @@ impl Drop for TreePin {
 mod capture;
 #[cfg(target_os = "linux")]
 mod materialize;
-#[cfg(target_os = "linux")]
-pub use materialize::{MaterializationStats, MaterializedTree};
 #[cfg(test)]
 mod tests;

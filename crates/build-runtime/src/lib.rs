@@ -14,7 +14,8 @@ pub use spec::{BuildPath, CommandSpec, ExecutionSpec, OutputSpec};
 mod tree;
 pub mod wire;
 pub use identity::{
-    ActionFingerprint, ActionKey, Artifact, BlobRef, ContentId, ResultId, ResultManifest,
+    ActionFingerprint, ActionKey, Artifact, BlobRef, ContentId, OutputKind, ResultId,
+    ResultManifest,
 };
 pub use tree::{TreeEntry, TreeId, TreeManifest, TreeMetadata, TreePath, TreeTimestamp};
 
@@ -42,8 +43,10 @@ pub mod sandbox;
 #[cfg(all(target_os = "linux", feature = "store"))]
 pub use execution::{CapturedExecution, ExecutionPolicy, execute};
 
-#[cfg(all(target_os = "linux", feature = "store"))]
-pub use store::{MaterializationStats, MaterializedTree};
+#[cfg(all(target_os = "linux", feature = "mapping"))]
+mod tree_fs;
+#[cfg(all(target_os = "linux", feature = "mapping"))]
+pub use tree_fs::{MaterializationStats, MaterializedTree, materialize_tree};
 
 #[cfg(all(target_os = "linux", feature = "mapping"))]
 mod mapped;

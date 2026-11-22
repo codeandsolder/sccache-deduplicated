@@ -25,7 +25,7 @@ use rustix::{
 
 use crate::{
     Artifact, BlobRef, BuildPath, ContentId, ExecutionSpec, MaterializedTree, NativeStore,
-    ResultManifest, TreeEntry, TreeLease, TreePath,
+    OutputKind, ResultManifest, TreeEntry, TreeLease, TreePath,
     sandbox::{MountAccess, SandboxInvocation, SandboxPath, SandboxPlan},
 };
 
@@ -165,19 +165,31 @@ fn writable_locations(
     for output in spec.outputs.values() {
         let (mount, tree) = backing(leases, &output.path)?;
         let path = relative(&output.path, mount)?;
-        let parent = path
-            .parent()
-            .context("output cannot replace a mount root")?;
-        require_directory(tree, parent)?;
-        ensure!(
-            !tree
-                .manifest()
+        let existing = if path.as_os_str().is_empty() {
+            ensure!(
+                output.kind == OutputKind::Tree,
+                "file output cannot replace a mount root"
+            );
+            true
+        } else {
+            let parent = path
+                .parent()
+                .context("output cannot replace a mount root")?;
+            require_directory(tree, parent)?;
+            tree.manifest()
                 .entries
-                .contains_key(&TreePath::new(path.as_os_str().as_bytes().to_vec())?),
-            "declared output already exists in the immutable input: {}",
-            host_path(output.path.as_bytes()).display()
-        );
-        writable.insert(output_parent(&output.path)?);
+                .contains_key(&TreePath::new(path.as_os_str().as_bytes().to_vec())?)
+        };
+        if existing {
+            ensure!(
+                output.kind == OutputKind::Tree,
+                "declared file output already exists in immutable input"
+            );
+            require_directory(tree, path)?;
+            writable.insert(output.path.clone());
+        } else {
+            writable.insert(output_parent(&output.path)?);
+        }
     }
     // Remove redundant nested bindings only within the same backing tree.
     let mut result = BTreeSet::new();
@@ -412,28 +424,49 @@ impl Capture {
             let location = locations
                 .get(name)
                 .context("declared output location missing")?;
-            let file = match openat2(
-                &location.directory,
-                &location.relative,
-                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
-                Mode::empty(),
-                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
-            ) {
-                Ok(fd) => File::from(fd),
-                Err(Errno::NOENT) if !output.required => continue,
-                Err(error) => {
-                    return Err(error).with_context(|| format!("open declared output {name}"));
+            let flags = OFlags::RDONLY
+                | OFlags::CLOEXEC
+                | OFlags::NONBLOCK
+                | if output.kind == OutputKind::Tree {
+                    OFlags::DIRECTORY
+                } else {
+                    OFlags::empty()
+                };
+            let file = if location.relative.as_os_str().is_empty() {
+                location.directory.try_clone()?
+            } else {
+                match openat2(
+                    &location.directory,
+                    &location.relative,
+                    flags,
+                    Mode::empty(),
+                    ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
+                ) {
+                    Ok(fd) => File::from(fd),
+                    Err(Errno::NOENT) if !output.required => continue,
+                    Err(error) => {
+                        return Err(error).with_context(|| format!("open declared output {name}"));
+                    }
                 }
             };
-            let mode = file.metadata()?.mode() & 0o777;
-            let blob = self.file(file)?;
-            outputs.insert(
-                name.clone(),
-                Artifact {
-                    blob,
-                    mode: Some(mode),
-                },
-            );
+            let artifact = match output.kind {
+                OutputKind::File => {
+                    let mode = file.metadata()?.mode() & 0o777;
+                    Artifact::File {
+                        blob: self.file(file)?,
+                        mode: Some(mode),
+                    }
+                }
+                OutputKind::Tree => {
+                    let tree = crate::source::capture_tree(&file, |file, stat| {
+                        let reference = self.file(file.try_clone()?)?;
+                        crate::source::unchanged(stat, &rustix::fs::fstat(&file)?)?;
+                        Ok(reference)
+                    })?;
+                    Artifact::Tree(tree)
+                }
+            };
+            outputs.insert(name.clone(), artifact);
         }
         Ok(outputs)
     }

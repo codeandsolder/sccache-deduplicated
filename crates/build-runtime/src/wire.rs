@@ -1,12 +1,15 @@
 //! Native cache wire messages, shared by clients and workers.
 
-use std::{collections::BTreeSet, net::SocketAddr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::SocketAddr,
+};
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActionFingerprint, BlobRef, ContentId, ResultManifest, TreeId, TreeManifest,
+    ActionFingerprint, BlobRef, ContentId, OutputKind, ResultManifest, TreeId, TreeManifest,
     identity::typed_digest,
 };
 
@@ -34,8 +37,8 @@ pub enum Publisher {
 pub struct ActionRequest {
     pub fingerprint: ActionFingerprint,
     pub input_trees: BTreeSet<TreeId>,
-    pub required_outputs: BTreeSet<String>,
-    pub optional_outputs: BTreeSet<String>,
+    pub required_outputs: BTreeMap<String, OutputKind>,
+    pub optional_outputs: BTreeMap<String, OutputKind>,
 }
 
 impl ActionRequest {
@@ -46,19 +49,21 @@ impl ActionRequest {
     pub fn action_fingerprint(&self) -> Result<ActionFingerprint> {
         ensure!(!self.fingerprint.schema.is_empty(), "empty action schema");
         ensure!(
-            self.required_outputs.is_disjoint(&self.optional_outputs),
+            self.required_outputs
+                .keys()
+                .all(|name| !self.optional_outputs.contains_key(name)),
             "ambiguous output contract"
         );
         ensure!(
             self.required_outputs
-                .iter()
-                .chain(&self.optional_outputs)
+                .keys()
+                .chain(self.optional_outputs.keys())
                 .all(|name| !name.is_empty() && !name.contains('\0')),
             "invalid output name"
         );
         let mut fingerprint = self.fingerprint.clone();
         let digest = ContentId(typed_digest(
-            b"sccache-output-contract-v1\0",
+            b"sccache-output-contract-v2\0",
             &(&self.required_outputs, &self.optional_outputs),
         )?);
         ensure!(
@@ -89,23 +94,20 @@ impl ActionRequest {
     pub fn validate_result(&self, result: &ResultManifest) -> Result<()> {
         ensure!(
             self.required_outputs
-                .iter()
+                .keys()
                 .all(|name| result.outputs.contains_key(name)),
             "missing required output"
         );
-        ensure!(
-            result
-                .outputs
-                .keys()
-                .all(|name| self.required_outputs.contains(name)
-                    || self.optional_outputs.contains(name)),
-            "unexpected output"
-        );
-        for artifact in result.outputs.values() {
+        for (name, artifact) in &result.outputs {
+            let expected = self
+                .required_outputs
+                .get(name)
+                .or_else(|| self.optional_outputs.get(name));
             ensure!(
-                artifact.mode.is_none_or(|mode| mode & !0o777 == 0),
-                "unsupported output mode"
+                expected == Some(&artifact.kind()),
+                "unexpected output name or kind"
             );
+            artifact.validate()?;
         }
         Ok(())
     }

@@ -25,8 +25,8 @@ fn request() -> ActionRequest {
             components: BTreeMap::from([("source".into(), ContentId::of(b"input"))]),
         },
         input_trees: BTreeSet::new(),
-        required_outputs: BTreeSet::from(["obj".into()]),
-        optional_outputs: BTreeSet::new(),
+        required_outputs: BTreeMap::from([("obj".into(), crate::OutputKind::File)]),
+        optional_outputs: BTreeMap::new(),
     }
 }
 
@@ -34,7 +34,7 @@ fn manifest(bytes: &[u8]) -> ResultManifest {
     ResultManifest {
         outputs: BTreeMap::from([(
             "obj".into(),
-            Artifact {
+            Artifact::File {
                 blob: BlobRef {
                     id: ContentId::of(bytes),
                     size: bytes.len() as u64,
@@ -67,7 +67,7 @@ fn worker_publication_and_client_download_are_bound_to_ticket() -> Result<()> {
         NativeAdmission::InFlight
     );
     let output = manifest(b"object");
-    let blob = output.outputs["obj"].blob;
+    let blob = output.outputs["obj"].test_file_blob();
     assert!(service.begin(ticket, other_worker, output.clone()).is_err());
     assert!(
         service
@@ -199,7 +199,9 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     );
     assert!(service.renew(ticket, Publisher::Client).is_err());
     let mut changed = request();
-    changed.required_outputs.insert("other".into());
+    changed
+        .required_outputs
+        .insert("other".into(), crate::OutputKind::File);
     assert!(
         service
             .schedule(ticket, &changed, || bail!("wrong declaration"))
@@ -328,5 +330,86 @@ fn expiry_releases_action_even_when_a_transfer_retains_the_session() -> Result<(
         service.admit(request(), Publisher::Client)?,
         NativeAdmission::Compile { .. }
     ));
+    Ok(())
+}
+
+#[test]
+fn tree_result_contract_rejects_wrong_kinds_and_duplicate_logical_overflow() -> Result<()> {
+    use crate::{OutputKind, TreeEntry, TreeManifest, TreeMetadata, TreePath, TreeTimestamp};
+    let dir = tempfile::tempdir()?;
+    let service = service(dir.path())?;
+    let mut request = request();
+    request
+        .required_outputs
+        .insert("obj".into(), OutputKind::Tree);
+    let NativeAdmission::Compile { ticket } = service.admit(request.clone(), Publisher::Client)?
+    else {
+        bail!("expected tree miss");
+    };
+    assert!(
+        service
+            .begin(ticket, Publisher::Client, manifest(b"wrong kind"))
+            .is_err()
+    );
+    let metadata = TreeMetadata {
+        mode: 0o755,
+        modified: TreeTimestamp {
+            seconds: 0,
+            nanoseconds: 0,
+        },
+    };
+    let data = vec![42_u8; 600];
+    let blob = BlobRef {
+        id: ContentId::of(&data),
+        size: data.len() as u64,
+    };
+    let tree = TreeManifest {
+        root: metadata,
+        entries: BTreeMap::from([
+            (
+                TreePath::new(b"one".to_vec())?,
+                TreeEntry::File { blob, metadata },
+            ),
+            (
+                TreePath::new(b"two".to_vec())?,
+                TreeEntry::File { blob, metadata },
+            ),
+        ]),
+    };
+    let mut result = ResultManifest {
+        outputs: BTreeMap::from([("obj".into(), Artifact::Tree(tree))]),
+        stdout: None,
+        stderr: None,
+    };
+    assert_eq!(result.blobs()?.len(), 1);
+    assert_eq!(result.logical_bytes()?, 1200);
+    assert!(
+        service
+            .begin(ticket, Publisher::Client, result.clone())
+            .is_err()
+    );
+    let Artifact::Tree(tree) = result.outputs.get_mut("obj").context("missing tree")? else {
+        bail!("expected tree");
+    };
+    tree.entries.remove(&TreePath::new(b"two".to_vec())?);
+    assert_eq!(
+        service
+            .begin(ticket, Publisher::Client, result.clone())?
+            .missing,
+        vec![blob]
+    );
+    service.upload(ticket, Publisher::Client, blob, data.as_slice())?;
+    assert_eq!(service.commit(ticket, Publisher::Client)?, result);
+    service.close(ticket, Publisher::Client)?;
+    let NativeAdmission::Hit { ticket, manifest } = service.admit(request, Publisher::Client)?
+    else {
+        bail!("expected tree hit");
+    };
+    assert_eq!(manifest, result);
+    let mut restored = Vec::new();
+    service
+        .download(ticket, Publisher::Client, blob.id)?
+        .read_to_end(&mut restored)?;
+    assert_eq!(restored, data);
     Ok(())
 }

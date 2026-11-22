@@ -552,6 +552,10 @@ impl NativeSessions {
         let mut state = Self::lock(&session)?;
         self.authorize(&mut state, publisher)?;
         self.limits.check_blobs(Kind::Action, &manifest.blobs()?)?;
+        ensure!(
+            manifest.logical_bytes()? <= self.limits.max_result_bytes,
+            "native result logical byte limit exceeded"
+        );
         match &mut state.phase {
             Phase::Pending(pending) => {
                 let Pending::Action(action) = &mut **pending else {

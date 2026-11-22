@@ -177,7 +177,7 @@ mod tests {
         let result = ResultManifest {
             outputs: BTreeMap::from([(
                 "output".into(),
-                Artifact {
+                Artifact::File {
                     blob: staged.reference(),
                     mode: None,
                 },

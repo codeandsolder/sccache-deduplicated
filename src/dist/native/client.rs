@@ -18,7 +18,7 @@ use tempfile::NamedTempFile;
 
 use super::NativeCacheClient;
 use crate::build_runtime::{
-    BlobRef, ExecutionSpec, PreparedTree, ResultManifest, TreeId, TreeManifest,
+    Artifact, BlobRef, ExecutionSpec, MaterializedTree, OutputKind, PreparedTree, ResultManifest, TreeId, TreeManifest, materialize_tree,
     wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply, Ticket},
 };
 
@@ -77,6 +77,21 @@ impl InputProvider for LocalInputs<'_> {
 
     fn open_blob(&mut self, tree: TreeId, blob: BlobRef) -> Result<Box<dyn Read + Send>> {
         self.tree(tree)?.open_blob(blob.id)
+    }
+}
+
+enum StagedOutput {
+    File(NamedTempFile),
+    Tree(MaterializedTree),
+}
+
+impl StagedOutput {
+    fn publish(self, path: &Path) -> Result<()> {
+        match self {
+            Self::File(file) => { file.persist(path)?; }
+            Self::Tree(tree) => tree.publish(path)?,
+        }
+        Ok(())
     }
 }
 
@@ -306,15 +321,7 @@ pub(super) fn validate_manifest(
     max_result_bytes: u64,
 ) -> Result<()> {
     spec.action_request()?.validate_result(manifest)?;
-    let total = manifest.blobs()?.values().try_fold(0_u64, |total, &size| {
-        total
-            .checked_add(size)
-            .context("native result length overflow")
-    })?;
-    ensure!(
-        total <= max_result_bytes,
-        "native result exceeds client limits"
-    );
+    ensure!(manifest.logical_bytes()? <= max_result_bytes, "native result exceeds client limits");
     Ok(())
 }
 
@@ -341,12 +348,19 @@ pub(super) fn fetch_result(
     for (name, artifact) in &manifest.outputs {
         let path = destinations.get(name).context("unexpected native output")?;
         let parent = path.parent().context("native output has no parent")?;
-        let mut temp = NamedTempFile::new_in(parent)?;
-        download(artifact.blob, &mut temp)?;
-        if let Some(mode) = artifact.mode {
-            temp.as_file()
-                .set_permissions(fs::Permissions::from_mode(mode))?;
-        }
+        let temp = match artifact {
+            Artifact::File { blob, mode } => {
+                let mut temp = NamedTempFile::new_in(parent)?;
+                download(*blob, &mut temp)?;
+                if let Some(mode) = mode {
+                    temp.as_file().set_permissions(fs::Permissions::from_mode(*mode))?;
+                }
+                StagedOutput::File(temp)
+            }
+            Artifact::Tree(manifest) => StagedOutput::Tree(materialize_tree(manifest, parent, |blob, path| {
+                download(blob, &mut fs::OpenOptions::new().write(true).create_new(true).open(path)?)
+            })?),
+        };
         staged.push((temp, path.clone()));
     }
     Ok(StagedResult {
@@ -359,14 +373,14 @@ pub(super) fn fetch_result(
 pub(super) struct StagedResult {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
-    files: Vec<(NamedTempFile, PathBuf)>,
+    files: Vec<(StagedOutput, PathBuf)>,
 }
 
 impl StagedResult {
     pub(super) fn install(self) -> Result<Output> {
         // File-wise atomic publication, not an atomic multi-file rename.
         for (temp, path) in self.files {
-            temp.persist(path)?;
+            temp.publish(&path)?;
         }
         Ok(Output {
             status: crate::util::exit_status_from_code(0),
@@ -397,10 +411,15 @@ pub(super) fn verify_destinations(
             .canonicalize()?;
         let filename = path.file_name().context("output file name missing")?;
         let path = parent.join(filename);
-        ensure!(
-            seen.insert(path.clone()),
-            "multiple native outputs select the same destination"
-        );
+        ensure!(seen.iter().all(|other: &PathBuf| !path.starts_with(other) && !other.starts_with(&path)), "native output destination paths overlap");
+        if spec.outputs[name].kind == OutputKind::Tree {
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => bail!("native tree output destination must not exist"),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        seen.insert(path.clone());
         verified.insert(name.clone(), path);
     }
     Ok(verified)

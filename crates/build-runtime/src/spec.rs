@@ -7,7 +7,7 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActionFingerprint, ContentId, TreeId, TreePath, TreeRecipe, identity::typed_digest,
+    ActionFingerprint, ContentId, OutputKind, TreeId, TreePath, TreeRecipe, identity::typed_digest,
     wire::ActionRequest,
 };
 
@@ -115,6 +115,7 @@ impl CommandSpec {
 pub struct OutputSpec {
     pub path: BuildPath,
     pub required: bool,
+    pub kind: OutputKind,
 }
 
 /// All declared inputs to a Linux native build.
@@ -173,7 +174,8 @@ impl ExecutionSpec {
                     && !self
                         .mounts
                         .keys()
-                        .any(|mount| mount.within(output.path.as_bytes())),
+                        .any(|mount| mount.within(output.path.as_bytes())
+                            && (mount != &output.path || output.kind != OutputKind::Tree)),
                 "output conflicts with a reserved or mounted path"
             );
             ensure!(
@@ -206,22 +208,22 @@ impl ExecutionSpec {
             );
             trees.insert(*tree);
         }
-        let mut required_outputs = BTreeSet::new();
-        let mut optional_outputs = BTreeSet::new();
+        let mut required_outputs = BTreeMap::new();
+        let mut optional_outputs = BTreeMap::new();
         for (name, output) in &self.outputs {
             components.insert(
                 format!("output/path/{name}"),
                 ContentId::of(output.path.as_bytes()),
             );
             if output.required {
-                required_outputs.insert(name.clone());
+                required_outputs.insert(name.clone(), output.kind);
             } else {
-                optional_outputs.insert(name.clone());
+                optional_outputs.insert(name.clone(), output.kind);
             }
         }
         Ok(ActionRequest {
             fingerprint: ActionFingerprint {
-                schema: "native-linux-bwrap-v3".into(),
+                schema: "native-linux-bwrap-v4".into(),
                 components,
             },
             input_trees: trees,
@@ -262,6 +264,7 @@ mod tests {
                 OutputSpec {
                     path: BuildPath::new(b"/out/object.o".to_vec())?,
                     required: true,
+                    kind: crate::OutputKind::File,
                 },
             )]),
         })
@@ -303,6 +306,13 @@ mod tests {
             .required = false;
         assert_ne!(first, key(&changed)?);
         changed = original.clone();
+        changed
+            .outputs
+            .get_mut("object")
+            .context("test output")?
+            .kind = OutputKind::Tree;
+        assert_ne!(first, key(&changed)?);
+        changed = original.clone();
         changed.mounts.clear();
         changed
             .mounts
@@ -339,6 +349,7 @@ mod tests {
             OutputSpec {
                 path: BuildPath::new(b"/out/object.o/nested".to_vec())?,
                 required: false,
+                kind: crate::OutputKind::File,
             },
         );
         assert!(invalid.action_request().is_err());

@@ -95,7 +95,8 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
             },
         )]),
     };
-    let src = store.publish_tree(&tree, vec![input])?;
+    let original_manifest = tree;
+    let src = store.publish_tree(&original_manifest, vec![input])?;
     let platform = ContentId::of(b"test platform");
     let mut spec = ExecutionSpec {
         platform, root: TreeRecipe::union(metadata(0o755), [root]),
@@ -107,8 +108,8 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
             environment: BTreeMap::new(),
         },
         outputs: BTreeMap::from([
-            ("obj".into(), OutputSpec { path: BuildPath::new(b"/out/nested/object".to_vec())?, required: true }),
-            ("optional".into(), OutputSpec { path: BuildPath::new(b"/out/optional".to_vec())?, required: false }),
+            ("obj".into(), OutputSpec { path: BuildPath::new(b"/out/nested/object".to_vec())?, required: true, kind: crate::OutputKind::File }),
+            ("optional".into(), OutputSpec { path: BuildPath::new(b"/out/optional".to_vec())?, required: false, kind: crate::OutputKind::File }),
         ]),
     };
     let policy = ExecutionPolicy {
@@ -123,8 +124,8 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
     spec.action_request()?.validate_result(manifest)?;
     let object = manifest.outputs.get("obj").context("object missing")?;
     let mut bytes = Vec::new();
-    let mut a = result.open_blob(object.blob.id)?;
-    let mut b = result.open_blob(object.blob.id)?;
+    let mut a = result.open_blob(object.test_file_blob().id)?;
+    let mut b = result.open_blob(object.test_file_blob().id)?;
     let mut first = [0];
     a.read_exact(&mut first)?;
     b.read_to_end(&mut bytes)?;
@@ -155,6 +156,7 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
             OutputSpec {
                 path: BuildPath::new(b"/src/object".to_vec())?,
                 required: true,
+                kind: crate::OutputKind::File,
             },
         ),
         (
@@ -162,6 +164,7 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
             OutputSpec {
                 path: BuildPath::new(b"/tmp/result".to_vec())?,
                 required: true,
+                kind: crate::OutputKind::File,
             },
         ),
     ]);
@@ -172,7 +175,7 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
         .context("in-place output execution failed")?;
     let mut content = Vec::new();
     result
-        .open_blob(manifest.outputs["scratch"].blob.id)?
+        .open_blob(manifest.outputs["scratch"].test_file_blob().id)?
         .read_to_end(&mut content)?;
     assert_eq!(content, b"hello native");
     assert!(
@@ -183,6 +186,47 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
             .entries
             .contains_key(&TreePath::new(b"object".to_vec())?)
     );
+
+    let file_outputs = spec.outputs.clone();
+    spec.outputs = BTreeMap::from([(
+        "codegen".into(),
+        OutputSpec {
+            path: BuildPath::new(b"/src".to_vec())?,
+            required: true,
+            kind: crate::OutputKind::Tree,
+        },
+    )]);
+    spec.command.arguments[1] = b"printf generated > /src/first.o; printf second > /src/second.o; printf changed > /src/input".to_vec();
+    let result = execute(&spec, &store, &policy, || Ok(()))?;
+    let manifest = result
+        .successful_result()
+        .context("tree output execution failed")?;
+    spec.action_request()?.validate_result(manifest)?;
+    let Artifact::Tree(tree) = &manifest.outputs["codegen"] else {
+        anyhow::bail!("expected complete directory output");
+    };
+    assert_eq!(tree.entries.len(), 3);
+    let mut seen = BTreeMap::new();
+    for (path, entry) in &tree.entries {
+        let TreeEntry::File { blob, .. } = entry else {
+            anyhow::bail!("expected file");
+        };
+        let mut bytes = Vec::new();
+        result.open_blob(blob.id)?.read_to_end(&mut bytes)?;
+        seen.insert(path.as_bytes(), bytes);
+    }
+    assert_eq!(seen[b"first.o".as_slice()], b"generated");
+    assert_eq!(seen[b"second.o".as_slice()], b"second");
+    assert_eq!(seen[b"input".as_slice()], b"changed");
+    assert_eq!(
+        store
+            .lookup_tree(src)?
+            .context("original input")?
+            .manifest(),
+        &original_manifest
+    );
+    spec.outputs = file_outputs;
+    spec.command.arguments[1] = b"printf new > object".to_vec();
 
     // A preexisting input cannot silently serve as a compiler output.
     spec.outputs.get_mut("object").context("output")?.path =
@@ -223,6 +267,7 @@ fn rejects_symlink_and_fifo_outputs_without_following_or_blocking() -> Result<()
             OutputSpec {
                 path: BuildPath::new(b"/out/object".to_vec())?,
                 required: true,
+                kind: crate::OutputKind::File,
             },
         )]),
     };

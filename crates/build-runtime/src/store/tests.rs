@@ -16,7 +16,7 @@ fn result(blob: BlobRef) -> ResultManifest {
     ResultManifest {
         outputs: BTreeMap::from([(
             "obj".into(),
-            Artifact {
+            Artifact::File {
                 blob,
                 mode: Some(0o644),
             },
@@ -198,7 +198,7 @@ fn reopen_recovers_unindexed_content_and_keeps_committed_results() -> Result<()>
     assert_eq!(lease.manifest(), &manifest);
     let mut bytes = Vec::new();
     lease
-        .open_blob(manifest.outputs["obj"].blob.id)?
+        .open_blob(manifest.outputs["obj"].test_file_blob().id)?
         .read_to_end(&mut bytes)?;
     assert_eq!(bytes, b"committed");
     Ok(())

@@ -29,8 +29,8 @@ tempfile = "3"
 
 [features]
 default = ["store"]
-mapping = ["dep:rustix"]
-store = ["mapping", "dep:rand", "dep:log", "dep:redb", "dep:tempfile", "dep:flate2", "dep:lzma-rust2", "dep:sha2", "dep:tar"]
+mapping = ["dep:rustix", "dep:tempfile", "dep:log"]
+store = ["mapping", "dep:rand", "dep:redb", "dep:flate2", "dep:lzma-rust2", "dep:sha2", "dep:tar"]
 
 [lints]
 workspace = true

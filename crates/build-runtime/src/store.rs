@@ -1017,8 +1017,6 @@ mod packages;
 pub use packages::{PackageCompression, PackagePolicy, PackageSource};
 mod trees;
 pub use trees::TreeLease;
-#[cfg(target_os = "linux")]
-pub use trees::{MaterializationStats, MaterializedTree};
 
 #[cfg(test)]
 mod tests;

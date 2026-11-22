@@ -15,8 +15,8 @@ use std::{
 use anyhow::{Result, ensure};
 use sccache::{
     build_runtime::{
-        BuildPath, CommandSpec, ContentId, ExecutionSpec, MappedMetadata, MappedTree, NativeStore,
-        OutputSpec, SpacePolicy, TreeLayer, TreePath, TreeRecipe,
+        Artifact, BuildPath, CommandSpec, ContentId, ExecutionSpec, MappedMetadata, MappedTree,
+        NativeStore, OutputSpec, SpacePolicy, TreeLayer, TreePath, TreeRecipe,
         wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply},
     },
     config::{Config, DistAuth, HTTPUrl, NativeClientConfig, scheduler, server},
@@ -330,6 +330,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
             OutputSpec {
                 path: BuildPath::new(b"/src/object.o".to_vec())?,
                 required: true,
+                kind: sccache_build::OutputKind::File,
             },
         )]),
     };
@@ -370,7 +371,10 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
         anyhow::bail!("result not published");
     };
     let mut bytes = Vec::new();
-    client.download(ticket, manifest.outputs["object"].blob, &mut bytes)?;
+    let Artifact::File { blob, .. } = &manifest.outputs["object"] else {
+        anyhow::bail!("expected file output");
+    };
+    client.download(ticket, *blob, &mut bytes)?;
     assert_eq!(bytes, fs::read(&reference)?);
     client.close(ticket)?;
     let warm_pin = client.push_tree(
@@ -413,6 +417,36 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let hit = client.run_action(&second, &inputs, &destinations, &policy)?;
     assert_eq!(hit.source, NativeBuildSource::Hit);
 
+    // The same worker can declare a complete directory result, including
+    // live input files at the original logical output root. The scheduler
+    // retains leaf content; both miss and hit materialize a private tree.
+    let mut directory = spec.clone();
+    directory.outputs = BTreeMap::from([(
+        "codegen".into(),
+        OutputSpec {
+            path: BuildPath::new(b"/src".to_vec())?,
+            required: true,
+            kind: sccache_build::OutputKind::Tree,
+        },
+    )]);
+    let generated = root.join("generated-codegen");
+    let tree_destinations = BTreeMap::from([("codegen".into(), generated.clone())]);
+    let result = client.run_action(&directory, &inputs, &tree_destinations, &policy)?;
+    assert_eq!(result.source, NativeBuildSource::Worker(worker_address));
+    assert!(result.output.status.success());
+    assert_eq!(fs::read(generated.join("object.o"))?, fs::read(&reference)?);
+    let source_bytes = fs::read(generated.join("input.s"))?;
+    assert!(
+        client
+            .run_action(&directory, &inputs, &tree_destinations, &policy)
+            .is_err()
+    );
+    fs::remove_dir_all(&generated)?;
+    let result = client.run_action(&directory, &inputs, &tree_destinations, &policy)?;
+    assert_eq!(result.source, NativeBuildSource::Hit);
+    assert_eq!(fs::read(generated.join("object.o"))?, fs::read(&reference)?);
+    assert_eq!(fs::read(generated.join("input.s"))?, source_bytes);
+
     // A real compiler failure must be reported but never become a hit.
     let mut invalid = spec;
     invalid
@@ -440,8 +474,8 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     assert!(!failed.output.stderr.is_empty());
     let (scheduler_stats, worker_stats) = fleet.finish()?;
     assert_eq!(worker_stats.actions, 0);
-    assert_eq!(scheduler_stats.actions, 2);
-    assert_eq!(scheduler_stats.results, 1);
+    assert_eq!(scheduler_stats.actions, 3);
+    assert_eq!(scheduler_stats.results, 2);
     assert_eq!(worker_stats.trees, 2);
     assert_eq!(scheduler_stats.trees, 2);
     Ok(())
