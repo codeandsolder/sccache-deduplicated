@@ -53,7 +53,7 @@ use std::env::consts::DLL_PREFIX;
 use std::env::consts::EXE_EXTENSION;
 #[cfg(feature = "dist-client")]
 use std::env::consts::EXE_SUFFIX;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::OpenOptions;
 use std::future::Future;
@@ -2651,12 +2651,24 @@ where
         let output_dir = cwd.join(&self.parsed_args.output_dir);
         let canonical_output_dir =
             super::canonical_paths::physical_operand(&cwd, &self.parsed_args.output_dir);
+        let cargo_target = self
+            .parsed_args
+            .arguments
+            .iter()
+            .rev()
+            .find_map(|argument| match argument.get_data() {
+                Some(Target(ArgTarget::Name(name))) => Some(OsStr::new(name)),
+                Some(Target(ArgTarget::Path(path))) => Some(path.as_os_str()),
+                Some(Target(ArgTarget::Unsure(name))) => Some(name.as_os_str()),
+                _ => None,
+            });
         let mut canonical_paths = canonical_output_dir.as_ref().and_then(|output_dir| {
             CanonicalRustPaths::from_env_with_output_dir(
                 &env_vars,
                 &cwd,
                 &self.sysroot,
                 Some(output_dir),
+                cargo_target,
             )
         });
         if let Some(canonical) = canonical_paths.as_ref() {

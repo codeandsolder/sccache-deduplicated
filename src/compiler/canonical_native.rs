@@ -93,7 +93,10 @@ impl NativeCargoPaths {
         if paths.maps.is_empty() {
             return None;
         }
-        if let Some(intermediate) = target_root_from_out_dir_path(&out) {
+        let target = env_value(env, "TARGET");
+        if let Some(intermediate) =
+            target_root_from_out_dir_path(&out, target.as_deref().map(Path::as_os_str))
+        {
             paths.add(&intermediate, "/__sccache/cargo/intermediate");
         }
         if let Some(target) = env_value(env, "SCCACHE_CANONICAL_TARGET_ROOT")
