@@ -412,6 +412,184 @@ fn main() {
     });
 }
 
+/// The policy directory is tracked by Clippy itself and can also be observed
+/// by user source. The worker must resolve the original spelling, not a
+/// rewritten environment value, with the exact policy contents.
+#[test]
+#[cfg(unix)]
+#[cfg_attr(not(feature = "dist-tests"), ignore)]
+fn test_dist_rust_clippy_observed_paths() -> Result<()> {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), &root);
+    system.add_scheduler();
+    let _worker = system.add_server(&[]);
+    let mut cfg = harness::sccache_client_cfg(&root, false);
+    cfg.dist.scheduler_url = Some(system.scheduler_url());
+    let cfg_path = root.join("sccache-cfg.json");
+    write_json_cfg(&root, "sccache-cfg.json", &cfg);
+    let cached_cfg = root.join("sccache-cached-cfg");
+    let _ = stop_local_daemon();
+    start_local_daemon(&cfg_path, &cached_cfg);
+
+    let project = root.join("source");
+    let target = root.join("target");
+    let policy = root.join("policy");
+    let other_policy = root.join("other/policy");
+    for path in [
+        &project,
+        &target,
+        &policy,
+        &other_policy,
+        &root.join("other/traversal"),
+        &root.join("scripts"),
+        &root.join("tempdir"),
+        &project.join("policy"),
+    ] {
+        fs::create_dir_all(path)?;
+    }
+    let allow = "disallowed-names = []\n";
+    let deny = "disallowed-names = [\"policy_denied_name\"]\n";
+    fs::write(policy.join("clippy.toml"), allow)?;
+    fs::write(other_policy.join("actual.toml"), allow)?;
+    symlink("actual.toml", other_policy.join("clippy.toml"))?;
+    // Flattening the link/.. pair would select source/policy (the decoy),
+    // whereas the kernel enters other/traversal and then selects other/policy.
+    fs::write(project.join("policy/clippy.toml"), deny)?;
+    symlink("../other/traversal", project.join("hop"))?;
+    symlink("hop", project.join("link"))?;
+    symlink(&policy, root.join("absolute-alias"))?;
+
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let sysroot = std::process::Command::new(&rustc)
+        .args(["--print", "sysroot"])
+        .output()?;
+    assert!(sysroot.status.success());
+    let clippy = Path::new(std::str::from_utf8(&sysroot.stdout)?.trim()).join("bin/clippy-driver");
+    assert!(clippy.is_file(), "Install the toolchain's Clippy component");
+    let tmpdir = root.join("scripts/../tempdir");
+    let cases = [
+        ("normalized", policy.clone()),
+        ("lexical", root.join("scripts/../policy")),
+        ("relative", Path::new("../policy").to_owned()),
+        ("symlink_parent", Path::new("link/../policy").to_owned()),
+        ("absolute_alias", root.join("absolute-alias")),
+    ];
+    for (name, spelling) in &cases {
+        let source = project.join(format!("{name}.rs"));
+        let metadata = target.join(format!("lib{name}.rmeta"));
+        let observed = spelling.to_str().context("non-UTF8 config path")?;
+        let observed_tmp = tmpdir.to_str().context("non-UTF8 temporary path")?;
+        fs::write(
+            &source,
+            format!(
+                r#"
+pub const OBSERVED: &str = env!("CLIPPY_CONF_DIR");
+pub const TEMP: &str = env!("TMPDIR");
+pub const POLICY: &str = include_str!(concat!(env!("CLIPPY_CONF_DIR"), "/clippy.toml"));
+const fn equal(a: &[u8], b: &[u8]) -> bool {{
+    if a.len() != b.len() {{ return false; }}
+    let mut i = 0;
+    while i < a.len() {{
+        if a[i] != b[i] {{ return false; }}
+        i += 1;
+    }}
+    true
+}}
+const _: () = assert!(equal(OBSERVED.as_bytes(), {observed:?}.as_bytes()));
+const _: () = assert!(equal(TEMP.as_bytes(), {observed_tmp:?}.as_bytes()));
+pub fn marker() -> u32 {{ let policy_denied_name = 11; policy_denied_name + 1 }}
+"#
+            ),
+        )?;
+        let compile = || {
+            let mut command = sccache_command();
+            for (key, _) in env::vars_os() {
+                if key.to_string_lossy().starts_with("CARGO") || key == "OUT_DIR" {
+                    command.env_remove(key);
+                }
+            }
+            command
+                .current_dir(&project)
+                .arg(&clippy)
+                .args([
+                    "rustc",
+                    "--edition=2024",
+                    "--crate-name",
+                    name,
+                    "--crate-type",
+                    "lib",
+                    "--emit=metadata,dep-info",
+                    "-Wclippy::disallowed_names",
+                ])
+                .arg("--out-dir")
+                .arg(&target)
+                .arg(&source)
+                .env("CLIPPY_CONF_DIR", spelling)
+                .env_remove("CLIPPY_ARGS")
+                .env("TMPDIR", &tmpdir)
+                .env("SCCACHE_CONF", &cfg_path)
+                .env("SCCACHE_CACHED_CONF", &cached_cfg)
+                .env("SCCACHE_EXPERIMENTAL_CANONICAL_RUST", "1")
+                .env("SCCACHE_CANONICAL_BUILD_ROOT", &project)
+                .env("SCCACHE_CANONICAL_TARGET_ROOT", &target);
+            command
+        };
+        let first = compile().output()?;
+        assert!(
+            first.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&first.stderr)
+                .contains("use of a disallowed/placeholder name")
+        );
+        let initial = fs::read(&metadata)?;
+        assert!(!initial.is_empty());
+        fs::remove_file(&metadata)?;
+        let cached = compile().output()?;
+        assert!(cached.status.success());
+        assert_eq!(cached.stderr, first.stderr);
+        assert_eq!(fs::read(&metadata)?, initial);
+
+        // Changing only the resolved policy must invalidate the cache, run
+        // on the worker, and enforce the new lint rather than reuse success.
+        let resolved = project.join(spelling).canonicalize()?.join("clippy.toml");
+        fs::write(&resolved, deny)?;
+        fs::remove_file(&metadata)?;
+        let result = compile().output()?;
+        assert!(
+            result.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&result.stderr)
+                .contains("use of a disallowed/placeholder name"),
+            "{name}: unexpected diagnostic: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_ne!(
+            fs::read(&metadata)?,
+            initial,
+            "changed policy must change embedded metadata"
+        );
+        fs::write(&resolved, allow)?;
+    }
+    let count = cases.len();
+    let expected_hits = u64::try_from(count)?;
+    get_stats(move |info| {
+        assert_eq!(count * 2, info.stats.dist_compiles.values().sum::<usize>());
+        assert_eq!(expected_hits, info.stats.cache_hits.all());
+        assert_eq!(0, info.stats.dist_errors);
+    });
+    Ok(())
+}
+
 // Check the real worker and cache restoration, including zero-length rmeta
 // marker files required by Cargo for executable and test targets.
 #[test]

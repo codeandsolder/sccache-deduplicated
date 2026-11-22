@@ -17,7 +17,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::str;
 
-use crate::errors::{Result, anyhow, bail};
+use crate::errors::{Context, Result, anyhow, bail};
 
 #[cfg(all(
     target_os = "linux",
@@ -639,6 +639,297 @@ pub fn lexical_parent_traversal_dirs(path: &Path) -> Vec<PathBuf> {
     }
 
     required
+}
+
+/// Plan compiler-input archive paths in a single namespace. In the physical
+/// Unix layout this preserves symlink and parent-traversal semantics. In the
+/// relocated layout, use the compiler's root mappings and retain the required
+/// lexical traversal directories. Directory inputs never imply copying a
+/// directory tree.
+pub(crate) struct InputArchivePaths {
+    transformer: crate::dist::PathTransformer,
+    directories: std::collections::BTreeMap<String, PathBuf>,
+    #[cfg(unix)]
+    physical: Option<PhysicalInputLayout>,
+}
+
+impl InputArchivePaths {
+    pub(crate) fn new(transformer: crate::dist::PathTransformer) -> Self {
+        #[cfg(unix)]
+        let physical = transformer
+            .path_mappings()
+            .next()
+            .is_none()
+            .then(PhysicalInputLayout::default);
+        Self {
+            transformer,
+            directories: std::collections::BTreeMap::new(),
+            #[cfg(unix)]
+            physical,
+        }
+    }
+
+    fn archive_path(&mut self, path: &Path) -> Result<String> {
+        self.transformer
+            .as_dist_abs(path)
+            .with_context(|| format!("Unable to transform compiler input {}", path.display()))
+    }
+
+    fn add_mapped_directory(&mut self, directory: PathBuf) -> Result<()> {
+        if !directory.is_dir() {
+            bail!("Missing compiler input directory {}", directory.display());
+        }
+        let remote = self.archive_path(&directory)?;
+        if remote == "/" {
+            return Ok(());
+        }
+        if remote
+            .trim_start_matches('/')
+            .split('/')
+            .any(|part| part == "..")
+        {
+            bail!("Unsafe compiler input directory {remote}");
+        }
+        self.directories.insert(remote, directory);
+        Ok(())
+    }
+
+    fn resolve(&mut self, path: &Path) -> Result<PathBuf> {
+        #[cfg(unix)]
+        if let Some(physical) = self.physical.as_mut() {
+            return physical.resolve(path);
+        }
+        for directory in lexical_parent_traversal_dirs(path) {
+            self.add_mapped_directory(directory)?;
+        }
+        simplify_path(path)
+    }
+
+    pub(crate) fn file(&mut self, path: &Path) -> Result<(PathBuf, String)> {
+        let path = self.resolve(path)?;
+        let remote = self.archive_path(&path)?;
+        Ok((path, remote))
+    }
+
+    pub(crate) fn directory(&mut self, path: &Path) -> Result<()> {
+        #[cfg(unix)]
+        if let Some(physical) = self.physical.as_mut() {
+            return physical.add_directory(path);
+        }
+        let path = self.resolve(path)?;
+        self.add_mapped_directory(path)
+    }
+
+    /// Emit supporting entries after all files, so extraction never writes
+    /// through a symlink that was just created by this archive.
+    pub(crate) fn append_support_entries<W: io::Write>(
+        self,
+        builder: &mut tar::Builder<W>,
+    ) -> Result<()> {
+        for (remote, local) in self.directories {
+            builder.append_dir(remote.trim_start_matches('/'), local)?;
+        }
+        #[cfg(unix)]
+        if let Some(layout) = self.physical {
+            layout.append_support_entries(builder)?;
+        }
+        Ok(())
+    }
+}
+
+/// Physical-layout Rust inputs must retain the paths by which the compiler
+/// reaches them, not merely the bytes at their canonical destinations.
+/// Resolve file and directory inputs into a single archive namespace, retaining
+/// traversed directories and symlink entries along the way. No archive member
+/// contains a parent component, and no file is emitted beneath a symlink.
+#[cfg(unix)]
+#[derive(Default)]
+struct PhysicalInputLayout {
+    directories: std::collections::BTreeSet<PathBuf>,
+    links: std::collections::BTreeMap<PathBuf, PathBuf>,
+    nodes: std::collections::HashSet<PathBuf>,
+}
+
+#[cfg(unix)]
+impl PhysicalInputLayout {
+    /// Resolve an existing absolute input, remembering the filesystem entries
+    /// required to resolve its original spelling inside a worker's root.
+    fn resolve(&mut self, path: &Path) -> Result<PathBuf> {
+        if !path.is_absolute() {
+            bail!(
+                "Physical archive input must be absolute: {}",
+                path.display()
+            );
+        }
+        // Let the OS validate existence, trailing slashes, and symlink loops,
+        // and check that the collected topology agrees with its resolution.
+        let expected = path.canonicalize()?;
+        let resolved = self.resolve_components(path, 0)?;
+        if resolved != expected {
+            bail!(
+                "Input path changed during archive planning: {}",
+                path.display()
+            );
+        }
+        Ok(resolved)
+    }
+
+    fn resolve_components(&mut self, path: &Path, depth: usize) -> Result<PathBuf> {
+        if depth > 40 {
+            bail!("Too many input symlink traversals: {}", path.display());
+        }
+        let mut current = PathBuf::from("/");
+        for component in path.components() {
+            match component {
+                Component::RootDir => current = PathBuf::from("/"),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    // The kernel must enter this directory before processing
+                    // .., including when the preceding component was a link.
+                    if current != Path::new("/") {
+                        self.directories.insert(current.clone());
+                    }
+                    current.pop();
+                }
+                Component::Normal(name) => {
+                    let candidate = current.join(name);
+                    if self.nodes.contains(&candidate) {
+                        current = candidate;
+                        continue;
+                    }
+                    let target = if let Some(target) = self.links.get(&candidate) {
+                        Some(target.clone())
+                    } else if fs::symlink_metadata(&candidate)?.is_symlink() {
+                        let target = candidate.read_link()?;
+                        self.links.insert(candidate.clone(), target.clone());
+                        Some(target)
+                    } else {
+                        self.nodes.insert(candidate.clone());
+                        None
+                    };
+                    current = if let Some(target) = target {
+                        self.resolve_components(&current.join(target), depth + 1)?
+                    } else {
+                        candidate
+                    };
+                }
+                Component::Prefix(_) => bail!("Unexpected prefix in Unix archive input"),
+            }
+        }
+        Ok(current)
+    }
+
+    fn add_directory(&mut self, path: &Path) -> Result<()> {
+        let resolved = self.resolve(path)?;
+        if !resolved.is_dir() {
+            bail!(
+                "Physical archive directory is not a directory: {}",
+                path.display()
+            );
+        }
+        if resolved != Path::new("/") {
+            self.directories.insert(resolved);
+        }
+        Ok(())
+    }
+
+    /// Add the empty traversal directories and the original symlink spellings.
+    /// The caller must emit physical files first. Absolute symlink destinations
+    /// are interpreted inside the worker chroot, as for packaged toolchains.
+    fn append_support_entries<W: io::Write>(self, builder: &mut tar::Builder<W>) -> Result<()> {
+        for path in self.directories {
+            let member = path.strip_prefix("/")?;
+            builder.append_dir(member, &path)?;
+        }
+        for (path, target) in self.links {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_mode(0o777);
+            header.set_size(0);
+            builder.append_link(&mut header, path.strip_prefix("/")?, target)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn physical_archive_preserves_aliases_and_parent_traversal() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    for dir in [
+        "project",
+        "actual/deep",
+        "actual/policy",
+        "actual/empty",
+        "project/policy",
+    ] {
+        fs::create_dir_all(root.join(dir))?;
+    }
+    let policy = root.join("actual/policy");
+    fs::write(policy.join("actual.toml"), b"actual policy")?;
+    fs::write(root.join("project/policy/clippy.toml"), b"wrong policy")?;
+    symlink("actual.toml", policy.join("clippy.toml"))?;
+    symlink("../actual/deep", root.join("project/hop"))?;
+    symlink("hop", root.join("project/link"))?;
+    symlink("../actual/empty", root.join("project/empty"))?;
+    let lexical = root.join("project/link/../policy");
+    let file = lexical.join("clippy.toml");
+
+    let mut paths = InputArchivePaths::new(crate::dist::PathTransformer::new());
+    paths.directory(&lexical)?;
+    paths.directory(&root.join("project/empty"))?;
+    let (local, remote) = paths.file(&file)?;
+    assert_eq!(local, policy.join("actual.toml"));
+    assert_eq!((local.clone(), remote.clone()), paths.file(&local)?);
+    let mut bytes = Vec::new();
+    let mut archive = tar::Builder::new(&mut bytes);
+    archive.append_file(
+        Path::new(&remote).strip_prefix("/")?,
+        fs::File::open(&local)?.file_mut(),
+    )?;
+    paths.append_support_entries(&mut archive)?;
+    archive.into_inner()?;
+
+    let extracted = tempfile::tempdir()?;
+    tar::Archive::new(bytes.as_slice()).unpack(extracted.path())?;
+    let in_archive =
+        |path: &Path| -> Result<PathBuf> { Ok(extracted.path().join(path.strip_prefix("/")?)) };
+    assert_eq!(fs::read(in_archive(&file)?)?, b"actual policy");
+    assert!(in_archive(&root.join("project/empty"))?.is_dir());
+    assert!(in_archive(&root.join("actual/deep"))?.is_dir());
+    assert_eq!(
+        fs::read_link(in_archive(&root.join("project/link"))?)?,
+        Path::new("hop")
+    );
+    assert_eq!(
+        fs::read_link(in_archive(&root.join("project/hop"))?)?,
+        Path::new("../actual/deep")
+    );
+    assert_eq!(
+        fs::read_link(in_archive(&policy.join("clippy.toml"))?)?,
+        Path::new("actual.toml")
+    );
+    assert!(!in_archive(&root.join("project/policy/clippy.toml"))?.exists());
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn physical_archive_rejects_missing_traversal_and_symlink_loops() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    fs::write(root.join("file"), b"data")?;
+    symlink("loop", root.join("loop"))?;
+    let mut paths = InputArchivePaths::new(crate::dist::PathTransformer::new());
+    assert!(paths.file(&root.join("missing/../file")).is_err());
+    assert!(paths.directory(&root.join("loop")).is_err());
+    assert!(paths.directory(&root.join("file")).is_err());
+    Ok(())
 }
 
 /// Simplify a path to remove relative components while preserving meaningful symlink paths.
