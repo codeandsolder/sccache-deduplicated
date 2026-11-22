@@ -216,17 +216,18 @@ pub async fn connection_task<T: Send + 'static>(
 ) -> Result<T> {
     // Waiting for the lock is itself cancellable and occupies no blocking
     // thread. Only the owner of a transaction may invalidate its socket.
-    let connection = connection.lock_owned().await;
-    ensure!(!connection.closed.is_cancelled(), IpcTransportFailure);
-    let mut abort = AbortTransfer {
-        socket: connection
-            .invalidate(connection.reader.get_ref().try_clone().map_err(Into::into))?,
-        closed: connection.closed.clone(),
-        armed: true,
+    let (mut abort, worker) = {
+        let connection = connection.lock_owned().await;
+        ensure!(!connection.closed.is_cancelled(), IpcTransportFailure);
+        let abort = AbortTransfer {
+            socket: connection
+                .invalidate(connection.reader.get_ref().try_clone().map_err(Into::into))?,
+            closed: connection.closed.clone(),
+            armed: true,
+        };
+        (abort, spawn_transaction(connection, task))
     };
-    let (guard, result) = spawn_transaction(connection, task)
-        .await
-        .context(IpcTransportFailure)?;
+    let (guard, result) = worker.await.context(IpcTransportFailure)?;
     // Keep exclusive ownership until the cancellation guard is disarmed.
     // No next transaction may start in the completion/cancellation race.
     abort.armed = false;
