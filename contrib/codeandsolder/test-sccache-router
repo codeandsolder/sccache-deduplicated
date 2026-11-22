@@ -41,13 +41,12 @@ user_endpoint=unix:$root/listener.sock
 root_endpoint=tcp:$port
 readiness_seconds=1
 EOF
-route() {
-    bash -c '
-        source "$1"
-        shift
-        sccache_wrapper_main "$@"
-    ' _ contrib/codeandsolder/sccache-client "$1" "$2" "$root/wrapper.conf" "$root/bin/fake-sccache" "$root/bin/rustup" "${@:3}"
-}
+# shellcheck source=contrib/codeandsolder/sccache-client
+source contrib/codeandsolder/sccache-client
+route() (
+    sccache_wrapper_main "$1" "$2" "$root/wrapper.conf" "$root/bin/fake-sccache" "$root/bin/rustup" "${@:3}"
+)
+
 unset SCCACHE_SERVER_PORT SCCACHE_SERVER_UDS SCCACHE_CANONICAL_TARGET_ROOT CARGO_TARGET_DIR OUT_DIR SCCACHE_EXPERIMENTAL_CANONICAL_RUST
 output="$(route compiler 1000 rustc 'space and "quote"')"
 rg -Fxq "uds=$root/listener.sock port= canonical= start=0 no_auto=1" <<<"$output"
