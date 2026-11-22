@@ -517,7 +517,6 @@ fn deserialize_os_string<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<OsString, D::Error> {
     // The other platform's variant is only read to be rejected.
-    #[allow(dead_code)]
     #[derive(Deserialize)]
     enum OsStringRepr {
         Unix(Bytes),
@@ -529,15 +528,25 @@ fn deserialize_os_string<'de, D: serde::Deserializer<'de>>(
         OsStringRepr::Unix(Bytes(bytes)) => Ok(std::os::unix::ffi::OsStringExt::from_vec(bytes)),
         #[cfg(windows)]
         OsStringRepr::Windows(wide) => Ok(std::os::windows::ffi::OsStringExt::from_wide(&wide)),
-        _ => Err(serde::de::Error::custom(
-            "cannot deserialize an OsString from another platform",
-        )),
+        #[cfg(not(unix))]
+        OsStringRepr::Unix(Bytes(bytes)) => {
+            drop(bytes);
+            Err(serde::de::Error::custom(
+                "cannot deserialize an OsString from another platform",
+            ))
+        }
+        #[cfg(not(windows))]
+        OsStringRepr::Windows(wide) => {
+            drop(wide);
+            Err(serde::de::Error::custom(
+                "cannot deserialize an OsString from another platform",
+            ))
+        }
     }
 }
 
 /// A `Vec<u8>` read as a byte buffer rather than as a sequence of bytes.
 // Only `Unix` paths are made of bytes; elsewhere they are only read to be rejected.
-#[cfg_attr(not(unix), allow(dead_code))]
 struct Bytes(Vec<u8>);
 
 impl<'de> Deserialize<'de> for Bytes {
@@ -1044,16 +1053,17 @@ mod test {
         #[derive(Deserialize)]
         struct Path(#[serde(deserialize_with = "deserialize_os_string")] OsString);
 
-        #[cfg_attr(not(unix), allow(unused_mut))]
-        let mut paths = vec![
+        let paths = [
             OsString::new(),
             OsString::from("/usr/include/stdio.h"),
             OsString::from("/home/\u{e9}t\u{e9}/header with spaces.h"),
         ];
         #[cfg(unix)]
-        paths.push(std::os::unix::ffi::OsStringExt::from_vec(vec![
-            b'/', 0xff, 0xfe, b'x',
-        ]));
+        let paths = paths
+            .into_iter()
+            .chain([std::os::unix::ffi::OsStringExt::from_vec(vec![
+                b'/', 0xff, 0xfe, b'x',
+            ])]);
         for path in paths {
             let encoded = bincode::serialize(&path).unwrap();
             let decoded: Path = bincode::deserialize(&encoded).unwrap();
