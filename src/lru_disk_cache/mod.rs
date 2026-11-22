@@ -508,7 +508,7 @@ impl LruDiskCache {
                 // an otherwise read-only handle; do not request write-data access.
                 #[cfg(windows)]
                 {
-                    use std::os::windows::fs::OpenOptionsExt;
+                    use fs_err::os::windows::fs::OpenOptionsExt;
                     use windows_sys::Win32::Foundation::GENERIC_READ;
                     use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
                     options.access_mode(GENERIC_READ | FILE_WRITE_ATTRIBUTES);
