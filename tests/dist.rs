@@ -544,7 +544,10 @@ pub fn marker() -> u32 {{ let policy_denied_name = 11; policy_denied_name + 1 }}
             "{name}: {}",
             String::from_utf8_lossy(&first.stderr)
         );
-        assert!(!String::from_utf8_lossy(&first.stderr).contains("clippy::disallowed_names"));
+        assert!(
+            !String::from_utf8_lossy(&first.stderr)
+                .contains("use of a disallowed/placeholder name")
+        );
         let initial = fs::read(&metadata)?;
         assert!(!initial.is_empty());
         fs::remove_file(&metadata)?;
@@ -565,7 +568,8 @@ pub fn marker() -> u32 {{ let policy_denied_name = 11; policy_denied_name + 1 }}
             String::from_utf8_lossy(&result.stderr)
         );
         assert!(
-            String::from_utf8_lossy(&result.stderr).contains("clippy::disallowed_names"),
+            String::from_utf8_lossy(&result.stderr)
+                .contains("use of a disallowed/placeholder name"),
             "{name}: unexpected diagnostic: {}",
             String::from_utf8_lossy(&result.stderr)
         );
