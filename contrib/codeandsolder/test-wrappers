@@ -21,7 +21,7 @@ printf '\n' >>"$CARGO_LOG"
 SH
 cat >"$root/bin/cargo-real" <<'SH'
 #!/usr/bin/env bash
-printf 'toolchain=%s wrapper=%s cargo=%s args=' "${RUSTUP_TOOLCHAIN:-}" "${EPHEMERAL_CARGO_WRAPPER:-}" "${CARGO:-}" >>"$CARGO_REAL_LOG"
+printf 'toolchain=%s wrapper=%s cargo=%s min_jobs=%s args=' "${RUSTUP_TOOLCHAIN:-}" "${EPHEMERAL_CARGO_WRAPPER:-}" "${CARGO:-}" "${SCCACHE_MIN_JOBS:-}" >>"$CARGO_REAL_LOG"
 printf '%q ' "$@" >>"$CARGO_REAL_LOG"
 printf '\n' >>"$CARGO_REAL_LOG"
 SH
@@ -48,9 +48,14 @@ grep -Fxq 'args=+1.99.0 test --locked ' "$CARGO_LOG"
 grep -Fxq 'args=+nightly check ' "$CARGO_LOG"
 [[ "$(wc -l <"$CARGO_LOG")" -eq 2 ]]
 
-CODEANDSOLDER_REAL_CARGO="$root/bin/cargo-real" contrib/codeandsolder/cargo-wrapper +1.99.0 probe
+env -u SCCACHE_MIN_JOBS CODEANDSOLDER_REAL_CARGO="$root/bin/cargo-real" contrib/codeandsolder/cargo-wrapper +1.99.0 probe
 wrapper_path="$(readlink -f contrib/codeandsolder/cargo-wrapper)"
-expected="toolchain=1.99.0 wrapper=$wrapper_path cargo=$wrapper_path args=probe "
+expected="toolchain=1.99.0 wrapper=$wrapper_path cargo=$wrapper_path min_jobs=12 args=probe "
 grep -Fxq "$expected" "$CARGO_REAL_LOG"
+
+SCCACHE_MIN_JOBS=24 CODEANDSOLDER_REAL_CARGO="$root/bin/cargo-real" contrib/codeandsolder/cargo-wrapper +1.99.0 probe
+grep -Fxq "${expected/min_jobs=12/min_jobs=24}" "$CARGO_REAL_LOG"
+SCCACHE_MIN_JOBS=0 CODEANDSOLDER_REAL_CARGO="$root/bin/cargo-real" contrib/codeandsolder/cargo-wrapper +1.99.0 probe
+grep -Fxq "${expected/min_jobs=12/min_jobs=0}" "$CARGO_REAL_LOG"
 
 echo 'codeandsolder wrapper routing tests passed'
