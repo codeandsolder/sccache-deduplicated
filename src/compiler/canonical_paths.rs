@@ -50,7 +50,7 @@ pub struct CanonicalRustPaths {
     clippy_config_dir: Option<PathBuf>,
 }
 
-pub(crate) fn env_value(env: &[(OsString, OsString)], name: &str) -> Option<PathBuf> {
+pub(super) fn env_value(env: &[(OsString, OsString)], name: &str) -> Option<PathBuf> {
     env.iter()
         .rev()
         .find(|(k, _)| k == name)
@@ -72,7 +72,7 @@ fn topmost_cargo_root(start: &Path) -> Option<PathBuf> {
         .map(Path::to_owned)
 }
 
-pub(crate) fn target_root_from_out_dir_path(out_dir: &Path) -> Option<PathBuf> {
+pub(super) fn target_root_from_out_dir_path(out_dir: &Path) -> Option<PathBuf> {
     // Cargo writes CACHEDIR.TAG (and normally .rustc_info.json) at the actual
     // target root. Prefer that marker so cross-target layouts such as
     // target/<triple>/<profile>/build/... still map to the whole target tree.
