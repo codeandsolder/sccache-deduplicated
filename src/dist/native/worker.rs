@@ -31,6 +31,12 @@ impl NativeCacheClient {
     ) -> Result<CapturedExecution> {
         let result = self.with_renewal(ticket, renewal_interval, |check| {
             self.verify_execution(ticket, spec.clone())?;
+            if let Some(report) = store.maintain_space()? {
+                ensure!(
+                    report.minimum_satisfied,
+                    "native worker store lacks allocatable space: {report:?}"
+                );
+            }
             let request = spec.action_request()?;
             ensure!(
                 spec.platform == policy.platform,

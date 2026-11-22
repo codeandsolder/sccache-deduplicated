@@ -5,6 +5,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
+    time::Instant,
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -101,6 +102,7 @@ struct Pins {
     actions: BTreeMap<ActionKey, usize>,
     trees: BTreeMap<crate::TreeId, usize>,
     uploads: BTreeMap<ContentId, usize>,
+    last_used: BTreeMap<space::Root, Instant>,
 }
 
 // All lease categories use the same pin reference-counting invariant.
@@ -121,6 +123,8 @@ struct Inner {
     // Readers only acquire the separate pin lock, not the publication lock.
     mutations: Mutex<()>,
     pins: Mutex<Pins>,
+    space_policy: Option<SpacePolicy>,
+    space: Mutex<space::SpaceState>,
 }
 
 impl Inner {
@@ -251,6 +255,10 @@ impl NativeStore {
     /// Returns an error for filesystem, database or recovery failures, including
     /// when another live process owns this directory.
     pub fn open(root: &Path) -> Result<Self> {
+        Self::open_inner(root, None)
+    }
+
+    fn open_inner(root: &Path, space_policy: Option<SpacePolicy>) -> Result<Self> {
         fs::create_dir_all(root)?;
         let root = fs::canonicalize(root)?;
         let index = root.join("index.redb");
@@ -300,6 +308,8 @@ impl NativeStore {
             db,
             mutations: Mutex::new(()),
             pins: Mutex::new(Pins::default()),
+            space_policy,
+            space: Mutex::default(),
         });
         inner.recover_orphans()?;
         Ok(Self { inner })
@@ -310,7 +320,17 @@ impl NativeStore {
     ///
     /// # Errors
     /// Returns an error if the stream or filesystem fails.
-    pub fn stage(&self, mut reader: impl Read) -> Result<StagedBlob> {
+    pub fn stage(&self, reader: impl Read) -> Result<StagedBlob> {
+        self.stage_inner(reader, None)
+    }
+
+    // Size is an upper bound, not a substitute for digest/length validation.
+    fn stage_inner(&self, mut reader: impl Read, bound: Option<u64>) -> Result<StagedBlob> {
+        let mut budget = space::StageBudget::new(self);
+        if let Some(bound) = bound {
+            budget.grow_to(bound)?;
+        }
+
         let mut file = NamedTempFile::new_in(self.inner.root.join("staging"))?;
         let mut hash = blake3::Hasher::new();
         let mut buffer = vec![0; 64 * 1024];
@@ -320,11 +340,22 @@ impl NativeStore {
                 Ok(0) => break,
                 Ok(count) => {
                     let bytes = &buffer[..count];
-                    file.write_all(bytes)?;
-                    hash.update(bytes);
                     size = size
                         .checked_add(u64::try_from(count)?)
                         .context("blob length overflow")?;
+                    if let Some(bound) = bound {
+                        ensure!(size <= bound, "native staged stream exceeds upper bound");
+                    } else {
+                        // Grow unknown-length streams in 4 MiB increments.
+                        const CHUNK: u64 = 4 * 1024 * 1024;
+                        budget.grow_to(
+                            size.div_ceil(CHUNK)
+                                .checked_mul(CHUNK)
+                                .context("staging budget overflow")?,
+                        )?;
+                    }
+                    file.write_all(bytes)?;
+                    hash.update(bytes);
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error.into()),
@@ -355,7 +386,7 @@ impl NativeStore {
             .size
             .checked_add(1)
             .context("blob length overflow")?;
-        let staged = self.stage(reader.take(limit))?;
+        let staged = self.stage_inner(reader.take(limit), Some(limit))?;
         ensure!(
             staged.reference() == expected,
             "uploaded content does not match its declared digest and length"
@@ -505,6 +536,7 @@ impl NativeStore {
         // Files and their directory entries are durable before the index
         // exposes them. Orphans from an interrupted write are harmless.
         write.commit()?;
+        self.inner.lock_pins()?.touch(space::Root::Action(action));
         Ok(Published {
             action,
             result,
@@ -648,6 +680,7 @@ impl NativeStore {
         for (&id, &size) in &blobs {
             self.inner.check_blob(id, size)?;
         }
+        pins.touch(space::Root::Action(action));
         let count = pins.actions.entry(action).or_default();
         *count = count.checked_add(1).context("action pin count overflow")?;
         drop(pins);
@@ -690,7 +723,7 @@ impl NativeStore {
     /// Returns an error for inconsistent metadata or storage failures.
     pub fn evict(&self, action: ActionKey) -> Result<Eviction> {
         let _mutation = self.inner.lock_mutations()?;
-        let pins = self.inner.lock_pins()?;
+        let mut pins = self.inner.lock_pins()?;
         if pins.actions.contains_key(&action) {
             return Ok(Eviction::Pinned);
         }
@@ -722,6 +755,7 @@ impl NativeStore {
         // can batch work and retry failures without scanning the live store.
         write.commit()?;
         // Lookup and eviction must serialize until removal is committed.
+        pins.last_used.remove(&space::Root::Action(action));
         drop(pins);
         Ok(Eviction::Removed {
             unreferenced_logical_bytes,
@@ -975,6 +1009,8 @@ impl<L> Seek for LeasedReader<'_, L> {
     }
 }
 
+mod space;
+pub use space::{SpacePolicy, SpaceReport};
 mod audit;
 pub use audit::ComponentAudit;
 mod packages;

@@ -93,7 +93,7 @@ impl NativeStore {
             reader: input.take(limit),
             hash: Sha256::new(),
         };
-        let archive = self.stage(&mut hashed)?;
+        let archive = self.stage_inner(&mut hashed, Some(limit))?;
         ensure!(
             archive.reference().size == source.size,
             "incorrect original package length"
@@ -182,7 +182,7 @@ impl ImportedTree {
                 self.bytes <= self.policy.max_expanded_bytes,
                 "expanded package size limit exceeded"
             );
-            let staged = store.stage(&mut entry)?;
+            let staged = store.stage_inner(&mut entry, Some(size))?;
             let blob = staged.reference();
             ensure!(blob.size == size, "archive member size mismatch");
             self.staged.entry(blob.id).or_insert(staged);

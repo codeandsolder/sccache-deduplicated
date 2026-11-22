@@ -119,7 +119,9 @@ impl Capture<'_> {
             Mode::empty(),
         )?);
         unchanged(stat, &fstat(&file)?)?;
-        let blob = self.store.stage(&file)?;
+        let blob = self
+            .store
+            .stage_inner(&file, Some(u64::try_from(stat.st_size)?))?;
         unchanged(stat, &fstat(&file)?)?;
         let reference = blob.reference();
         ensure!(

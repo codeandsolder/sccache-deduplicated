@@ -1158,6 +1158,11 @@ mod server {
                             let bytes = BASE64_URL_SAFE_ENGINE.decode(value)?;
                             Ok(ContentId(bytes.try_into().map_err(|_| anyhow!("invalid native platform digest"))?))
                         }).transpose());
+                        let archive = match request.header("X-Sccache-Archive-Worker") {
+                            None | Some("true") => true,
+                            Some("false") => false,
+                            _ => return rouille::Response::empty_400(),
+                        };
                         let heartbeat_server = try_or_400_log!(req_id, bincode_input(request));
                         trace!(target: "sccache_heartbeat", "Req {}: heartbeat_server: {:?}", req_id, heartbeat_server);
 
@@ -1185,9 +1190,8 @@ mod server {
                         let res: HeartbeatServerResult = try_or_500_log!(req_id, handler.handle_heartbeat_server(
                             server_id, server_nonce,
                             cpu_capacity, &running_job_ids,
-                            job_authorizer
+                            job_authorizer, dist::WorkerCapabilities { archive, native_platform }
                         ));
-                        try_or_500_log!(req_id, handler.handle_update_native_platform(server_id, worker_name_nonce.clone(), native_platform));
                         if let Some(worker_name) = worker_name
                             && let Err(error) = handler.handle_update_worker_name(
                                 server_id,
@@ -1371,7 +1375,7 @@ mod server {
             let mut load_aware_capacity = LoadAwareCapacity::new();
             let handler = Arc::new(handler);
             let heartbeat_handler = Arc::clone(&handler);
-            let native_platform = handler.native_platform();
+            let capabilities = handler.capabilities();
             let running_jobs = Arc::new(Mutex::new(HashSet::<JobId>::new()));
             let heartbeat_running_jobs = Arc::clone(&running_jobs);
             let heartbeat_jwt_key = jwt_key.clone();
@@ -1419,7 +1423,15 @@ mod server {
                         heartbeat_request =
                             heartbeat_request.header("X-Sccache-Worker-Name", worker_name);
                     }
-                    if let Some(platform) = native_platform {
+                    heartbeat_request = heartbeat_request.header(
+                        "X-Sccache-Archive-Worker",
+                        if capabilities.archive {
+                            "true"
+                        } else {
+                            "false"
+                        },
+                    );
+                    if let Some(platform) = capabilities.native_platform {
                         heartbeat_request = heartbeat_request.header(
                             "X-Sccache-Native-Platform",
                             BASE64_URL_SAFE_ENGINE.encode(platform.0),

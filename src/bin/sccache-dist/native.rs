@@ -35,7 +35,7 @@ impl NativeWorker {
             "invalid native worker configuration"
         );
         std::fs::create_dir_all(&config.scratch)?;
-        let store = NativeStore::open(&config.directory)?;
+        let store = NativeStore::open_managed(&config.directory, config.space)?;
         let client = NativeCacheClient::new(
             config.cache_url.to_url(),
             auth,

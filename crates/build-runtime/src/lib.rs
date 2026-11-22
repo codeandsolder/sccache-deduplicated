@@ -31,7 +31,8 @@ pub use coordinator::{Admission, BuildCoordinator, CompilePermit};
 #[cfg(all(unix, feature = "store"))]
 pub use store::{
     CacheStats, ComponentAudit, Eviction, GarbageCollected, NativeStore, PackageCompression,
-    PackagePolicy, PackageSource, Published, ResultLease, StagedBlob, TreeLease, UploadReservation,
+    PackagePolicy, PackageSource, Published, ResultLease, SpacePolicy, SpaceReport, StagedBlob,
+    TreeLease, UploadReservation,
 };
 
 #[cfg(all(target_os = "linux", feature = "store"))]

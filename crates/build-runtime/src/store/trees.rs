@@ -11,7 +11,7 @@ use redb::{ReadableDatabase, ReadableTable};
 
 use super::{
     Eviction, Inner, LeasedReader, NativeStore, PACKAGES, StagedBlob, TREE_PACKAGES, TREES,
-    UploadReservation, encoding, release_pin,
+    UploadReservation, encoding, release_pin, space::Root,
 };
 use crate::{ContentId, TreeId, TreeManifest, TreeRecipe};
 
@@ -96,6 +96,7 @@ impl NativeStore {
             }
         }
         write.commit()?;
+        self.inner.lock_pins()?.touch(Root::Tree(id));
         Ok(id)
     }
 
@@ -139,6 +140,7 @@ impl NativeStore {
         for (&content, &size) in &blobs {
             self.inner.check_blob(content, size)?;
         }
+        pins.touch(Root::Tree(id));
         let count = pins.trees.entry(id).or_default();
         *count = count.checked_add(1).context("tree pin count overflow")?;
         drop(pins);
@@ -156,7 +158,7 @@ impl NativeStore {
     /// Returns an error for inconsistent metadata or storage failure.
     pub fn evict_tree(&self, id: TreeId) -> Result<Eviction> {
         let _mutation = self.inner.lock_mutations()?;
-        let pins = self.inner.lock_pins()?;
+        let mut pins = self.inner.lock_pins()?;
         if pins.trees.contains_key(&id) {
             return Ok(Eviction::Pinned);
         }
@@ -180,6 +182,7 @@ impl NativeStore {
             Self::detach_blobs(&write, &id.0, manifest.blobs()?)?
         };
         write.commit()?;
+        pins.last_used.remove(&Root::Tree(id));
         drop(pins);
         Ok(Eviction::Removed {
             unreferenced_logical_bytes: bytes,

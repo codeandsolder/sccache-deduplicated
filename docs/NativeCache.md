@@ -69,12 +69,26 @@ max_concurrent_uploads = 4
 max_total_uploads = 16
 http_threads = 32
 max_metadata_bytes = 67108864
+
+[native_cache.space]
+min_available_bytes = 536870912
+target_available_bytes = 2147483648
+max_evictions_per_pass = 32
+gc_batch = 1024
 ```
 
-Linux worker configuration example (use the reachable scheduler cache
-address, not necessarily the example loopback address):
+Linux native-only worker configuration example (use the reachable scheduler
+cache address, not necessarily the example loopback address). Select
+`builder.type = "native"` in the main worker configuration and omit archive
+`cache_dir` and archive sources. This worker never constructs the legacy
+overlay builder or archive cache, and cannot be scheduled for archive jobs.
+A worker with a legacy builder and a native worker section supports both
+protocols, sharing its advertised capacity.
 
 ```toml
+[builder]
+type = "native"
+
 [native_worker]
 cache_url = "http://127.0.0.1:10502"
 directory = "/var/lib/sccache-native/worker"
@@ -86,6 +100,12 @@ request_timeout_secs = 120
 execution_timeout_secs = 600
 max_result_bytes = 1073741824
 max_metadata_bytes = 67108864
+
+[native_worker.space]
+min_available_bytes = 536870912
+target_available_bytes = 2147483648
+max_evictions_per_pass = 32
+gc_batch = 1024
 ```
 
 The worker advertises the BLAKE3 digest of the exact platform contract.
@@ -94,9 +114,18 @@ interval must be shorter than the scheduler idle timeout.
 
 Place store and scratch on appropriate quota-controlled dedicated filesystems.
 The application currently bounds sessions, transfer sizes and concurrent
-uploads, but does not yet implement physical-usage-based eviction admission
-or per-job scratch quotas. Worker-side tree retention and fleet-level
-capacity policy are still required before rollout. The native store is not
+uploads. Store admission uses allocatable filesystem bytes (statvfs), not
+logical blob lengths, so compressed and block-cloned ZFS content is not
+mistaken for physical allocation. Below the configured low watermark it
+reclaims pending garbage and evicts unpinned least-recently-used action
+and tree roots in bounded passes, rechecking actual free space rather than
+assuming deleted logical lengths were reclaimed. Active writers reserve a
+conservative uncompressed upper bound until staged bytes are synced.
+Recency is in-memory and unknown roots after restart rank oldest.
+The external dataset quota remains the hard limit; snapshots, open files,
+clone extents, delayed accounting and other writers can prevent reclaim.
+A separate quota-controlled scratch filesystem is still required; per-job
+scratch limits and fleet-level capacity policy remain outstanding. The native store is not
 an additional production sccache cache tier.
 
 ## Validation

@@ -29,7 +29,7 @@ pub(super) fn spawn(
 ) -> Result<()> {
     let limits = config.session_limits()?;
     let sessions = Arc::new(NativeSessions::new(
-        NativeStore::open(&config.directory)?,
+        NativeStore::open_managed(&config.directory, config.space)?,
         limits,
     )?);
     let maintenance = Arc::downgrade(&sessions);
@@ -57,6 +57,13 @@ pub(super) fn spawn(
                 };
                 if let Err(error) = maintenance.reap() {
                     error!("native cache session reap failed: {error:#}");
+                }
+                match maintenance.store().maintain_space() {
+                    Ok(Some(report)) if !report.minimum_satisfied => {
+                        warn!("native cache space pressure: {report:?}")
+                    }
+                    Ok(_) => {}
+                    Err(error) => error!("native cache space maintenance failed: {error:#}"),
                 }
             }
         })?;

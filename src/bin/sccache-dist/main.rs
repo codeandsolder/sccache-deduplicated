@@ -289,42 +289,59 @@ fn run(command: Command) -> Result<i32> {
             toolchain_archive_sources,
             native_worker,
         }) => {
-            let builder: Box<dyn dist::BuilderIncoming> = match builder {
+            let builder: Option<Box<dyn dist::BuilderIncoming>> = match builder {
+                server_config::BuilderType::Native => None,
                 #[cfg(not(target_os = "freebsd"))]
-                server_config::BuilderType::Docker => {
-                    Box::new(build::DockerBuilder::new().context("Docker builder failed to start")?)
-                }
+                server_config::BuilderType::Docker => Some(Box::new(
+                    build::DockerBuilder::new().context("Docker builder failed to start")?,
+                )),
                 #[cfg(not(target_os = "freebsd"))]
                 server_config::BuilderType::Overlay {
                     bwrap_path,
                     build_dir,
                     extracted_toolchain_cache_size,
-                } => Box::new(
+                } => Some(Box::new(
                     build::OverlayBuilder::new(
                         bwrap_path,
                         build_dir,
                         extracted_toolchain_cache_size,
                     )
                     .context("Overlay builder failed to start")?,
-                ),
+                )),
                 #[cfg(target_os = "freebsd")]
                 server_config::BuilderType::Pot {
                     pot_fs_root,
                     clone_from,
                     pot_cmd,
                     pot_clone_args,
-                } => Box::new(
+                } => Some(Box::new(
                     build::PotBuilder::new(pot_fs_root, clone_from, pot_cmd, pot_clone_args)
                         .context("Pot builder failed to start")?,
-                ),
-                _ => bail!(
-                    "Builder type `{}` not supported on this platform",
-                    format!("{:?}", builder)
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("")
-                ),
+                )),
+                _ => bail!("Builder type not supported on this platform: {builder:?}"),
             };
+            if builder.is_none() {
+                anyhow::ensure!(
+                    native_worker.is_some(),
+                    "native builder requires native_worker configuration"
+                );
+                anyhow::ensure!(
+                    cache_dir.is_none() && toolchain_archive_sources.is_empty(),
+                    "native-only worker cannot configure archive cache paths"
+                );
+            }
+            let archive = builder
+                .map(|builder| {
+                    ArchiveWorker::new(
+                        builder,
+                        cache_dir
+                            .as_deref()
+                            .context("archive builder requires cache_dir")?,
+                        toolchain_cache_size,
+                        toolchain_archive_sources,
+                    )
+                })
+                .transpose()?;
 
             let server_id = ServerId::new(public_addr);
             let scheduler_auth = match scheduler_auth {
@@ -358,13 +375,7 @@ fn run(command: Command) -> Result<i32> {
             if native_worker.is_some() {
                 bail!("native worker requires Linux");
             }
-            let server = Server::new(
-                builder,
-                &cache_dir,
-                toolchain_cache_size,
-                toolchain_archive_sources,
-            )
-            .context("Failed to create sccache server instance")?;
+            let server = Server::new(archive);
             #[cfg(target_os = "linux")]
             let server = Server {
                 native_worker,
@@ -499,7 +510,7 @@ struct ServerDetails {
     cpu_capacity: f64,
     server_nonce: ServerNonce,
     worker_name: Option<String>,
-    native_platform: Option<sccache::build_runtime::ContentId>,
+    capabilities: dist::WorkerCapabilities,
     job_authorizer: Box<dyn JobAuthorizer>,
 }
 
@@ -525,10 +536,12 @@ impl Scheduler {
         )
     }
 
+    #[cfg(test)]
     fn with_job_id_base(job_id_base: u64) -> Self {
         Self::with_job_id_base_and_slack(job_id_base, JobSlackConfig::default())
     }
 
+    #[cfg(test)]
     fn with_job_id_base_and_slack(job_id_base: u64, job_slack: JobSlackConfig) -> Self {
         Self::with_job_id_base_and_slack_and_drain(job_id_base, job_slack, None)
     }
@@ -668,9 +681,11 @@ impl Scheduler {
                 let mut retry = Vec::new();
                 let now = Instant::now();
                 for (&server_id, details) in servers.iter_mut() {
-                    if native_platform
-                        .is_some_and(|platform| details.native_platform != Some(platform))
-                    {
+                    let compatible = match native_platform {
+                        Some(platform) => details.capabilities.native_platform == Some(platform),
+                        None => details.capabilities.archive,
+                    };
+                    if !compatible {
                         continue;
                     }
                     let Some(weight) = admission_weight(
@@ -833,28 +848,6 @@ impl SchedulerIncoming for Scheduler {
         self.allocate_job(requester, JobAssignment::Native(Box::new(assignment)))
     }
 
-    fn handle_update_native_platform(
-        &self,
-        server_id: ServerId,
-        nonce: ServerNonce,
-        platform: Option<sccache::build_runtime::ContentId>,
-    ) -> Result<()> {
-        let mut servers = self
-            .servers
-            .lock()
-            .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
-        let details = servers
-            .get_mut(&server_id)
-            .context("unknown native platform advertiser")?;
-        anyhow::ensure!(
-            details.server_nonce == nonce,
-            "stale native platform advertisement"
-        );
-        details.native_platform = platform;
-        drop(servers);
-        Ok(())
-    }
-
     fn handle_heartbeat_server(
         &self,
         server_id: ServerId,
@@ -862,6 +855,7 @@ impl SchedulerIncoming for Scheduler {
         cpu_capacity: f64,
         running_job_ids: &[JobId],
         job_authorizer: Box<dyn JobAuthorizer>,
+        capabilities: dist::WorkerCapabilities,
     ) -> Result<HeartbeatServerResult> {
         // LOCKS
         let mut jobs = self
@@ -878,11 +872,16 @@ impl SchedulerIncoming for Scheduler {
         if !cpu_capacity.is_finite() || cpu_capacity < 0.0 {
             bail!("invalid worker CPU capacity {cpu_capacity}");
         }
+        anyhow::ensure!(
+            capabilities.archive || capabilities.native_platform.is_some(),
+            "worker advertises no build engine"
+        );
         match servers.get_mut(&server_id) {
             Some(ref mut details) if details.server_nonce == server_nonce => {
                 let now = Instant::now();
                 details.last_seen = now;
                 details.cpu_capacity = cpu_capacity;
+                details.capabilities = capabilities;
 
                 // The worker heartbeat is authoritative for *executing* jobs.
                 // A Started job missing from one heartbeat can be an in-flight
@@ -962,7 +961,7 @@ impl SchedulerIncoming for Scheduler {
                 cpu_capacity,
                 server_nonce,
                 worker_name: None,
-                native_platform: None,
+                capabilities,
                 job_authorizer,
             },
         );
@@ -1161,25 +1160,22 @@ struct LocalAssignment {
     accepted_at: Instant,
 }
 
-pub struct Server {
+struct ArchiveWorker {
     builder: Box<dyn BuilderIncoming>,
     cache: Mutex<TcCache>,
     staging_dir: PathBuf,
     toolchain_cache_size: u64,
     #[cfg(target_os = "linux")]
     toolchain_archive_sources: Vec<PathBuf>,
-    job_toolchains: Mutex<HashMap<JobId, LocalAssignment>>,
-    #[cfg(target_os = "linux")]
-    native_worker: Option<NativeWorker>,
 }
 
-impl Server {
-    pub fn new(
+impl ArchiveWorker {
+    fn new(
         builder: Box<dyn BuilderIncoming>,
         cache_dir: &Path,
         toolchain_cache_size: u64,
         toolchain_archive_sources: Vec<PathBuf>,
-    ) -> Result<Server> {
+    ) -> Result<Self> {
         if toolchain_archive_sources
             .iter()
             .any(|path| !path.is_absolute())
@@ -1192,16 +1188,13 @@ impl Server {
         }
         let cache = TcCache::new(&cache_dir.join("tc"), toolchain_cache_size)
             .context("Failed to create toolchain cache")?;
-        Ok(Server {
+        Ok(Self {
             builder,
             cache: Mutex::new(cache),
             staging_dir: cache_dir.join("tc"),
             toolchain_cache_size,
             #[cfg(target_os = "linux")]
             toolchain_archive_sources,
-            job_toolchains: Mutex::new(HashMap::new()),
-            #[cfg(target_os = "linux")]
-            native_worker: None,
         })
     }
 
@@ -1248,6 +1241,24 @@ impl Server {
             .lock()
             .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?
             .contains_toolchain(tc))
+    }
+}
+
+pub struct Server {
+    archive: Option<ArchiveWorker>,
+    job_toolchains: Mutex<HashMap<JobId, LocalAssignment>>,
+    #[cfg(target_os = "linux")]
+    native_worker: Option<NativeWorker>,
+}
+
+impl Server {
+    fn new(archive: Option<ArchiveWorker>) -> Self {
+        Self {
+            archive,
+            job_toolchains: Mutex::new(HashMap::new()),
+            #[cfg(target_os = "linux")]
+            native_worker: None,
+        }
     }
 }
 
@@ -1319,16 +1330,17 @@ impl ServerIncoming for Server {
         Ok(removed)
     }
 
-    fn native_platform(&self) -> Option<sccache::build_runtime::ContentId> {
+    fn capabilities(&self) -> dist::WorkerCapabilities {
         #[cfg(target_os = "linux")]
-        {
-            self.native_worker
-                .as_ref()
-                .map(|worker| worker.policy.platform)
-        }
+        let native_platform = self
+            .native_worker
+            .as_ref()
+            .map(|worker| worker.policy.platform);
         #[cfg(not(target_os = "linux"))]
-        {
-            None
+        let native_platform = None;
+        dist::WorkerCapabilities {
+            archive: self.archive.is_some(),
+            native_platform,
         }
     }
 
@@ -1352,7 +1364,7 @@ impl ServerIncoming for Server {
     ) -> Result<AssignJobResult> {
         assignment.spec.validate()?;
         anyhow::ensure!(
-            self.native_platform() == Some(assignment.spec.platform),
+            self.capabilities().native_platform == Some(assignment.spec.platform),
             "native worker platform unavailable"
         );
         let mut assignments = self
@@ -1407,7 +1419,11 @@ impl ServerIncoming for Server {
     }
 
     fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> Result<AssignJobResult> {
-        let need_toolchain = !self.has_or_reuse_toolchain(&tc)?;
+        let need_toolchain = !self
+            .archive
+            .as_ref()
+            .context("archive worker disabled")?
+            .has_or_reuse_toolchain(&tc)?;
         let mut assignments = self
             .job_toolchains
             .lock()
@@ -1441,6 +1457,7 @@ impl ServerIncoming for Server {
         job_id: JobId,
         tc_rdr: ToolchainReader,
     ) -> Result<SubmitToolchainResult> {
+        let archive = self.archive.as_ref().context("archive worker disabled")?;
         let tc = match self
             .job_toolchains
             .lock()
@@ -1457,10 +1474,10 @@ impl ServerIncoming for Server {
         // Streaming and hashing large archives must not hold the cache mutex:
         // other toolchains still need to be assigned while uploads are slow.
         let staged = match StagedToolchainArchive::receive(
-            &self.staging_dir,
+            &archive.staging_dir,
             tc,
             tc_rdr,
-            self.toolchain_cache_size,
+            archive.toolchain_cache_size,
         ) {
             Ok(staged) => staged,
             Err(error) => {
@@ -1468,7 +1485,7 @@ impl ServerIncoming for Server {
                 return Ok(SubmitToolchainResult::CannotCache);
             }
         };
-        let inserted = self
+        let inserted = archive
             .cache
             .lock()
             .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?
@@ -1507,9 +1524,10 @@ impl ServerIncoming for Server {
             bail!("archive job assignment type changed");
         };
 
-        let res = self
+        let archive = self.archive.as_ref().context("archive worker disabled")?;
+        let res = archive
             .builder
-            .run_build(toolchain, command, outputs, inputs_rdr, &self.cache)
+            .run_build(toolchain, command, outputs, inputs_rdr, &archive.cache)
             .map(|res| {
                 RunJobResult::Complete(JobComplete {
                     output: res.output,
@@ -1608,7 +1626,14 @@ mod scheduler_tests {
 
     fn register_test_server(scheduler: &Scheduler, server_id: ServerId, nonce: ServerNonce) {
         scheduler
-            .handle_heartbeat_server(server_id, nonce, 1.0, &[], Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(
+                server_id,
+                nonce,
+                1.0,
+                &[],
+                Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
+            )
             .unwrap();
     }
 
@@ -1650,11 +1675,29 @@ mod scheduler_tests {
         let b: ServerId = "127.0.0.2:10501".parse()?;
         let nonce_a = ServerNonce::new();
         let nonce_b = ServerNonce::new();
-        register_test_server(&scheduler, a, nonce_a.clone());
-        register_test_server(&scheduler, b, nonce_b.clone());
         let platform = ContentId::of(b"native-test");
-        scheduler.handle_update_native_platform(a, nonce_a, Some(platform))?;
-        scheduler.handle_update_native_platform(b, nonce_b, Some(ContentId::of(b"other")))?;
+        scheduler.handle_heartbeat_server(
+            a,
+            nonce_a,
+            1.0,
+            &[],
+            Box::new(TestJobAuthorizer),
+            dist::WorkerCapabilities {
+                archive: false,
+                native_platform: Some(platform),
+            },
+        )?;
+        scheduler.handle_heartbeat_server(
+            b,
+            nonce_b,
+            1.0,
+            &[],
+            Box::new(TestJobAuthorizer),
+            dist::WorkerCapabilities {
+                archive: true,
+                native_platform: Some(ContentId::of(b"other")),
+            },
+        )?;
         let assignment = NativeAssignment {
             ticket: Ticket([42; 32]),
             spec: ExecutionSpec {
@@ -1703,7 +1746,14 @@ mod scheduler_tests {
         let nonce = ServerNonce::new();
         for (id, cpus) in ids.into_iter().zip([1.0, 3.0, 0.0]) {
             scheduler
-                .handle_heartbeat_server(id, nonce.clone(), cpus, &[], Box::new(TestJobAuthorizer))
+                .handle_heartbeat_server(
+                    id,
+                    nonce.clone(),
+                    cpus,
+                    &[],
+                    Box::new(TestJobAuthorizer),
+                    dist::WorkerCapabilities::ARCHIVE,
+                )
                 .unwrap();
         }
         let status = scheduler.handle_status().unwrap();
@@ -1731,10 +1781,24 @@ mod scheduler_tests {
             (13, 13, 0)
         );
         scheduler
-            .handle_heartbeat_server(ids[0], nonce.clone(), 0.0, &[], Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(
+                ids[0],
+                nonce.clone(),
+                0.0,
+                &[],
+                Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
+            )
             .unwrap();
         scheduler
-            .handle_heartbeat_server(ids[1], nonce, 4.0, &[], Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(
+                ids[1],
+                nonce,
+                4.0,
+                &[],
+                Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
+            )
             .unwrap();
         let status = scheduler.handle_status().unwrap();
         // Three jobs remain assigned to the now-busy worker; the other worker
@@ -1785,6 +1849,7 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
             )?;
             assert_eq!(snapshot.assigned_job_ids, vec![job_id]);
             Ok(AssignJobResult {
@@ -1816,6 +1881,7 @@ mod scheduler_tests {
             1.0,
             &[],
             Box::new(TestJobAuthorizer),
+            dist::WorkerCapabilities::ARCHIVE,
         )?;
         assert_eq!(snapshot.assigned_job_ids, vec![job_alloc.job_id]);
         for state in [JobState::Ready, JobState::Started, JobState::Complete] {
@@ -1827,6 +1893,7 @@ mod scheduler_tests {
             1.0,
             &[],
             Box::new(TestJobAuthorizer),
+            dist::WorkerCapabilities::ARCHIVE,
         )?;
         assert!(snapshot.assigned_job_ids.is_empty());
         Ok(())
@@ -1868,6 +1935,7 @@ mod scheduler_tests {
                     capacity,
                     &[],
                     Box::new(TestJobAuthorizer),
+                    dist::WorkerCapabilities::ARCHIVE,
                 )
                 .unwrap();
         }
@@ -1975,6 +2043,7 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
             )?;
             assert!(!heartbeat.is_new);
 
@@ -2016,6 +2085,7 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
             )
             .unwrap();
         assert_eq!(
@@ -2029,7 +2099,14 @@ mod scheduler_tests {
                 .unwrap();
         }
         scheduler
-            .handle_heartbeat_server(server_id, nonce, 1.0, &[], Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(
+                server_id,
+                nonce,
+                1.0,
+                &[],
+                Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
+            )
             .unwrap();
         assert_no_assigned_jobs(&scheduler, &server_id);
     }
@@ -2060,6 +2137,7 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
             )
             .unwrap();
         assert_no_assigned_jobs(&scheduler, &server_id);
@@ -2082,7 +2160,14 @@ mod scheduler_tests {
                 .unwrap();
         }
         scheduler
-            .handle_heartbeat_server(server_id, nonce, 1.0, &[], Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(
+                server_id,
+                nonce,
+                1.0,
+                &[],
+                Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
+            )
             .unwrap();
         assert_eq!(
             scheduler
@@ -2123,6 +2208,7 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(RejectToken),
+                dist::WorkerCapabilities::ARCHIVE,
             )
             .unwrap();
         assert!(
@@ -2218,6 +2304,7 @@ mod scheduler_tests {
                 1.0,
                 &[job_id],
                 Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
             )
             .unwrap();
         assert!(scheduler.jobs.lock().unwrap().contains_key(&job_id));
@@ -2230,6 +2317,7 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
             )
             .unwrap();
         assert!(scheduler.jobs.lock().unwrap().contains_key(&job_id));
@@ -2242,7 +2330,14 @@ mod scheduler_tests {
             );
         }
         scheduler
-            .handle_heartbeat_server(server_id, nonce, 1.0, &[], Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(
+                server_id,
+                nonce,
+                1.0,
+                &[],
+                Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
+            )
             .unwrap();
         assert_no_assigned_jobs(&scheduler, &server_id);
         // Reconciliation is not a successful completion. A late terminal
@@ -2338,6 +2433,7 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
             )
             .unwrap();
         assert!(
@@ -2357,6 +2453,7 @@ mod scheduler_tests {
                 1.0,
                 &[job_id],
                 Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
             )
             .unwrap();
         assert!(
@@ -2370,7 +2467,14 @@ mod scheduler_tests {
                 .is_none()
         );
         scheduler
-            .handle_heartbeat_server(server_id, nonce, 1.0, &[], Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(
+                server_id,
+                nonce,
+                1.0,
+                &[],
+                Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
+            )
             .unwrap();
         assert!(scheduler.jobs.lock().unwrap().contains_key(&job_id));
         scheduler
@@ -2420,6 +2524,7 @@ mod scheduler_tests {
                 8.0,
                 &[],
                 Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
             )
             .unwrap();
         assert_eq!(scheduler.handle_get_worker_name(server_id).unwrap(), None);
@@ -2446,6 +2551,7 @@ mod scheduler_tests {
                 8.0,
                 &[],
                 Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
             )
             .unwrap();
         assert!(heartbeat.is_new);
@@ -2461,7 +2567,14 @@ mod scheduler_tests {
         let second_nonce = ServerNonce::new();
         for (server_id, nonce) in [(first, first_nonce.clone()), (second, second_nonce.clone())] {
             scheduler
-                .handle_heartbeat_server(server_id, nonce, 8.0, &[], Box::new(TestJobAuthorizer))
+                .handle_heartbeat_server(
+                    server_id,
+                    nonce,
+                    8.0,
+                    &[],
+                    Box::new(TestJobAuthorizer),
+                    dist::WorkerCapabilities::ARCHIVE,
+                )
                 .unwrap();
         }
         scheduler
@@ -2485,6 +2598,7 @@ mod scheduler_tests {
                 8.0,
                 &[],
                 Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
             )
             .unwrap();
         scheduler
@@ -2556,7 +2670,12 @@ mod server_upload_tests {
 
     fn test_server() -> Result<(tempfile::TempDir, Arc<Server>)> {
         let dir = tempfile::tempdir()?;
-        let server = Server::new(Box::new(NoopBuilder), dir.path(), 1024 * 1024, vec![])?;
+        let server = Server::new(Some(ArchiveWorker::new(
+            Box::new(NoopBuilder),
+            dir.path(),
+            1024 * 1024,
+            vec![],
+        )?));
         Ok((dir, Arc::new(server)))
     }
 
@@ -2785,7 +2904,16 @@ mod server_upload_tests {
         )?;
         assert!(matches!(result, SubmitToolchainResult::CannotCache));
         assert!(requester.0.lock().unwrap().is_empty());
-        assert!(!server.cache.lock().unwrap().contains_toolchain(&expected));
+        assert!(
+            !server
+                .archive
+                .as_ref()
+                .unwrap()
+                .cache
+                .lock()
+                .unwrap()
+                .contains_toolchain(&expected)
+        );
         Ok(())
     }
 
@@ -2803,7 +2931,16 @@ mod server_upload_tests {
         )?;
         assert!(matches!(result, SubmitToolchainResult::CannotCache));
         assert!(requester.0.lock().unwrap().is_empty());
-        assert!(!server.cache.lock().unwrap().contains_toolchain(&expected));
+        assert!(
+            !server
+                .archive
+                .as_ref()
+                .unwrap()
+                .cache
+                .lock()
+                .unwrap()
+                .contains_toolchain(&expected)
+        );
         Ok(())
     }
 }

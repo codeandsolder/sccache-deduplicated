@@ -1006,6 +1006,22 @@ pub trait JobAuthorizer: Send {
     fn verify_token(&self, job_id: JobId, token: &str) -> Result<()>;
 }
 
+/// Worker build engines advertised atomically with its scheduler heartbeat.
+#[cfg(feature = "dist-server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerCapabilities {
+    pub archive: bool,
+    pub native_platform: Option<crate::build_runtime::ContentId>,
+}
+
+#[cfg(feature = "dist-server")]
+impl WorkerCapabilities {
+    pub const ARCHIVE: Self = Self {
+        archive: true,
+        native_platform: None,
+    };
+}
+
 #[cfg(feature = "dist-server")]
 pub trait SchedulerIncoming: Send + Sync {
     // From Client
@@ -1023,16 +1039,6 @@ pub trait SchedulerIncoming: Send + Sync {
         requester: &dyn SchedulerOutgoing,
         assignment: NativeAssignment,
     ) -> ExtResult<AllocJobResult, Error>;
-    /// Update a registered worker’s native execution capability.
-    ///
-    /// # Errors
-    /// Returns an error if the worker nonce is stale or state is unavailable.
-    fn handle_update_native_platform(
-        &self,
-        server_id: ServerId,
-        nonce: ServerNonce,
-        platform: Option<crate::build_runtime::ContentId>,
-    ) -> ExtResult<(), Error>;
     // From Server
     fn handle_heartbeat_server(
         &self,
@@ -1041,6 +1047,7 @@ pub trait SchedulerIncoming: Send + Sync {
         cpu_capacity: f64,
         running_job_ids: &[JobId],
         job_authorizer: Box<dyn JobAuthorizer>,
+        capabilities: WorkerCapabilities,
     ) -> ExtResult<HeartbeatServerResult, Error>;
     // From Server, best-effort observability metadata.
     fn handle_update_worker_name(
@@ -1075,7 +1082,7 @@ pub trait SchedulerIncoming: Send + Sync {
 pub trait ServerIncoming: Send + Sync {
     // From Scheduler
     fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> ExtResult<AssignJobResult, Error>;
-    fn native_platform(&self) -> Option<crate::build_runtime::ContentId>;
+    fn capabilities(&self) -> WorkerCapabilities;
     fn native_metadata_limit(&self) -> Option<usize>;
     /// Accept an immutable native action assignment.
     ///

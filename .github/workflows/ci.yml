@@ -333,6 +333,9 @@ jobs:
         chmod +x "$test_runner"
         export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$test_runner"
         cargo +nightly-2026-11-22 test --locked --target x86_64-unknown-linux-gnu --lib --bins --tests
+        cargo +nightly-2026-11-22 test --locked --target x86_64-unknown-linux-gnu -p sccache-build -- --include-ignored
+        cargo +nightly-2026-11-22 test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-client,dist-server --test native_dist -- --include-ignored
+        cargo +nightly-2026-11-22 test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-server --bin sccache-dist scheduler_tests
       rust-toolchain: "nightly-2026-11-22"
       rustflags: "-C target-cpu=x86-64-v2"
 

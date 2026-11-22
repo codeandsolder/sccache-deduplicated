@@ -254,7 +254,7 @@ fn sccache_server_cfg(
             bwrap_path: DIST_IMAGE_BWRAP_PATH.into(),
             extracted_toolchain_cache_size: TC_CACHE_SIZE,
         },
-        cache_dir: Path::new(CONFIGS_CONTAINER_PATH).join(relpath),
+        cache_dir: Some(Path::new(CONFIGS_CONTAINER_PATH).join(relpath)),
         public_addr: SocketAddr::new(server_ip, SERVER_PORT),
         bind_address: Some(SocketAddr::from(([0, 0, 0, 0], SERVER_PORT))),
         scheduler_url,

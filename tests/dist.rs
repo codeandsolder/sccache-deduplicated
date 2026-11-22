@@ -387,8 +387,8 @@ impl ServerIncoming for FailingServer {
         None
     }
 
-    fn native_platform(&self) -> Option<sccache::build_runtime::ContentId> {
-        None
+    fn capabilities(&self) -> sccache::dist::WorkerCapabilities {
+        sccache::dist::WorkerCapabilities::ARCHIVE
     }
     fn handle_assign_native_job(
         &self,

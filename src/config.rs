@@ -2029,6 +2029,7 @@ pub mod scheduler {
     pub struct NativeCacheConfig {
         pub public_addr: SocketAddr,
         pub directory: PathBuf,
+        pub space: crate::build_runtime::SpacePolicy,
         pub idle_timeout_secs: u64,
         pub max_sessions: usize,
         pub max_result_bytes: u64,
@@ -2066,6 +2067,7 @@ pub mod scheduler {
                 max_total_uploads: self.max_total_uploads,
             };
             limits.validate()?;
+            self.space.validate()?;
             Ok(limits)
         }
     }
@@ -2177,6 +2179,8 @@ pub mod server {
     #[serde(tag = "type")]
     #[serde(deny_unknown_fields)]
     pub enum BuilderType {
+        #[serde(rename = "native")]
+        Native,
         #[serde(rename = "docker")]
         Docker,
         #[serde(rename = "overlay")]
@@ -2217,6 +2221,7 @@ pub mod server {
     pub struct NativeWorkerConfig {
         pub cache_url: HTTPUrl,
         pub directory: PathBuf,
+        pub space: crate::build_runtime::SpacePolicy,
         pub scratch: PathBuf,
         pub bubblewrap: PathBuf,
         pub platform_contract: String,
@@ -2231,7 +2236,7 @@ pub mod server {
     #[serde(deny_unknown_fields)]
     pub struct Config {
         pub builder: BuilderType,
-        pub cache_dir: PathBuf,
+        pub cache_dir: Option<PathBuf>,
         pub public_addr: SocketAddr,
         pub bind_address: Option<SocketAddr>,
         pub scheduler_url: HTTPUrl,
@@ -3638,7 +3643,7 @@ fn server_toml_parse() {
                 bwrap_path: PathBuf::from("/usr/bin/bwrap"),
                 extracted_toolchain_cache_size: 8 * 1024 * 1024 * 1024,
             },
-            cache_dir: PathBuf::from("/tmp/toolchains"),
+            cache_dir: Some(PathBuf::from("/tmp/toolchains")),
             public_addr: "192.168.1.1:10501"
                 .parse()
                 .expect("Public address must be valid socket address"),
