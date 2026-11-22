@@ -6954,7 +6954,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         let env_a = policy_env(&a);
         let env_b = policy_env(&b);
         let key = |fixture: &TestFixture, env: &[(OsString, OsString)]| {
-            hash_key_for_compiler(fixture, &args, env, |_| Ok(()), false, "clippy-driver")
+            hash_keys_for_compiler(fixture, &args, env, |_| Ok(()), false, "clippy-driver").0
         };
         let first = key(&a, &env_a);
         assert_eq!(first, key(&b, &env_b));

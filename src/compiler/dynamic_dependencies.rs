@@ -63,7 +63,7 @@ pub(crate) fn find_ldd_libraries(
         let elf = object::File::parse(bytes.as_slice())?;
         if elf.format() != object::BinaryFormat::Elf
             || elf.kind() != ObjectKind::Executable
-            || elf.imports()?.iter().next().is_some()
+            || elf.imports()?.next().is_some()
         {
             bail!(
                 "dynamic dependency discovery failed for {}",
