@@ -270,7 +270,6 @@ fn restore_root(archive: &Path, destination: &Path, budget: &mut Budget) -> Resu
         );
         budget.consume(entry.size())?;
     }
-    drop(reader);
     file.seek(SeekFrom::Start(0))?;
     tar::Archive::new(file).unpack(destination)?;
     Ok(())
