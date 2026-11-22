@@ -102,7 +102,7 @@ impl NativeCacheClient {
 
     /// Reuse a configured HTTP client for one authenticated worker job.
     #[must_use = "the returned client is scoped to this worker job"]
-    pub fn for_worker(mut self, job: JobId) -> Self {
+    pub const fn for_worker(mut self, job: JobId) -> Self {
         self.role = Role::Worker(job);
         self
     }

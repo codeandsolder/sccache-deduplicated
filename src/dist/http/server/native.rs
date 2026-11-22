@@ -22,7 +22,7 @@ pub(super) type Allocator =
     dyn Fn(crate::dist::NativeAssignment) -> Result<ScheduleReply> + Send + Sync;
 
 pub(super) fn spawn(
-    config: NativeCacheConfig,
+    config: &NativeCacheConfig,
     allocate: impl Fn(crate::dist::NativeAssignment) -> Result<ScheduleReply> + Send + Sync + 'static,
     client_auth: Arc<dyn ClientAuthCheck>,
     server_auth: Arc<ServerAuthenticator>,

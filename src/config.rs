@@ -2212,7 +2212,7 @@ pub mod server {
     }
 
     /// Explicit native worker execution and store configuration.
-    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     pub struct NativeWorkerConfig {
         pub cache_url: HTTPUrl,

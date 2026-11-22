@@ -1014,11 +1014,19 @@ pub trait SchedulerIncoming: Send + Sync {
         requester: &dyn SchedulerOutgoing,
         tc: Toolchain,
     ) -> ExtResult<AllocJobResult, Error>;
+    /// Allocate a native action from the shared worker capacity pool.
+    ///
+    /// # Errors
+    /// Returns an error if allocation or assignment fails.
     fn handle_alloc_native_job(
         &self,
         requester: &dyn SchedulerOutgoing,
         assignment: NativeAssignment,
     ) -> ExtResult<AllocJobResult, Error>;
+    /// Update a registered worker’s native execution capability.
+    ///
+    /// # Errors
+    /// Returns an error if the worker nonce is stale or state is unavailable.
     fn handle_update_native_platform(
         &self,
         server_id: ServerId,
@@ -1069,11 +1077,19 @@ pub trait ServerIncoming: Send + Sync {
     fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> ExtResult<AssignJobResult, Error>;
     fn native_platform(&self) -> Option<crate::build_runtime::ContentId>;
     fn native_metadata_limit(&self) -> Option<usize>;
+    /// Accept an immutable native action assignment.
+    ///
+    /// # Errors
+    /// Returns an error for incompatible platforms or duplicate assignments.
     fn handle_assign_native_job(
         &self,
         job_id: JobId,
         assignment: NativeAssignment,
     ) -> ExtResult<AssignJobResult, Error>;
+    /// Claim and execute an assigned native action.
+    ///
+    /// # Errors
+    /// Returns an error if execution, scheduler reporting or publication fails.
     fn handle_run_native_job(
         &self,
         requester: &dyn ServerOutgoing,

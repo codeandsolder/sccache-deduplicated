@@ -277,7 +277,7 @@ pub mod urls {
         Ok(scheduler_url.join("/api/v1/scheduler/status")?)
     }
 
-    /// Build the server assignment endpoint.
+    /// Build the native server assignment endpoint.
     ///
     /// # Errors
     ///
@@ -289,6 +289,10 @@ pub mod urls {
         ))?)
     }
 
+    /// Build the native job execution endpoint.
+    ///
+    /// # Errors
+    /// Returns an error if the generated server URL is invalid.
     pub fn server_run_native_job(server_id: ServerId, job_id: JobId) -> Result<reqwest::Url> {
         Ok(reqwest::Url::parse(&format!(
             "https://{}/api/v3/distserver/run_native_job/{job_id}",
@@ -296,6 +300,10 @@ pub mod urls {
         ))?)
     }
 
+    /// Build the server archive assignment endpoint.
+    ///
+    /// # Errors
+    /// Returns an error if the generated server URL is invalid.
     pub fn server_assign_job(server_id: ServerId, job_id: JobId) -> Result<reqwest::Url> {
         let url = format!(
             "https://{}/api/v1/distserver/assign_job/{job_id}",
@@ -1005,7 +1013,7 @@ mod server {
                 let requester = Arc::clone(&requester);
                 let certs = Arc::clone(&server_certificates);
                 native::spawn(
-                    config,
+                    &config,
                     move |assignment| match handler
                         .handle_alloc_native_job(&*requester, assignment)?
                     {

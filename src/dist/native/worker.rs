@@ -91,7 +91,7 @@ impl NativeCacheClient {
         let renew = thread::Builder::new()
             .name("native-lease-renewal".into())
             .spawn(move || {
-                while let Err(mpsc::RecvTimeoutError::Timeout) = stop_rx.recv_timeout(interval) {
+                while stop_rx.recv_timeout(interval) == Err(mpsc::RecvTimeoutError::Timeout) {
                     if let Err(error) = client.renew(ticket) {
                         let _ = failure_tx.send(error);
                         break;
