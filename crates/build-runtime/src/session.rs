@@ -401,15 +401,21 @@ impl NativeSessions {
                 Ok(NativeAdmission::Hit { ticket, manifest })
             }
             Admission::Compile(permit) => {
-                let inputs = request
-                    .input_trees
-                    .iter()
-                    .map(|id| {
-                        self.store()
-                            .lookup_tree(*id)?
-                            .context("native action input tree missing")
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                let mut inputs = Vec::new();
+                let mut missing = BTreeSet::new();
+                for &id in &request.input_trees {
+                    match self.store().lookup_tree(id)? {
+                        Some(lease) => inputs.push(lease),
+                        None => {
+                            missing.insert(id);
+                        }
+                    }
+                }
+                if !missing.is_empty() {
+                    // Drop the compile permit rather than reserve capacity
+                    // while the client supplies its input closure.
+                    return Ok(NativeAdmission::MissingInputs { trees: missing });
+                }
                 let pending = Pending::Action(Box::new(PendingAction {
                     request,
                     permit,

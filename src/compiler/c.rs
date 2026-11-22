@@ -1990,7 +1990,7 @@ impl pkg::InputsPackager for CInputsPackager {
         (*self).discover()?.write_archive(wtr, |_, _| Ok(None))
     }
 
-    #[cfg(all(feature = "native-store", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
         (*self).discover()?.into_native_mapping()
     }
@@ -2256,7 +2256,6 @@ impl pkg::ToolchainPackager for CToolchainPackager {
         self.package_builder()?.write_compressed_tar(f)
     }
 
-    #[cfg(feature = "native-store")]
     fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
         self.package_builder()?.into_native_mapping()
     }
@@ -2813,7 +2812,9 @@ mod test {
             extra_hash_files: Vec::new(),
         };
         let store = NativeStore::open(&temp.path().join("store"))?;
-        let tree = pkg::InputsPackager::native_mapping(Box::new(packager))?.capture(&store)?;
+        let tree = pkg::InputsPackager::native_mapping(Box::new(packager))?
+            .prepare()?
+            .import(&store)?;
         let view = tree.materialize(temp.path())?;
         assert_eq!(
             std::fs::read(view.root().join("work/empty/deep/../../source.c"))?,

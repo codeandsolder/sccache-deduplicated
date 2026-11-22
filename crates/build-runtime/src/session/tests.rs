@@ -304,7 +304,12 @@ fn shared_input_tree_is_pinned_and_worker_can_fetch_only_declared_inputs() -> Re
             unreferenced_logical_bytes: 9
         }
     );
-    assert!(service.admit(request, Publisher::Client).is_err());
+    assert_eq!(
+        service.admit(request, Publisher::Client)?,
+        NativeAdmission::MissingInputs {
+            trees: BTreeSet::from([id])
+        }
+    );
     Ok(())
 }
 

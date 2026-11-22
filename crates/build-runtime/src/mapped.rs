@@ -4,16 +4,17 @@
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fs::File,
+    io::{Cursor, Read},
     path::PathBuf,
+    sync::Arc,
 };
 
-use anyhow::{Result, ensure};
-use rustix::fs::{CWD, Mode, OFlags, fstat, openat};
+use anyhow::{Context, Result, ensure};
+use rustix::fs::{CWD, FileType, Mode, OFlags, Stat, fstat, openat};
 
-use super::capture::{capture_regular, metadata};
+use crate::source::{metadata, unchanged};
 use crate::{
-    ContentId, NativeStore, StagedBlob, TreeEntry, TreeLease, TreeManifest, TreeMetadata, TreePath,
-    TreeTimestamp,
+    BlobRef, ContentId, TreeEntry, TreeId, TreeManifest, TreeMetadata, TreePath, TreeTimestamp,
 };
 
 /// File metadata contract for a mapped build tree. Normalization is explicit
@@ -146,38 +147,37 @@ impl MappedTree {
         Ok(())
     }
 
-    /// Read selected files directly into verified CAS staging and publish
-    /// one tree. The caller must keep the selected sources quiescent over
-    /// the whole capture. Per-file before/after metadata detects mutation.
+    /// Compute the input manifest without writing or staging any content.
+    /// Retain source locators and verified metadata, not one open file per
+    /// entry. Only missing content is opened again for transfer.
     ///
+    /// The caller must keep the selected sources quiescent over the whole
+    /// operation. Metadata checks detect changes but do not replace a snapshot.
     /// # Errors
-    /// Returns an error for invalid topology, changed source files, or
-    /// storage failure.
-    pub fn capture(mut self, store: &NativeStore) -> Result<TreeLease> {
+    /// Returns an error for invalid topology, changed or unreadable sources.
+    pub fn prepare(mut self) -> Result<PreparedTree> {
         self.add_parents()?;
         let mut entries = BTreeMap::new();
-        let mut staged = BTreeMap::new();
+        let mut sources = BTreeMap::new();
         for (path, source) in self.entries {
             let entry = match source {
                 Source::Directory(metadata) => TreeEntry::Directory(metadata),
                 Source::Symlink { target, modified } => TreeEntry::Symlink { target, modified },
                 Source::Bytes { data, metadata } => {
-                    let size = u64::try_from(data.len())?;
-                    let blob = store.stage_inner(data.as_slice(), Some(size))?;
-                    staged_file(blob, metadata, &mut staged)
+                    let blob = BlobRef {
+                        id: ContentId::of(&data),
+                        size: u64::try_from(data.len())?,
+                    };
+                    sources
+                        .entry(blob.id)
+                        .or_insert_with(|| PreparedSource::Bytes(data.into()));
+                    TreeEntry::File { blob, metadata }
                 }
                 Source::File {
                     path,
                     metadata: policy,
                 } => {
-                    let file = File::from(openat(
-                        CWD,
-                        &path,
-                        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-                        Mode::empty(),
-                    )?);
-                    let stat = fstat(&file)?;
-                    let blob = capture_regular(store, &file, &stat)?;
+                    let (blob, stat) = hash_source(&path)?;
                     let metadata = match policy {
                         MappedMetadata::Preserve => metadata(&stat)?,
                         MappedMetadata::Normalize(modified) => TreeMetadata {
@@ -189,40 +189,117 @@ impl MappedTree {
                             modified,
                         },
                     };
-                    staged_file(blob, metadata, &mut staged)
+                    sources
+                        .entry(blob.id)
+                        .or_insert(PreparedSource::File { path, stat });
+                    TreeEntry::File { blob, metadata }
                 }
             };
             entries.insert(path, entry);
         }
-        // Mapped paths are deliberately independent files (not hardlinks);
-        // the mapping does not infer alias topology from host inode numbers.
-        // The physical content is still deduplicated by the shared CAS.
-        store.publish_tree_pinned(
-            &TreeManifest {
-                root: self.directories,
-                entries,
-            },
-            staged.into_values().collect(),
-        )
+        let manifest = TreeManifest {
+            root: self.directories,
+            entries,
+        };
+        let id = manifest.id()?;
+        Ok(PreparedTree {
+            id,
+            manifest,
+            sources,
+        })
     }
 }
 
-fn staged_file(
-    blob: StagedBlob,
-    metadata: TreeMetadata,
-    staged: &mut BTreeMap<ContentId, StagedBlob>,
-) -> TreeEntry {
-    let reference = blob.reference();
-    staged.entry(reference.id).or_insert(blob);
-    TreeEntry::File {
-        blob: reference,
-        metadata,
+fn open_source(path: &std::path::Path) -> Result<(File, Stat)> {
+    let file = File::from(openat(
+        CWD,
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )?);
+    let stat = fstat(&file)?;
+    ensure!(
+        FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile,
+        "capture source is not a regular file"
+    );
+    Ok((file, stat))
+}
+
+fn hash_source(path: &std::path::Path) -> Result<(BlobRef, Stat)> {
+    let (file, stat) = open_source(path)?;
+    let size = u64::try_from(stat.st_size)?;
+    let mut reader = (&file).take(size.checked_add(1).context("mapped file length overflow")?);
+    let mut hash = blake3::Hasher::new();
+    hash.update_reader(&mut reader)?;
+    ensure!(reader.limit() == 1, "file size changed during capture");
+    unchanged(&stat, &fstat(&file)?)?;
+    Ok((
+        BlobRef {
+            id: ContentId(*hash.finalize().as_bytes()),
+            size,
+        },
+        stat,
+    ))
+}
+
+enum PreparedSource {
+    File { path: PathBuf, stat: Stat },
+    Bytes(Arc<[u8]>),
+}
+
+/// A validated mapped manifest and direct readers for its unique content.
+/// No local CAS, temporary archive, or persistent staging is needed.
+pub struct PreparedTree {
+    id: TreeId,
+    manifest: TreeManifest,
+    sources: BTreeMap<ContentId, PreparedSource>,
+}
+
+impl PreparedTree {
+    #[must_use = "the identity names the manifest"]
+    pub const fn id(&self) -> TreeId {
+        self.id
+    }
+
+    #[must_use = "the manifest describes the selected build inputs"]
+    pub const fn manifest(&self) -> &TreeManifest {
+        &self.manifest
+    }
+
+    /// Reopen only an advertised source blob. The receiver must verify the
+    /// exact content digest and length while consuming the returned reader.
+    /// # Errors
+    /// Returns an error for unknown content or a changed source file.
+    pub fn open_blob(&self, id: ContentId) -> Result<Box<dyn Read + Send>> {
+        match self.sources.get(&id).context("undeclared mapped content")? {
+            PreparedSource::File { path, stat } => {
+                let (file, current) = open_source(path)?;
+                unchanged(stat, &current)?;
+                Ok(Box::new(file))
+            }
+            PreparedSource::Bytes(bytes) => Ok(Box::new(Cursor::new(Arc::clone(bytes)))),
+        }
+    }
+
+    /// Import the prepared mapping into an explicitly selected local store.
+    /// Existing blobs are negotiated and no redundant staging is performed.
+    /// # Errors
+    /// Returns an error for changed sources or storage failure.
+    #[cfg(feature = "store")]
+    pub fn import(&self, store: &crate::NativeStore) -> Result<crate::TreeLease> {
+        let reserved = store.reserve_tree_upload(&self.manifest)?;
+        let mut staged = Vec::new();
+        for blob in reserved.missing() {
+            staged.push(store.stage_expected(*blob, self.open_blob(blob.id)?)?);
+        }
+        store.publish_tree_pinned(&self.manifest, staged)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "store"))]
 mod tests {
     use super::*;
+    use crate::NativeStore;
     use std::{
         fs,
         io::Read,
@@ -263,7 +340,7 @@ mod tests {
             b"/compiler/bin/tool".to_vec(),
             modified,
         )?;
-        let tree = mapping.capture(&store)?;
+        let tree = mapping.prepare()?.import(&store)?;
         assert_eq!(tree.manifest().blobs()?.len(), 1);
         let TreeEntry::File { blob, metadata } =
             tree.manifest().entries[&TreePath::new(b"compiler/bin/tool".to_vec())?]
@@ -278,9 +355,40 @@ mod tests {
     }
 
     #[test]
+    fn prepared_sources_reject_replaced_and_modified_files() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("file");
+        fs::write(&path, b"original")?;
+        let mut mapping = MappedTree::new(TreeMetadata {
+            mode: 0o755,
+            modified: TreeTimestamp {
+                seconds: 1,
+                nanoseconds: 0,
+            },
+        });
+        mapping.add_file(
+            TreePath::new(b"file".to_vec())?,
+            path.clone(),
+            MappedMetadata::Preserve,
+        )?;
+        let prepared = mapping.prepare()?;
+        let id = ContentId::of(b"original");
+        let mut bytes = Vec::new();
+        prepared.open_blob(id)?.read_to_end(&mut bytes)?;
+        assert_eq!(bytes, b"original");
+        assert!(prepared.open_blob(ContentId::of(b"undeclared")).is_err());
+        fs::rename(&path, dir.path().join("old"))?;
+        fs::write(&path, b"original")?;
+        assert!(prepared.open_blob(id).is_err());
+        fs::remove_file(&path)?;
+        symlink(dir.path().join("old"), &path)?;
+        assert!(prepared.open_blob(id).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn mapping_rejects_nondirectory_ancestors_and_source_symlinks() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = NativeStore::open(&dir.path().join("store"))?;
         let modified = TreeTimestamp {
             seconds: 1,
             nanoseconds: 0,
@@ -296,7 +404,7 @@ mod tests {
             modified,
         )?;
         mapping.add_directory(TreePath::new(b"alias/child".to_vec())?)?;
-        assert!(mapping.capture(&store).is_err());
+        assert!(mapping.prepare().is_err());
         let actual = dir.path().join("actual");
         fs::write(&actual, b"content")?;
         let link = dir.path().join("link");
@@ -307,7 +415,7 @@ mod tests {
             link,
             MappedMetadata::Preserve,
         )?;
-        assert!(mapping.capture(&store).is_err());
+        assert!(mapping.prepare().is_err());
         Ok(())
     }
 }

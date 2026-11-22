@@ -514,6 +514,11 @@ struct FileInputs(std::fs::File);
 
 #[cfg(feature = "dist-client")]
 impl crate::dist::pkg::InputsPackager for FileInputs {
+    #[cfg(target_os = "linux")]
+    fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
+        bail!("namespace archive transport cannot supply a native input mapping")
+    }
+
     fn write_inputs(mut self: Box<Self>, output: &mut dyn std::io::Write) -> Result<()> {
         std::io::copy(&mut self.0, output)?;
         Ok(())

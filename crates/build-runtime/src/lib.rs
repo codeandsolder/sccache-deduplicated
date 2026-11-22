@@ -43,4 +43,11 @@ pub mod sandbox;
 pub use execution::{CapturedExecution, ExecutionPolicy, execute};
 
 #[cfg(all(target_os = "linux", feature = "store"))]
-pub use store::{MappedMetadata, MappedTree, MaterializationStats, MaterializedTree};
+pub use store::{MaterializationStats, MaterializedTree};
+
+#[cfg(all(target_os = "linux", feature = "mapping"))]
+mod mapped;
+#[cfg(all(target_os = "linux", feature = "mapping"))]
+mod source;
+#[cfg(all(target_os = "linux", feature = "mapping"))]
+pub use mapped::{MappedMetadata, MappedTree, PreparedTree};

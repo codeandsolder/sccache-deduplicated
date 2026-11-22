@@ -4207,7 +4207,10 @@ fn native_rust_inputs_retain_complete_dependency_artifacts() -> Result<()> {
         rlib_dep_reader: None,
     };
     let store = NativeStore::open(&tmp.path().join("store"))?;
-    let tree = Box::new(packager).native_mapping()?.capture(&store)?;
+    let tree = Box::new(packager)
+        .native_mapping()?
+        .prepare()?
+        .import(&store)?;
     let view = tree.materialize(tmp.path())?;
     assert_eq!(
         fs::read(view.root().join("work/deps/libdirect-abc.rlib"))?,
@@ -4274,7 +4277,7 @@ impl pkg::InputsPackager for RustInputsPackager {
     // The native store shares complete dependency artifacts across actions,
     // including metadata and linkable code. Do not introduce a second
     // representation of rlibs merely to reduce a per-job archive.
-    #[cfg(all(feature = "native-store", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
         (*self).discover()?.into_native_mapping()
     }
@@ -4501,7 +4504,6 @@ impl pkg::ToolchainPackager for RustToolchainPackager {
         self.package_builder()?.write_compressed_tar(f)
     }
 
-    #[cfg(feature = "native-store")]
     fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
         self.package_builder()?.into_native_mapping()
     }

@@ -88,7 +88,7 @@ impl CompilerInputs {
         Ok(())
     }
 
-    #[cfg(all(feature = "native-store", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     pub(crate) fn into_native_mapping(self) -> Result<crate::build_runtime::MappedTree> {
         use crate::build_runtime::{
             MappedMetadata, MappedTree, TreeMetadata, TreePath, TreeTimestamp,

@@ -15,8 +15,8 @@ use std::{
 use anyhow::{Result, ensure};
 use sccache::{
     build_runtime::{
-        BuildPath, CommandSpec, ContentId, ExecutionSpec, NativeStore, OutputSpec, SpacePolicy,
-        TreeLayer, TreePath, TreeRecipe,
+        BuildPath, CommandSpec, ContentId, ExecutionSpec, MappedMetadata, MappedTree, NativeStore,
+        OutputSpec, SpacePolicy, TreeLayer, TreePath, TreeRecipe,
         wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply},
     },
     config::{HTTPUrl, scheduler, server},
@@ -227,14 +227,16 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
             .success(),
         "local assembler failed"
     );
-    let sender = NativeStore::open(&root.join("sender"))?;
     let mut discovery = ToolchainPackageBuilder::new();
     discovery.add_executable_and_deps("/usr/bin/as".into())?;
-    let mapping = discovery.into_native_mapping()?;
-    let root_tree = mapping.capture(&sender)?;
-    let source_tree = sender.capture_tree(&source_dir)?;
-    let root_pin = client.push_tree(&root_tree)?;
-    let source_pin = client.push_tree(&source_tree)?;
+    let root_tree = discovery.into_native_mapping()?.prepare()?;
+    let mut mapping = MappedTree::new(root_tree.manifest().root);
+    mapping.add_file(
+        TreePath::new(b"input.s".to_vec())?,
+        input.clone(),
+        MappedMetadata::Preserve,
+    )?;
+    let source_tree = mapping.prepare()?;
     let spec = ExecutionSpec {
         platform: ContentId::of(PLATFORM.as_bytes()),
         root: TreeRecipe {
@@ -269,6 +271,14 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
             },
         )]),
     };
+    assert_eq!(
+        client.admit(&spec)?,
+        NativeAdmission::MissingInputs {
+            trees: [root_tree.id(), source_tree.id()].into_iter().collect()
+        },
+    );
+    let root_pin = client.push_tree(root_tree.manifest(), |id| root_tree.open_blob(id))?;
+    let source_pin = client.push_tree(source_tree.manifest(), |id| source_tree.open_blob(id))?;
     let NativeAdmission::Compile { ticket } = client.admit(&spec)? else {
         anyhow::bail!("expected native miss");
     };
@@ -293,6 +303,10 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     client.download(ticket, manifest.outputs["object"].blob, &mut bytes)?;
     assert_eq!(bytes, fs::read(&reference)?);
     client.close(ticket)?;
+    let warm_pin = client.push_tree(source_tree.manifest(), |_| -> Result<File> {
+        anyhow::bail!("warm tree must not reopen input content")
+    })?;
+    client.close(warm_pin)?;
     let NativeAdmission::Hit {
         ticket: hit,
         manifest: cached,

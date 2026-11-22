@@ -20,9 +20,15 @@ optional output paths. The scheduler derives the action fingerprint from
 this declaration and the worker verifies the same specification before
 execution. There is no translation from an old compiler cache key.
 
-The client pushes constituent trees by manifest and missing blobs, then
-admits an action containing the exact root composition recipe and any
-additional independent mounts. Every source tree is pinned by the action.
+The client prepares manifests directly from mapped source files and generated
+bytes without a local CAS. File metadata is checked before and after hashing
+and again when a missing blob is opened; the scheduler verifies its exact
+digest and length. Sources must remain quiescent across the operation.
+Admission precedes upload: a cache hit does not require input trees to still
+exist, and a miss reports only the missing tree identities. The client
+offers those constituent manifests and uploads missing blobs directly.
+A successful miss admission pins every source tree in the action's root
+recipe and independent mounts.
 Workers compose the recipe directly in memory from the pinned package
 manifests, including their selected subtrees and logical destinations.
 The combined root is neither uploaded nor published to either CAS index.

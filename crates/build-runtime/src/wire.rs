@@ -119,6 +119,9 @@ pub enum NativeAdmission {
         manifest: ResultManifest,
     },
     InFlight,
+    MissingInputs {
+        trees: BTreeSet<TreeId>,
+    },
     Compile {
         ticket: Ticket,
     },

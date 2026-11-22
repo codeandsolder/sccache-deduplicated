@@ -219,20 +219,30 @@ impl NativeCacheClient {
         self.control("tree_open", &OpenTreeRequest { action, tree })
     }
 
-    /// Publish a local tree, transferring only absent blobs.
-    ///
+    /// Publish a tree directly from its declared sources, transferring only
+    /// absent blobs. Readers are opened lazily; no client CAS is needed.
     /// # Errors
-    /// Returns an error on a negotiation, verification or transport failure.
-    #[cfg(all(unix, feature = "native-store"))]
-    pub fn push_tree(&self, tree: &crate::build_runtime::TreeLease) -> Result<Ticket> {
-        let offer = self.offer_tree(tree.manifest())?;
+    /// Returns an error on negotiation, verification or transport failure.
+    pub fn push_tree<R: Read + Send + 'static>(
+        &self,
+        manifest: &TreeManifest,
+        mut open: impl FnMut(ContentId) -> Result<R>,
+    ) -> Result<Ticket> {
+        let id = manifest.id()?;
+        let blobs = manifest.blobs()?;
+        let offer = self.offer_tree(manifest)?;
         let result = (|| {
-            ensure!(offer.id == tree.id(), "native tree offer identity mismatch");
+            ensure!(offer.id == id, "native tree offer identity mismatch");
+            let mut seen = std::collections::BTreeSet::new();
             for blob in offer.missing {
-                self.upload_file(offer.ticket, blob, tree.open_file(blob.id)?)?;
+                ensure!(
+                    blobs.get(&blob.id) == Some(&blob.size) && seen.insert(blob.id),
+                    "scheduler requested undeclared or duplicate input content"
+                );
+                self.upload(offer.ticket, blob, open(blob.id)?)?;
             }
             ensure!(
-                self.commit_tree(offer.ticket)? == tree.id(),
+                self.commit_tree(offer.ticket)? == id,
                 "native tree commit identity mismatch"
             );
             Ok(offer.ticket)

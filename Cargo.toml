@@ -235,6 +235,7 @@ vendored-openssl = ["openssl?/vendored", "reqwest?/native-tls-vendored"]
 unstable = []
 # Enables distributed support in the sccache client
 dist-client = [
+  "sccache-build/mapping",
   "zlib-rs-fast",
   "zlib-rs-fast/parallel",
   "hyper",

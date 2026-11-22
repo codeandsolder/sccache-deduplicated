@@ -28,7 +28,7 @@ pub use self::toolchain_imp::ToolchainPackageBuilder;
 mod inputs;
 pub(crate) use inputs::CompilerInputs;
 
-#[cfg(all(feature = "native-store", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub(crate) fn native_directory_metadata() -> Result<crate::build_runtime::TreeMetadata> {
     Ok(crate::build_runtime::TreeMetadata {
         mode: 0o755,
@@ -74,7 +74,6 @@ pub trait ToolchainPackager: Send {
     /// # Errors
     /// Returns an error if discovery fails or this packager has no native mapping.
     #[cfg(all(
-        feature = "native-store",
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
@@ -95,7 +94,7 @@ pub trait InputsPackager: Send {
     ///
     /// # Errors
     /// Returns an error for unavailable sources or conflicting logical paths.
-    #[cfg(all(feature = "native-store", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree>;
 }
 
@@ -399,7 +398,6 @@ mod toolchain_imp {
         ///
         /// # Errors
         /// Returns an error for conflicting paths or a source that cannot be resolved.
-        #[cfg(feature = "native-store")]
         pub fn into_native_mapping(self) -> Result<crate::build_runtime::MappedTree> {
             use crate::build_runtime::{MappedMetadata, MappedTree, TreePath};
             use std::os::unix::ffi::OsStrExt;
@@ -611,7 +609,7 @@ mod toolchain_imp {
         builder.add_root_mapping(sysroot.clone(), "/rust".into());
         builder.add_file(sysroot.join("bin/alias"))?;
         let store = NativeStore::open(&temp.path().join("cas"))?;
-        let tree = builder.into_native_mapping()?.capture(&store)?;
+        let tree = builder.into_native_mapping()?.prepare()?.import(&store)?;
         let entries = &tree.manifest().entries;
         assert!(matches!(
             entries.get(&TreePath::new(b"rust/bin/compiler".to_vec())?),
