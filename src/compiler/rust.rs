@@ -2841,6 +2841,10 @@ where
                 .chain(abs_externs.iter())
                 .chain(abs_staticlibs.iter())
                 .chain(target_json_files.iter())
+                // An rmeta can implicitly load a host proc macro through -L
+                // dependency, even when no direct --extern names that macro.
+                // A split layout must cover these search directories too.
+                .chain(self.parsed_args.crate_link_paths.iter())
                 .find(|path| !canonical.root_is_known(path))
         {
             warn!(

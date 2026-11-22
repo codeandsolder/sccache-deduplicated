@@ -1,4 +1,6 @@
 use crate::dist;
+#[cfg(target_os = "linux")]
+use crate::util::OsStrExt;
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
@@ -269,7 +271,6 @@ impl CanonicalRustPaths {
         // An IPC failure must run rustc with the same sandbox roots as the
         // daemon would have used, including its ephemeral --out-dir. OUT_DIR
         // alone is absent for many dependency crates.
-        use crate::util::OsStrExt;
         let mut parsed_output_dir = None;
         let mut target = None;
         let mut args = arguments.iter();
@@ -319,7 +320,7 @@ impl CanonicalRustPaths {
             })?;
 
         let environment_target = env_value(env, "TARGET");
-        let target = target.or(environment_target.as_deref().map(Path::as_os_str));
+        let target = target.or_else(|| environment_target.as_deref().map(Path::as_os_str));
         let actual_build_root = target_root_from_out_dir(env, target)
             .or_else(|| output_dir.and_then(|path| target_root_from_output_dir(path, target)));
         let target_root = env_value(env, "SCCACHE_CANONICAL_TARGET_ROOT")
