@@ -156,6 +156,7 @@ pub trait CommandCreatorSync: Clone + Send + Sync + 'static {
 pub struct Child {
     inner: tokio::process::Child,
     token: Acquired,
+    _activity: crate::server::activity::ChildActivity,
 }
 
 /// Trivial implementation of `CommandChild` for `std::process::Child`.
@@ -176,14 +177,22 @@ impl CommandChild for Child {
     }
 
     async fn wait(self) -> io::Result<ExitStatus> {
-        let Self { mut inner, token } = self;
+        let Self {
+            mut inner,
+            token,
+            _activity,
+        } = self;
         inner.wait().await.inspect(|_ret| {
             drop(token);
         })
     }
 
     async fn wait_with_output(self) -> io::Result<Output> {
-        let Self { inner, token } = self;
+        let Self {
+            inner,
+            token,
+            _activity,
+        } = self;
         inner.wait_with_output().await.inspect(|_ret| {
             drop(token);
         })
@@ -289,6 +298,7 @@ impl RunCommand for AsyncCommand {
         // The token is acquired either way: it rate-limits how many children
         // *we* run, which is separate from whether the child can acquire
         // tokens of its own.
+        let mut activity = crate::server::activity::ChildActivity::waiting();
         let token = self.jobserver.acquire().await?;
         let mut inner = tokio::process::Command::from(inner);
         let child = inner
@@ -296,9 +306,11 @@ impl RunCommand for AsyncCommand {
             .spawn()
             .with_context(|| format!("failed to spawn {inner:?}"))?;
 
+        activity.started();
         Ok(Child {
             inner: child,
             token,
+            _activity: activity,
         })
     }
 }

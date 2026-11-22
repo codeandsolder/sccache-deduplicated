@@ -506,17 +506,18 @@ where
     Y: AsRef<Path>,
 {
     let req = Request::Compile(Compile {
+        client_pid: std::process::id(),
         exe: exe.as_ref().to_owned().into(),
         cwd: cwd.as_ref().to_owned().into(),
         args: args.iter().map(|a| a.as_ref().to_owned()).collect(),
         env_vars,
     });
     trace!("request_compile: {req:?}");
-    //TODO: better error mapping?
+    conn.set_compile_timeout()?;
     let response = conn
         .request(req)
         .context("Failed to send data to or receive data from server")?;
-    if let Response::Compile(response) = response {
+    if let Response::Compile(response) = conn.read_compile_response(response)? {
         Ok(response)
     } else {
         bail!("Unexpected response from server")
@@ -630,7 +631,7 @@ where
     let result = match &response {
         CompileResponse::CompileStarted => {
             debug!("Server sent CompileStarted");
-            match conn.read_one_response().context(
+            match conn.read_one_response().and_then(|initial| conn.read_compile_response(initial)).context(
                 "accepted compile lost its terminal response; outcome unknown, refusing duplicate local compilation",
             )? {
                 Response::CompileFinished(result) => Some(result),
@@ -793,6 +794,7 @@ where
         config.compiler_aliases.clone(),
     );
     let compile = Compile {
+        client_pid: std::process::id(),
         exe: exe_path.as_os_str().to_owned(),
         cwd: invocation.cwd.as_os_str().to_owned(),
         args: invocation.cmdline.clone(),
@@ -819,6 +821,30 @@ where
         let _ = conn.request(Request::RecordStats(Box::new(delta)));
     }
     Ok(exit_code)
+}
+
+fn show_active_compiles() -> Result<()> {
+    let mut conn = connect_to_server(&get_addr()).context("could not connect to managed daemon")?;
+    conn.set_compile_timeout()?;
+    let Response::ActiveCompiles(active) = conn.request(Request::ActiveCompiles)? else {
+        bail!("unexpected active compile response");
+    };
+    serde_json::to_writer_pretty(std::io::stdout().lock(), &active)?;
+    println!();
+    Ok(())
+}
+
+fn cancel_compile(id: String) -> Result<()> {
+    let mut conn = connect_to_server(&get_addr()).context("could not connect to managed daemon")?;
+    conn.set_compile_timeout()?;
+    match conn.request(Request::CancelCompile(id))? {
+        Response::CompileCancellationRequested(true) => println!("Cancellation requested."),
+        Response::CompileCancellationRequested(false) => {
+            bail!("request is no longer active on this daemon")
+        }
+        _ => bail!("unexpected cancel compile response"),
+    }
+    Ok(())
 }
 
 fn show_stats(config: &Config, fmt: StatsFormat, advanced: bool) -> Result<()> {
@@ -1054,6 +1080,8 @@ pub fn run_command(cmd: Command) -> Result<i32> {
     match cmd {
         Command::Capabilities => unreachable!("capabilities returned before config loading"),
         Command::ShowStats(fmt, advanced) => show_stats(config, fmt, advanced)?,
+        Command::ActiveCompiles => show_active_compiles()?,
+        Command::CancelCompile(id) => cancel_compile(id)?,
         Command::DebugPreprocessorCacheEntries => debug_preprocessor_cache_entries()?,
         Command::InternalStartServer => start_internal_server(config)?,
         Command::StartServer => start_server_command(startup_timeout)?,
@@ -1186,6 +1214,9 @@ mod test {
     impl Connection for DisconnectedConnection {
         fn try_clone(&self) -> io::Result<Box<dyn Connection>> {
             Ok(Box::new(Self))
+        }
+        fn set_io_timeout(&self, _timeout: Duration) -> io::Result<()> {
+            Ok(())
         }
     }
 

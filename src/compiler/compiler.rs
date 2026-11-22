@@ -40,6 +40,7 @@ use crate::dist::pkg;
 use crate::lru_disk_cache;
 use crate::mock_command::{CommandChild, CommandCreatorSync, RunCommand, exit_status};
 use crate::server;
+use crate::server::activity::{self, Phase};
 use crate::util::{
     Digest, fmt_duration_as_secs, resolve_compiler_avoiding_wrapper, run_input_output,
 };
@@ -637,6 +638,7 @@ where
         let rewrite_includes_only = dist_client
             .as_ref()
             .is_some_and(|client| client.rewrite_includes_only());
+        activity::phase(Phase::HashInputs);
         let result = self
             .generate_hash_key(GenerateHashKeyContext {
                 creator: &creator,
@@ -714,6 +716,7 @@ where
             })
             .collect::<Vec<_>>();
 
+        activity::phase(Phase::CacheLookup);
         let lookup = match cache_status.await {
             (Ok(Ok(Cache::Hit(mut entry))), duration) => {
                 debug!(
@@ -748,6 +751,7 @@ where
                 };
 
                 let hit = CompileResult::CacheHit(duration);
+                activity::phase(Phase::RestoreOutputs);
                 match entry.extract_objects(filtered_outputs, &pool).await {
                     Ok(()) => Ok(CacheLookupResult::Success(hit, output)),
                     Err(e) => {
@@ -828,6 +832,7 @@ where
                         .await;
                 }
 
+                activity::phase(Phase::PlanCompile);
                 let existing_outputs = crate::cache::cache_io::snapshot_existing_outputs(
                     &outputs,
                     compilation.is_locally_preprocessed(),
@@ -884,6 +889,7 @@ where
                     "[{out_pretty}]: Compiled in {}, storing in cache",
                     fmt_duration_as_secs(&duration_compilation)
                 );
+                activity::phase(Phase::PackResult);
                 let start_create_artifact = Instant::now();
                 let Some(mut entry) =
                     CacheWrite::from_objects(outputs, remote_outputs, existing_outputs, &pool)
@@ -1020,6 +1026,7 @@ where
         .context("Failed to generate compile commands")?;
 
     debug!("[{}]: Compiling locally", out_pretty);
+    activity::phase(Phase::LocalCompile);
     compile_cmd
         .execute(service, &creator)
         .await
@@ -1060,6 +1067,7 @@ where
 
     let Some(dist_client) = dist_compile_cmd.clone().and(dist_client) else {
         debug!("[{out_pretty}]: Compiling locally");
+        activity::phase(Phase::LocalCompile);
         return compile_cmd
             .execute(service, &creator)
             .await
@@ -1073,6 +1081,7 @@ where
             .is_none()
     {
         debug!("[{out_pretty}]: No automatic toolchain for compiler launcher; compiling locally");
+        activity::phase(Phase::LocalCompile);
         return compile_cmd
             .execute(service, &creator)
             .await
@@ -1119,6 +1128,7 @@ where
             "[{out_pretty}]: Identifying dist toolchain for {}",
             crate::util::debug_display(&local_executable)
         );
+        activity::phase(Phase::IdentifyToolchain);
         let (dist_toolchain, maybe_toolchain_override) = dist_client
             .put_toolchain(local_executable, weak_toolchain_key, toolchain_packager)
             .await?;
@@ -1131,6 +1141,7 @@ where
         validate_dist_environment_dependencies(&dist_compile_cmd, &environment_dependencies)?;
 
         debug!("[{out_pretty}]: Requesting allocation");
+        activity::phase(Phase::AllocateWorker);
         let allocation_result = dist_client.do_alloc_job(dist_toolchain.clone()).await?;
         let job_alloc = match allocation_result {
             dist::AllocJobResult::Success {
@@ -1142,6 +1153,8 @@ where
                     dist_toolchain.archive_id, job_alloc.job_id
                 );
 
+                activity::job(job_alloc.job_id.0, job_alloc.server_id.addr().to_string());
+                activity::phase(Phase::UploadToolchain);
                 match dist_client
                     .do_submit_toolchain(job_alloc.clone(), dist_toolchain)
                     .await
@@ -1167,7 +1180,10 @@ where
         }?;
         let job_id = job_alloc.job_id;
         let server_id = job_alloc.server_id;
+        activity::job(job_id.0, server_id.addr().to_string());
         let worker_label = dist_client.worker_label(server_id).await;
+        activity::job(job_id.0, worker_label.clone());
+        activity::phase(Phase::RunDistributed);
         debug!("[{out_pretty}]: Running job on {worker_label}");
         let job_result = dist_client
             .do_run_job(
@@ -1181,6 +1197,7 @@ where
                 format!("could not run distributed compilation job on {server_id:?}")
             })?;
 
+        activity::phase(Phase::PublishOutputs);
         let mut jc = match job_result {
             dist::RunJobResult::Complete(jc) => jc,
             dist::RunJobResult::JobNotFound => bail!("Job {job_id} not found on server"),
@@ -1281,6 +1298,7 @@ where
                     "[{out_pretty2}]: Could not perform distributed compile, falling back to local: {errmsg}"
                 );
 
+                activity::phase(Phase::LocalCompile);
                 compile_cmd
                     .execute(service, &creator)
                     .await
