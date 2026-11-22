@@ -69,13 +69,13 @@ impl ToolchainReservations {
         let lock = {
             let mut keys = self.keys.lock().await;
             keys.retain(|_, lock| lock.strong_count() != 0);
-            if let Some(lock) = keys.get(key).and_then(std::sync::Weak::upgrade) {
-                lock
-            } else {
-                let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
-                keys.insert(key.to_owned(), std::sync::Arc::downgrade(&lock));
-                lock
-            }
+            keys.get(key)
+                .and_then(std::sync::Weak::upgrade)
+                .unwrap_or_else(|| {
+                    let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                    keys.insert(key.to_owned(), std::sync::Arc::downgrade(&lock));
+                    lock
+                })
         };
         lock.lock_owned().await
     }
@@ -276,6 +276,7 @@ impl TransferSession {
                     .dist_client()?
                     .import_namespace_toolchain(compiler, key, rewind_file(file).await?)
                     .await?;
+                drop(reservation);
                 self.toolchain = Some(tc.clone());
                 Ok(TransferReply::Toolchain(Some(tc)))
             }
@@ -353,47 +354,12 @@ impl TransferSession {
         let client = self.dist_client()?;
         match request {
             TransferRequest::LookupToolchain { compiler, key } => {
-                validate_storage_key(&key)?;
-                ensure!(self.allocation.is_none(), "a job is already allocated");
-                ensure!(
-                    self.reservation.is_none(),
-                    "a toolchain is already reserved"
-                );
-                let (mut tc, max_size) = client
-                    .lookup_namespace_toolchain(compiler.clone(), key.clone())
-                    .await?;
-                if tc.is_none() {
-                    let guard = self.reservations.reserve(&key).await;
-                    (tc, _) = client
-                        .lookup_namespace_toolchain(compiler.clone(), key.clone())
-                        .await?;
-                    if tc.is_none() {
-                        self.reservation = Some(Reservation {
-                            compiler,
-                            key,
-                            max_size,
-                            _guard: guard,
-                        });
-                    }
-                }
-                self.toolchain = tc.clone();
-                Ok(TransferReply::Toolchain(tc))
+                self.lookup_toolchain(compiler, key).await
             }
             TransferRequest::BeginToolchain { compiler, key, len } => {
                 validate_storage_key(&key)?;
                 ensure!(self.allocation.is_none(), "a job is already allocated");
-                let reservation = self
-                    .reservation
-                    .as_ref()
-                    .context("toolchain upload was not reserved")?;
-                ensure!(
-                    reservation.key == key && reservation.compiler == compiler,
-                    "toolchain reservation mismatch"
-                );
-                ensure!(
-                    len <= reservation.max_size,
-                    "toolchain exceeds daemon archive capacity"
-                );
+                self.validate_reservation(&compiler, &key, len)?;
                 self.begin_upload(UploadKind::Toolchain { compiler, key }, len)
                     .await
             }
@@ -455,6 +421,57 @@ impl TransferSession {
             )),
             _ => bail!("invalid distributed transfer operation"),
         }
+    }
+
+    #[cfg(feature = "dist-client")]
+    fn validate_reservation(&self, compiler: &std::path::Path, key: &str, len: u64) -> Result<()> {
+        let reservation = self
+            .reservation
+            .as_ref()
+            .context("toolchain upload was not reserved")?;
+        ensure!(
+            reservation.key == key && reservation.compiler == compiler,
+            "toolchain reservation mismatch"
+        );
+        ensure!(
+            len <= reservation.max_size,
+            "toolchain exceeds daemon archive capacity"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "dist-client")]
+    async fn lookup_toolchain(
+        &mut self,
+        compiler: std::path::PathBuf,
+        key: String,
+    ) -> Result<TransferReply> {
+        let client = self.dist_client()?;
+        validate_storage_key(&key)?;
+        ensure!(self.allocation.is_none(), "a job is already allocated");
+        ensure!(
+            self.reservation.is_none(),
+            "a toolchain is already reserved"
+        );
+        let (mut tc, max_size) = client
+            .lookup_namespace_toolchain(compiler.clone(), key.clone())
+            .await?;
+        if tc.is_none() {
+            let guard = self.reservations.reserve(&key).await;
+            (tc, _) = client
+                .lookup_namespace_toolchain(compiler.clone(), key.clone())
+                .await?;
+            if tc.is_none() {
+                self.reservation = Some(Reservation {
+                    compiler,
+                    key,
+                    max_size,
+                    _guard: guard,
+                });
+            }
+        }
+        self.toolchain.clone_from(&tc);
+        Ok(TransferReply::Toolchain(tc))
     }
 
     #[cfg(feature = "dist-client")]

@@ -130,9 +130,9 @@ impl ServerConnection {
     }
 }
 
-pub(crate) type SharedConnection = Arc<Mutex<ServerConnection>>;
+pub type SharedConnection = Arc<Mutex<ServerConnection>>;
 
-pub(crate) async fn connection_task<T: Send + 'static>(
+pub async fn connection_task<T: Send + 'static>(
     connection: SharedConnection,
     task: impl FnOnce(&mut ServerConnection) -> Result<T> + Send + 'static,
 ) -> Result<T> {

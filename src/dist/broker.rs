@@ -17,7 +17,7 @@ use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub(crate) struct NamespaceClient {
+pub struct NamespaceClient {
     conn: SharedConnection,
     chunk_bytes: usize,
     rewrite_includes_only: bool,
@@ -234,15 +234,14 @@ impl Client for NamespaceClient {
                 bail!("unexpected broker toolchain lookup response");
             };
             let result = (|| {
-                let tc = match found {
-                    Some(tc) => tc,
-                    None => {
-                        let file = match source {
-                            PackageSource::File(file) => file,
-                            PackageSource::Packager(packager) => construct_package(packager)?,
-                        };
-                        upload_toolchain(conn, compiler, key, file, chunk_bytes)?
-                    }
+                let tc = if let Some(tc) = found {
+                    tc
+                } else {
+                    let file = match source {
+                        PackageSource::File(file) => file,
+                        PackageSource::Packager(packager) => construct_package(packager)?,
+                    };
+                    upload_toolchain(conn, compiler, key, file, chunk_bytes)?
                 };
                 Ok((tc, custom))
             })();
