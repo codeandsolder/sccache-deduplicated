@@ -290,9 +290,14 @@ fn run(command: Command) -> Result<i32> {
                 server_config::BuilderType::Overlay {
                     bwrap_path,
                     build_dir,
+                    extracted_toolchain_cache_size,
                 } => Box::new(
-                    build::OverlayBuilder::new(bwrap_path, build_dir)
-                        .context("Overlay builder failed to start")?,
+                    build::OverlayBuilder::new(
+                        bwrap_path,
+                        build_dir,
+                        extracted_toolchain_cache_size,
+                    )
+                    .context("Overlay builder failed to start")?,
                 ),
                 #[cfg(target_os = "freebsd")]
                 server_config::BuilderType::Pot {
