@@ -1029,6 +1029,9 @@ where
     #[cfg(feature = "dist-client")]
     namespace_reservations: Arc<namespace::ToolchainReservations>,
 
+    /// Cache policy of this invocation, inherited by decomposed subcommands.
+    cache_control: CacheControl,
+
     /// Cache storage.
     storage: Arc<dyn Storage>,
 
@@ -1184,6 +1187,7 @@ where
     ) -> Self {
         Self {
             stats: Arc::default(),
+            cache_control: CacheControl::Default,
             dist_client: Arc::new(dist_client),
             storage,
             compiler_aliases: Arc::new(compiler_aliases),
@@ -1205,6 +1209,7 @@ where
         let dist_client = DistClientContainer::new_disabled();
         Self {
             stats: Arc::default(),
+            cache_control: CacheControl::Default,
             dist_client: Arc::new(dist_client),
             storage,
             compiler_aliases: Arc::default(),
@@ -1230,6 +1235,7 @@ where
         let client = Client::new_num(1);
         Self {
             stats: Arc::default(),
+            cache_control: CacheControl::Default,
             dist_client: Arc::new(DistClientContainer::new_with_state(DistClientState::Some(
                 Box::new(DistClientConfig {
                     pool: rt.clone(),
@@ -1367,10 +1373,11 @@ where
         let exe = compile.exe;
         let cmd = compile.args;
         let cwd: PathBuf = compile.cwd.into();
-        let env_vars = compile.env_vars;
-        let me = self.clone();
+        let mut env_vars = compile.env_vars;
+        let mut me = self.clone();
+        me.cache_control = consume_cache_control(&mut env_vars);
 
-        let info = self
+        let info = me
             .compiler_info(exe.into(), cwd.clone(), &cmd, &env_vars)
             .await;
         Ok(me.check_compiler(info, cmd, cwd, env_vars).await)
@@ -1641,16 +1648,7 @@ where
     ) -> Result<CompileFinished> {
         self.stats.lock().await.requests_executed += 1;
 
-        let force_recache = env_vars.iter().any(|(k, _v)| k == "SCCACHE_RECACHE");
-        let force_no_cache = env_vars.iter().any(|(k, _v)| k == "SCCACHE_NO_CACHE");
-
-        let cache_control = if force_no_cache {
-            CacheControl::ForceNoCache
-        } else if force_recache {
-            CacheControl::ForceRecache
-        } else {
-            CacheControl::Default
-        };
+        let cache_control = self.cache_control;
 
         let out_pretty = hasher.output_pretty().into_owned();
         let color_mode = hasher.color_mode();
@@ -1755,7 +1753,10 @@ where
                             debug!("stats after compile result: {stats:?}");
                             cache_write = Some(future);
                         }
-                        CompileResult::NativeMiss(dt, duration) => {
+                        CompileResult::NativeMiss(miss_type, dt, duration) => {
+                            if miss_type == MissType::ForcedRecache {
+                                stats.forced_recaches += 1;
+                            }
                             dist_type = dt;
                             stats.compilations += 1;
                             stats.cache_misses.increment(&kind, lang);
@@ -2738,6 +2739,25 @@ fn waits_until_zero() {
     drop(active);
     drop(active2);
     assert_eq!(wait.now_or_never(), Some(()));
+}
+
+/// Cache controls are consumed by sccache, not passed to the compiler.
+fn consume_cache_control(env: &mut Vec<(OsString, OsString)>) -> CacheControl {
+    let mut control = CacheControl::Default;
+    env.retain(|(key, _)| {
+        if key == "SCCACHE_NO_CACHE" {
+            control = CacheControl::ForceNoCache;
+            false
+        } else if key == "SCCACHE_RECACHE" {
+            if control != CacheControl::ForceNoCache {
+                control = CacheControl::ForceRecache;
+            }
+            false
+        } else {
+            true
+        }
+    });
+    control
 }
 
 fn fatal_error_message(err: &anyhow::Error) -> String {

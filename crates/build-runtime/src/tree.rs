@@ -201,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_paths_even_after_deserialization() -> Result<()> {
+    fn validates_paths_even_after_deserialization() {
         for invalid in [
             b"".as_slice(),
             b"/a",
@@ -222,7 +222,6 @@ mod tests {
             assert!(tree.id().is_err());
         }
         assert!(TreePath::new(vec![0xff]).is_ok());
-        Ok(())
     }
 
     #[test]

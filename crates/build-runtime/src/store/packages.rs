@@ -1,24 +1,30 @@
 //! Verify original package bytes, stream archive members into the native
-//! store, and retain only the normalized tree and unique uncompressed blobs.
+//! store, optionally retaining the original for compressed delivery.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{self, Read, Seek},
+    sync::Mutex,
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use bincode::Options;
 use redb::ReadableDatabase;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{NativeStore, PACKAGES, StagedBlob, TreeLease};
+use super::{NativeStore, PACKAGES, StagedBlob, TreeLease, encoding};
 use crate::{
-    ArchiveLength, ContentId, PackageIdentity, PackageSource, TreeEntry, TreeId, TreeManifest,
-    TreeMetadata, TreePath, TreeTimestamp, identity::typed_digest,
+    ArchiveLength, BlobRef, ContentId, NativeServiceBusy, PackageArchive, PackageIdentity,
+    PackageSource, TreeEntry, TreeId, TreeManifest, TreeMetadata, TreePath, TreeTimestamp,
+    identity::typed_digest,
 };
 
 /// Explicit normalization and expansion limits for an original package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackagePolicy {
+    /// Keep the verified original compressed representation for transport.
+    pub retain_original: bool,
     pub directory: TreeMetadata,
     pub modified: TreeTimestamp,
     pub max_entries: usize,
@@ -31,9 +37,10 @@ pub struct PackagePolicy {
 
 /// Scheduler-owned limits for live original-package provisioning. All limits
 /// are chosen by the store owner, never by an uploading compiler client.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackageImportLimits {
+    pub retain_original: bool,
     /// Maximum distinct original archives being acquired or decoded concurrently.
     pub max_concurrent_imports: usize,
     pub max_archive_bytes: u64,
@@ -70,12 +77,14 @@ impl PackageImportLimits {
     /// Returns an error for invalid limits or timestamp normalization failure.
     pub fn policy(self) -> Result<PackagePolicy> {
         self.validate()?;
-        PackagePolicy::rust_installer(
+        let mut policy = PackagePolicy::rust_installer(
             self.max_entries,
             self.max_expanded_bytes,
             self.max_tar_bytes,
             self.max_metadata_bytes,
-        )
+        )?;
+        policy.retain_original = self.retain_original;
+        Ok(policy)
     }
 }
 
@@ -94,6 +103,7 @@ impl PackagePolicy {
             nanoseconds: 0,
         };
         Ok(Self {
+            retain_original: false,
             directory: TreeMetadata {
                 mode: 0o755,
                 modified,
@@ -104,6 +114,51 @@ impl PackagePolicy {
             max_tar_bytes,
             max_metadata_bytes,
         })
+    }
+}
+
+/// The transport archive has its own blob reference, rooted at the
+/// domain-separated package key. Evicting the package tree releases it
+/// together with the provenance record, not with an arbitrary action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct PackageRecord {
+    pub source: PackageSource,
+    pub tree: TreeId,
+    pub archive: Option<BlobRef>,
+}
+
+impl PackageRecord {
+    pub fn archive(&self) -> Option<PackageArchive> {
+        Some(PackageArchive {
+            source: self.source,
+            tree: self.tree,
+            blob: self.archive?,
+        })
+    }
+}
+
+/// A compressed package delivery bound to a pin on its verified source tree.
+pub struct PackageArchiveLease {
+    archive: PackageArchive,
+    tree: TreeLease,
+}
+
+impl PackageArchiveLease {
+    #[must_use = "the archive identifies the verified compressed original"]
+    pub const fn archive(&self) -> PackageArchive {
+        self.archive
+    }
+
+    /// Open the retained original while its package root is pinned.
+    /// # Errors
+    /// Returns an error for an unavailable archive or filesystem failure.
+    pub fn open_file(&self) -> Result<std::fs::File> {
+        self.tree
+            .inner
+            .check_blob(self.archive.blob.id, self.archive.blob.size)?;
+        Ok(std::fs::File::open(
+            self.tree.inner.blob_path(self.archive.blob.id),
+        )?)
     }
 }
 
@@ -134,7 +189,102 @@ fn package_key(identity: PackageIdentity, policy: PackagePolicy) -> Result<Conte
     )?))
 }
 
+/// Exclusive reservation for one original package import.
+pub struct PackageSlot<'a> {
+    active: &'a Mutex<BTreeSet<PackageIdentity>>,
+    identity: PackageIdentity,
+}
+
+impl Drop for PackageSlot<'_> {
+    fn drop(&mut self) {
+        match self.active.lock() {
+            Ok(mut active) => {
+                active.remove(&self.identity);
+            }
+            Err(error) => log::error!("could not release native package reservation: {error:#}"),
+        }
+    }
+}
+
 impl NativeStore {
+    /// Reserve one original archive identity for import. Distinct packages
+    /// may proceed concurrently within the owner-configured limit.
+    /// # Errors
+    /// Returns a busy error if the identity or capacity is reserved.
+    pub fn package_slot(
+        &self,
+        identity: PackageIdentity,
+        maximum: usize,
+    ) -> Result<PackageSlot<'_>> {
+        let mut active = self
+            .inner
+            .package_imports
+            .lock()
+            .map_err(|_| anyhow!("native package reservation lock poisoned"))?;
+        if active.len() >= maximum || !active.insert(identity) {
+            return Err(NativeServiceBusy.into());
+        }
+        drop(active);
+        Ok(PackageSlot {
+            active: &self.inner.package_imports,
+            identity,
+        })
+    }
+
+    /// Resolve or import an original archive under the store's shared
+    /// per-package admission limit. The input factory is invoked only
+    /// after admission and a second verified-cache lookup.
+    /// # Errors
+    /// Returns an error for busy service, invalid input or storage failure.
+    pub fn acquire_package<R: Read>(
+        &self,
+        identity: PackageIdentity,
+        length: ArchiveLength,
+        limits: PackageImportLimits,
+        executable: &std::path::Path,
+        acquire: impl FnOnce() -> Result<R>,
+    ) -> Result<(VerifiedPackage, bool)> {
+        let policy = limits.policy()?;
+        let mut package = self.lookup_package(identity, policy)?;
+        let reservation = if package.is_none() {
+            let reservation = self.package_slot(identity, limits.max_concurrent_imports)?;
+            package = self.lookup_package(identity, policy)?;
+            Some(reservation)
+        } else {
+            None
+        };
+        let result = if let Some(package) = package {
+            if let ArchiveLength::Exact(size) = length {
+                ensure!(
+                    package.source().size == size,
+                    "original package length differs from verified source"
+                );
+            }
+            (package, true)
+        } else {
+            ensure!(
+                length.maximum() <= limits.max_archive_bytes,
+                "original package exceeds archive size limit"
+            );
+            (
+                self.import_package(
+                    identity,
+                    length,
+                    policy,
+                    acquire()?,
+                    PackageDecoder::Isolated {
+                        executable,
+                        memory_bytes: limits.decoder_memory_bytes,
+                        timeout: std::time::Duration::from_secs(limits.decoder_timeout_secs),
+                    },
+                )?,
+                false,
+            )
+        };
+        drop(reservation);
+        Ok(result)
+    }
+
     /// Resolve a previously imported exact package without transferring or
     /// decompressing it again. Expansion limits apply to new imports only.
     ///
@@ -150,19 +300,23 @@ impl NativeStore {
         let id = {
             let read = self.inner.db.begin_read()?;
             let table = read.open_table(PACKAGES)?;
-            table.get(&key.0)?.map(|entry| {
-                let (id, size) = entry.value();
-                (TreeId(*id), size)
-            })
+            table
+                .get(&key.0)?
+                .map(|entry| encoding().deserialize::<PackageRecord>(entry.value()))
+                .transpose()?
         };
-        let Some((id, size)) = id else {
+        let Some(record) = id else {
             return Ok(None);
         };
+        ensure!(
+            record.source.identity == identity,
+            "inconsistent package identity"
+        );
         let tree = self
-            .lookup_tree(id)?
+            .lookup_tree(record.tree)?
             .context("indexed package tree missing")?;
         Ok(Some(VerifiedPackage {
-            source: PackageSource { identity, size },
+            source: record.source,
             tree,
         }))
     }
@@ -220,11 +374,11 @@ impl NativeStore {
             |entry, data| imported.add(self, entry, data),
         )?;
         let (manifest, staged) = imported.finish()?;
-        drop(archive);
+        let original = policy.retain_original.then_some(archive);
         let tree = self.publish_tree_indexed_pinned(
             &manifest,
             staged.into_values().collect(),
-            Some((package_key(source.identity, policy)?, source.size)),
+            Some((package_key(source.identity, policy)?, source, original)),
         )?;
         Ok(VerifiedPackage { source, tree })
     }
@@ -463,6 +617,7 @@ mod decoder;
 use decoder::{ArchiveEntry, EntryKind, MAX_MEMBER_PATH};
 pub use decoder::{PackageDecoder, decode_package_process};
 mod rust_installer;
+mod transport;
 
 #[cfg(test)]
 mod tests {
@@ -475,6 +630,7 @@ mod tests {
             nanoseconds: 0,
         };
         PackagePolicy {
+            retain_original: false,
             directory: TreeMetadata {
                 mode: 0o755,
                 modified,

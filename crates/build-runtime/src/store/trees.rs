@@ -9,11 +9,12 @@ use anyhow::{Context, Result, ensure};
 use bincode::Options;
 use redb::{ReadableDatabase, ReadableTable};
 
+use super::packages::PackageRecord;
 use super::{
-    Eviction, Inner, LeasedReader, NativeStore, PACKAGES, StagedBlob, TREE_PACKAGES, TREES,
-    UploadReservation, encoding, release_pin, space::Root,
+    BLOB_PACKAGES, Eviction, Inner, LeasedReader, NativeStore, PACKAGES, StagedBlob, TREE_PACKAGES,
+    TREES, UploadReservation, encoding, release_pin, space::Root,
 };
-use crate::{ContentId, TreeId, TreeManifest, TreeRecipe};
+use crate::{BlobRef, ContentId, PackageSource, TreeId, TreeManifest, TreeRecipe};
 
 impl NativeStore {
     /// Reserve any already available files before negotiating a tree upload.
@@ -52,7 +53,7 @@ impl NativeStore {
         &self,
         manifest: &TreeManifest,
         staged: Vec<StagedBlob>,
-        package: Option<(ContentId, u64)>,
+        package: Option<(ContentId, PackageSource, Option<StagedBlob>)>,
     ) -> Result<TreeLease> {
         let _mutation = self.inner.lock_mutations()?;
         let id = self.publish_tree_locked(manifest, staged, package)?;
@@ -63,7 +64,7 @@ impl NativeStore {
         &self,
         manifest: &TreeManifest,
         staged: Vec<StagedBlob>,
-        package: Option<(ContentId, u64)>,
+        package: Option<(ContentId, PackageSource, Option<StagedBlob>)>,
     ) -> Result<TreeId> {
         let id = manifest.id()?;
         let blobs = manifest.blobs()?;
@@ -82,14 +83,36 @@ impl NativeStore {
             if !exists {
                 trees.insert(&id.0, encoding().serialize(manifest)?.as_slice())?;
             }
-            if let Some((package, size)) = package {
+            if let Some((package, source, original)) = package {
                 let mut packages = write.open_table(PACKAGES)?;
-                if let Some(previous) = packages.insert(&package.0, (&id.0, size))? {
+                let previous = packages
+                    .get(&package.0)?
+                    .map(|entry| encoding().deserialize::<PackageRecord>(entry.value()))
+                    .transpose()?;
+                let mut record = PackageRecord {
+                    source,
+                    tree: id,
+                    archive: original.as_ref().map(StagedBlob::reference),
+                };
+                if let Some(previous) = previous {
                     ensure!(
-                        previous.value() == (&id.0, size),
+                        previous.source == source && previous.tree == id,
                         "conflicting upstream package tree"
                     );
+                    if let Some(archive) = previous.archive {
+                        ensure!(
+                            record.archive.is_none_or(|new| new == archive),
+                            "conflicting upstream package archive"
+                        );
+                        record.archive = Some(archive);
+                        self.inner.check_blob(archive.id, archive.size)?;
+                    } else if let Some(original) = original {
+                        self.attach_package_archive(&write, package, original, &blobs)?;
+                    }
+                } else if let Some(original) = original {
+                    self.attach_package_archive(&write, package, original, &blobs)?;
                 }
+                packages.insert(&package.0, encoding().serialize(&record)?.as_slice())?;
                 write
                     .open_multimap_table(TREE_PACKAGES)?
                     .insert(&id.0, &package.0)?;
@@ -98,6 +121,24 @@ impl NativeStore {
         write.commit()?;
         self.inner.lock_pins()?.touch(Root::Tree(id));
         Ok(id)
+    }
+
+    fn attach_package_archive(
+        &self,
+        write: &redb::WriteTransaction,
+        package: ContentId,
+        original: StagedBlob,
+        contents: &BTreeMap<ContentId, u64>,
+    ) -> Result<()> {
+        let BlobRef { id, size } = original.reference();
+        let blobs = BTreeMap::from([(id, size)]);
+        let staged = self.prepare_staging(&blobs, vec![original])?;
+        self.attach_blobs(write, &package.0, &blobs, staged, false)?;
+        let mut reverse = write.open_multimap_table(BLOB_PACKAGES)?;
+        for id in contents.keys() {
+            reverse.insert(&id.0, &package.0)?;
+        }
+        Ok(())
     }
 
     /// Publish a composed recipe, while pinning all of its input package
@@ -196,14 +237,36 @@ impl NativeStore {
             ensure!(manifest.id()? == id, "invalid indexed tree");
             let mut packages = write.open_table(PACKAGES)?;
             let mut reverse = write.open_multimap_table(TREE_PACKAGES)?;
+            let contents = manifest.blobs()?;
+            let mut archive_bytes = 0_u64;
             for key in reverse.remove_all(&id.0)? {
                 let package = *key?.value();
                 let previous = packages
                     .remove(&package)?
                     .context("missing reverse package reference")?;
-                ensure!(*previous.value().0 == id.0, "inconsistent package index");
+                let record: PackageRecord = encoding().deserialize(previous.value())?;
+                ensure!(record.tree == id, "inconsistent package index");
+                if let Some(blob) = record.archive {
+                    let mut by_blob = write.open_multimap_table(BLOB_PACKAGES)?;
+                    for id in contents.keys() {
+                        ensure!(
+                            by_blob.remove(&id.0, &package)?,
+                            "missing original package content reference"
+                        );
+                    }
+                    drop(by_blob);
+                    archive_bytes = archive_bytes
+                        .checked_add(Self::detach_blobs(
+                            &write,
+                            &package,
+                            BTreeMap::from([(blob.id, blob.size)]),
+                        )?)
+                        .context("archive eviction size overflow")?;
+                }
             }
-            Self::detach_blobs(&write, &id.0, manifest.blobs()?)?
+            archive_bytes
+                .checked_add(Self::detach_blobs(&write, &id.0, contents)?)
+                .context("tree eviction size overflow")?
         };
         write.commit()?;
         pins.last_used.remove(&Root::Tree(id));
@@ -216,7 +279,7 @@ impl NativeStore {
 
 /// A tree manifest with indexed root or constituent-package pins.
 pub struct TreeLease {
-    inner: Arc<Inner>,
+    pub(super) inner: Arc<Inner>,
     id: TreeId,
     manifest: TreeManifest,
     blobs: BTreeMap<ContentId, u64>,

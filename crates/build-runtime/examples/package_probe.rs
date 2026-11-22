@@ -34,6 +34,7 @@ mod unix {
             nanoseconds: 0,
         };
         let policy = PackagePolicy {
+            retain_original: false,
             directory: TreeMetadata {
                 mode: 0o755,
                 modified,

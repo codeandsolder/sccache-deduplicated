@@ -71,7 +71,12 @@ mod linux {
             stdout: None,
             stderr: None,
         };
-        store.publish(&fingerprint, &output, vec![])?;
+        store.publish(
+            &fingerprint,
+            &output,
+            vec![],
+            sccache_build::ActionMode::Reuse,
+        )?;
         let indexed = start.elapsed();
         let stats = store.stats()?;
         ensure!(

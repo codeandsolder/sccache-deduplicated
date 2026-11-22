@@ -2,16 +2,107 @@
 //! native store and results move straight from captured descriptors to the
 //! scheduler. There is no legacy archive creation or client-side reupload.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, ensure};
 
-use super::NativeCacheClient;
+use super::{NativeCacheClient, PackagePlanRequest};
 use crate::build_runtime::{
-    CapturedExecution, ExecutionPolicy, ExecutionSpec, NativeStore, execute, wire::Ticket,
+    ArchiveLength, BlobRef, CapturedExecution, ExecutionPolicy, ExecutionSpec, NativeServiceBusy,
+    NativeStore, PackageArchive, PackageImportLimits, VerifiedPackage, execute, wire::Ticket,
 };
 
 impl NativeCacheClient {
+    pub(super) fn reconstruct_packages(
+        &self,
+        ticket: Ticket,
+        missing: &[BlobRef],
+        store: &NativeStore,
+        limits: PackageImportLimits,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Vec<VerifiedPackage>> {
+        let plan = self.control(
+            "package_plan",
+            &PackagePlanRequest {
+                ticket,
+                missing: missing.to_vec(),
+                max_archive_bytes: limits.max_archive_bytes,
+            },
+        );
+        let offers: Vec<PackageArchive> = match plan {
+            Ok(offers) => offers,
+            Err(error) => {
+                warn!("native original package plan unavailable: {error:#}");
+                return Ok(Vec::new());
+            }
+        };
+        let mut packages = Vec::new();
+        for offer in offers {
+            check()?;
+            match self.reconstruct_package(ticket, offer, store, limits, check) {
+                Ok(package) => packages.push(package),
+                Err(error) => {
+                    // This is a transport optimization, not an input
+                    // authority. Exact blob retrieval still verifies every
+                    // required byte if archive acquisition cannot help.
+                    warn!("native package reconstruction unavailable: {error:#}");
+                }
+            }
+        }
+        Ok(packages)
+    }
+
+    fn reconstruct_package(
+        &self,
+        ticket: Ticket,
+        offer: PackageArchive,
+        store: &NativeStore,
+        limits: PackageImportLimits,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<VerifiedPackage> {
+        ensure!(
+            !limits.retain_original
+                && offer.blob.size == offer.source.size
+                && offer.source.size <= limits.max_archive_bytes,
+            "invalid native original archive offer"
+        );
+        let start = Instant::now();
+        let executable = std::env::current_exe()?;
+        loop {
+            check()?;
+            let (package, reused) = match store.acquire_package(
+                offer.source.identity,
+                ArchiveLength::Exact(offer.source.size),
+                limits,
+                &executable,
+                || self.download_response(ticket, offer.blob.id),
+            ) {
+                Ok(package) => package,
+                Err(error) if error.is::<NativeServiceBusy>() => {
+                    ensure!(
+                        start.elapsed() < self.timeout,
+                        "native worker package reservation deadline exceeded"
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            ensure!(
+                package.source() == offer.source && package.tree().id() == offer.tree,
+                "reconstructed original package identity mismatch"
+            );
+            if !reused {
+                info!(
+                    "native original package reconstructed from {} compressed bytes in {:.3}s",
+                    offer.source.size,
+                    start.elapsed().as_secs_f64()
+                );
+            }
+            return Ok(package);
+        }
+    }
+
     /// Execute an admitted native build and publish successful outputs directly.
     ///
     /// The independent renewal loop keeps the scheduler reservation live
@@ -28,6 +119,7 @@ impl NativeCacheClient {
         store: &NativeStore,
         policy: &ExecutionPolicy,
         renewal_interval: Duration,
+        package_import: Option<PackageImportLimits>,
     ) -> Result<CapturedExecution> {
         let result = self.with_renewal(ticket, renewal_interval, |check| {
             self.verify_execution(ticket, spec.clone())?;
@@ -47,7 +139,9 @@ impl NativeCacheClient {
                 check()?;
                 let tree = match store.lookup_tree(*id)? {
                     Some(tree) => tree,
-                    None => self.fetch_tree(ticket, *id, store, renewal_interval)?,
+                    None => {
+                        self.fetch_tree(ticket, *id, store, renewal_interval, package_import)?
+                    }
                 };
                 inputs.push(tree);
             }

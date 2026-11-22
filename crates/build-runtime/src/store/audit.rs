@@ -244,18 +244,38 @@ mod tests {
                 .insert("environment/FOO".into(), ContentId::of(value));
             fp
         };
-        store.publish(&absent, &first_result, vec![first])?;
-        store.publish(&with(b"a"), &first_result, vec![])?;
-        store.publish(&with(b"b"), &first_result, vec![])?;
-        store.publish(&with(b"c"), &second_result, vec![second])?;
+        store.publish(
+            &absent,
+            &first_result,
+            vec![first],
+            crate::ActionMode::Reuse,
+        )?;
+        store.publish(&with(b"a"), &first_result, vec![], crate::ActionMode::Reuse)?;
+        store.publish(&with(b"b"), &first_result, vec![], crate::ActionMode::Reuse)?;
+        store.publish(
+            &with(b"c"),
+            &second_result,
+            vec![second],
+            crate::ActionMode::Reuse,
+        )?;
         let mut other_schema = with(b"d");
         other_schema.schema = "c".into();
-        store.publish(&other_schema, &second_result, vec![])?;
+        store.publish(
+            &other_schema,
+            &second_result,
+            vec![],
+            crate::ActionMode::Reuse,
+        )?;
         let mut other_source = with(b"a");
         other_source
             .components
             .insert("source".into(), ContentId::of(b"y"));
-        store.publish(&other_source, &second_result, vec![])?;
+        store.publish(
+            &other_source,
+            &second_result,
+            vec![],
+            crate::ActionMode::Reuse,
+        )?;
 
         let report = store.audit_components("rust", &["environment/FOO".into()])?;
         assert_eq!(report.examined_actions, 5);

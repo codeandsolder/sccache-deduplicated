@@ -2296,6 +2296,7 @@ pub mod server {
         pub execution_timeout_secs: u64,
         pub max_result_bytes: u64,
         pub max_metadata_bytes: u64,
+        pub package_import: Option<crate::build_runtime::PackageImportLimits>,
     }
 
     #[derive(Debug, Serialize, Deserialize, PartialEq)]

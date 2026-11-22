@@ -10,7 +10,9 @@ mod identity;
 mod installation;
 mod package;
 pub use installation::{InstallationManifest, InstallationRecipe, InstalledComponent};
-pub use package::{ArchiveLength, PackageCompression, PackageIdentity, PackageSource};
+pub use package::{
+    ArchiveLength, PackageArchive, PackageCompression, PackageIdentity, PackageSource,
+};
 mod recipe;
 mod spec;
 pub use recipe::{TreeLayer, TreeRecipe};
@@ -18,7 +20,7 @@ pub use spec::{BuildPath, CommandSpec, ExecutionRoot, ExecutionSpec, OutputSpec}
 mod tree;
 pub mod wire;
 pub use identity::{
-    ActionFingerprint, ActionKey, Artifact, BlobRef, ContentId, OutputKind, ResultId,
+    ActionFingerprint, ActionKey, ActionMode, Artifact, BlobRef, ContentId, OutputKind, ResultId,
     ResultManifest,
 };
 pub use tree::{TreeEntry, TreeId, TreeManifest, TreeMetadata, TreePath, TreeTimestamp};
@@ -36,9 +38,9 @@ pub use coordinator::{Admission, BuildCoordinator, CompilePermit};
 #[cfg(all(unix, feature = "store"))]
 pub use store::{
     CacheStats, ComponentAudit, Eviction, GarbageCollected, NativeIndexAudit, NativeStore,
-    PackageDecoder, PackageImportLimits, PackagePolicy, Published, ResultLease, SchemaInventory,
-    SpacePolicy, SpaceReport, StagedBlob, TreeLease, UploadReservation, VerifiedPackage,
-    decode_package_process,
+    PackageArchiveLease, PackageDecoder, PackageImportLimits, PackagePolicy, PackageSlot,
+    Published, ResultLease, SchemaInventory, SpacePolicy, SpaceReport, StagedBlob, TreeLease,
+    UploadReservation, VerifiedPackage, decode_package_process,
 };
 
 #[cfg(all(target_os = "linux", feature = "store"))]

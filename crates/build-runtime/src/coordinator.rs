@@ -8,7 +8,8 @@ use std::{
 use anyhow::{Result, anyhow};
 
 use crate::{
-    ActionFingerprint, ActionKey, NativeStore, Published, ResultLease, ResultManifest, StagedBlob,
+    ActionFingerprint, ActionKey, ActionMode, NativeStore, Published, ResultLease, ResultManifest,
+    StagedBlob,
 };
 
 /// The scheduler owns both durable cache data and in-flight compilation keys.
@@ -58,9 +59,11 @@ impl BuildCoordinator {
     ///
     /// # Errors
     /// Returns an error for an invalid fingerprint or storage failure.
-    pub fn admit(&self, fingerprint: ActionFingerprint) -> Result<Admission> {
+    pub fn admit(&self, fingerprint: ActionFingerprint, mode: ActionMode) -> Result<Admission> {
         let key = fingerprint.key()?;
-        if let Some(result) = self.store().lookup(key)? {
+        if mode == ActionMode::Reuse
+            && let Some(result) = self.store().lookup(key)?
+        {
             return Ok(Admission::Cached(result));
         }
         {
@@ -77,11 +80,14 @@ impl BuildCoordinator {
             inner: Arc::clone(&self.inner),
             key,
             fingerprint,
+            mode,
         };
         // A previous owner can finish between the first lookup and our
         // reservation. Check again after reserving so we never schedule a
         // second build solely because of that race.
-        if let Some(result) = self.store().lookup(key)? {
+        if mode == ActionMode::Reuse
+            && let Some(result) = self.store().lookup(key)?
+        {
             return Ok(Admission::Cached(result));
         }
         Ok(Admission::Compile(permit))
@@ -96,6 +102,7 @@ pub struct CompilePermit {
     inner: Arc<Inner>,
     key: ActionKey,
     fingerprint: ActionFingerprint,
+    mode: ActionMode,
 }
 
 impl CompilePermit {
@@ -112,7 +119,7 @@ impl CompilePermit {
     pub fn publish(self, manifest: &ResultManifest, staged: Vec<StagedBlob>) -> Result<Published> {
         self.inner
             .store
-            .publish(&self.fingerprint, manifest, staged)
+            .publish(&self.fingerprint, manifest, staged, self.mode)
     }
 
     /// Commit the result and pin it for delivery in the same mutation scope.
@@ -126,7 +133,7 @@ impl CompilePermit {
     ) -> Result<ResultLease> {
         self.inner
             .store
-            .publish_pinned(&self.fingerprint, manifest, staged)
+            .publish_pinned(&self.fingerprint, manifest, staged, self.mode)
     }
 }
 
@@ -162,15 +169,17 @@ mod tests {
     fn admission_reuses_committed_results_and_releases_cancelled_jobs() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let coordinator = BuildCoordinator::new(NativeStore::open(dir.path())?);
-        let Admission::Compile(permit) = coordinator.admit(fingerprint())? else {
+        let Admission::Compile(permit) = coordinator.admit(fingerprint(), ActionMode::Reuse)?
+        else {
             anyhow::bail!("expected new compilation");
         };
         assert!(matches!(
-            coordinator.admit(fingerprint())?,
+            coordinator.admit(fingerprint(), ActionMode::Reuse)?,
             Admission::InFlight
         ));
         drop(permit);
-        let Admission::Compile(permit) = coordinator.admit(fingerprint())? else {
+        let Admission::Compile(permit) = coordinator.admit(fingerprint(), ActionMode::Reuse)?
+        else {
             anyhow::bail!("cancelled compilation was not released");
         };
         let staged = coordinator.store().stage(&b"output"[..])?;
@@ -187,7 +196,7 @@ mod tests {
         };
         let key = permit.key();
         assert_eq!(permit.publish(&result, vec![staged])?.action, key);
-        let Admission::Cached(lease) = coordinator.admit(fingerprint())? else {
+        let Admission::Cached(lease) = coordinator.admit(fingerprint(), ActionMode::Reuse)? else {
             anyhow::bail!("expected cache hit");
         };
         assert_eq!(lease.manifest(), &result);
@@ -206,7 +215,7 @@ mod tests {
                     let barrier = &barrier;
                     scope.spawn(move || {
                         barrier.wait();
-                        coordinator.admit(fingerprint())
+                        coordinator.admit(fingerprint(), ActionMode::Reuse)
                     })
                 })
                 .collect::<Vec<_>>();
@@ -235,7 +244,7 @@ mod tests {
         );
         drop(results);
         assert!(matches!(
-            coordinator.admit(fingerprint())?,
+            coordinator.admit(fingerprint(), ActionMode::Reuse)?,
             Admission::Compile(_)
         ));
         Ok(())
@@ -245,7 +254,8 @@ mod tests {
     fn invalid_publication_releases_admission() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let coordinator = BuildCoordinator::new(NativeStore::open(dir.path())?);
-        let Admission::Compile(permit) = coordinator.admit(fingerprint())? else {
+        let Admission::Compile(permit) = coordinator.admit(fingerprint(), ActionMode::Reuse)?
+        else {
             anyhow::bail!("expected compilation");
         };
         let staged = coordinator.store().stage(&b"not the output"[..])?;
@@ -258,7 +268,7 @@ mod tests {
         let key = fingerprint().key()?;
         assert!(coordinator.store().lookup(key)?.is_none());
         assert!(matches!(
-            coordinator.admit(fingerprint())?,
+            coordinator.admit(fingerprint(), ActionMode::Reuse)?,
             Admission::Compile(_)
         ));
         drop(staged);

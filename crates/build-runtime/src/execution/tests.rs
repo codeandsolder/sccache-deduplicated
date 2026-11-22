@@ -20,7 +20,7 @@ fn add_parents(entries: &mut BTreeMap<TreePath, TreeEntry>, path: &[u8]) -> Resu
     for (index, _) in path.iter().enumerate().filter(|(_, byte)| **byte == b'/') {
         entries
             .entry(TreePath::new(path[..index].to_vec())?)
-            .or_insert(TreeEntry::Directory(metadata(0o755)));
+            .or_insert_with(|| TreeEntry::Directory(metadata(0o755)));
     }
     Ok(())
 }
@@ -151,6 +151,16 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
         result.diagnostics().1.context("stderr missing")?.id,
         ContentId::of(b"failed")
     );
+    verify_writable_mounts_and_invalid_outputs(&mut spec, &store, &policy, src)?;
+    Ok(())
+}
+
+fn verify_writable_mounts_and_invalid_outputs(
+    spec: &mut ExecutionSpec,
+    store: &NativeStore,
+    policy: &ExecutionPolicy,
+    src: crate::TreeId,
+) -> Result<()> {
     // Two mounts of the same tree must be independent even when one is
     // writable. Preserve the compiler's relative output path and input
     // dependencies without rewriting any invocation arguments.
@@ -174,7 +184,7 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
         ),
     ]);
     spec.command.arguments[1] = br#"printf new > object; test ! -e /other/object || exit 8; IFS= read -r word < /other/input; printf '%s' "$word" > /tmp/result"#.to_vec();
-    let result = execute(&spec, &store, &policy, || Ok(()))?;
+    let result = execute(spec, store, policy, || Ok(()))?;
     let manifest = result
         .successful_result()
         .context("in-place output execution failed")?;
@@ -270,14 +280,14 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
     // A preexisting input cannot silently serve as a compiler output.
     spec.outputs.get_mut("object").context("output")?.path =
         BuildPath::new(b"/src/input".to_vec())?;
-    assert!(execute(&spec, &store, &policy, || Ok(())).is_err());
+    assert!(execute(spec, store, policy, || Ok(())).is_err());
     spec.outputs.get_mut("object").context("output")?.path =
         BuildPath::new(b"/src/missing/object".to_vec())?;
-    assert!(execute(&spec, &store, &policy, || Ok(())).is_err());
+    assert!(execute(spec, store, policy, || Ok(())).is_err());
     // A symlink must never make host bytes a cached output.
     spec.command.arguments[1] = b"printf ok > /out/nested/object".to_vec();
     spec.platform = ContentId::of(b"incorrect");
-    assert!(execute(&spec, &store, &policy, || Ok(())).is_err());
+    assert!(execute(spec, store, policy, || Ok(())).is_err());
     Ok(())
 }
 

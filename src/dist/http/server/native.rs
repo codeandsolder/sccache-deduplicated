@@ -11,14 +11,14 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::{ClientAuthCheck, ServerAuthenticator, authenticate_client, authenticate_server};
 use crate::{
     build_runtime::{
-        ArchiveLength, ExecutionSpec, NativeServiceBusy, NativeSessions, NativeStore,
+        ActionMode, ArchiveLength, ExecutionSpec, NativeServiceBusy, NativeSessions, NativeStore,
         PackageIdentity, PackageImportLimits, PackageSource,
         wire::{Publisher, ScheduleReply, UploadHeader},
     },
     config::scheduler::NativeCacheConfig,
     dist::native::{
         DownloadRequest, ExecutionRequest, ManifestRequest, OpenTreeRequest, PackageAcquisition,
-        RustPackageLocator, codec,
+        PackagePlanRequest, RustPackageLocator, codec,
     },
 };
 
@@ -246,8 +246,11 @@ fn dispatch(
             encode(&manifest, limit)
         }
         "admit" if publisher == Publisher::Client => {
-            let input: ExecutionSpec = metadata(request, limit)?;
-            encode(&sessions.admit(input.action_request()?, publisher)?, limit)
+            let (input, mode): (ExecutionSpec, ActionMode) = metadata(request, limit)?;
+            encode(
+                &sessions.admit(input.action_request()?, publisher, mode)?,
+                limit,
+            )
         }
         "schedule" if publisher == Publisher::Client => {
             let ExecutionRequest { ticket, spec } = metadata(request, limit)?;
@@ -280,6 +283,17 @@ fn dispatch(
         "tree_open" => {
             let OpenTreeRequest { action, tree } = metadata(request, limit)?;
             encode(&sessions.open_tree(tree, publisher, Some(action))?, limit)
+        }
+        "package_plan" if matches!(publisher, Publisher::Worker { .. }) => {
+            let PackagePlanRequest {
+                ticket,
+                missing,
+                max_archive_bytes,
+            } = metadata(request, limit)?;
+            encode(
+                &sessions.plan_packages(ticket, publisher, &missing, max_archive_bytes)?,
+                limit,
+            )
         }
         "verify" => {
             let ExecutionRequest { ticket, spec } = metadata(request, limit)?;

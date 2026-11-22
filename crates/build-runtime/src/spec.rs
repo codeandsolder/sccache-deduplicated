@@ -351,7 +351,7 @@ mod tests {
             .context("test output")?
             .kind = OutputKind::Tree;
         assert_ne!(first, key(&changed)?);
-        changed = original.clone();
+        changed = original;
         changed.mounts.clear();
         changed
             .mounts

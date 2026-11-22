@@ -15,9 +15,10 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use crate::{
-    Admission, ArchiveLength, BlobRef, BuildCoordinator, CompilePermit, ContentId,
-    InstallationManifest, NativeStore, PackageDecoder, PackageIdentity, PackageImportLimits,
-    ResultLease, ResultManifest, StagedBlob, TreeId, TreeLease, TreeManifest, UploadReservation,
+    ActionMode, Admission, ArchiveLength, BlobRef, BuildCoordinator, CompilePermit, ContentId,
+    InstallationManifest, NativeStore, PackageArchive, PackageArchiveLease, PackageIdentity,
+    PackageImportLimits, ResultLease, ResultManifest, StagedBlob, TreeId, TreeLease, TreeManifest,
+    UploadReservation,
     wire::{
         ActionRequest, BeginResult, NativeAdmission, NativeStatus, Publisher, ScheduleReply,
         Ticket, TreeOffer, TreeRead, WorkerAllocation,
@@ -190,18 +191,37 @@ impl Pending {
                 drop(inputs);
                 Ok(Ready::Result(result?))
             }
-            Self::Tree { manifest, transfer } => {
-                Ok(Ready::Tree(transfer.publish(|staged| {
-                    store.publish_tree_pinned(&manifest, staged)
-                })?))
-            }
+            Self::Tree { manifest, transfer } => Ok(Ready::Tree(TreeDelivery::new(
+                transfer.publish(|staged| store.publish_tree_pinned(&manifest, staged))?,
+            ))),
         }
+    }
+}
+
+struct TreeDelivery {
+    tree: TreeLease,
+    packages: BTreeMap<ContentId, PackageArchiveLease>,
+}
+
+impl TreeDelivery {
+    const fn new(tree: TreeLease) -> Self {
+        Self {
+            tree,
+            packages: BTreeMap::new(),
+        }
+    }
+
+    fn open_file(&self, id: ContentId) -> Result<File> {
+        if let Some(package) = self.packages.get(&id) {
+            return package.open_file();
+        }
+        self.tree.open_file(id)
     }
 }
 
 enum Ready {
     Result(ResultLease),
-    Tree(TreeLease),
+    Tree(TreeDelivery),
 }
 
 impl Ready {
@@ -215,7 +235,7 @@ impl Ready {
     fn committed(&self) -> Committed {
         match self {
             Self::Result(lease) => Committed::Result(lease.manifest().clone()),
-            Self::Tree(lease) => Committed::Tree(lease.id()),
+            Self::Tree(lease) => Committed::Tree(lease.tree.id()),
         }
     }
 }
@@ -256,23 +276,6 @@ pub struct NativeSessions {
     limits: SessionLimits,
     sessions: Mutex<HashMap<Ticket, SharedSession>>,
     active_uploads: AtomicUsize,
-    package_imports: Mutex<BTreeSet<PackageIdentity>>,
-}
-
-struct PackageSlot<'a> {
-    active: &'a Mutex<BTreeSet<PackageIdentity>>,
-    identity: PackageIdentity,
-}
-
-impl Drop for PackageSlot<'_> {
-    fn drop(&mut self) {
-        match self.active.lock() {
-            Ok(mut active) => {
-                active.remove(&self.identity);
-            }
-            Err(error) => log::error!("could not release native package reservation: {error:#}"),
-        }
-    }
 }
 
 /// A bounded service slot is occupied. Clients can retry without changing
@@ -300,28 +303,12 @@ impl NativeSessions {
             limits,
             sessions: Mutex::new(HashMap::new()),
             active_uploads: AtomicUsize::new(0),
-            package_imports: Mutex::new(BTreeSet::new()),
         })
     }
 
     #[must_use = "the store contains the native content and action index"]
     pub fn store(&self) -> &NativeStore {
         self.coordinator.store()
-    }
-
-    fn package_slot(&self, identity: PackageIdentity, maximum: usize) -> Result<PackageSlot<'_>> {
-        let mut active = self
-            .package_imports
-            .lock()
-            .map_err(|_| anyhow!("native package reservation lock poisoned"))?;
-        if active.len() >= maximum || !active.insert(identity) {
-            return Err(NativeServiceBusy.into());
-        }
-        drop(active);
-        Ok(PackageSlot {
-            active: &self.package_imports,
-            identity,
-        })
     }
 
     /// Resolve an original Rust installer without fetching or decoding its archive.
@@ -355,47 +342,16 @@ impl NativeSessions {
         executable: &Path,
         acquire: impl FnOnce() -> Result<R>,
     ) -> Result<(InstallationManifest, bool)> {
-        let policy = limits.policy()?;
         let store = self.store();
-        let mut package = store.lookup_package(identity, policy)?;
-        let _provisioning = if package.is_none() {
-            let reservation = self.package_slot(identity, limits.max_concurrent_imports)?;
-            // Another owner may have published after the first lookup.
-            package = store.lookup_package(identity, policy)?;
-            Some(reservation)
-        } else {
-            None
-        };
-        let (package, reused) = if let Some(package) = package {
-            if let ArchiveLength::Exact(size) = length {
-                ensure!(
-                    package.source().size == size,
-                    "original package length differs from verified source"
-                );
-            }
-            (package, true)
-        } else {
-            ensure!(
-                length.maximum() <= limits.max_archive_bytes,
-                "original package exceeds archive size limit"
-            );
-            let slot = self.upload_slot()?;
-            let package = store.import_package(
-                identity,
-                length,
-                policy,
-                acquire()?,
-                PackageDecoder::Isolated {
-                    executable,
-                    memory_bytes: limits.decoder_memory_bytes,
-                    timeout: Duration::from_secs(limits.decoder_timeout_secs),
-                },
-            )?;
-            drop(slot);
-            (package, false)
-        };
+        let mut upload = None;
+        let (package, reused) =
+            store.acquire_package(identity, length, limits, executable, || {
+                upload = Some(self.upload_slot()?);
+                acquire()
+            })?;
+        drop(upload);
         Ok((
-            store.publish_rust_installer(&package, policy.directory)?,
+            store.publish_rust_installer(&package, limits.policy()?.directory)?,
             reused,
         ))
     }
@@ -512,10 +468,15 @@ impl NativeSessions {
     /// # Errors
     /// Returns an error for invalid inputs, missing trees, capacity exhaustion
     /// or storage failure.
-    pub fn admit(&self, request: ActionRequest, publisher: Publisher) -> Result<NativeAdmission> {
+    pub fn admit(
+        &self,
+        request: ActionRequest,
+        publisher: Publisher,
+        mode: ActionMode,
+    ) -> Result<NativeAdmission> {
         self.reap()?;
         let fingerprint = request.action_fingerprint()?;
-        match self.coordinator.admit(fingerprint)? {
+        match self.coordinator.admit(fingerprint, mode)? {
             Admission::InFlight => Ok(NativeAdmission::InFlight),
             Admission::Cached(lease) => {
                 request.validate_result(lease.manifest())?;
@@ -729,7 +690,10 @@ impl NativeSessions {
         let id = manifest.id()?;
         self.limits.check_blobs(Kind::Tree, &manifest.blobs()?)?;
         let (phase, missing) = if let Some(lease) = self.store().lookup_tree(id)? {
-            (Phase::Ready(Ready::Tree(lease)), Vec::new())
+            (
+                Phase::Ready(Ready::Tree(TreeDelivery::new(lease))),
+                Vec::new(),
+            )
         } else {
             let transfer = Transfer::new(self.store().reserve_tree_upload(&manifest)?);
             let missing = transfer.missing();
@@ -787,8 +751,55 @@ impl NativeSessions {
             .context("native input tree unavailable")?;
         drop(state);
         let manifest = lease.manifest().clone();
-        let ticket = self.register(Kind::Tree, reader, Phase::Ready(Ready::Tree(lease)))?;
+        let ticket = self.register(
+            Kind::Tree,
+            reader,
+            Phase::Ready(Ready::Tree(TreeDelivery::new(lease))),
+        )?;
         Ok(TreeRead { ticket, manifest })
+    }
+
+    /// Negotiate compressed originals for an already authorized worker tree
+    /// delivery. Requests cannot name blobs outside that tree.
+    /// # Errors
+    /// Returns an error for unauthorized or invalid delivery requests.
+    pub fn plan_packages(
+        &self,
+        ticket: Ticket,
+        reader: Publisher,
+        missing: &[BlobRef],
+        max_archive_bytes: u64,
+    ) -> Result<Vec<PackageArchive>> {
+        ensure!(
+            matches!(reader, Publisher::Worker { .. }),
+            "package delivery requires a worker"
+        );
+        let session = self.get(ticket)?;
+        let mut state = Self::lock(&session)?;
+        self.authorize_reader(&mut state, reader)?;
+        let Phase::Ready(Ready::Tree(delivery)) = &mut state.phase else {
+            bail!("package delivery requires a tree ticket");
+        };
+        let blobs = delivery.tree.manifest().blobs()?;
+        ensure!(
+            missing.len() <= blobs.len()
+                && missing
+                    .iter()
+                    .all(|blob| blobs.get(&blob.id) == Some(&blob.size)),
+            "package request contains undeclared content"
+        );
+        // Bounded archive count per request. Remaining content is fetched by
+        // the ordinary exact-blob protocol.
+        let packages = self
+            .store()
+            .plan_package_downloads(missing, 8, max_archive_bytes)?;
+        let offers = packages.iter().map(PackageArchiveLease::archive).collect();
+        delivery.packages = packages
+            .into_iter()
+            .map(|lease| (lease.archive().blob.id, lease))
+            .collect();
+        drop(state);
+        Ok(offers)
     }
 
     /// Stream one negotiated missing blob, verifying digest and size.

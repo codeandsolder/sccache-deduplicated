@@ -27,7 +27,14 @@ fn publish(store: &NativeStore, name: &str) -> Result<ActionKey> {
         schema: "test".into(),
         components: BTreeMap::from([("source".into(), ContentId::of(name.as_bytes()))]),
     };
-    Ok(store.publish(&fingerprint, &manifest, vec![stage])?.action)
+    Ok(store
+        .publish(
+            &fingerprint,
+            &manifest,
+            vec![stage],
+            crate::ActionMode::Reuse,
+        )?
+        .action)
 }
 
 #[test]

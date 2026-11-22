@@ -81,3 +81,12 @@ impl ArchiveLength {
         }
     }
 }
+
+/// Original compressed transport representation of a verified package tree.
+/// This is deliberately not part of the build's semantic filesystem identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageArchive {
+    pub source: PackageSource,
+    pub tree: crate::TreeId,
+    pub blob: crate::BlobRef,
+}

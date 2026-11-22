@@ -33,8 +33,8 @@ fn aliases_and_shared_artifacts_reclaim_only_last_reference() -> Result<()> {
     let stage = store.stage(&b"object"[..])?;
     let object = stage.reference();
     let first = result(object);
-    let a = store.publish(&action("a"), &first, vec![stage])?;
-    let b = store.publish(&action("b"), &first, vec![])?;
+    let a = store.publish(&action("a"), &first, vec![stage], crate::ActionMode::Reuse)?;
+    let b = store.publish(&action("b"), &first, vec![], crate::ActionMode::Reuse)?;
     assert_eq!(a.result, b.result);
     assert_ne!(a.action, b.action);
     assert_eq!(store.equivalent_actions(a.result)?.len(), 2);
@@ -52,9 +52,14 @@ fn aliases_and_shared_artifacts_reclaim_only_last_reference() -> Result<()> {
     );
 
     let diagnostics = store.stage(&b"warning"[..])?;
-    let mut second = first.clone();
+    let mut second = first;
     second.stderr = Some(diagnostics.reference());
-    let c = store.publish(&action("c"), &second, vec![diagnostics])?;
+    let c = store.publish(
+        &action("c"),
+        &second,
+        vec![diagnostics],
+        crate::ActionMode::Reuse,
+    )?;
     assert_ne!(c.result, a.result);
     assert_eq!(
         store.stats()?,
@@ -114,10 +119,10 @@ fn aliases_and_shared_artifacts_reclaim_only_last_reference() -> Result<()> {
     assert!(store.inner.blob_path(object.id).exists());
     let gc = store.collect_garbage(1)?;
     assert_eq!(gc.blobs, 1);
-    assert!(gc.failed.is_empty());
+    assert_eq!(gc.failed, []);
     let gc = store.collect_garbage(1)?;
     assert_eq!(gc.blobs, 1);
-    assert!(gc.failed.is_empty());
+    assert_eq!(gc.failed, []);
     assert_eq!(store.stats()?.pending_gc_bytes, 0);
     assert!(!store.inner.blob_path(object.id).exists());
     Ok(())
@@ -130,15 +135,25 @@ fn publication_is_idempotent_and_conflicts_are_rejected() -> Result<()> {
     let stage = store.stage(&b"first"[..])?;
     let manifest = result(stage.reference());
     let fingerprint = action("same");
-    let first = store.publish(&fingerprint, &manifest, vec![stage])?;
-    let duplicate = store.publish(&fingerprint, &manifest, vec![])?;
+    let first = store.publish(
+        &fingerprint,
+        &manifest,
+        vec![stage],
+        crate::ActionMode::Reuse,
+    )?;
+    let duplicate = store.publish(&fingerprint, &manifest, vec![], crate::ActionMode::Reuse)?;
     assert!(first.new_action);
     assert!(!duplicate.new_action);
     assert_eq!(first.result, duplicate.result);
     let other = store.stage(&b"other"[..])?;
     assert!(
         store
-            .publish(&fingerprint, &result(other.reference()), vec![other])
+            .publish(
+                &fingerprint,
+                &result(other.reference()),
+                vec![other],
+                crate::ActionMode::Reuse
+            )
             .is_err()
     );
     assert_eq!(store.stats()?.actions, 1);
@@ -166,7 +181,12 @@ fn incomplete_publication_never_installs_or_exposes_partial_results() -> Result<
     let fingerprint = action("incomplete");
     assert!(
         store
-            .publish(&fingerprint, &manifest, vec![staged])
+            .publish(
+                &fingerprint,
+                &manifest,
+                vec![staged],
+                crate::ActionMode::Reuse
+            )
             .is_err()
     );
     assert!(!store.inner.blob_path(reference.id).exists());
@@ -181,7 +201,12 @@ fn reopen_recovers_unindexed_content_and_keeps_committed_results() -> Result<()>
     let store = NativeStore::open(dir.path())?;
     let stage = store.stage(&b"committed"[..])?;
     let manifest = result(stage.reference());
-    let published = store.publish(&action("persisted"), &manifest, vec![stage])?;
+    let published = store.publish(
+        &action("persisted"),
+        &manifest,
+        vec![stage],
+        crate::ActionMode::Reuse,
+    )?;
     let orphan = ContentId::of(b"unindexed");
     let orphan_path = store.inner.blob_path(orphan);
     fs::create_dir_all(orphan_path.parent().context("missing parent")?)?;
@@ -210,7 +235,12 @@ fn missing_content_is_not_returned_as_a_hit() -> Result<()> {
     let store = NativeStore::open(dir.path())?;
     let stage = store.stage(&b"object"[..])?;
     let object = stage.reference();
-    let published = store.publish(&action("invalid"), &result(object), vec![stage])?;
+    let published = store.publish(
+        &action("invalid"),
+        &result(object),
+        vec![stage],
+        crate::ActionMode::Reuse,
+    )?;
     fs::remove_file(store.inner.blob_path(object.id))?;
     assert!(store.lookup(published.action).is_err());
     Ok(())
@@ -228,7 +258,12 @@ fn foreign_staged_content_is_rejected_and_keeps_owner_alive() -> Result<()> {
     assert!(NativeStore::open(first_dir.path()).is_err());
     assert!(
         second
-            .publish(&action("foreign"), &manifest, vec![staged])
+            .publish(
+                &action("foreign"),
+                &manifest,
+                vec![staged],
+                crate::ActionMode::Reuse
+            )
             .is_err()
     );
     assert!(NativeStore::open(first_dir.path()).is_ok());
@@ -249,7 +284,12 @@ fn concurrent_publishers_share_content_and_result() -> Result<()> {
                     let staged = store.stage(&b"identical"[..])?;
                     let manifest = result(staged.reference());
                     barrier.wait();
-                    store.publish(&action(&index.to_string()), &manifest, vec![staged])
+                    store.publish(
+                        &action(&index.to_string()),
+                        &manifest,
+                        vec![staged],
+                        crate::ActionMode::Reuse,
+                    )
                 })
             })
             .collect();
@@ -282,10 +322,15 @@ fn negotiated_content_survives_eviction_and_is_reused_without_upload() -> Result
     let before = store.reserve_upload(&manifest)?;
     assert_eq!(before.missing(), &[stage.reference()]);
     drop(before);
-    let first = store.publish(&action("first"), &manifest, vec![stage])?;
+    let first = store.publish(
+        &action("first"),
+        &manifest,
+        vec![stage],
+        crate::ActionMode::Reuse,
+    )?;
 
     let reserved = store.reserve_upload(&manifest)?;
-    assert!(reserved.missing().is_empty());
+    assert_eq!(reserved.missing(), []);
     assert_eq!(
         store.evict(first.action)?,
         Eviction::Removed {
@@ -294,7 +339,12 @@ fn negotiated_content_survives_eviction_and_is_reused_without_upload() -> Result
     );
     assert_eq!(store.stats()?.pending_gc_bytes, 6);
     assert_eq!(store.collect_garbage(32)?.blobs, 0);
-    let second = store.publish(&action("second"), &manifest, vec![])?;
+    let second = store.publish(
+        &action("second"),
+        &manifest,
+        vec![],
+        crate::ActionMode::Reuse,
+    )?;
     assert_eq!(first.result, second.result);
     assert_eq!(store.stats()?.pending_gc_bytes, 0);
     assert_eq!(store.stats()?.logical_bytes, 6);
@@ -331,7 +381,12 @@ fn restart_reclaims_pending_garbage_including_empty_files() -> Result<()> {
     let store = NativeStore::open(dir.path())?;
     let stage = store.stage(&b""[..])?;
     let content = stage.reference();
-    let published = store.publish(&action("empty"), &result(content), vec![stage])?;
+    let published = store.publish(
+        &action("empty"),
+        &result(content),
+        vec![stage],
+        crate::ActionMode::Reuse,
+    )?;
     assert_eq!(
         store.evict(published.action)?,
         Eviction::Removed {
@@ -354,7 +409,12 @@ fn garbage_collection_failures_remain_queued() -> Result<()> {
     let store = NativeStore::open(dir.path())?;
     let stage = store.stage(&b"data"[..])?;
     let content = stage.reference();
-    let published = store.publish(&action("remove"), &result(content), vec![stage])?;
+    let published = store.publish(
+        &action("remove"),
+        &result(content),
+        vec![stage],
+        crate::ActionMode::Reuse,
+    )?;
     store.evict(published.action)?;
     let path = store.inner.blob_path(content.id);
     fs::remove_file(&path)?;
@@ -383,7 +443,12 @@ fn lookups_do_not_wait_on_publication_lock() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let store = NativeStore::open(dir.path())?;
     let stage = store.stage(&b"data"[..])?;
-    let published = store.publish(&action("lookup"), &result(stage.reference()), vec![stage])?;
+    let published = store.publish(
+        &action("lookup"),
+        &result(stage.reference()),
+        vec![stage],
+        crate::ActionMode::Reuse,
+    )?;
     let mutation = store.inner.lock_mutations()?;
     thread::scope(|scope| -> Result<()> {
         let (send, receive) = std::sync::mpsc::channel();
@@ -396,5 +461,48 @@ fn lookups_do_not_wait_on_publication_lock() -> Result<()> {
         assert!(observed??);
         Ok(())
     })?;
+    Ok(())
+}
+
+#[test]
+fn refresh_retains_shared_aliases_and_old_result_leases() -> Result<()> {
+    use crate::ActionMode;
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let old = store.stage(&b"first"[..])?;
+    let old_blob = old.reference();
+    let first = result(old_blob);
+    let a = store.publish(&action("a"), &first, vec![old], ActionMode::Reuse)?;
+    let b = store.publish(&action("b"), &first, vec![], ActionMode::Reuse)?;
+    let reader = store.lookup(a.action)?.context("old result missing")?;
+    let new = store.stage(&b"second"[..])?;
+    let second = result(new.reference());
+    let refreshed = store.publish(&action("a"), &second, vec![new], ActionMode::Refresh)?;
+    assert_eq!(refreshed.action, a.action);
+    assert!(!refreshed.new_action);
+    assert_eq!(store.equivalent_actions(a.result)?.len(), 1);
+    assert_eq!(
+        store.lookup(b.action)?.context("alias lost")?.manifest(),
+        &first
+    );
+    assert_eq!(store.stats()?.results, 2);
+    assert_eq!(store.stats()?.pending_gc_blobs, 0);
+    store.publish(&action("b"), &second, vec![], ActionMode::Refresh)?;
+    assert_eq!(store.equivalent_actions(a.result)?.len(), 0);
+    assert_eq!(store.stats()?.results, 1);
+    assert_eq!(store.stats()?.pending_gc_blobs, 1);
+    assert_eq!(store.collect_garbage(8)?.blobs, 0);
+    let mut bytes = Vec::new();
+    reader.open_blob(old_blob.id)?.read_to_end(&mut bytes)?;
+    assert_eq!(bytes, b"first");
+    drop(reader);
+    assert_eq!(store.collect_garbage(8)?.blobs, 1);
+    assert_eq!(
+        store
+            .lookup(a.action)?
+            .context("refreshed result missing")?
+            .manifest(),
+        &second
+    );
     Ok(())
 }

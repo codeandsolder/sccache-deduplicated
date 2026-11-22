@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     build_runtime::{
-        BlobRef, ContentId, ExecutionSpec, PreparedTree, ResultManifest, TreeId, TreeManifest,
-        wire::NativeRunResult,
+        ActionMode, BlobRef, ContentId, ExecutionSpec, PreparedTree, ResultManifest, TreeId,
+        TreeManifest, wire::NativeRunResult,
     },
     client::SharedConnection,
     protocol::{NativeNamespacePolicy, TransferReply, TransferRequest},
@@ -90,8 +90,9 @@ fn receive<T: DeserializeOwned>(stream: &mut impl Read, limit: u64) -> Result<T>
 }
 
 impl NativeNamespacePolicy {
-    pub const fn build_policy(&self) -> NativeBuildPolicy {
+    pub const fn build_policy(&self, mode: ActionMode) -> NativeBuildPolicy {
         NativeBuildPolicy {
+            mode,
             timeout: Duration::from_secs(self.build_timeout_secs),
             renewal_interval: Duration::from_secs(self.renewal_interval_secs),
             max_result_bytes: self.max_result_bytes,
@@ -137,12 +138,12 @@ fn serve_inner(
     policy: &NativeNamespacePolicy,
     stream: &mut DaemonStream,
 ) -> Result<()> {
-    let spec: ExecutionSpec = receive(stream, policy.max_metadata_bytes)?;
+    let (spec, mode): (ExecutionSpec, ActionMode) = receive(stream, policy.max_metadata_bytes)?;
     ensure!(
         spec.platform == policy.platform,
         "native namespace platform mismatch"
     );
-    let build_policy = policy.build_policy();
+    let build_policy = policy.build_policy(mode);
     let mut inputs = RemoteInputs {
         stream,
         limit: policy.max_metadata_bytes,
@@ -201,6 +202,7 @@ pub fn run_action(
     chunk_bytes: usize,
     policy: &NativeNamespacePolicy,
     spec: &ExecutionSpec,
+    mode: ActionMode,
     inputs: &[PreparedTree],
     destinations: &BTreeMap<String, PathBuf>,
 ) -> Result<NativeBuildResult> {
@@ -224,6 +226,7 @@ pub fn run_action(
         &mut pipe::CallerStream::new(&mut connection, chunk_bytes),
         policy,
         spec,
+        mode,
         &inputs,
         &destinations,
     );
@@ -250,11 +253,12 @@ fn run_inner(
     stream: &mut pipe::CallerStream<'_>,
     policy: &NativeNamespacePolicy,
     spec: &ExecutionSpec,
+    mode: ActionMode,
     inputs: &LocalInputs<'_>,
     destinations: &BTreeMap<String, PathBuf>,
 ) -> Result<NativeBuildResult> {
     let limit = policy.max_metadata_bytes;
-    send(stream, spec, limit)?;
+    send(stream, &(spec, mode), limit)?;
     let mut advertised = BTreeMap::<TreeId, BTreeMap<ContentId, u64>>::new();
     let mut buffer = vec![0; stream.chunk_bytes()];
     loop {
