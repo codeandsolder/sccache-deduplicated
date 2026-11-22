@@ -28,6 +28,7 @@ pub struct MockStorage {
     tx: mpsc::UnboundedSender<Result<Cache>>,
     delay: Option<Duration>,
     preprocessor_cache_mode: bool,
+    fail_size_query: bool,
 }
 
 impl MockStorage {
@@ -39,7 +40,12 @@ impl MockStorage {
             rx: Arc::new(Mutex::new(rx)),
             delay,
             preprocessor_cache_mode,
+            fail_size_query: false,
         }
+    }
+
+    pub(crate) fn fail_current_size(&mut self) {
+        self.fail_size_query = true;
     }
 
     /// Queue up `res` to be returned as the next result from `Storage::get`.
@@ -71,6 +77,7 @@ impl Storage for MockStorage {
         "Mock Storage".to_string()
     }
     async fn current_size(&self) -> Result<Option<u64>> {
+        anyhow::ensure!(!self.fail_size_query, "injected size query failure");
         Ok(None)
     }
     async fn max_size(&self) -> Result<Option<u64>> {

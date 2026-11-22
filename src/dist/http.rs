@@ -1949,6 +1949,7 @@ mod client {
         ) -> Result<RunJobResult> {
             let url = urls::server_run_job(job_alloc.server_id, job_alloc.job_id)?;
 
+            crate::server::activity::phase(crate::server::activity::Phase::StageInputs);
             let body = self
                 .pool
                 .spawn_blocking(move || -> Result<_> {
@@ -1981,6 +1982,7 @@ mod client {
                     Ok(body)
                 })
                 .await??;
+            crate::server::activity::phase(crate::server::activity::Phase::RunDistributed);
             let mut req = {
                 let client = self
                     .http

@@ -865,6 +865,94 @@ pub fn marker() -> u32 {{ let policy_denied_name = 11; policy_denied_name + 1 }}
     Ok(())
 }
 
+// MinGW's raw-dylib import library is generated during rlib compilation.
+#[test]
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(feature = "dist-tests"), ignore)]
+fn test_dist_rust_windows_gnu_dlltool() -> Result<()> {
+    use std::io::Write;
+    let tmpdir = tempfile::tempdir()?;
+    let root = tmpdir.path();
+    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
+    system.add_scheduler();
+    let _worker = system.add_server(&[]);
+    let mut cfg = harness::sccache_client_cfg(root, false);
+    cfg.dist.scheduler_url = Some(system.scheduler_url());
+    let cfg_path = root.join("sccache-cfg.json");
+    write_json_cfg(root, "sccache-cfg.json", &cfg);
+    let cached_cfg = root.join("sccache-cached-cfg");
+    let _ = stop_local_daemon();
+    start_local_daemon(&cfg_path, &cached_cfg);
+
+    let tools = root.join("auxiliary tools");
+    std::fs::create_dir(&tools)?;
+    let dlltool = tools.join("x86_64-w64-mingw32-dlltool");
+    let assembler = tools.join("x86_64-w64-mingw32-as");
+    std::fs::copy(which::which("x86_64-w64-mingw32-dlltool")?, &dlltool)?;
+    std::fs::copy(which::which("x86_64-w64-mingw32-as")?, &assembler)?;
+    write_source(
+        root,
+        "raw.rs",
+        r#"
+#[link(name = "kernel32", kind = "raw-dylib")]
+unsafe extern "system" { fn GetTickCount() -> u32; }
+pub fn ticks() -> u32 { unsafe { GetTickCount() } }
+"#,
+    );
+    let compiler = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output = root.join("libraw.rlib");
+    let compile = |explicit: bool| {
+        let mut command = sccache_command();
+        for (key, _) in env::vars_os() {
+            if key.to_string_lossy().starts_with("CARGO") || key == "OUT_DIR" {
+                command.env_remove(key);
+            }
+        }
+        command.current_dir(root).arg(&compiler).args([
+            "--edition=2024",
+            "--crate-name=raw",
+            "--crate-type=rlib",
+            "--target=x86_64-pc-windows-gnu",
+            "--emit=link,dep-info",
+            "--out-dir",
+            ".",
+        ]);
+        if explicit {
+            command
+                .arg("-C")
+                .arg(format!("dlltool={}", dlltool.display()));
+        }
+        command
+            .arg("raw.rs")
+            .env("SCCACHE_CONF", &cfg_path)
+            .env("SCCACHE_CACHED_CONF", &cached_cfg)
+            .assert()
+            .success();
+    };
+    for explicit in [false, true] {
+        compile(explicit);
+        let expected = std::fs::read(&output)?;
+        assert!(expected.starts_with(b"!<arch>\n"));
+        std::fs::remove_file(&output)?;
+        compile(explicit);
+        assert_eq!(std::fs::read(&output)?, expected);
+    }
+    // A byte-identical result from a changed tool still needs a new key.
+    // Trailing data does not change ELF execution.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&assembler)?
+        .write_all(b"identity mutation")?;
+    std::fs::remove_file(&output)?;
+    compile(true);
+    get_stats(|info| {
+        assert_eq!(3, info.stats.dist_compiles.values().sum::<usize>());
+        assert_eq!(2, info.stats.cache_hits.all());
+        assert_eq!(0, info.stats.dist_errors);
+    });
+    Ok(())
+}
+
 // Check the real worker and cache restoration, including zero-length rmeta
 // marker files required by Cargo for executable and test targets.
 #[test]
