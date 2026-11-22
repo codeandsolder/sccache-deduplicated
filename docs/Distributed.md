@@ -84,6 +84,15 @@ The HTTP implementation of sccache has the following API, where all HTTP body co
       - Returns a digest and PEM for the temporary server HTTPS certificate.
    - `POST /api/v1/scheduler/heartbeat_server`
       - Called (repeatedly) by servers to register as available for jobs.
+      - Every five seconds, advertises fractional effective CPU capacity from
+        host idle CPU time plus the worker's currently executing jobs (capped
+        at the available CPU count). The scheduler subtracts all outstanding
+        assignments, including in-flight reservations, and randomly selects
+        a healthy worker in proportion to its remaining CPU capacity. If no
+        healthy worker has free CPUs, configured job slack provides a second
+        weighted draw over remaining queue slots. Zero-capacity workers are
+        always excluded. The previous busy cutoff and re-enable delay are
+        removed.
       - Includes active `run_job` IDs. A `Started` job absent for a full
         heartbeat timeout is released, while long compilations remain
         assigned as long as the worker reports them running.
@@ -376,7 +385,7 @@ secret_key = "my secret key"
 #### Admission policy
 
 The `[job_slack]` section is required. For a worker advertising `C` CPUs,
-the limit on outstanding assignments is `C + static_jobs + floor(C * percent / 100)`.
+the limit on outstanding assignments is `ceil(C) + static_jobs + floor(C * percent / 100)`.
 A worker advertising zero CPUs always has zero admission capacity. The
 example admits three assignments per advertised CPU, including assignments
 waiting for toolchain transfer and assignment RPCs. It does not change the

@@ -1891,12 +1891,12 @@ pub mod scheduler {
             Ok(())
         }
 
-        pub fn max_jobs(self, core_count: usize) -> usize {
-            if core_count == 0 {
+        pub fn max_jobs(self, cpu_capacity: f64) -> usize {
+            if !cpu_capacity.is_finite() || cpu_capacity <= 0.0 {
                 return 0;
             }
-            let proportional = (core_count as f64 * self.percent / 100.0).floor() as usize;
-            core_count
+            let proportional = (cpu_capacity * self.percent / 100.0).floor() as usize;
+            (cpu_capacity.ceil() as usize)
                 .saturating_add(self.static_jobs)
                 .saturating_add(proportional)
         }
@@ -1949,7 +1949,7 @@ type = "DANGEROUSLY_INSECURE"
                 let loaded = from_path(&path);
                 assert_eq!(loaded.is_ok(), valid, "{policy}");
                 if valid {
-                    assert_eq!(loaded.unwrap().unwrap().job_slack.max_jobs(12), 36);
+                    assert_eq!(loaded.unwrap().unwrap().job_slack.max_jobs(12.0), 36);
                 }
             }
         }
