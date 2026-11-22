@@ -216,8 +216,19 @@ impl CompileCommandImpl for SingleCompileCommand {
         } = self;
         // Resolve compiler avoiding ccache wrappers to prevent double-caching.
         let resolved_executable = resolve_compiler_avoiding_wrapper(executable, env_vars);
+        let prepared = if is_rustc_like(&resolved_executable) {
+            Some(super::rust_response::prepare(
+                &resolved_executable,
+                arguments,
+            )?)
+        } else {
+            None
+        };
+        let spawn_arguments = prepared
+            .as_ref()
+            .map_or(arguments.as_slice(), |prepared| prepared.args.as_ref());
         let mut cmd = creator.clone().new_command_sync(&resolved_executable);
-        cmd.args(arguments)
+        cmd.args(spawn_arguments)
             .env_clear()
             .envs(env_vars.clone())
             .current_dir(cwd);
