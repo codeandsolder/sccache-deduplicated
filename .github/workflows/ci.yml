@@ -43,7 +43,7 @@ jobs:
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
         with:
-          rust-toolchain: "nightly-2026-11-20"
+          rust-toolchain: "nightly-2026-11-22"
 
       - name: clippy version
         run: cargo clippy --version
@@ -76,7 +76,7 @@ jobs:
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
         with:
-          rust-toolchain: "nightly-2026-11-20"
+          rust-toolchain: "nightly-2026-11-22"
 
       - name: Check feature ${{ matrix.feature }}
         run: cargo check --no-default-features --features ${{ matrix.feature }}
@@ -331,7 +331,7 @@ jobs:
         chmod +x "$test_runner"
         export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$test_runner"
         cargo +nightly-2026-11-20 test --locked --target x86_64-unknown-linux-gnu --lib --bins --tests
-      rust-toolchain: "nightly-2026-11-20"
+      rust-toolchain: "nightly-2026-11-22"
       rustflags: "-C target-cpu=x86-64-v2"
 
   ci-bundle-release-profile:
@@ -343,7 +343,7 @@ jobs:
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@d168449633a47de6c0166f0c0cff903e96983820 # main
     with:
       isolate-public-sccache-server: true
-      rust-toolchain: "nightly-2026-11-20"
+      rust-toolchain: "nightly-2026-11-22"
       rustflags: "-C target-cpu=x86-64-v2"
       command: >-
         cargo +nightly-2026-11-20 check --release --locked --no-default-features
@@ -366,7 +366,7 @@ jobs:
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
         with:
-          rust-toolchain: "nightly-2026-11-20"
+          rust-toolchain: "nightly-2026-11-22"
 
       - name: Install rust
         uses: ./.github/actions/rust-toolchain

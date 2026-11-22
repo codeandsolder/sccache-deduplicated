@@ -34,7 +34,7 @@ jobs:
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
         with:
-          rust-toolchain: "nightly-2026-11-20"
+          rust-toolchain: "nightly-2026-11-22"
 
       - name: Build
         run: |
@@ -118,7 +118,7 @@ jobs:
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
         with:
-          rust-toolchain: "nightly-2026-11-20"
+          rust-toolchain: "nightly-2026-11-22"
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -184,7 +184,7 @@ jobs:
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
         with:
-          rust-toolchain: "nightly-2026-11-20"
+          rust-toolchain: "nightly-2026-11-22"
 
       - name: Build
         run: cargo build --bin sccache --target $env:TARGET --features=vendored-openssl
@@ -297,7 +297,7 @@ jobs:
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
         with:
-          rust-toolchain: "nightly-2026-11-20"
+          rust-toolchain: "nightly-2026-11-22"
 
       - name: Install dependencies
         shell: bash
@@ -388,7 +388,7 @@ jobs:
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
         with:
-          rust-toolchain: "nightly-2026-11-20"
+          rust-toolchain: "nightly-2026-11-22"
 
       - name: Build sccache
         run: |
