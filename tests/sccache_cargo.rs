@@ -174,14 +174,13 @@ fn test_rust_cargo_cmd(cmd: &str, test_info: SccacheTest) -> Result<()> {
         .try_stderr(predicates::str::contains("\x1b[").from_utf8())?
         .try_success()?;
 
+    let expected = if cmd == "check" { 3 } else { 2 };
+    let hits = format!(
+        r#""cache_hits":{{"counts":{{"Rust":{expected}}},"adv_counts":{{"rust":{expected}}}}}"#
+    );
     test_info
         .show_stats()?
-        .try_stdout(
-            predicates::str::contains(
-                r#""cache_hits":{"counts":{"Rust":2},"adv_counts":{"rust":2}}"#,
-            )
-            .from_utf8(),
-        )?
+        .try_stdout(predicates::str::contains(hits).from_utf8())?
         .try_success()?;
 
     Ok(())
@@ -219,6 +218,13 @@ fn restart_sccache(
 ///
 /// The environment variable for read/write mode is added by this function.
 fn test_rust_cargo_cmd_readonly(cmd: &str, test_info: SccacheTest) -> Result<()> {
+    let expected = if cmd == "check" { 3 } else { 2 };
+    let misses = format!(
+        r#""cache_misses":{{"counts":{{"Rust":{expected}}},"adv_counts":{{"rust":{expected}}}}}"#
+    );
+    let hits = format!(
+        r#""cache_hits":{{"counts":{{"Rust":{expected}}},"adv_counts":{{"rust":{expected}}}}}"#
+    );
     // `cargo clean` first, just to be sure there's no leftover build objects.
     cargo_clean(&test_info)?;
 
@@ -244,12 +250,7 @@ fn test_rust_cargo_cmd_readonly(cmd: &str, test_info: SccacheTest) -> Result<()>
         .try_stdout(
             predicates::str::contains(r#""cache_hits":{"counts":{},"adv_counts":{}}"#).from_utf8(),
         )?
-        .try_stdout(
-            predicates::str::contains(
-                r#""cache_misses":{"counts":{"Rust":2},"adv_counts":{"rust":2}}"#,
-            )
-            .from_utf8(),
-        )?
+        .try_stdout(predicates::str::contains(misses.clone()).from_utf8())?
         .try_success()?;
 
     cargo_clean(&test_info)?;
@@ -270,12 +271,7 @@ fn test_rust_cargo_cmd_readonly(cmd: &str, test_info: SccacheTest) -> Result<()>
         .try_stdout(
             predicates::str::contains(r#""cache_hits":{"counts":{},"adv_counts":{}}"#).from_utf8(),
         )?
-        .try_stdout(
-            predicates::str::contains(
-                r#""cache_misses":{"counts":{"Rust":2},"adv_counts":{"rust":2}}"#,
-            )
-            .from_utf8(),
-        )?
+        .try_stdout(predicates::str::contains(misses.clone()).from_utf8())?
         .try_success()?;
 
     cargo_clean(&test_info)?;
@@ -293,12 +289,7 @@ fn test_rust_cargo_cmd_readonly(cmd: &str, test_info: SccacheTest) -> Result<()>
 
     test_info
         .show_stats()?
-        .try_stdout(
-            predicates::str::contains(
-                r#""cache_hits":{"counts":{"Rust":2},"adv_counts":{"rust":2}}"#,
-            )
-            .from_utf8(),
-        )?
+        .try_stdout(predicates::str::contains(hits).from_utf8())?
         .try_stdout(
             predicates::str::contains(r#""cache_misses":{"counts":{},"adv_counts":{}}"#)
                 .from_utf8(),

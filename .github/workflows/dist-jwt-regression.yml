@@ -1,4 +1,4 @@
-name: Distributed JWT regression
+name: Distributed runtime regression
 
 on:
   pull_request:
@@ -6,6 +6,11 @@ on:
       - Cargo.toml
       - Cargo.lock
       - src/dist/**
+      - src/compiler/rust.rs
+      - src/compiler/compiler.rs
+      - src/compiler/canonical_paths.rs
+      - tests/dist.rs
+      - tests/harness/**
       - src/bin/sccache-dist/**
       - .github/workflows/dist-jwt-regression.yml
   push:
@@ -14,6 +19,11 @@ on:
       - Cargo.toml
       - Cargo.lock
       - src/dist/**
+      - src/compiler/rust.rs
+      - src/compiler/compiler.rs
+      - src/compiler/canonical_paths.rs
+      - tests/dist.rs
+      - tests/harness/**
       - src/bin/sccache-dist/**
       - .github/workflows/dist-jwt-regression.yml
 
@@ -33,12 +43,20 @@ jobs:
         uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: "nightly-2026-11-20"
+      - name: Isolate build cache from regression test services
+        run: echo "SCCACHE_SERVER_UDS=$RUNNER_TEMP/dist-regression-build.sock" >> "$GITHUB_ENV"
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
         with:
           rust-toolchain: "nightly-2026-11-20"
-      - name: Verify distributed JWT signing
-        run: cargo +nightly-2026-11-20 test --locked --no-default-features --features=dist-server --lib test_job_token_verification
+      - name: Verify distributed JWT signing and Rust metadata and environment round trips
+        run: |
+          test_runner="$RUNNER_TEMP/dist-test-runner"
+          printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'unset SCCACHE_SERVER_UDS SCCACHE_SERVER_PORT' 'exec "$@"' > "$test_runner"
+          chmod +x "$test_runner"
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$test_runner"
+          cargo +nightly-2026-11-20 test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-tests --lib test_job_token_verification
+          cargo +nightly-2026-11-20 test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-tests --test dist test_dist_rust_ -- --test-threads 1
       - name: Finalize mandatory sccache
         if: always()
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main

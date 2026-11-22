@@ -227,6 +227,7 @@ pub fn sccache_client_cfg(
 #[cfg(feature = "dist-server")]
 fn sccache_scheduler_cfg() -> sccache::config::scheduler::Config {
     sccache::config::scheduler::Config {
+        maintenance_drain_file: None,
         public_addr: SocketAddr::from(([0, 0, 0, 0], SCHEDULER_PORT)),
         client_auth: sccache::config::scheduler::ClientAuth::Insecure,
         server_auth: sccache::config::scheduler::ServerAuth::Token {

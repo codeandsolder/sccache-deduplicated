@@ -244,9 +244,10 @@ pub struct ParsedArguments {
     ///
     /// For more information, see <https://doc.rust-lang.org/rustc/instrument-coverage.html>
     gcno: Option<PathBuf>,
-    /// rustc says that emits .rlib for --emit=metadata
-    /// <https://github.com/rust-lang/rust/issues/54852>
+    /// Requested output kinds.
     emit: HashSet<String>,
+    /// Metadata-only invocations produce this file regardless of crate type.
+    metadata_only_output: Option<String>,
     /// The value of any `--color` option passed on the commandline.
     color_mode: ColorMode,
     /// Whether `--json` was passed to this invocation.
@@ -277,8 +278,9 @@ pub struct RustCompilation {
     crate_link_paths: Vec<PathBuf>,
     /// The crate name being compiled.
     crate_name: String,
-    /// The crate types that will be generated
-    crate_types: CrateTypes,
+    /// Whether only dependency metadata (not native objects) is needed.
+    #[cfg(feature = "dist-client")]
+    can_trim_rlibs: bool,
     /// The current working directory
     cwd: PathBuf,
     /// The environment variables
@@ -2106,6 +2108,8 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
         staticlib: false,
         cdylib: false,
     };
+    let mut other_crate_types = HashSet::new();
+    let mut test_harness = false;
     let mut target_name: Option<String> = None;
     let mut has_opaque_linker_args = false;
     let mut extra_filename = None;
@@ -2164,15 +2168,7 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
                 cdylib,
                 others,
             })) => {
-                // General linked Rust artifacts remain non-cacheable because their system
-                // linker inputs are opaque. wasm32-wasip2 is handled narrowly after all
-                // arguments are parsed: its linker ships in the Rust sysroot.
-                if !others.is_empty() {
-                    let mut others: Vec<&str> = others.iter().map(String::as_str).collect();
-                    others.sort_unstable();
-                    let others_string = others.join(",");
-                    cannot_cache!("crate-type", others_string)
-                }
+                other_crate_types.extend(others.iter().cloned());
                 crate_types.rlib |= rlib;
                 crate_types.staticlib |= staticlib;
                 crate_types.cdylib |= cdylib;
@@ -2243,7 +2239,9 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
                         }
                         input = Some(val.clone());
                     }
-                    Argument::UnknownFlag(_) => {}
+                    Argument::UnknownFlag(ref flag) => {
+                        test_harness |= flag == "--test";
+                    }
                     _ => {
                         cannot_cache!("unexpected Rust argument variant", format!("{arg:?}"));
                     }
@@ -2256,19 +2254,6 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
             Some(Color(_)) => {}
             _ => args.push(arg.normalize(NormalizedDisposition::Separated)),
         }
-    }
-
-    // Unlike general cdylibs, wasm32-wasip2 is an only-cdylib target whose
-    // component linker (wasm-component-ld/rust-lld) is shipped inside rustc's
-    // sysroot and therefore travels in the distributed toolchain archive.
-    // Keep the exception deliberately narrow and reject custom linker inputs.
-    if crate_types.cdylib
-        && (target_name.as_deref() != Some("wasm32-wasip2")
-            || crate_types.rlib
-            || crate_types.staticlib
-            || has_opaque_linker_args)
-    {
-        cannot_cache!("crate-type", "cdylib".to_owned())
     }
 
     // Unwrap required values.
@@ -2291,23 +2276,50 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     if !emit.is_empty() && !emit.contains("link") && !emit.contains("metadata") {
         return CompilerArguments::NotCompilation;
     }
-    // If it's not an rlib and not a staticlib then crate-type wasn't passed,
-    // so it will usually be inferred as a binary, though the `#![crate_type`
-    // annotation may dictate otherwise - either way, we don't know what to do.
-    if crate_types
-        == (CrateTypes {
-            rlib: false,
-            staticlib: false,
-            cdylib: false,
-        })
-    {
-        cannot_cache!("crate-type", "No crate-type passed".to_owned())
-    }
-    // We won't cache invocations that are outputting anything but
-    // linker output and dep-info.
     if emit.iter().any(|e| !ALLOWED_EMIT.contains(e.as_str())) {
         cannot_cache!("unsupported --emit");
     }
+    let metadata_only = emit.contains("metadata") && !emit.contains("link");
+    if !metadata_only {
+        // General linked Rust artifacts remain non-cacheable: their native
+        // linker inputs are opaque. A test harness always links an executable,
+        // irrespective of an explicit crate type.
+        if !other_crate_types.is_empty() {
+            let mut others: Vec<_> = other_crate_types.into_iter().collect();
+            others.sort_unstable();
+            cannot_cache!("crate-type", others.join(","))
+        }
+        if test_harness {
+            cannot_cache!("crate-type", "test harness".to_owned())
+        }
+        if crate_types
+            == (CrateTypes {
+                rlib: false,
+                staticlib: false,
+                cdylib: false,
+            })
+        {
+            cannot_cache!("crate-type", "No crate-type passed".to_owned())
+        }
+        // wasm32-wasip2's component linker ships inside the Rust sysroot.
+        if crate_types.cdylib
+            && (target_name.as_deref() != Some("wasm32-wasip2")
+                || crate_types.rlib
+                || crate_types.staticlib
+                || has_opaque_linker_args)
+        {
+            cannot_cache!("crate-type", "cdylib".to_owned())
+        }
+    }
+    // --print file-names reports the *linked* output even for --emit=metadata.
+    // Rust metadata instead uses lib<crate-name><extra-filename>.rmeta, even
+    // for executable targets where the file is an empty Cargo marker.
+    let metadata_only_output = metadata_only.then(|| {
+        format!(
+            "lib{crate_name}{}.rmeta",
+            extra_filename.as_deref().unwrap_or_default()
+        )
+    });
 
     // Figure out the dep-info filename, if emitting dep-info.
     let dep_info = if emit.contains("dep-info") {
@@ -2374,6 +2386,7 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
         profile: profile.map(std::convert::Into::into),
         gcno: gcno.map(std::convert::Into::into),
         emit,
+        metadata_only_output,
         color_mode,
         has_json,
         target_json,
@@ -2823,6 +2836,9 @@ where
                 m.update(b"proc-macro-manifest-tree-v1");
             }
         }
+        if self.parsed_args.metadata_only_output.is_some() && !self.parsed_args.crate_types.rlib {
+            m.update(b"rust-metadata-output-v1");
+        }
         // 2. compiler_shlibs_digests
         for d in &self.compiler_shlibs_digests {
             m.update(d.as_bytes());
@@ -2982,59 +2998,32 @@ where
             .cloned()
             .collect();
 
-        let mut outputs = get_compiler_outputs(
-            creator,
-            &self.executable,
-            flat_os_string_arguments,
-            &cwd,
-            &env_vars,
-        )
-        .await?;
-
-        // metadata / dep-info don't ever generate binaries, but
-        // rustc still makes them appear in the --print
-        // file-names output (see
-        // https://github.com/rust-lang/rust/pull/68799).
-        //
-        // So if we see a binary in the rustc output and figure
-        // out that we're not _actually_ generating it, then we
-        // can avoid generating everything that isn't an rlib /
-        // rmeta.
-        //
-        // This can go away once the above rustc PR makes it in.
-        let emit_generates_only_metadata = !self.parsed_args.emit.is_empty()
-            && self
-                .parsed_args
-                .emit
+        let mut outputs = if let Some(metadata) = &self.parsed_args.metadata_only_output {
+            vec![metadata.clone()]
+        } else {
+            // Linked outputs depend on the compiler and target. Query rustc
+            // rather than guessing executable or library naming conventions.
+            get_compiler_outputs(
+                creator,
+                &self.executable,
+                flat_os_string_arguments,
+                &cwd,
+                &env_vars,
+            )
+            .await?
+        };
+        if self.parsed_args.emit.contains("metadata")
+            && self.parsed_args.metadata_only_output.is_none()
+        {
+            // --print file-names only reports the linked outputs.
+            let metadata = outputs
                 .iter()
-                .all(|e| e == "metadata" || e == "dep-info");
-
-        if emit_generates_only_metadata {
-            outputs.retain(|o| {
-                Path::new(o)
-                    .extension()
-                    .is_some_and(|ext| ext == "rlib" || ext == "rmeta")
-            });
-        }
-
-        if self.parsed_args.emit.contains("metadata") {
-            // rustc currently does not report rmeta outputs with --print file-names
-            // --emit metadata the rlib is printed, and with --emit metadata,link
-            // only the rlib is printed.
-            let rlibs: HashSet<_> = outputs
-                .iter()
-                .filter(|&p| Path::new(p).extension().is_some_and(|ext| ext == "rlib"))
-                .cloned()
-                .collect();
-            for lib in rlibs {
-                let rmeta = lib.replacen(".rlib", ".rmeta", 1);
-                // Do this defensively for future versions of rustc that may
-                // be fixed.
-                if !outputs.contains(&rmeta) {
-                    outputs.push(rmeta);
-                }
-                if !self.parsed_args.emit.contains("link") {
-                    outputs.retain(|p| *p != lib);
+                .filter_map(|name| name.strip_suffix(".rlib"))
+                .map(|stem| format!("{stem}.rmeta"))
+                .collect::<Vec<_>>();
+            for name in metadata {
+                if !outputs.contains(&name) {
+                    outputs.push(name);
                 }
             }
         }
@@ -3238,7 +3227,16 @@ where
                 outputs,
                 crate_link_paths: self.parsed_args.crate_link_paths.clone(),
                 crate_name: self.parsed_args.crate_name.clone(),
-                crate_types: self.parsed_args.crate_types.clone(),
+                #[cfg(feature = "dist-client")]
+                can_trim_rlibs: self.parsed_args.metadata_only_output.is_some()
+                    || matches!(
+                        self.parsed_args.crate_types,
+                        CrateTypes {
+                            rlib: true,
+                            staticlib: false,
+                            cdylib: false,
+                        }
+                    ),
                 cwd,
                 env_vars,
                 env_dep_names,
@@ -3544,7 +3542,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             inputs,
             crate_link_paths,
             sysroot,
-            crate_types,
+            can_trim_rlibs,
             rlib_dep_reader,
             env_vars,
             canonical_paths,
@@ -3561,7 +3559,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             env_vars,
             clippy_dir,
             crate_link_paths,
-            crate_types,
+            can_trim_rlibs,
             inputs,
             path_transformer,
             rlib_dep_reader,
@@ -3602,7 +3600,7 @@ struct RustInputsPackager {
     env_vars: Vec<(OsString, OsString)>,
     clippy_dir: Option<PathBuf>,
     crate_link_paths: Vec<PathBuf>,
-    crate_types: CrateTypes,
+    can_trim_rlibs: bool,
     inputs: Vec<PathBuf>,
     path_transformer: dist::PathTransformer,
     rlib_dep_reader: Option<Arc<RlibDepReader>>,
@@ -3825,11 +3823,7 @@ version = "6.1.0"
             OsString::from("fast_image_resize"),
         )],
         crate_link_paths: vec![],
-        crate_types: CrateTypes {
-            rlib: true,
-            staticlib: false,
-            cdylib: false,
-        },
+        can_trim_rlibs: true,
         inputs,
         path_transformer,
         rlib_dep_reader: None,
@@ -3884,11 +3878,7 @@ fn test_dist_archive_includes_clippy_config_files_and_empty_directory() -> Resul
             env_vars: vec![],
             clippy_dir: Some(policy.clone()),
             crate_link_paths: vec![],
-            crate_types: CrateTypes {
-                rlib: true,
-                staticlib: false,
-                cdylib: false,
-            },
+            can_trim_rlibs: true,
             inputs: if empty {
                 vec![]
             } else {
@@ -3924,7 +3914,7 @@ impl pkg::InputsPackager for RustInputsPackager {
         debug!("Packaging compile inputs for compile");
         let Self {
             crate_link_paths,
-            crate_types,
+            can_trim_rlibs,
             inputs,
             mut path_transformer,
             rlib_dep_reader,
@@ -4054,17 +4044,6 @@ impl pkg::InputsPackager for RustInputsPackager {
 
         tar_traversal_dirs.sort_by(|a, b| a.1.cmp(&b.1));
         tar_traversal_dirs.dedup_by(|a, b| a.1 == b.1);
-
-        // If we're just creating an rlib then the only thing inspected inside dependency rlibs is the
-        // metadata, in which case we can create a trimmed rlib (which is actually a .a) with the metadata
-        let can_trim_rlibs = matches!(
-            crate_types,
-            CrateTypes {
-                rlib: true,
-                staticlib: false,
-                cdylib: false,
-            }
-        );
 
         let mut builder = tar::Builder::new(wtr);
 
@@ -5079,6 +5058,62 @@ LLVM version: 15.0.2
     }
 
     #[test]
+    fn test_metadata_only_all_crate_types_and_test_harness() {
+        for crate_type in [
+            None,
+            Some("bin"),
+            Some("lib"),
+            Some("proc-macro"),
+            Some("dylib"),
+            Some("cdylib"),
+            Some("staticlib"),
+            Some("rlib,staticlib,cdylib"),
+        ] {
+            for test_harness in [false, true] {
+                let mut args = vec![
+                    "--crate-name",
+                    "foo",
+                    "--out-dir",
+                    "out",
+                    "-C",
+                    "extra-filename=-abc",
+                    "foo.rs",
+                ];
+                if let Some(ty) = crate_type {
+                    args.extend(["--crate-type", ty]);
+                }
+                if test_harness {
+                    args.push("--test");
+                }
+                args.extend(["--emit", "dep-info,metadata"]);
+                let args = args.into_iter().map(OsString::from).collect::<Vec<_>>();
+                let CompilerArguments::Ok(parsed) = parse_arguments(&args, Path::new(".")) else {
+                    panic!("metadata-only compile rejected: {args:?}");
+                };
+                assert_eq!(
+                    parsed.metadata_only_output.as_deref(),
+                    Some("libfoo-abc.rmeta")
+                );
+            }
+        }
+        assert_eq!(
+            fails!(
+                "--test",
+                "--crate-type",
+                "lib",
+                "--emit",
+                "link",
+                "--out-dir",
+                "out",
+                "--crate-name",
+                "foo",
+                "foo.rs"
+            ),
+            CompilerArguments::CannotCache("crate-type", Some("test harness".to_owned()))
+        );
+    }
+
+    #[test]
     fn test_parse_arguments_wasip2_cdylib_is_cacheable() {
         let parsed = parses!(
             "--emit",
@@ -5770,6 +5805,84 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
     }
 
     #[test]
+    fn test_metadata_only_output_is_materialized_and_has_local_dep_info() -> Result<()> {
+        for crate_type in ["bin", "lib", "staticlib", "cdylib", "proc-macro", "dylib"] {
+            let f = TestFixture::new();
+            f.touch("foo.rs")?;
+            let args = [
+                "--crate-name",
+                "foo",
+                "--crate-type",
+                crate_type,
+                "--out-dir",
+                "out",
+                "--emit",
+                "metadata,dep-info",
+                "-C",
+                "extra-filename=-abc",
+                "foo.rs",
+            ]
+            .map(OsString::from);
+            let CompilerArguments::Ok(parsed_args) = parse_arguments(&args, f.tempdir.path())
+            else {
+                bail!("could not parse metadata compile for {crate_type}");
+            };
+            let mut hasher = RustHasher {
+                executable: "rustc".into(),
+                host: "x86_64-unknown-linux-gnu".into(),
+                version: TEST_RUSTC_VERSION.to_string(),
+                sysroot: f.tempdir.path().join("sysroot"),
+                compiler_shlibs_digests: vec![],
+                dist_archive: None,
+                #[cfg(feature = "dist-client")]
+                rlib_dep_reader: None,
+                native_profile: Some("test-native".into()),
+                parsed_args,
+            };
+            let creator = new_creator();
+            // Exactly one compiler call: source dependency discovery. The
+            // --print file-names query describes linked outputs, not metadata.
+            mock_dep_info(&creator, &["foo.rs"]);
+            let runtime = single_threaded_runtime();
+            let pool = runtime.handle().clone();
+            let result = hasher
+                .generate_hash_key(GenerateHashKeyContext {
+                    creator: &creator,
+                    cwd: f.tempdir.path().to_owned(),
+                    env_vars: vec![],
+                    may_dist: true,
+                    pool: &pool,
+                    rewrite_includes_only: false,
+                    storage: Arc::new(MockStorage::new(None, false)),
+                    cache_control: CacheControl::Default,
+                })
+                .wait()?;
+            let outputs = result.compilation.outputs().collect::<Vec<_>>();
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0].key, "libfoo-abc.rmeta");
+            assert_eq!(outputs[0].path, Path::new("out/libfoo-abc.rmeta"));
+            assert!(!outputs[0].optional);
+            let dep_info = fs::read_to_string(f.tempdir.path().join("out/foo-abc.d"))?;
+            assert!(dep_info.contains("out/libfoo-abc.rmeta: foo.rs"));
+            #[cfg(feature = "dist-client")]
+            {
+                let mut transformer = dist::PathTransformer::new();
+                let (_, command, _) = result
+                    .compilation
+                    .generate_compile_commands(&mut transformer, false)?;
+                let command = command.context("metadata-only command should be distributable")?;
+                assert!(
+                    command
+                        .arguments
+                        .windows(2)
+                        .any(|pair| pair == ["--emit", "metadata"])
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_generate_hash_key_writes_local_dep_info() {
         let f = TestFixture::new();
         f.touch("foo.rs").unwrap();
@@ -5803,6 +5916,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 },
                 dep_info: Some("foo-abc.d".into()),
                 emit,
+                metadata_only_output: None,
                 color_mode: ColorMode::Auto,
                 has_json: false,
                 profile: None,
@@ -5906,6 +6020,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 },
                 dep_info: None,
                 emit,
+                metadata_only_output: None,
                 color_mode: ColorMode::Auto,
                 has_json: false,
                 profile: None,
@@ -6045,7 +6160,9 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         let pool = runtime.handle().clone();
 
         mock_dep_info(&creator, &["foo.rs"]);
-        mock_file_names(&creator, &["foo.rlib"]);
+        if hasher.parsed_args.metadata_only_output.is_none() {
+            mock_file_names(&creator, &["foo.rlib"]);
+        }
         hasher
             .generate_hash_key(GenerateHashKeyContext {
                 creator: &creator,
@@ -6170,7 +6287,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 outputs: HashMap::new(),
                 crate_link_paths: vec![],
                 crate_name: "model_alb_xspice_ffi".into(),
-                crate_types: parsed.crate_types,
+                #[cfg(feature = "dist-client")]
+                can_trim_rlibs: true,
                 cwd: cwd.clone(),
                 env_vars: Vec::new(),
                 env_dep_names: HashSet::new(),
@@ -6278,7 +6396,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             outputs: HashMap::new(),
             crate_link_paths: vec![],
             crate_name: "foo".into(),
-            crate_types: parsed.crate_types,
+            #[cfg(feature = "dist-client")]
+            can_trim_rlibs: true,
             cwd: build,
             env_vars: env,
             env_dep_names: HashSet::new(),
@@ -6509,7 +6628,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             outputs: HashMap::new(),
             crate_link_paths: vec![],
             crate_name: "foo".to_owned(),
-            crate_types: parsed.crate_types,
+            #[cfg(feature = "dist-client")]
+            can_trim_rlibs: true,
             cwd: temp.path().to_owned(),
             env_vars: vec![(
                 OsString::from("CARGO"),
@@ -6577,7 +6697,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             outputs: HashMap::new(),
             crate_link_paths: vec![],
             crate_name: "foo".to_owned(),
-            crate_types: parsed.crate_types,
+            #[cfg(feature = "dist-client")]
+            can_trim_rlibs: true,
             cwd: temp.path().to_owned(),
             env_vars: vec![(
                 OsString::from("CARGO"),
