@@ -701,13 +701,24 @@ impl fmt::Display for JobState {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompileCommand {
     pub executable: String,
     pub arguments: Vec<String>,
     pub env_vars: Vec<(String, String)>,
     pub cwd: String,
+}
+impl fmt::Debug for CompileCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let env_var_names: Vec<_> = self.env_vars.iter().map(|(name, _)| name).collect();
+        f.debug_struct("CompileCommand")
+            .field("executable", &self.executable)
+            .field("argument_count", &self.arguments.len())
+            .field("env_var_names", &env_var_names)
+            .field("cwd", &self.cwd)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::command_helpers::{CommandExt, run_with_environment};
-use anyhow::{Context, Error, Result, bail};
+use anyhow::{Context, Error, Result, anyhow, bail};
 use sccache::compression::ZstdFrame;
 use sccache::compression::deflate::unpack_gzip;
 use sccache::dist::{
@@ -102,7 +102,10 @@ impl PotBuilder {
     // the way)
     fn get_container(&self, tc: &Toolchain, tccache: &Mutex<TcCache>) -> Result<String> {
         let container = {
-            let mut map = self.container_lists.lock().unwrap();
+            let mut map = self
+                .container_lists
+                .lock()
+                .map_err(|_| anyhow!("container list mutex poisoned"))?;
             map.entry(tc.clone()).or_insert_with(Vec::new).pop()
         };
         match container {
@@ -111,7 +114,10 @@ impl PotBuilder {
                 // TODO: can improve parallelism (of creating multiple images at a time) by using another
                 // (more fine-grained) mutex around the entry value and checking if its empty a second time
                 let image = {
-                    let mut map = self.image_map.lock().unwrap();
+                    let mut map = self
+                        .image_map
+                        .lock()
+                        .map_err(|_| anyhow!("image map mutex poisoned"))?;
                     match map.entry(tc.clone()) {
                         hash_map::Entry::Occupied(e) => e.get().clone(),
                         hash_map::Entry::Vacant(e) => {
@@ -171,14 +177,27 @@ impl PotBuilder {
             return;
         }
 
-        // Good as new, add it back to the container list
-        if let Some(entry) = container_lists.lock().unwrap().get_mut(&tc) {
-            debug!("Reclaimed container {}", cid);
-            entry.push(cid)
-        } else {
+        // Good as new, add it back to the container list. If bookkeeping is poisoned,
+        // discard the container rather than panicking the cleanup thread.
+        let reclaimed = match container_lists.lock() {
+            Ok(mut containers) => {
+                if let Some(entry) = containers.get_mut(&tc) {
+                    debug!("Reclaimed container {}", cid);
+                    entry.push(cid.clone());
+                    true
+                } else {
+                    false
+                }
+            }
+            Err(_) => {
+                warn!("Container list mutex poisoned while reclaiming {}", cid);
+                false
+            }
+        };
+        if !reclaimed {
             warn!(
-                "Was ready to reclaim container {} but toolchain went missing",
-                cid
+                "Could not reclaim container {} for toolchain {}; removing it",
+                cid, tc.archive_id
             );
             if let Err(e) = pot_rm(&cid, pot_cmd) {
                 warn!("Failed to remove container {}: {}", cid, e);
@@ -197,7 +216,9 @@ impl PotBuilder {
         // Hold the LRU mutex only long enough to open the archive. Extraction
         // may be slow, and the open descriptor remains valid after eviction.
         let toolchain_rdr = {
-            let mut cache = tccache.lock().unwrap();
+            let mut cache = tccache
+                .lock()
+                .map_err(|_| anyhow!("toolchain cache mutex poisoned"))?;
             match cache.get(tc) {
                 Ok(rdr) => rdr,
                 Err(LruError::FileNotInCache) => {
@@ -225,7 +246,11 @@ impl PotBuilder {
                 &pot_fs_root.join("jails").join(&imagename).join("m"),
             ) {
                 warn!("Failed to unpack toolchain: {error:?}");
-                if let Err(cache_error) = tccache.lock().unwrap().remove(tc) {
+                if let Err(cache_error) = tccache
+                    .lock()
+                    .map_err(|_| anyhow!("toolchain cache mutex poisoned"))
+                    .and_then(|mut cache| cache.remove(tc).map_err(Into::into))
+                {
                     warn!(
                         "Failed to remove corrupt toolchain {} from cache: {cache_error:#}",
                         tc.archive_id
@@ -293,11 +318,7 @@ impl PotBuilder {
             paths: output_paths,
             compression_level,
         } = outputs;
-        trace!("Compile environment: {:?}", compile_command.env_vars);
-        trace!(
-            "Compile command: {:?} {:?}",
-            compile_command.executable, compile_command.arguments
-        );
+        trace!("Compile command: {:?}", compile_command);
 
         trace!("copying in inputs");
         // not elegant
