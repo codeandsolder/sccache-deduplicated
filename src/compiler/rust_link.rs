@@ -880,10 +880,20 @@ impl NativeLinkWorkspace {
 
 #[cfg(feature = "dist-client")]
 fn publish_leaf(source: &Path, destination: &Path) -> Result<()> {
-    match fs::rename(source, destination) {
+    // fs_err adds useful path context but wraps the underlying OS error.
+    // Inspect the original errno before adding that context.
+    match std::fs::rename(source, destination) {
         Ok(()) => return Ok(()),
-        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {}
-        Err(error) => return Err(error.into()),
+        Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "publish generated output {} to {}",
+                    source.display(),
+                    destination.display()
+                )
+            });
+        }
     }
     // Cross-filesystem delivery still publishes each verified leaf by
     // atomic rename. Copy only when the source cannot be renamed.
@@ -892,10 +902,17 @@ fn publish_leaf(source: &Path, destination: &Path) -> Result<()> {
         .prefix(".rust-link-publish-")
         .tempdir_in(parent)?;
     let temporary = stage.path().join("output");
-    if fs::symlink_metadata(source)?.is_symlink() {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.is_symlink() {
         std::os::unix::fs::symlink(fs::read_link(source)?, &temporary)?;
     } else {
         fs::copy(source, &temporary)?;
+        // Preserve compiler output timestamps across the bind-mount boundary.
+        fs::File::open(&temporary)?.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(metadata.modified()?)
+                .set_accessed(metadata.accessed()?),
+        )?;
     }
     fs::rename(temporary, destination)?;
     Ok(())
