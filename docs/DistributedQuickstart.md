@@ -70,6 +70,10 @@ Create a server.conf file to configure authentication, storage locations, networ
 ```toml
 # This is where client toolchains will be stored.
 cache_dir = "/tmp/toolchains"
+# Optional Linux same-filesystem archive sources (the source cache's tc/).
+# Archives are reflink-cloned and digest-verified before use; misses fall
+# back to an ordinary upload. Never share writable cache directories.
+# toolchain_archive_sources = ["/var/cache/sccache-client-dist/client/tc"]
 # The maximum size of the toolchain cache, in bytes.
 # If unspecified the default is 10GB.
 # toolchain_cache_size = 10737418240
