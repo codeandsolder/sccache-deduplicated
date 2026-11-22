@@ -15,9 +15,9 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use crate::{
-    Admission, BlobRef, BuildCoordinator, CompilePermit, ContentId, InstallationManifest,
-    NativeStore, PackageDecoder, PackageIdentity, PackageImportLimits, PackageSource, ResultLease,
-    ResultManifest, StagedBlob, TreeId, TreeLease, TreeManifest, UploadReservation,
+    Admission, ArchiveLength, BlobRef, BuildCoordinator, CompilePermit, ContentId,
+    InstallationManifest, NativeStore, PackageDecoder, PackageIdentity, PackageImportLimits,
+    ResultLease, ResultManifest, StagedBlob, TreeId, TreeLease, TreeManifest, UploadReservation,
     wire::{
         ActionRequest, BeginResult, NativeAdmission, NativeStatus, Publisher, ScheduleReply,
         Ticket, TreeOffer, TreeRead, WorkerAllocation,
@@ -259,6 +259,19 @@ pub struct NativeSessions {
     package_import: Mutex<()>,
 }
 
+/// A bounded service slot is occupied. Clients can retry without changing
+/// identities or starting additional downloads.
+#[derive(Debug)]
+pub struct NativeServiceBusy;
+
+impl std::fmt::Display for NativeServiceBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native service capacity exceeded")
+    }
+}
+
+impl std::error::Error for NativeServiceBusy {}
+
 impl NativeSessions {
     /// Initialize a scheduler-owned native service.
     ///
@@ -280,22 +293,24 @@ impl NativeSessions {
         self.coordinator.store()
     }
 
-    /// Resolve or import an original Rust installer while the scheduler owns
-    /// the store. Imports use a single provisioning slot in addition to the
-    /// shared upload limit so decompression cannot occupy all service threads.
+    fn package_slot(&self) -> Result<MutexGuard<'_, ()>> {
+        match self.package_import.try_lock() {
+            Ok(guard) => Ok(guard),
+            Err(std::sync::TryLockError::WouldBlock) => Err(NativeServiceBusy.into()),
+            Err(std::sync::TryLockError::Poisoned(_)) => bail!("native package lock poisoned"),
+        }
+    }
+
+    /// Resolve an original Rust installer without fetching or decoding its archive.
     /// # Errors
-    /// Returns an error for busy service, exceeded limits, checksum mismatch,
-    /// invalid installer metadata or storage failures.
+    /// Returns an error for busy service, invalid metadata or storage failure.
     pub fn lookup_rust_package(
         &self,
         identity: PackageIdentity,
         limits: PackageImportLimits,
     ) -> Result<Option<InstallationManifest>> {
         let policy = limits.policy()?;
-        let _provisioning = self
-            .package_import
-            .try_lock()
-            .map_err(|_| anyhow!("native package provisioning busy"))?;
+        let _provisioning = self.package_slot()?;
         let Some(package) = self.store().lookup_package(identity, policy)? else {
             return Ok(None);
         };
@@ -304,49 +319,53 @@ impl NativeSessions {
             .map(Some)
     }
 
-    /// Import an original package through the scheduler's bounded decoder.
+    /// Import or acquire an original package. The input factory is invoked
+    /// only after admission and a verified-cache miss, while holding the
+    /// shared provisioning slot.
     /// # Errors
     /// Returns an error for busy service, invalid archive or storage failures.
-    pub fn provision_rust_package(
+    pub fn provision_rust_package<R: Read>(
         &self,
-        source: PackageSource,
-        archive: &mut dyn Read,
+        identity: PackageIdentity,
+        length: ArchiveLength,
         limits: PackageImportLimits,
         executable: &Path,
-    ) -> Result<InstallationManifest> {
-        ensure!(
-            source.size <= limits.max_archive_bytes,
-            "original package exceeds archive size limit"
-        );
+        acquire: impl FnOnce() -> Result<R>,
+    ) -> Result<(InstallationManifest, bool)> {
         let policy = limits.policy()?;
-        let slot = self.upload_slot()?;
-        let provisioning = self
-            .package_import
-            .try_lock()
-            .map_err(|_| anyhow!("native package provisioning busy"))?;
+        let provisioning = self.package_slot()?;
         let store = self.store();
-        let package = if let Some(package) = store.lookup_package(source.identity, policy)? {
-            ensure!(
-                package.source() == source,
-                "original package length differs from verified source"
-            );
-            package
+        let (package, reused) = if let Some(package) = store.lookup_package(identity, policy)? {
+            if let ArchiveLength::Exact(size) = length {
+                ensure!(
+                    package.source().size == size,
+                    "original package length differs from verified source"
+                );
+            }
+            (package, true)
         } else {
-            store.import_package(
-                source,
+            ensure!(
+                length.maximum() <= limits.max_archive_bytes,
+                "original package exceeds archive size limit"
+            );
+            let slot = self.upload_slot()?;
+            let package = store.import_package(
+                identity,
+                length,
                 policy,
-                archive,
+                acquire()?,
                 PackageDecoder::Isolated {
                     executable,
                     memory_bytes: limits.decoder_memory_bytes,
                     timeout: Duration::from_secs(limits.decoder_timeout_secs),
                 },
-            )?
+            )?;
+            drop(slot);
+            (package, false)
         };
         let result = store.publish_rust_installer(&package, policy.directory);
         drop(provisioning);
-        drop(slot);
-        result
+        Ok((result?, reused))
     }
 
     fn sessions(&self) -> Result<MutexGuard<'_, HashMap<Ticket, SharedSession>>> {
@@ -594,10 +613,9 @@ impl NativeSessions {
     fn upload_slot(&self) -> Result<UploadSlot<'_>> {
         let mut active = self.active_uploads.load(Ordering::Acquire);
         loop {
-            ensure!(
-                active < self.limits.max_total_uploads,
-                "native service upload capacity exceeded"
-            );
+            if active >= self.limits.max_total_uploads {
+                return Err(NativeServiceBusy.into());
+            }
             match self.active_uploads.compare_exchange_weak(
                 active,
                 active + 1,

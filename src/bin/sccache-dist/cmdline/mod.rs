@@ -50,9 +50,18 @@ pub enum Command {
         manifest_output: Option<std::path::PathBuf>,
     },
     #[cfg(target_os = "linux")]
+    NativeSyncRust {
+        root: std::path::PathBuf,
+        client_config: std::path::PathBuf,
+        output: std::path::PathBuf,
+        recipe_output: std::path::PathBuf,
+        full: bool,
+    },
+    #[cfg(target_os = "linux")]
     NativeAttestInstallation {
         root: std::path::PathBuf,
         manifests: Vec<std::path::PathBuf>,
+        recipe: Option<std::path::PathBuf>,
         output: std::path::PathBuf,
     },
 }

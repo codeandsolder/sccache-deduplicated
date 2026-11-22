@@ -3,7 +3,7 @@
 use std::{
     fs::File,
     io::{self, Cursor, Read, Write},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -19,6 +19,9 @@ use crate::build_runtime::{
     },
 };
 use crate::dist::JobId;
+
+mod package;
+pub use package::{PackageAcquisition, RustPackageLocator};
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct ExecutionRequest {
@@ -61,6 +64,7 @@ pub struct NativeCacheClient {
     auth: String,
     role: Role,
     metadata_limit: u64,
+    timeout: Duration,
 }
 
 impl NativeCacheClient {
@@ -98,6 +102,7 @@ impl NativeCacheClient {
             auth,
             role: Role::Client,
             metadata_limit,
+            timeout,
         })
     }
 
@@ -138,6 +143,49 @@ impl NativeCacheClient {
         decode_response(response, self.metadata_limit)
     }
 
+    // Retrying is deliberately limited to package resolution: a busy reply
+    // does not mutate anything, and even a repeated acquisition is idempotent.
+    fn package_control<T: Serialize, R: DeserializeOwned>(
+        &self,
+        operation: &str,
+        value: &T,
+    ) -> Result<R> {
+        let data = codec().with_limit(self.metadata_limit).serialize(value)?;
+        let start = Instant::now();
+        loop {
+            let remaining = self
+                .timeout
+                .checked_sub(start.elapsed())
+                .context("package provisioning deadline expired")?;
+            let response = self
+                .request(operation)?
+                .timeout(remaining)
+                .body(data.clone())
+                .send()?;
+            if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                return decode_response(response.error_for_status()?, self.metadata_limit);
+            }
+            drop(response);
+            let delay = Duration::from_millis(250);
+            ensure!(
+                remaining > delay,
+                "native package provisioning busy until deadline"
+            );
+            std::thread::sleep(delay);
+        }
+    }
+
+    /// Resolve a verified package or let the scheduler download its original
+    /// bytes from the configured Rust distribution origin.
+    /// # Errors
+    /// Returns an error for unavailable provisioning, invalid provenance or transport failure.
+    pub fn acquire_rust_package(&self, locator: &RustPackageLocator) -> Result<PackageAcquisition> {
+        locator.validate()?;
+        let result: PackageAcquisition = self.package_control("package_acquire", locator)?;
+        validate_installation_manifest(locator.identity, &result.manifest)?;
+        Ok(result)
+    }
+
     /// Resolve portable installation metadata from an already verified
     /// original package. No archive or installed files are uploaded.
     /// # Errors
@@ -146,7 +194,8 @@ impl NativeCacheClient {
         &self,
         identity: PackageIdentity,
     ) -> Result<Option<InstallationManifest>> {
-        let manifest: Option<InstallationManifest> = self.control("package_lookup", &identity)?;
+        let manifest: Option<InstallationManifest> =
+            self.package_control("package_lookup", &identity)?;
         if let Some(manifest) = &manifest {
             validate_installation_manifest(identity, manifest)?;
         }

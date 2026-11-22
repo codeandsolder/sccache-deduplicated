@@ -309,7 +309,7 @@ sccache-dist native-provision-rust --client-config /path/to/client.toml \
   --compression xz --manifest-output rustc.manifest
 ```
 
-The CLI first performs an authenticated lookup by exact upstream identity.
+The CLI first performs an authenticated lookup by upstream SHA-256 and codec, without an upstream length query.
 On a hit it needs no archive; on a miss it streams the original bytes.
 The owner verifies the compressed size and SHA-256 before decoding.
 A single import slot shares global upload admission. Compressed input,
@@ -325,6 +325,67 @@ security principal. Use the authenticated native listener and a trusted
 release checksum. The decoder deadline starts after compressed-input
 verification; transport timeouts are controlled by the client and the
 HTTP transport.
+
+### Automatic Rustup provisioning
+
+To let the scheduler acquire missing original packages directly, additionally
+configure its allowed distribution origin and request deadline:
+
+```toml
+[native_cache.package_upstream]
+origin = "https://static.rust-lang.org/"
+timeout_secs = 180
+```
+
+The server combines the configured origin with independently validated
+distribution paths beneath /dist/, disables redirects, and does not forward
+client authorization upstream. Concurrent acquisitions share one provisioning
+slot; clients retry busy replies within their configured request deadline.
+The scheduler streams compressed content into staging, enforces its archive
+byte limit even without Content-Length, verifies the release SHA-256, and
+decodes into the existing CAS. Verified hits do not contact the origin.
+
+On each Rustup installation host, run:
+
+```sh
+sccache-dist native-sync-rust --root /path/to/installed/sysroot \
+  --client-config /path/to/client.toml \
+  --output /path/to/installation.catalog \
+  --recipe-output /path/to/installation.recipe
+```
+
+This reads the installed Rustup component inventory and channel manifest
+(v1 config, v2 release metadata), not a guessed toolchain version. By default
+it selects every installed component with declared bin/lib payload, matching
+the current compiler toolchain discovery scope; installed cross-target
+standard libraries and target-independent components are included. Use
+`--full` to include documentation and other non-build components. Component
+names and target variants are resolved against the original installer
+metadata. Conflicting component trees or changed installation inventory
+abort publication.
+
+The portable recipe contains exact package provenance and selected
+component trees, validates composition, and can be used for offline
+reattestation:
+
+```sh
+sccache-dist native-attest-installation --root /path/to/installed/sysroot \
+  --recipe /path/to/installation.recipe --output /path/to/installation.catalog
+```
+
+On the same kernel boot, reattestation reuses a previous matching catalog
+entry only when the expected upstream digest and the currently opened
+file's version agree; stale records are rehashed. The catalog and recipe
+are each written atomically. These files can be retained across compiler
+processes, but the recipe does not pin the scheduler's contents indefinitely.
+The normal compiler still discovers and hashes the actual local input
+closure, including custom and modified tools; the catalog avoids repeated
+reads, and package content eliminates duplicate uploads.
+
+The draft native package index and portable installation manifest have
+changed format to store the verified archive length separately from the
+upstream identity. Recreate earlier experimental native stores; there is
+no production-store migration or compatibility path.
 
 ### Verified installation catalogs
 

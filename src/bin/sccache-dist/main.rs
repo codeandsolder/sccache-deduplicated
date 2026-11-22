@@ -33,6 +33,8 @@ mod cmdline;
 mod command_helpers;
 #[cfg(target_os = "linux")]
 mod native;
+#[cfg(target_os = "linux")]
+mod rustup;
 mod token_check;
 #[cfg(target_os = "linux")]
 use native::NativeWorker;
@@ -191,12 +193,7 @@ fn write_installation_metadata(
     Ok(())
 }
 
-fn provision_rust_package(
-    client_config: &Path,
-    archive: Option<&Path>,
-    source: sccache::build_runtime::PackageSource,
-    manifest_output: Option<&Path>,
-) -> Result<()> {
+fn package_client(client_config: &Path) -> Result<sccache::dist::native::NativeCacheClient> {
     use sccache::{
         config::{DistAuth, FileConfig, try_read_config_file},
         dist::native::NativeCacheClient,
@@ -210,12 +207,21 @@ fn provision_rust_package(
     let DistAuth::Token { token } = config.dist.auth else {
         bail!("original-package provisioning requires token authentication");
     };
-    let client = NativeCacheClient::new(
+    NativeCacheClient::new(
         native.endpoint.to_url(),
         token,
         Duration::from_secs(native.request_timeout_secs),
         native.max_metadata_bytes,
-    )?;
+    )
+}
+
+fn provision_rust_package(
+    client_config: &Path,
+    archive: Option<&Path>,
+    source: sccache::build_runtime::PackageSource,
+    manifest_output: Option<&Path>,
+) -> Result<()> {
+    let client = package_client(client_config)?;
     let (manifest, reused) = if let Some(manifest) = client.lookup_rust_package(source.identity)? {
         anyhow::ensure!(
             manifest.source == source,
@@ -294,7 +300,7 @@ fn run(command: Command) -> Result<i32> {
             max_tar_bytes,
             manifest_output,
         } => {
-            use sccache::build_runtime::{NativeStore, PackagePolicy};
+            use sccache::build_runtime::{ArchiveLength, NativeStore, PackagePolicy};
             let policy = PackagePolicy::rust_installer(
                 max_entries,
                 max_expanded_bytes,
@@ -314,7 +320,8 @@ fn run(command: Command) -> Result<i32> {
                 let archive = archive.context("upstream package unavailable; supply --archive")?;
                 (
                     store.import_package(
-                        source,
+                        source.identity,
+                        ArchiveLength::Exact(source.size),
                         policy,
                         std::fs::File::open(archive)?,
                         sccache::build_runtime::PackageDecoder::Isolated {
@@ -343,17 +350,35 @@ fn run(command: Command) -> Result<i32> {
             Ok(0)
         }
         #[cfg(target_os = "linux")]
+        Command::NativeSyncRust {
+            root,
+            client_config,
+            output,
+            recipe_output,
+            full,
+        } => {
+            rustup::sync(&root, &client_config, &output, &recipe_output, full)?;
+            Ok(0)
+        }
+        #[cfg(target_os = "linux")]
         Command::NativeAttestInstallation {
             root,
             manifests,
+            recipe,
             output,
         } => {
-            use sccache::build_runtime::{InstallationCatalog, InstallationManifest};
-            let manifests = manifests
-                .iter()
-                .map(|path| InstallationManifest::read(std::fs::File::open(path)?))
-                .collect::<Result<Vec<_>>>()?;
-            let (catalog, report) = InstallationCatalog::attest(&root, &manifests)?;
+            use sccache::build_runtime::{
+                InstallationCatalog, InstallationManifest, InstallationRecipe,
+            };
+            let manifests = if let Some(recipe) = recipe {
+                InstallationRecipe::read(std::fs::File::open(recipe)?)?.selected_manifests()?
+            } else {
+                manifests
+                    .iter()
+                    .map(|path| InstallationManifest::read(std::fs::File::open(path)?))
+                    .collect::<Result<Vec<_>>>()?
+            };
+            let (catalog, report) = InstallationCatalog::attest(&root, &manifests, Some(&output))?;
             write_installation_metadata(&output, |file| catalog.write(file))?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(0)

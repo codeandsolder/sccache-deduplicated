@@ -6,8 +6,8 @@ mod unix {
 
     use anyhow::{Context, Result, bail, ensure};
     use sccache_build::{
-        NativeStore, PackageCompression, PackageDecoder, PackageIdentity, PackagePolicy,
-        PackageSource, TreeLayer, TreeMetadata, TreePath, TreeRecipe, TreeTimestamp,
+        ArchiveLength, NativeStore, PackageCompression, PackageDecoder, PackageIdentity,
+        PackagePolicy, PackageSource, TreeLayer, TreeMetadata, TreePath, TreeRecipe, TreeTimestamp,
     };
 
     pub fn run() -> Result<()> {
@@ -49,8 +49,13 @@ mod unix {
             .tempdir_in(parent)?;
         let store = NativeStore::open(&scratch.path().join("store"))?;
         let start = Instant::now();
-        let imported_package =
-            store.import_package(source, policy, input, PackageDecoder::InProcess)?;
+        let imported_package = store.import_package(
+            source.identity,
+            ArchiveLength::Exact(source.size),
+            policy,
+            input,
+            PackageDecoder::InProcess,
+        )?;
         let id = imported_package.tree().id();
         let imported = start.elapsed();
         let stats = store.stats()?;

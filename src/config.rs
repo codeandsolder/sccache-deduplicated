@@ -2058,6 +2058,14 @@ pub mod scheduler {
         }
     }
 
+    /// Owner-configured origin for original Rust distribution archives.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct RustPackageUpstream {
+        pub origin: super::HTTPUrl,
+        pub timeout_secs: u64,
+    }
+
     /// Dedicated native cache listener and its explicit resource limits.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -2076,6 +2084,7 @@ pub mod scheduler {
         pub http_threads: usize,
         pub max_metadata_bytes: usize,
         pub package_import: Option<crate::build_runtime::PackageImportLimits>,
+        pub package_upstream: Option<RustPackageUpstream>,
     }
 
     impl NativeCacheConfig {
@@ -2106,6 +2115,21 @@ pub mod scheduler {
             self.space.validate()?;
             if let Some(package_import) = self.package_import {
                 package_import.validate()?;
+            }
+            if let Some(upstream) = &self.package_upstream {
+                let url = upstream.origin.to_url();
+                if self.package_import.is_none()
+                    || upstream.timeout_secs == 0
+                    || !matches!(url.scheme(), "http" | "https")
+                    || url.host_str().is_none()
+                    || url.path() != "/"
+                    || url.query().is_some()
+                    || url.fragment().is_some()
+                    || !url.username().is_empty()
+                    || url.password().is_some()
+                {
+                    bail!("invalid Rust package upstream configuration");
+                }
             }
             Ok(limits)
         }

@@ -52,13 +52,19 @@ fn verified_installation_reuses_digest_without_reading_and_rejects_mutation() ->
     let mut encoded = Vec::new();
     manifest.write(&mut encoded)?;
     let decoded = InstallationManifest::read(encoded.as_slice())?;
-    let (catalog, report) = InstallationCatalog::attest(&root, &[decoded])?;
+    let (catalog, report) =
+        InstallationCatalog::attest(&root, std::slice::from_ref(&decoded), None)?;
     assert_eq!(report.verified_files, 1);
     assert_eq!(report.verified_bytes, 8);
     assert_eq!(report.differing_files, 1);
     assert_eq!(report.missing_files, 1);
     let catalog_path = temp.path().join("catalog");
     catalog.write(File::create(&catalog_path)?)?;
+    let (_, warm) =
+        InstallationCatalog::attest(&root, std::slice::from_ref(&decoded), Some(&catalog_path))?;
+    assert_eq!(warm.verified_files, 1);
+    assert_eq!(warm.reused_files, 1);
+    assert_eq!(warm.reused_bytes, 8);
     let mut cache = SourceDigestCache::default();
     cache.load_catalog(&catalog_path)?;
     let capture = |cache: Option<&SourceDigestCache>| -> Result<TreeId> {
@@ -83,6 +89,9 @@ fn verified_installation_reuses_digest_without_reading_and_rejects_mutation() ->
     file.seek(SeekFrom::Start(0))?;
     fs::write(&tool, b"changed!")?;
     assert_ne!(capture(Some(&cache))?, original);
+    let (_, changed) = InstallationCatalog::attest(&root, &[decoded], Some(&catalog_path))?;
+    assert_eq!(changed.reused_files, 0);
+    assert_eq!(changed.differing_files, 2);
     assert_eq!(cache.catalog_hits(), (2, 16));
     let mut stale = catalog;
     stale.boot = b"other boot".to_vec();

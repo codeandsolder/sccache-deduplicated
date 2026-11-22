@@ -231,7 +231,7 @@ impl NativeStore {
 mod tests {
     use super::*;
     use crate::{
-        PackageCompression, PackageDecoder, PackageIdentity, PackagePolicy, PackageSource,
+        ArchiveLength, PackageCompression, PackageDecoder, PackageIdentity, PackagePolicy,
         TreeRecipe, TreeTimestamp,
     };
     use sha2::{Digest, Sha256};
@@ -276,13 +276,11 @@ mod tests {
             modified,
         };
         let id = store.import_package(
-            PackageSource {
-                identity: PackageIdentity {
-                    sha256: Sha256::digest(bytes).into(),
-                    compression: PackageCompression::Tar,
-                },
-                size: u64::try_from(bytes.len())?,
+            PackageIdentity {
+                sha256: Sha256::digest(bytes).into(),
+                compression: PackageCompression::Tar,
             },
+            ArchiveLength::Exact(u64::try_from(bytes.len())?),
             PackagePolicy {
                 directory,
                 modified,

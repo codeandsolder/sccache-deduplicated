@@ -141,7 +141,10 @@ struct Fleet {
 }
 
 impl Fleet {
-    fn start(root: &Path) -> Result<Self> {
+    fn start(
+        root: &Path,
+        package_upstream: Option<scheduler::RustPackageUpstream>,
+    ) -> Result<Self> {
         let [scheduler_address, cache_address, worker_address] = addresses()?;
         let scheduler_url = reqwest::Url::parse(&format!("http://{scheduler_address}/"))?;
         let cache_url = reqwest::Url::parse(&format!("http://{cache_address}/"))?;
@@ -186,6 +189,7 @@ impl Fleet {
                         decoder_memory_bytes: 512 * 1024 * 1024,
                         decoder_timeout_secs: 120,
                     }),
+                    package_upstream,
                 }),
             },
         )?;
@@ -291,6 +295,225 @@ fn rust_installer_fixture() -> Result<Vec<u8>> {
     Ok(archive.into_inner()?)
 }
 
+fn provisioning_config(root: &Path, endpoint: &reqwest::Url) -> Result<PathBuf> {
+    let config = sccache::config::FileConfig {
+        dist: sccache::config::DistConfig {
+            auth: DistAuth::Token {
+                token: CLIENT_TOKEN.into(),
+            },
+            native: Some(NativeClientConfig {
+                endpoint: HTTPUrl::from_url(endpoint.clone()),
+                platform_contract: PLATFORM.into(),
+                request_timeout_secs: 30,
+                build_timeout_secs: 30,
+                renewal_interval_secs: 1,
+                max_metadata_bytes: 1024 * 1024,
+                max_result_bytes: 1024 * 1024,
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let config_path = root.join("provision.json");
+    fs::write(&config_path, serde_json::to_vec(&config)?)?;
+    Ok(config_path)
+}
+
+struct OriginalUpstream {
+    origin: reqwest::Url,
+    requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    stop: std::sync::mpsc::Sender<()>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl OriginalUpstream {
+    fn start(path: &'static str, bytes: Vec<u8>) -> Result<Self> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&requests);
+        let bytes: Arc<[u8]> = bytes.into();
+        let server = rouille::Server::new("127.0.0.1:0", move |request| {
+            if request.method() != "GET"
+                || request.url() != path
+                || request.header("Authorization").is_some()
+            {
+                return rouille::Response::empty_404();
+            }
+            count.fetch_add(1, Ordering::Relaxed);
+            // Make concurrent provisioners contend for the import slot.
+            thread::sleep(Duration::from_millis(400));
+            let mut response = rouille::Response::from_data("application/octet-stream", Vec::new());
+            // Intentionally omit Content-Length.
+            response.data =
+                rouille::ResponseBody::from_reader(std::io::Cursor::new(Arc::clone(&bytes)));
+            response
+        })
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .pool_size(2);
+        let origin = reqwest::Url::parse(&format!("http://{}/", server.server_addr()))?;
+        let (worker, stop) = server.stoppable();
+        Ok(Self {
+            origin,
+            requests,
+            stop,
+            thread: Some(worker),
+        })
+    }
+
+    fn count(&self) -> usize {
+        self.requests.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for OriginalUpstream {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn sync_rustup_command(root: &Path, config: &Path, catalog: &Path, recipe: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sccache-dist"));
+    command
+        .args(["native-sync-rust", "--root"])
+        .arg(root)
+        .arg("--client-config")
+        .arg(config)
+        .arg("--output")
+        .arg(catalog)
+        .arg("--recipe-output")
+        .arg(recipe);
+    command
+}
+
+fn json_output(output: std::process::Output) -> Result<serde_json::Value> {
+    ensure!(
+        output.status.success(),
+        "command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+#[test]
+#[ignore = "requires actual scheduler, worker subprocesses and xz"]
+fn rustup_sync_acquires_once_and_reuses_portable_recipe_and_catalog() -> Result<()> {
+    use sccache::build_runtime::{InstallationRecipe, PackageCompression, PackageIdentity};
+    use sha2::{Digest, Sha256};
+
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let archive = root.join("fixture.tar");
+    fs::write(&archive, rust_installer_fixture()?)?;
+    let compressed = Command::new("xz").arg("-c").arg(&archive).output()?;
+    ensure!(compressed.status.success(), "fixture xz compression failed");
+    let identity = PackageIdentity {
+        sha256: Sha256::digest(&compressed.stdout).into(),
+        compression: PackageCompression::Xz,
+    };
+    let archive_bytes = compressed.stdout.len();
+    let path = "/dist/2026-11-22/compiler-nightly-host.tar.xz";
+    let upstream = OriginalUpstream::start(path, compressed.stdout)?;
+    let fleet = Fleet::start(
+        root,
+        Some(scheduler::RustPackageUpstream {
+            origin: HTTPUrl::from_url(upstream.origin.clone()),
+            timeout_secs: 10,
+        }),
+    )?;
+    let config = provisioning_config(root, &fleet.cache_url)?;
+    let sysroot = root.join("sysroot");
+    let rustlib = sysroot.join("lib/rustlib");
+    fs::create_dir_all(&rustlib)?;
+    fs::create_dir(sysroot.join("bin"))?;
+    fs::write(sysroot.join("bin/rustc"), b"original compiler bytes")?;
+    fs::write(rustlib.join("components"), "compiler-host\n")?;
+    fs::write(rustlib.join("manifest-compiler-host"), "file:bin/rustc\n")?;
+    fs::write(
+        rustlib.join("multirust-config.toml"),
+        "config_version = \"1\"\n[[components]]\npkg = \"compiler\"\ntarget = \"host\"\n",
+    )?;
+    fs::write(
+        rustlib.join("multirust-channel-manifest.toml"),
+        format!(
+            "manifest-version = \"2\"\ndate = \"2026-11-22\"\n[pkg.compiler.target.host]\navailable = true\nxz_url = \"https://other-mirror.example{path}\"\nxz_hash = \"{}\"\n",
+            identity.checksum_hex()
+        ),
+    )?;
+    let catalog = root.join("installation.catalog");
+    let recipe = root.join("installation.recipe");
+    let catalog2 = root.join("installation-second.catalog");
+    let recipe2 = root.join("installation-second.recipe");
+    let first = sync_rustup_command(&sysroot, &config, &catalog, &recipe)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let second = sync_rustup_command(&sysroot, &config, &catalog2, &recipe2)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let first = json_output(first.wait_with_output()?)?;
+    let second = json_output(second.wait_with_output()?)?;
+    for field in ["acquired_packages", "reused_packages"] {
+        assert_eq!(
+            first["packages"][field].as_u64().unwrap_or(0)
+                + second["packages"][field].as_u64().unwrap_or(0),
+            1
+        );
+    }
+    assert_eq!(
+        first["packages"]["downloaded_archive_bytes"]
+            .as_u64()
+            .unwrap_or(0)
+            + second["packages"]["downloaded_archive_bytes"]
+                .as_u64()
+                .unwrap_or(0),
+        u64::try_from(archive_bytes)?
+    );
+    assert_eq!(upstream.count(), 1);
+    assert_eq!(fs::read(&recipe)?, fs::read(&recipe2)?);
+    let installation = InstallationRecipe::read(File::open(&recipe)?)?;
+    assert_eq!(
+        installation.components["compiler-host"].component,
+        "compiler"
+    );
+    assert_eq!(installation.tree_recipe()?.layers.len(), 1);
+    assert_eq!(first["attestation"]["verified_files"], 1);
+    assert_eq!(second["attestation"]["verified_files"], 1);
+    let warm = json_output(sync_rustup_command(&sysroot, &config, &catalog, &recipe).output()?)?;
+    assert_eq!(warm["packages"]["downloaded_archive_bytes"], 0);
+    assert_eq!(warm["packages"]["reused_packages"], 1);
+    assert_eq!(warm["attestation"]["reused_files"], 1);
+    assert_eq!(upstream.count(), 1);
+    let (scheduler, worker) = fleet.finish()?;
+    assert_eq!(scheduler.blobs, 4);
+    assert_eq!(scheduler.trees, 2);
+    assert_eq!(worker.blobs, 0);
+    drop(upstream);
+
+    // Offline reattestation needs neither scheduler nor upstream, and a
+    // changed installed file cannot inherit the original content identity.
+    fs::write(sysroot.join("bin/rustc"), b"modified compiler bytes")?;
+    let report = json_output(
+        Command::new(env!("CARGO_BIN_EXE_sccache-dist"))
+            .args(["native-attest-installation", "--root"])
+            .arg(&sysroot)
+            .arg("--recipe")
+            .arg(&recipe)
+            .arg("--output")
+            .arg(&catalog)
+            .output()?,
+    )?;
+    assert_eq!(report["reused_files"], 0);
+    assert_eq!(report["differing_files"], 1);
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires actual scheduler and worker subprocesses"]
 fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
@@ -299,7 +522,7 @@ fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
 
     let temp = tempfile::tempdir()?;
     let root = temp.path();
-    let fleet = Fleet::start(root)?;
+    let fleet = Fleet::start(root, None)?;
     let bytes = rust_installer_fixture()?;
     let archive = root.join("package.tar");
     fs::write(&archive, &bytes)?;
@@ -333,26 +556,7 @@ fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
     )?
     .for_worker(sccache::dist::JobId(123));
     assert!(worker.lookup_rust_package(source.identity).is_err());
-    let config = sccache::config::FileConfig {
-        dist: sccache::config::DistConfig {
-            auth: DistAuth::Token {
-                token: CLIENT_TOKEN.into(),
-            },
-            native: Some(NativeClientConfig {
-                endpoint: HTTPUrl::from_url(fleet.cache_url.clone()),
-                platform_contract: PLATFORM.into(),
-                request_timeout_secs: 30,
-                build_timeout_secs: 30,
-                renewal_interval_secs: 1,
-                max_metadata_bytes: 1024 * 1024,
-                max_result_bytes: 1024 * 1024,
-            }),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let config_path = root.join("provision.json");
-    fs::write(&config_path, serde_json::to_vec(&config)?)?;
+    let config_path = provisioning_config(root, &fleet.cache_url)?;
     let manifest_path = root.join("package.manifest");
     let sha256 = source.identity.checksum_hex();
     let command = || {
@@ -422,7 +626,7 @@ fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
 fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path();
-    let fleet = Fleet::start(root)?;
+    let fleet = Fleet::start(root, None)?;
     let worker_address = fleet.worker_address;
     let cache_url = fleet.cache_url.clone();
     let client = NativeCacheClient::new(
@@ -907,7 +1111,7 @@ fn audit_index(index: &Path, component: &str) -> Result<ComponentAudit> {
 fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;
-    let fleet = Fleet::start(&root)?;
+    let fleet = Fleet::start(&root, None)?;
     let mut service = LocalService::start(&root, &fleet)?;
     let rustc = Command::new("rustc")
         .args(["--print", "sysroot"])

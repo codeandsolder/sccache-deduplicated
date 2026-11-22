@@ -56,3 +56,28 @@ pub struct PackageSource {
     pub identity: PackageIdentity,
     pub size: u64,
 }
+
+/// Length expectation for original archive ingestion. A checksum is mandatory
+/// even when the upstream HTTP response has no Content-Length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveLength {
+    Exact(u64),
+    AtMost(u64),
+}
+
+impl ArchiveLength {
+    #[must_use = "maximum compressed input size"]
+    pub const fn maximum(self) -> u64 {
+        match self {
+            Self::Exact(size) | Self::AtMost(size) => size,
+        }
+    }
+
+    #[must_use = "whether the observed archive length is acceptable"]
+    pub const fn accepts(self, size: u64) -> bool {
+        match self {
+            Self::Exact(expected) => size == expected,
+            Self::AtMost(maximum) => size <= maximum,
+        }
+    }
+}

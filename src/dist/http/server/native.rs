@@ -11,16 +11,79 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::{ClientAuthCheck, ServerAuthenticator, authenticate_client, authenticate_server};
 use crate::{
     build_runtime::{
-        ExecutionSpec, NativeSessions, NativeStore, PackageIdentity, PackageImportLimits,
-        PackageSource,
+        ArchiveLength, ExecutionSpec, NativeServiceBusy, NativeSessions, NativeStore,
+        PackageIdentity, PackageImportLimits, PackageSource,
         wire::{Publisher, ScheduleReply, UploadHeader},
     },
     config::scheduler::NativeCacheConfig,
-    dist::native::{DownloadRequest, ExecutionRequest, ManifestRequest, OpenTreeRequest, codec},
+    dist::native::{
+        DownloadRequest, ExecutionRequest, ManifestRequest, OpenTreeRequest, PackageAcquisition,
+        RustPackageLocator, codec,
+    },
 };
 
 pub(super) type Allocator =
     dyn Fn(crate::dist::NativeAssignment) -> Result<ScheduleReply> + Send + Sync;
+
+struct PackageService {
+    limits: PackageImportLimits,
+    upstream: Option<(reqwest::Url, reqwest::blocking::Client)>,
+}
+
+impl PackageService {
+    fn new(config: &NativeCacheConfig) -> Result<Option<Self>> {
+        let Some(limits) = config.package_import else {
+            return Ok(None);
+        };
+        let upstream = if let Some(upstream) = &config.package_upstream {
+            let client = crate::util::new_reqwest_blocking_builder()?
+                .timeout(Duration::from_secs(upstream.timeout_secs))
+                .connect_timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
+                .pool_max_idle_per_host(0)
+                .no_proxy()
+                .build()?;
+            Some((upstream.origin.to_url(), client))
+        } else {
+            None
+        };
+        Ok(Some(Self { limits, upstream }))
+    }
+
+    fn acquire(
+        &self,
+        sessions: &NativeSessions,
+        locator: &RustPackageLocator,
+    ) -> Result<PackageAcquisition> {
+        locator.validate()?;
+        let (manifest, reused) = sessions.provision_rust_package(
+            locator.identity,
+            ArchiveLength::AtMost(self.limits.max_archive_bytes),
+            self.limits,
+            &std::env::current_exe()?,
+            || {
+                let (origin, client) = self
+                    .upstream
+                    .as_ref()
+                    .context("Rust package upstream not configured")?;
+                let url = origin.join(&locator.path)?;
+                ensure!(
+                    url.origin() == origin.origin(),
+                    "package locator escaped origin"
+                );
+                let response = client.get(url).send()?.error_for_status()?;
+                ensure!(
+                    response
+                        .content_length()
+                        .is_none_or(|size| size <= self.limits.max_archive_bytes),
+                    "upstream package exceeds archive size limit"
+                );
+                Ok(response)
+            },
+        )?;
+        Ok(PackageAcquisition { manifest, reused })
+    }
+}
 
 pub(super) fn spawn(
     config: &NativeCacheConfig,
@@ -35,7 +98,7 @@ pub(super) fn spawn(
     )?);
     let maintenance = Arc::downgrade(&sessions);
     let metadata_limit = config.max_metadata_bytes;
-    let package_import = config.package_import;
+    let packages = PackageService::new(config)?;
     let server = rouille::Server::new(config.public_addr, move |request| {
         respond(
             request,
@@ -44,7 +107,7 @@ pub(super) fn spawn(
             &*client_auth,
             &*server_auth,
             metadata_limit,
-            package_import,
+            packages.as_ref(),
         )
     })
     .map_err(|error| anyhow!("could not bind native cache listener: {error}"))?
@@ -88,7 +151,7 @@ fn respond(
     client_auth: &dyn ClientAuthCheck,
     server_auth: &ServerAuthenticator,
     limit: usize,
-    package_import: Option<PackageImportLimits>,
+    packages: Option<&PackageService>,
 ) -> Response {
     if request.method() != "POST" {
         return Response::empty_404();
@@ -129,15 +192,12 @@ fn respond(
         return Response::empty_400();
     }
     match dispatch(
-        request,
-        sessions,
-        allocate,
-        publisher,
-        operation,
-        limit,
-        package_import,
+        request, sessions, allocate, publisher, operation, limit, packages,
     ) {
         Ok(response) => response,
+        Err(error) if error.is::<NativeServiceBusy>() => {
+            Response::text("native service busy").with_status_code(503)
+        }
         Err(error) => {
             // Do not return host paths, auth tokens or raw internal metadata
             // to callers. The service log carries diagnostic context.
@@ -154,27 +214,34 @@ fn dispatch(
     publisher: Publisher,
     operation: &str,
     limit: usize,
-    package_import: Option<PackageImportLimits>,
+    packages: Option<&PackageService>,
 ) -> Result<Response> {
     match operation {
-        "package_lookup" if publisher == Publisher::Client && package_import.is_some() => {
+        "package_lookup" if publisher == Publisher::Client && packages.is_some() => {
             let identity: PackageIdentity = metadata(request, limit)?;
-            let imports =
-                package_import.context("native original-package provisioning disabled")?;
-            encode(&sessions.lookup_rust_package(identity, imports)?, limit)
+            let service = packages.context("native original-package provisioning disabled")?;
+            encode(
+                &sessions.lookup_rust_package(identity, service.limits)?,
+                limit,
+            )
         }
-        "package_import" if publisher == Publisher::Client && package_import.is_some() => {
-            let imports =
-                package_import.context("native original-package provisioning disabled")?;
+        "package_acquire" if publisher == Publisher::Client && packages.is_some() => {
+            let locator: RustPackageLocator = metadata(request, limit)?;
+            let service = packages.context("native original-package provisioning disabled")?;
+            encode(&service.acquire(sessions, &locator)?, limit)
+        }
+        "package_import" if publisher == Publisher::Client && packages.is_some() => {
+            let service = packages.context("native original-package provisioning disabled")?;
             let mut body = request.data().context("missing original package body")?;
             // Fixed width: SHA-256, u32 codec, u64 length. The remaining
             // bytes stream directly into verified archive staging.
             let source: PackageSource = codec().with_limit(44).deserialize_from(&mut body)?;
-            let manifest = sessions.provision_rust_package(
-                source,
-                &mut body,
-                imports,
+            let (manifest, _) = sessions.provision_rust_package(
+                source.identity,
+                ArchiveLength::Exact(source.size),
+                service.limits,
                 &std::env::current_exe()?,
+                || Ok(body),
             )?;
             encode(&manifest, limit)
         }
