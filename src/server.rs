@@ -3095,7 +3095,7 @@ mod tests {
             peer.bind(socket).await
         });
         let observer = tokio::task::spawn_blocking(move || {
-            crate::client::CompileObserver::connect(&addr, identity)
+            crate::client::CompileObserver::connect(&addr, &identity)
         })
         .await??;
         let (held, dropped) = tokio::sync::oneshot::channel::<()>();

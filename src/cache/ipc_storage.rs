@@ -72,9 +72,9 @@ impl IpcStorage {
             "invalid daemon chunk size"
         );
         Ok(Self {
-            closed,
             conn,
             handshake,
+            closed,
         })
     }
 

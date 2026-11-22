@@ -258,7 +258,7 @@ pub struct CompileObserver {
 impl CompileObserver {
     pub fn connect(
         address: &crate::net::SocketAddr,
-        identity: crate::protocol::CompileIdentity,
+        identity: &crate::protocol::CompileIdentity,
     ) -> Result<Self> {
         let mut connection = connect_to_server(address)?;
         let Response::CompileObserved(id) =
@@ -268,7 +268,7 @@ impl CompileObserver {
         };
         let activity = Arc::new(crate::server::activity::Activity::new(
             id,
-            &identity,
+            identity,
             crate::server::activity::CompileOwner::Namespace,
         ));
         Ok(Self {

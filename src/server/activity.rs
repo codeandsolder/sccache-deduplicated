@@ -224,17 +224,20 @@ impl Activity {
         let age = Duration::from_millis(sample.phase_age_ms).min(now.duration_since(self.started));
         let changed = now - age;
         let mut state = lock(&self.state);
-        ensure!(
-            sample.phase_sequence > state.sequence
-                || (sample.phase_sequence == state.sequence && sample.phase == state.phase),
-            "out-of-order namespace compile observation"
-        );
-        if sample.phase_sequence > state.sequence {
-            state.sequence = sample.phase_sequence;
-            state.phase = sample.phase;
-            state.changed = changed;
-        } else {
-            state.changed = state.changed.min(changed);
+        match sample.phase_sequence.cmp(&state.sequence) {
+            std::cmp::Ordering::Less => anyhow::bail!("out-of-order namespace compile observation"),
+            std::cmp::Ordering::Equal => {
+                ensure!(
+                    sample.phase == state.phase,
+                    "inconsistent namespace phase sequence"
+                );
+                state.changed = state.changed.min(changed);
+            }
+            std::cmp::Ordering::Greater => {
+                state.sequence = sample.phase_sequence;
+                state.phase = sample.phase;
+                state.changed = changed;
+            }
         }
         state.observed = Some(now);
         state.output = sample.output;
@@ -242,6 +245,7 @@ impl Activity {
         state.compiler_children = sample.compiler_children;
         state.distributed_job = sample.distributed_job;
         state.worker = sample.worker;
+        drop(state);
         Ok(())
     }
 }
