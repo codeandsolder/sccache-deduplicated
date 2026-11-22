@@ -149,6 +149,7 @@ thirtyfour = "0.38"
 
 [target.'cfg(unix)'.dependencies]
 daemonix = "0.1"
+redb = { version = "4.6", optional = true }
 
 [target.'cfg(not(target_os = "freebsd"))'.dependencies.libmount]
 optional = true
@@ -207,6 +208,7 @@ gha = [
 ]
 memcached = ["opendal/services-memcached", "opendal-layer-logging"]
 native-zlib = []
+native-store = ["dep:redb"]
 oss = [
   "opendal/services-oss",
   "opendal-layer-logging",
@@ -246,6 +248,7 @@ dist-client = [
 ]
 # Enables the sccache-dist binary
 dist-server = [
+  "native-store",
   "jwt",
   "zlib-rs-fast",
   "libmount",
