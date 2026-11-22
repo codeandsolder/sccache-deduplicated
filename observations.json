@@ -1,5 +1,10 @@
 {
   "source": "mozilla/sccache:main",
-  "lastAttempt": 1795351428993,
-  "observations": []
+  "lastAttempt": 1795351430956,
+  "observations": [
+    {
+      "sha": "4a138d78794bf3c1df11adfdef2ad49fed05b031",
+      "firstObserved": 1795351430956
+    }
+  ]
 }
