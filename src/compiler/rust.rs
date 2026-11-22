@@ -54,7 +54,6 @@ use std::env::consts::EXE_EXTENSION;
 #[cfg(feature = "dist-client")]
 use std::env::consts::EXE_SUFFIX;
 use std::ffi::{OsStr, OsString};
-use std::fmt;
 use std::fs::OpenOptions;
 use std::future::Future;
 use std::hash::Hash;
@@ -226,16 +225,6 @@ pub struct ParsedArguments {
     crate_types: CrateTypes,
     /// If dependency info is being emitted, the name of the dep info file.
     dep_info: Option<PathBuf>,
-    /// If profile info is being emitted, the path of the profile.
-    ///
-    /// This could be filled while `-Cprofile-use` been enabled.
-    ///
-    /// We need to add the profile into our outputs to enable distributed compilation.
-    /// We don't need to track `profile-generate` since it's users work to make sure
-    /// the `profdata` been generated from profraw files.
-    ///
-    /// For more information, see <https://doc.rust-lang.org/rustc/profile-guided-optimization.html>
-    profile: Option<PathBuf>,
     /// If `-Z profile` has been enabled, we will use a GCC-compatible, gcov-based
     /// coverage implementation.
     ///
@@ -539,12 +528,34 @@ fn parse_env_dep_info(dep_info: &str) -> Vec<(OsString, OsString)> {
         if let Some(env_dep) = line.strip_prefix("# env-dep:") {
             let mut split = env_dep.splitn(2, '=');
             match (split.next(), split.next()) {
-                (Some(var), Some(val)) => env_deps.push((var.into(), val.into())),
-                _ => env_deps.push((env_dep.into(), "".into())),
+                (Some(var), Some(val)) => {
+                    env_deps.push((unescape_dep_env(var).into(), unescape_dep_env(val).into()));
+                }
+                _ => env_deps.push((unescape_dep_env(env_dep).into(), "".into())),
             }
         }
     }
     env_deps
+}
+
+/// Undo rustc's escaping of `\`, newlines and carriage returns
+/// in env-dep names and values.
+fn unescape_dep_env(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some(c) => out.push(c),
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// Derive the real compilation's dep-info from the dep-info-only prepass.
@@ -1787,15 +1798,14 @@ impl IntoArg for ArgCrateTypes {
 
 #[derive(Clone, Debug, PartialEq)]
 struct ArgLinkLibrary {
-    kind: String,
+    kind: Option<String>,
     name: String,
 }
 impl FromArg for ArgLinkLibrary {
     fn process(arg: OsString) -> ArgParseResult<Self> {
         let (kind, name) = match split_os_string_arg(arg, "=")? {
-            (kind, Some(name)) => (kind, name),
-            // If no kind is specified, the default is dylib.
-            (name, None) => ("dylib".to_owned(), name),
+            (kind, Some(name)) => (Some(kind), name),
+            (name, None) => (None, name),
         };
         Ok(Self { kind, name })
     }
@@ -1803,11 +1813,19 @@ impl FromArg for ArgLinkLibrary {
 impl IntoArg for ArgLinkLibrary {
     fn into_arg_os_string(self) -> OsString {
         let Self { kind, name } = self;
-        make_os_string!(kind, "=", name)
+        if let Some(kind) = kind {
+            make_os_string!(kind, "=", name)
+        } else {
+            make_os_string!(name)
+        }
     }
     fn into_arg_string(self, _transformer: PathTransformerFn<'_>) -> ArgToStringResult {
         let Self { kind, name } = self;
-        Ok(format!("{kind}={name}"))
+        if let Some(kind) = kind {
+            Ok(format!("{kind}={name}"))
+        } else {
+            Ok(name)
+        }
     }
 }
 
@@ -1862,10 +1880,15 @@ impl IntoArg for ArgCodegen {
     }
     fn into_arg_string(self, transformer: PathTransformerFn<'_>) -> ArgToStringResult {
         let Self { opt, value } = self;
-        Ok(if let Some(value) = value {
-            format!("{opt}={}", value.into_arg_string(transformer)?)
-        } else {
-            opt
+        Ok(match value {
+            Some(value) if opt == "profile-use" => {
+                format!(
+                    "{opt}={}",
+                    PathBuf::from(value).into_arg_string(transformer)?
+                )
+            }
+            Some(value) => format!("{opt}={value}"),
+            None => opt,
         })
     }
 }
@@ -2072,7 +2095,6 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     let mut static_link_paths: Vec<PathBuf> = vec![];
     let mut color_mode = ColorMode::Auto;
     let mut has_json = false;
-    let mut profile = None;
     let mut gcno = false;
     let mut target_json = None;
 
@@ -2109,8 +2131,17 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
                 return CompilerArguments::NotCompilation;
             }
             Some(LinkLibrary(ArgLinkLibrary { kind, name })) => {
+                // The kind may be inherited from a source #[link] attribute.
+                let (kind, modifiers) = kind.as_deref().map_or(("static", ""), |kind| {
+                    kind.split_once(':').unwrap_or((kind, ""))
+                });
                 if kind == "static" {
-                    static_lib_names.push(name.to_owned());
+                    let name = name
+                        .split_once(':')
+                        .map_or(name.as_str(), |(_, rename)| rename);
+                    let bundle = !modifiers.split(',').any(|m| m == "-bundle");
+                    let verbatim = modifiers.split(',').any(|m| m == "+verbatim");
+                    static_lib_names.push((name.to_owned(), bundle, verbatim));
                 }
             }
             Some(LinkPath(ArgLinkPath { kind, path })) => {
@@ -2151,7 +2182,6 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
                     ("linker" | "link-arg" | "link-args", _) => {
                         has_opaque_linker_args = true;
                     }
-                    ("profile-use", Some(v)) => profile = Some(v.clone()),
                     // Incremental compilation makes a mess of sccache's entire world
                     // view. It produces additional compiler outputs that we don't cache,
                     // and just letting rustc do its work in incremental mode is likely
@@ -2301,9 +2331,6 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
         None
     };
 
-    // Ignore profile is `link` is not in emit which means we are running `cargo check`.
-    let profile = if emit.contains("link") { profile } else { None };
-
     // Figure out the gcno filename, if producing gcno files with `-Zprofile`.
     let gcno = if gcno && emit.contains("link") {
         let mut gcno = crate_name.clone();
@@ -2319,22 +2346,26 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     // Locate all static libs specified on the commandline.
     let staticlibs = static_lib_names
         .into_iter()
-        .filter_map(|name| {
-            for path in &static_link_paths {
-                for f in &[
-                    format_args!("lib{name}.a"),
-                    format_args!("{name}.lib"),
-                    format_args!("{name}.a"),
-                ] {
-                    let lib_path = path.join(fmt::format(*f));
-                    if lib_path.exists() {
-                        return Some(lib_path);
-                    }
-                }
-            }
-            // rustc will just error if there's a missing static library, so don't worry about
-            // it too much.
-            None
+        .filter(|(_, bundle, _)| *bundle || crate_types.cdylib)
+        .flat_map(|(name, _, verbatim)| {
+            // Search target-dependent filename alternatives instead of
+            // assuming the compiler uses the host archive convention.
+            let names = if verbatim {
+                vec![name]
+            } else {
+                vec![
+                    format!("lib{name}.a"),
+                    format!("{name}.lib"),
+                    format!("{name}.a"),
+                ]
+            };
+            static_link_paths.iter().flat_map(move |path| {
+                names
+                    .iter()
+                    .map(|name| path.join(name))
+                    .filter(|path| path.is_file())
+                    .collect::<Vec<_>>()
+            })
         })
         .collect();
     // We'll figure out the source files and outputs later in
@@ -2351,7 +2382,6 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
         staticlibs,
         crate_name,
         dep_info: dep_info.map(std::convert::Into::into),
-        profile: profile.map(std::convert::Into::into),
         gcno: gcno.map(std::convert::Into::into),
         emit,
         metadata_only_output,
@@ -2371,6 +2401,24 @@ fn relocate_rust_operands(
 ) -> Option<()> {
     use super::canonical_paths::physical_operand;
 
+    let relocate_path = |path: &mut PathBuf| {
+        if path.is_absolute()
+            && !path
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+        {
+            return Some(());
+        }
+        let physical = physical_operand(cwd, path)?;
+        if !canonical.root_is_known(&physical) {
+            return None;
+        }
+        // Preserve the existing absolute spelling unless normalization is
+        // necessary. Relative operands must be mapped independently of cwd.
+        *path = physical;
+        Some(())
+    };
+
     for argument in arguments {
         let path = match argument {
             Argument::WithValue(
@@ -2381,6 +2429,19 @@ fn relocate_rust_operands(
                 | Target(ArgTarget::Path(path)),
                 _,
             ) => path,
+            Argument::WithValue(
+                _,
+                CodeGen(ArgCodegen {
+                    opt,
+                    value: Some(value),
+                }),
+                _,
+            ) if opt == "profile-use" => {
+                let mut path = PathBuf::from(&*value);
+                relocate_path(&mut path)?;
+                *value = path.into_os_string().into_string().ok()?;
+                continue;
+            }
             // Source spelling is observable through file!(). Keep a relative
             // source operand only if it still reaches the mapped input.
             Argument::Raw(input) => {
@@ -2407,20 +2468,7 @@ fn relocate_rust_operands(
             }
             _ => continue,
         };
-        if path.is_absolute()
-            && !path
-                .components()
-                .any(|c| c == std::path::Component::ParentDir)
-        {
-            continue;
-        }
-        let physical = physical_operand(cwd, path)?;
-        if !canonical.root_is_known(&physical) {
-            return None;
-        }
-        // Preserve the existing absolute spelling unless normalization is
-        // necessary. Relative operands must be mapped independently of cwd.
-        *path = physical;
+        relocate_path(path)?;
     }
     Some(())
 }
@@ -2910,6 +2958,13 @@ where
         // Hash inputs:
         // 1. A version
         m.update(CACHE_VERSION);
+        if effective_arguments.iter().any(|arg| {
+            matches!(arg.get_data(), Some(LinkLibrary(ArgLinkLibrary { kind, name }))
+                if kind.as_deref().is_none_or(|kind| kind.starts_with("static:"))
+                    || name.contains(':'))
+        }) {
+            m.delimiter(b"native-library-inputs-v1");
+        }
         if is_clippy_driver(&self.executable) {
             // Separate correctly executed Clippy from old rustc-substituted results.
             m.update(b"clippy-driver-correct-execution-v1");
@@ -3170,16 +3225,6 @@ where
                 )
             })
             .collect::<HashMap<_, _>>();
-        if let Some(profile) = &self.parsed_args.profile {
-            let p = artifact_dir.join(profile);
-            outputs.insert(
-                profile.to_string_lossy().into_owned(),
-                ArtifactDescriptor {
-                    path: p,
-                    optional: true,
-                },
-            );
-        }
         if let Some(gcno) = &self.parsed_args.gcno {
             let p = artifact_dir.join(gcno);
             outputs.insert(
@@ -5504,6 +5549,114 @@ LLVM version: 15.0.2
         );
     }
 
+    /// `-l` reaches rustc as it was given. In particular a library without a kind must not
+    /// become `dylib`: rustc picks the kind per target (e.g. static with `crt-static`).
+    #[test_case("bar" ; "without kind")]
+    #[test_case("static=bar" ; "static")]
+    #[test_case("static:-bundle=bar" ; "static with modifiers")]
+    #[test_case("dylib=bar" ; "dylib")]
+    fn test_parse_arguments_link_library_is_passed_unchanged(lib: &str) {
+        let h = parses!(
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "--emit",
+            "link",
+            "-l",
+            lib,
+            "foo.rs",
+            "--out-dir",
+            "out"
+        );
+        let arguments: Vec<OsString> = h
+            .arguments
+            .iter()
+            .flat_map(|arg| arg.iter_os_strings())
+            .collect();
+        let position = arguments.iter().position(|arg| arg == "-l").unwrap();
+        assert_eq!(arguments[position + 1], lib);
+    }
+
+    #[test_case("static", true ; "without modifiers")]
+    #[test_case("static:+bundle", true ; "with bundle")]
+    #[test_case("static:+whole-archive", true ; "with whole-archive")]
+    #[test_case("static:-bundle", false ; "without bundle")]
+    #[test_case("static:+whole-archive,-bundle", false ; "with whole-archive, without bundle")]
+    #[test_case("static:-bundle,+whole-archive", false ; "without bundle, with whole-archive")]
+    #[test_case("dylib", false ; "dylib, without modifiers")]
+    #[test_case("dylib:+as-needed", false ; "dylib, with as-needed")]
+    fn test_parse_arguments_static_lib_with_link_modifiers(kind: &str, hashed: bool) {
+        let f = TestFixture::new();
+        let lib = f.touch("libbar.a").unwrap();
+        let h = parses!(
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "--emit",
+            "link",
+            "-L",
+            format!("native={}", lib.parent().unwrap().display()),
+            "-l",
+            format!("{kind}=bar"),
+            "foo.rs",
+            "--out-dir",
+            "out"
+        );
+        let expected = if hashed { vec![lib] } else { vec![] };
+        assert_eq!(h.staticlibs, expected);
+    }
+
+    #[test_case("static=original:renamed", "librenamed.a"; "renamed")]
+    #[test_case("static:+verbatim=archive.custom", "archive.custom"; "verbatim")]
+    #[test_case("static:+verbatim=original:renamed.custom", "renamed.custom"; "renamed verbatim")]
+    #[test_case("renamed", "librenamed.a"; "implicit kind")]
+    fn test_parse_arguments_static_library_names(spec: &str, file: &str) {
+        let f = TestFixture::new();
+        let lib = f.touch(file).unwrap();
+        let h = parses!(
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "--emit",
+            "link",
+            "-L",
+            format!("native={}", lib.parent().unwrap().display()),
+            "-l",
+            spec,
+            "foo.rs",
+            "--out-dir",
+            "out"
+        );
+        assert_eq!(h.staticlibs, [lib]);
+    }
+
+    #[test]
+    fn test_static_library_without_bundle_for_component_link() {
+        let f = TestFixture::new();
+        let lib = f.touch("libbar.a").unwrap();
+        let h = parses!(
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "cdylib",
+            "--target",
+            "wasm32-wasip2",
+            "--emit",
+            "link",
+            "-L",
+            format!("native={}", lib.parent().unwrap().display()),
+            "-l",
+            "static:-bundle=bar",
+            "foo.rs",
+            "--out-dir",
+            "out"
+        );
+        assert_eq!(h.staticlibs, [lib]);
+    }
+
     #[test]
     fn test_parse_arguments_non_rlib_crate() {
         parses!(
@@ -5708,6 +5861,19 @@ bar.rs:
         assert_eq!(
             pathvec!["abc.rs", "bar.rs", "baz.rs"],
             parse_dep_info(deps, "")
+        );
+    }
+
+    #[test]
+    fn test_parse_env_dep_info_unescapes() {
+        let deps = "# env-dep:OUT_DIR=C:\\\\dir\\\\out\n# env-dep:X=a\\nb\\rc=d\n# env-dep:Y\n";
+        assert_eq!(
+            parse_env_dep_info(deps),
+            [
+                ("OUT_DIR".into(), r"C:\dir\out".into()),
+                ("X".into(), "a\nb\rc=d".into()),
+                ("Y".into(), "".into()),
+            ]
         );
     }
 
@@ -6164,7 +6330,6 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 metadata_only_output: None,
                 color_mode: ColorMode::Auto,
                 has_json: false,
-                profile: None,
                 gcno: None,
                 target_json: None,
             },
@@ -6268,7 +6433,6 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 metadata_only_output: None,
                 color_mode: ColorMode::Auto,
                 has_json: false,
-                profile: None,
                 gcno: None,
                 target_json: None,
             },
@@ -6337,6 +6501,86 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         let mut out = res.compilation.outputs().map(|k| k.key).collect::<Vec<_>>();
         out.sort();
         assert_eq!(out, vec!["foo.a", "foo.rlib", "foo.rmeta"]);
+    }
+
+    #[test]
+    fn test_profile_use_path_transforms_for_worker() {
+        let arg = ArgCodegen {
+            opt: "profile-use".into(),
+            value: Some("/profiles/merged.profdata".into()),
+        };
+        let transformed = arg
+            .into_arg_string(&mut |path| {
+                assert_eq!(path, Path::new("/profiles/merged.profdata"));
+                Some("/worker/profiles/merged.profdata".into())
+            })
+            .unwrap();
+        assert_eq!(transformed, "profile-use=/worker/profiles/merged.profdata");
+    }
+
+    #[test]
+    fn test_generate_hash_key_profile_use() {
+        // The profile is an input: rustc lists it in its dep-info, which is how its
+        // contents reach the key. As an output it was rewritten on every cache hit, and
+        // the new mtime made cargo rebuild every crate that had read it.
+        let f = TestFixture::new();
+        f.touch("foo.rs").unwrap();
+        let key_and_outputs = |profile: &[u8]| {
+            create_file(f.tempdir.path(), "merged.profdata", |mut f| {
+                f.write_all(profile)
+            })
+            .unwrap();
+            let parsed_args = parses!(
+                "--emit",
+                "link",
+                "foo.rs",
+                "--out-dir",
+                "out",
+                "--crate-name",
+                "foo",
+                "--crate-type",
+                "lib",
+                "-C",
+                "profile-use=merged.profdata"
+            );
+            let mut hasher = Box::new(RustHasher {
+                executable: "rustc".into(),
+                host: "x86-64-unknown-unknown-unknown".to_owned(),
+                version: TEST_RUSTC_VERSION.to_string(),
+                sysroot: f.tempdir.path().join("sysroot"),
+                compiler_shlibs_digests: vec![],
+                dist_archive: None,
+                #[cfg(feature = "dist-client")]
+                rlib_dep_reader: None,
+                native_profile: Some("test-native".into()),
+                parsed_args,
+            });
+            let creator = new_creator();
+            mock_dep_info(&creator, &["foo.rs", "merged.profdata"]);
+            mock_file_names(&creator, &["libfoo.rlib"]);
+            let runtime = single_threaded_runtime();
+            let pool = runtime.handle().clone();
+            let res = hasher
+                .generate_hash_key(GenerateHashKeyContext {
+                    creator: &creator,
+                    cwd: f.tempdir.path().to_owned(),
+                    env_vars: vec![],
+                    may_dist: false,
+                    pool: &pool,
+                    rewrite_includes_only: false,
+                    storage: Arc::new(MockStorage::new(None, false)),
+                    cache_control: CacheControl::Default,
+                })
+                .wait()
+                .unwrap();
+            let outputs = res.compilation.outputs().map(|k| k.key).collect::<Vec<_>>();
+            (res.key, outputs)
+        };
+
+        let (key, outputs) = key_and_outputs(b"one profile");
+        assert_eq!(outputs, ["libfoo.rlib"]);
+        assert_eq!(key, key_and_outputs(b"one profile").0);
+        assert_ne!(key, key_and_outputs(b"another profile").0);
     }
 
     fn hash_key<F>(
