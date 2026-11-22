@@ -277,12 +277,54 @@ The checksum and length identify the original archive. Component manifests
 select installed paths; the command emits the verified package and normalized
 installation tree IDs as JSON. The component trees reuse the original file
 blobs, and can be placed as layers in a root recipe. Repeating the command
-without `--archive` uses an already indexed original package. The operation
-requires exclusive access to the store, so provision it before starting its
-owner. Preseeded content is also available to ordinary mapped-tree upload
-negotiation. A release name alone does not attest an installed local sysroot;
+without `--archive` uses an already indexed original package. The offline command requires exclusive access to the store. Both offline and
+online provisioning use a verified-package lease through component projection.
+Preseeded content is also available to ordinary mapped-tree upload negotiation. A release name alone does not attest an installed local sysroot;
 regular compiler discovery still hashes its observed installed contents.
 
+
+### Live original-package provisioning
+
+Enable original-package imports explicitly in the scheduler configuration.
+Limits here are owned by the scheduler, not supplied by build clients:
+
+```toml
+[native_cache.package_import]
+max_archive_bytes = 1073741824
+max_entries = 100000
+max_expanded_bytes = 8589934592
+max_tar_bytes = 9663676416
+max_metadata_bytes = 67108864
+decoder_memory_bytes = 536870912
+decoder_timeout_secs = 600
+```
+
+With a client configuration specifying the native cache endpoint and
+token authentication, provision the same archive while the scheduler runs:
+
+```sh
+sccache-dist native-provision-rust --client-config /path/to/client.toml \
+  --archive rustc-nightly-x86_64-unknown-linux-gnu.tar.xz \
+  --sha256 CHECKSUM_FROM_RELEASE_MANIFEST --size COMPRESSED_BYTE_LENGTH \
+  --compression xz --manifest-output rustc.manifest
+```
+
+The CLI first performs an authenticated lookup by exact upstream identity.
+On a hit it needs no archive; on a miss it streams the original bytes.
+The owner verifies the compressed size and SHA-256 before decoding.
+A single import slot shares global upload admission. Compressed input,
+expanded file contents, decoded tar bytes (including padding), member count,
+and path metadata are bounded separately. A memory-limited subprocess
+decodes packages with a wall-clock deadline, streaming length-delimited
+entries and raw file bytes into the owner. No generated toolchain archive or
+complete decoded tar is persisted. The same content, component and package
+identities are used whether imported offline or live.
+
+The decoder subprocess is a resource-isolation boundary, not a separate
+security principal. Use the authenticated native listener and a trusted
+release checksum. The decoder deadline starts after compressed-input
+verification; transport timeouts are controlled by the client and the
+HTTP transport.
 
 ### Verified installation catalogs
 

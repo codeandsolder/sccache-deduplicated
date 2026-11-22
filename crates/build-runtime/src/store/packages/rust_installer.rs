@@ -114,16 +114,19 @@ fn component_tree(
 ) -> Result<TreeManifest> {
     let selections = selections(package, component)?;
     let mut paths = BTreeMap::new();
-    for path in package.manifest().entries.keys() {
-        if let Some(local) = path
-            .as_bytes()
-            .strip_prefix(component.as_bytes())
-            .and_then(|rest| rest.strip_prefix(b"/"))
-        {
-            let local = TreePath::new(local.to_vec())?;
-            if selected(&local, &selections) {
-                paths.insert(path, local);
-            }
+    let mut prefix = component.as_bytes().to_vec();
+    prefix.push(b'/');
+    let bounds = (
+        std::ops::Bound::Included(prefix.as_slice()),
+        std::ops::Bound::Unbounded,
+    );
+    for (path, _) in package.manifest().entries.range::<[u8], _>(bounds) {
+        let Some(local) = path.as_bytes().strip_prefix(prefix.as_slice()) else {
+            break;
+        };
+        let local = TreePath::new(local.to_vec())?;
+        if selected(&local, &selections) {
+            paths.insert(path, local);
         }
     }
     let mut manifest = TreeManifest {
@@ -199,12 +202,13 @@ impl NativeStore {
         for name in lines(&bytes) {
             let name = std::str::from_utf8(name)?;
             ensure!(!name.contains('/'), "invalid installer component name");
-            let component = joined(root, name.as_bytes())?;
-            let manifest = component_tree(package, &component, directories)?;
             ensure!(
-                manifests.insert(name.to_owned(), manifest).is_none(),
+                !manifests.contains_key(name),
                 "duplicate installer component"
             );
+            let component = joined(root, name.as_bytes())?;
+            let manifest = component_tree(package, &component, directories)?;
+            manifests.insert(name.to_owned(), manifest);
         }
         ensure!(
             !manifests.is_empty(),
@@ -226,7 +230,9 @@ impl NativeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PackageCompression, PackagePolicy, PackageSource, TreeRecipe, TreeTimestamp};
+    use crate::{
+        PackageCompression, PackageDecoder, PackagePolicy, PackageSource, TreeRecipe, TreeTimestamp,
+    };
     use sha2::{Digest, Sha256};
 
     fn fixture(manifest: &[u8]) -> Result<Vec<u8>> {
@@ -280,8 +286,10 @@ mod tests {
                 max_entries: 100,
                 max_expanded_bytes: 100_000,
                 max_tar_bytes: 1_000_000,
+                max_metadata_bytes: 1_000_000,
             },
             bytes,
+            PackageDecoder::InProcess,
         )?;
         Ok((id, directory))
     }

@@ -11,7 +11,8 @@ use bincode::Options;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::build_runtime::{
-    BlobRef, ContentId, ExecutionSpec, ResultManifest, TreeId, TreeManifest,
+    BlobRef, ContentId, ExecutionSpec, InstallationManifest, PackageSource, ResultManifest, TreeId,
+    TreeManifest,
     wire::{
         BeginResult, NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply, Ticket,
         TreeOffer, TreeRead, UploadHeader, WorkerAllocation,
@@ -135,6 +136,40 @@ impl NativeCacheClient {
             .send()?
             .error_for_status()?;
         decode_response(response, self.metadata_limit)
+    }
+
+    /// Resolve portable installation metadata from an already verified
+    /// original package. No archive or installed files are uploaded.
+    /// # Errors
+    /// Returns an error for unavailable provisioning or invalid metadata.
+    pub fn lookup_rust_package(
+        &self,
+        source: PackageSource,
+    ) -> Result<Option<InstallationManifest>> {
+        let manifest: Option<InstallationManifest> = self.control("package_lookup", &source)?;
+        if let Some(manifest) = &manifest {
+            validate_installation_manifest(source, manifest)?;
+        }
+        Ok(manifest)
+    }
+
+    /// Upload the exact original archive, allowing the store owner to decode
+    /// and index the package without a generated toolchain archive.
+    /// # Errors
+    /// Returns an error on checksum, size, decoder or transport failure.
+    pub fn import_rust_package(
+        &self,
+        source: PackageSource,
+        archive: File,
+    ) -> Result<InstallationManifest> {
+        ensure!(
+            archive.metadata()?.len() == source.size,
+            "original package file length mismatch"
+        );
+        let response = self.send_stream("package_import", &source, source.size, archive)?;
+        let manifest: InstallationManifest = decode_response(response, self.metadata_limit)?;
+        validate_installation_manifest(source, &manifest)?;
+        Ok(manifest)
     }
 
     /// Admit a complete native action.
@@ -329,19 +364,29 @@ impl NativeCacheClient {
         blob: BlobRef,
         reader: impl Read + Send + 'static,
     ) -> Result<()> {
-        let header = codec().serialize(&UploadHeader { ticket, blob })?;
-        let length = blob
-            .size
+        self.send_stream("upload", &UploadHeader { ticket, blob }, blob.size, reader)?;
+        Ok(())
+    }
+
+    fn send_stream(
+        &self,
+        operation: &str,
+        metadata: &impl Serialize,
+        size: u64,
+        reader: impl Read + Send + 'static,
+    ) -> Result<reqwest::blocking::Response> {
+        let header = codec()
+            .with_limit(self.metadata_limit)
+            .serialize(metadata)?;
+        let length = size
             .checked_add(u64::try_from(header.len())?)
             .context("native upload length overflow")?;
-        // The body content length is explicit. Callers provide exact input
-        // streams; the scheduler validates the transmitted bytes independently.
         let body = reqwest::blocking::Body::sized(Cursor::new(header).chain(reader), length);
-        self.request("upload")?
+        Ok(self
+            .request(operation)?
             .body(body)
             .send()?
-            .error_for_status()?;
-        Ok(())
+            .error_for_status()?)
     }
 
     /// Commit the negotiated result.
@@ -474,6 +519,17 @@ fn decode_response<T: DeserializeOwned>(
         "native response exceeds configured limit"
     );
     Ok(codec().with_limit(limit).deserialize(&bytes)?)
+}
+
+fn validate_installation_manifest(
+    source: PackageSource,
+    manifest: &InstallationManifest,
+) -> Result<()> {
+    ensure!(
+        manifest.source_sha256 == source.sha256,
+        "incorrect original package provenance"
+    );
+    manifest.validate()
 }
 
 pub(super) fn codec() -> impl Options {

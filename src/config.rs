@@ -2075,6 +2075,7 @@ pub mod scheduler {
         pub max_total_uploads: usize,
         pub http_threads: usize,
         pub max_metadata_bytes: usize,
+        pub package_import: Option<crate::build_runtime::PackageImportLimits>,
     }
 
     impl NativeCacheConfig {
@@ -2103,6 +2104,9 @@ pub mod scheduler {
             };
             limits.validate()?;
             self.space.validate()?;
+            if let Some(package_import) = self.package_import {
+                package_import.validate()?;
+            }
             Ok(limits)
         }
     }

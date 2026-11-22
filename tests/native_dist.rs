@@ -177,6 +177,15 @@ impl Fleet {
                     max_total_uploads: 4,
                     http_threads: 8,
                     max_metadata_bytes: 64 * 1024 * 1024,
+                    package_import: Some(sccache::build_runtime::PackageImportLimits {
+                        max_archive_bytes: 1024 * 1024 * 1024,
+                        max_entries: 100_000,
+                        max_expanded_bytes: 4 * 1024 * 1024 * 1024,
+                        max_tar_bytes: 5 * 1024 * 1024 * 1024,
+                        max_metadata_bytes: 64 * 1024 * 1024,
+                        decoder_memory_bytes: 512 * 1024 * 1024,
+                        decoder_timeout_secs: 120,
+                    }),
                 }),
             },
         )?;
@@ -260,6 +269,154 @@ impl Fleet {
             NativeStore::open(&worker_directory)?.stats()?,
         ))
     }
+}
+
+fn rust_installer_fixture() -> Result<Vec<u8>> {
+    let mut archive = tar::Builder::new(Vec::new());
+    for (path, bytes) in [
+        ("release/rust-installer-version", &b"3\n"[..]),
+        ("release/components", &b"compiler\n"[..]),
+        ("release/compiler/manifest.in", &b"file:bin/rustc\n"[..]),
+        (
+            "release/compiler/bin/rustc",
+            &b"original compiler bytes"[..],
+        ),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o755);
+        header.set_size(u64::try_from(bytes.len())?);
+        header.set_cksum();
+        archive.append_data(&mut header, path, bytes)?;
+    }
+    Ok(archive.into_inner()?)
+}
+
+#[test]
+#[ignore = "requires actual scheduler and worker subprocesses"]
+fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
+    use sccache::build_runtime::{PackageCompression, PackageSource};
+    use sha2::{Digest, Sha256};
+
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let fleet = Fleet::start(root)?;
+    let bytes = rust_installer_fixture()?;
+    let archive = root.join("package.tar");
+    fs::write(&archive, &bytes)?;
+    let source = PackageSource {
+        sha256: Sha256::digest(&bytes).into(),
+        size: u64::try_from(bytes.len())?,
+        compression: PackageCompression::Tar,
+    };
+    let client = NativeCacheClient::new(
+        fleet.cache_url.clone(),
+        CLIENT_TOKEN.into(),
+        Duration::from_secs(30),
+        1024 * 1024,
+    )?;
+    assert!(client.lookup_rust_package(source)?.is_none());
+    let mut wrong = source;
+    wrong.sha256[0] ^= 1;
+    assert!(
+        client
+            .import_rust_package(wrong, File::open(&archive)?)
+            .is_err()
+    );
+    assert!(client.lookup_rust_package(wrong)?.is_none());
+    let worker = NativeCacheClient::new(
+        fleet.cache_url.clone(),
+        WORKER_TOKEN.into(),
+        Duration::from_secs(5),
+        1024 * 1024,
+    )?
+    .for_worker(sccache::dist::JobId(123));
+    assert!(worker.lookup_rust_package(source).is_err());
+    let config = sccache::config::FileConfig {
+        dist: sccache::config::DistConfig {
+            auth: DistAuth::Token {
+                token: CLIENT_TOKEN.into(),
+            },
+            native: Some(NativeClientConfig {
+                endpoint: HTTPUrl::from_url(fleet.cache_url.clone()),
+                platform_contract: PLATFORM.into(),
+                request_timeout_secs: 30,
+                build_timeout_secs: 30,
+                renewal_interval_secs: 1,
+                max_metadata_bytes: 1024 * 1024,
+                max_result_bytes: 1024 * 1024,
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let config_path = root.join("provision.json");
+    fs::write(&config_path, serde_json::to_vec(&config)?)?;
+    let manifest_path = root.join("package.manifest");
+    let mut sha256 = String::with_capacity(64);
+    for byte in source.sha256 {
+        use std::fmt::Write as _;
+        write!(&mut sha256, "{byte:02x}")?;
+    }
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sccache-dist"));
+        command
+            .args(["native-provision-rust", "--client-config"])
+            .arg(&config_path)
+            .args([
+                "--sha256",
+                &sha256,
+                "--size",
+                &source.size.to_string(),
+                "--compression",
+                "tar",
+                "--manifest-output",
+            ])
+            .arg(&manifest_path);
+        command
+    };
+    let cold = command().arg("--archive").arg(&archive).output()?;
+    ensure!(
+        cold.status.success(),
+        "cold provisioning failed: {}",
+        String::from_utf8_lossy(&cold.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&cold.stdout)?;
+    assert_eq!(report["reused_original_package"], false);
+    let installed = InstallationManifest::read(File::open(&manifest_path)?)?;
+    assert_eq!(installed.source_sha256, source.sha256);
+    assert_eq!(installed.files()?.len(), 1);
+    let warm = command().output()?;
+    ensure!(
+        warm.status.success(),
+        "warm provisioning failed: {}",
+        String::from_utf8_lossy(&warm.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&warm.stdout)?;
+    assert_eq!(report["reused_original_package"], true);
+    let resolved = client
+        .lookup_rust_package(source)?
+        .ok_or_else(|| anyhow::anyhow!("verified package lost"))?;
+    assert_eq!(resolved.components, installed.components);
+    assert_eq!(resolved.package, installed.package);
+
+    // A different tree with one of the package payloads needs no upload.
+    let mut tree = installed.components["compiler"].clone();
+    let path = TreePath::new(b"bin/rustc".to_vec())?;
+    let entry = tree
+        .entries
+        .remove(&path)
+        .ok_or_else(|| anyhow::anyhow!("installed compiler missing"))?;
+    tree.entries
+        .insert(TreePath::new(b"bin/renamed".to_vec())?, entry);
+    let offer = client.offer_tree(&tree)?;
+    assert!(offer.missing.is_empty());
+    assert_eq!(client.commit_tree(offer.ticket)?, tree.id()?);
+    client.close(offer.ticket)?;
+    assert_eq!(fleet.status()?.num_servers, 1);
+    let (scheduler, _) = fleet.finish()?;
+    assert_eq!(scheduler.blobs, 4);
+    assert_eq!(scheduler.trees, 3);
+    Ok(())
 }
 
 #[test]

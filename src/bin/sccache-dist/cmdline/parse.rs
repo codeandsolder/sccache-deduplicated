@@ -156,17 +156,23 @@ fn get_clap_command() -> ClapCommand {
                 ),
         )
         .subcommand(
-            ClapCommand::new("native-import-rust")
-                .about("Verify an original Rust installer archive and index its component trees")
-                .arg(flag_infer_long("store").value_parser(clap::value_parser!(PathBuf)).required(true))
-                .arg(flag_infer_long("archive").value_parser(clap::value_parser!(PathBuf)))
-                .arg(flag_infer_long("sha256").required(true))
-                .arg(flag_infer_long("size").value_parser(clap::value_parser!(u64)).required(true))
+            ClapCommand::new("native-decode-package").hide(true)
                 .arg(flag_infer_long("compression").value_parser(["xz", "gzip", "tar"]).required(true))
+                .arg(flag_infer_long("max-tar-bytes").value_parser(clap::value_parser!(u64)).required(true))
+                .arg(flag_infer_long("memory-bytes").value_parser(clap::value_parser!(u64)).required(true))
+        )
+        .subcommand(
+            package_args(ClapCommand::new("native-import-rust"))
+                .about("Verify an original Rust installer archive in an exclusive offline store")
+                .arg(flag_infer_long("store").value_parser(clap::value_parser!(PathBuf)).required(true))
                 .arg(flag_infer_long("max-entries").value_parser(clap::value_parser!(usize)).default_value("100000"))
                 .arg(flag_infer_long("max-expanded-bytes").value_parser(clap::value_parser!(u64)).default_value("8589934592"))
                 .arg(flag_infer_long("max-tar-bytes").value_parser(clap::value_parser!(u64)).default_value("9663676416"))
-                .arg(flag_infer_long("manifest-output").value_parser(clap::value_parser!(PathBuf)))
+        )
+        .subcommand(
+            package_args(ClapCommand::new("native-provision-rust"))
+                .about("Provision or resolve an original Rust installer through a live scheduler")
+                .arg(flag_infer_long("client-config").value_parser(clap::value_parser!(PathBuf)).required(true))
         )
         .subcommand(
             ClapCommand::new("native-audit")
@@ -255,23 +261,26 @@ pub fn try_parse_from(
             }
             _ => unreachable!("Subcommand is enforced by clap"),
         }),
+        Some(("native-decode-package", matches)) => Command::NativeDecodePackage {
+            compression: package_compression(matches)?,
+            max_tar_bytes: *matches
+                .get_one::<u64>("max-tar-bytes")
+                .context("missing decoded tar limit")?,
+            memory_bytes: *matches
+                .get_one::<u64>("memory-bytes")
+                .context("missing memory limit")?,
+        },
+        Some(("native-provision-rust", matches)) => Command::NativeProvisionRust {
+            client_config: matches
+                .get_one::<PathBuf>("client-config")
+                .context("missing client configuration")?
+                .clone(),
+            archive: matches.get_one::<PathBuf>("archive").cloned(),
+            source: package_source(matches)?,
+            manifest_output: matches.get_one::<PathBuf>("manifest-output").cloned(),
+        },
         Some(("native-import-rust", matches)) => {
-            use sccache::build_runtime::{PackageCompression, PackageSource};
-            let compression = match matches.get_one::<String>("compression").map(String::as_str) {
-                Some("xz") => PackageCompression::Xz,
-                Some("gzip") => PackageCompression::Gzip,
-                Some("tar") => PackageCompression::Tar,
-                _ => bail!("invalid package compression"),
-            };
-            let source = PackageSource::from_sha256_hex(
-                matches
-                    .get_one::<String>("sha256")
-                    .context("missing SHA-256")?,
-                *matches
-                    .get_one::<u64>("size")
-                    .context("missing package size")?,
-                compression,
-            )?;
+            let source = package_source(matches)?;
             Command::NativeImportRust {
                 store: matches
                     .get_one::<PathBuf>("store")
@@ -462,4 +471,49 @@ mod tests {
             );
         }
     }
+}
+
+fn package_compression(
+    matches: &clap::ArgMatches,
+) -> anyhow::Result<sccache::build_runtime::PackageCompression> {
+    use sccache::build_runtime::PackageCompression;
+    Ok(
+        match matches.get_one::<String>("compression").map(String::as_str) {
+            Some("xz") => PackageCompression::Xz,
+            Some("gzip") => PackageCompression::Gzip,
+            Some("tar") => PackageCompression::Tar,
+            _ => anyhow::bail!("invalid package compression"),
+        },
+    )
+}
+
+fn package_args(command: ClapCommand) -> ClapCommand {
+    command
+        .arg(flag_infer_long("archive").value_parser(clap::value_parser!(PathBuf)))
+        .arg(flag_infer_long("sha256").required(true))
+        .arg(
+            flag_infer_long("size")
+                .value_parser(clap::value_parser!(u64))
+                .required(true),
+        )
+        .arg(
+            flag_infer_long("compression")
+                .value_parser(["xz", "gzip", "tar"])
+                .required(true),
+        )
+        .arg(flag_infer_long("manifest-output").value_parser(clap::value_parser!(PathBuf)))
+}
+
+fn package_source(
+    matches: &clap::ArgMatches,
+) -> anyhow::Result<sccache::build_runtime::PackageSource> {
+    sccache::build_runtime::PackageSource::from_sha256_hex(
+        matches
+            .get_one::<String>("sha256")
+            .context("missing SHA-256")?,
+        *matches
+            .get_one::<u64>("size")
+            .context("missing package size")?,
+        package_compression(matches)?,
+    )
 }

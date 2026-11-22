@@ -20,6 +20,12 @@ pub struct TreeId(pub [u8; 32]);
 #[serde(transparent)]
 pub struct TreePath(Vec<u8>);
 
+impl std::borrow::Borrow<[u8]> for TreePath {
+    fn borrow(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
 impl TreePath {
     /// Create a relative path.
     ///

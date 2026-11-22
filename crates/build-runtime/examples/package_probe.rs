@@ -6,8 +6,8 @@ mod unix {
 
     use anyhow::{Context, Result, bail, ensure};
     use sccache_build::{
-        NativeStore, PackageCompression, PackagePolicy, PackageSource, TreeLayer, TreeMetadata,
-        TreePath, TreeRecipe, TreeTimestamp,
+        NativeStore, PackageCompression, PackageDecoder, PackagePolicy, PackageSource, TreeLayer,
+        TreeMetadata, TreePath, TreeRecipe, TreeTimestamp,
     };
 
     pub fn run() -> Result<()> {
@@ -39,13 +39,15 @@ mod unix {
             max_entries: 100_000,
             max_expanded_bytes: 8 * 1024 * 1024 * 1024,
             max_tar_bytes: 9 * 1024 * 1024 * 1024,
+            max_metadata_bytes: 64 * 1024 * 1024,
         };
         let scratch = tempfile::Builder::new()
             .prefix("package-probe-")
             .tempdir_in(parent)?;
         let store = NativeStore::open(&scratch.path().join("store"))?;
         let start = Instant::now();
-        let imported_package = store.import_package(source, policy, input)?;
+        let imported_package =
+            store.import_package(source, policy, input, PackageDecoder::InProcess)?;
         let id = imported_package.tree().id();
         let imported = start.elapsed();
         let stats = store.stats()?;
