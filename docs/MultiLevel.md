@@ -59,6 +59,15 @@ This creates a cache hierarchy where frequently accessed artifacts stay in fast 
 7. Next request: Check L0 → Hit! (10ms)
 ```
 
+### Lookup failures
+
+Each tier records hits, confirmed misses, and read errors separately. A read
+error does not stop the lookup: a valid hit from a subsequent tier remains a
+hit. If no tier supplies an artifact and any read failed, the aggregate lookup
+returns the error and compilation proceeds through the normal cache-error
+fallback. The `sccache_cache_level_operations_total` metric exposes the
+`read_error` operation; tier hit rates exclude read failures.
+
 ### Write Path
 
 All write operations go to **all configured levels** in parallel:

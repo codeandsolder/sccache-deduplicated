@@ -24,6 +24,8 @@ mod clang;
 mod core;
 mod cudafe;
 mod diab;
+#[cfg(target_os = "linux")]
+pub mod dynamic_dependencies;
 mod gcc;
 mod msvc;
 mod nvcc;
@@ -31,6 +33,9 @@ mod nvhpc;
 mod preprocessor_cache;
 mod ptxas;
 mod rust;
+mod rust_dlltool;
+#[cfg(target_os = "linux")]
+pub mod rust_link;
 mod rust_response;
 mod tasking_vx;
 #[macro_use]
@@ -39,6 +44,3 @@ mod counted_array;
 pub use crate::compiler::c::CCompilerKind;
 pub use crate::compiler::core::*;
 pub use crate::compiler::preprocessor_cache::PreprocessorCacheEntry;
-
-#[cfg(target_os = "linux")]
-pub use rust::relocate_raw_rust_operands;

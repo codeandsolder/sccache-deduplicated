@@ -25,7 +25,6 @@ use std::{
     hash::Hash,
     io::Write,
     path::{Path, PathBuf},
-    sync::LazyLock,
     time::SystemTime,
 };
 
@@ -62,11 +61,15 @@ pub struct PreprocessorCacheEntry {
 }
 
 impl PreprocessorCacheEntry {
+    #[must_use = "the new entry holds preprocessor results"]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Tries to deserialize a preprocessor cache entry from `contents`
+    /// Tries to deserialize a preprocessor cache entry from `contents`.
+    ///
+    /// # Errors
+    /// Returns an error for an unknown format version or invalid encoded entry.
     pub fn read(contents: &[u8]) -> Result<Self, Error> {
         if contents.is_empty() {
             Ok(Self {
@@ -80,7 +83,10 @@ impl PreprocessorCacheEntry {
         }
     }
 
-    /// Serialize the preprocessor cache entry to `buf`
+    /// Serialize the preprocessor cache entry to `buf`.
+    ///
+    /// # Errors
+    /// Returns an error if writing or serializing the entry fails.
     pub fn serialize_to(&self, mut buf: impl Write) -> Result<(), Error> {
         // Add the starting byte for version check since `bincode` doesn't
         // support it.
@@ -176,6 +182,7 @@ impl PreprocessorCacheEntry {
 
     /// Returns the digest of the first result whose expected included files
     /// are already on disk and have not changed.
+    #[must_use = "the returned digest identifies a validated compilation result"]
     pub fn lookup_result_digest(&self, config: PreprocessorCacheModeConfig) -> Option<String> {
         self.results.iter().rev().find_map(|(digest, includes)| {
             Self::result_matches(includes, config).then(|| digest.clone())
@@ -376,10 +383,12 @@ fn file_digest(
 
 #[cfg(unix)]
 mod digest_cache {
-    use super::*;
+    use super::{
+        Digest, Metadata, MetadataCtimeExt, Path, PathBuf, SystemTime, TimeMacroFinder, Timestamp,
+    };
     use crate::lru_disk_cache::lru_cache::LruCache;
     use std::os::unix::fs::MetadataExt;
-    use std::sync::Mutex;
+    use std::sync::{LazyLock, Mutex};
     use std::time::Duration;
 
     /// Digests of the files hashed for the preprocessor cache, so that a
@@ -407,7 +416,7 @@ mod digest_cache {
 
     impl FileStat {
         fn new(meta: &Metadata) -> Self {
-            FileStat {
+            Self {
                 len: meta.len(),
                 mtime: meta.modified().ok().map(Into::into),
                 ctime: meta.ctime_or_creation().ok(),
@@ -454,14 +463,19 @@ mod digest_cache {
             return None;
         }
         let stat = FileStat::new(meta);
-        let mut digests = FILE_DIGESTS.lock().unwrap_or_else(|e| e.into_inner());
-        let cached = digests.get(path).filter(|cached| cached.stat == stat)?;
-        let finder = TimeMacroFinder::with_found(
-            cached.found_date,
-            cached.found_time,
-            cached.found_timestamp,
-        );
-        Some((cached.digest.clone(), finder))
+        let (digest, date, time, timestamp) = {
+            let mut digests = FILE_DIGESTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cached = digests.get(path).filter(|cached| cached.stat == stat)?;
+            (
+                cached.digest.clone(),
+                cached.found_date,
+                cached.found_time,
+                cached.found_timestamp,
+            )
+        };
+        Some((digest, TimeMacroFinder::with_found(date, time, timestamp)))
     }
 
     /// [`file_digest`], with `now` deciding whether the file is old enough to be
@@ -482,7 +496,9 @@ mod digest_cache {
         let (digest, finder) = Digest::reader_sync_time_macros(&file)?;
         // Not remembered if it changed while being read.
         if metadata.is_file() && stat.is_settled(now) && FileStat::new(&file.metadata()?) == stat {
-            let mut digests = FILE_DIGESTS.lock().unwrap_or_else(|e| e.into_inner());
+            let mut digests = FILE_DIGESTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             digests.insert(
                 path.to_owned(),
                 CachedFileDigest {
@@ -556,7 +572,7 @@ impl<'de> Deserialize<'de> for Bytes {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct BytesVisitor;
 
-        impl<'de> serde::de::Visitor<'de> for BytesVisitor {
+        impl serde::de::Visitor<'_> for BytesVisitor {
             type Value = Bytes;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

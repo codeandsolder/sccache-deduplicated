@@ -7,6 +7,8 @@ on:
       - Cargo.lock
       - src/dist/**
       - src/compiler/rust.rs
+      - src/compiler/rust_dlltool.rs
+      - src/compiler/dynamic_dependencies.rs
       - src/compiler/compiler.rs
       - src/compiler/canonical_paths.rs
       - tests/dist.rs
@@ -20,6 +22,8 @@ on:
       - Cargo.lock
       - src/dist/**
       - src/compiler/rust.rs
+      - src/compiler/rust_dlltool.rs
+      - src/compiler/dynamic_dependencies.rs
       - src/compiler/compiler.rs
       - src/compiler/canonical_paths.rs
       - tests/dist.rs
@@ -44,6 +48,7 @@ jobs:
         with:
           toolchain: "nightly-2026-11-22"
           components: clippy
+          targets: x86_64-pc-windows-gnu
       - name: Isolate build cache from regression test services
         run: echo "SCCACHE_SERVER_UDS=$RUNNER_TEMP/dist-regression-build.sock" >> "$GITHUB_ENV"
       - name: Setup mandatory sccache
@@ -53,7 +58,7 @@ jobs:
       - name: Enable mount namespace regression
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bubblewrap
+          sudo apt-get install -y --no-install-recommends bubblewrap binutils-mingw-w64-x86-64
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           bwrap --ro-bind / / -- /usr/bin/true
       - name: Verify distributed JWT signing and Rust metadata and environment round trips

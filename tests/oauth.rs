@@ -62,6 +62,7 @@ fn config_with_dist_auth(
         basedirs: vec![],
         client_side_mode: false,
         compiler_aliases: Default::default(),
+        compile_limits: Default::default(),
     }
 }
 
