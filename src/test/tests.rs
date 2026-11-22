@@ -91,6 +91,7 @@ where
             dist_client,
             storage,
             Default::default(),
+            Default::default(),
         )
         .unwrap();
         let mut srv: SccacheServer<_, Arc<Mutex<MockCommandCreator>>> = srv;

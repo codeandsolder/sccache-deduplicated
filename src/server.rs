@@ -579,6 +579,7 @@ fn bind_server(
     dist_client: DistClientContainer,
     storage: Arc<dyn Storage>,
     compiler_aliases: CompilerAliases,
+    compile_limits: CompileLimits,
 ) -> io::Result<(crate::net::SocketAddr, StartupRunner)> {
     match addr {
         crate::net::SocketAddr::Net(addr) => {
@@ -591,6 +592,7 @@ fn bind_server(
                 dist_client,
                 storage,
                 compiler_aliases,
+                compile_limits,
             );
             let bound_addr = server.try_local_addr()?.ok_or_else(|| {
                 io::Error::new(
@@ -615,6 +617,7 @@ fn bind_server(
                 dist_client,
                 storage,
                 compiler_aliases,
+                compile_limits,
             );
             let bound_addr = server.try_local_addr()?.ok_or_else(|| {
                 io::Error::new(
@@ -641,6 +644,7 @@ fn bind_server(
                 dist_client,
                 storage,
                 compiler_aliases,
+                compile_limits,
             );
             let bound_addr = server
                 .try_local_addr()?
@@ -703,6 +707,7 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
         dist_client,
         storage,
         config.compiler_aliases.clone(),
+        config.compile_limits,
     ) {
         Ok((bound_addr, run)) => {
             info!("server started, listening on {bound_addr}");
@@ -746,6 +751,7 @@ impl<C: CommandCreatorSync> SccacheServer<tokio::net::TcpListener, C> {
         dist_client: DistClientContainer,
         storage: Arc<dyn Storage>,
         compiler_aliases: CompilerAliases,
+        compile_limits: CompileLimits,
     ) -> Result<Self> {
         let addr = crate::net::SocketAddr::with_port(port);
         let net_addr = addr
@@ -760,6 +766,7 @@ impl<C: CommandCreatorSync> SccacheServer<tokio::net::TcpListener, C> {
             dist_client,
             storage,
             compiler_aliases,
+            compile_limits,
         ))
     }
 }
@@ -772,13 +779,14 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         dist_client: DistClientContainer,
         storage: Arc<dyn Storage>,
         compiler_aliases: CompilerAliases,
+        compile_limits: CompileLimits,
     ) -> Self {
         // Prepare the service which we'll use to service all incoming TCP
         // connections.
         let (tx, rx) = mpsc::channel(1);
         let (wait, info) = WaitUntilZero::new();
         let pool = runtime.handle().clone();
-        let service = SccacheService::new(
+        let mut service = SccacheService::new(
             dist_client,
             storage,
             client,
@@ -788,6 +796,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
             compiler_aliases,
         );
 
+        service.compile_limits = compile_limits;
         Self {
             runtime,
             listener,
@@ -984,6 +993,9 @@ pub struct SccacheService<C>
 where
     C: Send,
 {
+    activities: Arc<activity::Registry>,
+    compile_limits: CompileLimits,
+
     /// Server statistics.
     stats: Arc<Mutex<ServerStats>>,
 
@@ -1045,6 +1057,8 @@ pub enum ServerMessage {
     Shutdown,
 }
 
+pub mod activity;
+use activity::{CompileLimits, Phase};
 mod namespace;
 use namespace::TransferSession;
 
@@ -1121,6 +1135,9 @@ where
                     result.map_err(|error| format!("{error:#}")),
                 )))
             }
+            Request::ActiveCompiles => Ok(Message::WithoutBody(Response::ActiveCompiles(
+                self.activities.snapshots(),
+            ))),
             Request::RecordStats(delta) => {
                 self.merge_stats(*delta).await;
                 Ok(Message::WithoutBody(Response::RecordStats))
@@ -1145,6 +1162,8 @@ where
         compiler_aliases: CompilerAliases,
     ) -> Self {
         Self {
+            activities: Arc::default(),
+            compile_limits: CompileLimits::default(),
             stats: Arc::default(),
             dist_client: Arc::new(dist_client),
             storage,
@@ -1166,6 +1185,8 @@ where
         let client = Client::new_num(1);
         let dist_client = DistClientContainer::new_disabled();
         Self {
+            activities: Arc::default(),
+            compile_limits: CompileLimits::default(),
             stats: Arc::default(),
             dist_client: Arc::new(dist_client),
             storage,
@@ -1191,6 +1212,8 @@ where
         let (_, info) = WaitUntilZero::new();
         let client = Client::new_num(1);
         Self {
+            activities: Arc::default(),
+            compile_limits: CompileLimits::default(),
             stats: Arc::default(),
             dist_client: Arc::new(DistClientContainer::new_with_state(DistClientState::Some(
                 Box::new(DistClientConfig {
@@ -1258,18 +1281,16 @@ where
                 Arc::clone(&me.namespace_reservations),
             );
             while let Some(req) = reqs_rx.recv().await {
-                match me.dispatch(req, &mut transfers).await? {
-                    Message::WithoutBody(message) => {
-                        sink.send(Frame::Message { message }).await?;
-                    }
-                    Message::WithBody(message, body) => {
-                        sink.send(Frame::Message { message }).await?;
-                        sink.send(Frame::Body {
-                            chunk: Some(util::spawn(body).await??),
-                        })
+                if let Message::WithoutBody(Request::Compile(compile)) = &req {
+                    let registration = me.activities.begin(compile);
+                    me.serve_compile(&registration.activity, req, &mut transfers, &mut sink)
                         .await?;
-                        sink.send(Frame::Body { chunk: None }).await?;
-                    }
+                } else {
+                    let Message::WithoutBody(message) = me.dispatch(req, &mut transfers).await?
+                    else {
+                        bail!("unexpected compiler body outside a compile request");
+                    };
+                    sink.send(Frame::Message { message }).await?;
                 }
             }
 
@@ -1289,6 +1310,86 @@ where
             biased;
             result = &mut handler => result.context("response handler task failed")?,
             result = reader => result,
+        }
+    }
+
+    async fn serve_compile<S>(
+        &self,
+        activity: &Arc<activity::Activity>,
+        req: SccacheRequest,
+        transfers: &mut TransferSession,
+        sink: &mut S,
+    ) -> Result<()>
+    where
+        S: Sink<Frame<Response, Response>, Error = Error> + Unpin,
+    {
+        let result = async {
+            match self
+                .monitor_compile(
+                    activity,
+                    sink,
+                    activity::scope(activity, self.dispatch(req, transfers)),
+                )
+                .await?
+            {
+                Message::WithoutBody(message) => {
+                    activity.phase(Phase::SendReply);
+                    sink.send(Frame::Message { message }).await?;
+                }
+                Message::WithBody(message, body) => {
+                    sink.send(Frame::Message { message }).await?;
+                    let body = activity::scope(activity, async {
+                        util::spawn(activity::inherit(body)).await?
+                    });
+                    let message = self.monitor_compile(activity, sink, body).await?;
+                    activity.phase(Phase::SendReply);
+                    sink.send(Frame::Body { chunk: message }).await?;
+                }
+            }
+            Ok::<_, Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            // The monitored future has been dropped. Some blocking I/O
+            // may still finish, so the outcome is explicitly ambiguous.
+            let _ = sink
+                .send(Frame::Message {
+                    message: Response::CompileAborted(format!("{error:#}")),
+                })
+                .await;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn monitor_compile<F, R, S>(
+        &self,
+        activity: &Arc<activity::Activity>,
+        sink: &mut S,
+        work: F,
+    ) -> Result<R>
+    where
+        F: Future<Output = Result<R>> + Send,
+        S: Sink<Frame<Response, Response>, Error = Error> + Unpin,
+    {
+        let mut ticker = time::interval_at(
+            time::Instant::now() + activity::HEARTBEAT_INTERVAL,
+            activity::HEARTBEAT_INTERVAL,
+        );
+        ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        tokio::pin!(work);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut work => return result,
+                _ = ticker.tick() => {
+                    let snapshot = activity.snapshot();
+                    if Duration::from_millis(snapshot.phase_age_ms) >= self.compile_limits.budget(snapshot.phase) {
+                        bail!("compile request {} exceeded its {:?} phase deadline after {} ms; outcome unknown", snapshot.id, snapshot.phase, snapshot.phase_age_ms);
+                    }
+                    sink.send(Frame::Message { message: Response::CompileProgress(snapshot) }).await?;
+                }
+            }
         }
     }
 
@@ -1333,6 +1434,7 @@ where
         let info = self
             .compiler_info(exe.into(), cwd.clone(), &cmd, &env_vars)
             .await;
+        activity::phase(Phase::ParseArguments);
         Ok(me.check_compiler(info, cmd, cwd, env_vars).await)
     }
 
@@ -1532,6 +1634,7 @@ where
                 match c.parse_arguments(&cmd, &cwd, &env_vars) {
                     CompilerArguments::Ok(hasher) => {
                         debug!("parse_arguments: Ok: {cmd:?}");
+                        activity::output(hasher.output_pretty().into_owned());
 
                         let body = self
                             .clone()
@@ -1586,6 +1689,7 @@ where
         cwd: PathBuf,
         env_vars: Vec<(OsString, OsString)>,
     ) -> Result<CompileFinished> {
+        activity::phase(Phase::ResolveDistribution);
         self.stats.lock().await.requests_executed += 1;
 
         let force_recache = env_vars.iter().any(|(k, _v)| k == "SCCACHE_RECACHE");
@@ -1619,7 +1723,7 @@ where
 
         let me = self.clone();
 
-        util::spawn_on(&self.rt, async move {
+        util::spawn_on(&self.rt, activity::inherit(async move {
             let result = match me.dist_client.get_client().await {
                 Ok(client) => std::panic::AssertUnwindSafe(hasher.get_cached_or_compile(
                     CacheCompileContext {
@@ -1656,6 +1760,7 @@ where
                 Err(e) => Err(e),
             };
 
+            activity::phase(Phase::RecordResult);
             let mut cache_write = None;
             let mut res = CompileFinished {
                 color_mode,
@@ -1812,6 +1917,7 @@ where
             }
 
             if let Some(cache_write) = cache_write {
+                activity::phase(Phase::WriteCache);
                 match cache_write.await {
                     Err(e) => {
                         debug!("Error executing cache write: {e}");
@@ -1832,7 +1938,7 @@ where
             }
 
             Ok(res)
-        })
+        }))
         .map_err(anyhow::Error::new)
         .await?
     }
@@ -2472,7 +2578,7 @@ impl ServerInfo {
 }
 
 enum Frame<R, R1> {
-    Body { chunk: Option<R1> },
+    Body { chunk: R1 },
     Message { message: R },
 }
 
@@ -2568,8 +2674,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin> Sink<Frame<Response, Response>> for Scca
     fn start_send(mut self: Pin<&mut Self>, item: Frame<Response, Response>) -> Result<()> {
         match item {
             Frame::Message { message } => Pin::new(&mut self.inner).start_send(message),
-            Frame::Body { chunk: Some(chunk) } => Pin::new(&mut self.inner).start_send(chunk),
-            Frame::Body { chunk: None } => Ok(()),
+            Frame::Body { chunk } => Pin::new(&mut self.inner).start_send(chunk),
         }
     }
 
@@ -2712,6 +2817,138 @@ mod tests {
         fn write(&mut self, text: &str) {
             self.buffer.push_str(&format!("{text}\n"));
         }
+    }
+
+    #[tokio::test]
+    async fn active_compile_listing_does_not_touch_cache_storage() -> Result<()> {
+        let mut storage = crate::test::mock_storage::MockStorage::new(None, false);
+        storage.fail_current_size();
+        let service = SccacheService::<ProcessCommandCreator>::mock_with_storage(
+            Arc::new(storage),
+            tokio::runtime::Handle::current(),
+        );
+        let request = Compile {
+            client_pid: 123,
+            exe: "rustc".into(),
+            cwd: "/build".into(),
+            args: vec![],
+            env_vars: vec![],
+        };
+        let registration = service.activities.begin(&request);
+        registration.activity.phase(Phase::WriteCache);
+        let (client, server) = tokio::io::duplex(4096);
+        let handler = util::spawn(service.clone().bind(server));
+        let mut client = tokio_util::codec::Framed::new(client, LengthDelimitedCodec::new());
+        client
+            .send(Bytes::from(bincode::serialize(&Request::ActiveCompiles)?))
+            .await?;
+        let frame = time::timeout(Duration::from_secs(2), client.next())
+            .await?
+            .context("active list closed")??;
+        let Response::ActiveCompiles(active) = bincode::deserialize::<Response>(&frame)? else {
+            bail!("not an activity listing");
+        };
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].client_pid, 123);
+        assert_eq!(active[0].phase, Phase::WriteCache);
+        drop(registration);
+        drop(client);
+        time::timeout(Duration::from_secs(2), handler).await???;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_reports_age_without_resetting_phase_deadline() -> Result<()> {
+        let storage = crate::test::mock_storage::MockStorage::new(None, false);
+        let mut service = SccacheService::<ProcessCommandCreator>::mock_with_storage(
+            Arc::new(storage),
+            tokio::runtime::Handle::current(),
+        );
+        service.compile_limits = CompileLimits {
+            phase_timeout_secs: 31,
+            execution_timeout_secs: 120,
+        };
+        let request = Compile {
+            client_pid: std::process::id(),
+            exe: "rustc".into(),
+            cwd: "/build".into(),
+            args: vec![],
+            env_vars: vec![],
+        };
+        let registration = service.activities.begin(&request);
+        let activity = &registration.activity;
+        let (tx, mut rx) = mpsc::unbounded();
+        let mut sink = tx.sink_err_into::<Error>();
+        let monitor = service.monitor_compile(activity, &mut sink, future::pending::<Result<()>>());
+        tokio::pin!(monitor);
+        for elapsed in [15_000, 30_000] {
+            let frame = tokio::select! {
+                message = rx.next() => message.context("heartbeat channel closed")?,
+                result = &mut monitor => bail!("premature watchdog completion: {result:?}"),
+            };
+            let Frame::Message {
+                message: Response::CompileProgress(snapshot),
+            } = frame
+            else {
+                bail!("not a progress notification");
+            };
+            assert_eq!(snapshot.phase, Phase::DetectCompiler);
+            assert_eq!(snapshot.phase_age_ms, elapsed);
+        }
+        let error = monitor.await.expect_err("stranded phase must expire");
+        assert!(error.to_string().contains("DetectCompiler phase deadline"));
+        assert_eq!(activity.snapshot().phase_age_ms, 45_000);
+        drop(registration);
+        assert!(service.activities.snapshots().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn real_phase_transition_allows_long_compilation_and_completion() -> Result<()> {
+        let storage = crate::test::mock_storage::MockStorage::new(None, false);
+        let mut service = SccacheService::<ProcessCommandCreator>::mock_with_storage(
+            Arc::new(storage),
+            tokio::runtime::Handle::current(),
+        );
+        service.compile_limits = CompileLimits {
+            phase_timeout_secs: 20,
+            execution_timeout_secs: 120,
+        };
+        let request = Compile {
+            client_pid: std::process::id(),
+            exe: "rustc".into(),
+            cwd: "/build".into(),
+            args: vec![],
+            env_vars: vec![],
+        };
+        let registration = service.activities.begin(&request);
+        let activity = &registration.activity;
+        let (tx, mut rx) = mpsc::unbounded();
+        let mut sink = tx.sink_err_into::<Error>();
+        let work = activity::scope(activity, async {
+            time::sleep(Duration::from_secs(10)).await;
+            activity::phase(Phase::LocalCompile);
+            time::sleep(Duration::from_secs(60)).await;
+            Ok::<_, Error>(42)
+        });
+        let monitor = service.monitor_compile(activity, &mut sink, work);
+        tokio::pin!(monitor);
+        for age in [5_000, 20_000, 35_000, 50_000] {
+            let frame = tokio::select! {
+                message = rx.next() => message.context("heartbeat channel closed")?,
+                result = &mut monitor => bail!("premature watchdog completion: {result:?}"),
+            };
+            let Frame::Message {
+                message: Response::CompileProgress(snapshot),
+            } = frame
+            else {
+                bail!("not a progress notification");
+            };
+            assert_eq!(snapshot.phase, Phase::LocalCompile);
+            assert_eq!(snapshot.phase_age_ms, age);
+        }
+        assert_eq!(monitor.await?, 42);
+        Ok(())
     }
 
     #[tokio::test]

@@ -114,6 +114,36 @@ impl ServerConnection {
         result
     }
 
+    /// Bound IPC inactivity. A compile heartbeat prevents ordinary long
+    /// asynchronous work from exhausting this socket deadline.
+    pub fn set_compile_timeout(&self) -> Result<()> {
+        self.reader
+            .get_ref()
+            .set_io_timeout(crate::server::activity::IPC_INACTIVITY_TIMEOUT)?;
+        Ok(())
+    }
+
+    /// Consume progress notifications until an actual response arrives.
+    pub fn read_compile_response(&mut self, mut response: Response) -> Result<Response> {
+        loop {
+            match response {
+                Response::CompileProgress(activity) => {
+                    debug!(
+                        "compile request {} {:?}, phase age {} ms, job {:?}, worker {:?}",
+                        activity.id,
+                        activity.phase,
+                        activity.phase_age_ms,
+                        activity.distributed_job,
+                        activity.worker
+                    );
+                }
+                Response::CompileAborted(reason) => bail!("server aborted compile: {reason}"),
+                other => return Ok(other),
+            }
+            response = self.read_one_response()?;
+        }
+    }
+
     /// Read a single `Response` from the server.
     pub fn read_one_response(&mut self) -> Result<Response> {
         trace!("ServerConnection::read_one_response");
@@ -185,6 +215,66 @@ pub fn connect_with_retry(addr: &crate::net::SocketAddr) -> io::Result<ServerCon
 mod test {
     use super::*;
     use std::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn heartbeat_frames_do_not_replace_terminal_response() -> Result<()> {
+        use crate::server::activity::{CompileActivity, Phase};
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let stream = TcpStream::connect(listener.local_addr()?)?;
+        let (mut server, _) = listener.accept()?;
+        let progress = CompileActivity {
+            id: 7,
+            client_pid: 123,
+            output: Some("crate".into()),
+            compiler: "rustc".into(),
+            cwd: "/build".into(),
+            phase: Phase::RunDistributed,
+            elapsed_ms: 15000,
+            phase_age_ms: 15000,
+            waiting_for_jobserver: 0,
+            compiler_children: 0,
+            distributed_job: Some(42),
+            worker: Some("worker".into()),
+        };
+        util::write_length_prefixed_bincode(
+            &mut server,
+            Response::CompileProgress(progress.clone()),
+        )?;
+        util::write_length_prefixed_bincode(&mut server, Response::CompileProgress(progress))?;
+        util::write_length_prefixed_bincode(
+            &mut server,
+            Response::CompileFinished(crate::protocol::CompileFinished {
+                retcode: Some(0),
+                ..Default::default()
+            }),
+        )?;
+        let mut conn = ServerConnection::new(Box::new(stream))?;
+        conn.set_compile_timeout()?;
+        let initial = conn.read_one_response()?;
+        let Response::CompileFinished(finished) = conn.read_compile_response(initial)? else {
+            bail!("heartbeat replaced terminal response");
+        };
+        assert_eq!(finished.retcode, Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn silent_open_connection_has_bounded_read() -> Result<()> {
+        use std::time::Duration;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let stream = TcpStream::connect(listener.local_addr()?)?;
+        let (_server, _) = listener.accept()?;
+        Connection::set_io_timeout(&stream, Duration::from_millis(100))?;
+        let mut conn = ServerConnection::new(Box::new(stream))?;
+        let error = conn
+            .read_one_response()
+            .expect_err("silent open socket must time out");
+        assert!(matches!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+        ));
+        Ok(())
+    }
 
     #[test]
     fn test_read_one_response_server_hung_up() -> Result<()> {

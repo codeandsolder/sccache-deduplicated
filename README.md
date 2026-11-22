@@ -233,6 +233,17 @@ endif()
 
 sccache fails the build if an accepted compiler request loses its terminal response. It does not retry the command locally after an ambiguous disconnect, because the original compilation may still be running or modifying outputs. Local execution is used when the server explicitly reports that it cannot handle the invocation.
 
+For a stalled daemon-owned compilation, `sccache --active-compiles` prints a JSON list of request IDs, caller PIDs, compiler/output names, current phases, phase ages, jobserver waiters, active child handles and distributed job/worker identities. This does not query cache storage. Heartbeats are sent every 15 seconds while a compile RPC is pending, and the client fails after 90 seconds of socket inactivity rather than starting a potentially duplicate compilation. A heartbeat does not reset a phase deadline. Configure the maximum duration of a single phase in the daemon's TOML configuration:
+
+```toml
+[compile_limits]
+phase_timeout_secs = 1800
+execution_timeout_secs = 7200
+```
+
+The longer execution deadline applies to compiler hashing/probes, local compilation and distributed execution. These are elapsed phase limits, not a measurement of compiler CPU progress; a legitimate unusually long phase may require a larger configured budget. Cancellation drops the pending request and its cancellable tasks, but cannot revoke already-running blocking I/O. This diagnostic protocol covers daemon-owned compile RPCs, not the complete lifetime of a client-side namespace compilation.
+
+
 **For versions of cmake 3.25 and later**, to compile with MSVC, you have to use the new `CMAKE_MSVC_DEBUG_INFORMATION_FORMAT` option, meant to configure the `-Z7` flag.  Additionally, you must set the cmake policy number 0141 to the NEW setting:
 ```cmake
 set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>")

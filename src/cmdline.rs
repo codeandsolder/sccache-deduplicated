@@ -54,6 +54,8 @@ impl FromStr for StatsFormat {
 pub enum Command {
     /// Show cache statistics and exit.
     ShowStats(StatsFormat, bool),
+    /// List active daemon-owned compile requests as JSON.
+    ActiveCompiles,
     /// Print machine-readable build capabilities and exit.
     Capabilities,
     /// Run background server.
@@ -134,6 +136,9 @@ fn get_clap_command() -> clap::Command {
             flag_long_and_short("show-stats", 's')
                 .help("show cache statistics")
                 .action(ArgAction::SetTrue),
+            flag_infer_long("active-compiles")
+                .help("list active compiler requests with phases and ages as JSON")
+                .action(ArgAction::SetTrue),
             flag_infer_long("show-adv-stats")
                 .help("show advanced cache statistics")
                 .action(ArgAction::SetTrue),
@@ -178,6 +183,7 @@ fn get_clap_command() -> clap::Command {
                     "debug-preprocessor-cache",
                     "dist-status",
                     "show-stats",
+                    "active-compiles",
                     "show-adv-stats",
                     "start-server",
                     "stop-server",
@@ -255,6 +261,8 @@ fn command_from_matches(matches: &clap::ArgMatches, cwd: PathBuf) -> Result<Comm
         Ok(Command::Capabilities)
     } else if matches.get_flag("show-stats") {
         Ok(Command::ShowStats(stats_format(matches)?, false))
+    } else if matches.get_flag("active-compiles") {
+        Ok(Command::ActiveCompiles)
     } else if matches.get_flag("show-adv-stats") {
         Ok(Command::ShowStats(stats_format(matches)?, true))
     } else if matches.get_flag("start-server") {
