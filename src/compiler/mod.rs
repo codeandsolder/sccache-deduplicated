@@ -32,6 +32,8 @@ mod preprocessor_cache;
 mod ptxas;
 mod rust;
 mod rust_response;
+#[cfg(target_os = "linux")]
+pub mod rust_link;
 mod tasking_vx;
 #[macro_use]
 mod counted_array;
