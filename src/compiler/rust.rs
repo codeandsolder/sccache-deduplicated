@@ -281,6 +281,8 @@ pub struct RustCompilation {
     /// rewritten before compilation.
     env_dep_names: HashSet<OsString>,
     allow_dist: bool,
+    #[cfg(feature = "dist-client")]
+    dlltool_files: Vec<PathBuf>,
     canonical_paths: Option<CanonicalRustPaths>,
 }
 
@@ -613,6 +615,7 @@ async fn get_compiler_outputs<T>(
 where
     T: Clone + CommandCreatorSync,
 {
+    let start = time::Instant::now();
     let mut arguments = arguments;
     arguments.extend([OsString::from("--print"), OsString::from("file-names")]);
     let prepared = super::rust_response::prepare(executable, &arguments)?;
@@ -628,7 +631,10 @@ where
 
     let outstr = String::from_utf8(outputs.stdout).context("Error parsing rustc output")?;
     if log_enabled!(Trace) {
-        trace!("get_compiler_outputs: {outstr:?}");
+        trace!(
+            "get_compiler_outputs in {}: {outstr:?}",
+            fmt_duration_as_secs(&start.elapsed())
+        );
     }
     Ok(outstr.lines().map(std::borrow::ToOwned::to_owned).collect())
 }
@@ -1056,41 +1062,46 @@ fn compilation_target(arguments: &[Argument<ArgData>], host: &str) -> String {
 // where they appear. The weak map persists across sccache upgrades, so the
 // package format must participate in the weak key independently of compile
 // cache versioning.
-const RUST_DIST_TOOLCHAIN_PACKAGE_SCHEMA: &[u8] = b"rust-dist-toolchain-package-v2";
+const RUST_DIST_TOOLCHAIN_PACKAGE_SCHEMA: &[u8] = b"rust-dist-toolchain-package-v3";
 
 fn dist_toolchain_weak_key_with_schema(
-    base: &Digest,
+    compiler_shlibs_digests: &[String],
     package_schema: &[u8],
     target: &str,
     target_std_manifest_digest: Option<&str>,
     noncanonical_sysroot: Option<&Path>,
 ) -> String {
-    let mut weak = base.clone();
-    weak.update(package_schema);
-    weak.update(b"rust-dist-toolchain-target-v1");
-    if let Some(sysroot) = noncanonical_sysroot {
-        weak.update(b"noncanonical-sysroot-v1");
-        weak.update(sysroot.as_os_str().as_encoded_bytes());
+    // Clippy policy, manifest inputs, proc macros and --emit affect the
+    // compilation cache key, not the contents of the packaged sysroot.
+    let mut weak = Digest::new();
+    weak.delimiter(package_schema);
+    for digest in compiler_shlibs_digests {
+        weak.delimiter(digest.as_bytes());
     }
-    weak.update(target.as_bytes());
+    weak.delimiter(b"rust-dist-toolchain-target-v1");
+    if let Some(sysroot) = noncanonical_sysroot {
+        weak.delimiter(b"noncanonical-sysroot-v1");
+        weak.delimiter(sysroot.as_os_str().as_encoded_bytes());
+    }
+    weak.delimiter(target.as_bytes());
     match target_std_manifest_digest {
         Some(digest) => {
-            weak.update(b"target-std-present");
-            weak.update(digest.as_bytes());
+            weak.delimiter(b"target-std-present");
+            weak.delimiter(digest.as_bytes());
         }
-        None => weak.update(b"target-std-missing"),
+        None => weak.delimiter(b"target-std-missing"),
     }
     weak.finish()
 }
 
 fn dist_toolchain_weak_key(
-    base: &Digest,
+    compiler_shlibs_digests: &[String],
     target: &str,
     target_std_manifest_digest: Option<&str>,
     noncanonical_sysroot: Option<&Path>,
 ) -> String {
     dist_toolchain_weak_key_with_schema(
-        base,
+        compiler_shlibs_digests,
         RUST_DIST_TOOLCHAIN_PACKAGE_SCHEMA,
         target,
         target_std_manifest_digest,
@@ -1495,6 +1506,7 @@ where
             canonical: false,
             host: None,
             target: None,
+            dlltool_files: Vec::new(),
         })
     }
     /// Parse `arguments` as rustc command-line arguments, determine if
@@ -2481,31 +2493,6 @@ fn relocate_rust_operands(
     Some(())
 }
 
-#[cfg(target_os = "linux")]
-pub fn relocate_raw_rust_operands(
-    arguments: &[OsString],
-    canonical: &CanonicalRustPaths,
-    cwd: &Path,
-) -> Option<Vec<OsString>> {
-    let mut parsed = ArgsIter::new(
-        super::rust_response::expand(arguments, cwd)
-            .ok()?
-            .into_iter(),
-        &ARGS[..],
-    )
-    .collect::<std::result::Result<Vec<_>, _>>()
-    .ok()?;
-    relocate_rust_operands(&mut parsed, canonical, cwd)?;
-    // An IPC fallback retains the original emit and color settings, unlike
-    // the cacheable compile where dep-info has already been generated.
-    Some(
-        parsed
-            .iter()
-            .flat_map(|arg| arg.iter_os_strings())
-            .collect(),
-    )
-}
-
 /// Identify the source operand using the same typed argument grammar as
 /// compiler hashing. Retain the expanded argv itself, not a reserialization:
 /// linker options, repeated options, and option spellings remain exact.
@@ -2627,6 +2614,47 @@ where
         // operands in the local response-file-aware path.
         let mut allow_dist = !needs_literal_argfile;
         let mut effective_cache_control = cache_control;
+        let dlltool_result = if self.parsed_args.metadata_only_output.is_some() {
+            Ok(None)
+        } else {
+            let explicit =
+                effective_arguments
+                    .iter()
+                    .rev()
+                    .find_map(|argument| match argument.get_data() {
+                        Some(CodeGen(ArgCodegen { opt, value })) if opt == "dlltool" => {
+                            value.as_deref()
+                        }
+                        _ => None,
+                    });
+            let target_json = self
+                .parsed_args
+                .target_json
+                .as_ref()
+                .map(|path| cwd.join(path));
+            super::rust_dlltool::discover(
+                &target,
+                target_json.as_deref(),
+                explicit,
+                &env_vars,
+                &cwd,
+                pool,
+            )
+            .await
+        };
+        let dlltool_unresolved = dlltool_result.is_err();
+        let dlltool_plan = match dlltool_result {
+            Ok(plan) => plan,
+            Err(error) => {
+                warn!(
+                    "Rust codegen auxiliary dependency discovery failed; bypassing cache: {error:#}"
+                );
+                effective_cache_control = CacheControl::ForceNoCache;
+                allow_dist = false;
+                None
+            }
+        };
+
         let resolved_native_profile = if native_requested {
             let profile = if let Some(profile) = self.native_profile.as_ref() {
                 profile.clone()
@@ -2774,6 +2802,15 @@ where
                     cargo_target,
                 )
             });
+        if dlltool_unresolved
+            || canonical_paths.as_ref().is_some_and(|canonical| {
+                dlltool_plan
+                    .as_ref()
+                    .is_some_and(|plan| !plan.canonical_visible(canonical))
+            })
+        {
+            canonical_paths = None;
+        }
         if let Some(canonical) = canonical_paths.as_ref() {
             // The sandbox mounts /build read-only and both output roots writable.
             // Validate the paths we already know before the dep-info pre-pass so
@@ -2925,17 +2962,34 @@ where
 
         let target_json_hash = hash_all(&target_json_files, pool);
 
+        // Output filenames depend on crate type, target and naming flags, not
+        // the canonical layout selected after source discovery. Query the compiler
+        // in the original namespace with the physical pre-pass arguments.
+        let outputs = async {
+            if let Some(metadata) = &self.parsed_args.metadata_only_output {
+                return Ok(vec![metadata.clone()]);
+            }
+            let arguments = prepass_os_string_arguments
+                .iter()
+                .flat_map(|(arg, val)| iter::once(arg).chain(val.as_ref()))
+                .cloned()
+                .collect();
+            get_compiler_outputs(creator, &self.executable, arguments, &cwd, &env_vars).await
+        };
+
         // Perform all hashing operations on the files.
         let (
             (source_files, source_hashes, mut env_deps, dep_info_text),
             extern_hashes,
             staticlib_hashes,
             target_json_hash,
+            mut outputs,
         ) = futures::try_join!(
             source_files_and_hashes_and_env_deps,
             extern_hashes,
             staticlib_hashes,
-            target_json_hash
+            target_json_hash,
+            outputs
         )?;
 
         if let Some(canonical) = canonical_paths.as_ref()
@@ -3099,11 +3153,25 @@ where
             None
         };
         let weak_toolchain_key = dist_toolchain_weak_key(
-            &m,
+            &self.compiler_shlibs_digests,
             &target,
             target_std_manifest_digest.as_deref(),
             canonical_paths.is_none().then_some(self.sysroot.as_path()),
         );
+        // The same selected auxiliary closure participates in both result
+        // identity and the weak-to-strong archive mapping. Changing the
+        // assembler, DLL generator, or any loaded library cannot reuse an
+        // old compiled import library or an old toolchain package.
+        let weak_toolchain_key = if let Some(plan) = &dlltool_plan {
+            m.delimiter(b"rust-dlltool-closure-v1");
+            m.delimiter(plan.identity.as_bytes());
+            let mut weak = Digest::new();
+            weak.delimiter(weak_toolchain_key.as_bytes());
+            weak.delimiter(plan.identity.as_bytes());
+            weak.finish()
+        } else {
+            weak_toolchain_key
+        };
         // 3. The full commandline (self.arguments)
         // TODO: there will be full paths here, it would be nice to
         // normalize them so we can get cross-machine cache hits.
@@ -3212,11 +3280,22 @@ where
             val.hash(&mut HashToDigest { digest: &mut m });
         }
         if is_clippy_driver(&self.executable) {
+            if canonical_paths.is_some() {
+                m.delimiter(b"canonical-clippy-env-v1");
+            }
             // Clippy lint flags arrive through CLIPPY_ARGS, not rustc argv.
+            // Hash the environment seen by the canonical compiler, rather
+            // than the physical spelling of the relocated policy directory.
+            // Explicit env!/option_env! observations remain separately hashed
+            // above, and the actual policy files are hashed as source inputs.
             for (var, val) in env_vars.iter().filter(|(k, _)| k.starts_with("CLIPPY_")) {
+                let value = canonical_paths.as_ref().map_or_else(
+                    || val.clone(),
+                    |paths| paths.env_value_to_canonical(var, val),
+                );
                 var.hash(&mut HashToDigest { digest: &mut m });
                 m.update(b"=");
-                val.hash(&mut HashToDigest { digest: &mut m });
+                value.hash(&mut HashToDigest { digest: &mut m });
             }
         }
         // 9. The cwd of the compile. This will wind up in the rlib.
@@ -3227,27 +3306,6 @@ where
         // 10. The version of the compiler.
         self.version.hash(&mut HashToDigest { digest: &mut m });
 
-        // Turn arguments into a simple Vec<OsString> to calculate outputs.
-        let flat_os_string_arguments: Vec<OsString> = os_string_arguments
-            .iter()
-            .flat_map(|(arg, val)| iter::once(arg).chain(val.as_ref()))
-            .cloned()
-            .collect();
-
-        let mut outputs = if let Some(metadata) = &self.parsed_args.metadata_only_output {
-            vec![metadata.clone()]
-        } else {
-            // Linked outputs depend on the compiler and target. Query rustc
-            // rather than guessing executable or library naming conventions.
-            get_compiler_outputs(
-                creator,
-                &self.executable,
-                flat_os_string_arguments,
-                &cwd,
-                &env_vars,
-            )
-            .await?
-        };
         if self.parsed_args.emit.contains("metadata")
             && self.parsed_args.metadata_only_output.is_none()
         {
@@ -3475,6 +3533,8 @@ where
                 env_vars,
                 env_dep_names,
                 allow_dist,
+                #[cfg(feature = "dist-client")]
+                dlltool_files: dlltool_plan.map_or_else(Vec::new, |plan| plan.files),
                 canonical_paths,
                 #[cfg(feature = "dist-client")]
                 rlib_dep_reader: self.rlib_dep_reader.clone(),
@@ -3787,6 +3847,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             env_vars,
             env_dep_names,
             canonical_paths,
+            dlltool_files,
             host,
             arguments,
             executable,
@@ -3844,6 +3905,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             canonical,
             host: Some(host),
             target: Some(target),
+            dlltool_files,
         });
 
         Ok((inputs_packager, toolchain_packager))
@@ -4432,6 +4494,7 @@ fn rlib_metadata_archive(file: &mut fs::File) -> Result<Option<Vec<u8>>> {
 #[cfg(feature = "dist-client")]
 struct RustToolchainPackager {
     sysroot: PathBuf,
+    dlltool_files: Vec<PathBuf>,
     canonical: bool,
     // Compiler-wide callers have no target; preserve full-package semantics.
     host: Option<String>,
@@ -4557,6 +4620,7 @@ fn test_dist_toolchain_archive_contains_only_required_installed_targets() -> Res
         canonical: true,
         host: Some(host.to_owned()),
         target: Some(target.to_owned()),
+        dlltool_files: Vec::new(),
     };
     pkg::ToolchainPackager::write_pkg(Box::new(packager), writer)?;
     let reader = fs::File::open(archive_path)?;
@@ -4615,6 +4679,7 @@ impl RustToolchainPackager {
             canonical,
             host,
             target,
+            dlltool_files,
         } = self;
 
         let mut package_builder = pkg::ToolchainPackageBuilder::new();
@@ -4622,6 +4687,10 @@ impl RustToolchainPackager {
             package_builder.add_root_mapping(sysroot.clone(), PathBuf::from("/rust"));
         }
         package_builder.add_common()?;
+
+        for dependency in dlltool_files {
+            package_builder.add_file(dependency)?;
+        }
 
         let bins_path = sysroot.join(BINS_DIR);
         let sysroot_executable = bins_path.join("rustc").with_extension(EXE_EXTENSION);
@@ -6319,14 +6388,14 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
 
     fn mock_file_names(creator: &Arc<Mutex<MockCommandCreator>>, filenames: &[&str]) {
         // Mock the `rustc --print=file-names` process output.
-        next_command(
-            creator,
-            Ok(MockChild::new(
-                exit_status(0),
-                filenames.iter().join("\n"),
-                "",
-            )),
-        );
+        let stdout = filenames.iter().join("\n");
+        next_command_calls(creator, move |args| {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "--print" && pair[1] == "file-names")
+            );
+            Ok(MockChild::new(exit_status(0), &stdout, ""))
+        });
     }
 
     #[test]
@@ -6707,7 +6776,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
     where
         F: Fn(&Path) -> Result<()>,
     {
-        hash_key_for_compiler(
+        hash_keys_for_compiler(
             f,
             args,
             env_vars,
@@ -6715,16 +6784,17 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             preprocessor_cache_mode,
             "rustc",
         )
+        .0
     }
 
-    fn hash_key_for_compiler<F>(
+    fn hash_keys_for_compiler<F>(
         f: &TestFixture,
         args: &[&'static str],
         env_vars: &[(OsString, OsString)],
         pre_func: F,
         preprocessor_cache_mode: bool,
         executable: &str,
-    ) -> String
+    ) -> (String, String)
     where
         F: Fn(&Path) -> Result<()>,
     {
@@ -6766,7 +6836,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         if hasher.parsed_args.metadata_only_output.is_none() {
             mock_file_names(&creator, &["foo.rlib"]);
         }
-        hasher
+        let result = hasher
             .generate_hash_key(GenerateHashKeyContext {
                 creator: &creator,
                 cwd: f.tempdir.path().to_owned(),
@@ -6778,8 +6848,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 cache_control: CacheControl::Default,
             })
             .wait()
-            .unwrap()
-            .key
+            .unwrap();
+        (result.key, result.weak_toolchain_key)
     }
 
     #[test]
@@ -6801,13 +6871,70 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             "--crate-type",
             "lib",
         ];
-        let first = hash_key_for_compiler(&f, &args, &env, |_| Ok(()), false, "clippy-driver");
+        let first = hash_keys_for_compiler(&f, &args, &env, |_| Ok(()), false, "clippy-driver").0;
         fs::write(&file, b"disallowed-names = [\"bad_two\"]\n")?;
-        let second = hash_key_for_compiler(&f, &args, &env, |_| Ok(()), false, "clippy-driver");
+        let second = hash_keys_for_compiler(&f, &args, &env, |_| Ok(()), false, "clippy-driver").0;
         assert_ne!(
             first, second,
             "changing the external Clippy policy must invalidate cache"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_canonical_clippy_policy_location_does_not_change_cache_key() -> Result<()> {
+        let a = TestFixture::new();
+        let b = TestFixture::new();
+        let args = [
+            "--emit",
+            "metadata",
+            "foo.rs",
+            "--out-dir",
+            "target/out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+        ];
+        let policy_env = |fixture: &TestFixture| {
+            let root = fixture.tempdir.path();
+            vec![
+                ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+                (
+                    "SCCACHE_CANONICAL_BUILD_ROOT".into(),
+                    root.as_os_str().to_owned(),
+                ),
+                (
+                    "CARGO_TARGET_DIR".into(),
+                    root.join("target").into_os_string(),
+                ),
+                (
+                    "CLIPPY_CONF_DIR".into(),
+                    root.join("policy").into_os_string(),
+                ),
+                (
+                    "CLIPPY_ARGS".into(),
+                    "-Dclippy::unwrap_used__CLIPPY_HACKERY__".into(),
+                ),
+            ]
+        };
+        let policy = |fixture: &TestFixture, contents: &[u8]| -> Result<()> {
+            let dir = fixture.tempdir.path().join("policy");
+            fs::create_dir_all(&dir)?;
+            fs::write(dir.join("clippy.toml"), contents)?;
+            Ok(())
+        };
+        policy(&a, b"disallowed-names = [\"bad_one\"]\n")?;
+        policy(&b, b"disallowed-names = [\"bad_one\"]\n")?;
+        let env_a = policy_env(&a);
+        let env_b = policy_env(&b);
+        let key = |fixture: &TestFixture, env: &[(OsString, OsString)]| {
+            hash_keys_for_compiler(fixture, &args, env, |_| Ok(()), false, "clippy-driver").0
+        };
+        let first = key(&a, &env_a);
+        assert_eq!(first, key(&b, &env_b));
+        policy(&b, b"disallowed-names = [\"bad_two\"]\n")?;
+        assert_ne!(first, key(&b, &env_b));
         Ok(())
     }
 
@@ -6833,10 +6960,11 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             "CLIPPY_ARGS".into(),
             "-Aclippy::unwrap_used__CLIPPY_HACKERY__".into(),
         )];
-        let deny_key = hash_key_for_compiler(&f, &args, &deny, |_| Ok(()), false, "clippy-driver");
+        let deny_key =
+            hash_keys_for_compiler(&f, &args, &deny, |_| Ok(()), false, "clippy-driver").0;
         let allow_key =
-            hash_key_for_compiler(&f, &args, &allow, |_| Ok(()), false, "clippy-driver");
-        let rustc_key = hash_key_for_compiler(&f, &args, &deny, |_| Ok(()), false, "rustc");
+            hash_keys_for_compiler(&f, &args, &allow, |_| Ok(()), false, "clippy-driver").0;
+        let rustc_key = hash_keys_for_compiler(&f, &args, &deny, |_| Ok(()), false, "rustc").0;
         assert_ne!(
             deny_key, allow_key,
             "different Clippy lint levels must not reuse diagnostics"
@@ -6896,6 +7024,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 env_vars: Vec::new(),
                 env_dep_names: HashSet::new(),
                 allow_dist: true,
+                #[cfg(feature = "dist-client")]
+                dlltool_files: Vec::new(),
                 canonical_paths: None,
             };
             let mut transformer = dist::PathTransformer::new();
@@ -7005,6 +7135,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             env_vars: env,
             env_dep_names: HashSet::new(),
             allow_dist: true,
+            #[cfg(feature = "dist-client")]
+            dlltool_files: Vec::new(),
             canonical_paths: Some(canonical),
         };
         let mut transformer = dist::PathTransformer::new();
@@ -7244,6 +7376,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             )],
             env_dep_names: HashSet::new(),
             allow_dist: true,
+            #[cfg(feature = "dist-client")]
+            dlltool_files: Vec::new(),
             canonical_paths: None,
         };
 
@@ -7313,6 +7447,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             )],
             env_dep_names: HashSet::new(),
             allow_dist: true,
+            #[cfg(feature = "dist-client")]
+            dlltool_files: Vec::new(),
             canonical_paths: None,
         };
 
@@ -8249,8 +8385,7 @@ version='2.0.0'
 
     #[test]
     fn dist_toolchain_weak_key_tracks_target_std_manifest_and_physical_layout() {
-        let mut base = Digest::new();
-        base.update(b"same-rustc");
+        let base = ["same-rustc".to_owned()];
 
         let host = dist_toolchain_weak_key(
             &base,
@@ -8269,7 +8404,7 @@ version='2.0.0'
 
         let previous_package_schema = dist_toolchain_weak_key_with_schema(
             &base,
-            b"rust-dist-toolchain-package-v1",
+            b"rust-dist-toolchain-package-v2",
             "x86_64-unknown-linux-gnu",
             Some("host-std-digest"),
             None,
@@ -8290,6 +8425,45 @@ version='2.0.0'
         );
         assert_ne!(root_toolchain, user_toolchain);
         assert_ne!(root_toolchain, host);
+        assert_ne!(
+            host,
+            dist_toolchain_weak_key(
+                &["different-rustc".to_owned()],
+                "x86_64-unknown-linux-gnu",
+                Some("host-std-digest"),
+                None,
+            )
+        );
+    }
+
+    #[test]
+    fn dist_toolchain_key_is_independent_of_compilation_policy() -> Result<()> {
+        let f = TestFixture::new();
+        let args = [
+            "--emit",
+            "metadata",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+        ];
+        let policy = f.tempdir.path().join("policy");
+        fs::create_dir_all(&policy)?;
+        fs::write(
+            policy.join("clippy.toml"),
+            b"disallowed-names = [\"test\"]\n",
+        )?;
+        let env = vec![(OsString::from("CLIPPY_CONF_DIR"), policy.into_os_string())];
+        let (rustc_key, rustc_toolchain) =
+            hash_keys_for_compiler(&f, &args, &[], |_| Ok(()), false, "rustc");
+        let (clippy_key, clippy_toolchain) =
+            hash_keys_for_compiler(&f, &args, &env, |_| Ok(()), false, "clippy-driver");
+        assert_ne!(rustc_key, clippy_key);
+        assert_eq!(rustc_toolchain, clippy_toolchain);
+        Ok(())
     }
 
     #[test]

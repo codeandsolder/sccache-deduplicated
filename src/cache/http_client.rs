@@ -1,12 +1,12 @@
+use crate::util::new_reqwest_client_builder;
 use opendal::HttpTransporter;
 use opendal_http_transport_reqwest::ReqwestTransport;
-use reqwest::ClientBuilder;
 
 /// Build an HTTP transport with a custom user agent (helps with monitoring on
 /// the server side).
 pub fn set_user_agent() -> reqwest::Result<HttpTransporter> {
     let user_agent = format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-    ClientBuilder::new()
+    new_reqwest_client_builder()?
         .user_agent(user_agent)
         .build()
         .map(|client| HttpTransporter::new(ReqwestTransport::new(client)))

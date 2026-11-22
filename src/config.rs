@@ -1009,6 +1009,7 @@ pub struct FileConfig {
     pub basedirs: Vec<String>,
     pub client_side_mode: bool,
     pub compiler_aliases: CompilerAliases,
+    pub compile_limits: crate::server::activity::CompileLimits,
 }
 
 // If the file doesn't exist or we can't read it, log the issue and proceed. If the
@@ -1663,6 +1664,7 @@ pub struct Config {
     pub basedirs: Vec<Vec<u8>>,
     pub client_side_mode: bool,
     pub compiler_aliases: CompilerAliases,
+    pub compile_limits: crate::server::activity::CompileLimits,
 }
 
 impl Config {
@@ -1707,7 +1709,9 @@ impl Config {
             basedirs: file_basedirs,
             client_side_mode: file_client_side_mode,
             compiler_aliases,
+            compile_limits,
         } = file_conf;
+        compile_limits.validate()?;
         conf_caches.merge(cache);
         compiler_aliases.validate()?;
 
@@ -1781,6 +1785,7 @@ impl Config {
             basedirs,
             client_side_mode,
             compiler_aliases,
+            compile_limits,
         })
     }
 }
@@ -2300,6 +2305,7 @@ fn config_overrides() {
         basedirs: vec![],
         client_side_mode: false,
         compiler_aliases: Default::default(),
+        compile_limits: Default::default(),
     };
 
     assert_eq!(
@@ -2358,6 +2364,7 @@ fn config_overrides() {
             basedirs: vec![],
             client_side_mode: false,
             compiler_aliases: Default::default(),
+            compile_limits: Default::default(),
         }
     );
 }
@@ -3504,6 +3511,7 @@ key_prefix = "cosprefix"
             basedirs: vec![],
             client_side_mode: false,
             compiler_aliases: Default::default(),
+            compile_limits: Default::default(),
         }
     );
 }
@@ -3601,8 +3609,24 @@ size = "7g"
             basedirs: vec![],
             client_side_mode: false,
             compiler_aliases: Default::default(),
+            compile_limits: Default::default(),
         }
     );
+}
+
+#[test]
+fn rejects_zero_compile_deadlines() -> Result<()> {
+    for name in ["phase_timeout_secs", "execution_timeout_secs"] {
+        let file: FileConfig = toml::from_str(&format!("[compile_limits]\n{name} = 0\n"))?;
+        assert!(Config::from_env_and_file_configs(EnvConfig::default(), file).is_err());
+    }
+    let file: FileConfig = toml::from_str(
+        "[compile_limits]\nphase_timeout_secs = 42\nexecution_timeout_secs = 3600\n",
+    )?;
+    let config = Config::from_env_and_file_configs(EnvConfig::default(), file)?;
+    assert_eq!(config.compile_limits.phase_timeout_secs, 42);
+    assert_eq!(config.compile_limits.execution_timeout_secs, 3600);
+    Ok(())
 }
 
 #[test]

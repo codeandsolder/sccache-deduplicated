@@ -642,7 +642,7 @@ pub fn parse_arguments(
             Some(DirectClangProfileUse(_)) => {
                 cannot_cache!(arg.flag_str().unwrap_or("profile-use"))
             }
-            Some(CInput(path)) | Some(CxxInput(path)) => {
+            Some(CInput(path) | CxxInput(path)) => {
                 if path.as_os_str().is_empty() {
                     cannot_cache!("no input file");
                 }
@@ -2894,62 +2894,14 @@ mod test {
 
     #[test]
     fn test_compile_simple() {
-        let creator = new_creator();
-        let f = TestFixture::new();
-        let parsed_args = ParsedArguments {
-            input: "foo.c".into(),
-            double_dash_input: false,
-            language: Language::C,
-            compilation_flag: "-c".into(),
-            depfile: None,
-            outputs: vec![(
-                "obj",
-                ArtifactDescriptor {
-                    path: "foo.obj".into(),
-                    optional: false,
-                },
-            )]
-            .into_iter()
-            .collect(),
-            dependency_args: vec![],
-            preprocessor_args: vec![],
-            common_args: vec![],
-            arch_args: vec![],
-            unhashed_args: vec![],
-            extra_dist_files: vec![],
-            extra_hash_files: vec![],
-            uses_external_assembler: false,
-            msvc_show_includes: false,
-            msvc_explicit_language: false,
-            profile_generate: false,
-            color_mode: ColorMode::Auto,
-            suppress_rewrite_includes_only: false,
-            too_hard_for_preprocessor_cache_mode: None,
-        };
-        let runtime = single_threaded_runtime();
-        let storage = MockStorage::new(None, false);
-        let storage: std::sync::Arc<MockStorage> = std::sync::Arc::new(storage);
-        let service = server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
-        let compiler = &f.bins[0];
-        // Compiler invocation.
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
-        let mut path_transformer = dist::PathTransformer::new();
-        let (command, dist_command, cacheable) = generate_compile_commands(
-            &mut path_transformer,
-            compiler,
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-        )
-        .unwrap();
-        #[cfg(feature = "dist-client")]
-        assert!(dist_command.is_some());
-        #[cfg(not(feature = "dist-client"))]
-        assert!(dist_command.is_none());
-        let _ = command.execute(&service, &creator).wait();
-        assert_eq!(Cacheable::Yes, cacheable);
-        // Ensure that we ran all processes.
-        assert_eq!(0, creator.lock().unwrap().children.len());
+        super::super::c::assert_simple_compile(
+            "foo.c",
+            "foo.obj",
+            Language::C,
+            vec![],
+            true,
+            generate_compile_commands,
+        );
     }
 
     #[test]

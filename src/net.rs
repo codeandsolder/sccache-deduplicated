@@ -119,6 +119,7 @@ impl Acceptor for tokio::net::TcpListener {
 // A helper trait to unify the behavior of TCP and UDS stream.
 pub trait Connection: std::io::Read + std::io::Write + Send {
     fn try_clone(&self) -> std::io::Result<Box<dyn Connection>>;
+    fn set_io_timeout(&self, timeout: std::time::Duration) -> std::io::Result<()>;
 }
 
 impl Connection for std::net::TcpStream {
@@ -126,6 +127,10 @@ impl Connection for std::net::TcpStream {
     fn try_clone(&self) -> std::io::Result<Box<dyn Connection>> {
         let stream = Self::try_clone(self)?;
         Ok(Box::new(stream))
+    }
+    fn set_io_timeout(&self, timeout: std::time::Duration) -> std::io::Result<()> {
+        self.set_read_timeout(Some(timeout))?;
+        self.set_write_timeout(Some(timeout))
     }
 }
 
@@ -195,6 +200,10 @@ mod unix_imp {
         fn try_clone(&self) -> std::io::Result<Box<dyn Connection>> {
             let stream = Self::try_clone(self)?;
             Ok(Box::new(stream))
+        }
+        fn set_io_timeout(&self, timeout: std::time::Duration) -> std::io::Result<()> {
+            self.set_read_timeout(Some(timeout))?;
+            self.set_write_timeout(Some(timeout))
         }
     }
 }

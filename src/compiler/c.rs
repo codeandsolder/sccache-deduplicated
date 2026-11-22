@@ -215,6 +215,85 @@ impl ParsedArguments {
     }
 }
 
+/// Common end-to-end command-generation fixture for frontend smoke tests.
+#[cfg(test)]
+pub(super) fn assert_simple_compile(
+    input: &str,
+    object: &str,
+    language: Language,
+    common_args: Vec<OsString>,
+    can_distribute: bool,
+    generate: impl FnOnce(
+        &mut dist::PathTransformer,
+        &Path,
+        &ParsedArguments,
+        &Path,
+        &[(OsString, OsString)],
+    ) -> Result<(
+        SingleCompileCommand,
+        Option<dist::CompileCommand>,
+        Cacheable,
+    )>,
+) {
+    use crate::mock_command::{MockChild, exit_status};
+    use crate::test::{mock_storage::MockStorage, utils::*};
+
+    let fixture = TestFixture::new();
+    let creator = new_creator();
+    let parsed_args = ParsedArguments {
+        input: input.into(),
+        double_dash_input: false,
+        language,
+        compilation_flag: "-c".into(),
+        depfile: None,
+        outputs: HashMap::from([(
+            "obj",
+            ArtifactDescriptor {
+                path: object.into(),
+                optional: false,
+            },
+        )]),
+        dependency_args: vec![],
+        preprocessor_args: vec![],
+        common_args,
+        arch_args: vec![],
+        unhashed_args: vec![],
+        extra_dist_files: vec![],
+        extra_hash_files: vec![],
+        uses_external_assembler: false,
+        msvc_show_includes: false,
+        msvc_explicit_language: false,
+        profile_generate: false,
+        color_mode: ColorMode::Auto,
+        suppress_rewrite_includes_only: false,
+        too_hard_for_preprocessor_cache_mode: None,
+    };
+    let runtime = single_threaded_runtime();
+    let service = server::SccacheService::mock_with_storage(
+        Arc::new(MockStorage::new(None, false)),
+        runtime.handle().clone(),
+    );
+    next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
+    let (command, distributed, cacheable) = generate(
+        &mut dist::PathTransformer::new(),
+        &fixture.bins[0],
+        &parsed_args,
+        fixture.tempdir.path(),
+        &[],
+    )
+    .expect("generate compiler command");
+    assert_eq!(
+        distributed.is_some(),
+        can_distribute && cfg!(feature = "dist-client")
+    );
+    assert_eq!(cacheable, Cacheable::Yes);
+    let output = runtime
+        .block_on(command.execute(&service, &creator))
+        .expect("execute compiler command");
+    assert!(output.status.success());
+    assert!(creator.lock().unwrap().children.is_empty());
+}
+
 /// A generic implementation of the `Compilation` trait for C/C++ compilers.
 struct CCompilation<I: CCompilerImpl> {
     parsed_args: ParsedArguments,
