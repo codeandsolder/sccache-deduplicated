@@ -469,12 +469,14 @@ mod digest_cache {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let cached = digests.get(path).filter(|cached| cached.stat == stat)?;
-            (
+            let result = (
                 cached.digest.clone(),
                 cached.found_date,
                 cached.found_time,
                 cached.found_timestamp,
-            )
+            );
+            drop(digests);
+            result
         };
         Some((digest, TimeMacroFinder::with_found(date, time, timestamp)))
     }
