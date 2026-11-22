@@ -678,8 +678,9 @@ impl NativeLinkLayout {
     }
 }
 
-/// Prepared native Rust codegen delivery and local replay roots. Each
-/// returned directory is mounted over the current caller's lower directory,
+/// Prepared native Rust codegen delivery and local replay roots.
+///
+/// Each returned directory is mounted over the current caller's lower directory,
 /// so native dependencies remain live at the same logical paths. There is no
 /// archive or copied staging tree between CAS delivery and linking.
 pub struct NativeLinkWorkspace {

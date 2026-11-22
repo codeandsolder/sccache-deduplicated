@@ -221,7 +221,7 @@ impl NativeOutput {
             kind: OutputKind::File,
         }
     }
-    fn generated(name: String, source: PathBuf, destination: PathBuf) -> Self {
+    const fn generated(name: String, source: PathBuf, destination: PathBuf) -> Self {
         Self {
             name,
             source,
@@ -462,11 +462,66 @@ impl NativeLink {
                 self.layout.dep_info.as_deref(),
             )?;
         }
+        if !linked.status.success() {
+            debug!(
+                "native local link failed with {}: {}",
+                linked.status,
+                String::from_utf8_lossy(&linked.stderr)
+            );
+        }
         generated.status = linked.status;
         generated.stdout.extend(linked.stdout);
         generated.stderr.extend(linked.stderr);
         Ok(generated)
     }
+}
+
+fn prepare_dispatch(
+    compilation: Box<dyn Compilation<impl CommandCreatorSync>>,
+    remote: &mut dist::CompileCommand,
+    transformer: dist::PathTransformer,
+    cwd: &Path,
+    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    scratch: &mut Option<tempfile::TempDir>,
+    split: &mut Option<NativeLink>,
+) -> Result<(Vec<NativeOutput>, dist::PathTransformer, DistPackagers)> {
+    super::core::validate_dist_environment_dependencies(
+        remote,
+        &compilation.dist_environment_dependencies(),
+    )?;
+    let expected = compilation
+        .outputs()
+        .filter(|output| output.key != "d")
+        .collect::<Vec<_>>();
+    let outputs = if let Some(layout) = compilation.native_link_layout() {
+        let directory = tempfile::Builder::new()
+            .prefix("sccache-native-link-")
+            .tempdir()?;
+        let link = NativeLink::prepare(
+            layout.clone(),
+            remote,
+            &transformer,
+            directory.path(),
+            environment,
+            expected,
+            cwd.to_owned(),
+        )?;
+        let outputs = link.outputs();
+        *scratch = Some(directory);
+        *split = Some(link);
+        outputs
+    } else {
+        expected
+            .into_iter()
+            .map(|output| NativeOutput::file(cwd, output))
+            .collect()
+    };
+    let mut layout = dist::PathTransformer::new();
+    for (local, remote) in transformer.path_mappings() {
+        layout.add_root_mapping(local, &remote);
+    }
+    let packagers = compilation.into_dist_packagers(transformer)?;
+    Ok((outputs, layout, packagers))
 }
 
 pub(super) async fn compile<T: CommandCreatorSync>(
@@ -494,44 +549,15 @@ pub(super) async fn compile<T: CommandCreatorSync>(
         let mut scratch = None;
         let mut split = None;
         let result = (|| {
-            super::core::validate_dist_environment_dependencies(
-                &remote,
-                &compilation.dist_environment_dependencies(),
+            let (outputs, layout, packagers) = prepare_dispatch(
+                compilation,
+                &mut remote,
+                transformer,
+                &cwd,
+                local.get_env_vars(),
+                &mut scratch,
+                &mut split,
             )?;
-            let expected = compilation
-                .outputs()
-                .filter(|output| output.key != "d")
-                .collect::<Vec<_>>();
-            let outputs = if let Some(layout) = compilation.native_link_layout() {
-                let directory = tempfile::Builder::new()
-                    .prefix("sccache-native-link-")
-                    .tempdir()?;
-                let link = NativeLink::prepare(
-                    layout.clone(),
-                    &mut remote,
-                    &transformer,
-                    directory.path(),
-                    local.get_env_vars(),
-                    expected,
-                    cwd.clone(),
-                )?;
-                let outputs = link.outputs();
-                scratch = Some(directory);
-                split = Some(link);
-                outputs
-            } else {
-                expected
-                    .into_iter()
-                    .map(|output| NativeOutput::file(&cwd, output))
-                    .collect()
-            };
-            // Preserve root mappings, but do not carry the large reverse
-            // path table into the independent directory-only plan.
-            let mut layout = dist::PathTransformer::new();
-            for (local, remote) in transformer.path_mappings() {
-                layout.add_root_mapping(local, &remote);
-            }
-            let packagers = compilation.into_dist_packagers(transformer)?;
             Ok::<_, anyhow::Error>(pool.spawn_blocking(move || {
                 let plan = CompilerPlan::prepare(
                     remote,

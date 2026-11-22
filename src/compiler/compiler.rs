@@ -2957,17 +2957,23 @@ LLVM version: 6.0",
         Ok(())
     }
 
-    #[test_case(true ; "with preprocessor cache")]
-    #[test_case(false ; "without preprocessor cache")]
-    fn test_common_args_affects_hash(preprocessor_cache_mode: bool) -> Result<()> {
+    #[test_case(true, ["-fPIC", "-fno-pic"], false ; "common flags with preprocessor cache")]
+    #[test_case(false, ["-fPIC", "-fno-pic"], false ; "common flags without preprocessor cache")]
+    #[test_case(true, ["-DHELLO", "-DHI"], true ; "preprocessor flags with preprocessor cache")]
+    #[test_case(false, ["-DHELLO", "-DHI"], true ; "preprocessor flags without preprocessor cache")]
+    fn test_argument_hash_identity(
+        preprocessor_cache_mode: bool,
+        flags: [&str; 2],
+        same_key: bool,
+    ) -> Result<()> {
         let f = TestFixture::new();
         let creator = new_creator();
         let runtime = single_threaded_runtime();
         let pool = runtime.handle();
         let output = "compiler_id=clang\ncompiler_version=\"16.0.0\"";
         let arguments = [
-            ovec!["-c", "foo.c", "-o", "foo.o", "-fPIC"],
-            ovec!["-c", "foo.c", "-o", "foo.o", "-fno-pic"],
+            ovec!["-c", "foo.c", "-o", "foo.o", flags[0]],
+            ovec!["-c", "foo.c", "-o", "foo.o", flags[1]],
             ovec!["-c", "foo.c", "-o", "foo.o"],
         ];
         let cwd = f.tempdir.path();
@@ -3027,85 +3033,9 @@ LLVM version: 6.0",
             .collect::<Result<Vec<_>>>()?;
 
         assert_eq!(results.len(), 3);
-        assert_ne!(results[0].key, results[1].key);
-        assert_ne!(results[1].key, results[2].key);
-        assert_ne!(results[0].key, results[2].key);
-        Ok(())
-    }
-
-    #[test_case(true ; "with preprocessor cache")]
-    #[test_case(false ; "without preprocessor cache")]
-    fn test_preprocessor_only_args_do_not_salt_hash_when_output_is_identical(
-        preprocessor_cache_mode: bool,
-    ) -> Result<()> {
-        let f = TestFixture::new();
-        let creator = new_creator();
-        let runtime = single_threaded_runtime();
-        let pool = runtime.handle();
-        let output = "compiler_id=clang\ncompiler_version=\"16.0.0\"";
-        let arguments = [
-            ovec!["-c", "foo.c", "-o", "foo.o", "-DHELLO"],
-            ovec!["-c", "foo.c", "-o", "foo.o", "-DHI"],
-            ovec!["-c", "foo.c", "-o", "foo.o"],
-        ];
-        let cwd = f.tempdir.path();
-        std::fs::write(f.tempdir.path().join("foo.c"), "whatever")?;
-
-        let results = arguments
-            .iter()
-            .map(|argument| -> Result<_> {
-                next_command(
-                    &creator,
-                    Ok(MockChild::new(
-                        exit_status(1),
-                        "",
-                        "clang: error: unknown argument: '-vV'",
-                    )),
-                );
-                next_command(&creator, Ok(MockChild::new(exit_status(0), output, "")));
-                next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-                let c = detect_compiler(
-                    creator.clone(),
-                    &f.bins[0],
-                    f.tempdir.path(),
-                    &[],
-                    &[],
-                    pool,
-                    None,
-                )
-                .wait()?
-                .0;
-                next_command(
-                    &creator,
-                    Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
-                );
-                let mut hasher = match c.parse_arguments(
-                    argument,
-                    ".".as_ref(),
-                    &[],
-                    CompilerCachePolicy::FinishedArtifact,
-                ) {
-                    CompilerArguments::Ok(h) => h,
-                    o => bail!("Bad result from parse_arguments: {o:?}"),
-                };
-                hasher
-                    .generate_hash_key(GenerateHashKeyContext {
-                        creator: &creator,
-                        cwd: cwd.to_path_buf(),
-                        env_vars: vec![],
-                        may_dist: false,
-                        pool,
-                        rewrite_includes_only: false,
-                        storage: Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
-                        cache_control: CacheControl::Default,
-                    })
-                    .wait()
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[0].key, results[1].key);
-        assert_eq!(results[1].key, results[2].key);
+        for (first, second) in [(0, 1), (1, 2), (0, 2)] {
+            assert_eq!(results[first].key == results[second].key, same_key);
+        }
         Ok(())
     }
 
@@ -3200,9 +3130,64 @@ LLVM version: 6.0",
         Ok(())
     }
 
-    #[test_case(true ; "with preprocessor cache")]
-    #[test_case(false ; "without preprocessor cache")]
-    fn test_compiler_get_cached_or_compile(preprocessor_cache_mode: bool) -> Result<()> {
+    const COMPILER_STDOUT: &[u8] = b"compiler stdout";
+    const COMPILER_STDERR: &[u8] = b"compiler stderr";
+
+    fn mock_successful_compile(creator: &Arc<std::sync::Mutex<MockCommandCreator>>, obj: &Path) {
+        // The preprocessor invocation.
+        next_command(
+            creator,
+            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+        );
+        // The compiler invocation.
+        let o = obj.to_owned();
+        next_command_calls(creator, move |_| {
+            // Pretend to compile something.
+            let mut f = File::create(&o)?;
+            f.write_all(b"file contents")?;
+            Ok(MockChild::new(
+                exit_status(0),
+                COMPILER_STDOUT,
+                COMPILER_STDERR,
+            ))
+        });
+    }
+
+    fn mock_gcc_hasher(
+        creator: &Arc<std::sync::Mutex<MockCommandCreator>>,
+        gcc: &Path,
+        cwd: &Path,
+        pool: &tokio::runtime::Handle,
+        arguments: &[OsString],
+    ) -> Result<Box<dyn CompilerHasher<Arc<std::sync::Mutex<MockCommandCreator>>>>> {
+        std::fs::write(cwd.join("foo.c"), "whatever")?;
+        next_command(
+            creator,
+            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
+        );
+        next_assembler(creator, "GNU assembler (GNU Binutils) 2.42", "");
+        let compiler = get_compiler_info(creator.clone(), gcc, cwd, &[], &[], pool, None)
+            .wait()?
+            .0;
+        match compiler.parse_arguments(
+            arguments,
+            ".".as_ref(),
+            &[],
+            CompilerCachePolicy::FinishedArtifact,
+        ) {
+            CompilerArguments::Ok(hasher) => Ok(hasher),
+            other => bail!("Bad result from parse_arguments: {other:?}"),
+        }
+    }
+
+    #[test_case(true, CacheControl::Default ; "hit with preprocessor cache")]
+    #[test_case(false, CacheControl::Default ; "hit without preprocessor cache")]
+    #[test_case(true, CacheControl::ForceRecache ; "recache with preprocessor cache")]
+    #[test_case(false, CacheControl::ForceRecache ; "recache without preprocessor cache")]
+    fn test_compiler_get_cached_or_compile(
+        preprocessor_cache_mode: bool,
+        second_control: CacheControl,
+    ) -> Result<()> {
         drop(env_logger::try_init());
         let creator = new_creator();
         let f = TestFixture::new();
@@ -3220,59 +3205,14 @@ LLVM version: 6.0",
             CacheMode::ReadWrite,
             vec![],
         );
-        // Write a dummy input file so the preprocessor cache mode can work
-        std::fs::write(f.tempdir.path().join("foo.c"), "whatever")?;
         let storage = Arc::new(storage);
         let service = server::SccacheService::mock_with_storage(storage.clone(), pool.clone());
 
-        // Pretend to be GCC.
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
-        );
-        next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = get_compiler_info(
-            creator.clone(),
-            &gcc,
-            f.tempdir.path(),
-            &[],
-            &[],
-            &pool,
-            None,
-        )
-        .wait()?
-        .0;
-        // The preprocessor invocation.
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
-        );
-        // The compiler invocation.
-        const COMPILER_STDOUT: &[u8] = b"compiler stdout";
-        const COMPILER_STDERR: &[u8] = b"compiler stderr";
-        let obj = f.tempdir.path().join("foo.o");
-        let o = obj.clone();
-        next_command_calls(&creator, move |_| {
-            // Pretend to compile something.
-            let mut f = File::create(&o)?;
-            f.write_all(b"file contents")?;
-            Ok(MockChild::new(
-                exit_status(0),
-                COMPILER_STDOUT,
-                COMPILER_STDERR,
-            ))
-        });
         let cwd = f.tempdir.path();
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
-        let mut hasher = match c.parse_arguments(
-            &arguments,
-            ".".as_ref(),
-            &[],
-            CompilerCachePolicy::FinishedArtifact,
-        ) {
-            CompilerArguments::Ok(h) => h,
-            o => bail!("Bad result from parse_arguments: {o:?}"),
-        };
+        let mut hasher = mock_gcc_hasher(&creator, &gcc, cwd, &pool, &arguments)?;
+        let obj = cwd.join("foo.o");
+        mock_successful_compile(&creator, &obj);
         let (cached, res) = runtime.block_on(async {
             hasher
                 .get_cached_or_compile(CacheCompileContext {
@@ -3300,14 +3240,16 @@ LLVM version: 6.0",
         assert_eq!(exit_status(0), res.status);
         assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
         assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
-        // Now compile again, which should be a cache hit.
+        // The second request either restores the existing artifact or forces a rebuild.
         fs::remove_file(&obj)?;
-        // The preprocessor invocation.
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
-        );
-        // There should be no actual compiler invocation.
+        if second_control == CacheControl::ForceRecache {
+            mock_successful_compile(&creator, &obj);
+        } else {
+            next_command(
+                &creator,
+                Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+            );
+        }
         let (cached, res) = runtime.block_on(async {
             hasher
                 .get_cached_or_compile(CacheCompileContext {
@@ -3318,14 +3260,23 @@ LLVM version: 6.0",
                     arguments,
                     cwd: cwd.to_path_buf(),
                     env_vars: vec![],
-                    cache_control: CacheControl::Default,
+                    cache_control: second_control,
                     pool,
                 })
                 .await
         })?;
         // Ensure that the object file was created.
         assert!(fs::metadata(&obj).map(|m| m.len() > 0)?);
-        assert_eq!(CompileResult::CacheHit(Duration::new(0, 0)), cached);
+        match (second_control, cached) {
+            (CacheControl::Default, CompileResult::CacheHit(_)) => {}
+            (
+                CacheControl::ForceRecache,
+                CompileResult::CacheMiss(MissType::ForcedRecache, DistType::NoDist, _, write),
+            ) => {
+                write.wait()?;
+            }
+            (_, result) => bail!("Unexpected compile result: {result:?}"),
+        }
         assert_eq!(exit_status(0), res.status);
         assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
         assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
@@ -3487,56 +3438,11 @@ LLVM version: 6.0",
         let storage: Arc<MockStorage> = Arc::new(storage);
         let service = server::SccacheService::mock_with_storage(storage.clone(), pool.clone());
 
-        // Write a dummy input file so the preprocessor cache mode can work
-        std::fs::write(f.tempdir.path().join("foo.c"), "whatever")?;
-        // Pretend to be GCC.
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
-        );
-        next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = get_compiler_info(
-            creator.clone(),
-            &gcc,
-            f.tempdir.path(),
-            &[],
-            &[],
-            &pool,
-            None,
-        )
-        .wait()?
-        .0;
-        // The preprocessor invocation.
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
-        );
-        // The compiler invocation.
-        const COMPILER_STDOUT: &[u8] = b"compiler stdout";
-        const COMPILER_STDERR: &[u8] = b"compiler stderr";
-        let obj = f.tempdir.path().join("foo.o");
-        let o = obj.clone();
-        next_command_calls(&creator, move |_| {
-            // Pretend to compile something.
-            let mut f = File::create(&o)?;
-            f.write_all(b"file contents")?;
-            Ok(MockChild::new(
-                exit_status(0),
-                COMPILER_STDOUT,
-                COMPILER_STDERR,
-            ))
-        });
         let cwd = f.tempdir.path();
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
-        let mut hasher = match c.parse_arguments(
-            &arguments,
-            ".".as_ref(),
-            &[],
-            CompilerCachePolicy::FinishedArtifact,
-        ) {
-            CompilerArguments::Ok(h) => h,
-            o => bail!("Bad result from parse_arguments: {o:?}"),
-        };
+        let mut hasher = mock_gcc_hasher(&creator, &gcc, cwd, &pool, &arguments)?;
+        let obj = cwd.join("foo.o");
+        mock_successful_compile(&creator, &obj);
         // The cache will return an error.
         storage.next_get(Err(anyhow!("Some Error")));
         let (cached, res) =
@@ -3650,141 +3556,6 @@ LLVM version: 6.0",
             }
             _ => bail!("Unexpected compile result: {cached:?}"),
         }
-        Ok(())
-    }
-
-    #[test_case(true ; "with preprocessor cache")]
-    #[test_case(false ; "without preprocessor cache")]
-    fn test_compiler_get_cached_or_compile_force_recache(
-        preprocessor_cache_mode: bool,
-    ) -> Result<()> {
-        drop(env_logger::try_init());
-        let creator = new_creator();
-        let f = TestFixture::new();
-        let gcc = f.mk_bin("gcc")?;
-        let runtime = single_threaded_runtime();
-        let pool = runtime.handle().clone();
-        let storage = DiskCache::new(
-            f.tempdir.path().join("cache"),
-            u64::MAX,
-            &pool,
-            PreprocessorCacheModeConfig {
-                use_preprocessor_cache_mode: preprocessor_cache_mode,
-                ..Default::default()
-            },
-            CacheMode::ReadWrite,
-            vec![],
-        );
-        let storage = Arc::new(storage);
-        let service = server::SccacheService::mock_with_storage(storage.clone(), pool.clone());
-        // Write a dummy input file so the preprocessor cache mode can work
-        std::fs::write(f.tempdir.path().join("foo.c"), "whatever")?;
-        // Pretend to be GCC.
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
-        );
-        next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = get_compiler_info(
-            creator.clone(),
-            &gcc,
-            f.tempdir.path(),
-            &[],
-            &[],
-            &pool,
-            None,
-        )
-        .wait()?
-        .0;
-        const COMPILER_STDOUT: &[u8] = b"compiler stdout";
-        const COMPILER_STDERR: &[u8] = b"compiler stderr";
-        // The compiler should be invoked twice, since we're forcing
-        // recaching.
-        let obj = f.tempdir.path().join("foo.o");
-        for _ in 0..2 {
-            // The preprocessor invocation.
-            next_command(
-                &creator,
-                Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
-            );
-            // The compiler invocation.
-            let o = obj.clone();
-            next_command_calls(&creator, move |_| {
-                // Pretend to compile something.
-                let mut f = File::create(&o)?;
-                f.write_all(b"file contents")?;
-                Ok(MockChild::new(
-                    exit_status(0),
-                    COMPILER_STDOUT,
-                    COMPILER_STDERR,
-                ))
-            });
-        }
-        let cwd = f.tempdir.path();
-        let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
-        let mut hasher = match c.parse_arguments(
-            &arguments,
-            ".".as_ref(),
-            &[],
-            CompilerCachePolicy::FinishedArtifact,
-        ) {
-            CompilerArguments::Ok(h) => h,
-            o => bail!("Bad result from parse_arguments: {o:?}"),
-        };
-        let (cached, res) = runtime.block_on(async {
-            hasher
-                .get_cached_or_compile(CacheCompileContext {
-                    service: &service,
-                    dist_client: None,
-                    creator: creator.clone(),
-                    storage: storage.clone(),
-                    arguments: arguments.clone(),
-                    cwd: cwd.to_path_buf(),
-                    env_vars: vec![],
-                    cache_control: CacheControl::Default,
-                    pool: pool.clone(),
-                })
-                .await
-        })?;
-        // Ensure that the object file was created.
-        assert!(fs::metadata(&obj).map(|m| m.len() > 0)?);
-        match cached {
-            CompileResult::CacheMiss(MissType::Normal, DistType::NoDist, _, f) => {
-                // wait on cache write future so we don't race with it!
-                f.wait()?;
-            }
-            _ => bail!("Unexpected compile result: {cached:?}"),
-        }
-        assert_eq!(exit_status(0), res.status);
-        assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
-        assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
-        // Now compile again, but force recaching.
-        fs::remove_file(&obj)?;
-        let (cached, res) = hasher
-            .get_cached_or_compile(CacheCompileContext {
-                service: &service,
-                dist_client: None,
-                creator,
-                storage,
-                arguments,
-                cwd: cwd.to_path_buf(),
-                env_vars: vec![],
-                cache_control: CacheControl::ForceRecache,
-                pool,
-            })
-            .wait()?;
-        // Ensure that the object file was created.
-        assert!(fs::metadata(&obj).map(|m| m.len() > 0)?);
-        match cached {
-            CompileResult::CacheMiss(MissType::ForcedRecache, DistType::NoDist, _, f) => {
-                // wait on cache write future so we don't race with it!
-                f.wait()?;
-            }
-            _ => bail!("Unexpected compile result: {cached:?}"),
-        }
-        assert_eq!(exit_status(0), res.status);
-        assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
-        assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
         Ok(())
     }
 
