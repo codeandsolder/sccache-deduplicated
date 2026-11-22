@@ -208,9 +208,17 @@ fn copy_to_tempdir(inputs: &[&str], tempdir: &Path) {
         // Certain OS/FS combinations have a slow resolution (up to 2s for NFS),
         // leading to flaky tests.
         // We set the times for the new file to 10 seconds ago, to be safe.
-        let new_time =
-            filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(10));
-        filetime::set_file_times(source_file, new_time, new_time).unwrap();
+        let new_time = SystemTime::now() - Duration::from_secs(10);
+        File::options()
+            .write(true)
+            .open(source_file)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(new_time)
+                    .set_modified(new_time),
+            )
+            .unwrap();
     }
 }
 
