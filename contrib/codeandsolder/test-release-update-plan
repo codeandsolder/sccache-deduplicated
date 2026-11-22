@@ -85,3 +85,34 @@ if result=$("$updater" --plan-only 2>&1); then
 fi
 [[ "$result" == *"coordinated migration required"* ]]
 echo 'Incompatible protocol requires coordinated migration'
+
+# The release updater and publisher share a deployment contract. Keep these
+# source-level guards next to the behavioral plan tests, not in workflow YAML.
+cmp -s -- "$updater" <(tr -d '\000' <"$updater") || {
+    echo "$updater contains embedded NUL bytes" >&2
+    exit 1
+}
+rg -q '^CLIENT_SERVICES=.*"\$OPENWRT_ROOT_SERVICE"' "$updater"
+rg -q '^OPENWRT_ROOT_PORT=.*SCCACHE_AUTOUPDATE_OPENWRT_ROOT_PORT' "$updater"
+for literal in client_source_sha dist_sha256 current_dist_protocol \
+    'trap rollback EXIT INT TERM' --plan-only SCCACHE_AUTOUPDATE_CLIENT_PORT \
+    local_client_ready SCCACHE_METRICS_HEARTBEAT_MS '(heartbeat_ms + 999) / 1000 + 15'; do
+    rg -Fq -- "$literal" "$updater"
+done
+if rg -Fq 'trap rollback EXIT ERR' "$updater"; then
+    echo "Updater uses the obsolete rollback trap" >&2
+    exit 1
+fi
+publisher="$(dirname -- "$updater")/../../.github/workflows/publish-ci-client.yml"
+protocol="$(dirname -- "$updater")/release-protocol.env"
+for literal in 'dist_protocol=4' 'rollout_epoch=5' 'glibc_abi_max=2.39'; do
+    rg -Fxq -- "$literal" "$protocol"
+done
+for literal in 'source contrib/codeandsolder/release-protocol.env' 'vendored-openssl' \
+    'openssl_linkage=vendored-static' 'Reject unsupported fleet native shared library ABIs' \
+    'Reject binaries requiring a newer GNU libc ABI' 'steps.protocol.outputs.dist_protocol' \
+    'steps.protocol.outputs.rollout_epoch' 'Skipping superseded main revision' \
+    'Skipping superseded main release'; do
+    rg -Fq -- "$literal" "$publisher"
+done
+echo 'Release updater and publisher contract checks passed'

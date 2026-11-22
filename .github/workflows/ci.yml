@@ -111,43 +111,6 @@ jobs:
           contrib/codeandsolder/test-wrappers
           contrib/codeandsolder/test-sccache-router
           sudo contrib/codeandsolder/test-host-native-metadata
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path("contrib/codeandsolder/sccache-release-update")
-          assert b"\0" not in path.read_bytes(), f"{path} contains embedded NUL bytes"
-          source = path.read_text()
-          assignments = {
-              line.split("=", 1)[0]: line
-              for line in source.splitlines()
-              if line.startswith(("CLIENT_SERVICES=", "OPENWRT_ROOT_PORT="))
-          }
-          assert '"$OPENWRT_ROOT_SERVICE"' in assignments["CLIENT_SERVICES"]
-          assert 'SCCACHE_AUTOUPDATE_OPENWRT_ROOT_PORT' in assignments["OPENWRT_ROOT_PORT"]
-          assert 'client_source_sha' in source
-          assert 'dist_sha256' in source
-          assert 'current_dist_protocol' in source
-          assert 'trap rollback EXIT INT TERM' in source
-          assert 'trap rollback EXIT ERR' not in source
-          assert '--plan-only' in source
-          assert 'SCCACHE_AUTOUPDATE_CLIENT_PORT' in source
-          assert 'local_client_ready' in source
-          assert 'SCCACHE_METRICS_HEARTBEAT_MS' in source
-          assert '(heartbeat_ms + 999) / 1000 + 15' in source
-          publisher = Path(".github/workflows/publish-ci-client.yml").read_text()
-          protocol = Path("contrib/codeandsolder/release-protocol.env").read_text()
-          assert "dist_protocol=4" in protocol
-          assert "rollout_epoch=5" in protocol
-          assert "glibc_abi_max=2.39" in protocol
-          assert "source contrib/codeandsolder/release-protocol.env" in publisher
-          assert "vendored-openssl" in publisher
-          assert "openssl_linkage=vendored-static" in publisher
-          assert "Reject unsupported fleet native shared library ABIs" in publisher
-          assert "Reject binaries requiring a newer GNU libc ABI" in publisher
-          assert "steps.protocol.outputs.dist_protocol" in publisher
-          assert "steps.protocol.outputs.rollout_epoch" in publisher
-          assert "Skipping superseded main revision" in publisher
-          assert "Skipping superseded main release" in publisher
-          PY
 
   toml_format:
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
