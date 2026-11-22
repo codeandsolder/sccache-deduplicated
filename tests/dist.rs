@@ -342,7 +342,7 @@ fn test_dist_cargo_build() {
 #[test]
 #[cfg(unix)]
 #[cfg_attr(not(feature = "dist-tests"), ignore)]
-fn test_dist_observed_rust_environment() {
+fn test_dist_rust_observed_environment() {
     let tmpdir = tempfile::tempdir().unwrap();
     let root = tmpdir.path();
     let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
@@ -401,6 +401,106 @@ fn main() {
         assert_eq!(1, info.stats.dist_compiles.values().sum::<usize>());
         assert_eq!(0, info.stats.dist_errors);
     });
+}
+
+// Check the real worker and cache restoration, including zero-length rmeta
+// marker files required by Cargo for executable and test targets.
+#[test]
+#[cfg(unix)]
+#[cfg_attr(not(feature = "dist-tests"), ignore)]
+fn test_dist_rust_metadata_outputs() -> Result<()> {
+    let tmpdir = tempfile::tempdir()?;
+    let root = tmpdir.path();
+    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
+    system.add_scheduler();
+    let _worker = system.add_server(&[]);
+    let cfg = dist_test_sccache_client_cfg(root, system.scheduler_url());
+    let cfg_path = root.join("sccache-cfg.json");
+    write_json_cfg(root, "sccache-cfg.json", &cfg);
+    let cached_cfg = root.join("sccache-cached-cfg");
+    let _ = stop_local_daemon();
+    start_local_daemon(&cfg_path, &cached_cfg);
+
+    let source = root.join("source");
+    std::fs::create_dir(&source)?;
+    let output = root.join("output");
+    std::fs::create_dir(&output)?;
+    write_source(&source, "common.rs", "pub fn marker() {} fn main() {}");
+    write_source(
+        &source,
+        "macro.rs",
+        r#"
+extern crate proc_macro;
+use proc_macro::TokenStream;
+#[proc_macro] pub fn identity(input: TokenStream) -> TokenStream { input }
+"#,
+    );
+    let compiler = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let cases: &[(&str, &[&str])] = &[
+        ("executable", &["--crate-type", "bin"]),
+        ("implicit", &[]),
+        ("unit_test", &["--test"]),
+        ("lib_test", &["--crate-type", "lib", "--test"]),
+        ("rlib", &["--crate-type", "rlib"]),
+        ("dylib", &["--crate-type", "dylib"]),
+        ("staticlib", &["--crate-type", "staticlib"]),
+        ("cdylib", &["--crate-type", "cdylib"]),
+        ("proc_macro", &["--crate-type", "proc-macro"]),
+    ];
+    for (name, flags) in cases {
+        let src = if *name == "proc_macro" {
+            "macro.rs"
+        } else {
+            "common.rs"
+        };
+        let metadata = output.join(format!("lib{name}-regression.rmeta"));
+        let dep_info = output.join(format!("{name}-regression.d"));
+        let compile = || {
+            let mut command = sccache_command();
+            for (key, _) in env::vars_os() {
+                if key.to_string_lossy().starts_with("CARGO") || key == "OUT_DIR" {
+                    command.env_remove(key);
+                }
+            }
+            command
+                .current_dir(&source)
+                .arg(&compiler)
+                .args([
+                    "--crate-name",
+                    name,
+                    "--emit",
+                    "metadata,dep-info",
+                    "-C",
+                    "extra-filename=-regression",
+                ])
+                .args(*flags)
+                .arg("--out-dir")
+                .arg(&output)
+                .arg(src)
+                .env("SCCACHE_CONF", &cfg_path)
+                .env("SCCACHE_CACHED_CONF", &cached_cfg)
+                .env("SCCACHE_EXPERIMENTAL_CANONICAL_RUST", "1")
+                .env("SCCACHE_CANONICAL_BUILD_ROOT", &source)
+                .env("SCCACHE_CANONICAL_TARGET_ROOT", &output)
+                .assert()
+                .success();
+        };
+        compile();
+        let expected = std::fs::read(&metadata)?;
+        let deps = std::fs::read(&dep_info)?;
+        std::fs::remove_file(&metadata)?;
+        std::fs::remove_file(&dep_info)?;
+        compile();
+        assert_eq!(std::fs::read(metadata)?, expected, "{name}");
+        assert_eq!(std::fs::read(dep_info)?, deps, "{name}");
+    }
+    let expected = cases.len();
+    get_stats(move |info| {
+        assert_eq!(expected, info.stats.dist_compiles.values().sum::<usize>());
+        assert_eq!(expected, info.stats.cache_hits.all());
+        assert_eq!(0, info.stats.dist_errors);
+    });
+    Ok(())
 }
 
 #[test]

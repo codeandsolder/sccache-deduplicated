@@ -31,3 +31,16 @@ with an empty environment and add the command's supplied variables; worker
 service variables must not leak into `option_env!`. Deploy the client and
 worker changes together for this contract. This does not extend the
 supported linked crate types or change Cargo's runtime environment.
+
+## Metadata-only compilation
+
+Metadata-only Rust invocations are cacheable independently of crate type.
+This includes executable targets, implicit crate types, test harnesses,
+procedural macros, static libraries and dynamic libraries. Their output is
+`lib<crate-name><extra-filename>.rmeta`, including an empty marker when
+rustc does not export metadata for that crate type. Unlike linked outputs,
+this filename is not what `rustc --print file-names` reports; no extra
+compiler process is required to discover it. Dependency records remain
+client-local and the metadata artifact must be restored on a cache hit.
+Linked native executables and test harnesses remain excluded until native
+linker inputs can be represented completely.
