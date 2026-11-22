@@ -345,6 +345,12 @@ fn split_link_argument_plan_preserves_expanded_option_bytes() -> Result<()> {
         "message=\"two words\"",
         "--out-dir",
         "output directory",
+        "--edition",
+        "2024",
+        "--force-warn",
+        "unused",
+        "--remap-path-scope",
+        "all",
         "--",
         "-source.rs",
     ]
