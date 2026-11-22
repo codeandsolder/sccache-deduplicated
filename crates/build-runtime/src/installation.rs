@@ -1,6 +1,9 @@
 //! Portable original-package installation metadata.
 
-use crate::{BlobRef, TreeEntry, TreeId, TreeManifest, TreePath, identity::encoding};
+use crate::{
+    BlobRef, PackageIdentity, PackageSource, TreeEntry, TreeId, TreeManifest, TreePath, TreeRecipe,
+    identity::encoding,
+};
 use anyhow::{Context, Result, ensure};
 use bincode::Options;
 use serde::{Deserialize, Serialize};
@@ -9,14 +12,15 @@ use std::{
     io::{Read, Write},
 };
 
-const MANIFEST_MAGIC: &[u8] = b"sccache-installation-manifest-v1\0";
+const MANIFEST_MAGIC: &[u8] = b"sccache-installation-manifest-v2\0";
+const RECIPE_MAGIC: &[u8] = b"sccache-installation-recipe-v1\0";
 const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A portable manifest derived from an original verified package. It contains
 /// metadata and content identities only; no host-local file versions.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstallationManifest {
-    pub source_sha256: [u8; 32],
+    pub source: PackageSource,
     pub package: TreeId,
     pub components: BTreeMap<String, TreeManifest>,
 }
@@ -114,5 +118,127 @@ impl InstallationManifest {
             }
         }
         Ok(files)
+    }
+}
+
+/// One installed component selected from a verified archive. The installed
+/// name can include its target triple even when the archive's component
+/// directory uses an unqualified package name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstalledComponent {
+    pub package: PackageIdentity,
+    pub component: String,
+}
+
+/// Portable release selection, independent of the installing host and its
+/// inode versions. Each original package appears once and its selected
+/// component trees can be composed without reading file bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstallationRecipe {
+    pub release: String,
+    pub packages: BTreeMap<PackageIdentity, InstallationManifest>,
+    pub components: BTreeMap<String, InstalledComponent>,
+}
+
+impl InstallationRecipe {
+    /// Select only installed components and retain their exact upstream
+    /// provenance. Unselected payload in a multi-component archive is not
+    /// used for local attestation or tree assembly.
+    /// # Errors
+    /// Returns an error for missing or conflicting package metadata.
+    pub fn selected_manifests(&self) -> Result<Vec<InstallationManifest>> {
+        ensure!(
+            !self.release.is_empty() && !self.components.is_empty(),
+            "empty installation recipe"
+        );
+        let mut selected = BTreeMap::<PackageIdentity, InstallationManifest>::new();
+        for (name, component) in &self.components {
+            ensure!(!name.is_empty(), "empty installed component name");
+            let manifest = self
+                .packages
+                .get(&component.package)
+                .context("installation package missing")?;
+            ensure!(
+                manifest.source.identity == component.package,
+                "installation package identity mismatch"
+            );
+            let tree = manifest
+                .components
+                .get(&component.component)
+                .context("installation component missing")?;
+            let selection =
+                selected
+                    .entry(component.package)
+                    .or_insert_with(|| InstallationManifest {
+                        source: manifest.source,
+                        package: manifest.package,
+                        components: BTreeMap::new(),
+                    });
+            selection
+                .components
+                .insert(component.component.clone(), tree.clone());
+        }
+        ensure!(
+            selected.len() == self.packages.len(),
+            "unreferenced installation package"
+        );
+        let manifests = selected.into_values().collect::<Vec<_>>();
+        for manifest in &manifests {
+            manifest.validate()?;
+        }
+        Ok(manifests)
+    }
+
+    /// Derive the normalized immutable installed tree recipe. Validate
+    /// overlapping paths and content now rather than on a remote worker.
+    /// # Errors
+    /// Returns an error for incomplete or conflicting component trees.
+    pub fn tree_recipe(&self) -> Result<TreeRecipe> {
+        let manifests = self.selected_manifests()?;
+        let mut trees = BTreeMap::new();
+        let mut directories = None;
+        for tree in manifests
+            .iter()
+            .flat_map(|manifest| manifest.components.values())
+        {
+            if let Some(previous) = directories {
+                ensure!(
+                    previous == tree.root,
+                    "inconsistent installation directory normalization"
+                );
+            } else {
+                directories = Some(tree.root);
+            }
+            let id = tree.id()?;
+            if let Some(previous) = trees.insert(id, tree) {
+                ensure!(
+                    previous == tree,
+                    "conflicting identical component identifiers"
+                );
+            }
+        }
+        let recipe = TreeRecipe::union(
+            directories.context("empty installation tree")?,
+            trees.keys().copied(),
+        );
+        recipe.compose(&trees)?;
+        Ok(recipe)
+    }
+
+    /// Encode the portable release selection and its component manifests.
+    /// # Errors
+    /// Returns an error for invalid recipe metadata or serialization failure.
+    pub fn write(&self, writer: impl Write) -> Result<()> {
+        self.tree_recipe()?;
+        write_document(writer, RECIPE_MAGIC, self)
+    }
+
+    /// Decode and validate an installation recipe from a trusted source.
+    /// # Errors
+    /// Returns an error for malformed, incomplete or conflicting metadata.
+    pub fn read(reader: impl Read) -> Result<Self> {
+        let recipe: Self = read_document(reader, RECIPE_MAGIC)?;
+        recipe.tree_recipe()?;
+        Ok(recipe)
     }
 }

@@ -33,8 +33,17 @@ Workers compose the recipe directly in memory from the pinned package
 manifests, including their selected subtrees and logical destinations.
 The combined root is neither uploaded nor published to either CAS index.
 Conflicting file entries are rejected, directory metadata normalization
-is explicit in the recipe, and the recipe fingerprint is part of the
-native action identity. A hit has a result delivery ticket; an in-flight action
+is explicit in the recipe. The native action identity (schema
+`native-linux-bwrap-v4`) hashes the composed root manifest rather than the
+recipe fingerprint or constituent tree IDs. Mount identities remain bound to
+their exact destination paths. The scheduler independently composes and
+verifies the declared root digest before admitting a miss, applies tree
+limits to the composed root, and binds the exact delivery recipe to the
+ticket. The worker also verifies the resolved root before execution.
+Equivalent layer orderings or flattened trees therefore reuse a cached
+result without publishing a new tree, but a different file or metadata
+entry requires a different action. The old experimental action schema is
+not reused. A hit has a result delivery ticket; an in-flight action
 can be observed by retrying admission; a miss reserves a compilation.
 Scheduling a miss selects a worker whose advertised platform contract
 matches and accounts for capacity in the same pool as ordinary jobs.
@@ -274,7 +283,7 @@ snapshot supported by redb) without opening a writable store:
 ```sh
 sccache-dist native-audit --index /path/to/index.redb
 sccache-dist native-audit --index /path/to/index.redb \
-  --schema native-linux-bwrap-v3 --without environment/CARGO_SOME_SETTING
+  --schema native-linux-bwrap-v4 --without environment/CARGO_SOME_SETTING
 ```
 
 Repeat `--without` to evaluate a group jointly. The report counts pairs of
@@ -335,7 +344,7 @@ sccache-dist native-provision-rust --client-config /path/to/client.toml \
   --compression xz --manifest-output rustc.manifest
 ```
 
-The CLI first performs an authenticated lookup by exact upstream identity.
+The CLI first performs an authenticated lookup by upstream SHA-256 and codec, without an upstream length query.
 On a hit it needs no archive; on a miss it streams the original bytes.
 The owner verifies the compressed size and SHA-256 before decoding.
 A single import slot shares global upload admission. Compressed input,
@@ -351,6 +360,67 @@ security principal. Use the authenticated native listener and a trusted
 release checksum. The decoder deadline starts after compressed-input
 verification; transport timeouts are controlled by the client and the
 HTTP transport.
+
+### Automatic Rustup provisioning
+
+To let the scheduler acquire missing original packages directly, additionally
+configure its allowed distribution origin and request deadline:
+
+```toml
+[native_cache.package_upstream]
+origin = "https://static.rust-lang.org/"
+timeout_secs = 180
+```
+
+The server combines the configured origin with independently validated
+distribution paths beneath /dist/, disables redirects, and does not forward
+client authorization upstream. Concurrent acquisitions share one provisioning
+slot; clients retry busy replies within their configured request deadline.
+The scheduler streams compressed content into staging, enforces its archive
+byte limit even without Content-Length, verifies the release SHA-256, and
+decodes into the existing CAS. Verified hits do not contact the origin.
+
+On each Rustup installation host, run:
+
+```sh
+sccache-dist native-sync-rust --root /path/to/installed/sysroot \
+  --client-config /path/to/client.toml \
+  --output /path/to/installation.catalog \
+  --recipe-output /path/to/installation.recipe
+```
+
+This reads the installed Rustup component inventory and channel manifest
+(v1 config, v2 release metadata), not a guessed toolchain version. By default
+it selects every installed component with declared bin/lib payload, matching
+the current compiler toolchain discovery scope; installed cross-target
+standard libraries and target-independent components are included. Use
+`--full` to include documentation and other non-build components. Component
+names and target variants are resolved against the original installer
+metadata. Conflicting component trees or changed installation inventory
+abort publication.
+
+The portable recipe contains exact package provenance and selected
+component trees, validates composition, and can be used for offline
+reattestation:
+
+```sh
+sccache-dist native-attest-installation --root /path/to/installed/sysroot \
+  --recipe /path/to/installation.recipe --output /path/to/installation.catalog
+```
+
+On the same kernel boot, reattestation reuses a previous matching catalog
+entry only when the expected upstream digest and the currently opened
+file's version agree; stale records are rehashed. The catalog and recipe
+are each written atomically. These files can be retained across compiler
+processes, but the recipe does not pin the scheduler's contents indefinitely.
+The normal compiler still discovers and hashes the actual local input
+closure, including custom and modified tools; the catalog avoids repeated
+reads, and package content eliminates duplicate uploads.
+
+The draft native package index and portable installation manifest have
+changed format to store the verified archive length separately from the
+upstream identity. Recreate earlier experimental native stores; there is
+no production-store migration or compatibility path.
 
 ### Verified installation catalogs
 

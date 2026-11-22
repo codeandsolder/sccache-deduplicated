@@ -9,8 +9,8 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActionFingerprint, BlobRef, ContentId, OutputKind, ResultManifest, TreeId, TreeManifest,
-    identity::typed_digest,
+    ActionFingerprint, BlobRef, ContentId, ExecutionRoot, OutputKind, ResultManifest, TreeId,
+    TreeManifest, identity::typed_digest,
 };
 
 /// A short-lived, unguessable capability. Never log its bytes.
@@ -35,7 +35,8 @@ pub enum Publisher {
 /// The output contract is an additional mandatory fingerprint component.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionRequest {
-    pub fingerprint: ActionFingerprint,
+    pub(crate) fingerprint: ActionFingerprint,
+    pub(crate) root: ExecutionRoot,
     pub input_trees: BTreeSet<TreeId>,
     pub required_outputs: BTreeMap<String, OutputKind>,
     pub optional_outputs: BTreeMap<String, OutputKind>,
@@ -73,16 +74,21 @@ impl ActionRequest {
                 .is_none(),
             "reserved output-contract component"
         );
-        let trees = ContentId(typed_digest(
-            b"sccache-input-trees-v1\0",
-            &self.input_trees,
-        )?);
+        self.root.recipe.validate()?;
+        ensure!(
+            self.root
+                .recipe
+                .layers
+                .iter()
+                .all(|layer| self.input_trees.contains(&layer.tree)),
+            "native root recipe references an undeclared input"
+        );
         ensure!(
             fingerprint
                 .components
-                .insert("native/input-trees".into(), trees)
+                .insert("root/tree".into(), ContentId(self.root.id.0))
                 .is_none(),
-            "reserved input-tree component"
+            "reserved root component"
         );
         Ok(fingerprint)
     }

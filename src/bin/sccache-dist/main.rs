@@ -33,6 +33,8 @@ mod cmdline;
 mod command_helpers;
 #[cfg(target_os = "linux")]
 mod native;
+#[cfg(target_os = "linux")]
+mod rustup;
 mod token_check;
 #[cfg(target_os = "linux")]
 use native::NativeWorker;
@@ -191,12 +193,7 @@ fn write_installation_metadata(
     Ok(())
 }
 
-fn provision_rust_package(
-    client_config: &Path,
-    archive: Option<&Path>,
-    source: sccache::build_runtime::PackageSource,
-    manifest_output: Option<&Path>,
-) -> Result<()> {
+fn package_client(client_config: &Path) -> Result<sccache::dist::native::NativeCacheClient> {
     use sccache::{
         config::{DistAuth, FileConfig, try_read_config_file},
         dist::native::NativeCacheClient,
@@ -210,13 +207,26 @@ fn provision_rust_package(
     let DistAuth::Token { token } = config.dist.auth else {
         bail!("original-package provisioning requires token authentication");
     };
-    let client = NativeCacheClient::new(
+    NativeCacheClient::new(
         native.endpoint.to_url(),
         token,
         Duration::from_secs(native.request_timeout_secs),
         native.max_metadata_bytes,
-    )?;
-    let (manifest, reused) = if let Some(manifest) = client.lookup_rust_package(source)? {
+    )
+}
+
+fn provision_rust_package(
+    client_config: &Path,
+    archive: Option<&Path>,
+    source: sccache::build_runtime::PackageSource,
+    manifest_output: Option<&Path>,
+) -> Result<()> {
+    let client = package_client(client_config)?;
+    let (manifest, reused) = if let Some(manifest) = client.lookup_rust_package(source.identity)? {
+        anyhow::ensure!(
+            manifest.source == source,
+            "original package length differs from verified source"
+        );
         (manifest, true)
     } else {
         let archive = archive.context("upstream package unavailable; supply --archive")?;
@@ -290,7 +300,7 @@ fn run(command: Command) -> Result<i32> {
             max_tar_bytes,
             manifest_output,
         } => {
-            use sccache::build_runtime::{NativeStore, PackagePolicy};
+            use sccache::build_runtime::{ArchiveLength, NativeStore, PackagePolicy};
             let policy = PackagePolicy::rust_installer(
                 max_entries,
                 max_expanded_bytes,
@@ -298,13 +308,20 @@ fn run(command: Command) -> Result<i32> {
                 64 * 1024 * 1024,
             )?;
             let store = NativeStore::open(&store)?;
-            let (package, reused) = if let Some(existing) = store.lookup_package(source, policy)? {
+            let (package, reused) = if let Some(existing) =
+                store.lookup_package(source.identity, policy)?
+            {
+                anyhow::ensure!(
+                    existing.source() == source,
+                    "original package length differs from verified source"
+                );
                 (existing, true)
             } else {
                 let archive = archive.context("upstream package unavailable; supply --archive")?;
                 (
                     store.import_package(
-                        source,
+                        source.identity,
+                        ArchiveLength::Exact(source.size),
                         policy,
                         std::fs::File::open(archive)?,
                         sccache::build_runtime::PackageDecoder::Isolated {
@@ -333,17 +350,35 @@ fn run(command: Command) -> Result<i32> {
             Ok(0)
         }
         #[cfg(target_os = "linux")]
+        Command::NativeSyncRust {
+            root,
+            client_config,
+            output,
+            recipe_output,
+            full,
+        } => {
+            rustup::sync(&root, &client_config, &output, &recipe_output, full)?;
+            Ok(0)
+        }
+        #[cfg(target_os = "linux")]
         Command::NativeAttestInstallation {
             root,
             manifests,
+            recipe,
             output,
         } => {
-            use sccache::build_runtime::{InstallationCatalog, InstallationManifest};
-            let manifests = manifests
-                .iter()
-                .map(|path| InstallationManifest::read(std::fs::File::open(path)?))
-                .collect::<Result<Vec<_>>>()?;
-            let (catalog, report) = InstallationCatalog::attest(&root, &manifests)?;
+            use sccache::build_runtime::{
+                InstallationCatalog, InstallationManifest, InstallationRecipe,
+            };
+            let manifests = if let Some(recipe) = recipe {
+                InstallationRecipe::read(std::fs::File::open(recipe)?)?.selected_manifests()?
+            } else {
+                manifests
+                    .iter()
+                    .map(|path| InstallationManifest::read(std::fs::File::open(path)?))
+                    .collect::<Result<Vec<_>>>()?
+            };
+            let (catalog, report) = InstallationCatalog::attest(&root, &manifests, Some(&output))?;
             write_installation_metadata(&output, |file| catalog.write(file))?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(0)
@@ -1865,8 +1900,8 @@ mod scheduler_tests {
     #[test]
     fn native_jobs_select_compatible_workers_using_shared_capacity() -> Result<()> {
         use sccache::build_runtime::{
-            BuildPath, CommandSpec, ContentId, ExecutionSpec, TreeId, TreeMetadata, TreeRecipe,
-            TreeTimestamp, wire::Ticket,
+            BuildPath, CommandSpec, ContentId, ExecutionRoot, ExecutionSpec, TreeId, TreeMetadata,
+            TreeRecipe, TreeTimestamp, wire::Ticket,
         };
         let scheduler = Scheduler::new_with_job_slack(JobSlackConfig {
             static_jobs: 0,
@@ -1903,16 +1938,19 @@ mod scheduler_tests {
             ticket: Ticket([42; 32]),
             spec: ExecutionSpec {
                 platform,
-                root: TreeRecipe::union(
-                    TreeMetadata {
-                        mode: 0o755,
-                        modified: TreeTimestamp {
-                            seconds: 1,
-                            nanoseconds: 0,
+                root: ExecutionRoot {
+                    id: TreeId([0; 32]),
+                    recipe: TreeRecipe::union(
+                        TreeMetadata {
+                            mode: 0o755,
+                            modified: TreeTimestamp {
+                                seconds: 1,
+                                nanoseconds: 0,
+                            },
                         },
-                    },
-                    [TreeId([0; 32])],
-                ),
+                        [TreeId([0; 32])],
+                    ),
+                },
                 mounts: BTreeMap::new(),
                 command: CommandSpec {
                     executable: BuildPath::new(b"/bin/tool".to_vec())?,

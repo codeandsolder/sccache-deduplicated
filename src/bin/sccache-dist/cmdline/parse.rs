@@ -110,10 +110,20 @@ fn get_clap_command() -> ClapCommand {
     let command = ClapCommand::new(env!("CARGO_PKG_NAME"));
     #[cfg(target_os = "linux")]
     let command = command.subcommand(
+        ClapCommand::new("native-sync-rust")
+            .about("Acquire original packages for an installed Rustup sysroot and emit its recipe and verified catalog")
+            .arg(flag_infer_long("root").value_parser(clap::value_parser!(PathBuf)).required(true))
+            .arg(flag_infer_long("client-config").value_parser(clap::value_parser!(PathBuf)).required(true))
+            .arg(flag_infer_long("output").value_parser(clap::value_parser!(PathBuf)).required(true))
+            .arg(flag_infer_long("recipe-output").value_parser(clap::value_parser!(PathBuf)).required(true))
+            .arg(flag_infer_long("full").action(clap::ArgAction::SetTrue).help("Include installed non-build components such as documentation")),
+    ).subcommand(
         ClapCommand::new("native-attest-installation")
             .about("Verify installed files against original package manifests for reuse by compiler clients")
             .arg(flag_infer_long("root").value_parser(clap::value_parser!(PathBuf)).required(true))
-            .arg(flag_infer_long("manifest").value_parser(clap::value_parser!(PathBuf)).action(clap::ArgAction::Append).required(true))
+            .arg(flag_infer_long("manifest").value_parser(clap::value_parser!(PathBuf)).action(clap::ArgAction::Append))
+            .arg(flag_infer_long("recipe").value_parser(clap::value_parser!(PathBuf)))
+            .group(ArgGroup::new("installation_input").args(["manifest", "recipe"]).required(true))
             .arg(flag_infer_long("output").value_parser(clap::value_parser!(PathBuf)).required(true)),
     );
     command
@@ -301,6 +311,26 @@ pub fn try_parse_from(
             }
         }
         #[cfg(target_os = "linux")]
+        Some(("native-sync-rust", matches)) => Command::NativeSyncRust {
+            root: matches
+                .get_one::<PathBuf>("root")
+                .context("missing installation root")?
+                .clone(),
+            client_config: matches
+                .get_one::<PathBuf>("client-config")
+                .context("missing client configuration")?
+                .clone(),
+            output: matches
+                .get_one::<PathBuf>("output")
+                .context("missing catalog output")?
+                .clone(),
+            recipe_output: matches
+                .get_one::<PathBuf>("recipe-output")
+                .context("missing recipe output")?
+                .clone(),
+            full: matches.get_flag("full"),
+        },
+        #[cfg(target_os = "linux")]
         Some(("native-attest-installation", matches)) => Command::NativeAttestInstallation {
             root: matches
                 .get_one::<PathBuf>("root")
@@ -308,9 +338,11 @@ pub fn try_parse_from(
                 .clone(),
             manifests: matches
                 .get_many::<PathBuf>("manifest")
-                .context("missing package manifests")?
+                .into_iter()
+                .flatten()
                 .cloned()
                 .collect(),
+            recipe: matches.get_one::<PathBuf>("recipe").cloned(),
             output: matches
                 .get_one::<PathBuf>("output")
                 .context("missing catalog output")?
@@ -507,13 +539,15 @@ fn package_args(command: ClapCommand) -> ClapCommand {
 fn package_source(
     matches: &clap::ArgMatches,
 ) -> anyhow::Result<sccache::build_runtime::PackageSource> {
-    sccache::build_runtime::PackageSource::from_sha256_hex(
-        matches
-            .get_one::<String>("sha256")
-            .context("missing SHA-256")?,
-        *matches
+    Ok(sccache::build_runtime::PackageSource {
+        identity: sccache::build_runtime::PackageIdentity::from_sha256_hex(
+            matches
+                .get_one::<String>("sha256")
+                .context("missing SHA-256")?,
+            package_compression(matches)?,
+        )?,
+        size: *matches
             .get_one::<u64>("size")
             .context("missing package size")?,
-        package_compression(matches)?,
-    )
+    })
 }

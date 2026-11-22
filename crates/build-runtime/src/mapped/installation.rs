@@ -53,6 +53,8 @@ pub struct InstallationCatalog {
 pub struct InstallationReport {
     pub verified_files: u64,
     pub verified_bytes: u64,
+    pub reused_files: u64,
+    pub reused_bytes: u64,
     pub missing_files: u64,
     pub differing_files: u64,
 }
@@ -74,6 +76,7 @@ impl InstallationCatalog {
     pub fn attest(
         root: &Path,
         manifests: &[InstallationManifest],
+        previous: Option<&Path>,
     ) -> Result<(Self, InstallationReport)> {
         let root = root.canonicalize()?;
         ensure!(root.is_dir(), "installation root is not a directory");
@@ -85,7 +88,7 @@ impl InstallationCatalog {
         let mut expected = BTreeMap::new();
         for manifest in manifests {
             manifest.validate()?;
-            catalog.packages.insert(manifest.source_sha256);
+            catalog.packages.insert(manifest.source.identity.sha256);
             for (path, blob) in manifest.files()? {
                 if let Some(previous) = expected.insert(path, blob) {
                     ensure!(previous == blob, "conflicting original package contents");
@@ -93,6 +96,16 @@ impl InstallationCatalog {
             }
         }
         ensure!(!expected.is_empty(), "no installation files to verify");
+        let previous = match previous {
+            Some(path) if path.exists() => match Self::load(path) {
+                Ok(files) => files,
+                Err(error) => {
+                    log::warn!("Previous installation catalog unavailable: {error:#}");
+                    BTreeMap::new()
+                }
+            },
+            _ => BTreeMap::new(),
+        };
         let mut report = InstallationReport::default();
         for (path, blob) in expected {
             let local = root.join(std::ffi::OsStr::from_bytes(path.as_bytes()));
@@ -109,8 +122,15 @@ impl InstallationCatalog {
                 continue;
             }
             let (file, stat) = open_source(&resolved)?;
-            if u64::try_from(stat.st_size)? != blob.size || hash_open_source(&file, &stat)? != blob
-            {
+            if u64::try_from(stat.st_size)? != blob.size {
+                report.differing_files += 1;
+                continue;
+            }
+            let reused = lookup(&previous, &resolved, &file, &stat)? == Some(blob);
+            if reused {
+                report.reused_files += 1;
+                report.reused_bytes += blob.size;
+            } else if hash_open_source(&file, &stat)? != blob {
                 report.differing_files += 1;
                 continue;
             }

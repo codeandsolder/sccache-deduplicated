@@ -1,10 +1,15 @@
 use super::*;
-use crate::{ActionFingerprint, Artifact, ContentId, Eviction};
+use crate::{
+    ActionFingerprint, Artifact, ContentId, Eviction, ExecutionRoot, TreeMetadata, TreeRecipe,
+    TreeTimestamp,
+};
 use std::{collections::BTreeMap, io::Read};
 
 fn service(dir: &std::path::Path) -> Result<NativeSessions> {
+    let store = NativeStore::open(dir)?;
+    store.publish_tree(&empty_root(), vec![])?;
     NativeSessions::new(
-        NativeStore::open(dir)?,
+        store,
         SessionLimits {
             idle_timeout: Duration::from_secs(10),
             max_sessions: 8,
@@ -18,16 +23,35 @@ fn service(dir: &std::path::Path) -> Result<NativeSessions> {
     )
 }
 
-fn request() -> ActionRequest {
-    ActionRequest {
+fn empty_root() -> TreeManifest {
+    TreeManifest {
+        root: TreeMetadata {
+            mode: 0o755,
+            modified: TreeTimestamp {
+                seconds: 1,
+                nanoseconds: 0,
+            },
+        },
+        entries: BTreeMap::new(),
+    }
+}
+
+fn request() -> Result<ActionRequest> {
+    let root = empty_root();
+    let id = root.id()?;
+    Ok(ActionRequest {
         fingerprint: ActionFingerprint {
             schema: "test-native-v1".into(),
             components: BTreeMap::from([("source".into(), ContentId::of(b"input"))]),
         },
-        input_trees: BTreeSet::new(),
+        root: ExecutionRoot {
+            id,
+            recipe: TreeRecipe::union(root.root, [id]),
+        },
+        input_trees: BTreeSet::from([id]),
         required_outputs: BTreeMap::from([("obj".into(), crate::OutputKind::File)]),
         optional_outputs: BTreeMap::new(),
-    }
+    })
 }
 
 fn manifest(bytes: &[u8]) -> ResultManifest {
@@ -59,11 +83,11 @@ fn worker_publication_and_client_download_are_bound_to_ticket() -> Result<()> {
         address: "127.0.0.1:10502".parse()?,
         job: 42,
     };
-    let NativeAdmission::Compile { ticket } = service.admit(request(), worker)? else {
+    let NativeAdmission::Compile { ticket } = service.admit(request()?, worker)? else {
         bail!("expected compilation");
     };
     assert_eq!(
-        service.admit(request(), Publisher::Client)?,
+        service.admit(request()?, Publisher::Client)?,
         NativeAdmission::InFlight
     );
     let output = manifest(b"object");
@@ -98,12 +122,12 @@ fn worker_publication_and_client_download_are_bound_to_ticket() -> Result<()> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     assert_eq!(bytes, b"object");
-    let key = request().action_fingerprint()?.key()?;
+    let key = request()?.action_fingerprint()?.key()?;
     assert_eq!(service.store().evict(key)?, Eviction::Pinned);
     let NativeAdmission::Hit {
         ticket: second,
         manifest,
-    } = service.admit(request(), Publisher::Client)?
+    } = service.admit(request()?, Publisher::Client)?
     else {
         bail!("expected hit");
     };
@@ -126,7 +150,7 @@ fn worker_publication_and_client_download_are_bound_to_ticket() -> Result<()> {
 fn abandoned_and_failed_sessions_release_exclusive_compilation() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
-    let NativeAdmission::Compile { ticket } = service.admit(request(), Publisher::Client)? else {
+    let NativeAdmission::Compile { ticket } = service.admit(request()?, Publisher::Client)? else {
         bail!("expected compilation");
     };
     {
@@ -135,13 +159,13 @@ fn abandoned_and_failed_sessions_release_exclusive_compilation() -> Result<()> {
     }
     assert_eq!(service.reap()?, 1);
     assert!(service.status(ticket).is_err());
-    let NativeAdmission::Compile { ticket } = service.admit(request(), Publisher::Client)? else {
+    let NativeAdmission::Compile { ticket } = service.admit(request()?, Publisher::Client)? else {
         bail!("expected compilation after expiration");
     };
     service.fail(ticket, Publisher::Client)?;
     assert_eq!(service.status(ticket)?, NativeStatus::Failed);
     assert!(matches!(
-        service.admit(request(), Publisher::Client)?,
+        service.admit(request()?, Publisher::Client)?,
         NativeAdmission::Compile { .. }
     ));
     Ok(())
@@ -151,7 +175,7 @@ fn abandoned_and_failed_sessions_release_exclusive_compilation() -> Result<()> {
 fn result_contract_and_limits_control_publication() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
-    let NativeAdmission::Compile { ticket } = service.admit(request(), Publisher::Client)? else {
+    let NativeAdmission::Compile { ticket } = service.admit(request()?, Publisher::Client)? else {
         bail!("expected compilation");
     };
     let mut invalid = manifest(b"data");
@@ -168,7 +192,7 @@ fn result_contract_and_limits_control_publication() -> Result<()> {
     );
     service.close(ticket, Publisher::Client)?;
     assert!(matches!(
-        service.admit(request(), Publisher::Client)?,
+        service.admit(request()?, Publisher::Client)?,
         NativeAdmission::Compile { .. }
     ));
     Ok(())
@@ -178,7 +202,7 @@ fn result_contract_and_limits_control_publication() -> Result<()> {
 fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
-    let NativeAdmission::Compile { ticket } = service.admit(request(), Publisher::Client)? else {
+    let NativeAdmission::Compile { ticket } = service.admit(request()?, Publisher::Client)? else {
         bail!("expected compilation");
     };
     let worker = "127.0.0.1:10501".parse()?;
@@ -190,15 +214,15 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     };
     let expected = ScheduleReply::Assigned(allocation);
     assert_eq!(
-        service.schedule(ticket, &request(), || Ok(expected.clone()))?,
+        service.schedule(ticket, &request()?, || Ok(expected.clone()))?,
         expected
     );
     assert_eq!(
-        service.schedule(ticket, &request(), || bail!("duplicate allocation"))?,
+        service.schedule(ticket, &request()?, || bail!("duplicate allocation"))?,
         expected
     );
     assert!(service.renew(ticket, Publisher::Client).is_err());
-    let mut changed = request();
+    let mut changed = request()?;
     changed
         .required_outputs
         .insert("other".into(), crate::OutputKind::File);
@@ -227,7 +251,7 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
         manifest(b"object"),
     )?;
     assert_eq!(
-        service.schedule(ticket, &request(), || bail!("duplicate assignment"))?,
+        service.schedule(ticket, &request()?, || bail!("duplicate assignment"))?,
         expected
     );
     Ok(())
@@ -235,7 +259,7 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
 
 #[test]
 fn shared_input_tree_is_pinned_and_worker_can_fetch_only_declared_inputs() -> Result<()> {
-    use crate::{TreeEntry, TreeMetadata, TreePath, TreeTimestamp};
+    use crate::{TreeEntry, TreePath};
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
     let blob = BlobRef {
@@ -266,8 +290,12 @@ fn shared_input_tree_is_pinned_and_worker_can_fetch_only_declared_inputs() -> Re
     assert!(again.missing.is_empty());
     assert_eq!(service.commit_tree(again.ticket)?, id);
 
-    let mut request = request();
-    request.input_trees.insert(id);
+    let mut request = request()?;
+    request.root = ExecutionRoot {
+        id,
+        recipe: TreeRecipe::union(metadata, [id]),
+    };
+    request.input_trees = BTreeSet::from([id]);
     let worker = Publisher::Worker {
         address: "127.0.0.1:10501".parse()?,
         job: 42,
@@ -319,7 +347,7 @@ fn shared_input_tree_is_pinned_and_worker_can_fetch_only_declared_inputs() -> Re
 fn expiry_releases_action_even_when_a_transfer_retains_the_session() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
-    let NativeAdmission::Compile { ticket } = service.admit(request(), Publisher::Client)? else {
+    let NativeAdmission::Compile { ticket } = service.admit(request()?, Publisher::Client)? else {
         bail!("expected compilation");
     };
     let held = service.get(ticket)?;
@@ -327,7 +355,7 @@ fn expiry_releases_action_even_when_a_transfer_retains_the_session() -> Result<(
     assert_eq!(service.reap()?, 1);
     assert!(matches!(NativeSessions::lock(&held)?.phase, Phase::Failed));
     assert!(matches!(
-        service.admit(request(), Publisher::Client)?,
+        service.admit(request()?, Publisher::Client)?,
         NativeAdmission::Compile { .. }
     ));
     Ok(())
@@ -338,7 +366,7 @@ fn tree_result_contract_rejects_wrong_kinds_and_duplicate_logical_overflow() -> 
     use crate::{OutputKind, TreeEntry, TreeManifest, TreeMetadata, TreePath, TreeTimestamp};
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
-    let mut request = request();
+    let mut request = request()?;
     request
         .required_outputs
         .insert("obj".into(), OutputKind::Tree);

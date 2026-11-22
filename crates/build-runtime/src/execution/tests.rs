@@ -2,7 +2,8 @@ use std::{collections::BTreeMap, fs, io::Read, process::Command};
 
 use super::*;
 use crate::{
-    BuildPath, CommandSpec, OutputSpec, TreeManifest, TreeMetadata, TreeRecipe, TreeTimestamp,
+    BuildPath, CommandSpec, ExecutionRoot, OutputSpec, TreeManifest, TreeMetadata, TreeRecipe,
+    TreeTimestamp,
 };
 
 fn metadata(mode: u32) -> TreeMetadata {
@@ -99,7 +100,7 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
     let src = store.publish_tree(&original_manifest, vec![input])?;
     let platform = ContentId::of(b"test platform");
     let mut spec = ExecutionSpec {
-        platform, root: TreeRecipe::union(metadata(0o755), [root]),
+        platform, root: ExecutionRoot { id: root, recipe: TreeRecipe::union(metadata(0o755), [root]) },
         mounts: BTreeMap::from([(BuildPath::new(b"/src".to_vec())?, src)]),
         command: CommandSpec {
             executable: BuildPath::new(b"/bin/sh".to_vec())?,
@@ -136,6 +137,10 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
         ContentId::of(b"diagnostic")
     );
     assert_eq!(store.stats()?.actions, 0);
+
+    let mut forged = spec.clone();
+    forged.root.id = crate::TreeId([0xA5; 32]);
+    assert!(execute(&forged, &store, &policy, || Ok(())).is_err());
 
     // Failures must retain diagnostics without publishing a successful entry.
     spec.command.arguments[1] = b"printf 'failed' >&2; exit 7".to_vec();
@@ -288,7 +293,10 @@ fn rejects_symlink_and_fifo_outputs_without_following_or_blocking() -> Result<()
     };
     let spec = ExecutionSpec {
         platform: ContentId::of(b"platform"),
-        root: TreeRecipe::union(metadata(0o755), [crate::TreeId([0; 32])]),
+        root: ExecutionRoot {
+            id: crate::TreeId([0; 32]),
+            recipe: TreeRecipe::union(metadata(0o755), [crate::TreeId([0; 32])]),
+        },
         mounts: BTreeMap::new(),
         command: CommandSpec {
             executable: BuildPath::new(b"/bin/sh".to_vec())?,

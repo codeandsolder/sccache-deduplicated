@@ -16,8 +16,8 @@ use anyhow::{Context, Result, ensure};
 
 use crate::{
     build_runtime::{
-        BuildPath, CommandSpec, ContentId, ExecutionSpec, OutputKind, OutputSpec, PreparedTree,
-        SourceDigestCache, TreeRecipe,
+        BuildPath, CommandSpec, ContentId, ExecutionRoot, ExecutionSpec, OutputKind, OutputSpec,
+        PreparedTree, SourceDigestCache, TreeRecipe,
     },
     cache::FileObjectSource,
     client::{SharedConnection, connection_task},
@@ -336,7 +336,14 @@ impl CompilerPlan {
         let layout = layout.into_native_mapping()?.prepare()?;
         let directories = pkg::native_directory_metadata()?;
         let inputs = vec![toolchain, inputs, layout];
-        let root = TreeRecipe::union(directories, inputs.iter().map(PreparedTree::id));
+        let recipe = TreeRecipe::union(directories, inputs.iter().map(PreparedTree::id));
+        let root = ExecutionRoot::resolve(
+            recipe,
+            &inputs
+                .iter()
+                .map(|tree| (tree.id(), tree.manifest()))
+                .collect(),
+        )?;
         let spec = ExecutionSpec {
             platform,
             root,

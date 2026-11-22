@@ -9,12 +9,12 @@
 mod identity;
 mod installation;
 mod package;
-pub use installation::InstallationManifest;
-pub use package::{PackageCompression, PackageSource};
+pub use installation::{InstallationManifest, InstallationRecipe, InstalledComponent};
+pub use package::{ArchiveLength, PackageCompression, PackageIdentity, PackageSource};
 mod recipe;
 mod spec;
 pub use recipe::{TreeLayer, TreeRecipe};
-pub use spec::{BuildPath, CommandSpec, ExecutionSpec, OutputSpec};
+pub use spec::{BuildPath, CommandSpec, ExecutionRoot, ExecutionSpec, OutputSpec};
 mod tree;
 pub mod wire;
 pub use identity::{
@@ -28,7 +28,7 @@ mod coordinator;
 #[cfg(all(unix, feature = "store"))]
 mod session;
 #[cfg(all(unix, feature = "store"))]
-pub use session::{NativeSessions, SessionLimits};
+pub use session::{NativeServiceBusy, NativeSessions, SessionLimits};
 #[cfg(all(unix, feature = "store"))]
 mod store;
 #[cfg(all(unix, feature = "store"))]
