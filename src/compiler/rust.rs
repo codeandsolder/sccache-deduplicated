@@ -2198,7 +2198,7 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
                 _ if matches!(opt.as_ref(), "no-link" | "link-only") => {
                     // An explicit stage invocation has a different output
                     // contract from an ordinary --emit=link compilation.
-                    cannot_cache!("explicit Rust link stage", opt.to_string());
+                    cannot_cache!("explicit Rust link stage", opt.clone());
                 }
                 Some("y" | "yes" | "on") | None if opt == "profile" => {
                     gcno = true;
