@@ -84,6 +84,14 @@ The HTTP implementation of sccache has the following API, where all HTTP body co
       - Returns a digest and PEM for the temporary server HTTPS certificate.
    - `POST /api/v1/scheduler/heartbeat_server`
       - Called (repeatedly) by servers to register as available for jobs.
+      - Every five seconds, advertises fractional effective CPU capacity from
+        host idle CPU time plus the worker's currently executing jobs (capped
+        at the available CPU count). The scheduler subtracts all outstanding
+        assignments, including in-flight reservations, and randomly selects
+        a healthy worker with weight max(0, effective CPUs - assigned jobs) + 0.5.
+        Even a fully busy worker remains eligible unless its admission limit
+        is reached; there is no separate queue-slot draw. The previous busy
+        cutoff and re-enable delay are removed.
       - Includes active `run_job` IDs. A `Started` job absent for a full
         heartbeat timeout is released, while long compilations remain
         assigned as long as the worker reports them running.
@@ -100,7 +108,8 @@ The HTTP implementation of sccache has the following API, where all HTTP body co
       - Returns information about the scheduler, including total outstanding-job
         capacity and currently available admission slots. Capacity is computed
         per worker from its current advertised CPU count and the scheduler's
-        `[job_slack]` configuration; zero-width workers admit no jobs.
+        `[job_slack]` configuration; a fully busy worker retains a minimum
+        admission slot.
       - Protocol 4 / rollout epoch 5 adds these fields to the status wire format.
  - `server`
    - `POST /api/v1/distserver/assign_job`
@@ -376,8 +385,8 @@ secret_key = "my secret key"
 #### Admission policy
 
 The `[job_slack]` section is required. For a worker advertising `C` CPUs,
-the limit on outstanding assignments is `C + static_jobs + floor(C * percent / 100)`.
-A worker advertising zero CPUs always has zero admission capacity. The
+the limit on outstanding assignments is `max(1, ceil(C)) + static_jobs + floor(C * percent / 100)`.
+A worker advertising zero effective CPUs can still accept at least one job. The
 example admits three assignments per advertised CPU, including assignments
 waiting for toolchain transfer and assignment RPCs. It does not change the
 worker's execution width. Negative or nonfinite percentages are rejected.

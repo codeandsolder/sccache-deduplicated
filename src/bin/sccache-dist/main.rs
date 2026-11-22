@@ -459,15 +459,12 @@ pub struct Scheduler {
 
 struct ServerDetails {
     jobs_assigned: HashSet<JobId>,
-    // Scheduler-local sequence of the last assignment. Used to rotate equally
-    // loaded workers; HashMap iteration order must not decide idle-worker use.
-    last_assignment: Option<usize>,
     // Reservations for assignment RPCs still in flight. Once assigned,
     // the state and unclaimed timeout are owned exclusively by JobDetail.
     jobs_assigning: HashMap<JobId, Instant>,
     last_seen: Instant,
     last_error: Option<Instant>,
-    num_cpus: usize,
+    cpu_capacity: f64,
     server_nonce: ServerNonce,
     worker_name: Option<String>,
     job_authorizer: Box<dyn JobAuthorizer>,
@@ -588,14 +585,27 @@ impl Default for Scheduler {
     }
 }
 
-fn load_weight(job_count: usize, core_count: usize, job_slack: JobSlackConfig) -> Option<f64> {
-    // Admission and balancing are deliberately separate. The in-flight limit controls how many
-    // jobs may be assigned to a worker, while the weight still reflects jobs per real CPU so
-    // heterogeneous workers remain balanced by actual compute capacity.
-    if core_count == 0 || job_count >= job_slack.max_jobs(core_count) {
-        return None;
+fn admission_weight(job_count: usize, cpu_capacity: f64, job_slack: JobSlackConfig) -> Option<f64> {
+    (job_count < job_slack.max_jobs(cpu_capacity))
+        .then_some((cpu_capacity - job_count as f64).max(0.0) + 0.5)
+}
+
+fn weighted_server(candidates: &[(ServerId, f64)], draw: f64) -> Option<ServerId> {
+    let total: f64 = candidates.iter().map(|(_, weight)| weight).sum();
+    let mut ticket = draw * total;
+    for &(server_id, weight) in candidates {
+        if weight > 0.0 {
+            if ticket < weight {
+                return Some(server_id);
+            }
+            ticket -= weight;
+        }
     }
-    Some(job_count as f64 / core_count as f64)
+    candidates
+        .iter()
+        .rev()
+        .find(|(_, weight)| *weight > 0.0)
+        .map(|(id, _)| *id)
 }
 
 impl SchedulerIncoming for Scheduler {
@@ -614,62 +624,35 @@ impl SchedulerIncoming for Scheduler {
             let mut servers = self.servers.lock().unwrap();
 
             let res = {
-                let mut best = None;
-                let mut best_err = None;
-                let mut best_load = f64::INFINITY;
-                let mut best_last_assignment = None;
+                let mut healthy = Vec::new();
+                let mut retry = Vec::new();
                 let now = Instant::now();
                 for (&server_id, details) in servers.iter_mut() {
-                    let Some(load) = load_weight(
+                    let Some(weight) = admission_weight(
                         details.jobs_assigned.len(),
-                        details.num_cpus,
+                        details.cpu_capacity,
                         self.job_slack,
                     ) else {
                         continue;
                     };
-
-                    if let Some(last_error) = details.last_error {
-                        if now.duration_since(last_error) > SERVER_REMEMBER_ERROR_TIMEOUT {
-                            details.last_error = None;
-                        }
-                        match best_err {
-                            Some((
-                                _,
-                                &mut ServerDetails {
-                                    last_error: Some(best_last_err),
-                                    ..
-                                },
-                            )) => {
-                                if last_error < best_last_err {
-                                    trace!(
-                                        "Selected {:?}, its most recent error is {:?} ago",
-                                        server_id,
-                                        now - last_error
-                                    );
-                                    best_err = Some((server_id, details));
-                                }
-                            }
-                            _ => {
-                                trace!(
-                                    "Selected {:?}, its most recent error is {:?} ago",
-                                    server_id,
-                                    now - last_error
-                                );
-                                best_err = Some((server_id, details));
-                            }
-                        }
-                    } else if load < best_load
-                        || (load == best_load && details.last_assignment < best_last_assignment)
-                    {
-                        best_last_assignment = details.last_assignment;
-                        best = Some((server_id, details));
-                        trace!("Selected {:?} as the server with the best load", server_id);
-                        best_load = load;
+                    if details.last_error.is_some_and(|when| {
+                        now.duration_since(when) > SERVER_REMEMBER_ERROR_TIMEOUT
+                    }) {
+                        details.last_error = None;
+                    }
+                    if details.last_error.is_some() {
+                        retry.push((server_id, weight));
+                    } else {
+                        healthy.push((server_id, weight));
                     }
                 }
-
-                // Assign the job to our best choice
-                if let Some((server_id, server_details)) = best.or(best_err) {
+                let selected = [&healthy, &retry]
+                    .into_iter()
+                    .find_map(|candidates| weighted_server(candidates, rand::random::<f64>()));
+                if let Some(server_id) = selected {
+                    let server_details = servers
+                        .get_mut(&server_id)
+                        .expect("selected worker remains registered");
                     let job_id = self.next_job_id();
                     // Unique while holding the servers lock: every allocation
                     // advances job_count, including assignments that later fail.
@@ -679,7 +662,6 @@ impl SchedulerIncoming for Scheduler {
                         .job_authorizer
                         .generate_token(job_id)
                         .context("Could not create an auth token for this job")?;
-                    server_details.last_assignment = Some(self.job_count.load(Ordering::Relaxed));
                     assert!(server_details.jobs_assigned.insert(job_id));
                     assert!(
                         server_details
@@ -783,7 +765,7 @@ impl SchedulerIncoming for Scheduler {
         &self,
         server_id: ServerId,
         server_nonce: ServerNonce,
-        num_cpus: usize,
+        cpu_capacity: f64,
         running_job_ids: &[JobId],
         job_authorizer: Box<dyn JobAuthorizer>,
     ) -> Result<HeartbeatServerResult> {
@@ -793,11 +775,14 @@ impl SchedulerIncoming for Scheduler {
 
         self.prune_servers(&mut servers, &mut jobs);
 
+        if !cpu_capacity.is_finite() || cpu_capacity < 0.0 {
+            bail!("invalid worker CPU capacity {cpu_capacity}");
+        }
         match servers.get_mut(&server_id) {
             Some(ref mut details) if details.server_nonce == server_nonce => {
                 let now = Instant::now();
                 details.last_seen = now;
-                details.num_cpus = num_cpus;
+                details.cpu_capacity = cpu_capacity;
 
                 // The worker heartbeat is authoritative for *executing* jobs.
                 // A Started job missing from one heartbeat can be an in-flight
@@ -873,9 +858,8 @@ impl SchedulerIncoming for Scheduler {
                 last_seen: Instant::now(),
                 last_error: None,
                 jobs_assigned: HashSet::new(),
-                last_assignment: None,
                 jobs_assigning: HashMap::new(),
-                num_cpus,
+                cpu_capacity,
                 server_nonce,
                 worker_name: None,
                 job_authorizer,
@@ -1022,13 +1006,16 @@ impl SchedulerIncoming for Scheduler {
 
         Ok(SchedulerStatusResult {
             num_servers: servers.len(),
-            num_cpus: servers.values().map(|v| v.num_cpus).sum(),
+            num_cpus: servers
+                .values()
+                .map(|v| v.cpu_capacity.ceil() as usize)
+                .sum(),
             // Reservations are already consuming capacity while the assignment
             // RPC runs. Count them too, especially for maintenance drain checks.
             in_progress: servers.values().map(|v| v.jobs_assigned.len()).sum(),
             max_jobs: servers
                 .values()
-                .map(|v| self.job_slack.max_jobs(v.num_cpus))
+                .map(|v| self.job_slack.max_jobs(v.cpu_capacity))
                 .fold(0, usize::saturating_add),
             available_jobs: if self.is_draining() {
                 0
@@ -1037,7 +1024,7 @@ impl SchedulerIncoming for Scheduler {
                     .values()
                     .map(|v| {
                         self.job_slack
-                            .max_jobs(v.num_cpus)
+                            .max_jobs(v.cpu_capacity)
                             .saturating_sub(v.jobs_assigned.len())
                     })
                     .fold(0, usize::saturating_add)
@@ -1232,10 +1219,10 @@ mod scheduler_tests {
         let slack = JobSlackConfig::default();
 
         for cores in [1, 2, 7, 8, 12, 16, 64] {
-            assert_eq!(slack.max_jobs(cores), cores + 1 + cores / 8);
+            assert_eq!(slack.max_jobs(cores as f64), cores + 1 + cores / 8);
         }
-        assert!(load_weight(13, 12, slack).is_some());
-        assert!(load_weight(14, 12, slack).is_none());
+        assert!(admission_weight(13, 12.0, slack).is_some());
+        assert!(admission_weight(14, 12.0, slack).is_none());
     }
 
     #[test]
@@ -1245,11 +1232,36 @@ mod scheduler_tests {
             percent: 200.0,
         };
 
-        assert_eq!(slack.max_jobs(12), 36);
-        assert!(load_weight(35, 12, slack).is_some());
-        assert!(load_weight(36, 12, slack).is_none());
-        assert_eq!(slack.max_jobs(0), 0);
-        assert_eq!(JobSlackConfig::default().max_jobs(0), 0);
+        assert_eq!(slack.max_jobs(12.0), 36);
+        assert!(admission_weight(35, 12.0, slack).is_some());
+        assert!(admission_weight(36, 12.0, slack).is_none());
+        assert_eq!(slack.max_jobs(0.0), 1);
+        assert_eq!(JobSlackConfig::default().max_jobs(0.0), 2);
+    }
+
+    #[test]
+    fn free_cpu_weight_accounts_for_reservations_and_capacity_changes() {
+        let slack = JobSlackConfig {
+            static_jobs: 0,
+            percent: 400.0,
+        };
+        assert_eq!(admission_weight(0, 2.5, slack), Some(3.0));
+        assert_eq!(admission_weight(0, 0.01, slack), Some(0.51));
+        assert_eq!(admission_weight(1, 2.5, slack), Some(2.0));
+        assert_eq!(admission_weight(2, 2.5, slack), Some(1.0));
+        assert_eq!(admission_weight(3, 2.5, slack), Some(0.5));
+        assert_eq!(admission_weight(0, 0.0, slack), Some(0.5));
+        assert!(admission_weight(1, 0.0, slack).is_none());
+        assert!(admission_weight(0, f64::NAN, slack).is_none());
+        let a: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let b: ServerId = "127.0.0.2:10501".parse().unwrap();
+        let c: ServerId = "127.0.0.3:10501".parse().unwrap();
+        let choices = [(a, 1.5), (b, 3.5), (c, 0.5)];
+        assert_eq!(weighted_server(&choices, 0.0), Some(a));
+        assert_eq!(weighted_server(&choices, 0.27), Some(a));
+        assert_eq!(weighted_server(&choices, 0.28), Some(b));
+        assert_eq!(weighted_server(&choices, 0.999), Some(c));
+        assert_eq!(weighted_server(&[(c, 0.0)], 0.0), None);
     }
 
     struct TestJobAuthorizer;
@@ -1266,7 +1278,7 @@ mod scheduler_tests {
 
     fn register_test_server(scheduler: &Scheduler, server_id: ServerId, nonce: ServerNonce) {
         scheduler
-            .handle_heartbeat_server(server_id, nonce, 1, &[], Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(server_id, nonce, 1.0, &[], Box::new(TestJobAuthorizer))
             .unwrap();
     }
 
@@ -1307,7 +1319,7 @@ mod scheduler_tests {
             "127.0.0.1:10503".parse().unwrap(),
         ];
         let nonce = ServerNonce::new();
-        for (id, cpus) in ids.into_iter().zip([1, 3, 0]) {
+        for (id, cpus) in ids.into_iter().zip([1.0, 3.0, 0.0]) {
             scheduler
                 .handle_heartbeat_server(id, nonce.clone(), cpus, &[], Box::new(TestJobAuthorizer))
                 .unwrap();
@@ -1315,9 +1327,9 @@ mod scheduler_tests {
         let status = scheduler.handle_status().unwrap();
         assert_eq!(
             (status.num_cpus, status.max_jobs, status.available_jobs),
-            (4, 12, 12)
+            (4, 13, 13)
         );
-        for _ in 0..12 {
+        for _ in 0..13 {
             assert!(matches!(
                 scheduler
                     .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
@@ -1334,20 +1346,20 @@ mod scheduler_tests {
         let status = scheduler.handle_status().unwrap();
         assert_eq!(
             (status.in_progress, status.max_jobs, status.available_jobs),
-            (12, 12, 0)
+            (13, 13, 0)
         );
         scheduler
-            .handle_heartbeat_server(ids[0], nonce.clone(), 0, &[], Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(ids[0], nonce.clone(), 0.0, &[], Box::new(TestJobAuthorizer))
             .unwrap();
         scheduler
-            .handle_heartbeat_server(ids[1], nonce, 4, &[], Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(ids[1], nonce, 4.0, &[], Box::new(TestJobAuthorizer))
             .unwrap();
         let status = scheduler.handle_status().unwrap();
-        // Three jobs remain assigned to the now-paused worker; the other worker
+        // Three jobs remain assigned to the now-busy worker; the other worker
         // can admit three more despite the fleet's nominal capacity being full.
         assert_eq!(
             (status.in_progress, status.max_jobs, status.available_jobs),
-            (12, 12, 3)
+            (13, 14, 3)
         );
     }
 
@@ -1388,7 +1400,7 @@ mod scheduler_tests {
             let snapshot = self.scheduler.handle_heartbeat_server(
                 server_id,
                 self.nonce.clone(),
-                1,
+                1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
             )?;
@@ -1419,7 +1431,7 @@ mod scheduler_tests {
         let snapshot = scheduler.handle_heartbeat_server(
             server_id,
             nonce.clone(),
-            1,
+            1.0,
             &[],
             Box::new(TestJobAuthorizer),
         )?;
@@ -1430,7 +1442,7 @@ mod scheduler_tests {
         let snapshot = scheduler.handle_heartbeat_server(
             server_id,
             nonce,
-            1,
+            1.0,
             &[],
             Box::new(TestJobAuthorizer),
         )?;
@@ -1459,19 +1471,19 @@ mod scheduler_tests {
     }
 
     #[test]
-    fn equally_loaded_workers_rotate_after_each_completed_job() {
+    fn idle_workers_receive_jobs_proportional_to_cpu_capacity() {
         let scheduler = Scheduler::new();
         let ids: Vec<ServerId> = ["127.0.0.1:10501", "127.0.0.2:10501", "127.0.0.3:10501"]
             .into_iter()
             .map(|s| s.parse().unwrap())
             .collect();
 
-        for &id in &ids {
+        for (&id, capacity) in ids.iter().zip([1.0, 3.0, 0.0]) {
             scheduler
                 .handle_heartbeat_server(
                     id,
                     ServerNonce::new(),
-                    4,
+                    capacity,
                     &[],
                     Box::new(TestJobAuthorizer),
                 )
@@ -1479,7 +1491,7 @@ mod scheduler_tests {
         }
 
         let mut observed = Vec::new();
-        for _ in 0..12 {
+        for _ in 0..1024 {
             let result = scheduler
                 .handle_alloc_job(&AcceptAssign, test_toolchain('b'))
                 .unwrap();
@@ -1494,16 +1506,22 @@ mod scheduler_tests {
             }
         }
 
-        // Under serial, short jobs every worker is equally idle on every
-        // allocation. Previously the first zero-load HashMap entry won every
-        // time, starving all others despite full capacity.
-        for id in ids {
-            assert_eq!(
-                observed.iter().filter(|&&selected| selected == id).count(),
-                4,
-                "worker {id:?} should receive an equal share of idle jobs"
-            );
-        }
+        let first = observed
+            .iter()
+            .filter(|&&selected| selected == ids[0])
+            .count();
+        assert!(
+            (210..=350).contains(&first),
+            "first worker received {first} jobs"
+        );
+        let busy = observed
+            .iter()
+            .filter(|&&selected| selected == ids[2])
+            .count();
+        assert!(
+            (40..=150).contains(&busy),
+            "busy worker received {busy} jobs"
+        );
     }
 
     #[test]
@@ -1572,7 +1590,7 @@ mod scheduler_tests {
             let heartbeat = self.scheduler.handle_heartbeat_server(
                 server_id,
                 self.server_nonce.clone(),
-                1,
+                1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
             )?;
@@ -1613,7 +1631,7 @@ mod scheduler_tests {
             .handle_heartbeat_server(
                 server_id,
                 nonce.clone(),
-                1,
+                1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
             )
@@ -1629,7 +1647,7 @@ mod scheduler_tests {
                 .unwrap();
         }
         scheduler
-            .handle_heartbeat_server(server_id, nonce, 1, &[], Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(server_id, nonce, 1.0, &[], Box::new(TestJobAuthorizer))
             .unwrap();
         assert_no_assigned_jobs(&scheduler, &server_id);
     }
@@ -1657,7 +1675,7 @@ mod scheduler_tests {
             .handle_heartbeat_server(
                 server_id,
                 nonce.clone(),
-                1,
+                1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
             )
@@ -1682,7 +1700,7 @@ mod scheduler_tests {
                 .unwrap();
         }
         scheduler
-            .handle_heartbeat_server(server_id, nonce, 1, &[], Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(server_id, nonce, 1.0, &[], Box::new(TestJobAuthorizer))
             .unwrap();
         assert_eq!(
             scheduler
@@ -1717,7 +1735,13 @@ mod scheduler_tests {
         let scheduler = Scheduler::new();
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
         scheduler
-            .handle_heartbeat_server(server_id, ServerNonce::new(), 1, &[], Box::new(RejectToken))
+            .handle_heartbeat_server(
+                server_id,
+                ServerNonce::new(),
+                1.0,
+                &[],
+                Box::new(RejectToken),
+            )
             .unwrap();
         assert!(
             scheduler
@@ -1809,7 +1833,7 @@ mod scheduler_tests {
             .handle_heartbeat_server(
                 server_id,
                 nonce.clone(),
-                1,
+                1.0,
                 &[job_id],
                 Box::new(TestJobAuthorizer),
             )
@@ -1821,7 +1845,7 @@ mod scheduler_tests {
             .handle_heartbeat_server(
                 server_id,
                 nonce.clone(),
-                1,
+                1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
             )
@@ -1836,7 +1860,7 @@ mod scheduler_tests {
             );
         }
         scheduler
-            .handle_heartbeat_server(server_id, nonce, 1, &[], Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(server_id, nonce, 1.0, &[], Box::new(TestJobAuthorizer))
             .unwrap();
         assert_no_assigned_jobs(&scheduler, &server_id);
         // Reconciliation is not a successful completion. A late terminal
@@ -1929,7 +1953,7 @@ mod scheduler_tests {
             .handle_heartbeat_server(
                 server_id,
                 nonce.clone(),
-                1,
+                1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
             )
@@ -1948,7 +1972,7 @@ mod scheduler_tests {
             .handle_heartbeat_server(
                 server_id,
                 nonce.clone(),
-                1,
+                1.0,
                 &[job_id],
                 Box::new(TestJobAuthorizer),
             )
@@ -1964,7 +1988,7 @@ mod scheduler_tests {
                 .is_none()
         );
         scheduler
-            .handle_heartbeat_server(server_id, nonce, 1, &[], Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(server_id, nonce, 1.0, &[], Box::new(TestJobAuthorizer))
             .unwrap();
         assert!(scheduler.jobs.lock().unwrap().contains_key(&job_id));
         scheduler
@@ -2011,7 +2035,7 @@ mod scheduler_tests {
             .handle_heartbeat_server(
                 server_id,
                 nonce.clone(),
-                8,
+                8.0,
                 &[],
                 Box::new(TestJobAuthorizer),
             )
@@ -2037,7 +2061,7 @@ mod scheduler_tests {
             .handle_heartbeat_server(
                 server_id,
                 replacement_nonce,
-                8,
+                8.0,
                 &[],
                 Box::new(TestJobAuthorizer),
             )
@@ -2055,7 +2079,7 @@ mod scheduler_tests {
         let second_nonce = ServerNonce::new();
         for (server_id, nonce) in [(first, first_nonce.clone()), (second, second_nonce.clone())] {
             scheduler
-                .handle_heartbeat_server(server_id, nonce, 8, &[], Box::new(TestJobAuthorizer))
+                .handle_heartbeat_server(server_id, nonce, 8.0, &[], Box::new(TestJobAuthorizer))
                 .unwrap();
         }
         scheduler
@@ -2076,7 +2100,7 @@ mod scheduler_tests {
             .handle_heartbeat_server(
                 server_id,
                 nonce.clone(),
-                8,
+                8.0,
                 &[],
                 Box::new(TestJobAuthorizer),
             )

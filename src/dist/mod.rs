@@ -991,7 +991,7 @@ pub trait SchedulerIncoming: Send + Sync {
         &self,
         server_id: ServerId,
         server_nonce: ServerNonce,
-        num_cpus: usize,
+        cpu_capacity: f64,
         running_job_ids: &[JobId],
         job_authorizer: Box<dyn JobAuthorizer>,
     ) -> ExtResult<HeartbeatServerResult, Error>;
