@@ -284,6 +284,8 @@ pub struct RustCompilation {
     /// rewritten before compilation.
     env_dep_names: HashSet<OsString>,
     allow_dist: bool,
+    #[cfg(feature = "dist-client")]
+    dlltool_files: Vec<PathBuf>,
     canonical_paths: Option<CanonicalRustPaths>,
     #[cfg(all(feature = "dist-client", target_os = "linux"))]
     native_link: Option<super::rust_link::NativeLinkLayout>,
@@ -1509,6 +1511,7 @@ where
             canonical: false,
             host: None,
             target: None,
+            dlltool_files: Vec::new(),
         })
     }
     /// Parse `arguments` as rustc command-line arguments, determine if
@@ -2531,31 +2534,6 @@ fn relocate_rust_operands(
     Some(())
 }
 
-#[cfg(target_os = "linux")]
-pub fn relocate_raw_rust_operands(
-    arguments: &[OsString],
-    canonical: &CanonicalRustPaths,
-    cwd: &Path,
-) -> Option<Vec<OsString>> {
-    let mut parsed = ArgsIter::new(
-        super::rust_response::expand(arguments, cwd)
-            .ok()?
-            .into_iter(),
-        &ARGS[..],
-    )
-    .collect::<std::result::Result<Vec<_>, _>>()
-    .ok()?;
-    relocate_rust_operands(&mut parsed, canonical, cwd)?;
-    // An IPC fallback retains the original emit and color settings, unlike
-    // the cacheable compile where dep-info has already been generated.
-    Some(
-        parsed
-            .iter()
-            .flat_map(|arg| arg.iter_os_strings())
-            .collect(),
-    )
-}
-
 /// Identify the source operand using the same typed argument grammar as
 /// compiler hashing. Retain the expanded argv itself, not a reserialization:
 /// linker options, repeated options, and option spellings remain exact.
@@ -2695,6 +2673,47 @@ where
         // operands in the local response-file-aware path.
         let mut allow_dist = !needs_literal_argfile;
         let mut effective_cache_control = cache_control;
+        let dlltool_result = if self.parsed_args.metadata_only_output.is_some() {
+            Ok(None)
+        } else {
+            let explicit =
+                effective_arguments
+                    .iter()
+                    .rev()
+                    .find_map(|argument| match argument.get_data() {
+                        Some(CodeGen(ArgCodegen { opt, value })) if opt == "dlltool" => {
+                            value.as_deref()
+                        }
+                        _ => None,
+                    });
+            let target_json = self
+                .parsed_args
+                .target_json
+                .as_ref()
+                .map(|path| cwd.join(path));
+            super::rust_dlltool::discover(
+                &target,
+                target_json.as_deref(),
+                explicit,
+                &env_vars,
+                &cwd,
+                pool,
+            )
+            .await
+        };
+        let dlltool_unresolved = dlltool_result.is_err();
+        let dlltool_plan = match dlltool_result {
+            Ok(plan) => plan,
+            Err(error) => {
+                warn!(
+                    "Rust codegen auxiliary dependency discovery failed; bypassing cache: {error:#}"
+                );
+                effective_cache_control = CacheControl::ForceNoCache;
+                allow_dist = false;
+                None
+            }
+        };
+
         let resolved_native_profile = if native_requested {
             let profile = if let Some(profile) = self.native_profile.as_ref() {
                 profile.clone()
@@ -2842,6 +2861,15 @@ where
                     cargo_target,
                 )
             });
+        if dlltool_unresolved
+            || canonical_paths.as_ref().is_some_and(|canonical| {
+                dlltool_plan
+                    .as_ref()
+                    .is_some_and(|plan| !plan.canonical_visible(canonical))
+            })
+        {
+            canonical_paths = None;
+        }
         if let Some(canonical) = canonical_paths.as_ref() {
             // The sandbox mounts /build read-only and both output roots writable.
             // Validate the paths we already know before the dep-info pre-pass so
@@ -3189,6 +3217,20 @@ where
             target_std_manifest_digest.as_deref(),
             canonical_paths.is_none().then_some(self.sysroot.as_path()),
         );
+        // The same selected auxiliary closure participates in both result
+        // identity and the weak-to-strong archive mapping. Changing the
+        // assembler, DLL generator, or any loaded library cannot reuse an
+        // old compiled import library or an old toolchain package.
+        let weak_toolchain_key = if let Some(plan) = &dlltool_plan {
+            m.delimiter(b"rust-dlltool-closure-v1");
+            m.delimiter(plan.identity.as_bytes());
+            let mut weak = Digest::new();
+            weak.delimiter(weak_toolchain_key.as_bytes());
+            weak.delimiter(plan.identity.as_bytes());
+            weak.finish()
+        } else {
+            weak_toolchain_key
+        };
         // 3. The full commandline (self.arguments)
         // TODO: there will be full paths here, it would be nice to
         // normalize them so we can get cross-machine cache hits.
@@ -3566,6 +3608,8 @@ where
                 env_vars,
                 env_dep_names,
                 allow_dist,
+                #[cfg(feature = "dist-client")]
+                dlltool_files: dlltool_plan.map_or_else(Vec::new, |plan| plan.files),
                 canonical_paths,
                 #[cfg(all(feature = "dist-client", target_os = "linux"))]
                 native_link,
@@ -3890,6 +3934,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             env_vars,
             env_dep_names,
             canonical_paths,
+            dlltool_files,
             host,
             arguments,
             executable,
@@ -3947,6 +3992,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             canonical,
             host: Some(host),
             target: Some(target),
+            dlltool_files,
         });
 
         Ok((inputs_packager, toolchain_packager))
@@ -4575,6 +4621,7 @@ fn rlib_metadata_archive(file: &mut fs::File) -> Result<Option<Vec<u8>>> {
 #[cfg(feature = "dist-client")]
 struct RustToolchainPackager {
     sysroot: PathBuf,
+    dlltool_files: Vec<PathBuf>,
     canonical: bool,
     // Compiler-wide callers have no target; preserve full-package semantics.
     host: Option<String>,
@@ -4700,6 +4747,7 @@ fn test_dist_toolchain_archive_contains_only_required_installed_targets() -> Res
         canonical: true,
         host: Some(host.to_owned()),
         target: Some(target.to_owned()),
+        dlltool_files: Vec::new(),
     };
     pkg::ToolchainPackager::write_pkg(Box::new(packager), writer)?;
     let reader = fs::File::open(archive_path)?;
@@ -4743,6 +4791,7 @@ impl pkg::DiscoverToolchain for RustToolchainPackager {
             canonical,
             host,
             target,
+            dlltool_files,
         } = self;
 
         let mut package_builder = pkg::ToolchainPackageBuilder::new();
@@ -4750,6 +4799,10 @@ impl pkg::DiscoverToolchain for RustToolchainPackager {
             package_builder.add_root_mapping(sysroot.clone(), PathBuf::from("/rust"));
         }
         package_builder.add_common()?;
+
+        for dependency in dlltool_files {
+            package_builder.add_file(dependency)?;
+        }
 
         let bins_path = sysroot.join(BINS_DIR);
         let sysroot_executable = bins_path.join("rustc").with_extension(EXE_EXTENSION);
@@ -7135,6 +7188,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 env_vars: Vec::new(),
                 env_dep_names: HashSet::new(),
                 allow_dist: true,
+                #[cfg(feature = "dist-client")]
+                dlltool_files: Vec::new(),
                 canonical_paths: None,
                 #[cfg(all(feature = "dist-client", target_os = "linux"))]
                 native_link: None,
@@ -7250,6 +7305,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             env_vars: env,
             env_dep_names: HashSet::new(),
             allow_dist: true,
+            #[cfg(feature = "dist-client")]
+            dlltool_files: Vec::new(),
             canonical_paths: Some(canonical),
             #[cfg(all(feature = "dist-client", target_os = "linux"))]
             native_link: None,
@@ -7499,6 +7556,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             )],
             env_dep_names: HashSet::new(),
             allow_dist: true,
+            #[cfg(feature = "dist-client")]
+            dlltool_files: Vec::new(),
             canonical_paths: None,
             #[cfg(all(feature = "dist-client", target_os = "linux"))]
             native_link: None,
@@ -7573,6 +7632,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             )],
             env_dep_names: HashSet::new(),
             allow_dist: true,
+            #[cfg(feature = "dist-client")]
+            dlltool_files: Vec::new(),
             canonical_paths: None,
             #[cfg(all(feature = "dist-client", target_os = "linux"))]
             native_link: None,

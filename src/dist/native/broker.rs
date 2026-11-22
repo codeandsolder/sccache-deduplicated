@@ -24,7 +24,7 @@ use crate::{
 };
 
 use super::{
-    NativeBuildPolicy, NativeBuildResult, NativeBuildSource, NativeCacheClient,
+    LocalExecutor, NativeBuildPolicy, NativeBuildResult, NativeBuildSource, NativeCacheClient,
     client::{
         InputProvider, LocalInputs, Outcome, failed_output, fetch_result, validate_manifest,
         verify_destinations,
@@ -129,14 +129,16 @@ pub fn serve_action(
     client: &NativeCacheClient,
     policy: &NativeNamespacePolicy,
     mut stream: DaemonStream,
+    local: Option<&LocalExecutor>,
 ) -> Result<()> {
-    serve_inner(client, policy, &mut stream)
+    serve_inner(client, policy, &mut stream, local)
 }
 
 fn serve_inner(
     client: &NativeCacheClient,
     policy: &NativeNamespacePolicy,
     stream: &mut DaemonStream,
+    local: Option<&LocalExecutor>,
 ) -> Result<()> {
     let (spec, mode): (ExecutionSpec, ActionMode) = receive(stream, policy.max_metadata_bytes)?;
     ensure!(
@@ -148,7 +150,7 @@ fn serve_inner(
         stream,
         limit: policy.max_metadata_bytes,
     };
-    match client.acquire_action(&spec, &mut inputs, &build_policy)? {
+    match client.acquire_action(&spec, &mut inputs, &build_policy, local)? {
         Outcome::Failed { source, failure } => {
             send(
                 stream,
@@ -158,19 +160,18 @@ fn serve_inner(
         }
         Outcome::Ready {
             source,
-            pin,
+            delivery,
             manifest,
         } => {
             validate_manifest(&spec, &manifest, policy.max_result_bytes)?;
             let blobs = manifest.blobs()?;
-            client.with_renewal(pin.ticket, build_policy.renewal_interval, |check| {
+            delivery.with_download(build_policy.renewal_interval, |download| {
                 send(
                     stream,
                     &Event::Ready { source, manifest },
                     policy.max_metadata_bytes,
                 )?;
                 loop {
-                    check()?;
                     match receive(stream, policy.max_metadata_bytes)? {
                         ResultRequest::Finish => break,
                         ResultRequest::Blob(blob) => {
@@ -180,7 +181,7 @@ fn serve_inner(
                             );
                             let mut writer =
                                 BufWriter::with_capacity(stream.chunk_bytes(), &mut *stream);
-                            client.download(pin.ticket, blob, &mut writer)?;
+                            download(blob, &mut writer)?;
                             writer.flush()?;
                         }
                     }
@@ -190,7 +191,7 @@ fn serve_inner(
             // Closing a connection-owned result lease is independent of local
             // file installation. Send completion only after all transfers and
             // their validation have finished.
-            drop(pin);
+            drop(delivery);
             send(stream, &Event::Done, policy.max_metadata_bytes)?;
         }
     }

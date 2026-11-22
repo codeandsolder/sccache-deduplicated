@@ -20,10 +20,13 @@ use sccache::{
         SpacePolicy, TreeLayer, TreePath, TreeRecipe,
         wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply},
     },
-    config::{Config, DistAuth, HTTPUrl, NativeClientConfig, scheduler, server},
+    config::{
+        Config, DistAuth, HTTPUrl, NativeClientConfig, NativeExecutionPreference,
+        NativeLocalConfig, scheduler, server,
+    },
     dist::{
         SchedulerStatusResult,
-        native::{NativeBuildPolicy, NativeBuildSource, NativeCacheClient},
+        native::{LocalExecutor, NativeBuildPolicy, NativeBuildSource, NativeCacheClient},
         pkg::ToolchainPackageBuilder,
     },
 };
@@ -52,6 +55,17 @@ fn space() -> SpacePolicy {
         target_available_bytes: 2 * 1024 * 1024,
         max_evictions_per_pass: 8,
         gc_batch: 128,
+    }
+}
+
+fn local_config(root: &Path, preference: NativeExecutionPreference) -> NativeLocalConfig {
+    NativeLocalConfig {
+        preference,
+        max_jobs: 2,
+        directory: root.join("local-input-store"),
+        scratch: root.join("local-scratch"),
+        bubblewrap: "/usr/bin/bwrap".into(),
+        space: space(),
     }
 }
 
@@ -318,6 +332,7 @@ fn provisioning_config(root: &Path, endpoint: &reqwest::Url) -> Result<PathBuf> 
                 renewal_interval_secs: 1,
                 max_metadata_bytes: 1024 * 1024,
                 max_result_bytes: 1024 * 1024,
+                local_execution: None,
             }),
             ..Default::default()
         },
@@ -659,6 +674,39 @@ fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
     Ok(())
 }
 
+fn provision_compressed_fixture(
+    client: &NativeCacheClient,
+    root: &Path,
+    component: &str,
+    data: &[u8],
+) -> Result<(
+    sccache::build_runtime::PackageSource,
+    sccache::build_runtime::TreeId,
+)> {
+    use sccache::build_runtime::{PackageCompression, PackageIdentity, PackageSource};
+    use sha2::{Digest, Sha256};
+    let original = root.join(format!("{component}.tar"));
+    fs::write(
+        &original,
+        rust_installer_fixture(component, "lib/payload", data)?,
+    )?;
+    let compressed = Command::new("xz").arg("-c").arg(&original).output()?;
+    ensure!(compressed.status.success(), "fixture compression failed");
+    let package = PackageSource {
+        identity: PackageIdentity {
+            sha256: Sha256::digest(&compressed.stdout).into(),
+            compression: PackageCompression::Xz,
+        },
+        size: u64::try_from(compressed.stdout.len())?,
+    };
+    let archive = root.join(format!("{component}.tar.xz"));
+    fs::write(&archive, compressed.stdout)?;
+    let installed = client.import_rust_package(package, File::open(&archive)?)?;
+    assert_eq!(installed.source, package);
+    assert!(package.size < u64::try_from(data.len())? / 100);
+    Ok((package, installed.package))
+}
+
 #[test]
 #[ignore = "requires Linux Bubblewrap, GNU assembler and ldd"]
 fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()> {
@@ -676,40 +724,25 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let source_dir = root.join("source");
     fs::create_dir(&source_dir)?;
     let input = source_dir.join("input.s");
-    // The same payload exists under a different path in an original package.
-    // Its compressed representation is much smaller than the raw source.
-    let mut assembly = b".text\n.globl entry\nentry:\n.byte 1, 2, 3, 4\n".to_vec();
+    // Two independent missing source blobs have smaller original archives.
+    // Both are required by the same tree and can be reconstructed concurrently.
+    let mut assembly = b".text\n.globl entry\nentry:\n.include \"input.inc\"\n".to_vec();
+    let mut include = b".byte 1, 2, 3, 4\n".to_vec();
     for _ in 0..32768 {
         assembly.extend_from_slice(b"# repeated original assembly content\n");
+        include.extend_from_slice(b"# repeated original include content\n");
     }
     fs::write(&input, &assembly)?;
-    let original = root.join("assembly.tar");
-    fs::write(
-        &original,
-        rust_installer_fixture("assembly", "lib/assembly.s", &assembly)?,
-    )?;
-    let compressed = Command::new("xz").arg("-c").arg(&original).output()?;
-    ensure!(
-        compressed.status.success(),
-        "assembly fixture compression failed"
-    );
-    use sccache::build_runtime::{PackageCompression, PackageIdentity, PackageSource};
-    use sha2::{Digest, Sha256};
-    let package = PackageSource {
-        identity: PackageIdentity {
-            sha256: Sha256::digest(&compressed.stdout).into(),
-            compression: PackageCompression::Xz,
-        },
-        size: u64::try_from(compressed.stdout.len())?,
-    };
-    let archive = root.join("assembly.tar.xz");
-    fs::write(&archive, compressed.stdout)?;
-    let installed = client.import_rust_package(package, File::open(&archive)?)?;
-    assert_eq!(installed.source, package);
-    assert!(package.size < u64::try_from(assembly.len())? / 100);
+    let include_path = source_dir.join("input.inc");
+    fs::write(&include_path, &include)?;
+    let packages = [
+        provision_compressed_fixture(&client, root, "assembly", &assembly)?,
+        provision_compressed_fixture(&client, root, "include", &include)?,
+    ];
     let reference = root.join("reference.o");
     ensure!(
         Command::new("/usr/bin/as")
+            .current_dir(&source_dir)
             .arg("-o")
             .arg(&reference)
             .arg(&input)
@@ -724,6 +757,11 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     mapping.add_file(
         TreePath::new(b"input.s".to_vec())?,
         input.clone(),
+        MappedMetadata::Preserve,
+    )?;
+    mapping.add_file(
+        TreePath::new(b"input.inc".to_vec())?,
+        include_path,
         MappedMetadata::Preserve,
     )?;
     let source_tree = mapping.prepare()?;
@@ -868,7 +906,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     };
     let delivered = root.join("delivered.o");
     let destinations = BTreeMap::from([("object".into(), delivered.clone())]);
-    let hit = client.run_action(&spec, &inputs, &destinations, &policy)?;
+    let hit = client.run_action(&spec, &inputs, &destinations, &policy, None)?;
     assert_eq!(hit.source, NativeBuildSource::Hit);
     assert!(hit.output.status.success());
     assert_eq!(fs::read(&delivered)?, fs::read(&reference)?);
@@ -876,11 +914,11 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let mut second = spec.clone();
     second.command.arguments.insert(0, b"--64".to_vec());
     fs::remove_file(&delivered)?;
-    let miss = client.run_action(&second, &inputs, &destinations, &policy)?;
+    let miss = client.run_action(&second, &inputs, &destinations, &policy, None)?;
     assert_eq!(miss.source, NativeBuildSource::Worker(worker_address));
     assert!(miss.output.status.success());
     assert_eq!(fs::read(&delivered)?, fs::read(&reference)?);
-    let hit = client.run_action(&second, &inputs, &destinations, &policy)?;
+    let hit = client.run_action(&second, &inputs, &destinations, &policy, None)?;
     assert_eq!(hit.source, NativeBuildSource::Hit);
 
     // The same worker can declare a complete directory result, including
@@ -897,18 +935,18 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     )]);
     let generated = root.join("generated-codegen");
     let tree_destinations = BTreeMap::from([("codegen".into(), generated.clone())]);
-    let result = client.run_action(&directory, &inputs, &tree_destinations, &policy)?;
+    let result = client.run_action(&directory, &inputs, &tree_destinations, &policy, None)?;
     assert_eq!(result.source, NativeBuildSource::Worker(worker_address));
     assert!(result.output.status.success());
     assert_eq!(fs::read(generated.join("object.o"))?, fs::read(&reference)?);
     let source_bytes = fs::read(generated.join("input.s"))?;
     assert!(
         client
-            .run_action(&directory, &inputs, &tree_destinations, &policy)
+            .run_action(&directory, &inputs, &tree_destinations, &policy, None)
             .is_err()
     );
     fs::remove_dir_all(&generated)?;
-    let result = client.run_action(&directory, &inputs, &tree_destinations, &policy)?;
+    let result = client.run_action(&directory, &inputs, &tree_destinations, &policy, None)?;
     assert_eq!(result.source, NativeBuildSource::Hit);
     assert_eq!(fs::read(generated.join("object.o"))?, fs::read(&reference)?);
     assert_eq!(fs::read(generated.join("input.s"))?, source_bytes);
@@ -916,15 +954,60 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     directory.outputs.get_mut("codegen").context("output")?.kind =
         sccache_build::OutputKind::GeneratedTree;
     fs::remove_dir_all(&generated)?;
-    let result = client.run_action(&directory, &inputs, &tree_destinations, &policy)?;
+    let result = client.run_action(&directory, &inputs, &tree_destinations, &policy, None)?;
     assert_eq!(result.source, NativeBuildSource::Worker(worker_address));
     assert_eq!(fs::read(generated.join("object.o"))?, fs::read(&reference)?);
     assert!(!generated.join("input.s").exists());
     fs::remove_dir_all(&generated)?;
-    let result = client.run_action(&directory, &inputs, &tree_destinations, &policy)?;
+    let result = client.run_action(&directory, &inputs, &tree_destinations, &policy, None)?;
     assert_eq!(result.source, NativeBuildSource::Hit);
     assert_eq!(fs::read(generated.join("object.o"))?, fs::read(&reference)?);
     assert_eq!(fs::read_dir(&generated)?.count(), 1);
+
+    // The exact sandbox on the client host can publish and refresh the same
+    // action as the remote worker; its successful result needs no download.
+    let local = LocalExecutor::new(
+        local_config(root, NativeExecutionPreference::Local),
+        spec.platform,
+    );
+    let refresh = NativeBuildPolicy {
+        mode: ActionMode::Refresh,
+        ..policy
+    };
+    let result = client.run_action(&second, &inputs, &destinations, &refresh, Some(&local))?;
+    assert_eq!(result.source, NativeBuildSource::Local);
+    assert!(result.output.status.success());
+    assert_eq!(fs::read(&delivered)?, fs::read(&reference)?);
+    assert_eq!(
+        client
+            .run_action(&second, &inputs, &destinations, &policy, None)?
+            .source,
+        NativeBuildSource::Hit
+    );
+    drop(local);
+
+    let mut local_only = second.clone();
+    local_only.platform = ContentId::of(b"no compatible remote worker");
+    let local = LocalExecutor::new(
+        local_config(root, NativeExecutionPreference::RemoteFirst),
+        local_only.platform,
+    );
+    let result = client.run_action(&local_only, &inputs, &destinations, &policy, Some(&local))?;
+    assert_eq!(result.source, NativeBuildSource::Local);
+    assert!(result.output.status.success());
+    assert_eq!(fs::read(&delivered)?, fs::read(&reference)?);
+    assert_eq!(
+        client
+            .run_action(&local_only, &inputs, &destinations, &policy, None)?
+            .source,
+        NativeBuildSource::Hit
+    );
+    assert_eq!(fleet.status()?.in_progress, 0);
+    drop(local);
+    let local_store = NativeStore::open(&root.join("local-input-store"))?;
+    assert_eq!(local_store.stats()?.actions, 0);
+    assert_eq!(local_store.stats()?.trees, 2);
+    drop(local_store);
 
     // A real compiler failure must be reported but never become a hit.
     let mut invalid = spec;
@@ -947,7 +1030,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     assert!(!stderr.is_empty());
     assert_eq!(client.status(ticket)?, NativeStatus::Failed);
     client.close(ticket)?;
-    let failed = client.run_action(&invalid, &inputs, &destinations, &policy)?;
+    let failed = client.run_action(&invalid, &inputs, &destinations, &policy, None)?;
     assert_eq!(failed.source, NativeBuildSource::Worker(worker_address));
     assert!(!failed.output.status.success());
     assert!(!failed.output.stderr.is_empty());
@@ -956,29 +1039,31 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let store = NativeStore::open(&worker_directory)?;
     let policy =
         sccache::build_runtime::PackagePolicy::rust_installer(100000, 1 << 32, 5 << 30, 1 << 26)?;
-    let reconstructed = store
-        .lookup_package(package.identity, policy)?
-        .context("worker did not reconstruct original archive")?;
-    assert_eq!(reconstructed.tree().id(), installed.package);
-    assert_eq!(reconstructed.source(), package);
-    let missing = reconstructed
-        .tree()
-        .manifest()
-        .blobs()?
-        .into_iter()
-        .map(|(id, size)| sccache::build_runtime::BlobRef { id, size })
-        .collect::<Vec<_>>();
-    assert!(
-        store
-            .plan_package_downloads(&missing, 8, u64::MAX)?
-            .is_empty(),
-        "worker retained redundant archive"
-    );
+    for (package, tree) in packages {
+        let reconstructed = store
+            .lookup_package(package.identity, policy)?
+            .context("worker did not reconstruct original archive")?;
+        assert_eq!(reconstructed.tree().id(), tree);
+        assert_eq!(reconstructed.source(), package);
+        let missing = reconstructed
+            .tree()
+            .manifest()
+            .blobs()?
+            .into_iter()
+            .map(|(id, size)| sccache::build_runtime::BlobRef { id, size })
+            .collect::<Vec<_>>();
+        assert!(
+            store
+                .plan_package_downloads(&missing, 8, u64::MAX)?
+                .is_empty(),
+            "worker retained redundant archive"
+        );
+    }
     assert_eq!(worker_stats.actions, 0);
-    assert_eq!(scheduler_stats.actions, 4);
+    assert_eq!(scheduler_stats.actions, 5);
     assert_eq!(scheduler_stats.results, 3);
-    assert_eq!(worker_stats.trees, 3);
-    assert_eq!(scheduler_stats.trees, 4);
+    assert_eq!(worker_stats.trees, 4);
+    assert_eq!(scheduler_stats.trees, 6);
     Ok(())
 }
 
@@ -992,7 +1077,11 @@ struct LocalService {
 }
 
 impl LocalService {
-    fn start(root: &Path, fleet: &Fleet) -> Result<Self> {
+    fn start(
+        root: &Path,
+        fleet: &Fleet,
+        local_execution: Option<NativeLocalConfig>,
+    ) -> Result<Self> {
         let socket = root.join("client.sock");
         let caller_config = root.join("caller.toml");
         let cached_config = root.join("caller-cached.toml");
@@ -1010,6 +1099,7 @@ impl LocalService {
             renewal_interval_secs: 1,
             max_metadata_bytes: 64 * 1024 * 1024,
             max_result_bytes: 64 * 1024 * 1024,
+            local_execution,
         });
         config.fallback_cache.dir = root.join("unexpected-archive-cache");
         config.dist.cache_dir = root.join("unexpected-toolchain-cache");
@@ -1345,7 +1435,7 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;
     let fleet = Fleet::start(&root, None)?;
-    let mut service = LocalService::start(&root, &fleet)?;
+    let mut service = LocalService::start(&root, &fleet, None)?;
     let rustc = Command::new("rustc")
         .args(["--print", "sysroot"])
         .output()?;
@@ -1461,6 +1551,73 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
     assert_eq!(observed.conflicting_pairs, 1);
     assert_eq!(unused.examined_actions, 11);
     eprintln!("actual Rust environment audit: {unused:?}; {observed:?}");
+    assert_eq!(worker.actions, 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Linux Bubblewrap, GCC, Rust toolchain and ldd"]
+fn native_local_execution_in_networkless_namespace_shares_remote_actions() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let fleet = Fleet::start(&root, None)?;
+    let rustc = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()?;
+    ensure!(rustc.status.success(), "could not discover test sysroot");
+    let rustc = PathBuf::from(String::from_utf8(rustc.stdout)?.trim()).join("bin/rustc");
+    let visible = root.join("visible");
+    let private = root.join("private");
+    fs::create_dir(&visible)?;
+    fs::write(visible.join("probe.c"), b"#error wrong daemon source\n")?;
+    fs::write(
+        visible.join("probe.rs"),
+        b"compile_error!(\"wrong daemon source\");\n",
+    )?;
+    write_compiler_sources(&private)?;
+    let mut service = LocalService::start(
+        &root,
+        &fleet,
+        Some(local_config(&root, NativeExecutionPreference::Local)),
+    )?;
+    let output = namespace_compilers(&service, &private, &visible, &rustc, true)?;
+    ensure!(
+        output.status.success(),
+        "local namespace compilation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stats = service.stats()?;
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 0);
+    assert_eq!(stats.cache_misses.all(), 4);
+    assert_eq!(stats.cache_hits.all(), 4);
+    assert_eq!(stats.forced_recaches, 2);
+    assert_eq!(stats.dist_errors, 0);
+    service.stop()?;
+    drop(service);
+    let store = NativeStore::open(&root.join("local-input-store"))?;
+    assert_eq!(store.stats()?.actions, 0);
+    assert!(store.stats()?.trees >= 2);
+    drop(store);
+    // Restart only the local daemon with remote execution policy. Both
+    // ordinary hits and forced remote refreshes must reuse the same keys.
+    let mut service = LocalService::start(&root, &fleet, None)?;
+    let output = namespace_compilers(&service, &private, &visible, &rustc, true)?;
+    ensure!(
+        output.status.success(),
+        "remote refresh after local publication failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stats = service.stats()?;
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 2);
+    assert_eq!(stats.cache_misses.all(), 2);
+    assert_eq!(stats.cache_hits.all(), 6);
+    assert_eq!(stats.forced_recaches, 2);
+    assert_eq!(stats.dist_errors, 0);
+    assert!(!visible.join("build").exists());
+    assert!(!root.join("unexpected-archive-cache").exists());
+    service.stop()?;
+    let (scheduler, worker) = fleet.finish()?;
+    assert_eq!(scheduler.actions, 2);
     assert_eq!(worker.actions, 0);
     Ok(())
 }

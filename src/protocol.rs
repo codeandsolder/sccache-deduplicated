@@ -105,9 +105,9 @@ pub enum TransferRequest {
     // handshake can start one. No scheduler tickets or credentials cross IPC.
     NativeStart,
     NativeRead,
-    NativeWrite(Vec<u8>),
+    NativeWrite(#[serde(with = "serde_bytes")] Vec<u8>),
     NativeEnd,
-    WriteChunk(Vec<u8>),
+    WriteChunk(#[serde(with = "serde_bytes")] Vec<u8>),
     FinishWrite,
     ReadChunk,
     Abort,
@@ -117,7 +117,7 @@ pub enum TransferRequest {
 pub enum TransferReply {
     ReadStarted(Option<u64>),
     WriteStarted,
-    Chunk(Vec<u8>),
+    Chunk(#[serde(with = "serde_bytes")] Vec<u8>),
     Toolchain(Option<Toolchain>),
     Allocation {
         server: ServerId,
@@ -247,4 +247,39 @@ pub struct NativeNamespacePolicy {
     pub renewal_interval_secs: u64,
     pub max_metadata_bytes: u64,
     pub max_result_bytes: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bulk_transfer_frames_roundtrip_full_chunk() -> anyhow::Result<()> {
+        let payload = (0..TRANSFER_CHUNK_BYTES)
+            .map(|index| index.to_le_bytes()[0])
+            .collect::<Vec<_>>();
+        for request in [
+            TransferRequest::NativeWrite(payload.clone()),
+            TransferRequest::WriteChunk(payload.clone()),
+        ] {
+            let bytes = bincode::serialize(&Request::Transfer(request))?;
+            assert!(bytes.len() <= payload.len() + 32);
+            match bincode::deserialize(&bytes)? {
+                Request::Transfer(
+                    TransferRequest::NativeWrite(decoded) | TransferRequest::WriteChunk(decoded),
+                ) => assert_eq!(decoded, payload),
+                _ => anyhow::bail!("unexpected decoded transfer request"),
+            }
+        }
+        let bytes = bincode::serialize(&Response::Transfer(Ok(TransferReply::Chunk(
+            payload.clone(),
+        ))))?;
+        assert!(bytes.len() <= payload.len() + 32);
+        let Response::Transfer(Ok(TransferReply::Chunk(decoded))) = bincode::deserialize(&bytes)?
+        else {
+            anyhow::bail!("unexpected decoded transfer response");
+        };
+        assert_eq!(decoded, payload);
+        Ok(())
+    }
 }

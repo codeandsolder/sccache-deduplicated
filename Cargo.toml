@@ -92,6 +92,7 @@ reqwest = { version = "0.13", features = [
 semver = "1.0"
 sccache-build = { path = "crates/build-runtime", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
+serde_bytes = "0.11.19"
 serde_json = ">=1.0, <1.0.155" # zmij (used in 1.0.147+) requires Rust 1.84+
 sha2 = { version = "0.11.0", optional = true }
 shlex = "2.0.1"
@@ -235,7 +236,7 @@ vendored-openssl = ["openssl?/vendored", "reqwest?/native-tls-vendored"]
 unstable = []
 # Enables distributed support in the sccache client
 dist-client = [
-  "sccache-build/mapping",
+  "native-store",
   "zlib-rs-fast",
   "zlib-rs-fast/parallel",
   "hyper",

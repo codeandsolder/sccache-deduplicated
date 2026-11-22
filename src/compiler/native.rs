@@ -24,7 +24,7 @@ use crate::{
     config::{DistAuth, DistToolchainConfig, HTTPUrl, NativeClientConfig},
     dist::{
         self,
-        native::{NativeBuildResult, NativeBuildSource, NativeCacheClient, broker},
+        native::{LocalExecutor, NativeBuildResult, NativeBuildSource, NativeCacheClient, broker},
         pkg,
     },
     mock_command::CommandCreatorSync,
@@ -41,6 +41,7 @@ struct DirectEndpoint {
     config: NativeClientConfig,
     scheduler: Option<HTTPUrl>,
     auth: DistAuth,
+    local: Option<LocalExecutor>,
 }
 
 enum Endpoint {
@@ -86,11 +87,16 @@ impl NativeCompilerClient {
             max_metadata_bytes: config.max_metadata_bytes,
             max_result_bytes: config.max_result_bytes,
         };
+        let local = config
+            .local_execution
+            .clone()
+            .map(|config| LocalExecutor::new(config, policy.platform));
         Self {
             endpoint: Endpoint::Direct(Box::new(DirectEndpoint {
                 config,
                 scheduler,
                 auth,
+                local,
             })),
             policy,
             toolchains,
@@ -126,7 +132,10 @@ impl NativeCompilerClient {
 
     pub fn serve_namespace(&self, stream: broker::DaemonStream) -> Result<()> {
         let client = self.connect_http()?;
-        broker::serve_action(&client, &self.policy, stream)
+        let Endpoint::Direct(endpoint) = &self.endpoint else {
+            anyhow::bail!("native namespace endpoint cannot serve");
+        };
+        broker::serve_action(&client, &self.policy, stream, endpoint.local.as_ref())
     }
 
     pub async fn status(&self) -> DistInfo {
@@ -201,11 +210,12 @@ impl NativeCompilerClient {
 
     fn execute(&self, plan: &CompilerPlan, mode: ActionMode) -> Result<NativeBuildResult> {
         match &self.endpoint {
-            Endpoint::Direct(_) => self.connect_http()?.run_action(
+            Endpoint::Direct(endpoint) => self.connect_http()?.run_action(
                 &plan.spec,
                 &plan.inputs,
                 &plan.destinations,
                 &self.policy.build_policy(mode),
+                endpoint.local.as_ref(),
             ),
             Endpoint::Namespace {
                 connection,
@@ -639,13 +649,16 @@ pub(super) async fn compile<T: CommandCreatorSync>(
                 let elapsed = start.elapsed();
                 let classification = match result.source {
                     NativeBuildSource::Hit => CompileResult::CacheHit(elapsed),
-                    NativeBuildSource::Worker(addr) => CompileResult::NativeMiss(
+                    source => CompileResult::NativeMiss(
                         if mode == ActionMode::Refresh {
                             MissType::ForcedRecache
                         } else {
                             MissType::Normal
                         },
-                        DistType::Ok(addr.to_string()),
+                        match source {
+                            NativeBuildSource::Local | NativeBuildSource::Hit => DistType::NoDist,
+                            NativeBuildSource::Worker(addr) => DistType::Ok(addr.to_string()),
+                        },
                         elapsed,
                     ),
                 };
@@ -701,6 +714,7 @@ mod tests {
             renewal_interval_secs: 1,
             max_metadata_bytes: 64 * 1024 * 1024,
             max_result_bytes: 64 * 1024 * 1024,
+            local_execution: None,
         });
         Ok(config)
     }

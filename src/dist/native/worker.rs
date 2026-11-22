@@ -2,14 +2,18 @@
 //! native store and results move straight from captured descriptors to the
 //! scheduler. There is no legacy archive creation or client-side reupload.
 
-use std::time::{Duration, Instant};
+use std::{
+    num::NonZeroUsize,
+    time::{Duration, Instant},
+};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 
-use super::{NativeCacheClient, PackagePlanRequest};
+use super::{LeaseCheck, NativeCacheClient, PackagePlanRequest, map_packages};
 use crate::build_runtime::{
     ArchiveLength, BlobRef, CapturedExecution, ExecutionPolicy, ExecutionSpec, NativeServiceBusy,
-    NativeStore, PackageArchive, PackageImportLimits, VerifiedPackage, execute, wire::Ticket,
+    NativeStore, PackageArchive, PackageImportLimits, TreeId, TreeLease, VerifiedPackage, execute,
+    wire::Ticket,
 };
 
 impl NativeCacheClient {
@@ -19,7 +23,7 @@ impl NativeCacheClient {
         missing: &[BlobRef],
         store: &NativeStore,
         limits: PackageImportLimits,
-        check: &mut dyn FnMut() -> Result<()>,
+        check: &LeaseCheck<'_>,
     ) -> Result<Vec<VerifiedPackage>> {
         let plan = self.control(
             "package_plan",
@@ -36,20 +40,22 @@ impl NativeCacheClient {
                 return Ok(Vec::new());
             }
         };
-        let mut packages = Vec::new();
-        for offer in offers {
+        let jobs = NonZeroUsize::new(limits.max_concurrent_imports)
+            .context("zero package acquisition concurrency")?;
+        let packages = map_packages(&offers, jobs, |offer| {
             check()?;
-            match self.reconstruct_package(ticket, offer, store, limits, check) {
-                Ok(package) => packages.push(package),
+            match self.reconstruct_package(ticket, *offer, store, limits, check) {
+                Ok(package) => Ok(Some(package)),
                 Err(error) => {
-                    // This is a transport optimization, not an input
-                    // authority. Exact blob retrieval still verifies every
-                    // required byte if archive acquisition cannot help.
+                    check()?;
+                    // Package transport is optional. Verify all remaining
+                    // input bytes by retrieving the missing blobs directly.
                     warn!("native package reconstruction unavailable: {error:#}");
+                    Ok(None)
                 }
             }
-        }
-        Ok(packages)
+        })?;
+        Ok(packages.into_iter().flatten().collect())
     }
 
     fn reconstruct_package(
@@ -58,7 +64,7 @@ impl NativeCacheClient {
         offer: PackageArchive,
         store: &NativeStore,
         limits: PackageImportLimits,
-        check: &mut dyn FnMut() -> Result<()>,
+        check: &LeaseCheck<'_>,
     ) -> Result<VerifiedPackage> {
         ensure!(
             !limits.retain_original
@@ -121,31 +127,43 @@ impl NativeCacheClient {
         renewal_interval: Duration,
         package_import: Option<PackageImportLimits>,
     ) -> Result<CapturedExecution> {
+        self.execute_admitted(ticket, spec, store, policy, renewal_interval, |id, _| {
+            self.fetch_tree(ticket, id, store, renewal_interval, package_import)
+        })
+    }
+
+    pub(super) fn execute_admitted(
+        &self,
+        ticket: Ticket,
+        spec: &ExecutionSpec,
+        store: &NativeStore,
+        policy: &ExecutionPolicy,
+        renewal_interval: Duration,
+        mut fetch: impl FnMut(TreeId, &LeaseCheck<'_>) -> Result<TreeLease>,
+    ) -> Result<CapturedExecution> {
         let result = self.with_renewal(ticket, renewal_interval, |check| {
             self.verify_execution(ticket, spec.clone())?;
             if let Some(report) = store.maintain_space()? {
                 ensure!(
                     report.minimum_satisfied,
-                    "native worker store lacks allocatable space: {report:?}"
+                    "native executor store lacks allocatable space: {report:?}"
                 );
             }
             let request = spec.action_request()?;
             ensure!(
                 spec.platform == policy.platform,
-                "worker execution platform mismatch"
+                "native executor platform mismatch"
             );
             let mut inputs = Vec::new();
             for id in &request.input_trees {
                 check()?;
                 let tree = match store.lookup_tree(*id)? {
                     Some(tree) => tree,
-                    None => {
-                        self.fetch_tree(ticket, *id, store, renewal_interval, package_import)?
-                    }
+                    None => fetch(*id, check)?,
                 };
                 inputs.push(tree);
             }
-            let captured = execute(spec, store, policy, &mut *check)?;
+            let captured = execute(spec, store, policy, check)?;
             check()?;
             if let Some(manifest) = captured.successful_result() {
                 request.validate_result(manifest)?;

@@ -1,6 +1,4 @@
 use crate::dist;
-#[cfg(target_os = "linux")]
-use crate::util::OsStrExt;
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
@@ -260,44 +258,6 @@ pub(super) fn physical_operand(cwd: &Path, operand: &Path) -> Option<PathBuf> {
 }
 
 impl CanonicalRustPaths {
-    #[cfg(target_os = "linux")]
-    pub(crate) fn from_rustc_executable(
-        env: &[(OsString, OsString)],
-        cwd: &Path,
-        executable: &Path,
-        arguments: &[OsString],
-    ) -> Option<Self> {
-        let rust_root = executable.parent()?.parent()?;
-        // An IPC failure must run rustc with the same sandbox roots as the
-        // daemon would have used, including its ephemeral --out-dir. OUT_DIR
-        // alone is absent for many dependency crates.
-        let mut parsed_output_dir = None;
-        let mut target = None;
-        let mut args = arguments.iter();
-        while let Some(argument) = args.next() {
-            if argument == "--out-dir" {
-                parsed_output_dir = args.next().map(PathBuf::from);
-            } else if let Some(path) = argument.split_prefix("--out-dir=") {
-                parsed_output_dir = Some(PathBuf::from(path));
-            } else if argument == "--target" {
-                target = args.next().cloned();
-            } else if let Some(value) = argument.split_prefix("--target=") {
-                target = Some(value);
-            }
-        }
-        let output_dir = match parsed_output_dir {
-            Some(path) => Some(physical_operand(cwd, &path)?),
-            None => None,
-        };
-        Self::from_env_with_output_dir(
-            env,
-            cwd,
-            rust_root,
-            output_dir.as_deref(),
-            target.as_deref(),
-        )
-    }
-
     #[cfg(test)]
     pub(crate) fn from_env(
         env: &[(OsString, OsString)],
@@ -944,31 +904,6 @@ mod tests {
                     )
                 );
             }
-            #[cfg(target_os = "linux")]
-            for (target_args, out_args) in [
-                (
-                    vec![
-                        OsString::from("--target"),
-                        OsString::from("x86_64-unknown-uefi"),
-                    ],
-                    vec![OsString::from("--out-dir"), output.clone().into_os_string()],
-                ),
-                (
-                    vec![OsString::from("--target=x86_64-unknown-uefi")],
-                    vec![OsString::from(format!("--out-dir={}", output.display()))],
-                ),
-            ] {
-                let args: Vec<_> = target_args.into_iter().chain(out_args).collect();
-                let roots = CanonicalRustPaths::from_rustc_executable(
-                    &base_env,
-                    &source,
-                    Path::new("/rust/bin/rustc"),
-                    &args,
-                )
-                .unwrap();
-                assert_eq!(roots.intermediate_root.as_deref(), Some(shared.as_path()));
-                assert!(roots.root_is_known(&host_proc_macro));
-            }
             // An unrelated nested marked cache must not be promoted.
             for hint in [None, Some(OsStr::new("other-target"))] {
                 assert_eq!(marked_cargo_root(&output, hint), Some(target.clone()));
@@ -1037,9 +972,8 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn rustc_fallback_uses_same_ephemeral_output_root_without_out_dir_env() {
+    fn rustc_uses_ephemeral_output_root_without_out_dir_env() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
         let persistent = source.join("target");
@@ -1060,17 +994,12 @@ mod tests {
                 persistent.into_os_string(),
             ),
         ];
-        let arguments = vec![
-            OsString::from("--crate-name"),
-            OsString::from("foo"),
-            OsString::from("--out-dir"),
-            output_dir.clone().into_os_string(),
-        ];
-        let roots = CanonicalRustPaths::from_rustc_executable(
+        let roots = CanonicalRustPaths::from_env_with_output_dir(
             &env,
             &source,
-            Path::new("/rust/bin/rustc"),
-            &arguments,
+            Path::new("/rust"),
+            Some(&output_dir),
+            None,
         )
         .unwrap();
         assert_eq!(

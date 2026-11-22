@@ -16,10 +16,10 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use tempfile::NamedTempFile;
 
-use super::{NativeCacheClient, renewal::Renewals};
+use super::{LocalExecutor, NativeCacheClient, copy_verified, renewal::Renewals};
 use crate::build_runtime::{
-    ActionMode, Artifact, BlobRef, ExecutionSpec, MaterializedTree, PreparedTree, ResultManifest,
-    TreeId, TreeManifest, materialize_tree,
+    ActionMode, Artifact, BlobRef, CapturedExecution, ExecutionSpec, MaterializedTree,
+    PreparedTree, ResultManifest, TreeId, TreeLease, TreeManifest, materialize_tree,
     wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply, Ticket},
 };
 
@@ -35,6 +35,7 @@ pub struct NativeBuildPolicy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NativeBuildSource {
     Hit,
+    Local,
     Worker(SocketAddr),
 }
 
@@ -116,7 +117,7 @@ impl Drop for Pin<'_> {
 /// lease, or returned compiler failure diagnostics without a cache entry.
 pub(super) enum Outcome<'a> {
     Ready {
-        pin: Pin<'a>,
+        delivery: Delivery<'a>,
         source: NativeBuildSource,
         manifest: ResultManifest,
     },
@@ -126,10 +127,42 @@ pub(super) enum Outcome<'a> {
     },
 }
 
+type BlobDownload<'a> = dyn FnMut(BlobRef, &mut dyn Write) -> Result<()> + 'a;
+
+pub(super) enum Delivery<'a> {
+    Scheduler(Pin<'a>),
+    Local(Box<CapturedExecution>),
+}
+
+impl Delivery<'_> {
+    pub(super) fn with_download<T>(
+        &self,
+        renewal_interval: Duration,
+        operation: impl FnOnce(&mut BlobDownload<'_>) -> Result<T>,
+    ) -> Result<T> {
+        match self {
+            Self::Scheduler(pin) => {
+                pin.client
+                    .with_renewal(pin.ticket, renewal_interval, |check| {
+                        let result = operation(&mut |blob, output| {
+                            check()?;
+                            pin.client.download(pin.ticket, blob, output)
+                        })?;
+                        check()?;
+                        Ok(result)
+                    })
+            }
+            Self::Local(captured) => operation(&mut |blob, output| {
+                copy_verified(captured.open_blob(blob.id)?, blob, output)
+            }),
+        }
+    }
+}
+
 impl NativeCacheClient {
     /// Admit an exact native action, supply only absent inputs, and execute
-    /// on a compatible worker when needed. On success, results are read
-    /// directly from the scheduler and installed at the supplied local paths.
+    /// in the configured exact sandbox when needed. Remote results are read
+    /// from the scheduler; local results use captured descriptors directly.
     /// No result is repackaged into the legacy cache.
     ///
     /// # Errors
@@ -141,28 +174,24 @@ impl NativeCacheClient {
         inputs: &[PreparedTree],
         destinations: &BTreeMap<String, PathBuf>,
         policy: &NativeBuildPolicy,
+        local: Option<&LocalExecutor>,
     ) -> Result<NativeBuildResult> {
         let mut inputs = LocalInputs::new(spec, inputs)?;
         let destinations = verify_destinations(spec, destinations)?;
-        match self.acquire_action(spec, &mut inputs, policy)? {
+        match self.acquire_action(spec, &mut inputs, policy, local)? {
             Outcome::Ready {
-                pin,
+                delivery,
                 source,
                 manifest,
             } => {
-                let staged = self.with_renewal(pin.ticket, policy.renewal_interval, |check| {
-                    let result = fetch_result(
+                let staged = delivery.with_download(policy.renewal_interval, |download| {
+                    fetch_result(
                         spec,
                         &manifest,
                         &destinations,
                         policy.max_result_bytes,
-                        |blob, output| {
-                            check()?;
-                            self.download(pin.ticket, blob, output)
-                        },
-                    )?;
-                    check()?;
-                    Ok(result)
+                        download,
+                    )
                 })?;
                 let output = staged.install()?;
                 Ok(NativeBuildResult { source, output })
@@ -179,11 +208,13 @@ impl NativeCacheClient {
         spec: &ExecutionSpec,
         inputs: &mut impl InputProvider,
         policy: &NativeBuildPolicy,
+        local: Option<&LocalExecutor>,
     ) -> Result<Outcome<'_>> {
         validate_policy(policy)?;
         let request = spec.action_request()?;
         let start = Instant::now();
         let mut pins: BTreeMap<TreeId, Pin<'_>> = BTreeMap::new();
+        let mut local_pins: BTreeMap<TreeId, TreeLease> = BTreeMap::new();
         let renewals = Renewals::start(self.clone(), policy.renewal_interval)?;
 
         loop {
@@ -201,7 +232,7 @@ impl NativeCacheClient {
                     renewals.finish()?;
                     drop(pins);
                     return Ok(Outcome::Ready {
-                        pin,
+                        delivery: Delivery::Scheduler(pin),
                         source: NativeBuildSource::Hit,
                         manifest,
                     });
@@ -211,6 +242,7 @@ impl NativeCacheClient {
                     // not needed while another admitted action owns its closure.
                     renewals.clear()?;
                     pins.clear();
+                    local_pins.clear();
                     thread::sleep(
                         Duration::from_millis(50)
                             .min(policy.timeout.saturating_sub(start.elapsed())),
@@ -227,19 +259,16 @@ impl NativeCacheClient {
                             request.input_trees.contains(&id),
                             "scheduler requested undeclared input tree"
                         );
-                        let manifest = inputs.manifest(id)?;
-                        ensure!(manifest.id()? == id, "input provider supplied wrong tree");
-                        let blobs = manifest.blobs()?;
                         if let Some(pin) = pins.remove(&id) {
                             renewals.remove(pin.ticket)?;
                             drop(pin);
                         }
-                        let ticket = self.push_tree(
-                            &manifest,
-                            |content| {
-                                let size = *blobs.get(&content).context("undeclared content")?;
-                                inputs.open_blob(id, BlobRef { id: content, size })
-                            },
+                        let ticket = self.supply_input(
+                            id,
+                            inputs,
+                            local,
+                            &mut local_pins,
+                            &renewals,
                             policy.renewal_interval,
                         )?;
                         renewals.add(ticket)?;
@@ -259,9 +288,41 @@ impl NativeCacheClient {
                     };
                     renewals.finish()?;
                     drop(pins);
-                    return self.run_admitted(pin, spec, policy, start);
+                    return self.run_admitted(pin, spec, inputs, policy, start, local);
                 }
             }
+        }
+    }
+
+    fn supply_input(
+        &self,
+        id: TreeId,
+        inputs: &mut impl InputProvider,
+        local: Option<&LocalExecutor>,
+        local_pins: &mut BTreeMap<TreeId, TreeLease>,
+        renewals: &Renewals,
+        interval: Duration,
+    ) -> Result<Ticket> {
+        if let Some(local) = local.filter(|executor| executor.prefers_local()) {
+            let tree = match local_pins.entry(id) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(local.prepare_input(id, inputs, &|| renewals.check())?)
+                }
+            };
+            self.push_tree(tree.manifest(), |content| tree.open_file(content), interval)
+        } else {
+            let manifest = inputs.manifest(id)?;
+            ensure!(manifest.id()? == id, "input provider supplied wrong tree");
+            let blobs = manifest.blobs()?;
+            self.push_tree(
+                &manifest,
+                |content| {
+                    let size = *blobs.get(&content).context("undeclared content")?;
+                    inputs.open_blob(id, BlobRef { id: content, size })
+                },
+                interval,
+            )
         }
     }
 
@@ -269,12 +330,22 @@ impl NativeCacheClient {
         &self,
         pin: Pin<'a>,
         spec: &ExecutionSpec,
+        inputs: &mut impl InputProvider,
         policy: &NativeBuildPolicy,
         start: Instant,
+        local: Option<&LocalExecutor>,
     ) -> Result<Outcome<'a>> {
+        if let Some(local) = local.filter(|executor| executor.prefers_local()) {
+            return self.run_local(pin, spec, inputs, policy, start, local);
+        }
         let allocation = match self.schedule(pin.ticket, spec.clone())? {
             ScheduleReply::Assigned(allocation) => allocation,
-            ScheduleReply::Unavailable { message } => bail!("native worker unavailable: {message}"),
+            ScheduleReply::Unavailable { message } => {
+                if let Some(local) = local {
+                    return self.run_local(pin, spec, inputs, policy, start, local);
+                }
+                bail!("native worker unavailable: {message}");
+            }
         };
         let source = NativeBuildSource::Worker(allocation.address);
         let remaining = policy.timeout.saturating_sub(start.elapsed());
@@ -284,13 +355,38 @@ impl NativeCacheClient {
                     bail!("native worker did not publish its result");
                 };
                 Ok(Outcome::Ready {
-                    pin,
+                    delivery: Delivery::Scheduler(pin),
                     source,
                     manifest,
                 })
             }
             failure @ NativeRunResult::Failed { .. } => Ok(Outcome::Failed { source, failure }),
             NativeRunResult::JobNotFound => bail!("native worker lost its assigned job"),
+        }
+    }
+    fn run_local<'a>(
+        &self,
+        pin: Pin<'a>,
+        spec: &ExecutionSpec,
+        inputs: &mut impl InputProvider,
+        policy: &NativeBuildPolicy,
+        start: Instant,
+        local: &LocalExecutor,
+    ) -> Result<Outcome<'a>> {
+        let captured = local.execute(self, pin.ticket, spec, inputs, policy, start)?;
+        drop(pin);
+        let source = NativeBuildSource::Local;
+        if let Some(manifest) = captured.successful_result() {
+            Ok(Outcome::Ready {
+                manifest: manifest.clone(),
+                source,
+                delivery: Delivery::Local(Box::new(captured)),
+            })
+        } else {
+            Ok(Outcome::Failed {
+                source,
+                failure: captured.failure_result()?,
+            })
         }
     }
 }

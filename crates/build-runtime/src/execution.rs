@@ -10,6 +10,7 @@ use std::{
     os::unix::{
         ffi::OsStrExt,
         fs::{FileExt, MetadataExt},
+        process::ExitStatusExt,
     },
     path::{Path, PathBuf},
     process::{Child, ExitStatus, Stdio},
@@ -68,6 +69,30 @@ impl CapturedExecution {
     #[must_use = "the references identify the captured process diagnostics"]
     pub const fn diagnostics(&self) -> (Option<BlobRef>, Option<BlobRef>) {
         (self.manifest.stdout, self.manifest.stderr)
+    }
+
+    /// Return failure diagnostics for transport without publishing a cache hit.
+    /// # Errors
+    /// Returns an error for a successful execution or a diagnostic read failure.
+    pub fn failure_result(&self) -> Result<crate::wire::NativeRunResult> {
+        ensure!(!self.status.success(), "expected failed execution");
+        let diagnostic = |reference: Option<BlobRef>| -> Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            if let Some(reference) = reference {
+                self.open_blob(reference.id)?.read_to_end(&mut bytes)?;
+                ensure!(
+                    u64::try_from(bytes.len())? == reference.size,
+                    "failed diagnostic length mismatch"
+                );
+            }
+            Ok(bytes)
+        };
+        Ok(crate::wire::NativeRunResult::Failed {
+            code: self.status.code(),
+            signal: self.status.signal(),
+            stdout: diagnostic(self.manifest.stdout)?,
+            stderr: diagnostic(self.manifest.stderr)?,
+        })
     }
 
     /// Open a fresh independent stream of captured content.

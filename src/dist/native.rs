@@ -21,7 +21,9 @@ use crate::build_runtime::{
 use crate::dist::JobId;
 
 mod package;
-pub use package::{PackageAcquisition, RustPackageLocator};
+pub use package::{PackageAcquisition, RustPackageLocator, map_packages};
+
+type LeaseCheck<'a> = dyn Fn() -> Result<()> + Sync + 'a;
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct ExecutionRequest {
@@ -505,12 +507,12 @@ impl NativeCacheClient {
         &self,
         ticket: Ticket,
         interval: Duration,
-        operation: impl FnOnce(&mut dyn FnMut() -> Result<()>) -> Result<T>,
+        operation: impl FnOnce(&LeaseCheck<'_>) -> Result<T>,
     ) -> Result<T> {
         self.renew(ticket)?;
         let renewals = renewal::Renewals::start(self.clone(), interval)?;
         renewals.add(ticket)?;
-        let result = operation(&mut || renewals.check());
+        let result = operation(&|| renewals.check());
         let renewed = renewals.finish();
         result.and_then(|value| renewed.map(|()| value))
     }
@@ -634,7 +636,11 @@ mod worker;
 #[cfg(all(target_os = "linux", feature = "dist-client"))]
 mod client;
 #[cfg(all(target_os = "linux", feature = "dist-client"))]
+mod local;
+#[cfg(all(target_os = "linux", feature = "dist-client"))]
 pub use client::{NativeBuildPolicy, NativeBuildResult, NativeBuildSource};
+#[cfg(all(target_os = "linux", feature = "dist-client"))]
+pub use local::LocalExecutor;
 
 #[cfg(all(target_os = "linux", feature = "dist-client"))]
 pub(crate) mod broker;
