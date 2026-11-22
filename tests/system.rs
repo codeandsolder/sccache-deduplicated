@@ -2011,10 +2011,20 @@ fn test_assembler_affects_cache(preprocessor_cache_mode: bool) {
     writeln!(wrapper, "#!/bin/sh\nexec {} \"$@\"", assembler.display()).unwrap();
     drop(wrapper);
 
-    let path = env::var_os("PATH").unwrap();
-    let mut wrapper_first = OsString::from(&bindir);
-    wrapper_first.push(":");
-    wrapper_first.push(&path);
+    // GCC's built-in target-specific search directories may precede PATH.
+    // COMPILER_PATH is the actual explicit helper search override, and this
+    // assertion proves that the second invocation selects a different file.
+    let original_search = env::var_os("COMPILER_PATH");
+    let selected = Command::new(&compiler.exe)
+        .env("COMPILER_PATH", &bindir)
+        .arg("-print-prog-name=as")
+        .output()
+        .unwrap();
+    assert!(selected.status.success());
+    assert_eq!(
+        Path::new(String::from_utf8_lossy(&selected.stdout).trim()),
+        bindir.join("as")
+    );
 
     copy_to_tempdir(&[INPUT], tempdir.path());
     let sccache_cfg = sccache_client_cfg(tempdir.path(), preprocessor_cache_mode);
@@ -2023,12 +2033,21 @@ fn test_assembler_affects_cache(preprocessor_cache_mode: bool) {
 
     // The compiler is only looked at once per server, so anything that wants a
     // fresh look at the assembler needs a fresh server.
-    let compile = |path: &OsString, expected_hits: u64| {
+    let compile = |search: Option<&OsStr>, expected_hits: u64| {
         let _ = stop_local_daemon();
         start_local_daemon(&tempdir.path().join("sccache-cfg.json"), &cached_cfg);
         zero_stats();
         fs::remove_file(tempdir.path().join(OUTPUT)).ok();
-        sccache_command()
+        let mut command = sccache_command();
+        match search {
+            Some(search) => {
+                command.env("COMPILER_PATH", search);
+            }
+            None => {
+                command.env_remove("COMPILER_PATH");
+            }
+        }
+        command
             .args(compile_cmdline(
                 compiler.name,
                 &compiler.exe,
@@ -2037,7 +2056,6 @@ fn test_assembler_affects_cache(preprocessor_cache_mode: bool) {
                 Vec::new(),
             ))
             .current_dir(tempdir.path())
-            .env("PATH", path)
             .assert()
             .success();
         get_stats(move |info| {
@@ -2046,10 +2064,10 @@ fn test_assembler_affects_cache(preprocessor_cache_mode: bool) {
         });
     };
 
-    compile(&path, 0);
-    compile(&wrapper_first, 0);
+    compile(original_search.as_deref(), 0);
+    compile(Some(bindir.as_os_str()), 0);
     // Back to the assembler the cache was populated with.
-    compile(&path, 1);
+    compile(original_search.as_deref(), 1);
     let _ = stop_local_daemon();
 }
 
