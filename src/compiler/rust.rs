@@ -54,7 +54,6 @@ use std::env::consts::EXE_EXTENSION;
 #[cfg(feature = "dist-client")]
 use std::env::consts::EXE_SUFFIX;
 use std::ffi::{OsStr, OsString};
-use std::fmt;
 use std::fs::OpenOptions;
 use std::future::Future;
 use std::hash::Hash;
