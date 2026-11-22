@@ -154,7 +154,8 @@ pub(crate) mod common {
     pub struct HeartbeatServerHttpRequest {
         pub jwt_key: Vec<u8>,
         pub cpu_capacity: f64,
-        pub running_job_ids: Vec<dist::JobId>,
+        // Executing jobs and pending jobs receiving bytes from a client.
+        pub active_job_ids: Vec<dist::JobId>,
         pub server_nonce: dist::ServerNonce,
         pub cert_digest: Vec<u8>,
         pub cert_pem: Vec<u8>,
@@ -165,7 +166,7 @@ pub(crate) mod common {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("HeartbeatServerHttpRequest")
                 .field("cpu_capacity", &self.cpu_capacity)
-                .field("running_job_ids", &self.running_job_ids)
+                .field("active_job_ids", &self.active_job_ids)
                 .field("server_nonce", &self.server_nonce)
                 .field(
                     "cert_digest",
@@ -185,7 +186,7 @@ pub(crate) mod common {
             let heartbeat = HeartbeatServerHttpRequest {
                 jwt_key,
                 cpu_capacity: 4.0,
-                running_job_ids: Vec::new(),
+                active_job_ids: Vec::new(),
                 server_nonce: dist::ServerNonce::new(),
                 cert_digest: vec![1, 2, 3],
                 cert_pem: b"certificate".to_vec(),
@@ -515,6 +516,98 @@ mod server {
         );
         drop(second);
         assert!(active.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    // A pending assignment must survive a genuinely progressing archive upload,
+    // but a connected client that stops sending bytes must not hold a slot.
+    type UploadActivity = Arc<Mutex<HashMap<JobId, Instant>>>;
+
+    struct ProgressReader<R> {
+        inner: R,
+        activity: UploadActivity,
+        job_id: JobId,
+    }
+
+    impl<R: Read> ProgressReader<R> {
+        fn new(inner: R, activity: &UploadActivity, job_id: JobId) -> Result<Self> {
+            let mut uploads = activity
+                .lock()
+                .map_err(|_| anyhow!("upload activity mutex poisoned"))?;
+            match uploads.entry(job_id) {
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    return Err(anyhow!("job {job_id} already has an active upload"));
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Instant::now());
+                }
+            }
+            drop(uploads);
+            Ok(Self {
+                inner,
+                activity: Arc::clone(activity),
+                job_id,
+            })
+        }
+    }
+
+    impl<R: Read> Read for ProgressReader<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let bytes = self.inner.read(buffer)?;
+            if bytes != 0 {
+                let mut uploads = self
+                    .activity
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if let Some(last_progress) = uploads.get_mut(&self.job_id) {
+                    *last_progress = Instant::now();
+                }
+            }
+            Ok(bytes)
+        }
+    }
+
+    impl<R> Drop for ProgressReader<R> {
+        fn drop(&mut self) {
+            self.activity
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&self.job_id);
+        }
+    }
+
+    fn recently_progressing_uploads(activity: &UploadActivity, now: Instant) -> Vec<JobId> {
+        let uploads = activity.lock().unwrap_or_else(|error| error.into_inner());
+        uploads
+            .iter()
+            .filter_map(|(&job, &progress)| {
+                (now.saturating_duration_since(progress) < HEARTBEAT_TIMEOUT).then_some(job)
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn upload_activity_requires_recent_byte_progress() -> Result<()> {
+        let activity = UploadActivity::default();
+        let job = JobId(42);
+        let mut reader = ProgressReader::new(std::io::Cursor::new(b"archive"), &activity, job)?;
+        assert!(ProgressReader::new(std::io::empty(), &activity, job).is_err());
+        let now = Instant::now();
+        activity
+            .lock()
+            .unwrap()
+            .insert(job, now.checked_sub(HEARTBEAT_TIMEOUT).unwrap());
+        assert!(recently_progressing_uploads(&activity, now).is_empty());
+        let mut bytes = [0; 3];
+        reader.read_exact(&mut bytes)?;
+        assert_eq!(&bytes, b"arc");
+        assert_eq!(
+            recently_progressing_uploads(&activity, Instant::now()),
+            vec![job]
+        );
+        drop(reader);
+        assert!(activity.lock().unwrap().is_empty());
         Ok(())
     }
 
@@ -1166,7 +1259,7 @@ mod server {
                         let heartbeat_server = try_or_400_log!(req_id, bincode_input(request));
                         trace!(target: "sccache_heartbeat", "Req {}: heartbeat_server: {:?}", req_id, heartbeat_server);
 
-                        let HeartbeatServerHttpRequest { cpu_capacity, running_job_ids, jwt_key, server_nonce, cert_digest, cert_pem } = heartbeat_server;
+                        let HeartbeatServerHttpRequest { cpu_capacity, active_job_ids, jwt_key, server_nonce, cert_digest, cert_pem } = heartbeat_server;
                         let job_authorizer = try_or_400_log!(req_id, JWTJobAuthorizer::boxed(&jwt_key));
                         let mut requester_client = try_or_500_log!(
                             req_id,
@@ -1189,7 +1282,7 @@ mod server {
                         let worker_name_nonce = server_nonce.clone();
                         let res: HeartbeatServerResult = try_or_500_log!(req_id, handler.handle_heartbeat_server(
                             server_id, server_nonce,
-                            cpu_capacity, &running_job_ids,
+                            cpu_capacity, &active_job_ids,
                             job_authorizer, dist::WorkerCapabilities { archive, native_platform }
                         ));
                         if let Some(worker_name) = worker_name
@@ -1378,6 +1471,8 @@ mod server {
             let capabilities = handler.capabilities();
             let running_jobs = Arc::new(Mutex::new(HashSet::<JobId>::new()));
             let heartbeat_running_jobs = Arc::clone(&running_jobs);
+            let upload_activity = UploadActivity::default();
+            let heartbeat_upload_activity = Arc::clone(&upload_activity);
             let heartbeat_jwt_key = jwt_key.clone();
             let heartbeat_cert_pem = cert_pem.clone();
             let job_authorizer = JWTJobAuthorizer::boxed(&jwt_key)?;
@@ -1406,9 +1501,20 @@ mod server {
                         .collect();
                     let advertised_cpus =
                         load_aware_capacity.advertised_cpus(running_job_ids.len());
+                    // Transfers keep their assignment alive, but do not count as
+                    // executing compiler processes for CPU-capacity restoration.
+                    let active_job_ids = running_job_ids
+                        .into_iter()
+                        .chain(recently_progressing_uploads(
+                            &heartbeat_upload_activity,
+                            Instant::now(),
+                        ))
+                        .collect::<HashSet<_>>()
+                        .into_iter()
+                        .collect();
                     let heartbeat_req = HeartbeatServerHttpRequest {
                         cpu_capacity: advertised_cpus,
-                        running_job_ids,
+                        active_job_ids,
                         jwt_key: heartbeat_jwt_key.clone(),
                         server_nonce: server_nonce.clone(),
                         cert_digest: cert_digest.clone(),
@@ -1511,7 +1617,8 @@ mod server {
                                 .data()
                                 .context("missing submit_toolchain request body")
                         );
-                        let toolchain_rdr = ToolchainReader(Box::new(body));
+                        let progress = try_or_500_log!(req_id, ProgressReader::new(body, &upload_activity, job_id));
+                        let toolchain_rdr = ToolchainReader(Box::new(progress));
                         let res: SubmitToolchainResult = try_or_500_log!(req_id, handler.handle_submit_toolchain(&requester, job_id, toolchain_rdr));
                         prepare_response(request, &res)
                     },
@@ -1675,7 +1782,7 @@ mod client {
     use crate::errors::{Context, Result, anyhow};
 
     const REQUEST_TIMEOUT_SECS: u64 = 1200;
-    const CONNECT_TIMEOUT_SECS: u64 = 5;
+    const CONNECT_TIMEOUT_SECS: u64 = 20;
     const WORKER_NAME_LOOKUP_TIMEOUT: Duration = Duration::from_secs(1);
     const WORKER_NAME_CACHE_TTL: Duration = Duration::from_secs(300);
     const WORKER_NAME_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -1758,6 +1865,7 @@ mod client {
             let timeout = Duration::new(REQUEST_TIMEOUT_SECS, 0);
             let new_client_async = client_async_builder
                 .timeout(timeout)
+                .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
                 // Disable keep-alive
                 .pool_max_idle_per_host(0)
                 .build()

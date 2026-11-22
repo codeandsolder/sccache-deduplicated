@@ -90,7 +90,7 @@ fn receive<T: DeserializeOwned>(stream: &mut impl Read, limit: u64) -> Result<T>
 }
 
 impl NativeNamespacePolicy {
-    pub fn build_policy(&self) -> NativeBuildPolicy {
+    pub const fn build_policy(&self) -> NativeBuildPolicy {
         NativeBuildPolicy {
             timeout: Duration::from_secs(self.build_timeout_secs),
             renewal_interval: Duration::from_secs(self.renewal_interval_secs),
@@ -233,6 +233,7 @@ pub fn run_action(
         TransferRequest::Abort
     };
     let close = connection.transfer(request);
+    drop(connection);
     match result {
         Ok(result) => {
             ensure!(

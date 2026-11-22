@@ -47,11 +47,13 @@ impl fmt::Display for SocketAddr {
 impl SocketAddr {
     /// Get a Net address that with IP part set to "127.0.0.1".
     #[inline]
+    #[must_use = "returns the constructed address"]
     pub fn with_port(port: u16) -> Self {
         Self::Net(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
     }
 
     #[inline]
+    #[must_use = "returns the network address, if present"]
     pub const fn as_net(&self) -> Option<&std::net::SocketAddr> {
         match self {
             Self::Net(addr) => Some(addr),
@@ -63,6 +65,9 @@ impl SocketAddr {
     /// Parse a string as a unix domain socket.
     ///
     /// The string should follow the format of `self.to_string()`.
+    ///
+    /// # Errors
+    /// Returns an error for invalid escaped abstract socket names.
     #[cfg(unix)]
     pub fn parse_uds(s: &str) -> std::io::Result<Self> {
         // Parse abstract socket address first as it can contain any chars.
@@ -79,11 +84,13 @@ impl SocketAddr {
     }
 
     #[cfg(unix)]
+    #[must_use = "indicates whether the address is a Unix socket path"]
     pub const fn is_unix_path(&self) -> bool {
         matches!(self, Self::Unix(_))
     }
 
     #[cfg(not(unix))]
+    #[must_use = "indicates whether the address is a Unix socket path"]
     pub fn is_unix_path(&self) -> bool {
         false
     }

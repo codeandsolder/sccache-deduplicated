@@ -1012,7 +1012,7 @@ impl<L> Seek for LeasedReader<'_, L> {
 mod space;
 pub use space::{SpacePolicy, SpaceReport};
 mod audit;
-pub use audit::ComponentAudit;
+pub use audit::{ComponentAudit, NativeIndexAudit, SchemaInventory};
 mod packages;
 pub use packages::{PackageCompression, PackagePolicy, PackageSource};
 mod trees;

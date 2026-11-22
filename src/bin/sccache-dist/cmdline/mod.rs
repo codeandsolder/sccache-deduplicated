@@ -24,6 +24,18 @@ pub enum Command {
     Auth(AuthSubcommand),
     Scheduler(config::scheduler::Config),
     Server(config::server::Config),
+    NativeAudit {
+        index: std::path::PathBuf,
+        schema: Option<String>,
+        without: Vec<String>,
+    },
+    NativeImportRust {
+        store: std::path::PathBuf,
+        archive: Option<std::path::PathBuf>,
+        source: sccache::build_runtime::PackageSource,
+        max_entries: usize,
+        max_expanded_bytes: u64,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]

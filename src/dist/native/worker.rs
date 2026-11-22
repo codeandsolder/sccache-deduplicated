@@ -47,7 +47,7 @@ impl NativeCacheClient {
                 check()?;
                 let tree = match store.lookup_tree(*id)? {
                     Some(tree) => tree,
-                    None => self.fetch_tree(ticket, *id, store)?,
+                    None => self.fetch_tree(ticket, *id, store, renewal_interval)?,
                 };
                 inputs.push(tree);
             }

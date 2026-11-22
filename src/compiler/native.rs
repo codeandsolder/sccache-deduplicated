@@ -36,12 +36,14 @@ use super::{
     CacheControl, Cacheable, Compilation, CompileResult, CompileTransport, DistPackagers, DistType,
 };
 
+struct DirectEndpoint {
+    config: NativeClientConfig,
+    scheduler: Option<HTTPUrl>,
+    auth: DistAuth,
+}
+
 enum Endpoint {
-    Direct {
-        config: NativeClientConfig,
-        scheduler: Option<HTTPUrl>,
-        auth: DistAuth,
-    },
+    Direct(Box<DirectEndpoint>),
     Namespace {
         connection: SharedConnection,
         chunk_bytes: usize,
@@ -70,11 +72,11 @@ impl NativeCompilerClient {
             max_result_bytes: config.max_result_bytes,
         };
         Self {
-            endpoint: Endpoint::Direct {
+            endpoint: Endpoint::Direct(Box::new(DirectEndpoint {
                 config,
                 scheduler,
                 auth,
-            },
+            })),
             policy,
             toolchains,
             toolchain_digests: SourceDigestCache::default(),
@@ -121,9 +123,10 @@ impl NativeCompilerClient {
                     DistInfo::NotConnected(None, format!("native daemon unavailable: {error:#}"))
                 })
             }
-            Endpoint::Direct {
-                config, scheduler, ..
-            } => {
+            Endpoint::Direct(endpoint) => {
+                let DirectEndpoint {
+                    config, scheduler, ..
+                } = endpoint.as_ref();
                 let result = async {
                     let scheduler = scheduler.as_ref().context("scheduler URL unavailable")?;
                     let url = dist::http::urls::scheduler_status(&scheduler.to_url())?;
@@ -157,9 +160,10 @@ impl NativeCompilerClient {
     }
 
     fn connect_http(&self) -> Result<NativeCacheClient> {
-        let Endpoint::Direct { config, auth, .. } = &self.endpoint else {
+        let Endpoint::Direct(endpoint) = &self.endpoint else {
             anyhow::bail!("namespace client cannot authenticate directly with scheduler");
         };
+        let DirectEndpoint { config, auth, .. } = endpoint.as_ref();
         let token = match auth {
             DistAuth::Token { token } => token.clone(),
             DistAuth::Oauth2CodeGrantPKCE { auth_url, .. }
@@ -177,7 +181,7 @@ impl NativeCompilerClient {
 
     fn execute(&self, plan: &CompilerPlan) -> Result<NativeBuildResult> {
         match &self.endpoint {
-            Endpoint::Direct { .. } => self.connect_http()?.run_action(
+            Endpoint::Direct(_) => self.connect_http()?.run_action(
                 &plan.spec,
                 &plan.inputs,
                 &plan.destinations,

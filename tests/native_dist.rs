@@ -15,8 +15,8 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use sccache::{
     build_runtime::{
-        Artifact, BuildPath, CommandSpec, ContentId, ExecutionSpec, MappedMetadata, MappedTree,
-        NativeStore, OutputSpec, SpacePolicy, TreeLayer, TreePath, TreeRecipe,
+        Artifact, BuildPath, CommandSpec, ComponentAudit, ContentId, ExecutionSpec, MappedMetadata,
+        MappedTree, NativeStore, OutputSpec, SpacePolicy, TreeLayer, TreePath, TreeRecipe,
         wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply},
     },
     config::{Config, DistAuth, HTTPUrl, NativeClientConfig, scheduler, server},
@@ -645,6 +645,64 @@ fn write_compiler_sources(root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn run_environment_audit(
+    service: &LocalService,
+    directory: &Path,
+    rustc: &Path,
+    config: &Path,
+) -> Result<()> {
+    fs::write(
+        directory.join("audit.rs"),
+        b"pub const OBSERVED: &str = env!(\"NATIVE_AUDIT_OBSERVED\");\n",
+    )?;
+    let compile = |unused: &str, observed: &str| -> Result<Vec<u8>> {
+        let output = service
+            .command(env!("CARGO_BIN_EXE_sccache"))
+            .arg(rustc)
+            .args([
+                "--crate-name",
+                "audit",
+                "--crate-type",
+                "rlib",
+                "--edition=2024",
+                "--emit=link,dep-info",
+                "--out-dir",
+                "build",
+                "audit.rs",
+            ])
+            .current_dir(directory)
+            .env("SCCACHE_CONF", config)
+            .env("CARGO_NATIVE_AUDIT_UNUSED", unused)
+            .env("NATIVE_AUDIT_OBSERVED", observed)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "environment audit compile failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(fs::read(directory.join("build/libaudit.rlib"))?)
+    };
+    let first = compile("first", "first")?;
+    assert_eq!(compile("second", "first")?, first);
+    assert_ne!(compile("first", "second")?, first);
+    Ok(())
+}
+
+fn audit_index(index: &Path, component: &str) -> Result<ComponentAudit> {
+    let output = Command::new(env!("CARGO_BIN_EXE_sccache-dist"))
+        .args(["native-audit", "--index"])
+        .arg(index)
+        .args(["--schema", "native-linux-bwrap-v3", "--without", component])
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "native audit command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    Ok(serde_json::from_value(report["comparison"].clone())?)
+}
+
 #[test]
 #[ignore = "requires Linux Bubblewrap, GCC, Rust toolchain and ldd"]
 fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
@@ -746,9 +804,22 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
     assert!(!visible.join("build").exists());
     assert!(!root.join("unexpected-archive-cache").exists());
     assert!(!root.join("unexpected-toolchain-cache").exists());
+    run_environment_audit(&service, &direct, &rustc, &direct_config)?;
+    let stats = service.stats()?;
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 7);
+    assert_eq!(stats.dist_errors, 0);
+    let index = fleet.scheduler_directory.join("index.redb");
     service.stop()?;
     let (scheduler, worker) = fleet.finish()?;
-    assert_eq!(scheduler.actions, 4);
+    assert_eq!(scheduler.actions, 7);
+    let unused = audit_index(&index, "environment/CARGO_NATIVE_AUDIT_UNUSED")?;
+    assert_eq!(unused.equivalent_pairs, 1);
+    assert_eq!(unused.conflicting_pairs, 0);
+    let observed = audit_index(&index, "environment/NATIVE_AUDIT_OBSERVED")?;
+    assert_eq!(observed.equivalent_pairs, 0);
+    assert_eq!(observed.conflicting_pairs, 1);
+    assert_eq!(unused.examined_actions, 7);
+    eprintln!("actual Rust environment audit: {unused:?}; {observed:?}");
     assert_eq!(worker.actions, 0);
     Ok(())
 }

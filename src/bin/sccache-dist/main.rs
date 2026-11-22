@@ -176,6 +176,78 @@ fn check_jwt_server_token(
 
 fn run(command: Command) -> Result<i32> {
     match command {
+        Command::NativeImportRust {
+            store,
+            archive,
+            source,
+            max_entries,
+            max_expanded_bytes,
+        } => {
+            use sccache::build_runtime::{NativeStore, PackagePolicy, TreeMetadata, TreeTimestamp};
+            let modified = TreeTimestamp {
+                seconds: i64::try_from(tar::DETERMINISTIC_TIMESTAMP)?,
+                nanoseconds: 0,
+            };
+            let policy = PackagePolicy {
+                directory: TreeMetadata {
+                    mode: 0o755,
+                    modified,
+                },
+                modified,
+                max_entries,
+                max_expanded_bytes,
+            };
+            let store = NativeStore::open(&store)?;
+            let (package, reused) = if let Some(existing) = store.lookup_package(source, policy)? {
+                (existing.id(), true)
+            } else {
+                let archive = archive.context("upstream package unavailable; supply --archive")?;
+                (
+                    store.import_package(source, policy, std::fs::File::open(archive)?)?,
+                    false,
+                )
+            };
+            let before = store.stats()?;
+            let components = store.publish_rust_installer(package, policy.directory)?;
+            let after = store.stats()?;
+            anyhow::ensure!(
+                before.logical_bytes == after.logical_bytes && before.blobs == after.blobs,
+                "installer projection unexpectedly created content"
+            );
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "source": source,
+                    "package": package,
+                    "components": components,
+                    "reused_original_package": reused,
+                    "logical_bytes": after.logical_bytes,
+                    "blobs": after.blobs,
+                }))?
+            );
+            Ok(0)
+        }
+        Command::NativeAudit {
+            index,
+            schema,
+            without,
+        } => {
+            let audit = sccache::build_runtime::NativeIndexAudit::open(&index)?;
+            if let Some(schema) = schema {
+                let comparison = audit.compare(&schema, &without)?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema": schema,
+                        "without": without,
+                        "comparison": comparison,
+                    }))?
+                );
+            } else {
+                println!("{}", serde_json::to_string_pretty(&audit.inventory()?)?);
+            }
+            Ok(0)
+        }
         Command::Auth(AuthSubcommand::Base64 { num_bytes }) => {
             let mut bytes = vec![0; num_bytes];
             rand::fill(&mut bytes);
@@ -414,8 +486,10 @@ fn init_logging() {
 }
 
 const SERVER_REMEMBER_ERROR_TIMEOUT: Duration = Duration::from_secs(300);
-const UNCLAIMED_PENDING_TIMEOUT: Duration = Duration::from_secs(300);
-const UNCLAIMED_READY_TIMEOUT: Duration = Duration::from_secs(60);
+// Temporary fleet relief for slow input staging and toolchain uploads.
+// Track progress explicitly instead of holding unclaimed reservations in #333.
+const UNCLAIMED_PENDING_TIMEOUT: Duration = Duration::from_secs(900);
+const UNCLAIMED_READY_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Copy, Clone)]
 struct JobDetail {
@@ -853,7 +927,7 @@ impl SchedulerIncoming for Scheduler {
         server_id: ServerId,
         server_nonce: ServerNonce,
         cpu_capacity: f64,
-        running_job_ids: &[JobId],
+        active_job_ids: &[JobId],
         job_authorizer: Box<dyn JobAuthorizer>,
         capabilities: dist::WorkerCapabilities,
     ) -> Result<HeartbeatServerResult> {
@@ -883,10 +957,10 @@ impl SchedulerIncoming for Scheduler {
                 details.cpu_capacity = cpu_capacity;
                 details.capabilities = capabilities;
 
-                // The worker heartbeat is authoritative for *executing* jobs.
-                // A Started job missing from one heartbeat can be an in-flight
-                // snapshot, so require a full heartbeat timeout of absence.
-                let running: HashSet<JobId> = running_job_ids.iter().copied().collect();
+                // Executing jobs and transfers with recent byte progress have
+                // live request owners. A Started job missing from one heartbeat
+                // can be an in-flight snapshot; require a full timeout of absence.
+                let active: HashSet<JobId> = active_job_ids.iter().copied().collect();
                 let stale_jobs: Vec<_> = details
                     .jobs_assigned
                     .iter()
@@ -894,13 +968,18 @@ impl SchedulerIncoming for Scheduler {
                     .filter(|job_id| match jobs.get_mut(job_id) {
                         Some(detail) if detail.server_id == server_id => {
                             if detail.state == JobState::Started {
-                                if running.contains(job_id) {
+                                if active.contains(job_id) {
                                     detail.missing_since = None;
                                     false
                                 } else {
                                     let since = detail.missing_since.get_or_insert(now);
                                     now.duration_since(*since) >= dist::http::HEARTBEAT_TIMEOUT
                                 }
+                            } else if active.contains(job_id) {
+                                // Renew the inactivity lease, not the maximum
+                                // duration of a progressing toolchain transfer.
+                                detail.state_since = now;
+                                false
                             } else {
                                 detail.is_stale_unclaimed(now)
                             }
@@ -2119,6 +2198,59 @@ mod scheduler_tests {
             )
             .unwrap();
         assert_no_assigned_jobs(&scheduler, &server_id);
+    }
+
+    #[test]
+    fn progressing_pending_upload_renews_lease_but_inactive_upload_expires() -> Result<()> {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse()?;
+        let nonce = ServerNonce::new();
+        register_test_server(&scheduler, server_id, nonce.clone());
+        let AllocJobResult::Success { job_alloc, .. } =
+            scheduler.handle_alloc_job(&AcceptAssign, test_toolchain('c'))?
+        else {
+            bail!("worker should accept job");
+        };
+        let job_id = job_alloc.job_id;
+        let backdate = |scheduler: &Scheduler| {
+            scheduler
+                .jobs
+                .lock()
+                .unwrap()
+                .get_mut(&job_id)
+                .unwrap()
+                .state_since = Instant::now()
+                .checked_sub(UNCLAIMED_PENDING_TIMEOUT + Duration::from_secs(1))
+                .unwrap();
+        };
+        backdate(&scheduler);
+        scheduler.handle_heartbeat_server(
+            server_id,
+            nonce.clone(),
+            1.0,
+            &[job_id],
+            Box::new(TestJobAuthorizer),
+        )?;
+        assert!(
+            !scheduler
+                .jobs
+                .lock()
+                .unwrap()
+                .get(&job_id)
+                .unwrap()
+                .is_stale_unclaimed(Instant::now())
+        );
+        // A later snapshot without progress cannot renew that lease.
+        backdate(&scheduler);
+        scheduler.handle_heartbeat_server(
+            server_id,
+            nonce,
+            1.0,
+            &[],
+            Box::new(TestJobAuthorizer),
+        )?;
+        assert_no_assigned_jobs(&scheduler, &server_id);
+        Ok(())
     }
 
     #[test]
