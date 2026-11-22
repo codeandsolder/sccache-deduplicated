@@ -2027,10 +2027,13 @@ counted_array!(static ARGS: [ArgInfo<ArgData>; _] = [
     take_arg!("-F", OsString, CanBeSeparated, PassThrough),
     take_arg!("-L", ArgLinkPath, CanBeSeparated, LinkPath),
     flag!("-V", NotCompilationFlag),
+    flag!("-Vv", NotCompilationFlag),
     take_arg!("-W", OsString, CanBeSeparated, PassThrough),
     take_arg!("-Z", ArgUnstable, CanBeSeparated, Unstable),
+    flag!("-h", NotCompilationFlag),
     take_arg!("-l", ArgLinkLibrary, CanBeSeparated, LinkLibrary),
     take_arg!("-o", PathBuf, CanBeSeparated, TooHardPath),
+    flag!("-vV", NotCompilationFlag),
 ]);
 
 /// Split the contents of a rustc `@response` file into arguments.
@@ -2126,8 +2129,19 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     // Custom iterator to expand `@` arguments which stand for reading a file
     // and interpreting it as a list of more arguments.
     let it = ExpandResponseFile::new(cwd, arguments);
+    let parsed: Vec<_> = ArgsIter::new(it, &ARGS[..]).collect();
+    // Cargo commonly puts the stdin input before --print=file-names.
+    // Query classification must not depend on the order of otherwise
+    // unsupported compilation options. Parse rather than scan strings:
+    // "--print" can itself be the value of another argument.
+    if parsed.iter().any(|arg| {
+        arg.as_ref()
+            .is_ok_and(|arg| matches!(arg.get_data(), Some(NotCompilationFlag | NotCompilation(_))))
+    }) {
+        return CompilerArguments::NotCompilation;
+    }
 
-    for (idx, arg) in ArgsIter::new(it, &ARGS[..]).enumerate() {
+    for (idx, arg) in parsed.into_iter().enumerate() {
         let arg = try_or_cannot_cache!(arg, "argument parse");
         match arg.get_data() {
             Some(TooHardFlag | TooHardPath(_)) => {
@@ -4990,6 +5004,36 @@ LLVM version: 15.0.2
                 "/foo/target/debug/deps/liblog-2f7366be74992849.rlib"
             ]
         );
+    }
+
+    #[test]
+    fn rust_queries_are_not_rejected_compilations() {
+        for args in [
+            &[
+                "-",
+                "--crate-name",
+                "___",
+                "--print=file-names",
+                "--crate-type",
+                "bin",
+            ][..],
+            &["--sysroot", "/some/sysroot", "--print", "target-libdir"],
+            &["--print=cfg", "-"],
+            &["-vV"],
+            &["-Vv"],
+            &["-h"],
+        ] {
+            let args = args.iter().map(OsString::from).collect::<Vec<_>>();
+            assert_eq!(
+                parse_arguments(&args, Path::new(".")),
+                CompilerArguments::NotCompilation
+            );
+        }
+        // Do not interpret strings consumed by another option as queries.
+        assert!(matches!(
+            fails!("-", "--cfg", "--print", "--emit=metadata"),
+            CompilerArguments::CannotCache("unsupported compiler option", _)
+        ));
     }
 
     #[test]
