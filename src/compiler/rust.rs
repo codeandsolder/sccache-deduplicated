@@ -2490,31 +2490,6 @@ fn relocate_rust_operands(
     Some(())
 }
 
-#[cfg(target_os = "linux")]
-pub fn relocate_raw_rust_operands(
-    arguments: &[OsString],
-    canonical: &CanonicalRustPaths,
-    cwd: &Path,
-) -> Option<Vec<OsString>> {
-    let mut parsed = ArgsIter::new(
-        super::rust_response::expand(arguments, cwd)
-            .ok()?
-            .into_iter(),
-        &ARGS[..],
-    )
-    .collect::<std::result::Result<Vec<_>, _>>()
-    .ok()?;
-    relocate_rust_operands(&mut parsed, canonical, cwd)?;
-    // An IPC fallback retains the original emit and color settings, unlike
-    // the cacheable compile where dep-info has already been generated.
-    Some(
-        parsed
-            .iter()
-            .flat_map(|arg| arg.iter_os_strings())
-            .collect(),
-    )
-}
-
 /// Identify the source operand using the same typed argument grammar as
 /// compiler hashing. Retain the expanded argv itself, not a reserialization:
 /// linker options, repeated options, and option spellings remain exact.
