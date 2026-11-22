@@ -196,7 +196,7 @@ cmp initial.rmeta libprobe.rmeta
     let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     let gcc = which::which("gcc")?;
     let mut command = harness::prune_command(std::process::Command::new("bwrap"));
-    command
+    let output = command
         .args(["--bind", "/", "/", "--bind"])
         .arg(&private)
         .arg(&visible)
@@ -215,11 +215,17 @@ cmp initial.rmeta libprobe.rmeta
         .env("SCCACHE_CONF", visible.join("config.json"))
         .env("SCCACHE_CACHED_CONF", visible.join("cached-config"))
         .env_remove("SCCACHE_ERROR_LOG")
+        .env("SCCACHE_LOG", "sccache=debug")
         .env_remove("CARGO_INCREMENTAL")
         .env_remove("CARGO_BUILD_INCREMENTAL")
         .env("CARGO_PKG_NAME", "probe")
-        .assert()
-        .success();
+        .output()?;
+    eprintln!(
+        "namespace compiler stdout:\n{}\nnamespace compiler stderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success());
     assert!(private.join("probe.o").is_file());
     assert!(private.join("libprobe.rmeta").is_file());
     assert!(!visible.join("probe.o").exists());
