@@ -2032,8 +2032,8 @@ counted_array!(static ARGS: [ArgInfo<ArgData>; _] = [
     take_arg!("-Z", ArgUnstable, CanBeSeparated, Unstable),
     flag!("-h", NotCompilationFlag),
     take_arg!("-l", ArgLinkLibrary, CanBeSeparated, LinkLibrary),
-    flag!("-vV", NotCompilationFlag),
     take_arg!("-o", PathBuf, CanBeSeparated, TooHardPath),
+    flag!("-vV", NotCompilationFlag),
 ]);
 
 /// Split the contents of a rustc `@response` file into arguments.
