@@ -3591,51 +3591,49 @@ fn test_integration_config_normalizes_and_strips() {
 }
 
 #[test]
-#[cfg(not(target_os = "windows"))]
-fn test_integration_normalized_path_with_double_slashes() {
-    // Test that Config normalizes paths with double slashes
+fn test_integration_normalized_paths() -> Result<()> {
     use crate::util::strip_basedirs;
-
-    let env_conf = EnvConfig::default();
-
-    let file_conf = FileConfig {
-        basedirs: vec!["/home//user///project/".to_string()],
-        ..Default::default()
+    let cases: &[(&str, &[u8], &[u8], &[u8])] = if cfg!(windows) {
+        &[
+            (
+                r"C:\Users\Test\Project",
+                b"c:/users/test/project/",
+                br#"# 1 "C:\Users\Test\Project\src\main.c""#,
+                br#"# 1 "src\main.c""#,
+            ),
+            (
+                r"C:\Users\test\project",
+                b"c:/users/test/project/",
+                br#"# 1 "C:/Users\test\project\src/main.c""#,
+                br#"# 1 "src/main.c""#,
+            ),
+        ]
+    } else {
+        &[
+            (
+                "/home//user///project/",
+                b"/home/user/project/",
+                br#"# 1 "/home/user/project/src/main.c""#,
+                br#"# 1 "src/main.c""#,
+            ),
+            (
+                "/home/user/./project/../project",
+                b"/home/user/project/",
+                br#"# 1 "/home/user/project/src/main.c""#,
+                br#"# 1 "src/main.c""#,
+            ),
+        ]
     };
-
-    let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-
-    // Config should normalize to single slashes with one trailing slash
-    assert_eq!(config.basedirs, vec![b"/home/user/project/"]);
-
-    // Verify it works with strip_basedirs
-    let input = b"# 1 \"/home/user/project/src/main.c\"";
-    let output = strip_basedirs(input, &config.basedirs);
-    assert_eq!(&*output, b"# 1 \"src/main.c\"");
-}
-
-#[test]
-#[cfg(target_os = "windows")]
-fn test_integration_windows_path_normalization() {
-    // Test that Config normalizes Windows paths correctly
-    use crate::util::strip_basedirs;
-
-    let env_conf = EnvConfig::default();
-
-    let file_conf = FileConfig {
-        basedirs: vec!["C:\\Users\\Test\\Project".to_string()],
-        ..Default::default()
-    };
-
-    let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-
-    // Should be normalized to lowercase with forward slashes
-    assert_eq!(config.basedirs, vec![b"c:/users/test/project/"]);
-
-    // Test with mixed case preprocessor output
-    let input = b"# 1 \"C:\\Users\\Test\\Project\\src\\main.c\"";
-    let output = strip_basedirs(input, &config.basedirs);
-    assert_eq!(&*output, b"# 1 \"src\\main.c\"");
+    for &(path, normalized, input, expected) in cases {
+        let file = FileConfig {
+            basedirs: vec![path.to_owned()],
+            ..Default::default()
+        };
+        let config = Config::from_env_and_file_configs(EnvConfig::default(), file)?;
+        assert_eq!(config.basedirs, vec![normalized]);
+        assert_eq!(&*strip_basedirs(input, &config.basedirs), expected);
+    }
+    Ok(())
 }
 
 #[test]
@@ -3710,56 +3708,6 @@ fn test_integration_multiple_basedirs_longest_match() {
     let output = strip_basedirs(input, &config.basedirs);
 
     // Should match the longest basedir (/home/user/project/)
-    let expected = b"# 1 \"src/main.c\"";
-    assert_eq!(&*output, expected);
-}
-
-#[test]
-#[cfg(not(target_os = "windows"))]
-fn test_integration_paths_with_dots_normalized() {
-    // Test that paths with . and .. are normalized correctly
-    use crate::util::strip_basedirs;
-
-    let env_conf = EnvConfig::default();
-
-    let file_conf = FileConfig {
-        basedirs: vec!["/home/user/./project/../project".to_string()],
-        ..Default::default()
-    };
-
-    let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-
-    // Should be normalized to remove ./ and ../
-    assert_eq!(config.basedirs[0], b"/home/user/project/");
-
-    // Verify it works with strip_basedirs
-    let input = b"# 1 \"/home/user/project/src/main.c\"";
-    let output = strip_basedirs(input, &config.basedirs);
-    let expected = b"# 1 \"src/main.c\"";
-    assert_eq!(&*output, expected);
-}
-
-#[test]
-#[cfg(target_os = "windows")]
-fn test_integration_windows_mixed_slashes() {
-    // Test Windows path with mixed slashes in preprocessor output
-    use crate::util::strip_basedirs;
-
-    let env_conf = EnvConfig::default();
-
-    let file_conf = FileConfig {
-        basedirs: vec!["C:\\Users\\test\\project".to_string()],
-        ..Default::default()
-    };
-
-    let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert_eq!(config.basedirs[0], b"c:/users/test/project/");
-
-    // Preprocessor output with mixed slashes
-    let input = b"# 1 \"C:/Users\\test\\project\\src/main.c\"";
-    let output = strip_basedirs(input, &config.basedirs);
-
-    // Should strip despite mixed slashes
     let expected = b"# 1 \"src/main.c\"";
     assert_eq!(&*output, expected);
 }
