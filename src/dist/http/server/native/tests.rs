@@ -3,8 +3,8 @@ use std::{collections::BTreeMap, io::Cursor};
 use super::*;
 use crate::{
     build_runtime::{
-        Artifact, BlobRef, BuildPath, CommandSpec, ContentId, ExecutionSpec, OutputSpec,
-        ResultManifest, SessionLimits, TreeId, TreeManifest, TreeMetadata, TreeRecipe,
+        Artifact, BlobRef, BuildPath, CommandSpec, ContentId, ExecutionRoot, ExecutionSpec,
+        OutputSpec, ResultManifest, SessionLimits, TreeManifest, TreeMetadata, TreeRecipe,
         TreeTimestamp,
         wire::{NativeAdmission, NativeStatus, ScheduleReply, WorkerAllocation},
     },
@@ -25,19 +25,23 @@ impl ClientAuthCheck for ClientCheck {
     }
 }
 
-fn action(root: TreeId) -> Result<ExecutionSpec> {
+fn action(root: &TreeManifest) -> Result<ExecutionSpec> {
+    let id = root.id()?;
     Ok(ExecutionSpec {
         platform: ContentId::of(b"test-platform"),
-        root: TreeRecipe::union(
-            TreeMetadata {
-                mode: 0o755,
-                modified: TreeTimestamp {
-                    seconds: 1,
-                    nanoseconds: 0,
+        root: ExecutionRoot::resolve(
+            TreeRecipe::union(
+                TreeMetadata {
+                    mode: 0o755,
+                    modified: TreeTimestamp {
+                        seconds: 1,
+                        nanoseconds: 0,
+                    },
                 },
-            },
-            [root],
-        ),
+                [id],
+            ),
+            &BTreeMap::from([(id, root)]),
+        )?,
         mounts: BTreeMap::new(),
         command: CommandSpec {
             executable: BuildPath::new(b"/bin/tool".to_vec())?,
@@ -138,8 +142,8 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
         };
         let offer = client.offer_tree(&root)?;
         assert!(offer.missing.is_empty());
-        let root = client.commit_tree(offer.ticket)?;
-        let spec = action(root)?;
+        assert_eq!(client.commit_tree(offer.ticket)?, root.id()?);
+        let spec = action(&root)?;
 
         assert!(unauthorized.admit(&spec).is_err());
 
@@ -301,7 +305,7 @@ fn native_action_transfers_inputs_executes_and_publishes_without_worker_result_s
             |id| source.open_file(id),
             Duration::from_secs(1),
         )?;
-        let mut spec = action(root.id())?;
+        let mut spec = action(root.manifest())?;
         spec.mounts
             .insert(BuildPath::new(b"/src".to_vec())?, source.id());
         spec.command.arguments = vec![b"-c".to_vec(), b"IFS= read -r data < /src/input; printf '%s' \"$data\" > /out/obj; printf diagnostic >&2".to_vec()];

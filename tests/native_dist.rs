@@ -15,9 +15,9 @@ use std::{
 use anyhow::{Result, ensure};
 use sccache::{
     build_runtime::{
-        BuildPath, CommandSpec, ComponentAudit, ContentId, ExecutionSpec, InstallationManifest,
-        MappedMetadata, MappedTree, NativeStore, OutputSpec, SpacePolicy, TreeLayer, TreePath,
-        TreeRecipe,
+        BuildPath, CommandSpec, ComponentAudit, ContentId, ExecutionRoot, ExecutionSpec,
+        InstallationManifest, MappedMetadata, MappedTree, NativeStore, OutputSpec, SpacePolicy,
+        TreeLayer, TreePath, TreeRecipe,
         wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply},
     },
     config::{Config, DistAuth, HTTPUrl, NativeClientConfig, scheduler, server},
@@ -661,21 +661,27 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let source_tree = mapping.prepare()?;
     let spec = ExecutionSpec {
         platform: ContentId::of(PLATFORM.as_bytes()),
-        root: TreeRecipe {
-            directories: root_tree.manifest().root,
-            layers: vec![
-                TreeLayer {
-                    tree: root_tree.id(),
-                    source: None,
-                    destination: None,
-                },
-                TreeLayer {
-                    tree: source_tree.id(),
-                    source: None,
-                    destination: Some(TreePath::new(b"src".to_vec())?),
-                },
-            ],
-        },
+        root: ExecutionRoot::resolve(
+            TreeRecipe {
+                directories: root_tree.manifest().root,
+                layers: vec![
+                    TreeLayer {
+                        tree: root_tree.id(),
+                        source: None,
+                        destination: None,
+                    },
+                    TreeLayer {
+                        tree: source_tree.id(),
+                        source: None,
+                        destination: Some(TreePath::new(b"src".to_vec())?),
+                    },
+                ],
+            },
+            &BTreeMap::from([
+                (root_tree.id(), root_tree.manifest()),
+                (source_tree.id(), source_tree.manifest()),
+            ]),
+        )?,
         mounts: BTreeMap::new(),
         command: CommandSpec {
             executable: BuildPath::new(b"/usr/bin/as".to_vec())?,
@@ -748,6 +754,37 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     };
     assert_eq!(cached, manifest);
     client.close(hit)?;
+
+    // A different transport recipe with exactly the same resolved tree must
+    // hit the existing result without uploading the flattened tree.
+    let mut flattened = spec.clone();
+    flattened.root.recipe = TreeRecipe::union(spec.root.recipe.directories, [spec.root.id]);
+    let NativeAdmission::Hit {
+        ticket: flattened_hit,
+        manifest: cached,
+    } = client.admit(&flattened)?
+    else {
+        anyhow::bail!("equivalent flattened root missed the cache");
+    };
+    assert_eq!(cached, manifest);
+    client.close(flattened_hit)?;
+    let mut reordered = spec.clone();
+    reordered.root.recipe.layers.reverse();
+    let NativeAdmission::Hit {
+        ticket: reordered_hit,
+        manifest: cached,
+    } = client.admit(&reordered)?
+    else {
+        anyhow::bail!("equivalent reordered root missed the cache");
+    };
+    assert_eq!(cached, manifest);
+    client.close(reordered_hit)?;
+
+    // A forged root cannot obtain a publication permit even when all
+    // transport trees are already available to the scheduler.
+    let mut forged = spec.clone();
+    forged.root.id = sccache::build_runtime::TreeId([0xA5; 32]);
+    assert!(client.admit(&forged).is_err());
     assert_eq!(fleet.status()?.in_progress, 0);
 
     let inputs = [root_tree, source_tree];
@@ -1095,7 +1132,7 @@ fn audit_index(index: &Path, component: &str) -> Result<ComponentAudit> {
     let output = Command::new(env!("CARGO_BIN_EXE_sccache-dist"))
         .args(["native-audit", "--index"])
         .arg(index)
-        .args(["--schema", "native-linux-bwrap-v3", "--without", component])
+        .args(["--schema", "native-linux-bwrap-v4", "--without", component])
         .output()?;
     ensure!(
         output.status.success(),

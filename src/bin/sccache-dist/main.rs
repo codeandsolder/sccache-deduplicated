@@ -1900,8 +1900,8 @@ mod scheduler_tests {
     #[test]
     fn native_jobs_select_compatible_workers_using_shared_capacity() -> Result<()> {
         use sccache::build_runtime::{
-            BuildPath, CommandSpec, ContentId, ExecutionSpec, TreeId, TreeMetadata, TreeRecipe,
-            TreeTimestamp, wire::Ticket,
+            BuildPath, CommandSpec, ContentId, ExecutionRoot, ExecutionSpec, TreeId, TreeMetadata,
+            TreeRecipe, TreeTimestamp, wire::Ticket,
         };
         let scheduler = Scheduler::new_with_job_slack(JobSlackConfig {
             static_jobs: 0,
@@ -1938,16 +1938,19 @@ mod scheduler_tests {
             ticket: Ticket([42; 32]),
             spec: ExecutionSpec {
                 platform,
-                root: TreeRecipe::union(
-                    TreeMetadata {
-                        mode: 0o755,
-                        modified: TreeTimestamp {
-                            seconds: 1,
-                            nanoseconds: 0,
+                root: ExecutionRoot {
+                    id: TreeId([0; 32]),
+                    recipe: TreeRecipe::union(
+                        TreeMetadata {
+                            mode: 0o755,
+                            modified: TreeTimestamp {
+                                seconds: 1,
+                                nanoseconds: 0,
+                            },
                         },
-                    },
-                    [TreeId([0; 32])],
-                ),
+                        [TreeId([0; 32])],
+                    ),
+                },
                 mounts: BTreeMap::new(),
                 command: CommandSpec {
                     executable: BuildPath::new(b"/bin/tool".to_vec())?,

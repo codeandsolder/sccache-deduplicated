@@ -207,8 +207,9 @@ impl PreparedBuild {
                 ))
             })
             .collect::<Result<_>>()?;
-        leases.insert(root_point.clone(), store.lease_recipe(&spec.root)?);
+        leases.insert(root_point.clone(), store.lease_recipe(&spec.root.recipe)?);
         let root = leases.get(&root_point).context("native root unavailable")?;
+        spec.root.verify(root.id())?;
         // Never mount through a symlink or a nonexistent parent in the root.
         for path in spec.mounts.keys().map(BuildPath::as_bytes).chain([
             b"/tmp".as_slice(),

@@ -33,8 +33,17 @@ Workers compose the recipe directly in memory from the pinned package
 manifests, including their selected subtrees and logical destinations.
 The combined root is neither uploaded nor published to either CAS index.
 Conflicting file entries are rejected, directory metadata normalization
-is explicit in the recipe, and the recipe fingerprint is part of the
-native action identity. A hit has a result delivery ticket; an in-flight action
+is explicit in the recipe. The native action identity (schema
+`native-linux-bwrap-v4`) hashes the composed root manifest rather than the
+recipe fingerprint or constituent tree IDs. Mount identities remain bound to
+their exact destination paths. The scheduler independently composes and
+verifies the declared root digest before admitting a miss, applies tree
+limits to the composed root, and binds the exact delivery recipe to the
+ticket. The worker also verifies the resolved root before execution.
+Equivalent layer orderings or flattened trees therefore reuse a cached
+result without publishing a new tree, but a different file or metadata
+entry requires a different action. The old experimental action schema is
+not reused. A hit has a result delivery ticket; an in-flight action
 can be observed by retrying admission; a miss reserves a compilation.
 Scheduling a miss selects a worker whose advertised platform contract
 matches and accounts for capacity in the same pool as ordinary jobs.
@@ -248,7 +257,7 @@ snapshot supported by redb) without opening a writable store:
 ```sh
 sccache-dist native-audit --index /path/to/index.redb
 sccache-dist native-audit --index /path/to/index.redb \
-  --schema native-linux-bwrap-v3 --without environment/CARGO_SOME_SETTING
+  --schema native-linux-bwrap-v4 --without environment/CARGO_SOME_SETTING
 ```
 
 Repeat `--without` to evaluate a group jointly. The report counts pairs of

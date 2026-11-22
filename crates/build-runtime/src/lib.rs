@@ -14,7 +14,7 @@ pub use package::{ArchiveLength, PackageCompression, PackageIdentity, PackageSou
 mod recipe;
 mod spec;
 pub use recipe::{TreeLayer, TreeRecipe};
-pub use spec::{BuildPath, CommandSpec, ExecutionSpec, OutputSpec};
+pub use spec::{BuildPath, CommandSpec, ExecutionRoot, ExecutionSpec, OutputSpec};
 mod tree;
 pub mod wire;
 pub use identity::{

@@ -508,6 +508,13 @@ impl NativeSessions {
                     // while the client supplies its input closure.
                     return Ok(NativeAdmission::MissingInputs { trees: missing });
                 }
+                let packages = inputs
+                    .iter()
+                    .map(|lease| (lease.id(), lease.manifest()))
+                    .collect();
+                let composed = request.root.recipe.compose(&packages)?;
+                request.root.verify(composed.id()?)?;
+                self.limits.check_blobs(Kind::Tree, &composed.blobs()?)?;
                 let pending = Pending::Action(Box::new(PendingAction {
                     request,
                     permit,

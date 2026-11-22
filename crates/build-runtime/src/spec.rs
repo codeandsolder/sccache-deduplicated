@@ -7,8 +7,8 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActionFingerprint, ContentId, TreeId, TreePath, TreeRecipe, identity::typed_digest,
-    wire::ActionRequest,
+    ActionFingerprint, ContentId, TreeId, TreeManifest, TreePath, TreeRecipe,
+    identity::typed_digest, wire::ActionRequest,
 };
 
 /// Exact canonical absolute POSIX path, including non-UTF-8 names.
@@ -117,6 +117,36 @@ pub struct OutputSpec {
     pub required: bool,
 }
 
+/// Canonical root filesystem identity and its independently replaceable delivery recipe.
+///
+/// Compilation identity depends on the composed filesystem, not on how its
+/// verified input trees were split, ordered or obtained.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionRoot {
+    pub id: TreeId,
+    pub recipe: TreeRecipe,
+}
+
+impl ExecutionRoot {
+    /// Resolve a recipe against the exact manifests that will be supplied.
+    ///
+    /// # Errors
+    /// Returns an error if composition or hashing fails.
+    pub fn resolve(recipe: TreeRecipe, packages: &BTreeMap<TreeId, &TreeManifest>) -> Result<Self> {
+        let id = recipe.compose(packages)?.id()?;
+        Ok(Self { id, recipe })
+    }
+
+    /// Check the declared identity against independently resolved content.
+    ///
+    /// # Errors
+    /// Returns an error for a different composed filesystem.
+    pub fn verify(&self, id: TreeId) -> Result<()> {
+        ensure!(self.id == id, "native composed root digest mismatch");
+        Ok(())
+    }
+}
+
 /// All declared inputs to a Linux native build.
 ///
 /// Platform is a versioned execution-contract digest supplied by deployment
@@ -127,7 +157,7 @@ pub struct OutputSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionSpec {
     pub platform: ContentId,
-    pub root: TreeRecipe,
+    pub root: ExecutionRoot,
     pub mounts: BTreeMap<BuildPath, TreeId>,
     pub command: CommandSpec,
     pub outputs: BTreeMap<String, OutputSpec>,
@@ -140,7 +170,7 @@ impl ExecutionSpec {
     /// Returns an error for invalid topology or process/output declarations.
     pub fn validate(&self) -> Result<()> {
         self.command.validate()?;
-        self.root.validate()?;
+        self.root.recipe.validate()?;
         for target in self.mounts.keys() {
             target.validate()?;
             ensure!(
@@ -197,8 +227,13 @@ impl ExecutionSpec {
         self.validate()?;
         let mut components = self.command.input_components()?;
         components.insert("platform".into(), self.platform);
-        components.insert("root/recipe".into(), self.root.fingerprint()?);
-        let mut trees: BTreeSet<_> = self.root.layers.iter().map(|layer| layer.tree).collect();
+        let mut trees: BTreeSet<_> = self
+            .root
+            .recipe
+            .layers
+            .iter()
+            .map(|layer| layer.tree)
+            .collect();
         for (mount, tree) in &self.mounts {
             components.insert(
                 format!("mount/{}", mount.as_bytes().escape_ascii()),
@@ -221,9 +256,10 @@ impl ExecutionSpec {
         }
         Ok(ActionRequest {
             fingerprint: ActionFingerprint {
-                schema: "native-linux-bwrap-v3".into(),
+                schema: "native-linux-bwrap-v4".into(),
                 components,
             },
+            root: self.root.clone(),
             input_trees: trees,
             required_outputs,
             optional_outputs,
@@ -240,16 +276,19 @@ mod tests {
     fn spec() -> Result<ExecutionSpec> {
         Ok(ExecutionSpec {
             platform: ContentId::of(b"platform"),
-            root: TreeRecipe::union(
-                TreeMetadata {
-                    mode: 0o755,
-                    modified: TreeTimestamp {
-                        seconds: 1,
-                        nanoseconds: 0,
+            root: ExecutionRoot {
+                id: TreeId([1; 32]),
+                recipe: TreeRecipe::union(
+                    TreeMetadata {
+                        mode: 0o755,
+                        modified: TreeTimestamp {
+                            seconds: 1,
+                            nanoseconds: 0,
+                        },
                     },
-                },
-                [TreeId([1; 32])],
-            ),
+                    [TreeId([1; 32])],
+                ),
+            },
             mounts: BTreeMap::from([(BuildPath::new(b"/src".to_vec())?, TreeId([2; 32]))]),
             command: CommandSpec {
                 executable: BuildPath::new(b"/bin/tool".to_vec())?,
@@ -276,15 +315,15 @@ mod tests {
         changed.command.environment.clear();
         assert_ne!(first, key(&changed)?);
         changed = original.clone();
-        changed.root.layers[0].tree = TreeId([3; 32]);
+        changed.root.id = TreeId([3; 32]);
         assert_ne!(first, key(&changed)?);
         changed = original.clone();
-        changed.root.layers.push(crate::TreeLayer {
+        changed.root.recipe.layers.push(crate::TreeLayer {
             tree: TreeId([4; 32]),
             source: None,
             destination: Some(TreePath::new(b"layer".to_vec())?),
         });
-        assert_ne!(first, key(&changed)?);
+        assert_eq!(first, key(&changed)?);
         assert!(
             changed
                 .action_request()?
@@ -308,6 +347,58 @@ mod tests {
             .mounts
             .insert(BuildPath::new(b"/other".to_vec())?, TreeId([2; 32]));
         assert_ne!(first, key(&changed)?);
+        Ok(())
+    }
+
+    #[test]
+    fn composed_filesystem_identity_is_independent_of_transport_layout() -> Result<()> {
+        use crate::{BlobRef, TreeEntry};
+        let mut action = spec()?;
+        let metadata = action.root.recipe.directories;
+        let path = TreePath::new(b"file".to_vec())?;
+        let file = TreeManifest {
+            root: metadata,
+            entries: BTreeMap::from([(
+                path.clone(),
+                TreeEntry::File {
+                    blob: BlobRef {
+                        id: ContentId::of(b"contents"),
+                        size: 8,
+                    },
+                    metadata,
+                },
+            )]),
+        };
+        let empty = TreeManifest {
+            root: metadata,
+            entries: BTreeMap::new(),
+        };
+        let file_id = file.id()?;
+        let empty_id = empty.id()?;
+        let packages = BTreeMap::from([(file_id, &file), (empty_id, &empty)]);
+        let key = |spec: &ExecutionSpec| spec.action_request()?.action_fingerprint()?.key();
+        action.root = ExecutionRoot::resolve(TreeRecipe::union(metadata, [file_id]), &packages)?;
+        let original = key(&action)?;
+        action.root =
+            ExecutionRoot::resolve(TreeRecipe::union(metadata, [empty_id, file_id]), &packages)?;
+        assert_eq!(key(&action)?, original);
+        action.root =
+            ExecutionRoot::resolve(TreeRecipe::union(metadata, [file_id, empty_id]), &packages)?;
+        assert_eq!(key(&action)?, original);
+
+        let mut modified = file.clone();
+        let TreeEntry::File { metadata, .. } =
+            modified.entries.get_mut(&path).context("missing file")?
+        else {
+            anyhow::bail!("not a file");
+        };
+        metadata.mode = 0o644;
+        let changed_id = modified.id()?;
+        action.root = ExecutionRoot::resolve(
+            TreeRecipe::union(action.root.recipe.directories, [changed_id]),
+            &BTreeMap::from([(changed_id, &modified)]),
+        )?;
+        assert_ne!(key(&action)?, original);
         Ok(())
     }
 
