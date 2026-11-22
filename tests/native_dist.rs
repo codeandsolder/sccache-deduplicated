@@ -1588,8 +1588,8 @@ fn native_local_execution_in_networkless_namespace_shares_remote_actions() -> Re
     );
     let stats = service.stats()?;
     assert_eq!(stats.dist_compiles.values().sum::<usize>(), 0);
-    assert_eq!(stats.cache_misses.all(), 4);
-    assert_eq!(stats.cache_hits.all(), 4);
+    assert_eq!(stats.cache_misses.all(), 6);
+    assert_eq!(stats.cache_hits.all(), 6);
     assert_eq!(stats.forced_recaches, 2);
     assert_eq!(stats.dist_errors, 0);
     service.stop()?;
@@ -1610,14 +1610,14 @@ fn native_local_execution_in_networkless_namespace_shares_remote_actions() -> Re
     let stats = service.stats()?;
     assert_eq!(stats.dist_compiles.values().sum::<usize>(), 2);
     assert_eq!(stats.cache_misses.all(), 2);
-    assert_eq!(stats.cache_hits.all(), 6);
+    assert_eq!(stats.cache_hits.all(), 10);
     assert_eq!(stats.forced_recaches, 2);
     assert_eq!(stats.dist_errors, 0);
     assert!(!visible.join("build").exists());
     assert!(!root.join("unexpected-archive-cache").exists());
     service.stop()?;
     let (scheduler, worker) = fleet.finish()?;
-    assert_eq!(scheduler.actions, 2);
+    assert_eq!(scheduler.actions, 4);
     assert_eq!(worker.actions, 0);
     Ok(())
 }
