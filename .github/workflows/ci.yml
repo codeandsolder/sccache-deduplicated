@@ -286,11 +286,17 @@ jobs:
         # bwrap, just like the managed Linux hosts.
         command -v bwrap
         [[ "$(bwrap --help)" == *--overlay-src* ]]
-        # Ubuntu 24.04's AppArmor profile blocks unprivileged user namespaces
-        # by default. The ephemeral CI VM permits this setting via sudo;
-        # canonical Rust's bwrap sandbox requires a user namespace to run.
+        # This disposable test VM must permit nested mount namespaces: the
+        # networkless caller creates its own overlay for Rust's local link.
+        # Ubuntu 26.04's bwrap-userns-restrict profile denies nested namespace
+        # creation independently of the global unprivileged-userns sysctl.
+        # Do not change this policy on managed production hosts.
         sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-        bwrap --ro-bind / / --proc /proc --dev-bind /dev /dev -- /usr/bin/true
+        profile=/etc/apparmor.d/bwrap-userns-restrict
+        if [ -f "$profile" ]; then
+          sudo apparmor_parser -R "$profile"
+        fi
+        bwrap --unshare-net --ro-bind / / --proc /proc --dev-bind /dev /dev --           bwrap --ro-bind / / --dev-bind /dev /dev -- /usr/bin/true
         # Compile with the canonical CI sccache daemon on its isolated Unix socket.
         # Run test executables without that socket variable: the sccache system
         # tests must manage their own independent test daemon.
