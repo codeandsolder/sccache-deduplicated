@@ -2625,18 +2625,14 @@ where
                 Some(Target(ArgTarget::Unsure(name))) => Some(name.as_os_str()),
                 _ => None,
             });
-        let mut canonical_paths = canonical_output_dir.as_ref().and_then(|output_dir| {
-            CanonicalRustPaths::from_env_with_output_dir(
-                &env_vars,
-                &cwd,
-                &self.sysroot,
-                Some(output_dir),
-                cargo_target,
-            )
-        });
-        if needs_literal_argfile {
-            canonical_paths = None;
-        }
+        let mut canonical_paths = canonical_output_dir
+            .as_ref()
+            .filter(|_| !needs_literal_argfile)
+            .and_then(|output_dir| {
+                CanonicalRustPaths::from_env_with_output_dir(
+                    &env_vars, &cwd, &self.sysroot, Some(output_dir), cargo_target,
+                )
+            });
         if let Some(canonical) = canonical_paths.as_ref() {
             // The sandbox mounts /build read-only and both output roots writable.
             // Validate the paths we already know before the dep-info pre-pass so
