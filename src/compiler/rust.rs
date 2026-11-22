@@ -2421,10 +2421,14 @@ fn relocate_rust_operands(
 
     for argument in arguments {
         let path = match argument {
-            Argument::WithValue(_, OutDir(path), _)
-            | Argument::WithValue(_, Extern(ArgExtern { path, .. }), _)
-            | Argument::WithValue(_, LinkPath(ArgLinkPath { path, .. }), _)
-            | Argument::WithValue(_, Target(ArgTarget::Path(path)), _) => path,
+            Argument::WithValue(
+                _,
+                OutDir(path)
+                | Extern(ArgExtern { path, .. })
+                | LinkPath(ArgLinkPath { path, .. })
+                | Target(ArgTarget::Path(path)),
+                _,
+            ) => path,
             // Source spelling is observable through file!(). Keep a relative
             // source operand only if it still reaches the mapped input.
             Argument::Raw(input) => {
@@ -2470,7 +2474,7 @@ fn relocate_rust_operands(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn relocate_raw_rust_operands(
+pub fn relocate_raw_rust_operands(
     arguments: &[OsString],
     canonical: &CanonicalRustPaths,
     cwd: &Path,

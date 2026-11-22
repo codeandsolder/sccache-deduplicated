@@ -40,4 +40,4 @@ pub use crate::compiler::core::*;
 pub use crate::compiler::preprocessor_cache::PreprocessorCacheEntry;
 
 #[cfg(target_os = "linux")]
-pub(crate) use rust::relocate_raw_rust_operands;
+pub use rust::relocate_raw_rust_operands;
