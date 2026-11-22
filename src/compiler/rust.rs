@@ -59,7 +59,7 @@ use std::fs::OpenOptions;
 use std::future::Future;
 use std::hash::Hash;
 #[cfg(feature = "dist-client")]
-use std::io::{self, Seek};
+use std::io;
 use std::io::{Read, Write};
 use std::iter;
 use std::path::{Path, PathBuf};
@@ -4173,6 +4173,54 @@ fn test_dist_dependency_inspection_failure_keeps_all_candidates() -> Result<()> 
     Ok(())
 }
 
+#[cfg(all(feature = "dist-client", feature = "native-store", target_os = "linux"))]
+#[test]
+fn native_rust_inputs_retain_complete_dependency_artifacts() -> Result<()> {
+    use crate::build_runtime::NativeStore;
+    use crate::dist::pkg::InputsPackager as _;
+    let tmp = tempfile::tempdir()?;
+    let source = tmp.path().join("project");
+    let deps = source.join("deps");
+    fs::create_dir_all(&deps)?;
+    let explicit = deps.join("libdirect-abc.rlib");
+    let mut bytes = Vec::new();
+    {
+        let mut archive = ar::Builder::new(&mut bytes);
+        archive.append(&ar::Header::new(b"code.o".to_vec(), 4), &b"code"[..])?;
+        archive.append(
+            &ar::Header::new(b"rust.metadata.bin".to_vec(), 4),
+            &b"meta"[..],
+        )?;
+    }
+    fs::write(&explicit, &bytes)?;
+    fs::write(deps.join("libtransitive-def.rmeta"), b"metadata")?;
+    fs::write(deps.join("unrelated.txt"), b"not a dependency")?;
+    let mut transformer = dist::PathTransformer::new();
+    transformer.add_root_mapping(source, "/work");
+    let packager = RustInputsPackager {
+        env_vars: Vec::new(),
+        input_dirs: Vec::new(),
+        crate_link_paths: vec![deps],
+        can_trim_rlibs: true,
+        inputs: vec![explicit],
+        path_transformer: transformer,
+        rlib_dep_reader: None,
+    };
+    let store = NativeStore::open(&tmp.path().join("store"))?;
+    let tree = Box::new(packager).native_mapping()?.capture(&store)?;
+    let view = tree.materialize(tmp.path())?;
+    assert_eq!(
+        fs::read(view.root().join("work/deps/libdirect-abc.rlib"))?,
+        bytes
+    );
+    assert_eq!(
+        fs::read(view.root().join("work/deps/libtransitive-def.rmeta"))?,
+        b"metadata"
+    );
+    assert!(!view.root().join("work/deps/unrelated.txt").exists());
+    Ok(())
+}
+
 #[test]
 #[cfg(feature = "dist-client")]
 fn test_dist_rlib_trimming_preserves_recognized_metadata() -> Result<()> {
@@ -4204,58 +4252,11 @@ fn test_dist_rlib_trimming_preserves_recognized_metadata() -> Result<()> {
 #[cfg(feature = "dist-client")]
 impl pkg::InputsPackager for RustInputsPackager {
     fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<()> {
-        debug!("Packaging compile inputs for compile");
-        let Self {
-            crate_link_paths,
-            can_trim_rlibs,
-            inputs,
-            path_transformer,
-            rlib_dep_reader,
-            env_vars,
-            input_dirs,
-        } = *{ self };
-
-        let dependency_names =
-            rust_dependency_names(&inputs, &env_vars, rlib_dep_reader.as_deref());
-        let crate_libraries =
-            rust_dependency_candidates(&crate_link_paths, dependency_names.as_ref())?;
-
-        let mut paths = pkg::InputArchivePaths::new(path_transformer);
-        let mut all_tar_inputs = Vec::with_capacity(inputs.len() + crate_libraries.len());
-        for input_path in inputs.into_iter().chain(crate_libraries) {
-            if !super::CAN_DIST_DYLIBS
-                && input_path
-                    .extension()
-                    .is_some_and(|ext| ext == DLL_EXTENSION)
-            {
-                bail!(
-                    "Cannot distribute dylib input {} on this platform",
-                    input_path.display()
-                );
-            }
-            all_tar_inputs.push(paths.file(&input_path)?);
-        }
-        // The explicit externs and implicit search directories can refer to
-        // the same file, including via symlink aliases.
-        all_tar_inputs.sort_unstable();
-        all_tar_inputs.dedup();
-        for directory in input_dirs {
-            paths.directory(&directory)?;
-        }
-
-        let mut builder = tar::Builder::new(wtr);
-
-        for (input_path, dist_input_path) in &all_tar_inputs {
-            let mut file_header = pkg::make_tar_header(input_path, dist_input_path)?;
-            let mut file = fs::File::open(input_path)?;
+        let can_trim_rlibs = self.can_trim_rlibs;
+        (*self).discover()?.write_archive(wtr, |input_path, file| {
             if can_trim_rlibs && can_trim_this(input_path) {
-                match rlib_metadata_archive(&mut file) {
-                    Ok(Some(metadata_ar)) => {
-                        file_header.set_size(metadata_ar.len() as u64);
-                        file_header.set_cksum();
-                        builder.append(&file_header, metadata_ar.as_slice())?;
-                        continue;
-                    }
+                match rlib_metadata_archive(file) {
+                    Ok(Some(metadata_ar)) => return Ok(Some(metadata_ar)),
                     Ok(None) => debug!(
                         "No recognized metadata member in {}; transferring full rlib",
                         input_path.display()
@@ -4265,16 +4266,52 @@ impl pkg::InputsPackager for RustInputsPackager {
                         input_path.display()
                     ),
                 }
-                file.rewind()?;
             }
-            file_header.set_cksum();
-            builder.append(&file_header, file)?;
-        }
+            Ok(None)
+        })
+    }
 
-        paths.append_support_entries(&mut builder)?;
-        // Finish archive
-        builder.into_inner()?;
-        Ok(())
+    // The native store shares complete dependency artifacts across actions,
+    // including metadata and linkable code. Do not introduce a second
+    // representation of rlibs merely to reduce a per-job archive.
+    #[cfg(all(feature = "native-store", target_os = "linux"))]
+    fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
+        (*self).discover()?.into_native_mapping()
+    }
+}
+
+#[cfg(feature = "dist-client")]
+impl RustInputsPackager {
+    fn discover(self) -> Result<pkg::CompilerInputs> {
+        let Self {
+            crate_link_paths,
+            can_trim_rlibs: _,
+            inputs,
+            path_transformer,
+            rlib_dep_reader,
+            env_vars,
+            input_dirs,
+        } = self;
+
+        let dependency_names =
+            rust_dependency_names(&inputs, &env_vars, rlib_dep_reader.as_deref());
+        let crate_libraries =
+            rust_dependency_candidates(&crate_link_paths, dependency_names.as_ref())?;
+        let mut plan = pkg::CompilerInputs::new(path_transformer);
+        for input_path in inputs.into_iter().chain(crate_libraries) {
+            if !super::CAN_DIST_DYLIBS
+                && input_path
+                    .extension()
+                    .is_some_and(|ext| ext == DLL_EXTENSION)
+            {
+                bail!("Cannot distribute dylib input {}", input_path.display());
+            }
+            plan.file(&input_path, None)?;
+        }
+        for directory in input_dirs {
+            plan.directory(&directory)?;
+        }
+        Ok(plan)
     }
 }
 

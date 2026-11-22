@@ -153,6 +153,16 @@ The caller must keep sources stable during capture; per-file stat checks
 detect changes but are not a filesystem snapshot. This API is available when
 the distributed client and native store features are enabled.
 
+### Compiler inputs
+
+C and Rust use one input discovery plan for logical paths, traversal
+directories and physical symlink topology. Native capture consumes the
+preprocessed C bytes directly and retains complete Rust dependency
+artifacts rather than generating another, metadata-only variant of each
+rlib. The archive emitter still supports per-file trimming and streams
+ordinary files instead of collecting them into a buffer. The native
+input and toolchain trees use the same explicit directory normalization.
+
 ## Validation
 
 The runtime crate has focused tests for identity, import, tree capture,

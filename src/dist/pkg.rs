@@ -25,6 +25,20 @@ use crate::errors::{Context, Result, anyhow, bail};
 ))]
 pub use self::toolchain_imp::ToolchainPackageBuilder;
 
+mod inputs;
+pub(crate) use inputs::CompilerInputs;
+
+#[cfg(all(feature = "native-store", target_os = "linux"))]
+pub(crate) fn native_directory_metadata() -> Result<crate::build_runtime::TreeMetadata> {
+    Ok(crate::build_runtime::TreeMetadata {
+        mode: 0o755,
+        modified: crate::build_runtime::TreeTimestamp {
+            seconds: i64::try_from(tar::DETERMINISTIC_TIMESTAMP)?,
+            nanoseconds: 0,
+        },
+    })
+}
+
 pub trait ToolchainPackager: Send {
     /// Additional identity of files and search paths used to build this package.
     ///
@@ -67,6 +81,13 @@ pub trait InputsPackager: Send {
     ///
     /// Returns an error if packaging or writing an input fails.
     fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<()>;
+
+    /// Discover compiler input files directly in the native content namespace.
+    ///
+    /// # Errors
+    /// Returns an error for unavailable sources or conflicting logical paths.
+    #[cfg(all(feature = "native-store", target_os = "linux"))]
+    fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree>;
 }
 
 #[cfg(not(all(
@@ -309,19 +330,12 @@ mod toolchain_imp {
         /// Returns an error for conflicting paths or a source that cannot be resolved.
         #[cfg(feature = "native-store")]
         pub fn into_native_mapping(self) -> Result<crate::build_runtime::MappedTree> {
-            use crate::build_runtime::{
-                MappedMetadata, MappedTree, TreeMetadata, TreePath, TreeTimestamp,
-            };
+            use crate::build_runtime::{MappedMetadata, MappedTree, TreePath};
             use std::os::unix::ffi::OsStrExt;
 
-            let modified = TreeTimestamp {
-                seconds: i64::try_from(tar::DETERMINISTIC_TIMESTAMP)?,
-                nanoseconds: 0,
-            };
-            let mut mapping = MappedTree::new(TreeMetadata {
-                mode: 0o755,
-                modified,
-            });
+            let directories = super::native_directory_metadata()?;
+            let modified = directories.modified;
+            let mut mapping = MappedTree::new(directories);
             let relative = |path: &Path| TreePath::new(path.as_os_str().as_bytes().to_vec());
             for mount in ["out", "tmp", "dev", "proc"] {
                 mapping.add_directory(relative(Path::new(mount))?)?;
