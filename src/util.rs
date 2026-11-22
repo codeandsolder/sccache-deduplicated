@@ -59,6 +59,31 @@ pub const fn debug_display<T: fmt::Debug + ?Sized>(value: &T) -> DebugDisplay<'_
     DebugDisplay(value)
 }
 
+/// Reads `reader` to the end, passing each chunk read to `f`.
+///
+/// Goes through `std::io::copy`, whose buffer lives on the stack and is not
+/// zeroed for readers that can fill uninitialized memory, such as files and
+/// byte slices. Zeroing a buffer for each input costs more than hashing a
+/// typical header, which is what direct mode hashes the most, and keeping one
+/// around between calls keeps that memory allocated.
+fn read_chunks<R: Read + ?Sized>(reader: &mut R, f: impl FnMut(&[u8])) -> Result<()> {
+    struct Chunks<F>(F);
+
+    impl<F: FnMut(&[u8])> Write for Chunks<F> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            (self.0)(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    std::io::copy(reader, &mut Chunks(f))?;
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Digest {
     inner: blake3_Hasher,
@@ -90,17 +115,10 @@ impl Digest {
     /// `each` before each time the digest is updated.
     pub fn reader_sync_with<R: Read, F: FnMut(&[u8])>(mut reader: R, mut each: F) -> Result<Self> {
         let mut m = Self::default();
-        // A buffer of 128KB should give us the best performance.
-        // See https://eklitzke.org/efficient-file-copying-on-linux.
-        let mut buffer = vec![0_u8; HASH_BUFFER_SIZE];
-        loop {
-            let count = reader.read(&mut buffer[..])?;
-            if count == 0 {
-                break;
-            }
-            each(&buffer[..count]);
-            m.update(&buffer[..count]);
-        }
+        read_chunks(&mut reader, |chunk| {
+            each(chunk);
+            m.update(chunk);
+        })?;
         Ok(m)
     }
 
@@ -146,14 +164,7 @@ impl Digest {
         let mut file = File::open(path).with_context(|| {
             format!("Failed to open file for hashing: {}", debug_display(&path))
         })?;
-        let mut buf = vec![0_u8; HASH_BUFFER_SIZE];
-        loop {
-            let n = file.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            self.update(&buf[..n]);
-        }
+        read_chunks(&mut file, |chunk| self.update(chunk))?;
         Ok(())
     }
 
@@ -620,12 +631,13 @@ where
     W: Write,
     S: Serialize,
 {
-    let bytes = bincode::serialize(&data)?;
-    let byte_len =
-        u32::try_from(bytes.len()).context("serialized payload exceeds u32 length prefix")?;
-    let mut len = [0; 4];
-    BigEndian::write_u32(&mut len, byte_len);
-    writer.write_all(&len)?;
+    // One write: with TCP_NODELAY, writing the length on its own would send it
+    // as a separate packet whenever the body overflows the caller's BufWriter.
+    let mut bytes = vec![0; 4];
+    bincode::serialize_into(&mut bytes, &data)?;
+    let len =
+        u32::try_from(bytes.len() - 4).context("serialized payload exceeds u32 length prefix")?;
+    BigEndian::write_u32(&mut bytes[..4], len);
     writer.write_all(&bytes)?;
     writer.flush()?;
     Ok(())
@@ -1664,6 +1676,32 @@ mod tests {
     use super::{Digest, OsStrExt, TimeMacroFinder, resolve_compiler_avoiding_wrapper};
     use std::ffi::{OsStr, OsString};
     use std::path::Path;
+
+    #[test]
+    fn test_reader_sync_across_buffer_sizes() {
+        use super::HASH_BUFFER_SIZE;
+        // `std::io::copy` reads 8KB at a time (std's `DEFAULT_BUF_SIZE`):
+        // sizes around the end of the first and second chunks, and around
+        // `HASH_BUFFER_SIZE`, the chunk size used before.
+        const COPY_CHUNK: usize = 8 * 1024;
+        let boundaries = [COPY_CHUNK, 2 * COPY_CHUNK, HASH_BUFFER_SIZE];
+        for boundary in boundaries {
+            for len in [boundary - 1, boundary, boundary + 1] {
+                let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+                let mut expected = Digest::new();
+                expected.update(&data);
+                let expected = expected.finish();
+                assert_eq!(Digest::reader_sync(data.as_slice()).unwrap(), expected);
+            }
+            // A time macro split by the chunk boundary is still found.
+            let mut data = vec![0u8; boundary + HASH_BUFFER_SIZE];
+            let start = boundary - b"__TIME__".len() / 2;
+            data[start..][..b"__TIME__".len()].copy_from_slice(b"__TIME__");
+            let finder = Digest::reader_sync_time_macros(data.as_slice()).unwrap().1;
+            assert!(finder.found_time());
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_decode_path_rejects_embedded_nul() {
@@ -2404,5 +2442,34 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_write_length_prefixed_bincode_single_write() {
+        use super::write_length_prefixed_bincode;
+        use byteorder::{BigEndian, ByteOrder};
+        use std::io::Write;
+
+        #[derive(Default)]
+        struct Writes(Vec<Vec<u8>>);
+        impl Write for Writes {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.push(buf.to_vec());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let data = vec![7u8; 20_000];
+        let mut writes = Writes::default();
+        write_length_prefixed_bincode(&mut writes, &data).unwrap();
+
+        assert_eq!(writes.0.len(), 1);
+        let frame = &writes.0[0];
+        let body = bincode::serialize(&data).unwrap();
+        assert_eq!(BigEndian::read_u32(&frame[..4]) as usize, body.len());
+        assert_eq!(&frame[4..], &body[..]);
     }
 }

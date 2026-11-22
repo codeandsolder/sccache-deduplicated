@@ -247,7 +247,7 @@ counted_array!(pub static ARGS: [ArgInfo<ArgData>; _] = [
     flag!("--save-temps=cwd", TooHardFlag),
     flag!("--save-temps=obj", TooHardFlag),
     take_arg!("--serialize-diagnostics", PathBuf, Separated, SerializeDiagnostics),
-    take_arg!("--sysroot", PathBuf, Separated, PassThroughPath),
+    take_arg!("--sysroot", PathBuf, CanBeSeparated(b'='), PassThroughPath),
     take_arg!("-A", OsString, Separated, PreprocessorArgument),
     take_arg!("-B", PathBuf, CanBeSeparated, PassThroughPath),
     take_arg!("-D", OsString, CanBeSeparated, PreprocessorArgument),
@@ -1385,6 +1385,35 @@ mod test {
             plusplus,
             CCompilerKind::Clang,
         )
+    }
+
+    #[test]
+    fn test_parse_arguments_sysroot() {
+        let parse = |args| match parse_arguments_(args, false) {
+            CompilerArguments::Ok(ParsedArguments { common_args, .. }) => common_args,
+            o => panic!("Got unexpected parse result: {o:?}"),
+        };
+        assert_eq!(
+            ovec!["--sysroot", "/opt/sysroot"],
+            parse(stringvec![
+                "-c",
+                "foo.c",
+                "-o",
+                "foo.o",
+                "--sysroot",
+                "/opt/sysroot"
+            ])
+        );
+        assert_eq!(
+            ovec!["--sysroot", "/opt/sysroot"],
+            parse(stringvec![
+                "-c",
+                "foo.c",
+                "-o",
+                "foo.o",
+                "--sysroot=/opt/sysroot"
+            ])
+        );
     }
 
     #[test]

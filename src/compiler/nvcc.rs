@@ -807,7 +807,18 @@ where
                     }
                     false
                 });
-                (env_vars.clone(), Cacheable::Yes, group)
+                // PTX verification passes have no output to cache.
+                let cacheable = if args.iter().any(|arg| {
+                    arg == "-o"
+                        || arg == "--output-file"
+                        || arg.starts_with("-o=")
+                        || arg.starts_with("--output-file=")
+                }) {
+                    Cacheable::Yes
+                } else {
+                    Cacheable::No
+                };
+                (env_vars.clone(), cacheable, group)
             }
             // cudafe++ _must be_ cached, because the `.module_id` file is unique to each invocation (new in CTK 12.8)
             Some("cudafe++") => {
@@ -1030,6 +1041,7 @@ where
             cwd,
             &line,
             host_compiler,
+            env_vars,
         )?;
 
         let Some((exe, mut args)) = maybe_exe_and_args else {
@@ -1077,6 +1089,7 @@ fn fold_env_vars_or_split_into_exe_and_args(
     cwd: &Path,
     line: &str,
     host_compiler: &NvccHostCompiler,
+    inherited_env_vars: &[(OsString, OsString)],
 ) -> Result<Option<(PathBuf, Vec<String>)>> {
     fn envvar_in_shell_format(var: &str) -> String {
         if cfg!(target_os = "windows") {
@@ -1147,13 +1160,20 @@ fn fold_env_vars_or_split_into_exe_and_args(
         return Err(anyhow!("Could not split shell line"));
     };
 
+    // Some NVCC distributions omit the inherited PATH from their dry-run output.
     let env_path = env_vars
         .iter()
-        .find(|(k, _)| k == "PATH")
-        .map(|(_, p)| p.to_owned())
-        .context("NVCC dry-run environment did not provide PATH")?;
+        .chain(inherited_env_vars)
+        .find(|(k, _)| {
+            if cfg!(windows) {
+                k.eq_ignore_ascii_case("PATH")
+            } else {
+                k == "PATH"
+            }
+        })
+        .map(|(_, p)| p);
 
-    let exe = which_in(exe, env_path.into(), cwd)?;
+    let exe = which_in(exe, env_path, cwd)?;
 
     Ok(Some((exe, args.to_vec())))
 }
@@ -1579,6 +1599,98 @@ mod test {
         }
     }
 
+    #[test_case::test_case("PATH"; "uppercase")]
+    #[cfg_attr(windows, test_case::test_case("Path"; "mixed_case"))]
+    fn test_select_nvcc_subcommands_path(path_name: &str) {
+        let inherited_dir = tempfile::tempdir().unwrap();
+        let dryrun_dir = tempfile::tempdir().unwrap();
+        for dir in [inherited_dir.path(), dryrun_dir.path()] {
+            fake_executable(dir, "host-compiler");
+        }
+        let executable_name = format!("host-compiler{}", std::env::consts::EXE_SUFFIX);
+        let inherited_executable = inherited_dir.path().join(&executable_name);
+        let inherited_env = vec![(
+            path_name.into(),
+            inherited_dir.path().as_os_str().to_owned(),
+        )];
+
+        for (dryrun, mut env_vars, expected_executable) in [
+            (
+                "#$ host-compiler -c kernel.cu\n".to_owned(),
+                inherited_env.clone(),
+                inherited_executable.clone(),
+            ),
+            (
+                format!(
+                    "#$ PATH={}\n#$ host-compiler -c kernel.cu\n",
+                    dryrun_dir.path().display()
+                ),
+                inherited_env,
+                dryrun_dir.path().join(&executable_name),
+            ),
+            (
+                format!("#$ \"{}\" -c kernel.cu\n", inherited_executable.display()),
+                vec![],
+                inherited_executable,
+            ),
+        ] {
+            let creator = new_creator();
+            next_command(
+                &creator,
+                Ok(MockChild::new(
+                    exit_status(0),
+                    dryrun.as_bytes(),
+                    dryrun.as_bytes(),
+                )),
+            );
+            let commands = select_nvcc_subcommands(
+                NvccSelectContext {
+                    creator: &creator,
+                    executable: &inherited_dir.path().join("nvcc"),
+                    cwd: inherited_dir.path(),
+                    env_vars: &mut env_vars,
+                    remap_filenames: false,
+                    arguments: &[],
+                    host_compiler: &NvccHostCompiler::Gcc,
+                    output_file_name: OsStr::new("kernel.o"),
+                },
+                |_| true,
+            )
+            .wait()
+            .unwrap();
+            assert_eq!(commands.len(), 1);
+            assert_eq!(
+                fs::canonicalize(&commands[0].1).unwrap(),
+                fs::canonicalize(expected_executable).unwrap()
+            );
+            assert_eq!(commands[0].2, ["-c", "kernel.cu"]);
+        }
+    }
+
+    #[test]
+    fn test_select_nvcc_subcommands_without_path_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let creator = new_creator();
+        let dryrun = b"#$ host-compiler -c kernel.cu\n";
+        next_command(&creator, Ok(MockChild::new(exit_status(0), dryrun, dryrun)));
+        let error = select_nvcc_subcommands(
+            NvccSelectContext {
+                creator: &creator,
+                executable: &dir.path().join("nvcc"),
+                cwd: dir.path(),
+                env_vars: &mut vec![],
+                remap_filenames: false,
+                arguments: &[],
+                host_compiler: &NvccHostCompiler::Gcc,
+                output_file_name: OsStr::new("kernel.o"),
+            },
+            |_| true,
+        )
+        .wait()
+        .unwrap_err();
+        assert!(error.downcast_ref::<which::Error>().is_some());
+    }
+
     #[test]
     #[cfg(windows)]
     fn test_group_nvcc_subcommands_preserves_escaped_quotes_in_defines() {
@@ -1673,6 +1785,21 @@ mod test {
 
     #[test]
     fn test_group_nvcc_subcommands_with_simt_only_cicc_input() {
+        check_group_nvcc_subcommands_with_ptx_verification("-o \"kernel.cubin\"");
+    }
+
+    #[test]
+    fn test_group_nvcc_subcommands_with_ptxas_output_flags() {
+        for output in [
+            "--output-file \"kernel.cubin\"",
+            "-o=kernel.cubin",
+            "--output-file=kernel.cubin",
+        ] {
+            check_group_nvcc_subcommands_with_ptx_verification(output);
+        }
+    }
+
+    fn check_group_nvcc_subcommands_with_ptx_verification(output: &str) {
         let bin_dir = tempfile::tempdir().unwrap();
 
         #[cfg(windows)]
@@ -1692,7 +1819,10 @@ mod test {
 #$ cudafe++ --gen_c_file_name "kernel.cudafe1.cpp" --stub_file_name "kernel.cudafe1.stub.c" --module_id_file_name "kernel.module_id" --simt-only "kernel.cpp4.ii"
 #$ cl -D__CUDA_ARCH__=800 -D__CUDACC__ -E -x c++ "kernel.cu" > "kernel.cpp1.ii"
 #$ cicc --device-c -arch compute_80 --module_id_file_name "kernel.module_id" --gen_c_file_name "kernel.cudafe1.c" --stub_file_name "kernel.cudafe1.stub.c" --gen_device_file_name "kernel.cudafe1.gpu" "kernel.cpp1.ii" --simt-only -o "kernel.ptx"
-#$ ptxas -arch=sm_80 --compile-only "kernel.ptx" -o "kernel.cubin"
+#$ ptxas -arch=sm_80 --compile-only "kernel.ptx" {output}
+#$ cl -D__CUDA_ARCH__=1200 -D__CUDACC__ -E -x c++ "kernel.cu" > "kernel.compute_120.cpp1.ii"
+#$ cicc --device-c -arch compute_120 "kernel.compute_120.cpp1.ii" -o "kernel.compute_120.ptx"
+#$ ptxas -arch=compute_120 -m64 "kernel.compute_120.ptx"
 #$ fatbinary --create="kernel.fatbin" "--image3=kind=elf,sm=80,file=kernel.cubin" --embedded-fatbin="kernel.fatbin.c" --device-c
 #$ cl -D__CUDA_ARCH__=800 -D__CUDACC__ -c -x c++ "kernel.cudafe1.cpp" -Fo"kernel.o"
 "#
@@ -1704,7 +1834,10 @@ mod test {
 #$ cudafe++ --gen_c_file_name "kernel.cudafe1.cpp" --stub_file_name "kernel.cudafe1.stub.c" --module_id_file_name "kernel.module_id" --simt-only "kernel.cpp4.ii"
 #$ gcc -D__CUDA_ARCH__=800 -D__CUDACC__ -E -x c++ "kernel.cu" -o "kernel.cpp1.ii"
 #$ cicc --device-c -arch compute_80 --module_id_file_name "kernel.module_id" --gen_c_file_name "kernel.cudafe1.c" --stub_file_name "kernel.cudafe1.stub.c" --gen_device_file_name "kernel.cudafe1.gpu" "kernel.cpp1.ii" --simt-only -o "kernel.ptx"
-#$ ptxas -arch=sm_80 --compile-only "kernel.ptx" -o "kernel.cubin"
+#$ ptxas -arch=sm_80 --compile-only "kernel.ptx" {output}
+#$ gcc -D__CUDA_ARCH__=1200 -D__CUDACC__ -E -x c++ "kernel.cu" -o "kernel.compute_120.cpp1.ii"
+#$ cicc --device-c -arch compute_120 "kernel.compute_120.cpp1.ii" -o "kernel.compute_120.ptx"
+#$ ptxas -arch=compute_120 -m64 "kernel.compute_120.ptx"
 #$ fatbinary --create="kernel.fatbin" "--image3=kind=elf,sm=80,file=kernel.cubin" --embedded-fatbin="kernel.fatbin.c" --device-c
 #$ gcc -D__CUDA_ARCH__=800 -D__CUDACC__ -c -x c++ "kernel.cudafe1.cpp" -o "kernel.o"
 "#
@@ -1748,7 +1881,7 @@ mod test {
             .find(|group| {
                 group
                     .iter()
-                    .any(|cmd| cmd.exe.file_stem().and_then(|stem| stem.to_str()) == Some("cicc"))
+                    .any(|cmd| cmd.args.iter().any(|arg| arg == "kernel.ptx"))
             })
             .expect("missing device compile group");
 
@@ -1772,6 +1905,17 @@ mod test {
             .find(|cmd| cmd.exe.file_stem().and_then(|stem| stem.to_str()) == Some("ptxas"))
             .unwrap();
         assert!(ptxas.args.iter().any(cicc::is_ptxas_input));
+        assert_eq!(Cacheable::Yes, ptxas.cacheable);
+
+        let virtual_ptxas = groups
+            .iter()
+            .flatten()
+            .find(|cmd| {
+                cmd.exe.file_stem().and_then(|stem| stem.to_str()) == Some("ptxas")
+                    && cmd.args.iter().any(|arg| arg == "kernel.compute_120.ptx")
+            })
+            .expect("missing virtual-only ptxas command");
+        assert_eq!(Cacheable::No, virtual_ptxas.cacheable);
     }
 
     #[test]
