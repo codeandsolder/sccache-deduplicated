@@ -96,41 +96,42 @@ fn flag_infer_long(name: &'static str) -> Arg {
     Arg::new(name).long(name)
 }
 
+const ENABLED_FEATURES_HELP: &str = concat!(
+    "Enabled features:\n",
+    "    S3:        ",
+    cfg!(feature = "s3"),
+    "\n",
+    "    Redis:     ",
+    cfg!(feature = "redis"),
+    "\n",
+    "    Memcached: ",
+    cfg!(feature = "memcached"),
+    "\n",
+    "    GCS:       ",
+    cfg!(feature = "gcs"),
+    "\n",
+    "    GHA:       ",
+    cfg!(feature = "gha"),
+    "\n",
+    "    Azure:     ",
+    cfg!(feature = "azure"),
+    "\n",
+    "    WebDAV:    ",
+    cfg!(feature = "webdav"),
+    "\n",
+    "    OSS:       ",
+    cfg!(feature = "oss"),
+    "\n",
+    "    COS:       ",
+    cfg!(feature = "cos"),
+    "\n"
+);
 /// Get the [`clap::Command`] used for argument parsing.
 fn get_clap_command() -> clap::Command {
     clap::Command::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
         .max_term_width(110)
-        .after_help(concat!(
-            "Enabled features:\n",
-            "    S3:        ",
-            cfg!(feature = "s3"),
-            "\n",
-            "    Redis:     ",
-            cfg!(feature = "redis"),
-            "\n",
-            "    Memcached: ",
-            cfg!(feature = "memcached"),
-            "\n",
-            "    GCS:       ",
-            cfg!(feature = "gcs"),
-            "\n",
-            "    GHA:       ",
-            cfg!(feature = "gha"),
-            "\n",
-            "    Azure:     ",
-            cfg!(feature = "azure"),
-            "\n",
-            "    WebDAV:    ",
-            cfg!(feature = "webdav"),
-            "\n",
-            "    OSS:       ",
-            cfg!(feature = "oss"),
-            "\n",
-            "    COS:       ",
-            cfg!(feature = "cos"),
-            "\n"
-        ))
+        .after_help(ENABLED_FEATURES_HELP)
         .args(&[
             flag_infer_long("capabilities")
                 .help("print machine-readable build capabilities")

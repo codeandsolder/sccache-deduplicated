@@ -1384,7 +1384,7 @@ where
         loop {
             tokio::select! {
                 biased;
-                _ = activity.cancellation.cancelled() => {
+                () = activity.cancellation.cancelled() => {
                     let snapshot = activity.snapshot();
                     bail!("compile request {} cancellation requested during {:?}; outcome unknown", snapshot.id, snapshot.phase);
                 }

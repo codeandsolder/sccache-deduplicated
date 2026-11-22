@@ -211,12 +211,10 @@ impl Registry {
 
     pub(super) fn cancel(&self, id: &str) -> bool {
         let activity = lock(&self.active).get(id).cloned();
-        if let Some(activity) = activity {
+        activity.is_some_and(|activity| {
             activity.cancellation.cancel();
             true
-        } else {
-            false
-        }
+        })
     }
 
     pub(super) fn snapshots(&self) -> Vec<CompileActivity> {
