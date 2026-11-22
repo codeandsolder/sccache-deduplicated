@@ -24,6 +24,7 @@ pub(super) struct NativeCargoPaths {
     // GCC and Clang resolve overlapping maps in favor of the most specific
     // prefix when the longer maps are supplied last.
     maps: Vec<PrefixMap>,
+    preserve_preprocessed_identity: bool,
 }
 
 impl NativeCargoPaths {
@@ -67,7 +68,24 @@ impl NativeCargoPaths {
         if !out.is_absolute() || !out.is_dir() {
             return None;
         }
-        let mut paths = Self { maps: Vec::new() };
+        let mut paths = Self {
+            maps: Vec::new(),
+            // Clang's integrated assembler can embed a checksum of the
+            // temporary preprocessed assembly file (including its original
+            // line markers) in DWARF 5. Remapping that filename alone does not
+            // normalize the checksum. Keep the real stream identity whenever
+            // debug output can observe it, without disabling caching.
+            preserve_preprocessed_identity: kind == CCompilerKind::Clang
+                && args.language == Language::AssemblerToPreprocess
+                && args.common_args.iter().chain(&args.arch_args).any(|arg| {
+                    let bytes = arg.as_encoded_bytes();
+                    bytes.split(|&b| b == b',').any(|part| {
+                        (part.starts_with(b"-g") && part != b"-gcc-toolchain")
+                            || part.starts_with(b"--gdwarf")
+                            || part.starts_with(b"-debug-info-kind=")
+                    })
+                }),
+        };
         // Per-package OUT_DIR is the most specific stable identity, including
         // generated sources copied there by a build script. It deliberately
         // does not contain Cargo's package/build fingerprint directory.
@@ -141,6 +159,9 @@ impl NativeCargoPaths {
     }
 
     pub(super) fn preprocessed_key_bytes<'a>(&self, bytes: &'a [u8]) -> Cow<'a, [u8]> {
+        if self.preserve_preprocessed_identity {
+            return Cow::Borrowed(bytes);
+        }
         let mut lexer = LineContext::Code;
         let mut continued = false;
         let mut result = None::<Vec<u8>>;
@@ -416,6 +437,7 @@ mod tests {
     #[test]
     fn markers_are_not_source_literals_or_comments() {
         let paths = NativeCargoPaths {
+            preserve_preprocessed_identity: false,
             maps: vec![PrefixMap {
                 physical: "/tmp/physical".into(),
                 canonical: "/stable",

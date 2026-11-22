@@ -2203,15 +2203,20 @@ fn test_cargo_native_relocated_objects_and_depfiles() -> anyhow::Result<()> {
         &root.join("sccache-cached-cfg"),
     );
 
-    for compiler in ["gcc", "clang"] {
-        let compiler = which(compiler)?;
-        for (extension, contents) in [
-            ("cc", "extern const char *const path = __FILE__;\n"),
-            ("S", ".section .rodata\n.ascii __FILE__\n"),
+    for compiler_name in ["gcc", "clang"] {
+        let compiler = which(compiler_name)?;
+        for (extension, debug, contents) in [
+            ("cc", true, "extern const char *const path = __FILE__;\n"),
+            ("S", false, ".section .rodata\n.ascii __FILE__\n"),
+            ("S", true, ".section .rodata\n.ascii __FILE__\n"),
         ] {
+            let shares_across_roots = compiler_name != "clang" || extension != "S" || !debug;
             zero_stats();
             let mut objects = Vec::new();
-            for (i, name) in ["pkg-first", "pkg-second", "pkg-third"].iter().enumerate() {
+            for (i, name) in ["pkg-first", "pkg-first", "pkg-second", "pkg-third"]
+                .iter()
+                .enumerate()
+            {
                 let target = root.join(name).join("target");
                 let out = target.join("debug/build").join(name).join("out");
                 let cwd = out.join("build");
@@ -2223,14 +2228,17 @@ fn test_cargo_native_relocated_objects_and_depfiles() -> anyhow::Result<()> {
                 command
                     .arg(&compiler)
                     .current_dir(&cwd)
-                    .args(["-c", "-g", "-MD", "-MF", "native.d"])
+                    .args(["-c", "-MD", "-MF", "native.d"])
                     .arg(&source)
                     .args(["-o", "native.o"])
                     .env("OUT_DIR", &out)
                     .env("SCCACHE_CANONICAL_TARGET_ROOT", &target);
-                if i == 2 {
-                    // A fresh build in another root must match the cached bytes,
-                    // not merely return the first root's object.
+                if debug {
+                    command.arg("-g");
+                }
+                if i == 3 {
+                    // A fresh build in another root must match the cached bytes
+                    // whenever the compiler does not observe physical identity.
                     command.env("SCCACHE_RECACHE", "1");
                 }
                 command.assert().success();
@@ -2249,10 +2257,24 @@ fn test_cargo_native_relocated_objects_and_depfiles() -> anyhow::Result<()> {
                         assert_eq!(1, info.stats.cache_misses.all());
                         assert_eq!(1, info.stats.cache_hits.all());
                     });
+                } else if i == 2 {
+                    get_stats(move |info| {
+                        assert_eq!(
+                            if shares_across_roots { 1 } else { 2 },
+                            info.stats.cache_misses.all()
+                        );
+                        assert_eq!(
+                            1 + u64::from(shares_across_roots),
+                            info.stats.cache_hits.all()
+                        );
+                    });
                 }
             }
             assert_eq!(objects[0], objects[1]);
-            assert_eq!(objects[0], objects[2]);
+            if shares_across_roots {
+                assert_eq!(objects[0], objects[2]);
+                assert_eq!(objects[0], objects[3]);
+            }
         }
     }
     let _ = stop_local_daemon();
