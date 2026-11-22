@@ -39,8 +39,9 @@ impl BuildPath {
         &self.0
     }
 
-    fn within(&self, parent: &[u8]) -> bool {
-        self.0 == parent
+    pub(crate) fn within(&self, parent: &[u8]) -> bool {
+        parent == b"/"
+            || self.0 == parent
             || self
                 .0
                 .strip_prefix(parent)
@@ -108,10 +109,10 @@ impl CommandSpec {
     }
 }
 
-/// One named output under the private writable /out mount.
+/// One named output at its exact absolute sandbox path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputSpec {
-    pub path: TreePath,
+    pub path: BuildPath,
     pub required: bool,
 }
 
@@ -142,7 +143,7 @@ impl ExecutionSpec {
             target.validate()?;
             ensure!(
                 target.0 != b"/"
-                    && ![b"/proc".as_slice(), b"/dev", b"/out", b"/tmp"]
+                    && ![b"/proc".as_slice(), b"/dev", b"/tmp"]
                         .iter()
                         .any(|reserved| target.within(reserved)),
                 "reserved build mount"
@@ -161,7 +162,18 @@ impl ExecutionSpec {
                 !name.is_empty() && !name.contains('\0'),
                 "invalid output name"
             );
-            TreePath::new(output.path.as_bytes().to_vec())?;
+            output.path.validate()?;
+            ensure!(
+                output.path.as_bytes() != b"/"
+                    && ![b"/proc".as_slice(), b"/dev"]
+                        .iter()
+                        .any(|reserved| output.path.within(reserved))
+                    && !self
+                        .mounts
+                        .keys()
+                        .any(|mount| mount.within(output.path.as_bytes())),
+                "output conflicts with a reserved or mounted path"
+            );
             ensure!(
                 paths.insert(output.path.as_bytes()),
                 "duplicate output path"
@@ -207,7 +219,7 @@ impl ExecutionSpec {
         }
         Ok(ActionRequest {
             fingerprint: ActionFingerprint {
-                schema: "native-linux-bwrap-v1".into(),
+                schema: "native-linux-bwrap-v2".into(),
                 components,
             },
             input_trees: trees,
@@ -236,7 +248,7 @@ mod tests {
             outputs: BTreeMap::from([(
                 "object".into(),
                 OutputSpec {
-                    path: TreePath::new(b"object.o".to_vec())?,
+                    path: BuildPath::new(b"/out/object.o".to_vec())?,
                     required: true,
                 },
             )]),
@@ -293,13 +305,13 @@ mod tests {
         invalid = spec()?;
         invalid
             .mounts
-            .insert(BuildPath::new(b"/out/nested".to_vec())?, TreeId([3; 32]));
+            .insert(BuildPath::new(b"/tmp/nested".to_vec())?, TreeId([3; 32]));
         assert!(invalid.action_request().is_err());
         invalid = spec()?;
         invalid.outputs.insert(
             "other".into(),
             OutputSpec {
-                path: TreePath::new(b"object.o/nested".to_vec())?,
+                path: BuildPath::new(b"/out/object.o/nested".to_vec())?,
                 required: false,
             },
         );

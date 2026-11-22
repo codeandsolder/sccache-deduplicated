@@ -3,9 +3,9 @@
 //! archive, local CAS publication, or intermediary copy is required.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
-    fs::{self, File},
+    fs::File,
     io::{self, Read, Seek, SeekFrom},
     os::unix::{
         ffi::OsStrExt,
@@ -22,11 +22,10 @@ use rustix::{
     fs::{Mode, OFlags, ResolveFlags, openat2},
     io::Errno,
 };
-use tempfile::TempDir;
 
 use crate::{
-    Artifact, BlobRef, ContentId, ExecutionSpec, MaterializedTree, NativeStore, ResultManifest,
-    TreeEntry, TreePath,
+    Artifact, BlobRef, BuildPath, ContentId, ExecutionSpec, MaterializedTree, NativeStore,
+    ResultManifest, TreeEntry, TreeId, TreeLease, TreePath,
     sandbox::{MountAccess, SandboxInvocation, SandboxPath, SandboxPlan},
 };
 
@@ -101,72 +100,180 @@ impl Read for PositionalReader {
     }
 }
 
+struct OutputLocation {
+    directory: File,
+    relative: PathBuf,
+}
+
 struct PreparedBuild {
     plan: SandboxPlan,
-    outputs: TempDir,
-    // Keep all private input materializations alive until the process exits.
-    _trees: BTreeMap<crate::TreeId, MaterializedTree>,
+    outputs: BTreeMap<String, OutputLocation>,
+    // One independently cloned view per namespace location, even when two
+    // locations reference the same tree ID.
+    _views: BTreeMap<BuildPath, MaterializedTree>,
+}
+
+fn host_path(bytes: &[u8]) -> &Path {
+    Path::new(OsStr::from_bytes(bytes))
+}
+
+fn backing<'a, T>(
+    locations: &'a BTreeMap<BuildPath, T>,
+    path: &BuildPath,
+) -> Result<(&'a BuildPath, &'a T)> {
+    locations
+        .iter()
+        .filter(|(point, _)| path.within(point.as_bytes()))
+        .max_by_key(|(point, _)| point.as_bytes().len())
+        .context("missing native backing tree")
+}
+
+fn relative<'a>(path: &'a BuildPath, mount: &BuildPath) -> Result<&'a Path> {
+    host_path(path.as_bytes())
+        .strip_prefix(host_path(mount.as_bytes()))
+        .context("native path lies outside its backing tree")
+}
+
+fn require_directory(tree: &TreeLease, path: &Path) -> Result<()> {
+    if !path.as_os_str().is_empty() {
+        let relative = TreePath::new(path.as_os_str().as_bytes().to_vec())?;
+        ensure!(
+            matches!(
+                tree.manifest().entries.get(&relative),
+                Some(TreeEntry::Directory(_))
+            ),
+            "native directory is not declared: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn output_parent(path: &BuildPath) -> Result<BuildPath> {
+    let parent = host_path(path.as_bytes())
+        .parent()
+        .context("output parent missing")?;
+    BuildPath::new(parent.as_os_str().as_bytes().to_vec())
+}
+
+fn writable_locations(
+    spec: &ExecutionSpec,
+    leases: &BTreeMap<BuildPath, TreeLease>,
+) -> Result<BTreeSet<BuildPath>> {
+    let tmp = BuildPath::new(b"/tmp".to_vec())?;
+    let mut writable = BTreeSet::from([tmp]);
+    for output in spec.outputs.values() {
+        let (mount, tree) = backing(leases, &output.path)?;
+        let path = relative(&output.path, mount)?;
+        let parent = path
+            .parent()
+            .context("output cannot replace a mount root")?;
+        require_directory(tree, parent)?;
+        ensure!(
+            !tree
+                .manifest()
+                .entries
+                .contains_key(&TreePath::new(path.as_os_str().as_bytes().to_vec())?),
+            "declared output already exists in the immutable input: {}",
+            host_path(output.path.as_bytes()).display()
+        );
+        writable.insert(output_parent(&output.path)?);
+    }
+    // Remove redundant nested bindings only within the same backing tree.
+    let mut result = BTreeSet::new();
+    for path in &writable {
+        let (mount, _) = backing(leases, path)?;
+        if !result.iter().any(|parent: &BuildPath| {
+            path.within(parent.as_bytes()) && parent.within(mount.as_bytes())
+        }) {
+            result.insert(path.clone());
+        }
+    }
+    Ok(result)
 }
 
 impl PreparedBuild {
     fn prepare(spec: &ExecutionSpec, store: &NativeStore, scratch: &Path) -> Result<Self> {
-        let request = spec.action_request()?;
-        let root = store
-            .lookup_tree(spec.root)?
-            .context("native root unavailable")?;
-        // Mount destinations are declared real directories in the immutable
-        // root; never resolve an untrusted symlink on the host.
-        for path in spec.mounts.keys().map(crate::BuildPath::as_bytes).chain([
-            b"/out".as_slice(),
-            b"/tmp",
+        let root_point = BuildPath::new(b"/".to_vec())?;
+        let mut locations = spec.mounts.clone();
+        locations.insert(root_point.clone(), spec.root);
+        let leases: BTreeMap<BuildPath, TreeLease> = locations
+            .into_iter()
+            .map(|(path, id): (BuildPath, TreeId)| {
+                Ok((
+                    path,
+                    store
+                        .lookup_tree(id)?
+                        .context("native input tree unavailable")?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        let root = leases.get(&root_point).context("native root unavailable")?;
+        // Never mount through a symlink or a nonexistent parent in the root.
+        for path in spec.mounts.keys().map(BuildPath::as_bytes).chain([
+            b"/tmp".as_slice(),
             b"/proc",
             b"/dev",
         ]) {
-            let relative = TreePath::new(path[1..].to_vec())?;
-            ensure!(
-                matches!(
-                    root.manifest().entries.get(&relative),
-                    Some(TreeEntry::Directory(_))
-                ),
-                "native mount destination is not a declared directory"
-            );
+            require_directory(root, host_path(&path[1..]))?;
         }
-        let mut trees = BTreeMap::new();
-        for id in request.input_trees {
-            let lease = store
-                .lookup_tree(id)?
-                .context("native input tree unavailable")?;
-            trees.insert(id, lease.materialize(scratch)?);
+        let writable = writable_locations(spec, &leases)?;
+        let mut views: BTreeMap<BuildPath, MaterializedTree> = leases
+            .iter()
+            .map(|(path, lease)| Ok((path.clone(), lease.materialize(scratch)?)))
+            .collect::<Result<_>>()?;
+        for path in &writable {
+            let (point, _) = backing(&leases, path)?;
+            views
+                .get_mut(point)
+                .context("native view missing")?
+                .mark_writable(relative(path, point)?);
         }
-        let root_view = trees.get(&spec.root).context("materialized root missing")?;
-        let mut plan = SandboxPlan::new(root_view.root(), MountAccess::ReadOnly)?;
-        for (path, tree) in &spec.mounts {
-            let view = trees.get(tree).context("materialized input missing")?;
+        let access = |path: &BuildPath| {
+            if writable.contains(path) {
+                MountAccess::Writable
+            } else {
+                MountAccess::ReadOnly
+            }
+        };
+        let root = views.get(&root_point).context("native root view missing")?;
+        let mut plan = SandboxPlan::new(root.root(), access(&root_point))?;
+        for (path, view) in &views {
+            if path != &root_point {
+                plan.bind(
+                    view.root(),
+                    SandboxPath::new(host_path(path.as_bytes()))?,
+                    access(path),
+                )?;
+            }
+        }
+        for path in &writable {
+            // The mount root itself already has the correct access mode.
+            if views.contains_key(path) {
+                continue;
+            }
+            let (point, view) = backing(&views, path)?;
             plan.bind(
-                view.root(),
-                SandboxPath::new(Path::new(OsStr::from_bytes(path.as_bytes())))?,
-                MountAccess::ReadOnly,
+                &view.root().join(relative(path, point)?),
+                SandboxPath::new(host_path(path.as_bytes()))?,
+                MountAccess::Writable,
             )?;
         }
-        let outputs = tempfile::Builder::new()
-            .prefix("native-outputs-")
-            .tempdir_in(scratch)?;
-        for declared in spec.outputs.values() {
-            let path = outputs
-                .path()
-                .join(OsStr::from_bytes(declared.path.as_bytes()));
-            fs::create_dir_all(path.parent().context("output parent missing")?)?;
+        let mut outputs = BTreeMap::new();
+        for (name, output) in &spec.outputs {
+            let (point, view) = backing(&views, &output.path)?;
+            outputs.insert(
+                name.clone(),
+                OutputLocation {
+                    directory: File::open(view.root())?,
+                    relative: relative(&output.path, point)?.to_owned(),
+                },
+            );
         }
-        plan.bind(
-            outputs.path(),
-            SandboxPath::new(Path::new("/out"))?,
-            MountAccess::Writable,
-        )?;
-        plan.tmpfs(SandboxPath::new(Path::new("/tmp"))?)?;
         Ok(Self {
             plan,
             outputs,
-            _trees: trees,
+            _views: views,
         })
     }
 }
@@ -205,7 +312,7 @@ impl RunningChild {
 ///
 /// The progress callback is invoked while the process runs and may renew its
 /// scheduler lease or cancel execution. It must return promptly. Output
-/// capture uses opened regular files under the private output directory, not
+/// capture uses opened regular files under the private backing views, not
 /// paths supplied by the child. The caller controls the lifetime and quota
 /// of the scratch filesystem.
 ///
@@ -297,15 +404,17 @@ impl Capture {
 
     fn outputs(
         &mut self,
-        directory: &TempDir,
+        locations: &BTreeMap<String, OutputLocation>,
         spec: &ExecutionSpec,
     ) -> Result<BTreeMap<String, Artifact>> {
-        let root = File::open(directory.path())?;
         let mut outputs = BTreeMap::new();
         for (name, output) in &spec.outputs {
+            let location = locations
+                .get(name)
+                .context("declared output location missing")?;
             let file = match openat2(
-                &root,
-                Path::new(OsStr::from_bytes(output.path.as_bytes())),
+                &location.directory,
+                &location.relative,
                 OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
                 Mode::empty(),
                 ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,

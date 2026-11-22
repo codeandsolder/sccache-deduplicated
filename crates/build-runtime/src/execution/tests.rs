@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, io::Read, process::Command};
+use std::{collections::BTreeMap, fs, io::Read, process::Command};
 
 use super::*;
 use crate::{BuildPath, CommandSpec, OutputSpec, TreeManifest, TreeMetadata, TreeTimestamp};
@@ -24,7 +24,16 @@ fn add_parents(entries: &mut BTreeMap<TreePath, TreeEntry>, path: &[u8]) -> Resu
 
 fn shell_root(store: &NativeStore) -> Result<crate::TreeId> {
     let mut entries = BTreeMap::new();
-    for path in [b"bin".as_slice(), b"out", b"tmp", b"proc", b"dev", b"src"] {
+    for path in [
+        b"bin".as_slice(),
+        b"out",
+        b"out/nested",
+        b"tmp",
+        b"proc",
+        b"dev",
+        b"src",
+        b"other",
+    ] {
         entries.insert(
             TreePath::new(path.to_vec())?,
             TreeEntry::Directory(metadata(0o755)),
@@ -96,8 +105,8 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
             environment: BTreeMap::new(),
         },
         outputs: BTreeMap::from([
-            ("obj".into(), OutputSpec { path: TreePath::new(b"nested/object".to_vec())?, required: true }),
-            ("optional".into(), OutputSpec { path: TreePath::new(b"optional".to_vec())?, required: false }),
+            ("obj".into(), OutputSpec { path: BuildPath::new(b"/out/nested/object".to_vec())?, required: true }),
+            ("optional".into(), OutputSpec { path: BuildPath::new(b"/out/optional".to_vec())?, required: false }),
         ]),
     };
     let policy = ExecutionPolicy {
@@ -134,6 +143,52 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
         result.diagnostics().1.context("stderr missing")?.id,
         ContentId::of(b"failed")
     );
+    // Two mounts of the same tree must be independent even when one is
+    // writable. Preserve the compiler's relative output path and input
+    // dependencies without rewriting any invocation arguments.
+    spec.mounts.insert(BuildPath::new(b"/other".to_vec())?, src);
+    spec.outputs = BTreeMap::from([
+        (
+            "object".into(),
+            OutputSpec {
+                path: BuildPath::new(b"/src/object".to_vec())?,
+                required: true,
+            },
+        ),
+        (
+            "scratch".into(),
+            OutputSpec {
+                path: BuildPath::new(b"/tmp/result".to_vec())?,
+                required: true,
+            },
+        ),
+    ]);
+    spec.command.arguments[1] = br#"printf new > object; test ! -e /other/object || exit 8; IFS= read -r word < /other/input; printf '%s' "$word" > /tmp/result"#.to_vec();
+    let result = execute(&spec, &store, &policy, || Ok(()))?;
+    let manifest = result
+        .successful_result()
+        .context("in-place output execution failed")?;
+    let mut content = Vec::new();
+    result
+        .open_blob(manifest.outputs["scratch"].blob.id)?
+        .read_to_end(&mut content)?;
+    assert_eq!(content, b"hello native");
+    assert!(
+        !store
+            .lookup_tree(src)?
+            .context("missing original tree")?
+            .manifest()
+            .entries
+            .contains_key(&TreePath::new(b"object".to_vec())?)
+    );
+
+    // A preexisting input cannot silently serve as a compiler output.
+    spec.outputs.get_mut("object").context("output")?.path =
+        BuildPath::new(b"/src/input".to_vec())?;
+    assert!(execute(&spec, &store, &policy, || Ok(())).is_err());
+    spec.outputs.get_mut("object").context("output")?.path =
+        BuildPath::new(b"/src/missing/object".to_vec())?;
+    assert!(execute(&spec, &store, &policy, || Ok(())).is_err());
     // A symlink must never make host bytes a cached output.
     spec.command.arguments[1] = b"printf ok > /out/nested/object".to_vec();
     spec.platform = ContentId::of(b"incorrect");
@@ -164,12 +219,19 @@ fn rejects_symlink_and_fifo_outputs_without_following_or_blocking() -> Result<()
         outputs: BTreeMap::from([(
             "obj".into(),
             OutputSpec {
-                path: TreePath::new(b"object".to_vec())?,
+                path: BuildPath::new(b"/out/object".to_vec())?,
                 required: true,
             },
         )]),
     };
-    assert!(capture.outputs(&dir, &spec).is_err());
+    let locations = BTreeMap::from([(
+        "obj".into(),
+        OutputLocation {
+            directory: File::open(dir.path())?,
+            relative: "object".into(),
+        },
+    )]);
+    assert!(capture.outputs(&locations, &spec).is_err());
     fs::remove_file(&output)?;
     rustix::fs::mknodat(
         rustix::fs::CWD,
@@ -178,6 +240,6 @@ fn rejects_symlink_and_fifo_outputs_without_following_or_blocking() -> Result<()
         Mode::RUSR | Mode::WUSR,
         0,
     )?;
-    assert!(capture.outputs(&dir, &spec).is_err());
+    assert!(capture.outputs(&locations, &spec).is_err());
     Ok(())
 }

@@ -4,7 +4,7 @@ use super::*;
 use crate::{
     build_runtime::{
         Artifact, BlobRef, BuildPath, CommandSpec, ContentId, ExecutionSpec, OutputSpec,
-        ResultManifest, SessionLimits, TreeId, TreeManifest, TreeMetadata, TreePath, TreeTimestamp,
+        ResultManifest, SessionLimits, TreeId, TreeManifest, TreeMetadata, TreeTimestamp,
         wire::{NativeAdmission, NativeStatus, ScheduleReply, WorkerAllocation},
     },
     dist::{JobId, ServerId, native::NativeCacheClient},
@@ -38,7 +38,7 @@ fn action(root: TreeId) -> Result<ExecutionSpec> {
         outputs: BTreeMap::from([(
             "obj".into(),
             OutputSpec {
-                path: TreePath::new(b"obj".to_vec())?,
+                path: BuildPath::new(b"/out/obj".to_vec())?,
                 required: true,
             },
         )]),

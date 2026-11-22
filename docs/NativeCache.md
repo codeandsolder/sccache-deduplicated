@@ -27,11 +27,17 @@ Scheduling a miss selects a worker whose advertised platform contract
 matches and accounts for capacity in the same pool as ordinary jobs.
 Repeating scheduling for the same pending ticket replays the allocation.
 
-On the worker, immutable tree views are materialized from the local store
-and bound read-only in Bubblewrap with private writable `/out` and tmpfs
-`/tmp`. The root must declare real directories for every mount point and
-the fixed `/out`, `/tmp`, `/dev` and `/proc` mounts. Outputs and
-diagnostics are captured as regular file descriptors, hashed, negotiated
+On the worker, each tree location is independently block-cloned (or copied)
+into a private view. Bubblewrap binds views read-only except for declared
+output parent directories and private `/tmp`. The command and its output
+paths need not be rewritten into a special `/out` directory. Every output
+parent and mount destination must be a real declared directory; an output
+cannot replace an input entry, mount root, or namespace device/proc path.
+Output parents can contain input files; modifications affect only the
+per-execution private view. Multiple mounts of the same tree never share
+a mutable view. The root declares `/tmp`, `/dev` and `/proc` directories.
+Outputs and diagnostics are captured via descriptors rooted in the correct
+backing view, rejecting symlink traversal, hashed, negotiated
 against the scheduler's content store, and transferred directly only if
 missing. The scheduler commits the manifest and a client delivery pin
 atomically. Successful worker HTTPS responses contain no output bytes.

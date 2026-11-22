@@ -242,7 +242,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
         mounts: BTreeMap::from([(BuildPath::new(b"/src".to_vec())?, source_tree.id())]),
         command: CommandSpec {
             executable: BuildPath::new(b"/usr/bin/as".to_vec())?,
-            arguments: [b"-o".as_slice(), b"/out/object.o", b"/src/input.s"]
+            arguments: [b"-o".as_slice(), b"object.o", b"/src/input.s"]
                 .map(<[u8]>::to_vec)
                 .to_vec(),
             cwd: BuildPath::new(b"/src".to_vec())?,
@@ -251,7 +251,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
         outputs: BTreeMap::from([(
             "object".into(),
             OutputSpec {
-                path: TreePath::new(b"object.o".to_vec())?,
+                path: BuildPath::new(b"/src/object.o".to_vec())?,
                 required: true,
             },
         )]),

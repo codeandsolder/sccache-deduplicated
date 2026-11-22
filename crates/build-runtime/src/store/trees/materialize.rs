@@ -32,11 +32,12 @@ pub struct MaterializationStats {
 ///
 /// The temporary directory owns its files
 /// independently of the store's lifetime, and is removed when dropped.
-/// Expose this root to untrusted builds only through a read-only mount.
+/// Mutable views must be marked before exposing them through writable mounts.
 pub struct MaterializedTree {
     directory: TempDir,
     root: PathBuf,
     directories: Vec<PathBuf>,
+    writable: Vec<PathBuf>,
     stats: MaterializationStats,
 }
 
@@ -44,6 +45,12 @@ impl MaterializedTree {
     #[must_use = "the returned path is the materialized root"]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Enable cleanup of a private view that may be modified by a build.
+    /// No CAS inode is shared with the view, even when block cloning succeeds.
+    pub(crate) fn mark_writable(&mut self, relative: &Path) {
+        self.writable.push(self.root.join(relative));
     }
 
     #[must_use = "the counters distinguish block cloning from copying"]
@@ -54,11 +61,17 @@ impl MaterializedTree {
 
 impl Drop for MaterializedTree {
     fn drop(&mut self) {
-        // Directory permissions may intentionally be read-only or even 000.
-        // Restore access in parent-first order while still in the private
-        // materialization directory, before tempfile removes it. The caller
-        // must not hand the root to an untrusted writable process.
+        // Immutable ancestors are known from the manifest. Never trust that
+        // list below a writable mount: a process may replace directories
+        // with links, rename them, or create new directories with mode 000.
         for path in std::iter::once(&self.root).chain(&self.directories) {
+            if self
+                .writable
+                .iter()
+                .any(|writable| path.starts_with(writable))
+            {
+                continue;
+            }
             if let Err(error) = fs::set_permissions(path, fs::Permissions::from_mode(0o700)) {
                 log::warn!(
                     "could not restore directory permissions at {}: {error}",
@@ -66,8 +79,39 @@ impl Drop for MaterializedTree {
                 );
             }
         }
+        for root in &self.writable {
+            restore_mutable_directories(root);
+        }
         // The owner field keeps the private parent alive through this cleanup.
         let _ = self.directory.path();
+    }
+}
+
+fn restore_mutable_directories(root: &Path) {
+    // Execution has stopped. The private parent is never exposed to the
+    // sandbox. Walk the current tree without following replacement links.
+    let mut pending = vec![root.to_owned()];
+    while let Some(path) = pending.pop() {
+        let result = (|| -> io::Result<()> {
+            let metadata = fs::symlink_metadata(&path)?;
+            if !metadata.is_dir() {
+                return Ok(());
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+            for child in fs::read_dir(&path)? {
+                let child = child?;
+                if child.file_type()?.is_dir() {
+                    pending.push(child.path());
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            log::warn!(
+                "could not restore mutable view directory {}: {error}",
+                path.display()
+            );
+        }
     }
 }
 
@@ -89,6 +133,7 @@ impl TreeLease {
             directory,
             root,
             directories: Vec::new(),
+            writable: Vec::new(),
             stats: MaterializationStats::default(),
         };
         for (relative, entry) in &self.manifest.entries {
@@ -190,4 +235,40 @@ fn set_timestamp(path: &Path, timestamp: TreeTimestamp) -> Result<()> {
     };
     utimensat(CWD, path, &timestamps, AtFlags::SYMLINK_NOFOLLOW)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn mutable_cleanup_does_not_follow_replacement_symlinks() -> Result<()> {
+        let private = tempfile::tempdir()?;
+        let external = tempfile::tempdir()?;
+        fs::set_permissions(external.path(), fs::Permissions::from_mode(0o755))?;
+        let root = private.path().join("root");
+        fs::create_dir_all(root.join("out/old"))?;
+        fs::create_dir_all(root.join("out/new/restricted"))?;
+        fs::set_permissions(
+            root.join("out/new/restricted"),
+            fs::Permissions::from_mode(0o0),
+        )?;
+        fs::remove_dir(root.join("out/old"))?;
+        symlink(external.path(), root.join("out/old"))?;
+        let private_path = private.path().to_owned();
+        let view = MaterializedTree {
+            directory: private,
+            root: root.clone(),
+            directories: vec![root.join("out"), root.join("out/old")],
+            writable: vec![root.join("out")],
+            stats: MaterializationStats::default(),
+        };
+        drop(view);
+        assert_eq!(
+            fs::metadata(external.path())?.permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(!private_path.exists());
+        Ok(())
+    }
 }
