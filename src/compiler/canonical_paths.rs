@@ -289,7 +289,13 @@ impl CanonicalRustPaths {
             Some(path) => Some(physical_operand(cwd, &path)?),
             None => None,
         };
-        Self::from_env_with_output_dir(env, cwd, rust_root, output_dir.as_deref(), target.as_deref())
+        Self::from_env_with_output_dir(
+            env,
+            cwd,
+            rust_root,
+            output_dir.as_deref(),
+            target.as_deref(),
+        )
     }
 
     #[cfg(test)]
