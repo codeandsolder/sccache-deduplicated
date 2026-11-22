@@ -231,7 +231,7 @@ elseif(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
 endif()
 ```
 
-By default, sccache will fail your build if it fails to successfully communicate with its associated server. To have sccache instead gracefully failover to the local compiler without stopping, set the environment variable `SCCACHE_IGNORE_SERVER_IO_ERROR=1`.
+sccache fails the build if an accepted compiler request loses its terminal response. It does not retry the command locally after an ambiguous disconnect, because the original compilation may still be running or modifying outputs. Local execution is used when the server explicitly reports that it cannot handle the invocation.
 
 **For versions of cmake 3.25 and later**, to compile with MSVC, you have to use the new `CMAKE_MSVC_DEBUG_INFORMATION_FORMAT` option, meant to configure the `-Z7` flag.  Additionally, you must set the cmake policy number 0141 to the NEW setting:
 ```cmake

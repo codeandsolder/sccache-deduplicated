@@ -44,6 +44,3 @@ mod counted_array;
 pub use crate::compiler::c::CCompilerKind;
 pub use crate::compiler::core::*;
 pub use crate::compiler::preprocessor_cache::PreprocessorCacheEntry;
-
-#[cfg(target_os = "linux")]
-pub use rust::relocate_raw_rust_operands;
