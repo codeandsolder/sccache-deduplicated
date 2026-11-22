@@ -358,7 +358,9 @@ impl LinkInvocation {
 }
 
 /// Private generated output tree over the original logical compiler output
-/// directory. The lower directory remains visible for input dependencies and
+/// directory.
+///
+/// The lower directory remains visible for input dependencies and
 /// is never mutated by either compilation stage. The generated delta is the
 /// artifact: it contains no unchanged dependency files from the lower tree.
 pub struct PrivateOutputTree {
