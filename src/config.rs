@@ -853,6 +853,44 @@ impl Default for DistAuth {
     }
 }
 
+/// Select the executor for an admitted native cache miss.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeExecutionPreference {
+    Local,
+    RemoteFirst,
+}
+
+/// Owner-local input store and sandbox settings. The caller never chooses
+/// these paths through the namespace protocol.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeLocalConfig {
+    pub preference: NativeExecutionPreference,
+    pub max_jobs: usize,
+    pub directory: PathBuf,
+    pub scratch: PathBuf,
+    pub bubblewrap: PathBuf,
+    pub space: crate::build_runtime::SpacePolicy,
+}
+
+impl NativeLocalConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.directory.is_absolute()
+                && self.scratch.is_absolute()
+                && self.bubblewrap.is_absolute(),
+            "native local execution paths must be absolute"
+        );
+        anyhow::ensure!(
+            self.max_jobs > 0,
+            "native local execution requires at least one slot"
+        );
+        self.space.validate()?;
+        Ok(())
+    }
+}
+
 /// Explicit scheduler-owned cache and execution policy for a native client.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -867,6 +905,7 @@ pub struct NativeClientConfig {
     pub renewal_interval_secs: u64,
     pub max_metadata_bytes: u64,
     pub max_result_bytes: u64,
+    pub local_execution: Option<NativeLocalConfig>,
 }
 
 impl NativeClientConfig {
@@ -890,6 +929,9 @@ impl NativeClientConfig {
                 && self.max_result_bytes < u64::MAX,
             "invalid native compiler client limits or platform contract"
         );
+        if let Some(local) = &self.local_execution {
+            local.validate()?;
+        }
         Ok(())
     }
 }

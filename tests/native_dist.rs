@@ -20,10 +20,13 @@ use sccache::{
         SpacePolicy, TreeLayer, TreePath, TreeRecipe,
         wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply},
     },
-    config::{Config, DistAuth, HTTPUrl, NativeClientConfig, scheduler, server},
+    config::{
+        Config, DistAuth, HTTPUrl, NativeClientConfig, NativeExecutionPreference,
+        NativeLocalConfig, scheduler, server,
+    },
     dist::{
         SchedulerStatusResult,
-        native::{NativeBuildPolicy, NativeBuildSource, NativeCacheClient},
+        native::{LocalExecutor, NativeBuildPolicy, NativeBuildSource, NativeCacheClient},
         pkg::ToolchainPackageBuilder,
     },
 };
@@ -52,6 +55,17 @@ fn space() -> SpacePolicy {
         target_available_bytes: 2 * 1024 * 1024,
         max_evictions_per_pass: 8,
         gc_batch: 128,
+    }
+}
+
+fn local_config(root: &Path, preference: NativeExecutionPreference) -> NativeLocalConfig {
+    NativeLocalConfig {
+        preference,
+        max_jobs: 2,
+        directory: root.join("local-input-store"),
+        scratch: root.join("local-scratch"),
+        bubblewrap: "/usr/bin/bwrap".into(),
+        space: space(),
     }
 }
 
@@ -318,6 +332,7 @@ fn provisioning_config(root: &Path, endpoint: &reqwest::Url) -> Result<PathBuf> 
                 renewal_interval_secs: 1,
                 max_metadata_bytes: 1024 * 1024,
                 max_result_bytes: 1024 * 1024,
+                local_execution: None,
             }),
             ..Default::default()
         },
@@ -864,7 +879,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     };
     let delivered = root.join("delivered.o");
     let destinations = BTreeMap::from([("object".into(), delivered.clone())]);
-    let hit = client.run_action(&spec, &inputs, &destinations, &policy)?;
+    let hit = client.run_action(&spec, &inputs, &destinations, &policy, None)?;
     assert_eq!(hit.source, NativeBuildSource::Hit);
     assert!(hit.output.status.success());
     assert_eq!(fs::read(&delivered)?, fs::read(&reference)?);
@@ -872,12 +887,57 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let mut second = spec.clone();
     second.command.arguments.insert(0, b"--64".to_vec());
     fs::remove_file(&delivered)?;
-    let miss = client.run_action(&second, &inputs, &destinations, &policy)?;
+    let miss = client.run_action(&second, &inputs, &destinations, &policy, None)?;
     assert_eq!(miss.source, NativeBuildSource::Worker(worker_address));
     assert!(miss.output.status.success());
     assert_eq!(fs::read(&delivered)?, fs::read(&reference)?);
-    let hit = client.run_action(&second, &inputs, &destinations, &policy)?;
+    let hit = client.run_action(&second, &inputs, &destinations, &policy, None)?;
     assert_eq!(hit.source, NativeBuildSource::Hit);
+
+    // The exact sandbox on the client host can publish and refresh the same
+    // action as the remote worker; its successful result needs no download.
+    let local = LocalExecutor::new(
+        local_config(root, NativeExecutionPreference::Local),
+        spec.platform,
+    );
+    let refresh = NativeBuildPolicy {
+        mode: ActionMode::Refresh,
+        ..policy
+    };
+    let result = client.run_action(&second, &inputs, &destinations, &refresh, Some(&local))?;
+    assert_eq!(result.source, NativeBuildSource::Local);
+    assert!(result.output.status.success());
+    assert_eq!(fs::read(&delivered)?, fs::read(&reference)?);
+    assert_eq!(
+        client
+            .run_action(&second, &inputs, &destinations, &policy, None)?
+            .source,
+        NativeBuildSource::Hit
+    );
+    drop(local);
+
+    let mut local_only = second.clone();
+    local_only.platform = ContentId::of(b"no compatible remote worker");
+    let local = LocalExecutor::new(
+        local_config(root, NativeExecutionPreference::RemoteFirst),
+        local_only.platform,
+    );
+    let result = client.run_action(&local_only, &inputs, &destinations, &policy, Some(&local))?;
+    assert_eq!(result.source, NativeBuildSource::Local);
+    assert!(result.output.status.success());
+    assert_eq!(fs::read(&delivered)?, fs::read(&reference)?);
+    assert_eq!(
+        client
+            .run_action(&local_only, &inputs, &destinations, &policy, None)?
+            .source,
+        NativeBuildSource::Hit
+    );
+    assert_eq!(fleet.status()?.in_progress, 0);
+    drop(local);
+    let local_store = NativeStore::open(&root.join("local-input-store"))?;
+    assert_eq!(local_store.stats()?.actions, 0);
+    assert_eq!(local_store.stats()?.trees, 2);
+    drop(local_store);
 
     // A real compiler failure must be reported but never become a hit.
     let mut invalid = spec;
@@ -900,7 +960,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     assert!(!stderr.is_empty());
     assert_eq!(client.status(ticket)?, NativeStatus::Failed);
     client.close(ticket)?;
-    let failed = client.run_action(&invalid, &inputs, &destinations, &policy)?;
+    let failed = client.run_action(&invalid, &inputs, &destinations, &policy, None)?;
     assert_eq!(failed.source, NativeBuildSource::Worker(worker_address));
     assert!(!failed.output.status.success());
     assert!(!failed.output.stderr.is_empty());
@@ -928,7 +988,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
         "worker retained redundant archive"
     );
     assert_eq!(worker_stats.actions, 0);
-    assert_eq!(scheduler_stats.actions, 2);
+    assert_eq!(scheduler_stats.actions, 3);
     assert_eq!(scheduler_stats.results, 1);
     assert_eq!(worker_stats.trees, 3);
     assert_eq!(scheduler_stats.trees, 4);
@@ -945,7 +1005,11 @@ struct LocalService {
 }
 
 impl LocalService {
-    fn start(root: &Path, fleet: &Fleet) -> Result<Self> {
+    fn start(
+        root: &Path,
+        fleet: &Fleet,
+        local_execution: Option<NativeLocalConfig>,
+    ) -> Result<Self> {
         let socket = root.join("client.sock");
         let caller_config = root.join("caller.toml");
         let cached_config = root.join("caller-cached.toml");
@@ -963,6 +1027,7 @@ impl LocalService {
             renewal_interval_secs: 1,
             max_metadata_bytes: 64 * 1024 * 1024,
             max_result_bytes: 64 * 1024 * 1024,
+            local_execution,
         });
         config.fallback_cache.dir = root.join("unexpected-archive-cache");
         config.dist.cache_dir = root.join("unexpected-toolchain-cache");
@@ -1243,7 +1308,7 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;
     let fleet = Fleet::start(&root, None)?;
-    let mut service = LocalService::start(&root, &fleet)?;
+    let mut service = LocalService::start(&root, &fleet, None)?;
     let rustc = Command::new("rustc")
         .args(["--print", "sysroot"])
         .output()?;
@@ -1359,6 +1424,73 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
     assert_eq!(observed.conflicting_pairs, 1);
     assert_eq!(unused.examined_actions, 7);
     eprintln!("actual Rust environment audit: {unused:?}; {observed:?}");
+    assert_eq!(worker.actions, 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Linux Bubblewrap, GCC, Rust toolchain and ldd"]
+fn native_local_execution_in_networkless_namespace_shares_remote_actions() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let fleet = Fleet::start(&root, None)?;
+    let rustc = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()?;
+    ensure!(rustc.status.success(), "could not discover test sysroot");
+    let rustc = PathBuf::from(String::from_utf8(rustc.stdout)?.trim()).join("bin/rustc");
+    let visible = root.join("visible");
+    let private = root.join("private");
+    fs::create_dir(&visible)?;
+    fs::write(visible.join("probe.c"), b"#error wrong daemon source\n")?;
+    fs::write(
+        visible.join("probe.rs"),
+        b"compile_error!(\"wrong daemon source\");\n",
+    )?;
+    write_compiler_sources(&private)?;
+    let mut service = LocalService::start(
+        &root,
+        &fleet,
+        Some(local_config(&root, NativeExecutionPreference::Local)),
+    )?;
+    let output = namespace_compilers(&service, &private, &visible, &rustc, true)?;
+    ensure!(
+        output.status.success(),
+        "local namespace compilation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stats = service.stats()?;
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 0);
+    assert_eq!(stats.cache_misses.all(), 4);
+    assert_eq!(stats.cache_hits.all(), 4);
+    assert_eq!(stats.forced_recaches, 2);
+    assert_eq!(stats.dist_errors, 0);
+    service.stop()?;
+    drop(service);
+    let store = NativeStore::open(&root.join("local-input-store"))?;
+    assert_eq!(store.stats()?.actions, 0);
+    assert!(store.stats()?.trees >= 2);
+    drop(store);
+    // Restart only the local daemon with remote execution policy. Both
+    // ordinary hits and forced remote refreshes must reuse the same keys.
+    let mut service = LocalService::start(&root, &fleet, None)?;
+    let output = namespace_compilers(&service, &private, &visible, &rustc, true)?;
+    ensure!(
+        output.status.success(),
+        "remote refresh after local publication failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stats = service.stats()?;
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 2);
+    assert_eq!(stats.cache_misses.all(), 2);
+    assert_eq!(stats.cache_hits.all(), 6);
+    assert_eq!(stats.forced_recaches, 2);
+    assert_eq!(stats.dist_errors, 0);
+    assert!(!visible.join("build").exists());
+    assert!(!root.join("unexpected-archive-cache").exists());
+    service.stop()?;
+    let (scheduler, worker) = fleet.finish()?;
+    assert_eq!(scheduler.actions, 2);
     assert_eq!(worker.actions, 0);
     Ok(())
 }

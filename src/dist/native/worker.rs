@@ -9,7 +9,8 @@ use anyhow::{Result, ensure};
 use super::{NativeCacheClient, PackagePlanRequest};
 use crate::build_runtime::{
     ArchiveLength, BlobRef, CapturedExecution, ExecutionPolicy, ExecutionSpec, NativeServiceBusy,
-    NativeStore, PackageArchive, PackageImportLimits, VerifiedPackage, execute, wire::Ticket,
+    NativeStore, PackageArchive, PackageImportLimits, TreeId, TreeLease, VerifiedPackage, execute,
+    wire::Ticket,
 };
 
 impl NativeCacheClient {
@@ -121,27 +122,39 @@ impl NativeCacheClient {
         renewal_interval: Duration,
         package_import: Option<PackageImportLimits>,
     ) -> Result<CapturedExecution> {
+        self.execute_admitted(ticket, spec, store, policy, renewal_interval, |id, _| {
+            self.fetch_tree(ticket, id, store, renewal_interval, package_import)
+        })
+    }
+
+    pub(super) fn execute_admitted(
+        &self,
+        ticket: Ticket,
+        spec: &ExecutionSpec,
+        store: &NativeStore,
+        policy: &ExecutionPolicy,
+        renewal_interval: Duration,
+        mut fetch: impl FnMut(TreeId, &mut dyn FnMut() -> Result<()>) -> Result<TreeLease>,
+    ) -> Result<CapturedExecution> {
         let result = self.with_renewal(ticket, renewal_interval, |check| {
             self.verify_execution(ticket, spec.clone())?;
             if let Some(report) = store.maintain_space()? {
                 ensure!(
                     report.minimum_satisfied,
-                    "native worker store lacks allocatable space: {report:?}"
+                    "native executor store lacks allocatable space: {report:?}"
                 );
             }
             let request = spec.action_request()?;
             ensure!(
                 spec.platform == policy.platform,
-                "worker execution platform mismatch"
+                "native executor platform mismatch"
             );
             let mut inputs = Vec::new();
             for id in &request.input_trees {
                 check()?;
                 let tree = match store.lookup_tree(*id)? {
                     Some(tree) => tree,
-                    None => {
-                        self.fetch_tree(ticket, *id, store, renewal_interval, package_import)?
-                    }
+                    None => fetch(*id, check)?,
                 };
                 inputs.push(tree);
             }

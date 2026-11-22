@@ -706,7 +706,7 @@ impl NativeSessions {
         })
     }
 
-    /// Open a tree delivery lease. Workers can only fetch a declared input of
+    /// Open a tree delivery lease. Executors can only fetch a declared input of
     /// their currently delegated action.
     ///
     /// # Errors
@@ -715,31 +715,22 @@ impl NativeSessions {
         &self,
         id: TreeId,
         reader: Publisher,
-        action_ticket: Option<Ticket>,
+        action_ticket: Ticket,
     ) -> Result<TreeRead> {
         self.reap()?;
-        let action = if reader == Publisher::Client {
-            None
-        } else {
-            Some(self.get(action_ticket.context("worker tree request needs its action ticket")?)?)
+        let action = self.get(action_ticket)?;
+        let mut state = Self::lock(&action)?;
+        self.authorize(&mut state, reader)?;
+        let Phase::Pending(pending) = &state.phase else {
+            bail!("native executor action no longer pending");
         };
-        let state = if let Some(action) = &action {
-            let mut state = Self::lock(action)?;
-            self.authorize(&mut state, reader)?;
-            let Phase::Pending(pending) = &state.phase else {
-                bail!("worker action no longer pending");
-            };
-            let Pending::Action(action) = &**pending else {
-                bail!("worker ticket is not an action");
-            };
-            ensure!(
-                action.request.input_trees.contains(&id),
-                "tree is not an input of this action"
-            );
-            Some(state)
-        } else {
-            None
+        let Pending::Action(action) = &**pending else {
+            bail!("native executor ticket is not an action");
         };
+        ensure!(
+            action.request.input_trees.contains(&id),
+            "tree is not an input of this action"
+        );
         // The action pins this tree until the delivery lease is acquired.
         let lease = self
             .store()

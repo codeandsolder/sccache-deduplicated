@@ -209,6 +209,44 @@ precedes publication. No client or daemon archive staging is required.
 The stream has bounded queues, frame limits and an absolute deadline;
 disconnect releases or expires the native action pins.
 
+## Local exact-sandbox execution
+
+Opt in on the managed sccache daemon (or a directly configured compiler
+service) using the same native client configuration and platform contract:
+
+```toml
+[dist.native.local_execution]
+preference = "remote_first" # or "local"
+max_jobs = 4
+directory = "/path/to/native-local-input-store"
+scratch = "/path/to/native-local-scratch"
+bubblewrap = "/usr/bin/bwrap"
+
+[dist.native.local_execution.space]
+min_available_bytes = 2147483648
+target_available_bytes = 4294967296
+max_evictions_per_pass = 128
+gc_batch = 1024
+```
+
+The local executor owns an explicit quota-managed input CAS and private
+scratch directory. It uses the same execution specification, verified root
+composition, Bubblewrap runner, output capture, scheduler ticket and atomic
+publication as a remote worker. Ordinary hits bypass execution. With the
+local preference, missing input trees are first staged from the caller;
+only missing content goes to the scheduler from those exact verified files.
+With remote-first, local execution is selected only on an explicit unavailable
+allocation, never after an ambiguous or successful remote assignment.
+The local executor imports missing input bytes directly from caller-provided
+sources, including through the scoped networkless namespace stream. Local
+misses publish to the scheduler and deliver the captured descriptors directly
+to the caller; they do not download the just-published result or populate a
+second local action cache. A bounded local job pool renews the action lease
+while waiting. Both local and worker execution require an administrator-
+attested matching platform contract. Unconstrained local fallbacks remain
+uncached. Native control and result publication work even when no compatible
+remote worker is available, provided the scheduler cache service is reachable.
+
 ## Toolchain discovery and mapped trees
 
 The Linux C and Rust toolchain packagers share their existing dependency and

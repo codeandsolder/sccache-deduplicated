@@ -282,7 +282,7 @@ fn dispatch(
         }
         "tree_open" => {
             let OpenTreeRequest { action, tree } = metadata(request, limit)?;
-            encode(&sessions.open_tree(tree, publisher, Some(action))?, limit)
+            encode(&sessions.open_tree(tree, publisher, action)?, limit)
         }
         "package_plan" if matches!(publisher, Publisher::Worker { .. }) => {
             let PackagePlanRequest {

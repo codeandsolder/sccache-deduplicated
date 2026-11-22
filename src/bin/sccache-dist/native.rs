@@ -1,12 +1,11 @@
 //! Configured native build executor for a distributed worker.
 
-use std::{io::Read, os::unix::process::ExitStatusExt, time::Duration};
+use std::time::Duration;
 
 use anyhow::{Result, ensure};
 use sccache::{
     build_runtime::{
-        BlobRef, CapturedExecution, ContentId, ExecutionPolicy, NativeStore, PackageImportLimits,
-        wire::NativeRunResult,
+        ContentId, ExecutionPolicy, NativeStore, PackageImportLimits, wire::NativeRunResult,
     },
     config::server::NativeWorkerConfig,
     dist::{JobId, NativeAssignment, native::NativeCacheClient},
@@ -79,24 +78,6 @@ impl NativeWorker {
         if captured.successful_result().is_some() {
             return Ok(NativeRunResult::Stored);
         }
-        let (stdout, stderr) = captured.diagnostics();
-        Ok(NativeRunResult::Failed {
-            code: captured.status().code(),
-            signal: captured.status().signal(),
-            stdout: diagnostic(&captured, stdout)?,
-            stderr: diagnostic(&captured, stderr)?,
-        })
+        captured.failure_result()
     }
-}
-
-fn diagnostic(captured: &CapturedExecution, reference: Option<BlobRef>) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    if let Some(reference) = reference {
-        captured.open_blob(reference.id)?.read_to_end(&mut bytes)?;
-        ensure!(
-            u64::try_from(bytes.len())? == reference.size,
-            "failed diagnostic length mismatch"
-        );
-    }
-    Ok(bytes)
 }

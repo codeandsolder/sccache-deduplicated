@@ -347,7 +347,7 @@ fn shared_input_tree_is_pinned_and_worker_can_fetch_only_declared_inputs() -> Re
     service.close(offer.ticket, Publisher::Client)?;
     service.close(again.ticket, Publisher::Client)?;
     assert_eq!(service.store().evict_tree(id)?, Eviction::Pinned);
-    assert!(service.open_tree(id, worker, None).is_err());
+    assert!(service.open_tree(id, worker, Ticket([0; 32])).is_err());
     let unrelated = service.store().publish_tree(
         &TreeManifest {
             root: metadata,
@@ -355,8 +355,9 @@ fn shared_input_tree_is_pinned_and_worker_can_fetch_only_declared_inputs() -> Re
         },
         vec![],
     )?;
-    assert!(service.open_tree(unrelated, worker, Some(ticket)).is_err());
-    let read = service.open_tree(id, worker, Some(ticket))?;
+    assert!(service.open_tree(unrelated, worker, ticket).is_err());
+    assert!(service.open_tree(id, Publisher::Client, ticket).is_err());
+    let read = service.open_tree(id, worker, ticket)?;
     verify_package_plan_authorization(&service, read.ticket, worker, blob)?;
     assert!(
         service
