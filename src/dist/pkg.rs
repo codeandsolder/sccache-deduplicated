@@ -547,7 +547,13 @@ mod toolchain_imp {
             status,
             stdout,
             stderr,
-        } = process::Command::new("ldd").arg(executable).output()?;
+        } = process::Command::new("ldd")
+            .arg(executable)
+            // The probe requires EOF, not a device node. A namespace may
+            // have a restricted /dev even when compiler execution works.
+            .stdin(process::Stdio::piped())
+            .output()
+            .context("could not execute dynamic dependency probe")?;
 
         // Not a file ldd can handle. This can be a non-executable, or a static non-PIE
         if !status.success() {

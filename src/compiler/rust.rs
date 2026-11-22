@@ -4592,7 +4592,10 @@ impl RlibDepReader {
             status,
             stdout,
             stderr,
-        } = cmd.output()?;
+        } = cmd
+            .stdin(process::Stdio::piped())
+            .output()
+            .context("could not execute Rust dependency probe")?;
 
         if !stdout.is_empty() {
             bail!(
@@ -4646,7 +4649,10 @@ impl RlibDepReader {
             status,
             stdout,
             stderr,
-        } = cmd.output()?;
+        } = cmd
+            .stdin(process::Stdio::piped())
+            .output()
+            .context("could not execute Rust dependency probe")?;
 
         if !status.success() {
             bail!("Failed to get rustc version with {}", executable.display())
@@ -4719,7 +4725,10 @@ impl RlibDepReader {
             status,
             stdout,
             stderr,
-        } = cmd.output()?;
+        } = cmd
+            .stdin(process::Stdio::piped())
+            .output()
+            .context("could not execute Rust dependency probe")?;
 
         if !status.success() {
             bail!(format!("Failed to list deps of {}", rlib.display()))
