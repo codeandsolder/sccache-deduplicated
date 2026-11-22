@@ -2845,15 +2845,14 @@ where
         // in the original namespace with the physical pre-pass arguments.
         let outputs = async {
             if let Some(metadata) = &self.parsed_args.metadata_only_output {
-                Ok(vec![metadata.clone()])
-            } else {
-                let arguments = prepass_os_string_arguments
-                    .iter()
-                    .flat_map(|(arg, val)| iter::once(arg).chain(val.as_ref()))
-                    .cloned()
-                    .collect();
-                get_compiler_outputs(creator, &self.executable, arguments, &cwd, &env_vars).await
+                return Ok(vec![metadata.clone()]);
             }
+            let arguments = prepass_os_string_arguments
+                .iter()
+                .flat_map(|(arg, val)| iter::once(arg).chain(val.as_ref()))
+                .cloned()
+                .collect();
+            get_compiler_outputs(creator, &self.executable, arguments, &cwd, &env_vars).await
         };
 
         // Perform all hashing operations on the files.
@@ -6206,14 +6205,14 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
 
     fn mock_file_names(creator: &Arc<Mutex<MockCommandCreator>>, filenames: &[&str]) {
         // Mock the `rustc --print=file-names` process output.
-        next_command(
-            creator,
-            Ok(MockChild::new(
-                exit_status(0),
-                filenames.iter().join("\n"),
-                "",
-            )),
-        );
+        let stdout = filenames.iter().join("\n");
+        next_command_calls(creator, move |args| {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "--print" && pair[1] == "file-names")
+            );
+            Ok(MockChild::new(exit_status(0), &stdout, ""))
+        });
     }
 
     #[test]
