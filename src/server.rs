@@ -310,6 +310,7 @@ impl DistClientContainer {
                 config.dist.scheduler_url.clone(),
                 config.dist.auth.clone(),
                 config.dist.toolchains.clone(),
+                &config.dist.native_installation_catalogs,
             ));
         }
 
@@ -332,6 +333,7 @@ impl DistClientContainer {
     }
 
     #[cfg(target_os = "linux")]
+    #[must_use = "the returned container owns native compiler state"]
     pub fn new_native(client: crate::compiler::NativeCompilerClient) -> Self {
         Self {
             state: futures::lock::Mutex::new(DistClientState::Disabled),
@@ -1415,7 +1417,13 @@ where
             args,
             env,
             &self.rt,
-            dist_info.clone().map(|(archive, _)| archive),
+            crate::compiler::CompilerDiscovery {
+                dist_archive: dist_info.clone().map(|(archive, _)| archive),
+                #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                native_digests: self
+                    .native_compiler()
+                    .map(|client| client.toolchain_digests()),
+            },
         )
         .await;
 

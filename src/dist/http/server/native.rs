@@ -11,7 +11,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::{ClientAuthCheck, ServerAuthenticator, authenticate_client, authenticate_server};
 use crate::{
     build_runtime::{
-        ExecutionSpec, NativeSessions, NativeStore,
+        ExecutionSpec, NativeSessions, NativeStore, PackageImportLimits, PackageSource,
         wire::{Publisher, ScheduleReply, UploadHeader},
     },
     config::scheduler::NativeCacheConfig,
@@ -34,6 +34,7 @@ pub(super) fn spawn(
     )?);
     let maintenance = Arc::downgrade(&sessions);
     let metadata_limit = config.max_metadata_bytes;
+    let package_import = config.package_import;
     let server = rouille::Server::new(config.public_addr, move |request| {
         respond(
             request,
@@ -42,6 +43,7 @@ pub(super) fn spawn(
             &*client_auth,
             &*server_auth,
             metadata_limit,
+            package_import,
         )
     })
     .map_err(|error| anyhow!("could not bind native cache listener: {error}"))?
@@ -85,6 +87,7 @@ fn respond(
     client_auth: &dyn ClientAuthCheck,
     server_auth: &ServerAuthenticator,
     limit: usize,
+    package_import: Option<PackageImportLimits>,
 ) -> Response {
     if request.method() != "POST" {
         return Response::empty_404();
@@ -124,7 +127,15 @@ fn respond(
     if request.header("Content-Type") != Some("application/octet-stream") {
         return Response::empty_400();
     }
-    match dispatch(request, sessions, allocate, publisher, operation, limit) {
+    match dispatch(
+        request,
+        sessions,
+        allocate,
+        publisher,
+        operation,
+        limit,
+        package_import,
+    ) {
         Ok(response) => response,
         Err(error) => {
             // Do not return host paths, auth tokens or raw internal metadata
@@ -142,8 +153,40 @@ fn dispatch(
     publisher: Publisher,
     operation: &str,
     limit: usize,
+    package_import: Option<PackageImportLimits>,
 ) -> Result<Response> {
     match operation {
+        "package_lookup" if publisher == Publisher::Client && package_import.is_some() => {
+            let source: PackageSource = metadata(request, limit)?;
+            let imports =
+                package_import.context("native original-package provisioning disabled")?;
+            encode(
+                &sessions.provision_rust_package(
+                    source,
+                    None,
+                    imports,
+                    &std::env::current_exe()?,
+                )?,
+                limit,
+            )
+        }
+        "package_import" if publisher == Publisher::Client && package_import.is_some() => {
+            let imports =
+                package_import.context("native original-package provisioning disabled")?;
+            let mut body = request.data().context("missing original package body")?;
+            // Fixed width: SHA-256, u64 length, u32 codec. The remaining
+            // bytes stream directly into verified archive staging.
+            let source: PackageSource = codec().with_limit(44).deserialize_from(&mut body)?;
+            let manifest = sessions
+                .provision_rust_package(
+                    source,
+                    Some(&mut body),
+                    imports,
+                    &std::env::current_exe()?,
+                )?
+                .context("original package missing after import")?;
+            encode(&manifest, limit)
+        }
         "admit" if publisher == Publisher::Client => {
             let input: ExecutionSpec = metadata(request, limit)?;
             encode(&sessions.admit(input.action_request()?, publisher)?, limit)

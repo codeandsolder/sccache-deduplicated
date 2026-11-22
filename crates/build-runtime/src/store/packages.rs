@@ -8,51 +8,13 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use redb::ReadableDatabase;
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::{NativeStore, PACKAGES, StagedBlob, TreeLease};
 use crate::{
-    ContentId, TreeEntry, TreeId, TreeManifest, TreeMetadata, TreePath, TreeTimestamp,
-    identity::typed_digest,
+    ContentId, PackageSource, TreeEntry, TreeId, TreeManifest, TreeMetadata, TreePath,
+    TreeTimestamp, identity::typed_digest,
 };
-
-/// Compression of the original upstream tar package.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub enum PackageCompression {
-    Tar,
-    Gzip,
-    Xz,
-}
-
-/// Upstream package identity, independent of the normalized content tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct PackageSource {
-    pub sha256: [u8; 32],
-    pub size: u64,
-    pub compression: PackageCompression,
-}
-
-impl PackageSource {
-    /// Parse an upstream SHA-256 checksum, with explicit archive length and codec.
-    /// # Errors
-    /// Returns an error for an invalid hexadecimal checksum.
-    pub fn from_sha256_hex(hash: &str, size: u64, compression: PackageCompression) -> Result<Self> {
-        ensure!(
-            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
-            "invalid SHA-256 checksum"
-        );
-        let mut sha256 = [0; 32];
-        for (index, value) in sha256.iter_mut().enumerate() {
-            *value = u8::from_str_radix(&hash[index * 2..index * 2 + 2], 16)?;
-        }
-        Ok(Self {
-            sha256,
-            size,
-            compression,
-        })
-    }
-}
 
 /// Explicit normalization and expansion limits for an original package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +23,108 @@ pub struct PackagePolicy {
     pub modified: TreeTimestamp,
     pub max_entries: usize,
     pub max_expanded_bytes: u64,
+    /// Maximum decoded tar bytes, including metadata, padding and non-file entries.
+    pub max_tar_bytes: u64,
+    /// Total path and link metadata budget, including implicit directories.
+    pub max_metadata_bytes: u64,
+}
+
+/// Scheduler-owned limits for live original-package provisioning. All limits
+/// are chosen by the store owner, never by an uploading compiler client.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageImportLimits {
+    pub max_archive_bytes: u64,
+    pub max_entries: usize,
+    pub max_expanded_bytes: u64,
+    pub max_tar_bytes: u64,
+    pub max_metadata_bytes: u64,
+    pub decoder_memory_bytes: u64,
+    pub decoder_timeout_secs: u64,
+}
+
+impl PackageImportLimits {
+    /// Validate limits before enabling the provisioning endpoint.
+    /// # Errors
+    /// Returns an error for unusable resource limits.
+    pub fn validate(self) -> Result<()> {
+        ensure!(
+            self.max_archive_bytes > 0
+                && self.max_archive_bytes < u64::MAX
+                && self.max_entries > 0
+                && self.max_expanded_bytes > 0
+                && self.max_tar_bytes > 0
+                && self.max_metadata_bytes > 0
+                && self.decoder_memory_bytes > 0
+                && self.decoder_timeout_secs > 0,
+            "invalid native package import limits"
+        );
+        Ok(())
+    }
+
+    /// Check the compressed identity and return canonical installer policy.
+    /// # Errors
+    /// Returns an error for invalid limits or an oversized compressed archive.
+    pub fn policy(self, source: PackageSource) -> Result<PackagePolicy> {
+        self.validate()?;
+        ensure!(
+            source.size <= self.max_archive_bytes,
+            "original package exceeds archive size limit"
+        );
+        PackagePolicy::rust_installer(
+            self.max_entries,
+            self.max_expanded_bytes,
+            self.max_tar_bytes,
+            self.max_metadata_bytes,
+        )
+    }
+}
+
+impl PackagePolicy {
+    /// Shared canonical timestamp and directory modes for Rust installer imports.
+    /// # Errors
+    /// Returns an error if the canonical timestamp cannot be represented.
+    pub fn rust_installer(
+        max_entries: usize,
+        max_expanded_bytes: u64,
+        max_tar_bytes: u64,
+        max_metadata_bytes: u64,
+    ) -> Result<Self> {
+        let modified = TreeTimestamp {
+            seconds: i64::try_from(tar::DETERMINISTIC_TIMESTAMP)?,
+            nanoseconds: 0,
+        };
+        Ok(Self {
+            directory: TreeMetadata {
+                mode: 0o755,
+                modified,
+            },
+            modified,
+            max_entries,
+            max_expanded_bytes,
+            max_tar_bytes,
+            max_metadata_bytes,
+        })
+    }
+}
+
+/// A pinned tree whose provenance was established by verification of an
+/// original archive or by its durable package index, not by a supplied tree ID.
+pub struct VerifiedPackage {
+    source: PackageSource,
+    tree: TreeLease,
+}
+
+impl VerifiedPackage {
+    #[must_use = "the source identifies the verified upstream archive"]
+    pub const fn source(&self) -> PackageSource {
+        self.source
+    }
+
+    #[must_use = "the tree remains pinned for this package lease"]
+    pub const fn tree(&self) -> &TreeLease {
+        &self.tree
+    }
 }
 
 fn package_key(source: PackageSource, policy: PackagePolicy) -> Result<ContentId> {
@@ -81,14 +145,21 @@ impl NativeStore {
         &self,
         source: PackageSource,
         policy: PackagePolicy,
-    ) -> Result<Option<TreeLease>> {
+    ) -> Result<Option<VerifiedPackage>> {
+        let _mutation = self.inner.lock_mutations()?;
         let key = package_key(source, policy)?;
         let id = {
             let read = self.inner.db.begin_read()?;
             let table = read.open_table(PACKAGES)?;
             table.get(&key.0)?.map(|entry| TreeId(*entry.value()))
         };
-        id.map_or_else(|| Ok(None), |id| self.lookup_tree(id))
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        let tree = self
+            .lookup_tree(id)?
+            .context("indexed package tree missing")?;
+        Ok(Some(VerifiedPackage { source, tree }))
     }
 
     /// Verify the compressed package against its upstream SHA-256 and length,
@@ -102,7 +173,12 @@ impl NativeStore {
         source: PackageSource,
         policy: PackagePolicy,
         input: impl Read,
-    ) -> Result<TreeId> {
+        decoder: PackageDecoder<'_>,
+    ) -> Result<VerifiedPackage> {
+        ensure!(
+            policy.max_entries > 0 && policy.max_tar_bytes > 0 && policy.max_metadata_bytes > 0,
+            "invalid package limits"
+        );
         // Verify *before* decompression. A private staged compressed file
         // prevents verification/decode races and is never published as a
         // second permanent representation of the package.
@@ -126,21 +202,18 @@ impl NativeStore {
         );
         let mut reader = archive.file.as_file().try_clone()?;
         reader.rewind()?;
-        let (manifest, staged) = match source.compression {
-            PackageCompression::Tar => read_tar(self, reader, policy)?,
-            PackageCompression::Gzip => {
-                read_tar(self, flate2::read::MultiGzDecoder::new(reader), policy)?
-            }
-            PackageCompression::Xz => {
-                read_tar(self, lzma_rust2::XzReader::new(reader, true), policy)?
-            }
-        };
+        let mut imported = ImportedTree::new(policy);
+        decoder.decode(reader, source.compression, policy, |entry, data| {
+            imported.add(self, entry, data)
+        })?;
+        let (manifest, staged) = imported.finish()?;
         drop(archive);
-        self.publish_tree_indexed(
+        let tree = self.publish_tree_indexed_pinned(
             &manifest,
             staged.into_values().collect(),
             Some(package_key(source, policy)?),
-        )
+        )?;
+        Ok(VerifiedPackage { source, tree })
     }
 }
 
@@ -163,11 +236,27 @@ struct ImportedTree {
     explicit: BTreeSet<TreePath>,
     count: usize,
     bytes: u64,
+    metadata_bytes: u64,
     policy: PackagePolicy,
 }
 
 impl ImportedTree {
-    fn add(&mut self, store: &NativeStore, mut entry: tar::Entry<'_, impl Read>) -> Result<()> {
+    const fn new(policy: PackagePolicy) -> Self {
+        Self {
+            manifest: TreeManifest {
+                root: policy.directory,
+                entries: BTreeMap::new(),
+            },
+            staged: BTreeMap::new(),
+            explicit: BTreeSet::new(),
+            count: 0,
+            bytes: 0,
+            metadata_bytes: 0,
+            policy,
+        }
+    }
+
+    fn add(&mut self, store: &NativeStore, entry: ArchiveEntry, data: &mut dyn Read) -> Result<()> {
         self.count = self
             .count
             .checked_add(1)
@@ -176,53 +265,50 @@ impl ImportedTree {
             self.count <= self.policy.max_entries,
             "package entry limit exceeded"
         );
-        let kind = entry.header().entry_type();
-        let path = normalize_path(&entry.path_bytes(), kind.is_dir())?;
+        let path = normalize_path(&entry.path, matches!(entry.kind, EntryKind::Directory))?;
         let Some(path) = path else {
-            ensure!(kind.is_dir(), "non-directory archive root");
             return Ok(());
         };
+        self.account_metadata(&path, 128)?;
         ensure!(
             self.explicit.insert(path.clone()),
             "duplicate archive member"
         );
         self.add_parents(&path)?;
         let metadata = TreeMetadata {
-            mode: entry.header().mode()? & 0o7777,
+            mode: entry.mode & 0o7777,
             modified: self.policy.modified,
         };
-        let value = if kind.is_dir() {
-            TreeEntry::Directory(metadata)
-        } else if kind.is_file() || kind.is_gnu_sparse() {
-            let size = entry.size();
-            self.bytes = self
-                .bytes
-                .checked_add(size)
-                .context("expanded package size overflow")?;
-            ensure!(
-                self.bytes <= self.policy.max_expanded_bytes,
-                "expanded package size limit exceeded"
-            );
-            let staged = store.stage_inner(&mut entry, Some(size))?;
-            let blob = staged.reference();
-            ensure!(blob.size == size, "archive member size mismatch");
-            self.staged.entry(blob.id).or_insert(staged);
-            TreeEntry::File { blob, metadata }
-        } else if kind.is_symlink() {
-            TreeEntry::Symlink {
-                target: entry
-                    .link_name_bytes()
-                    .context("missing symbolic link target")?
-                    .into_owned(),
-                modified: self.policy.modified,
+        let value = match entry.kind {
+            EntryKind::Directory => TreeEntry::Directory(metadata),
+            EntryKind::File(size) => {
+                self.bytes = self
+                    .bytes
+                    .checked_add(size)
+                    .context("expanded package size overflow")?;
+                ensure!(
+                    self.bytes <= self.policy.max_expanded_bytes,
+                    "expanded package size limit exceeded"
+                );
+                let staged = store.stage_inner(data.take(size), Some(size))?;
+                let blob = staged.reference();
+                ensure!(blob.size == size, "archive member size mismatch");
+                self.staged.entry(blob.id).or_insert(staged);
+                TreeEntry::File { blob, metadata }
             }
-        } else if kind.is_hard_link() {
-            let name = entry.link_name_bytes().context("missing hardlink target")?;
-            let target =
-                normalize_path(&name, false)?.context("hardlink target cannot be the root")?;
-            TreeEntry::Hardlink(target)
-        } else {
-            bail!("unsupported tar member type {kind:?}");
+            EntryKind::Symlink(target) => {
+                self.account_link(&target)?;
+                TreeEntry::Symlink {
+                    target,
+                    modified: self.policy.modified,
+                }
+            }
+            EntryKind::Hardlink(target) => {
+                self.account_link(&target)?;
+                let target = normalize_path(&target, false)?
+                    .context("hardlink target cannot be the root")?;
+                TreeEntry::Hardlink(target)
+            }
         };
         if let Some(previous) = self.manifest.entries.insert(path, value.clone()) {
             // Parent directories may have been synthesized before the actual
@@ -240,11 +326,46 @@ impl ImportedTree {
         Ok(())
     }
 
+    fn account_link(&mut self, target: &[u8]) -> Result<()> {
+        ensure!(
+            target.len() <= MAX_MEMBER_PATH,
+            "archive link path too long"
+        );
+        self.add_metadata_bytes(u64::try_from(target.len())?)
+    }
+
+    fn account_metadata(&mut self, path: &TreePath, overhead: u64) -> Result<()> {
+        self.add_metadata_bytes(
+            u64::try_from(path.as_bytes().len())?
+                .checked_add(overhead)
+                .context("package metadata size overflow")?,
+        )
+    }
+
+    fn add_metadata_bytes(&mut self, count: u64) -> Result<()> {
+        self.metadata_bytes = self
+            .metadata_bytes
+            .checked_add(count)
+            .context("package metadata size overflow")?;
+        ensure!(
+            self.metadata_bytes <= self.policy.max_metadata_bytes,
+            "package path metadata budget exceeded"
+        );
+        Ok(())
+    }
+
     fn add_parents(&mut self, path: &TreePath) -> Result<()> {
         let bytes = path.as_bytes();
         for (index, &byte) in bytes.iter().enumerate() {
             if byte == b'/' {
                 let parent = TreePath::new(bytes[..index].to_vec())?;
+                if !self.manifest.entries.contains_key(&parent) {
+                    ensure!(
+                        self.manifest.entries.len() < self.policy.max_entries,
+                        "package tree entry limit exceeded"
+                    );
+                    self.account_metadata(&parent, 128)?;
+                }
                 let entry = self
                     .manifest
                     .entries
@@ -271,7 +392,7 @@ impl ImportedTree {
             })
             .collect::<Vec<_>>();
         for path in paths {
-            let mut current = path.clone();
+            let mut current = path;
             let mut visited = BTreeSet::new();
             loop {
                 ensure!(visited.insert(current.clone()), "cyclic archive hardlink");
@@ -286,54 +407,29 @@ impl ImportedTree {
                     _ => bail!("archive hardlink target is not a regular file"),
                 }
             }
-            self.manifest
-                .entries
-                .insert(path, TreeEntry::Hardlink(current));
+            for link in visited {
+                if link != current {
+                    self.account_link(current.as_bytes())?;
+                    self.manifest
+                        .entries
+                        .insert(link, TreeEntry::Hardlink(current.clone()));
+                }
+            }
         }
         Ok(())
     }
-}
-
-fn read_tar(
-    store: &NativeStore,
-    reader: impl Read,
-    policy: PackagePolicy,
-) -> Result<(TreeManifest, BTreeMap<ContentId, StagedBlob>)> {
-    let mut archive = tar::Archive::new(reader);
-    let mut imported = ImportedTree {
-        manifest: TreeManifest {
-            root: policy.directory,
-            entries: BTreeMap::new(),
-        },
-        staged: BTreeMap::new(),
-        explicit: BTreeSet::new(),
-        count: 0,
-        bytes: 0,
-        policy,
-    };
-    for entry in archive.entries()? {
-        imported.add(store, entry?)?;
+    fn finish(mut self) -> Result<(TreeManifest, BTreeMap<ContentId, StagedBlob>)> {
+        self.resolve_hardlinks()?;
+        self.manifest.validate()?;
+        Ok((self.manifest, self.staged))
     }
-    imported.resolve_hardlinks()?;
-    imported.manifest.validate()?;
-    // Ensure the decompressor validates its final checksum. Tar writers may
-    // pad the ending record with zero blocks, but not with another archive.
-    let mut reader = archive.into_inner();
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let count = reader.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        ensure!(
-            buffer[..count].iter().all(|&byte| byte == 0),
-            "unexpected bytes after tar end"
-        );
-    }
-    Ok((imported.manifest, imported.staged))
 }
 
 fn normalize_path(mut bytes: &[u8], directory: bool) -> Result<Option<TreePath>> {
+    ensure!(
+        bytes.len() <= MAX_MEMBER_PATH,
+        "archive member path too long"
+    );
     while let Some(rest) = bytes.strip_prefix(b"./") {
         bytes = rest;
     }
@@ -350,12 +446,15 @@ fn normalize_path(mut bytes: &[u8], directory: bool) -> Result<Option<TreePath>>
     Ok(Some(TreePath::new(bytes.to_vec())?))
 }
 
+mod decoder;
+use decoder::{ArchiveEntry, EntryKind, MAX_MEMBER_PATH};
+pub use decoder::{PackageDecoder, decode_package_process};
 mod rust_installer;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{TreeLayer, TreeRecipe};
+    use crate::{PackageCompression, TreeLayer, TreeRecipe};
 
     fn policy() -> PackagePolicy {
         let modified = TreeTimestamp {
@@ -370,6 +469,8 @@ mod tests {
             modified,
             max_entries: 100,
             max_expanded_bytes: 10000,
+            max_tar_bytes: 100_000,
+            max_metadata_bytes: 100_000,
         }
     }
 
@@ -408,14 +509,20 @@ mod tests {
         let gzip = gzip.finish()?;
         let directory = tempfile::tempdir()?;
         let store = NativeStore::open(directory.path())?;
-        let id =
-            store.import_package(source(&gzip, PackageCompression::Gzip), policy(), &gzip[..])?;
+        let package = store.import_package(
+            source(&gzip, PackageCompression::Gzip),
+            policy(),
+            &gzip[..],
+            PackageDecoder::InProcess,
+        )?;
+        let id = package.tree().id();
+        assert_eq!(store.evict_tree(id)?, super::super::Eviction::Pinned);
         assert_eq!(store.stats()?.blobs, 1);
         assert_eq!(store.stats()?.logical_bytes, 4);
         let existing = store
             .lookup_package(source(&gzip, PackageCompression::Gzip), policy())?
             .context("missing original package mapping")?;
-        assert_eq!(existing.id(), id);
+        assert_eq!(existing.tree().id(), id);
         drop(existing);
         let recipe = TreeRecipe {
             directories: policy().directory,
@@ -429,6 +536,7 @@ mod tests {
         assert_ne!(id, composed);
         assert_eq!(store.stats()?.blobs, 1);
         assert_eq!(store.stats()?.trees, 2);
+        drop(package);
         store.evict_tree(id)?;
         assert!(
             store
@@ -441,20 +549,59 @@ mod tests {
     }
 
     #[test]
+    fn decoded_tar_limit_includes_padding_and_accepts_exact_boundary() -> Result<()> {
+        use std::io::Write;
+
+        let mut bytes = example_tar()?;
+        bytes.resize(bytes.len() + 16_384, 0);
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(&bytes)?;
+        let gzip = gzip.finish()?;
+        let directory = tempfile::tempdir()?;
+        let store = NativeStore::open(directory.path())?;
+        let src = source(&gzip, PackageCompression::Gzip);
+        let mut limits = PackagePolicy {
+            max_tar_bytes: u64::try_from(bytes.len())? - 1,
+            ..policy()
+        };
+        assert!(
+            store
+                .import_package(src, limits, &gzip[..], PackageDecoder::InProcess)
+                .is_err()
+        );
+        assert_eq!(store.stats()?.trees, 0);
+        assert_eq!(store.stats()?.blobs, 0);
+        limits.max_tar_bytes += 1;
+        let package = store.import_package(src, limits, &gzip[..], PackageDecoder::InProcess)?;
+        assert_eq!(package.source(), src);
+        assert_eq!(store.stats()?.blobs, 1);
+        Ok(())
+    }
+
+    #[test]
     fn checksum_mismatch_and_expansion_limit_do_not_publish() -> Result<()> {
         let bytes = example_tar()?;
         let directory = tempfile::tempdir()?;
         let store = NativeStore::open(directory.path())?;
         let mut wrong = source(&bytes, PackageCompression::Tar);
         wrong.sha256[0] ^= 1;
-        assert!(store.import_package(wrong, policy(), &bytes[..]).is_err());
+        assert!(
+            store
+                .import_package(wrong, policy(), &bytes[..], PackageDecoder::InProcess)
+                .is_err()
+        );
         let limited = PackagePolicy {
             max_expanded_bytes: 2,
             ..policy()
         };
         assert!(
             store
-                .import_package(source(&bytes, PackageCompression::Tar), limited, &bytes[..])
+                .import_package(
+                    source(&bytes, PackageCompression::Tar),
+                    limited,
+                    &bytes[..],
+                    PackageDecoder::InProcess
+                )
                 .is_err()
         );
         assert_eq!(store.stats()?.blobs, 0);

@@ -909,6 +909,7 @@ pub struct DistConfig {
     pub toolchain_cache_size: u64,
     pub rewrite_includes_only: bool,
     pub native: Option<NativeClientConfig>,
+    pub native_installation_catalogs: Vec<PathBuf>,
 }
 
 impl Default for DistConfig {
@@ -921,6 +922,7 @@ impl Default for DistConfig {
             toolchain_cache_size: default_toolchain_cache_size(),
             rewrite_includes_only: false,
             native: None,
+            native_installation_catalogs: Vec::new(),
         }
     }
 }
@@ -2073,6 +2075,7 @@ pub mod scheduler {
         pub max_total_uploads: usize,
         pub http_threads: usize,
         pub max_metadata_bytes: usize,
+        pub package_import: Option<crate::build_runtime::PackageImportLimits>,
     }
 
     impl NativeCacheConfig {
@@ -2101,6 +2104,9 @@ pub mod scheduler {
             };
             limits.validate()?;
             self.space.validate()?;
+            if let Some(package_import) = self.package_import {
+                package_import.validate()?;
+            }
             Ok(limits)
         }
     }
@@ -3626,6 +3632,7 @@ key_prefix = "cosprefix"
                 toolchain_cache_size: 5_368_709_120,
                 rewrite_includes_only: false,
                 native: None,
+                native_installation_catalogs: Vec::new(),
             },
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],

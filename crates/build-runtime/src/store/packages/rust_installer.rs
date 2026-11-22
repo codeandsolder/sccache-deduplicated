@@ -9,8 +9,8 @@ use std::{
 use anyhow::{Context, Result, ensure};
 
 use crate::{
-    NativeStore, TreeEntry, TreeId, TreeLease, TreeManifest, TreeMetadata, TreePath,
-    recipe::project_entries,
+    InstallationManifest, NativeStore, TreeEntry, TreeLease, TreeManifest, TreeMetadata, TreePath,
+    VerifiedPackage, recipe::project_entries,
 };
 
 const CONTROL_BYTES: u64 = 16 * 1024 * 1024;
@@ -114,16 +114,19 @@ fn component_tree(
 ) -> Result<TreeManifest> {
     let selections = selections(package, component)?;
     let mut paths = BTreeMap::new();
-    for path in package.manifest().entries.keys() {
-        if let Some(local) = path
-            .as_bytes()
-            .strip_prefix(component.as_bytes())
-            .and_then(|rest| rest.strip_prefix(b"/"))
-        {
-            let local = TreePath::new(local.to_vec())?;
-            if selected(&local, &selections) {
-                paths.insert(path, local);
-            }
+    let mut prefix = component.as_bytes().to_vec();
+    prefix.push(b'/');
+    let bounds = (
+        std::ops::Bound::Included(prefix.as_slice()),
+        std::ops::Bound::Unbounded,
+    );
+    for (path, _) in package.manifest().entries.range::<[u8], _>(bounds) {
+        let Some(local) = path.as_bytes().strip_prefix(prefix.as_slice()) else {
+            break;
+        };
+        let local = TreePath::new(local.to_vec())?;
+        if selected(&local, &selections) {
+            paths.insert(path, local);
         }
     }
     let mut manifest = TreeManifest {
@@ -175,12 +178,10 @@ impl NativeStore {
     /// invalid topology or metadata storage failures.
     pub fn publish_rust_installer(
         &self,
-        package: TreeId,
+        verified: &VerifiedPackage,
         directories: TreeMetadata,
-    ) -> Result<BTreeMap<String, TreeId>> {
-        let package = self
-            .lookup_tree(package)?
-            .context("Rust installer package not imported")?;
+    ) -> Result<InstallationManifest> {
+        let package = verified.tree();
         let mut roots = package
             .manifest()
             .entries
@@ -191,22 +192,23 @@ impl NativeStore {
             matches!(entry, TreeEntry::Directory(_)) && roots.next().is_none(),
             "Rust installer must have exactly one package directory"
         );
-        let version = control(&package, &joined(root, b"rust-installer-version")?)?;
+        let version = control(package, &joined(root, b"rust-installer-version")?)?;
         ensure!(
             version == b"3" || version == b"3\n",
             "unsupported Rust installer version"
         );
-        let bytes = control(&package, &joined(root, b"components")?)?;
+        let bytes = control(package, &joined(root, b"components")?)?;
         let mut manifests = BTreeMap::new();
         for name in lines(&bytes) {
             let name = std::str::from_utf8(name)?;
             ensure!(!name.contains('/'), "invalid installer component name");
-            let component = joined(root, name.as_bytes())?;
-            let manifest = component_tree(&package, &component, directories)?;
             ensure!(
-                manifests.insert(name.to_owned(), manifest).is_none(),
+                !manifests.contains_key(name),
                 "duplicate installer component"
             );
+            let component = joined(root, name.as_bytes())?;
+            let manifest = component_tree(package, &component, directories)?;
+            manifests.insert(name.to_owned(), manifest);
         }
         ensure!(
             !manifests.is_empty(),
@@ -214,17 +216,23 @@ impl NativeStore {
         );
         // Validate all components before publishing any. Publication is
         // idempotent; storage errors can only leave independently valid trees.
-        manifests
-            .into_iter()
-            .map(|(name, manifest)| Ok((name, self.publish_tree(&manifest, Vec::new())?)))
-            .collect()
+        for manifest in manifests.values() {
+            self.publish_tree(manifest, Vec::new())?;
+        }
+        Ok(InstallationManifest {
+            source_sha256: verified.source().sha256,
+            package: package.id(),
+            components: manifests,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PackageCompression, PackagePolicy, PackageSource, TreeRecipe, TreeTimestamp};
+    use crate::{
+        PackageCompression, PackageDecoder, PackagePolicy, PackageSource, TreeRecipe, TreeTimestamp,
+    };
     use sha2::{Digest, Sha256};
 
     fn fixture(manifest: &[u8]) -> Result<Vec<u8>> {
@@ -257,7 +265,7 @@ mod tests {
         Ok(archive.into_inner()?)
     }
 
-    fn import(store: &NativeStore, bytes: &[u8]) -> Result<(TreeId, TreeMetadata)> {
+    fn import(store: &NativeStore, bytes: &[u8]) -> Result<(VerifiedPackage, TreeMetadata)> {
         let modified = TreeTimestamp {
             seconds: 123,
             nanoseconds: 0,
@@ -277,8 +285,11 @@ mod tests {
                 modified,
                 max_entries: 100,
                 max_expanded_bytes: 100_000,
+                max_tar_bytes: 1_000_000,
+                max_metadata_bytes: 1_000_000,
             },
             bytes,
+            PackageDecoder::InProcess,
         )?;
         Ok((id, directory))
     }
@@ -289,9 +300,14 @@ mod tests {
         let store = NativeStore::open(scratch.path())?;
         let (package, directories) = import(&store, &fixture(b"file:bin/rustc\ndir:lib\n")?)?;
         let before = store.stats()?;
-        let components = store.publish_rust_installer(package, directories)?;
-        assert_eq!(components.len(), 2);
-        let recipe = TreeRecipe::union(directories, components.values().copied());
+        let components = store.publish_rust_installer(&package, directories)?;
+        assert_eq!(components.components.len(), 2);
+        let ids = components
+            .components
+            .values()
+            .map(TreeManifest::id)
+            .collect::<Result<Vec<_>>>()?;
+        let recipe = TreeRecipe::union(directories, ids);
         let installed = store.lease_recipe(&recipe)?;
         let entries = &installed.manifest().entries;
         let path = |name: &str| TreePath::new(name.as_bytes().to_vec());
@@ -306,8 +322,10 @@ mod tests {
         assert_eq!(store.stats()?.logical_bytes, before.logical_bytes);
         assert_eq!(store.stats()?.blobs, before.blobs);
         assert_eq!(
-            store.publish_rust_installer(package, directories)?,
-            components
+            store
+                .publish_rust_installer(&package, directories)?
+                .components,
+            components.components
         );
         Ok(())
     }
@@ -323,7 +341,7 @@ mod tests {
         ] {
             let (package, directories) = import(&store, &fixture(manifest)?)?;
             let before = store.stats()?.trees;
-            assert!(store.publish_rust_installer(package, directories).is_err());
+            assert!(store.publish_rust_installer(&package, directories).is_err());
             assert_eq!(store.stats()?.trees, before);
         }
         Ok(())

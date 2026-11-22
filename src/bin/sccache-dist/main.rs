@@ -174,57 +174,178 @@ fn check_jwt_server_token(
         .ok()
 }
 
+/// Install metadata as one atomic file. Readers always see either the
+/// complete old or complete new document, never a partial catalog.
+fn write_installation_metadata(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> Result<()>,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    write(temp.as_file_mut())?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)?;
+    Ok(())
+}
+
+fn provision_rust_package(
+    client_config: &Path,
+    archive: Option<&Path>,
+    source: sccache::build_runtime::PackageSource,
+    manifest_output: Option<&Path>,
+) -> Result<()> {
+    use sccache::{
+        config::{DistAuth, FileConfig, try_read_config_file},
+        dist::native::NativeCacheClient,
+    };
+    let config: FileConfig =
+        try_read_config_file(client_config)?.context("client configuration unavailable")?;
+    let native = config
+        .dist
+        .native
+        .context("missing native client configuration")?;
+    let DistAuth::Token { token } = config.dist.auth else {
+        bail!("original-package provisioning requires token authentication");
+    };
+    let client = NativeCacheClient::new(
+        native.endpoint.to_url(),
+        token,
+        Duration::from_secs(native.request_timeout_secs),
+        native.max_metadata_bytes,
+    )?;
+    let (manifest, reused) = if let Some(manifest) = client.lookup_rust_package(source)? {
+        (manifest, true)
+    } else {
+        let archive = archive.context("upstream package unavailable; supply --archive")?;
+        (
+            client.import_rust_package(source, std::fs::File::open(archive)?)?,
+            false,
+        )
+    };
+    if let Some(path) = manifest_output {
+        write_installation_metadata(path, |file| manifest.write(file))?;
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&package_report(source, &manifest, reused)?)?
+    );
+    Ok(())
+}
+
+fn package_report(
+    source: sccache::build_runtime::PackageSource,
+    manifest: &sccache::build_runtime::InstallationManifest,
+    reused: bool,
+) -> Result<serde_json::Value> {
+    let components = manifest
+        .components
+        .iter()
+        .map(|(name, tree)| Ok((name, tree.id()?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    Ok(serde_json::json!({
+        "source": source,
+        "package": manifest.package,
+        "components": components,
+        "reused_original_package": reused,
+    }))
+}
+
 fn run(command: Command) -> Result<i32> {
     match command {
+        Command::NativeDecodePackage {
+            compression,
+            max_tar_bytes,
+            memory_bytes,
+        } => {
+            sccache::build_runtime::decode_package_process(
+                compression,
+                max_tar_bytes,
+                memory_bytes,
+            )?;
+            Ok(0)
+        }
+        Command::NativeProvisionRust {
+            client_config,
+            archive,
+            source,
+            manifest_output,
+        } => {
+            provision_rust_package(
+                &client_config,
+                archive.as_deref(),
+                source,
+                manifest_output.as_deref(),
+            )?;
+            Ok(0)
+        }
         Command::NativeImportRust {
             store,
             archive,
             source,
             max_entries,
             max_expanded_bytes,
+            max_tar_bytes,
+            manifest_output,
         } => {
-            use sccache::build_runtime::{NativeStore, PackagePolicy, TreeMetadata, TreeTimestamp};
-            let modified = TreeTimestamp {
-                seconds: i64::try_from(tar::DETERMINISTIC_TIMESTAMP)?,
-                nanoseconds: 0,
-            };
-            let policy = PackagePolicy {
-                directory: TreeMetadata {
-                    mode: 0o755,
-                    modified,
-                },
-                modified,
+            use sccache::build_runtime::{NativeStore, PackagePolicy};
+            let policy = PackagePolicy::rust_installer(
                 max_entries,
                 max_expanded_bytes,
-            };
+                max_tar_bytes,
+                64 * 1024 * 1024,
+            )?;
             let store = NativeStore::open(&store)?;
             let (package, reused) = if let Some(existing) = store.lookup_package(source, policy)? {
-                (existing.id(), true)
+                (existing, true)
             } else {
                 let archive = archive.context("upstream package unavailable; supply --archive")?;
                 (
-                    store.import_package(source, policy, std::fs::File::open(archive)?)?,
+                    store.import_package(
+                        source,
+                        policy,
+                        std::fs::File::open(archive)?,
+                        sccache::build_runtime::PackageDecoder::Isolated {
+                            executable: &std::env::current_exe()?,
+                            memory_bytes: 512 * 1024 * 1024,
+                            timeout: Duration::from_secs(600),
+                        },
+                    )?,
                     false,
                 )
             };
             let before = store.stats()?;
-            let components = store.publish_rust_installer(package, policy.directory)?;
+            let manifest = store.publish_rust_installer(&package, policy.directory)?;
+            if let Some(path) = manifest_output {
+                write_installation_metadata(&path, |file| manifest.write(file))?;
+            }
             let after = store.stats()?;
             anyhow::ensure!(
                 before.logical_bytes == after.logical_bytes && before.blobs == after.blobs,
                 "installer projection unexpectedly created content"
             );
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "source": source,
-                    "package": package,
-                    "components": components,
-                    "reused_original_package": reused,
-                    "logical_bytes": after.logical_bytes,
-                    "blobs": after.blobs,
-                }))?
-            );
+            let mut report = package_report(source, &manifest, reused)?;
+            report["logical_bytes"] = after.logical_bytes.into();
+            report["blobs"] = after.blobs.into();
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(0)
+        }
+        #[cfg(target_os = "linux")]
+        Command::NativeAttestInstallation {
+            root,
+            manifests,
+            output,
+        } => {
+            use sccache::build_runtime::{InstallationCatalog, InstallationManifest};
+            let manifests = manifests
+                .iter()
+                .map(|path| InstallationManifest::read(std::fs::File::open(path)?))
+                .collect::<Result<Vec<_>>>()?;
+            let (catalog, report) = InstallationCatalog::attest(&root, &manifests)?;
+            write_installation_metadata(&output, |file| catalog.write(file))?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(0)
         }
         Command::NativeAudit {

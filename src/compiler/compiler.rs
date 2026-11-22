@@ -1624,6 +1624,41 @@ fn is_known_c_compiler<P: AsRef<Path>>(p: P) -> bool {
     )
 }
 
+/// Installed compiler inputs needed during discovery. Native compilation
+/// shares the content memo with its subsequent executable-tree preparation.
+#[derive(Default)]
+pub struct CompilerDiscovery {
+    pub dist_archive: Option<PathBuf>,
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    pub native_digests: Option<Arc<crate::build_runtime::SourceDigestCache>>,
+}
+
+impl CompilerDiscovery {
+    pub async fn hash_toolchain_files(
+        &self,
+        files: &[PathBuf],
+        pool: &tokio::runtime::Handle,
+    ) -> Result<Vec<String>> {
+        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+        if let Some(cache) = &self.native_digests {
+            let tasks = files.iter().map(|path| {
+                let path = path.clone();
+                let cache = Arc::clone(cache);
+                pool.spawn_blocking(move || {
+                    let blob = cache.file_digest(&path)?;
+                    // Preserve the original sccache hex representation.
+                    Ok::<_, anyhow::Error>(crate::util::hex(&blob.id.0))
+                })
+            });
+            return futures::future::try_join_all(tasks)
+                .await?
+                .into_iter()
+                .collect();
+        }
+        crate::util::hash_all(files, pool).await
+    }
+}
+
 /// If `executable` is a known compiler, return `Some(Box<Compiler>)`.
 async fn detect_compiler<T>(
     creator: T,
@@ -1632,7 +1667,7 @@ async fn detect_compiler<T>(
     args: &[OsString],
     env: &[(OsString, OsString)],
     pool: &tokio::runtime::Handle,
-    dist_archive: Option<PathBuf>,
+    discovery: CompilerDiscovery,
 ) -> Result<(Box<dyn Compiler<T>>, Option<Box<dyn CompilerProxy<T>>>)>
 where
     T: CommandCreatorSync,
@@ -1712,7 +1747,7 @@ where
         rustc_executable.to_path_buf(),
         env,
         cwd.to_path_buf(),
-        dist_archive,
+        discovery,
         pool.clone(),
     )
     .await
@@ -1740,7 +1775,7 @@ async fn resolve_rust_compiler<T>(
     rustc_executable: PathBuf,
     env: &[(OsString, OsString)],
     cwd: PathBuf,
-    dist_archive: Option<PathBuf>,
+    discovery: CompilerDiscovery,
     pool: tokio::runtime::Handle,
 ) -> Result<(Box<dyn Compiler<T>>, Option<Box<dyn CompilerProxy<T>>>)>
 where
@@ -1831,7 +1866,7 @@ where
                 resolved_rustc,
                 env,
                 &rustc_verbose_version,
-                dist_archive,
+                discovery,
                 pool,
             )
             .await
@@ -2251,13 +2286,13 @@ pub async fn get_compiler_info<T>(
     args: &[OsString],
     env: &[(OsString, OsString)],
     pool: &tokio::runtime::Handle,
-    dist_archive: Option<PathBuf>,
+    discovery: CompilerDiscovery,
 ) -> Result<(Box<dyn Compiler<T>>, Option<Box<dyn CompilerProxy<T>>>)>
 where
     T: CommandCreatorSync,
 {
     let pool = pool.clone();
-    detect_compiler(creator, executable, cwd, args, env, &pool, dist_archive).await
+    detect_compiler(creator, executable, cwd, args, env, &pool, discovery).await
 }
 
 #[cfg(test)]
@@ -2275,6 +2310,33 @@ mod test {
     use std::time::Duration;
     use test_case::test_case;
     use tokio::runtime::Runtime;
+
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    #[test]
+    fn native_toolchain_digest_matches_legacy_encoding() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let library = dir.path().join("library.so");
+        fs::write(&library, b"library contents")?;
+        let alias = dir.path().join("libalias.so");
+        std::os::unix::fs::symlink(&library, &alias)?;
+        let files = vec![library.clone(), alias];
+        let runtime = single_threaded_runtime();
+        let pool = runtime.handle();
+        let discovery = CompilerDiscovery {
+            dist_archive: None,
+            native_digests: Some(Arc::new(crate::build_runtime::SourceDigestCache::default())),
+        };
+        for contents in [
+            b"library contents".as_slice(),
+            b"changed contents".as_slice(),
+        ] {
+            fs::write(&library, contents)?;
+            let original = runtime.block_on(crate::util::hash_all(&files, pool))?;
+            let native = runtime.block_on(discovery.hash_toolchain_files(&files, pool))?;
+            assert_eq!(native, original);
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_c_preprocessing_consistent() -> Result<()> {
@@ -2336,55 +2398,37 @@ mod test {
         Ok(())
     }
 
-    #[test]
-    fn test_detect_compiler_kind_gcc() -> Result<()> {
+    #[test_case("gcc: error: unrecognized command-line option '-vV'; did you mean '-v'?", "\n\ncompiler_id=gcc", CCompilerKind::Gcc, true; "gcc")]
+    #[test_case("clang: error: unknown argument: '-vV'", "compiler_id=clang\n", CCompilerKind::Clang, true; "clang")]
+    #[test_case("no -vV", "compiler_id=nvcc\n", CCompilerKind::Nvcc, false; "nvcc")]
+    #[test_case("no -vV", "compiler_id=nvhpc\n", CCompilerKind::Nvhpc, false; "nvhpc")]
+    #[test_case("no -vV", "\ncompiler_id=diab\n", CCompilerKind::Diab, false; "diab")]
+    fn test_detect_c_kind(
+        stderr: &str,
+        probe: &str,
+        expected: CCompilerKind,
+        assembler: bool,
+    ) -> Result<()> {
         let f = TestFixture::new();
         let creator = new_creator();
         let runtime = single_threaded_runtime();
-        let pool = runtime.handle();
-        next_command(
-            &creator,
-            Ok(MockChild::new(
-                exit_status(1),
-                "",
-                "gcc: error: unrecognized command-line option '-vV'; did you mean '-v'?",
-            )),
-        );
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "\n\ncompiler_id=gcc", "")),
-        );
-        next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &[], pool, None)
-            .wait()?
-            .0;
-        assert_eq!(CompilerKind::C(CCompilerKind::Gcc), c.kind());
-        Ok(())
-    }
-
-    #[test]
-    fn test_detect_compiler_kind_clang() -> Result<()> {
-        let f = TestFixture::new();
-        let creator = new_creator();
-        let runtime = single_threaded_runtime();
-        let pool = runtime.handle();
-        next_command(
-            &creator,
-            Ok(MockChild::new(
-                exit_status(1),
-                "",
-                "clang: error: unknown argument: '-vV'",
-            )),
-        );
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "compiler_id=clang\n", "")),
-        );
-        next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &[], pool, None)
-            .wait()?
-            .0;
-        assert_eq!(CompilerKind::C(CCompilerKind::Clang), c.kind());
+        next_command(&creator, Ok(MockChild::new(exit_status(1), "", stderr)));
+        next_command(&creator, Ok(MockChild::new(exit_status(0), probe, "")));
+        if assembler {
+            next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
+        }
+        let c = detect_compiler(
+            creator,
+            &f.bins[0],
+            f.tempdir.path(),
+            &[],
+            &[],
+            runtime.handle(),
+            CompilerDiscovery::default(),
+        )
+        .wait()?
+        .0;
+        assert_eq!(CompilerKind::C(expected), c.kind());
         Ok(())
     }
 
@@ -2420,7 +2464,16 @@ mod test {
                     Ok(MockChild::new(exit_status(0), output, ""))
                 });
             }
-            detect_compiler(creator, &compiler, f.tempdir.path(), &[], &[], pool, None).wait()?;
+            detect_compiler(
+                creator,
+                &compiler,
+                f.tempdir.path(),
+                &[],
+                &[],
+                pool,
+                CompilerDiscovery::default(),
+            )
+            .wait()?;
         }
         Ok(())
     }
@@ -2437,9 +2490,17 @@ mod test {
             Ok(MockChild::new(exit_status(0), "compiler_id=clang\n", "")),
         );
         next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = detect_compiler(creator, &clang, f.tempdir.path(), &[], &[], pool, None)
-            .wait()?
-            .0;
+        let c = detect_compiler(
+            creator,
+            &clang,
+            f.tempdir.path(),
+            &[],
+            &[],
+            pool,
+            CompilerDiscovery::default(),
+        )
+        .wait()?
+        .0;
         assert_eq!(CompilerKind::C(CCompilerKind::Clang), c.kind());
         Ok(())
     }
@@ -2459,9 +2520,17 @@ mod test {
             Ok(MockChild::new(exit_status(0), "compiler_id=clang\n", "")),
         );
         next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &[], pool, None)
-            .wait()?
-            .0;
+        let c = detect_compiler(
+            creator,
+            &f.bins[0],
+            f.tempdir.path(),
+            &[],
+            &[],
+            pool,
+            CompilerDiscovery::default(),
+        )
+        .wait()?
+        .0;
         assert_eq!(CompilerKind::C(CCompilerKind::Clang), c.kind());
         Ok(())
     }
@@ -2500,46 +2569,18 @@ mod test {
             &creator,
             Ok(MockChild::new(exit_status(0), String::new(), stderr)),
         );
-        let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &[], pool, None)
-            .wait()?
-            .0;
+        let c = detect_compiler(
+            creator,
+            &f.bins[0],
+            f.tempdir.path(),
+            &[],
+            &[],
+            pool,
+            CompilerDiscovery::default(),
+        )
+        .wait()?
+        .0;
         assert_eq!(CompilerKind::C(CCompilerKind::Msvc), c.kind());
-        Ok(())
-    }
-
-    #[test]
-    fn test_detect_compiler_kind_nvcc() -> Result<()> {
-        let f = TestFixture::new();
-        let creator = new_creator();
-        let runtime = single_threaded_runtime();
-        let pool = runtime.handle();
-        next_command(&creator, Ok(MockChild::new(exit_status(1), "", "no -vV")));
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "compiler_id=nvcc\n", "")),
-        );
-        let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &[], pool, None)
-            .wait()?
-            .0;
-        assert_eq!(CompilerKind::C(CCompilerKind::Nvcc), c.kind());
-        Ok(())
-    }
-
-    #[test]
-    fn test_detect_compiler_kind_nvhpc() -> Result<()> {
-        let f = TestFixture::new();
-        let creator = new_creator();
-        let runtime = single_threaded_runtime();
-        let pool = runtime.handle();
-        next_command(&creator, Ok(MockChild::new(exit_status(1), "", "no -vV")));
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "compiler_id=nvhpc\n", "")),
-        );
-        let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &[], pool, None)
-            .wait()?
-            .0;
-        assert_eq!(CompilerKind::C(CCompilerKind::Nvhpc), c.kind());
         Ok(())
     }
 
@@ -2554,9 +2595,17 @@ mod test {
         let runtime = single_threaded_runtime();
         let pool = runtime.handle();
         populate_rustc_command_mock(&creator, &f)?;
-        let c = detect_compiler(creator, &rustc, f.tempdir.path(), &[], &[], pool, None)
-            .wait()?
-            .0;
+        let c = detect_compiler(
+            creator,
+            &rustc,
+            f.tempdir.path(),
+            &[],
+            &[],
+            pool,
+            CompilerDiscovery::default(),
+        )
+        .wait()?
+        .0;
         assert_eq!(CompilerKind::Rust, c.kind());
         Ok(())
     }
@@ -2629,7 +2678,7 @@ LLVM version: 6.0",
             &[OsString::from("rustc.exe")],
             &[(OsString::from("CARGO"), OsString::from("CARGO"))],
             pool,
-            None,
+            CompilerDiscovery::default(),
         )
         .wait()?
         .0;
@@ -2647,7 +2696,7 @@ LLVM version: 6.0",
                 &[OsString::from("not-rustc")],
                 &[(OsString::from("CARGO"), OsString::from("CARGO"))],
                 pool,
-                None,
+                CompilerDiscovery::default(),
             )
             .wait()
             .is_err()
@@ -2664,29 +2713,11 @@ LLVM version: 6.0",
                 &[OsString::from("rustc")],
                 &[],
                 pool,
-                None,
+                CompilerDiscovery::default(),
             )
             .wait()
             .is_ok()
         );
-        Ok(())
-    }
-
-    #[test]
-    fn test_detect_compiler_kind_diab() -> Result<()> {
-        let f = TestFixture::new();
-        let creator = new_creator();
-        let runtime = single_threaded_runtime();
-        let pool = runtime.handle();
-        next_command(&creator, Ok(MockChild::new(exit_status(1), "", "no -vV")));
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "\ncompiler_id=diab\n", "")),
-        );
-        let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &[], pool, None)
-            .wait()?
-            .0;
-        assert_eq!(CompilerKind::C(CCompilerKind::Diab), c.kind());
         Ok(())
     }
 
@@ -2709,7 +2740,7 @@ LLVM version: 6.0",
                 &[],
                 &[],
                 pool,
-                None
+                CompilerDiscovery::default()
             )
             .wait()
             .is_err()
@@ -2733,7 +2764,7 @@ LLVM version: 6.0",
                 &[],
                 &[],
                 pool,
-                None
+                CompilerDiscovery::default()
             )
             .wait()
             .is_err()
@@ -2767,7 +2798,7 @@ LLVM version: 6.0",
                     &[],
                     &[],
                     pool,
-                    None,
+                    CompilerDiscovery::default(),
                 )
                 .wait()?
                 .0;
@@ -2832,7 +2863,7 @@ LLVM version: 6.0",
                 &[],
                 &[],
                 pool,
-                None,
+                CompilerDiscovery::default(),
             )
             .wait()?
             .0;
@@ -2916,9 +2947,17 @@ LLVM version: 6.0",
             )),
         );
         next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let compiler = detect_compiler(creator.clone(), &clang, cwd, &[], &[], pool, None)
-            .wait()?
-            .0;
+        let compiler = detect_compiler(
+            creator.clone(),
+            &clang,
+            cwd,
+            &[],
+            &[],
+            pool,
+            CompilerDiscovery::default(),
+        )
+        .wait()?
+        .0;
         let arguments = ovec!["-c", "foo.S", "-o", "foo.o"];
 
         let key_for = |payload: &[u8]| -> Result<String> {
@@ -2957,14 +2996,15 @@ LLVM version: 6.0",
         Ok(())
     }
 
-    #[test_case(true, ["-fPIC", "-fno-pic"], false ; "common flags with preprocessor cache")]
-    #[test_case(false, ["-fPIC", "-fno-pic"], false ; "common flags without preprocessor cache")]
-    #[test_case(true, ["-DHELLO", "-DHI"], true ; "preprocessor flags with preprocessor cache")]
-    #[test_case(false, ["-DHELLO", "-DHI"], true ; "preprocessor flags without preprocessor cache")]
-    fn test_argument_hash_identity(
+    #[test_case(true, "-fPIC", "-fno-pic", false; "common args with preprocessor cache")]
+    #[test_case(false, "-fPIC", "-fno-pic", false; "common args without preprocessor cache")]
+    #[test_case(true, "-DHELLO", "-DHI", true; "preprocessor args with preprocessor cache")]
+    #[test_case(false, "-DHELLO", "-DHI", true; "preprocessor args without preprocessor cache")]
+    fn test_argument_hash_equivalence(
         preprocessor_cache_mode: bool,
-        flags: [&str; 2],
-        same_key: bool,
+        first: &str,
+        second: &str,
+        equivalent: bool,
     ) -> Result<()> {
         let f = TestFixture::new();
         let creator = new_creator();
@@ -2972,8 +3012,8 @@ LLVM version: 6.0",
         let pool = runtime.handle();
         let output = "compiler_id=clang\ncompiler_version=\"16.0.0\"";
         let arguments = [
-            ovec!["-c", "foo.c", "-o", "foo.o", flags[0]],
-            ovec!["-c", "foo.c", "-o", "foo.o", flags[1]],
+            ovec!["-c", "foo.c", "-o", "foo.o", first],
+            ovec!["-c", "foo.c", "-o", "foo.o", second],
             ovec!["-c", "foo.c", "-o", "foo.o"],
         ];
         let cwd = f.tempdir.path();
@@ -3000,7 +3040,7 @@ LLVM version: 6.0",
                     &[],
                     &[],
                     pool,
-                    None,
+                    CompilerDiscovery::default(),
                 )
                 .wait()?
                 .0;
@@ -3033,8 +3073,8 @@ LLVM version: 6.0",
             .collect::<Result<Vec<_>>>()?;
 
         assert_eq!(results.len(), 3);
-        for (first, second) in [(0, 1), (1, 2), (0, 2)] {
-            assert_eq!(results[first].key == results[second].key, same_key);
+        for (left, right) in [(0, 1), (1, 2), (0, 2)] {
+            assert_eq!(results[left].key == results[right].key, equivalent);
         }
         Ok(())
     }
@@ -3069,7 +3109,7 @@ LLVM version: 6.0",
                     &[],
                     &[],
                     pool,
-                    None,
+                    CompilerDiscovery::default(),
                 )
                 .wait()?
                 .0;
@@ -3122,9 +3162,17 @@ LLVM version: 6.0",
             Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
         );
         next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = get_compiler_info(creator, &gcc, f.tempdir.path(), &[], &[], pool, None)
-            .wait()?
-            .0;
+        let c = get_compiler_info(
+            creator,
+            &gcc,
+            f.tempdir.path(),
+            &[],
+            &[],
+            pool,
+            CompilerDiscovery::default(),
+        )
+        .wait()?
+        .0;
         // digest of an empty file.
         assert_eq!(CompilerKind::C(CCompilerKind::Gcc), c.kind());
         Ok(())
@@ -3133,18 +3181,10 @@ LLVM version: 6.0",
     const COMPILER_STDOUT: &[u8] = b"compiler stdout";
     const COMPILER_STDERR: &[u8] = b"compiler stderr";
 
-    fn mock_successful_compile(creator: &Arc<std::sync::Mutex<MockCommandCreator>>, obj: &Path) {
-        // The preprocessor invocation.
-        next_command(
-            creator,
-            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
-        );
-        // The compiler invocation.
-        let o = obj.to_owned();
+    fn queue_mock_compile(creator: &Arc<std::sync::Mutex<MockCommandCreator>>, output: &Path) {
+        let output = output.to_owned();
         next_command_calls(creator, move |_| {
-            // Pretend to compile something.
-            let mut f = File::create(&o)?;
-            f.write_all(b"file contents")?;
+            File::create(&output)?.write_all(b"file contents")?;
             Ok(MockChild::new(
                 exit_status(0),
                 COMPILER_STDOUT,
@@ -3153,41 +3193,63 @@ LLVM version: 6.0",
         });
     }
 
-    fn mock_gcc_hasher(
+    type TestHasher = Box<dyn CompilerHasher<Arc<std::sync::Mutex<MockCommandCreator>>>>;
+
+    fn mock_local_compile(
         creator: &Arc<std::sync::Mutex<MockCommandCreator>>,
         gcc: &Path,
         cwd: &Path,
         pool: &tokio::runtime::Handle,
-        arguments: &[OsString],
-    ) -> Result<Box<dyn CompilerHasher<Arc<std::sync::Mutex<MockCommandCreator>>>>> {
-        std::fs::write(cwd.join("foo.c"), "whatever")?;
+    ) -> Result<(TestHasher, Vec<OsString>, PathBuf)> {
+        let c = mock_gcc_for_compile(creator, gcc, cwd, pool)?;
+        next_command(
+            creator,
+            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+        );
+        let obj = cwd.join("foo.o");
+        queue_mock_compile(creator, &obj);
+        let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
+        let hasher = match c.parse_arguments(
+            &arguments,
+            ".".as_ref(),
+            &[],
+            CompilerCachePolicy::FinishedArtifact,
+        ) {
+            CompilerArguments::Ok(h) => h,
+            o => bail!("Bad result from parse_arguments: {o:?}"),
+        };
+        Ok((hasher, arguments, obj))
+    }
+
+    type TestCompiler = Box<dyn Compiler<Arc<std::sync::Mutex<MockCommandCreator>>>>;
+
+    fn mock_gcc_for_compile(
+        creator: &Arc<std::sync::Mutex<MockCommandCreator>>,
+        gcc: &Path,
+        cwd: &Path,
+        pool: &tokio::runtime::Handle,
+    ) -> Result<TestCompiler> {
         next_command(
             creator,
             Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
         );
         next_assembler(creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let compiler = get_compiler_info(creator.clone(), gcc, cwd, &[], &[], pool, None)
-            .wait()?
-            .0;
-        match compiler.parse_arguments(
-            arguments,
-            ".".as_ref(),
+        Ok(get_compiler_info(
+            creator.clone(),
+            gcc,
+            cwd,
             &[],
-            CompilerCachePolicy::FinishedArtifact,
-        ) {
-            CompilerArguments::Ok(hasher) => Ok(hasher),
-            other => bail!("Bad result from parse_arguments: {other:?}"),
-        }
+            &[],
+            pool,
+            CompilerDiscovery::default(),
+        )
+        .wait()?
+        .0)
     }
 
-    #[test_case(true, CacheControl::Default ; "hit with preprocessor cache")]
-    #[test_case(false, CacheControl::Default ; "hit without preprocessor cache")]
-    #[test_case(true, CacheControl::ForceRecache ; "recache with preprocessor cache")]
-    #[test_case(false, CacheControl::ForceRecache ; "recache without preprocessor cache")]
-    fn test_compiler_get_cached_or_compile(
-        preprocessor_cache_mode: bool,
-        second_control: CacheControl,
-    ) -> Result<()> {
+    #[test_case(true ; "with preprocessor cache")]
+    #[test_case(false ; "without preprocessor cache")]
+    fn test_compiler_get_cached_or_compile(preprocessor_cache_mode: bool) -> Result<()> {
         drop(env_logger::try_init());
         let creator = new_creator();
         let f = TestFixture::new();
@@ -3205,14 +3267,13 @@ LLVM version: 6.0",
             CacheMode::ReadWrite,
             vec![],
         );
+        // Write a dummy input file so the preprocessor cache mode can work
+        std::fs::write(f.tempdir.path().join("foo.c"), "whatever")?;
         let storage = Arc::new(storage);
         let service = server::SccacheService::mock_with_storage(storage.clone(), pool.clone());
 
         let cwd = f.tempdir.path();
-        let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
-        let mut hasher = mock_gcc_hasher(&creator, &gcc, cwd, &pool, &arguments)?;
-        let obj = cwd.join("foo.o");
-        mock_successful_compile(&creator, &obj);
+        let (mut hasher, arguments, obj) = mock_local_compile(&creator, &gcc, cwd, &pool)?;
         let (cached, res) = runtime.block_on(async {
             hasher
                 .get_cached_or_compile(CacheCompileContext {
@@ -3240,16 +3301,14 @@ LLVM version: 6.0",
         assert_eq!(exit_status(0), res.status);
         assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
         assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
-        // The second request either restores the existing artifact or forces a rebuild.
+        // Now compile again, which should be a cache hit.
         fs::remove_file(&obj)?;
-        if second_control == CacheControl::ForceRecache {
-            mock_successful_compile(&creator, &obj);
-        } else {
-            next_command(
-                &creator,
-                Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
-            );
-        }
+        // The preprocessor invocation.
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+        );
+        // There should be no actual compiler invocation.
         let (cached, res) = runtime.block_on(async {
             hasher
                 .get_cached_or_compile(CacheCompileContext {
@@ -3260,23 +3319,14 @@ LLVM version: 6.0",
                     arguments,
                     cwd: cwd.to_path_buf(),
                     env_vars: vec![],
-                    cache_control: second_control,
+                    cache_control: CacheControl::Default,
                     pool,
                 })
                 .await
         })?;
         // Ensure that the object file was created.
         assert!(fs::metadata(&obj).map(|m| m.len() > 0)?);
-        match (second_control, cached) {
-            (CacheControl::Default, CompileResult::CacheHit(_)) => {}
-            (
-                CacheControl::ForceRecache,
-                CompileResult::CacheMiss(MissType::ForcedRecache, DistType::NoDist, _, write),
-            ) => {
-                write.wait()?;
-            }
-            (_, result) => bail!("Unexpected compile result: {result:?}"),
-        }
+        assert_eq!(CompileResult::CacheHit(Duration::new(0, 0)), cached);
         assert_eq!(exit_status(0), res.status);
         assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
         assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
@@ -3312,22 +3362,7 @@ LLVM version: 6.0",
         std::fs::write(f.tempdir.path().join("foo.c"), "whatever")?;
         let storage = Arc::new(storage);
         // Pretend to be GCC.
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
-        );
-        next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = get_compiler_info(
-            creator.clone(),
-            &gcc,
-            f.tempdir.path(),
-            &[],
-            &[],
-            &pool,
-            None,
-        )
-        .wait()?
-        .0;
+        let c = mock_gcc_for_compile(&creator, &gcc, f.tempdir.path(), &pool)?;
         // The preprocessor invocation.
         next_command(
             &creator,
@@ -3438,11 +3473,10 @@ LLVM version: 6.0",
         let storage: Arc<MockStorage> = Arc::new(storage);
         let service = server::SccacheService::mock_with_storage(storage.clone(), pool.clone());
 
+        // Write a dummy input file so the preprocessor cache mode can work
+        std::fs::write(f.tempdir.path().join("foo.c"), "whatever")?;
         let cwd = f.tempdir.path();
-        let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
-        let mut hasher = mock_gcc_hasher(&creator, &gcc, cwd, &pool, &arguments)?;
-        let obj = cwd.join("foo.o");
-        mock_successful_compile(&creator, &obj);
+        let (mut hasher, arguments, obj) = mock_local_compile(&creator, &gcc, cwd, &pool)?;
         // The cache will return an error.
         storage.next_get(Err(anyhow!("Some Error")));
         let (cached, res) =
@@ -3493,22 +3527,7 @@ LLVM version: 6.0",
         let storage: Arc<MockStorage> = Arc::new(storage);
         let service = server::SccacheService::mock_with_storage(storage.clone(), pool.clone());
         // Pretend to be GCC.
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
-        );
-        next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = get_compiler_info(
-            creator.clone(),
-            &gcc,
-            f.tempdir.path(),
-            &[],
-            &[],
-            &pool,
-            None,
-        )
-        .wait()?
-        .0;
+        let c = mock_gcc_for_compile(&creator, &gcc, f.tempdir.path(), &pool)?;
         // The preprocessor invocation.
         next_command(
             &creator,
@@ -3561,6 +3580,114 @@ LLVM version: 6.0",
 
     #[test_case(true ; "with preprocessor cache")]
     #[test_case(false ; "without preprocessor cache")]
+    fn test_compiler_get_cached_or_compile_force_recache(
+        preprocessor_cache_mode: bool,
+    ) -> Result<()> {
+        drop(env_logger::try_init());
+        let creator = new_creator();
+        let f = TestFixture::new();
+        let gcc = f.mk_bin("gcc")?;
+        let runtime = single_threaded_runtime();
+        let pool = runtime.handle().clone();
+        let storage = DiskCache::new(
+            f.tempdir.path().join("cache"),
+            u64::MAX,
+            &pool,
+            PreprocessorCacheModeConfig {
+                use_preprocessor_cache_mode: preprocessor_cache_mode,
+                ..Default::default()
+            },
+            CacheMode::ReadWrite,
+            vec![],
+        );
+        let storage = Arc::new(storage);
+        let service = server::SccacheService::mock_with_storage(storage.clone(), pool.clone());
+        // Write a dummy input file so the preprocessor cache mode can work
+        std::fs::write(f.tempdir.path().join("foo.c"), "whatever")?;
+        // Pretend to be GCC.
+        let c = mock_gcc_for_compile(&creator, &gcc, f.tempdir.path(), &pool)?;
+        // The compiler should be invoked twice, since we're forcing
+        // recaching.
+        let obj = f.tempdir.path().join("foo.o");
+        for _ in 0..2 {
+            // The preprocessor invocation.
+            next_command(
+                &creator,
+                Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+            );
+            // The compiler invocation.
+            queue_mock_compile(&creator, &obj);
+        }
+        let cwd = f.tempdir.path();
+        let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
+        let mut hasher = match c.parse_arguments(
+            &arguments,
+            ".".as_ref(),
+            &[],
+            CompilerCachePolicy::FinishedArtifact,
+        ) {
+            CompilerArguments::Ok(h) => h,
+            o => bail!("Bad result from parse_arguments: {o:?}"),
+        };
+        let (cached, res) = runtime.block_on(async {
+            hasher
+                .get_cached_or_compile(CacheCompileContext {
+                    service: &service,
+                    dist_client: None,
+                    creator: creator.clone(),
+                    storage: storage.clone(),
+                    arguments: arguments.clone(),
+                    cwd: cwd.to_path_buf(),
+                    env_vars: vec![],
+                    cache_control: CacheControl::Default,
+                    pool: pool.clone(),
+                })
+                .await
+        })?;
+        // Ensure that the object file was created.
+        assert!(fs::metadata(&obj).map(|m| m.len() > 0)?);
+        match cached {
+            CompileResult::CacheMiss(MissType::Normal, DistType::NoDist, _, f) => {
+                // wait on cache write future so we don't race with it!
+                f.wait()?;
+            }
+            _ => bail!("Unexpected compile result: {cached:?}"),
+        }
+        assert_eq!(exit_status(0), res.status);
+        assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
+        assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
+        // Now compile again, but force recaching.
+        fs::remove_file(&obj)?;
+        let (cached, res) = hasher
+            .get_cached_or_compile(CacheCompileContext {
+                service: &service,
+                dist_client: None,
+                creator,
+                storage,
+                arguments,
+                cwd: cwd.to_path_buf(),
+                env_vars: vec![],
+                cache_control: CacheControl::ForceRecache,
+                pool,
+            })
+            .wait()?;
+        // Ensure that the object file was created.
+        assert!(fs::metadata(&obj).map(|m| m.len() > 0)?);
+        match cached {
+            CompileResult::CacheMiss(MissType::ForcedRecache, DistType::NoDist, _, f) => {
+                // wait on cache write future so we don't race with it!
+                f.wait()?;
+            }
+            _ => bail!("Unexpected compile result: {cached:?}"),
+        }
+        assert_eq!(exit_status(0), res.status);
+        assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
+        assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
+        Ok(())
+    }
+
+    #[test_case(true ; "with preprocessor cache")]
+    #[test_case(false ; "without preprocessor cache")]
     fn test_compiler_get_cached_or_compile_preprocessor_error(
         preprocessor_cache_mode: bool,
     ) -> Result<()> {
@@ -3603,7 +3730,7 @@ LLVM version: 6.0",
             &[],
             &[],
             &pool,
-            None,
+            CompilerDiscovery::default(),
         )
         .wait()?
         .0;
@@ -3686,22 +3813,7 @@ LLVM version: 6.0",
         );
         let storage = Arc::new(storage);
         // Pretend to be GCC.
-        next_command(
-            &creator,
-            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
-        );
-        next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = get_compiler_info(
-            creator.clone(),
-            &gcc,
-            f.tempdir.path(),
-            &[],
-            &[],
-            &pool,
-            None,
-        )
-        .wait()?
-        .0;
+        let c = mock_gcc_for_compile(&creator, &gcc, f.tempdir.path(), &pool)?;
         const COMPILER_STDOUT: &[u8] = b"compiler stdout";
         const COMPILER_STDERR: &[u8] = b"compiler stderr";
         // The compiler should be invoked twice, since we're forcing
@@ -3714,17 +3826,7 @@ LLVM version: 6.0",
                 Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
             );
             // The compiler invocation.
-            let o = obj.clone();
-            next_command_calls(&creator, move |_| {
-                // Pretend to compile something.
-                let mut f = File::create(&o)?;
-                f.write_all(b"file contents")?;
-                Ok(MockChild::new(
-                    exit_status(0),
-                    COMPILER_STDOUT,
-                    COMPILER_STDERR,
-                ))
-            });
+            queue_mock_compile(&creator, &obj);
         }
         let cwd = f.tempdir.path();
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];

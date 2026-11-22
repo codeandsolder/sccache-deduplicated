@@ -31,17 +31,8 @@ impl NativeStore {
     /// # Errors
     /// Returns an error for an invalid manifest, missing content or storage failure.
     pub fn publish_tree(&self, manifest: &TreeManifest, staged: Vec<StagedBlob>) -> Result<TreeId> {
-        self.publish_tree_indexed(manifest, staged, None)
-    }
-
-    pub(super) fn publish_tree_indexed(
-        &self,
-        manifest: &TreeManifest,
-        staged: Vec<StagedBlob>,
-        package: Option<ContentId>,
-    ) -> Result<TreeId> {
         let _mutation = self.inner.lock_mutations()?;
-        self.publish_tree_locked(manifest, staged, package)
+        self.publish_tree_locked(manifest, staged, None)
     }
 
     /// Publish a tree and acquire its delivery lease atomically with respect
@@ -54,8 +45,17 @@ impl NativeStore {
         manifest: &TreeManifest,
         staged: Vec<StagedBlob>,
     ) -> Result<TreeLease> {
+        self.publish_tree_indexed_pinned(manifest, staged, None)
+    }
+
+    pub(super) fn publish_tree_indexed_pinned(
+        &self,
+        manifest: &TreeManifest,
+        staged: Vec<StagedBlob>,
+        package: Option<ContentId>,
+    ) -> Result<TreeLease> {
         let _mutation = self.inner.lock_mutations()?;
-        let id = self.publish_tree_locked(manifest, staged, None)?;
+        let id = self.publish_tree_locked(manifest, staged, package)?;
         self.lookup_tree(id)?.context("committed tree missing")
     }
 

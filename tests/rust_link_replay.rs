@@ -371,9 +371,9 @@ fn split_link_argument_plan_preserves_expanded_option_bytes() -> Result<()> {
     let stages = RustLinkStages::new(&[at], root.path())?;
     let codegen = stages.codegen_arguments();
     assert_eq!(codegen[..2], ["-Z", "no-link"]);
-    let expected = original[..4]
+    let expected = original[..3]
         .iter()
-        .chain(&original[8..])
+        .chain(&original[7..])
         .cloned()
         .collect::<Vec<_>>();
     assert_eq!(codegen[2..], expected);

@@ -7,6 +7,10 @@
 #![deny(rust_2018_idioms)]
 
 mod identity;
+mod installation;
+mod package;
+pub use installation::InstallationManifest;
+pub use package::{PackageCompression, PackageSource};
 mod recipe;
 mod spec;
 pub use recipe::{TreeLayer, TreeRecipe};
@@ -32,8 +36,9 @@ pub use coordinator::{Admission, BuildCoordinator, CompilePermit};
 #[cfg(all(unix, feature = "store"))]
 pub use store::{
     CacheStats, ComponentAudit, Eviction, GarbageCollected, NativeIndexAudit, NativeStore,
-    PackageCompression, PackagePolicy, PackageSource, Published, ResultLease, SchemaInventory,
-    SpacePolicy, SpaceReport, StagedBlob, TreeLease, UploadReservation,
+    PackageDecoder, PackageImportLimits, PackagePolicy, Published, ResultLease, SchemaInventory,
+    SpacePolicy, SpaceReport, StagedBlob, TreeLease, UploadReservation, VerifiedPackage,
+    decode_package_process,
 };
 
 #[cfg(all(target_os = "linux", feature = "store"))]
@@ -53,4 +58,7 @@ mod mapped;
 #[cfg(all(target_os = "linux", feature = "mapping"))]
 mod source;
 #[cfg(all(target_os = "linux", feature = "mapping"))]
-pub use mapped::{MappedMetadata, MappedTree, PreparedTree, SourceDigestCache};
+pub use mapped::{
+    InstallationCatalog, InstallationReport, MappedMetadata, MappedTree, PreparedTree,
+    SourceDigestCache,
+};

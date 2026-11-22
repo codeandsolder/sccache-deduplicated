@@ -29,12 +29,31 @@ pub enum Command {
         schema: Option<String>,
         without: Vec<String>,
     },
+    NativeDecodePackage {
+        compression: sccache::build_runtime::PackageCompression,
+        max_tar_bytes: u64,
+        memory_bytes: u64,
+    },
+    NativeProvisionRust {
+        client_config: std::path::PathBuf,
+        archive: Option<std::path::PathBuf>,
+        source: sccache::build_runtime::PackageSource,
+        manifest_output: Option<std::path::PathBuf>,
+    },
     NativeImportRust {
         store: std::path::PathBuf,
         archive: Option<std::path::PathBuf>,
         source: sccache::build_runtime::PackageSource,
         max_entries: usize,
         max_expanded_bytes: u64,
+        max_tar_bytes: u64,
+        manifest_output: Option<std::path::PathBuf>,
+    },
+    #[cfg(target_os = "linux")]
+    NativeAttestInstallation {
+        root: std::path::PathBuf,
+        manifests: Vec<std::path::PathBuf>,
+        output: std::path::PathBuf,
     },
 }
 

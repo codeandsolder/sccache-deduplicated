@@ -104,6 +104,7 @@ fn with_native_service(
                 &ClientCheck,
                 &move |token| (token == "worker-token").then_some(worker),
                 1024 * 1024,
+                None,
             )
         }
     })

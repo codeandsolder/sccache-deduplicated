@@ -200,8 +200,8 @@ hashes selected files without staging, normalizes toolchain modes
 and timestamps, and rebases both symlink names and targets when a logical
 sysroot mapping is applied. No archive or intermediate materialized root is
 created. Mappings also support generated file bytes and explicit directories.
-The client shares a bounded, process-local digest memo for installed
-toolchain files. Inventory discovery still runs on each preparation.
+Rust compiler discovery and mapped toolchain preparation share a bounded,
+process-local digest memo for installed toolchain files. Inventory discovery still runs on each preparation.
 A matching device, inode, mode, link count, size, mtime and ctime allow
 a toolchain digest to be reused without reading file contents. Concurrent
 preparations of the same path share a slot. The memo retains no bytes,
@@ -303,8 +303,92 @@ The checksum and length identify the original archive. Component manifests
 select installed paths; the command emits the verified package and normalized
 installation tree IDs as JSON. The component trees reuse the original file
 blobs, and can be placed as layers in a root recipe. Repeating the command
-without `--archive` uses an already indexed original package. The operation
-requires exclusive access to the store, so provision it before starting its
-owner. Preseeded content is also available to ordinary mapped-tree upload
-negotiation. A release name alone does not attest an installed local sysroot;
+without `--archive` uses an already indexed original package. The offline command requires exclusive access to the store. Both offline and
+online provisioning use a verified-package lease through component projection.
+Preseeded content is also available to ordinary mapped-tree upload negotiation. A release name alone does not attest an installed local sysroot;
 regular compiler discovery still hashes its observed installed contents.
+
+
+### Live original-package provisioning
+
+Enable original-package imports explicitly in the scheduler configuration.
+Limits here are owned by the scheduler, not supplied by build clients:
+
+```toml
+[native_cache.package_import]
+max_archive_bytes = 1073741824
+max_entries = 100000
+max_expanded_bytes = 8589934592
+max_tar_bytes = 9663676416
+max_metadata_bytes = 67108864
+decoder_memory_bytes = 536870912
+decoder_timeout_secs = 600
+```
+
+With a client configuration specifying the native cache endpoint and
+token authentication, provision the same archive while the scheduler runs:
+
+```sh
+sccache-dist native-provision-rust --client-config /path/to/client.toml \
+  --archive rustc-nightly-x86_64-unknown-linux-gnu.tar.xz \
+  --sha256 CHECKSUM_FROM_RELEASE_MANIFEST --size COMPRESSED_BYTE_LENGTH \
+  --compression xz --manifest-output rustc.manifest
+```
+
+The CLI first performs an authenticated lookup by exact upstream identity.
+On a hit it needs no archive; on a miss it streams the original bytes.
+The owner verifies the compressed size and SHA-256 before decoding.
+A single import slot shares global upload admission. Compressed input,
+expanded file contents, decoded tar bytes (including padding), member count,
+and path metadata are bounded separately. A memory-limited subprocess
+decodes packages with a wall-clock deadline, streaming length-delimited
+entries and raw file bytes into the owner. No generated toolchain archive or
+complete decoded tar is persisted. The same content, component and package
+identities are used whether imported offline or live.
+
+The decoder subprocess is a resource-isolation boundary, not a separate
+security principal. Use the authenticated native listener and a trusted
+release checksum. The decoder deadline starts after compressed-input
+verification; transport timeouts are controlled by the client and the
+HTTP transport.
+
+### Verified installation catalogs
+
+Export portable component metadata while importing a verified archive:
+
+```sh
+sccache-dist native-import-rust --store /path/to/scheduler-store \
+  --archive rustc-nightly-x86_64-unknown-linux-gnu.tar.xz \
+  --sha256 CHECKSUM_FROM_RELEASE_MANIFEST --size COMPRESSED_BYTE_LENGTH \
+  --compression xz --manifest-output rustc.manifest
+```
+
+On the installation host, verify the manifests against its actual local
+sysroot, including all needed installed components:
+
+```sh
+sccache-dist native-attest-installation --root /path/to/installed/sysroot \
+  --manifest rustc.manifest --manifest rust-std.manifest \
+  --manifest rustfmt.manifest --output /path/to/installation.catalog
+```
+
+Configure the local client (or the direct-mode daemon) with the catalog:
+
+```toml
+[dist]
+native_installation_catalogs = ["/path/to/installation.catalog"]
+```
+
+The namespace caller reads its own catalog, not a daemon-side substitute.
+Only files whose bytes verified against the expected BLAKE3 digest and whose
+current stat version matches the attestation reuse that digest. The catalog
+is scoped to the current Linux boot; reattest after reboot or installation
+changes. Missing, stale, changed and uncovered files use ordinary content
+hashing. Treat the catalog as trusted local installation metadata and store
+it with the same ownership and write controls as the installation. The
+command publishes it atomically. The compiler still discovers exact
+libraries, executable paths, symlinks, target files and host dependencies.
+No action identity or sandbox tree identity changes solely because a catalog
+is present. Preseeding the scheduler with original package bytes lets the
+same content-addressed tree negotiation avoid uploads of already-known
+files. The catalog alone does not place a package in the scheduler.
