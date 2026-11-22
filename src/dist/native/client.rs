@@ -18,7 +18,8 @@ use tempfile::NamedTempFile;
 
 use super::NativeCacheClient;
 use crate::build_runtime::{
-    Artifact, BlobRef, ExecutionSpec, MaterializedTree, PreparedTree, ResultManifest, TreeId, TreeManifest, materialize_tree,
+    Artifact, BlobRef, ExecutionSpec, MaterializedTree, PreparedTree, ResultManifest, TreeId,
+    TreeManifest, materialize_tree,
     wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply, Ticket},
 };
 
@@ -88,7 +89,9 @@ enum StagedOutput {
 impl StagedOutput {
     fn publish(self, path: &Path) -> Result<()> {
         match self {
-            Self::File(file) => { file.persist(path)?; }
+            Self::File(file) => {
+                file.persist(path)?;
+            }
             Self::Tree(tree) => tree.publish(path)?,
         }
         Ok(())
@@ -321,7 +324,10 @@ pub(super) fn validate_manifest(
     max_result_bytes: u64,
 ) -> Result<()> {
     spec.action_request()?.validate_result(manifest)?;
-    ensure!(manifest.logical_bytes()? <= max_result_bytes, "native result exceeds client limits");
+    ensure!(
+        manifest.logical_bytes()? <= max_result_bytes,
+        "native result exceeds client limits"
+    );
     Ok(())
 }
 
@@ -353,13 +359,22 @@ pub(super) fn fetch_result(
                 let mut temp = NamedTempFile::new_in(parent)?;
                 download(*blob, &mut temp)?;
                 if let Some(mode) = mode {
-                    temp.as_file().set_permissions(fs::Permissions::from_mode(*mode))?;
+                    temp.as_file()
+                        .set_permissions(fs::Permissions::from_mode(*mode))?;
                 }
                 StagedOutput::File(temp)
             }
-            Artifact::Tree(manifest) | Artifact::GeneratedTree(manifest) => StagedOutput::Tree(materialize_tree(manifest, parent, |blob, path| {
-                download(blob, &mut fs::OpenOptions::new().write(true).create_new(true).open(path)?)
-            })?),
+            Artifact::Tree(manifest) | Artifact::GeneratedTree(manifest) => {
+                StagedOutput::Tree(materialize_tree(manifest, parent, |blob, path| {
+                    download(
+                        blob,
+                        &mut fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(path)?,
+                    )
+                })?)
+            }
         };
         staged.push((temp, path.clone()));
     }
@@ -411,7 +426,11 @@ pub(super) fn verify_destinations(
             .canonicalize()?;
         let filename = path.file_name().context("output file name missing")?;
         let path = parent.join(filename);
-        ensure!(seen.iter().all(|other: &PathBuf| !path.starts_with(other) && !other.starts_with(&path)), "native output destination paths overlap");
+        ensure!(
+            seen.iter()
+                .all(|other: &PathBuf| !path.starts_with(other) && !other.starts_with(&path)),
+            "native output destination paths overlap"
+        );
         if spec.outputs[name].kind.is_tree() {
             match fs::symlink_metadata(&path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
