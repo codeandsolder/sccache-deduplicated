@@ -59,7 +59,7 @@ pub enum Response {
 /// Maximum application payload in a transfer frame. The framing envelope
 /// stays well below the default 8 MiB IPC frame limit.
 pub const TRANSFER_CHUNK_BYTES: usize = 1024 * 1024;
-pub const NAMESPACE_PROTOCOL_VERSION: u32 = 1;
+pub const NAMESPACE_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum StorageBlob {
@@ -101,6 +101,12 @@ pub enum TransferRequest {
     WorkerLabel {
         server: ServerId,
     },
+    // Native action stream: only a connection that completed the native
+    // handshake can start one. No scheduler tickets or credentials cross IPC.
+    NativeStart,
+    NativeRead,
+    NativeWrite(Vec<u8>),
+    NativeEnd,
     WriteChunk(Vec<u8>),
     FinishWrite,
     ReadChunk,
@@ -139,6 +145,10 @@ impl std::fmt::Debug for TransferRequest {
             Self::BeginRun { .. } => "BeginRun",
             Self::Status => "Status",
             Self::WorkerLabel { .. } => "WorkerLabel",
+            Self::NativeStart => "NativeStart",
+            Self::NativeRead => "NativeRead",
+            Self::NativeWrite(_) => "NativeWrite",
+            Self::NativeEnd => "NativeEnd",
             Self::WriteChunk(_) => "WriteChunk",
             Self::FinishWrite => "FinishWrite",
             Self::ReadChunk => "ReadChunk",
@@ -224,4 +234,17 @@ pub struct StorageHandshakeInfo {
     pub namespace_protocol: u32,
     pub transfer_chunk_bytes: usize,
     pub dist_rewrite_includes_only: Option<bool>,
+    pub native: Option<NativeNamespacePolicy>,
+}
+
+/// Public execution limits and platform identity for a namespace caller.
+/// Endpoints, authentication and worker allocation capabilities are private
+/// to the daemon.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NativeNamespacePolicy {
+    pub platform: crate::build_runtime::ContentId,
+    pub build_timeout_secs: u64,
+    pub renewal_interval_secs: u64,
+    pub max_metadata_bytes: u64,
+    pub max_result_bytes: u64,
 }

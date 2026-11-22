@@ -83,6 +83,18 @@ impl IpcStorage {
         toolchains: Vec<crate::config::DistToolchainConfig>,
     ) -> crate::server::DistClientContainer {
         use crate::server::{DistClientContainer, DistClientState};
+        #[cfg(target_os = "linux")]
+        if let Some(policy) = &self.handshake.native {
+            return DistClientContainer::new_native(
+                crate::compiler::NativeCompilerClient::from_namespace(
+                    self.conn(),
+                    self.handshake.transfer_chunk_bytes,
+                    policy.clone(),
+                    toolchains,
+                ),
+            );
+        }
+
         self.handshake.dist_rewrite_includes_only.map_or_else(
             DistClientContainer::new_disabled,
             |rewrite| {

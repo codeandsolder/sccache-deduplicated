@@ -304,15 +304,12 @@ impl DistClientContainer {
     fn new(config: &Config, pool: &tokio::runtime::Handle) -> Self {
         #[cfg(target_os = "linux")]
         if let Some(native) = &config.dist.native {
-            return Self {
-                state: futures::lock::Mutex::new(DistClientState::Disabled),
-                native: Some(Arc::new(crate::compiler::NativeCompilerClient::new(
-                    native.clone(),
-                    config.dist.scheduler_url.clone(),
-                    config.dist.auth.clone(),
-                    config.dist.toolchains.clone(),
-                ))),
-            };
+            return Self::new_native(crate::compiler::NativeCompilerClient::new(
+                native.clone(),
+                config.dist.scheduler_url.clone(),
+                config.dist.auth.clone(),
+                config.dist.toolchains.clone(),
+            ));
         }
 
         let config = DistClientConfig {
@@ -330,6 +327,14 @@ impl DistClientContainer {
             state: futures::lock::Mutex::new(state),
             #[cfg(target_os = "linux")]
             native: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn new_native(client: crate::compiler::NativeCompilerClient) -> Self {
+        Self {
+            state: futures::lock::Mutex::new(DistClientState::Disabled),
+            native: Some(Arc::new(client)),
         }
     }
 
@@ -698,6 +703,9 @@ fn notify_server_bind_error(notify: Option<&OsString>, error: &io::Error) -> Res
         )
     }
 }
+
+/// The address accepted by the in-process server API.
+pub use crate::net::SocketAddr;
 
 /// Start an sccache server, listening on `addr`.
 ///
@@ -1126,13 +1134,8 @@ where
             }
             Request::StorageHandshake => {
                 debug!("handle_client: storage_handshake");
-                #[cfg(all(feature = "dist-client", target_os = "linux"))]
-                if self.dist_client.native.is_some() {
-                    bail!(
-                        "native compiler mode does not yet support namespace-local compiler requests"
-                    );
-                }
-
+                let dist_rewrite_includes_only =
+                    transfers.initialize_distribution(&self.dist_client).await;
                 let info = StorageHandshakeInfo {
                     location: self.storage.location(),
                     cache_type_name: self.storage.cache_type_name().to_owned(),
@@ -1142,9 +1145,8 @@ where
                     max_size: self.storage.max_size().await.unwrap_or(None),
                     namespace_protocol: crate::protocol::NAMESPACE_PROTOCOL_VERSION,
                     transfer_chunk_bytes: transfers.chunk_bytes(),
-                    dist_rewrite_includes_only: transfers
-                        .initialize_distribution(&self.dist_client)
-                        .await,
+                    dist_rewrite_includes_only,
+                    native: transfers.native_policy(),
                 };
                 Ok(Message::WithoutBody(Response::StorageHandshake(info)))
             }

@@ -7415,8 +7415,9 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         assert_ne!(key_a, key_b);
     }
 
-    #[test]
-    fn test_canonical_unknown_source_falls_back_without_failing() -> Result<()> {
+    #[test_case::test_case(true; "unknown_source")]
+    #[test_case::test_case(false; "output_under_read_only_build")]
+    fn test_canonical_layout_falls_back_without_failing(external_dependency: bool) -> Result<()> {
         let f = TestFixture::new();
         f.touch("foo.rs")?;
         let external = tempfile::tempdir()?;
@@ -7428,7 +7429,11 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             "link,dep-info",
             "foo.rs",
             "--out-dir",
-            "target/out",
+            if external_dependency {
+                "target/out"
+            } else {
+                "out"
+            },
             "--crate-name",
             "foo",
             "--crate-type",
@@ -7441,13 +7446,11 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         };
 
         let creator = new_creator();
-        mock_dep_info(
-            &creator,
-            &[
-                "foo.rs",
-                external_source.to_str().context("non-UTF-8 temp path")?,
-            ],
-        );
+        let mut dependencies = vec!["foo.rs"];
+        if external_dependency {
+            dependencies.push(external_source.to_str().context("non-UTF-8 temp path")?);
+        }
+        mock_dep_info(&creator, &dependencies);
         mock_file_names(&creator, &["foo.rlib"]);
         let runtime = single_threaded_runtime();
         let pool = runtime.handle().clone();
@@ -7503,95 +7506,6 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         assert!(
             !arguments.iter().any(|arg| arg == "--die-with-parent"),
             "fallback unexpectedly kept canonical bubblewrap execution"
-        );
-        assert!(
-            arguments
-                .windows(2)
-                .any(|pair| pair[0] == "--emit" && pair[1] == "link,dep-info"),
-            "ordinary fallback did not preserve the caller's dep-info emission"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_canonical_output_outside_target_falls_back_without_failing() -> Result<()> {
-        let f = TestFixture::new();
-        f.touch("foo.rs")?;
-
-        let raw = [
-            "--emit",
-            "link,dep-info",
-            "foo.rs",
-            "--out-dir",
-            "out",
-            "--crate-name",
-            "foo",
-            "--crate-type",
-            "lib",
-        ];
-        let oargs = raw.iter().map(OsString::from).collect::<Vec<_>>();
-        let parsed_args = match parse_arguments(&oargs, f.tempdir.path()) {
-            CompilerArguments::Ok(parsed_args) => parsed_args,
-            other => bail!("unexpected parse result: {other:?}"),
-        };
-
-        let creator = new_creator();
-        mock_dep_info(&creator, &["foo.rs"]);
-        mock_file_names(&creator, &["foo.rlib"]);
-        let runtime = single_threaded_runtime();
-        let pool = runtime.handle().clone();
-        let mut hasher = RustHasher {
-            executable: "rustc".into(),
-            host: "x86_64-unknown-linux-gnu".to_owned(),
-            version: TEST_RUSTC_VERSION.to_string(),
-            sysroot: f.tempdir.path().join("sysroot"),
-            compiler_shlibs_digests: vec![],
-            dist_archive: None,
-            #[cfg(feature = "dist-client")]
-            rlib_dep_reader: None,
-            native_profile: Some("test-native".into()),
-            parsed_args,
-        };
-        let env = vec![
-            (
-                OsString::from("SCCACHE_EXPERIMENTAL_CANONICAL_RUST"),
-                OsString::from("1"),
-            ),
-            (
-                OsString::from("SCCACHE_CANONICAL_BUILD_ROOT"),
-                f.tempdir.path().as_os_str().to_owned(),
-            ),
-            (
-                OsString::from("SCCACHE_CANONICAL_TARGET_ROOT"),
-                f.tempdir.path().join("target").into_os_string(),
-            ),
-        ];
-
-        let result = hasher
-            .generate_hash_key(GenerateHashKeyContext {
-                creator: &creator,
-                cwd: f.tempdir.path().to_owned(),
-                env_vars: env,
-                may_dist: false,
-                pool: &pool,
-                rewrite_includes_only: false,
-                storage: Arc::new(MockStorage::new(None, false)),
-                cache_control: CacheControl::Default,
-            })
-            .wait()?;
-
-        let mut transformer = dist::PathTransformer::new();
-        let (command, _, _) = result.compilation.generate_compile_commands(
-            &mut transformer,
-            CompileTransport::Archive {
-                rewrite_includes_only: false,
-            },
-        )?;
-        let arguments = command.get_arguments();
-        assert!(
-            !arguments.iter().any(|arg| arg == "--die-with-parent"),
-            "output under read-only /build unexpectedly kept canonical execution"
         );
         assert!(
             arguments

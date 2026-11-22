@@ -19,7 +19,7 @@ use sccache::{
         OutputSpec, SpacePolicy, TreeLayer, TreePath, TreeRecipe,
         wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply},
     },
-    config::{HTTPUrl, scheduler, server},
+    config::{Config, DistAuth, HTTPUrl, NativeClientConfig, scheduler, server},
     dist::{
         SchedulerStatusResult,
         native::{NativeBuildPolicy, NativeBuildSource, NativeCacheClient},
@@ -116,101 +116,159 @@ fn addresses() -> Result<[SocketAddr; 3]> {
         .map_err(|_| anyhow::anyhow!("wrong listener count"))
 }
 
+fn fetch_status(
+    http: &reqwest::blocking::Client,
+    scheduler: &reqwest::Url,
+) -> Result<SchedulerStatusResult> {
+    Ok(http
+        .get(scheduler.join("/api/v1/scheduler/status")?)
+        .header("Accept", "application/json")
+        .send()?
+        .error_for_status()?
+        .json()?)
+}
+
+struct Fleet {
+    worker: Process,
+    scheduler: Process,
+    worker_directory: PathBuf,
+    scheduler_directory: PathBuf,
+    worker_address: SocketAddr,
+    cache_url: reqwest::Url,
+    scheduler_url: reqwest::Url,
+    http: reqwest::blocking::Client,
+}
+
+impl Fleet {
+    fn start(root: &Path) -> Result<Self> {
+        let [scheduler_address, cache_address, worker_address] = addresses()?;
+        let scheduler_url = reqwest::Url::parse(&format!("http://{scheduler_address}/"))?;
+        let cache_url = reqwest::Url::parse(&format!("http://{cache_address}/"))?;
+        let scheduler_directory = root.join("scheduler-store");
+        let worker_directory = root.join("worker-store");
+        let mut scheduler_process = Process::start(
+            root,
+            "scheduler",
+            &scheduler::Config {
+                public_addr: scheduler_address,
+                client_auth: scheduler::ClientAuth::Token {
+                    token: CLIENT_TOKEN.into(),
+                },
+                server_auth: scheduler::ServerAuth::Token {
+                    token: WORKER_TOKEN.into(),
+                },
+                maintenance_drain_file: None,
+                job_slack: scheduler::JobSlackConfig {
+                    static_jobs: 0,
+                    percent: 0.0,
+                },
+                native_cache: Some(scheduler::NativeCacheConfig {
+                    public_addr: cache_address,
+                    directory: scheduler_directory.clone(),
+                    space: space(),
+                    idle_timeout_secs: 120,
+                    max_sessions: 64,
+                    max_result_bytes: 64 * 1024 * 1024,
+                    max_result_blobs: 128,
+                    max_tree_bytes: 4 * 1024 * 1024 * 1024,
+                    max_tree_blobs: 32_768,
+                    max_concurrent_uploads: 2,
+                    max_total_uploads: 4,
+                    http_threads: 8,
+                    max_metadata_bytes: 64 * 1024 * 1024,
+                }),
+            },
+        )?;
+        let http = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()?;
+        let status = || fetch_status(&http, &scheduler_url);
+        wait_for(|| {
+            scheduler_process.check()?;
+            Ok(status().ok())
+        })?;
+        let mut worker_process = Process::start(
+            root,
+            "server",
+            &server::Config {
+                builder: server::BuilderType::Native,
+                cache_dir: None,
+                public_addr: worker_address,
+                bind_address: None,
+                scheduler_url: HTTPUrl::from_url(scheduler_url.clone()),
+                scheduler_auth: server::SchedulerAuth::Token {
+                    token: WORKER_TOKEN.into(),
+                },
+                toolchain_cache_size: 0,
+                toolchain_archive_sources: Vec::new(),
+                native_worker: Some(server::NativeWorkerConfig {
+                    cache_url: HTTPUrl::from_url(cache_url.clone()),
+                    directory: worker_directory.clone(),
+                    space: space(),
+                    scratch: root.join("scratch"),
+                    bubblewrap: "/usr/bin/bwrap".into(),
+                    platform_contract: PLATFORM.into(),
+                    renewal_interval_secs: 1,
+                    request_timeout_secs: 60,
+                    execution_timeout_secs: 120,
+                    max_result_bytes: 64 * 1024 * 1024,
+                    max_metadata_bytes: 64 * 1024 * 1024,
+                }),
+            },
+        )?;
+        wait_for(|| {
+            scheduler_process.check()?;
+            worker_process.check()?;
+            Ok(status()
+                .ok()
+                .filter(|status| status.num_servers == 1 && status.available_jobs > 0))
+        })?;
+        Ok(Self {
+            worker: worker_process,
+            scheduler: scheduler_process,
+            worker_directory,
+            scheduler_directory,
+            worker_address,
+            cache_url,
+            scheduler_url,
+            http,
+        })
+    }
+
+    fn status(&self) -> Result<SchedulerStatusResult> {
+        fetch_status(&self.http, &self.scheduler_url)
+    }
+
+    fn finish(
+        self,
+    ) -> Result<(
+        sccache::build_runtime::CacheStats,
+        sccache::build_runtime::CacheStats,
+    )> {
+        let Self {
+            worker,
+            scheduler,
+            worker_directory,
+            scheduler_directory,
+            ..
+        } = self;
+        drop(worker);
+        drop(scheduler);
+        Ok((
+            NativeStore::open(&scheduler_directory)?.stats()?,
+            NativeStore::open(&worker_directory)?.stats()?,
+        ))
+    }
+}
+
 #[test]
 #[ignore = "requires Linux Bubblewrap, GNU assembler and ldd"]
 fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path();
-    let [scheduler_address, cache_address, worker_address] = addresses()?;
-    let scheduler_url = reqwest::Url::parse(&format!("http://{scheduler_address}/"))?;
-    let cache_url = reqwest::Url::parse(&format!("http://{cache_address}/"))?;
-    let scheduler_directory = root.join("scheduler-store");
-    let worker_directory = root.join("worker-store");
-    let mut scheduler_process = Process::start(
-        root,
-        "scheduler",
-        &scheduler::Config {
-            public_addr: scheduler_address,
-            client_auth: scheduler::ClientAuth::Token {
-                token: CLIENT_TOKEN.into(),
-            },
-            server_auth: scheduler::ServerAuth::Token {
-                token: WORKER_TOKEN.into(),
-            },
-            maintenance_drain_file: None,
-            job_slack: scheduler::JobSlackConfig {
-                static_jobs: 0,
-                percent: 0.0,
-            },
-            native_cache: Some(scheduler::NativeCacheConfig {
-                public_addr: cache_address,
-                directory: scheduler_directory.clone(),
-                space: space(),
-                idle_timeout_secs: 30,
-                max_sessions: 32,
-                max_result_bytes: 16 * 1024 * 1024,
-                max_result_blobs: 16,
-                max_tree_bytes: 256 * 1024 * 1024,
-                max_tree_blobs: 512,
-                max_concurrent_uploads: 2,
-                max_total_uploads: 4,
-                http_threads: 8,
-                max_metadata_bytes: 1024 * 1024,
-            }),
-        },
-    )?;
-    let http = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()?;
-    let status_url = scheduler_url.join("/api/v1/scheduler/status")?;
-    let status = || -> Result<SchedulerStatusResult> {
-        Ok(http
-            .get(status_url.clone())
-            .header("Accept", "application/json")
-            .send()?
-            .error_for_status()?
-            .json()?)
-    };
-    wait_for(|| {
-        scheduler_process.check()?;
-        Ok(status().ok())
-    })?;
-    let mut worker_process = Process::start(
-        root,
-        "server",
-        &server::Config {
-            builder: server::BuilderType::Native,
-            cache_dir: None,
-            public_addr: worker_address,
-            bind_address: None,
-            scheduler_url: HTTPUrl::from_url(scheduler_url),
-            scheduler_auth: server::SchedulerAuth::Token {
-                token: WORKER_TOKEN.into(),
-            },
-            toolchain_cache_size: 0,
-            toolchain_archive_sources: Vec::new(),
-            native_worker: Some(server::NativeWorkerConfig {
-                cache_url: HTTPUrl::from_url(cache_url.clone()),
-                directory: worker_directory.clone(),
-                space: space(),
-                scratch: root.join("scratch"),
-                bubblewrap: "/usr/bin/bwrap".into(),
-                platform_contract: PLATFORM.into(),
-                renewal_interval_secs: 1,
-                request_timeout_secs: 10,
-                execution_timeout_secs: 10,
-                max_result_bytes: 16 * 1024 * 1024,
-                max_metadata_bytes: 1024 * 1024,
-            }),
-        },
-    )?;
-    wait_for(|| {
-        scheduler_process.check()?;
-        worker_process.check()?;
-        Ok(status()
-            .ok()
-            .filter(|status| status.num_servers == 1 && status.available_jobs > 0))
-    })?;
+    let fleet = Fleet::start(root)?;
+    let worker_address = fleet.worker_address;
+    let cache_url = fleet.cache_url.clone();
     let client = NativeCacheClient::new(
         cache_url,
         CLIENT_TOKEN.into(),
@@ -330,7 +388,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     };
     assert_eq!(cached, manifest);
     client.close(hit)?;
-    assert_eq!(status()?.in_progress, 0);
+    assert_eq!(fleet.status()?.in_progress, 0);
 
     let inputs = [root_tree, source_tree];
     let policy = NativeBuildPolicy {
@@ -380,14 +438,270 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     assert_eq!(failed.source, NativeBuildSource::Worker(worker_address));
     assert!(!failed.output.status.success());
     assert!(!failed.output.stderr.is_empty());
-    drop(worker_process);
-    drop(scheduler_process);
-    let worker_stats = NativeStore::open(&worker_directory)?.stats()?;
-    let scheduler_stats = NativeStore::open(&scheduler_directory)?.stats()?;
+    let (scheduler_stats, worker_stats) = fleet.finish()?;
     assert_eq!(worker_stats.actions, 0);
     assert_eq!(scheduler_stats.actions, 2);
     assert_eq!(scheduler_stats.results, 1);
     assert_eq!(worker_stats.trees, 2);
     assert_eq!(scheduler_stats.trees, 2);
+    Ok(())
+}
+
+/// A test-owned in-process service, not a separately launched managed
+/// sccache daemon. It listens exclusively on a temporary Unix socket.
+struct LocalService {
+    socket: PathBuf,
+    caller_config: PathBuf,
+    cached_config: PathBuf,
+    thread: Option<thread::JoinHandle<Result<()>>>,
+}
+
+impl LocalService {
+    fn start(root: &Path, fleet: &Fleet) -> Result<Self> {
+        let socket = root.join("client.sock");
+        let caller_config = root.join("caller.toml");
+        let cached_config = root.join("caller-cached.toml");
+        fs::write(&caller_config, "client_side_mode = true\n")?;
+        let mut config = Config::default();
+        config.dist.scheduler_url = Some(HTTPUrl::from_url(fleet.scheduler_url.clone()));
+        config.dist.auth = DistAuth::Token {
+            token: CLIENT_TOKEN.into(),
+        };
+        config.dist.native = Some(NativeClientConfig {
+            endpoint: HTTPUrl::from_url(fleet.cache_url.clone()),
+            platform_contract: PLATFORM.into(),
+            request_timeout_secs: 60,
+            build_timeout_secs: 180,
+            renewal_interval_secs: 1,
+            max_metadata_bytes: 64 * 1024 * 1024,
+            max_result_bytes: 64 * 1024 * 1024,
+        });
+        config.fallback_cache.dir = root.join("unexpected-archive-cache");
+        config.dist.cache_dir = root.join("unexpected-toolchain-cache");
+        let address = sccache::server::SocketAddr::parse_uds(
+            socket
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("non-UTF8 socket path"))?,
+        )?;
+        let thread = thread::spawn(move || sccache::server::start_server(&config, &address));
+        let mut service = Self {
+            socket,
+            caller_config,
+            cached_config,
+            thread: Some(thread),
+        };
+        wait_for(|| {
+            if service
+                .thread
+                .as_ref()
+                .is_some_and(thread::JoinHandle::is_finished)
+            {
+                service.join()?;
+                anyhow::bail!("test sccache service exited during start");
+            }
+            Ok(std::os::unix::net::UnixStream::connect(&service.socket)
+                .ok()
+                .map(|_| ()))
+        })?;
+        Ok(service)
+    }
+
+    fn command(&self, executable: impl AsRef<std::ffi::OsStr>) -> Command {
+        let mut command = Command::new(executable);
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("SCCACHE_SERVER_UDS", &self.socket)
+            .env("SCCACHE_CONF", &self.caller_config)
+            .env("SCCACHE_CACHED_CONF", &self.cached_config)
+            .env("SCCACHE_NO_AUTO_START_SERVER", "1")
+            .env("SCCACHE_LOG", "sccache=debug");
+        command
+    }
+
+    fn stats(&self) -> Result<sccache::server::ServerStats> {
+        let output = self
+            .command(env!("CARGO_BIN_EXE_sccache"))
+            .args(["--show-stats", "--stats-format=json"])
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "test stats request failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let info: sccache::server::ServerInfo = serde_json::from_slice(&output.stdout)?;
+        Ok(info.stats)
+    }
+
+    fn join(&mut self) -> Result<()> {
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("test sccache service panicked"))??;
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        if self.thread.is_some() {
+            let output = self
+                .command(env!("CARGO_BIN_EXE_sccache"))
+                .arg("--stop-server")
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "test stop failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            self.join()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for LocalService {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+fn compiler_script() -> &'static str {
+    r#"
+set -eu
+mkdir -p build
+"$2" -c probe.c -o build/probe.o -MMD -MF build/probe-c.d
+"$3" --crate-name probe --crate-type rlib --edition=2024 --emit=link,dep-info --out-dir build probe.rs
+cp build/probe.o gcc-reference.o
+cp build/libprobe.rlib rust-reference.rlib
+for i in 1 2; do
+    rm -f build/probe.o build/libprobe.rlib build/probe.d build/probe-c.d
+    "$1" "$2" -c probe.c -o build/probe.o -MMD -MF build/probe-c.d
+    "$1" "$3" --crate-name probe --crate-type rlib --edition=2024 --emit=link,dep-info --out-dir build probe.rs
+    cmp gcc-reference.o build/probe.o
+    cmp rust-reference.rlib build/libprobe.rlib
+    test -s build/probe-c.d
+    test -s build/probe.d
+done
+"#
+}
+
+fn write_compiler_sources(root: &Path) -> Result<()> {
+    fs::create_dir(root)?;
+    fs::write(
+        root.join("probe.c"),
+        b"int namespace_probe(void) { return 42; }\n",
+    )?;
+    fs::write(
+        root.join("probe.rs"),
+        b"pub fn namespace_probe() -> u32 { 42 }\n",
+    )?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Linux Bubblewrap, GCC, Rust toolchain and ldd"]
+fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let fleet = Fleet::start(&root)?;
+    let mut service = LocalService::start(&root, &fleet)?;
+    let rustc = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()?;
+    ensure!(rustc.status.success(), "could not discover test sysroot");
+    let rustc = PathBuf::from(String::from_utf8(rustc.stdout)?.trim()).join("bin/rustc");
+    let direct = root.join("direct");
+    write_compiler_sources(&direct)?;
+    let direct_config = root.join("direct.toml");
+    fs::write(&direct_config, "client_side_mode = false\n")?;
+    let start = Instant::now();
+    let output = service
+        .command("/bin/sh")
+        .args([
+            "-c",
+            compiler_script(),
+            "direct-test",
+            env!("CARGO_BIN_EXE_sccache"),
+            "/usr/bin/gcc",
+        ])
+        .arg(&rustc)
+        .current_dir(&direct)
+        .env("SCCACHE_CONF", &direct_config)
+        .output()?;
+    eprintln!(
+        "direct compiler elapsed {:?}:\n{}",
+        start.elapsed(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    ensure!(
+        output.status.success(),
+        "direct native compiler path failed"
+    );
+    let stats = service.stats()?;
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 2);
+    assert_eq!(stats.cache_hits.all(), 2);
+    assert_eq!(stats.cache_misses.all(), 2);
+    assert_eq!(stats.dist_errors, 0);
+
+    let visible = root.join("visible");
+    let private = root.join("private");
+    fs::create_dir(&visible)?;
+    fs::write(visible.join("probe.c"), b"#error wrong daemon source\n")?;
+    fs::write(
+        visible.join("probe.rs"),
+        b"compile_error!(\"wrong daemon source\");\n",
+    )?;
+    write_compiler_sources(&private)?;
+    let start = Instant::now();
+    let output = service
+        .command("/usr/bin/bwrap")
+        .args([
+            "--unshare-net",
+            "--bind",
+            "/",
+            "/",
+            "--dev-bind",
+            "/dev",
+            "/dev",
+            "--bind",
+        ])
+        .arg(&private)
+        .arg(&visible)
+        .arg("--chdir")
+        .arg(&visible)
+        .args([
+            "--",
+            "/bin/sh",
+            "-c",
+            compiler_script(),
+            "namespace-test",
+            env!("CARGO_BIN_EXE_sccache"),
+            "/usr/bin/gcc",
+        ])
+        .arg(&rustc)
+        .output()?;
+    eprintln!(
+        "namespace compiler elapsed {:?}:\n{}",
+        start.elapsed(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    ensure!(
+        output.status.success(),
+        "native namespace compiler path failed"
+    );
+    let stats = service.stats()?;
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 4);
+    assert_eq!(stats.cache_hits.all(), 4);
+    assert_eq!(stats.cache_misses.all(), 4);
+    assert_eq!(stats.dist_errors, 0);
+    assert!(private.join("build/probe.o").is_file());
+    assert!(private.join("build/libprobe.rlib").is_file());
+    assert!(!visible.join("build").exists());
+    assert!(!root.join("unexpected-archive-cache").exists());
+    assert!(!root.join("unexpected-toolchain-cache").exists());
+    service.stop()?;
+    let (scheduler, worker) = fleet.finish()?;
+    assert_eq!(scheduler.actions, 4);
+    assert_eq!(worker.actions, 0);
     Ok(())
 }

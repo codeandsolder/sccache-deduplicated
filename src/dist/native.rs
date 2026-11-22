@@ -421,38 +421,13 @@ impl NativeCacheClient {
         blob: BlobRef,
         mut destination: impl Write,
     ) -> Result<()> {
-        let response = self.download_response(ticket, blob.id)?;
-        let limit = blob
-            .size
-            .checked_add(1)
-            .context("native download size overflow")?;
-        let mut reader = response.take(limit);
-        let mut hash = blake3::Hasher::new();
-        let mut buffer = vec![0_u8; 64 * 1024];
-        let mut received = 0_u64;
-        loop {
-            let count = match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(count) => count,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error.into()),
-            };
-            received = received
-                .checked_add(u64::try_from(count)?)
-                .context("native download length overflow")?;
-            ensure!(
-                received <= blob.size,
-                "native download exceeds declared length"
-            );
-            hash.update(&buffer[..count]);
-            destination.write_all(&buffer[..count])?;
-        }
-        ensure!(
-            received == blob.size && ContentId(*hash.finalize().as_bytes()) == blob.id,
-            "native download digest or length mismatch"
-        );
-        Ok(())
+        copy_verified(
+            self.download_response(ticket, blob.id)?,
+            blob,
+            &mut destination,
+        )
     }
+
     fn download_response(
         &self,
         ticket: Ticket,
@@ -465,6 +440,39 @@ impl NativeCacheClient {
             .send()?
             .error_for_status()?)
     }
+}
+
+fn copy_verified(reader: impl Read, blob: BlobRef, mut destination: impl Write) -> Result<()> {
+    let limit = blob
+        .size
+        .checked_add(1)
+        .context("native download size overflow")?;
+    let mut reader = reader.take(limit);
+    let mut hash = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut received = 0_u64;
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        received = received
+            .checked_add(u64::try_from(count)?)
+            .context("native download length overflow")?;
+        ensure!(
+            received <= blob.size,
+            "native download exceeds declared length"
+        );
+        hash.update(&buffer[..count]);
+        destination.write_all(&buffer[..count])?;
+    }
+    ensure!(
+        received == blob.size && ContentId(*hash.finalize().as_bytes()) == blob.id,
+        "native download digest or length mismatch"
+    );
+    Ok(())
 }
 
 fn decode_response<T: DeserializeOwned>(
@@ -494,3 +502,6 @@ mod worker;
 mod client;
 #[cfg(all(target_os = "linux", feature = "dist-client"))]
 pub use client::{NativeBuildPolicy, NativeBuildResult, NativeBuildSource};
+
+#[cfg(all(target_os = "linux", feature = "dist-client"))]
+pub(crate) mod broker;

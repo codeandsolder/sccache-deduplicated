@@ -20,13 +20,15 @@ use crate::{
         SourceDigestCache, TreeRecipe,
     },
     cache::FileObjectSource,
+    client::{SharedConnection, connection_task},
     config::{DistAuth, DistToolchainConfig, HTTPUrl, NativeClientConfig},
     dist::{
         self,
-        native::{NativeBuildPolicy, NativeBuildResult, NativeBuildSource, NativeCacheClient},
+        native::{NativeBuildResult, NativeBuildSource, NativeCacheClient, broker},
         pkg,
     },
     mock_command::CommandCreatorSync,
+    protocol::{NativeNamespacePolicy, Request, Response},
     server::{DistClientContainer, DistInfo, SccacheService},
 };
 
@@ -34,10 +36,21 @@ use super::{
     CacheControl, Cacheable, Compilation, CompileResult, CompileTransport, DistPackagers, DistType,
 };
 
+enum Endpoint {
+    Direct {
+        config: NativeClientConfig,
+        scheduler: Option<HTTPUrl>,
+        auth: DistAuth,
+    },
+    Namespace {
+        connection: SharedConnection,
+        chunk_bytes: usize,
+    },
+}
+
 pub struct NativeCompilerClient {
-    config: NativeClientConfig,
-    scheduler: Option<HTTPUrl>,
-    auth: DistAuth,
+    endpoint: Endpoint,
+    policy: NativeNamespacePolicy,
     toolchains: Vec<DistToolchainConfig>,
     toolchain_digests: SourceDigestCache,
 }
@@ -49,34 +62,85 @@ impl NativeCompilerClient {
         auth: DistAuth,
         toolchains: Vec<DistToolchainConfig>,
     ) -> Self {
+        let policy = NativeNamespacePolicy {
+            platform: ContentId::of(config.platform_contract.as_bytes()),
+            build_timeout_secs: config.build_timeout_secs,
+            renewal_interval_secs: config.renewal_interval_secs,
+            max_metadata_bytes: config.max_metadata_bytes,
+            max_result_bytes: config.max_result_bytes,
+        };
         Self {
-            config,
-            scheduler,
-            auth,
+            endpoint: Endpoint::Direct {
+                config,
+                scheduler,
+                auth,
+            },
+            policy,
             toolchains,
             toolchain_digests: SourceDigestCache::default(),
         }
     }
 
-    pub async fn status(&self) -> DistInfo {
-        let result = async {
-            let scheduler = self
-                .scheduler
-                .as_ref()
-                .context("scheduler URL unavailable")?;
-            let url = dist::http::urls::scheduler_status(&scheduler.to_url())?;
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(self.config.request_timeout_secs))
-                .build()?;
-            dist::http::common::bincode_req_fut(client.get(url)).await
+    pub fn from_namespace(
+        connection: SharedConnection,
+        chunk_bytes: usize,
+        policy: NativeNamespacePolicy,
+        toolchains: Vec<DistToolchainConfig>,
+    ) -> Self {
+        Self {
+            endpoint: Endpoint::Namespace {
+                connection,
+                chunk_bytes,
+            },
+            policy,
+            toolchains,
+            toolchain_digests: SourceDigestCache::default(),
         }
-        .await;
-        match result {
-            Ok(status) => DistInfo::SchedulerStatus(self.scheduler.clone(), status),
-            Err(error) => DistInfo::NotConnected(
-                self.scheduler.clone(),
-                format!("native scheduler unavailable: {error:#}"),
-            ),
+    }
+
+    pub const fn namespace_policy(&self) -> &NativeNamespacePolicy {
+        &self.policy
+    }
+
+    pub fn serve_namespace(&self, stream: broker::DaemonStream) -> Result<()> {
+        let client = self.connect_http()?;
+        broker::serve_action(&client, &self.policy, stream)
+    }
+
+    pub async fn status(&self) -> DistInfo {
+        match &self.endpoint {
+            Endpoint::Namespace { connection, .. } => {
+                let result = connection_task(Arc::clone(connection), |conn| {
+                    let Response::DistStatus(status) = conn.request(Request::DistStatus)? else {
+                        anyhow::bail!("unexpected native namespace distribution status");
+                    };
+                    Ok(status)
+                })
+                .await;
+                result.unwrap_or_else(|error| {
+                    DistInfo::NotConnected(None, format!("native daemon unavailable: {error:#}"))
+                })
+            }
+            Endpoint::Direct {
+                config, scheduler, ..
+            } => {
+                let result = async {
+                    let scheduler = scheduler.as_ref().context("scheduler URL unavailable")?;
+                    let url = dist::http::urls::scheduler_status(&scheduler.to_url())?;
+                    let client = reqwest::Client::builder()
+                        .timeout(Duration::from_secs(config.request_timeout_secs))
+                        .build()?;
+                    dist::http::common::bincode_req_fut(client.get(url)).await
+                }
+                .await;
+                match result {
+                    Ok(status) => DistInfo::SchedulerStatus(scheduler.clone(), status),
+                    Err(error) => DistInfo::NotConnected(
+                        scheduler.clone(),
+                        format!("native scheduler unavailable: {error:#}"),
+                    ),
+                }
+            }
         }
     }
 
@@ -92,26 +156,45 @@ impl NativeCompilerClient {
         })
     }
 
-    fn execute(&self, plan: &CompilerPlan) -> Result<NativeBuildResult> {
-        let token = match &self.auth {
+    fn connect_http(&self) -> Result<NativeCacheClient> {
+        let Endpoint::Direct { config, auth, .. } = &self.endpoint else {
+            anyhow::bail!("namespace client cannot authenticate directly with scheduler");
+        };
+        let token = match auth {
             DistAuth::Token { token } => token.clone(),
             DistAuth::Oauth2CodeGrantPKCE { auth_url, .. }
             | DistAuth::Oauth2Implicit { auth_url, .. } => {
                 DistClientContainer::get_cached_config_auth_token(auth_url)?
             }
         };
-        let client = NativeCacheClient::new(
-            self.config.endpoint.to_url(),
+        NativeCacheClient::new(
+            config.endpoint.to_url(),
             token,
-            Duration::from_secs(self.config.request_timeout_secs),
-            self.config.max_metadata_bytes,
-        )?;
-        let policy = NativeBuildPolicy {
-            timeout: Duration::from_secs(self.config.build_timeout_secs),
-            renewal_interval: Duration::from_secs(self.config.renewal_interval_secs),
-            max_result_bytes: self.config.max_result_bytes,
-        };
-        client.run_action(&plan.spec, &plan.inputs, &plan.destinations, &policy)
+            Duration::from_secs(config.request_timeout_secs),
+            config.max_metadata_bytes,
+        )
+    }
+
+    fn execute(&self, plan: &CompilerPlan) -> Result<NativeBuildResult> {
+        match &self.endpoint {
+            Endpoint::Direct { .. } => self.connect_http()?.run_action(
+                &plan.spec,
+                &plan.inputs,
+                &plan.destinations,
+                &self.policy.build_policy(),
+            ),
+            Endpoint::Namespace {
+                connection,
+                chunk_bytes,
+            } => broker::run_action(
+                connection,
+                *chunk_bytes,
+                &self.policy,
+                &plan.spec,
+                &plan.inputs,
+                &plan.destinations,
+            ),
+        }
     }
 }
 
@@ -251,7 +334,7 @@ pub(super) async fn compile<T: CommandCreatorSync>(
                     outputs,
                     layout,
                     packagers,
-                    ContentId::of(client.config.platform_contract.as_bytes()),
+                    client.policy.platform,
                     &client.toolchain_digests,
                 )?;
                 client.execute(&plan)

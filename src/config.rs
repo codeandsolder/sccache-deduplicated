@@ -1815,10 +1815,6 @@ impl Config {
         if let Some(native) = &dist.native {
             native.validate()?;
             anyhow::ensure!(
-                !client_side_mode,
-                "native compiler mode does not yet support the namespace broker"
-            );
-            anyhow::ensure!(
                 dist.scheduler_url.is_some(),
                 "native compiler mode requires the scheduler status URL"
             );
@@ -4092,6 +4088,6 @@ max_result_bytes = 1073741824
         make(&input.replace("renewal_interval_secs = 15", "renewal_interval_secs = 0")).is_err()
     );
     assert!(make(&input.replace("scheduler_url = \"http://127.0.0.1:10500\"", "")).is_err());
-    assert!(make(&format!("client_side_mode = true\n{input}")).is_err());
+    assert!(make(&format!("client_side_mode = true\n{input}"))?.client_side_mode);
     Ok(())
 }

@@ -180,9 +180,17 @@ needed for identical rlib metadata.
 
 Unavailable native execution, unsupported custom toolchains, non-cacheable
 commands and forced-cache policy requests currently execute locally without
-archive caching. Forced recache does not yet replace a native action. Native
-mode rejects namespace-broker/client-side mode until that path uses the
-native protocol.
+archive caching. Forced recache does not yet replace a native action. In client-side mode, the caller needs only
+`client_side_mode = true` and access to the existing managed daemon's socket.
+The daemon supplies the platform and resource policy in its namespace
+handshake; endpoint URLs, authentication and job capabilities remain private.
+The native action transaction runs in the daemon, requesting manifests and
+missing blobs over a connection-owned bounded byte stream. The caller alone
+discovers sources and installs outputs. The daemon verifies scheduler result
+streams, the caller independently verifies them, and final completion
+precedes publication. No client or daemon archive staging is required.
+The stream has bounded queues, frame limits and an absolute deadline;
+disconnect releases or expires the native action pins.
 
 ## Toolchain discovery and mapped trees
 
@@ -222,6 +230,11 @@ The scheduler unit test checks platform matching and shared capacity.
 A subprocess integration test uses real assembler dependency discovery, direct CAS transfer, the scheduler, HTTPS job claiming and a native-only Bubblewrap worker; it compares object bytes against local assembly and verifies cache reuse and failed-action handling.
 Real GCC and Rust compiler-plan tests compare native sandbox outputs
 byte-for-byte against direct compiler invocations, including local dep-info
-generation. Full ordinary-client network integration, namespace brokering,
-production deployment, multi-host benchmarking and hard scratch quotas
-remain separate integration work.
+generation. A subprocess integration additionally runs real GCC and Rust through an
+in-process sccache IPC service, real scheduler and native worker, both
+directly and through a networkless Bubblewrap caller whose source files
+differ from the daemon's files at the same paths. All four misses must
+execute remotely, all four repeated calls must hit, and artifacts must
+match the direct compiler byte-for-byte. The service never creates either
+legacy cache. Production deployment, multi-host benchmarking and hard
+scratch quotas remain separate integration work.
