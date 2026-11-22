@@ -51,8 +51,13 @@ impl IpcStorage {
     /// # Errors
     ///
     /// Returns an error if the handshake request fails or the daemon returns an unexpected response.
-    pub fn connect(mut conn: ServerConnection) -> Result<Self> {
-        let resp = conn.request(Request::StorageHandshake)?;
+    pub async fn connect(conn: ServerConnection) -> Result<Self> {
+        let closed = conn.session_health();
+        let conn = Arc::new(Mutex::new(conn));
+        let resp = connection_task(Arc::clone(&conn), |conn| {
+            conn.request(Request::StorageHandshake)
+        })
+        .await?;
         let handshake = match resp {
             Response::StorageHandshake(info) => info,
             other => bail!("IpcStorage: unexpected handshake response: {other:?}"),
@@ -67,8 +72,8 @@ impl IpcStorage {
             "invalid daemon chunk size"
         );
         Ok(Self {
-            closed: conn.session_health(),
-            conn: Arc::new(Mutex::new(conn)),
+            closed,
+            conn,
             handshake,
         })
     }

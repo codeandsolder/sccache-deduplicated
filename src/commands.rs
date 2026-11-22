@@ -640,16 +640,15 @@ where
         _ => None,
     };
 
-    handle_compile_result(
-        creator, runtime, response, result, invocation, stdout, stderr,
-    )
+    runtime.block_on(handle_compile_result(
+        creator, response, result, invocation, stdout, stderr,
+    ))
 }
 
 /// Dispatch the outcome of a compile, whether received from the daemon over IPC
 /// or produced by a local `SccacheService` in client-side mode.
-fn handle_compile_result<T>(
+async fn handle_compile_result<T>(
     mut creator: T,
-    runtime: &Runtime,
     response: CompileResponse,
     finished: Option<CompileFinished>,
     invocation: &CompileInvocation<'_>,
@@ -690,13 +689,13 @@ where
         trace!("running command: {cmd:?}");
     }
 
-    let status = runtime.block_on(async move {
-        let child = cmd.spawn().await?;
-        child
-            .wait()
-            .await
-            .with_context(|| "failed to wait for a child")
-    })?;
+    server::activity::phase(server::activity::Phase::LocalCompile);
+    let status = cmd
+        .spawn()
+        .await?
+        .wait()
+        .await
+        .context("failed to wait for a child")?;
 
     Ok(status.code().unwrap_or_else(|| {
         if let Some(sig) = status_signal(status) {
@@ -775,23 +774,6 @@ where
 {
     trace!("do_compile_client_side");
     let exe_path = which_in(invocation.exe, env::var_os("PATH"), invocation.cwd)?;
-    let storage = IpcStorage::connect(conn)?;
-    let conn_arc = storage.conn();
-    let (tx, _rx) = futures::channel::mpsc::channel(1);
-    let (_, info) = server::WaitUntilZero::new();
-    #[cfg(feature = "dist-client")]
-    let dist_client = storage.dist_client(config.dist.toolchains.clone());
-    #[cfg(not(feature = "dist-client"))]
-    let dist_client = server::DistClientContainer::new_disabled();
-    let service = server::SccacheService::<C>::new(
-        dist_client,
-        Arc::new(storage),
-        jobserver,
-        runtime.handle().clone(),
-        tx,
-        info,
-        config.compiler_aliases.clone(),
-    );
     let compile = Compile {
         client_pid: std::process::id(),
         exe: exe_path.as_os_str().to_owned(),
@@ -799,27 +781,45 @@ where
         args: invocation.cmdline.clone(),
         env_vars: invocation.env_vars.clone(),
     };
-    let (compile_resp, finished) = runtime.block_on(service.compile_direct(compile))?;
+    let observer = crate::client::CompileObserver::connect(&get_addr(), (&compile).into())?;
     let creator = C::new(jobserver);
     let invocation = CompileInvocation {
         exe: &exe_path,
         ..invocation
     };
-    let exit_code = handle_compile_result(
-        creator,
-        runtime,
-        compile_resp,
-        finished,
-        &invocation,
-        stdout,
-        stderr,
-    )?;
-    // Ship accumulated stats back to the daemon (best-effort; don't fail the build on error).
-    let delta: ServerStats = runtime.block_on(service.take_stats());
-    let _ = runtime.block_on(crate::client::connection_task(conn_arc, move |conn| {
-        conn.request(Request::RecordStats(Box::new(delta)))
-    }));
-    Ok(exit_code)
+    runtime.block_on(observer.run(async {
+        server::activity::phase(server::activity::Phase::ResolveDistribution);
+        let storage = IpcStorage::connect(conn).await?;
+        let conn_arc = storage.conn();
+        let (tx, _rx) = futures::channel::mpsc::channel(1);
+        let (_, info) = server::WaitUntilZero::new();
+        #[cfg(feature = "dist-client")]
+        let dist_client = storage.dist_client(config.dist.toolchains.clone());
+        #[cfg(not(feature = "dist-client"))]
+        let dist_client = server::DistClientContainer::new_disabled();
+        let service = server::SccacheService::<C>::new(
+            dist_client,
+            Arc::new(storage),
+            jobserver,
+            runtime.handle().clone(),
+            tx,
+            info,
+            config.compiler_aliases.clone(),
+        );
+        server::activity::phase(server::activity::Phase::DetectCompiler);
+        let (compile_resp, finished) = service.compile_direct(compile).await?;
+        let exit_code =
+            handle_compile_result(creator, compile_resp, finished, &invocation, stdout, stderr)
+                .await?;
+        // Ship accumulated stats back to the daemon (best-effort; don't fail the build on error).
+        server::activity::phase(server::activity::Phase::RecordResult);
+        let delta: ServerStats = service.take_stats().await;
+        let _ = crate::client::connection_task(conn_arc, move |conn| {
+            conn.request(Request::RecordStats(Box::new(delta)))
+        })
+        .await;
+        Ok(exit_code)
+    }))
 }
 
 fn show_active_compiles() -> Result<()> {
@@ -1258,15 +1258,14 @@ mod test {
         let mut stdout = vec![];
         let mut stderr = vec![];
 
-        let code = handle_compile_result(
+        let code = runtime.block_on(handle_compile_result(
             creator,
-            &runtime,
             CompileResponse::UnhandledCompile,
             None,
             &invocation,
             &mut stdout,
             &mut stderr,
-        )?;
+        ))?;
 
         assert_eq!(code, 0);
         Ok(())

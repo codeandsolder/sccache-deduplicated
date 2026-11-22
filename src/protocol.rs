@@ -33,6 +33,10 @@ pub enum Request {
     ActiveCompiles,
     /// Request cancellation of one active daemon-owned compile.
     CancelCompile(String),
+    /// Open a dedicated observation connection for a caller-owned compile.
+    ObserveCompile(CompileIdentity),
+    /// Report caller-monotonic phase ages on that connection.
+    ObservePhase(crate::server::activity::CompileActivity),
 }
 
 /// A server response.
@@ -69,12 +73,15 @@ pub enum Response {
     Heartbeat,
     /// The connection-owned operation was abandoned; the session is invalid.
     RequestAborted(String),
+    /// The daemon registered a caller-owned compile with this ID.
+    CompileObserved(String),
+    ObservationAccepted,
 }
 
 /// Maximum application payload in a transfer frame. The framing envelope
 /// stays well below the default 8 MiB IPC frame limit.
 pub const TRANSFER_CHUNK_BYTES: usize = 1024 * 1024;
-pub const NAMESPACE_PROTOCOL_VERSION: u32 = 3;
+pub const NAMESPACE_PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum StorageBlob {
@@ -227,6 +234,25 @@ pub struct Compile {
     pub args: Vec<OsString>,
     /// The environment variables present when the compiler was executed, as (var, val).
     pub env_vars: Vec<(OsString, OsString)>,
+}
+
+/// Compiler identity for observation only. Arguments and environment are
+/// never sent to the daemon merely to observe a caller-owned compile.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompileIdentity {
+    pub client_pid: u32,
+    pub exe: OsString,
+    pub cwd: OsString,
+}
+
+impl From<&Compile> for CompileIdentity {
+    fn from(value: &Compile) -> Self {
+        Self {
+            client_pid: value.client_pid,
+            exe: value.exe.clone(),
+            cwd: value.cwd.clone(),
+        }
+    }
 }
 
 /// Cache metadata returned by the daemon on `StorageHandshake`.

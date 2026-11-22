@@ -241,7 +241,7 @@ phase_timeout_secs = 1800
 execution_timeout_secs = 7200
 ```
 
-The longer execution deadline applies to compiler hashing/probes, local compilation and distributed execution. These are elapsed phase limits, not a measurement of compiler CPU progress; a legitimate unusually long phase may require a larger configured budget. Cancellation drops the pending request and its cancellable tasks, but cannot revoke already-running blocking I/O. This diagnostic protocol covers daemon-owned compile RPCs, not the complete lifetime of a client-side namespace compilation.
+The longer execution deadline applies to compiler hashing/probes, local compilation and distributed execution. These are elapsed phase limits, not a measurement of compiler CPU progress; a legitimate unusually long phase may require a larger configured budget. Cancellation drops the pending request and its cancellable tasks, but cannot revoke already-running blocking I/O. Client-side namespace compilations use an independent observation connection carrying phase snapshots every 15 seconds, including the storage handshake and local fallback. This cannot be blocked by a pending data RPC. The listing distinguishes daemon and namespace ownership, and reports the age of the most recent caller observation. Cancellation or loss of the observation connection aborts the pending caller future; it still cannot revoke already-running blocking I/O.
 
 
 **For versions of cmake 3.25 and later**, to compile with MSVC, you have to use the new `CMAKE_MSVC_DEBUG_INFORMATION_FORMAT` option, meant to configure the `-Z7` flag.  Additionally, you must set the cmake policy number 0141 to the NEW setting:

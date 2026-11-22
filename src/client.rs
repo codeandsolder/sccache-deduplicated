@@ -249,6 +249,61 @@ fn spawn_transaction<T: Send + 'static>(
     })
 }
 
+/// Dedicated control link, independent of a long-running data transfer.
+pub struct CompileObserver {
+    connection: SharedConnection,
+    activity: Arc<crate::server::activity::Activity>,
+}
+
+impl CompileObserver {
+    pub fn connect(
+        address: &crate::net::SocketAddr,
+        identity: crate::protocol::CompileIdentity,
+    ) -> Result<Self> {
+        let mut connection = connect_to_server(address)?;
+        let Response::CompileObserved(id) =
+            connection.request(Request::ObserveCompile(identity.clone()))?
+        else {
+            bail!("unexpected namespace observation registration reply");
+        };
+        let activity = Arc::new(crate::server::activity::Activity::new(
+            id,
+            &identity,
+            crate::server::activity::CompileOwner::Namespace,
+        ));
+        Ok(Self {
+            connection: Arc::new(Mutex::new(connection)),
+            activity,
+        })
+    }
+
+    pub async fn run<T>(self, work: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        tokio::select! {
+            biased;
+            result = self.report() => result.and_then(|()| Err(anyhow!("namespace observation ended prematurely"))),
+            result = crate::server::activity::scope(&self.activity, work) => result,
+        }
+    }
+
+    async fn report(&self) -> Result<()> {
+        let interval = crate::server::activity::HEARTBEAT_INTERVAL;
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let observation = self.activity.snapshot();
+            let response = connection_task(Arc::clone(&self.connection), move |connection| {
+                connection.request(Request::ObservePhase(observation))
+            })
+            .await?;
+            ensure!(
+                matches!(response, Response::ObservationAccepted),
+                "unexpected namespace compile observation reply"
+            );
+        }
+    }
+}
+
 /// Establish a TCP connection to an sccache server listening on `addr`.
 pub fn connect_to_server(addr: &crate::net::SocketAddr) -> io::Result<ServerConnection> {
     trace!("connect_to_server({addr})");
@@ -292,10 +347,13 @@ mod test {
         let progress = CompileActivity {
             id: "generation-7".into(),
             client_pid: 123,
+            owner: crate::server::activity::CompileOwner::Daemon,
             output: Some("crate".into()),
             compiler: "rustc".into(),
             cwd: "/build".into(),
             phase: Phase::RunDistributed,
+            phase_sequence: 3,
+            observation_age_ms: None,
             cancellation_requested: false,
             elapsed_ms: 15000,
             phase_age_ms: 15000,
