@@ -889,12 +889,16 @@ where
 
 fn show_stats(config: &Config, fmt: StatsFormat, advanced: bool) -> Result<()> {
     trace!("Command::ShowStats({fmt:?})");
-    let stats = if let Ok(srv) = connect_to_server(&get_addr()) {
-        request_stats(srv).context("failed to get stats from server")?
-    } else {
-        let runtime = new_client_runtime()?;
-        let storage = storage_from_config(config, runtime.handle()).ok();
-        runtime.block_on(ServerInfo::new(ServerStats::default(), storage.as_deref()))?
+    let stats = match connect_to_server(&get_addr()) {
+        Ok(srv) => request_stats(srv).context("failed to get stats from server")?,
+        Err(error) if !auto_start_server_enabled() => {
+            return Err(error).context("managed sccache endpoint is unavailable");
+        }
+        Err(_) => {
+            let runtime = new_client_runtime()?;
+            let storage = storage_from_config(config, runtime.handle()).ok();
+            runtime.block_on(ServerInfo::new(ServerStats::default(), storage.as_deref()))?
+        }
     };
     match fmt {
         StatsFormat::Text => stats.print(advanced),
