@@ -3,10 +3,12 @@
 use std::{
     fs::File,
     io::{self, Cursor, Read, Write},
+    sync::mpsc,
+    thread,
     time::Duration,
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use bincode::Options;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -227,14 +229,16 @@ impl NativeCacheClient {
         &self,
         manifest: &TreeManifest,
         mut open: impl FnMut(ContentId) -> Result<R>,
+        renewal_interval: Duration,
     ) -> Result<Ticket> {
         let id = manifest.id()?;
         let blobs = manifest.blobs()?;
         let offer = self.offer_tree(manifest)?;
-        let result = (|| {
+        let result = self.with_renewal(offer.ticket, renewal_interval, |check| {
             ensure!(offer.id == id, "native tree offer identity mismatch");
             let mut seen = std::collections::BTreeSet::new();
             for blob in offer.missing {
+                check()?;
                 ensure!(
                     blobs.get(&blob.id) == Some(&blob.size) && seen.insert(blob.id),
                     "scheduler requested undeclared or duplicate input content"
@@ -246,7 +250,7 @@ impl NativeCacheClient {
                 "native tree commit identity mismatch"
             );
             Ok(offer.ticket)
-        })();
+        });
         if result.is_err() {
             let _ = self.close(offer.ticket);
         }
@@ -353,6 +357,42 @@ impl NativeCacheClient {
         self.control("fail", &ticket)
     }
 
+    fn with_renewal<T>(
+        &self,
+        ticket: Ticket,
+        interval: Duration,
+        operation: impl FnOnce(&mut dyn FnMut() -> Result<()>) -> Result<T>,
+    ) -> Result<T> {
+        ensure!(
+            !interval.is_zero(),
+            "native renewal interval must be nonzero"
+        );
+        self.renew(ticket)?;
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let (failure_tx, failure_rx) = mpsc::channel::<anyhow::Error>();
+        let client = self.clone();
+        let renew = thread::Builder::new()
+            .name("native-lease-renewal".into())
+            .spawn(move || {
+                while stop_rx.recv_timeout(interval) == Err(mpsc::RecvTimeoutError::Timeout) {
+                    if let Err(error) = client.renew(ticket) {
+                        let _ = failure_tx.send(error);
+                        break;
+                    }
+                }
+            })?;
+        let mut check = || match failure_rx.try_recv() {
+            Ok(error) => Err(error).context("native scheduler lease renewal failed"),
+            Err(mpsc::TryRecvError::Empty) => Ok(()),
+            Err(mpsc::TryRecvError::Disconnected) => Err(anyhow!("native renewal loop stopped")),
+        };
+        let result = operation(&mut check);
+        drop(stop_tx);
+        renew
+            .join()
+            .map_err(|_| anyhow!("native renewal loop panicked"))?;
+        result
+    }
     /// Observe the client's result ticket.
     ///
     /// # Errors
@@ -449,3 +489,8 @@ pub(super) fn codec() -> impl Options {
 
 #[cfg(all(target_os = "linux", feature = "native-store"))]
 mod worker;
+
+#[cfg(all(target_os = "linux", feature = "dist-client"))]
+mod client;
+#[cfg(all(target_os = "linux", feature = "dist-client"))]
+pub use client::{NativeBuildPolicy, NativeBuildResult, NativeBuildSource};

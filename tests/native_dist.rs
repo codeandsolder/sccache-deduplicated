@@ -20,7 +20,11 @@ use sccache::{
         wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply},
     },
     config::{HTTPUrl, scheduler, server},
-    dist::{SchedulerStatusResult, native::NativeCacheClient, pkg::ToolchainPackageBuilder},
+    dist::{
+        SchedulerStatusResult,
+        native::{NativeBuildPolicy, NativeBuildSource, NativeCacheClient},
+        pkg::ToolchainPackageBuilder,
+    },
 };
 
 const CLIENT_TOKEN: &str = "native-integration-client";
@@ -277,8 +281,16 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
             trees: [root_tree.id(), source_tree.id()].into_iter().collect()
         },
     );
-    let root_pin = client.push_tree(root_tree.manifest(), |id| root_tree.open_blob(id))?;
-    let source_pin = client.push_tree(source_tree.manifest(), |id| source_tree.open_blob(id))?;
+    let root_pin = client.push_tree(
+        root_tree.manifest(),
+        |id| root_tree.open_blob(id),
+        Duration::from_secs(1),
+    )?;
+    let source_pin = client.push_tree(
+        source_tree.manifest(),
+        |id| source_tree.open_blob(id),
+        Duration::from_secs(1),
+    )?;
     let NativeAdmission::Compile { ticket } = client.admit(&spec)? else {
         anyhow::bail!("expected native miss");
     };
@@ -303,9 +315,11 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     client.download(ticket, manifest.outputs["object"].blob, &mut bytes)?;
     assert_eq!(bytes, fs::read(&reference)?);
     client.close(ticket)?;
-    let warm_pin = client.push_tree(source_tree.manifest(), |_| -> Result<File> {
-        anyhow::bail!("warm tree must not reopen input content")
-    })?;
+    let warm_pin = client.push_tree(
+        source_tree.manifest(),
+        |_| -> Result<File> { anyhow::bail!("warm tree must not reopen input content") },
+        Duration::from_secs(1),
+    )?;
     client.close(warm_pin)?;
     let NativeAdmission::Hit {
         ticket: hit,
@@ -317,6 +331,29 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     assert_eq!(cached, manifest);
     client.close(hit)?;
     assert_eq!(status()?.in_progress, 0);
+
+    let inputs = [root_tree, source_tree];
+    let policy = NativeBuildPolicy {
+        timeout: Duration::from_secs(30),
+        renewal_interval: Duration::from_secs(1),
+        max_result_bytes: 16 * 1024 * 1024,
+    };
+    let delivered = root.join("delivered.o");
+    let destinations = BTreeMap::from([("object".into(), delivered.clone())]);
+    let hit = client.run_action(&spec, &inputs, &destinations, &policy)?;
+    assert_eq!(hit.source, NativeBuildSource::Hit);
+    assert!(hit.output.status.success());
+    assert_eq!(fs::read(&delivered)?, fs::read(&reference)?);
+
+    let mut second = spec.clone();
+    second.command.arguments.insert(0, b"--64".to_vec());
+    fs::remove_file(&delivered)?;
+    let miss = client.run_action(&second, &inputs, &destinations, &policy)?;
+    assert_eq!(miss.source, NativeBuildSource::Worker(worker_address));
+    assert!(miss.output.status.success());
+    assert_eq!(fs::read(&delivered)?, fs::read(&reference)?);
+    let hit = client.run_action(&second, &inputs, &destinations, &policy)?;
+    assert_eq!(hit.source, NativeBuildSource::Hit);
 
     // A real compiler failure must be reported but never become a hit.
     let mut invalid = spec;
@@ -339,16 +376,17 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     assert!(!stderr.is_empty());
     assert_eq!(client.status(ticket)?, NativeStatus::Failed);
     client.close(ticket)?;
-    assert!(matches!(
-        client.admit(&invalid)?,
-        NativeAdmission::Compile { .. }
-    ));
+    let failed = client.run_action(&invalid, &inputs, &destinations, &policy)?;
+    assert_eq!(failed.source, NativeBuildSource::Worker(worker_address));
+    assert!(!failed.output.status.success());
+    assert!(!failed.output.stderr.is_empty());
     drop(worker_process);
     drop(scheduler_process);
     let worker_stats = NativeStore::open(&worker_directory)?.stats()?;
     let scheduler_stats = NativeStore::open(&scheduler_directory)?.stats()?;
     assert_eq!(worker_stats.actions, 0);
-    assert_eq!(scheduler_stats.actions, 1);
+    assert_eq!(scheduler_stats.actions, 2);
+    assert_eq!(scheduler_stats.results, 1);
     assert_eq!(worker_stats.trees, 2);
     assert_eq!(scheduler_stats.trees, 2);
     Ok(())

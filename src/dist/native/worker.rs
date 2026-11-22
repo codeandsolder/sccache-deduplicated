@@ -2,9 +2,9 @@
 //! native store and results move straight from captured descriptors to the
 //! scheduler. There is no legacy archive creation or client-side reupload.
 
-use std::{sync::mpsc, thread, time::Duration};
+use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Result, ensure};
 
 use super::NativeCacheClient;
 use crate::build_runtime::{
@@ -77,43 +77,6 @@ impl NativeCacheClient {
         if result.is_err() {
             let _ = self.fail(ticket);
         }
-        result
-    }
-
-    fn with_renewal<T>(
-        &self,
-        ticket: Ticket,
-        interval: Duration,
-        operation: impl FnOnce(&mut dyn FnMut() -> Result<()>) -> Result<T>,
-    ) -> Result<T> {
-        ensure!(
-            !interval.is_zero(),
-            "native renewal interval must be nonzero"
-        );
-        self.renew(ticket)?;
-        let (stop_tx, stop_rx) = mpsc::channel::<()>();
-        let (failure_tx, failure_rx) = mpsc::channel::<anyhow::Error>();
-        let client = self.clone();
-        let renew = thread::Builder::new()
-            .name("native-lease-renewal".into())
-            .spawn(move || {
-                while stop_rx.recv_timeout(interval) == Err(mpsc::RecvTimeoutError::Timeout) {
-                    if let Err(error) = client.renew(ticket) {
-                        let _ = failure_tx.send(error);
-                        break;
-                    }
-                }
-            })?;
-        let mut check = || match failure_rx.try_recv() {
-            Ok(error) => Err(error).context("native scheduler lease renewal failed"),
-            Err(mpsc::TryRecvError::Empty) => Ok(()),
-            Err(mpsc::TryRecvError::Disconnected) => Err(anyhow!("native renewal loop stopped")),
-        };
-        let result = operation(&mut check);
-        drop(stop_tx);
-        renew
-            .join()
-            .map_err(|_| anyhow!("native renewal loop panicked"))?;
         result
     }
 }

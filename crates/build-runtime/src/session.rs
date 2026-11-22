@@ -511,7 +511,11 @@ impl NativeSessions {
     pub fn renew(&self, ticket: Ticket, publisher: Publisher) -> Result<()> {
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
-        self.authorize(&mut state, publisher)
+        if matches!(state.phase, Phase::Ready(_)) && publisher == Publisher::Client {
+            self.authorize_reader(&mut state, publisher)
+        } else {
+            self.authorize(&mut state, publisher)
+        }
     }
 
     fn upload_slot(&self) -> Result<UploadSlot<'_>> {
