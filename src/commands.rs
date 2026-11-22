@@ -720,10 +720,14 @@ where
     };
 
     #[cfg(target_os = "linux")]
-    let mut cmd = if let Some(canonical) = canonical_rust {
+    let mut cmd = if let Some(canonical) = canonical_rust
+        && let Some(arguments) = crate::compiler::relocate_raw_rust_operands(
+            &invocation.cmdline,
+            &canonical,
+            invocation.cwd,
+        ) {
         let mut cmd = creator.new_command_sync("/usr/bin/bwrap");
-        let bwrap_args =
-            canonical.bwrap_arguments(invocation.exe, &invocation.cmdline, invocation.cwd);
+        let bwrap_args = canonical.bwrap_arguments(invocation.exe, &arguments, invocation.cwd);
         cmd.args(&bwrap_args)
             .env_clear()
             .envs(canonical.env_to_canonical(&invocation.env_vars))

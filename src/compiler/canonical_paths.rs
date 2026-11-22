@@ -1,7 +1,7 @@
 use crate::dist;
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RootMapping {
@@ -200,6 +200,26 @@ fn replace_embedded_path(text: &str, physical: &str, canonical: &str) -> String 
     output
 }
 
+/// Resolve an operand against the invocation's physical cwd before applying
+/// an independent sandbox root mapping. Never erase a symlink traversal.
+pub(super) fn physical_operand(cwd: &Path, operand: &Path) -> Option<PathBuf> {
+    let absolute = cwd.join(operand);
+    let mut result = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::ParentDir => {
+                if result.is_symlink() || !result.is_dir() {
+                    return None;
+                }
+                result.pop();
+            }
+            Component::CurDir => {}
+            other => result.push(other),
+        }
+    }
+    Some(result)
+}
+
 impl CanonicalRustPaths {
     #[cfg(target_os = "linux")]
     pub(crate) fn from_rustc_executable(
@@ -224,13 +244,10 @@ impl CanonicalRustPaths {
                 parsed_output_dir = Some(PathBuf::from(path));
             }
         }
-        let output_dir = parsed_output_dir.map(|path| {
-            if path.is_absolute() {
-                path
-            } else {
-                cwd.join(path)
-            }
-        });
+        let output_dir = match parsed_output_dir {
+            Some(path) => Some(physical_operand(cwd, &path)?),
+            None => None,
+        };
         Self::from_env_with_output_dir(env, cwd, rust_root, output_dir.as_deref())
     }
 
