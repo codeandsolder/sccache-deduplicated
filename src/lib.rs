@@ -33,6 +33,9 @@ mod client;
 mod cmdline;
 mod commands;
 mod compiler;
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub use compiler::rust_link;
 pub mod compression;
 pub mod config;
 pub mod dist;
@@ -69,6 +72,17 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const LOGGING_ENV: &str = "SCCACHE_LOG";
 
 pub fn main() {
+    #[cfg(target_os = "linux")]
+    if let Some(result) = rust_link::capture_if_relay() {
+        std::process::exit(match result {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("sccache link capture: {error:#}");
+                1
+            }
+        });
+    }
+
     init_logging();
 
     let command = match cmdline::try_parse() {
