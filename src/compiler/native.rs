@@ -221,7 +221,6 @@ impl NativeOutput {
             kind: OutputKind::File,
         }
     }
-    #[cfg(test)]
     fn generated(name: String, source: PathBuf, destination: PathBuf) -> Self {
         Self {
             name,
@@ -337,6 +336,139 @@ impl CompilerPlan {
     }
 }
 
+/// Split a Rust action without changing its logical cwd, argument ordering,
+/// target, or environment. The private delivery directories are independent
+/// of all of those key fields.
+struct NativeLink {
+    workspace: super::rust_link::NativeLinkWorkspace,
+    layout: super::rust_link::NativeLinkLayout,
+    executable: PathBuf,
+    logical_cwd: PathBuf,
+    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    expected: Vec<FileObjectSource>,
+    physical_cwd: PathBuf,
+}
+
+impl NativeLink {
+    fn prepare(
+        layout: super::rust_link::NativeLinkLayout,
+        remote: &mut dist::CompileCommand,
+        transformer: &dist::PathTransformer,
+        scratch: &Path,
+        local_environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+        expected: Vec<FileObjectSource>,
+        physical_cwd: PathBuf,
+    ) -> Result<Self> {
+        use super::rust_link::{NativeLinkWorkspace, RustLinkStages};
+
+        let args = remote
+            .arguments
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect();
+        let logical_cwd = PathBuf::from(&remote.cwd);
+        let stages = RustLinkStages::from_expanded(args, &logical_cwd, |cwd, path| {
+            let logical = cwd.join(path);
+            let physical = transformer
+                .to_local(logical.to_str().context("non-UTF8 logical output root")?)?
+                .canonicalize()?;
+            let mut mapping = dist::PathTransformer::new();
+            for (local, remote) in transformer.path_mappings() {
+                mapping.add_root_mapping(local, &remote);
+            }
+            Ok(PathBuf::from(
+                mapping
+                    .as_dist_abs(&physical)
+                    .context("output path has no native mapping")?,
+            ))
+        })?;
+        let workspace = NativeLinkWorkspace::new(stages, scratch, |root| {
+            transformer.to_local(root.to_str().context("non-UTF8 output root")?)
+        })?;
+        remote.arguments = workspace
+            .codegen_arguments()
+            .into_iter()
+            .map(|arg| {
+                arg.into_string()
+                    .map_err(|_| anyhow::anyhow!("non-UTF8 native argument"))
+            })
+            .collect::<Result<_>>()?;
+        // Literal leading @ arguments have already been expanded by the
+        // frontend. The worker command cannot regenerate response files.
+        ensure!(
+            !remote.arguments.iter().any(|arg| arg.starts_with('@')),
+            "native worker would expand a literal response-file operand"
+        );
+        Ok(Self {
+            workspace,
+            layout,
+            executable: PathBuf::from(&remote.executable),
+            logical_cwd,
+            environment: local_environment,
+            expected,
+            physical_cwd,
+        })
+    }
+
+    fn outputs(&self) -> Vec<NativeOutput> {
+        self.workspace
+            .outputs()
+            .enumerate()
+            .map(|(index, (_, physical, destination))| {
+                NativeOutput::generated(
+                    format!("codegen-{index}"),
+                    physical.to_owned(),
+                    destination.to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    async fn finish<T: CommandCreatorSync>(
+        &self,
+        creator: &T,
+        mut generated: process::Output,
+    ) -> Result<process::Output> {
+        use crate::errors::ProcessError;
+        use crate::mock_command::RunCommand;
+        let mut args = self.layout.mounts.clone();
+        args.extend(self.workspace.overlay_arguments()?);
+        args.extend([
+            "--chdir".into(),
+            self.logical_cwd.clone().into_os_string(),
+            "--".into(),
+            self.executable.clone().into_os_string(),
+        ]);
+        args.extend(self.workspace.link_arguments()?);
+
+        let mut command = creator.clone().new_command_sync("/usr/bin/bwrap");
+        command
+            .args(&args)
+            .env_clear()
+            .envs(self.environment.clone())
+            .current_dir("/");
+        command.share_jobserver();
+        let linked = match crate::util::run_input_output(command, None).await {
+            Ok(output) => output,
+            Err(error) => match error.downcast::<ProcessError>() {
+                Ok(ProcessError(output)) => output,
+                Err(error) => return Err(error),
+            },
+        };
+        if linked.status.success() {
+            self.workspace.publish(
+                &self.expected,
+                &self.physical_cwd,
+                self.layout.dep_info.as_deref(),
+            )?;
+        }
+        generated.status = linked.status;
+        generated.stdout.extend(linked.stdout);
+        generated.stderr.extend(linked.stderr);
+        Ok(generated)
+    }
+}
+
 pub(super) async fn compile<T: CommandCreatorSync>(
     client: Arc<NativeCompilerClient>,
     service: &SccacheService<T>,
@@ -356,17 +488,43 @@ pub(super) async fn compile<T: CommandCreatorSync>(
         && compilation.automatic_dist_toolchain_is_ready()
         && client.allows_automatic_toolchain(&local.get_executable());
     let mut fallback = DistType::NoDist;
-    if let Some(remote) = remote.filter(|_| eligible) {
+    if let Some(mut remote) = remote.filter(|_| eligible) {
+        // Hold the temporary parent until link completion and artifact
+        // publication. It is private scratch, not a cache tier.
+        let mut scratch = None;
+        let mut split = None;
         let result = (|| {
             super::core::validate_dist_environment_dependencies(
                 &remote,
                 &compilation.dist_environment_dependencies(),
             )?;
-            let outputs = compilation
+            let expected = compilation
                 .outputs()
                 .filter(|output| output.key != "d")
-                .map(|output| NativeOutput::file(&cwd, output))
-                .collect();
+                .collect::<Vec<_>>();
+            let outputs = if let Some(layout) = compilation.native_link_layout() {
+                let directory = tempfile::Builder::new()
+                    .prefix("sccache-native-link-")
+                    .tempdir()?;
+                let link = NativeLink::prepare(
+                    layout.clone(),
+                    &mut remote,
+                    &transformer,
+                    directory.path(),
+                    local.get_env_vars(),
+                    expected,
+                    cwd.clone(),
+                )?;
+                let outputs = link.outputs();
+                scratch = Some(directory);
+                split = Some(link);
+                outputs
+            } else {
+                expected
+                    .into_iter()
+                    .map(|output| NativeOutput::file(&cwd, output))
+                    .collect()
+            };
             // Preserve root mappings, but do not carry the large reverse
             // path table into the independent directory-only plan.
             let mut layout = dist::PathTransformer::new();
@@ -391,6 +549,21 @@ pub(super) async fn compile<T: CommandCreatorSync>(
             Ok(task) => task.await?,
             Err(error) => Err(error),
         };
+        let result = match (result, split.as_ref()) {
+            (Ok(mut result), Some(link)) if result.output.status.success() => {
+                match link.finish(&creator, result.output).await {
+                    Ok(output) => {
+                        result.output = output;
+                        Ok(result)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            (result, _) => result,
+        };
+        // Explicit drop order: the workspace's TempDirs reference scratch.
+        drop(split);
+        drop(scratch);
         match result {
             Ok(result) if result.output.status.success() => {
                 let elapsed = start.elapsed();
@@ -486,8 +659,12 @@ mod tests {
             pool,
             None,
         ))?;
-        let CompilerArguments::Ok(mut hasher) = compiler.parse_arguments(&args, &cwd, &environment)
-        else {
+        let CompilerArguments::Ok(mut hasher) = compiler.parse_arguments(
+            &args,
+            &cwd,
+            &environment,
+            super::super::CompilerCachePolicy::Native,
+        ) else {
             anyhow::bail!("real compiler arguments are not cacheable");
         };
         let hashed = rt.block_on(hasher.generate_hash_key(GenerateHashKeyContext {
@@ -517,59 +694,26 @@ mod tests {
             .collect::<Vec<_>>();
         let mut replay = None;
         let outputs = if split_link {
-            use super::super::rust_link::{NativeLinkWorkspace, RustLinkStages};
-            let remote_arguments = remote
-                .arguments
-                .iter()
-                .map(OsString::from)
-                .collect::<Vec<_>>();
-            let stages = RustLinkStages::from_expanded(
-                remote_arguments,
-                Path::new(&remote.cwd),
-                |cwd, path| {
-                    let logical = cwd.join(path);
-                    let physical = transformer
-                        .to_local(logical.to_str().context("non-UTF8 logical output root")?)?
-                        .canonicalize()?;
-                    let mut mapping = dist::PathTransformer::new();
-                    for (local, remote) in transformer.path_mappings() {
-                        mapping.add_root_mapping(local, &remote);
-                    }
-                    Ok(PathBuf::from(
-                        mapping
-                            .as_dist_abs(&physical)
-                            .context("output path has no native mapping")?,
-                    ))
-                },
+            let layout = compilation
+                .native_link_layout()
+                .context("linked Rust invocation did not select split linking")?
+                .clone();
+            let link = NativeLink::prepare(
+                layout,
+                &mut remote,
+                &transformer,
+                &cwd,
+                environment.clone(),
+                expected.clone(),
+                cwd.clone(),
             )?;
-            let workspace = NativeLinkWorkspace::new(stages, &cwd, |root| {
-                transformer.to_local(root.to_str().context("non-UTF8 output root")?)
-            })?;
-            let outputs = workspace
-                .outputs()
-                .enumerate()
-                .map(|(index, (_, physical, destination))| {
-                    NativeOutput::generated(
-                        format!("codegen-{index}"),
-                        physical.to_owned(),
-                        destination.to_owned(),
-                    )
-                })
-                .collect();
-            remote.arguments = workspace
-                .codegen_arguments()
-                .into_iter()
-                .map(|arg| {
-                    arg.into_string()
-                        .map_err(|_| anyhow::anyhow!("non-UTF8 native argument"))
-                })
-                .collect::<Result<_>>()?;
-            replay = Some(workspace);
+            let outputs = link.outputs();
+            replay = Some(link);
             outputs
         } else {
-            compilation
-                .outputs()
-                .filter(|output| output.key != "d")
+            assert!(compilation.native_link_layout().is_none());
+            expected
+                .into_iter()
                 .map(|output| NativeOutput::file(&cwd, output))
                 .collect()
         };
@@ -620,9 +764,9 @@ mod tests {
             .context("compiler produced no result")?;
         plan.spec.action_request()?.validate_result(manifest)?;
         let mut replayed = BTreeMap::new();
-        if let Some(workspace) = &replay {
+        if let Some(link) = &replay {
             use crate::build_runtime::{Artifact, materialize_tree};
-            for (index, (_, _, destination)) in workspace.outputs().enumerate() {
+            for (index, (_, _, destination)) in link.workspace.outputs().enumerate() {
                 let Artifact::GeneratedTree(manifest) =
                     &manifest.outputs[&format!("codegen-{index}")]
                 else {
@@ -641,49 +785,31 @@ mod tests {
                 )?;
                 staged.publish(destination)?;
             }
-            let mut link = process::Command::new("/usr/bin/bwrap");
-            let output = link
-                .args([
-                    "--die-with-parent",
-                    "--bind",
-                    "/",
-                    "/",
-                    "--dev-bind",
-                    "/dev",
-                    "/dev",
-                ])
-                .args(workspace.overlay_arguments()?)
-                .arg("--chdir")
-                .arg(&cwd)
-                .arg("--")
-                .arg(executable)
-                .args(workspace.link_arguments()?)
-                .env_clear()
-                .envs(
-                    environment
-                        .iter()
-                        .map(|(key, value)| (key.as_os_str(), value.as_os_str())),
-                )
-                .output()?;
+            let output = rt.block_on(link.finish(
+                &creator,
+                process::Output {
+                    status: result.status(),
+                    stdout: vec![],
+                    stderr: vec![],
+                },
+            ))?;
             ensure!(
                 output.status.success(),
                 "native link failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            for output in &expected {
+            for output in &link.expected {
                 let physical = cwd.join(&output.path);
-                let (_, lower, generated) = workspace
-                    .outputs()
-                    .find(|(_, lower, _)| physical.starts_with(lower))
-                    .context("expected artifact is outside native output roots")?;
-                let staged = generated.join(physical.strip_prefix(lower)?);
-                if output.optional && !staged.exists() {
+                if output.optional && !physical.exists() {
                     continue;
                 }
-                assert!(!physical.exists());
-                replayed.insert(physical, std::fs::read(staged)?);
+                replayed.insert(physical.clone(), std::fs::read(physical)?);
             }
-            ensure!(!replayed.is_empty(), "local link did not produce a library");
+            ensure!(
+                !replayed.is_empty(),
+                "local link did not produce an artifact"
+            );
+            assert!(!cwd.join("build/input-stage.rlink").exists());
         }
         let reference = process::Command::new(executable)
             .args(&args)
@@ -740,7 +866,7 @@ mod tests {
     }
 
     #[test_case::test_case(false; "completed_rlib")]
-    #[test_case::test_case(true; "split_link_rlib")]
+    #[test_case::test_case(true; "split_link_bin")]
     #[ignore = "requires a nightly Rust toolchain, ldd and Linux Bubblewrap"]
     fn native_rust_compiler_plan(split_link: bool) -> Result<()> {
         let sysroot = process::Command::new("rustc")
@@ -754,7 +880,7 @@ mod tests {
                 "--crate-name",
                 "input",
                 "--crate-type",
-                "rlib",
+                if split_link { "bin" } else { "rlib" },
                 "--emit=link,dep-info",
                 "--out-dir",
                 "build",
@@ -762,7 +888,11 @@ mod tests {
                 "input.rs",
             ],
             "input.rs",
-            "pub fn square(x: i32) -> i32 { x*x }\n",
+            if split_link {
+                "fn main() { println!(\"{}\", 7 * 7); }\n"
+            } else {
+                "pub fn square(x: i32) -> i32 { x*x }\n"
+            },
             split_link,
         )
     }

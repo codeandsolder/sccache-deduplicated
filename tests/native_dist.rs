@@ -629,6 +629,42 @@ for i in 1 2; do
     test -s build/probe-c.d
     test -s build/probe.d
 done
+
+# The two calls have exactly the same Rust codegen inputs and arguments.
+# Change only the native archive, which is consumed by the caller linker.
+# The second call must reuse codegen and produce a different executable.
+for value in 17 42; do
+    printf 'unsigned native_value(void) { return %s; }\n' "$value" > native.c
+    "$2" -c native.c -o native.o
+    /usr/bin/ar rcs libnative.a native.o
+    printf '%s\n' "-Wl,--defsym,native_marker=$value" > native.rsp
+    rm -f build/linked-stage build/linked-stage.d build/linked-stage.dwp build/liblinked-stage.rmeta
+    "$1" "$3" --crate-name linked --crate-type bin --edition=2024 --emit=link,metadata,dep-info --out-dir build -Cextra-filename=-stage -Cdebuginfo=2 -Csplit-debuginfo=packed -Lnative=. -lstatic=native -Clink-arg=@native.rsp linked.rs
+    test "$(build/linked-stage)" = "$value"
+    test -f build/liblinked-stage.rmeta
+    test -s build/linked-stage.d
+    test -s build/linked-stage.dwp
+    test ! -e build/linked-stage.rlink
+done
+# A test harness is an ordinary executable despite its explicit lib
+# crate type. Its actual output must also be independently cacheable.
+for i in 1 2; do
+    rm -f build/testcase-stage build/testcase-stage.d
+    "$1" "$3" --crate-name testcase --crate-type lib --test --edition=2024 --emit=link,dep-info --out-dir build -Cextra-filename=-stage testcase.rs
+    build/testcase-stage --quiet
+    test ! -e build/testcase-stage.rlink
+done
+# -Zno-link currently changes the crate metadata hash. The native
+# backend must not silently replace a proc macro with an incompatible
+# metadata identity, even though its linker invocation can be replayed.
+"$3" --crate-name identity --crate-type proc-macro --edition=2024 --emit=link,dep-info --out-dir build -Cextra-filename=-stage identity.rs
+"$3" --crate-name intermediate --crate-type rlib --edition=2024 --extern identity=build/libidentity-stage.so intermediate.rs --out-dir build
+rm -f build/libidentity-stage.so
+"$1" "$3" --crate-name identity --crate-type proc-macro --edition=2024 --emit=link,dep-info --out-dir build -Cextra-filename=-stage identity.rs
+"$3" --edition=2024 --extern intermediate=build/libintermediate.rlib -Ldependency=build consumer.rs -o build/consumer
+build/consumer
+test ! -e build/identity-stage.rlink
+
 "#
 }
 
@@ -641,6 +677,24 @@ fn write_compiler_sources(root: &Path) -> Result<()> {
     fs::write(
         root.join("probe.rs"),
         b"pub fn namespace_probe() -> u32 { 42 }\n",
+    )?;
+    fs::write(
+        root.join("linked.rs"),
+        br#"unsafe extern "C" { fn native_value() -> u32; }
+fn main() { println!("{}", unsafe { native_value() }); }"#,
+    )?;
+    fs::write(root.join("identity.rs"), b"extern crate proc_macro; #[proc_macro] pub fn identity(x:proc_macro::TokenStream)->proc_macro::TokenStream{x}")?;
+    fs::write(
+        root.join("consumer.rs"),
+        b"fn main(){assert_eq!(intermediate::answer(),49);}",
+    )?;
+    fs::write(
+        root.join("intermediate.rs"),
+        b"pub fn answer()->i32 {identity::identity!(7 * 7)}",
+    )?;
+    fs::write(
+        root.join("testcase.rs"),
+        b"#[test] fn answer(){assert_eq!(7 * 7,49);}",
     )?;
     Ok(())
 }
@@ -692,7 +746,7 @@ fn audit_index(index: &Path, component: &str) -> Result<ComponentAudit> {
     let output = Command::new(env!("CARGO_BIN_EXE_sccache-dist"))
         .args(["native-audit", "--index"])
         .arg(index)
-        .args(["--schema", "native-linux-bwrap-v3", "--without", component])
+        .args(["--schema", "native-linux-bwrap-v4", "--without", component])
         .output()?;
     ensure!(
         output.status.success(),
@@ -743,9 +797,9 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
         "direct native compiler path failed"
     );
     let stats = service.stats()?;
-    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 2);
-    assert_eq!(stats.cache_hits.all(), 2);
-    assert_eq!(stats.cache_misses.all(), 2);
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 4);
+    assert_eq!(stats.cache_hits.all(), 4);
+    assert_eq!(stats.cache_misses.all(), 4);
     assert_eq!(stats.dist_errors, 0);
 
     let visible = root.join("visible");
@@ -795,9 +849,9 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
         "native namespace compiler path failed"
     );
     let stats = service.stats()?;
-    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 4);
-    assert_eq!(stats.cache_hits.all(), 4);
-    assert_eq!(stats.cache_misses.all(), 4);
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 8);
+    assert_eq!(stats.cache_hits.all(), 8);
+    assert_eq!(stats.cache_misses.all(), 8);
     assert_eq!(stats.dist_errors, 0);
     assert!(private.join("build/probe.o").is_file());
     assert!(private.join("build/libprobe.rlib").is_file());
@@ -806,19 +860,19 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
     assert!(!root.join("unexpected-toolchain-cache").exists());
     run_environment_audit(&service, &direct, &rustc, &direct_config)?;
     let stats = service.stats()?;
-    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 7);
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 11);
     assert_eq!(stats.dist_errors, 0);
     let index = fleet.scheduler_directory.join("index.redb");
     service.stop()?;
     let (scheduler, worker) = fleet.finish()?;
-    assert_eq!(scheduler.actions, 7);
+    assert_eq!(scheduler.actions, 11);
     let unused = audit_index(&index, "environment/CARGO_NATIVE_AUDIT_UNUSED")?;
     assert_eq!(unused.equivalent_pairs, 1);
     assert_eq!(unused.conflicting_pairs, 0);
     let observed = audit_index(&index, "environment/NATIVE_AUDIT_OBSERVED")?;
     assert_eq!(observed.equivalent_pairs, 0);
     assert_eq!(observed.conflicting_pairs, 1);
-    assert_eq!(unused.examined_actions, 7);
+    assert_eq!(unused.examined_actions, 11);
     eprintln!("actual Rust environment audit: {unused:?}; {observed:?}");
     assert_eq!(worker.actions, 0);
     Ok(())

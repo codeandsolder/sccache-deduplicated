@@ -641,6 +641,43 @@ impl PrivateOutputTree {
     }
 }
 
+/// Local namespace of an ordinary Rust native link.
+///
+/// Linking must use these mounts rather than the worker's
+/// sparse input filesystem.
+#[cfg(feature = "dist-client")]
+#[derive(Debug, Clone)]
+pub struct NativeLinkLayout {
+    pub(crate) mounts: Vec<OsString>,
+    pub(crate) dep_info: Option<PathBuf>,
+}
+
+#[cfg(feature = "dist-client")]
+impl NativeLinkLayout {
+    pub(crate) fn new(
+        canonical: Option<&super::canonical_paths::CanonicalRustPaths>,
+        dep_info: Option<PathBuf>,
+    ) -> Self {
+        let mounts = canonical.map_or_else(
+            || {
+                [
+                    "--die-with-parent",
+                    "--bind",
+                    "/",
+                    "/",
+                    "--dev-bind",
+                    "/dev",
+                    "/dev",
+                ]
+                .map(OsString::from)
+                .to_vec()
+            },
+            super::canonical_paths::CanonicalRustPaths::bwrap_mount_arguments,
+        );
+        Self { mounts, dep_info }
+    }
+}
+
 /// Prepared native Rust codegen delivery and local replay roots. Each
 /// returned directory is mounted over the current caller's lower directory,
 /// so native dependencies remain live at the same logical paths. There is no
@@ -723,6 +760,10 @@ impl NativeLinkWorkspace {
     /// # Errors
     /// Returns an error if codegen did not deliver exactly one link artifact.
     pub fn link_arguments(&self) -> Result<Vec<OsString>> {
+        Ok(self.stages.link_arguments(&self.link_artifact()?))
+    }
+
+    fn link_artifact(&self) -> Result<PathBuf> {
         let directory = self.stages.codegen_directory();
         let (logical, root) = self
             .roots
@@ -733,9 +774,128 @@ impl NativeLinkWorkspace {
             .tree
             .generated_root()
             .join(directory.strip_prefix(logical)?);
-        let artifact = RustLinkStages::link_artifact(&generated, directory)?;
-        Ok(self.stages.link_arguments(&artifact))
+        RustLinkStages::link_artifact(&generated, directory)
     }
+
+    /// Install the surviving outputs of the successful link stage.
+    ///
+    /// The compiler has cleaned its own temporary files. Skip
+    /// only the exact internal .rlink and the independently generated local
+    /// dependency file, not classes of names or filename suffixes.
+    /// # Errors
+    /// Invalid output topology, missing required outputs, or publication I/O
+    /// failure. No paths outside the declared output roots are published.
+    #[cfg(feature = "dist-client")]
+    pub(crate) fn publish(
+        &self,
+        expected: &[crate::cache::FileObjectSource],
+        cwd: &Path,
+        dep_info: Option<&Path>,
+    ) -> Result<()> {
+        use std::collections::BTreeSet;
+
+        let artifact = self.link_artifact()?;
+        let mut entries = Vec::new();
+        let mut seen = BTreeSet::new();
+        for (logical, root) in &self.roots {
+            for entry in WalkDir::new(root.tree.generated_root())
+                .min_depth(1)
+                .follow_links(false)
+            {
+                let entry = entry?;
+                let relative = entry.path().strip_prefix(root.tree.generated_root())?;
+                let destination = root.physical.join(relative);
+                if logical.join(relative) == artifact || dep_info == Some(destination.as_path()) {
+                    continue;
+                }
+                let kind = entry.file_type();
+                ensure!(
+                    kind.is_dir() || kind.is_file() || kind.is_symlink(),
+                    "unsupported generated filesystem object: {}",
+                    entry.path().display()
+                );
+                // Validate every existing lower ancestor without following
+                // links: the final rename must remain in the output root.
+                let mut parent = destination.parent().context("missing output parent")?;
+                while parent.starts_with(&root.physical) {
+                    match fs::symlink_metadata(parent) {
+                        Ok(metadata) => ensure!(
+                            metadata.is_dir(),
+                            "unsafe output parent {}",
+                            parent.display()
+                        ),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    if parent == root.physical {
+                        break;
+                    }
+                    parent = parent.parent().context("missing output ancestor")?;
+                }
+                if let Ok(metadata) = fs::symlink_metadata(&destination) {
+                    ensure!(
+                        metadata.is_dir() == kind.is_dir(),
+                        "output kind conflicts with existing path {}",
+                        destination.display()
+                    );
+                }
+                if !kind.is_dir() {
+                    seen.insert(destination.clone());
+                }
+                entries.push((entry.into_path(), destination, kind));
+            }
+        }
+        for output in expected {
+            let path = cwd.join(&output.path);
+            let parent = resolve_output_directory(
+                cwd,
+                path.parent().context("missing declared output parent")?,
+            )?;
+            let destination =
+                parent.join(path.file_name().context("missing declared output name")?);
+            ensure!(
+                output.optional || seen.contains(&destination),
+                "native link did not produce {}",
+                destination.display()
+            );
+        }
+        // WalkDir is parent-first. A directory from an overlay can represent
+        // existing lower topology; never replace the lower directory wholesale.
+        for (_, destination, kind) in &entries {
+            if kind.is_dir() && !destination.exists() {
+                fs::create_dir(destination)?;
+            }
+        }
+        for (source, destination, kind) in &entries {
+            if !kind.is_dir() {
+                publish_leaf(source, destination)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "dist-client")]
+fn publish_leaf(source: &Path, destination: &Path) -> Result<()> {
+    match fs::rename(source, destination) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {}
+        Err(error) => return Err(error.into()),
+    }
+    // Cross-filesystem delivery still publishes each verified leaf by
+    // atomic rename. Copy only when the source cannot be renamed.
+    let parent = destination.parent().context("missing publication parent")?;
+    let stage = tempfile::Builder::new()
+        .prefix(".rust-link-publish-")
+        .tempdir_in(parent)?;
+    let temporary = stage.path().join("output");
+    if fs::symlink_metadata(source)?.is_symlink() {
+        std::os::unix::fs::symlink(fs::read_link(source)?, &temporary)?;
+    } else {
+        fs::copy(source, &temporary)?;
+    }
+    fs::rename(temporary, destination)?;
+    Ok(())
 }
 
 /// The normal sccache executable also acts as an explicitly installed relay.

@@ -15,8 +15,9 @@
 use crate::cache::readonly::ReadOnlyStorage;
 use crate::cache::{CacheMode, Storage, storage_from_config};
 use crate::compiler::{
-    CacheCompileContext, CacheControl, CompileResult, Compiler, CompilerArguments, CompilerHasher,
-    CompilerKind, CompilerProxy, DistType, Language, MissType, get_compiler_info,
+    CacheCompileContext, CacheControl, CompileResult, Compiler, CompilerArguments,
+    CompilerCachePolicy, CompilerHasher, CompilerKind, CompilerProxy, DistType, Language, MissType,
+    get_compiler_info,
 };
 #[cfg(feature = "dist-client")]
 use crate::config;
@@ -1566,7 +1567,14 @@ where
                 debug!("check_compiler: Supported compiler");
                 // Now check that we can handle this compiler with
                 // the provided commandline.
-                match c.parse_arguments(&cmd, &cwd, &env_vars) {
+                let policy = CompilerCachePolicy::FinishedArtifact;
+                #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                let policy = if self.native_compiler().is_some() {
+                    CompilerCachePolicy::Native
+                } else {
+                    policy
+                };
+                match c.parse_arguments(&cmd, &cwd, &env_vars, policy) {
                     CompilerArguments::Ok(hasher) => {
                         debug!("parse_arguments: Ok: {cmd:?}");
 

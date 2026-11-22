@@ -51,13 +51,13 @@ pub fn unchanged(before: &Stat, after: &Stat) -> Result<()> {
 /// delegated to the caller; directory topology, symlinks, hardlinks, and
 /// mutation checks have a single implementation.
 #[cfg(feature = "store")]
-pub(crate) fn capture_tree(
+pub fn capture_tree(
     fd: &impl AsFd,
-    capture_file: impl FnMut(&TreePath, File, &Stat) -> Result<BlobRef>,
+    file_sink: impl FnMut(&TreePath, File, &Stat) -> Result<BlobRef>,
 ) -> Result<TreeManifest> {
     let stat = fstat(fd)?;
     let mut capture = Capture {
-        capture_file,
+        file_sink,
         entries: BTreeMap::new(),
         links: BTreeMap::new(),
     };
@@ -73,7 +73,7 @@ pub(crate) fn capture_tree(
 
 #[cfg(feature = "store")]
 struct Capture<F> {
-    capture_file: F,
+    file_sink: F,
     entries: BTreeMap<TreePath, TreeEntry>,
     links: BTreeMap<(u64, u64), TreePath>,
 }
@@ -143,7 +143,7 @@ impl<F: FnMut(&TreePath, File, &Stat) -> Result<BlobRef>> Capture<F> {
             Mode::empty(),
         )?);
         unchanged(stat, &fstat(&file)?)?;
-        let reference = (self.capture_file)(path, file, stat)?;
+        let reference = (self.file_sink)(path, file, stat)?;
         if stat.st_nlink > 1 {
             self.links.insert(identity, path.clone());
         }

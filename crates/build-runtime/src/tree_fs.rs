@@ -133,8 +133,9 @@ fn restore_mutable_directories(root: &Path) {
     }
 }
 
-/// Materialize the complete validated directory tree in a private staging
-/// directory. The file callback must supply verified bytes for the reference;
+/// Materialize a validated tree in a private staging directory.
+///
+/// The file callback must supply verified bytes for the reference;
 /// it may clone local CAS content or receive it directly from the scheduler.
 /// # Errors
 /// Returns an error on invalid topology, incomplete content or I/O failure.

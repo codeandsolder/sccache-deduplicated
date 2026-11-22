@@ -405,6 +405,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
         arguments: &[OsString],
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
+        _policy: super::CompilerCachePolicy,
     ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>> {
         match self.compiler.parse_arguments(arguments, cwd, env_vars) {
             CompilerArguments::Ok(mut args) => {

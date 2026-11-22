@@ -512,6 +512,13 @@ enum CacheLookupResult {
     Miss(MissType),
 }
 
+/// Which execution/cache contract the caller intends to use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompilerCachePolicy {
+    FinishedArtifact,
+    Native,
+}
+
 /// An interface to a compiler for argument parsing.
 pub trait Compiler<T>: Send + Sync + 'static
 where
@@ -528,6 +535,7 @@ where
         arguments: &[OsString],
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
+        policy: CompilerCachePolicy,
     ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>>;
     fn box_clone(&self) -> Box<dyn Compiler<T>>;
 }
@@ -1308,6 +1316,13 @@ where
         path_transformer: &mut dist::PathTransformer,
         transport: CompileTransport,
     ) -> GenerateCompileCommandsResult<T>;
+
+    /// The original Rust native link stage's local namespace, if this
+    /// compilation uses an independently cacheable codegen action.
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    fn native_link_layout(&self) -> Option<&super::rust_link::NativeLinkLayout> {
+        None
+    }
 
     /// Exact environment observations that the final distributed command must preserve.
     #[cfg(feature = "dist-client")]
@@ -2760,7 +2775,12 @@ LLVM version: 6.0",
                     &creator,
                     Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
                 );
-                let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
+                let mut hasher = match c.parse_arguments(
+                    &arguments,
+                    ".".as_ref(),
+                    &[],
+                    CompilerCachePolicy::FinishedArtifact,
+                ) {
                     CompilerArguments::Ok(h) => h,
                     o => bail!("Bad result from parse_arguments: {o:?}"),
                 };
@@ -2820,7 +2840,12 @@ LLVM version: 6.0",
                 &creator,
                 Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
             );
-            let mut hasher = match c.parse_arguments(arguments, ".".as_ref(), &[]) {
+            let mut hasher = match c.parse_arguments(
+                arguments,
+                ".".as_ref(),
+                &[],
+                CompilerCachePolicy::FinishedArtifact,
+            ) {
                 CompilerArguments::Ok(h) => h,
                 o => bail!("Bad result from parse_arguments: {o:?}"),
             };
@@ -2902,7 +2927,12 @@ LLVM version: 6.0",
                 &creator,
                 Ok(MockChild::new(exit_status(0), ".incbin \"blob.bin\"\n", "")),
             );
-            let mut hasher = match compiler.parse_arguments(&arguments, cwd, &[]) {
+            let mut hasher = match compiler.parse_arguments(
+                &arguments,
+                cwd,
+                &[],
+                CompilerCachePolicy::FinishedArtifact,
+            ) {
                 CompilerArguments::Ok(hasher) => hasher,
                 other => bail!("Bad result from parse_arguments: {other:?}"),
             };
@@ -2972,7 +3002,12 @@ LLVM version: 6.0",
                     &creator,
                     Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
                 );
-                let mut hasher = match c.parse_arguments(argument, ".".as_ref(), &[]) {
+                let mut hasher = match c.parse_arguments(
+                    argument,
+                    ".".as_ref(),
+                    &[],
+                    CompilerCachePolicy::FinishedArtifact,
+                ) {
                     CompilerArguments::Ok(h) => h,
                     o => bail!("Bad result from parse_arguments: {o:?}"),
                 };
@@ -3044,7 +3079,12 @@ LLVM version: 6.0",
                     &creator,
                     Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
                 );
-                let mut hasher = match c.parse_arguments(argument, ".".as_ref(), &[]) {
+                let mut hasher = match c.parse_arguments(
+                    argument,
+                    ".".as_ref(),
+                    &[],
+                    CompilerCachePolicy::FinishedArtifact,
+                ) {
                     CompilerArguments::Ok(h) => h,
                     o => bail!("Bad result from parse_arguments: {o:?}"),
                 };
@@ -3111,7 +3151,12 @@ LLVM version: 6.0",
                         Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
                     );
                 }
-                let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
+                let mut hasher = match c.parse_arguments(
+                    &arguments,
+                    ".".as_ref(),
+                    &[],
+                    CompilerCachePolicy::FinishedArtifact,
+                ) {
                     CompilerArguments::Ok(h) => h,
                     o => bail!("Bad result from parse_arguments: {o:?}"),
                 };
@@ -3219,7 +3264,12 @@ LLVM version: 6.0",
         });
         let cwd = f.tempdir.path();
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
-        let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
+        let mut hasher = match c.parse_arguments(
+            &arguments,
+            ".".as_ref(),
+            &[],
+            CompilerCachePolicy::FinishedArtifact,
+        ) {
             CompilerArguments::Ok(h) => h,
             o => bail!("Bad result from parse_arguments: {o:?}"),
         };
@@ -3351,7 +3401,12 @@ LLVM version: 6.0",
 
         let cwd = f.tempdir.path();
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
-        let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
+        let mut hasher = match c.parse_arguments(
+            &arguments,
+            ".".as_ref(),
+            &[],
+            CompilerCachePolicy::FinishedArtifact,
+        ) {
             CompilerArguments::Ok(h) => h,
             o => bail!("Bad result from parse_arguments: {o:?}"),
         };
@@ -3473,7 +3528,12 @@ LLVM version: 6.0",
         });
         let cwd = f.tempdir.path();
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
-        let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
+        let mut hasher = match c.parse_arguments(
+            &arguments,
+            ".".as_ref(),
+            &[],
+            CompilerCachePolicy::FinishedArtifact,
+        ) {
             CompilerArguments::Ok(h) => h,
             o => bail!("Bad result from parse_arguments: {o:?}"),
         };
@@ -3562,7 +3622,12 @@ LLVM version: 6.0",
 
         let cwd = f.tempdir.path();
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
-        let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
+        let mut hasher = match c.parse_arguments(
+            &arguments,
+            ".".as_ref(),
+            &[],
+            CompilerCachePolicy::FinishedArtifact,
+        ) {
             CompilerArguments::Ok(h) => h,
             o => bail!("Bad result from parse_arguments: {o:?}"),
         };
@@ -3657,7 +3722,12 @@ LLVM version: 6.0",
         }
         let cwd = f.tempdir.path();
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
-        let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
+        let mut hasher = match c.parse_arguments(
+            &arguments,
+            ".".as_ref(),
+            &[],
+            CompilerCachePolicy::FinishedArtifact,
+        ) {
             CompilerArguments::Ok(h) => h,
             o => bail!("Bad result from parse_arguments: {o:?}"),
         };
@@ -3780,7 +3850,12 @@ LLVM version: 6.0",
         );
         let cwd = f.tempdir.path();
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
-        let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
+        let mut hasher = match c.parse_arguments(
+            &arguments,
+            ".".as_ref(),
+            &[],
+            CompilerCachePolicy::FinishedArtifact,
+        ) {
             CompilerArguments::Ok(h) => h,
             o => bail!("Bad result from parse_arguments: {o:?}"),
         };
@@ -3882,7 +3957,12 @@ LLVM version: 6.0",
         }
         let cwd = f.tempdir.path();
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
-        let hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
+        let hasher = match c.parse_arguments(
+            &arguments,
+            ".".as_ref(),
+            &[],
+            CompilerCachePolicy::FinishedArtifact,
+        ) {
             CompilerArguments::Ok(h) => h,
             o => bail!("Bad result from parse_arguments: {o:?}"),
         };
