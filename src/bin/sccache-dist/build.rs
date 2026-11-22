@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::command_helpers::CommandExt;
+use super::command_helpers::{CommandExt, run_with_environment};
 use anyhow::{Context, Error, Result, anyhow, bail};
 use fs_err as fs;
 use libmount::Overlay;
@@ -448,7 +448,10 @@ impl OverlayBuilder {
                         .args(["--proc", "/proc"])
                         .args(["--dev", "/dev"])
                         .arg("--chdir")
-                        .arg(cwd);
+                        .arg(cwd)
+                        // The compiler must see the client environment, not
+                        // variables inherited from the worker service.
+                        .arg("--clearenv");
 
                     for (k, v) in env_vars {
                         if k.contains('=') {
@@ -897,24 +900,10 @@ impl DockerBuilder {
         trace!("performing compile");
         // TODO: likely shouldn't perform the compile as root in the container
         let mut cmd = Command::new("docker");
-        cmd.arg("exec");
-        for (k, v) in env_vars {
-            if k.contains('=') {
-                warn!("Skipping environment variable: {:?}", k);
-                continue;
-            }
-            let mut env = k;
-            env.push('=');
-            env.push_str(&v);
-            cmd.arg("-e").arg(env);
-        }
-        let shell_cmd = "cd \"$1\" && shift && exec \"$@\"";
-        cmd.args([cid, "/busybox", "sh", "-c", shell_cmd]);
-        cmd.arg(&executable);
-        cmd.arg(cwd);
-        cmd.arg(executable);
-        cmd.args(arguments);
-        let compile_output = cmd.output().context("Failed to start executing compile")?;
+        cmd.args(["exec", "--workdir"])
+            .arg(cwd)
+            .args([cid, "/busybox", "env", "-i", "--"]);
+        let compile_output = run_with_environment(&mut cmd, env_vars, executable, arguments)?;
         trace!("compile_output: {:?}", compile_output);
 
         let mut outputs = vec![];
