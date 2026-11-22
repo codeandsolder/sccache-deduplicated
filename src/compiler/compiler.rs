@@ -3138,6 +3138,21 @@ LLVM version: 6.0",
         Ok(())
     }
 
+    const COMPILER_STDOUT: &[u8] = b"compiler stdout";
+    const COMPILER_STDERR: &[u8] = b"compiler stderr";
+
+    fn queue_mock_compile(creator: &Arc<std::sync::Mutex<MockCommandCreator>>, output: &Path) {
+        let output = output.to_owned();
+        next_command_calls(creator, move |_| {
+            File::create(&output)?.write_all(b"file contents")?;
+            Ok(MockChild::new(
+                exit_status(0),
+                COMPILER_STDOUT,
+                COMPILER_STDERR,
+            ))
+        });
+    }
+
     type TestCompiler = Box<dyn Compiler<Arc<std::sync::Mutex<MockCommandCreator>>>>;
 
     fn mock_gcc_for_compile(
@@ -3196,21 +3211,8 @@ LLVM version: 6.0",
             &creator,
             Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
         );
-        // The compiler invocation.
-        const COMPILER_STDOUT: &[u8] = b"compiler stdout";
-        const COMPILER_STDERR: &[u8] = b"compiler stderr";
         let obj = f.tempdir.path().join("foo.o");
-        let o = obj.clone();
-        next_command_calls(&creator, move |_| {
-            // Pretend to compile something.
-            let mut f = File::create(&o)?;
-            f.write_all(b"file contents")?;
-            Ok(MockChild::new(
-                exit_status(0),
-                COMPILER_STDOUT,
-                COMPILER_STDERR,
-            ))
-        });
+        queue_mock_compile(&creator, &obj);
         let cwd = f.tempdir.path();
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
         let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
@@ -3420,21 +3422,8 @@ LLVM version: 6.0",
             &creator,
             Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
         );
-        // The compiler invocation.
-        const COMPILER_STDOUT: &[u8] = b"compiler stdout";
-        const COMPILER_STDERR: &[u8] = b"compiler stderr";
         let obj = f.tempdir.path().join("foo.o");
-        let o = obj.clone();
-        next_command_calls(&creator, move |_| {
-            // Pretend to compile something.
-            let mut f = File::create(&o)?;
-            f.write_all(b"file contents")?;
-            Ok(MockChild::new(
-                exit_status(0),
-                COMPILER_STDOUT,
-                COMPILER_STDERR,
-            ))
-        });
+        queue_mock_compile(&creator, &obj);
         let cwd = f.tempdir.path();
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
         let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
@@ -3565,8 +3554,6 @@ LLVM version: 6.0",
         std::fs::write(f.tempdir.path().join("foo.c"), "whatever")?;
         // Pretend to be GCC.
         let c = mock_gcc_for_compile(&creator, &gcc, f.tempdir.path(), &pool)?;
-        const COMPILER_STDOUT: &[u8] = b"compiler stdout";
-        const COMPILER_STDERR: &[u8] = b"compiler stderr";
         // The compiler should be invoked twice, since we're forcing
         // recaching.
         let obj = f.tempdir.path().join("foo.o");
@@ -3577,17 +3564,7 @@ LLVM version: 6.0",
                 Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
             );
             // The compiler invocation.
-            let o = obj.clone();
-            next_command_calls(&creator, move |_| {
-                // Pretend to compile something.
-                let mut f = File::create(&o)?;
-                f.write_all(b"file contents")?;
-                Ok(MockChild::new(
-                    exit_status(0),
-                    COMPILER_STDOUT,
-                    COMPILER_STDERR,
-                ))
-            });
+            queue_mock_compile(&creator, &obj);
         }
         let cwd = f.tempdir.path();
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
@@ -3787,17 +3764,7 @@ LLVM version: 6.0",
                 Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
             );
             // The compiler invocation.
-            let o = obj.clone();
-            next_command_calls(&creator, move |_| {
-                // Pretend to compile something.
-                let mut f = File::create(&o)?;
-                f.write_all(b"file contents")?;
-                Ok(MockChild::new(
-                    exit_status(0),
-                    COMPILER_STDOUT,
-                    COMPILER_STDERR,
-                ))
-            });
+            queue_mock_compile(&creator, &obj);
         }
         let cwd = f.tempdir.path();
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
