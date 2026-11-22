@@ -196,6 +196,7 @@ fn run(command: Command) -> Result<i32> {
             server_auth,
             maintenance_drain_file,
             job_slack,
+            native_cache,
         }) => {
             let check_client_auth: Box<dyn dist::http::ClientAuthCheck> = match client_auth {
                 scheduler_config::ClientAuth::Insecure => Box::new(token_check::EqCheck::new(
@@ -266,6 +267,7 @@ fn run(command: Command) -> Result<i32> {
                 scheduler,
                 check_client_auth,
                 check_server_auth,
+                native_cache,
             );
             // A running server never exits successfully (Result<Infallible>).
             match http_scheduler.start()? {}
@@ -966,6 +968,32 @@ impl SchedulerIncoming for Scheduler {
             .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?
             .get(&server_id)
             .and_then(|details| details.worker_name.clone()))
+    }
+
+    fn handle_authorize_native_job(&self, job: &JobAlloc) -> Result<()> {
+        let jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("jobs mutex poisoned"))?;
+        let servers = self
+            .servers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
+        let detail = jobs
+            .get(&job.job_id)
+            .context("unknown native job allocation")?;
+        anyhow::ensure!(
+            detail.server_id == job.server_id,
+            "native job assigned to another worker"
+        );
+        let owner = servers
+            .get(&job.server_id)
+            .context("native job worker unavailable")?;
+        anyhow::ensure!(
+            owner.jobs_assigned.contains(&job.job_id),
+            "native job reservation no longer active"
+        );
+        owner.job_authorizer.verify_token(job.job_id, &job.auth)
     }
 
     fn handle_update_job_state(

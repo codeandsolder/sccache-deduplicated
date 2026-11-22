@@ -2023,6 +2023,53 @@ pub mod scheduler {
         }
     }
 
+    /// Dedicated native cache listener and its explicit resource limits.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct NativeCacheConfig {
+        pub public_addr: SocketAddr,
+        pub directory: PathBuf,
+        pub idle_timeout_secs: u64,
+        pub max_sessions: usize,
+        pub max_result_bytes: u64,
+        pub max_result_blobs: usize,
+        pub max_tree_bytes: u64,
+        pub max_tree_blobs: usize,
+        pub max_concurrent_uploads: usize,
+        pub max_total_uploads: usize,
+        pub http_threads: usize,
+        pub max_metadata_bytes: usize,
+    }
+
+    impl NativeCacheConfig {
+        /// Validate configuration before binding the listener.
+        ///
+        /// # Errors
+        /// Returns an error for a relative path or unusable resource bounds.
+        pub fn session_limits(&self) -> Result<crate::build_runtime::SessionLimits> {
+            if !self.directory.is_absolute() {
+                bail!("native cache directory must be absolute");
+            }
+            if self.http_threads <= self.max_total_uploads || self.max_metadata_bytes == 0 {
+                bail!(
+                    "native cache requires spare HTTP threads for control traffic and a nonzero metadata limit"
+                );
+            }
+            let limits = crate::build_runtime::SessionLimits {
+                idle_timeout: std::time::Duration::from_secs(self.idle_timeout_secs),
+                max_sessions: self.max_sessions,
+                max_result_bytes: self.max_result_bytes,
+                max_result_blobs: self.max_result_blobs,
+                max_tree_bytes: self.max_tree_bytes,
+                max_tree_blobs: self.max_tree_blobs,
+                max_concurrent_uploads: self.max_concurrent_uploads,
+                max_total_uploads: self.max_total_uploads,
+            };
+            limits.validate()?;
+            Ok(limits)
+        }
+    }
+
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct Config {
@@ -2032,6 +2079,7 @@ pub mod scheduler {
         #[serde(default)]
         pub maintenance_drain_file: Option<PathBuf>,
         pub job_slack: JobSlackConfig,
+        pub native_cache: Option<NativeCacheConfig>,
     }
 
     pub fn from_path(conf_path: &Path) -> Result<Option<Config>> {
@@ -2039,6 +2087,12 @@ pub mod scheduler {
             .context("Failed to load scheduler config file")?;
         if let Some(config) = &config {
             config.job_slack.validate()?;
+            if let Some(native) = &config.native_cache {
+                native.session_limits()?;
+                if native.public_addr == config.public_addr {
+                    bail!("native cache listener must have a separate address");
+                }
+            }
         }
         Ok(config)
     }

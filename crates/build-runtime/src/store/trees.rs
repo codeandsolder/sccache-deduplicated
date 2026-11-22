@@ -5,13 +5,13 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use bincode::Options;
 use redb::{ReadableDatabase, ReadableTable};
 
 use super::{
     Eviction, Inner, LeasedReader, NativeStore, PACKAGES, StagedBlob, TREE_PACKAGES, TREES,
-    UploadReservation, encoding,
+    UploadReservation, encoding, release_pin,
 };
 use crate::{ContentId, TreeId, TreeManifest, TreeRecipe};
 
@@ -40,10 +40,34 @@ impl NativeStore {
         staged: Vec<StagedBlob>,
         package: Option<ContentId>,
     ) -> Result<TreeId> {
+        let _mutation = self.inner.lock_mutations()?;
+        self.publish_tree_locked(manifest, staged, package)
+    }
+
+    /// Publish a tree and acquire its delivery lease atomically with respect
+    /// to eviction.
+    ///
+    /// # Errors
+    /// Returns an error for invalid manifests, missing blobs or storage failure.
+    pub fn publish_tree_pinned(
+        &self,
+        manifest: &TreeManifest,
+        staged: Vec<StagedBlob>,
+    ) -> Result<TreeLease> {
+        let _mutation = self.inner.lock_mutations()?;
+        let id = self.publish_tree_locked(manifest, staged, None)?;
+        self.lookup_tree(id)?.context("committed tree missing")
+    }
+
+    fn publish_tree_locked(
+        &self,
+        manifest: &TreeManifest,
+        staged: Vec<StagedBlob>,
+        package: Option<ContentId>,
+    ) -> Result<TreeId> {
         let id = manifest.id()?;
         let blobs = manifest.blobs()?;
         let staged = self.prepare_staging(&blobs, staged)?;
-        let _mutation = self.inner.lock_mutations()?;
         let write = self.inner.db.begin_write()?;
         {
             let mut trees = write.open_table(TREES)?;
@@ -182,16 +206,21 @@ impl TreeLease {
         &self.manifest
     }
 
+    /// Open declared content for streaming independently of the tree lease.
+    ///
+    /// # Errors
+    /// Returns an error for undeclared content or storage failure.
+    pub fn open_file(&self, id: ContentId) -> Result<File> {
+        self.inner.open_declared(&self.blobs, id)
+    }
+
     /// Open an independent reader for content declared by this tree.
     ///
     /// # Errors
     /// Returns an error for undeclared content or filesystem failure.
     pub fn open_blob(&self, id: ContentId) -> Result<impl Read + Seek + '_> {
-        if !self.blobs.contains_key(&id) {
-            bail!("content {id:?} is not part of this tree");
-        }
         Ok(LeasedReader {
-            file: File::open(self.inner.blob_path(id))?,
+            file: self.open_file(id)?,
             _lease: self,
         })
     }
@@ -200,13 +229,7 @@ impl TreeLease {
 impl Drop for TreeLease {
     fn drop(&mut self) {
         match self.inner.lock_pins() {
-            Ok(mut pins) => match pins.trees.get_mut(&self.id) {
-                Some(count) if *count > 1 => *count -= 1,
-                Some(_) => {
-                    pins.trees.remove(&self.id);
-                }
-                None => log::error!("native store tree lease lost its pin"),
-            },
+            Ok(mut pins) => release_pin(&mut pins.trees, &self.id),
             Err(error) => log::error!("could not release native store tree lease: {error:#}"),
         }
     }

@@ -38,6 +38,8 @@ mod cache;
 pub mod client_auth;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 pub mod http;
+#[cfg(any(feature = "dist-client", feature = "dist-server"))]
+pub mod native;
 #[cfg(test)]
 mod test;
 
@@ -997,6 +999,9 @@ pub trait SchedulerIncoming: Send + Sync {
         requester: &dyn SchedulerOutgoing,
         tc: Toolchain,
     ) -> ExtResult<AllocJobResult, Error>;
+    /// Verify the allocation capability and return the currently assigned
+    /// publisher for native result delivery.
+    fn handle_authorize_native_job(&self, job: &JobAlloc) -> ExtResult<(), Error>;
     // From Server
     fn handle_heartbeat_server(
         &self,

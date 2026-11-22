@@ -1,0 +1,393 @@
+//! Client and worker adapters for the scheduler's native cache protocol.
+
+use std::{
+    fs::File,
+    io::{self, Cursor, Read, Write},
+    time::Duration,
+};
+
+use anyhow::{Context, Result, ensure};
+use bincode::Options;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+
+use crate::build_runtime::{
+    BlobRef, ContentId, ResultManifest, TreeId, TreeManifest,
+    wire::{
+        ActionRequest, BeginResult, NativeAdmission, NativeStatus, Ticket, TreeOffer, TreeRead,
+        UploadHeader,
+    },
+};
+use crate::dist::{JobAlloc, JobId};
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct DelegateRequest {
+    pub ticket: Ticket,
+    pub job: JobAlloc,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct ManifestRequest {
+    pub ticket: Ticket,
+    pub manifest: ResultManifest,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct DownloadRequest {
+    pub ticket: Ticket,
+    pub id: ContentId,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct OpenTreeRequest {
+    pub action: Ticket,
+    pub tree: TreeId,
+}
+
+#[derive(Clone, Copy)]
+enum Role {
+    Client,
+    Worker(JobId),
+}
+
+/// Bounded streaming HTTP client for native result publication and retrieval.
+///
+/// The worker uses the same authenticated listener as clients, but is scoped
+/// to its scheduler-assigned job and the delegated ticket.
+#[derive(Clone)]
+pub struct NativeCacheClient {
+    http: reqwest::blocking::Client,
+    base: reqwest::Url,
+    auth: String,
+    role: Role,
+    metadata_limit: u64,
+}
+
+impl NativeCacheClient {
+    /// Create an authenticated native client with explicit request bounds.
+    ///
+    /// # Errors
+    /// Returns an error for invalid endpoint configuration or HTTP setup.
+    pub fn new(
+        base: reqwest::Url,
+        auth: String,
+        timeout: Duration,
+        metadata_limit: u64,
+    ) -> Result<Self> {
+        ensure!(
+            matches!(base.scheme(), "http" | "https")
+                && base.query().is_none()
+                && base.fragment().is_none()
+                && base.username().is_empty()
+                && base.password().is_none(),
+            "invalid native cache endpoint"
+        );
+        ensure!(
+            metadata_limit > 0 && metadata_limit < u64::MAX && !timeout.is_zero(),
+            "invalid native client bounds"
+        );
+        let http = reqwest::blocking::ClientBuilder::new()
+            .timeout(timeout)
+            .connect_timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .pool_max_idle_per_host(0)
+            .build()?;
+        Ok(Self {
+            http,
+            base,
+            auth,
+            role: Role::Client,
+            metadata_limit,
+        })
+    }
+
+    /// Reuse a configured HTTP client for one authenticated worker job.
+    #[must_use = "the returned client is scoped to this worker job"]
+    pub fn for_worker(mut self, job: JobId) -> Self {
+        self.role = Role::Worker(job);
+        self
+    }
+
+    fn request(&self, operation: &str) -> Result<reqwest::blocking::RequestBuilder> {
+        let (role, job) = match self.role {
+            Role::Client => ("client", None),
+            Role::Worker(job) => ("worker", Some(job)),
+        };
+        let url = self
+            .base
+            .join(&format!("/api/v2/native/{role}/{operation}"))?;
+        let mut request = self
+            .http
+            .post(url)
+            .bearer_auth(&self.auth)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .header(reqwest::header::CONNECTION, "close");
+        if let Some(job) = job {
+            request = request.header("X-Sccache-Native-Job", job.to_string());
+        }
+        Ok(request)
+    }
+
+    fn control<T: Serialize, R: DeserializeOwned>(&self, operation: &str, value: &T) -> Result<R> {
+        let data = codec().with_limit(self.metadata_limit).serialize(value)?;
+        let response = self
+            .request(operation)?
+            .body(data)
+            .send()?
+            .error_for_status()?;
+        let mut bytes = Vec::new();
+        response
+            .take(self.metadata_limit + 1)
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            u64::try_from(bytes.len())? <= self.metadata_limit,
+            "native response exceeds configured metadata limit"
+        );
+        Ok(codec()
+            .with_limit(self.metadata_limit)
+            .deserialize(&bytes)?)
+    }
+
+    /// Admit a complete native action.
+    ///
+    /// # Errors
+    /// Returns an error on invalid metadata, authentication or transport failure.
+    pub fn admit(&self, request: &ActionRequest) -> Result<NativeAdmission> {
+        self.control("admit", request)
+    }
+
+    /// Bind the ticket to a real scheduler allocation, using its capability.
+    ///
+    /// # Errors
+    /// Returns an error if the allocation or ticket is invalid.
+    pub fn delegate(&self, ticket: Ticket, job: JobAlloc) -> Result<()> {
+        self.control("delegate", &DelegateRequest { ticket, job })
+    }
+
+    /// Negotiate and upload a tree using the sender's immutable content.
+    ///
+    /// # Errors
+    /// Returns an error for a rejected tree or transfer failure.
+    pub fn offer_tree(&self, manifest: &TreeManifest) -> Result<TreeOffer> {
+        self.control("tree_offer", manifest)
+    }
+
+    /// Publish the offered tree, retaining the ticket's delivery pin.
+    ///
+    /// # Errors
+    /// Returns an error if content is missing or the offer expired.
+    pub fn commit_tree(&self, ticket: Ticket) -> Result<TreeId> {
+        self.control("tree_commit", &ticket)
+    }
+
+    /// Obtain a tree's manifest and delivery pin for an authorized job.
+    ///
+    /// # Errors
+    /// Returns an error if this action cannot access the tree.
+    pub fn open_tree(&self, action: Ticket, tree: TreeId) -> Result<TreeRead> {
+        self.control("tree_open", &OpenTreeRequest { action, tree })
+    }
+
+    /// Publish a local tree, transferring only absent blobs.
+    ///
+    /// # Errors
+    /// Returns an error on a negotiation, verification or transport failure.
+    #[cfg(all(unix, feature = "native-store"))]
+    pub fn push_tree(&self, tree: &crate::build_runtime::TreeLease) -> Result<Ticket> {
+        let offer = self.offer_tree(tree.manifest())?;
+        let result = (|| {
+            ensure!(offer.id == tree.id(), "native tree offer identity mismatch");
+            for blob in offer.missing {
+                self.upload_file(offer.ticket, blob, tree.open_file(blob.id)?)?;
+            }
+            ensure!(
+                self.commit_tree(offer.ticket)? == tree.id(),
+                "native tree commit identity mismatch"
+            );
+            Ok(offer.ticket)
+        })();
+        if result.is_err() {
+            let _ = self.close(offer.ticket);
+        }
+        result
+    }
+
+    /// Fetch a declared input tree into the worker store.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid manifest or failed transfer.
+    #[cfg(all(unix, feature = "native-store"))]
+    pub fn fetch_tree(
+        &self,
+        action: Ticket,
+        id: TreeId,
+        store: &crate::build_runtime::NativeStore,
+    ) -> Result<crate::build_runtime::TreeLease> {
+        let read = self.open_tree(action, id)?;
+        let result = (|| {
+            ensure!(
+                read.manifest.id()? == id,
+                "native tree download identity mismatch"
+            );
+            let reserved = store.reserve_tree_upload(&read.manifest)?;
+            let mut staged = Vec::new();
+            for blob in reserved.missing() {
+                let response = self.download_response(read.ticket, blob.id)?;
+                staged.push(store.stage_expected(*blob, response)?);
+            }
+            store.publish_tree_pinned(&read.manifest, staged)
+        })();
+        // Best effort: the remote pin also expires automatically.
+        let _ = self.close(read.ticket);
+        result
+    }
+
+    /// Negotiate missing content for a successful result.
+    ///
+    /// # Errors
+    /// Returns an error if the output contract or session is invalid.
+    pub fn begin(&self, ticket: Ticket, manifest: ResultManifest) -> Result<BeginResult> {
+        self.control("begin", &ManifestRequest { ticket, manifest })
+    }
+
+    /// Upload one missing blob directly from an open file descriptor.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid length or rejected transfer.
+    pub fn upload_file(&self, ticket: Ticket, blob: BlobRef, file: File) -> Result<()> {
+        ensure!(
+            file.metadata()?.len() == blob.size,
+            "native upload file length mismatch"
+        );
+        self.upload(ticket, blob, file)
+    }
+
+    /// Send raw content without buffering it in memory. The scheduler verifies
+    /// the full digest and declared length before admitting it.
+    ///
+    /// # Errors
+    /// Returns an error on transport or verification failure.
+    pub fn upload(
+        &self,
+        ticket: Ticket,
+        blob: BlobRef,
+        reader: impl Read + Send + 'static,
+    ) -> Result<()> {
+        let header = codec().serialize(&UploadHeader { ticket, blob })?;
+        let length = blob
+            .size
+            .checked_add(u64::try_from(header.len())?)
+            .context("native upload length overflow")?;
+        // The body content length is explicit. Callers provide exact input
+        // streams; the scheduler validates the transmitted bytes independently.
+        let body = reqwest::blocking::Body::sized(Cursor::new(header).chain(reader), length);
+        self.request("upload")?
+            .body(body)
+            .send()?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Commit the negotiated result.
+    ///
+    /// # Errors
+    /// Returns an error if uploads are unfinished or publication failed.
+    pub fn commit(&self, ticket: Ticket) -> Result<ResultManifest> {
+        self.control("commit", &ticket)
+    }
+
+    /// Renew the publishing lease during a long-running compilation.
+    ///
+    /// # Errors
+    /// Returns an error for expired or unauthorized tickets.
+    pub fn renew(&self, ticket: Ticket) -> Result<()> {
+        self.control("renew", &ticket)
+    }
+
+    /// Report a failed compilation without publishing any shared result.
+    ///
+    /// # Errors
+    /// Returns an error for expired or unauthorized tickets.
+    pub fn fail(&self, ticket: Ticket) -> Result<()> {
+        self.control("fail", &ticket)
+    }
+
+    /// Observe the client's result ticket.
+    ///
+    /// # Errors
+    /// Returns an error on an unavailable ticket or transport failure.
+    pub fn status(&self, ticket: Ticket) -> Result<NativeStatus> {
+        self.control("status", &ticket)
+    }
+
+    /// Release a result ticket or cancel an unfinished action.
+    ///
+    /// # Errors
+    /// Returns an error if the ticket cannot be closed.
+    pub fn close(&self, ticket: Ticket) -> Result<()> {
+        self.control("close", &ticket)
+    }
+
+    /// Stream a result blob into caller-owned staging storage and verify it.
+    ///
+    /// Do not expose the destination to consumers until this method succeeds.
+    ///
+    /// # Errors
+    /// Returns an error for a rejected transfer, wrong length/digest or I/O.
+    pub fn download(
+        &self,
+        ticket: Ticket,
+        blob: BlobRef,
+        mut destination: impl Write,
+    ) -> Result<()> {
+        let response = self.download_response(ticket, blob.id)?;
+        let limit = blob
+            .size
+            .checked_add(1)
+            .context("native download size overflow")?;
+        let mut reader = response.take(limit);
+        let mut hash = blake3::Hasher::new();
+        let mut buffer = vec![0_u8; 64 * 1024];
+        let mut received = 0_u64;
+        loop {
+            let count = match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            };
+            received = received
+                .checked_add(u64::try_from(count)?)
+                .context("native download length overflow")?;
+            ensure!(
+                received <= blob.size,
+                "native download exceeds declared length"
+            );
+            hash.update(&buffer[..count]);
+            destination.write_all(&buffer[..count])?;
+        }
+        ensure!(
+            received == blob.size && ContentId(*hash.finalize().as_bytes()) == blob.id,
+            "native download digest or length mismatch"
+        );
+        Ok(())
+    }
+    fn download_response(
+        &self,
+        ticket: Ticket,
+        id: ContentId,
+    ) -> Result<reqwest::blocking::Response> {
+        let request = codec().serialize(&DownloadRequest { ticket, id })?;
+        Ok(self
+            .request("download")?
+            .body(request)
+            .send()?
+            .error_for_status()?)
+    }
+}
+
+pub(super) fn codec() -> impl Options {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_little_endian()
+        .reject_trailing_bytes()
+}

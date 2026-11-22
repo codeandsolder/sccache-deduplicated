@@ -114,6 +114,20 @@ impl CompilePermit {
             .store
             .publish(&self.fingerprint, manifest, staged)
     }
+
+    /// Commit the result and pin it for delivery in the same mutation scope.
+    ///
+    /// # Errors
+    /// Returns an error for invalid results, missing content or storage failure.
+    pub fn publish_pinned(
+        self,
+        manifest: &ResultManifest,
+        staged: Vec<StagedBlob>,
+    ) -> Result<ResultLease> {
+        self.inner
+            .store
+            .publish_pinned(&self.fingerprint, manifest, staged)
+    }
 }
 
 impl Drop for CompilePermit {

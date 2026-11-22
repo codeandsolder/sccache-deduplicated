@@ -345,6 +345,8 @@ mod server {
     };
     use crate::errors::{Context, Result, anyhow};
 
+    mod native;
+
     const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
     const HEARTBEAT_ERROR_INTERVAL: Duration = Duration::from_secs(10);
     pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
@@ -626,7 +628,8 @@ mod server {
     pub trait ClientAuthCheck: Send + Sync {
         fn check(&self, token: &str) -> StdResult<(), ClientVisibleMsg>;
     }
-    pub type ServerAuthCheck = Box<dyn Fn(&str) -> Option<ServerId> + Send + Sync>;
+    type ServerAuthenticator = dyn Fn(&str) -> Option<ServerId> + Send + Sync;
+    pub type ServerAuthCheck = Box<ServerAuthenticator>;
 
     const JWT_KEY_LENGTH: usize = 256 / 8;
     static JWT_HEADER: LazyLock<jwt::Header> =
@@ -780,6 +783,34 @@ mod server {
         split.next()
     }
 
+    fn authenticate_client(
+        request: &rouille::Request,
+        check: &dyn ClientAuthCheck,
+    ) -> StdResult<(), rouille::Response> {
+        let token = bearer_http_auth(request).ok_or_else(|| make_401("no_bearer_auth"))?;
+        check.check(token).map_err(|message| {
+            warn!("Bearer auth failed: {message:?}");
+            make_401_with_body("bearer_auth_failed", message)
+        })
+    }
+
+    fn authenticate_server(
+        request: &rouille::Request,
+        check: &dyn Fn(&str) -> Option<ServerId>,
+    ) -> StdResult<ServerId, rouille::Response> {
+        let server_id = bearer_http_auth(request)
+            .and_then(check)
+            .ok_or_else(|| make_401("invalid_bearer_token"))?;
+        let origin = request_origin_ip(request).map_err(|error| {
+            warn!("Could not determine server origin IP: {error}");
+            rouille::Response::empty_400()
+        })?;
+        if server_id.addr().ip() != origin {
+            return Err(make_401("invalid_bearer_token_mismatched_address"));
+        }
+        Ok(server_id)
+    }
+
     /// Return `content` as a bincode-encoded `Response`.
     pub fn bincode_response<T>(content: &T) -> rouille::Response
     where
@@ -911,6 +942,7 @@ mod server {
         check_client_auth: Box<dyn ClientAuthCheck>,
         // Do we believe the server is who they appear to be?
         check_server_auth: ServerAuthCheck,
+        native_cache: Option<crate::config::scheduler::NativeCacheConfig>,
     }
 
     impl<S: dist::SchedulerIncoming + 'static> Scheduler<S> {
@@ -919,12 +951,14 @@ mod server {
             handler: S,
             check_client_auth: Box<dyn ClientAuthCheck>,
             check_server_auth: ServerAuthCheck,
+            native_cache: Option<crate::config::scheduler::NativeCacheConfig>,
         ) -> Self {
             Self {
                 public_addr,
                 handler,
                 check_client_auth,
                 check_server_auth,
+                native_cache,
             }
         }
 
@@ -934,31 +968,29 @@ mod server {
                 handler,
                 check_client_auth,
                 check_server_auth,
+                native_cache,
             } = self;
             let requester = SchedulerRequester {
                 client: Mutex::new(new_reqwest_blocking_client()?),
             };
 
+            let handler = Arc::new(handler);
+            let check_client_auth: Arc<dyn ClientAuthCheck> = Arc::from(check_client_auth);
+            let check_server_auth: Arc<ServerAuthenticator> = Arc::from(check_server_auth);
+            if let Some(config) = native_cache {
+                native::spawn(
+                    config,
+                    Arc::clone(&handler),
+                    Arc::clone(&check_client_auth),
+                    Arc::clone(&check_server_auth),
+                )?;
+            }
+
             macro_rules! check_server_auth_or_err {
                 ($request:ident) => {{
-                    match bearer_http_auth($request).and_then(&*check_server_auth) {
-                        Some(server_id) => {
-                            let origin_ip = match request_origin_ip($request) {
-                                Ok(ip) => ip,
-                                Err(err) => {
-                                    warn!("Could not determine server origin IP: {err}");
-                                    return rouille::Response::empty_400();
-                                }
-                            };
-                            if server_id.addr().ip() != origin_ip {
-                                trace!("server ip: {:?}", server_id.addr().ip());
-                                trace!("request ip: {:?}", $request.remote_addr().ip());
-                                return make_401("invalid_bearer_token_mismatched_address");
-                            } else {
-                                server_id
-                            }
-                        }
-                        None => return make_401("invalid_bearer_token"),
+                    match authenticate_server($request, &*check_server_auth) {
+                        Ok(server_id) => server_id,
+                        Err(response) => return response,
                     }
                 }};
             }
@@ -1015,16 +1047,8 @@ mod server {
                 trace!(target: "sccache_http", "Req {}: {:?}", req_id, SafeRequest(request));
                 let response = (|| router!(request,
                     (POST) (/api/v1/scheduler/alloc_job) => {
-                        let bearer_auth = match bearer_http_auth(request) {
-                            Some(s) => s,
-                            None => return make_401("no_bearer_auth"),
-                        };
-                        match check_client_auth.check(bearer_auth) {
-                            Ok(()) => (),
-                            Err(client_msg) => {
-                                warn!("Bearer auth failed: {:?}", client_msg);
-                                return make_401_with_body("bearer_auth_failed", client_msg)
-                            },
+                        if let Err(response) = authenticate_client(request, &*check_client_auth) {
+                            return response;
                         }
                         let toolchain = try_or_400_log!(req_id, bincode_input(request));
                         trace!("Req {}: alloc_job: {:?}", req_id, toolchain);
@@ -1059,13 +1083,8 @@ mod server {
                         prepare_response(request, &res)
                     },
                     (GET) (/api/v1/scheduler/worker_name/{server_id: ServerId}) => {
-                        let bearer_auth = match bearer_http_auth(request) {
-                            Some(auth) => auth,
-                            None => return make_401("no_bearer_auth"),
-                        };
-                        if let Err(client_msg) = check_client_auth.check(bearer_auth) {
-                            warn!("Bearer auth failed: {:?}", client_msg);
-                            return make_401_with_body("bearer_auth_failed", client_msg)
+                        if let Err(response) = authenticate_client(request, &*check_client_auth) {
+                            return response;
                         }
                         let worker_name = try_or_500_log!(
                             req_id,

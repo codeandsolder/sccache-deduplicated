@@ -229,6 +229,7 @@ pub fn sccache_client_cfg(
 fn sccache_scheduler_cfg() -> sccache::config::scheduler::Config {
     sccache::config::scheduler::Config {
         maintenance_drain_file: None,
+        native_cache: None,
         job_slack: Default::default(),
         public_addr: SocketAddr::from(([0, 0, 0, 0], SCHEDULER_PORT)),
         client_auth: sccache::config::scheduler::ClientAuth::Insecure,

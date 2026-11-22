@@ -10,6 +10,7 @@ mod identity;
 mod recipe;
 pub use recipe::{TreeLayer, TreeRecipe};
 mod tree;
+pub mod wire;
 pub use identity::{
     ActionFingerprint, ActionKey, Artifact, BlobRef, ContentId, ResultId, ResultManifest,
 };
@@ -17,6 +18,10 @@ pub use tree::{TreeEntry, TreeId, TreeManifest, TreeMetadata, TreePath, TreeTime
 
 #[cfg(all(unix, feature = "store"))]
 mod coordinator;
+#[cfg(all(unix, feature = "store"))]
+mod session;
+#[cfg(all(unix, feature = "store"))]
+pub use session::{NativeSessions, SessionLimits};
 #[cfg(all(unix, feature = "store"))]
 mod store;
 #[cfg(all(unix, feature = "store"))]

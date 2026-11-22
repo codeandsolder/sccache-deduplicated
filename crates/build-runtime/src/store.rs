@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use bincode::Options;
 use redb::{
     Database, MultimapTableDefinition, ReadableDatabase, ReadableMultimapTable, ReadableTable,
@@ -103,6 +103,17 @@ struct Pins {
     uploads: BTreeMap<ContentId, usize>,
 }
 
+// All lease categories use the same pin reference-counting invariant.
+fn release_pin<K: Ord + std::fmt::Debug>(pins: &mut BTreeMap<K, usize>, key: &K) {
+    match pins.get_mut(key) {
+        Some(count) if *count > 1 => *count -= 1,
+        Some(_) => {
+            pins.remove(key);
+        }
+        None => log::error!("native store lease lost its pin: {key:?}"),
+    }
+}
+
 struct Inner {
     root: PathBuf,
     db: Database,
@@ -141,6 +152,14 @@ impl Inner {
             "invalid native store content {id:?}"
         );
         Ok(())
+    }
+
+    fn open_declared(&self, blobs: &BTreeMap<ContentId, u64>, id: ContentId) -> Result<File> {
+        ensure!(
+            blobs.contains_key(&id),
+            "content {id:?} is not part of the leased manifest"
+        );
+        Ok(File::open(self.blob_path(id))?)
     }
 
     fn install_blob(&self, blob: StagedBlob) -> Result<()> {
@@ -413,11 +432,36 @@ impl NativeStore {
         manifest: &ResultManifest,
         staged: Vec<StagedBlob>,
     ) -> Result<Published> {
+        let _mutation = self.inner.lock_mutations()?;
+        self.publish_locked(fingerprint, manifest, staged)
+    }
+
+    /// Publish and pin the resulting action before eviction can remove it.
+    ///
+    /// # Errors
+    /// Returns an error for invalid results, missing content or storage failure.
+    pub fn publish_pinned(
+        &self,
+        fingerprint: &ActionFingerprint,
+        manifest: &ResultManifest,
+        staged: Vec<StagedBlob>,
+    ) -> Result<ResultLease> {
+        let _mutation = self.inner.lock_mutations()?;
+        let published = self.publish_locked(fingerprint, manifest, staged)?;
+        self.lookup(published.action)?
+            .context("committed result missing")
+    }
+
+    fn publish_locked(
+        &self,
+        fingerprint: &ActionFingerprint,
+        manifest: &ResultManifest,
+        staged: Vec<StagedBlob>,
+    ) -> Result<Published> {
         let action = fingerprint.key()?;
         let result = manifest.id()?;
         let blobs = manifest.blobs()?;
         let staged = self.prepare_staging(&blobs, staged)?;
-        let _mutation = self.inner.lock_mutations()?;
         let write = self.inner.db.begin_write()?;
         {
             let mut actions = write.open_table(ACTIONS)?;
@@ -859,13 +903,7 @@ impl Drop for UploadReservation {
         match self.inner.lock_pins() {
             Ok(mut pins) => {
                 for id in &self.reserved {
-                    match pins.uploads.get_mut(id) {
-                        Some(count) if *count > 1 => *count -= 1,
-                        Some(_) => {
-                            pins.uploads.remove(id);
-                        }
-                        None => log::error!("native store upload reservation lost content pin"),
-                    }
+                    release_pin(&mut pins.uploads, id);
                 }
             }
             Err(error) => {
@@ -889,17 +927,23 @@ impl ResultLease {
         &self.manifest
     }
 
+    /// Open a file for transport. Its inode remains valid after unlinking,
+    /// so a response can own it independently of this lease.
+    ///
+    /// # Errors
+    /// Returns an error for undeclared content or filesystem failure.
+    pub fn open_file(&self, id: ContentId) -> Result<File> {
+        self.inner.open_declared(&self.blobs, id)
+    }
+
     /// Open a blob belonging to this result. The reader borrows the lease and
     /// cannot outlive the corresponding eviction pin.
     ///
     /// # Errors
     /// Returns an error for an undeclared blob or filesystem failure.
     pub fn open_blob(&self, id: ContentId) -> Result<impl Read + Seek + '_> {
-        if !self.blobs.contains_key(&id) {
-            bail!("content {id:?} is not part of this result");
-        }
         Ok(LeasedReader {
-            file: File::open(self.inner.blob_path(id))?,
+            file: self.open_file(id)?,
             _lease: self,
         })
     }
@@ -908,13 +952,7 @@ impl ResultLease {
 impl Drop for ResultLease {
     fn drop(&mut self) {
         match self.inner.lock_pins() {
-            Ok(mut pins) => match pins.actions.get_mut(&self.action) {
-                Some(count) if *count > 1 => *count -= 1,
-                Some(_) => {
-                    pins.actions.remove(&self.action);
-                }
-                None => log::error!("native store result lease lost its pin"),
-            },
+            Ok(mut pins) => release_pin(&mut pins.actions, &self.action),
             Err(error) => log::error!("could not release native store result lease: {error:#}"),
         }
     }
