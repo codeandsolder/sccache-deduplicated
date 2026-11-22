@@ -635,7 +635,8 @@ where
     // as a separate packet whenever the body overflows the caller's BufWriter.
     let mut bytes = vec![0; 4];
     bincode::serialize_into(&mut bytes, &data)?;
-    let len = u32::try_from(bytes.len() - 4).context("serialized payload exceeds u32 length prefix")?;
+    let len =
+        u32::try_from(bytes.len() - 4).context("serialized payload exceeds u32 length prefix")?;
     BigEndian::write_u32(&mut bytes[..4], len);
     writer.write_all(&bytes)?;
     writer.flush()?;
