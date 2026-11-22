@@ -73,7 +73,7 @@ jwt = { package = "jsonwebtoken", version = "12", optional = true, features = [
 libc = "0.2.153"
 linked-hash-map = "0.5"
 log = "0.4"
-lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "6b6cb082cdc12734d9fea99c549f3ea47cc85a06", optional = true }
+lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "2473c40e61d526b756c7b48a11debd7dc2642537", optional = true }
 memchr = "2"
 mime = "0.3"
 object = "0.41"
@@ -111,7 +111,6 @@ tokio = { version = "1", features = [
 tokio-serde = "0.9"
 tokio-util = { version = "0.7.18", features = ["codec", "io", "rt"] }
 toml = "1.0"
-tower-service = "0.3"
 typed-path = "0.13.0"
 url = { version = "2", optional = true }
 uuid = { version = "1.9", features = ["v4"] }

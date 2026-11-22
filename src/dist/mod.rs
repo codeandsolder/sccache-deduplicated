@@ -32,6 +32,8 @@ use crate::errors::Result;
 #[cfg(unix)]
 use crate::errors::bail;
 
+#[cfg(feature = "dist-client")]
+pub(crate) mod broker;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 mod cache;
 #[cfg(feature = "dist-client")]
@@ -1170,6 +1172,23 @@ pub trait Client: Send + Sync {
         weak_key: String,
         toolchain_packager: Box<dyn pkg::ToolchainPackager>,
     ) -> Result<(Toolchain, Option<CustomToolchainOverride>)>;
+    // The daemon-side broker uses the same toolchain store as its ordinary
+    // distributed client, but package construction happens in the namespace.
+    async fn lookup_namespace_toolchain(
+        &self,
+        _compiler: PathBuf,
+        _key: String,
+    ) -> Result<(Option<Toolchain>, u64)> {
+        Err(anyhow::anyhow!("client does not own a toolchain store"))
+    }
+    async fn import_namespace_toolchain(
+        &self,
+        _compiler: PathBuf,
+        _key: String,
+        _package: std::fs::File,
+    ) -> Result<Toolchain> {
+        Err(anyhow::anyhow!("client does not own a toolchain store"))
+    }
     fn rewrite_includes_only(&self) -> bool;
     fn get_custom_toolchain(&self, exe: &Path) -> Option<PathBuf>;
 }

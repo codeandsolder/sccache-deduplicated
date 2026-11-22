@@ -2001,7 +2001,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 [[package]]
 name = "lurkmoar"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/lurkmoar-rs?rev=6b6cb082cdc12734d9fea99c549f3ea47cc85a06#6b6cb082cdc12734d9fea99c549f3ea47cc85a06"
+source = "git+https://github.com/codeandsolder/lurkmoar-rs?rev=2473c40e61d526b756c7b48a11debd7dc2642537#2473c40e61d526b756c7b48a11debd7dc2642537"
 dependencies = [
  "flate2",
  "tracing",
@@ -3613,7 +3613,6 @@ dependencies = [
  "tokio-serde",
  "tokio-util",
  "toml",
- "tower-service",
  "typed-path",
  "url",
  "uuid",

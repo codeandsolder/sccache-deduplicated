@@ -1,6 +1,9 @@
-use crate::cache::{CacheMode, GetPathResult};
+use crate::cache::CacheMode;
 use crate::compiler::ColorMode;
 use crate::config::PreprocessorCacheModeConfig;
+use crate::dist::{
+    CompileCommand, JobId, SchedulerStatusResult, ServerId, SubmitToolchainResult, Toolchain,
+};
 use crate::server::{DistInfo, ServerInfo, ServerStats};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -22,17 +25,8 @@ pub enum Request {
     // --- Storage RPCs (client-side mode) ---
     /// One-shot handshake: client requests cache metadata from the daemon.
     StorageHandshake,
-    /// Fetch the filesystem path of the cached entry for `key`.
-    /// Returns `None` if the backend does not support direct file access or the key is absent.
-    StorageGetPath { key: String },
-    /// Fetch raw (zip) bytes for `key`; returns `None` on a miss.
-    StorageGetRaw { key: String },
-    /// Store raw (zip) bytes under `key`.
-    StoragePutRaw { key: String, data: Vec<u8> },
-    /// Retrieve the preprocessor cache entry for `key`.
-    StorageGetPreprocessorEntry { key: String },
-    /// Store or overwrite the preprocessor cache entry for `key`.
-    StoragePutPreprocessorEntry { key: String, entry_bytes: Vec<u8> },
+    /// Transfer an opaque blob without sharing filesystem paths.
+    Transfer(TransferRequest),
     /// Merge per-invocation stats into the daemon's running totals.
     RecordStats(Box<ServerStats>),
 }
@@ -56,18 +50,127 @@ pub enum Response {
     // --- Storage RPC responses (client-side mode) ---
     /// Response for `Request::StorageHandshake`.
     StorageHandshake(StorageHandshakeInfo),
-    /// Response for `Request::StorageGetPath`.
-    StorageGetPath(GetPathResult),
-    /// Response for `Request::StorageGetRaw`: zip bytes on hit, `None` on miss.
-    StorageGetRaw(Option<Vec<u8>>),
-    /// Response for `Request::StoragePutRaw`.
-    StoragePutRaw(Result<(), String>),
-    /// Response for `Request::StorageGetPreprocessorEntry`.
-    StorageGetPreprocessorEntry(Result<Option<Vec<u8>>, String>),
-    /// Response for `Request::StoragePutPreprocessorEntry`.
-    StoragePutPreprocessorEntry(Result<(), String>),
+    /// Response for a namespace-safe transfer request.
+    Transfer(Result<TransferReply, String>),
     /// Response for `Request::RecordStats`.
     RecordStats,
+}
+
+/// Maximum application payload in a transfer frame. The framing envelope
+/// stays well below the default 8 MiB IPC frame limit.
+pub const TRANSFER_CHUNK_BYTES: usize = 1024 * 1024;
+pub const NAMESPACE_PROTOCOL_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum StorageBlob {
+    Cache,
+    Preprocessor,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum TransferRequest {
+    Read {
+        kind: StorageBlob,
+        key: String,
+    },
+    BeginWrite {
+        kind: StorageBlob,
+        key: String,
+        len: u64,
+    },
+    LookupToolchain {
+        compiler: std::path::PathBuf,
+        key: String,
+    },
+    BeginToolchain {
+        compiler: std::path::PathBuf,
+        key: String,
+        len: u64,
+    },
+    Allocate {
+        toolchain: Toolchain,
+    },
+    SubmitToolchain {
+        job: JobId,
+    },
+    BeginRun {
+        job: JobId,
+        len: u64,
+    },
+    Status,
+    WorkerLabel {
+        server: ServerId,
+    },
+    WriteChunk(Vec<u8>),
+    FinishWrite,
+    ReadChunk,
+    Abort,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum TransferReply {
+    ReadStarted(Option<u64>),
+    WriteStarted,
+    Chunk(Vec<u8>),
+    Toolchain(Option<Toolchain>),
+    Allocation {
+        server: ServerId,
+        job: JobId,
+        need_toolchain: bool,
+    },
+    AllocationFailed(String),
+    Submitted(SubmitToolchainResult),
+    Status(SchedulerStatusResult),
+    WorkerLabel(String),
+    Ack,
+}
+
+// Transfer frames can carry complete object data; don't dump payload bytes
+// or metadata such as filenames into diagnostics.
+impl std::fmt::Debug for TransferRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Read { .. } => "Read",
+            Self::BeginWrite { .. } => "BeginWrite",
+            Self::LookupToolchain { .. } => "LookupToolchain",
+            Self::BeginToolchain { .. } => "BeginToolchain",
+            Self::Allocate { .. } => "Allocate",
+            Self::SubmitToolchain { .. } => "SubmitToolchain",
+            Self::BeginRun { .. } => "BeginRun",
+            Self::Status => "Status",
+            Self::WorkerLabel { .. } => "WorkerLabel",
+            Self::WriteChunk(_) => "WriteChunk",
+            Self::FinishWrite => "FinishWrite",
+            Self::ReadChunk => "ReadChunk",
+            Self::Abort => "Abort",
+        };
+        f.write_str(name)
+    }
+}
+
+impl std::fmt::Debug for TransferReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReadStarted(len) => f.debug_tuple("ReadStarted").field(len).finish(),
+            Self::WriteStarted => f.write_str("WriteStarted"),
+            Self::Chunk(bytes) => f.debug_tuple("Chunk").field(&bytes.len()).finish(),
+            Self::Toolchain(_) => f.write_str("Toolchain"),
+            Self::Allocation { .. } => f.write_str("Allocation"),
+            Self::AllocationFailed(_) => f.write_str("AllocationFailed"),
+            Self::Submitted(_) => f.write_str("Submitted"),
+            Self::Status(_) => f.write_str("Status"),
+            Self::WorkerLabel(_) => f.write_str("WorkerLabel"),
+            Self::Ack => f.write_str("Ack"),
+        }
+    }
+}
+
+/// Serialized at the start of the input stream, followed by the raw input
+/// archive. All of it is chunked, including unusually large argument vectors.
+#[derive(Serialize, Deserialize)]
+pub struct NamespaceRunSpec {
+    pub command: CompileCommand,
+    pub outputs: Vec<String>,
 }
 
 /// Possible responses from the server for a `Compile` request.
@@ -118,4 +221,7 @@ pub struct StorageHandshakeInfo {
     pub preprocessor_cache_mode_config: PreprocessorCacheModeConfig,
     pub cache_mode: CacheMode,
     pub max_size: Option<u64>,
+    pub namespace_protocol: u32,
+    pub transfer_chunk_bytes: usize,
+    pub dist_rewrite_includes_only: Option<bool>,
 }

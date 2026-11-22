@@ -53,6 +53,15 @@ pub trait ToolchainPackager: Send {
         Ok(None)
     }
 
+    /// Discover the actual package inventory in the calling namespace before
+    /// requesting a reservation. The prepared package carries the same files
+    /// used to derive its identity, without transient namespace identifiers.
+    /// # Errors
+    /// Returns an error if automatic preparation is unsupported or discovery fails.
+    fn prepare_namespace(self: Box<Self>) -> Result<(String, Box<dyn ToolchainPackager>)> {
+        bail!("namespace toolchain preparation is unsupported")
+    }
+
     /// Write the packaged toolchain to `f`.
     ///
     /// # Errors
@@ -288,37 +297,99 @@ mod toolchain_imp {
             Ok(())
         }
 
+        /// Fingerprint the files actually selected for the archive. Mount and
+        /// namespace IDs are irrelevant: two bind mounts of the same files
+        /// must share a package. The boot ID scopes device/inode metadata to
+        /// its lifetime; archive paths and emitted symlink targets also matter.
+        fn identity(&self) -> Result<String> {
+            use crate::util::Digest;
+            use std::os::unix::fs::MetadataExt;
+
+            let mut digest = Digest::new();
+            digest.delimiter(b"toolchain-archive-inventory-v1");
+            let boot_id = fs::read("/proc/sys/kernel/random/boot_id").ok();
+            if let Some(boot_id) = &boot_id {
+                digest.delimiter(b"local-file-metadata");
+                digest.delimiter(boot_id);
+            } else {
+                // A caller can have a minimal /proc mount. In that case use
+                // content identity, rather than persisting ambiguous inode IDs.
+                digest.delimiter(b"file-content");
+            }
+            for (archive, physical) in &self.dir_set {
+                digest.delimiter(b"directory");
+                digest.delimiter(archive.as_os_str().as_encoded_bytes());
+                digest.update(&fs::metadata(physical)?.mode().to_le_bytes());
+            }
+            for (archive, physical) in &self.file_set {
+                digest.delimiter(b"regular");
+                digest.delimiter(archive.as_os_str().as_encoded_bytes());
+                let metadata = fs::metadata(physical)?;
+                digest.update(&metadata.mode().to_le_bytes());
+                if boot_id.is_some() {
+                    for field in [
+                        metadata.dev(),
+                        metadata.ino(),
+                        metadata.len(),
+                        metadata.mtime().cast_unsigned(),
+                        metadata.mtime_nsec().cast_unsigned(),
+                        metadata.ctime().cast_unsigned(),
+                        metadata.ctime_nsec().cast_unsigned(),
+                    ] {
+                        digest.update(&field.to_le_bytes());
+                    }
+                } else {
+                    digest.delimiter(Digest::reader_sync(fs::File::open(physical)?)?.as_bytes());
+                }
+            }
+            for (archive, target) in &self.symlinks {
+                digest.delimiter(b"symlink");
+                digest.delimiter(archive.as_os_str().as_encoded_bytes());
+                digest.delimiter(target.as_os_str().as_encoded_bytes());
+            }
+            Ok(digest.finish())
+        }
+
+        /// Freeze the selected package inventory for an IPC reservation.
+        ///
+        /// # Errors
+        /// A selected file or its metadata cannot be read.
+        pub fn prepare_namespace(self) -> Result<(String, Box<dyn super::ToolchainPackager>)> {
+            let identity = self.identity()?;
+            Ok((
+                identity.clone(),
+                Box::new(PreparedNamespacePackage {
+                    builder: self,
+                    identity,
+                }),
+            ))
+        }
+
         /// Write the package as a deterministic compressed tar archive.
         ///
         /// # Errors
         ///
         /// Returns an error if archive construction or compression fails.
-        pub fn into_compressed_tar<W: Write + Send + 'static>(self, writer: W) -> Result<()> {
+        pub fn write_compressed_tar<W: Write + Send + 'static>(&self, writer: W) -> Result<()> {
             use crate::compression::deflate::ParallelGzipWriter;
 
-            let Self {
-                dir_set,
-                file_set,
-                symlinks,
-                root_mappings: _,
-            } = self;
             let mut builder = tar::Builder::new(ParallelGzipWriter::new(writer)?);
             builder.mode(tar::HeaderMode::Deterministic);
 
-            for (tar_path, dir_path) in dir_set {
+            for (tar_path, dir_path) in &self.dir_set {
                 builder.append_dir(tar_path, dir_path)?;
             }
-            for (tar_path, file_path) in file_set {
+            for (tar_path, file_path) in &self.file_set {
                 let file = &mut fs::File::open(file_path)?;
                 builder.append_file(tar_path, file.file_mut())?;
             }
-            for (from_path, to_path) in symlinks {
+            for (from_path, to_path) in &self.symlinks {
                 let mut header = tar::Header::new_gnu();
                 header.set_entry_type(tar::EntryType::Symlink);
                 header.set_size(0);
                 // Leave `to_path` as absolute, assuming the tar will be used in a chroot-like
                 // environment.
-                builder.append_link(&mut header, tar_safe_path(from_path), to_path)?;
+                builder.append_link(&mut header, tar_safe_path(from_path.clone()), to_path)?;
             }
             builder.into_inner()?.finish()?;
             Ok(())
@@ -392,10 +463,63 @@ mod toolchain_imp {
         }
     }
 
+    struct PreparedNamespacePackage {
+        builder: ToolchainPackageBuilder,
+        identity: String,
+    }
+
+    impl super::ToolchainPackager for PreparedNamespacePackage {
+        fn write_pkg(self: Box<Self>, file: fs::File) -> Result<()> {
+            use anyhow::ensure;
+            ensure!(
+                self.builder.identity()? == self.identity,
+                "toolchain changed before packaging"
+            );
+            self.builder.write_compressed_tar(file)?;
+            ensure!(
+                self.builder.identity()? == self.identity,
+                "toolchain changed during packaging"
+            );
+            Ok(())
+        }
+    }
+
     impl Default for ToolchainPackageBuilder {
         fn default() -> Self {
             Self::new()
         }
+    }
+
+    #[test]
+    fn namespace_package_identity_tracks_inventory_not_mount_alias() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first)?;
+        fs::create_dir(&second)?;
+        fs::write(first.join("compiler"), b"compiler bytes")?;
+        fs::hard_link(first.join("compiler"), second.join("compiler"))?;
+
+        let inventory = |root: &Path| -> Result<ToolchainPackageBuilder> {
+            let mut builder = ToolchainPackageBuilder::new();
+            builder.add_root_mapping(root.to_owned(), PathBuf::from("/toolchain"));
+            builder.add_file(root.join("compiler"))?;
+            Ok(builder)
+        };
+        let (key, prepared) = inventory(&first)?.prepare_namespace()?;
+        let (alias, _) = inventory(&second)?.prepare_namespace()?;
+        assert_eq!(key, alias);
+
+        // The same package selection at a different physical inode must not
+        // silently use a stale archive after a namespace replaces a tool.
+        fs::remove_file(second.join("compiler"))?;
+        fs::write(second.join("compiler"), b"different compiler")?;
+        assert_ne!(key, inventory(&second)?.identity()?);
+
+        fs::write(first.join("compiler"), b"modified compiler")?;
+        let archive = fs::File::create(temp.path().join("archive.tar.gz"))?;
+        assert!(prepared.write_pkg(archive).is_err());
+        Ok(())
     }
 
     #[test]
@@ -417,7 +541,7 @@ mod toolchain_imp {
         let mut builder = ToolchainPackageBuilder::new();
         builder.add_file(reported.clone())?;
         let archive_path = temp.path().join("toolchain.tar.gz");
-        builder.into_compressed_tar(fs::File::create(&archive_path)?)?;
+        builder.write_compressed_tar(fs::File::create(&archive_path)?)?;
 
         let root = temp.path().join("unpacked");
         crate::compression::deflate::unpack_gzip(fs::File::open(&archive_path)?, &root)?;
@@ -449,7 +573,7 @@ mod toolchain_imp {
         let archive_path = temp.path().join("toolchain.tar.gz");
         let mut builder = ToolchainPackageBuilder::new();
         builder.add_file(artifact.clone())?;
-        builder.into_compressed_tar(fs::File::create(&archive_path)?)?;
+        builder.write_compressed_tar(fs::File::create(&archive_path)?)?;
         let root = temp.path().join("unpacked");
         crate::compression::deflate::unpack_gzip(fs::File::open(&archive_path)?, &root)?;
         assert_eq!(fs::read(root.join(artifact.strip_prefix("/")?))?, data);
@@ -533,7 +657,13 @@ mod toolchain_imp {
             status,
             stdout,
             stderr,
-        } = process::Command::new("ldd").arg(executable).output()?;
+        } = process::Command::new("ldd")
+            .arg(executable)
+            // The probe requires EOF, not a device node. A namespace may
+            // have a restricted /dev even when compiler execution works.
+            .stdin(process::Stdio::piped())
+            .output()
+            .context("could not execute dynamic dependency probe")?;
 
         // Not a file ldd can handle. This can be a non-executable, or a static non-PIE
         if !status.success() {

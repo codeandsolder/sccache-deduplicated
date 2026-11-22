@@ -2248,13 +2248,17 @@ impl pkg::ToolchainPackager for CToolchainPackager {
         )?))
     }
 
+    fn prepare_namespace(self: Box<Self>) -> Result<(String, Box<dyn pkg::ToolchainPackager>)> {
+        self.package_builder()?.prepare_namespace()
+    }
+
     fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()> {
-        self.discover()?.into_compressed_tar(f)
+        self.package_builder()?.write_compressed_tar(f)
     }
 
     #[cfg(feature = "native-store")]
     fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
-        self.discover()?.into_native_mapping()
+        self.package_builder()?.into_native_mapping()
     }
 }
 
@@ -2264,7 +2268,7 @@ impl pkg::ToolchainPackager for CToolchainPackager {
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 impl CToolchainPackager {
-    fn discover(&self) -> Result<pkg::ToolchainPackageBuilder> {
+    fn package_builder(self) -> Result<pkg::ToolchainPackageBuilder> {
         use std::os::unix::ffi::OsStringExt;
 
         info!("Generating toolchain {}", self.executable.display());

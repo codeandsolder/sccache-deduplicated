@@ -60,7 +60,7 @@ pub(super) fn spawn(
                 }
                 match maintenance.store().maintain_space() {
                     Ok(Some(report)) if !report.minimum_satisfied => {
-                        warn!("native cache space pressure: {report:?}")
+                        warn!("native cache space pressure: {report:?}");
                     }
                     Ok(_) => {}
                     Err(error) => error!("native cache space maintenance failed: {error:#}"),

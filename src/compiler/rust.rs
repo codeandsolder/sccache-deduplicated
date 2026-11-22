@@ -4493,13 +4493,17 @@ fn test_dist_toolchain_archive_contains_only_required_installed_targets() -> Res
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 impl pkg::ToolchainPackager for RustToolchainPackager {
+    fn prepare_namespace(self: Box<Self>) -> Result<(String, Box<dyn pkg::ToolchainPackager>)> {
+        self.package_builder()?.prepare_namespace()
+    }
+
     fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()> {
-        (*self).discover()?.into_compressed_tar(f)
+        self.package_builder()?.write_compressed_tar(f)
     }
 
     #[cfg(feature = "native-store")]
     fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
-        (*self).discover()?.into_native_mapping()
+        self.package_builder()?.into_native_mapping()
     }
 }
 
@@ -4509,7 +4513,7 @@ impl pkg::ToolchainPackager for RustToolchainPackager {
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 impl RustToolchainPackager {
-    fn discover(self) -> Result<pkg::ToolchainPackageBuilder> {
+    fn package_builder(self) -> Result<pkg::ToolchainPackageBuilder> {
         info!(
             "Packaging Rust compiler for sysroot {}",
             self.sysroot.display()
@@ -4630,7 +4634,10 @@ impl RlibDepReader {
             status,
             stdout,
             stderr,
-        } = cmd.output()?;
+        } = cmd
+            .stdin(process::Stdio::piped())
+            .output()
+            .context("could not execute Rust dependency probe")?;
 
         if !stdout.is_empty() {
             bail!(
@@ -4684,7 +4691,10 @@ impl RlibDepReader {
             status,
             stdout,
             stderr,
-        } = cmd.output()?;
+        } = cmd
+            .stdin(process::Stdio::piped())
+            .output()
+            .context("could not execute Rust dependency probe")?;
 
         if !status.success() {
             bail!("Failed to get rustc version with {}", executable.display())
@@ -4757,7 +4767,10 @@ impl RlibDepReader {
             status,
             stdout,
             stderr,
-        } = cmd.output()?;
+        } = cmd
+            .stdin(process::Stdio::piped())
+            .output()
+            .context("could not execute Rust dependency probe")?;
 
         if !status.success() {
             bail!(format!("Failed to list deps of {}", rlib.display()))

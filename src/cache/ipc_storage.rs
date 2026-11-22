@@ -11,14 +11,17 @@
 // limitations under the License.
 
 use crate::cache::CacheMode;
-use crate::cache::GetPathResult;
 use crate::cache::cache::Storage;
 use crate::cache::cache_io::{Cache, CacheRead, CacheWrite};
-use crate::client::ServerConnection;
+use crate::client::{ServerConnection, SharedConnection, connection_task};
 use crate::compiler::PreprocessorCacheEntry;
 use crate::config::PreprocessorCacheModeConfig;
-use crate::errors::{Context, Result, anyhow, bail};
-use crate::protocol::{Request, Response, StorageHandshakeInfo};
+use crate::errors::{Result, anyhow, bail};
+use crate::protocol::{
+    NAMESPACE_PROTOCOL_VERSION, Request, Response, StorageBlob, StorageHandshakeInfo,
+    TRANSFER_CHUNK_BYTES, TransferReply, TransferRequest,
+};
+use anyhow::ensure;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::io::Cursor;
@@ -31,10 +34,10 @@ use std::time::Duration;
 ///
 /// `ServerConnection` is synchronous and non-`Clone`, so it lives behind a
 /// `Mutex` and every RPC dispatches via `tokio::task::spawn_blocking`.  The
-/// lock is held only for the duration of a single blocking call, never across
+/// lock is held for a complete transfer transaction, never across
 /// an `.await` point.
 pub struct IpcStorage {
-    conn: Arc<Mutex<ServerConnection>>,
+    conn: SharedConnection,
     handshake: StorageHandshakeInfo,
 }
 
@@ -51,6 +54,15 @@ impl IpcStorage {
             Response::StorageHandshake(info) => info,
             other => bail!("IpcStorage: unexpected handshake response: {other:?}"),
         };
+        ensure!(
+            handshake.namespace_protocol == NAMESPACE_PROTOCOL_VERSION,
+            "incompatible daemon namespace protocol"
+        );
+        ensure!(
+            handshake.transfer_chunk_bytes > 0
+                && handshake.transfer_chunk_bytes <= TRANSFER_CHUNK_BYTES,
+            "invalid daemon chunk size"
+        );
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             handshake,
@@ -61,53 +73,85 @@ impl IpcStorage {
     /// additional RPCs (e.g., `RecordStats`) after the storage is no longer
     /// needed.
     #[must_use = "the returned handle gives access to the existing IPC connection"]
-    pub fn conn(&self) -> Arc<Mutex<ServerConnection>> {
+    pub fn conn(&self) -> SharedConnection {
         Arc::clone(&self.conn)
     }
 
-    async fn rpc(&self, req: Request) -> Result<Response> {
-        let conn = Arc::clone(&self.conn);
-        tokio::task::spawn_blocking(move || {
-            let mut conn = conn
-                .lock()
-                .map_err(|_| anyhow!("IpcStorage connection lock is poisoned"))?;
-            conn.request(req)
+    #[cfg(feature = "dist-client")]
+    pub(crate) fn dist_client(
+        &self,
+        toolchains: Vec<crate::config::DistToolchainConfig>,
+    ) -> crate::server::DistClientContainer {
+        use crate::server::{DistClientContainer, DistClientState};
+        self.handshake.dist_rewrite_includes_only.map_or_else(
+            DistClientContainer::new_disabled,
+            |rewrite| {
+                DistClientContainer::new_with_state(DistClientState::Broker(Arc::new(
+                    crate::dist::broker::NamespaceClient::new(
+                        self.conn(),
+                        self.handshake.transfer_chunk_bytes,
+                        rewrite,
+                        toolchains,
+                    ),
+                )))
+            },
+        )
+    }
+
+    async fn read_blob(&self, kind: StorageBlob, key: &str) -> Result<Option<Bytes>> {
+        let key = key.to_owned();
+        let chunk_bytes = self.handshake.transfer_chunk_bytes;
+        connection_task(self.conn(), move |conn| {
+            let TransferReply::ReadStarted(len) =
+                conn.transfer(TransferRequest::Read { kind, key })?
+            else {
+                bail!("expected download length");
+            };
+            let Some(len) = len else {
+                return Ok(None);
+            };
+            let mut data = Vec::new();
+            conn.download(len, chunk_bytes, &mut data)?;
+            Ok(Some(data.into()))
         })
         .await
-        .context("IpcStorage RPC task failed")?
+    }
+
+    async fn write_blob(&self, kind: StorageBlob, key: &str, data: Bytes) -> Result<()> {
+        let key = key.to_owned();
+        let len = data.len() as u64;
+        let chunk_bytes = self.handshake.transfer_chunk_bytes;
+        connection_task(self.conn(), move |conn| {
+            ensure!(
+                matches!(
+                    conn.transfer(TransferRequest::BeginWrite { kind, key, len })?,
+                    TransferReply::WriteStarted
+                ),
+                "expected upload start"
+            );
+            conn.upload(len, chunk_bytes, data.as_ref())?;
+            ensure!(
+                matches!(
+                    conn.transfer(TransferRequest::FinishWrite)?,
+                    TransferReply::Ack
+                ),
+                "expected upload commit"
+            );
+            Ok(())
+        })
+        .await
     }
 }
 
 #[async_trait]
 impl Storage for IpcStorage {
     async fn get(&self, key: &str) -> Result<Cache> {
-        match self.get_path(key).await {
-            GetPathResult::Found(path) => {
-                let file = std::fs::File::open(&path)
-                    .with_context(|| format!("IpcStorage::get: open {}", path.display()))?;
-                Ok(CacheRead::from(file).map_or_else(|_| Cache::Miss, Cache::Hit))
-            }
-            GetPathResult::Miss => Ok(Cache::Miss),
-            // Backend doesn't support paths (S3, Redis, …); fall back to bytes over IPC.
-            GetPathResult::Unsupported => Ok(self.get_raw(key).await?.map_or_else(
-                || Cache::Miss,
-                |bytes| {
-                    CacheRead::from(Cursor::new(bytes)).map_or_else(|_| Cache::Miss, Cache::Hit)
-                },
-            )),
-        }
-    }
-
-    async fn get_path(&self, key: &str) -> GetPathResult {
-        match self
-            .rpc(Request::StorageGetPath {
-                key: key.to_owned(),
-            })
-            .await
-        {
-            Ok(Response::StorageGetPath(result)) => result,
-            _ => GetPathResult::Unsupported,
-        }
+        // A daemon path can be unavailable or name different bytes in this
+        // namespace. Only consume bytes returned by the storage authority.
+        Ok(self.get_raw(key).await?.map_or_else(
+            || Cache::Miss,
+            |bytes| CacheRead::from(Cursor::new(bytes)).map_or_else(|_| Cache::Miss, Cache::Hit),
+        ))
     }
 
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
@@ -115,29 +159,12 @@ impl Storage for IpcStorage {
     }
 
     async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {
-        let resp = self
-            .rpc(Request::StorageGetRaw {
-                key: key.to_owned(),
-            })
-            .await?;
-        match resp {
-            Response::StorageGetRaw(opt) => Ok(opt.map(Bytes::from)),
-            other => bail!("IpcStorage::get_raw: unexpected response: {other:?}"),
-        }
+        self.read_blob(StorageBlob::Cache, key).await
     }
 
     async fn put_raw(&self, key: &str, data: Bytes) -> Result<Duration> {
-        let resp = self
-            .rpc(Request::StoragePutRaw {
-                key: key.to_owned(),
-                data: data.to_vec(),
-            })
-            .await?;
-        match resp {
-            Response::StoragePutRaw(Ok(())) => Ok(Duration::ZERO),
-            Response::StoragePutRaw(Err(e)) => bail!("IpcStorage::put_raw: daemon error: {e}"),
-            other => bail!("IpcStorage::put_raw: unexpected response: {other:?}"),
-        }
+        self.write_blob(StorageBlob::Cache, key, data).await?;
+        Ok(Duration::ZERO)
     }
 
     async fn check(&self) -> Result<CacheMode> {
@@ -172,23 +199,10 @@ impl Storage for IpcStorage {
         &self,
         key: &str,
     ) -> Result<Option<Box<dyn crate::lru_disk_cache::ReadSeek>>> {
-        let resp = self
-            .rpc(Request::StorageGetPreprocessorEntry {
-                key: key.to_owned(),
-            })
-            .await?;
-        match resp {
-            Response::StorageGetPreprocessorEntry(Ok(None)) => Ok(None),
-            Response::StorageGetPreprocessorEntry(Ok(Some(bytes))) => Ok(Some(
-                Box::new(Cursor::new(bytes)) as Box<dyn crate::lru_disk_cache::ReadSeek>,
-            )),
-            Response::StorageGetPreprocessorEntry(Err(e)) => {
-                bail!("IpcStorage::get_preprocessor_cache_entry: {e}")
-            }
-            other => {
-                bail!("IpcStorage::get_preprocessor_cache_entry: unexpected response: {other:?}")
-            }
-        }
+        Ok(self
+            .read_blob(StorageBlob::Preprocessor, key)
+            .await?
+            .map(|bytes| Box::new(Cursor::new(bytes)) as Box<dyn crate::lru_disk_cache::ReadSeek>))
     }
 
     async fn put_preprocessor_cache_entry(
@@ -197,23 +211,8 @@ impl Storage for IpcStorage {
         entry: PreprocessorCacheEntry,
     ) -> Result<()> {
         let mut buf = vec![];
-        entry
-            .serialize_to(&mut buf)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let resp = self
-            .rpc(Request::StoragePutPreprocessorEntry {
-                key: key.to_owned(),
-                entry_bytes: buf,
-            })
-            .await?;
-        match resp {
-            Response::StoragePutPreprocessorEntry(Ok(())) => Ok(()),
-            Response::StoragePutPreprocessorEntry(Err(e)) => {
-                bail!("IpcStorage::put_preprocessor_cache_entry: {e}")
-            }
-            other => {
-                bail!("IpcStorage::put_preprocessor_cache_entry: unexpected response: {other:?}")
-            }
-        }
+        entry.serialize_to(&mut buf).map_err(|e| anyhow!("{e}"))?;
+        self.write_blob(StorageBlob::Preprocessor, key, buf.into())
+            .await
     }
 }

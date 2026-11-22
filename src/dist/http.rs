@@ -407,7 +407,7 @@ mod server {
     fn idle_fraction(previous: (u64, u64), current: (u64, u64)) -> Option<f64> {
         let total = current.0.checked_sub(previous.0)?;
         let idle = current.1.checked_sub(previous.1)?;
-        (total != 0 && idle <= total).then(|| idle as f64 / total as f64)
+        (total != 0 && idle <= total).then_some(idle as f64 / total as f64)
     }
 
     fn effective_cpu_capacity(cpus: usize, idle_fraction: f64, running_jobs: usize) -> f64 {
@@ -1061,10 +1061,10 @@ mod server {
                 cert_digest: Vec<u8>,
                 cert_pem: Vec<u8>,
             ) -> Result<()> {
-                if let Some((saved_cert_digest, _)) = certs.get(&server_id) {
-                    if saved_cert_digest == &cert_digest {
-                        return Ok(());
-                    }
+                if let Some((saved_cert_digest, _)) = certs.get(&server_id)
+                    && saved_cert_digest == &cert_digest
+                {
+                    return Ok(());
                 }
                 info!(
                     "Adding new certificate for {} to scheduler",
@@ -1451,10 +1451,10 @@ mod server {
                                 heartbeat_started_at,
                             ) {
                                 Ok(removed) if removed > 0 => {
-                                    info!("Discarded {removed} stale unclaimed worker assignments")
+                                    info!("Discarded {removed} stale unclaimed worker assignments");
                                 }
                                 Err(error) => {
-                                    warn!("Unable to reconcile worker assignments: {error:#}")
+                                    warn!("Unable to reconcile worker assignments: {error:#}");
                                 }
                                 _ => {}
                             }
@@ -1462,11 +1462,11 @@ mod server {
                             if is_new {
                                 info!("Server connected to scheduler");
                             }
-                            thread::sleep(HEARTBEAT_INTERVAL)
+                            thread::sleep(HEARTBEAT_INTERVAL);
                         }
                         Err(e) => {
                             error!(target: "sccache_heartbeat", "Failed to send heartbeat to server: {}", e);
-                            thread::sleep(HEARTBEAT_ERROR_INTERVAL)
+                            thread::sleep(HEARTBEAT_ERROR_INTERVAL);
                         }
                     }
                 }
@@ -2015,6 +2015,29 @@ mod client {
                 .spawn_blocking(move || {
                     tc_cache.put_toolchain(&compiler_path, &weak_key, toolchain_packager)
                 })
+                .await?
+        }
+
+        async fn lookup_namespace_toolchain(
+            &self,
+            compiler: PathBuf,
+            key: String,
+        ) -> Result<(Option<Toolchain>, u64)> {
+            let cache = self.tc_cache.clone();
+            self.pool
+                .spawn_blocking(move || cache.lookup_namespace_toolchain(&compiler, &key))
+                .await?
+        }
+
+        async fn import_namespace_toolchain(
+            &self,
+            compiler: PathBuf,
+            key: String,
+            package: std::fs::File,
+        ) -> Result<Toolchain> {
+            let cache = self.tc_cache.clone();
+            self.pool
+                .spawn_blocking(move || cache.import_namespace_toolchain(&compiler, &key, package))
                 .await?
         }
 
