@@ -131,7 +131,7 @@ mod encode {
             })
         }
 
-        #[must_use]
+        #[must_use = "the compressor input byte count is returned without modifying it"]
         pub const fn total_in(&self) -> u64 {
             self.encoder.total_in()
         }

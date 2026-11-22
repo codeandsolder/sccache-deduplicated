@@ -150,7 +150,7 @@ mod code_grant_pkce {
 
     pub static STATE: Mutex<Option<State>> = Mutex::new(None);
 
-    #[must_use]
+    #[must_use = "the verifier and matching challenge must be retained for the OAuth exchange"]
     pub fn generate_verifier_and_challenge() -> (String, String) {
         let mut code_verifier_bytes = vec![0; NUM_CODE_VERIFIER_BYTES];
         rand::fill(&mut code_verifier_bytes);

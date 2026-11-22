@@ -284,7 +284,7 @@ pub struct RemoteStorage {
     feature = "cos"
 ))]
 impl RemoteStorage {
-    #[must_use]
+    #[must_use = "the returned storage owns the configured backend operator"]
     pub const fn new(
         operator: opendal::Operator,
         basedirs: Vec<Vec<u8>>,
@@ -300,14 +300,14 @@ impl RemoteStorage {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned storage configuration contains the new cache-check policy"]
     pub const fn with_skip_cache_check(mut self, skip_cache_check: bool) -> Self {
         self.skip_cache_check = skip_cache_check;
         self
     }
 
     #[cfg(feature = "s3")]
-    #[must_use]
+    #[must_use = "the returned storage instance contains the managed capacity policy"]
     pub fn with_managed_capacity(mut self, managed_capacity: Arc<ManagedRemoteCache>) -> Self {
         self.managed_capacity = Some(managed_capacity);
         self

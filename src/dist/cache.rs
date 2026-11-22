@@ -980,7 +980,7 @@ impl TcCache {
         })
     }
 
-    #[must_use]
+    #[must_use = "the result determines whether a toolchain upload or reuse is needed"]
     pub fn contains_toolchain(&self, tc: &Toolchain) -> bool {
         self.inner.contains_key(make_lru_key_path(&tc.archive_id))
     }
@@ -1051,12 +1051,12 @@ impl TcCache {
         self.inner.get(make_lru_key_path(&tc.archive_id))
     }
 
-    #[must_use]
+    #[must_use = "the entry count is returned without modifying the cache"]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
-    #[must_use]
+    #[must_use = "the result describes whether the cache contains any entries"]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

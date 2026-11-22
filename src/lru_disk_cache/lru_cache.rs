@@ -182,7 +182,7 @@ impl<K: Eq + Hash, V> LruCache<K, V> {
     /// use lru_cache::LruCache;
     /// let mut cache: LruCache<i32, &str> = LruCache::new(10);
     /// ```
-    #[must_use]
+    #[must_use = "the returned LRU cache owns the configured capacity"]
     pub fn new(capacity: u64) -> Self {
         Self {
             map: LinkedHashMap::new(),

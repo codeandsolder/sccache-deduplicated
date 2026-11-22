@@ -334,7 +334,7 @@ pub struct CacheWrite {
 
 impl CacheWrite {
     /// Create a new, empty cache entry.
-    #[must_use]
+    #[must_use = "the returned archive writer must receive the compilation outputs"]
     pub fn new() -> Self {
         Self {
             zip: ZipWriter::new(Cursor::new(vec![])),
