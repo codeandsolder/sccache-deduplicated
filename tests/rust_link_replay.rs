@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, ensure};
 use fs_err as fs;
 use sccache::rust_link::{
-    CaptureConfig, CaptureLimits, LinkEnvironment, LinkInvocation, SnapshotRoot,
+    CaptureConfig, CaptureLimits, LinkEnvironment, LinkInvocation, PrivateOutputTree, SnapshotRoot,
 };
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -24,15 +24,21 @@ struct Namespace<'a> {
 }
 
 impl Namespace<'_> {
-    fn run(&self, command: &Command) -> Result<Output> {
+    fn run(&self, command: &Command, output_tree: Option<&PrivateOutputTree>) -> Result<Output> {
         let mut sandbox = Command::new("bwrap");
         sandbox
             .args(["--bind", "/", "/", "--bind"])
             .arg(self.source)
-            .arg(self.source_mount)
-            .arg("--bind")
-            .arg(self.output)
-            .arg(self.output_mount)
+            .arg(self.source_mount);
+        if let Some(tree) = output_tree {
+            sandbox.args(tree.overlay_arguments(self.output, self.output_mount)?);
+        } else {
+            sandbox
+                .arg("--bind")
+                .arg(self.output)
+                .arg(self.output_mount);
+        }
+        sandbox
             .arg("--chdir")
             .arg(command.get_current_dir().context("missing command cwd")?)
             .arg("--")
@@ -165,7 +171,7 @@ fn main() { println!("{}", unsafe { native_value() }); }"#;
         source_mount: &source_mount,
         output_mount: &output_mount,
     };
-    codegen.run(&compile)?;
+    codegen.run(&compile, None)?;
     // Rustc reports codegen success, but the relay has never linked a binary.
     assert!(!output_a.join("probe").exists());
 
@@ -181,7 +187,7 @@ fn main() { println!("{}", unsafe { native_value() }); }"#;
         source_mount: &source_mount,
         output_mount: &output_mount,
     };
-    client.run(&replay)?;
+    client.run(&replay, None)?;
     let output = Command::new(output_b.join("probe")).output()?;
     assert!(output.status.success());
     assert_eq!(output.stdout, b"42\n");
@@ -191,7 +197,7 @@ fn main() { println!("{}", unsafe { native_value() }); }"#;
         source: &source_a,
         ..client
     };
-    original.run(&replay)?;
+    original.run(&replay, None)?;
     let output = Command::new(output_b.join("probe")).output()?;
     assert!(output.status.success());
     assert_eq!(output.stdout, b"17\n");
@@ -199,5 +205,127 @@ fn main() { println!("{}", unsafe { native_value() }); }"#;
     let mut changed = environment;
     changed.insert(OsString::from("LC_ALL"), OsString::from("changed"));
     assert!(invocation.command(&linker, &changed).is_err());
+    Ok(())
+}
+
+#[test]
+fn rustc_native_split_link_preserves_logical_output_tree_and_live_inputs() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let source_mount = root.join("source-mount");
+    let output_mount = root.join("output-mount");
+    let source_a = root.join("source-a");
+    let source_b = root.join("source-b");
+    let output_a = root.join("output-a");
+    let output_b = root.join("output-b");
+    for path in [
+        &source_mount,
+        &output_mount,
+        &source_a,
+        &source_b,
+        &output_a,
+        &output_b,
+    ] {
+        fs::create_dir(path)?;
+    }
+    let source = r#"unsafe extern "C" { fn native_value() -> u32; }
+fn main() { println!("{}", unsafe { native_value() }); }"#;
+    fs::write(source_a.join("probe.rs"), source)?;
+    fs::write(
+        source_b.join("probe.rs"),
+        "compile_error!(\"must not run source again\");",
+    )?;
+    native_library(&source_a, 17, "libnative.a")?;
+    native_library(&source_b, 42, "libnative.a")?;
+    fs::write(output_a.join("lower-input"), b"first dependency")?;
+    fs::write(output_b.join("lower-input"), b"second dependency")?;
+    let environment: LinkEnvironment = std::env::vars_os().collect();
+    let rustc = compiler()?;
+    let mut compile = Command::new(&rustc);
+    let common = [
+        "--crate-name",
+        "probe",
+        "--crate-type",
+        "bin",
+        "--edition=2024",
+        "--emit=metadata,link,dep-info",
+        "--error-format=json",
+        "--json=artifacts",
+        "-C",
+        "codegen-units=4",
+        "-C",
+        "extra-filename=-stage",
+        "-L",
+        "native=.",
+        "-l",
+        "static=native",
+    ];
+    compile
+        .current_dir(&source_mount)
+        .env_clear()
+        .envs(&environment)
+        .args(common)
+        .arg("--out-dir")
+        .arg(&output_mount)
+        .args(["-Z", "no-link", "probe.rs"]);
+    let first = Namespace {
+        source: &source_a,
+        output: &output_a,
+        source_mount: &source_mount,
+        output_mount: &output_mount,
+    };
+    let first_tree = PrivateOutputTree::new(&root)?;
+    let generated = first.run(&compile, Some(&first_tree))?;
+    assert!(!first_tree.generated_root().join("probe-stage").exists());
+    assert!(
+        first_tree
+            .generated_root()
+            .join("probe-stage.rlink")
+            .is_file()
+    );
+    assert!(!first_tree.generated_root().join("lower-input").exists());
+    assert_eq!(fs::read_dir(&output_a)?.count(), 1);
+
+    let archive = root.join("codegen.tar");
+    first_tree.archive(&archive, LIMITS)?;
+    let second_tree = PrivateOutputTree::new(&root)?;
+    second_tree.restore(&archive, LIMITS)?;
+    let second = Namespace {
+        source: &source_b,
+        output: &output_b,
+        ..first
+    };
+    let mut link = Command::new(&rustc);
+    link.current_dir(&source_mount)
+        .env_clear()
+        .envs(&environment)
+        .args(common)
+        .arg("--out-dir")
+        .arg(&output_mount)
+        .args(["-Z", "link-only"])
+        .arg(output_mount.join("probe-stage.rlink"));
+    let linked = second.run(&link, Some(&second_tree))?;
+    let output = Command::new(second_tree.generated_root().join("probe-stage")).output()?;
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"42\n");
+    assert_eq!(fs::read_dir(&output_b)?.count(), 1);
+    // Rustc's own stage diagnostics distinguish the two emitted artifacts
+    // and use the original logical output directory, not the staging path.
+    let mut emitted = Vec::new();
+    for diagnostics in [&generated.stderr, &linked.stderr] {
+        for line in String::from_utf8_lossy(diagnostics).lines() {
+            let value: serde_json::Value = serde_json::from_str(line)?;
+            if let Some(artifact) = value.get("artifact").and_then(serde_json::Value::as_str) {
+                assert!(Path::new(artifact).starts_with(&output_mount));
+                emitted.push(
+                    value["emit"]
+                        .as_str()
+                        .context("missing emit kind")?
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    assert_eq!(emitted, ["dep-info", "metadata", "link"]);
     Ok(())
 }
