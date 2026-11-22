@@ -18,7 +18,7 @@ use tempfile::NamedTempFile;
 
 use super::NativeCacheClient;
 use crate::build_runtime::{
-    Artifact, BlobRef, ExecutionSpec, MaterializedTree, OutputKind, PreparedTree, ResultManifest, TreeId, TreeManifest, materialize_tree,
+    Artifact, BlobRef, ExecutionSpec, MaterializedTree, PreparedTree, ResultManifest, TreeId, TreeManifest, materialize_tree,
     wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply, Ticket},
 };
 
@@ -357,7 +357,7 @@ pub(super) fn fetch_result(
                 }
                 StagedOutput::File(temp)
             }
-            Artifact::Tree(manifest) => StagedOutput::Tree(materialize_tree(manifest, parent, |blob, path| {
+            Artifact::Tree(manifest) | Artifact::GeneratedTree(manifest) => StagedOutput::Tree(materialize_tree(manifest, parent, |blob, path| {
                 download(blob, &mut fs::OpenOptions::new().write(true).create_new(true).open(path)?)
             })?),
         };
@@ -412,7 +412,7 @@ pub(super) fn verify_destinations(
         let filename = path.file_name().context("output file name missing")?;
         let path = parent.join(filename);
         ensure!(seen.iter().all(|other: &PathBuf| !path.starts_with(other) && !other.starts_with(&path)), "native output destination paths overlap");
-        if spec.outputs[name].kind == OutputKind::Tree {
+        if spec.outputs[name].kind.is_tree() {
             match fs::symlink_metadata(&path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Ok(_) => bail!("native tree output destination must not exist"),

@@ -53,7 +53,7 @@ pub fn unchanged(before: &Stat, after: &Stat) -> Result<()> {
 #[cfg(feature = "store")]
 pub(crate) fn capture_tree(
     fd: &impl AsFd,
-    capture_file: impl FnMut(File, &Stat) -> Result<BlobRef>,
+    capture_file: impl FnMut(&TreePath, File, &Stat) -> Result<BlobRef>,
 ) -> Result<TreeManifest> {
     let stat = fstat(fd)?;
     let mut capture = Capture {
@@ -79,7 +79,7 @@ struct Capture<F> {
 }
 
 #[cfg(feature = "store")]
-impl<F: FnMut(File, &Stat) -> Result<BlobRef>> Capture<F> {
+impl<F: FnMut(&TreePath, File, &Stat) -> Result<BlobRef>> Capture<F> {
     fn directory(&mut self, dir: &impl AsFd, prefix: &[u8]) -> Result<()> {
         let mut names = Vec::new();
         for entry in Dir::read_from(dir)? {
@@ -143,7 +143,7 @@ impl<F: FnMut(File, &Stat) -> Result<BlobRef>> Capture<F> {
             Mode::empty(),
         )?);
         unchanged(stat, &fstat(&file)?)?;
-        let reference = (self.capture_file)(file, stat)?;
+        let reference = (self.capture_file)(path, file, stat)?;
         if stat.st_nlink > 1 {
             self.links.insert(identity, path.clone());
         }

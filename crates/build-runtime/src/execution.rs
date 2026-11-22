@@ -19,13 +19,13 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use rustix::{
-    fs::{Mode, OFlags, ResolveFlags, openat2},
+    fs::{Mode, OFlags, ResolveFlags, Stat, openat2},
     io::Errno,
 };
 
 use crate::{
     Artifact, BlobRef, BuildPath, ContentId, ExecutionSpec, MaterializedTree, NativeStore,
-    OutputKind, ResultManifest, TreeEntry, TreeLease, TreePath,
+    OutputKind, ResultManifest, TreeEntry, TreeLease, TreeManifest, TreePath,
     sandbox::{MountAccess, SandboxInvocation, SandboxPath, SandboxPlan},
 };
 
@@ -103,6 +103,140 @@ impl Read for PositionalReader {
 struct OutputLocation {
     directory: File,
     relative: PathBuf,
+    baseline: Option<GeneratedBaseline>,
+}
+
+impl OutputLocation {
+    fn open(&self, kind: OutputKind, required: bool) -> Result<Option<File>> {
+        let flags = OFlags::RDONLY
+            | OFlags::CLOEXEC
+            | OFlags::NONBLOCK
+            | if kind.is_tree() {
+                OFlags::DIRECTORY
+            } else {
+                OFlags::empty()
+            };
+        if self.relative.as_os_str().is_empty() {
+            return Ok(Some(self.directory.try_clone()?));
+        }
+        match openat2(
+            &self.directory,
+            &self.relative,
+            flags,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
+        ) {
+            Ok(fd) => Ok(Some(File::from(fd))),
+            Err(Errno::NOENT) if !required => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+/// The existing immutable inputs inside a generated-output directory.
+/// Capture their actual private-view metadata without reading their bytes.
+/// An identical input is not a generated artifact and must not be sent back.
+struct GeneratedBaseline {
+    tree: TreeManifest,
+    files: BTreeMap<TreePath, Stat>,
+}
+
+impl GeneratedBaseline {
+    fn capture(directory: &File, relative: &Path, input: &TreeManifest) -> Result<Self> {
+        let mut files = BTreeMap::new();
+        let tree = crate::source::capture_tree(directory, |path, _, stat| {
+            let logical = relative.join(host_path(path.as_bytes()));
+            let key = TreePath::new(logical.as_os_str().as_bytes().to_vec())?;
+            let entry = input
+                .entries
+                .get(&key)
+                .context("generated root contains an undeclared input")?;
+            let entry = if let TreeEntry::Hardlink(target) = entry {
+                input
+                    .entries
+                    .get(target)
+                    .context("missing input hardlink target")?
+            } else {
+                entry
+            };
+            let TreeEntry::File { blob, .. } = entry else {
+                anyhow::bail!("generated root input is not a regular file");
+            };
+            ensure!(
+                u64::try_from(stat.st_size)? == blob.size,
+                "materialized input size changed"
+            );
+            files.insert(path.clone(), *stat);
+            Ok(*blob)
+        })?;
+        Ok(Self { tree, files })
+    }
+
+    fn existing_file(&self, path: &TreePath, stat: &Stat) -> Result<Option<BlobRef>> {
+        if let Some(before) = self.files.get(path) {
+            crate::source::unchanged(before, stat)
+                .context("generated output modified an input file")?;
+            let Some(TreeEntry::File { blob, .. }) = self.tree.entries.get(path) else {
+                anyhow::bail!("generated baseline file missing");
+            };
+            Ok(Some(*blob))
+        } else {
+            ensure!(
+                !self.tree.entries.contains_key(path),
+                "generated output replaced an input"
+            );
+            Ok(None)
+        }
+    }
+
+    fn additions(&self, mut actual: TreeManifest) -> Result<TreeManifest> {
+        ensure!(
+            actual.root.mode == self.tree.root.mode,
+            "generated output changed input root permissions"
+        );
+        for (path, before) in &self.tree.entries {
+            let after = actual
+                .entries
+                .get(path)
+                .context("generated output removed an input")?;
+            let unchanged = match (before, after) {
+                (TreeEntry::Directory(before), TreeEntry::Directory(after)) => {
+                    before.mode == after.mode
+                }
+                _ => before == after,
+            };
+            ensure!(
+                unchanged,
+                "generated output changed an input: {:?}",
+                path.as_bytes()
+            );
+        }
+
+        // Existing directories are included only when needed as parents of
+        // generated entries. No unchanged regular files, links, or unrelated
+        // input directories are copied into the result.
+        let mut parents = BTreeSet::new();
+        for path in actual
+            .entries
+            .keys()
+            .filter(|path| !self.tree.entries.contains_key(*path))
+        {
+            for (index, _) in path
+                .as_bytes()
+                .iter()
+                .enumerate()
+                .filter(|(_, byte)| **byte == b'/')
+            {
+                parents.insert(TreePath::new(path.as_bytes()[..index].to_vec())?);
+            }
+        }
+        actual
+            .entries
+            .retain(|path, _| !self.tree.entries.contains_key(path) || parents.contains(path));
+        // This also rejects aliases to inputs outside the generated tree.
+        actual.validate()?;
+        Ok(actual)
+    }
 }
 
 struct PreparedBuild {
@@ -167,7 +301,7 @@ fn writable_locations(
         let path = relative(&output.path, mount)?;
         let existing = if path.as_os_str().is_empty() {
             ensure!(
-                output.kind == OutputKind::Tree,
+                output.kind.is_tree(),
                 "file output cannot replace a mount root"
             );
             true
@@ -182,7 +316,7 @@ fn writable_locations(
         };
         if existing {
             ensure!(
-                output.kind == OutputKind::Tree,
+                output.kind.is_tree(),
                 "declared file output already exists in immutable input"
             );
             require_directory(tree, path)?;
@@ -274,13 +408,25 @@ impl PreparedBuild {
         let mut outputs = BTreeMap::new();
         for (name, output) in &spec.outputs {
             let (point, view) = backing(&views, &output.path)?;
-            outputs.insert(
-                name.clone(),
-                OutputLocation {
-                    directory: File::open(view.root())?,
-                    relative: relative(&output.path, point)?.to_owned(),
-                },
-            );
+            let mut location = OutputLocation {
+                directory: File::open(view.root())?,
+                relative: relative(&output.path, point)?.to_owned(),
+                baseline: None,
+            };
+            if output.kind == OutputKind::GeneratedTree
+                && let Some(directory) = location.open(output.kind, false)?
+            {
+                let manifest = leases
+                    .get(point)
+                    .context("generated output input tree missing")?
+                    .manifest();
+                location.baseline = Some(GeneratedBaseline::capture(
+                    &directory,
+                    &location.relative,
+                    manifest,
+                )?);
+            }
+            outputs.insert(name.clone(), location);
         }
         Ok(Self {
             plan,
@@ -424,30 +570,11 @@ impl Capture {
             let location = locations
                 .get(name)
                 .context("declared output location missing")?;
-            let flags = OFlags::RDONLY
-                | OFlags::CLOEXEC
-                | OFlags::NONBLOCK
-                | if output.kind == OutputKind::Tree {
-                    OFlags::DIRECTORY
-                } else {
-                    OFlags::empty()
-                };
-            let file = if location.relative.as_os_str().is_empty() {
-                location.directory.try_clone()?
-            } else {
-                match openat2(
-                    &location.directory,
-                    &location.relative,
-                    flags,
-                    Mode::empty(),
-                    ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
-                ) {
-                    Ok(fd) => File::from(fd),
-                    Err(Errno::NOENT) if !output.required => continue,
-                    Err(error) => {
-                        return Err(error).with_context(|| format!("open declared output {name}"));
-                    }
-                }
+            let Some(file) = location
+                .open(output.kind, output.required)
+                .with_context(|| format!("open declared output {name}"))?
+            else {
+                continue;
             };
             let artifact = match output.kind {
                 OutputKind::File => {
@@ -457,13 +584,27 @@ impl Capture {
                         mode: Some(mode),
                     }
                 }
-                OutputKind::Tree => {
-                    let tree = crate::source::capture_tree(&file, |file, stat| {
+                OutputKind::Tree | OutputKind::GeneratedTree => {
+                    let tree = crate::source::capture_tree(&file, |path, file, stat| {
+                        if let Some(baseline) = &location.baseline
+                            && let Some(blob) = baseline.existing_file(path, stat)?
+                        {
+                            return Ok(blob);
+                        }
                         let reference = self.file(file.try_clone()?)?;
                         crate::source::unchanged(stat, &rustix::fs::fstat(&file)?)?;
                         Ok(reference)
                     })?;
-                    Artifact::Tree(tree)
+                    match output.kind {
+                        OutputKind::GeneratedTree => {
+                            Artifact::GeneratedTree(if let Some(baseline) = &location.baseline {
+                                baseline.additions(tree)?
+                            } else {
+                                tree
+                            })
+                        }
+                        _ => Artifact::Tree(tree),
+                    }
                 }
             };
             outputs.insert(name.clone(), artifact);

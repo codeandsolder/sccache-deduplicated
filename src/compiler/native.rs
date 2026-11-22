@@ -245,7 +245,8 @@ impl CompilerPlan {
                         output.key.clone(),
                         OutputSpec {
                             path,
-                            required: !output.optional
+                            required: !output.optional,
+                            kind: crate::build_runtime::OutputKind::File,
                         }
                     )
                     .is_none(),

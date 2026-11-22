@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use sccache::{
     build_runtime::{
         Artifact, BuildPath, CommandSpec, ContentId, ExecutionSpec, MappedMetadata, MappedTree,
@@ -447,6 +447,19 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     assert_eq!(fs::read(generated.join("object.o"))?, fs::read(&reference)?);
     assert_eq!(fs::read(generated.join("input.s"))?, source_bytes);
 
+    directory.outputs.get_mut("codegen").context("output")?.kind =
+        sccache_build::OutputKind::GeneratedTree;
+    fs::remove_dir_all(&generated)?;
+    let result = client.run_action(&directory, &inputs, &tree_destinations, &policy)?;
+    assert_eq!(result.source, NativeBuildSource::Worker(worker_address));
+    assert_eq!(fs::read(generated.join("object.o"))?, fs::read(&reference)?);
+    assert!(!generated.join("input.s").exists());
+    fs::remove_dir_all(&generated)?;
+    let result = client.run_action(&directory, &inputs, &tree_destinations, &policy)?;
+    assert_eq!(result.source, NativeBuildSource::Hit);
+    assert_eq!(fs::read(generated.join("object.o"))?, fs::read(&reference)?);
+    assert_eq!(fs::read_dir(&generated)?.count(), 1);
+
     // A real compiler failure must be reported but never become a hit.
     let mut invalid = spec;
     invalid
@@ -474,8 +487,8 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     assert!(!failed.output.stderr.is_empty());
     let (scheduler_stats, worker_stats) = fleet.finish()?;
     assert_eq!(worker_stats.actions, 0);
-    assert_eq!(scheduler_stats.actions, 3);
-    assert_eq!(scheduler_stats.results, 2);
+    assert_eq!(scheduler_stats.actions, 4);
+    assert_eq!(scheduler_stats.results, 3);
     assert_eq!(worker_stats.trees, 2);
     assert_eq!(scheduler_stats.trees, 2);
     Ok(())

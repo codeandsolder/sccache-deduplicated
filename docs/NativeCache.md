@@ -238,3 +238,29 @@ execute remotely, all four repeated calls must hit, and artifacts must
 match the direct compiler byte-for-byte. The service never creates either
 legacy cache. Production deployment, multi-host benchmarking and hard
 scratch quotas remain separate integration work.
+
+### Native directory results
+
+The execution declaration assigns every named output a kind: regular file,
+complete directory tree, or generated-only tree. The output kind is part of
+the action key and checked against the result manifest. Directory outputs
+reuse the same portable tree metadata and content references as input trees;
+the scheduler's normal result lease retains all referenced blobs. No result
+archives or client-side persistent CAS are needed.
+
+A generated-only output may occupy an existing logical input directory,
+as required by Rust's codegen stage. The worker records the immutable
+private view's input topology and inode metadata before execution, without
+rehashing the already verified input blobs. After execution it verifies the
+existing regular files are unchanged and the original input topology and
+permissions are retained. Only newly generated entries and their required
+parent directories are returned. A modification or deletion of an immutable
+input, or a generated hardlink to an input inode, is rejected. Actions
+intending to transform the input directory instead declare a complete tree.
+
+Both worker capture and client delivery account for logical file bytes
+independently of content deduplication. All staged directory contents are
+validated and materialized before publication at a previously absent
+destination. The caller can mount a generated-only result over its original
+live input directory for native linking, without replacing its dependencies
+with stale worker copies.

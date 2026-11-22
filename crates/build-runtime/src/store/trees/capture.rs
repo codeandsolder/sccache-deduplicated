@@ -27,7 +27,7 @@ impl NativeStore {
             Mode::empty(),
         )?;
         let mut blobs = BTreeMap::new();
-        let manifest = crate::source::capture_tree(&fd, |file, stat| {
+        let manifest = crate::source::capture_tree(&fd, |_, file, stat| {
             let blob = capture_regular(self, &file, stat)?;
             let reference = blob.reference();
             blobs.entry(reference.id).or_insert(blob);

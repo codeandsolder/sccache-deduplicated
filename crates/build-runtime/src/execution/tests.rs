@@ -225,6 +225,40 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
             .manifest(),
         &original_manifest
     );
+    // Generated-only mode never returns existing input files, even if the
+    // original logical output directory also contains compiler dependencies.
+    spec.outputs.get_mut("codegen").context("output")?.kind = crate::OutputKind::GeneratedTree;
+    spec.command.arguments[1] =
+        b"printf generated > /src/first.o; printf second > /src/second.o".to_vec();
+    let result = execute(&spec, &store, &policy, || Ok(()))?;
+    let manifest = result
+        .successful_result()
+        .context("generated output execution failed")?;
+    let Artifact::GeneratedTree(tree) = &manifest.outputs["codegen"] else {
+        anyhow::bail!("expected generated directory output");
+    };
+    assert_eq!(tree.entries.len(), 2);
+    assert!(
+        !tree
+            .entries
+            .contains_key(&TreePath::new(b"input".to_vec())?)
+    );
+    assert!(
+        !manifest
+            .blobs()?
+            .contains_key(&ContentId::of(b"hello native\n"))
+    );
+    assert_eq!(manifest.logical_bytes()?, 15);
+    for path in [b"first.o".as_slice(), b"second.o"] {
+        let Some(TreeEntry::File { blob, .. }) = tree.entries.get(&TreePath::new(path.to_vec())?)
+        else {
+            anyhow::bail!("generated file missing");
+        };
+        assert!(result.open_blob(blob.id).is_ok());
+    }
+    spec.command.arguments[1] = b"printf replaced > /src/input".to_vec();
+    assert!(execute(&spec, &store, &policy, || Ok(())).is_err());
+
     spec.outputs = file_outputs;
     spec.command.arguments[1] = b"printf new > object".to_vec();
 
@@ -276,6 +310,7 @@ fn rejects_symlink_and_fifo_outputs_without_following_or_blocking() -> Result<()
         OutputLocation {
             directory: File::open(dir.path())?,
             relative: "object".into(),
+            baseline: None,
         },
     )]);
     assert!(capture.outputs(&locations, &spec).is_err());

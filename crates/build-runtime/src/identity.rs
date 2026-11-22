@@ -70,8 +70,19 @@ pub struct BlobRef {
 /// The kind of filesystem object promised by an output declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutputKind {
+    /// One regular file at the declared path.
     File,
+    /// A complete directory snapshot, including any remaining input entries.
     Tree,
+    /// New entries only. Existing inputs must remain intact.
+    GeneratedTree,
+}
+
+impl OutputKind {
+    #[must_use = "directory outputs must be captured using directory descriptors"]
+    pub const fn is_tree(self) -> bool {
+        matches!(self, Self::Tree | Self::GeneratedTree)
+    }
 }
 
 /// One materialized compiler output, with metadata separate from content.
@@ -79,6 +90,7 @@ pub enum OutputKind {
 pub enum Artifact {
     File { blob: BlobRef, mode: Option<u32> },
     Tree(crate::TreeManifest),
+    GeneratedTree(crate::TreeManifest),
 }
 
 impl Artifact {
@@ -87,6 +99,7 @@ impl Artifact {
         match self {
             Self::File { .. } => OutputKind::File,
             Self::Tree(_) => OutputKind::Tree,
+            Self::GeneratedTree(_) => OutputKind::GeneratedTree,
         }
     }
 
@@ -96,7 +109,7 @@ impl Artifact {
                 mode.is_none_or(|mode| mode & !0o777 == 0),
                 "unsupported output mode"
             ),
-            Self::Tree(tree) => tree.validate()?,
+            Self::Tree(tree) | Self::GeneratedTree(tree) => tree.validate()?,
         }
         Ok(())
     }
@@ -105,7 +118,7 @@ impl Artifact {
     pub(crate) fn test_file_blob(&self) -> BlobRef {
         match self {
             Self::File { blob, .. } => *blob,
-            Self::Tree(_) => panic!("expected a regular file"),
+            Self::Tree(_) | Self::GeneratedTree(_) => panic!("expected a regular file"),
         }
     }
 }
@@ -146,7 +159,7 @@ impl ResultManifest {
         for artifact in self.outputs.values() {
             match artifact {
                 Artifact::File { blob, .. } => count(*blob)?,
-                Artifact::Tree(tree) => {
+                Artifact::Tree(tree) | Artifact::GeneratedTree(tree) => {
                     for entry in tree.entries.values() {
                         if let crate::TreeEntry::File { blob, .. } = entry {
                             count(*blob)?;
@@ -178,7 +191,7 @@ impl ResultManifest {
             artifact.validate()?;
             match artifact {
                 Artifact::File { blob, .. } => insert(blob.id, blob.size)?,
-                Artifact::Tree(tree) => {
+                Artifact::Tree(tree) | Artifact::GeneratedTree(tree) => {
                     for (id, size) in tree.blobs()? {
                         insert(id, size)?;
                     }

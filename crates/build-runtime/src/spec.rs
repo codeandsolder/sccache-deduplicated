@@ -175,7 +175,7 @@ impl ExecutionSpec {
                         .mounts
                         .keys()
                         .any(|mount| mount.within(output.path.as_bytes())
-                            && (mount != &output.path || output.kind != OutputKind::Tree)),
+                            && (mount != &output.path || !output.kind.is_tree())),
                 "output conflicts with a reserved or mounted path"
             );
             ensure!(
