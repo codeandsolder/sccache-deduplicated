@@ -38,7 +38,7 @@ use crate::{
 };
 
 use super::Language;
-use super::c::hash_arguments;
+use super::c::{INPUT_FILE_NAME_DOMAIN, hash_arguments, hashed_input_file_name};
 
 /// The current format is 1 header byte for the version + bincode encoding
 /// of the [`PreprocessorCacheEntry`] struct.
@@ -412,6 +412,9 @@ pub fn preprocessor_cache_entry_hash_key(
     // A hit on a preprocessor cache entry hands back the object cache key that
     // was stored in it, so everything the object key is made of has to be here
     // too or the assembler would be forgotten on that path.
+    if hashed_input_file_name(language, input_file).is_some() {
+        m.delimiter(INPUT_FILE_NAME_DOMAIN);
+    }
     if let Some(assembler_digest) = assembler_digest {
         m.update(assembler_digest.as_bytes());
     }
@@ -702,6 +705,50 @@ mod test {
             config,
             &mut updated
         ));
+    }
+
+    #[test]
+    fn test_basename_aware_direct_index_rejects_old_keys() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("test.c");
+        let source = b"int x;";
+        std::fs::write(&file, source)?;
+        for language in [
+            Language::C,
+            Language::Cxx,
+            Language::Cuda,
+            Language::CudaFE,
+            Language::Ptx,
+            Language::Cubin,
+        ] {
+            let key = preprocessor_cache_entry_hash_key(PreprocessorCacheKey {
+                compiler_digest: "compiler",
+                language,
+                arguments: &[],
+                extra_hashes: &[],
+                assembler_digest: None,
+                env_vars: &[],
+                input_file: &file,
+                plusplus: false,
+                config: PreprocessorCacheModeConfig::activated(),
+                basedirs: &[],
+            })?
+            .context("cacheable direct key")?;
+            let mut old = Digest::new();
+            old.update(b"compiler");
+            old.update(&[0, FORMAT_VERSION]);
+            old.update(language.as_str().as_bytes());
+            let mut encoded = vec![];
+            encode_path(&mut encoded, &file)?;
+            old.update(&encoded);
+            old.update(Digest::reader_sync(&source[..])?.as_bytes());
+            let old = old.finish();
+            match language {
+                Language::CudaFE | Language::Ptx | Language::Cubin => assert_eq!(key, old),
+                _ => assert_ne!(key, old),
+            }
+        }
+        Ok(())
     }
 
     #[test]
