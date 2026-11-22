@@ -103,7 +103,8 @@ jobs:
       - name: Validate managed host scripts
         run: |
           bash -n contrib/codeandsolder/sccache-release-update contrib/codeandsolder/cargo-wrapper contrib/codeandsolder/rustup-wrapper contrib/codeandsolder/test-wrappers
-          shellcheck -x contrib/codeandsolder/sccache-release-update contrib/codeandsolder/cargo-wrapper contrib/codeandsolder/rustup-wrapper contrib/codeandsolder/test-wrappers contrib/codeandsolder/build-host-native contrib/codeandsolder/host-native-metadata contrib/codeandsolder/test-host-native-metadata
+          shellcheck -x contrib/codeandsolder/sccache-release-update contrib/codeandsolder/cargo-wrapper contrib/codeandsolder/rustup-wrapper contrib/codeandsolder/test-wrappers contrib/codeandsolder/build-host-native contrib/codeandsolder/host-native-metadata contrib/codeandsolder/test-host-native-metadata contrib/codeandsolder/test-release-update-plan
+          contrib/codeandsolder/test-release-update-plan
           contrib/codeandsolder/test-wrappers
           sudo contrib/codeandsolder/test-host-native-metadata
           python3 - <<'PY'
@@ -114,10 +115,10 @@ jobs:
           assignments = {
               line.split("=", 1)[0]: line
               for line in source.splitlines()
-              if line.startswith(("CLIENT_SERVICES=", "CLIENT_PORTS="))
+              if line.startswith(("CLIENT_SERVICES=", "OPENWRT_ROOT_PORT="))
           }
           assert '"$OPENWRT_ROOT_SERVICE"' in assignments["CLIENT_SERVICES"]
-          assert '"$OPENWRT_ROOT_PORT"' in assignments["CLIENT_PORTS"]
+          assert 'SCCACHE_AUTOUPDATE_OPENWRT_ROOT_PORT' in assignments["OPENWRT_ROOT_PORT"]
           assert 'client_source_sha' in source
           assert 'dist_sha256' in source
           assert 'current_dist_protocol' in source
