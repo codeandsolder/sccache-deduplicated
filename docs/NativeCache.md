@@ -417,8 +417,9 @@ and size before isolated decoding, verifies the reconstructed package tree,
 and renegotiates the exact missing content. Files not present in the
 original (custom, generated, modified or host libraries) still follow the
 ordinary verified blob protocol. Failed archive reconstruction falls
-back to verified raw content. Concurrent worker jobs share per-package
-import reservations. The worker retains decoded content but discards
+back to verified raw content. Independent selected originals download and decode concurrently, bounded by
+`max_concurrent_imports`. Concurrent worker jobs share per-package
+import reservations and the same global import limit. The worker retains decoded content but discards
 the compressed input after import, so subsequent builds can use any of
 its files without another download.
 
