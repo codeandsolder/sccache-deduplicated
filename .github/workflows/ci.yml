@@ -41,7 +41,7 @@ jobs:
           toolchain: "nightly-2026-11-20"
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ecf97ef6708aaba39d6afad83bb82ebcca84723a # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
         with:
           rust-toolchain: "nightly-2026-11-20"
 
@@ -54,7 +54,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ecf97ef6708aaba39d6afad83bb82ebcca84723a # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
 
   check_features:
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
@@ -74,7 +74,7 @@ jobs:
           toolchain: "nightly-2026-11-20"
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ecf97ef6708aaba39d6afad83bb82ebcca84723a # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
         with:
           rust-toolchain: "nightly-2026-11-20"
 
@@ -87,7 +87,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ecf97ef6708aaba39d6afad83bb82ebcca84723a # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
 
   host_tools:
     runs-on: ubuntu-latest
@@ -194,7 +194,7 @@ jobs:
           components: llvm-tools-preview
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ecf97ef6708aaba39d6afad83bb82ebcca84723a # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
         with:
           rust-toolchain: ${{ matrix.rustc || 'nightly-2026-11-20' }}
 
@@ -304,14 +304,14 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ecf97ef6708aaba39d6afad83bb82ebcca84723a # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
 
   shared-sccache:
     name: Linux tests (runner-local sccache)
     # Single current-Rust Linux lane on every PR and main push.
     permissions:
       contents: read
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@ecf97ef6708aaba39d6afad83bb82ebcca84723a # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
     with:
       isolate-public-sccache-server: true
       command: |
@@ -342,7 +342,7 @@ jobs:
     # on every PR and main push (not only tag builds).
     permissions:
       contents: read
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@ecf97ef6708aaba39d6afad83bb82ebcca84723a # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
     with:
       isolate-public-sccache-server: true
       rust-toolchain: "nightly-2026-11-20"
@@ -366,7 +366,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ecf97ef6708aaba39d6afad83bb82ebcca84723a # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
         with:
           rust-toolchain: "nightly-2026-11-20"
 
@@ -424,7 +424,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ecf97ef6708aaba39d6afad83bb82ebcca84723a # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
 
       # Workaround for the lack of substring() function in github actions expressions.
       - name: Id
