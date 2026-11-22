@@ -38,6 +38,19 @@
         ".github/workflows/ci.yml"
       ],
       "enabled": false
+    },
+    {
+      "description": "The Ubuntu 24.04 publication runner is the intentional GLIBC 2.39 ABI floor",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDepNames": [
+        "ubuntu"
+      ],
+      "matchFileNames": [
+        ".github/workflows/publish-ci-client.yml"
+      ],
+      "enabled": false
     }
   ]
 }

@@ -1165,3 +1165,89 @@ fn dist_rust_dependency_chain(relative: Option<&str>) -> Result<()> {
     });
     Ok(())
 }
+
+/// Cargo's real split build root contains target metadata and sibling host
+/// proc macro artifacts. Compile a consumer of a re-exported proc macro
+/// through a transitive metadata dependency in two independent build roots.
+#[test]
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(feature = "dist-tests"), ignore)]
+fn test_dist_rust_cargo_split_root_proc_macro() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
+    system.add_scheduler();
+    let _worker = system.add_server(&[]);
+    let mut cfg = harness::sccache_client_cfg(root, false);
+    cfg.dist.scheduler_url = Some(system.scheduler_url());
+    let cfg_path = root.join("sccache-cfg.json");
+    write_json_cfg(root, "sccache-cfg.json", &cfg);
+    let cached_cfg = root.join("sccache-cached-cfg");
+    let _ = stop_local_daemon();
+    start_local_daemon(&cfg_path, &cached_cfg);
+
+    let project = root.join("consumer");
+    for (name, manifest, source) in [
+        (
+            "",
+            "[package]\nname='consumer'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nsecond={path='second'}\n",
+            "#[second::identity]\npub fn answer() -> second::Value { second::Value }",
+        ),
+        (
+            "second",
+            "[package]\nname='second'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nfirst={path='../first'}\n",
+            "pub use first::{identity, Value};",
+        ),
+        (
+            "first",
+            "[package]\nname='first'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nmacro_dep={path='../macro_dep'}\n",
+            "pub use macro_dep::identity; pub struct Value;",
+        ),
+        (
+            "macro_dep",
+            "[package]\nname='macro_dep'\nversion='0.1.0'\nedition='2024'\n[lib]\nproc-macro=true\n",
+            "extern crate proc_macro; #[proc_macro_attribute] pub fn identity(_: proc_macro::TokenStream, item: proc_macro::TokenStream) -> proc_macro::TokenStream { item }",
+        ),
+    ] {
+        let dir = project.join(name);
+        std::fs::create_dir_all(dir.join("src"))?;
+        write_source(&dir, "Cargo.toml", manifest);
+        write_source(&dir, "src/lib.rs", source);
+    }
+    let compiler = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let version = std::process::Command::new(&compiler).arg("-vV").output()?;
+    assert!(version.status.success());
+    let version = String::from_utf8(version.stdout)?;
+    let host = version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .context("rustc did not report its host triple")?;
+
+    for session in ["one", "two"] {
+        let target = root.join(session).join("target");
+        let intermediate = root.join(session).join("intermediate");
+        cargo_command()
+            .current_dir(&project)
+            .args(["check", "--offline", "--target", host, "--config"])
+            .arg(format!("build.build-dir='{}'", intermediate.display()))
+            .arg("--target-dir")
+            .arg(&target)
+            .env("RUSTC_WRAPPER", env!("CARGO_BIN_EXE_sccache"))
+            .env("SCCACHE_CONF", &cfg_path)
+            .env("SCCACHE_CACHED_CONF", &cached_cfg)
+            .env("SCCACHE_EXPERIMENTAL_CANONICAL_RUST", "1")
+            .env("SCCACHE_CANONICAL_TARGET_ROOT", &target)
+            .env("CARGO_BUILD_EPHEMERAL_INTERMEDIATES", "false")
+            .env("CARGO_INCREMENTAL", "0")
+            .assert()
+            .success();
+        assert!(intermediate.join("CACHEDIR.TAG").is_file());
+        assert!(intermediate.join(host).join("CACHEDIR.TAG").is_file());
+    }
+    get_stats(|info| {
+        assert!(info.stats.dist_compiles.values().sum::<usize>() >= 3);
+        assert!(info.stats.cache_hits.all() >= 3);
+        assert_eq!(info.stats.dist_errors, 0);
+    });
+    Ok(())
+}

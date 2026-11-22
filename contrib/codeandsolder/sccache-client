@@ -1,53 +1,130 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# The managed sccache daemon executes the compiler path supplied by the client.
-# If that path is one of our strict compiler wrappers, it lands back here with
-# the daemon itself as our parent. Re-entering sccache from that context would
-# recursively submit the same compile to the daemon and deadlock. The compile
-# is already inside sccache, so execute the real compiler directly instead.
-parent_exe="$(readlink "/proc/$PPID/exe" 2>/dev/null || true)"
-parent_exe="${parent_exe% (deleted)}"
-if [[ "$parent_exe" == */sccache ]]; then
-    exec "$@"
-fi
+# Both /usr/local/bin/sccache and /usr/local/libexec/sccache-client use
+# this file. Only the compiler-wrapper entrypoint changes compiler arguments.
+sccache_wait_endpoint() {
+    local endpoint="$1" service="$2" seconds="$3"
+    local deadline=$((SECONDS + seconds))
+    while true; do
+        case "$endpoint" in
+            unix:*) [[ -S "${endpoint#unix:}" ]] && return 0 ;;
+            tcp:*) ( : >"/dev/tcp/127.0.0.1/${endpoint#tcp:}" ) 2>/dev/null && return 0 ;;
+        esac
+        if ! systemctl is-active --quiet "$service"; then
+            printf 'sccache: managed service %s is not active; refusing to start a separate daemon\n' "$service" >&2
+            return 75
+        fi
+        if (( SECONDS >= deadline )); then
+            printf 'sccache: managed endpoint %s did not become ready\n' "$endpoint" >&2
+            return 75
+        fi
+        sleep 0.1
+    done
+}
 
-# During an sccache binary rollout, stop admitting new compiler submissions
-# while allowing already-admitted daemon work to finish. A stale marker is
-# ignored after 15 minutes so an interrupted updater cannot wedge compilation.
-drain="/dev/shm/sccache-maintenance-drain"
-while [[ -e "$drain" ]]; do
-    drain_mtime="$(stat -c %Y "$drain" 2>/dev/null || printf '0')"
-    now="$(date +%s)"
-    if (( drain_mtime <= 0 || now - drain_mtime >= 900 )); then
-        break
+sccache_wrapper_main() {
+    local mode="$1" uid="$2" configuration="$3" binary="$4" rustup="$5"
+    shift 5
+    local parent_exe endpoint service key value
+    local user_endpoint='unix:/run/sccache-jan/sccache.sock'
+    local root_endpoint='tcp:4227'
+    local user_service='sccache-local.service'
+    local root_service='sccache-local-root.service'
+    local readiness_seconds=300
+    local drain='/dev/shm/sccache-maintenance-drain'
+    local drain_mtime now
+
+    if [[ "$mode" == compiler ]]; then
+        # A strict compiler wrapper invoked by sccache itself is already
+        # inside a managed compilation. Resubmission would deadlock.
+        parent_exe="$(readlink "/proc/$PPID/exe" 2>/dev/null || true)"
+        parent_exe="${parent_exe% (deleted)}"
+        if [[ "$parent_exe" == */sccache ]]; then
+            exec "$@"
+        fi
     fi
-    sleep 0.1
-done
 
-if [[ -z "${SCCACHE_SERVER_PORT:-}" ]]; then
-    if (( EUID == 0 )); then
-        export SCCACHE_SERVER_PORT=4227
-    else
-        export SCCACHE_SERVER_PORT=4226
+    if [[ -e "$configuration" ]]; then
+        while IFS='=' read -r key value || [[ -n "$key" ]]; do
+            case "$key" in
+                ''|'#'*) continue ;;
+                user_endpoint) user_endpoint="$value" ;;
+                root_endpoint) root_endpoint="$value" ;;
+                user_service) user_service="$value" ;;
+                root_service) root_service="$value" ;;
+                readiness_seconds) readiness_seconds="$value" ;;
+                *) printf 'sccache: unknown wrapper setting %s\n' "$key" >&2; return 78 ;;
+            esac
+        done <"$configuration"
     fi
-fi
-export SCCACHE_START_SERVER=0
-export SCCACHE_NO_AUTO_START_SERVER=1
+    if [[ ! "$readiness_seconds" =~ ^[0-9]{1,4}$ ]]; then
+        printf 'sccache: invalid readiness_seconds\n' >&2
+        return 78
+    fi
+    readiness_seconds=$((10#$readiness_seconds))
 
-# Canonical Rust is an optimization, not a correctness requirement. Only opt
-# into it when Cargo (or an explicit caller) supplied target-layout context.
-# Direct rustc with no Cargo target context uses ordinary sccache.
-if [[ -n "${SCCACHE_CANONICAL_TARGET_ROOT:-}" || -n "${CARGO_TARGET_DIR:-}" || -n "${OUT_DIR:-}" ]]; then
-    export SCCACHE_EXPERIMENTAL_CANONICAL_RUST=1
-else
-    unset SCCACHE_EXPERIMENTAL_CANONICAL_RUST
-fi
+    if [[ "$mode" == compiler || (${1:-} != -* && $# -gt 0) ]]; then
+        while [[ -e "$drain" ]]; do
+            drain_mtime="$(stat -c %Y "$drain" 2>/dev/null || printf '0')"
+            now="$(date +%s)"
+            if (( drain_mtime <= 0 || now - drain_mtime >= 900 )); then
+                break
+            fi
+            sleep 0.1
+        done
+    fi
 
-args=("$@")
-if (( ${#args[@]} )) && [[ "${args[0]}" == "rustc" ]]; then
-    resolved_rustc="$(/usr/bin/rustup which rustc)"
-    args[0]="$resolved_rustc"
-fi
+    # Preserve explicit endpoints, including abstract Unix sockets and test
+    # daemons. Only an automatically selected managed endpoint is waited on.
+    if [[ -z "${SCCACHE_SERVER_PORT:-}" && -z "${SCCACHE_SERVER_UDS:-}" ]]; then
+        if (( uid == 0 )); then
+            endpoint="$root_endpoint"
+            service="$root_service"
+        else
+            endpoint="$user_endpoint"
+            service="$user_service"
+        fi
+        case "$endpoint" in
+            unix:/*)
+                unset SCCACHE_SERVER_PORT
+                export SCCACHE_SERVER_UDS="${endpoint#unix:}"
+                ;;
+            tcp:*)
+                value="${endpoint#tcp:}"
+                if [[ ! "$value" =~ ^[0-9]{1,5}$ ]] || (( 10#$value < 1 || 10#$value > 65535 )); then
+                    printf 'sccache: invalid TCP endpoint %s\n' "$endpoint" >&2
+                    return 78
+                fi
+                unset SCCACHE_SERVER_UDS
+                export SCCACHE_SERVER_PORT="$value"
+                ;;
+            *) printf 'sccache: invalid managed endpoint %s\n' "$endpoint" >&2; return 78 ;;
+        esac
+        # Do not wait for an explicitly requested administrative command.
+        if [[ "$mode" == compiler || (${1:-} != -* && $# -gt 0) ]]; then
+            sccache_wait_endpoint "$endpoint" "$service" "$readiness_seconds" || return "$?"
+        fi
+    fi
 
-exec /usr/local/libexec/sccache-bin/sccache "${args[@]}"
+    export SCCACHE_START_SERVER=0
+    export SCCACHE_NO_AUTO_START_SERVER=1
+    local -a args=("$@")
+    if [[ "$mode" == compiler ]]; then
+        if [[ -n "${SCCACHE_CANONICAL_TARGET_ROOT:-}" || -n "${CARGO_TARGET_DIR:-}" || -n "${OUT_DIR:-}" ]]; then
+            export SCCACHE_EXPERIMENTAL_CANONICAL_RUST=1
+        else
+            unset SCCACHE_EXPERIMENTAL_CANONICAL_RUST
+        fi
+        if (( ${#args[@]} )) && [[ "${args[0]}" == rustc ]]; then
+            args[0]="$("$rustup" which rustc)"
+        fi
+    fi
+    exec "$binary" "${args[@]}"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    mode=public
+    [[ "${0##*/}" == sccache-client ]] && mode=compiler
+    sccache_wrapper_main "$mode" "$EUID" /etc/sccache/wrapper.conf /usr/local/libexec/sccache-bin/sccache /usr/bin/rustup "$@"
+fi

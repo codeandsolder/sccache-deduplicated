@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root="$(mktemp -d "${TMPDIR:-/tmp}/sccache-router-test.XXXXXXXX")"
+pids=()
+cleanup() {
+    for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; done
+    rm -rf -- "$root"
+}
+trap cleanup EXIT
+mkdir "$root/bin"
+cat >"$root/bin/fake-sccache" <<'EOF'
+#!/usr/bin/env bash
+printf 'uds=%s port=%s canonical=%s start=%s no_auto=%s\n' "${SCCACHE_SERVER_UDS:-}" "${SCCACHE_SERVER_PORT:-}" "${SCCACHE_EXPERIMENTAL_CANONICAL_RUST:-}" "$SCCACHE_START_SERVER" "$SCCACHE_NO_AUTO_START_SERVER"
+printf 'arg=<%s>\n' "$@"
+EOF
+cat >"$root/bin/rustup" <<'EOF'
+#!/usr/bin/env bash
+[[ "$*" == 'which rustc' ]]
+printf '/fixture/toolchain/rustc\n'
+EOF
+cat >"$root/bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+exit 3
+EOF
+chmod +x "$root/bin/"*
+export PATH="$root/bin:$PATH"
+# Actual listening socket fixtures, not additional compiler/cache daemons.
+socat UNIX-LISTEN:"$root/listener.sock",fork EXEC:/bin/true &
+pids+=("$!")
+socat -d -d TCP-LISTEN:0,bind=127.0.0.1,reuseaddr,fork EXEC:/bin/true 2>"$root/tcp.log" &
+pids+=("$!")
+port=''
+for ((attempt=0; attempt<100; attempt++)); do
+    port="$(rg -o '127\.0\.0\.1:[0-9]+' "$root/tcp.log" | head -1 | cut -d: -f2 || true)"
+    [[ -S "$root/listener.sock" && "$port" =~ ^[0-9]+$ ]] && break
+    sleep 0.05
+done
+[[ -S "$root/listener.sock" && "$port" =~ ^[0-9]+$ ]]
+cat >"$root/wrapper.conf" <<EOF
+user_endpoint=unix:$root/listener.sock
+root_endpoint=tcp:$port
+readiness_seconds=1
+EOF
+# shellcheck source=contrib/codeandsolder/sccache-client
+source contrib/codeandsolder/sccache-client
+route() (
+    sccache_wrapper_main "$1" "$2" "$root/wrapper.conf" "$root/bin/fake-sccache" "$root/bin/rustup" "${@:3}"
+)
+
+unset SCCACHE_SERVER_PORT SCCACHE_SERVER_UDS SCCACHE_CANONICAL_TARGET_ROOT CARGO_TARGET_DIR OUT_DIR SCCACHE_EXPERIMENTAL_CANONICAL_RUST
+output="$(route compiler 1000 rustc 'space and "quote"')"
+rg -Fxq "uds=$root/listener.sock port= canonical= start=0 no_auto=1" <<<"$output"
+rg -Fxq 'arg=</fixture/toolchain/rustc>' <<<"$output"
+rg -Fxq 'arg=<space and "quote">' <<<"$output"
+output="$(CARGO_TARGET_DIR="$root/target" route compiler 0 rustc --version)"
+rg -Fxq "uds= port=$port canonical=1 start=0 no_auto=1" <<<"$output"
+output="$(route public 1000 rustc --version)"
+rg -Fxq 'arg=<rustc>' <<<"$output"
+output="$(SCCACHE_SERVER_PORT=12345 route compiler 1000 gcc -c 'foo bar.c')"
+rg -Fxq 'uds= port=12345 canonical= start=0 no_auto=1' <<<"$output"
+output="$(SCCACHE_SERVER_UDS='\x00explicit' route compiler 0 gcc -c a.c)"
+rg -Fxq 'uds=\x00explicit port= canonical= start=0 no_auto=1' <<<"$output"
+printf 'user_endpoint=unix:%s/unavailable.sock\n' "$root" >"$root/wrapper.conf"
+if route compiler 1000 rustc --version >"$root/failed.log" 2>&1; then
+    printf 'missing endpoint unexpectedly succeeded\n' >&2; exit 1
+else
+    [[ "$?" == 75 ]]
+fi
+rg -q 'refusing to start a separate daemon' "$root/failed.log"
+output="$(route public 1000 --show-stats)"
+rg -Fxq 'arg=<--show-stats>' <<<"$output"
+echo 'Managed TCP/Unix routing, explicit endpoints, root selection, refusal and argv tests passed.'
