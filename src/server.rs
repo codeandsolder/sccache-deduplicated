@@ -318,14 +318,14 @@ impl DistClientContainer {
     }
 
     #[cfg(feature = "dist-client")]
-    #[must_use]
+    #[must_use = "the returned client owns the supplied distribution state"]
     pub const fn new_with_state(state: DistClientState) -> Self {
         Self {
             state: futures::lock::Mutex::new(state),
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned client represents disabled distribution"]
     pub const fn new_disabled() -> Self {
         Self {
             state: futures::lock::Mutex::new(DistClientState::Disabled),
@@ -1903,12 +1903,12 @@ impl PerLanguageCount {
         *count += 1;
     }
 
-    #[must_use]
+    #[must_use = "the total is returned without mutating the counters"]
     pub fn all(&self) -> u64 {
         self.counts.values().sum()
     }
 
-    #[must_use]
+    #[must_use = "inspect the returned counter to distinguish a missing key"]
     pub fn get(&self, key: &str) -> Option<&u64> {
         self.counts.get(key)
     }
@@ -1923,12 +1923,12 @@ impl PerLanguageCount {
         &self.adv_counts
     }
 
-    #[must_use]
+    #[must_use = "inspect the returned advanced counter to distinguish a missing key"]
     pub fn get_adv(&self, key: &str) -> Option<&u64> {
         self.adv_counts.get(key)
     }
 
-    #[must_use]
+    #[must_use = "the returned counter set must be stored to accumulate statistics"]
     pub fn new() -> Self {
         Self::default()
     }

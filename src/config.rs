@@ -103,7 +103,7 @@ pub const INSECURE_DIST_CLIENT_TOKEN: &str = "dangerously_insecure_client";
 
 // Unfortunately this means that nothing else can use the sccache cache dir as
 // this top level directory is used directly to store sccache cached objects...
-#[must_use]
+#[must_use = "the returned path identifies the default disk cache location"]
 pub fn default_disk_cache_dir() -> PathBuf {
     ProjectDirs::from("", ORGANIZATION, APP_NAME).map_or_else(
         || env::temp_dir().join(APP_NAME),
@@ -111,7 +111,7 @@ pub fn default_disk_cache_dir() -> PathBuf {
     )
 }
 // ...whereas subdirectories are used of this one
-#[must_use]
+#[must_use = "the returned path identifies the default distributed cache location"]
 pub fn default_dist_cache_dir() -> PathBuf {
     ProjectDirs::from("", ORGANIZATION, DIST_APP_NAME).map_or_else(
         || env::temp_dir().join(DIST_APP_NAME),
@@ -164,7 +164,7 @@ where
     deserializer.deserialize_any(StringOrU64Visitor)
 }
 
-#[must_use]
+#[must_use = "check the result to distinguish a valid byte count from invalid input"]
 pub fn parse_size(val: &str) -> Option<u64> {
     let multiplier = match val.chars().last().map(|v| v.to_ascii_uppercase()) {
         Some('K') => 1024,
@@ -226,11 +226,11 @@ fn parse_http_url(url: &str) -> Result<reqwest::Url> {
 }
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 impl HTTPUrl {
-    #[must_use]
+    #[must_use = "the returned wrapper contains the supplied HTTP URL"]
     pub const fn from_url(u: reqwest::Url) -> Self {
         Self(u)
     }
-    #[must_use]
+    #[must_use = "the HTTP URL is returned without modifying the wrapper"]
     pub fn to_url(&self) -> reqwest::Url {
         self.0.clone()
     }
@@ -302,7 +302,7 @@ impl Default for PreprocessorCacheModeConfig {
 
 impl PreprocessorCacheModeConfig {
     /// Return a default [`Self`], but with the cache active.
-    #[must_use]
+    #[must_use = "the returned settings enable direct preprocessor caching"]
     pub fn activated() -> Self {
         Self {
             use_preprocessor_cache_mode: true,

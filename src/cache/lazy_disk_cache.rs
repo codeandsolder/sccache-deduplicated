@@ -43,7 +43,7 @@ impl LazyDiskCache {
         }
     }
 
-    #[must_use]
+    #[must_use = "the configured byte limit is returned without changing it"]
     pub const fn capacity(&self) -> u64 {
         match self {
             Self::Uninit { max_size, .. } => *max_size,
@@ -51,7 +51,7 @@ impl LazyDiskCache {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned path identifies the cache storage location"]
     pub fn path(&self) -> &Path {
         match self {
             Self::Uninit { root, .. } => root.as_ref(),
