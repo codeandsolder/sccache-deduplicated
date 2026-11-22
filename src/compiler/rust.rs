@@ -1056,41 +1056,46 @@ fn compilation_target(arguments: &[Argument<ArgData>], host: &str) -> String {
 // where they appear. The weak map persists across sccache upgrades, so the
 // package format must participate in the weak key independently of compile
 // cache versioning.
-const RUST_DIST_TOOLCHAIN_PACKAGE_SCHEMA: &[u8] = b"rust-dist-toolchain-package-v2";
+const RUST_DIST_TOOLCHAIN_PACKAGE_SCHEMA: &[u8] = b"rust-dist-toolchain-package-v3";
 
 fn dist_toolchain_weak_key_with_schema(
-    base: &Digest,
+    compiler_shlibs_digests: &[String],
     package_schema: &[u8],
     target: &str,
     target_std_manifest_digest: Option<&str>,
     noncanonical_sysroot: Option<&Path>,
 ) -> String {
-    let mut weak = base.clone();
-    weak.update(package_schema);
-    weak.update(b"rust-dist-toolchain-target-v1");
-    if let Some(sysroot) = noncanonical_sysroot {
-        weak.update(b"noncanonical-sysroot-v1");
-        weak.update(sysroot.as_os_str().as_encoded_bytes());
+    // Clippy policy, manifest inputs, proc macros and --emit affect the
+    // compilation cache key, not the contents of the packaged sysroot.
+    let mut weak = Digest::new();
+    weak.delimiter(package_schema);
+    for digest in compiler_shlibs_digests {
+        weak.delimiter(digest.as_bytes());
     }
-    weak.update(target.as_bytes());
+    weak.delimiter(b"rust-dist-toolchain-target-v1");
+    if let Some(sysroot) = noncanonical_sysroot {
+        weak.delimiter(b"noncanonical-sysroot-v1");
+        weak.delimiter(sysroot.as_os_str().as_encoded_bytes());
+    }
+    weak.delimiter(target.as_bytes());
     match target_std_manifest_digest {
         Some(digest) => {
-            weak.update(b"target-std-present");
-            weak.update(digest.as_bytes());
+            weak.delimiter(b"target-std-present");
+            weak.delimiter(digest.as_bytes());
         }
-        None => weak.update(b"target-std-missing"),
+        None => weak.delimiter(b"target-std-missing"),
     }
     weak.finish()
 }
 
 fn dist_toolchain_weak_key(
-    base: &Digest,
+    compiler_shlibs_digests: &[String],
     target: &str,
     target_std_manifest_digest: Option<&str>,
     noncanonical_sysroot: Option<&Path>,
 ) -> String {
     dist_toolchain_weak_key_with_schema(
-        base,
+        compiler_shlibs_digests,
         RUST_DIST_TOOLCHAIN_PACKAGE_SCHEMA,
         target,
         target_std_manifest_digest,
@@ -3099,7 +3104,7 @@ where
             None
         };
         let weak_toolchain_key = dist_toolchain_weak_key(
-            &m,
+            &self.compiler_shlibs_digests,
             &target,
             target_std_manifest_digest.as_deref(),
             canonical_paths.is_none().then_some(self.sysroot.as_path()),
@@ -6707,7 +6712,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
     where
         F: Fn(&Path) -> Result<()>,
     {
-        hash_key_for_compiler(
+        hash_keys_for_compiler(
             f,
             args,
             env_vars,
@@ -6715,16 +6720,17 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             preprocessor_cache_mode,
             "rustc",
         )
+        .0
     }
 
-    fn hash_key_for_compiler<F>(
+    fn hash_keys_for_compiler<F>(
         f: &TestFixture,
         args: &[&'static str],
         env_vars: &[(OsString, OsString)],
         pre_func: F,
         preprocessor_cache_mode: bool,
         executable: &str,
-    ) -> String
+    ) -> (String, String)
     where
         F: Fn(&Path) -> Result<()>,
     {
@@ -6766,7 +6772,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         if hasher.parsed_args.metadata_only_output.is_none() {
             mock_file_names(&creator, &["foo.rlib"]);
         }
-        hasher
+        let result = hasher
             .generate_hash_key(GenerateHashKeyContext {
                 creator: &creator,
                 cwd: f.tempdir.path().to_owned(),
@@ -6778,8 +6784,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 cache_control: CacheControl::Default,
             })
             .wait()
-            .unwrap()
-            .key
+            .unwrap();
+        (result.key, result.weak_toolchain_key)
     }
 
     #[test]
@@ -6801,9 +6807,9 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             "--crate-type",
             "lib",
         ];
-        let first = hash_key_for_compiler(&f, &args, &env, |_| Ok(()), false, "clippy-driver");
+        let first = hash_keys_for_compiler(&f, &args, &env, |_| Ok(()), false, "clippy-driver").0;
         fs::write(&file, b"disallowed-names = [\"bad_two\"]\n")?;
-        let second = hash_key_for_compiler(&f, &args, &env, |_| Ok(()), false, "clippy-driver");
+        let second = hash_keys_for_compiler(&f, &args, &env, |_| Ok(()), false, "clippy-driver").0;
         assert_ne!(
             first, second,
             "changing the external Clippy policy must invalidate cache"
@@ -6833,10 +6839,11 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             "CLIPPY_ARGS".into(),
             "-Aclippy::unwrap_used__CLIPPY_HACKERY__".into(),
         )];
-        let deny_key = hash_key_for_compiler(&f, &args, &deny, |_| Ok(()), false, "clippy-driver");
+        let deny_key =
+            hash_keys_for_compiler(&f, &args, &deny, |_| Ok(()), false, "clippy-driver").0;
         let allow_key =
-            hash_key_for_compiler(&f, &args, &allow, |_| Ok(()), false, "clippy-driver");
-        let rustc_key = hash_key_for_compiler(&f, &args, &deny, |_| Ok(()), false, "rustc");
+            hash_keys_for_compiler(&f, &args, &allow, |_| Ok(()), false, "clippy-driver").0;
+        let rustc_key = hash_keys_for_compiler(&f, &args, &deny, |_| Ok(()), false, "rustc").0;
         assert_ne!(
             deny_key, allow_key,
             "different Clippy lint levels must not reuse diagnostics"
@@ -8249,8 +8256,7 @@ version='2.0.0'
 
     #[test]
     fn dist_toolchain_weak_key_tracks_target_std_manifest_and_physical_layout() {
-        let mut base = Digest::new();
-        base.update(b"same-rustc");
+        let base = ["same-rustc".to_owned()];
 
         let host = dist_toolchain_weak_key(
             &base,
@@ -8269,7 +8275,7 @@ version='2.0.0'
 
         let previous_package_schema = dist_toolchain_weak_key_with_schema(
             &base,
-            b"rust-dist-toolchain-package-v1",
+            b"rust-dist-toolchain-package-v2",
             "x86_64-unknown-linux-gnu",
             Some("host-std-digest"),
             None,
@@ -8290,6 +8296,45 @@ version='2.0.0'
         );
         assert_ne!(root_toolchain, user_toolchain);
         assert_ne!(root_toolchain, host);
+        assert_ne!(
+            host,
+            dist_toolchain_weak_key(
+                &["different-rustc".to_owned()],
+                "x86_64-unknown-linux-gnu",
+                Some("host-std-digest"),
+                None,
+            )
+        );
+    }
+
+    #[test]
+    fn dist_toolchain_key_is_independent_of_compilation_policy() -> Result<()> {
+        let f = TestFixture::new();
+        let args = [
+            "--emit",
+            "metadata",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+        ];
+        let policy = f.tempdir.path().join("policy");
+        fs::create_dir_all(&policy)?;
+        fs::write(
+            policy.join("clippy.toml"),
+            b"disallowed-names = [\"test\"]\n",
+        )?;
+        let env = vec![(OsString::from("CLIPPY_CONF_DIR"), policy.into_os_string())];
+        let (rustc_key, rustc_toolchain) =
+            hash_keys_for_compiler(&f, &args, &[], |_| Ok(()), false, "rustc");
+        let (clippy_key, clippy_toolchain) =
+            hash_keys_for_compiler(&f, &args, &env, |_| Ok(()), false, "clippy-driver");
+        assert_ne!(rustc_key, clippy_key);
+        assert_eq!(rustc_toolchain, clippy_toolchain);
+        Ok(())
     }
 
     #[test]
