@@ -1300,6 +1300,7 @@ where
                 }
             }
 
+            drop(transfers);
             Ok::<_, Error>(())
         });
 

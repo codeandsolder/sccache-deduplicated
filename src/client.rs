@@ -183,7 +183,7 @@ impl ServerConnection {
 /// IPC failures invalidate the session rather than masquerading as a cache
 /// miss or a safe distributed retry.
 #[derive(Debug)]
-pub(crate) struct IpcTransportFailure;
+pub struct IpcTransportFailure;
 
 impl std::fmt::Display for IpcTransportFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -229,7 +229,9 @@ pub async fn connection_task<T: Send + 'static>(
     };
     let result = tokio::task::spawn_blocking(move || {
         ensure!(!connection.closed.is_cancelled(), IpcTransportFailure);
-        task(&mut connection)
+        let result = task(&mut connection);
+        drop(connection);
+        result
     })
     .await
     .context(IpcTransportFailure)?;

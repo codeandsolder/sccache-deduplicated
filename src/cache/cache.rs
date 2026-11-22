@@ -110,6 +110,9 @@ use crate::errors::{Result, anyhow};
 pub trait Storage: Send + Sync {
     /// Verify that a connection-owned compilation session remains usable.
     /// A failed session must not turn into a speculative local compilation.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying session is no longer usable.
     fn validate_session(&self) -> Result<()> {
         Ok(())
     }

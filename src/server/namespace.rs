@@ -132,7 +132,7 @@ impl TransferSession {
         }
     }
 
-    pub(super) fn request_budget(
+    pub(super) const fn request_budget(
         &self,
         request: &super::SccacheRequest,
         limits: super::activity::CompileLimits,
