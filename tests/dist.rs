@@ -577,9 +577,10 @@ pub fn marker() -> u32 {{ let policy_denied_name = 11; policy_denied_name + 1 }}
         fs::write(&resolved, allow)?;
     }
     let count = cases.len();
+    let expected_hits = u64::try_from(count)?;
     get_stats(move |info| {
         assert_eq!(count * 2, info.stats.dist_compiles.values().sum::<usize>());
-        assert_eq!(count, info.stats.cache_hits.all());
+        assert_eq!(expected_hits, info.stats.cache_hits.all());
         assert_eq!(0, info.stats.dist_errors);
     });
     Ok(())
