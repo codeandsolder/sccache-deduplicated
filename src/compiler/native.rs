@@ -527,7 +527,10 @@ mod tests {
         );
         for (name, output) in &manifest.outputs {
             let mut bytes = Vec::new();
-            result.open_blob(output.blob.id)?.read_to_end(&mut bytes)?;
+            let crate::build_runtime::Artifact::File { blob, .. } = output else {
+                anyhow::bail!("expected file output");
+            };
+            result.open_blob(blob.id)?.read_to_end(&mut bytes)?;
             assert_eq!(
                 ContentId::of(&bytes),
                 ContentId::of(&std::fs::read(&plan.destinations[name])?),
