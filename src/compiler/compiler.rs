@@ -1008,6 +1008,19 @@ where
             .map(move |o| CompilationOutcome::local(cacheable, DistType::NoDist, o));
     };
 
+    if !compilation.automatic_dist_toolchain_is_ready()
+        && !compilation.dist_command_uses_cargo()
+        && dist_client
+            .get_custom_toolchain(&compile_cmd.get_executable())
+            .is_none()
+    {
+        debug!("[{out_pretty}]: No automatic toolchain for compiler launcher; compiling locally");
+        return compile_cmd
+            .execute(service, &creator)
+            .await
+            .map(move |output| CompilationOutcome::local(cacheable, DistType::NoDist, output));
+    }
+
     debug!("[{out_pretty}]: Attempting distributed compilation");
     let out_pretty2 = out_pretty.clone();
 

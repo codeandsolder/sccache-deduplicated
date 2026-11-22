@@ -822,7 +822,7 @@ pub fn do_compile_client_side<C>(
     runtime: &Runtime,
     conn: ServerConnection,
     invocation: CompileInvocation<'_>,
-    path: Option<OsString>,
+    config: &Config,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<i32>
@@ -830,7 +830,7 @@ where
     C: CommandCreatorSync + Clone + Send + Sync + 'static,
 {
     trace!("do_compile_client_side");
-    let exe_path = which_in(invocation.exe, path, invocation.cwd)?;
+    let exe_path = which_in(invocation.exe, env::var_os("PATH"), invocation.cwd)?;
     let storage = IpcStorage::connect(conn)?;
     let conn_arc = storage.conn();
     let (tx, _rx) = futures::channel::mpsc::channel(1);
@@ -842,6 +842,7 @@ where
         runtime.handle().clone(),
         tx,
         info,
+        config.compiler_aliases.clone(),
     );
     let compile = Compile {
         exe: exe_path.as_os_str().to_owned(),
@@ -1052,7 +1053,7 @@ fn run_compile_command(
             &runtime,
             conn,
             invocation,
-            env::var_os("PATH"),
+            config,
             &mut io::stdout(),
             &mut io::stderr(),
         )
