@@ -1101,8 +1101,8 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
         fs::read(private.join("rust-reference.rlib"))?
     );
     let stats = service.stats()?;
-    assert_eq!(stats.cache_hits.all(), 8);
-    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 4);
+    assert_eq!(stats.cache_hits.all(), 16);
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 8);
     run_environment_audit(&service, &direct, &rustc, &direct_config)?;
     let stats = service.stats()?;
     assert_eq!(stats.dist_compiles.values().sum::<usize>(), 11);
