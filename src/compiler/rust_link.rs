@@ -368,6 +368,8 @@ impl LinkInvocation {
 pub struct RustLinkStages {
     arguments: Vec<OsString>,
     input: usize,
+    codegen_directory: PathBuf,
+    output_roots: Vec<PathBuf>,
 }
 
 impl RustLinkStages {
@@ -376,8 +378,59 @@ impl RustLinkStages {
     /// # Errors
     /// The input is ambiguous, not a linked compilation, or already a stage.
     pub fn new(arguments: &[OsString], cwd: &Path) -> Result<Self> {
-        let (arguments, input) = super::rust::native_link_stage_input(arguments, cwd)?;
-        Ok(Self { arguments, input })
+        super::rust::native_link_stage_input(arguments, cwd)
+    }
+
+    pub(super) fn from_parsed(
+        arguments: Vec<OsString>,
+        input: usize,
+        cwd: &Path,
+        out_dir: Option<&Path>,
+        output_file: Option<&Path>,
+        explicit_outputs: &[PathBuf],
+    ) -> Result<Self> {
+        ensure!(cwd.is_absolute(), "compiler cwd must be absolute");
+        let directory = output_file.map_or_else(
+            || out_dir.unwrap_or(cwd),
+            |path| path.parent().unwrap_or(Path::new("")),
+        );
+        let codegen_directory = resolve_output_directory(cwd, directory)?;
+        let mut roots = vec![codegen_directory.clone()];
+        for path in explicit_outputs {
+            roots.push(resolve_output_directory(
+                cwd,
+                path.parent().unwrap_or(Path::new("")),
+            )?);
+        }
+        // Parent roots already contain any nested output directory. Keep
+        // overlays disjoint, including when two paths resolve through aliases.
+        roots.sort_unstable();
+        let mut output_roots: Vec<PathBuf> = Vec::new();
+        for root in roots {
+            if !output_roots.iter().any(|parent| root.starts_with(parent)) {
+                output_roots.push(root);
+            }
+        }
+        Ok(Self {
+            arguments,
+            input,
+            codegen_directory,
+            output_roots,
+        })
+    }
+
+    /// The compiler's actual output directory for .rlink and generated
+    /// codegen objects; -o takes precedence over --out-dir.
+    #[must_use = "the codegen directory locates the generated link artifact"]
+    pub fn codegen_directory(&self) -> &Path {
+        &self.codegen_directory
+    }
+
+    /// Disjoint writable roots needed by both stages, including explicitly
+    /// placed emit files. Mount writable overlays only at these directories.
+    #[must_use = "these roots define the generated output tree contract"]
+    pub fn output_roots(&self) -> &[PathBuf] {
+        &self.output_roots
     }
 
     /// Expanded codegen arguments. Use the shared rustc response-file
@@ -434,6 +487,38 @@ impl RustLinkStages {
             }
         }
         artifact.context("compiler did not generate a .rlink artifact")
+    }
+}
+
+// Resolve the existing prefix through actual symlinks, then append any
+// not-yet-created suffix. Never erase unresolved parent traversal.
+fn resolve_output_directory(cwd: &Path, directory: &Path) -> Result<PathBuf> {
+    let path = super::canonical_paths::physical_operand(cwd, directory)
+        .context("cannot preserve output directory traversal")?;
+    let mut existing = path.as_path();
+    loop {
+        match fs::canonicalize(existing) {
+            Ok(resolved) => {
+                ensure!(resolved.is_dir(), "output ancestor is not a directory");
+                let result = resolved.join(path.strip_prefix(existing)?);
+                ensure!(
+                    result != Path::new("/"),
+                    "root cannot be a generated output directory"
+                );
+                return Ok(result);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling symlink is not a directory we can create.
+                ensure!(
+                    !existing.is_symlink(),
+                    "unresolved output directory symlink"
+                );
+                existing = existing
+                    .parent()
+                    .context("output directory has no existing ancestor")?;
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
 }
 

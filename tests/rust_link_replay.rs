@@ -549,3 +549,104 @@ fn generated_tree_round_trips_sparse_files_and_charges_logical_size() -> Result<
     assert_eq!(fs::read_dir(too_small.generated_root())?.count(), 0);
     Ok(())
 }
+
+#[test]
+fn split_link_output_layout_covers_default_override_and_explicit_emit_paths() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let cwd = root.join("source");
+    let out = cwd.join("out");
+    let elsewhere = cwd.join("elsewhere");
+    let stage = root.join("stage");
+    for directory in [&cwd, &out, &elsewhere, &stage] {
+        fs::create_dir(directory)?;
+    }
+    fs::write(cwd.join("probe.rs"), "fn main() { println!(\"linked\"); }")?;
+    let rustc = compiler()?;
+    let cases: &[(&[&str], &Path, &[&Path])] = &[
+        (&[], &cwd, &[&cwd]),
+        (&["--out-dir", "out"], &out, &[&out]),
+        (&["-o", "elsewhere/chosen"], &elsewhere, &[&elsewhere]),
+        (
+            &["--out-dir", "out", "-o", "elsewhere/chosen"],
+            &elsewhere,
+            &[&elsewhere],
+        ),
+        (
+            &[
+                "--out-dir",
+                "out",
+                "--emit=link=elsewhere/chosen,dep-info=elsewhere/chosen.d,metadata=elsewhere/chosen.rmeta",
+            ],
+            &out,
+            &[&elsewhere, &out],
+        ),
+    ];
+    for (flags, codegen_directory, expected_roots) in cases {
+        let mut arguments = [
+            "--crate-type=bin",
+            "--crate-name=probe",
+            "--edition=2024",
+            "-Cextra-filename=-tag",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        arguments.extend(flags.iter().map(OsString::from));
+        arguments.push("probe.rs".into());
+        let plan = RustLinkStages::new(&arguments, &cwd)?;
+        assert_eq!(plan.codegen_directory(), *codegen_directory);
+        assert_eq!(plan.output_roots(), *expected_roots);
+        let roots = plan
+            .output_roots()
+            .iter()
+            .map(|logical| Ok((logical, PrivateOutputTree::new(&stage)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let execute = |args: Vec<OsString>| -> Result<()> {
+            let mut command = Command::new("bwrap");
+            command.args(["--bind", "/", "/"]);
+            for (logical, tree) in &roots {
+                command.args(tree.overlay_arguments(logical, logical)?);
+            }
+            let output = command
+                .arg("--chdir")
+                .arg(&cwd)
+                .arg("--")
+                .arg(&rustc)
+                .args(args)
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(())
+        };
+        execute(plan.codegen_arguments())?;
+        let (logical, tree) = roots
+            .iter()
+            .find(|(logical, _)| plan.codegen_directory().starts_with(logical))
+            .context("missing codegen root")?;
+        let artifact = RustLinkStages::link_artifact(
+            &tree
+                .generated_root()
+                .join(plan.codegen_directory().strip_prefix(logical)?),
+            plan.codegen_directory(),
+        )?;
+        execute(plan.link_arguments(&artifact))?;
+        let expected = if flags.iter().any(|arg| arg.contains("elsewhere/chosen")) {
+            elsewhere.join("chosen")
+        } else {
+            codegen_directory.join("probe-tag")
+        };
+        let (logical, tree) = roots
+            .iter()
+            .find(|(logical, _)| expected.starts_with(logical))
+            .context("missing final output root")?;
+        let binary = tree.generated_root().join(expected.strip_prefix(logical)?);
+        let output = Command::new(binary).output()?;
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"linked\n");
+        assert!(!expected.exists(), "link changed the lower tree");
+    }
+    Ok(())
+}

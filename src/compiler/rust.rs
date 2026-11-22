@@ -2513,7 +2513,7 @@ pub fn relocate_raw_rust_operands(
 pub(super) fn native_link_stage_input(
     arguments: &[OsString],
     cwd: &Path,
-) -> Result<(Vec<OsString>, usize)> {
+) -> Result<super::rust_link::RustLinkStages> {
     use anyhow::ensure;
     use std::cell::Cell;
 
@@ -2522,6 +2522,9 @@ pub(super) fn native_link_stage_input(
     let mut input = None;
     let mut after_separator = false;
     let mut emit = None;
+    let mut out_dir = None;
+    let mut output_file = None;
+    let mut explicit_outputs = Vec::new();
     for argument in ArgsIter::new(
         expanded
             .iter()
@@ -2547,7 +2550,15 @@ pub(super) fn native_link_stage_input(
                     bail!("Rust invocation already specifies a link stage");
                 }
                 Some(NotCompilationFlag | NotCompilation(_)) => bail!("not a Rust compilation"),
+                Some(OutDir(path)) => out_dir = Some(path.clone()),
+                Some(TooHardPath(path)) if argument.flag_str() == Some("-o") => {
+                    output_file = Some(path.clone());
+                }
                 Some(Emit(value)) => {
+                    explicit_outputs.extend(value.split(',').filter_map(|kind| {
+                        let (_, path) = kind.split_once('=')?;
+                        (path != "-").then(|| PathBuf::from(path))
+                    }));
                     ensure!(
                         emit.replace(
                             value
@@ -2566,7 +2577,14 @@ pub(super) fn native_link_stage_input(
         emit.unwrap_or(true),
         "Rust invocation does not emit a linked artifact"
     );
-    Ok((expanded, input.context("missing Rust source operand")?))
+    super::rust_link::RustLinkStages::from_parsed(
+        expanded,
+        input.context("missing Rust source operand")?,
+        cwd,
+        out_dir.as_deref(),
+        output_file.as_deref(),
+        &explicit_outputs,
+    )
 }
 
 #[async_trait]
