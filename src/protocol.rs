@@ -29,6 +29,10 @@ pub enum Request {
     Transfer(TransferRequest),
     /// Merge per-invocation stats into the daemon's running totals.
     RecordStats(Box<ServerStats>),
+    /// List active daemon-owned compile requests without accessing cache storage.
+    ActiveCompiles,
+    /// Request cancellation of one active daemon-owned compile.
+    CancelCompile(String),
 }
 
 /// A server response.
@@ -54,6 +58,13 @@ pub enum Response {
     Transfer(Result<TransferReply, String>),
     /// Response for `Request::RecordStats`.
     RecordStats,
+    /// Liveness notification, carrying the actual phase and age.
+    CompileProgress(crate::server::activity::CompileActivity),
+    /// Terminal failure; no automatic duplicate compilation is permitted.
+    CompileAborted(String),
+    /// Active daemon-owned compiler requests.
+    ActiveCompiles(Vec<crate::server::activity::CompileActivity>),
+    CompileCancellationRequested(bool),
 }
 
 /// Maximum application payload in a transfer frame. The framing envelope
@@ -202,6 +213,8 @@ pub struct CompileFinished {
 /// The contents of a compile request from a client.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Compile {
+    /// Caller PID for correlating a request with local build processes.
+    pub client_pid: u32,
     /// The full path to the compiler executable.
     pub exe: OsString,
     /// The current working directory in which to execute the compile.

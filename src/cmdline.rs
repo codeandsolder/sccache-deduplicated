@@ -54,6 +54,10 @@ impl FromStr for StatsFormat {
 pub enum Command {
     /// Show cache statistics and exit.
     ShowStats(StatsFormat, bool),
+    /// List active daemon-owned compile requests as JSON.
+    ActiveCompiles,
+    /// Request cancellation of one active daemon-owned compile.
+    CancelCompile(String),
     /// Print machine-readable build capabilities and exit.
     Capabilities,
     /// Run background server.
@@ -92,41 +96,42 @@ fn flag_infer_long(name: &'static str) -> Arg {
     Arg::new(name).long(name)
 }
 
+const ENABLED_FEATURES_HELP: &str = concat!(
+    "Enabled features:\n",
+    "    S3:        ",
+    cfg!(feature = "s3"),
+    "\n",
+    "    Redis:     ",
+    cfg!(feature = "redis"),
+    "\n",
+    "    Memcached: ",
+    cfg!(feature = "memcached"),
+    "\n",
+    "    GCS:       ",
+    cfg!(feature = "gcs"),
+    "\n",
+    "    GHA:       ",
+    cfg!(feature = "gha"),
+    "\n",
+    "    Azure:     ",
+    cfg!(feature = "azure"),
+    "\n",
+    "    WebDAV:    ",
+    cfg!(feature = "webdav"),
+    "\n",
+    "    OSS:       ",
+    cfg!(feature = "oss"),
+    "\n",
+    "    COS:       ",
+    cfg!(feature = "cos"),
+    "\n"
+);
 /// Get the [`clap::Command`] used for argument parsing.
 fn get_clap_command() -> clap::Command {
     clap::Command::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
         .max_term_width(110)
-        .after_help(concat!(
-            "Enabled features:\n",
-            "    S3:        ",
-            cfg!(feature = "s3"),
-            "\n",
-            "    Redis:     ",
-            cfg!(feature = "redis"),
-            "\n",
-            "    Memcached: ",
-            cfg!(feature = "memcached"),
-            "\n",
-            "    GCS:       ",
-            cfg!(feature = "gcs"),
-            "\n",
-            "    GHA:       ",
-            cfg!(feature = "gha"),
-            "\n",
-            "    Azure:     ",
-            cfg!(feature = "azure"),
-            "\n",
-            "    WebDAV:    ",
-            cfg!(feature = "webdav"),
-            "\n",
-            "    OSS:       ",
-            cfg!(feature = "oss"),
-            "\n",
-            "    COS:       ",
-            cfg!(feature = "cos"),
-            "\n"
-        ))
+        .after_help(ENABLED_FEATURES_HELP)
         .args(&[
             flag_infer_long("capabilities")
                 .help("print machine-readable build capabilities")
@@ -134,6 +139,13 @@ fn get_clap_command() -> clap::Command {
             flag_long_and_short("show-stats", 's')
                 .help("show cache statistics")
                 .action(ArgAction::SetTrue),
+            flag_infer_long("active-compiles")
+                .help("list active compiler requests with phases and ages as JSON")
+                .action(ArgAction::SetTrue),
+            flag_infer_long("cancel-compile")
+                .help("request cancellation of one active compiler request")
+                .value_name("REQUEST-ID")
+                .value_parser(clap::value_parser!(String)),
             flag_infer_long("show-adv-stats")
                 .help("show advanced cache statistics")
                 .action(ArgAction::SetTrue),
@@ -178,6 +190,8 @@ fn get_clap_command() -> clap::Command {
                     "debug-preprocessor-cache",
                     "dist-status",
                     "show-stats",
+                    "active-compiles",
+                    "cancel-compile",
                     "show-adv-stats",
                     "start-server",
                     "stop-server",
@@ -255,6 +269,10 @@ fn command_from_matches(matches: &clap::ArgMatches, cwd: PathBuf) -> Result<Comm
         Ok(Command::Capabilities)
     } else if matches.get_flag("show-stats") {
         Ok(Command::ShowStats(stats_format(matches)?, false))
+    } else if matches.get_flag("active-compiles") {
+        Ok(Command::ActiveCompiles)
+    } else if let Some(id) = matches.get_one::<String>("cancel-compile") {
+        Ok(Command::CancelCompile(id.clone()))
     } else if matches.get_flag("show-adv-stats") {
         Ok(Command::ShowStats(stats_format(matches)?, true))
     } else if matches.get_flag("start-server") {
