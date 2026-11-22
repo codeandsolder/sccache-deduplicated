@@ -287,7 +287,7 @@ impl LruDiskCache {
         self.root.as_path()
     }
 
-    fn validate_key(key: &OsStr) -> Result<()> {
+    pub(crate) fn validate_key(key: &OsStr) -> Result<()> {
         let path = Path::new(key);
         let mut has_component = false;
         for component in path.components() {

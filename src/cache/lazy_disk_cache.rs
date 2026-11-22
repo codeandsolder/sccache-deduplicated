@@ -10,8 +10,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::cache::CacheMode;
 use crate::errors::Result;
-use crate::lru_disk_cache::LruDiskCache;
+use crate::lru_disk_cache::{Error as LruError, LruDiskCache, ReadSeek};
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -33,6 +34,33 @@ impl LazyDiskCache {
                 self.get_or_init()
             }
             Self::Init(d) => Ok(d),
+        }
+    }
+
+    /// Read-only storage is a direct filesystem reader. Do not initialize the
+    /// writable LRU (which scans, deletes and may create directories), or impose
+    /// its eviction limit on an immutable cache maintained by another process.
+    /// # Errors
+    /// Returns an error for an invalid key, cache initialization failure, or filesystem read error.
+    pub fn open(&mut self, key: &Path, mode: CacheMode) -> Result<Option<Box<dyn ReadSeek>>> {
+        LruDiskCache::validate_key(key.as_os_str())?;
+        if mode == CacheMode::ReadOnly {
+            let path = self.path().join(key);
+            return match fs_err::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() => match fs_err::File::open(&path) {
+                    Ok(file) => Ok(Some(Box::new(file))),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error.into()),
+                },
+                Ok(_) => Ok(None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error.into()),
+            };
+        }
+        match self.get_or_init()?.get(key) {
+            Ok(file) => Ok(Some(file)),
+            Err(LruError::FileNotInCache) => Ok(None),
+            Err(error) => Err(error.into()),
         }
     }
 
