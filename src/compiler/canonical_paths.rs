@@ -849,7 +849,11 @@ mod tests {
             let host_proc_macro = shared.join(
                 "release/build/uefi-macros/7a8cc8f45c370789/out/libuefi_macros-7a8cc8f45c370789.so",
             );
-            for path in [&generated, &output, host_proc_macro.parent().unwrap()] {
+            for path in [
+                generated.as_path(),
+                output.as_path(),
+                host_proc_macro.parent().unwrap(),
+            ] {
                 std::fs::create_dir_all(path).unwrap();
             }
             std::fs::write(shared.join("CACHEDIR.TAG"), tag).unwrap();
@@ -887,6 +891,39 @@ mod tests {
                     )
                 );
             }
+            #[cfg(target_os = "linux")]
+            for (target_args, out_args) in [
+                (
+                    vec![
+                        OsString::from("--target"),
+                        OsString::from("x86_64-unknown-uefi"),
+                    ],
+                    vec![OsString::from("--out-dir"), output.clone().into_os_string()],
+                ),
+                (
+                    vec![OsString::from("--target=x86_64-unknown-uefi")],
+                    vec![OsString::from(format!("--out-dir={}", output.display()))],
+                ),
+            ] {
+                let args: Vec<_> = target_args.into_iter().chain(out_args).collect();
+                let roots = CanonicalRustPaths::from_rustc_executable(
+                    &base_env,
+                    &source,
+                    Path::new("/rust/bin/rustc"),
+                    &args,
+                )
+                .unwrap();
+                assert_eq!(roots.intermediate_root.as_deref(), Some(shared.as_path()));
+                assert!(roots.root_is_known(&host_proc_macro));
+            }
+            // An unrelated nested marked cache must not be promoted.
+            for hint in [None, Some(OsStr::new("other-target"))] {
+                assert_eq!(marked_cargo_root(&output, hint), Some(target.clone()));
+            }
+            assert_eq!(
+                marked_cargo_root(&output, Some(OsStr::new("/specs/x86_64-unknown-uefi.json"))),
+                Some(shared)
+            );
         }
     }
 
