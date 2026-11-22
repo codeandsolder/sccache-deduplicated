@@ -33,7 +33,6 @@ use crate::protocol::{
 use crate::util;
 use anyhow::Context as _;
 use bytes::{Bytes, BytesMut, buf::BufMut};
-use filetime::FileTime;
 use fs::metadata;
 use fs_err as fs;
 use futures::channel::mpsc;
@@ -60,9 +59,9 @@ use std::pin::Pin;
 use std::process::{ExitStatus, Output};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
 #[cfg(feature = "dist-client")]
 use std::time::Instant;
+use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::{
@@ -915,7 +914,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
 }
 
 /// Maps a compiler proxy path to a compiler proxy and it's last modification time
-type CompilerProxyMap<C> = HashMap<PathBuf, (Arc<dyn CompilerProxy<C>>, FileTime)>;
+type CompilerProxyMap<C> = HashMap<PathBuf, (Arc<dyn CompilerProxy<C>>, SystemTime)>;
 type CompilerMap<C> = HashMap<PathBuf, Option<CompilerCacheEntry<C>>>;
 
 /// entry of the compiler cache
@@ -923,16 +922,16 @@ struct CompilerCacheEntry<C> {
     /// compiler argument trait obj
     pub compiler: Box<dyn Compiler<C>>,
     /// modification time of the compilers executable file
-    pub mtime: FileTime,
+    pub mtime: SystemTime,
     /// distributed compilation extra info
-    pub dist_info: Option<(PathBuf, FileTime)>,
+    pub dist_info: Option<(PathBuf, SystemTime)>,
 }
 
 impl<C> CompilerCacheEntry<C> {
     fn new(
         compiler: Box<dyn Compiler<C>>,
-        mtime: FileTime,
-        dist_info: Option<(PathBuf, FileTime)>,
+        mtime: SystemTime,
+        dist_info: Option<(PathBuf, SystemTime)>,
     ) -> Self {
         Self {
             compiler,
@@ -962,7 +961,7 @@ where
     /// map the cwd with compiler proxy path to a proxy resolver, which
     /// will dynamically resolve the input compiler for the current context
     /// (usually file or current working directory)
-    /// the associated `FileTime` is the modification time of
+    /// the associated `SystemTime` is the modification time of
     /// the compiler proxy, in order to track updates of the proxy itself
     compiler_proxies: Arc<RwLock<CompilerProxyMap<C>>>,
 
@@ -1368,7 +1367,7 @@ where
         cwd: &Path,
         args: &[OsString],
         env: &[(OsString, OsString)],
-        resolved: (PathBuf, FileTime, Option<(PathBuf, FileTime)>),
+        resolved: (PathBuf, SystemTime, Option<(PathBuf, SystemTime)>),
     ) -> Result<Box<dyn Compiler<C>>> {
         let (resolved_compiler_path, mtime, dist_info) = resolved;
         let info = get_compiler_info::<C>(
@@ -1455,7 +1454,15 @@ where
             let attr = metadata(&path).with_context(|| {
                 format!("failed to read compiler metadata at {}", path.display())
             })?;
-            (path.clone(), FileTime::from_last_modification_time(&attr))
+            (
+                path.clone(),
+                attr.modified().with_context(|| {
+                    format!(
+                        "failed to read compiler modification time at {}",
+                        path.display()
+                    )
+                })?,
+            )
         };
 
         // Follow symlinks without breaking clang-style multicall names.
@@ -1471,8 +1478,9 @@ where
                 .get_custom_toolchain(&resolved_compiler_path)
                 .and_then(|archive| {
                     metadata(&archive)
+                        .and_then(|attr| attr.modified())
                         .ok()
-                        .map(|attr| (archive, FileTime::from_last_modification_time(&attr)))
+                        .map(|mtime| (archive, mtime))
                 }),
             _ => None,
         };

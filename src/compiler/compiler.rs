@@ -45,7 +45,6 @@ use crate::util::{
 };
 use crate::{counted_array, dist};
 use async_trait::async_trait;
-use filetime::FileTime;
 use fs::File;
 use fs_err as fs;
 use futures::TryFutureExt;
@@ -63,7 +62,7 @@ use std::pin::Pin;
 use std::process::{self, Stdio};
 use std::str;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tempfile::TempDir;
 
 use crate::errors::{Context, Error, HttpClientError, ProcessError, Result, anyhow, bail};
@@ -451,7 +450,7 @@ pub type GenerateCompileCommandsResult<T> = Result<(
 )>;
 
 pub type CompilerProxyFuture =
-    Pin<Box<dyn Future<Output = Result<(PathBuf, FileTime)>> + Send + 'static>>;
+    Pin<Box<dyn Future<Output = Result<(PathBuf, SystemTime)>> + Send + 'static>>;
 
 #[cfg(feature = "dist-client")]
 pub type DistPackagers = (

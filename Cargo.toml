@@ -55,7 +55,6 @@ clap = { version = "4.5.13", features = ["derive", "env", "wrap_help"] }
 directories = "6.0"
 encoding_rs = "0.8"
 env_logger = "0.11"
-filetime = "0.2"
 fs-err = "3"
 futures = "0.3"
 hostname = { version = "0.4", optional = true }
@@ -142,7 +141,6 @@ assert_cmd = "2.0.13"
 cc = "1.0"
 chrono = "0.4.42"
 divan = { package = "codspeed-divan-compat", version = "6" }
-filetime = "0.2"
 predicates = "=3.1.4"
 serial_test = "4.0"
 temp-env = "0.3.6"

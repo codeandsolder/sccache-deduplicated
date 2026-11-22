@@ -36,7 +36,6 @@ use crate::util::{Digest, fmt_duration_as_secs, hash_all, hash_all_archives, run
 use crate::util::{HashToDigest, OsStrExt};
 use crate::{counted_array, dist};
 use async_trait::async_trait;
-use filetime::FileTime;
 use fs_err as fs;
 use log::Level::Trace;
 #[cfg(feature = "dist-client")]
@@ -72,7 +71,7 @@ use std::sync::LazyLock;
 #[cfg(feature = "dist-client")]
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time;
+use std::time::{self, SystemTime};
 use walkdir::WalkDir;
 
 use crate::errors::{Context, Result, anyhow, bail};
@@ -1527,7 +1526,7 @@ where
         mut creator: T,
         cwd: PathBuf,
         env: &[(OsString, OsString)],
-    ) -> Pin<Box<dyn Future<Output = Result<(PathBuf, FileTime)>> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(PathBuf, SystemTime)>> + Send>> {
         let mut child = creator.new_command_sync(&self.proxy_executable);
         child
             .current_dir(&cwd)
@@ -1553,13 +1552,14 @@ where
                 .context("Failed to obtain metadata of the resolved, true rustc")?;
 
             if attr.is_file() {
-                Ok(FileTime::from_last_modification_time(&attr))
+                attr.modified()
+                    .context("Failed to read the resolved rustc modification time")
             } else {
                 Err(anyhow!(
                     "proxy: rustup resolved compiler is not of type file"
                 ))
             }
-            .map(move |filetime| (proxied_compiler, filetime))
+            .map(move |mtime| (proxied_compiler, mtime))
         })
     }
 

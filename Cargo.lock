@@ -3505,7 +3505,6 @@ dependencies = [
  "directories",
  "encoding_rs",
  "env_logger",
- "filetime",
  "fs-err",
  "futures",
  "hostname",

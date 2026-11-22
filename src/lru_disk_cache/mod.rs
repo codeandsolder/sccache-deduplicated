@@ -15,8 +15,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use filetime::{FileTime, set_file_times};
 pub use lru_cache::{LruCache, Meter};
+use std::fs::FileTimes;
+use std::time::SystemTime;
 use tempfile::NamedTempFile;
 use walkdir::WalkDir;
 
@@ -501,9 +502,21 @@ impl LruDiskCache {
             .get(rel_path)
             .ok_or(Error::FileNotInCache)
             .and_then(|_| {
-                let t = FileTime::now();
-                set_file_times(&path, t, t)?;
-                File::open(path).map_err(Into::into)
+                let mut options = File::options();
+                options.read(true);
+                // Windows requires FILE_WRITE_ATTRIBUTES to set timestamps on
+                // an otherwise read-only handle; do not request write-data access.
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::OpenOptionsExt;
+                    use windows_sys::Win32::Foundation::GENERIC_READ;
+                    use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
+                    options.access_mode(GENERIC_READ | FILE_WRITE_ATTRIBUTES);
+                }
+                let file = options.open(path)?;
+                let now = SystemTime::now();
+                file.set_times(FileTimes::new().set_accessed(now).set_modified(now))?;
+                Ok(file)
             })
     }
 
@@ -551,9 +564,10 @@ mod tests {
     use super::fs::{self, File};
     use super::{Error, LruDiskCache, LruDiskCacheAddEntry, Result, get_all_files};
 
-    use filetime::{FileTime, set_file_times};
+    use std::fs::FileTimes;
     use std::io::{self, Read, Write};
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     struct TestFixture {
@@ -578,17 +592,21 @@ mod tests {
 
     /// Set the last modified time of `path` backwards by `seconds` seconds.
     fn set_mtime_back<T: AsRef<Path>>(path: T, seconds: usize) -> io::Result<()> {
-        let metadata = fs::metadata(path.as_ref())?;
-        let modified = FileTime::from_last_modification_time(&metadata);
-        let seconds = i64::try_from(seconds).map_err(|_| {
+        let file = File::options().write(true).open(path.as_ref())?;
+        let modified = file.metadata()?.modified()?;
+        let seconds = u64::try_from(seconds).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "mtime offset is too large")
         })?;
-        let modified = FileTime::from_unix_time(
-            modified.unix_seconds().saturating_sub(seconds),
-            modified.nanoseconds(),
-        );
-        set_file_times(path, modified, modified)?;
-        Ok(())
+        let modified = modified
+            .checked_sub(Duration::from_secs(seconds))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "mtime offset is out of range")
+            })?;
+        file.set_times(
+            FileTimes::new()
+                .set_accessed(modified)
+                .set_modified(modified),
+        )
     }
 
     fn read_all<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
