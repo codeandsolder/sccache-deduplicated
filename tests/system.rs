@@ -2188,3 +2188,73 @@ fn test_symlinked_exe() {
         fs::remove_file(&sccache_compiler_alias).unwrap();
     }
 }
+
+#[test]
+#[serial]
+#[cfg(target_os = "linux")]
+fn test_cargo_native_relocated_objects_and_depfiles() -> anyhow::Result<()> {
+    let tempdir = tempfile::tempdir()?;
+    let root = tempdir.path();
+    let _ = stop_local_daemon();
+    let cfg = sccache_client_cfg(root, true);
+    write_json_cfg(root, "sccache-cfg.json", &cfg);
+    start_local_daemon(
+        &root.join("sccache-cfg.json"),
+        &root.join("sccache-cached-cfg"),
+    );
+
+    for compiler in ["gcc", "clang"] {
+        let compiler = which(compiler)?;
+        for (extension, contents) in [
+            ("cc", "extern const char *const path = __FILE__;\n"),
+            ("S", ".section .rodata\n.ascii __FILE__\n"),
+        ] {
+            zero_stats();
+            let mut objects = Vec::new();
+            for (i, name) in ["pkg-first", "pkg-second", "pkg-third"].iter().enumerate() {
+                let target = root.join(name).join("target");
+                let out = target.join("debug/build").join(name).join("out");
+                let cwd = out.join("build");
+                fs::create_dir_all(&cwd)?;
+                fs::write(target.join("CACHEDIR.TAG"), b"")?;
+                let source = out.join(format!("native.{extension}"));
+                fs::write(&source, contents)?;
+                let mut command = sccache_command();
+                command
+                    .arg(&compiler)
+                    .current_dir(&cwd)
+                    .args(["-c", "-g", "-MD", "-MF", "native.d"])
+                    .arg(&source)
+                    .args(["-o", "native.o"])
+                    .env("OUT_DIR", &out)
+                    .env("SCCACHE_CANONICAL_TARGET_ROOT", &target);
+                if i == 2 {
+                    // A fresh build in another root must match the cached bytes,
+                    // not merely return the first root's object.
+                    command.env("SCCACHE_RECACHE", "1");
+                }
+                command.assert().success();
+                let depfile = fs::read_to_string(cwd.join("native.d"))?;
+                assert!(depfile.contains(source.to_str().unwrap()), "{depfile}");
+                let object = fs::read(cwd.join("native.o"))?;
+                assert!(
+                    object
+                        .windows(b"/__sccache/cargo/out/native.".len())
+                        .any(|w| w == b"/__sccache/cargo/out/native."),
+                    "{compiler:?} {extension}: expected remapped __FILE__"
+                );
+                objects.push(object);
+                if i == 1 {
+                    get_stats(|info| {
+                        assert_eq!(1, info.stats.cache_misses.all());
+                        assert_eq!(1, info.stats.cache_hits.all());
+                    });
+                }
+            }
+            assert_eq!(objects[0], objects[1]);
+            assert_eq!(objects[0], objects[2]);
+        }
+    }
+    let _ = stop_local_daemon();
+    Ok(())
+}
