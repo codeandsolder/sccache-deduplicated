@@ -224,7 +224,7 @@ pub async fn connection_task<T: Send + 'static>(
         closed: connection.closed.clone(),
         armed: true,
     };
-    let (guard, result) = tokio::task::spawn_blocking(move || run_transaction(connection, task))
+    let (guard, result) = spawn_transaction(connection, task)
         .await
         .context(IpcTransportFailure)?;
     // Keep exclusive ownership until the cancellation guard is disarmed.
@@ -234,16 +234,18 @@ pub async fn connection_task<T: Send + 'static>(
     result
 }
 
-fn run_transaction<T>(
+fn spawn_transaction<T: Send + 'static>(
     mut connection: tokio::sync::OwnedMutexGuard<ServerConnection>,
-    task: impl FnOnce(&mut ServerConnection) -> Result<T>,
-) -> (tokio::sync::OwnedMutexGuard<ServerConnection>, Result<T>) {
-    let result = if connection.closed.is_cancelled() {
-        Err(IpcTransportFailure.into())
-    } else {
-        task(&mut connection)
-    };
-    (connection, result)
+    task: impl FnOnce(&mut ServerConnection) -> Result<T> + Send + 'static,
+) -> tokio::task::JoinHandle<(tokio::sync::OwnedMutexGuard<ServerConnection>, Result<T>)> {
+    tokio::task::spawn_blocking(move || {
+        let result = if connection.closed.is_cancelled() {
+            Err(IpcTransportFailure.into())
+        } else {
+            task(&mut connection)
+        };
+        (connection, result)
+    })
 }
 
 /// Establish a TCP connection to an sccache server listening on `addr`.
