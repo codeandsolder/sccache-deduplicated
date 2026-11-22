@@ -2630,7 +2630,11 @@ where
             .filter(|_| !needs_literal_argfile)
             .and_then(|output_dir| {
                 CanonicalRustPaths::from_env_with_output_dir(
-                    &env_vars, &cwd, &self.sysroot, Some(output_dir), cargo_target,
+                    &env_vars,
+                    &cwd,
+                    &self.sysroot,
+                    Some(output_dir),
+                    cargo_target,
                 )
             });
         if let Some(canonical) = canonical_paths.as_ref() {
