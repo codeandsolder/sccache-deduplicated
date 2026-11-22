@@ -603,7 +603,11 @@ where
                 && cache_control == CacheControl::Default
                 && let Some(mut seekable) = storage
                     .get_preprocessor_cache_entry(preprocessor_key)
-                    .await?
+                    .await
+                    .unwrap_or_else(|error| {
+                        debug!("Preprocessor cache lookup failed for {preprocessor_key}: {error}");
+                        None
+                    })
                 && let Some(mut preprocessor_cache_entry) =
                     read_preprocessor_cache_entry(&mut seekable, preprocessor_key)
             {

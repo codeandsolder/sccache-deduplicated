@@ -2067,7 +2067,7 @@ fn find_gcc_or_clang() -> Option<Compiler> {
 #[cfg(all(unix, not(target_os = "macos")))]
 fn restart_local_daemon_with(dir: &Path, cfg: &sccache::config::FileConfig) {
     write_json_cfg(dir, "sccache-cfg.json", cfg);
-    stop_local_daemon();
+    let _ = stop_local_daemon();
     start_local_daemon(
         &dir.join("sccache-cfg.json"),
         &dir.join("sccache-cached-cfg"),
@@ -2091,12 +2091,6 @@ fn test_unreadable_preprocessor_cache_entry_is_a_miss() {
     };
 
     copy_to_tempdir(&[INPUT], tempdir.path());
-    // Preprocessor cache mode does not store an entry for a file modified
-    // during the compilation.
-    let backdated =
-        filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(10));
-    filetime::set_file_times(tempdir.path().join(INPUT), backdated, backdated).unwrap();
-
     let sccache_cfg = sccache_client_cfg(tempdir.path(), true);
     restart_local_daemon_with(tempdir.path(), &sccache_cfg);
 
@@ -2139,7 +2133,7 @@ fn test_unreadable_preprocessor_cache_entry_is_a_miss() {
 
     // The object is still cached; only the preprocessor cache is unusable.
     compile(1);
-    stop_local_daemon();
+    assert!(stop_local_daemon());
 }
 
 #[test]
