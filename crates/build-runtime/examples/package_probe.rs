@@ -38,13 +38,15 @@ mod unix {
             modified,
             max_entries: 100_000,
             max_expanded_bytes: 8 * 1024 * 1024 * 1024,
+            max_tar_bytes: 9 * 1024 * 1024 * 1024,
         };
         let scratch = tempfile::Builder::new()
             .prefix("package-probe-")
             .tempdir_in(parent)?;
         let store = NativeStore::open(&scratch.path().join("store"))?;
         let start = Instant::now();
-        let id = store.import_package(source, policy, input)?;
+        let imported_package = store.import_package(source, policy, input)?;
+        let id = imported_package.tree().id();
         let imported = start.elapsed();
         let stats = store.stats()?;
         let start = Instant::now();
@@ -52,8 +54,8 @@ mod unix {
             .lookup_package(source, policy)?
             .context("package mapping missing")?;
         let looked_up = start.elapsed();
-        ensure!(lease.id() == id, "incorrect package lookup");
-        let entries = lease.manifest().entries.len();
+        ensure!(lease.tree().id() == id, "incorrect package lookup");
+        let entries = lease.tree().manifest().entries.len();
         let recipe = TreeRecipe {
             directories: policy.directory,
             layers: vec![TreeLayer {

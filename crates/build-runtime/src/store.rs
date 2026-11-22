@@ -1014,7 +1014,7 @@ pub use space::{SpacePolicy, SpaceReport};
 mod audit;
 pub use audit::{ComponentAudit, NativeIndexAudit, SchemaInventory};
 mod packages;
-pub use packages::{PackageCompression, PackagePolicy, PackageSource};
+pub use packages::{PackageCompression, PackagePolicy, PackageSource, VerifiedPackage};
 mod trees;
 pub use trees::TreeLease;
 #[cfg(target_os = "linux")]

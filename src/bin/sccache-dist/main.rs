@@ -199,6 +199,7 @@ fn run(command: Command) -> Result<i32> {
             source,
             max_entries,
             max_expanded_bytes,
+            max_tar_bytes,
             manifest_output,
         } => {
             use sccache::build_runtime::{NativeStore, PackagePolicy, TreeMetadata, TreeTimestamp};
@@ -214,10 +215,11 @@ fn run(command: Command) -> Result<i32> {
                 modified,
                 max_entries,
                 max_expanded_bytes,
+                max_tar_bytes,
             };
             let store = NativeStore::open(&store)?;
             let (package, reused) = if let Some(existing) = store.lookup_package(source, policy)? {
-                (existing.id(), true)
+                (existing, true)
             } else {
                 let archive = archive.context("upstream package unavailable; supply --archive")?;
                 (
@@ -226,24 +228,15 @@ fn run(command: Command) -> Result<i32> {
                 )
             };
             let before = store.stats()?;
-            let components = store.publish_rust_installer(package, policy.directory)?;
+            let manifest = store.publish_rust_installer(&package, policy.directory)?;
             if let Some(path) = manifest_output {
-                let component_manifests = components
-                    .iter()
-                    .map(|(name, &id)| {
-                        let tree = store
-                            .lookup_tree(id)?
-                            .context("projected component missing")?;
-                        Ok((name.clone(), tree.manifest().clone()))
-                    })
-                    .collect::<Result<BTreeMap<_, _>>>()?;
-                let manifest = sccache::build_runtime::InstallationManifest {
-                    source_sha256: source.sha256,
-                    package,
-                    components: component_manifests,
-                };
                 write_installation_metadata(&path, |file| manifest.write(file))?;
             }
+            let components = manifest
+                .components
+                .iter()
+                .map(|(name, tree)| Ok((name, tree.id()?)))
+                .collect::<Result<BTreeMap<_, _>>>()?;
             let after = store.stats()?;
             anyhow::ensure!(
                 before.logical_bytes == after.logical_bytes && before.blobs == after.blobs,
@@ -253,7 +246,7 @@ fn run(command: Command) -> Result<i32> {
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "source": source,
-                    "package": package,
+                    "package": manifest.package,
                     "components": components,
                     "reused_original_package": reused,
                     "logical_bytes": after.logical_bytes,

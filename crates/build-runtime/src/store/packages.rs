@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use redb::ReadableDatabase;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{NativeStore, PACKAGES, StagedBlob, TreeLease};
@@ -18,7 +18,7 @@ use crate::{
 };
 
 /// Compression of the original upstream tar package.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PackageCompression {
     Tar,
     Gzip,
@@ -26,7 +26,7 @@ pub enum PackageCompression {
 }
 
 /// Upstream package identity, independent of the normalized content tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageSource {
     pub sha256: [u8; 32],
     pub size: u64,
@@ -61,6 +61,27 @@ pub struct PackagePolicy {
     pub modified: TreeTimestamp,
     pub max_entries: usize,
     pub max_expanded_bytes: u64,
+    /// Maximum decoded tar bytes, including metadata, padding and non-file entries.
+    pub max_tar_bytes: u64,
+}
+
+/// A pinned tree whose provenance was established by verification of an
+/// original archive or by its durable package index, not by a supplied tree ID.
+pub struct VerifiedPackage {
+    source: PackageSource,
+    tree: TreeLease,
+}
+
+impl VerifiedPackage {
+    #[must_use = "the source identifies the verified upstream archive"]
+    pub const fn source(&self) -> PackageSource {
+        self.source
+    }
+
+    #[must_use = "the tree remains pinned for this package lease"]
+    pub const fn tree(&self) -> &TreeLease {
+        &self.tree
+    }
 }
 
 fn package_key(source: PackageSource, policy: PackagePolicy) -> Result<ContentId> {
@@ -81,14 +102,21 @@ impl NativeStore {
         &self,
         source: PackageSource,
         policy: PackagePolicy,
-    ) -> Result<Option<TreeLease>> {
+    ) -> Result<Option<VerifiedPackage>> {
+        let _mutation = self.inner.lock_mutations()?;
         let key = package_key(source, policy)?;
         let id = {
             let read = self.inner.db.begin_read()?;
             let table = read.open_table(PACKAGES)?;
             table.get(&key.0)?.map(|entry| TreeId(*entry.value()))
         };
-        id.map_or_else(|| Ok(None), |id| self.lookup_tree(id))
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        let tree = self
+            .lookup_tree(id)?
+            .context("indexed package tree missing")?;
+        Ok(Some(VerifiedPackage { source, tree }))
     }
 
     /// Verify the compressed package against its upstream SHA-256 and length,
@@ -102,7 +130,11 @@ impl NativeStore {
         source: PackageSource,
         policy: PackagePolicy,
         input: impl Read,
-    ) -> Result<TreeId> {
+    ) -> Result<VerifiedPackage> {
+        ensure!(
+            policy.max_entries > 0 && policy.max_tar_bytes > 0,
+            "invalid package limits"
+        );
         // Verify *before* decompression. A private staged compressed file
         // prevents verification/decode races and is never published as a
         // second permanent representation of the package.
@@ -136,11 +168,12 @@ impl NativeStore {
             }
         };
         drop(archive);
-        self.publish_tree_indexed(
+        let tree = self.publish_tree_indexed_pinned(
             &manifest,
             staged.into_values().collect(),
             Some(package_key(source, policy)?),
-        )
+        )?;
+        Ok(VerifiedPackage { source, tree })
     }
 }
 
@@ -153,6 +186,32 @@ impl<R: Read> Read for ShaReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let count = self.reader.read(buffer)?;
         self.hash.update(&buffer[..count]);
+        Ok(count)
+    }
+}
+
+/// Unlike Read::take, reaching the limit cannot masquerade as a valid end
+/// of archive. Check one extra byte to distinguish an exact fit from overflow.
+struct BoundedTar<R> {
+    reader: R,
+    remaining: u64,
+}
+
+impl<R: Read> Read for BoundedTar<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            return match self.reader.read(&mut [0])? {
+                0 => Ok(0),
+                _ => Err(io::Error::other("decoded tar byte limit exceeded")),
+            };
+        }
+        let limit =
+            usize::try_from(self.remaining.min(buffer.len() as u64)).map_err(io::Error::other)?;
+        let count = self.reader.read(&mut buffer[..limit])?;
+        self.remaining -= count as u64;
         Ok(count)
     }
 }
@@ -299,7 +358,10 @@ fn read_tar(
     reader: impl Read,
     policy: PackagePolicy,
 ) -> Result<(TreeManifest, BTreeMap<ContentId, StagedBlob>)> {
-    let mut archive = tar::Archive::new(reader);
+    let mut archive = tar::Archive::new(BoundedTar {
+        reader,
+        remaining: policy.max_tar_bytes,
+    });
     let mut imported = ImportedTree {
         manifest: TreeManifest {
             root: policy.directory,
@@ -370,6 +432,7 @@ mod tests {
             modified,
             max_entries: 100,
             max_expanded_bytes: 10000,
+            max_tar_bytes: 100_000,
         }
     }
 
@@ -408,14 +471,16 @@ mod tests {
         let gzip = gzip.finish()?;
         let directory = tempfile::tempdir()?;
         let store = NativeStore::open(directory.path())?;
-        let id =
+        let package =
             store.import_package(source(&gzip, PackageCompression::Gzip), policy(), &gzip[..])?;
+        let id = package.tree().id();
+        assert_eq!(store.evict_tree(id)?, super::super::Eviction::Pinned);
         assert_eq!(store.stats()?.blobs, 1);
         assert_eq!(store.stats()?.logical_bytes, 4);
         let existing = store
             .lookup_package(source(&gzip, PackageCompression::Gzip), policy())?
             .context("missing original package mapping")?;
-        assert_eq!(existing.id(), id);
+        assert_eq!(existing.tree().id(), id);
         drop(existing);
         let recipe = TreeRecipe {
             directories: policy().directory,
@@ -429,6 +494,7 @@ mod tests {
         assert_ne!(id, composed);
         assert_eq!(store.stats()?.blobs, 1);
         assert_eq!(store.stats()?.trees, 2);
+        drop(package);
         store.evict_tree(id)?;
         assert!(
             store
@@ -437,6 +503,32 @@ mod tests {
         );
         assert_eq!(store.stats()?.pending_gc_blobs, 0);
         assert!(store.lookup_tree(composed)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn decoded_tar_limit_includes_padding_and_accepts_exact_boundary() -> Result<()> {
+        use std::io::Write;
+
+        let mut bytes = example_tar()?;
+        bytes.resize(bytes.len() + 16_384, 0);
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(&bytes)?;
+        let gzip = gzip.finish()?;
+        let directory = tempfile::tempdir()?;
+        let store = NativeStore::open(directory.path())?;
+        let src = source(&gzip, PackageCompression::Gzip);
+        let mut limits = PackagePolicy {
+            max_tar_bytes: u64::try_from(bytes.len())? - 1,
+            ..policy()
+        };
+        assert!(store.import_package(src, limits, &gzip[..]).is_err());
+        assert_eq!(store.stats()?.trees, 0);
+        assert_eq!(store.stats()?.blobs, 0);
+        limits.max_tar_bytes += 1;
+        let package = store.import_package(src, limits, &gzip[..])?;
+        assert_eq!(package.source(), src);
+        assert_eq!(store.stats()?.blobs, 1);
         Ok(())
     }
 

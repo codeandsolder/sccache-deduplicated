@@ -165,6 +165,7 @@ fn get_clap_command() -> ClapCommand {
                 .arg(flag_infer_long("compression").value_parser(["xz", "gzip", "tar"]).required(true))
                 .arg(flag_infer_long("max-entries").value_parser(clap::value_parser!(usize)).default_value("100000"))
                 .arg(flag_infer_long("max-expanded-bytes").value_parser(clap::value_parser!(u64)).default_value("8589934592"))
+                .arg(flag_infer_long("max-tar-bytes").value_parser(clap::value_parser!(u64)).default_value("9663676416"))
                 .arg(flag_infer_long("manifest-output").value_parser(clap::value_parser!(PathBuf)))
         )
         .subcommand(
@@ -284,6 +285,9 @@ pub fn try_parse_from(
                 max_expanded_bytes: *matches
                     .get_one::<u64>("max-expanded-bytes")
                     .context("missing expansion limit")?,
+                max_tar_bytes: *matches
+                    .get_one::<u64>("max-tar-bytes")
+                    .context("missing decoded tar limit")?,
                 manifest_output: matches.get_one::<PathBuf>("manifest-output").cloned(),
             }
         }

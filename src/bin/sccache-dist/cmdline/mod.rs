@@ -35,6 +35,7 @@ pub enum Command {
         source: sccache::build_runtime::PackageSource,
         max_entries: usize,
         max_expanded_bytes: u64,
+        max_tar_bytes: u64,
         manifest_output: Option<std::path::PathBuf>,
     },
     #[cfg(target_os = "linux")]
