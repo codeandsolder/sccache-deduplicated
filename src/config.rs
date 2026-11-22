@@ -882,6 +882,121 @@ impl Default for DistConfig {
     }
 }
 
+/// An administrator-attested, argument-transparent compiler launcher.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompilerAlias {
+    pub compiler: PathBuf,
+    pub blake3: String,
+}
+
+/// Exact path mappings, never inferred from the contents of arbitrary scripts.
+/// The expected digest prevents a modified launcher from being silently bypassed.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CompilerAliases(pub HashMap<PathBuf, CompilerAlias>);
+
+impl CompilerAliases {
+    fn validate(&self) -> Result<()> {
+        for (launcher, alias) in &self.0 {
+            if !launcher.is_absolute() || !alias.compiler.is_absolute() {
+                bail!(
+                    "Compiler alias paths must be absolute: {}",
+                    launcher.display()
+                );
+            }
+            if self.0.contains_key(&alias.compiler) {
+                bail!(
+                    "Compiler alias must name a real compiler, not another alias: {}",
+                    launcher.display()
+                );
+            }
+            blake3::Hash::from_hex(&alias.blake3).with_context(|| {
+                format!("Invalid compiler alias digest for {}", launcher.display())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Resolve a trusted launcher before compiler detection and key generation.
+    /// A changed launcher is a configuration error, not an alias match.
+    pub(crate) fn resolve(&self, executable: PathBuf) -> Result<PathBuf> {
+        let Some(alias) = self.0.get(&executable) else {
+            return Ok(executable);
+        };
+        let contents = fs::read(&executable)?;
+        let expected = blake3::Hash::from_hex(&alias.blake3)?;
+        if blake3::hash(&contents) != expected {
+            bail!(
+                "Compiler alias digest mismatch for {}; update the alias configuration or remove it",
+                executable.display()
+            );
+        }
+        debug!(
+            "Resolved transparent compiler alias {} to {}",
+            executable.display(),
+            alias.compiler.display()
+        );
+        Ok(alias.compiler.clone())
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn compiler_alias_configuration_and_identity() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let launcher = temp.path().join("launcher");
+    let compiler = temp.path().join("compiler");
+    let script = b"#!/bin/sh\nexec compiler \"$@\"\n";
+    fs::write(&launcher, script)?;
+    let aliases = CompilerAliases(HashMap::from([(
+        launcher.clone(),
+        CompilerAlias {
+            compiler: compiler.clone(),
+            blake3: blake3::hash(script).to_hex().to_string(),
+        },
+    )]));
+    let serialized = toml::to_string(&FileConfig {
+        compiler_aliases: aliases.clone(),
+        ..Default::default()
+    })?;
+    let file: FileConfig = toml::from_str(&serialized)?;
+    assert_eq!(file.compiler_aliases, aliases);
+    file.compiler_aliases.validate()?;
+    assert_eq!(file.compiler_aliases.resolve(launcher.clone())?, compiler);
+    let unrelated = temp.path().join("unrelated");
+    assert_eq!(file.compiler_aliases.resolve(unrelated.clone())?, unrelated);
+    fs::write(&launcher, b"#!/bin/sh\nexit 0\n")?;
+    assert!(file.compiler_aliases.resolve(launcher).is_err());
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn compiler_alias_rejects_relative_paths_and_alias_chains() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    let mut aliases = CompilerAliases(HashMap::from([(
+        first.clone(),
+        CompilerAlias {
+            compiler: PathBuf::from("relative"),
+            blake3: blake3::hash(b"").to_hex().to_string(),
+        },
+    )]));
+    assert!(aliases.validate().is_err());
+    aliases.0.get_mut(&first).context("first alias")?.compiler = second.clone();
+    aliases.0.insert(
+        second,
+        CompilerAlias {
+            compiler: first,
+            blake3: blake3::hash(b"").to_hex().to_string(),
+        },
+    );
+    assert!(aliases.validate().is_err());
+    Ok(())
+}
+
 // TODO: fields only pub for tests
 #[derive(Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(default)]
@@ -893,6 +1008,7 @@ pub struct FileConfig {
     /// Base directories to strip from paths for cache key computation.
     pub basedirs: Vec<String>,
     pub client_side_mode: bool,
+    pub compiler_aliases: CompilerAliases,
 }
 
 // If the file doesn't exist or we can't read it, log the issue and proceed. If the
@@ -1546,6 +1662,7 @@ pub struct Config {
     /// Similar to ccache's `CCACHE_BASEDIR`.
     pub basedirs: Vec<Vec<u8>>,
     pub client_side_mode: bool,
+    pub compiler_aliases: CompilerAliases,
 }
 
 impl Config {
@@ -1600,8 +1717,10 @@ impl Config {
             server_startup_timeout_ms,
             basedirs: file_basedirs,
             client_side_mode: file_client_side_mode,
+            compiler_aliases,
         } = file_conf;
         conf_caches.merge(cache);
+        compiler_aliases.validate()?;
 
         let server_startup_timeout =
             server_startup_timeout_ms.map(std::time::Duration::from_millis);
@@ -1678,6 +1797,7 @@ impl Config {
             skip_cache_check: false,
             basedirs,
             client_side_mode,
+            compiler_aliases,
         })
     }
 }
@@ -2112,6 +2232,7 @@ fn config_overrides() {
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
+        compiler_aliases: Default::default(),
     };
 
     assert_eq!(
@@ -2169,6 +2290,7 @@ fn config_overrides() {
             skip_cache_check: false,
             basedirs: vec![],
             client_side_mode: false,
+            compiler_aliases: Default::default(),
         }
     );
 }
@@ -2189,6 +2311,7 @@ fn config_basedirs_overrides() {
         server_startup_timeout_ms: None,
         basedirs: vec!["C:/file/basedir".to_string()],
         client_side_mode: false,
+        compiler_aliases: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2207,6 +2330,7 @@ fn config_basedirs_overrides() {
         server_startup_timeout_ms: None,
         basedirs: vec!["C:/file/basedir".to_string()],
         client_side_mode: false,
+        compiler_aliases: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2225,6 +2349,7 @@ fn config_basedirs_overrides() {
         server_startup_timeout_ms: None,
         basedirs: vec!["C:/file/basedir".to_string()],
         client_side_mode: false,
+        compiler_aliases: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2243,6 +2368,7 @@ fn config_basedirs_overrides() {
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
+        compiler_aliases: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2265,6 +2391,7 @@ fn config_basedirs_overrides() {
         server_startup_timeout_ms: None,
         basedirs: vec!["/file/basedir".to_string()],
         client_side_mode: false,
+        compiler_aliases: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2283,6 +2410,7 @@ fn config_basedirs_overrides() {
         server_startup_timeout_ms: None,
         basedirs: vec!["/file/basedir".to_string()],
         client_side_mode: false,
+        compiler_aliases: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2301,6 +2429,7 @@ fn config_basedirs_overrides() {
         server_startup_timeout_ms: None,
         basedirs: vec!["/file/basedir".to_string()],
         client_side_mode: false,
+        compiler_aliases: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2319,6 +2448,7 @@ fn config_basedirs_overrides() {
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
+        compiler_aliases: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2335,6 +2465,7 @@ fn config_basedirs_overrides() {
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
+        compiler_aliases: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2561,6 +2692,7 @@ fn test_env_basedirs_with_spaces() {
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
+        compiler_aliases: Default::default(),
     };
     Config::from_env_and_file_configs(env_conf, file_conf)
         .expect_err("Should fail due to non-absolute path");
@@ -2596,6 +2728,7 @@ fn test_env_basedirs_with_spaces() {
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
+        compiler_aliases: Default::default(),
     };
     Config::from_env_and_file_configs(env_conf, file_conf)
         .expect_err("Should fail due to non-absolute path");
@@ -3477,6 +3610,7 @@ key_prefix = "cosprefix"
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],
             client_side_mode: false,
+            compiler_aliases: Default::default(),
         }
     );
 }
@@ -3571,6 +3705,7 @@ size = "7g"
             server_startup_timeout_ms: None,
             basedirs: vec![],
             client_side_mode: false,
+            compiler_aliases: Default::default(),
         }
     );
 }
@@ -3619,6 +3754,7 @@ fn test_integration_config_normalizes_and_strips() {
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/project".to_string()],
         client_side_mode: false,
+        compiler_aliases: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3654,6 +3790,7 @@ fn test_integration_normalized_path_with_double_slashes() {
         server_startup_timeout_ms: None,
         basedirs: vec!["/home//user///project/".to_string()],
         client_side_mode: false,
+        compiler_aliases: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3685,6 +3822,7 @@ fn test_integration_windows_path_normalization() {
         server_startup_timeout_ms: None,
         basedirs: vec!["C:\\Users\\Test\\Project".to_string()],
         client_side_mode: false,
+        compiler_aliases: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3717,6 +3855,7 @@ fn test_integration_cow_borrowed_when_no_match() {
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/project".to_string()],
         client_side_mode: false,
+        compiler_aliases: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3749,6 +3888,7 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
+        compiler_aliases: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3780,6 +3920,7 @@ fn test_integration_multiple_basedirs_longest_match() {
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user".to_string(), "/home/user/project".to_string()],
         client_side_mode: false,
+        compiler_aliases: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3816,6 +3957,7 @@ fn test_integration_paths_with_dots_normalized() {
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/./project/../project".to_string()],
         client_side_mode: false,
+        compiler_aliases: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3848,6 +3990,7 @@ fn test_integration_windows_mixed_slashes() {
         server_startup_timeout_ms: None,
         basedirs: vec!["C:\\Users\\test\\project".to_string()],
         client_side_mode: false,
+        compiler_aliases: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();

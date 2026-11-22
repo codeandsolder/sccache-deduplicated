@@ -21,7 +21,7 @@ use crate::compiler::{
 };
 #[cfg(feature = "dist-client")]
 use crate::config;
-use crate::config::Config;
+use crate::config::{CompilerAliases, Config};
 use crate::dist;
 #[cfg(feature = "dist-client")]
 use crate::dist::Client as _;
@@ -577,13 +577,20 @@ fn bind_server(
     client: &Client,
     dist_client: DistClientContainer,
     storage: Arc<dyn Storage>,
+    compiler_aliases: CompilerAliases,
 ) -> io::Result<(crate::net::SocketAddr, StartupRunner)> {
     match addr {
         crate::net::SocketAddr::Net(addr) => {
             trace!("binding TCP {addr}");
             let listener = runtime.block_on(tokio::net::TcpListener::bind(addr))?;
-            let server =
-                SccacheServer::<_>::with_listener(listener, runtime, client, dist_client, storage);
+            let server = SccacheServer::<_>::with_listener(
+                listener,
+                runtime,
+                client,
+                dist_client,
+                storage,
+                compiler_aliases,
+            );
             let bound_addr = server.try_local_addr()?.ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::AddrNotAvailable,
@@ -600,8 +607,14 @@ fn bind_server(
                 let _guard = runtime.enter();
                 tokio::net::UnixListener::bind(path)?
             };
-            let server =
-                SccacheServer::<_>::with_listener(listener, runtime, client, dist_client, storage);
+            let server = SccacheServer::<_>::with_listener(
+                listener,
+                runtime,
+                client,
+                dist_client,
+                storage,
+                compiler_aliases,
+            );
             let bound_addr = server.try_local_addr()?.ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::AddrNotAvailable,
@@ -620,8 +633,14 @@ fn bind_server(
                 let _guard = runtime.enter();
                 tokio::net::UnixListener::from_std(listener)?
             };
-            let server =
-                SccacheServer::<_>::with_listener(listener, runtime, client, dist_client, storage);
+            let server = SccacheServer::<_>::with_listener(
+                listener,
+                runtime,
+                client,
+                dist_client,
+                storage,
+                compiler_aliases,
+            );
             let bound_addr = server
                 .try_local_addr()?
                 .unwrap_or_else(|| crate::net::SocketAddr::UnixAbstract(path.clone()));
@@ -676,7 +695,14 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
     let notify = env::var_os("SCCACHE_STARTUP_NOTIFY");
     let storage = initialize_server_storage(config, &pool, &runtime, notify.as_ref())?;
 
-    match bind_server(addr, runtime, &client, dist_client, storage) {
+    match bind_server(
+        addr,
+        runtime,
+        &client,
+        dist_client,
+        storage,
+        config.compiler_aliases.clone(),
+    ) {
         Ok((bound_addr, run)) => {
             info!("server started, listening on {bound_addr}");
             notify_server_startup(
@@ -718,6 +744,7 @@ impl<C: CommandCreatorSync> SccacheServer<tokio::net::TcpListener, C> {
         client: &Client,
         dist_client: DistClientContainer,
         storage: Arc<dyn Storage>,
+        compiler_aliases: CompilerAliases,
     ) -> Result<Self> {
         let addr = crate::net::SocketAddr::with_port(port);
         let net_addr = addr
@@ -731,6 +758,7 @@ impl<C: CommandCreatorSync> SccacheServer<tokio::net::TcpListener, C> {
             client,
             dist_client,
             storage,
+            compiler_aliases,
         ))
     }
 }
@@ -742,13 +770,22 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         client: &Client,
         dist_client: DistClientContainer,
         storage: Arc<dyn Storage>,
+        compiler_aliases: CompilerAliases,
     ) -> Self {
         // Prepare the service which we'll use to service all incoming TCP
         // connections.
         let (tx, rx) = mpsc::channel(1);
         let (wait, info) = WaitUntilZero::new();
         let pool = runtime.handle().clone();
-        let service = SccacheService::new(dist_client, storage, client, pool, tx, info);
+        let service = SccacheService::new(
+            dist_client,
+            storage,
+            client,
+            pool,
+            tx,
+            info,
+            compiler_aliases,
+        );
 
         Self {
             runtime,
@@ -954,6 +991,9 @@ where
 
     /// Cache storage.
     storage: Arc<dyn Storage>,
+
+    /// Explicit transparent launcher mappings from the local configuration.
+    compiler_aliases: Arc<CompilerAliases>,
 
     /// A cache of known compiler info.
     compilers: Arc<RwLock<CompilerMap<C>>>,
@@ -1163,11 +1203,13 @@ where
         rt: tokio::runtime::Handle,
         tx: mpsc::Sender<ServerMessage>,
         info: ActiveInfo,
+        compiler_aliases: CompilerAliases,
     ) -> Self {
         Self {
             stats: Arc::default(),
             dist_client: Arc::new(dist_client),
             storage,
+            compiler_aliases: Arc::new(compiler_aliases),
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
             rt,
@@ -1186,6 +1228,7 @@ where
             stats: Arc::default(),
             dist_client: Arc::new(dist_client),
             storage,
+            compiler_aliases: Arc::default(),
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
             rt,
@@ -1221,6 +1264,7 @@ where
                 dist_client,
             ))),
             storage,
+            compiler_aliases: Arc::default(),
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
             rt,
@@ -1433,6 +1477,7 @@ where
         env: &[(OsString, OsString)],
     ) -> Result<Box<dyn Compiler<C>>> {
         trace!("compiler_info");
+        let path = self.compiler_aliases.resolve(path)?;
 
         let compiler_proxy = {
             let compiler_proxies = self.compiler_proxies.read().await;

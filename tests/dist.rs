@@ -142,6 +142,103 @@ fn test_dist_basic() {
     });
 }
 
+/// Actual compiler scripts: only an explicitly attested transparent launcher
+/// shares the real GCC cache identity and remote toolchain. An arbitrary
+/// script that changes flags must retain its own local compilation semantics.
+#[cfg(unix)]
+#[test]
+#[cfg_attr(not(feature = "dist-tests"), ignore)]
+fn test_dist_c_compiler_aliases() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let gcc = which::which("gcc")?;
+    let transparent = root.join("cc");
+    let modifying = root.join("other-cc");
+    let script = format!("#!/bin/sh\nexec '{}' \"$@\"\n", gcc.display());
+    let modified = format!(
+        "#!/bin/sh\nexec '{}' -DWRAPPER_VALUE=42 \"$@\"\n",
+        gcc.display()
+    );
+    for (file, contents) in [(&transparent, &script), (&modifying, &modified)] {
+        std::fs::write(file, contents)?;
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755))?;
+    }
+    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), &root);
+    system.add_scheduler();
+    let _worker = system.add_server(&[]);
+    let mut cfg = harness::sccache_client_cfg(&root, false);
+    cfg.dist.scheduler_url = Some(system.scheduler_url());
+    cfg.compiler_aliases.0.insert(
+        transparent.clone(),
+        sccache::config::CompilerAlias {
+            compiler: gcc.clone(),
+            blake3: blake3::hash(script.as_bytes()).to_hex().to_string(),
+        },
+    );
+    let config = root.join("sccache-cfg.json");
+    write_json_cfg(&root, "sccache-cfg.json", &cfg);
+    let cached_config = root.join("sccache-cached-cfg");
+    let _ = stop_local_daemon();
+    start_local_daemon(&config, &cached_config);
+    let source = root.join("probe.c");
+    let object = root.join("probe.o");
+    std::fs::write(
+        &source,
+        "#ifndef WRAPPER_VALUE\n#define WRAPPER_VALUE 11\n#endif\nint marker(void) { return WRAPPER_VALUE; }\n",
+    )?;
+    let compile = |compiler: &Path| -> Result<Output> {
+        Ok(sccache_command()
+            .arg(compiler)
+            .arg("-c")
+            .arg(&source)
+            .arg("-o")
+            .arg(&object)
+            .env("SCCACHE_CONF", &config)
+            .env("SCCACHE_CACHED_CONF", &cached_config)
+            .current_dir(&root)
+            .output()?)
+    };
+    let first = compile(&transparent)?;
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let ordinary = std::fs::read(&object)?;
+    std::fs::remove_file(&object)?;
+    let direct = compile(&gcc)?;
+    assert!(
+        direct.status.success(),
+        "{}",
+        String::from_utf8_lossy(&direct.stderr)
+    );
+    assert_eq!(ordinary, std::fs::read(&object)?);
+    std::fs::remove_file(&object)?;
+    let altered = compile(&modifying)?;
+    assert!(
+        altered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&altered.stderr)
+    );
+    assert_ne!(ordinary, std::fs::read(&object)?);
+    std::fs::remove_file(&object)?;
+    // A changed formerly transparent wrapper must never reuse the alias.
+    std::fs::write(&transparent, modified)?;
+    let changed = compile(&transparent)?;
+    assert!(!changed.status.success());
+    assert!(String::from_utf8_lossy(&changed.stderr).contains("alias digest mismatch"));
+    assert!(!object.exists());
+    get_stats(|info| {
+        assert_eq!(1, info.stats.dist_compiles.values().sum::<usize>());
+        assert_eq!(1, info.stats.cache_hits.all());
+        assert_eq!(2, info.stats.cache_misses.all());
+        assert_eq!(0, info.stats.dist_errors);
+    });
+    Ok(())
+}
+
 // A successful assembler diagnostic may intentionally leave the object
 // absent or retain an existing file. Neither result can be cached as an object.
 #[test]

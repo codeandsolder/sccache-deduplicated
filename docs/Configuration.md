@@ -373,3 +373,24 @@ When using Entra ID, credentials are read from the ambient `AZURE_*` environment
 * `TENCENTCLOUD_SECRET_ID`
 * `TENCENTCLOUD_SECRET_KEY`
 * `SCCACHE_COS_RW_MODE`
+
+
+### Transparent compiler launchers
+
+A wrapper that only executes a known compiler with the original arguments can be
+declared explicitly in the daemon configuration. A compiler alias is an
+administrator assertion about the wrapper's semantics, not a general shell
+script parser. Use absolute executable paths and the BLAKE3 digest of the
+wrapper file:
+
+```toml
+[compiler_aliases."/usr/local/libexec/compiler-wrap/cc"]
+compiler = "/usr/bin/cc"
+blake3 = "<64 hexadecimal digits from b3sum of the wrapper>"
+```
+
+The launcher is verified before compiler detection and cache key generation.
+Editing the wrapper requires updating or removing its alias configuration.
+Unlisted wrappers are not automatically unwrapped; Linux script compilers
+cannot use automatic ELF toolchain packaging, but explicit custom toolchain
+archives remain available. Aliases cannot point to other configured aliases.

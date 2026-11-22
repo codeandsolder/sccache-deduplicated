@@ -1908,6 +1908,19 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
         Ok((command, dist_command, cacheable))
     }
 
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    fn automatic_dist_toolchain_is_ready(&self) -> bool {
+        use std::io::Read as _;
+
+        // A script's transitive execution environment is not automatically
+        // discoverable by ELF dependency analysis. A custom archive may
+        // still explicitly provide the wrapper and its dependencies.
+        let mut magic = [0; 2];
+        !fs::File::open(&self.executable)
+            .and_then(|mut file| file.read_exact(&mut magic))
+            .is_ok_and(|()| magic == *b"#!")
+    }
+
     #[cfg(feature = "dist-client")]
     fn into_dist_packagers(
         self: Box<Self>,
