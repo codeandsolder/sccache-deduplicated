@@ -362,14 +362,19 @@ impl LinkInvocation {
 
 /// A compiler-owned split-link invocation.
 ///
-/// Both stages retain the complete
-/// compiler option list, changing only the source operand and stage selector.
-/// The caller executes them in namespaces with identical logical paths.
+/// The link stage retains the complete compiler option list. The codegen
+/// stage omits typed native-linker-only arguments; all other argument bytes
+/// and ordering remain exact. Both use identical logical paths.
 pub struct RustLinkStages {
-    arguments: Vec<OsString>,
-    input: usize,
+    arguments: ParsedLinkArguments,
     codegen_directory: PathBuf,
     output_roots: Vec<PathBuf>,
+}
+
+pub(super) struct ParsedLinkArguments {
+    pub original: Vec<OsString>,
+    pub codegen: Vec<OsString>,
+    pub input: usize,
 }
 
 impl RustLinkStages {
@@ -400,8 +405,7 @@ impl RustLinkStages {
     }
 
     pub(super) fn from_parsed(
-        arguments: Vec<OsString>,
-        input: usize,
+        arguments: ParsedLinkArguments,
         cwd: &Path,
         out_dir: Option<&Path>,
         output_file: Option<&Path>,
@@ -442,7 +446,6 @@ impl RustLinkStages {
         }
         Ok(Self {
             arguments,
-            input,
             codegen_directory,
             output_roots,
         })
@@ -466,25 +469,24 @@ impl RustLinkStages {
     /// preparation when launching, so literal leading @ operands survive.
     #[must_use = "these arguments execute the codegen stage"]
     pub fn codegen_arguments(&self) -> Vec<OsString> {
-        self.stage_arguments("no-link", None)
+        let mut arguments = Vec::with_capacity(self.arguments.codegen.len() + 2);
+        arguments.extend([OsString::from("-Z"), OsString::from("no-link")]);
+        arguments.extend(self.arguments.codegen.iter().cloned());
+        arguments
     }
 
     /// Expanded link arguments, with the .rlink artifact at its original
     /// logical path and all current linker options retained.
     #[must_use = "these arguments execute the compiler's native link stage"]
     pub fn link_arguments(&self, artifact: &Path) -> Vec<OsString> {
-        self.stage_arguments("link-only", Some(artifact))
-    }
-
-    fn stage_arguments(&self, stage: &str, artifact: Option<&Path>) -> Vec<OsString> {
-        let mut arguments = Vec::with_capacity(self.arguments.len() + 2);
+        let mut arguments = Vec::with_capacity(self.arguments.original.len() + 2);
         // Prefix the stage option: a trailing -- must not turn it into a
         // source operand.
-        arguments.extend([OsString::from("-Z"), OsString::from(stage)]);
-        arguments.extend(self.arguments.iter().cloned());
-        if let Some(path) = artifact {
-            path.as_os_str().clone_into(&mut arguments[self.input + 2]);
-        }
+        arguments.extend([OsString::from("-Z"), OsString::from("link-only")]);
+        arguments.extend(self.arguments.original.iter().cloned());
+        artifact
+            .as_os_str()
+            .clone_into(&mut arguments[self.arguments.input + 2]);
         arguments
     }
 

@@ -296,7 +296,8 @@ jobs:
         if [ -f "$profile" ]; then
           sudo apparmor_parser -R "$profile"
         fi
-        bwrap --unshare-net --ro-bind / / --proc /proc --dev-bind /dev /dev --           bwrap --ro-bind / / --dev-bind /dev /dev -- /usr/bin/true
+        bwrap --unshare-net --ro-bind / / --proc /proc --dev-bind /dev /dev -- \
+          bwrap --ro-bind / / --dev-bind /dev /dev -- /usr/bin/true
         # Compile with the canonical CI sccache daemon on its isolated Unix socket.
         # Run test executables without that socket variable: the sccache system
         # tests must manage their own independent test daemon.

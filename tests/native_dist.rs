@@ -631,16 +631,17 @@ for i in 1 2; do
 done
 
 # The two calls have exactly the same Rust codegen inputs and arguments.
-# Change only the native archive, which is consumed by the caller linker.
-# The second call must reuse codegen and produce a different executable.
+# Change the native archive, response-file contents, and literal linker
+# argument. None is a codegen input; the same generated tree must be reused.
 for value in 17 42; do
     printf 'unsigned native_value(void) { return %s; }\n' "$value" > native.c
     "$2" -c native.c -o native.o
     /usr/bin/ar rcs libnative.a native.o
     printf '%s\n' "-Wl,--defsym,native_marker=$value" > native.rsp
     rm -f build/linked-stage build/linked-stage.d build/linked-stage.dwp build/liblinked-stage.rmeta
-    "$1" "$3" --crate-name linked --crate-type bin --edition=2024 --emit=link,metadata,dep-info --out-dir build -Cextra-filename=-stage -Cdebuginfo=2 -Csplit-debuginfo=packed -Lnative=. -lstatic=native -Clink-arg=@native.rsp linked.rs
+    "$1" "$3" --crate-name linked --crate-type bin --edition=2024 --emit=link,metadata,dep-info --out-dir build -Cextra-filename=-stage -Cdebuginfo=2 -Csplit-debuginfo=packed -Lnative=. -lstatic=native -Clink-arg=@native.rsp "-Clink-arg=-Wl,--defsym,live_marker=$value" linked.rs
     test "$(build/linked-stage)" = "$value"
+    test "$(readelf -Ws build/linked-stage | awk '$7 == "ABS" && $8 == "live_marker" { print $2 }')" = "$(printf '%016x' "$value")"
     test -f build/liblinked-stage.rmeta
     test -s build/linked-stage.d
     test -s build/linked-stage.dwp

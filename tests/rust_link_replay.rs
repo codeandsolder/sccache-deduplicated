@@ -341,6 +341,8 @@ fn split_link_argument_plan_preserves_expanded_option_bytes() -> Result<()> {
         "--emit=link,dep-info",
         "-C",
         "link-arg=@native.rsp",
+        "-Clink-args=-Wl,--as-needed",
+        "--codegen=link-arg=-lm",
         "--cfg",
         "message=\"two words\"",
         "--out-dir",
@@ -369,7 +371,12 @@ fn split_link_argument_plan_preserves_expanded_option_bytes() -> Result<()> {
     let stages = RustLinkStages::new(&[at], root.path())?;
     let codegen = stages.codegen_arguments();
     assert_eq!(codegen[..2], ["-Z", "no-link"]);
-    assert_eq!(codegen[2..], original);
+    let expected = original[..4]
+        .iter()
+        .chain(&original[8..])
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(codegen[2..], expected);
     let artifact = root.path().join("probe.rlink");
     let link = stages.link_arguments(&artifact);
     assert_eq!(link[..2], ["-Z", "link-only"]);

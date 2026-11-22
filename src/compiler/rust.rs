@@ -2574,6 +2574,8 @@ pub(super) fn native_link_stage_input(
     let mut out_dir = None;
     let mut output_file = None;
     let mut explicit_outputs = Vec::new();
+    let mut codegen_arguments = Vec::with_capacity(expanded.len());
+    let mut previous = 0;
     for argument in ArgsIter::new(
         expanded
             .iter()
@@ -2584,6 +2586,18 @@ pub(super) fn native_link_stage_input(
     .with_double_dashes()
     {
         let argument = argument?;
+        let end = consumed.get();
+        // These options are consumed exclusively by the native linker.
+        // Keep their exact original spelling in the link-stage arguments,
+        // but exclude them from the generated-tree action identity.
+        if !matches!(
+            argument.get_data(),
+            Some(CodeGen(ArgCodegen { opt, .. }))
+                if matches!(opt.as_str(), "link-arg" | "link-args" | "link_arg" | "link_args")
+        ) {
+            codegen_arguments.extend_from_slice(&expanded[previous..end]);
+        }
+        previous = end;
         match &argument {
             Argument::Raw(value) if value == "--" && !after_separator => after_separator = true,
             Argument::Raw(_) => {
@@ -2627,8 +2641,11 @@ pub(super) fn native_link_stage_input(
         "Rust invocation does not emit a linked artifact"
     );
     super::rust_link::RustLinkStages::from_parsed(
-        expanded,
-        input.context("missing Rust source operand")?,
+        super::rust_link::ParsedLinkArguments {
+            original: expanded,
+            codegen: codegen_arguments,
+            input: input.context("missing Rust source operand")?,
+        },
         cwd,
         out_dir.as_deref(),
         output_file.as_deref(),
