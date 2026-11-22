@@ -29,6 +29,12 @@ Create a scheduler.conf file to configure client/server authentication. A minima
 # to listen on localhost and put a HTTPS server in front of it.
 public_addr = "127.0.0.1:10600"
 
+# Required admission policy. Maximum outstanding jobs per worker = max(1, ceil(CPUs)) + static_jobs + floor(CPUs * percent / 100).
+# This example admits three jobs per advertised CPU without changing worker execution width.
+[job_slack]
+static_jobs = 0
+percent = 200.0
+
 [client_auth]
 type = "token"
 token = "my client token" # Must be a valid HTTP header value.
@@ -89,6 +95,10 @@ type = "overlay"
 build_dir = "/tmp/build"
 # The path to the bubblewrap version 0.3.0+ `bwrap` binary.
 bwrap_path = "/usr/bin/bwrap"
+# Maximum retained extracted-toolchain logical bytes (default 8 GiB).
+# Active builds may exceed the limit; idle extractions are reclaimed in
+# LRU order, while compressed archives remain cached.
+# extracted_toolchain_cache_size = 8589934592
 
 [scheduler_auth]
 type = "jwt_token"
@@ -147,7 +157,7 @@ You can check the status with `sccache --dist-status`, it should say something l
 
 ```
 $ sccache --dist-status
-{"SchedulerStatus":["https://sccache1.corpdmz.ber3.mozilla.com/",{"num_servers":3,"num_cpus":56,"in_progress":24}]}
+{"SchedulerStatus":["https://sccache1.corpdmz.ber3.mozilla.com/",{"num_servers":3,"num_cpus":56,"in_progress":24,"max_jobs":168,"available_jobs":144}]}
 ```
 
 Using custom toolchains

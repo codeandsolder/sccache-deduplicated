@@ -229,6 +229,7 @@ pub fn sccache_client_cfg(
 fn sccache_scheduler_cfg() -> sccache::config::scheduler::Config {
     sccache::config::scheduler::Config {
         maintenance_drain_file: None,
+        job_slack: Default::default(),
         public_addr: SocketAddr::from(([0, 0, 0, 0], SCHEDULER_PORT)),
         client_auth: sccache::config::scheduler::ClientAuth::Insecure,
         server_auth: sccache::config::scheduler::ServerAuth::Token {
@@ -250,6 +251,7 @@ fn sccache_server_cfg(
         builder: sccache::config::server::BuilderType::Overlay {
             build_dir: BUILD_DIR_CONTAINER_PATH.into(),
             bwrap_path: DIST_IMAGE_BWRAP_PATH.into(),
+            extracted_toolchain_cache_size: TC_CACHE_SIZE,
         },
         cache_dir: Path::new(CONFIGS_CONTAINER_PATH).join(relpath),
         public_addr: SocketAddr::new(server_ip, SERVER_PORT),
@@ -395,7 +397,8 @@ impl DistSystem {
                     SchedulerStatusResult {
                         num_servers: 0,
                         num_cpus: _,
-                        in_progress: 0
+                        in_progress: 0,
+                        ..
                     }
                 ) {
                     Ok(())
@@ -562,7 +565,8 @@ impl DistSystem {
                     SchedulerStatusResult {
                         num_servers: 1,
                         num_cpus: _,
-                        in_progress: 0
+                        in_progress: 0,
+                        ..
                     }
                 ) {
                     Ok(())

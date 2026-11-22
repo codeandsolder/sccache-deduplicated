@@ -1015,6 +1015,25 @@ fn test_dist_toolchain() {
 #[cfg(unix)]
 #[cfg_attr(not(feature = "dist-tests"), ignore)]
 fn test_dist_rust_dependency_chain() -> Result<()> {
+    dist_rust_dependency_chain(None)
+}
+
+#[test]
+#[cfg(unix)]
+#[cfg_attr(not(feature = "dist-tests"), ignore)]
+fn test_dist_rust_dependency_chain_relative_nested() -> Result<()> {
+    dist_rust_dependency_chain(Some("out"))
+}
+
+#[test]
+#[cfg(unix)]
+#[cfg_attr(not(feature = "dist-tests"), ignore)]
+fn test_dist_rust_dependency_chain_relative_sibling() -> Result<()> {
+    dist_rust_dependency_chain(Some("../target"))
+}
+
+#[cfg(unix)]
+fn dist_rust_dependency_chain(relative: Option<&str>) -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path();
     let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
@@ -1029,7 +1048,18 @@ fn test_dist_rust_dependency_chain() -> Result<()> {
     start_local_daemon(&cfg_path, &cached_cfg);
 
     let source = root.join("source");
-    let target = root.join("target");
+    let target = if relative == Some("out") {
+        source.join("out")
+    } else {
+        root.join("target")
+    };
+    let operand = relative.map_or(target.as_path(), Path::new);
+    let extension = if relative.is_some() { "rlib" } else { "rmeta" };
+    let emit = if relative.is_some() {
+        "--emit=link,dep-info"
+    } else {
+        "--emit=metadata,dep-info"
+    };
     std::fs::create_dir(&source)?;
     std::fs::create_dir(&target)?;
     write_source(
@@ -1049,7 +1079,7 @@ fn test_dist_rust_dependency_chain() -> Result<()> {
     );
     let compiler = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     for name in ["first", "second", "third"] {
-        let metadata = target.join(format!("lib{name}-regression.rmeta"));
+        let metadata = target.join(format!("lib{name}-regression.{extension}"));
         let predecessor = match name {
             "second" => Some("first"),
             "third" => Some("second"),
@@ -1071,14 +1101,14 @@ fn test_dist_rust_dependency_chain() -> Result<()> {
                     name,
                     "--crate-type",
                     "rlib",
-                    "--emit=metadata,dep-info",
+                    emit,
                     "-C",
                     "extra-filename=-regression",
                 ])
                 .arg("--out-dir")
-                .arg(&target)
+                .arg(operand)
                 .arg("-L")
-                .arg(format!("dependency={}", target.display()))
+                .arg(format!("dependency={}", operand.display()))
                 .arg(format!("{name}.rs"))
                 .env("CARGO_PKG_NAME", name)
                 .env("SCCACHE_CONF", &cfg_path)
@@ -1089,7 +1119,9 @@ fn test_dist_rust_dependency_chain() -> Result<()> {
             if let Some(dep) = predecessor {
                 command.arg("--extern").arg(format!(
                     "{dep}={}",
-                    target.join(format!("lib{dep}-regression.rmeta")).display()
+                    operand
+                        .join(format!("lib{dep}-regression.{extension}"))
+                        .display()
                 ));
             }
             command.assert().success();
@@ -1097,6 +1129,10 @@ fn test_dist_rust_dependency_chain() -> Result<()> {
         compile();
         let initial = std::fs::read(&metadata)?;
         assert!(!initial.is_empty());
+        let dep_info = std::fs::read_to_string(target.join(format!("{name}-regression.d")))?;
+        assert!(dep_info.contains(
+            &format!("{}:", operand.join(format!("lib{name}-regression.{extension}")).display())
+        ));
         std::fs::remove_file(&metadata)?;
         compile();
         assert_eq!(std::fs::read(&metadata)?, initial);

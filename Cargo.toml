@@ -123,7 +123,7 @@ zstd = "0.14"
 zlib-rs-fast = { package = "zlib-rs", git = "https://github.com/codeandsolder/zlib-rs-fast", rev = "746fd05382458d6962f86b453615d6ad51163375", optional = true, default-features = false, features = ["std"] }
 
 # dist-server only
-nix = { version = "0.31.0", optional = true, features = [
+nix = { version = "0.32.0", optional = true, features = [
   "mount",
   "fs",
   "user",

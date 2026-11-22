@@ -872,6 +872,8 @@ pub struct SchedulerStatusResult {
     pub num_servers: usize,
     pub num_cpus: usize,
     pub in_progress: usize,
+    pub max_jobs: usize,
+    pub available_jobs: usize,
 }
 
 // SubmitToolchain
@@ -989,7 +991,7 @@ pub trait SchedulerIncoming: Send + Sync {
         &self,
         server_id: ServerId,
         server_nonce: ServerNonce,
-        num_cpus: usize,
+        cpu_capacity: f64,
         running_job_ids: &[JobId],
         job_authorizer: Box<dyn JobAuthorizer>,
     ) -> ExtResult<HeartbeatServerResult, Error>;

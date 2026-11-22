@@ -2409,6 +2409,90 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     })
 }
 
+/// Resolve typed path operands in the physical namespace. The same arguments
+/// feed hashing, the local sandbox and the worker; in particular, a relative
+/// output directory can otherwise land under /build instead of /target.
+fn relocate_rust_operands(
+    arguments: &mut [Argument<ArgData>],
+    canonical: &CanonicalRustPaths,
+    cwd: &Path,
+) -> Option<()> {
+    use super::canonical_paths::physical_operand;
+
+    for argument in arguments {
+        let path = match argument {
+            Argument::WithValue(
+                _,
+                OutDir(path)
+                | Extern(ArgExtern { path, .. })
+                | LinkPath(ArgLinkPath { path, .. })
+                | Target(ArgTarget::Path(path)),
+                _,
+            ) => path,
+            // Source spelling is observable through file!(). Keep a relative
+            // source operand only if it still reaches the mapped input.
+            Argument::Raw(input) => {
+                let path = Path::new(input);
+                if path.is_relative() {
+                    let physical = physical_operand(cwd, path)?;
+                    let mapped = canonical.to_canonical(&physical);
+                    let virtual_path = canonical.canonical_cwd(cwd).join(path);
+                    let mut normalized = PathBuf::new();
+                    for component in virtual_path.components() {
+                        match component {
+                            std::path::Component::ParentDir => {
+                                normalized.pop();
+                            }
+                            std::path::Component::CurDir => {}
+                            other => normalized.push(other),
+                        }
+                    }
+                    if normalized != mapped {
+                        return None;
+                    }
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        if path.is_absolute()
+            && !path
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+        {
+            continue;
+        }
+        let physical = physical_operand(cwd, path)?;
+        if !canonical.root_is_known(&physical) {
+            return None;
+        }
+        // Preserve the existing absolute spelling unless normalization is
+        // necessary. Relative operands must be mapped independently of cwd.
+        *path = physical;
+    }
+    Some(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn relocate_raw_rust_operands(
+    arguments: &[OsString],
+    canonical: &CanonicalRustPaths,
+    cwd: &Path,
+) -> Option<Vec<OsString>> {
+    let mut parsed = ArgsIter::new(ExpandResponseFile::new(cwd, arguments), &ARGS[..])
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()?;
+    relocate_rust_operands(&mut parsed, canonical, cwd)?;
+    // An IPC fallback retains the original emit and color settings, unlike
+    // the cacheable compile where dep-info has already been generated.
+    Some(
+        parsed
+            .iter()
+            .flat_map(|arg| arg.iter_os_strings())
+            .collect(),
+    )
+}
+
 #[async_trait]
 impl<T> CompilerHasher<T> for RustHasher
 where
@@ -2564,23 +2648,24 @@ where
             }
         }
 
-        let output_dir = if self.parsed_args.output_dir.is_absolute() {
-            self.parsed_args.output_dir.clone()
-        } else {
-            cwd.join(&self.parsed_args.output_dir)
-        };
-        let mut canonical_paths = CanonicalRustPaths::from_env_with_output_dir(
-            &env_vars,
-            &cwd,
-            &self.sysroot,
-            Some(&output_dir),
-        );
+        let output_dir = cwd.join(&self.parsed_args.output_dir);
+        let canonical_output_dir =
+            super::canonical_paths::physical_operand(&cwd, &self.parsed_args.output_dir);
+        let mut canonical_paths = canonical_output_dir.as_ref().and_then(|output_dir| {
+            CanonicalRustPaths::from_env_with_output_dir(
+                &env_vars,
+                &cwd,
+                &self.sysroot,
+                Some(output_dir),
+            )
+        });
         if let Some(canonical) = canonical_paths.as_ref() {
             // The sandbox mounts /build read-only and both output roots writable.
             // Validate the paths we already know before the dep-info pre-pass so
             // a bad mapping cannot make that discovery step mutate/fail under a
             // location that canonical execution could not safely use anyway.
-            let mapped_output = canonical.to_canonical(&output_dir);
+            let mapped_output =
+                canonical.to_canonical(canonical_output_dir.as_deref().unwrap_or(&output_dir));
             let writable_output = mapped_output.starts_with(Path::new("/target"))
                 || (canonical.intermediate_root.is_some()
                     && mapped_output.starts_with(Path::new("/intermediate")));
@@ -2777,8 +2862,17 @@ where
             canonical_paths = None;
         }
 
-        if canonical_paths.is_some() {
-            remove_dep_info_emit(&mut effective_arguments);
+        if let Some(canonical) = canonical_paths.as_ref() {
+            let mut relocated = effective_arguments.clone();
+            if relocate_rust_operands(&mut relocated, canonical, &cwd).is_some() {
+                remove_dep_info_emit(&mut relocated);
+                effective_arguments = relocated;
+            } else {
+                debug!(
+                    "Relative Rust operand cannot safely be relocated; using physical input layout"
+                );
+                canonical_paths = None;
+            }
         }
 
         // TODO: this doesn't produce correct arguments if they should be concatenated - should use iter_os_strings
@@ -3074,10 +3168,17 @@ where
         // Convert output files into a map of basename -> full
         // path, and remove some unneeded / non-existing ones,
         // see https://github.com/rust-lang/rust/pull/68799.
+        let artifact_dir = if canonical_paths.is_some() {
+            canonical_output_dir
+                .as_deref()
+                .unwrap_or(&self.parsed_args.output_dir)
+        } else {
+            &self.parsed_args.output_dir
+        };
         let mut outputs = outputs
             .into_iter()
             .map(|o| {
-                let p = self.parsed_args.output_dir.join(&o);
+                let p = artifact_dir.join(&o);
                 (
                     o,
                     ArtifactDescriptor {
@@ -3088,7 +3189,7 @@ where
             })
             .collect::<HashMap<_, _>>();
         if let Some(profile) = &self.parsed_args.profile {
-            let p = self.parsed_args.output_dir.join(profile);
+            let p = artifact_dir.join(profile);
             outputs.insert(
                 profile.to_string_lossy().into_owned(),
                 ArtifactDescriptor {
@@ -3098,7 +3199,7 @@ where
             );
         }
         if let Some(gcno) = &self.parsed_args.gcno {
-            let p = self.parsed_args.output_dir.join(gcno);
+            let p = artifact_dir.join(gcno);
             outputs.insert(
                 gcno.to_string_lossy().into_owned(),
                 ArtifactDescriptor {
