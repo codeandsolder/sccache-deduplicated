@@ -829,16 +829,16 @@ mod test {
     use fs_err as fs;
 
     #[cfg(any(
-    feature = "azure",
-    feature = "gcs",
-    feature = "gha",
-    feature = "memcached",
-    feature = "redis",
-    feature = "s3",
-    feature = "webdav",
-    feature = "oss",
-    feature = "cos"
-))]
+        feature = "azure",
+        feature = "gcs",
+        feature = "gha",
+        feature = "memcached",
+        feature = "redis",
+        feature = "s3",
+        feature = "webdav",
+        feature = "oss",
+        feature = "cos"
+    ))]
     mod remote_storage {
         use super::super::decode_remote_cache_read;
         use opendal::{Error, ErrorKind};

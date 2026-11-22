@@ -277,6 +277,7 @@ impl Publisher {
             for (operation, value) in [
                 ("hit", level.hits),
                 ("miss", level.misses),
+                ("read_error", level.read_errors),
                 ("write", level.writes),
                 ("write_failure", level.write_failures),
                 ("backfill_from", level.backfills_from),

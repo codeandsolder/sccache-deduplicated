@@ -16,7 +16,7 @@ use crate::cache::cache_io::{Cache, CacheRead, CacheWrite};
 use crate::client::{ServerConnection, SharedConnection, connection_task};
 use crate::compiler::PreprocessorCacheEntry;
 use crate::config::PreprocessorCacheModeConfig;
-use crate::errors::{Result, anyhow, bail};
+use crate::errors::{Context, Result, anyhow, bail};
 use crate::protocol::{
     NAMESPACE_PROTOCOL_VERSION, Request, Response, StorageBlob, StorageHandshakeInfo,
     TRANSFER_CHUNK_BYTES, TransferReply, TransferRequest,
@@ -148,10 +148,12 @@ impl Storage for IpcStorage {
     async fn get(&self, key: &str) -> Result<Cache> {
         // A daemon path can be unavailable or name different bytes in this
         // namespace. Only consume bytes returned by the storage authority.
-        Ok(self.get_raw(key).await?.map_or_else(
-            || Cache::Miss,
-            |bytes| CacheRead::from(Cursor::new(bytes)).map_or_else(|_| Cache::Miss, Cache::Hit),
-        ))
+        match self.get_raw(key).await? {
+            Some(bytes) => CacheRead::from(Cursor::new(bytes))
+                .with_context(|| format!("IpcStorage: decode archive for key {key}"))
+                .map(Cache::Hit),
+            None => Ok(Cache::Miss),
+        }
     }
 
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
