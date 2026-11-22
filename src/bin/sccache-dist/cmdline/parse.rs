@@ -116,7 +116,8 @@ fn get_clap_command() -> ClapCommand {
             .arg(flag_infer_long("client-config").value_parser(clap::value_parser!(PathBuf)).required(true))
             .arg(flag_infer_long("output").value_parser(clap::value_parser!(PathBuf)).required(true))
             .arg(flag_infer_long("recipe-output").value_parser(clap::value_parser!(PathBuf)).required(true))
-            .arg(flag_infer_long("full").action(clap::ArgAction::SetTrue).help("Include installed non-build components such as documentation")),
+            .arg(flag_infer_long("full").action(clap::ArgAction::SetTrue).help("Include installed non-build components such as documentation"))
+            .arg(flag_infer_long("jobs").value_parser(clap::value_parser!(std::num::NonZeroUsize)).default_value("2").help("Maximum parallel package acquisitions")),
     ).subcommand(
         ClapCommand::new("native-attest-installation")
             .about("Verify installed files against original package manifests for reuse by compiler clients")
@@ -329,6 +330,9 @@ pub fn try_parse_from(
                 .context("missing recipe output")?
                 .clone(),
             full: matches.get_flag("full"),
+            jobs: *matches
+                .get_one::<std::num::NonZeroUsize>("jobs")
+                .context("missing acquisition concurrency")?,
         },
         #[cfg(target_os = "linux")]
         Some(("native-attest-installation", matches)) => Command::NativeAttestInstallation {

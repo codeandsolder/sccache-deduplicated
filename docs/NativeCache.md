@@ -325,6 +325,7 @@ Limits here are owned by the scheduler, not supplied by build clients:
 
 ```toml
 [native_cache.package_import]
+max_concurrent_imports = 2
 max_archive_bytes = 1073741824
 max_entries = 100000
 max_expanded_bytes = 8589934592
@@ -347,7 +348,8 @@ sccache-dist native-provision-rust --client-config /path/to/client.toml \
 The CLI first performs an authenticated lookup by upstream SHA-256 and codec, without an upstream length query.
 On a hit it needs no archive; on a miss it streams the original bytes.
 The owner verifies the compressed size and SHA-256 before decoding.
-A single import slot shares global upload admission. Compressed input,
+Per-package import reservations share global upload admission. The explicit
+concurrency limit bounds simultaneous archive imports and decoder processes. Compressed input,
 expanded file contents, decoded tar bytes (including padding), member count,
 and path metadata are bounded separately. A memory-limited subprocess
 decodes packages with a wall-clock deadline, streaming length-delimited
@@ -374,8 +376,10 @@ timeout_secs = 180
 
 The server combines the configured origin with independently validated
 distribution paths beneath /dist/, disables redirects, and does not forward
-client authorization upstream. Concurrent acquisitions share one provisioning
-slot; clients retry busy replies within their configured request deadline.
+client authorization upstream. Concurrent acquisitions of the same checksum and codec share one reservation;
+independent packages may progress within configured concurrency limits. Warm
+lookups do not wait for unrelated downloads. Clients retry busy replies
+within their configured request deadline.
 The scheduler streams compressed content into staging, enforces its archive
 byte limit even without Content-Length, verifies the release SHA-256, and
 decodes into the existing CAS. Verified hits do not contact the origin.
@@ -386,7 +390,7 @@ On each Rustup installation host, run:
 sccache-dist native-sync-rust --root /path/to/installed/sysroot \
   --client-config /path/to/client.toml \
   --output /path/to/installation.catalog \
-  --recipe-output /path/to/installation.recipe
+  --recipe-output /path/to/installation.recipe --jobs 2
 ```
 
 This reads the installed Rustup component inventory and channel manifest

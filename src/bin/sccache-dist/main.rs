@@ -356,8 +356,9 @@ fn run(command: Command) -> Result<i32> {
             output,
             recipe_output,
             full,
+            jobs,
         } => {
-            rustup::sync(&root, &client_config, &output, &recipe_output, full)?;
+            rustup::sync(&root, &client_config, &output, &recipe_output, full, jobs)?;
             Ok(0)
         }
         #[cfg(target_os = "linux")]

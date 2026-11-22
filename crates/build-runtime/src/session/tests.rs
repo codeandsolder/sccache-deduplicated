@@ -441,3 +441,24 @@ fn tree_result_contract_rejects_wrong_kinds_and_duplicate_logical_overflow() -> 
     assert_eq!(restored, data);
     Ok(())
 }
+
+#[test]
+fn original_package_slots_deduplicate_identities_and_bound_parallel_imports() -> Result<()> {
+    use crate::PackageCompression;
+    let dir = tempfile::tempdir()?;
+    let service = service(dir.path())?;
+    let identity = |byte| PackageIdentity {
+        sha256: [byte; 32],
+        compression: PackageCompression::Xz,
+    };
+    let first = service.package_slot(identity(1), 2)?;
+    assert!(service.package_slot(identity(1), 2).is_err());
+    let second = service.package_slot(identity(2), 2)?;
+    assert!(service.package_slot(identity(3), 2).is_err());
+    drop(first);
+    let third = service.package_slot(identity(3), 2)?;
+    assert!(service.package_slot(identity(1), 2).is_err());
+    drop((second, third));
+    assert!(service.package_slot(identity(1), 2).is_ok());
+    Ok(())
+}

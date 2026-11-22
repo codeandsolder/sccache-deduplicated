@@ -34,6 +34,8 @@ pub struct PackagePolicy {
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackageImportLimits {
+    /// Maximum distinct original archives being acquired or decoded concurrently.
+    pub max_concurrent_imports: usize,
     pub max_archive_bytes: u64,
     pub max_entries: usize,
     pub max_expanded_bytes: u64,
@@ -49,7 +51,8 @@ impl PackageImportLimits {
     /// Returns an error for unusable resource limits.
     pub fn validate(self) -> Result<()> {
         ensure!(
-            self.max_archive_bytes > 0
+            self.max_concurrent_imports > 0
+                && self.max_archive_bytes > 0
                 && self.max_archive_bytes < u64::MAX
                 && self.max_entries > 0
                 && self.max_expanded_bytes > 0
@@ -62,9 +65,9 @@ impl PackageImportLimits {
         Ok(())
     }
 
-    /// Check the compressed identity and return canonical installer policy.
+    /// Validate the service limits and return canonical installer policy.
     /// # Errors
-    /// Returns an error for invalid limits or an oversized compressed archive.
+    /// Returns an error for invalid limits or timestamp normalization failure.
     pub fn policy(self) -> Result<PackagePolicy> {
         self.validate()?;
         PackagePolicy::rust_installer(
