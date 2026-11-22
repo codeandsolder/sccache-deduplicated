@@ -423,7 +423,8 @@ fn test_dist_rust_metadata_outputs() -> Result<()> {
     let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
     system.add_scheduler();
     let _worker = system.add_server(&[]);
-    let cfg = dist_test_sccache_client_cfg(root, system.scheduler_url());
+    let mut cfg = harness::sccache_client_cfg(root, false);
+    cfg.dist.scheduler_url = Some(system.scheduler_url());
     let cfg_path = root.join("sccache-cfg.json");
     write_json_cfg(root, "sccache-cfg.json", &cfg);
     let cached_cfg = root.join("sccache-cached-cfg");
