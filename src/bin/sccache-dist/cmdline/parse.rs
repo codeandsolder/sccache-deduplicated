@@ -107,7 +107,16 @@ fn get_clap_command() -> ClapCommand {
             .value_parser(clap::value_parser!(PathBuf))
     };
 
-    ClapCommand::new(env!("CARGO_PKG_NAME"))
+    let command = ClapCommand::new(env!("CARGO_PKG_NAME"));
+    #[cfg(target_os = "linux")]
+    let command = command.subcommand(
+        ClapCommand::new("native-attest-installation")
+            .about("Verify installed files against original package manifests for reuse by compiler clients")
+            .arg(flag_infer_long("root").value_parser(clap::value_parser!(PathBuf)).required(true))
+            .arg(flag_infer_long("manifest").value_parser(clap::value_parser!(PathBuf)).action(clap::ArgAction::Append).required(true))
+            .arg(flag_infer_long("output").value_parser(clap::value_parser!(PathBuf)).required(true)),
+    );
+    command
         .version(env!("CARGO_PKG_VERSION"))
         .subcommand_required(true)
         .subcommand(
@@ -156,6 +165,7 @@ fn get_clap_command() -> ClapCommand {
                 .arg(flag_infer_long("compression").value_parser(["xz", "gzip", "tar"]).required(true))
                 .arg(flag_infer_long("max-entries").value_parser(clap::value_parser!(usize)).default_value("100000"))
                 .arg(flag_infer_long("max-expanded-bytes").value_parser(clap::value_parser!(u64)).default_value("8589934592"))
+                .arg(flag_infer_long("manifest-output").value_parser(clap::value_parser!(PathBuf)))
         )
         .subcommand(
             ClapCommand::new("native-audit")
@@ -274,8 +284,25 @@ pub fn try_parse_from(
                 max_expanded_bytes: *matches
                     .get_one::<u64>("max-expanded-bytes")
                     .context("missing expansion limit")?,
+                manifest_output: matches.get_one::<PathBuf>("manifest-output").cloned(),
             }
         }
+        #[cfg(target_os = "linux")]
+        Some(("native-attest-installation", matches)) => Command::NativeAttestInstallation {
+            root: matches
+                .get_one::<PathBuf>("root")
+                .context("missing installation root")?
+                .clone(),
+            manifests: matches
+                .get_many::<PathBuf>("manifest")
+                .context("missing package manifests")?
+                .cloned()
+                .collect(),
+            output: matches
+                .get_one::<PathBuf>("output")
+                .context("missing catalog output")?
+                .clone(),
+        },
         Some(("native-audit", matches)) => Command::NativeAudit {
             index: matches
                 .get_one::<PathBuf>("index")

@@ -80,7 +80,7 @@ impl IpcStorage {
     #[cfg(feature = "dist-client")]
     pub(crate) fn dist_client(
         &self,
-        toolchains: Vec<crate::config::DistToolchainConfig>,
+        config: &crate::config::DistConfig,
     ) -> crate::server::DistClientContainer {
         use crate::server::{DistClientContainer, DistClientState};
         #[cfg(target_os = "linux")]
@@ -90,7 +90,8 @@ impl IpcStorage {
                     self.conn(),
                     self.handshake.transfer_chunk_bytes,
                     policy.clone(),
-                    toolchains,
+                    config.toolchains.clone(),
+                    &config.native_installation_catalogs,
                 ),
             );
         }
@@ -103,7 +104,7 @@ impl IpcStorage {
                         self.conn(),
                         self.handshake.transfer_chunk_bytes,
                         rewrite,
-                        toolchains,
+                        config.toolchains.clone(),
                     ),
                 )))
             },

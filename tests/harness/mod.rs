@@ -218,6 +218,7 @@ pub fn sccache_client_cfg(
             toolchain_cache_size: TC_CACHE_SIZE,
             rewrite_includes_only: false, // TODO
             native: None,
+            native_installation_catalogs: Vec::new(),
         },
         server_startup_timeout_ms: None,
         basedirs: vec![],

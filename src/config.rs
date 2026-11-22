@@ -909,6 +909,7 @@ pub struct DistConfig {
     pub toolchain_cache_size: u64,
     pub rewrite_includes_only: bool,
     pub native: Option<NativeClientConfig>,
+    pub native_installation_catalogs: Vec<PathBuf>,
 }
 
 impl Default for DistConfig {
@@ -921,6 +922,7 @@ impl Default for DistConfig {
             toolchain_cache_size: default_toolchain_cache_size(),
             rewrite_includes_only: false,
             native: None,
+            native_installation_catalogs: Vec::new(),
         }
     }
 }
@@ -3626,6 +3628,7 @@ key_prefix = "cosprefix"
                 toolchain_cache_size: 5_368_709_120,
                 rewrite_includes_only: false,
                 native: None,
+                native_installation_catalogs: Vec::new(),
             },
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],

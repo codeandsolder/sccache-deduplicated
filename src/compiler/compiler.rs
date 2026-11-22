@@ -1609,6 +1609,41 @@ fn is_known_c_compiler<P: AsRef<Path>>(p: P) -> bool {
     )
 }
 
+/// Installed compiler inputs needed during discovery. Native compilation
+/// shares the content memo with its subsequent executable-tree preparation.
+#[derive(Default)]
+pub struct CompilerDiscovery {
+    pub dist_archive: Option<PathBuf>,
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    pub native_digests: Option<Arc<crate::build_runtime::SourceDigestCache>>,
+}
+
+impl CompilerDiscovery {
+    pub async fn hash_toolchain_files(
+        &self,
+        files: &[PathBuf],
+        pool: &tokio::runtime::Handle,
+    ) -> Result<Vec<String>> {
+        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+        if let Some(cache) = &self.native_digests {
+            let tasks = files.iter().map(|path| {
+                let path = path.clone();
+                let cache = Arc::clone(cache);
+                pool.spawn_blocking(move || {
+                    let blob = cache.file_digest(&path)?;
+                    // Preserve the original sccache hex representation.
+                    Ok::<_, anyhow::Error>(crate::util::hex(&blob.id.0))
+                })
+            });
+            return futures::future::try_join_all(tasks)
+                .await?
+                .into_iter()
+                .collect();
+        }
+        crate::util::hash_all(files, pool).await
+    }
+}
+
 /// If `executable` is a known compiler, return `Some(Box<Compiler>)`.
 async fn detect_compiler<T>(
     creator: T,
@@ -1617,7 +1652,7 @@ async fn detect_compiler<T>(
     args: &[OsString],
     env: &[(OsString, OsString)],
     pool: &tokio::runtime::Handle,
-    dist_archive: Option<PathBuf>,
+    discovery: CompilerDiscovery,
 ) -> Result<(Box<dyn Compiler<T>>, Option<Box<dyn CompilerProxy<T>>>)>
 where
     T: CommandCreatorSync,
@@ -1697,7 +1732,7 @@ where
         rustc_executable.to_path_buf(),
         env,
         cwd.to_path_buf(),
-        dist_archive,
+        discovery,
         pool.clone(),
     )
     .await
@@ -1725,7 +1760,7 @@ async fn resolve_rust_compiler<T>(
     rustc_executable: PathBuf,
     env: &[(OsString, OsString)],
     cwd: PathBuf,
-    dist_archive: Option<PathBuf>,
+    discovery: CompilerDiscovery,
     pool: tokio::runtime::Handle,
 ) -> Result<(Box<dyn Compiler<T>>, Option<Box<dyn CompilerProxy<T>>>)>
 where
@@ -1816,7 +1851,7 @@ where
                 resolved_rustc,
                 env,
                 &rustc_verbose_version,
-                dist_archive,
+                discovery,
                 pool,
             )
             .await
@@ -2236,13 +2271,13 @@ pub async fn get_compiler_info<T>(
     args: &[OsString],
     env: &[(OsString, OsString)],
     pool: &tokio::runtime::Handle,
-    dist_archive: Option<PathBuf>,
+    discovery: CompilerDiscovery,
 ) -> Result<(Box<dyn Compiler<T>>, Option<Box<dyn CompilerProxy<T>>>)>
 where
     T: CommandCreatorSync,
 {
     let pool = pool.clone();
-    detect_compiler(creator, executable, cwd, args, env, &pool, dist_archive).await
+    detect_compiler(creator, executable, cwd, args, env, &pool, discovery).await
 }
 
 #[cfg(test)]
@@ -2260,6 +2295,33 @@ mod test {
     use std::time::Duration;
     use test_case::test_case;
     use tokio::runtime::Runtime;
+
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    #[test]
+    fn native_toolchain_digest_matches_legacy_encoding() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let library = dir.path().join("library.so");
+        fs::write(&library, b"library contents")?;
+        let alias = dir.path().join("libalias.so");
+        std::os::unix::fs::symlink(&library, &alias)?;
+        let files = vec![library.clone(), alias];
+        let runtime = single_threaded_runtime();
+        let pool = runtime.handle();
+        let discovery = CompilerDiscovery {
+            dist_archive: None,
+            native_digests: Some(Arc::new(crate::build_runtime::SourceDigestCache::default())),
+        };
+        for contents in [
+            b"library contents".as_slice(),
+            b"changed contents".as_slice(),
+        ] {
+            fs::write(&library, contents)?;
+            let original = runtime.block_on(crate::util::hash_all(&files, pool))?;
+            let native = runtime.block_on(discovery.hash_toolchain_files(&files, pool))?;
+            assert_eq!(native, original);
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_c_preprocessing_consistent() -> Result<()> {
@@ -2340,9 +2402,17 @@ mod test {
             Ok(MockChild::new(exit_status(0), "\n\ncompiler_id=gcc", "")),
         );
         next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &[], pool, None)
-            .wait()?
-            .0;
+        let c = detect_compiler(
+            creator,
+            &f.bins[0],
+            f.tempdir.path(),
+            &[],
+            &[],
+            pool,
+            CompilerDiscovery::default(),
+        )
+        .wait()?
+        .0;
         assert_eq!(CompilerKind::C(CCompilerKind::Gcc), c.kind());
         Ok(())
     }
@@ -2366,9 +2436,17 @@ mod test {
             Ok(MockChild::new(exit_status(0), "compiler_id=clang\n", "")),
         );
         next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &[], pool, None)
-            .wait()?
-            .0;
+        let c = detect_compiler(
+            creator,
+            &f.bins[0],
+            f.tempdir.path(),
+            &[],
+            &[],
+            pool,
+            CompilerDiscovery::default(),
+        )
+        .wait()?
+        .0;
         assert_eq!(CompilerKind::C(CCompilerKind::Clang), c.kind());
         Ok(())
     }
@@ -2405,7 +2483,16 @@ mod test {
                     Ok(MockChild::new(exit_status(0), output, ""))
                 });
             }
-            detect_compiler(creator, &compiler, f.tempdir.path(), &[], &[], pool, None).wait()?;
+            detect_compiler(
+                creator,
+                &compiler,
+                f.tempdir.path(),
+                &[],
+                &[],
+                pool,
+                CompilerDiscovery::default(),
+            )
+            .wait()?;
         }
         Ok(())
     }
@@ -2422,9 +2509,17 @@ mod test {
             Ok(MockChild::new(exit_status(0), "compiler_id=clang\n", "")),
         );
         next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = detect_compiler(creator, &clang, f.tempdir.path(), &[], &[], pool, None)
-            .wait()?
-            .0;
+        let c = detect_compiler(
+            creator,
+            &clang,
+            f.tempdir.path(),
+            &[],
+            &[],
+            pool,
+            CompilerDiscovery::default(),
+        )
+        .wait()?
+        .0;
         assert_eq!(CompilerKind::C(CCompilerKind::Clang), c.kind());
         Ok(())
     }
@@ -2444,9 +2539,17 @@ mod test {
             Ok(MockChild::new(exit_status(0), "compiler_id=clang\n", "")),
         );
         next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &[], pool, None)
-            .wait()?
-            .0;
+        let c = detect_compiler(
+            creator,
+            &f.bins[0],
+            f.tempdir.path(),
+            &[],
+            &[],
+            pool,
+            CompilerDiscovery::default(),
+        )
+        .wait()?
+        .0;
         assert_eq!(CompilerKind::C(CCompilerKind::Clang), c.kind());
         Ok(())
     }
@@ -2485,9 +2588,17 @@ mod test {
             &creator,
             Ok(MockChild::new(exit_status(0), String::new(), stderr)),
         );
-        let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &[], pool, None)
-            .wait()?
-            .0;
+        let c = detect_compiler(
+            creator,
+            &f.bins[0],
+            f.tempdir.path(),
+            &[],
+            &[],
+            pool,
+            CompilerDiscovery::default(),
+        )
+        .wait()?
+        .0;
         assert_eq!(CompilerKind::C(CCompilerKind::Msvc), c.kind());
         Ok(())
     }
@@ -2503,9 +2614,17 @@ mod test {
             &creator,
             Ok(MockChild::new(exit_status(0), "compiler_id=nvcc\n", "")),
         );
-        let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &[], pool, None)
-            .wait()?
-            .0;
+        let c = detect_compiler(
+            creator,
+            &f.bins[0],
+            f.tempdir.path(),
+            &[],
+            &[],
+            pool,
+            CompilerDiscovery::default(),
+        )
+        .wait()?
+        .0;
         assert_eq!(CompilerKind::C(CCompilerKind::Nvcc), c.kind());
         Ok(())
     }
@@ -2521,9 +2640,17 @@ mod test {
             &creator,
             Ok(MockChild::new(exit_status(0), "compiler_id=nvhpc\n", "")),
         );
-        let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &[], pool, None)
-            .wait()?
-            .0;
+        let c = detect_compiler(
+            creator,
+            &f.bins[0],
+            f.tempdir.path(),
+            &[],
+            &[],
+            pool,
+            CompilerDiscovery::default(),
+        )
+        .wait()?
+        .0;
         assert_eq!(CompilerKind::C(CCompilerKind::Nvhpc), c.kind());
         Ok(())
     }
@@ -2539,9 +2666,17 @@ mod test {
         let runtime = single_threaded_runtime();
         let pool = runtime.handle();
         populate_rustc_command_mock(&creator, &f)?;
-        let c = detect_compiler(creator, &rustc, f.tempdir.path(), &[], &[], pool, None)
-            .wait()?
-            .0;
+        let c = detect_compiler(
+            creator,
+            &rustc,
+            f.tempdir.path(),
+            &[],
+            &[],
+            pool,
+            CompilerDiscovery::default(),
+        )
+        .wait()?
+        .0;
         assert_eq!(CompilerKind::Rust, c.kind());
         Ok(())
     }
@@ -2614,7 +2749,7 @@ LLVM version: 6.0",
             &[OsString::from("rustc.exe")],
             &[(OsString::from("CARGO"), OsString::from("CARGO"))],
             pool,
-            None,
+            CompilerDiscovery::default(),
         )
         .wait()?
         .0;
@@ -2632,7 +2767,7 @@ LLVM version: 6.0",
                 &[OsString::from("not-rustc")],
                 &[(OsString::from("CARGO"), OsString::from("CARGO"))],
                 pool,
-                None,
+                CompilerDiscovery::default(),
             )
             .wait()
             .is_err()
@@ -2649,7 +2784,7 @@ LLVM version: 6.0",
                 &[OsString::from("rustc")],
                 &[],
                 pool,
-                None,
+                CompilerDiscovery::default(),
             )
             .wait()
             .is_ok()
@@ -2668,9 +2803,17 @@ LLVM version: 6.0",
             &creator,
             Ok(MockChild::new(exit_status(0), "\ncompiler_id=diab\n", "")),
         );
-        let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &[], pool, None)
-            .wait()?
-            .0;
+        let c = detect_compiler(
+            creator,
+            &f.bins[0],
+            f.tempdir.path(),
+            &[],
+            &[],
+            pool,
+            CompilerDiscovery::default(),
+        )
+        .wait()?
+        .0;
         assert_eq!(CompilerKind::C(CCompilerKind::Diab), c.kind());
         Ok(())
     }
@@ -2694,7 +2837,7 @@ LLVM version: 6.0",
                 &[],
                 &[],
                 pool,
-                None
+                CompilerDiscovery::default()
             )
             .wait()
             .is_err()
@@ -2718,7 +2861,7 @@ LLVM version: 6.0",
                 &[],
                 &[],
                 pool,
-                None
+                CompilerDiscovery::default()
             )
             .wait()
             .is_err()
@@ -2752,7 +2895,7 @@ LLVM version: 6.0",
                     &[],
                     &[],
                     pool,
-                    None,
+                    CompilerDiscovery::default(),
                 )
                 .wait()?
                 .0;
@@ -2812,7 +2955,7 @@ LLVM version: 6.0",
                 &[],
                 &[],
                 pool,
-                None,
+                CompilerDiscovery::default(),
             )
             .wait()?
             .0;
@@ -2891,9 +3034,17 @@ LLVM version: 6.0",
             )),
         );
         next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let compiler = detect_compiler(creator.clone(), &clang, cwd, &[], &[], pool, None)
-            .wait()?
-            .0;
+        let compiler = detect_compiler(
+            creator.clone(),
+            &clang,
+            cwd,
+            &[],
+            &[],
+            pool,
+            CompilerDiscovery::default(),
+        )
+        .wait()?
+        .0;
         let arguments = ovec!["-c", "foo.S", "-o", "foo.o"];
 
         let key_for = |payload: &[u8]| -> Result<String> {
@@ -2964,7 +3115,7 @@ LLVM version: 6.0",
                     &[],
                     &[],
                     pool,
-                    None,
+                    CompilerDiscovery::default(),
                 )
                 .wait()?
                 .0;
@@ -3036,7 +3187,7 @@ LLVM version: 6.0",
                     &[],
                     &[],
                     pool,
-                    None,
+                    CompilerDiscovery::default(),
                 )
                 .wait()?
                 .0;
@@ -3099,7 +3250,7 @@ LLVM version: 6.0",
                     &[],
                     &[],
                     pool,
-                    None,
+                    CompilerDiscovery::default(),
                 )
                 .wait()?
                 .0;
@@ -3147,9 +3298,17 @@ LLVM version: 6.0",
             Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
         );
         next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
-        let c = get_compiler_info(creator, &gcc, f.tempdir.path(), &[], &[], pool, None)
-            .wait()?
-            .0;
+        let c = get_compiler_info(
+            creator,
+            &gcc,
+            f.tempdir.path(),
+            &[],
+            &[],
+            pool,
+            CompilerDiscovery::default(),
+        )
+        .wait()?
+        .0;
         // digest of an empty file.
         assert_eq!(CompilerKind::C(CCompilerKind::Gcc), c.kind());
         Ok(())
@@ -3193,7 +3352,7 @@ LLVM version: 6.0",
             &[],
             &[],
             &pool,
-            None,
+            CompilerDiscovery::default(),
         )
         .wait()?
         .0;
@@ -3323,7 +3482,7 @@ LLVM version: 6.0",
             &[],
             &[],
             &pool,
-            None,
+            CompilerDiscovery::default(),
         )
         .wait()?
         .0;
@@ -3447,7 +3606,7 @@ LLVM version: 6.0",
             &[],
             &[],
             &pool,
-            None,
+            CompilerDiscovery::default(),
         )
         .wait()?
         .0;
@@ -3539,7 +3698,7 @@ LLVM version: 6.0",
             &[],
             &[],
             &pool,
-            None,
+            CompilerDiscovery::default(),
         )
         .wait()?
         .0;
@@ -3627,7 +3786,7 @@ LLVM version: 6.0",
             &[],
             &[],
             &pool,
-            None,
+            CompilerDiscovery::default(),
         )
         .wait()?
         .0;
@@ -3762,7 +3921,7 @@ LLVM version: 6.0",
             &[],
             &[],
             &pool,
-            None,
+            CompilerDiscovery::default(),
         )
         .wait()?
         .0;
@@ -3852,7 +4011,7 @@ LLVM version: 6.0",
             &[],
             &[],
             &pool,
-            None,
+            CompilerDiscovery::default(),
         )
         .wait()?
         .0;

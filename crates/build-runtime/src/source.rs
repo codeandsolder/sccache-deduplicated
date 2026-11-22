@@ -1,6 +1,7 @@
 //! Metadata and mutation detection for regular source files and snapshots.
 use anyhow::{Result, ensure};
 use rustix::fs::Stat;
+use serde::{Deserialize, Serialize};
 
 use crate::{TreeMetadata, TreeTimestamp};
 
@@ -18,16 +19,30 @@ pub fn metadata(stat: &Stat) -> Result<TreeMetadata> {
     })
 }
 
-pub const fn same_version(before: &Stat, after: &Stat) -> bool {
-    before.st_dev == after.st_dev
-        && before.st_ino == after.st_ino
-        && before.st_mode == after.st_mode
-        && before.st_nlink == after.st_nlink
-        && before.st_size == after.st_size
-        && before.st_mtime == after.st_mtime
-        && before.st_mtime_nsec == after.st_mtime_nsec
-        && before.st_ctime == after.st_ctime
-        && before.st_ctime_nsec == after.st_ctime_nsec
+// Linux stat layouts differ by architecture. Normalize all fields without
+// narrowing, including the metadata needed to detect replacement and mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileVersion([i128; 10]);
+
+impl From<&Stat> for FileVersion {
+    fn from(stat: &Stat) -> Self {
+        Self([
+            stat.st_dev.into(),
+            stat.st_ino.into(),
+            stat.st_mode.into(),
+            stat.st_nlink.into(),
+            stat.st_size.into(),
+            stat.st_mtime.into(),
+            stat.st_mtime_nsec.into(),
+            stat.st_ctime.into(),
+            stat.st_ctime_nsec.into(),
+            stat.st_uid.into(),
+        ])
+    }
+}
+
+pub fn same_version(before: &Stat, after: &Stat) -> bool {
+    FileVersion::from(before) == FileVersion::from(after)
 }
 
 pub fn unchanged(before: &Stat, after: &Stat) -> Result<()> {

@@ -85,7 +85,7 @@ impl NativeCacheClient {
             metadata_limit > 0 && metadata_limit < u64::MAX && !timeout.is_zero(),
             "invalid native client bounds"
         );
-        let http = reqwest::blocking::ClientBuilder::new()
+        let http = crate::util::new_reqwest_blocking_builder()?
             .timeout(timeout)
             .connect_timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())

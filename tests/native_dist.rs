@@ -15,8 +15,9 @@ use std::{
 use anyhow::{Result, ensure};
 use sccache::{
     build_runtime::{
-        BuildPath, CommandSpec, ComponentAudit, ContentId, ExecutionSpec, MappedMetadata,
-        MappedTree, NativeStore, OutputSpec, SpacePolicy, TreeLayer, TreePath, TreeRecipe,
+        BuildPath, CommandSpec, ComponentAudit, ContentId, ExecutionSpec, InstallationManifest,
+        MappedMetadata, MappedTree, NativeStore, OutputSpec, SpacePolicy, TreeLayer, TreePath,
+        TreeRecipe,
         wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply},
     },
     config::{Config, DistAuth, HTTPUrl, NativeClientConfig, scheduler, server},
@@ -585,6 +586,90 @@ done
 "#
 }
 
+/// Exercise the real catalog command and configured namespace caller using
+/// package-content metadata for the installed compiler executable. The
+/// upstream installer projection has independent archive tests.
+fn compiler_catalog_fixture(root: &Path, rustc: &Path) -> Result<PathBuf> {
+    let sysroot = rustc
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| anyhow::anyhow!("missing compiler sysroot"))?;
+    let directories = sccache::build_runtime::TreeMetadata {
+        mode: 0o755,
+        modified: sccache::build_runtime::TreeTimestamp {
+            seconds: 0,
+            nanoseconds: 0,
+        },
+    };
+    let mut mapping = MappedTree::new(directories);
+    mapping.add_file(
+        TreePath::new(b"bin/rustc".to_vec())?,
+        rustc.canonicalize()?,
+        MappedMetadata::Normalize(directories.modified),
+    )?;
+    let prepared = mapping.prepare()?;
+    let manifest = InstallationManifest {
+        source_sha256: [0; 32],
+        package: prepared.id(),
+        components: BTreeMap::from([("test-compiler".into(), prepared.manifest().clone())]),
+    };
+    let path = root.join("fixture-package.manifest");
+    manifest.write(File::create(&path)?)?;
+    let catalog = root.join("fixture-installation.catalog");
+    let output = Command::new(env!("CARGO_BIN_EXE_sccache-dist"))
+        .args(["native-attest-installation", "--root"])
+        .arg(sysroot)
+        .arg("--manifest")
+        .arg(path)
+        .arg("--output")
+        .arg(&catalog)
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "catalog verification failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["verified_files"], 1);
+    assert_eq!(report["differing_files"], 0);
+    Ok(catalog)
+}
+
+fn namespace_compilers(
+    service: &LocalService,
+    private: &Path,
+    visible: &Path,
+    rustc: &Path,
+) -> Result<std::process::Output> {
+    Ok(service
+        .command("/usr/bin/bwrap")
+        .args([
+            "--unshare-net",
+            "--bind",
+            "/",
+            "/",
+            "--dev-bind",
+            "/dev",
+            "/dev",
+            "--bind",
+        ])
+        .arg(private)
+        .arg(visible)
+        .arg("--chdir")
+        .arg(visible)
+        .args([
+            "--",
+            "/bin/sh",
+            "-c",
+            compiler_script(),
+            "namespace-test",
+            env!("CARGO_BIN_EXE_sccache"),
+            "/usr/bin/gcc",
+        ])
+        .arg(rustc)
+        .output()?)
+}
+
 fn write_compiler_sources(root: &Path) -> Result<()> {
     fs::create_dir(root)?;
     fs::write(
@@ -711,33 +796,7 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
     )?;
     write_compiler_sources(&private)?;
     let start = Instant::now();
-    let output = service
-        .command("/usr/bin/bwrap")
-        .args([
-            "--unshare-net",
-            "--bind",
-            "/",
-            "/",
-            "--dev-bind",
-            "/dev",
-            "/dev",
-            "--bind",
-        ])
-        .arg(&private)
-        .arg(&visible)
-        .arg("--chdir")
-        .arg(&visible)
-        .args([
-            "--",
-            "/bin/sh",
-            "-c",
-            compiler_script(),
-            "namespace-test",
-            env!("CARGO_BIN_EXE_sccache"),
-            "/usr/bin/gcc",
-        ])
-        .arg(&rustc)
-        .output()?;
+    let output = namespace_compilers(&service, &private, &visible, &rustc)?;
     eprintln!(
         "namespace compiler elapsed {:?}:\n{}",
         start.elapsed(),
@@ -757,6 +816,34 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
     assert!(!visible.join("build").exists());
     assert!(!root.join("unexpected-archive-cache").exists());
     assert!(!root.join("unexpected-toolchain-cache").exists());
+
+    // Changing only whether the caller can reuse a verified digest must
+    // preserve the exact action key, including in a fresh networkless CLI.
+    let catalog = compiler_catalog_fixture(&root, &rustc)?;
+    fs::write(
+        &service.caller_config,
+        format!(
+            "client_side_mode = true\n[dist]\nnative_installation_catalogs = [{}]\n",
+            serde_json::to_string(&catalog)?
+        ),
+    )?;
+    let output = namespace_compilers(&service, &private, &visible, &rustc)?;
+    let log = String::from_utf8_lossy(&output.stderr);
+    ensure!(
+        output.status.success(),
+        "catalog-backed namespace compilation failed: {log}"
+    );
+    assert!(
+        log.contains("verified installation memo: 1 files"),
+        "catalog not used: {log}"
+    );
+    assert_eq!(
+        fs::read(private.join("build/libprobe.rlib"))?,
+        fs::read(private.join("rust-reference.rlib"))?
+    );
+    let stats = service.stats()?;
+    assert_eq!(stats.cache_hits.all(), 8);
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 4);
     run_environment_audit(&service, &direct, &rustc, &direct_config)?;
     let stats = service.stats()?;
     assert_eq!(stats.dist_compiles.values().sum::<usize>(), 7);

@@ -54,7 +54,20 @@ pub struct NativeCompilerClient {
     endpoint: Endpoint,
     policy: NativeNamespacePolicy,
     toolchains: Vec<DistToolchainConfig>,
-    toolchain_digests: SourceDigestCache,
+    toolchain_digests: Arc<SourceDigestCache>,
+}
+
+fn installed_digest_cache(catalogs: &[PathBuf]) -> Arc<SourceDigestCache> {
+    let mut cache = SourceDigestCache::default();
+    for path in catalogs {
+        if let Err(error) = cache.load_catalog(path) {
+            warn!(
+                "Native installation catalog {} unavailable: {error:#}",
+                path.display()
+            );
+        }
+    }
+    Arc::new(cache)
 }
 
 impl NativeCompilerClient {
@@ -63,6 +76,7 @@ impl NativeCompilerClient {
         scheduler: Option<HTTPUrl>,
         auth: DistAuth,
         toolchains: Vec<DistToolchainConfig>,
+        catalogs: &[PathBuf],
     ) -> Self {
         let policy = NativeNamespacePolicy {
             platform: ContentId::of(config.platform_contract.as_bytes()),
@@ -79,7 +93,7 @@ impl NativeCompilerClient {
             })),
             policy,
             toolchains,
-            toolchain_digests: SourceDigestCache::default(),
+            toolchain_digests: installed_digest_cache(catalogs),
         }
     }
 
@@ -88,6 +102,7 @@ impl NativeCompilerClient {
         chunk_bytes: usize,
         policy: NativeNamespacePolicy,
         toolchains: Vec<DistToolchainConfig>,
+        catalogs: &[PathBuf],
     ) -> Self {
         Self {
             endpoint: Endpoint::Namespace {
@@ -96,8 +111,12 @@ impl NativeCompilerClient {
             },
             policy,
             toolchains,
-            toolchain_digests: SourceDigestCache::default(),
+            toolchain_digests: installed_digest_cache(catalogs),
         }
+    }
+
+    pub fn toolchain_digests(&self) -> Arc<SourceDigestCache> {
+        Arc::clone(&self.toolchain_digests)
     }
 
     pub const fn namespace_policy(&self) -> &NativeNamespacePolicy {
@@ -130,7 +149,7 @@ impl NativeCompilerClient {
                 let result = async {
                     let scheduler = scheduler.as_ref().context("scheduler URL unavailable")?;
                     let url = dist::http::urls::scheduler_status(&scheduler.to_url())?;
-                    let client = reqwest::Client::builder()
+                    let client = crate::util::new_reqwest_client_builder()?
                         .timeout(Duration::from_secs(config.request_timeout_secs))
                         .build()?;
                     dist::http::common::bincode_req_fut(client.get(url)).await
@@ -258,9 +277,20 @@ impl CompilerPlan {
             destinations.insert(output.key, local);
         }
         let (inputs, toolchain) = packagers;
+        let before = toolchain_digests.catalog_hits();
+        let start = Instant::now();
         let toolchain = toolchain
             .native_mapping()?
             .prepare_with_cache(toolchain_digests)?;
+        let after = toolchain_digests.catalog_hits();
+        debug!(
+            "native toolchain preparation took {:.3}s; verified installation memo: {} files, {} bytes (process totals: {} files, {} bytes)",
+            start.elapsed().as_secs_f64(),
+            after.0.saturating_sub(before.0),
+            after.1.saturating_sub(before.1),
+            after.0,
+            after.1
+        );
         let inputs = inputs.native_mapping()?.prepare()?;
         let layout = layout.into_native_mapping()?.prepare()?;
         let directories = pkg::native_directory_metadata()?;
@@ -440,7 +470,7 @@ mod tests {
             &args,
             &environment,
             pool,
-            None,
+            crate::compiler::CompilerDiscovery::default(),
         ))?;
         let CompilerArguments::Ok(mut hasher) = compiler.parse_arguments(&args, &cwd, &environment)
         else {

@@ -7,6 +7,8 @@
 #![deny(rust_2018_idioms)]
 
 mod identity;
+mod installation;
+pub use installation::InstallationManifest;
 mod recipe;
 mod spec;
 pub use recipe::{TreeLayer, TreeRecipe};
@@ -50,4 +52,7 @@ mod mapped;
 #[cfg(all(target_os = "linux", feature = "mapping"))]
 mod source;
 #[cfg(all(target_os = "linux", feature = "mapping"))]
-pub use mapped::{MappedMetadata, MappedTree, PreparedTree, SourceDigestCache};
+pub use mapped::{
+    InstallationCatalog, InstallationReport, MappedMetadata, MappedTree, PreparedTree,
+    SourceDigestCache,
+};

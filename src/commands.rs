@@ -850,7 +850,7 @@ where
     let (tx, _rx) = futures::channel::mpsc::channel(1);
     let (_, info) = server::WaitUntilZero::new();
     #[cfg(feature = "dist-client")]
-    let dist_client = storage.dist_client(config.dist.toolchains.clone());
+    let dist_client = storage.dist_client(&config.dist);
     #[cfg(not(feature = "dist-client"))]
     let dist_client = server::DistClientContainer::new_disabled();
     let service = server::SccacheService::<C>::new(
@@ -1028,10 +1028,18 @@ fn package_toolchain(executable: PathBuf, out: PathBuf) -> Result<()> {
     let cwd = env::current_dir().context("failed to determine current directory")?;
     let pool = runtime.handle().clone();
     runtime.block_on(async move {
-        compiler::get_compiler_info(creator, &executable, &cwd, &args, &env, &pool, None)
-            .await
-            .map(|compiler| compiler.0.get_toolchain_packager())
-            .and_then(|packager| packager.write_pkg(out_file))
+        compiler::get_compiler_info(
+            creator,
+            &executable,
+            &cwd,
+            &args,
+            &env,
+            &pool,
+            compiler::CompilerDiscovery::default(),
+        )
+        .await
+        .map(|compiler| compiler.0.get_toolchain_packager())
+        .and_then(|packager| packager.write_pkg(out_file))
     })
 }
 

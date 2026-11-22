@@ -174,6 +174,23 @@ fn check_jwt_server_token(
         .ok()
 }
 
+/// Install metadata as one atomic file. Readers always see either the
+/// complete old or complete new document, never a partial catalog.
+fn write_installation_metadata(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> Result<()>,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    write(temp.as_file_mut())?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)?;
+    Ok(())
+}
+
 fn run(command: Command) -> Result<i32> {
     match command {
         Command::NativeImportRust {
@@ -182,6 +199,7 @@ fn run(command: Command) -> Result<i32> {
             source,
             max_entries,
             max_expanded_bytes,
+            manifest_output,
         } => {
             use sccache::build_runtime::{NativeStore, PackagePolicy, TreeMetadata, TreeTimestamp};
             let modified = TreeTimestamp {
@@ -209,6 +227,23 @@ fn run(command: Command) -> Result<i32> {
             };
             let before = store.stats()?;
             let components = store.publish_rust_installer(package, policy.directory)?;
+            if let Some(path) = manifest_output {
+                let component_manifests = components
+                    .iter()
+                    .map(|(name, &id)| {
+                        let tree = store
+                            .lookup_tree(id)?
+                            .context("projected component missing")?;
+                        Ok((name.clone(), tree.manifest().clone()))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?;
+                let manifest = sccache::build_runtime::InstallationManifest {
+                    source_sha256: source.sha256,
+                    package,
+                    components: component_manifests,
+                };
+                write_installation_metadata(&path, |file| manifest.write(file))?;
+            }
             let after = store.stats()?;
             anyhow::ensure!(
                 before.logical_bytes == after.logical_bytes && before.blobs == after.blobs,
@@ -225,6 +260,22 @@ fn run(command: Command) -> Result<i32> {
                     "blobs": after.blobs,
                 }))?
             );
+            Ok(0)
+        }
+        #[cfg(target_os = "linux")]
+        Command::NativeAttestInstallation {
+            root,
+            manifests,
+            output,
+        } => {
+            use sccache::build_runtime::{InstallationCatalog, InstallationManifest};
+            let manifests = manifests
+                .iter()
+                .map(|path| InstallationManifest::read(std::fs::File::open(path)?))
+                .collect::<Result<Vec<_>>>()?;
+            let (catalog, report) = InstallationCatalog::attest(&root, &manifests)?;
+            write_installation_metadata(&output, |file| catalog.write(file))?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(0)
         }
         Command::NativeAudit {

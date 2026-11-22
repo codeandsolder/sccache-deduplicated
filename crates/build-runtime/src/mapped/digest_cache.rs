@@ -2,17 +2,23 @@
 //! The inventory is always rediscovered. No file contents are cached here.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fs::File,
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use anyhow::{Context, Result};
 use rustix::fs::{Stat, fstat};
 
-use super::hash_open_source;
+use super::{
+    hash_open_source,
+    installation::{self, AttestedFile},
+};
 use crate::{
     BlobRef,
     source::{same_version, unchanged},
@@ -33,6 +39,9 @@ struct Entries {
 pub struct SourceDigestCache {
     capacity: NonZeroUsize,
     entries: Mutex<Entries>,
+    attested: BTreeMap<PathBuf, AttestedFile>,
+    catalog_hits: AtomicU64,
+    catalog_bytes: AtomicU64,
 }
 
 impl SourceDigestCache {
@@ -41,7 +50,54 @@ impl SourceDigestCache {
         Self {
             capacity,
             entries: Mutex::new(Entries::default()),
+            attested: BTreeMap::new(),
+            catalog_hits: AtomicU64::new(0),
+            catalog_bytes: AtomicU64::new(0),
         }
+    }
+
+    /// Load trusted local installation metadata before sharing the memo.
+    /// # Errors
+    /// Returns an error for stale boot identity, conflicting records or I/O failure.
+    pub fn load_catalog(&mut self, path: &Path) -> Result<()> {
+        let incoming = installation::InstallationCatalog::load(path)?;
+        for (path, record) in &incoming {
+            anyhow::ensure!(
+                self.attested
+                    .get(path)
+                    .is_none_or(|previous| previous == record),
+                "conflicting installed file attestations"
+            );
+        }
+        let additional = incoming
+            .keys()
+            .filter(|path| !self.attested.contains_key(*path))
+            .count();
+        anyhow::ensure!(
+            self.attested.len().saturating_add(additional) <= self.capacity.get(),
+            "installation catalogs exceed digest memo capacity"
+        );
+        self.attested.extend(incoming);
+        Ok(())
+    }
+
+    /// Count file hashes and bytes avoided by verified installation metadata.
+    #[must_use = "reports reused verified package file digests"]
+    pub fn catalog_hits(&self) -> (u64, u64) {
+        (
+            self.catalog_hits.load(Ordering::Relaxed),
+            self.catalog_bytes.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Hash an installed regular file through the same memo used by mapped
+    /// tree capture. Resolve source links before checking the file version.
+    /// # Errors
+    /// Returns an error for invalid or unstable file contents.
+    pub fn file_digest(&self, path: &Path) -> Result<BlobRef> {
+        let path = path.canonicalize()?;
+        let (file, version) = super::open_source(&path)?;
+        self.digest(&path, &file, &version)
     }
 
     fn slot(&self, path: &Path) -> Result<Slot> {
@@ -67,6 +123,11 @@ impl SourceDigestCache {
     }
 
     pub(super) fn digest(&self, path: &Path, file: &File, version: &Stat) -> Result<BlobRef> {
+        if let Some(blob) = installation::lookup(&self.attested, path, file, version)? {
+            self.catalog_hits.fetch_add(1, Ordering::Relaxed);
+            self.catalog_bytes.fetch_add(blob.size, Ordering::Relaxed);
+            return Ok(blob);
+        }
         let slot = self.slot(path)?;
         // The path-wide lock coalesces simultaneous preparations without
         // serializing hashing of unrelated files.

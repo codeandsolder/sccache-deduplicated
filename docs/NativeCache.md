@@ -200,8 +200,8 @@ hashes selected files without staging, normalizes toolchain modes
 and timestamps, and rebases both symlink names and targets when a logical
 sysroot mapping is applied. No archive or intermediate materialized root is
 created. Mappings also support generated file bytes and explicit directories.
-The client shares a bounded, process-local digest memo for installed
-toolchain files. Inventory discovery still runs on each preparation.
+Rust compiler discovery and mapped toolchain preparation share a bounded,
+process-local digest memo for installed toolchain files. Inventory discovery still runs on each preparation.
 A matching device, inode, mode, link count, size, mtime and ctime allow
 a toolchain digest to be reused without reading file contents. Concurrent
 preparations of the same path share a slot. The memo retains no bytes,
@@ -282,3 +282,45 @@ requires exclusive access to the store, so provision it before starting its
 owner. Preseeded content is also available to ordinary mapped-tree upload
 negotiation. A release name alone does not attest an installed local sysroot;
 regular compiler discovery still hashes its observed installed contents.
+
+
+### Verified installation catalogs
+
+Export portable component metadata while importing a verified archive:
+
+```sh
+sccache-dist native-import-rust --store /path/to/scheduler-store \
+  --archive rustc-nightly-x86_64-unknown-linux-gnu.tar.xz \
+  --sha256 CHECKSUM_FROM_RELEASE_MANIFEST --size COMPRESSED_BYTE_LENGTH \
+  --compression xz --manifest-output rustc.manifest
+```
+
+On the installation host, verify the manifests against its actual local
+sysroot, including all needed installed components:
+
+```sh
+sccache-dist native-attest-installation --root /path/to/installed/sysroot \
+  --manifest rustc.manifest --manifest rust-std.manifest \
+  --manifest rustfmt.manifest --output /path/to/installation.catalog
+```
+
+Configure the local client (or the direct-mode daemon) with the catalog:
+
+```toml
+[dist]
+native_installation_catalogs = ["/path/to/installation.catalog"]
+```
+
+The namespace caller reads its own catalog, not a daemon-side substitute.
+Only files whose bytes verified against the expected BLAKE3 digest and whose
+current stat version matches the attestation reuse that digest. The catalog
+is scoped to the current Linux boot; reattest after reboot or installation
+changes. Missing, stale, changed and uncovered files use ordinary content
+hashing. Treat the catalog as trusted local installation metadata and store
+it with the same ownership and write controls as the installation. The
+command publishes it atomically. The compiler still discovers exact
+libraries, executable paths, symlinks, target files and host dependencies.
+No action identity or sandbox tree identity changes solely because a catalog
+is present. Preseeding the scheduler with original package bytes lets the
+same content-addressed tree negotiation avoid uploads of already-known
+files. The catalog alone does not place a package in the scheduler.

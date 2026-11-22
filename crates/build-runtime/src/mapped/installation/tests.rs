@@ -1,0 +1,90 @@
+use super::*;
+use crate::{
+    ContentId, MappedMetadata, MappedTree, SourceDigestCache, TreeEntry, TreeId, TreeManifest,
+    TreeMetadata, TreePath, TreeTimestamp,
+};
+use std::io::{Seek, SeekFrom};
+
+#[test]
+fn verified_installation_reuses_digest_without_reading_and_rejects_mutation() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("install");
+    fs::create_dir(&root)?;
+    let tool = root.join("tool");
+    fs::write(&tool, b"original")?;
+    fs::write(root.join("modified"), b"modified")?;
+    let metadata = TreeMetadata {
+        mode: 0o755,
+        modified: TreeTimestamp {
+            seconds: 0,
+            nanoseconds: 0,
+        },
+    };
+    let blob = BlobRef {
+        id: ContentId::of(b"original"),
+        size: 8,
+    };
+    let manifest = InstallationManifest {
+        source_sha256: [1; 32],
+        package: TreeId([2; 32]),
+        components: BTreeMap::from([(
+            "test".into(),
+            TreeManifest {
+                root: metadata,
+                entries: ["tool", "modified", "missing"]
+                    .into_iter()
+                    .map(|name| {
+                        Ok((
+                            TreePath::new(name.as_bytes().to_vec())?,
+                            TreeEntry::File { blob, metadata },
+                        ))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?,
+            },
+        )]),
+    };
+    let mut encoded = Vec::new();
+    manifest.write(&mut encoded)?;
+    let decoded = InstallationManifest::read(encoded.as_slice())?;
+    let (catalog, report) = InstallationCatalog::attest(&root, &[decoded])?;
+    assert_eq!(report.verified_files, 1);
+    assert_eq!(report.verified_bytes, 8);
+    assert_eq!(report.differing_files, 1);
+    assert_eq!(report.missing_files, 1);
+    let catalog_path = temp.path().join("catalog");
+    catalog.write(File::create(&catalog_path)?)?;
+    let mut cache = SourceDigestCache::default();
+    cache.load_catalog(&catalog_path)?;
+    let capture = |cache: Option<&SourceDigestCache>| -> Result<TreeId> {
+        let mut mapping = MappedTree::new(metadata);
+        mapping.add_file(
+            TreePath::new(b"tool".to_vec())?,
+            tool.clone(),
+            MappedMetadata::Normalize(metadata.modified),
+        )?;
+        Ok(match cache {
+            Some(cache) => mapping.prepare_with_cache(cache)?,
+            None => mapping.prepare()?,
+        }
+        .id())
+    };
+    let original = capture(None)?;
+    assert_eq!(capture(Some(&cache))?, original);
+    assert_eq!(cache.catalog_hits(), (1, 8));
+    let (mut file, stat) = open_source(&tool)?;
+    assert_eq!(cache.digest(&tool, &file, &stat)?, blob);
+    assert_eq!(file.stream_position()?, 0);
+    file.seek(SeekFrom::Start(0))?;
+    fs::write(&tool, b"changed!")?;
+    assert_ne!(capture(Some(&cache))?, original);
+    assert_eq!(cache.catalog_hits(), (2, 16));
+    let mut stale = catalog;
+    stale.boot = b"other boot".to_vec();
+    stale.write(File::create(&catalog_path)?)?;
+    assert!(
+        SourceDigestCache::default()
+            .load_catalog(&catalog_path)
+            .is_err()
+    );
+    Ok(())
+}

@@ -24,8 +24,8 @@ use crate::compiler::args::{
 use crate::compiler::canonical_paths::CanonicalRustPaths;
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, CompileTransport, Compiler,
-    CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, GenerateHashKeyContext,
-    HashResult, Language, SingleCompileCommand, c::ArtifactDescriptor,
+    CompilerArguments, CompilerDiscovery, CompilerHasher, CompilerKind, CompilerProxy,
+    GenerateHashKeyContext, HashResult, Language, SingleCompileCommand, c::ArtifactDescriptor,
 };
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
@@ -1381,7 +1381,7 @@ impl Rust {
         executable: PathBuf,
         env_vars: &[(OsString, OsString)],
         rustc_verbose_version: &str,
-        dist_archive: Option<PathBuf>,
+        discovery: CompilerDiscovery,
         pool: tokio::runtime::Handle,
     ) -> Result<Self>
     where
@@ -1402,6 +1402,7 @@ impl Rust {
             .arg("--print=sysroot")
             .env_clear()
             .envs(env_vars.to_vec());
+        let dist_archive = discovery.dist_archive.clone();
         let hashed_archive = dist_archive.clone();
         let sysroot_and_libs = async move {
             let output = run_input_output(cmd, None).await?;
@@ -1464,28 +1465,34 @@ impl Rust {
                     None
                 }
             };
-            hash_all(&libs, &pool).await.map(move |digests| Self {
-                executable,
-                host,
-                version: rustc_verbose_version.to_string(),
-                sysroot,
-                compiler_shlibs_digests: digests,
-                dist_archive,
-                rlib_dep_reader,
-            })
+            discovery
+                .hash_toolchain_files(&libs, &pool)
+                .await
+                .map(move |digests| Self {
+                    executable,
+                    host,
+                    version: rustc_verbose_version.to_string(),
+                    sysroot,
+                    compiler_shlibs_digests: digests,
+                    dist_archive,
+                    rlib_dep_reader,
+                })
         }
 
         #[cfg(not(feature = "dist-client"))]
         {
             let (sysroot, libs) = sysroot_and_libs.await?;
-            hash_all(&libs, &pool).await.map(move |digests| Rust {
-                executable,
-                host,
-                version: rustc_verbose_version.to_string(),
-                sysroot,
-                compiler_shlibs_digests: digests,
-                dist_archive,
-            })
+            discovery
+                .hash_toolchain_files(&libs, &pool)
+                .await
+                .map(move |digests| Rust {
+                    executable,
+                    host,
+                    version: rustc_verbose_version.to_string(),
+                    sysroot,
+                    compiler_shlibs_digests: digests,
+                    dist_archive,
+                })
         }
     }
 }
@@ -6909,7 +6916,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         let env_a = policy_env(&a);
         let env_b = policy_env(&b);
         let key = |fixture: &TestFixture, env: &[(OsString, OsString)]| {
-            hash_key_for_compiler(fixture, &args, env, |_| Ok(()), false, "clippy-driver")
+            hash_keys_for_compiler(fixture, &args, env, |_| Ok(()), false, "clippy-driver").0
         };
         let first = key(&a, &env_a);
         assert_eq!(first, key(&b, &env_b));

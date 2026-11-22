@@ -15,10 +15,12 @@ use rustix::fs::{CWD, FileType, Mode, OFlags, Stat, fstat, openat};
 use crate::source::{metadata, unchanged};
 
 mod digest_cache;
+mod installation;
 use crate::{
     BlobRef, ContentId, TreeEntry, TreeId, TreeManifest, TreeMetadata, TreePath, TreeTimestamp,
 };
 pub use digest_cache::SourceDigestCache;
+pub use installation::{InstallationCatalog, InstallationReport};
 
 /// File metadata contract for a mapped build tree. Normalization is explicit
 /// and affects the actual materialized inode, not merely its cache key.
