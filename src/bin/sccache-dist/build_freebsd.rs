@@ -334,8 +334,13 @@ impl PotBuilder {
         trace!("performing compile");
         // TODO: likely shouldn't perform the compile as root in the container
         let mut cmd = Command::new("jexec");
+        // Set cwd first, then clear the shell's environment as well as
+        // the jail's inherited environment before executing the compiler.
         cmd.arg(cid);
-        cmd.arg("env");
+        let shell_cmd = "cd \"$1\" && shift && exec /usr/bin/env -i -- \"$@\"";
+        cmd.args(["/bin/sh", "-c", shell_cmd]);
+        cmd.arg(&executable);
+        cmd.arg(cwd);
         for (k, v) in env_vars {
             if k.contains('=') {
                 warn!("Skipping environment variable: {:?}", k);
@@ -346,10 +351,6 @@ impl PotBuilder {
             env.push_str(&v);
             cmd.arg(env);
         }
-        let shell_cmd = "cd \"$1\" && shift && exec \"$@\"";
-        cmd.args(&["sh", "-c", shell_cmd]);
-        cmd.arg(&executable);
-        cmd.arg(cwd);
         cmd.arg(executable);
         cmd.args(arguments);
         let compile_output = cmd.output().context("Failed to start executing compile")?;

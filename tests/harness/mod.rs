@@ -405,7 +405,7 @@ impl DistSystem {
         );
     }
 
-    pub fn add_server(&mut self) -> ServerHandle {
+    pub fn add_server(&mut self, environment: &[(&str, &str)]) -> ServerHandle {
         let server_cfg_relpath = format!("server-cfg-{}.json", self.server_names.len());
         let server_cfg_path = self.tmpdir.join(&server_cfg_relpath);
         let server_cfg_container_path = Path::new(CONFIGS_CONTAINER_PATH).join(server_cfg_relpath);
@@ -433,6 +433,13 @@ impl DistSystem {
                     CONFIGS_CONTAINER_PATH
                 ),
                 "-d",
+            ])
+            .args(
+                environment
+                    .iter()
+                    .flat_map(|(key, value)| ["-e".to_owned(), format!("{key}={value}")]),
+            )
+            .args([
                 DIST_IMAGE,
                 "bash",
                 "-c",

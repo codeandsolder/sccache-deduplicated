@@ -121,7 +121,7 @@ fn test_dist_basic() {
 
     let mut system = harness::DistSystem::new(&sccache_dist, tmpdir);
     system.add_scheduler();
-    system.add_server();
+    system.add_server(&[]);
 
     let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, system.scheduler_url());
     let sccache_cfg_path = tmpdir.join("sccache-cfg.json");
@@ -154,7 +154,7 @@ fn test_dist_restartedserver() {
 
     let mut system = harness::DistSystem::new(&sccache_dist, tmpdir);
     system.add_scheduler();
-    let server_handle = system.add_server();
+    let server_handle = system.add_server(&[]);
 
     let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, system.scheduler_url());
     let sccache_cfg_path = tmpdir.join("sccache-cfg.json");
@@ -315,7 +315,7 @@ fn test_dist_cargo_build() {
 
     let mut system = harness::DistSystem::new(&sccache_dist, tmpdir);
     system.add_scheduler();
-    let _server_handle = system.add_server();
+    let _server_handle = system.add_server(&[]);
 
     let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, system.scheduler_url());
     let sccache_cfg_path = tmpdir.join("sccache-cfg.json");
@@ -337,6 +337,72 @@ fn test_dist_cargo_build() {
     });
 }
 
+// The physical layout must preserve both observable strings and the paths
+// consumed by include_str! during compilation, not just the cache key.
+#[test]
+#[cfg(unix)]
+#[cfg_attr(not(feature = "dist-tests"), ignore)]
+fn test_dist_observed_rust_environment() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let root = tmpdir.path();
+    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
+    system.add_scheduler();
+    let _server_handle = system.add_server(&[("SCCACHE_OBSERVED_MISSING", "worker-only")]);
+    let cfg = dist_test_sccache_client_cfg(root, system.scheduler_url());
+    let cfg_path = root.join("sccache-cfg.json");
+    write_json_cfg(root, "sccache-cfg.json", &cfg);
+    let cached_cfg = root.join("sccache-cached-cfg");
+    let _ = stop_local_daemon();
+    start_local_daemon(&cfg_path, &cached_cfg);
+
+    let project = init_cargo(root, "observed_env");
+    write_source(
+        &project,
+        "Cargo.toml",
+        "[package]\nname = \"observed_env\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write_source(&project, "payload.txt", "physical input");
+    write_source(
+        &project,
+        "src/lib.rs",
+        r#"
+pub const ROOT: &str = env!("CARGO_MANIFEST_DIR");
+pub const PAYLOAD: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/payload.txt"));
+pub const EMPTY: Option<&str> = option_env!("SCCACHE_OBSERVED_EMPTY");
+pub const MISSING: Option<&str> = option_env!("SCCACHE_OBSERVED_MISSING");
+"#,
+    );
+    write_source(
+        &project,
+        "src/main.rs",
+        r#"
+fn main() {
+    assert_eq!(std::path::Path::new(observed_env::ROOT), std::env::current_dir().unwrap());
+    assert_eq!(observed_env::PAYLOAD, "physical input");
+    assert_eq!(observed_env::EMPTY, Some(""));
+    assert_eq!(observed_env::MISSING, None);
+}
+"#,
+    );
+    cargo_command()
+        .current_dir(&project)
+        .args(["run", "--quiet"])
+        .env("RUSTC_WRAPPER", env!("CARGO_BIN_EXE_sccache"))
+        .env("SCCACHE_CONF", &cfg_path)
+        .env("SCCACHE_CACHED_CONF", &cached_cfg)
+        .env("SCCACHE_EXPERIMENTAL_CANONICAL_RUST", "1")
+        .env("SCCACHE_CANONICAL_BUILD_ROOT", &project)
+        .env("CARGO_TARGET_DIR", project.join("target"))
+        .env("SCCACHE_OBSERVED_EMPTY", "")
+        .env_remove("SCCACHE_OBSERVED_MISSING")
+        .assert()
+        .success();
+    get_stats(|info| {
+        assert_eq!(1, info.stats.dist_compiles.values().sum::<usize>());
+        assert_eq!(0, info.stats.dist_errors);
+    });
+}
+
 #[test]
 #[cfg_attr(not(feature = "dist-tests"), ignore)]
 fn test_dist_cargo_makeflags() {
@@ -349,7 +415,7 @@ fn test_dist_cargo_makeflags() {
 
     let mut system = harness::DistSystem::new(&sccache_dist, tmpdir);
     system.add_scheduler();
-    let _server_handle = system.add_server();
+    let _server_handle = system.add_server(&[]);
 
     let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, system.scheduler_url());
     let sccache_cfg_path = tmpdir.join("sccache-cfg.json");
@@ -391,7 +457,7 @@ fn test_dist_preprocesspr_cache_bug_2173() {
 
     let mut system = harness::DistSystem::new(&sccache_dist, tmpdir);
     system.add_scheduler();
-    let _server_handle = system.add_server();
+    let _server_handle = system.add_server(&[]);
 
     let mut sccache_cfg = dist_test_sccache_client_cfg(tmpdir, system.scheduler_url());
     let disk_cache = sccache_cfg.cache.disk.as_mut().unwrap();
@@ -448,7 +514,7 @@ fn test_dist_toolchain() {
 
     let mut system = harness::DistSystem::new(&sccache_dist, tmpdir);
     system.add_scheduler();
-    let server_handle = system.add_server();
+    let server_handle = system.add_server(&[]);
     let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, system.scheduler_url());
     let sccache_cfg_path = tmpdir.join("sccache-cfg.json");
     write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);

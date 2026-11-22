@@ -2724,6 +2724,30 @@ where
             canonical_paths = None;
         }
 
+        let env_dep_names = env_deps
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<HashSet<_>>();
+        let observes_relocated_environment = canonical_paths.as_ref().is_some_and(|canonical| {
+            let mapped = canonical.env_to_canonical(&env_vars);
+            env_dep_names.iter().any(|name| {
+                let original = env_vars.iter().rev().find(|(key, _)| key == name);
+                let rewritten = mapped.iter().rev().find(|(key, _)| key == name);
+                original != rewritten
+            })
+        });
+        if observes_relocated_environment {
+            // An observed absolute path is program data, and may also be used
+            // by include!/include_str! during compilation. Preserve both the
+            // value and the input layout rather than rewriting the value or
+            // forcing compilation onto this host. The ordinary distributed
+            // layout packages inputs at their physical Unix paths.
+            debug!(
+                "Rust source observes a relocated environment value; using the physical input layout"
+            );
+            canonical_paths = None;
+        }
+
         if canonical_paths.is_some() {
             remove_dep_info_emit(&mut effective_arguments);
         }
@@ -2894,34 +2918,34 @@ where
         //    output. Additionally also has all environment variables starting with `CARGO_`,
         //    since those are not listed in dep-info but affect cacheability.
         env_deps.sort();
-        let env_dep_names = env_deps
-            .iter()
-            .map(|(name, _)| name.clone())
-            .collect::<HashSet<_>>();
-        let canonical_env_dep_differs = canonical_paths.as_ref().is_some_and(|canonical| {
-            env_deps
-                .iter()
-                .any(|(name, value)| canonical.env_value_to_canonical(name, value) != *value)
-        });
-        if canonical_env_dep_differs && may_dist && allow_dist {
-            allow_dist = false;
-            warn!(
-                "Rust source observes a host-specific environment value; compiling locally because canonical distributed compilation cannot preserve that runtime-visible value"
-            );
+        if canonical_paths.is_none() && !env_deps.is_empty() {
+            // Earlier physical-layout distributed builds could rewrite explicit
+            // observations. Do not reuse those entries. Keep normal canonical
+            // keys stable (including observed CARGO_PKG_VERSION metadata).
+            m.update(b"observed-rust-environment-v2");
         }
         for (var, val) in &env_deps {
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(b"=");
-            // rustc reports env!/option_env! inputs in dep-info. Their exact
-            // values are observable program data, so canonicalizing them would
-            // make distinct outputs share a cache key.
             val.hash(&mut HashToDigest { digest: &mut m });
+            // dep-info spells unset and empty differently but the parser
+            // represents both as empty strings. Hash actual membership and
+            // values wherever the old text representation is insufficient.
+            let actual = env_vars
+                .iter()
+                .rev()
+                .find(|(name, _)| name == var)
+                .map(|(_, value)| value);
+            if canonical_paths.is_none() || val.is_empty() || actual != Some(val) {
+                m.update(b"exact-env-dependency-v1");
+                actual.hash(&mut HashToDigest { digest: &mut m });
+            }
         }
         let mut env_vars: Vec<_> = env_vars
             .iter()
             // Filter out RUSTC_COLOR since we control color usage with command line flags.
             // rustc reports an error when both are present.
-            .filter(|(k, _)| k != "RUSTC_COLOR")
+            .filter(|(k, _)| k != "RUSTC_COLOR" || env_dep_names.contains(k))
             .cloned()
             .collect();
         env_vars.sort();
@@ -3080,7 +3104,9 @@ where
         }
         let mut arguments = effective_arguments;
         // Request color output unless json was requested. The client will strip colors if needed.
-        if !self.parsed_args.has_json {
+        if !self.parsed_args.has_json
+            && !env_dep_names.contains(std::ffi::OsStr::new("RUSTC_COLOR"))
+        {
             arguments.push(Argument::WithValue(
                 "--color",
                 ArgData::Color("always".into()),
@@ -3391,7 +3417,9 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
 
             let mut changed_out_dir: Option<PathBuf> = None;
             let env_vars = if let Some(canonical) = canonical_paths {
-                dist::osstring_tuples_to_strings(&canonical.env_to_canonical(env_vars))?
+                dist::osstring_tuples_to_strings(
+                    &canonical.env_to_canonical_preserving(env_vars, env_dep_names),
+                )?
             } else {
                 let mut env_vars = dist::osstring_tuples_to_strings(env_vars)?;
                 for (k, v) in &mut env_vars {
@@ -3473,6 +3501,22 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
         })();
 
         Ok((command, dist_command, Cacheable::Yes))
+    }
+
+    #[cfg(feature = "dist-client")]
+    fn dist_environment_dependencies(&self) -> Vec<(OsString, Option<OsString>)> {
+        self.env_dep_names
+            .iter()
+            .map(|name| {
+                let value = self
+                    .env_vars
+                    .iter()
+                    .rev()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.clone());
+                (name.clone(), value)
+            })
+            .collect()
     }
 
     #[cfg(feature = "dist-client")]
@@ -6649,7 +6693,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                     creator: &creator,
                     cwd: manifest,
                     env_vars: env,
-                    may_dist: false,
+                    may_dist: true,
                     pool: &pool,
                     rewrite_includes_only: false,
                     storage: Arc::new(MockStorage::new(None, false)),
@@ -6659,7 +6703,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 .unwrap();
 
             let mut transformer = dist::PathTransformer::new();
-            let (command, _, _) = result
+            let (command, distributed, _) = result
                 .compilation
                 .generate_compile_commands(&mut transformer, false)
                 .unwrap();
@@ -6670,6 +6714,28 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 .map(|(_, value)| value)
                 .unwrap();
 
+            #[cfg(all(feature = "dist-client", unix))]
+            {
+                let distributed =
+                    distributed.expect("observed path must not force local compilation");
+                assert_eq!(distributed.cwd, f.tempdir.path().to_str().unwrap());
+                assert_eq!(
+                    distributed
+                        .env_vars
+                        .iter()
+                        .find_map(|(name, value)| (name == "CARGO_MANIFEST_DIR")
+                            .then_some(value.as_str())),
+                    f.tempdir.path().to_str()
+                );
+                assert_eq!(
+                    transformer
+                        .as_dist(&f.tempdir.path().join("foo.rs"))
+                        .as_deref(),
+                    f.tempdir.path().join("foo.rs").to_str()
+                );
+            }
+            #[cfg(not(all(feature = "dist-client", unix)))]
+            let _ = distributed;
             (result.key, manifest_env)
         }
 

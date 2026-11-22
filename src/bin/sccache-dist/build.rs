@@ -448,7 +448,10 @@ impl OverlayBuilder {
                         .args(["--proc", "/proc"])
                         .args(["--dev", "/dev"])
                         .arg("--chdir")
-                        .arg(cwd);
+                        .arg(cwd)
+                        // The compiler must see the client environment, not
+                        // variables inherited from the worker service.
+                        .arg("--clearenv");
 
                     for (k, v) in env_vars {
                         if k.contains('=') {
@@ -897,7 +900,9 @@ impl DockerBuilder {
         trace!("performing compile");
         // TODO: likely shouldn't perform the compile as root in the container
         let mut cmd = Command::new("docker");
-        cmd.arg("exec");
+        cmd.args(["exec", "--workdir"])
+            .arg(cwd)
+            .args([cid, "/busybox", "env", "-i", "--"]);
         for (k, v) in env_vars {
             if k.contains('=') {
                 warn!("Skipping environment variable: {:?}", k);
@@ -906,12 +911,8 @@ impl DockerBuilder {
             let mut env = k;
             env.push('=');
             env.push_str(&v);
-            cmd.arg("-e").arg(env);
+            cmd.arg(env);
         }
-        let shell_cmd = "cd \"$1\" && shift && exec \"$@\"";
-        cmd.args([cid, "/busybox", "sh", "-c", shell_cmd]);
-        cmd.arg(&executable);
-        cmd.arg(cwd);
         cmd.arg(executable);
         cmd.args(arguments);
         let compile_output = cmd.output().context("Failed to start executing compile")?;

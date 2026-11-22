@@ -914,6 +914,29 @@ fn apply_selected_toolchain_override(
     Ok(())
 }
 
+#[cfg(feature = "dist-client")]
+fn validate_dist_environment_dependencies(
+    command: &dist::CompileCommand,
+    dependencies: &[(OsString, Option<OsString>)],
+) -> Result<()> {
+    for (name, expected) in dependencies {
+        let actual = command
+            .env_vars
+            .iter()
+            .rev()
+            .find(|(key, _)| OsStr::new(key) == name.as_os_str())
+            .map(|(_, value)| OsStr::new(value));
+        if actual != expected.as_deref() {
+            // Don't print potentially sensitive values from the environment.
+            bail!(
+                "distributed toolchain cannot preserve observed environment variable {}",
+                name.to_string_lossy()
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(not(feature = "dist-client"))]
 async fn dist_or_local_compile<T>(
     service: &server::SccacheService<T>,
@@ -1004,6 +1027,7 @@ where
                 }
             }
         }
+        let environment_dependencies = compilation.dist_environment_dependencies();
         let dist_command_uses_cargo = compilation.dist_command_uses_cargo();
         let automatic_dist_toolchain_is_ready = compilation.automatic_dist_toolchain_is_ready();
         let (inputs_packager, toolchain_packager) =
@@ -1022,6 +1046,7 @@ where
             dist_command_uses_cargo,
             automatic_dist_toolchain_is_ready,
         )?;
+        validate_dist_environment_dependencies(&dist_compile_cmd, &environment_dependencies)?;
 
         debug!("[{out_pretty}]: Requesting allocation");
         let allocation_result = dist_client.do_alloc_job(dist_toolchain.clone()).await?;
@@ -1201,6 +1226,12 @@ where
         path_transformer: &mut dist::PathTransformer,
         rewrite_includes_only: bool,
     ) -> GenerateCompileCommandsResult<T>;
+
+    /// Exact environment observations that the final distributed command must preserve.
+    #[cfg(feature = "dist-client")]
+    fn dist_environment_dependencies(&self) -> Vec<(OsString, Option<OsString>)> {
+        Vec::new()
+    }
 
     /// Whether a custom distributed toolchain must provide a Cargo executable for this command.
     #[cfg(feature = "dist-client")]
@@ -3811,7 +3842,7 @@ LLVM version: 6.0",
 
 #[cfg(all(test, feature = "dist-client"))]
 mod custom_toolchain_override_tests {
-    use super::apply_selected_toolchain_override;
+    use super::{apply_selected_toolchain_override, validate_dist_environment_dependencies};
     use crate::dist::{CompileCommand, CustomToolchainOverride};
     use crate::errors::Result;
     use std::path::PathBuf;
@@ -3823,6 +3854,38 @@ mod custom_toolchain_override_tests {
             env_vars,
             cwd: "/build".to_owned(),
         }
+    }
+
+    #[test]
+    fn observed_environment_survives_toolchain_selection() -> Result<()> {
+        let mut command = command(vec![
+            ("CARGO".into(), "/automatic/cargo".into()),
+            ("EMPTY".into(), String::new()),
+        ]);
+        let dependencies = [
+            ("CARGO".into(), Some("/automatic/cargo".into())),
+            ("EMPTY".into(), Some("".into())),
+            ("MISSING".into(), None),
+        ];
+        validate_dist_environment_dependencies(&command, &dependencies)?;
+        apply_selected_toolchain_override(
+            &mut command,
+            Some(CustomToolchainOverride {
+                compiler_executable: "/custom/rustc".into(),
+                archive: PathBuf::from("/custom/toolchain.tar.gz"),
+                cargo_executable: Some("/custom/cargo".into()),
+            }),
+            true,
+            false,
+        )?;
+        assert!(validate_dist_environment_dependencies(&command, &dependencies).is_err());
+        command.env_vars[0].1 = "/automatic/cargo".into();
+        command.env_vars.retain(|(key, _)| key != "EMPTY");
+        assert!(validate_dist_environment_dependencies(&command, &dependencies).is_err());
+        command.env_vars.push(("EMPTY".into(), "".into()));
+        command.env_vars.push(("MISSING".into(), "".into()));
+        assert!(validate_dist_environment_dependencies(&command, &dependencies).is_err());
+        Ok(())
     }
 
     #[test]
