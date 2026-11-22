@@ -43,6 +43,7 @@ fn aliases_and_shared_artifacts_reclaim_only_last_reference() -> Result<()> {
         CacheStats {
             actions: 2,
             results: 1,
+            trees: 0,
             blobs: 1,
             logical_bytes: 6,
             pending_gc_blobs: 0,
@@ -60,6 +61,7 @@ fn aliases_and_shared_artifacts_reclaim_only_last_reference() -> Result<()> {
         CacheStats {
             actions: 3,
             results: 2,
+            trees: 0,
             blobs: 2,
             logical_bytes: 13,
             pending_gc_blobs: 0,
@@ -102,6 +104,7 @@ fn aliases_and_shared_artifacts_reclaim_only_last_reference() -> Result<()> {
         CacheStats {
             actions: 0,
             results: 0,
+            trees: 0,
             blobs: 0,
             logical_bytes: 0,
             pending_gc_blobs: 2,
@@ -260,6 +263,7 @@ fn concurrent_publishers_share_content_and_result() -> Result<()> {
         CacheStats {
             actions: 4,
             results: 1,
+            trees: 0,
             blobs: 1,
             logical_bytes: 9,
             pending_gc_blobs: 0,

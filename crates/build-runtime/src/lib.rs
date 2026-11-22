@@ -7,17 +7,28 @@
 #![deny(rust_2018_idioms)]
 
 mod identity;
+mod recipe;
+pub use recipe::{TreeLayer, TreeRecipe};
+mod tree;
 pub use identity::{
     ActionFingerprint, ActionKey, Artifact, BlobRef, ContentId, ResultId, ResultManifest,
 };
+pub use tree::{TreeEntry, TreeId, TreeManifest, TreeMetadata, TreePath, TreeTimestamp};
 
+#[cfg(all(unix, feature = "store"))]
+mod coordinator;
 #[cfg(all(unix, feature = "store"))]
 mod store;
 #[cfg(all(unix, feature = "store"))]
+pub use coordinator::{Admission, BuildCoordinator, CompilePermit};
+#[cfg(all(unix, feature = "store"))]
 pub use store::{
-    CacheStats, Eviction, GarbageCollected, NativeStore, Published, ResultLease, StagedBlob,
-    UploadReservation,
+    CacheStats, ComponentAudit, Eviction, GarbageCollected, NativeStore, PackageCompression,
+    PackagePolicy, PackageSource, Published, ResultLease, StagedBlob, TreeLease, UploadReservation,
 };
 
 #[cfg(target_os = "linux")]
 pub mod sandbox;
+
+#[cfg(all(target_os = "linux", feature = "store"))]
+pub use store::{MaterializationStats, MaterializedTree};

@@ -13,16 +13,31 @@ blake3 = "1"
 serde = { version = "1", features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]
+flate2 = { version = "1", optional = true }
 log = { version = "0.4", optional = true }
+lzma-rust2 = { version = "0.15.8", default-features = false, features = ["std", "xz"], optional = true }
+sha2 = { version = "0.11", optional = true }
+tar = { version = "0.4", default-features = false, optional = true }
 redb = { version = "4.6", optional = true }
 tempfile = { version = "3", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", features = ["fs", "time"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 
 [features]
 default = ["store"]
-store = ["dep:log", "dep:redb", "dep:tempfile"]
+store = ["dep:log", "dep:redb", "dep:tempfile", "dep:rustix", "dep:flate2", "dep:lzma-rust2", "dep:sha2", "dep:tar"]
 
 [lints]
 workspace = true
+
+[[example]]
+name = "zfs_probe"
+required-features = ["store"]
+
+[[example]]
+name = "package_probe"
+required-features = ["store"]

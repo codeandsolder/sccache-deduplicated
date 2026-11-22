@@ -22,6 +22,11 @@ use super::{
 
 const ACTIONS: TableDefinition<'static, &[u8; 32], &[u8]> = TableDefinition::new("actions_v1");
 const RESULTS: TableDefinition<'static, &[u8; 32], &[u8]> = TableDefinition::new("results_v1");
+const PACKAGES: TableDefinition<'static, &[u8; 32], &[u8; 32]> =
+    TableDefinition::new("packages_v1");
+const TREE_PACKAGES: MultimapTableDefinition<'static, &[u8; 32], &[u8; 32]> =
+    MultimapTableDefinition::new("tree_packages_v1");
+const TREES: TableDefinition<'static, &[u8; 32], &[u8]> = TableDefinition::new("trees_v1");
 const BLOBS: TableDefinition<'static, &[u8; 32], u64> = TableDefinition::new("blobs_v1");
 const RESULT_ACTIONS: MultimapTableDefinition<'static, &[u8; 32], &[u8; 32]> =
     MultimapTableDefinition::new("result_actions_v1");
@@ -30,8 +35,8 @@ const LIVE_BYTES: u8 = 0;
 const PENDING_BYTES: u8 = 1;
 const PENDING_DELETIONS: TableDefinition<'static, &[u8; 32], u64> =
     TableDefinition::new("pending_deletions_v1");
-const BLOB_RESULTS: MultimapTableDefinition<'static, &[u8; 32], &[u8; 32]> =
-    MultimapTableDefinition::new("blob_results_v1");
+const BLOB_ROOTS: MultimapTableDefinition<'static, &[u8; 32], &[u8; 32]> =
+    MultimapTableDefinition::new("blob_roots_v1");
 
 #[derive(Serialize, Deserialize)]
 struct ActionRecord {
@@ -76,6 +81,7 @@ pub enum Eviction {
 pub struct CacheStats {
     pub actions: u64,
     pub results: u64,
+    pub trees: u64,
     pub blobs: u64,
     pub logical_bytes: u64,
     pub pending_gc_blobs: u64,
@@ -93,6 +99,7 @@ pub struct GarbageCollected {
 #[derive(Default)]
 struct Pins {
     actions: BTreeMap<ActionKey, usize>,
+    trees: BTreeMap<crate::TreeId, usize>,
     uploads: BTreeMap<ContentId, usize>,
 }
 
@@ -252,9 +259,12 @@ impl NativeStore {
         let write = db.begin_write()?;
         write.open_table(ACTIONS)?;
         write.open_table(RESULTS)?;
+        write.open_table(TREES)?;
+        write.open_table(PACKAGES)?;
+        write.open_multimap_table(TREE_PACKAGES)?;
         write.open_table(BLOBS)?;
         write.open_multimap_table(RESULT_ACTIONS)?;
-        write.open_multimap_table(BLOB_RESULTS)?;
+        write.open_multimap_table(BLOB_ROOTS)?;
         write.open_table(PENDING_DELETIONS)?;
         {
             let mut accounting = write.open_table(ACCOUNTING)?;
@@ -341,9 +351,11 @@ impl NativeStore {
     /// # Errors
     /// Returns an error for malformed manifests, inconsistent metadata or I/O.
     pub fn reserve_upload(&self, manifest: &ResultManifest) -> Result<UploadReservation> {
-        let blobs = manifest.blobs()?;
+        self.reserve_blobs(manifest.blobs()?)
+    }
+
+    fn reserve_blobs(&self, blobs: BTreeMap<ContentId, u64>) -> Result<UploadReservation> {
         let _mutation = self.inner.lock_mutations()?;
-        let mut pins = self.inner.lock_pins()?;
         let read = self.inner.db.begin_read()?;
         let live = read.open_table(BLOBS)?;
         let pending = read.open_table(PENDING_DELETIONS)?;
@@ -366,6 +378,7 @@ impl NativeStore {
                 missing.push(BlobRef { id, size });
             }
         }
+        let mut pins = self.inner.lock_pins()?;
         // Validate every count before changing any pin, so a failed
         // reservation cannot leave partially installed pins.
         for id in &reserved {
@@ -403,20 +416,7 @@ impl NativeStore {
         let action = fingerprint.key()?;
         let result = manifest.id()?;
         let blobs = manifest.blobs()?;
-        ensure!(
-            staged
-                .iter()
-                .all(|blob| Arc::ptr_eq(&blob.owner, &self.inner)),
-            "staged content belongs to a different store"
-        );
-        let staged: BTreeMap<_, _> = staged
-            .into_iter()
-            .map(|blob| (blob.reference.id, blob))
-            .collect();
-        ensure!(
-            staged.keys().all(|id| blobs.contains_key(id)),
-            "unreferenced staged content"
-        );
+        let staged = self.prepare_staging(&blobs, staged)?;
         let _mutation = self.inner.lock_mutations()?;
         let write = self.inner.db.begin_write()?;
         {
@@ -468,6 +468,28 @@ impl NativeStore {
         })
     }
 
+    fn prepare_staging(
+        &self,
+        blobs: &BTreeMap<ContentId, u64>,
+        staged: Vec<StagedBlob>,
+    ) -> Result<BTreeMap<ContentId, StagedBlob>> {
+        ensure!(
+            staged
+                .iter()
+                .all(|blob| Arc::ptr_eq(&blob.owner, &self.inner)),
+            "staged content belongs to a different store"
+        );
+        let staged: BTreeMap<_, _> = staged
+            .into_iter()
+            .map(|blob| (blob.reference.id, blob))
+            .collect();
+        ensure!(
+            staged.keys().all(|id| blobs.contains_key(id)),
+            "unreferenced staged content"
+        );
+        Ok(staged)
+    }
+
     fn attach_blobs(
         &self,
         write: &WriteTransaction,
@@ -477,7 +499,7 @@ impl NativeStore {
         existing_result: bool,
     ) -> Result<()> {
         let mut blob_table = write.open_table(BLOBS)?;
-        let mut blob_results = write.open_multimap_table(BLOB_RESULTS)?;
+        let mut blob_roots = write.open_multimap_table(BLOB_ROOTS)?;
         let mut pending = write.open_table(PENDING_DELETIONS)?;
         let mut accounting = write.open_table(ACCOUNTING)?;
         let mut resurrected = Vec::new();
@@ -525,7 +547,7 @@ impl NativeStore {
                 }
             }
             if !existing_result {
-                blob_results.insert(&id.0, root)?;
+                blob_roots.insert(&id.0, root)?;
             }
         }
         if added != 0 {
@@ -633,11 +655,7 @@ impl NativeStore {
         {
             let mut actions = write.open_table(ACTIONS)?;
             let mut results = write.open_table(RESULTS)?;
-            let mut blob_table = write.open_table(BLOBS)?;
             let mut result_actions = write.open_multimap_table(RESULT_ACTIONS)?;
-            let mut blob_results = write.open_multimap_table(BLOB_RESULTS)?;
-            let mut pending = write.open_table(PENDING_DELETIONS)?;
-            let mut accounting = write.open_table(ACCOUNTING)?;
             let Some(record) = actions.remove(&action.0)? else {
                 return Ok(Eviction::Missing);
             };
@@ -652,48 +670,8 @@ impl NativeStore {
                     .remove(&result.0)?
                     .context("missing indexed result")?;
                 let manifest: ResultManifest = encoding().deserialize(manifest.value())?;
-                for (id, size) in manifest.blobs()? {
-                    ensure!(
-                        blob_results.remove(&id.0, &result.0)?,
-                        "missing blob reverse reference"
-                    );
-                    if blob_results.get(&id.0)?.next().transpose()?.is_none() {
-                        let indexed_size =
-                            blob_table.remove(&id.0)?.context("missing indexed blob")?;
-                        ensure!(
-                            indexed_size.value() == size,
-                            "inconsistent indexed blob length"
-                        );
-                        ensure!(
-                            pending.insert(&id.0, size)?.is_none(),
-                            "live blob already pending deletion"
-                        );
-                        unreferenced_logical_bytes = unreferenced_logical_bytes
-                            .checked_add(size)
-                            .context("unreferenced size overflow")?;
-                    }
-                }
-            }
-            if unreferenced_logical_bytes != 0 {
-                let live = accounting
-                    .get(LIVE_BYTES)?
-                    .context("missing live accounting")?
-                    .value();
-                let queued = accounting
-                    .get(PENDING_BYTES)?
-                    .context("missing pending accounting")?
-                    .value();
-                accounting.insert(
-                    LIVE_BYTES,
-                    live.checked_sub(unreferenced_logical_bytes)
-                        .context("store size underflow")?,
-                )?;
-                accounting.insert(
-                    PENDING_BYTES,
-                    queued
-                        .checked_add(unreferenced_logical_bytes)
-                        .context("pending GC size overflow")?,
-                )?;
+                unreferenced_logical_bytes =
+                    Self::detach_blobs(&write, &result.0, manifest.blobs()?)?;
             }
         }
         // Durable deletion intent precedes physical deletion. The collector
@@ -704,6 +682,60 @@ impl NativeStore {
         Ok(Eviction::Removed {
             unreferenced_logical_bytes,
         })
+    }
+
+    fn detach_blobs(
+        write: &WriteTransaction,
+        root: &[u8; 32],
+        blobs: BTreeMap<ContentId, u64>,
+    ) -> Result<u64> {
+        let mut blob_table = write.open_table(BLOBS)?;
+        let mut blob_roots = write.open_multimap_table(BLOB_ROOTS)?;
+        let mut pending = write.open_table(PENDING_DELETIONS)?;
+        let mut accounting = write.open_table(ACCOUNTING)?;
+        let mut unreferenced_logical_bytes = 0_u64;
+        for (id, size) in blobs {
+            ensure!(
+                blob_roots.remove(&id.0, root)?,
+                "missing blob reverse reference"
+            );
+            if blob_roots.get(&id.0)?.next().transpose()?.is_none() {
+                let indexed_size = blob_table.remove(&id.0)?.context("missing indexed blob")?;
+                ensure!(
+                    indexed_size.value() == size,
+                    "inconsistent indexed blob length"
+                );
+                ensure!(
+                    pending.insert(&id.0, size)?.is_none(),
+                    "live blob already pending deletion"
+                );
+                unreferenced_logical_bytes = unreferenced_logical_bytes
+                    .checked_add(size)
+                    .context("unreferenced size overflow")?;
+            }
+        }
+        if unreferenced_logical_bytes != 0 {
+            let live = accounting
+                .get(LIVE_BYTES)?
+                .context("missing live accounting")?
+                .value();
+            let queued = accounting
+                .get(PENDING_BYTES)?
+                .context("missing pending accounting")?
+                .value();
+            accounting.insert(
+                LIVE_BYTES,
+                live.checked_sub(unreferenced_logical_bytes)
+                    .context("store size underflow")?,
+            )?;
+            accounting.insert(
+                PENDING_BYTES,
+                queued
+                    .checked_add(unreferenced_logical_bytes)
+                    .context("pending GC size overflow")?,
+            )?;
+        }
+        Ok(unreferenced_logical_bytes)
     }
 
     /// Reclaim up to `limit` unreferenced content files. Active upload
@@ -792,6 +824,7 @@ impl NativeStore {
         Ok(CacheStats {
             actions: actions.len()?,
             results: results.len()?,
+            trees: read.open_table(TREES)?.len()?,
             blobs: blobs.len()?,
             logical_bytes: accounting
                 .get(LIVE_BYTES)?
@@ -887,22 +920,31 @@ impl Drop for ResultLease {
     }
 }
 
-struct LeasedReader<'a> {
+struct LeasedReader<'a, L> {
     file: File,
-    _lease: &'a ResultLease,
+    _lease: &'a L,
 }
 
-impl Read for LeasedReader<'_> {
+impl<L> Read for LeasedReader<'_, L> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.file.read(buf)
     }
 }
 
-impl Seek for LeasedReader<'_> {
+impl<L> Seek for LeasedReader<'_, L> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         self.file.seek(pos)
     }
 }
+
+mod audit;
+pub use audit::ComponentAudit;
+mod packages;
+pub use packages::{PackageCompression, PackagePolicy, PackageSource};
+mod trees;
+pub use trees::TreeLease;
+#[cfg(target_os = "linux")]
+pub use trees::{MaterializationStats, MaterializedTree};
 
 #[cfg(test)]
 mod tests;

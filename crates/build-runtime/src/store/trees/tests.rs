@@ -1,0 +1,163 @@
+use std::collections::BTreeMap;
+
+use anyhow::{Context, Result};
+
+use crate::{
+    ActionFingerprint, Artifact, BlobRef, ContentId, Eviction, NativeStore, ResultManifest,
+    TreeEntry, TreeManifest, TreeMetadata, TreePath, TreeTimestamp,
+};
+
+fn metadata(mode: u32) -> TreeMetadata {
+    TreeMetadata {
+        mode,
+        modified: TreeTimestamp {
+            seconds: 1234,
+            nanoseconds: 5678,
+        },
+    }
+}
+
+fn sample_tree(blob: BlobRef) -> Result<TreeManifest> {
+    let file = TreePath::new(b"bin/compiler".to_vec())?;
+    Ok(TreeManifest {
+        root: metadata(0o555),
+        entries: BTreeMap::from([
+            (
+                TreePath::new(b"bin".to_vec())?,
+                TreeEntry::Directory(metadata(0o555)),
+            ),
+            (
+                file.clone(),
+                TreeEntry::File {
+                    blob,
+                    metadata: metadata(0o755),
+                },
+            ),
+            (
+                TreePath::new(b"bin/hardlink".to_vec())?,
+                TreeEntry::Hardlink(file),
+            ),
+            (
+                TreePath::new(b"bin/alias".to_vec())?,
+                TreeEntry::Symlink {
+                    target: b"compiler".to_vec(),
+                    modified: metadata(0o755).modified,
+                },
+            ),
+            (
+                TreePath::new(vec![0xff])?,
+                TreeEntry::File {
+                    blob,
+                    metadata: metadata(0o444),
+                },
+            ),
+        ]),
+    })
+}
+
+#[test]
+fn package_trees_and_actions_share_one_blob_index_across_restart() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let staged = store.stage(&b"compiler artifact"[..])?;
+    let blob = staged.reference();
+    let tree = sample_tree(blob)?;
+    let tree_id = store.publish_tree(&tree, vec![staged])?;
+    let mut other = tree.clone();
+    other.root.mode = 0o755;
+    let other_id = store.publish_tree(&other, vec![])?;
+    assert_ne!(tree_id, other_id);
+    let result = ResultManifest {
+        outputs: BTreeMap::from([(
+            "output".into(),
+            Artifact {
+                blob,
+                mode: Some(0o600),
+            },
+        )]),
+        stdout: None,
+        stderr: None,
+    };
+    let action = ActionFingerprint {
+        schema: "test".into(),
+        components: BTreeMap::from([("source".into(), ContentId::of(b"anything"))]),
+    };
+    let published = store.publish(&action, &result, vec![])?;
+    assert_eq!(store.stats()?.blobs, 1);
+    assert_eq!(store.stats()?.trees, 2);
+    assert_eq!(store.stats()?.logical_bytes, blob.size);
+    drop(store);
+
+    let store = NativeStore::open(dir.path())?;
+    let lease = store.lookup_tree(tree_id)?.context("tree missing")?;
+    assert_eq!(lease.manifest(), &tree);
+    assert_eq!(store.evict_tree(tree_id)?, Eviction::Pinned);
+    assert_eq!(
+        store.evict_tree(other_id)?,
+        Eviction::Removed {
+            unreferenced_logical_bytes: 0
+        }
+    );
+    assert_eq!(
+        store.evict(published.action)?,
+        Eviction::Removed {
+            unreferenced_logical_bytes: 0
+        }
+    );
+    drop(lease);
+    assert_eq!(
+        store.evict_tree(tree_id)?,
+        Eviction::Removed {
+            unreferenced_logical_bytes: blob.size
+        }
+    );
+    assert_eq!(store.collect_garbage(100)?.blobs, 1);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn materialization_preserves_modes_links_and_timestamps_without_mutating_cas() -> Result<()> {
+    use std::{
+        ffi::OsStr,
+        fs,
+        os::unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, PermissionsExt},
+        },
+    };
+
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(&dir.path().join("store"))?;
+    let staged = store.stage(&b"compiler artifact"[..])?;
+    let blob = staged.reference();
+    let tree = sample_tree(blob)?;
+    let id = store.publish_tree(&tree, vec![staged])?;
+    let lease = store.lookup_tree(id)?.context("tree missing")?;
+    let materialized = lease.materialize(dir.path())?;
+    let root = materialized.root();
+    let file = root.join("bin/compiler");
+    let hardlink = root.join("bin/hardlink");
+    let symlink = root.join("bin/alias");
+    let distinct = root.join(OsStr::from_bytes(&[0xff]));
+    assert_eq!(fs::read(&file)?, b"compiler artifact");
+    assert_eq!(fs::metadata(&file)?.ino(), fs::metadata(&hardlink)?.ino());
+    assert_ne!(fs::metadata(&file)?.ino(), fs::metadata(&distinct)?.ino());
+    assert_eq!(fs::metadata(&file)?.mode() & 0o777, 0o755);
+    assert_eq!(fs::metadata(&distinct)?.mode() & 0o777, 0o444);
+    assert_eq!(fs::read_link(&symlink)?, std::path::Path::new("compiler"));
+    assert_eq!(fs::symlink_metadata(&symlink)?.mtime(), 1234);
+    assert_eq!(fs::metadata(root.join("bin"))?.mtime_nsec(), 5678);
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o755))?;
+    fs::write(&file, b"modified")?;
+    let mut original = String::new();
+    std::io::Read::read_to_string(&mut lease.open_blob(blob.id)?, &mut original)?;
+    assert_eq!(original, "compiler artifact");
+    let parent = root
+        .parent()
+        .context("missing materialized parent")?
+        .to_owned();
+    drop(materialized);
+    assert!(!parent.exists());
+    Ok(())
+}
