@@ -232,6 +232,17 @@ impl NativeCacheClient {
         let id = manifest.id()?;
         let blobs = manifest.blobs()?;
         let offer = self.offer_tree(manifest)?;
+        debug!(
+            "native tree {id:?}: upload {}/{} blobs, {}/{} content bytes",
+            offer.missing.len(),
+            blobs.len(),
+            offer
+                .missing
+                .iter()
+                .map(|blob| u128::from(blob.size))
+                .sum::<u128>(),
+            blobs.values().copied().map(u128::from).sum::<u128>()
+        );
         let result = self.with_renewal(offer.ticket, renewal_interval, |check| {
             ensure!(offer.id == id, "native tree offer identity mismatch");
             let mut seen = std::collections::BTreeSet::new();
