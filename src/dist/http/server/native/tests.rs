@@ -4,7 +4,8 @@ use super::*;
 use crate::{
     build_runtime::{
         Artifact, BlobRef, BuildPath, CommandSpec, ContentId, ExecutionSpec, OutputSpec,
-        ResultManifest, SessionLimits, TreeId, TreeManifest, TreeMetadata, TreeTimestamp,
+        ResultManifest, SessionLimits, TreeId, TreeManifest, TreeMetadata, TreeRecipe,
+        TreeTimestamp,
         wire::{NativeAdmission, NativeStatus, ScheduleReply, WorkerAllocation},
     },
     dist::{JobId, ServerId, native::NativeCacheClient},
@@ -27,7 +28,16 @@ impl ClientAuthCheck for ClientCheck {
 fn action(root: TreeId) -> Result<ExecutionSpec> {
     Ok(ExecutionSpec {
         platform: ContentId::of(b"test-platform"),
-        root,
+        root: TreeRecipe::union(
+            TreeMetadata {
+                mode: 0o755,
+                modified: TreeTimestamp {
+                    seconds: 1,
+                    nanoseconds: 0,
+                },
+            },
+            [root],
+        ),
         mounts: BTreeMap::new(),
         command: CommandSpec {
             executable: BuildPath::new(b"/bin/tool".to_vec())?,

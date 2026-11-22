@@ -25,7 +25,7 @@ use rustix::{
 
 use crate::{
     Artifact, BlobRef, BuildPath, ContentId, ExecutionSpec, MaterializedTree, NativeStore,
-    ResultManifest, TreeEntry, TreeId, TreeLease, TreePath,
+    ResultManifest, TreeEntry, TreeLease, TreePath,
     sandbox::{MountAccess, SandboxInvocation, SandboxPath, SandboxPlan},
 };
 
@@ -195,19 +195,19 @@ fn writable_locations(
 impl PreparedBuild {
     fn prepare(spec: &ExecutionSpec, store: &NativeStore, scratch: &Path) -> Result<Self> {
         let root_point = BuildPath::new(b"/".to_vec())?;
-        let mut locations = spec.mounts.clone();
-        locations.insert(root_point.clone(), spec.root);
-        let leases: BTreeMap<BuildPath, TreeLease> = locations
-            .into_iter()
-            .map(|(path, id): (BuildPath, TreeId)| {
+        let mut leases: BTreeMap<BuildPath, TreeLease> = spec
+            .mounts
+            .iter()
+            .map(|(path, &id)| {
                 Ok((
-                    path,
+                    path.clone(),
                     store
                         .lookup_tree(id)?
                         .context("native input tree unavailable")?,
                 ))
             })
             .collect::<Result<_>>()?;
+        leases.insert(root_point.clone(), store.lease_recipe(&spec.root)?);
         let root = leases.get(&root_point).context("native root unavailable")?;
         // Never mount through a symlink or a nonexistent parent in the root.
         for path in spec.mounts.keys().map(BuildPath::as_bytes).chain([

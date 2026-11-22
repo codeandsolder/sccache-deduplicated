@@ -20,8 +20,15 @@ optional output paths. The scheduler derives the action fingerprint from
 this declaration and the worker verifies the same specification before
 execution. There is no translation from an old compiler cache key.
 
-The client pushes trees by manifest and missing blobs, then obtains an
-action admission. A hit has a result delivery ticket; an in-flight action
+The client pushes constituent trees by manifest and missing blobs, then
+admits an action containing the exact root composition recipe and any
+additional independent mounts. Every source tree is pinned by the action.
+Workers compose the recipe directly in memory from the pinned package
+manifests, including their selected subtrees and logical destinations.
+The combined root is neither uploaded nor published to either CAS index.
+Conflicting file entries are rejected, directory metadata normalization
+is explicit in the recipe, and the recipe fingerprint is part of the
+native action identity. A hit has a result delivery ticket; an in-flight action
 can be observed by retrying admission; a miss reserves a compilation.
 Scheduling a miss selects a worker whose advertised platform contract
 matches and accounts for capacity in the same pool as ordinary jobs.

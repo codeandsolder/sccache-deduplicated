@@ -7,7 +7,8 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActionFingerprint, ContentId, TreeId, TreePath, identity::typed_digest, wire::ActionRequest,
+    ActionFingerprint, ContentId, TreeId, TreePath, TreeRecipe, identity::typed_digest,
+    wire::ActionRequest,
 };
 
 /// Exact canonical absolute POSIX path, including non-UTF-8 names.
@@ -126,7 +127,7 @@ pub struct OutputSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionSpec {
     pub platform: ContentId,
-    pub root: TreeId,
+    pub root: TreeRecipe,
     pub mounts: BTreeMap<BuildPath, TreeId>,
     pub command: CommandSpec,
     pub outputs: BTreeMap<String, OutputSpec>,
@@ -139,6 +140,7 @@ impl ExecutionSpec {
     /// Returns an error for invalid topology or process/output declarations.
     pub fn validate(&self) -> Result<()> {
         self.command.validate()?;
+        self.root.validate()?;
         for target in self.mounts.keys() {
             target.validate()?;
             ensure!(
@@ -195,8 +197,8 @@ impl ExecutionSpec {
         self.validate()?;
         let mut components = self.command.input_components()?;
         components.insert("platform".into(), self.platform);
-        components.insert("root".into(), ContentId(self.root.0));
-        let mut trees = BTreeSet::from([self.root]);
+        components.insert("root/recipe".into(), self.root.fingerprint()?);
+        let mut trees: BTreeSet<_> = self.root.layers.iter().map(|layer| layer.tree).collect();
         for (mount, tree) in &self.mounts {
             components.insert(
                 format!("mount/{}", mount.as_bytes().escape_ascii()),
@@ -219,7 +221,7 @@ impl ExecutionSpec {
         }
         Ok(ActionRequest {
             fingerprint: ActionFingerprint {
-                schema: "native-linux-bwrap-v2".into(),
+                schema: "native-linux-bwrap-v3".into(),
                 components,
             },
             input_trees: trees,
@@ -232,12 +234,22 @@ impl ExecutionSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{TreeMetadata, TreeTimestamp};
     use anyhow::Context;
 
     fn spec() -> Result<ExecutionSpec> {
         Ok(ExecutionSpec {
             platform: ContentId::of(b"platform"),
-            root: TreeId([1; 32]),
+            root: TreeRecipe::union(
+                TreeMetadata {
+                    mode: 0o755,
+                    modified: TreeTimestamp {
+                        seconds: 1,
+                        nanoseconds: 0,
+                    },
+                },
+                [TreeId([1; 32])],
+            ),
             mounts: BTreeMap::from([(BuildPath::new(b"/src".to_vec())?, TreeId([2; 32]))]),
             command: CommandSpec {
                 executable: BuildPath::new(b"/bin/tool".to_vec())?,
@@ -264,8 +276,22 @@ mod tests {
         changed.command.environment.clear();
         assert_ne!(first, key(&changed)?);
         changed = original.clone();
-        changed.root = TreeId([3; 32]);
+        changed.root.layers[0].tree = TreeId([3; 32]);
         assert_ne!(first, key(&changed)?);
+        changed = original.clone();
+        changed.root.layers.push(crate::TreeLayer {
+            tree: TreeId([4; 32]),
+            source: None,
+            destination: Some(TreePath::new(b"layer".to_vec())?),
+        });
+        assert_ne!(first, key(&changed)?);
+        assert!(
+            changed
+                .action_request()?
+                .input_trees
+                .contains(&TreeId([4; 32]))
+        );
+
         changed = original.clone();
         changed.platform = ContentId::of(b"other platform");
         assert_ne!(first, key(&changed)?);

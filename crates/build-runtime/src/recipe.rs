@@ -32,11 +32,44 @@ pub struct TreeRecipe {
 }
 
 impl TreeRecipe {
+    /// Combine complete trees at the same root. Directory metadata is
+    /// explicitly normalized; conflicting file entries are rejected.
+    #[must_use = "the recipe describes the combined build filesystem"]
+    pub fn union(directories: TreeMetadata, trees: impl IntoIterator<Item = TreeId>) -> Self {
+        Self {
+            directories,
+            layers: trees
+                .into_iter()
+                .map(|tree| TreeLayer {
+                    tree,
+                    source: None,
+                    destination: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Validate metadata and paths without loading package contents.
+    ///
+    /// # Errors
+    /// Returns an error for an empty recipe or invalid entries.
+    pub fn validate(&self) -> Result<()> {
+        self.directories.validate()?;
+        ensure!(!self.layers.is_empty(), "empty build tree recipe");
+        for layer in &self.layers {
+            for path in layer.source.iter().chain(&layer.destination) {
+                path.validate()?;
+            }
+        }
+        Ok(())
+    }
+
     /// Stable fingerprint of the package selection and placement instructions.
     ///
     /// # Errors
     /// Returns an error if serialization fails.
     pub fn fingerprint(&self) -> Result<ContentId> {
+        self.validate()?;
         Ok(ContentId(typed_digest(b"sccache-tree-recipe-v1\0", self)?))
     }
 
@@ -46,6 +79,7 @@ impl TreeRecipe {
     /// Returns an error for unavailable packages, invalid paths or conflicting
     /// entries, including incompatible hardlink topology.
     pub fn compose(&self, packages: &BTreeMap<TreeId, &TreeManifest>) -> Result<TreeManifest> {
+        self.validate()?;
         let mut manifest = TreeManifest {
             root: self.directories,
             entries: BTreeMap::new(),

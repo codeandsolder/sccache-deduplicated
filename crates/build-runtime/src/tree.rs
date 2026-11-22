@@ -31,7 +31,7 @@ impl TreePath {
         Ok(path)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
             !self.0.contains(&0)
                 && self
@@ -82,7 +82,7 @@ pub struct TreeMetadata {
 }
 
 impl TreeMetadata {
-    fn validate(self) -> Result<()> {
+    pub(crate) fn validate(self) -> Result<()> {
         ensure!(self.mode & !0o1777 == 0, "unsupported build tree mode");
         self.modified.validate()
     }

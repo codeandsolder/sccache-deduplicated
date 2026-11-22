@@ -1,7 +1,9 @@
 use std::{collections::BTreeMap, fs, io::Read, process::Command};
 
 use super::*;
-use crate::{BuildPath, CommandSpec, OutputSpec, TreeManifest, TreeMetadata, TreeTimestamp};
+use crate::{
+    BuildPath, CommandSpec, OutputSpec, TreeManifest, TreeMetadata, TreeRecipe, TreeTimestamp,
+};
 
 fn metadata(mode: u32) -> TreeMetadata {
     TreeMetadata {
@@ -96,7 +98,7 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
     let src = store.publish_tree(&tree, vec![input])?;
     let platform = ContentId::of(b"test platform");
     let mut spec = ExecutionSpec {
-        platform, root,
+        platform, root: TreeRecipe::union(metadata(0o755), [root]),
         mounts: BTreeMap::from([(BuildPath::new(b"/src".to_vec())?, src)]),
         command: CommandSpec {
             executable: BuildPath::new(b"/bin/sh".to_vec())?,
@@ -208,7 +210,7 @@ fn rejects_symlink_and_fifo_outputs_without_following_or_blocking() -> Result<()
     };
     let spec = ExecutionSpec {
         platform: ContentId::of(b"platform"),
-        root: crate::TreeId([0; 32]),
+        root: TreeRecipe::union(metadata(0o755), [crate::TreeId([0; 32])]),
         mounts: BTreeMap::new(),
         command: CommandSpec {
             executable: BuildPath::new(b"/bin/sh".to_vec())?,

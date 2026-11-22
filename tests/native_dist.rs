@@ -16,7 +16,7 @@ use anyhow::{Result, ensure};
 use sccache::{
     build_runtime::{
         BuildPath, CommandSpec, ContentId, ExecutionSpec, NativeStore, OutputSpec, SpacePolicy,
-        TreePath,
+        TreeLayer, TreePath, TreeRecipe,
         wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply},
     },
     config::{HTTPUrl, scheduler, server},
@@ -230,16 +230,29 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let sender = NativeStore::open(&root.join("sender"))?;
     let mut discovery = ToolchainPackageBuilder::new();
     discovery.add_executable_and_deps("/usr/bin/as".into())?;
-    let mut mapping = discovery.into_native_mapping()?;
-    mapping.add_directory(TreePath::new(b"src".to_vec())?)?;
+    let mapping = discovery.into_native_mapping()?;
     let root_tree = mapping.capture(&sender)?;
     let source_tree = sender.capture_tree(&source_dir)?;
     let root_pin = client.push_tree(&root_tree)?;
     let source_pin = client.push_tree(&source_tree)?;
     let spec = ExecutionSpec {
         platform: ContentId::of(PLATFORM.as_bytes()),
-        root: root_tree.id(),
-        mounts: BTreeMap::from([(BuildPath::new(b"/src".to_vec())?, source_tree.id())]),
+        root: TreeRecipe {
+            directories: root_tree.manifest().root,
+            layers: vec![
+                TreeLayer {
+                    tree: root_tree.id(),
+                    source: None,
+                    destination: None,
+                },
+                TreeLayer {
+                    tree: source_tree.id(),
+                    source: None,
+                    destination: Some(TreePath::new(b"src".to_vec())?),
+                },
+            ],
+        },
+        mounts: BTreeMap::new(),
         command: CommandSpec {
             executable: BuildPath::new(b"/usr/bin/as".to_vec())?,
             arguments: [b"-o".as_slice(), b"object.o", b"/src/input.s"]
@@ -318,7 +331,11 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     ));
     drop(worker_process);
     drop(scheduler_process);
-    assert_eq!(NativeStore::open(&worker_directory)?.stats()?.actions, 0);
-    assert_eq!(NativeStore::open(&scheduler_directory)?.stats()?.actions, 1);
+    let worker_stats = NativeStore::open(&worker_directory)?.stats()?;
+    let scheduler_stats = NativeStore::open(&scheduler_directory)?.stats()?;
+    assert_eq!(worker_stats.actions, 0);
+    assert_eq!(scheduler_stats.actions, 1);
+    assert_eq!(worker_stats.trees, 2);
+    assert_eq!(scheduler_stats.trees, 2);
     Ok(())
 }

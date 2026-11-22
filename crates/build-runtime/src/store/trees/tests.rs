@@ -115,6 +115,36 @@ fn package_trees_and_actions_share_one_blob_index_across_restart() -> Result<()>
     Ok(())
 }
 
+#[test]
+fn recipe_lease_pins_original_packages_without_creating_an_indexed_root() -> Result<()> {
+    use crate::{TreeLayer, TreeRecipe};
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let staged = store.stage(&b"compiler"[..])?;
+    let blob = staged.reference();
+    let package = store.publish_tree(&sample_tree(blob)?, vec![staged])?;
+    let recipe = TreeRecipe {
+        directories: metadata(0o755),
+        layers: vec![TreeLayer {
+            tree: package,
+            source: None,
+            destination: Some(TreePath::new(b"toolchain".to_vec())?),
+        }],
+    };
+    let lease = store.lease_recipe(&recipe)?;
+    assert_ne!(lease.id(), package);
+    assert!(store.lookup_tree(lease.id())?.is_none());
+    assert_eq!(store.stats()?.trees, 1);
+    assert_eq!(store.evict_tree(package)?, Eviction::Pinned);
+    assert_eq!(lease.open_file(blob.id)?.metadata()?.len(), blob.size);
+    drop(lease);
+    assert!(matches!(
+        store.evict_tree(package)?,
+        Eviction::Removed { .. }
+    ));
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn materialization_preserves_modes_links_and_timestamps_without_mutating_cas() -> Result<()> {

@@ -106,6 +106,18 @@ impl NativeStore {
     /// # Errors
     /// Returns an error if any package is missing or the recipe conflicts.
     pub fn publish_recipe(&self, recipe: &TreeRecipe) -> Result<TreeId> {
+        let lease = self.lease_recipe(recipe)?;
+        self.publish_tree(lease.manifest(), Vec::new())
+    }
+
+    /// Compose and lease a recipe in memory, without publishing a new CAS
+    /// root or copying any content. The source package pins keep every
+    /// referenced file live until the composed lease is released.
+    ///
+    /// # Errors
+    /// Returns an error for missing trees, conflicting entries or invalid metadata.
+    pub fn lease_recipe(&self, recipe: &TreeRecipe) -> Result<TreeLease> {
+        recipe.validate()?;
         let mut leases = BTreeMap::new();
         for layer in &recipe.layers {
             if let std::collections::btree_map::Entry::Vacant(entry) = leases.entry(layer.tree) {
@@ -120,7 +132,15 @@ impl NativeStore {
             .map(|(&id, lease)| (id, lease.manifest()))
             .collect();
         let manifest = recipe.compose(&packages)?;
-        self.publish_tree(&manifest, Vec::new())
+        let id = manifest.id()?;
+        let blobs = manifest.blobs()?;
+        Ok(TreeLease {
+            inner: Arc::clone(&self.inner),
+            id,
+            manifest,
+            blobs,
+            pins: leases.into_values().flat_map(|lease| lease.pins).collect(),
+        })
     }
 
     /// Pin a tree while its files are consumed.
@@ -149,6 +169,10 @@ impl NativeStore {
             id,
             manifest,
             blobs,
+            pins: vec![TreePin {
+                inner: Arc::clone(&self.inner),
+                id,
+            }],
         }))
     }
 
@@ -190,12 +214,13 @@ impl NativeStore {
     }
 }
 
-/// A pinned tree manifest and its unique file content.
+/// A tree manifest with indexed root or constituent-package pins.
 pub struct TreeLease {
     inner: Arc<Inner>,
     id: TreeId,
     manifest: TreeManifest,
     blobs: BTreeMap<ContentId, u64>,
+    pins: Vec<TreePin>,
 }
 
 impl TreeLease {
@@ -229,7 +254,12 @@ impl TreeLease {
     }
 }
 
-impl Drop for TreeLease {
+struct TreePin {
+    inner: Arc<Inner>,
+    id: TreeId,
+}
+
+impl Drop for TreePin {
     fn drop(&mut self) {
         match self.inner.lock_pins() {
             Ok(mut pins) => release_pin(&mut pins.trees, &self.id),
