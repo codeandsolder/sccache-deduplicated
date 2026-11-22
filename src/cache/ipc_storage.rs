@@ -148,12 +148,14 @@ impl Storage for IpcStorage {
     async fn get(&self, key: &str) -> Result<Cache> {
         // A daemon path can be unavailable or name different bytes in this
         // namespace. Only consume bytes returned by the storage authority.
-        match self.get_raw(key).await? {
-            Some(bytes) => CacheRead::from(Cursor::new(bytes))
-                .with_context(|| format!("IpcStorage: decode archive for key {key}"))
-                .map(Cache::Hit),
-            None => Ok(Cache::Miss),
-        }
+        self.get_raw(key).await?.map_or_else(
+            || Ok(Cache::Miss),
+            |bytes| {
+                CacheRead::from(Cursor::new(bytes))
+                    .with_context(|| format!("IpcStorage: decode archive for key {key}"))
+                    .map(Cache::Hit)
+            },
+        )
     }
 
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
