@@ -3240,6 +3240,7 @@ where
             .iter()
             .chain(abs_externs.iter())
             .chain(abs_staticlibs.iter())
+            .chain(target_json_files.iter())
             .cloned()
             .collect();
 
