@@ -592,7 +592,7 @@ mod tests {
 
     /// Set the last modified time of `path` backwards by `seconds` seconds.
     fn set_mtime_back<T: AsRef<Path>>(path: T, seconds: usize) -> io::Result<()> {
-        let file = File::options().write(true).open(path)?;
+        let file = File::options().write(true).open(path.as_ref())?;
         let modified = file.metadata()?.modified()?;
         let seconds = u64::try_from(seconds).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "mtime offset is too large")
