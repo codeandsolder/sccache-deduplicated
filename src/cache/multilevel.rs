@@ -83,6 +83,7 @@ struct AtomicLevelStats {
     location: String,
     hits: AtomicU64,
     misses: AtomicU64,
+    read_errors: AtomicU64,
     writes: AtomicU64,
     write_failures: AtomicU64,
     backfills_from: AtomicU64,
@@ -98,6 +99,7 @@ impl AtomicLevelStats {
             location,
             hits: AtomicU64::default(),
             misses: AtomicU64::default(),
+            read_errors: AtomicU64::default(),
             writes: AtomicU64::default(),
             write_failures: AtomicU64::default(),
             backfills_from: AtomicU64::default(),
@@ -131,6 +133,7 @@ impl AtomicLevelStats {
             location: self.location.clone(),
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
+            read_errors: self.read_errors.load(Ordering::Relaxed),
             writes: self.writes.load(Ordering::Relaxed),
             write_failures: self.write_failures.load(Ordering::Relaxed),
             backfills_from: self.backfills_from.load(Ordering::Relaxed),
@@ -152,6 +155,8 @@ pub struct LevelStats {
     pub hits: u64,
     /// Number of cache misses (checked but not found) at this level
     pub misses: u64,
+    /// Number of lookup failures at this level, excluding ordinary misses.
+    pub read_errors: u64,
     /// Number of successful writes to this level
     pub writes: u64,
     /// Number of failed writes to this level
@@ -194,6 +199,7 @@ impl std::ops::AddAssign for LevelStats {
         // name and location identify the level — keep lhs values
         self.hits += rhs.hits;
         self.misses += rhs.misses;
+        self.read_errors += rhs.read_errors;
         self.writes += rhs.writes;
         self.write_failures += rhs.write_failures;
         self.backfills_from += rhs.backfills_from;
@@ -260,6 +266,12 @@ impl LevelStats {
         stats.push((
             format!("  {} misses", self.name),
             self.misses.to_string(),
+            0,
+        ));
+
+        stats.push((
+            format!("  {} read errors", self.name),
+            self.read_errors.to_string(),
             0,
         ));
 
@@ -655,9 +667,6 @@ impl MultiLevelStorage {
             hit_duration_nanos,
             duration_nanos_u64(duration)
         );
-        for miss_idx in 0..idx {
-            inc_stat!(self.atomic_stats.get(miss_idx), misses, 1);
-        }
 
         self.backfill_faster_levels(key, idx, raw_bytes_for_backfill);
     }
@@ -682,6 +691,7 @@ impl MultiLevelStorage {
     // Namespace IPC needs bytes, but should still share ordinary lookup,
     // fallback, accounting, and backfill behavior with local compilation.
     async fn lookup(&self, key: &str, mode: LookupMode) -> Result<(Cache, Option<Bytes>)> {
+        let mut first_error = None;
         for idx in 0..self.levels.len() {
             let start = Instant::now();
             let (cache_result, raw) = self
@@ -701,15 +711,26 @@ impl MultiLevelStorage {
                     self.record_hit_and_schedule_backfills(key, idx, start.elapsed(), raw);
                     return Ok((Cache::Hit(entry), returned_raw));
                 }
-                Ok(Cache::Miss) => trace!("Cache miss at level {idx}, trying next level"),
+                Ok(Cache::Miss) => {
+                    inc_stat!(self.atomic_stats.get(idx), misses, 1);
+                    trace!("Cache miss at level {idx}, trying next level");
+                }
                 Ok(other) => return Ok((other, None)),
-                Err(e) => warn!("Error checking cache level {idx}: {e}, trying next level"),
+                Err(error) => {
+                    inc_stat!(self.atomic_stats.get(idx), read_errors, 1);
+                    warn!("Error checking cache level {idx}: {error:#}, trying next level");
+                    if first_error.is_none() {
+                        first_error = Some(
+                            error.context(format!("cache level {idx} lookup failed for key {key}")),
+                        );
+                    }
+                }
             }
         }
-        debug!("Cache miss at all levels");
-        for idx in 0..self.levels.len() {
-            inc_stat!(self.atomic_stats.get(idx), misses, 1);
+        if let Some(error) = first_error {
+            return Err(error);
         }
+        debug!("Cache miss at all levels");
         Ok((Cache::Miss, None))
     }
 

@@ -613,6 +613,7 @@ async fn get_compiler_outputs<T>(
 where
     T: Clone + CommandCreatorSync,
 {
+    let start = time::Instant::now();
     let mut arguments = arguments;
     arguments.extend([OsString::from("--print"), OsString::from("file-names")]);
     let prepared = super::rust_response::prepare(executable, &arguments)?;
@@ -628,7 +629,10 @@ where
 
     let outstr = String::from_utf8(outputs.stdout).context("Error parsing rustc output")?;
     if log_enabled!(Trace) {
-        trace!("get_compiler_outputs: {outstr:?}");
+        trace!(
+            "get_compiler_outputs in {}: {outstr:?}",
+            fmt_duration_as_secs(&start.elapsed())
+        );
     }
     Ok(outstr.lines().map(std::borrow::ToOwned::to_owned).collect())
 }
@@ -1056,41 +1060,46 @@ fn compilation_target(arguments: &[Argument<ArgData>], host: &str) -> String {
 // where they appear. The weak map persists across sccache upgrades, so the
 // package format must participate in the weak key independently of compile
 // cache versioning.
-const RUST_DIST_TOOLCHAIN_PACKAGE_SCHEMA: &[u8] = b"rust-dist-toolchain-package-v2";
+const RUST_DIST_TOOLCHAIN_PACKAGE_SCHEMA: &[u8] = b"rust-dist-toolchain-package-v3";
 
 fn dist_toolchain_weak_key_with_schema(
-    base: &Digest,
+    compiler_shlibs_digests: &[String],
     package_schema: &[u8],
     target: &str,
     target_std_manifest_digest: Option<&str>,
     noncanonical_sysroot: Option<&Path>,
 ) -> String {
-    let mut weak = base.clone();
-    weak.update(package_schema);
-    weak.update(b"rust-dist-toolchain-target-v1");
-    if let Some(sysroot) = noncanonical_sysroot {
-        weak.update(b"noncanonical-sysroot-v1");
-        weak.update(sysroot.as_os_str().as_encoded_bytes());
+    // Clippy policy, manifest inputs, proc macros and --emit affect the
+    // compilation cache key, not the contents of the packaged sysroot.
+    let mut weak = Digest::new();
+    weak.delimiter(package_schema);
+    for digest in compiler_shlibs_digests {
+        weak.delimiter(digest.as_bytes());
     }
-    weak.update(target.as_bytes());
+    weak.delimiter(b"rust-dist-toolchain-target-v1");
+    if let Some(sysroot) = noncanonical_sysroot {
+        weak.delimiter(b"noncanonical-sysroot-v1");
+        weak.delimiter(sysroot.as_os_str().as_encoded_bytes());
+    }
+    weak.delimiter(target.as_bytes());
     match target_std_manifest_digest {
         Some(digest) => {
-            weak.update(b"target-std-present");
-            weak.update(digest.as_bytes());
+            weak.delimiter(b"target-std-present");
+            weak.delimiter(digest.as_bytes());
         }
-        None => weak.update(b"target-std-missing"),
+        None => weak.delimiter(b"target-std-missing"),
     }
     weak.finish()
 }
 
 fn dist_toolchain_weak_key(
-    base: &Digest,
+    compiler_shlibs_digests: &[String],
     target: &str,
     target_std_manifest_digest: Option<&str>,
     noncanonical_sysroot: Option<&Path>,
 ) -> String {
     dist_toolchain_weak_key_with_schema(
-        base,
+        compiler_shlibs_digests,
         RUST_DIST_TOOLCHAIN_PACKAGE_SCHEMA,
         target,
         target_std_manifest_digest,
@@ -2037,17 +2046,20 @@ counted_array!(static ARGS: [ArgInfo<ArgData>; _] = [
     take_arg!("--crate-type", ArgCrateTypes, CanBeSeparated(b'='), CrateType),
     take_arg!("--deny", OsString, CanBeSeparated(b'='), PassThrough),
     take_arg!("--diagnostic-width", OsString, CanBeSeparated(b'='), PassThrough),
+    take_arg!("--edition", OsString, CanBeSeparated(b'='), PassThrough),
     take_arg!("--emit", String, CanBeSeparated(b'='), Emit),
     take_arg!("--error-format", OsString, CanBeSeparated(b'='), PassThrough),
     take_arg!("--explain", OsString, CanBeSeparated(b'='), NotCompilation),
     take_arg!("--extern", ArgExtern, CanBeSeparated(b'='), Extern),
     take_arg!("--forbid", OsString, CanBeSeparated(b'='), PassThrough),
+    take_arg!("--force-warn", OsString, CanBeSeparated(b'='), PassThrough),
     flag!("--help", NotCompilationFlag),
     take_arg!("--json", String, CanBeSeparated(b'='), Json),
     take_arg!("--out-dir", PathBuf, CanBeSeparated(b'='), OutDir),
     take_arg!("--pretty", OsString, CanBeSeparated(b'='), NotCompilation),
     take_arg!("--print", OsString, CanBeSeparated(b'='), NotCompilation),
     take_arg!("--remap-path-prefix", OsString, CanBeSeparated(b'='), PassThrough),
+    take_arg!("--remap-path-scope", OsString, CanBeSeparated(b'='), PassThrough),
     take_arg!("--sysroot", PathBuf, CanBeSeparated(b'='), TooHardPath),
     take_arg!("--target", ArgTarget, CanBeSeparated(b'='), Target),
     take_arg!("--unpretty", OsString, CanBeSeparated(b'='), NotCompilation),
@@ -2195,6 +2207,11 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
                 }
             }
             Some(Unstable(ArgUnstable { opt, value })) => match value.as_deref() {
+                _ if matches!(opt.as_ref(), "no-link" | "link-only") => {
+                    // An explicit stage invocation has a different output
+                    // contract from an ordinary --emit=link compilation.
+                    cannot_cache!("explicit Rust link stage", opt.clone());
+                }
                 Some("y" | "yes" | "on") | None if opt == "profile" => {
                     gcno = true;
                 }
@@ -2495,6 +2512,87 @@ pub fn relocate_raw_rust_operands(
             .iter()
             .flat_map(|arg| arg.iter_os_strings())
             .collect(),
+    )
+}
+
+/// Identify the source operand using the same typed argument grammar as
+/// compiler hashing. Retain the expanded argv itself, not a reserialization:
+/// linker options, repeated options, and option spellings remain exact.
+#[cfg(target_os = "linux")]
+pub(super) fn native_link_stage_input(
+    arguments: &[OsString],
+    cwd: &Path,
+) -> Result<super::rust_link::RustLinkStages> {
+    use anyhow::ensure;
+    use std::cell::Cell;
+
+    let expanded = super::rust_response::expand(arguments, cwd)?;
+    let consumed = Cell::new(0);
+    let mut input = None;
+    let mut after_separator = false;
+    let mut emit = None;
+    let mut out_dir = None;
+    let mut output_file = None;
+    let mut explicit_outputs = Vec::new();
+    for argument in ArgsIter::new(
+        expanded
+            .iter()
+            .cloned()
+            .inspect(|_| consumed.set(consumed.get() + 1)),
+        &ARGS[..],
+    )
+    .with_double_dashes()
+    {
+        let argument = argument?;
+        match &argument {
+            Argument::Raw(value) if value == "--" && !after_separator => after_separator = true,
+            Argument::Raw(_) => {
+                ensure!(
+                    input.replace(consumed.get() - 1).is_none(),
+                    "multiple Rust source operands"
+                );
+            }
+            _ => match argument.get_data() {
+                Some(Unstable(option))
+                    if matches!(option.opt.as_str(), "no-link" | "link-only") =>
+                {
+                    bail!("Rust invocation already specifies a link stage");
+                }
+                Some(NotCompilationFlag | NotCompilation(_)) => bail!("not a Rust compilation"),
+                Some(OutDir(path)) => out_dir = Some(path.clone()),
+                Some(TooHardPath(path)) if argument.flag_str() == Some("-o") => {
+                    output_file = Some(path.clone());
+                }
+                Some(Emit(value)) => {
+                    explicit_outputs.extend(value.split(',').filter_map(|kind| {
+                        let (_, path) = kind.split_once('=')?;
+                        (path != "-").then(|| PathBuf::from(path))
+                    }));
+                    ensure!(
+                        emit.replace(
+                            value
+                                .split(',')
+                                .any(|kind| kind == "link" || kind.starts_with("link="))
+                        )
+                        .is_none(),
+                        "multiple Rust emit options"
+                    );
+                }
+                _ => {}
+            },
+        }
+    }
+    ensure!(
+        emit.unwrap_or(true),
+        "Rust invocation does not emit a linked artifact"
+    );
+    super::rust_link::RustLinkStages::from_parsed(
+        expanded,
+        input.context("missing Rust source operand")?,
+        cwd,
+        out_dir.as_deref(),
+        output_file.as_deref(),
+        &explicit_outputs,
     )
 }
 
@@ -2836,17 +2934,34 @@ where
 
         let target_json_hash = hash_all(&target_json_files, pool);
 
+        // Output filenames depend on crate type, target and naming flags, not
+        // the canonical layout selected after source discovery. Query the compiler
+        // in the original namespace with the physical pre-pass arguments.
+        let outputs = async {
+            if let Some(metadata) = &self.parsed_args.metadata_only_output {
+                return Ok(vec![metadata.clone()]);
+            }
+            let arguments = prepass_os_string_arguments
+                .iter()
+                .flat_map(|(arg, val)| iter::once(arg).chain(val.as_ref()))
+                .cloned()
+                .collect();
+            get_compiler_outputs(creator, &self.executable, arguments, &cwd, &env_vars).await
+        };
+
         // Perform all hashing operations on the files.
         let (
             (source_files, source_hashes, mut env_deps, dep_info_text),
             extern_hashes,
             staticlib_hashes,
             target_json_hash,
+            mut outputs,
         ) = futures::try_join!(
             source_files_and_hashes_and_env_deps,
             extern_hashes,
             staticlib_hashes,
-            target_json_hash
+            target_json_hash,
+            outputs
         )?;
 
         if let Some(canonical) = canonical_paths.as_ref()
@@ -3010,7 +3125,7 @@ where
             None
         };
         let weak_toolchain_key = dist_toolchain_weak_key(
-            &m,
+            &self.compiler_shlibs_digests,
             &target,
             target_std_manifest_digest.as_deref(),
             canonical_paths.is_none().then_some(self.sysroot.as_path()),
@@ -3138,27 +3253,6 @@ where
         // 10. The version of the compiler.
         self.version.hash(&mut HashToDigest { digest: &mut m });
 
-        // Turn arguments into a simple Vec<OsString> to calculate outputs.
-        let flat_os_string_arguments: Vec<OsString> = os_string_arguments
-            .iter()
-            .flat_map(|(arg, val)| iter::once(arg).chain(val.as_ref()))
-            .cloned()
-            .collect();
-
-        let mut outputs = if let Some(metadata) = &self.parsed_args.metadata_only_output {
-            vec![metadata.clone()]
-        } else {
-            // Linked outputs depend on the compiler and target. Query rustc
-            // rather than guessing executable or library naming conventions.
-            get_compiler_outputs(
-                creator,
-                &self.executable,
-                flat_os_string_arguments,
-                &cwd,
-                &env_vars,
-            )
-            .await?
-        };
         if self.parsed_args.emit.contains("metadata")
             && self.parsed_args.metadata_only_output.is_none()
         {
@@ -5493,6 +5587,31 @@ LLVM version: 15.0.2
     }
 
     #[test]
+    fn explicit_rust_link_stages_do_not_use_completed_library_cache() {
+        for option in ["no-link", "link-only", "no-link=yes", "link-only=yes"] {
+            let result = fails!(
+                "--emit=link",
+                "foo.rs",
+                "--out-dir",
+                "out",
+                "--crate-name",
+                "foo",
+                "--crate-type",
+                "rlib",
+                "-Z",
+                option
+            );
+            assert_eq!(
+                result,
+                CompilerArguments::CannotCache(
+                    "explicit Rust link stage",
+                    Some(option.split('=').next().unwrap().to_owned())
+                )
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_arguments_incremental() {
         parses!(
             "--emit",
@@ -6235,14 +6354,14 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
 
     fn mock_file_names(creator: &Arc<Mutex<MockCommandCreator>>, filenames: &[&str]) {
         // Mock the `rustc --print=file-names` process output.
-        next_command(
-            creator,
-            Ok(MockChild::new(
-                exit_status(0),
-                filenames.iter().join("\n"),
-                "",
-            )),
-        );
+        let stdout = filenames.iter().join("\n");
+        next_command_calls(creator, move |args| {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "--print" && pair[1] == "file-names")
+            );
+            Ok(MockChild::new(exit_status(0), &stdout, ""))
+        });
     }
 
     #[test]
@@ -6626,7 +6745,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
     where
         F: Fn(&Path) -> Result<()>,
     {
-        hash_key_for_compiler(
+        hash_keys_for_compiler(
             f,
             args,
             env_vars,
@@ -6634,16 +6753,17 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             preprocessor_cache_mode,
             "rustc",
         )
+        .0
     }
 
-    fn hash_key_for_compiler<F>(
+    fn hash_keys_for_compiler<F>(
         f: &TestFixture,
         args: &[&'static str],
         env_vars: &[(OsString, OsString)],
         pre_func: F,
         preprocessor_cache_mode: bool,
         executable: &str,
-    ) -> String
+    ) -> (String, String)
     where
         F: Fn(&Path) -> Result<()>,
     {
@@ -6685,7 +6805,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         if hasher.parsed_args.metadata_only_output.is_none() {
             mock_file_names(&creator, &["foo.rlib"]);
         }
-        hasher
+        let result = hasher
             .generate_hash_key(GenerateHashKeyContext {
                 creator: &creator,
                 cwd: f.tempdir.path().to_owned(),
@@ -6697,8 +6817,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 cache_control: CacheControl::Default,
             })
             .wait()
-            .unwrap()
-            .key
+            .unwrap();
+        (result.key, result.weak_toolchain_key)
     }
 
     #[test]
@@ -6720,9 +6840,9 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             "--crate-type",
             "lib",
         ];
-        let first = hash_key_for_compiler(&f, &args, &env, |_| Ok(()), false, "clippy-driver");
+        let first = hash_keys_for_compiler(&f, &args, &env, |_| Ok(()), false, "clippy-driver").0;
         fs::write(&file, b"disallowed-names = [\"bad_two\"]\n")?;
-        let second = hash_key_for_compiler(&f, &args, &env, |_| Ok(()), false, "clippy-driver");
+        let second = hash_keys_for_compiler(&f, &args, &env, |_| Ok(()), false, "clippy-driver").0;
         assert_ne!(
             first, second,
             "changing the external Clippy policy must invalidate cache"
@@ -6752,10 +6872,11 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             "CLIPPY_ARGS".into(),
             "-Aclippy::unwrap_used__CLIPPY_HACKERY__".into(),
         )];
-        let deny_key = hash_key_for_compiler(&f, &args, &deny, |_| Ok(()), false, "clippy-driver");
+        let deny_key =
+            hash_keys_for_compiler(&f, &args, &deny, |_| Ok(()), false, "clippy-driver").0;
         let allow_key =
-            hash_key_for_compiler(&f, &args, &allow, |_| Ok(()), false, "clippy-driver");
-        let rustc_key = hash_key_for_compiler(&f, &args, &deny, |_| Ok(()), false, "rustc");
+            hash_keys_for_compiler(&f, &args, &allow, |_| Ok(()), false, "clippy-driver").0;
+        let rustc_key = hash_keys_for_compiler(&f, &args, &deny, |_| Ok(()), false, "rustc").0;
         assert_ne!(
             deny_key, allow_key,
             "different Clippy lint levels must not reuse diagnostics"
@@ -8107,8 +8228,7 @@ version='2.0.0'
 
     #[test]
     fn dist_toolchain_weak_key_tracks_target_std_manifest_and_physical_layout() {
-        let mut base = Digest::new();
-        base.update(b"same-rustc");
+        let base = ["same-rustc".to_owned()];
 
         let host = dist_toolchain_weak_key(
             &base,
@@ -8127,7 +8247,7 @@ version='2.0.0'
 
         let previous_package_schema = dist_toolchain_weak_key_with_schema(
             &base,
-            b"rust-dist-toolchain-package-v1",
+            b"rust-dist-toolchain-package-v2",
             "x86_64-unknown-linux-gnu",
             Some("host-std-digest"),
             None,
@@ -8148,6 +8268,45 @@ version='2.0.0'
         );
         assert_ne!(root_toolchain, user_toolchain);
         assert_ne!(root_toolchain, host);
+        assert_ne!(
+            host,
+            dist_toolchain_weak_key(
+                &["different-rustc".to_owned()],
+                "x86_64-unknown-linux-gnu",
+                Some("host-std-digest"),
+                None,
+            )
+        );
+    }
+
+    #[test]
+    fn dist_toolchain_key_is_independent_of_compilation_policy() -> Result<()> {
+        let f = TestFixture::new();
+        let args = [
+            "--emit",
+            "metadata",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+        ];
+        let policy = f.tempdir.path().join("policy");
+        fs::create_dir_all(&policy)?;
+        fs::write(
+            policy.join("clippy.toml"),
+            b"disallowed-names = [\"test\"]\n",
+        )?;
+        let env = vec![(OsString::from("CLIPPY_CONF_DIR"), policy.into_os_string())];
+        let (rustc_key, rustc_toolchain) =
+            hash_keys_for_compiler(&f, &args, &[], |_| Ok(()), false, "rustc");
+        let (clippy_key, clippy_toolchain) =
+            hash_keys_for_compiler(&f, &args, &env, |_| Ok(()), false, "clippy-driver");
+        assert_ne!(rustc_key, clippy_key);
+        assert_eq!(rustc_toolchain, clippy_toolchain);
+        Ok(())
     }
 
     #[test]
