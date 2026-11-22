@@ -1526,10 +1526,12 @@ fn config_from_environment(environment: &Environment) -> Result<EnvConfig> {
     let disk_sz = environment
         .var_os("SCCACHE_CACHE_SIZE")
         .map(|value| {
-            value
-                .to_str()
-                .and_then(parse_size)
-                .ok_or_else(|| anyhow!("SCCACHE_CACHE_SIZE value is invalid: {value:?}"))
+            value.to_str().and_then(parse_size).ok_or_else(|| {
+                anyhow!(
+                    "SCCACHE_CACHE_SIZE value is invalid: {}",
+                    crate::util::debug_display(value)
+                )
+            })
         })
         .transpose()?;
 
