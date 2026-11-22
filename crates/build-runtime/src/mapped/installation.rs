@@ -85,7 +85,7 @@ impl InstallationCatalog {
         let mut expected = BTreeMap::new();
         for manifest in manifests {
             manifest.validate()?;
-            catalog.packages.insert(manifest.source_sha256);
+            catalog.packages.insert(manifest.source.identity.sha256);
             for (path, blob) in manifest.files()? {
                 if let Some(previous) = expected.insert(path, blob) {
                     ensure!(previous == blob, "conflicting original package contents");

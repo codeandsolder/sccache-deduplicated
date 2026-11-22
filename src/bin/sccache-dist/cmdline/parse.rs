@@ -507,13 +507,15 @@ fn package_args(command: ClapCommand) -> ClapCommand {
 fn package_source(
     matches: &clap::ArgMatches,
 ) -> anyhow::Result<sccache::build_runtime::PackageSource> {
-    sccache::build_runtime::PackageSource::from_sha256_hex(
-        matches
-            .get_one::<String>("sha256")
-            .context("missing SHA-256")?,
-        *matches
+    Ok(sccache::build_runtime::PackageSource {
+        identity: sccache::build_runtime::PackageIdentity::from_sha256_hex(
+            matches
+                .get_one::<String>("sha256")
+                .context("missing SHA-256")?,
+            package_compression(matches)?,
+        )?,
+        size: *matches
             .get_one::<u64>("size")
             .context("missing package size")?,
-        package_compression(matches)?,
-    )
+    })
 }

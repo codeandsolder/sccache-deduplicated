@@ -25,7 +25,13 @@ fn verified_installation_reuses_digest_without_reading_and_rejects_mutation() ->
         size: 8,
     };
     let manifest = InstallationManifest {
-        source_sha256: [1; 32],
+        source: crate::PackageSource {
+            identity: crate::PackageIdentity {
+                sha256: [1; 32],
+                compression: crate::PackageCompression::Tar,
+            },
+            size: 0,
+        },
         package: TreeId([2; 32]),
         components: BTreeMap::from([(
             "test".into(),

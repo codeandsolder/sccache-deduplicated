@@ -1,6 +1,8 @@
 //! Portable original-package installation metadata.
 
-use crate::{BlobRef, TreeEntry, TreeId, TreeManifest, TreePath, identity::encoding};
+use crate::{
+    BlobRef, PackageSource, TreeEntry, TreeId, TreeManifest, TreePath, identity::encoding,
+};
 use anyhow::{Context, Result, ensure};
 use bincode::Options;
 use serde::{Deserialize, Serialize};
@@ -9,14 +11,14 @@ use std::{
     io::{Read, Write},
 };
 
-const MANIFEST_MAGIC: &[u8] = b"sccache-installation-manifest-v1\0";
+const MANIFEST_MAGIC: &[u8] = b"sccache-installation-manifest-v2\0";
 const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A portable manifest derived from an original verified package. It contains
 /// metadata and content identities only; no host-local file versions.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InstallationManifest {
-    pub source_sha256: [u8; 32],
+    pub source: PackageSource,
     pub package: TreeId,
     pub components: BTreeMap<String, TreeManifest>,
 }

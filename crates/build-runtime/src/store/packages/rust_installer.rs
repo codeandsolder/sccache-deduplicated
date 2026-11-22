@@ -220,7 +220,7 @@ impl NativeStore {
             self.publish_tree(manifest, Vec::new())?;
         }
         Ok(InstallationManifest {
-            source_sha256: verified.source().sha256,
+            source: verified.source(),
             package: package.id(),
             components: manifests,
         })
@@ -231,7 +231,8 @@ impl NativeStore {
 mod tests {
     use super::*;
     use crate::{
-        PackageCompression, PackageDecoder, PackagePolicy, PackageSource, TreeRecipe, TreeTimestamp,
+        PackageCompression, PackageDecoder, PackageIdentity, PackagePolicy, PackageSource,
+        TreeRecipe, TreeTimestamp,
     };
     use sha2::{Digest, Sha256};
 
@@ -276,9 +277,11 @@ mod tests {
         };
         let id = store.import_package(
             PackageSource {
-                sha256: Sha256::digest(bytes).into(),
+                identity: PackageIdentity {
+                    sha256: Sha256::digest(bytes).into(),
+                    compression: PackageCompression::Tar,
+                },
                 size: u64::try_from(bytes.len())?,
-                compression: PackageCompression::Tar,
             },
             PackagePolicy {
                 directory,

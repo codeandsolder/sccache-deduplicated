@@ -6,8 +6,8 @@ mod unix {
 
     use anyhow::{Context, Result, bail, ensure};
     use sccache_build::{
-        NativeStore, PackageCompression, PackageDecoder, PackagePolicy, PackageSource, TreeLayer,
-        TreeMetadata, TreePath, TreeRecipe, TreeTimestamp,
+        NativeStore, PackageCompression, PackageDecoder, PackageIdentity, PackagePolicy,
+        PackageSource, TreeLayer, TreeMetadata, TreePath, TreeRecipe, TreeTimestamp,
     };
 
     pub fn run() -> Result<()> {
@@ -25,7 +25,10 @@ mod unix {
         };
         ensure!(args.next().is_none(), "unexpected argument");
         let input = File::open(&package)?;
-        let source = PackageSource::from_sha256_hex(hash, input.metadata()?.len(), compression)?;
+        let source = PackageSource {
+            identity: PackageIdentity::from_sha256_hex(hash, compression)?,
+            size: input.metadata()?.len(),
+        };
         let modified = TreeTimestamp {
             seconds: 1_700_000_000,
             nanoseconds: 0,
@@ -53,7 +56,7 @@ mod unix {
         let stats = store.stats()?;
         let start = Instant::now();
         let lease = store
-            .lookup_package(source, policy)?
+            .lookup_package(source.identity, policy)?
             .context("package mapping missing")?;
         let looked_up = start.elapsed();
         ensure!(lease.tree().id() == id, "incorrect package lookup");

@@ -52,7 +52,7 @@ impl NativeStore {
         &self,
         manifest: &TreeManifest,
         staged: Vec<StagedBlob>,
-        package: Option<ContentId>,
+        package: Option<(ContentId, u64)>,
     ) -> Result<TreeLease> {
         let _mutation = self.inner.lock_mutations()?;
         let id = self.publish_tree_locked(manifest, staged, package)?;
@@ -63,7 +63,7 @@ impl NativeStore {
         &self,
         manifest: &TreeManifest,
         staged: Vec<StagedBlob>,
-        package: Option<ContentId>,
+        package: Option<(ContentId, u64)>,
     ) -> Result<TreeId> {
         let id = manifest.id()?;
         let blobs = manifest.blobs()?;
@@ -82,11 +82,11 @@ impl NativeStore {
             if !exists {
                 trees.insert(&id.0, encoding().serialize(manifest)?.as_slice())?;
             }
-            if let Some(package) = package {
+            if let Some((package, size)) = package {
                 let mut packages = write.open_table(PACKAGES)?;
-                if let Some(previous) = packages.insert(&package.0, &id.0)? {
+                if let Some(previous) = packages.insert(&package.0, (&id.0, size))? {
                     ensure!(
-                        *previous.value() == id.0,
+                        previous.value() == (&id.0, size),
                         "conflicting upstream package tree"
                     );
                 }
@@ -201,7 +201,7 @@ impl NativeStore {
                 let previous = packages
                     .remove(&package)?
                     .context("missing reverse package reference")?;
-                ensure!(*previous.value() == id.0, "inconsistent package index");
+                ensure!(*previous.value().0 == id.0, "inconsistent package index");
             }
             Self::detach_blobs(&write, &id.0, manifest.blobs()?)?
         };

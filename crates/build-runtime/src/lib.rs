@@ -10,7 +10,7 @@ mod identity;
 mod installation;
 mod package;
 pub use installation::InstallationManifest;
-pub use package::{PackageCompression, PackageSource};
+pub use package::{PackageCompression, PackageIdentity, PackageSource};
 mod recipe;
 mod spec;
 pub use recipe::{TreeLayer, TreeRecipe};

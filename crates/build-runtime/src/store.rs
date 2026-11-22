@@ -23,7 +23,7 @@ use super::{
 
 const ACTIONS: TableDefinition<'static, &[u8; 32], &[u8]> = TableDefinition::new("actions_v1");
 const RESULTS: TableDefinition<'static, &[u8; 32], &[u8]> = TableDefinition::new("results_v1");
-const PACKAGES: TableDefinition<'static, &[u8; 32], &[u8; 32]> =
+const PACKAGES: TableDefinition<'static, &[u8; 32], (&[u8; 32], u64)> =
     TableDefinition::new("packages_v1");
 const TREE_PACKAGES: MultimapTableDefinition<'static, &[u8; 32], &[u8; 32]> =
     MultimapTableDefinition::new("tree_packages_v1");

@@ -11,19 +11,19 @@ pub enum PackageCompression {
     Xz,
 }
 
-/// Upstream package identity, independent of the normalized content tree.
+/// Cryptographic identity published by upstream release manifests. Archive
+/// length is verified at ingestion but is not needed to resolve this identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct PackageSource {
+pub struct PackageIdentity {
     pub sha256: [u8; 32],
-    pub size: u64,
     pub compression: PackageCompression,
 }
 
-impl PackageSource {
-    /// Parse an upstream SHA-256 checksum, with explicit archive length and codec.
+impl PackageIdentity {
+    /// Parse the upstream checksum and archive codec.
     /// # Errors
     /// Returns an error for an invalid hexadecimal checksum.
-    pub fn from_sha256_hex(hash: &str, size: u64, compression: PackageCompression) -> Result<Self> {
+    pub fn from_sha256_hex(hash: &str, compression: PackageCompression) -> Result<Self> {
         ensure!(
             hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
             "invalid SHA-256 checksum"
@@ -34,8 +34,25 @@ impl PackageSource {
         }
         Ok(Self {
             sha256,
-            size,
             compression,
         })
     }
+
+    /// The standard lowercase hexadecimal checksum used by upstream tooling.
+    #[must_use = "the checksum names the original package"]
+    pub fn checksum_hex(self) -> String {
+        use std::fmt::Write as _;
+        let mut hash = String::with_capacity(64);
+        for byte in self.sha256 {
+            let _ = write!(hash, "{byte:02x}");
+        }
+        hash
+    }
+}
+
+/// Verified upstream archive identity and compressed length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PackageSource {
+    pub identity: PackageIdentity,
+    pub size: u64,
 }

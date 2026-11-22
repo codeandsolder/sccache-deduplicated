@@ -12,8 +12,8 @@ use sha2::{Digest, Sha256};
 
 use super::{NativeStore, PACKAGES, StagedBlob, TreeLease};
 use crate::{
-    ContentId, PackageSource, TreeEntry, TreeId, TreeManifest, TreeMetadata, TreePath,
-    TreeTimestamp, identity::typed_digest,
+    ContentId, PackageIdentity, PackageSource, TreeEntry, TreeId, TreeManifest, TreeMetadata,
+    TreePath, TreeTimestamp, identity::typed_digest,
 };
 
 /// Explicit normalization and expansion limits for an original package.
@@ -65,12 +65,8 @@ impl PackageImportLimits {
     /// Check the compressed identity and return canonical installer policy.
     /// # Errors
     /// Returns an error for invalid limits or an oversized compressed archive.
-    pub fn policy(self, source: PackageSource) -> Result<PackagePolicy> {
+    pub fn policy(self) -> Result<PackagePolicy> {
         self.validate()?;
-        ensure!(
-            source.size <= self.max_archive_bytes,
-            "original package exceeds archive size limit"
-        );
         PackagePolicy::rust_installer(
             self.max_entries,
             self.max_expanded_bytes,
@@ -127,11 +123,11 @@ impl VerifiedPackage {
     }
 }
 
-fn package_key(source: PackageSource, policy: PackagePolicy) -> Result<ContentId> {
+fn package_key(identity: PackageIdentity, policy: PackagePolicy) -> Result<ContentId> {
     // Admission limits are not part of the resulting normalized tree identity.
     Ok(ContentId(typed_digest(
-        b"sccache-upstream-package-v1\0",
-        &(source, policy.directory, policy.modified),
+        b"sccache-upstream-package-v2\0",
+        &(identity, policy.directory, policy.modified),
     )?))
 }
 
@@ -143,23 +139,29 @@ impl NativeStore {
     /// Returns an error for index or storage failure.
     pub fn lookup_package(
         &self,
-        source: PackageSource,
+        identity: PackageIdentity,
         policy: PackagePolicy,
     ) -> Result<Option<VerifiedPackage>> {
         let _mutation = self.inner.lock_mutations()?;
-        let key = package_key(source, policy)?;
+        let key = package_key(identity, policy)?;
         let id = {
             let read = self.inner.db.begin_read()?;
             let table = read.open_table(PACKAGES)?;
-            table.get(&key.0)?.map(|entry| TreeId(*entry.value()))
+            table.get(&key.0)?.map(|entry| {
+                let (id, size) = entry.value();
+                (TreeId(*id), size)
+            })
         };
-        let Some(id) = id else {
+        let Some((id, size)) = id else {
             return Ok(None);
         };
         let tree = self
             .lookup_tree(id)?
             .context("indexed package tree missing")?;
-        Ok(Some(VerifiedPackage { source, tree }))
+        Ok(Some(VerifiedPackage {
+            source: PackageSource { identity, size },
+            tree,
+        }))
     }
 
     /// Verify the compressed package against its upstream SHA-256 and length,
@@ -197,21 +199,24 @@ impl NativeStore {
         );
         let digest: [u8; 32] = hashed.hash.finalize().into();
         ensure!(
-            digest == source.sha256,
+            digest == source.identity.sha256,
             "incorrect original package SHA-256"
         );
         let mut reader = archive.file.as_file().try_clone()?;
         reader.rewind()?;
         let mut imported = ImportedTree::new(policy);
-        decoder.decode(reader, source.compression, policy, |entry, data| {
-            imported.add(self, entry, data)
-        })?;
+        decoder.decode(
+            reader,
+            source.identity.compression,
+            policy,
+            |entry, data| imported.add(self, entry, data),
+        )?;
         let (manifest, staged) = imported.finish()?;
         drop(archive);
         let tree = self.publish_tree_indexed_pinned(
             &manifest,
             staged.into_values().collect(),
-            Some(package_key(source, policy)?),
+            Some((package_key(source.identity, policy)?, source.size)),
         )?;
         Ok(VerifiedPackage { source, tree })
     }
@@ -476,9 +481,11 @@ mod tests {
 
     fn source(bytes: &[u8], compression: PackageCompression) -> PackageSource {
         PackageSource {
-            sha256: Sha256::digest(bytes).into(),
+            identity: PackageIdentity {
+                sha256: Sha256::digest(bytes).into(),
+                compression,
+            },
             size: bytes.len() as u64,
-            compression,
         }
     }
 
@@ -520,9 +527,10 @@ mod tests {
         assert_eq!(store.stats()?.blobs, 1);
         assert_eq!(store.stats()?.logical_bytes, 4);
         let existing = store
-            .lookup_package(source(&gzip, PackageCompression::Gzip), policy())?
+            .lookup_package(source(&gzip, PackageCompression::Gzip).identity, policy())?
             .context("missing original package mapping")?;
         assert_eq!(existing.tree().id(), id);
+        assert_eq!(existing.source(), package.source());
         drop(existing);
         let recipe = TreeRecipe {
             directories: policy().directory,
@@ -540,7 +548,7 @@ mod tests {
         store.evict_tree(id)?;
         assert!(
             store
-                .lookup_package(source(&gzip, PackageCompression::Gzip), policy())?
+                .lookup_package(source(&gzip, PackageCompression::Gzip).identity, policy())?
                 .is_none()
         );
         assert_eq!(store.stats()?.pending_gc_blobs, 0);
@@ -584,7 +592,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let store = NativeStore::open(directory.path())?;
         let mut wrong = source(&bytes, PackageCompression::Tar);
-        wrong.sha256[0] ^= 1;
+        wrong.identity.sha256[0] ^= 1;
         assert!(
             store
                 .import_package(wrong, policy(), &bytes[..], PackageDecoder::InProcess)

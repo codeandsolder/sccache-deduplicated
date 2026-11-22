@@ -16,8 +16,8 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use crate::{
     Admission, BlobRef, BuildCoordinator, CompilePermit, ContentId, InstallationManifest,
-    NativeStore, PackageDecoder, PackageImportLimits, PackageSource, ResultLease, ResultManifest,
-    StagedBlob, TreeId, TreeLease, TreeManifest, UploadReservation,
+    NativeStore, PackageDecoder, PackageIdentity, PackageImportLimits, PackageSource, ResultLease,
+    ResultManifest, StagedBlob, TreeId, TreeLease, TreeManifest, UploadReservation,
     wire::{
         ActionRequest, BeginResult, NativeAdmission, NativeStatus, Publisher, ScheduleReply,
         Ticket, TreeOffer, TreeRead, WorkerAllocation,
@@ -286,23 +286,52 @@ impl NativeSessions {
     /// # Errors
     /// Returns an error for busy service, exceeded limits, checksum mismatch,
     /// invalid installer metadata or storage failures.
+    pub fn lookup_rust_package(
+        &self,
+        identity: PackageIdentity,
+        limits: PackageImportLimits,
+    ) -> Result<Option<InstallationManifest>> {
+        let policy = limits.policy()?;
+        let _provisioning = self
+            .package_import
+            .try_lock()
+            .map_err(|_| anyhow!("native package provisioning busy"))?;
+        let Some(package) = self.store().lookup_package(identity, policy)? else {
+            return Ok(None);
+        };
+        self.store()
+            .publish_rust_installer(&package, policy.directory)
+            .map(Some)
+    }
+
+    /// Import an original package through the scheduler's bounded decoder.
+    /// # Errors
+    /// Returns an error for busy service, invalid archive or storage failures.
     pub fn provision_rust_package(
         &self,
         source: PackageSource,
-        archive: Option<&mut dyn Read>,
+        archive: &mut dyn Read,
         limits: PackageImportLimits,
         executable: &Path,
-    ) -> Result<Option<InstallationManifest>> {
-        let policy = limits.policy(source)?;
+    ) -> Result<InstallationManifest> {
+        ensure!(
+            source.size <= limits.max_archive_bytes,
+            "original package exceeds archive size limit"
+        );
+        let policy = limits.policy()?;
         let slot = self.upload_slot()?;
         let provisioning = self
             .package_import
             .try_lock()
             .map_err(|_| anyhow!("native package provisioning busy"))?;
         let store = self.store();
-        let package = if let Some(package) = store.lookup_package(source, policy)? {
+        let package = if let Some(package) = store.lookup_package(source.identity, policy)? {
+            ensure!(
+                package.source() == source,
+                "original package length differs from verified source"
+            );
             package
-        } else if let Some(archive) = archive {
+        } else {
             store.import_package(
                 source,
                 policy,
@@ -313,13 +342,11 @@ impl NativeSessions {
                     timeout: Duration::from_secs(limits.decoder_timeout_secs),
                 },
             )?
-        } else {
-            return Ok(None);
         };
         let result = store.publish_rust_installer(&package, policy.directory);
         drop(provisioning);
         drop(slot);
-        result.map(Some)
+        result
     }
 
     fn sessions(&self) -> Result<MutexGuard<'_, HashMap<Ticket, SharedSession>>> {

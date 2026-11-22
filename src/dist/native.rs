@@ -11,8 +11,8 @@ use bincode::Options;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::build_runtime::{
-    BlobRef, ContentId, ExecutionSpec, InstallationManifest, PackageSource, ResultManifest, TreeId,
-    TreeManifest,
+    BlobRef, ContentId, ExecutionSpec, InstallationManifest, PackageIdentity, PackageSource,
+    ResultManifest, TreeId, TreeManifest,
     wire::{
         BeginResult, NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply, Ticket,
         TreeOffer, TreeRead, UploadHeader, WorkerAllocation,
@@ -144,11 +144,11 @@ impl NativeCacheClient {
     /// Returns an error for unavailable provisioning or invalid metadata.
     pub fn lookup_rust_package(
         &self,
-        source: PackageSource,
+        identity: PackageIdentity,
     ) -> Result<Option<InstallationManifest>> {
-        let manifest: Option<InstallationManifest> = self.control("package_lookup", &source)?;
+        let manifest: Option<InstallationManifest> = self.control("package_lookup", &identity)?;
         if let Some(manifest) = &manifest {
-            validate_installation_manifest(source, manifest)?;
+            validate_installation_manifest(identity, manifest)?;
         }
         Ok(manifest)
     }
@@ -168,7 +168,11 @@ impl NativeCacheClient {
         );
         let response = self.send_stream("package_import", &source, source.size, archive)?;
         let manifest: InstallationManifest = decode_response(response, self.metadata_limit)?;
-        validate_installation_manifest(source, &manifest)?;
+        validate_installation_manifest(source.identity, &manifest)?;
+        ensure!(
+            manifest.source == source,
+            "incorrect original package length"
+        );
         Ok(manifest)
     }
 
@@ -522,11 +526,11 @@ fn decode_response<T: DeserializeOwned>(
 }
 
 fn validate_installation_manifest(
-    source: PackageSource,
+    identity: PackageIdentity,
     manifest: &InstallationManifest,
 ) -> Result<()> {
     ensure!(
-        manifest.source_sha256 == source.sha256,
+        manifest.source.identity == identity,
         "incorrect original package provenance"
     );
     manifest.validate()

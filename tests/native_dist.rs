@@ -294,7 +294,7 @@ fn rust_installer_fixture() -> Result<Vec<u8>> {
 #[test]
 #[ignore = "requires actual scheduler and worker subprocesses"]
 fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
-    use sccache::build_runtime::{PackageCompression, PackageSource};
+    use sccache::build_runtime::{PackageCompression, PackageIdentity, PackageSource};
     use sha2::{Digest, Sha256};
 
     let temp = tempfile::tempdir()?;
@@ -304,9 +304,11 @@ fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
     let archive = root.join("package.tar");
     fs::write(&archive, &bytes)?;
     let source = PackageSource {
-        sha256: Sha256::digest(&bytes).into(),
+        identity: PackageIdentity {
+            sha256: Sha256::digest(&bytes).into(),
+            compression: PackageCompression::Tar,
+        },
         size: u64::try_from(bytes.len())?,
-        compression: PackageCompression::Tar,
     };
     let client = NativeCacheClient::new(
         fleet.cache_url.clone(),
@@ -314,15 +316,15 @@ fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
         Duration::from_secs(30),
         1024 * 1024,
     )?;
-    assert!(client.lookup_rust_package(source)?.is_none());
+    assert!(client.lookup_rust_package(source.identity)?.is_none());
     let mut wrong = source;
-    wrong.sha256[0] ^= 1;
+    wrong.identity.sha256[0] ^= 1;
     assert!(
         client
             .import_rust_package(wrong, File::open(&archive)?)
             .is_err()
     );
-    assert!(client.lookup_rust_package(wrong)?.is_none());
+    assert!(client.lookup_rust_package(wrong.identity)?.is_none());
     let worker = NativeCacheClient::new(
         fleet.cache_url.clone(),
         WORKER_TOKEN.into(),
@@ -330,7 +332,7 @@ fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
         1024 * 1024,
     )?
     .for_worker(sccache::dist::JobId(123));
-    assert!(worker.lookup_rust_package(source).is_err());
+    assert!(worker.lookup_rust_package(source.identity).is_err());
     let config = sccache::config::FileConfig {
         dist: sccache::config::DistConfig {
             auth: DistAuth::Token {
@@ -352,11 +354,7 @@ fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
     let config_path = root.join("provision.json");
     fs::write(&config_path, serde_json::to_vec(&config)?)?;
     let manifest_path = root.join("package.manifest");
-    let mut sha256 = String::with_capacity(64);
-    for byte in source.sha256 {
-        use std::fmt::Write as _;
-        write!(&mut sha256, "{byte:02x}")?;
-    }
+    let sha256 = source.identity.checksum_hex();
     let command = || {
         let mut command = Command::new(env!("CARGO_BIN_EXE_sccache-dist"));
         command
@@ -383,7 +381,7 @@ fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
     let report: serde_json::Value = serde_json::from_slice(&cold.stdout)?;
     assert_eq!(report["reused_original_package"], false);
     let installed = InstallationManifest::read(File::open(&manifest_path)?)?;
-    assert_eq!(installed.source_sha256, source.sha256);
+    assert_eq!(installed.source, source);
     assert_eq!(installed.files()?.len(), 1);
     let warm = command().output()?;
     ensure!(
@@ -394,7 +392,7 @@ fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
     let report: serde_json::Value = serde_json::from_slice(&warm.stdout)?;
     assert_eq!(report["reused_original_package"], true);
     let resolved = client
-        .lookup_rust_package(source)?
+        .lookup_rust_package(source.identity)?
         .ok_or_else(|| anyhow::anyhow!("verified package lost"))?;
     assert_eq!(resolved.components, installed.components);
     assert_eq!(resolved.package, installed.package);
@@ -766,7 +764,13 @@ fn compiler_catalog_fixture(root: &Path, rustc: &Path) -> Result<PathBuf> {
     )?;
     let prepared = mapping.prepare()?;
     let manifest = InstallationManifest {
-        source_sha256: [0; 32],
+        source: sccache::build_runtime::PackageSource {
+            identity: sccache::build_runtime::PackageIdentity {
+                sha256: [0; 32],
+                compression: sccache::build_runtime::PackageCompression::Tar,
+            },
+            size: 0,
+        },
         package: prepared.id(),
         components: BTreeMap::from([("test-compiler".into(), prepared.manifest().clone())]),
     };

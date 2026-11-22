@@ -216,7 +216,11 @@ fn provision_rust_package(
         Duration::from_secs(native.request_timeout_secs),
         native.max_metadata_bytes,
     )?;
-    let (manifest, reused) = if let Some(manifest) = client.lookup_rust_package(source)? {
+    let (manifest, reused) = if let Some(manifest) = client.lookup_rust_package(source.identity)? {
+        anyhow::ensure!(
+            manifest.source == source,
+            "original package length differs from verified source"
+        );
         (manifest, true)
     } else {
         let archive = archive.context("upstream package unavailable; supply --archive")?;
@@ -298,7 +302,13 @@ fn run(command: Command) -> Result<i32> {
                 64 * 1024 * 1024,
             )?;
             let store = NativeStore::open(&store)?;
-            let (package, reused) = if let Some(existing) = store.lookup_package(source, policy)? {
+            let (package, reused) = if let Some(existing) =
+                store.lookup_package(source.identity, policy)?
+            {
+                anyhow::ensure!(
+                    existing.source() == source,
+                    "original package length differs from verified source"
+                );
                 (existing, true)
             } else {
                 let archive = archive.context("upstream package unavailable; supply --archive")?;

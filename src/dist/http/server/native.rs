@@ -11,7 +11,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::{ClientAuthCheck, ServerAuthenticator, authenticate_client, authenticate_server};
 use crate::{
     build_runtime::{
-        ExecutionSpec, NativeSessions, NativeStore, PackageImportLimits, PackageSource,
+        ExecutionSpec, NativeSessions, NativeStore, PackageIdentity, PackageImportLimits,
+        PackageSource,
         wire::{Publisher, ScheduleReply, UploadHeader},
     },
     config::scheduler::NativeCacheConfig,
@@ -157,34 +158,24 @@ fn dispatch(
 ) -> Result<Response> {
     match operation {
         "package_lookup" if publisher == Publisher::Client && package_import.is_some() => {
-            let source: PackageSource = metadata(request, limit)?;
+            let identity: PackageIdentity = metadata(request, limit)?;
             let imports =
                 package_import.context("native original-package provisioning disabled")?;
-            encode(
-                &sessions.provision_rust_package(
-                    source,
-                    None,
-                    imports,
-                    &std::env::current_exe()?,
-                )?,
-                limit,
-            )
+            encode(&sessions.lookup_rust_package(identity, imports)?, limit)
         }
         "package_import" if publisher == Publisher::Client && package_import.is_some() => {
             let imports =
                 package_import.context("native original-package provisioning disabled")?;
             let mut body = request.data().context("missing original package body")?;
-            // Fixed width: SHA-256, u64 length, u32 codec. The remaining
+            // Fixed width: SHA-256, u32 codec, u64 length. The remaining
             // bytes stream directly into verified archive staging.
             let source: PackageSource = codec().with_limit(44).deserialize_from(&mut body)?;
-            let manifest = sessions
-                .provision_rust_package(
-                    source,
-                    Some(&mut body),
-                    imports,
-                    &std::env::current_exe()?,
-                )?
-                .context("original package missing after import")?;
+            let manifest = sessions.provision_rust_package(
+                source,
+                &mut body,
+                imports,
+                &std::env::current_exe()?,
+            )?;
             encode(&manifest, limit)
         }
         "admit" if publisher == Publisher::Client => {
