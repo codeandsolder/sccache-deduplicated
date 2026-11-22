@@ -47,6 +47,7 @@ use std::sync::LazyLock;
 use crate::errors::{Context, ProcessError, Result, bail};
 
 use super::CacheControl;
+use super::canonical_native::NativeCargoPaths;
 use super::preprocessor_cache::PreprocessorCacheEntry;
 
 /// A generic implementation of the `Compiler` trait for C/C++ compilers.
@@ -473,8 +474,22 @@ where
             cache_control,
         } = context;
         let start_of_compilation = std::time::SystemTime::now();
+        let mut parsed_args = self.parsed_args.clone();
+        let canonical_native = NativeCargoPaths::discover(
+            &env_vars,
+            self.compiler.kind(),
+            self.compiler.version().as_deref(),
+            &parsed_args,
+        );
+        if let Some(paths) = &canonical_native {
+            parsed_args.common_args.extend(paths.compiler_options());
+            // The native canonical key must see the expanded macro values,
+            // including filename builtins. Send that exact preprocessed stream
+            // to the worker rather than a second, directive-only interpretation.
+            parsed_args.suppress_rewrite_includes_only = true;
+        }
 
-        let mut extra_hashes = hash_all(&self.parsed_args.extra_hash_files, &pool.clone()).await?;
+        let mut extra_hashes = hash_all(&parsed_args.extra_hash_files, &pool.clone()).await?;
         let mut cache_control = match native_codegen_fingerprint(
             creator,
             &self.executable,
@@ -498,44 +513,43 @@ where
         };
         // The assembler that turns the compiler's output into the object file is
         // as much a part of the result as the compiler itself.
-        let assembler_digest = if self.parsed_args.uses_external_assembler {
+        let assembler_digest = if parsed_args.uses_external_assembler {
             self.compiler.assembler_digest()
         } else {
             None
         };
         // Create an argument vector containing both preprocessor and arch args, to
         // use in creating a hash key
-        let mut preprocessor_and_arch_args = self.parsed_args.preprocessor_args.clone();
-        preprocessor_and_arch_args.extend(self.parsed_args.arch_args.clone());
+        let mut preprocessor_and_arch_args = parsed_args.preprocessor_args.clone();
+        preprocessor_and_arch_args.extend(parsed_args.arch_args.clone());
         // common_args is used in preprocessing too
-        preprocessor_and_arch_args.extend(self.parsed_args.common_args.clone());
+        preprocessor_and_arch_args.extend(parsed_args.common_args.clone());
 
-        let absolute_input_path: Cow<'_, _> = if self.parsed_args.input.is_absolute() {
-            Cow::Borrowed(&self.parsed_args.input)
+        let absolute_input_path: Cow<'_, _> = if parsed_args.input.is_absolute() {
+            Cow::Borrowed(&parsed_args.input)
         } else {
-            Cow::Owned(cwd.join(&self.parsed_args.input))
+            Cow::Owned(cwd.join(&parsed_args.input))
         };
 
         // Try to look for a cached preprocessing step for this compilation
         // request.
         let preprocessor_cache_mode_config = storage.preprocessor_cache_mode_config();
-        let too_hard_for_preprocessor_cache_mode = self
-            .parsed_args
-            .too_hard_for_preprocessor_cache_mode
-            .is_some();
-        if let Some(arg) = &self.parsed_args.too_hard_for_preprocessor_cache_mode {
+        let too_hard_for_preprocessor_cache_mode =
+            parsed_args.too_hard_for_preprocessor_cache_mode.is_some();
+        if let Some(arg) = &parsed_args.too_hard_for_preprocessor_cache_mode {
             debug!(
                 "generate_hash_key: Cannot use preprocessor cache because of {}",
                 crate::util::debug_display(arg)
             );
         }
 
-        let needs_preprocessing = self.parsed_args.language.needs_c_preprocessing();
+        let needs_preprocessing = parsed_args.language.needs_c_preprocessing();
 
         let use_preprocessor_cache_mode = if needs_preprocessing {
             let can_use_preprocessor_cache_mode = preprocessor_cache_mode_config
                 .use_preprocessor_cache_mode
-                && !too_hard_for_preprocessor_cache_mode;
+                && !too_hard_for_preprocessor_cache_mode
+                && canonical_native.is_none();
 
             let mut use_preprocessor_cache_mode = can_use_preprocessor_cache_mode;
 
@@ -562,7 +576,7 @@ where
         } else {
             debug!(
                 "generate_hash_key: Disabling preprocessor cache because {} language doesn't need C preprocessing",
-                self.parsed_args.language.as_str()
+                parsed_args.language.as_str()
             );
             false
         };
@@ -570,7 +584,7 @@ where
         let mut preprocessor_key = if use_preprocessor_cache_mode {
             preprocessor_cache_entry_hash_key(PreprocessorCacheKey {
                 compiler_digest: &self.executable_digest,
-                language: self.parsed_args.language,
+                language: parsed_args.language,
                 arguments: &preprocessor_and_arch_args,
                 extra_hashes: &extra_hashes,
                 assembler_digest: assembler_digest.as_deref(),
@@ -629,7 +643,7 @@ where
                         return Ok(HashResult {
                             key,
                             compilation: Box::new(CCompilation {
-                                parsed_args: self.parsed_args.clone(),
+                                parsed_args: parsed_args.clone(),
                                 is_locally_preprocessed: false,
                                 allow_dist: true,
                                 #[cfg(feature = "dist-client")]
@@ -652,21 +666,21 @@ where
                 .preprocess(CPreprocessContext {
                     creator,
                     executable: &self.executable,
-                    parsed_args: &self.parsed_args,
+                    parsed_args: &parsed_args,
                     cwd: &cwd,
                     env_vars: &env_vars,
-                    may_dist,
+                    may_dist: may_dist || canonical_native.is_some(),
                     rewrite_includes_only,
                     preprocessor_cache_mode: use_preprocessor_cache_mode,
                 })
                 .await;
-            let out_pretty = self.parsed_args.output_pretty().into_owned();
+            let out_pretty = parsed_args.output_pretty().into_owned();
             let result = result.map_err(|e| {
                 debug!("[{out_pretty}]: preprocessor failed: {e:?}");
                 e
             });
 
-            let outputs = self.parsed_args.outputs.clone();
+            let outputs = parsed_args.outputs.clone();
             let args_cwd = cwd.clone();
 
             let mut preprocessor_result = result.or_else(move |err| {
@@ -724,7 +738,7 @@ where
 
             trace!(
                 "[{}]: Preprocessor output is {} bytes",
-                self.parsed_args.output_pretty(),
+                parsed_args.output_pretty(),
                 preprocessor_result.stdout.len()
             );
 
@@ -739,7 +753,7 @@ where
 
         let mut allow_dist = true;
         let has_assembler_external_input = if matches!(
-            self.parsed_args.language,
+            parsed_args.language,
             Language::Assembler | Language::AssemblerToPreprocess
         ) {
             contains_assembler_file_directive(&preprocessor_output)
@@ -759,17 +773,17 @@ where
             // through the front-end is intentionally left to the compiler, so keep
             // such compilations local and uncached rather than risking stale objects.
             if matches!(
-                self.parsed_args.language,
+                parsed_args.language,
                 Language::Assembler | Language::AssemblerToPreprocess
             ) {
-                match assembler_file_dependencies(&preprocessor_output, &cwd, &self.parsed_args) {
+                match assembler_file_dependencies(&preprocessor_output, &cwd, &parsed_args) {
                     AssemblerDependencyScan::Complete(paths) => {
                         let paths: Vec<_> = paths
                             .into_iter()
-                            .filter(|path| !self.parsed_args.extra_hash_files.contains(path))
+                            .filter(|path| !parsed_args.extra_hash_files.contains(path))
                             .collect();
                         extra_hashes.extend(hash_all(&paths, &pool.clone()).await?);
-                        self.parsed_args.extra_hash_files.extend(paths);
+                        parsed_args.extra_hash_files.extend(paths);
                     }
                     AssemblerDependencyScan::Incomplete(reason) => {
                         debug!("assembler external-input scan incomplete: {reason}");
@@ -794,16 +808,31 @@ where
         let mut common_and_arch_args = self.parsed_args.common_args.clone();
         common_and_arch_args.extend(self.parsed_args.arch_args.clone());
 
+        // Hash the same remapped filename identity that the compiler uses for
+        // debug information. Do not strip arbitrary source literals or flags.
+        let key_input = if let Some(paths) = &canonical_native {
+            let normalized = paths.preprocessed_key_bytes(&preprocessor_output);
+            extra_hashes.push(paths.context_digest(&self.parsed_args, &cwd, &normalized));
+            normalized
+        } else {
+            Cow::Borrowed(preprocessor_output.as_slice())
+        };
+        let basedirs = if canonical_native.is_some() {
+            &[][..]
+        } else {
+            storage.basedirs()
+        };
+
         let key = HashKeyParams::new(
             &self.executable_digest,
-            self.parsed_args.language,
+            parsed_args.language,
             &common_and_arch_args,
-            &preprocessor_output,
+            &key_input,
         )
         .with_extra_hashes(&extra_hashes)
         .with_env_vars(&env_vars)
         .with_plusplus(self.compiler.plusplus())
-        .with_basedirs(storage.basedirs())
+        .with_basedirs(basedirs)
         .with_assembler_digest(assembler_digest.as_deref())
         .compute();
 
@@ -838,7 +867,7 @@ where
         Ok(HashResult {
             key,
             compilation: Box::new(CCompilation {
-                parsed_args: self.parsed_args.clone(),
+                parsed_args,
                 is_locally_preprocessed: true,
                 allow_dist,
                 #[cfg(feature = "dist-client")]
@@ -1107,6 +1136,12 @@ fn matching_c_paren(bytes: &[u8], open: usize) -> Option<usize> {
 /// `__asm__`, optionally followed by the standard qualifiers, and a parenthesized
 /// operand list. Restrict the expensive/correctness fallback to those regions.
 fn contains_inline_assembler_file_directive(bytes: &[u8]) -> bool {
+    inline_assembly_matches(bytes, contains_assembler_file_directive)
+}
+
+/// A GNU inline-assembly operand can contain assembler directives as well as
+/// instructions. Inspect its operand rather than searching unrelated C++ text.
+pub(super) fn inline_assembly_matches(bytes: &[u8], predicate: impl Fn(&[u8]) -> bool) -> bool {
     let mut pos = 0;
     while pos < bytes.len() {
         match bytes[pos] {
@@ -1158,7 +1193,7 @@ fn contains_inline_assembler_file_directive(bytes: &[u8]) -> bool {
                     // stale cache entry, so there is no external-input dependency to track.
                     continue;
                 };
-                if contains_assembler_file_directive(&bytes[cursor + 1..close]) {
+                if predicate(&bytes[cursor + 1..close]) {
                     return true;
                 }
                 pos = close + 1;
@@ -2583,6 +2618,128 @@ mod test {
     use super::*;
     use crate::mock_command::*;
     use crate::test::utils::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cargo_native_paths_reuse_real_compiler_keys_and_preserve_depfiles() -> Result<()> {
+        use crate::compiler::gcc::Gcc;
+        use crate::test::mock_storage::MockStorage;
+        use std::sync::Arc;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()?;
+        let compiler_path = which::which("g++")?;
+        let version = std::process::Command::new(&compiler_path)
+            .arg("-dumpfullversion")
+            .output()?;
+        let version = String::from_utf8(version.stdout)?.trim().to_owned();
+        let compiler = Gcc {
+            gplusplus: true,
+            version: Some(version),
+            assembler_digest: Some("same-assembler".into()),
+        };
+        let creator = <ProcessCommandCreator as CommandCreatorSync>::new(
+            &crate::jobserver::Client::new_num(2),
+        );
+        let storage = Arc::new(MockStorage::new(None, true));
+        let work = tempfile::tempdir()?;
+
+        for (name, source) in [
+            (
+                "test.cc",
+                b"extern \"C\" const char *name() { return __FILE__; }\nextern \"C\" const char *base() { return __BASE_FILE__; }\n".as_slice(),
+            ),
+            (
+                "test.S",
+                b".text\n.globl native_cargo_test\nnative_cargo_test:\n ret\n".as_slice(),
+            ),
+        ] {
+            let mut first = None;
+            for (session, fingerprint) in [("first", "package-a"), ("second", "package-b")] {
+                let tree = work.path().join(session);
+                let out = tree.join("debug/build").join(fingerprint).join("out");
+                let cwd = out.join("cmake");
+                std::fs::create_dir_all(&cwd)?;
+                std::fs::write(tree.join("CACHEDIR.TAG"), b"")?;
+                let input = out.join(name);
+                std::fs::write(&input, source)?;
+                let object = cwd.join("result.o");
+                let depfile = cwd.join("result.d");
+                let env: Vec<_> = std::env::vars_os()
+                    .filter(|(key, _)| key != "OUT_DIR" && key != "SCCACHE_CANONICAL_TARGET_ROOT")
+                    .chain([
+                        ("OUT_DIR".into(), out.into_os_string()),
+                        ("SCCACHE_CANONICAL_TARGET_ROOT".into(), work.path().join("target").into_os_string()),
+                    ])
+                    .collect();
+                let arguments = vec![
+                    "-g".into(),
+                    "-O2".into(),
+                    "-MMD".into(),
+                    "-MF".into(),
+                    depfile.as_os_str().into(),
+                    "-c".into(),
+                    input.as_os_str().into(),
+                    "-o".into(),
+                    object.as_os_str().into(),
+                ];
+                let CompilerArguments::Ok(parsed_args) =
+                    compiler.parse_arguments(&arguments, &cwd, &env)
+                else {
+                    bail!("real compiler invocation was rejected");
+                };
+                let mut hasher = CCompilerHasher {
+                    parsed_args,
+                    executable: compiler_path.clone(),
+                    executable_digest: "same-compiler".into(),
+                    compiler: compiler.clone(),
+                };
+                let hash = runtime.block_on(
+                    <CCompilerHasher<Gcc> as CompilerHasher<ProcessCommandCreator>>::generate_hash_key(
+                        &mut hasher,
+                        GenerateHashKeyContext {
+                            creator: &creator,
+                            cwd: cwd.clone(),
+                            env_vars: env,
+                            may_dist: true,
+                            pool: runtime.handle(),
+                            rewrite_includes_only: false,
+                            storage: storage.clone(),
+                            cache_control: CacheControl::Default,
+                        },
+                    ),
+                )?;
+                assert!(hash.compilation.is_locally_preprocessed());
+                let deps = std::fs::read_to_string(&depfile)?;
+                assert!(deps.contains(input.to_str().context("UTF-8 input")?));
+                assert!(!deps.contains("/__sccache/"));
+                let (command, remote, _) =
+                    hash.compilation.generate_compile_commands(&mut dist::PathTransformer::new(), false)?;
+                #[cfg(feature = "dist-client")]
+                assert!(remote.context("distributed command")?.arguments.iter().any(|arg| arg.starts_with("-ffile-prefix-map=")));
+                #[cfg(not(feature = "dist-client"))]
+                let _ = remote;
+                assert!(command.get_arguments().iter().any(|arg| arg.as_encoded_bytes().starts_with(b"-ffile-prefix-map=")));
+                let output = std::process::Command::new(command.get_executable())
+                    .args(command.get_arguments())
+                    .env_clear()
+                    .envs(command.get_env_vars())
+                    .current_dir(command.get_cwd())
+                    .output()?;
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                let bytes = std::fs::read(&object)?;
+                if let Some((expected_key, expected_object)) = &first {
+                    assert_eq!(&hash.key, expected_key, "cache key differed for {name}");
+                    assert_eq!(&bytes, expected_object, "object differed for {name}");
+                } else {
+                    first = Some((hash.key, bytes));
+                }
+            }
+        }
+        Ok(())
+    }
 
     fn native_parsed_arguments() -> ParsedArguments {
         ParsedArguments {
