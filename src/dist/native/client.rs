@@ -246,36 +246,14 @@ impl NativeCacheClient {
                             renewals.remove(pin.ticket)?;
                             drop(pin);
                         }
-                        let ticket = if let Some(local) =
-                            local.filter(|executor| executor.prefers_local())
-                        {
-                            let tree = match local_pins.entry(id) {
-                                std::collections::btree_map::Entry::Occupied(entry) => {
-                                    entry.into_mut()
-                                }
-                                std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
-                                    local.prepare_input(id, inputs, &mut || renewals.check())?,
-                                ),
-                            };
-                            self.push_tree(
-                                tree.manifest(),
-                                |content| tree.open_file(content),
-                                policy.renewal_interval,
-                            )?
-                        } else {
-                            let manifest = inputs.manifest(id)?;
-                            ensure!(manifest.id()? == id, "input provider supplied wrong tree");
-                            let blobs = manifest.blobs()?;
-                            self.push_tree(
-                                &manifest,
-                                |content| {
-                                    let size =
-                                        *blobs.get(&content).context("undeclared content")?;
-                                    inputs.open_blob(id, BlobRef { id: content, size })
-                                },
-                                policy.renewal_interval,
-                            )?
-                        };
+                        let ticket = self.supply_input(
+                            id,
+                            inputs,
+                            local,
+                            &mut local_pins,
+                            &renewals,
+                            policy.renewal_interval,
+                        )?;
                         renewals.add(ticket)?;
                         pins.insert(
                             id,
@@ -296,6 +274,38 @@ impl NativeCacheClient {
                     return self.run_admitted(pin, spec, inputs, policy, start, local);
                 }
             }
+        }
+    }
+
+    fn supply_input(
+        &self,
+        id: TreeId,
+        inputs: &mut impl InputProvider,
+        local: Option<&LocalExecutor>,
+        local_pins: &mut BTreeMap<TreeId, TreeLease>,
+        renewals: &Renewals,
+        interval: Duration,
+    ) -> Result<Ticket> {
+        if let Some(local) = local.filter(|executor| executor.prefers_local()) {
+            let tree = match local_pins.entry(id) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(local.prepare_input(id, inputs, &mut || renewals.check())?)
+                }
+            };
+            self.push_tree(tree.manifest(), |content| tree.open_file(content), interval)
+        } else {
+            let manifest = inputs.manifest(id)?;
+            ensure!(manifest.id()? == id, "input provider supplied wrong tree");
+            let blobs = manifest.blobs()?;
+            self.push_tree(
+                &manifest,
+                |content| {
+                    let size = *blobs.get(&content).context("undeclared content")?;
+                    inputs.open_blob(id, BlobRef { id: content, size })
+                },
+                interval,
+            )
         }
     }
 
