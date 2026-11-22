@@ -1552,7 +1552,7 @@ mod client {
     use crate::errors::{Context, Result, anyhow};
 
     const REQUEST_TIMEOUT_SECS: u64 = 1200;
-    const CONNECT_TIMEOUT_SECS: u64 = 5;
+    const CONNECT_TIMEOUT_SECS: u64 = 20;
     const WORKER_NAME_LOOKUP_TIMEOUT: Duration = Duration::from_secs(1);
     const WORKER_NAME_CACHE_TTL: Duration = Duration::from_secs(300);
     const WORKER_NAME_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -1635,6 +1635,7 @@ mod client {
             let timeout = Duration::new(REQUEST_TIMEOUT_SECS, 0);
             let new_client_async = client_async_builder
                 .timeout(timeout)
+                .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
                 // Disable keep-alive
                 .pool_max_idle_per_host(0)
                 .build()

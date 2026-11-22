@@ -382,8 +382,10 @@ fn init_logging() {
 }
 
 const SERVER_REMEMBER_ERROR_TIMEOUT: Duration = Duration::from_secs(300);
-const UNCLAIMED_PENDING_TIMEOUT: Duration = Duration::from_secs(300);
-const UNCLAIMED_READY_TIMEOUT: Duration = Duration::from_secs(60);
+// Temporary fleet relief for slow input staging and toolchain uploads.
+// Track progress explicitly instead of holding unclaimed reservations in #333.
+const UNCLAIMED_PENDING_TIMEOUT: Duration = Duration::from_secs(900);
+const UNCLAIMED_READY_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Copy, Clone)]
 struct JobDetail {
