@@ -108,6 +108,12 @@ use crate::errors::{Result, anyhow};
 /// An interface to cache storage.
 #[async_trait]
 pub trait Storage: Send + Sync {
+    /// Verify that a connection-owned compilation session remains usable.
+    /// A failed session must not turn into a speculative local compilation.
+    fn validate_session(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Get a cache entry by `key`.
     ///
     /// If an error occurs, this method should return a `Cache::Error`.

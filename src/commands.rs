@@ -513,11 +513,10 @@ where
         env_vars,
     });
     trace!("request_compile: {req:?}");
-    conn.set_compile_timeout()?;
     let response = conn
         .request(req)
         .context("Failed to send data to or receive data from server")?;
-    if let Response::Compile(response) = conn.read_compile_response(response)? {
+    if let Response::Compile(response) = response {
         Ok(response)
     } else {
         bail!("Unexpected response from server")
@@ -631,7 +630,7 @@ where
     let result = match &response {
         CompileResponse::CompileStarted => {
             debug!("Server sent CompileStarted");
-            match conn.read_one_response().and_then(|initial| conn.read_compile_response(initial)).context(
+            match conn.read_one_response().context(
                 "accepted compile lost its terminal response; outcome unknown, refusing duplicate local compilation",
             )? {
                 Response::CompileFinished(result) => Some(result),
@@ -817,15 +816,14 @@ where
     )?;
     // Ship accumulated stats back to the daemon (best-effort; don't fail the build on error).
     let delta: ServerStats = runtime.block_on(service.take_stats());
-    if let Ok(mut conn) = conn_arc.lock() {
-        let _ = conn.request(Request::RecordStats(Box::new(delta)));
-    }
+    let _ = runtime.block_on(crate::client::connection_task(conn_arc, move |conn| {
+        conn.request(Request::RecordStats(Box::new(delta)))
+    }));
     Ok(exit_code)
 }
 
 fn show_active_compiles() -> Result<()> {
     let mut conn = connect_to_server(&get_addr()).context("could not connect to managed daemon")?;
-    conn.set_compile_timeout()?;
     let Response::ActiveCompiles(active) = conn.request(Request::ActiveCompiles)? else {
         bail!("unexpected active compile response");
     };
@@ -836,7 +834,6 @@ fn show_active_compiles() -> Result<()> {
 
 fn cancel_compile(id: String) -> Result<()> {
     let mut conn = connect_to_server(&get_addr()).context("could not connect to managed daemon")?;
-    conn.set_compile_timeout()?;
     match conn.request(Request::CancelCompile(id))? {
         Response::CompileCancellationRequested(true) => println!("Cancellation requested."),
         Response::CompileCancellationRequested(false) => {
@@ -1208,6 +1205,9 @@ mod test {
             Ok(Box::new(Self))
         }
         fn set_io_timeout(&self, _timeout: Duration) -> io::Result<()> {
+            Ok(())
+        }
+        fn shutdown(&self) -> io::Result<()> {
             Ok(())
         }
     }

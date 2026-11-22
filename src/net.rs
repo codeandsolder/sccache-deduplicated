@@ -120,6 +120,7 @@ impl Acceptor for tokio::net::TcpListener {
 pub trait Connection: std::io::Read + std::io::Write + Send {
     fn try_clone(&self) -> std::io::Result<Box<dyn Connection>>;
     fn set_io_timeout(&self, timeout: std::time::Duration) -> std::io::Result<()>;
+    fn shutdown(&self) -> std::io::Result<()>;
 }
 
 impl Connection for std::net::TcpStream {
@@ -131,6 +132,9 @@ impl Connection for std::net::TcpStream {
     fn set_io_timeout(&self, timeout: std::time::Duration) -> std::io::Result<()> {
         self.set_read_timeout(Some(timeout))?;
         self.set_write_timeout(Some(timeout))
+    }
+    fn shutdown(&self) -> std::io::Result<()> {
+        Self::shutdown(self, std::net::Shutdown::Both)
     }
 }
 
@@ -204,6 +208,9 @@ mod unix_imp {
         fn set_io_timeout(&self, timeout: std::time::Duration) -> std::io::Result<()> {
             self.set_read_timeout(Some(timeout))?;
             self.set_write_timeout(Some(timeout))
+        }
+        fn shutdown(&self) -> std::io::Result<()> {
+            Self::shutdown(self, std::net::Shutdown::Both)
         }
     }
 }

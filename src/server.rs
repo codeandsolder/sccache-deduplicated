@@ -1289,11 +1289,14 @@ where
                     me.serve_compile(&registration.activity, req, &mut transfers, &mut sink)
                         .await?;
                 } else {
-                    let Message::WithoutBody(message) = me.dispatch(req, &mut transfers).await?
+                    let budget = transfers.request_budget(&req, me.compile_limits);
+                    let Message::WithoutBody(message) =
+                        Self::monitor_control(&mut sink, me.dispatch(req, &mut transfers), budget)
+                            .await?
                     else {
                         bail!("unexpected compiler body outside a compile request");
                     };
-                    sink.send(Frame::Message { message }).await?;
+                    send_ipc_frame(&mut sink, Frame::Message { message }).await?;
                 }
             }
 
@@ -1337,16 +1340,16 @@ where
             {
                 Message::WithoutBody(message) => {
                     activity.phase(Phase::SendReply);
-                    sink.send(Frame::Message { message }).await?;
+                    send_ipc_frame(sink, Frame::Message { message }).await?;
                 }
                 Message::WithBody(message, body) => {
-                    sink.send(Frame::Message { message }).await?;
+                    send_ipc_frame(sink, Frame::Message { message }).await?;
                     let body = activity::scope(activity, async {
                         util::spawn(activity::inherit(body)).await?
                     });
                     let message = self.monitor_compile(activity, sink, body).await?;
                     activity.phase(Phase::SendReply);
-                    sink.send(Frame::Body { chunk: message }).await?;
+                    send_ipc_frame(sink, Frame::Body { chunk: message }).await?;
                 }
             }
             Ok::<_, Error>(())
@@ -1355,14 +1358,48 @@ where
         if let Err(error) = result {
             // The monitored future has been dropped. Some blocking I/O
             // may still finish, so the outcome is explicitly ambiguous.
-            let _ = sink
-                .send(Frame::Message {
-                    message: Response::CompileAborted(format!("{error:#}")),
-                })
+            if !error.is::<IpcSendFailure>() {
+                let _ = send_ipc_frame(
+                    sink,
+                    Frame::Message {
+                        message: Response::CompileAborted(format!("{error:#}")),
+                    },
+                )
                 .await;
+            }
             return Err(error);
         }
         Ok(())
+    }
+
+    async fn monitor_control<F, R, S>(sink: &mut S, work: F, budget: Duration) -> Result<R>
+    where
+        F: Future<Output = Result<R>> + Send,
+        S: Sink<Frame<Response, Response>, Error = Error> + Unpin,
+    {
+        let mut ticker = time::interval_at(
+            time::Instant::now() + activity::HEARTBEAT_INTERVAL,
+            activity::HEARTBEAT_INTERVAL,
+        );
+        ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        let deadline = time::sleep(budget);
+        tokio::pin!(work, deadline);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut work => return result,
+                () = &mut deadline => {
+                    let reason = "IPC operation exceeded its deadline; session abandoned";
+                    send_ipc_frame(sink, Frame::Message {
+                        message: Response::RequestAborted(reason.into()),
+                    }).await?;
+                    bail!("{reason}");
+                }
+                _ = ticker.tick() => {
+                    send_ipc_frame(sink, Frame::Message { message: Response::Heartbeat }).await?;
+                }
+            }
+        }
     }
 
     async fn monitor_compile<F, R, S>(
@@ -1394,7 +1431,7 @@ where
                     if Duration::from_millis(snapshot.phase_age_ms) >= self.compile_limits.budget(snapshot.phase) {
                         bail!("compile request {} exceeded its {:?} phase deadline after {} ms; outcome unknown", snapshot.id, snapshot.phase, snapshot.phase_age_ms);
                     }
-                    sink.send(Frame::Message { message: Response::CompileProgress(snapshot) }).await?;
+                    send_ipc_frame(sink, Frame::Message { message: Response::CompileProgress(snapshot) }).await?;
                 }
             }
         }
@@ -1458,11 +1495,15 @@ where
         &self,
         compile: Compile,
     ) -> Result<(CompileResponse, Option<CompileFinished>)> {
-        match self.handle_compile(compile).await? {
+        self.storage.validate_session()?;
+        let response = self.handle_compile(compile).await?;
+        self.storage.validate_session()?;
+        match response {
             Message::WithBody(Response::Compile(resp), body) => {
                 let Response::CompileFinished(finished) = body.await? else {
                     bail!("unexpected body response from compile_direct")
                 };
+                self.storage.validate_session()?;
                 Ok((resp, Some(finished)))
             }
             Message::WithoutBody(Response::Compile(resp)) => Ok((resp, None)),
@@ -2589,6 +2630,27 @@ enum Frame<R, R1> {
     Message { message: R },
 }
 
+#[derive(Debug)]
+struct IpcSendFailure;
+
+impl std::fmt::Display for IpcSendFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IPC response delivery failed")
+    }
+}
+
+impl std::error::Error for IpcSendFailure {}
+
+async fn send_ipc_frame<S>(sink: &mut S, frame: Frame<Response, Response>) -> Result<()>
+where
+    S: Sink<Frame<Response, Response>, Error = Error> + Unpin,
+{
+    time::timeout(activity::IPC_INACTIVITY_TIMEOUT, sink.send(frame))
+        .await
+        .context(IpcSendFailure)?
+        .context(IpcSendFailure)
+}
+
 struct Body<R> {
     receiver: mpsc::Receiver<Result<R>>,
 }
@@ -2896,6 +2958,39 @@ mod tests {
             env_vars: vec![],
         };
         (service, request)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn control_rpc_heartbeats_do_not_extend_deadline() -> Result<()> {
+        let (tx, mut rx) = mpsc::unbounded();
+        let mut sink = tx.sink_err_into::<Error>();
+        let monitor = SccacheService::<ProcessCommandCreator>::monitor_control(
+            &mut sink,
+            future::pending::<Result<()>>(),
+            Duration::from_secs(31),
+        );
+        tokio::pin!(monitor);
+        let result = async {
+            for _ in 0..2 {
+                assert!(matches!(
+                    rx.next().await,
+                    Some(Frame::Message {
+                        message: Response::Heartbeat
+                    })
+                ));
+            }
+            assert!(matches!(
+                rx.next().await,
+                Some(Frame::Message {
+                    message: Response::RequestAborted(_)
+                })
+            ));
+            Ok::<_, Error>(())
+        };
+        let (error, received) = tokio::join!(monitor, result);
+        received?;
+        assert!(error.is_err());
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]

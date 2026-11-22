@@ -132,6 +132,30 @@ impl TransferSession {
         }
     }
 
+    pub(super) fn request_budget(
+        &self,
+        request: &super::SccacheRequest,
+        limits: super::activity::CompileLimits,
+    ) -> std::time::Duration {
+        #[cfg(feature = "dist-client")]
+        if matches!(
+            (&self.state, request),
+            (
+                Transfer::Upload {
+                    kind: UploadKind::Run { .. },
+                    ..
+                },
+                super::Message::WithoutBody(crate::protocol::Request::Transfer(
+                    TransferRequest::FinishWrite
+                ))
+            )
+        ) {
+            return limits.budget(super::activity::Phase::RunDistributed);
+        }
+        let _ = request;
+        limits.budget(super::activity::Phase::IdentifyToolchain)
+    }
+
     pub(super) const fn chunk_bytes(&self) -> usize {
         self.chunk_bytes
     }

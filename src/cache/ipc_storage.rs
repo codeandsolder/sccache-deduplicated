@@ -25,8 +25,10 @@ use anyhow::ensure;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::io::Cursor;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 /// `Storage` implementation that forwards all cache operations to the sccache
 /// daemon over the existing IPC connection.  Used by CLI processes in
@@ -34,11 +36,12 @@ use std::time::Duration;
 ///
 /// `ServerConnection` is synchronous and non-`Clone`, so it lives behind a
 /// `Mutex` and every RPC dispatches via `tokio::task::spawn_blocking`.  The
-/// lock is held for a complete transfer transaction, never across
-/// an `.await` point.
+/// lock is held for a complete transfer transaction; cancellation closes
+/// the underlying socket to release a blocked transaction.
 pub struct IpcStorage {
     conn: SharedConnection,
     handshake: StorageHandshakeInfo,
+    closed: CancellationToken,
 }
 
 impl IpcStorage {
@@ -64,6 +67,7 @@ impl IpcStorage {
             "invalid daemon chunk size"
         );
         Ok(Self {
+            closed: conn.session_health(),
             conn: Arc::new(Mutex::new(conn)),
             handshake,
         })
@@ -145,6 +149,13 @@ impl IpcStorage {
 
 #[async_trait]
 impl Storage for IpcStorage {
+    fn validate_session(&self) -> Result<()> {
+        ensure!(
+            !self.closed.is_cancelled(),
+            crate::client::IpcTransportFailure
+        );
+        Ok(())
+    }
     async fn get(&self, key: &str) -> Result<Cache> {
         // A daemon path can be unavailable or name different bytes in this
         // namespace. Only consume bytes returned by the storage authority.
