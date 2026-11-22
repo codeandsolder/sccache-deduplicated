@@ -59,7 +59,7 @@ use std::fs::OpenOptions;
 use std::future::Future;
 use std::hash::Hash;
 #[cfg(feature = "dist-client")]
-use std::io;
+use std::io::{self, Seek};
 use std::io::{BufReader, Read, Write};
 use std::iter;
 use std::path::{Path, PathBuf};
@@ -4121,13 +4121,15 @@ impl pkg::InputsPackager for RustInputsPackager {
             }
 
             let input_path = pkg::simplify_path(&input_path)?;
-            if let Some(ext) = input_path.extension() {
-                if !super::CAN_DIST_DYLIBS && ext == DLL_EXTENSION {
-                    bail!(
-                        "Cannot distribute dylib input {} on this platform",
-                        input_path.display()
-                    )
-                }
+            if !super::CAN_DIST_DYLIBS
+                && input_path
+                    .extension()
+                    .is_some_and(|ext| ext == DLL_EXTENSION)
+            {
+                bail!(
+                    "Cannot distribute dylib input {} on this platform",
+                    input_path.display()
+                );
             }
 
             let dist_input_path = path_transformer.as_dist(&input_path).with_context(|| {
@@ -4196,7 +4198,6 @@ impl pkg::InputsPackager for RustInputsPackager {
                         input_path.display()
                     ),
                 }
-                use std::io::Seek;
                 file.rewind()?;
             }
             file_header.set_cksum();
