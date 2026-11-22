@@ -2296,180 +2296,51 @@ fn config_overrides() {
 }
 
 #[test]
-#[cfg(target_os = "windows")]
-fn config_basedirs_overrides() {
-    // Test that env variable takes precedence over file config
-    let env_conf = EnvConfig {
-        cache: Default::default(),
-        basedirs: vec!["C:/env/basedir".to_string()].into(),
-        client_side_mode: None,
+fn config_basedirs_overrides() -> Result<()> {
+    let (env_path, file_path, env_expected, file_expected) = if cfg!(windows) {
+        (
+            "C:/env/basedir",
+            "C:/file/basedir",
+            "c:/env/basedir/",
+            "c:/file/basedir/",
+        )
+    } else {
+        (
+            "/env/basedir",
+            "/file/basedir",
+            "/env/basedir/",
+            "/file/basedir/",
+        )
     };
-
-    let file_conf = FileConfig {
-        cache: Default::default(),
-        dist: Default::default(),
-        server_startup_timeout_ms: None,
-        basedirs: vec!["C:/file/basedir".to_string()],
-        client_side_mode: false,
-        compiler_aliases: Default::default(),
-    };
-
-    let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert_eq!(config.basedirs, vec![b"c:/env/basedir/".to_vec()]);
-
-    // Test that file config is used when env is None
-    let env_conf = EnvConfig {
-        cache: Default::default(),
-        basedirs: None,
-        client_side_mode: None,
-    };
-
-    let file_conf = FileConfig {
-        cache: Default::default(),
-        dist: Default::default(),
-        server_startup_timeout_ms: None,
-        basedirs: vec!["C:/file/basedir".to_string()],
-        client_side_mode: false,
-        compiler_aliases: Default::default(),
-    };
-
-    let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert_eq!(config.basedirs, vec![b"c:/file/basedir/".to_vec()]);
-
-    // Test that env config is used when env is set but empty
-    let env_conf = EnvConfig {
-        cache: Default::default(),
-        basedirs: vec![].into(),
-        client_side_mode: None,
-    };
-
-    let file_conf = FileConfig {
-        cache: Default::default(),
-        dist: Default::default(),
-        server_startup_timeout_ms: None,
-        basedirs: vec!["C:/file/basedir".to_string()],
-        client_side_mode: false,
-        compiler_aliases: Default::default(),
-    };
-
-    let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert!(config.basedirs.is_empty());
-
-    // Test that both empty results in empty
-    let env_conf = EnvConfig {
-        cache: Default::default(),
-        basedirs: vec![].into(),
-        client_side_mode: None,
-    };
-
-    let file_conf = FileConfig {
-        cache: Default::default(),
-        dist: Default::default(),
-        server_startup_timeout_ms: None,
-        basedirs: vec![],
-        client_side_mode: false,
-        compiler_aliases: Default::default(),
-    };
-
-    let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert!(config.basedirs.is_empty());
-}
-
-#[test]
-#[cfg(not(target_os = "windows"))]
-fn config_basedirs_overrides() {
-    // Test that env variable takes precedence over file config
-    let env_conf = EnvConfig {
-        cache: Default::default(),
-        basedirs: vec!["/env/basedir".to_string()].into(),
-        client_side_mode: None,
-    };
-
-    let file_conf = FileConfig {
-        cache: Default::default(),
-        dist: Default::default(),
-        server_startup_timeout_ms: None,
-        basedirs: vec!["/file/basedir".to_string()],
-        client_side_mode: false,
-        compiler_aliases: Default::default(),
-    };
-
-    let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert_eq!(config.basedirs, vec![b"/env/basedir/".to_vec()]);
-
-    // Test that file config is used when env is None
-    let env_conf = EnvConfig {
-        cache: Default::default(),
-        basedirs: None,
-        client_side_mode: None,
-    };
-
-    let file_conf = FileConfig {
-        cache: Default::default(),
-        dist: Default::default(),
-        server_startup_timeout_ms: None,
-        basedirs: vec!["/file/basedir".to_string()],
-        client_side_mode: false,
-        compiler_aliases: Default::default(),
-    };
-
-    let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert_eq!(config.basedirs, vec![b"/file/basedir/".to_vec()]);
-
-    // Test that env config is used when env is set but empty
-    let env_conf = EnvConfig {
-        cache: Default::default(),
-        basedirs: vec![].into(),
-        client_side_mode: None,
-    };
-
-    let file_conf = FileConfig {
-        cache: Default::default(),
-        dist: Default::default(),
-        server_startup_timeout_ms: None,
-        basedirs: vec!["/file/basedir".to_string()],
-        client_side_mode: false,
-        compiler_aliases: Default::default(),
-    };
-
-    let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert_eq!(config.basedirs, [] as [std::vec::Vec<u8>; 0]);
-
-    // Test that both empty results in empty
-    let env_conf = EnvConfig {
-        cache: Default::default(),
-        basedirs: vec![].into(),
-        client_side_mode: None,
-    };
-
-    let file_conf = FileConfig {
-        cache: Default::default(),
-        dist: Default::default(),
-        server_startup_timeout_ms: None,
-        basedirs: vec![],
-        client_side_mode: false,
-        compiler_aliases: Default::default(),
-    };
-
-    let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert_eq!(config.basedirs, [] as [std::vec::Vec<u8>; 0]);
-    let env_conf = EnvConfig {
-        cache: Default::default(),
-        basedirs: None,
-        client_side_mode: None,
-    };
-
-    let file_conf = FileConfig {
-        cache: Default::default(),
-        dist: Default::default(),
-        server_startup_timeout_ms: None,
-        basedirs: vec![],
-        client_side_mode: false,
-        compiler_aliases: Default::default(),
-    };
-
-    let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
-    assert_eq!(config.basedirs, [] as [std::vec::Vec<u8>; 0]);
+    for (env_dirs, file_dirs, expected) in [
+        (
+            Some(vec![env_path.to_owned()]),
+            vec![file_path.to_owned()],
+            vec![env_expected],
+        ),
+        (None, vec![file_path.to_owned()], vec![file_expected]),
+        (Some(vec![]), vec![file_path.to_owned()], vec![]),
+        (Some(vec![]), vec![], vec![]),
+        (None, vec![], vec![]),
+    ] {
+        let env_conf = EnvConfig {
+            basedirs: env_dirs,
+            ..Default::default()
+        };
+        let file_conf = FileConfig {
+            basedirs: file_dirs,
+            ..Default::default()
+        };
+        let config = Config::from_env_and_file_configs(env_conf, file_conf)?;
+        assert_eq!(
+            config.basedirs,
+            expected
+                .into_iter()
+                .map(|path| path.as_bytes().to_vec())
+                .collect::<Vec<_>>()
+        );
+    }
+    Ok(())
 }
 
 #[test]
@@ -2663,75 +2534,30 @@ fn test_env_basedirs_multiple() {
 }
 
 #[test]
-#[cfg(not(target_os = "windows"))]
-fn test_env_basedirs_with_spaces() {
+fn test_env_basedirs_with_spaces() -> Result<()> {
     let mut environment = Environment::default();
-    // Test that spaces around paths are not trimmed
-    {
-        environment.set(
-            "SCCACHE_BASEDIRS",
-            " /home/user/project : /home/user/workspace ",
-        );
-    }
-    let env_conf = config_from_environment(&environment).unwrap();
-    {
-        environment.remove("SCCACHE_BASEDIRS");
-    }
-
-    assert_eq!(
-        env_conf.basedirs.clone().expect("SCCACHE_BASEDIRS is set"),
-        vec![
-            " /home/user/project ".to_string(),
-            " /home/user/workspace ".to_string()
-        ]
-    );
-    // The lead to trailing spaces are preserved and server fails to start
-    let file_conf = FileConfig {
-        cache: Default::default(),
-        dist: Default::default(),
-        server_startup_timeout_ms: None,
-        basedirs: vec![],
-        client_side_mode: false,
-        compiler_aliases: Default::default(),
-    };
-    Config::from_env_and_file_configs(env_conf, file_conf)
-        .expect_err("Should fail due to non-absolute path");
-}
-
-#[test]
-#[cfg(target_os = "windows")]
-fn test_env_basedirs_with_spaces() {
-    let mut environment = Environment::default();
-    // Test that spaces around paths are not trimmed
-    {
-        environment.set(
-            "SCCACHE_BASEDIRS",
+    let (value, first, second) = if cfg!(windows) {
+        (
             " C:/home/user/project ; C:/home/user/workspace ",
-        );
-    }
-    let env_conf = config_from_environment(&environment).unwrap();
-    {
-        environment.remove("SCCACHE_BASEDIRS");
-    }
-
-    assert_eq!(
-        env_conf.basedirs.clone().expect("SCCACHE_BASEDIRS is set"),
-        vec![
-            " C:/home/user/project ".to_string(),
-            " C:/home/user/workspace ".to_string()
-        ]
-    );
-    // The lead to trailing spaces are preserved and server fails to start
-    let file_conf = FileConfig {
-        cache: Default::default(),
-        dist: Default::default(),
-        server_startup_timeout_ms: None,
-        basedirs: vec![],
-        client_side_mode: false,
-        compiler_aliases: Default::default(),
+            " C:/home/user/project ",
+            " C:/home/user/workspace ",
+        )
+    } else {
+        (
+            " /home/user/project : /home/user/workspace ",
+            " /home/user/project ",
+            " /home/user/workspace ",
+        )
     };
-    Config::from_env_and_file_configs(env_conf, file_conf)
-        .expect_err("Should fail due to non-absolute path");
+    environment.set("SCCACHE_BASEDIRS", value);
+    let env_conf = config_from_environment(&environment)?;
+    assert_eq!(
+        env_conf.basedirs.as_deref(),
+        Some(&[first.to_owned(), second.to_owned()][..])
+    );
+    // Leading and trailing spaces are preserved; these are not absolute paths.
+    assert!(Config::from_env_and_file_configs(env_conf, FileConfig::default()).is_err());
+    Ok(())
 }
 
 #[test]
@@ -3742,19 +3568,11 @@ fn test_integration_config_normalizes_and_strips() {
     use crate::util::strip_basedirs;
     use std::borrow::Cow;
 
-    let env_conf = EnvConfig {
-        cache: Default::default(),
-        basedirs: None,
-        client_side_mode: None,
-    };
+    let env_conf = EnvConfig::default();
 
     let file_conf = FileConfig {
-        cache: Default::default(),
-        dist: Default::default(),
-        server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/project".to_string()],
-        client_side_mode: false,
-        compiler_aliases: Default::default(),
+        ..Default::default()
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3778,19 +3596,11 @@ fn test_integration_normalized_path_with_double_slashes() {
     // Test that Config normalizes paths with double slashes
     use crate::util::strip_basedirs;
 
-    let env_conf = EnvConfig {
-        cache: Default::default(),
-        basedirs: None,
-        client_side_mode: None,
-    };
+    let env_conf = EnvConfig::default();
 
     let file_conf = FileConfig {
-        cache: Default::default(),
-        dist: Default::default(),
-        server_startup_timeout_ms: None,
         basedirs: vec!["/home//user///project/".to_string()],
-        client_side_mode: false,
-        compiler_aliases: Default::default(),
+        ..Default::default()
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3810,19 +3620,11 @@ fn test_integration_windows_path_normalization() {
     // Test that Config normalizes Windows paths correctly
     use crate::util::strip_basedirs;
 
-    let env_conf = EnvConfig {
-        cache: Default::default(),
-        basedirs: None,
-        client_side_mode: None,
-    };
+    let env_conf = EnvConfig::default();
 
     let file_conf = FileConfig {
-        cache: Default::default(),
-        dist: Default::default(),
-        server_startup_timeout_ms: None,
         basedirs: vec!["C:\\Users\\Test\\Project".to_string()],
-        client_side_mode: false,
-        compiler_aliases: Default::default(),
+        ..Default::default()
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3843,19 +3645,11 @@ fn test_integration_cow_borrowed_when_no_match() {
     use crate::util::strip_basedirs;
     use std::borrow::Cow;
 
-    let env_conf = EnvConfig {
-        cache: Default::default(),
-        basedirs: None,
-        client_side_mode: None,
-    };
+    let env_conf = EnvConfig::default();
 
     let file_conf = FileConfig {
-        cache: Default::default(),
-        dist: Default::default(),
-        server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/project".to_string()],
-        client_side_mode: false,
-        compiler_aliases: Default::default(),
+        ..Default::default()
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3876,20 +3670,9 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
     use crate::util::strip_basedirs;
     use std::borrow::Cow;
 
-    let env_conf = EnvConfig {
-        cache: Default::default(),
-        basedirs: None,
-        client_side_mode: None,
-    };
+    let env_conf = EnvConfig::default();
 
-    let file_conf = FileConfig {
-        cache: Default::default(),
-        dist: Default::default(),
-        server_startup_timeout_ms: None,
-        basedirs: vec![],
-        client_side_mode: false,
-        compiler_aliases: Default::default(),
-    };
+    let file_conf = FileConfig::default();
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
     assert_eq!(config.basedirs, [] as [std::vec::Vec<u8>; 0]);
@@ -3908,19 +3691,11 @@ fn test_integration_multiple_basedirs_longest_match() {
     // Test that strip_basedirs prefers longest match with normalized basedirs
     use crate::util::strip_basedirs;
 
-    let env_conf = EnvConfig {
-        cache: Default::default(),
-        basedirs: None,
-        client_side_mode: None,
-    };
+    let env_conf = EnvConfig::default();
 
     let file_conf = FileConfig {
-        cache: Default::default(),
-        dist: Default::default(),
-        server_startup_timeout_ms: None,
         basedirs: vec!["/home/user".to_string(), "/home/user/project".to_string()],
-        client_side_mode: false,
-        compiler_aliases: Default::default(),
+        ..Default::default()
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3945,19 +3720,11 @@ fn test_integration_paths_with_dots_normalized() {
     // Test that paths with . and .. are normalized correctly
     use crate::util::strip_basedirs;
 
-    let env_conf = EnvConfig {
-        cache: Default::default(),
-        basedirs: None,
-        client_side_mode: None,
-    };
+    let env_conf = EnvConfig::default();
 
     let file_conf = FileConfig {
-        cache: Default::default(),
-        dist: Default::default(),
-        server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/./project/../project".to_string()],
-        client_side_mode: false,
-        compiler_aliases: Default::default(),
+        ..Default::default()
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3978,19 +3745,11 @@ fn test_integration_windows_mixed_slashes() {
     // Test Windows path with mixed slashes in preprocessor output
     use crate::util::strip_basedirs;
 
-    let env_conf = EnvConfig {
-        cache: Default::default(),
-        basedirs: None,
-        client_side_mode: None,
-    };
+    let env_conf = EnvConfig::default();
 
     let file_conf = FileConfig {
-        cache: Default::default(),
-        dist: Default::default(),
-        server_startup_timeout_ms: None,
         basedirs: vec!["C:\\Users\\test\\project".to_string()],
-        client_side_mode: false,
-        compiler_aliases: Default::default(),
+        ..Default::default()
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
