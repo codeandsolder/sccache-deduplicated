@@ -154,6 +154,7 @@ mod common {
     pub struct HeartbeatServerHttpRequest {
         pub jwt_key: Vec<u8>,
         pub num_cpus: usize,
+        pub running_job_ids: Vec<dist::JobId>,
         pub server_nonce: dist::ServerNonce,
         pub cert_digest: Vec<u8>,
         pub cert_pem: Vec<u8>,
@@ -165,6 +166,7 @@ mod common {
             f.debug_struct("HeartbeatServerHttpRequest")
                 .field("jwt_key", &BASE64_URL_SAFE_ENGINE.encode(&self.jwt_key))
                 .field("num_cpus", &self.num_cpus)
+                .field("running_job_ids", &self.running_job_ids)
                 .field("server_nonce", &self.server_nonce)
                 .field(
                     "cert_digest",
@@ -177,7 +179,7 @@ mod common {
     #[serde(deny_unknown_fields)]
     pub struct RunJobHttpRequest {
         pub command: dist::CompileCommand,
-        pub outputs: Vec<String>,
+        pub outputs: dist::OutputRequest,
     }
 }
 
@@ -287,7 +289,7 @@ pub mod urls {
     /// Returns an error if the generated server URL is invalid.
     pub fn server_run_job(server_id: ServerId, job_id: JobId) -> Result<reqwest::Url> {
         let url = format!(
-            "https://{}/api/v1/distserver/run_job/{job_id}",
+            "https://{}/api/v2/distserver/run_job/{job_id}",
             server_id.addr()
         );
         Ok(reqwest::Url::parse(&url)?)
@@ -298,10 +300,9 @@ pub mod urls {
 mod server {
     use crate::util::{new_reqwest_blocking_client, num_cpus};
     use byteorder::{BigEndian, ReadBytesExt};
-    use flate2::read::ZlibDecoder as ZlibReadDecoder;
     use rouille::accept;
     use serde::{Deserialize, Serialize};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::convert::Infallible;
     use std::env;
     use std::fs;
@@ -447,17 +448,51 @@ mod server {
         None
     }
 
-    struct RunningJobGuard(Arc<atomic::AtomicUsize>);
+    // The running set has one owner for both load-advertisement and scheduler
+    // reconciliation. A guard clears its ID even if a build request unwinds.
+    struct RunningJobGuard {
+        jobs: Arc<Mutex<HashSet<JobId>>>,
+        job_id: JobId,
+    }
     impl RunningJobGuard {
-        fn new(counter: &Arc<atomic::AtomicUsize>) -> Self {
-            counter.fetch_add(1, atomic::Ordering::Relaxed);
-            Self(Arc::clone(counter))
+        fn new(jobs: &Arc<Mutex<HashSet<JobId>>>, job_id: JobId) -> Result<Self> {
+            let mut active = jobs
+                .lock()
+                .map_err(|_| anyhow!("running jobs mutex poisoned"))?;
+            if !active.insert(job_id) {
+                return Err(anyhow!("job {job_id} is already running"));
+            }
+            drop(active);
+            Ok(Self {
+                jobs: Arc::clone(jobs),
+                job_id,
+            })
         }
     }
     impl Drop for RunningJobGuard {
         fn drop(&mut self) {
-            self.0.fetch_sub(1, atomic::Ordering::Relaxed);
+            // Never leak a running entry if a different thread poisoned the lock.
+            let mut jobs = self.jobs.lock().unwrap_or_else(|error| error.into_inner());
+            jobs.remove(&self.job_id);
         }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn running_job_guard_tracks_exact_ownership_and_rejects_duplicates() -> Result<()> {
+        let active = Arc::new(Mutex::new(HashSet::<JobId>::new()));
+        let first = RunningJobGuard::new(&active, JobId(5))?;
+        let second = RunningJobGuard::new(&active, JobId(6))?;
+        assert!(RunningJobGuard::new(&active, JobId(5)).is_err());
+        assert_eq!(active.lock().unwrap().len(), 2);
+        drop(first);
+        assert_eq!(
+            active.lock().unwrap().iter().copied().collect::<Vec<_>>(),
+            vec![JobId(6)]
+        );
+        drop(second);
+        assert!(active.lock().unwrap().is_empty());
+        Ok(())
     }
 
     pub fn bincode_req<T: serde::de::DeserializeOwned + 'static>(
@@ -1027,7 +1062,7 @@ mod server {
                         let heartbeat_server = try_or_400_log!(req_id, bincode_input(request));
                         trace!(target: "sccache_heartbeat", "Req {}: heartbeat_server: {:?}", req_id, heartbeat_server);
 
-                        let HeartbeatServerHttpRequest { num_cpus, jwt_key, server_nonce, cert_digest, cert_pem } = heartbeat_server;
+                        let HeartbeatServerHttpRequest { num_cpus, running_job_ids, jwt_key, server_nonce, cert_digest, cert_pem } = heartbeat_server;
                         let mut requester_client = try_or_500_log!(
                             req_id,
                             requester
@@ -1050,7 +1085,7 @@ mod server {
                         let worker_name_nonce = server_nonce.clone();
                         let res: HeartbeatServerResult = try_or_500_log!(req_id, handler.handle_heartbeat_server(
                             server_id, server_nonce,
-                            num_cpus,
+                            num_cpus, &running_job_ids,
                             job_authorizer
                         ));
                         if let Some(worker_name) = worker_name
@@ -1225,7 +1260,9 @@ mod server {
                 handler,
             } = self;
             let mut load_aware_capacity = LoadAwareCapacity::from_env()?;
-            let running_jobs = Arc::new(atomic::AtomicUsize::new(0));
+            let handler = Arc::new(handler);
+            let heartbeat_handler = Arc::clone(&handler);
+            let running_jobs = Arc::new(Mutex::new(HashSet::<JobId>::new()));
             let heartbeat_running_jobs = Arc::clone(&running_jobs);
             let heartbeat_jwt_key = jwt_key.clone();
             let heartbeat_cert_pem = cert_pem.clone();
@@ -1242,15 +1279,23 @@ mod server {
             thread::spawn(move || {
                 let client = heartbeat_client;
                 loop {
+                    // A new assignment can arrive after this request starts but
+                    // before its response. Never prune that assignment.
+                    let heartbeat_started_at = Instant::now();
                     trace!(target: "sccache_heartbeat", "Performing heartbeat");
+                    let running_job_ids: Vec<_> = heartbeat_running_jobs
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .iter()
+                        .copied()
+                        .collect();
                     let advertised_cpus =
                         load_aware_capacity.as_mut().map_or_else(num_cpus, |state| {
-                            state.advertised_cpus(
-                                heartbeat_running_jobs.load(atomic::Ordering::Relaxed),
-                            )
+                            state.advertised_cpus(running_job_ids.len())
                         });
                     let heartbeat_req = HeartbeatServerHttpRequest {
                         num_cpus: advertised_cpus,
+                        running_job_ids,
                         jwt_key: heartbeat_jwt_key.clone(),
                         server_nonce: server_nonce.clone(),
                         cert_digest: cert_digest.clone(),
@@ -1258,6 +1303,8 @@ mod server {
                     };
                     let mut heartbeat_request = client
                         .post(heartbeat_url.clone())
+                        // A stalled scheduler must not permanently stop heartbeats.
+                        .timeout(HEARTBEAT_INTERVAL)
                         .bearer_auth(scheduler_auth.clone());
                     if let Some(worker_name) = worker_name.as_ref() {
                         heartbeat_request =
@@ -1267,8 +1314,23 @@ mod server {
                         .bincode(&heartbeat_req)
                         .and_then(bincode_req);
                     match heartbeat_result {
-                        Ok(HeartbeatServerResult { is_new }) => {
+                        Ok(HeartbeatServerResult {
+                            is_new,
+                            assigned_job_ids,
+                        }) => {
                             trace!(target: "sccache_heartbeat", "Heartbeat success is_new={}", is_new);
+                            match heartbeat_handler.handle_reconcile_assignments(
+                                &assigned_job_ids,
+                                heartbeat_started_at,
+                            ) {
+                                Ok(removed) if removed > 0 => {
+                                    info!("Discarded {removed} stale unclaimed worker assignments")
+                                }
+                                Err(error) => {
+                                    warn!("Unable to reconcile worker assignments: {error:#}")
+                                }
+                                _ => {}
+                            }
                             // TODO: if is_new, terminate all running jobs
                             if is_new {
                                 info!("Server connected to scheduler");
@@ -1312,7 +1374,7 @@ mod server {
                         let res: SubmitToolchainResult = try_or_500_log!(req_id, handler.handle_submit_toolchain(&requester, job_id, toolchain_rdr));
                         prepare_response(request, &res)
                     },
-                    (POST) (/api/v1/distserver/run_job/{job_id: JobId}) => {
+                    (POST) (/api/v2/distserver/run_job/{job_id: JobId}) => {
                         job_auth_or_401!(request, &job_authorizer, job_id);
 
                         let mut body = try_or_400_log!(
@@ -1328,10 +1390,9 @@ mod server {
                         trace!("Req {}: run_job({}): {:?}", req_id, job_id, runjob);
                         let RunJobHttpRequest { command, outputs } = runjob;
                         let body = bincode_reader.into_inner();
-                        let inputs_rdr = InputsReader(Box::new(ZlibReadDecoder::new(body)));
-                        let outputs = outputs.into_iter().collect();
+                        let inputs_rdr = InputsReader::new(Box::new(body));
 
-                        let _running_job = RunningJobGuard::new(&running_jobs);
+                        let _running_job = try_or_500_log!(req_id, RunningJobGuard::new(&running_jobs, job_id));
                         let res: RunJobResult = try_or_500_log!(req_id, handler.handle_run_job(&requester, job_id, command, outputs, inputs_rdr));
                         prepare_response(request, &res)
                     },
@@ -1367,13 +1428,26 @@ mod server {
             state: JobState,
         ) -> Result<UpdateJobStateResult> {
             let url = urls::scheduler_job_state(&self.scheduler_url, job_id)?;
-            bincode_req(
-                self.client
-                    .post(url)
-                    .bearer_auth(self.scheduler_auth.clone())
-                    .bincode(&state)?,
-            )
-            .context("POST to scheduler job_state failed")
+            let publish = || {
+                bincode_req(
+                    self.client
+                        .post(url.clone())
+                        // Never retain an execution slot forever on a stalled ACK.
+                        .timeout(HEARTBEAT_TIMEOUT)
+                        .bearer_auth(self.scheduler_auth.clone())
+                        .bincode(&state)?,
+                )
+            };
+            // A lost response may follow a successful scheduler transition.
+            // The scheduler accepts repeated state updates and terminal acks.
+            publish().or_else(|first_error| {
+                warn!(
+                    "Retrying job {job_id} state {state} after scheduler response failure: {first_error:#}"
+                );
+                publish().with_context(|| {
+                    format!("POST to scheduler job_state failed; first attempt: {first_error:#}")
+                })
+            })
         }
     }
 }
@@ -1384,15 +1458,13 @@ mod client {
     use crate::config;
     use crate::dist::pkg::{InputsPackager, ToolchainPackager};
     use crate::dist::{
-        self, AllocJobResult, CompileCommand, JobAlloc, PathTransformer, RunJobResult,
-        SchedulerStatusResult, ServerId, SubmitToolchainResult, Toolchain,
+        self, AllocJobResult, CompileCommand, JobAlloc, RunJobResult, SchedulerStatusResult,
+        ServerId, SubmitToolchainResult, Toolchain,
     };
 
+    use crate::compression::deflate::ZlibWriter;
     use async_trait::async_trait;
     use byteorder::{BigEndian, WriteBytesExt};
-    use flate2::Compression;
-    use flate2::write::ZlibEncoder as ZlibWriteEncoder;
-    use futures::TryFutureExt;
     use reqwest::Body;
     use std::collections::HashMap;
     use std::io::Write;
@@ -1688,12 +1760,16 @@ mod client {
             command: CompileCommand,
             outputs: Vec<String>,
             inputs_packager: Box<dyn InputsPackager>,
-        ) -> Result<(RunJobResult, PathTransformer)> {
+        ) -> Result<RunJobResult> {
             let url = urls::server_run_job(job_alloc.server_id, job_alloc.job_id)?;
 
-            let (body, path_transformer) = self
+            let body = self
                 .pool
                 .spawn_blocking(move || -> Result<_> {
+                    let outputs = dist::OutputRequest {
+                        paths: outputs,
+                        compression_level: crate::compression::cache_level(),
+                    };
                     let bincode = bincode::serialize(&RunJobHttpRequest { command, outputs })
                         .context("failed to serialize run job request")?;
                     let bincode_length = u32::try_from(bincode.len())
@@ -1704,22 +1780,19 @@ mod client {
                         .context("failed to encode run job request length")?;
                     body.write_all(&bincode)
                         .context("failed to encode run job request metadata")?;
-                    let path_transformer;
                     {
-                        let mut compressor = ZlibWriteEncoder::new(&mut body, Compression::fast());
-                        path_transformer = inputs_packager
+                        let header_size = body.len();
+                        let mut compressor = ZlibWriter::new(&mut body)?;
+                        inputs_packager
                             .write_inputs(&mut compressor)
                             .context("Could not write inputs for compilation")?;
-                        compressor.flush().context("failed to flush compressor")?;
-                        trace!(
-                            "Compressed inputs from {} -> {}",
-                            compressor.total_in(),
-                            compressor.total_out()
-                        );
-                        compressor.finish().context("failed to finish compressor")?;
+                        let input_size = compressor.total_in();
+                        let body = compressor.finish().context("failed to finish compressor")?;
+                        let compressed_size = body.len() - header_size;
+                        trace!("Compressed inputs from {input_size} -> {compressed_size}");
                     }
 
-                    Ok((body, path_transformer))
+                    Ok(body)
                 })
                 .await??;
             let mut req = {
@@ -1730,9 +1803,7 @@ mod client {
                 client.post(url)
             };
             req = req.bearer_auth(job_alloc.auth.clone()).bytes(body);
-            bincode_req_fut(req)
-                .map_ok(|res| (res, path_transformer))
-                .await
+            bincode_req_fut(req).await
         }
 
         async fn put_toolchain(
@@ -1757,7 +1828,7 @@ mod client {
         }
         fn get_custom_toolchain(&self, exe: &Path) -> Option<PathBuf> {
             match self.tc_cache.get_custom_toolchain(exe) {
-                Some(Ok((_, toolchain_override))) => Some(toolchain_override.archive),
+                Ok(Some((_, toolchain_override))) => Some(toolchain_override.archive),
                 _ => None,
             }
         }

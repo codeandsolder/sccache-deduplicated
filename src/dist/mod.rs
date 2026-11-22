@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::compiler;
+use crate::compression::ZstdFrame;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -503,13 +504,132 @@ pub fn try_compile_command_to_dist(
     })
 }
 
-// TODO: Clone by assuming immutable/no GC for now
-// TODO: make fields non-public?
-// TODO: make archive_id validate that it's just a bunch of hex chars
+/// A BLAKE3 archive digest in the canonical lowercase hexadecimal wire format.
+///
+/// Validating at deserialization and construction prevents malformed archive
+/// IDs from becoming filesystem components or container image names.
+#[derive(Debug, Hash, Eq, PartialEq, Clone, Serialize)]
+#[serde(transparent)]
+pub struct ArchiveId(String);
+
+impl ArchiveId {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct InvalidArchiveId;
+
+impl fmt::Display for InvalidArchiveId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("toolchain archive ID must be 64 lowercase hexadecimal characters")
+    }
+}
+
+impl std::error::Error for InvalidArchiveId {}
+
+impl TryFrom<String> for ArchiveId {
+    type Error = InvalidArchiveId;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        if value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            Ok(Self(value))
+        } else {
+            Err(InvalidArchiveId)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ArchiveId {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::try_from(value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Display for ArchiveId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::ops::Deref for ArchiveId {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<str> for ArchiveId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for ArchiveId {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_ref()
+    }
+}
+
+impl AsRef<Path> for ArchiveId {
+    fn as_ref(&self) -> &Path {
+        self.0.as_ref()
+    }
+}
+
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Toolchain {
-    pub archive_id: String,
+    pub archive_id: ArchiveId,
+}
+
+#[cfg(test)]
+mod archive_id_tests {
+    use super::*;
+
+    #[test]
+    fn accepted_archive_ids_round_trip_through_toolchain_json() -> anyhow::Result<()> {
+        let digest = crate::util::Digest::reader_sync(b"test archive".as_slice())?;
+        let tc = Toolchain {
+            archive_id: ArchiveId::try_from(digest.clone())?,
+        };
+        let encoded = serde_json::to_string(&tc)?;
+        assert_eq!(encoded, format!(r#"{{"archive_id":"{digest}"}}"#));
+        assert_eq!(serde_json::from_str::<Toolchain>(&encoded)?, tc);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_archive_ids_are_rejected() {
+        for value in [
+            "",
+            "a",
+            "../escape",
+            "/absolute",
+            "é",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(ArchiveId::try_from(value.to_owned()).is_err(), "{value:?}");
+            let encoded = serde_json::json!({"archive_id": value});
+            assert!(
+                serde_json::from_value::<Toolchain>(encoded).is_err(),
+                "{value:?}"
+            );
+        }
+    }
 }
 
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug, Ord, PartialOrd, Serialize, Deserialize)]
@@ -638,69 +758,42 @@ impl ProcessOutput {
 }
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
-#[cfg(windows)]
-use std::os::windows::process::ExitStatusExt;
-#[cfg(unix)]
-fn exit_status(code: i32) -> process::ExitStatus {
-    process::ExitStatus::from_raw(code)
-}
-#[cfg(windows)]
-fn exit_status(code: i32) -> process::ExitStatus {
-    // TODO: this is probably a subideal conversion - it's not clear how Unix exit codes map to
-    // Windows exit codes (other than 0 being a success)
-    process::ExitStatus::from_raw(code as u32)
-}
 impl From<ProcessOutput> for process::Output {
     fn from(o: ProcessOutput) -> Self {
         // TODO: handle signals, i.e. None code
         Self {
-            status: exit_status(o.code),
+            status: crate::util::exit_status_from_code(o.code),
             stdout: o.stdout,
             stderr: o.stderr,
         }
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[cfg(test)]
+#[test]
+fn test_distributed_process_output_preserves_exit_codes() {
+    for code in [0, 1, 2, 101, 126, 127, 254, 255] {
+        let output: process::Output =
+            ProcessOutput::fake_output(code, b"stdout".to_vec(), b"stderr".to_vec()).into();
+        assert_eq!(output.status.code(), Some(code), "exit code {code}");
+        assert_eq!(output.status.success(), code == 0);
+        assert_eq!(output.stdout, b"stdout");
+        assert_eq!(output.stderr, b"stderr");
+        #[cfg(unix)]
+        assert_eq!(
+            output.status.signal(),
+            None,
+            "exit code {code} misread as signal"
+        );
+    }
+}
+
+/// Requested output paths and the receiving client's cache compression level.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OutputData(Vec<u8>, u64);
-impl OutputData {
-    /// Compress output data read from `r`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error if reading or compression fails.
-    #[cfg(any(feature = "dist-server", all(feature = "dist-client", test)))]
-    pub fn try_from_reader<R: Read>(r: R) -> io::Result<Self> {
-        use flate2::Compression;
-        use flate2::read::ZlibEncoder as ZlibReadEncoder;
-        let mut compressor = ZlibReadEncoder::new(r, Compression::fast());
-        let mut res = vec![];
-        io::copy(&mut compressor, &mut res)?;
-        Ok(Self(res, compressor.total_in()))
-    }
-    #[must_use]
-    pub const fn lens(&self) -> OutputDataLens {
-        OutputDataLens {
-            actual: self.1,
-            compressed: self.0.len() as u64,
-        }
-    }
-    #[cfg(feature = "dist-client")]
-    #[must_use]
-    pub fn into_reader(self) -> impl Read {
-        use flate2::read::ZlibDecoder as ZlibReadDecoder;
-        ZlibReadDecoder::new(io::Cursor::new(self.0))
-    }
-}
-pub struct OutputDataLens {
-    pub actual: u64,
-    pub compressed: u64,
-}
-impl fmt::Display for OutputDataLens {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Size: {}->{}", self.actual, self.compressed)
-    }
+pub struct OutputRequest {
+    pub paths: Vec<String>,
+    pub compression_level: i32,
 }
 
 // TODO: standardise on compressed or not for inputs and toolchain
@@ -752,6 +845,8 @@ pub enum UpdateJobStateResult {
 #[serde(deny_unknown_fields)]
 pub struct HeartbeatServerResult {
     pub is_new: bool,
+    // Includes accepted jobs and assignment RPC reservations.
+    pub assigned_job_ids: Vec<JobId>,
 }
 
 // RunJob
@@ -766,7 +861,7 @@ pub enum RunJobResult {
 #[serde(deny_unknown_fields)]
 pub struct JobComplete {
     pub output: ProcessOutput,
-    pub outputs: Vec<(String, OutputData)>,
+    pub outputs: Vec<(String, ZstdFrame)>,
 }
 
 // Status
@@ -795,7 +890,7 @@ pub enum SubmitToolchainResult {
 
 pub struct BuildResult {
     pub output: ProcessOutput,
-    pub outputs: Vec<(String, OutputData)>,
+    pub outputs: Vec<(String, ZstdFrame)>,
 }
 
 ///////////////////
@@ -819,10 +914,37 @@ impl Read for ToolchainReader<'_> {
     }
 }
 
+#[cfg(feature = "dist-server")]
 pub struct InputsReader<'a>(Box<dyn Read + Send + 'a>);
-impl Read for InputsReader<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
+#[cfg(feature = "dist-server")]
+impl<'a> InputsReader<'a> {
+    /// Wrap a reader for a distributed compilation's input stream.
+    #[must_use]
+    pub fn new(reader: Box<dyn Read + Send + 'a>) -> Self {
+        Self(reader)
+    }
+}
+#[cfg(feature = "dist-server")]
+impl<'a> InputsReader<'a> {
+    /// Create the decoder on the thread consuming the transport stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the codec cannot be initialized.
+    pub fn into_decoded(self) -> io::Result<impl Read + 'a> {
+        crate::compression::deflate::InflateReader::zlib(self.0)
+    }
+
+    /// Extract input files, including validation of the compressed stream trailer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if decoding or extraction fails.
+    pub fn unpack(self, path: &Path) -> io::Result<()> {
+        let mut archive = tar::Archive::new(self.into_decoded()?);
+        archive.unpack(path)?;
+        io::copy(&mut archive.into_inner(), &mut io::sink())?;
+        Ok(())
     }
 }
 
@@ -868,6 +990,7 @@ pub trait SchedulerIncoming: Send + Sync {
         server_id: ServerId,
         server_nonce: ServerNonce,
         num_cpus: usize,
+        running_job_ids: &[JobId],
         job_authorizer: Box<dyn JobAuthorizer>,
     ) -> ExtResult<HeartbeatServerResult, Error>;
     // From Server, best-effort observability metadata.
@@ -903,6 +1026,13 @@ pub trait SchedulerIncoming: Send + Sync {
 pub trait ServerIncoming: Send + Sync {
     // From Scheduler
     fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> ExtResult<AssignJobResult, Error>;
+    // Reconcile scheduler-side reservations against local unclaimed jobs.
+    // The cutoff predates the heartbeat request; later assignments must survive.
+    fn handle_reconcile_assignments(
+        &self,
+        assigned_job_ids: &[JobId],
+        heartbeat_started_at: std::time::Instant,
+    ) -> ExtResult<usize, Error>;
     // From Client
     fn handle_submit_toolchain(
         &self,
@@ -916,7 +1046,7 @@ pub trait ServerIncoming: Send + Sync {
         requester: &dyn ServerOutgoing,
         job_id: JobId,
         command: CompileCommand,
-        outputs: Vec<String>,
+        outputs: OutputRequest,
         inputs_rdr: InputsReader<'_>,
     ) -> ExtResult<RunJobResult, Error>;
 }
@@ -928,7 +1058,7 @@ pub trait BuilderIncoming: Send + Sync {
         &self,
         toolchain: Toolchain,
         command: CompileCommand,
-        outputs: Vec<String>,
+        outputs: OutputRequest,
         inputs_rdr: InputsReader<'_>,
         cache: &Mutex<TcCache>,
     ) -> ExtResult<BuildResult, Error>;
@@ -954,7 +1084,7 @@ pub trait Client: Send + Sync {
         command: CompileCommand,
         outputs: Vec<String>,
         inputs_packager: Box<dyn pkg::InputsPackager>,
-    ) -> Result<(RunJobResult, PathTransformer)>;
+    ) -> Result<RunJobResult>;
     async fn worker_label(&self, server_id: ServerId) -> String {
         server_id.addr().to_string()
     }

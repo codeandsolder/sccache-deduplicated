@@ -15,6 +15,45 @@ Background:
    tokens), be aware that a lack of entropy is possible in cloud or
    virtualized environments in some scenarios.
 
+## Managed release native portability
+
+The managed Linux x86-64-v2 release includes distributed worker TLS support.
+Build it with the vendored-openssl Cargo feature so the worker embeds
+OpenSSL rather than depending on a particular host's libssl/libcrypto
+SONAME. The immutable release validator rejects all external OpenSSL
+dependencies and requires GLIBC no newer than 2.39; the release metadata
+records openssl_linkage=vendored-static. The older published protocol-v2
+canary e266a04e demonstrated why both checks matter: it passed GLIBC
+verification but required OpenSSL 4 on an OpenSSL 3 worker host.
+
+## Distributed compression backend
+
+Input transport uses the direct fallible zlib-rs-fast streaming API.
+Toolchains use standard multi-member gzip with fixed-size members and the
+fork's bounded parallel batch compressor. Decoders are created on the
+consuming thread, and cached archives can be read in either single-member or
+multi-member gzip form. No flate2 compatibility adapter is required. Compiler output is Zstandard, as described below.
+
+For host-local builds use `contrib/codeandsolder/build-host-native`;
+it compiles the client and worker specifically for the executing CPU.
+Both builds use the pinned nightly Rust toolchain required by zlib-rs-fast's portable SIMD implementation. Published shared fleet bundles retain their portable x86-64-v2 ABI.
+
+## Distributed output transport and cache storage
+
+Protocol 3 / rollout epoch 4 sends each compiler output as a checksummed
+Zstandard frame and its original byte length. The client supplies its cache
+compression level in the run-job request. The frame is validated during
+the single decompression needed to materialize the output file. The same
+compressed bytes are inserted verbatim into the cache ZIP's stored entry,
+rather than reading the output file and compressing it again. Local outputs
+such as preprocessor dependency files still use ordinary cache compression.
+If another output has overwritten or replaced a materialized file, only
+that file is compressed again. Local and remote cache entries use the same
+checksummed Zstandard encoder.
+The cache entry format is unchanged, including support for reading already
+stored Zstandard entries. The run-job endpoint is versioned separately to
+reject the old wire format; upgrade clients and workers together.
+
 ## Overview
 
 Distributed sccache consists of three parts:
@@ -45,8 +84,18 @@ The HTTP implementation of sccache has the following API, where all HTTP body co
       - Returns a digest and PEM for the temporary server HTTPS certificate.
    - `POST /api/v1/scheduler/heartbeat_server`
       - Called (repeatedly) by servers to register as available for jobs.
+      - Includes active `run_job` IDs. A `Started` job absent for a full
+        heartbeat timeout is released, while long compilations remain
+        assigned as long as the worker reports them running.
+      - The response includes the scheduler's assigned-job IDs, including
+        in-flight assignment reservations. Workers discard obsolete local
+        Pending/Ready assignments while retaining jobs received after the
+        heartbeat request started.
    - `POST /api/v1/scheduler/job_state`
       - Called by servers to inform the scheduler of the state of the job.
+      - Repeated state updates are idempotent. A terminal completion may be
+        acknowledged again for the same worker if the scheduler already
+        completed that job, within its bounded acknowledgment retry window.
    - `GET /api/v1/scheduler/status`
       - Returns information about the scheduler.
  - `server`
@@ -58,6 +107,10 @@ The HTTP implementation of sccache has the following API, where all HTTP body co
    - `POST /api/v1/distserver/run_job`
       - Called by the client to run a job.
       - Returns the compilation stdout along with files created.
+
+The heartbeat body uses a binary protocol shared by schedulers and workers.
+Changes to the active-job inventory therefore require deploying compatible
+scheduler and worker binaries together while the cluster is drained.
 
 There are three axes of security in this setup:
 

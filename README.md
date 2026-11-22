@@ -263,7 +263,7 @@ And you can build code as usual without any additional flags in the command line
 Build Requirements
 ------------------
 
-sccache is a [Rust](https://www.rust-lang.org/) program. Building it requires `cargo` (and thus`rustc`). sccache currently requires **Rust 1.91.0**. We recommend you install Rust via [Rustup](https://rustup.rs/).
+sccache is a [Rust](https://www.rust-lang.org/) program. Building it requires `cargo` (and thus`rustc`). This fork uses **nightly-2026-11-20** (pinned in rust-toolchain.toml) for the optimized zlib-rs-fast portable SIMD backend. We recommend you install Rust via [Rustup](https://rustup.rs/).
 
 Build
 -----

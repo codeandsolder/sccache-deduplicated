@@ -49,6 +49,12 @@ jobs:
           fi
 
           sha="${{ github.event.workflow_run.head_sha }}"
+          latest="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')"
+          if [[ "$sha" != "$latest" ]]; then
+            echo "Skipping superseded main revision $sha (current: $latest)"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           ready=true
           for workflow in ci.yml rust-skills2-strict.yml; do
             conclusion="$(
@@ -65,7 +71,8 @@ jobs:
   build-publish:
     needs: required-gates
     if: needs.required-gates.outputs.ready == 'true'
-    runs-on: ubuntu-26.04
+    # 24.04 ships GLIBC 2.39; the oldest managed host must stay compatible.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       RUSTFLAGS: "-C target-cpu=x86-64-v2"
@@ -83,23 +90,40 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "source SHA: $sha"
 
-      - name: Install Rust 1.99.0
+      - name: Read release protocol and rollout epoch
+        id: protocol
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install 1.99.0 --profile minimal
+          # Read from the checked-out source revision, never from the
+          # current workflow revision for a separately pinned release.
+          source contrib/codeandsolder/release-protocol.env
+          [[ "$dist_protocol" =~ ^[1-9][0-9]*$ ]]
+          [[ "$rollout_epoch" =~ ^[1-9][0-9]*$ ]]
+          [[ "$glibc_abi_max" =~ ^[0-9]+\.[0-9]+$ ]]
+          echo "dist_protocol=$dist_protocol" >> "$GITHUB_OUTPUT"
+          echo "rollout_epoch=$rollout_epoch" >> "$GITHUB_OUTPUT"
+          echo "glibc_abi_max=$glibc_abi_max" >> "$GITHUB_OUTPUT"
+          [[ "$rust_toolchain" =~ ^nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
+          echo "rust_toolchain=$rust_toolchain" >> "$GITHUB_OUTPUT"
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install ${{ steps.protocol.outputs.rust_toolchain }} --profile minimal
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@2376b14a6bc8263ab77013bd744248f49384b2fa # main
         with:
-          rust-toolchain: "1.99.0"
+          rust-toolchain: "${{ steps.protocol.outputs.rust_toolchain }}"
 
       - name: Build CI client + dist worker
         shell: bash
         run: |
           set -euo pipefail
-          cargo +1.99.0 build --release --locked \
+          cargo +${{ steps.protocol.outputs.rust_toolchain }} build --release --locked \
             --no-default-features \
-            --features s3,gha,dist-client,dist-server,direct-metrics \
+            --features s3,gha,dist-client,dist-server,direct-metrics,vendored-openssl \
             --bin sccache --bin sccache-dist
 
           install -D -m 0755 target/release/sccache dist/sccache-linux-x86_64-v2
@@ -107,18 +131,60 @@ jobs:
           sha256sum dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2 > dist/SHA256SUMS
           {
             echo "source_sha=${{ steps.rev.outputs.sha }}"
-            echo "rust_toolchain=1.99.0"
+            echo "rust_toolchain=${{ steps.protocol.outputs.rust_toolchain }}"
             echo "rustflags=-C target-cpu=x86-64-v2"
-            echo "features=s3,gha,dist-client,dist-server,direct-metrics"
-            echo "dist_protocol=1"
-            # Bump when a release requires coordinated host-side migration before deployment.
-            echo "rollout_epoch=2"
+            echo "features=s3,gha,dist-client,dist-server,direct-metrics,vendored-openssl"
+            echo "dist_protocol=${{ steps.protocol.outputs.dist_protocol }}"
+            echo "rollout_epoch=${{ steps.protocol.outputs.rollout_epoch }}"
+            echo "glibc_abi_max=${{ steps.protocol.outputs.glibc_abi_max }}"
+            echo "openssl_linkage=vendored-static"
             echo "capabilities=$(target/release/sccache --capabilities | paste -sd, -)"
           } > dist/build.txt
 
+      - name: Install native release validation tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ripgrep
+          rg --version
+          readelf --version
+
+      - name: Reject binaries requiring a newer GNU libc ABI
+        shell: bash
+        run: |
+          set -euo pipefail
+          max_supported="GLIBC_${{ steps.protocol.outputs.glibc_abi_max }}"
+          for binary in dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2; do
+            abi_report="$RUNNER_TEMP/$(basename "$binary").glibc-versions"
+            readelf -W --version-info "$binary" > "$abi_report"
+            # rg exit 1 means no matches (valid for a fully static binary);
+            # all other errors, including a missing rg executable, are fatal.
+            matches=""
+            search_status=0
+            matches="$(rg -o 'GLIBC_[0-9]+\.[0-9]+' "$abi_report")" || search_status=$?
+            if (( search_status > 1 )); then
+              echo "::error::failed to inspect GLIBC symbols in $binary (rg exit $search_status)"
+              exit "$search_status"
+            fi
+            max_required="$(printf '%s\n' "$matches" | sort -Vu | tail -n 1)"
+            if [[ -n "$max_required" &&
+                  "$(printf '%s\n%s\n' "$max_supported" "$max_required" | sort -V | tail -n 1)" != "$max_supported" ]]; then
+              echo "::error::$binary requires $max_required, newer than $max_supported"
+              exit 1
+            fi
+            echo "$binary requires at most ${max_required:-no GLIBC symbols}; fleet maximum $max_supported"
+          done
+
+      - name: Reject unsupported fleet native shared library ABIs
+        shell: bash
+        run: >-
+          bash contrib/codeandsolder/verify-release-native-abi.sh
+          dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2
+
       - name: Finalize mandatory sccache before publishing binaries
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@2376b14a6bc8263ab77013bd744248f49384b2fa # main
 
       - name: Publish immutable release
         shell: bash
@@ -127,6 +193,15 @@ jobs:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || format('sccache-ci-{0}', github.event.workflow_run.head_sha) }}
         run: |
           set -euo pipefail
+          # Completed older main runs must not publish a downgrade after a
+          # newer revision became the default branch.
+          if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
+            latest="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')"
+            if [[ "$latest" != "${{ steps.rev.outputs.sha }}" ]]; then
+              echo "Skipping superseded main release (latest: $latest)"
+              exit 0
+            fi
+          fi
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             echo "Release $RELEASE_TAG already exists; immutable release is already published."
             exit 0

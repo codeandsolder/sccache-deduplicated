@@ -1,4 +1,4 @@
-use crate::dist::Toolchain;
+use crate::dist::{ArchiveId, Toolchain};
 use crate::lru_disk_cache::Result as LruResult;
 use crate::lru_disk_cache::{LruDiskCache, ReadSeek};
 use anyhow::{Result, anyhow};
@@ -15,34 +15,75 @@ use std::io::Read;
 mod client {
     use crate::config;
     use crate::dist::pkg::ToolchainPackager;
-    use crate::dist::{CustomToolchainOverride, Toolchain};
+    use crate::dist::{ArchiveId, CustomToolchainOverride, Toolchain};
     use crate::lru_disk_cache::Error as LruError;
-    use anyhow::{Context, Error, Result, bail};
+    use anyhow::{Context, Error, Result, anyhow, bail};
     use fs_err as fs;
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use super::{TcCache, path_key};
 
     #[derive(Clone, Debug)]
-    pub struct CustomToolchain {
+    struct CustomToolchain {
         archive: PathBuf,
         compiler_executable: String,
         cargo_executable: Option<String>,
+        identity: Option<Toolchain>,
+        hash_lock: Arc<Mutex<()>>,
     }
 
-    // TODO: possibly shouldn't be public
+    impl CustomToolchain {
+        fn to_override(&self) -> CustomToolchainOverride {
+            CustomToolchainOverride {
+                compiler_executable: self.compiler_executable.clone(),
+                archive: self.archive.clone(),
+                cargo_executable: self.cargo_executable.clone(),
+            }
+        }
+    }
+
+    // Both indexes must be updated under one lock: returning a resolved toolchain
+    // without registering its archive makes get_toolchain() miss that toolchain.
+    struct CustomToolchainRegistry {
+        configured: HashMap<PathBuf, CustomToolchain>,
+        archives: HashMap<Toolchain, PathBuf>,
+    }
+
+    impl CustomToolchainRegistry {
+        fn register(
+            &mut self,
+            compiler_path: &Path,
+            candidate: Toolchain,
+        ) -> Result<(Toolchain, CustomToolchainOverride)> {
+            let custom = self
+                .configured
+                .get_mut(compiler_path)
+                .ok_or_else(|| anyhow!("configured toolchain disappeared during registration"))?;
+            // Another caller may have completed hashing and registered the path.
+            let tc = custom.identity.get_or_insert(candidate).clone();
+            let override_ = custom.to_override();
+            let previous = self.archives.insert(tc.clone(), override_.archive.clone());
+            if let Some(previous) = previous
+                && previous != override_.archive
+            {
+                warn!(
+                    "Detected interchangeable toolchain archives at {} and {}",
+                    previous.display(),
+                    override_.archive.display()
+                );
+            }
+            Ok((tc, override_))
+        }
+    }
+
     pub struct ClientToolchains {
         cache_dir: PathBuf,
         cache: Mutex<TcCache>,
         toolchain_creation: Mutex<()>,
-        // Lookup from dist toolchain -> path to custom toolchain archive
-        custom_toolchain_archives: Mutex<HashMap<Toolchain, PathBuf>>,
-        // Lookup from local path -> toolchain details
-        // The Option<Toolchain> could be populated on startup, but it's lazy for efficiency
-        custom_toolchain_paths: Mutex<HashMap<PathBuf, (CustomToolchain, Option<Toolchain>)>>,
+        custom_toolchains: Mutex<CustomToolchainRegistry>,
         // Toolchains configured to not be distributed
         disabled_toolchains: HashSet<PathBuf>,
         // Local machine mapping from 'weak' hashes to strong toolchain hashes
@@ -121,9 +162,11 @@ mod client {
                             archive: archive.clone(),
                             compiler_executable: archive_compiler_executable.clone(),
                             cargo_executable: archive_cargo_executable.clone(),
+                            identity: None,
+                            hash_lock: Arc::new(Mutex::new(())),
                         };
                         if custom_toolchain_paths
-                            .insert(compiler_executable.clone(), (custom_tc, None))
+                            .insert(compiler_executable.clone(), custom_tc)
                             .is_some()
                         {
                             bail!("Multiple toolchains for {}", compiler_executable.display())
@@ -154,14 +197,14 @@ mod client {
                     }
                 }
             }
-            let custom_toolchain_paths = Mutex::new(custom_toolchain_paths);
-
             Ok(Self {
                 cache_dir,
                 cache,
                 toolchain_creation: Mutex::new(()),
-                custom_toolchain_archives: Mutex::new(HashMap::new()),
-                custom_toolchain_paths,
+                custom_toolchains: Mutex::new(CustomToolchainRegistry {
+                    configured: custom_toolchain_paths,
+                    archives: HashMap::new(),
+                }),
                 disabled_toolchains,
                 // TODO: shouldn't clear on restart, but also should have some
                 // form of pruning
@@ -174,9 +217,10 @@ mod client {
         pub fn get_toolchain(&self, tc: &Toolchain) -> Result<Option<fs::File>> {
             // TODO: be more relaxed about path casing and slashes on Windows
             let custom_tc_archive = self
-                .custom_toolchain_archives
+                .custom_toolchains
                 .lock()
-                .map_err(|_| anyhow::anyhow!("custom toolchain archive mutex poisoned"))?
+                .map_err(|_| anyhow::anyhow!("custom toolchain registry mutex poisoned"))?
+                .archives
                 .get(tc)
                 .cloned();
             let file = if let Some(custom_tc_archive) = custom_tc_archive {
@@ -212,18 +256,24 @@ mod client {
                     compiler_path.display()
                 )
             }
-            if let Some(tc_and_paths) = self.get_custom_toolchain(compiler_path) {
+            if let Some((tc, toolchain_override)) = self.get_custom_toolchain(compiler_path)? {
                 debug!("Using custom toolchain for {}", compiler_path.display());
-                let (tc, toolchain_override) = tc_and_paths?;
                 return Ok((tc, Some(toolchain_override)));
             }
+            // Include package-specific dependencies in the weak cache identity.
+            // A GCC executable can stay byte-identical while its assembler,
+            // linker or other helper is rebuilt in place.
+            let weak_key = toolchain_packager.cache_key_extension()?.map_or_else(
+                || weak_key.to_owned(),
+                |extra| format!("{weak_key}:{extra}"),
+            );
             // Only permit one toolchain creation at a time, without holding the LRU
             // cache mutex across potentially slow packaging I/O.
             let _creation_guard = self
                 .toolchain_creation
                 .lock()
                 .map_err(|_| anyhow::anyhow!("toolchain creation mutex poisoned"))?;
-            if let Some(archive_id) = self.weak_to_strong(weak_key)? {
+            if let Some(archive_id) = self.weak_to_strong(&weak_key)? {
                 let tc = Toolchain { archive_id };
                 let cached = {
                     let mut cache = self
@@ -264,72 +314,61 @@ mod client {
                     .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?;
                 cache.insert_file(tmpfile.path())?
             };
-            self.record_weak(weak_key.to_owned(), tc.archive_id.clone())?;
+            self.record_weak(weak_key, tc.archive_id.to_string())?;
             Ok((tc, None))
         }
 
-        pub fn get_custom_toolchain(
+        pub(crate) fn get_custom_toolchain(
             &self,
             compiler_path: &Path,
-        ) -> Option<Result<(Toolchain, CustomToolchainOverride)>> {
-            let new_toolchain = {
-                let Ok(mut custom_toolchain_paths) = self.custom_toolchain_paths.lock() else {
-                    return Some(Err(anyhow::anyhow!("custom toolchain path mutex poisoned")));
+        ) -> Result<Option<(Toolchain, CustomToolchainOverride)>> {
+            let (archive, hash_lock) = {
+                let registry = self
+                    .custom_toolchains
+                    .lock()
+                    .map_err(|_| anyhow!("custom toolchain registry mutex poisoned"))?;
+                let Some(custom) = registry.configured.get(compiler_path) else {
+                    return Ok(None);
                 };
-                match custom_toolchain_paths.get_mut(compiler_path) {
-                    Some((custom_tc, Some(tc))) => {
-                        return Some(Ok((
-                            tc.clone(),
-                            CustomToolchainOverride {
-                                compiler_executable: custom_tc.compiler_executable.clone(),
-                                archive: custom_tc.archive.clone(),
-                                cargo_executable: custom_tc.cargo_executable.clone(),
-                            },
-                        )));
-                    }
-                    Some((custom_tc, maybe_tc @ None)) => {
-                        let archive_id = match path_key(&custom_tc.archive) {
-                            Ok(archive_id) => archive_id,
-                            Err(error) => return Some(Err(error)),
-                        };
-                        let tc = Toolchain { archive_id };
-                        *maybe_tc = Some(tc.clone());
-                        (
-                            tc,
-                            CustomToolchainOverride {
-                                compiler_executable: custom_tc.compiler_executable.clone(),
-                                archive: custom_tc.archive.clone(),
-                                cargo_executable: custom_tc.cargo_executable.clone(),
-                            },
-                        )
-                    }
-                    None => return None,
+                if let Some(tc) = &custom.identity {
+                    return Ok(Some((tc.clone(), custom.to_override())));
                 }
+                let values = (custom.archive.clone(), Arc::clone(&custom.hash_lock));
+                drop(registry);
+                values
             };
-
-            let (tc, toolchain_override) = new_toolchain;
-            let old_path = match self.custom_toolchain_archives.lock() {
-                Ok(mut archives) => archives.insert(tc.clone(), toolchain_override.archive.clone()),
-                Err(_) => {
-                    return Some(Err(anyhow::anyhow!(
-                        "custom toolchain archive mutex poisoned"
-                    )));
-                }
-            };
-            // If this entry already exists, someone has two custom toolchains with the same strong hash.
-            if let Some(old_path) = old_path
-                && old_path != toolchain_override.archive
+            // Only one caller hashes an uninitialized archive. Other toolchains
+            // and archive lookups remain independent of this slow I/O.
+            let hash_guard = hash_lock
+                .lock()
+                .map_err(|_| anyhow!("custom toolchain hash mutex poisoned"))?;
             {
-                warn!(
-                    "Detected interchangeable toolchain archives at {} and {}",
-                    old_path.display(),
-                    toolchain_override.archive.display()
-                );
+                let registry = self
+                    .custom_toolchains
+                    .lock()
+                    .map_err(|_| anyhow!("custom toolchain registry mutex poisoned"))?;
+                let Some(custom) = registry.configured.get(compiler_path) else {
+                    return Err(anyhow!("configured toolchain disappeared during hashing"));
+                };
+                if let Some(tc) = &custom.identity {
+                    return Ok(Some((tc.clone(), custom.to_override())));
+                }
+                drop(registry);
             }
-            Some(Ok((tc, toolchain_override)))
+            let candidate = Toolchain {
+                archive_id: path_key(&archive)?,
+            };
+            let mut registry = self
+                .custom_toolchains
+                .lock()
+                .map_err(|_| anyhow!("custom toolchain registry mutex poisoned"))?;
+            let result = registry.register(compiler_path, candidate).map(Some);
+            drop(registry);
+            drop(hash_guard);
+            result
         }
 
-        fn weak_to_strong(&self, weak_key: &str) -> Result<Option<String>> {
+        fn weak_to_strong(&self, weak_key: &str) -> Result<Option<ArchiveId>> {
             let result = {
                 let weak_map = self
                     .weak_map
@@ -337,19 +376,37 @@ mod client {
                     .map_err(|_| anyhow::anyhow!("toolchain weak-map mutex poisoned"))?;
                 weak_map.get(weak_key).cloned()
             };
-            Ok(result)
+            Ok(result.and_then(|value| match ArchiveId::try_from(value) {
+                Ok(id) => Some(id),
+                Err(error) => {
+                    warn!("Ignoring malformed weak toolchain mapping for {weak_key}: {error}");
+                    None
+                }
+            }))
         }
         fn record_weak(&self, weak_key: String, key: String) -> Result<()> {
-            let serialized = {
-                let mut weak_map = self
-                    .weak_map
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("toolchain weak-map mutex poisoned"))?;
-                weak_map.insert(weak_key, key);
-                serde_json::to_vec(&*weak_map).map_err(Error::from)?
-            };
+            let mut weak_map = self
+                .weak_map
+                .lock()
+                .map_err(|_| anyhow::anyhow!("toolchain weak-map mutex poisoned"))?;
+            // Keep serialization and persistence under the same lock so concurrent
+            // updates cannot publish an older snapshot over a newer one.
+            let mut updated = weak_map.clone();
+            updated.insert(weak_key, key);
+            let serialized = serde_json::to_vec(&updated).map_err(Error::from)?;
             let weak_map_path = self.cache_dir.join("weak_map.json");
-            fs::write(weak_map_path, serialized).context("failed to enter toolchain in weak map")
+            let mut temporary = tempfile::NamedTempFile::new_in(&self.cache_dir)
+                .context("failed to create temporary toolchain weak map")?;
+            temporary
+                .write_all(&serialized)
+                .context("failed to write temporary toolchain weak map")?;
+            temporary
+                .persist(&weak_map_path)
+                .map_err(|error| error.error)
+                .context("failed to publish toolchain weak map")?;
+            *weak_map = updated;
+            drop(weak_map);
+            Ok(())
         }
     }
 
@@ -377,6 +434,52 @@ mod client {
                 f.write_all(b"toolchain_contents")?;
                 Ok(())
             }
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        struct DependencyVersionedPackage(&'static str);
+
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        impl crate::dist::pkg::ToolchainPackager for DependencyVersionedPackage {
+            fn cache_key_extension(&self) -> Result<Option<String>> {
+                Ok(Some(self.0.to_owned()))
+            }
+
+            fn write_pkg(self: Box<Self>, mut f: super::fs::File) -> crate::errors::Result<()> {
+                f.write_all(self.0.as_bytes())?;
+                Ok(())
+            }
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        #[test]
+        fn toolchain_repackages_when_external_helper_changes() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let client = ClientToolchains::new(temp.path(), 1024 * 1024, &[])?;
+            let path = std::path::Path::new("/compiler/whose-binary-did-not-change");
+            let (first, _) = client.put_toolchain(
+                path,
+                "same-compiler-executable-digest",
+                Box::new(DependencyVersionedPackage("binutils-v1")),
+            )?;
+            let (second, _) = client.put_toolchain(
+                path,
+                "same-compiler-executable-digest",
+                Box::new(DependencyVersionedPackage("binutils-v2")),
+            )?;
+            assert_ne!(first.archive_id, second.archive_id);
+            assert!(client.get_toolchain(&first)?.is_some());
+            assert!(client.get_toolchain(&second)?.is_some());
+            Ok(())
         }
 
         #[cfg(all(
@@ -445,6 +548,36 @@ mod client {
             any(target_arch = "x86_64", target_arch = "aarch64")
         ))]
         #[test]
+        fn malformed_weak_mapping_repackages_and_repairs_disk_index() -> Result<()> {
+            let (_td, cache_dir, first, toolchain) = cached_toolchain()?;
+            drop(first);
+
+            std::fs::write(
+                cache_dir.join("weak_map.json"),
+                br#"{"weak_key":"../malformed"}"#,
+            )?;
+            let recovered = ClientToolchains::new(&cache_dir, 1024 * 1024, &[])?;
+            let (repacked, _) = recovered.put_toolchain(
+                "/my/compiler".as_ref(),
+                "weak_key",
+                Box::new(StaticToolchainPackager),
+            )?;
+            assert_eq!(repacked, toolchain);
+            assert_eq!(
+                recovered.weak_to_strong("weak_key")?,
+                Some(toolchain.archive_id.clone())
+            );
+            let persisted: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(cache_dir.join("weak_map.json"))?)?;
+            assert_eq!(persisted["weak_key"], toolchain.archive_id.to_string());
+            Ok(())
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        #[test]
         fn missing_archive_file_repackages_without_restart() -> Result<()> {
             let (_td, cache_dir, client, toolchain) = cached_toolchain()?;
 
@@ -462,6 +595,113 @@ mod client {
             )?;
             assert_eq!(repacked, toolchain);
             assert!(client.get_toolchain(&repacked)?.is_some());
+            Ok(())
+        }
+
+        #[test]
+        fn custom_toolchain_registration_is_atomic_across_both_indexes() -> Result<()> {
+            let directory = tempfile::tempdir()?;
+            let archive = create_file(directory.path(), "custom.tar", |mut file| {
+                file.write_all(b"custom archive")
+            })?;
+            let client = std::sync::Arc::new(ClientToolchains::new(
+                &directory.path().join("cache"),
+                1024 * 1024,
+                &[config::DistToolchainConfig::PathOverride {
+                    compiler_executable: "/my/compiler".into(),
+                    archive,
+                    archive_compiler_executable: "/my/compiler".into(),
+                    archive_cargo_executable: None,
+                }],
+            )?);
+
+            let workers: Vec<_> = (0..16)
+                .map(|_| {
+                    let client = std::sync::Arc::clone(&client);
+                    std::thread::spawn(move || -> Result<crate::dist::Toolchain> {
+                        let (tc, _) = client
+                            .get_custom_toolchain("/my/compiler".as_ref())?
+                            .ok_or_else(|| anyhow!("configured toolchain was not found"))?;
+                        assert!(client.get_toolchain(&tc)?.is_some());
+                        Ok(tc)
+                    })
+                })
+                .collect();
+            let mut expected = None;
+            for worker in workers {
+                let tc = worker.join().expect("worker panicked")?;
+                if let Some(expected) = &expected {
+                    assert_eq!(expected, &tc);
+                } else {
+                    expected = Some(tc);
+                }
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn custom_toolchain_failed_hash_can_be_retried() -> Result<()> {
+            let directory = tempfile::tempdir()?;
+            let archive = directory.path().join("custom.tar");
+            let client = ClientToolchains::new(
+                &directory.path().join("cache"),
+                1024 * 1024,
+                &[config::DistToolchainConfig::PathOverride {
+                    compiler_executable: "/my/compiler".into(),
+                    archive: archive.clone(),
+                    archive_compiler_executable: "/my/compiler".into(),
+                    archive_cargo_executable: None,
+                }],
+            )?;
+            assert!(
+                client
+                    .get_custom_toolchain("/my/compiler".as_ref())
+                    .is_err()
+            );
+            std::fs::write(&archive, b"restored archive")?;
+            let (tc, _) = client
+                .get_custom_toolchain("/my/compiler".as_ref())?
+                .ok_or_else(|| anyhow!("configured toolchain was not found"))?;
+            assert!(client.get_toolchain(&tc)?.is_some());
+            Ok(())
+        }
+
+        #[test]
+        fn weak_map_failed_publish_does_not_mutate_memory() -> Result<()> {
+            let directory = tempfile::tempdir()?;
+            let client = ClientToolchains::new(directory.path(), 1024 * 1024, &[])?;
+            let index = directory.path().join("weak_map.json");
+            std::fs::remove_file(&index)?;
+            std::fs::create_dir(&index)?;
+            assert!(client.record_weak("weak".into(), "strong".into()).is_err());
+            assert!(client.weak_map.lock().unwrap().get("weak").is_none());
+            Ok(())
+        }
+
+        #[test]
+        fn concurrent_weak_map_updates_are_all_persisted() -> Result<()> {
+            let directory = tempfile::tempdir()?;
+            let client =
+                std::sync::Arc::new(ClientToolchains::new(directory.path(), 1024 * 1024, &[])?);
+            let threads: Vec<_> = (0..8)
+                .map(|index| {
+                    let client = std::sync::Arc::clone(&client);
+                    std::thread::spawn(move || {
+                        client.record_weak(format!("weak-{index}"), format!("strong-{index}"))
+                    })
+                })
+                .collect();
+            for thread in threads {
+                thread.join().expect("worker panicked")?;
+            }
+            let persisted: std::collections::HashMap<String, String> =
+                serde_json::from_slice(&std::fs::read(directory.path().join("weak_map.json"))?)?;
+            for index in 0..8 {
+                assert_eq!(
+                    persisted.get(&format!("weak-{index}")),
+                    Some(&format!("strong-{index}"))
+                );
+            }
             Ok(())
         }
 
@@ -660,7 +900,7 @@ impl StagedToolchainArchive {
         if written > max_size {
             return Err(anyhow!("toolchain archive exceeds cache capacity"));
         }
-        if file_key(file.reopen()?)? != toolchain.archive_id {
+        if file_key(file.reopen()?)? != toolchain.archive_id.as_str() {
             return Err(anyhow!("toolchain archive digest mismatch"));
         }
         Ok(Self { toolchain, file })
@@ -712,13 +952,25 @@ impl TcCache {
     ) -> Result<()> {
         self.inner
             .insert_with(make_lru_key_path(&tc.archive_id), with)?;
-        let verified_archive_id = file_key(self.get(tc)?)?;
-        // TODO: remove created toolchain?
-        if verified_archive_id == tc.archive_id {
-            Ok(())
-        } else {
-            Err(anyhow!("written file does not match expected hash key"))
+        let verified = (|| -> Result<()> {
+            let verified_archive_id = file_key(self.get(tc)?)?;
+            if verified_archive_id == tc.archive_id.as_str() {
+                Ok(())
+            } else {
+                Err(anyhow!("written file does not match expected hash key"))
+            }
+        })();
+        if verified.is_err() {
+            // Never retain an incorrectly keyed archive in the LRU index,
+            // including when validation failed because of a read error.
+            if let Err(error) = self.remove(tc) {
+                log::warn!(
+                    "Failed to remove invalid toolchain archive {}: {error}",
+                    tc.archive_id
+                );
+            }
         }
+        verified
     }
 
     /// Open a cached toolchain archive as a file.
@@ -768,14 +1020,39 @@ impl TcCache {
 }
 
 #[cfg(feature = "dist-client")]
-fn path_key(path: &Path) -> Result<String> {
-    file_key(fs::File::open(path)?)
+fn path_key(path: &Path) -> Result<ArchiveId> {
+    Ok(ArchiveId::try_from(file_key(fs::File::open(path)?)?)?)
 }
 
 fn file_key<R: Read>(rdr: R) -> Result<String> {
     Digest::reader_sync(rdr)
 }
 /// Make a path to the cache entry with key `key`.
-fn make_lru_key_path(key: &str) -> PathBuf {
-    Path::new(&key[0..1]).join(&key[1..2]).join(key)
+fn make_lru_key_path(key: &ArchiveId) -> PathBuf {
+    Path::new(&key[0..1]).join(&key[1..2]).join(key.as_str())
+}
+
+#[cfg(test)]
+mod cache_validation_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn rejected_digest_does_not_leave_a_cached_archive() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let tc = Toolchain {
+            archive_id: ArchiveId::try_from(Digest::reader_sync(b"expected".as_slice())?)?,
+        };
+        let mut cache = TcCache::new(tempdir.path(), 1024 * 1024)?;
+        let failure = cache
+            .insert_with(&tc, |mut file| file.write_all(b"not the expected archive"))
+            .expect_err("mismatched archive digest must fail");
+        assert!(failure.to_string().contains("written file does not match"));
+        assert!(!cache.contains_toolchain(&tc));
+        assert!(matches!(
+            cache.get(&tc),
+            Err(crate::lru_disk_cache::Error::FileNotInCache)
+        ));
+        Ok(())
+    }
 }

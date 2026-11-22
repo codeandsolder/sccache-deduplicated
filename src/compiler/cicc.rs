@@ -102,11 +102,17 @@ impl CCompilerImpl for Cicc {
             env_vars,
             ..
         } = context;
-        generate_compile_commands(path_transformer, executable, parsed_args, cwd, env_vars).map(
-            |(command, dist_command, cacheable)| {
-                (CCompileCommand::boxed(command), dist_command, cacheable)
-            },
+        generate_compile_commands(
+            path_transformer,
+            executable,
+            parsed_args,
+            cwd,
+            env_vars,
+            OutputStyle::ObjectFile,
         )
+        .map(|(command, dist_command, cacheable)| {
+            (CCompileCommand::boxed(command), dist_command, cacheable)
+        })
     }
 }
 
@@ -266,12 +272,59 @@ pub fn preprocess(cwd: &Path, parsed_args: &ParsedArguments) -> Result<process::
         })
 }
 
+/// Output operands used by the CUDA device compilation stages.
+/// The two forms differ only in the order and spelling of the last three arguments.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputStyle {
+    ObjectFile,
+    ModuleIdFile,
+}
+
+impl OutputStyle {
+    fn local_args(self, input: &Path, output: &Path) -> [OsString; 3] {
+        match self {
+            Self::ObjectFile => [
+                input.as_os_str().to_owned(),
+                "-o".into(),
+                output.as_os_str().to_owned(),
+            ],
+            Self::ModuleIdFile => [
+                "--module_id_file_name".into(),
+                output.as_os_str().to_owned(),
+                input.as_os_str().to_owned(),
+            ],
+        }
+    }
+
+    #[cfg(feature = "dist-client")]
+    fn dist_args(
+        self,
+        transformer: &mut dist::PathTransformer,
+        input: &Path,
+        output: &Path,
+    ) -> Option<[String; 3]> {
+        match self {
+            Self::ObjectFile => Some([
+                transformer.as_dist(input)?,
+                "-o".into(),
+                transformer.as_dist(output)?,
+            ]),
+            Self::ModuleIdFile => Some([
+                "--module_id_file_name".into(),
+                transformer.as_dist(output)?,
+                transformer.as_dist(input)?,
+            ]),
+        }
+    }
+}
+
 pub fn generate_compile_commands(
     path_transformer: &mut dist::PathTransformer,
     executable: &Path,
     parsed_args: &ParsedArguments,
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
+    output_style: OutputStyle,
 ) -> Result<(
     SingleCompileCommand,
     Option<dist::CompileCommand>,
@@ -292,11 +345,7 @@ pub fn generate_compile_commands(
     let mut arguments: Vec<OsString> = vec![];
     arguments.extend_from_slice(&parsed_args.common_args);
     arguments.extend_from_slice(&parsed_args.unhashed_args);
-    arguments.extend(vec![
-        (&parsed_args.input).into(),
-        "-o".into(),
-        out_file.into(),
-    ]);
+    arguments.extend(output_style.local_args(&parsed_args.input, out_file));
 
     if log_enabled!(log::Level::Trace) {
         trace!(
@@ -334,11 +383,7 @@ pub fn generate_compile_commands(
         let mut arguments: Vec<String> = vec![];
         arguments.extend(dist::osstrings_to_strings(&parsed_args.common_args)?);
         arguments.extend(dist::osstrings_to_strings(&parsed_args.unhashed_args)?);
-        arguments.extend(vec![
-            path_transformer.as_dist(&parsed_args.input)?,
-            "-o".into(),
-            path_transformer.as_dist(out_file)?,
-        ]);
+        arguments.extend(output_style.dist_args(path_transformer, &parsed_args.input, out_file)?);
         Some(dist::CompileCommand {
             executable: path_transformer.as_dist(&executable.canonicalize().ok()?)?,
             arguments,
@@ -380,6 +425,46 @@ mod test {
 
     fn os_strings(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn cuda_output_styles_preserve_argument_order() {
+        let input = Path::new("kernel.cpp1.ii");
+        let output = Path::new("kernel.ptx");
+        assert_eq!(
+            OutputStyle::ObjectFile.local_args(input, output),
+            ["kernel.cpp1.ii", "-o", "kernel.ptx"].map(OsString::from)
+        );
+        assert_eq!(
+            OutputStyle::ModuleIdFile.local_args(input, output),
+            ["--module_id_file_name", "kernel.ptx", "kernel.cpp1.ii"].map(OsString::from)
+        );
+    }
+
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn cuda_output_styles_preserve_distributed_argument_order() {
+        let root = std::env::current_dir().expect("current directory");
+        let input = root.join("kernel.cpp1.ii");
+        let output = root.join("kernel.ptx");
+        let mut transformer = dist::PathTransformer::new();
+        transformer.add_root_mapping(root, "/build");
+        assert_eq!(
+            OutputStyle::ObjectFile.dist_args(&mut transformer, &input, &output),
+            Some([
+                "/build/kernel.cpp1.ii".to_owned(),
+                "-o".to_owned(),
+                "/build/kernel.ptx".to_owned(),
+            ])
+        );
+        assert_eq!(
+            OutputStyle::ModuleIdFile.dist_args(&mut transformer, &input, &output),
+            Some([
+                "--module_id_file_name".to_owned(),
+                "/build/kernel.ptx".to_owned(),
+                "/build/kernel.cpp1.ii".to_owned(),
+            ])
+        );
     }
 
     #[test]

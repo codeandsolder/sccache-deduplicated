@@ -33,6 +33,7 @@ mod client;
 mod cmdline;
 mod commands;
 mod compiler;
+pub mod compression;
 pub mod config;
 pub mod dist;
 mod jobserver;

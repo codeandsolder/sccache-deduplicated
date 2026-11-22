@@ -30,7 +30,8 @@ CLIENT_PORTS=("$ROOT_CLIENT_PORT" "$NATIVE_ROOT_PORT" "$OPENWRT_ROOT_PORT" "$STR
 SCHEDULER_URL="${SCCACHE_AUTOUPDATE_SCHEDULER_URL:-https://sccache.onhir.eu}"
 LOCK="${SCCACHE_AUTOUPDATE_LOCK:-/run/lock/sccache-autoupdate.lock}"
 MODE=apply
-EXPECTED_RUST_TOOLCHAIN="${SCCACHE_AUTOUPDATE_EXPECTED_RUST_TOOLCHAIN:-1.99.0}"
+NATIVE_BUNDLE_ROOT="${SCCACHE_AUTOUPDATE_NATIVE_BUNDLE_ROOT:-}"
+EXPECTED_RUST_TOOLCHAIN="${SCCACHE_AUTOUPDATE_EXPECTED_RUST_TOOLCHAIN:-nightly-2026-11-20}"
 EXPECTED_ROLLOUT_EPOCH="${SCCACHE_AUTOUPDATE_EXPECTED_ROLLOUT_EPOCH:-2}"
 SMOKE_RUSTC="${SCCACHE_AUTOUPDATE_SMOKE_RUSTC:-/opt/toolchains/rustup/toolchains/1.99.0-x86_64-unknown-linux-gnu/bin/rustc}"
 VERIFY_DIST_SMOKE="${SCCACHE_AUTOUPDATE_VERIFY_DIST_SMOKE:-0}"
@@ -138,8 +139,24 @@ if [[ "$MODE" == apply &&
     managed_dist_hash="$(cat "$STATE_DIR/dist_binary_sha256")"
     live_hash="$(sha256sum "$LIVE" | awk '{print $1}')"
     live_dist_hash="$(sha256sum "$DIST_LIVE" | awk '{print $1}')"
-    live_capabilities="$("$LIVE" --capabilities 2>/dev/null | paste -sd, - || true)"
-    if [[ "$managed_tag" == "$tag" &&
+    managed_kind="$(sed -n 's/^build_kind=//p' "$STATE_DIR/build.txt" 2>/dev/null || true)"
+    desired_kind=portable
+    native_identity_matches=1
+    if [[ -n "$NATIVE_BUNDLE_ROOT" ]]; then
+        desired_kind="host-native"
+        native_metadata="$(dirname -- "$(realpath -- "$0")")/host-native-metadata"
+        if [[ "$managed_kind" != "host-native" ]] ||
+           ! current_fingerprint="$("$native_metadata" fingerprint)" ||
+           [[ "$(sed -n 's/^host_fingerprint=//p' "$STATE_DIR/build.txt" 2>/dev/null || true)" != "$current_fingerprint" ]]; then
+            native_identity_matches=0
+        fi
+    fi
+    live_capabilities=""
+    if (( native_identity_matches )); then
+        live_capabilities="$("$LIVE" --capabilities 2>/dev/null | paste -sd, - || true)"
+    fi
+    if (( native_identity_matches )) && [[ "${managed_kind:-portable}" == "$desired_kind" &&
+          "$managed_tag" == "$tag" &&
           "$managed_hash" == "$live_hash" &&
           "$managed_dist_hash" == "$live_dist_hash" ]] &&
        capabilities_satisfy_requirements "$live_capabilities" &&
@@ -226,9 +243,20 @@ tag_sha="${tag#"$TAG_PREFIX"}"
     exit 1
 }
 
-chmod 0755 "$release_dir/sccache-linux-x86_64-v2" "$release_dir/sccache-dist-linux-x86_64-v2"
-ln -sfn "sccache-linux-x86_64-v2" "$release_dir/sccache"
-ln -sfn "sccache-dist-linux-x86_64-v2" "$release_dir/sccache-dist"
+if [[ -n "$NATIVE_BUNDLE_ROOT" ]]; then
+    native_dir="$NATIVE_BUNDLE_ROOT/$source_sha"
+    if [[ ! -d "$native_dir" ]]; then
+        echo "sccache-release-update: awaiting host-native bundle $native_dir; keeping installed binaries"
+        exit 0
+    fi
+    native_metadata="$(dirname -- "$(realpath -- "$0")")/host-native-metadata"
+    "$native_metadata" verify "$native_dir" "$release_dir/build.txt"
+    release_dir="$native_dir"
+else
+    chmod 0755 "$release_dir/sccache-linux-x86_64-v2" "$release_dir/sccache-dist-linux-x86_64-v2"
+    ln -sfn "sccache-linux-x86_64-v2" "$release_dir/sccache"
+    ln -sfn "sccache-dist-linux-x86_64-v2" "$release_dir/sccache-dist"
+fi
 "$release_dir/sccache" --version >/dev/null
 "$release_dir/sccache-dist" --version >/dev/null
 if ! candidate_capabilities="$("$release_dir/sccache" --capabilities | paste -sd, -)"; then
@@ -275,8 +303,8 @@ if [[ -n "$current_sha" && "$current_sha" != "$source_sha" ]]; then
     }
 fi
 
-candidate_sha="$(sha256sum "$release_dir/sccache-linux-x86_64-v2" | awk '{print $1}')"
-candidate_dist_sha="$(sha256sum "$release_dir/sccache-dist-linux-x86_64-v2" | awk '{print $1}')"
+candidate_sha="$(sha256sum "$release_dir/sccache" | awk '{print $1}')"
+candidate_dist_sha="$(sha256sum "$release_dir/sccache-dist" | awk '{print $1}')"
 live_sha=""
 live_dist_sha=""
 [[ -x "$LIVE" ]] && live_sha="$(sha256sum "$LIVE" | awk '{print $1}')"
@@ -489,7 +517,7 @@ if [[ "$candidate_dist_sha" == "$live_dist_sha" ]] &&
 fi
 
 if (( client_update_required == 0 && dist_update_required == 0 )); then
-    record_full_state
+    [[ "$MODE" != apply ]] || record_full_state
     echo "sccache-release-update: already running desired release"
     exit 0
 fi
@@ -737,7 +765,7 @@ if (( dist_was_active && apply_dist_update )); then
 fi
 
 if (( apply_dist_update )); then
-    install -o root -g root -m 0755 "$release_dir/sccache-dist-linux-x86_64-v2" "$DIST_LIVE.new"
+    install -o root -g root -m 0755 "$release_dir/sccache-dist" "$DIST_LIVE.new"
     mv -f "$DIST_LIVE.new" "$DIST_LIVE"
 
     if (( dist_was_active )); then
@@ -771,7 +799,7 @@ if (( client_update_required )); then
         systemctl stop "$STRICT_LOCAL_SERVICE"
     fi
     systemctl stop "$LOCAL_SERVICE"
-    install -o root -g root -m 0755 "$release_dir/sccache-linux-x86_64-v2" "$LIVE.new"
+    install -o root -g root -m 0755 "$release_dir/sccache" "$LIVE.new"
     mv -f "$LIVE.new" "$LIVE"
 
     metrics_not_before="$(date +%s)"

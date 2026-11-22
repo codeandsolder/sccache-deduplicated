@@ -390,49 +390,47 @@ impl ManagedRemoteCache {
         let now = unix_seconds();
 
         for _ in 0..CAS_ATTEMPTS {
-            if let Some(mut snapshot) = self.read_metadata_shard(&shard_path).await? {
-                let previous = snapshot.shard.entries.get(&key).copied();
-                let next = updated_entry_metadata(
-                    previous,
-                    now,
-                    size,
-                    hits,
-                    self.config.heat_half_life_secs,
-                );
-                snapshot.shard.entries.insert(key, next);
-                let body = serialize_metadata_shard(&snapshot.shard)?;
-                match self
-                    .operator
-                    .write_with(&shard_path, body)
-                    .if_match(&snapshot.etag)
-                    .await
-                {
-                    Ok(_) => return Ok(()),
-                    Err(error) if error.kind() == ErrorKind::ConditionNotMatch => {}
-                    Err(error) => return Err(error.into()),
-                }
-            } else {
-                let mut shard = MetadataShard::new();
-                shard.entries.insert(
-                    key,
-                    updated_entry_metadata(None, now, size, hits, self.config.heat_half_life_secs),
-                );
-                let body = serialize_metadata_shard(&shard)?;
-                match self
-                    .operator
-                    .write_with(&shard_path, body)
-                    .if_not_exists(true)
-                    .await
-                {
-                    Ok(_) => return Ok(()),
-                    Err(error) if error.kind() == ErrorKind::ConditionNotMatch => {}
-                    Err(error) => return Err(error.into()),
-                }
+            let snapshot = self.read_metadata_shard(&shard_path).await?;
+            let (mut shard, etag) = match snapshot {
+                Some(snapshot) => (snapshot.shard, Some(snapshot.etag)),
+                None => (MetadataShard::new(), None),
+            };
+            let previous = shard.entries.get(&key).copied();
+            let next =
+                updated_entry_metadata(previous, now, size, hits, self.config.heat_half_life_secs);
+            shard.entries.insert(key, next);
+            if self
+                .write_metadata_shard_if_unchanged(&shard_path, &shard, etag.as_deref())
+                .await?
+            {
+                return Ok(());
             }
         }
 
         debug!("managed cache touch for {data_path} lost repeated metadata shard races");
         Ok(())
+    }
+
+    /// Write a complete shard with optimistic concurrency control. The `ETag`
+    /// protects an existing snapshot; an absent `ETag` means the shard must not
+    /// have appeared since it was read. A failed condition is a retryable race.
+    async fn write_metadata_shard_if_unchanged(
+        &self,
+        shard_path: &str,
+        shard: &MetadataShard,
+        expected_etag: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let body = serialize_metadata_shard(shard)?;
+        let write = self.operator.write_with(shard_path, body);
+        let result = match expected_etag {
+            Some(etag) => write.if_match(etag).await,
+            None => write.if_not_exists(true).await,
+        };
+        match result {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == ErrorKind::ConditionNotMatch => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn read_metadata_shard(
@@ -869,16 +867,15 @@ impl ManagedRemoteCache {
                 return Ok(());
             }
             snapshot.shard.entries.remove(&key);
-            let body = serialize_metadata_shard(&snapshot.shard)?;
-            match self
-                .operator
-                .write_with(&shard_path, body)
-                .if_match(&snapshot.etag)
-                .await
+            if self
+                .write_metadata_shard_if_unchanged(
+                    &shard_path,
+                    &snapshot.shard,
+                    Some(&snapshot.etag),
+                )
+                .await?
             {
-                Ok(_) => return Ok(()),
-                Err(error) if error.kind() == ErrorKind::ConditionNotMatch => {}
-                Err(error) => return Err(error.into()),
+                return Ok(());
             }
         }
         debug!("managed cache metadata removal lost repeated shard races");

@@ -8,15 +8,15 @@ use sccache::config::{
 };
 use sccache::dist::{
     self, AllocJobResult, AssignJobResult, BuilderIncoming, CompileCommand, HeartbeatServerResult,
-    InputsReader, JobAlloc, JobAuthorizer, JobComplete, JobId, JobState, RunJobResult,
-    SchedulerIncoming, SchedulerOutgoing, SchedulerStatusResult, ServerId, ServerIncoming,
-    ServerNonce, ServerOutgoing, StagedToolchainArchive, SubmitToolchainResult, TcCache, Toolchain,
-    ToolchainReader, UpdateJobStateResult,
+    InputsReader, JobAlloc, JobAuthorizer, JobComplete, JobId, JobState, OutputRequest,
+    RunJobResult, SchedulerIncoming, SchedulerOutgoing, SchedulerStatusResult, ServerId,
+    ServerIncoming, ServerNonce, ServerOutgoing, StagedToolchainArchive, SubmitToolchainResult,
+    TcCache, Toolchain, ToolchainReader, UpdateJobStateResult,
 };
 use sccache::util::BASE64_URL_SAFE_ENGINE;
 use sccache::util::daemonize;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet, btree_map};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque, btree_map};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 mod build;
 
 mod cmdline;
+mod command_helpers;
 mod token_check;
 
 use cmdline::{AuthSubcommand, Command};
@@ -256,8 +257,8 @@ fn run(command: Command) -> Result<i32> {
                 check_client_auth,
                 check_server_auth,
             );
-            http_scheduler.start()?;
-            unreachable!();
+            // A running server never exits successfully (Result<Infallible>).
+            match http_scheduler.start()? {}
         }
 
         Command::Server(server_config::Config {
@@ -337,8 +338,8 @@ fn run(command: Command) -> Result<i32> {
                 server,
             )
             .context("Failed to create sccache HTTP server instance")?;
-            http_server.start()?;
-            unreachable!();
+            // A running server never exits successfully (Result<Infallible>).
+            match http_server.start()? {}
         }
     }
 }
@@ -421,6 +422,66 @@ impl JobSlackConfig {
 struct JobDetail {
     server_id: ServerId,
     state: JobState,
+    // Time spent in the current phase, not the total time since allocation.
+    state_since: Instant,
+    // First heartbeat that did not report this Started job as executing.
+    missing_since: Option<Instant>,
+}
+
+impl JobDetail {
+    fn is_stale_unclaimed(self, now: Instant) -> bool {
+        let age = now.duration_since(self.state_since);
+        match self.state {
+            JobState::Pending => age > UNCLAIMED_PENDING_TIMEOUT,
+            JobState::Ready => age >= UNCLAIMED_READY_TIMEOUT,
+            // Started jobs are owned by execution, not the unclaimed-job timeout.
+            JobState::Started | JobState::Complete => false,
+        }
+    }
+
+    fn transition_to(&mut self, state: JobState, now: Instant) {
+        self.state = state;
+        self.state_since = now;
+        self.missing_since = None;
+    }
+}
+
+const COMPLETION_ACK_RETRY_WINDOW: Duration = Duration::from_secs(600);
+const MAX_COMPLETION_ACKS: usize = 16_384;
+
+// Keep only terminal acknowledgments, not a second copy of active job state.
+// A lost response to Complete can be retried, but an arbitrary unknown job
+// must never be accepted as having completed.
+#[derive(Default)]
+struct CompletedJobAcks {
+    recent: VecDeque<(JobId, ServerId, Instant)>,
+}
+
+impl CompletedJobAcks {
+    fn prune(&mut self, now: Instant) {
+        while self
+            .recent
+            .front()
+            .is_some_and(|&(_, _, when)| now.duration_since(when) > COMPLETION_ACK_RETRY_WINDOW)
+        {
+            self.recent.pop_front();
+        }
+    }
+
+    fn record(&mut self, job_id: JobId, server_id: ServerId, now: Instant) {
+        self.prune(now);
+        if self.recent.len() == MAX_COMPLETION_ACKS {
+            self.recent.pop_front();
+        }
+        self.recent.push_back((job_id, server_id, now));
+    }
+
+    fn contains(&mut self, job_id: JobId, server_id: ServerId, now: Instant) -> bool {
+        self.prune(now);
+        self.recent
+            .iter()
+            .any(|&(id, owner, _)| id == job_id && owner == server_id)
+    }
 }
 
 // To avoid deadlicking, make sure to do all locking at once (i.e. no further locking in a downward scope),
@@ -436,8 +497,8 @@ pub struct Scheduler {
 
     // Currently running jobs, can never be Complete
     jobs: Mutex<BTreeMap<JobId, JobDetail>>,
-
     servers: Mutex<HashMap<ServerId, ServerDetails>>,
+    completed_acks: Mutex<CompletedJobAcks>,
 }
 
 struct ServerDetails {
@@ -445,9 +506,9 @@ struct ServerDetails {
     // Scheduler-local sequence of the last assignment. Used to rotate equally
     // loaded workers; HashMap iteration order must not decide idle-worker use.
     last_assignment: Option<usize>,
-    // Jobs assigned that haven't seen a state change. Can only be pending
-    // or ready.
-    jobs_unclaimed: HashMap<JobId, Instant>,
+    // Reservations for assignment RPCs still in flight. Once assigned,
+    // the state and unclaimed timeout are owned exclusively by JobDetail.
+    jobs_assigning: HashMap<JobId, Instant>,
     last_seen: Instant,
     last_error: Option<Instant>,
     num_cpus: usize,
@@ -510,6 +571,7 @@ impl Scheduler {
             maintenance_drain_file,
             jobs: Mutex::new(BTreeMap::new()),
             servers: Mutex::new(HashMap::new()),
+            completed_acks: Mutex::new(CompletedJobAcks::default()),
         }
     }
 
@@ -667,11 +729,17 @@ impl SchedulerIncoming for Scheduler {
                     let job_id = self.next_job_id();
                     // Unique while holding the servers lock: every allocation
                     // advances job_count, including assignments that later fail.
+                    // Token generation may fail. Never reserve worker capacity
+                    // until an auth token is ready to send.
+                    let auth = server_details
+                        .job_authorizer
+                        .generate_token(job_id)
+                        .context("Could not create an auth token for this job")?;
                     server_details.last_assignment = Some(self.job_count.load(Ordering::Relaxed));
                     assert!(server_details.jobs_assigned.insert(job_id));
                     assert!(
                         server_details
-                            .jobs_unclaimed
+                            .jobs_assigning
                             .insert(job_id, Instant::now())
                             .is_none()
                     );
@@ -680,10 +748,6 @@ impl SchedulerIncoming for Scheduler {
                         "Job {} created and will be assigned to server {:?}",
                         job_id, server_id
                     );
-                    let auth = server_details
-                        .job_authorizer
-                        .generate_token(job_id)
-                        .context("Could not create an auth token for this job")?;
                     Some((job_id, server_id, auth))
                 } else {
                     None
@@ -710,7 +774,7 @@ impl SchedulerIncoming for Scheduler {
                 let mut servers = self.servers.lock().unwrap();
                 if let Some(entry) = servers.get_mut(&server_id) {
                     entry.last_error = Some(Instant::now());
-                    entry.jobs_unclaimed.remove(&job_id);
+                    entry.jobs_assigning.remove(&job_id);
                     if !entry.jobs_assigned.remove(&job_id) {
                         "assign job failed and job not known to the server"
                     } else {
@@ -723,27 +787,41 @@ impl SchedulerIncoming for Scheduler {
         {
             // LOCKS
             let mut jobs = self.jobs.lock().unwrap();
-            let servers = self.servers.lock().unwrap();
+            let mut servers = self.servers.lock().unwrap();
 
-            if !servers
-                .get(&server_id)
-                .is_some_and(|details| details.jobs_assigned.contains(&job_id))
+            let Some(details) = servers.get_mut(&server_id) else {
+                let msg = format!("Job {job_id} assignment completed after server disappeared");
+                warn!("{msg}");
+                return Ok(AllocJobResult::Fail { msg });
+            };
+            if !details.jobs_assigned.contains(&job_id)
+                || !details.jobs_assigning.contains_key(&job_id)
             {
                 let msg = format!(
-                    "Job {} assignment was cleaned up before allocation completed",
-                    job_id
+                    "Job {job_id} assignment reservation was cleaned up before allocation completed"
                 );
-                warn!("{}", msg);
+                warn!("{msg}");
                 return Ok(AllocJobResult::Fail { msg });
             }
 
+            // Publish the job and retire its reservation under both locks.
+            // A heartbeat can never see an assigned job with neither owner.
+            assert!(
+                jobs.insert(
+                    job_id,
+                    JobDetail {
+                        server_id,
+                        state,
+                        state_since: Instant::now(),
+                        missing_since: None,
+                    }
+                )
+                .is_none()
+            );
+            details.jobs_assigning.remove(&job_id);
             info!(
                 "Job {} successfully assigned and saved with state {:?}",
                 job_id, state
-            );
-            assert!(
-                jobs.insert(job_id, JobDetail { server_id, state })
-                    .is_none()
             );
         }
         let job_alloc = JobAlloc {
@@ -762,6 +840,7 @@ impl SchedulerIncoming for Scheduler {
         server_id: ServerId,
         server_nonce: ServerNonce,
         num_cpus: usize,
+        running_job_ids: &[JobId],
         job_authorizer: Box<dyn JobAuthorizer>,
     ) -> Result<HeartbeatServerResult> {
         // LOCKS
@@ -776,37 +855,40 @@ impl SchedulerIncoming for Scheduler {
                 details.last_seen = now;
                 details.num_cpus = num_cpus;
 
-                let mut stale_jobs = Vec::new();
-                for (&job_id, &last_seen) in details.jobs_unclaimed.iter() {
-                    if now.duration_since(last_seen) < UNCLAIMED_READY_TIMEOUT {
-                        continue;
-                    }
-                    if let Some(detail) = jobs.get(&job_id) {
-                        match detail.state {
-                            JobState::Ready => {
-                                stale_jobs.push(job_id);
-                            }
-                            JobState::Pending => {
-                                if now.duration_since(last_seen) > UNCLAIMED_PENDING_TIMEOUT {
-                                    stale_jobs.push(job_id);
+                // The worker heartbeat is authoritative for *executing* jobs.
+                // A Started job missing from one heartbeat can be an in-flight
+                // snapshot, so require a full heartbeat timeout of absence.
+                let running: HashSet<JobId> = running_job_ids.iter().copied().collect();
+                let stale_jobs: Vec<_> = details
+                    .jobs_assigned
+                    .iter()
+                    .copied()
+                    .filter(|job_id| match jobs.get_mut(job_id) {
+                        Some(detail) if detail.server_id == server_id => {
+                            if detail.state == JobState::Started {
+                                if running.contains(job_id) {
+                                    detail.missing_since = None;
+                                    false
+                                } else {
+                                    let since = detail.missing_since.get_or_insert(now);
+                                    now.duration_since(*since) >= dist::http::HEARTBEAT_TIMEOUT
                                 }
-                            }
-                            state => {
-                                warn!("Invalid unclaimed job state for {}: {}", job_id, state);
+                            } else {
+                                detail.is_stale_unclaimed(now)
                             }
                         }
-                    } else {
-                        warn!("Unknown stale job {}", job_id);
-                        stale_jobs.push(job_id);
-                    }
-                }
+                        Some(_) => false,
+                        None => details.jobs_assigning.get(job_id).is_some_and(|&since| {
+                            now.duration_since(since) > UNCLAIMED_PENDING_TIMEOUT
+                        }),
+                    })
+                    .collect();
 
                 if !stale_jobs.is_empty() {
                     warn!(
                         "The following stale jobs will be de-allocated: {:?}",
                         stale_jobs
                     );
-
                     for job_id in stale_jobs {
                         if !details.jobs_assigned.remove(&job_id) {
                             warn!(
@@ -815,24 +897,17 @@ impl SchedulerIncoming for Scheduler {
                                 job_id
                             );
                         }
-                        if details.jobs_unclaimed.remove(&job_id).is_none() {
-                            warn!(
-                                "Unknown stale job for server {}: {}",
-                                server_id.addr(),
-                                job_id
-                            );
-                        }
-                        if jobs.remove(&job_id).is_none() {
-                            warn!(
-                                "Unknown stale job for server {}: {}",
-                                server_id.addr(),
-                                job_id
-                            );
-                        }
+                        details.jobs_assigning.remove(&job_id);
+                        jobs.remove(&job_id);
                     }
                 }
 
-                return Ok(HeartbeatServerResult { is_new: false });
+                let mut assigned_job_ids: Vec<_> = details.jobs_assigned.iter().copied().collect();
+                assigned_job_ids.sort_unstable();
+                return Ok(HeartbeatServerResult {
+                    is_new: false,
+                    assigned_job_ids,
+                });
             }
             Some(ref mut details) if details.server_nonce != server_nonce => {
                 for job_id in details.jobs_assigned.iter() {
@@ -855,14 +930,17 @@ impl SchedulerIncoming for Scheduler {
                 last_error: None,
                 jobs_assigned: HashSet::new(),
                 last_assignment: None,
-                jobs_unclaimed: HashMap::new(),
+                jobs_assigning: HashMap::new(),
                 num_cpus,
                 server_nonce,
                 worker_name: None,
                 job_authorizer,
             },
         );
-        Ok(HeartbeatServerResult { is_new: true })
+        Ok(HeartbeatServerResult {
+            is_new: true,
+            assigned_job_ids: Vec::new(),
+        })
     }
 
     fn handle_update_worker_name(
@@ -948,35 +1026,41 @@ impl SchedulerIncoming for Scheduler {
                 )
             }
 
+            let details = servers.get_mut(&server_id).ok_or_else(|| {
+                anyhow::anyhow!("Job state updated, but server is not known to scheduler")
+            })?;
+            if !details.jobs_assigned.contains(&job_id) {
+                bail!("job {job_id} was not assigned to server {server_id:?}");
+            }
+
             let now = Instant::now();
-            let mut server_details = servers.get_mut(&server_id);
-            if let Some(ref mut details) = server_details {
-                details.last_seen = now;
-            };
+            details.last_seen = now;
 
             match (job_detail.state, job_state) {
-                (JobState::Pending, JobState::Ready) => entry.get_mut().state = job_state,
-                (JobState::Ready, JobState::Started) => {
-                    if let Some(details) = server_details {
-                        details.jobs_unclaimed.remove(&job_id);
-                    } else {
-                        warn!("Job state updated, but server is not known to scheduler")
-                    }
-                    entry.get_mut().state = job_state
+                (current, requested) if current == requested => {}
+                (JobState::Pending, JobState::Ready) | (JobState::Ready, JobState::Started) => {
+                    entry.get_mut().transition_to(job_state, now);
                 }
                 (JobState::Started, JobState::Complete) => {
-                    let (job_id, _) = entry.remove_entry();
-                    if let Some(entry) = server_details {
-                        assert!(entry.jobs_assigned.remove(&job_id))
-                    } else {
-                        bail!("Job was marked as finished, but server is not known to scheduler")
-                    }
+                    let mut acks = self.completed_acks.lock().unwrap();
+                    details.jobs_assigned.remove(&job_id);
+                    entry.remove_entry();
+                    acks.record(job_id, server_id, now);
                 }
                 (from, to) => bail!("Invalid job state transition from {} to {}", from, to),
             }
             info!("Job {} updated state to {:?}", job_id, job_state);
+        } else if job_state == JobState::Complete
+            && self
+                .completed_acks
+                .lock()
+                .unwrap()
+                .contains(job_id, server_id, Instant::now())
+        {
+            // The scheduler applied a prior completion, but its reply was lost.
+            info!("Job {job_id} completion acknowledged again");
         } else {
-            bail!("Unknown job")
+            bail!("Unknown job {job_id} for server {server_id:?}")
         }
         Ok(UpdateJobStateResult::Success)
     }
@@ -995,9 +1079,17 @@ impl SchedulerIncoming for Scheduler {
         Ok(SchedulerStatusResult {
             num_servers: servers.len(),
             num_cpus: servers.values().map(|v| v.num_cpus).sum(),
-            in_progress: jobs.len(),
+            // Reservations are already consuming capacity while the assignment
+            // RPC runs. Count them too, especially for maintenance drain checks.
+            in_progress: servers.values().map(|v| v.jobs_assigned.len()).sum(),
         })
     }
+}
+
+struct LocalAssignment {
+    toolchain: Toolchain,
+    // Local time of receipt, not the scheduler's assignment timestamp.
+    accepted_at: Instant,
 }
 
 pub struct Server {
@@ -1005,7 +1097,7 @@ pub struct Server {
     cache: Mutex<TcCache>,
     staging_dir: PathBuf,
     toolchain_cache_size: u64,
-    job_toolchains: Mutex<HashMap<JobId, Toolchain>>,
+    job_toolchains: Mutex<HashMap<JobId, LocalAssignment>>,
 }
 
 impl Server {
@@ -1027,13 +1119,37 @@ impl Server {
 }
 
 impl ServerIncoming for Server {
+    fn handle_reconcile_assignments(
+        &self,
+        assigned_job_ids: &[JobId],
+        heartbeat_started_at: Instant,
+    ) -> Result<usize> {
+        let known: HashSet<_> = assigned_job_ids.iter().copied().collect();
+        let mut local = self.job_toolchains.lock().unwrap();
+        let before = local.len();
+        local.retain(|id, assignment| {
+            // A scheduler reservation precedes receipt by the worker. Do not
+            // prune assignments received after the heartbeat request began.
+            assignment.accepted_at >= heartbeat_started_at || known.contains(id)
+        });
+        let removed = before - local.len();
+        drop(local);
+        Ok(removed)
+    }
+
     fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> Result<AssignJobResult> {
         let need_toolchain = !self.cache.lock().unwrap().contains_toolchain(&tc);
         assert!(
             self.job_toolchains
                 .lock()
                 .unwrap()
-                .insert(job_id, tc)
+                .insert(
+                    job_id,
+                    LocalAssignment {
+                        toolchain: tc,
+                        accepted_at: Instant::now(),
+                    }
+                )
                 .is_none()
         );
         let state = if need_toolchain {
@@ -1053,8 +1169,8 @@ impl ServerIncoming for Server {
         job_id: JobId,
         tc_rdr: ToolchainReader,
     ) -> Result<SubmitToolchainResult> {
-        let tc = match self.job_toolchains.lock().unwrap().get(&job_id).cloned() {
-            Some(tc) => tc,
+        let tc = match self.job_toolchains.lock().unwrap().get(&job_id) {
+            Some(assigned) => assigned.toolchain.clone(),
             None => return Ok(SubmitToolchainResult::JobNotFound),
         };
         // Streaming and hashing large archives must not hold the cache mutex:
@@ -1076,7 +1192,11 @@ impl ServerIncoming for Server {
             warn!("Could not install verified toolchain archive: {error:#}");
             return Ok(SubmitToolchainResult::CannotCache);
         }
-        // A Pending job cannot become Ready before its toolchain exists.
+        // Uploads can outlive a scheduler-side timeout. Never publish Ready
+        // for a job that has since been removed by heartbeat reconciliation.
+        if !self.job_toolchains.lock().unwrap().contains_key(&job_id) {
+            return Ok(SubmitToolchainResult::JobNotFound);
+        }
         requester
             .do_update_job_state(job_id, JobState::Ready)
             .context("Updating job state failed")?;
@@ -1087,28 +1207,39 @@ impl ServerIncoming for Server {
         requester: &dyn ServerOutgoing,
         job_id: JobId,
         command: CompileCommand,
-        outputs: Vec<String>,
+        outputs: OutputRequest,
         inputs_rdr: InputsReader,
     ) -> Result<RunJobResult> {
-        requester
-            .do_update_job_state(job_id, JobState::Started)
-            .context("Updating job state failed")?;
-        let tc = self.job_toolchains.lock().unwrap().remove(&job_id);
-        let res = match tc {
-            None => Ok(RunJobResult::JobNotFound),
-            Some(tc) => {
-                match self
-                    .builder
-                    .run_build(tc, command, outputs, inputs_rdr, &self.cache)
-                {
-                    Err(e) => Err(e.context("run build failed")),
-                    Ok(res) => Ok(RunJobResult::Complete(JobComplete {
-                        output: res.output,
-                        outputs: res.outputs,
-                    })),
-                }
-            }
+        // Claim the local job before sending any scheduler transition. A
+        // duplicate/unknown run must never mark someone else's job Started.
+        let assigned = self.job_toolchains.lock().unwrap().remove(&job_id);
+        let Some(assigned) = assigned else {
+            return Ok(RunJobResult::JobNotFound);
         };
+        if let Err(error) = requester.do_update_job_state(job_id, JobState::Started) {
+            let mut jobs = self.job_toolchains.lock().unwrap();
+            if jobs.insert(job_id, assigned).is_some() {
+                bail!("job {job_id} reappeared while restoring failed start transition");
+            }
+            return Err(error).context("Updating job state failed");
+        }
+
+        let res = self
+            .builder
+            .run_build(
+                assigned.toolchain,
+                command,
+                outputs,
+                inputs_rdr,
+                &self.cache,
+            )
+            .map(|res| {
+                RunJobResult::Complete(JobComplete {
+                    output: res.output,
+                    outputs: res.outputs,
+                })
+            })
+            .map_err(|e| e.context("run build failed"));
         requester
             .do_update_job_state(job_id, JobState::Complete)
             .context("Updating job state failed")?;
@@ -1119,6 +1250,12 @@ impl ServerIncoming for Server {
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
+
+    fn test_toolchain(marker: char) -> Toolchain {
+        Toolchain {
+            archive_id: sccache::dist::ArchiveId::try_from(marker.to_string().repeat(64)).unwrap(),
+        }
+    }
 
     #[test]
     fn scheduler_instances_namespace_job_ids() {
@@ -1165,6 +1302,20 @@ mod scheduler_tests {
         }
     }
 
+    fn register_test_server(scheduler: &Scheduler, server_id: ServerId, nonce: ServerNonce) {
+        scheduler
+            .handle_heartbeat_server(server_id, nonce, 1, &[], Box::new(TestJobAuthorizer))
+            .unwrap();
+    }
+
+    fn assert_no_assigned_jobs(scheduler: &Scheduler, server_id: &ServerId) {
+        assert!(scheduler.jobs.lock().unwrap().is_empty());
+        let servers = scheduler.servers.lock().unwrap();
+        let details = servers.get(server_id).unwrap();
+        assert!(details.jobs_assigned.is_empty());
+        assert!(details.jobs_assigning.is_empty());
+    }
+
     struct AcceptAssign;
 
     impl SchedulerOutgoing for AcceptAssign {
@@ -1182,6 +1333,111 @@ mod scheduler_tests {
         }
     }
 
+    struct StatusDuringAssign<'a>(&'a Scheduler);
+
+    impl SchedulerOutgoing for StatusDuringAssign<'_> {
+        fn do_assign_job(
+            &self,
+            _server_id: ServerId,
+            _job_id: JobId,
+            _tc: Toolchain,
+            _auth: String,
+        ) -> Result<AssignJobResult> {
+            // Status must include reservations even before a JobDetail exists.
+            assert_eq!(self.0.handle_status()?.in_progress, 1);
+            Ok(AssignJobResult {
+                state: JobState::Pending,
+                need_toolchain: false,
+            })
+        }
+    }
+
+    struct SnapshotDuringAssign<'a> {
+        scheduler: &'a Scheduler,
+        nonce: ServerNonce,
+    }
+
+    impl SchedulerOutgoing for SnapshotDuringAssign<'_> {
+        fn do_assign_job(
+            &self,
+            server_id: ServerId,
+            job_id: JobId,
+            _tc: Toolchain,
+            _auth: String,
+        ) -> Result<AssignJobResult> {
+            let snapshot = self.scheduler.handle_heartbeat_server(
+                server_id,
+                self.nonce.clone(),
+                1,
+                &[],
+                Box::new(TestJobAuthorizer),
+            )?;
+            assert_eq!(snapshot.assigned_job_ids, vec![job_id]);
+            Ok(AssignJobResult {
+                state: JobState::Pending,
+                need_toolchain: false,
+            })
+        }
+    }
+
+    #[test]
+    fn heartbeat_reports_inflight_and_accepted_assignments() -> Result<()> {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse()?;
+        let nonce = ServerNonce::new();
+        register_test_server(&scheduler, server_id, nonce.clone());
+        let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_job(
+            &SnapshotDuringAssign {
+                scheduler: &scheduler,
+                nonce: nonce.clone(),
+            },
+            test_toolchain('c'),
+        )?
+        else {
+            panic!("expected job allocation");
+        };
+        let snapshot = scheduler.handle_heartbeat_server(
+            server_id,
+            nonce.clone(),
+            1,
+            &[],
+            Box::new(TestJobAuthorizer),
+        )?;
+        assert_eq!(snapshot.assigned_job_ids, vec![job_alloc.job_id]);
+        for state in [JobState::Ready, JobState::Started, JobState::Complete] {
+            scheduler.handle_update_job_state(job_alloc.job_id, server_id, state)?;
+        }
+        let snapshot = scheduler.handle_heartbeat_server(
+            server_id,
+            nonce,
+            1,
+            &[],
+            Box::new(TestJobAuthorizer),
+        )?;
+        assert!(snapshot.assigned_job_ids.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn status_counts_assignment_rpc_reservations() {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        register_test_server(&scheduler, server_id, ServerNonce::new());
+        let AllocJobResult::Success { job_alloc, .. } = scheduler
+            .handle_alloc_job(&StatusDuringAssign(&scheduler), test_toolchain('c'))
+            .unwrap()
+        else {
+            panic!("worker should accept job");
+        };
+        assert_eq!(scheduler.handle_status().unwrap().in_progress, 1);
+        for state in [JobState::Ready, JobState::Started, JobState::Complete] {
+            scheduler
+                .handle_update_job_state(job_alloc.job_id, server_id, state)
+                .unwrap();
+        }
+        assert_eq!(scheduler.handle_status().unwrap().in_progress, 0);
+    }
+
     #[test]
     fn equally_loaded_workers_rotate_after_each_completed_job() {
         let scheduler = Scheduler::new();
@@ -1192,19 +1448,20 @@ mod scheduler_tests {
 
         for &id in &ids {
             scheduler
-                .handle_heartbeat_server(id, ServerNonce::new(), 4, Box::new(TestJobAuthorizer))
+                .handle_heartbeat_server(
+                    id,
+                    ServerNonce::new(),
+                    4,
+                    &[],
+                    Box::new(TestJobAuthorizer),
+                )
                 .unwrap();
         }
 
         let mut observed = Vec::new();
         for _ in 0..12 {
             let result = scheduler
-                .handle_alloc_job(
-                    &AcceptAssign,
-                    Toolchain {
-                        archive_id: "same-toolchain".to_owned(),
-                    },
-                )
+                .handle_alloc_job(&AcceptAssign, test_toolchain('b'))
                 .unwrap();
             let AllocJobResult::Success { job_alloc, .. } = result else {
                 panic!("eligible idle workers must accept a job");
@@ -1236,42 +1493,20 @@ mod scheduler_tests {
         let scheduler =
             Scheduler::new_with_job_slack_and_drain(JobSlackConfig::default(), Some(drain.clone()));
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
-        scheduler
-            .handle_heartbeat_server(
-                server_id,
-                ServerNonce::new(),
-                1,
-                Box::new(TestJobAuthorizer),
-            )
-            .unwrap();
+        register_test_server(&scheduler, server_id, ServerNonce::new());
 
         std::fs::write(&drain, b"drain").unwrap();
         assert!(scheduler.handle_is_draining());
         let allocation = scheduler
-            .handle_alloc_job(
-                &AcceptAssign,
-                Toolchain {
-                    archive_id: "test-toolchain".to_owned(),
-                },
-            )
+            .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
             .unwrap();
         assert!(matches!(allocation, AllocJobResult::Fail { .. }));
-        assert!(scheduler.jobs.lock().unwrap().is_empty());
-        let servers = scheduler.servers.lock().unwrap();
-        let details = servers.get(&server_id).unwrap();
-        assert!(details.jobs_assigned.is_empty());
-        assert!(details.jobs_unclaimed.is_empty());
-        drop(servers);
+        assert_no_assigned_jobs(&scheduler, &server_id);
 
         std::fs::remove_file(&drain).unwrap();
         assert!(!scheduler.handle_is_draining());
         let allocation = scheduler
-            .handle_alloc_job(
-                &AcceptAssign,
-                Toolchain {
-                    archive_id: "test-toolchain".to_owned(),
-                },
-            )
+            .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
             .unwrap();
         assert!(matches!(allocation, AllocJobResult::Success { .. }));
     }
@@ -1308,7 +1543,7 @@ mod scheduler_tests {
             {
                 let mut servers = self.scheduler.servers.lock().unwrap();
                 let details = servers.get_mut(&server_id).unwrap();
-                *details.jobs_unclaimed.get_mut(&job_id).unwrap() = Instant::now()
+                *details.jobs_assigning.get_mut(&job_id).unwrap() = Instant::now()
                     .checked_sub(UNCLAIMED_PENDING_TIMEOUT + Duration::from_secs(1))
                     .unwrap();
             }
@@ -1317,6 +1552,7 @@ mod scheduler_tests {
                 server_id,
                 self.server_nonce.clone(),
                 1,
+                &[],
                 Box::new(TestJobAuthorizer),
             )?;
             assert!(!heartbeat.is_new);
@@ -1329,12 +1565,435 @@ mod scheduler_tests {
     }
 
     #[test]
+    fn ready_transition_starts_its_own_unclaimed_timeout() {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let nonce = ServerNonce::new();
+        register_test_server(&scheduler, server_id, nonce.clone());
+
+        let AllocJobResult::Success { job_alloc, .. } = scheduler
+            .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
+            .unwrap()
+        else {
+            panic!("worker should accept job");
+        };
+        let job_id = job_alloc.job_id;
+        {
+            let mut jobs = scheduler.jobs.lock().unwrap();
+            jobs.get_mut(&job_id).unwrap().state_since = Instant::now()
+                .checked_sub(UNCLAIMED_PENDING_TIMEOUT + Duration::from_secs(1))
+                .unwrap();
+        }
+
+        scheduler
+            .handle_update_job_state(job_id, server_id, JobState::Ready)
+            .unwrap();
+        scheduler
+            .handle_heartbeat_server(
+                server_id,
+                nonce.clone(),
+                1,
+                &[],
+                Box::new(TestJobAuthorizer),
+            )
+            .unwrap();
+        assert_eq!(
+            scheduler.jobs.lock().unwrap().get(&job_id).unwrap().state,
+            JobState::Ready
+        );
+        {
+            let mut jobs = scheduler.jobs.lock().unwrap();
+            jobs.get_mut(&job_id).unwrap().state_since = Instant::now()
+                .checked_sub(UNCLAIMED_READY_TIMEOUT + Duration::from_secs(1))
+                .unwrap();
+        }
+        scheduler
+            .handle_heartbeat_server(server_id, nonce, 1, &[], Box::new(TestJobAuthorizer))
+            .unwrap();
+        assert_no_assigned_jobs(&scheduler, &server_id);
+    }
+
+    #[test]
+    fn pending_jobs_expire_but_started_jobs_remain_owned_by_execution() {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let nonce = ServerNonce::new();
+        register_test_server(&scheduler, server_id, nonce.clone());
+
+        let AllocJobResult::Success { job_alloc, .. } = scheduler
+            .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
+            .unwrap()
+        else {
+            panic!("worker should accept job");
+        };
+        {
+            let mut jobs = scheduler.jobs.lock().unwrap();
+            jobs.get_mut(&job_alloc.job_id).unwrap().state_since = Instant::now()
+                .checked_sub(UNCLAIMED_PENDING_TIMEOUT + Duration::from_secs(1))
+                .unwrap();
+        }
+        scheduler
+            .handle_heartbeat_server(
+                server_id,
+                nonce.clone(),
+                1,
+                &[],
+                Box::new(TestJobAuthorizer),
+            )
+            .unwrap();
+        assert_no_assigned_jobs(&scheduler, &server_id);
+
+        let AllocJobResult::Success { job_alloc, .. } = scheduler
+            .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
+            .unwrap()
+        else {
+            panic!("worker should accept another job");
+        };
+        for state in [JobState::Ready, JobState::Started] {
+            scheduler
+                .handle_update_job_state(job_alloc.job_id, server_id, state)
+                .unwrap();
+        }
+        {
+            let mut jobs = scheduler.jobs.lock().unwrap();
+            jobs.get_mut(&job_alloc.job_id).unwrap().state_since = Instant::now()
+                .checked_sub(UNCLAIMED_PENDING_TIMEOUT + Duration::from_secs(1))
+                .unwrap();
+        }
+        scheduler
+            .handle_heartbeat_server(server_id, nonce, 1, &[], Box::new(TestJobAuthorizer))
+            .unwrap();
+        assert_eq!(
+            scheduler
+                .jobs
+                .lock()
+                .unwrap()
+                .get(&job_alloc.job_id)
+                .unwrap()
+                .state,
+            JobState::Started
+        );
+        scheduler
+            .handle_update_job_state(job_alloc.job_id, server_id, JobState::Complete)
+            .unwrap();
+        assert_no_assigned_jobs(&scheduler, &server_id);
+    }
+
+    struct RejectToken;
+
+    impl JobAuthorizer for RejectToken {
+        fn generate_token(&self, _job_id: JobId) -> Result<String> {
+            bail!("synthetic authorization failure")
+        }
+
+        fn verify_token(&self, _job_id: JobId, _token: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_token_generation_never_reserves_capacity() {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        scheduler
+            .handle_heartbeat_server(server_id, ServerNonce::new(), 1, &[], Box::new(RejectToken))
+            .unwrap();
+        assert!(
+            scheduler
+                .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
+                .is_err()
+        );
+        assert_no_assigned_jobs(&scheduler, &server_id);
+    }
+
+    #[test]
+    fn completion_without_assignment_does_not_discard_job() {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        register_test_server(&scheduler, server_id, ServerNonce::new());
+        let AllocJobResult::Success { job_alloc, .. } = scheduler
+            .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
+            .unwrap()
+        else {
+            panic!("worker should accept job");
+        };
+        for state in [JobState::Ready, JobState::Started] {
+            scheduler
+                .handle_update_job_state(job_alloc.job_id, server_id, state)
+                .unwrap();
+        }
+        {
+            let mut servers = scheduler.servers.lock().unwrap();
+            servers
+                .get_mut(&server_id)
+                .unwrap()
+                .jobs_assigned
+                .remove(&job_alloc.job_id);
+        }
+        assert!(
+            scheduler
+                .handle_update_job_state(job_alloc.job_id, server_id, JobState::Complete)
+                .is_err()
+        );
+        assert_eq!(
+            scheduler
+                .jobs
+                .lock()
+                .unwrap()
+                .get(&job_alloc.job_id)
+                .unwrap()
+                .state,
+            JobState::Started
+        );
+        {
+            let mut servers = scheduler.servers.lock().unwrap();
+            servers
+                .get_mut(&server_id)
+                .unwrap()
+                .jobs_assigned
+                .insert(job_alloc.job_id);
+        }
+        scheduler
+            .handle_update_job_state(job_alloc.job_id, server_id, JobState::Complete)
+            .unwrap();
+        assert_no_assigned_jobs(&scheduler, &server_id);
+    }
+
+    #[test]
+    fn started_jobs_reconcile_against_worker_running_inventory() {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let nonce = ServerNonce::new();
+        register_test_server(&scheduler, server_id, nonce.clone());
+        let AllocJobResult::Success { job_alloc, .. } = scheduler
+            .handle_alloc_job(&AcceptAssign, test_toolchain('d'))
+            .unwrap()
+        else {
+            panic!("expected scheduler job allocation");
+        };
+        let job_id = job_alloc.job_id;
+        for state in [JobState::Ready, JobState::Started] {
+            scheduler
+                .handle_update_job_state(job_id, server_id, state)
+                .unwrap();
+        }
+        {
+            let mut jobs = scheduler.jobs.lock().unwrap();
+            jobs.get_mut(&job_id).unwrap().state_since = Instant::now()
+                .checked_sub(UNCLAIMED_PENDING_TIMEOUT + Duration::from_secs(1))
+                .unwrap();
+        }
+        // Running compilation can exceed every unclaimed-job timeout.
+        scheduler
+            .handle_heartbeat_server(
+                server_id,
+                nonce.clone(),
+                1,
+                &[job_id],
+                Box::new(TestJobAuthorizer),
+            )
+            .unwrap();
+        assert!(scheduler.jobs.lock().unwrap().contains_key(&job_id));
+
+        // A single omitted heartbeat snapshot must not terminate a job.
+        scheduler
+            .handle_heartbeat_server(
+                server_id,
+                nonce.clone(),
+                1,
+                &[],
+                Box::new(TestJobAuthorizer),
+            )
+            .unwrap();
+        assert!(scheduler.jobs.lock().unwrap().contains_key(&job_id));
+        {
+            let mut jobs = scheduler.jobs.lock().unwrap();
+            jobs.get_mut(&job_id).unwrap().missing_since = Some(
+                Instant::now()
+                    .checked_sub(dist::http::HEARTBEAT_TIMEOUT + Duration::from_secs(1))
+                    .unwrap(),
+            );
+        }
+        scheduler
+            .handle_heartbeat_server(server_id, nonce, 1, &[], Box::new(TestJobAuthorizer))
+            .unwrap();
+        assert_no_assigned_jobs(&scheduler, &server_id);
+        // Reconciliation is not a successful completion. A late terminal
+        // message must not be disguised as a replayed acknowledgment.
+        assert!(
+            scheduler
+                .handle_update_job_state(job_id, server_id, JobState::Complete)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn only_the_completing_worker_can_retry_a_known_completion() -> Result<()> {
+        let scheduler = Scheduler::new();
+        let owner: ServerId = "127.0.0.1:10501".parse()?;
+        let other: ServerId = "127.0.0.1:10502".parse()?;
+        register_test_server(&scheduler, owner, ServerNonce::new());
+        let AllocJobResult::Success { job_alloc, .. } =
+            scheduler.handle_alloc_job(&AcceptAssign, test_toolchain('f'))?
+        else {
+            panic!("expected job");
+        };
+        let id = job_alloc.job_id;
+        assert!(
+            scheduler
+                .handle_update_job_state(id, owner, JobState::Complete)
+                .is_err()
+        );
+        assert!(
+            scheduler
+                .handle_update_job_state(JobId(id.0.wrapping_add(1)), owner, JobState::Complete)
+                .is_err()
+        );
+
+        for state in [JobState::Ready, JobState::Started, JobState::Complete] {
+            scheduler.handle_update_job_state(id, owner, state)?;
+        }
+        assert!(matches!(
+            scheduler.handle_update_job_state(id, owner, JobState::Complete)?,
+            UpdateJobStateResult::Success
+        ));
+        assert!(
+            scheduler
+                .handle_update_job_state(id, other, JobState::Complete)
+                .is_err()
+        );
+        assert_no_assigned_jobs(&scheduler, &owner);
+        Ok(())
+    }
+
+    #[test]
+    fn recent_completion_acknowledgments_expire_and_are_bounded() -> Result<()> {
+        let now = Instant::now();
+        let owner: ServerId = "127.0.0.1:10501".parse()?;
+        let mut acks = CompletedJobAcks::default();
+        for id in 0..MAX_COMPLETION_ACKS as u64 {
+            acks.record(JobId(id), owner, now);
+        }
+        assert_eq!(acks.recent.len(), MAX_COMPLETION_ACKS);
+        acks.record(JobId(MAX_COMPLETION_ACKS as u64), owner, now);
+        assert_eq!(acks.recent.len(), MAX_COMPLETION_ACKS);
+        assert!(!acks.contains(JobId(0), owner, now));
+        assert!(acks.contains(JobId(1), owner, now));
+
+        let expired = now + COMPLETION_ACK_RETRY_WINDOW + Duration::from_secs(1);
+        assert!(!acks.contains(JobId(1), owner, expired));
+        assert!(acks.recent.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn returned_running_job_resets_missing_heartbeat_grace() {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let nonce = ServerNonce::new();
+        register_test_server(&scheduler, server_id, nonce.clone());
+        let AllocJobResult::Success { job_alloc, .. } = scheduler
+            .handle_alloc_job(&AcceptAssign, test_toolchain('d'))
+            .unwrap()
+        else {
+            panic!("expected scheduler job allocation");
+        };
+        let job_id = job_alloc.job_id;
+        for state in [JobState::Ready, JobState::Started] {
+            scheduler
+                .handle_update_job_state(job_id, server_id, state)
+                .unwrap();
+        }
+        scheduler
+            .handle_heartbeat_server(
+                server_id,
+                nonce.clone(),
+                1,
+                &[],
+                Box::new(TestJobAuthorizer),
+            )
+            .unwrap();
+        assert!(
+            scheduler
+                .jobs
+                .lock()
+                .unwrap()
+                .get(&job_id)
+                .unwrap()
+                .missing_since
+                .is_some()
+        );
+        scheduler
+            .handle_heartbeat_server(
+                server_id,
+                nonce.clone(),
+                1,
+                &[job_id],
+                Box::new(TestJobAuthorizer),
+            )
+            .unwrap();
+        assert!(
+            scheduler
+                .jobs
+                .lock()
+                .unwrap()
+                .get(&job_id)
+                .unwrap()
+                .missing_since
+                .is_none()
+        );
+        scheduler
+            .handle_heartbeat_server(server_id, nonce, 1, &[], Box::new(TestJobAuthorizer))
+            .unwrap();
+        assert!(scheduler.jobs.lock().unwrap().contains_key(&job_id));
+        scheduler
+            .handle_update_job_state(job_id, server_id, JobState::Complete)
+            .unwrap();
+        assert_no_assigned_jobs(&scheduler, &server_id);
+    }
+
+    #[test]
+    fn state_acknowledgments_are_idempotent() {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        register_test_server(&scheduler, server_id, ServerNonce::new());
+        let AllocJobResult::Success { job_alloc, .. } = scheduler
+            .handle_alloc_job(&AcceptAssign, test_toolchain('d'))
+            .unwrap()
+        else {
+            panic!("expected scheduler job allocation");
+        };
+        for state in [
+            JobState::Ready,
+            JobState::Ready,
+            JobState::Started,
+            JobState::Started,
+            JobState::Complete,
+            JobState::Complete,
+        ] {
+            assert!(matches!(
+                scheduler
+                    .handle_update_job_state(job_alloc.job_id, server_id, state)
+                    .unwrap(),
+                UpdateJobStateResult::Success
+            ));
+        }
+        assert_no_assigned_jobs(&scheduler, &server_id);
+    }
+
+    #[test]
     fn worker_name_side_channel_is_optional_and_epoch_bound() {
         let scheduler = Scheduler::new();
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
         let nonce = ServerNonce::new();
         scheduler
-            .handle_heartbeat_server(server_id, nonce.clone(), 8, Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(
+                server_id,
+                nonce.clone(),
+                8,
+                &[],
+                Box::new(TestJobAuthorizer),
+            )
             .unwrap();
         assert_eq!(scheduler.handle_get_worker_name(server_id).unwrap(), None);
 
@@ -1354,7 +2013,13 @@ mod scheduler_tests {
 
         let replacement_nonce = ServerNonce::new();
         let heartbeat = scheduler
-            .handle_heartbeat_server(server_id, replacement_nonce, 8, Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(
+                server_id,
+                replacement_nonce,
+                8,
+                &[],
+                Box::new(TestJobAuthorizer),
+            )
             .unwrap();
         assert!(heartbeat.is_new);
         assert_eq!(scheduler.handle_get_worker_name(server_id).unwrap(), None);
@@ -1369,7 +2034,7 @@ mod scheduler_tests {
         let second_nonce = ServerNonce::new();
         for (server_id, nonce) in [(first, first_nonce.clone()), (second, second_nonce.clone())] {
             scheduler
-                .handle_heartbeat_server(server_id, nonce, 8, Box::new(TestJobAuthorizer))
+                .handle_heartbeat_server(server_id, nonce, 8, &[], Box::new(TestJobAuthorizer))
                 .unwrap();
         }
         scheduler
@@ -1387,7 +2052,13 @@ mod scheduler_tests {
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
         let nonce = ServerNonce::new();
         scheduler
-            .handle_heartbeat_server(server_id, nonce.clone(), 8, Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(
+                server_id,
+                nonce.clone(),
+                8,
+                &[],
+                Box::new(TestJobAuthorizer),
+            )
             .unwrap();
         scheduler
             .handle_update_worker_name(server_id, nonce.clone(), "worker-a".to_owned())
@@ -1404,14 +2075,7 @@ mod scheduler_tests {
         let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
         let server_nonce = ServerNonce::new();
 
-        scheduler
-            .handle_heartbeat_server(
-                server_id,
-                server_nonce.clone(),
-                1,
-                Box::new(TestJobAuthorizer),
-            )
-            .unwrap();
+        register_test_server(&scheduler, server_id, server_nonce.clone());
 
         let requester = ReapDuringAssign {
             scheduler: &scheduler,
@@ -1419,21 +2083,11 @@ mod scheduler_tests {
             server_nonce,
         };
         let allocation = scheduler
-            .handle_alloc_job(
-                &requester,
-                Toolchain {
-                    archive_id: "test-toolchain".to_owned(),
-                },
-            )
+            .handle_alloc_job(&requester, test_toolchain('c'))
             .unwrap();
 
         assert!(matches!(allocation, AllocJobResult::Fail { .. }));
-        assert!(scheduler.jobs.lock().unwrap().is_empty());
-
-        let servers = scheduler.servers.lock().unwrap();
-        let details = servers.get(&server_id).unwrap();
-        assert!(details.jobs_assigned.is_empty());
-        assert!(details.jobs_unclaimed.is_empty());
+        assert_no_assigned_jobs(&scheduler, &server_id);
     }
 }
 
@@ -1452,7 +2106,7 @@ mod server_upload_tests {
             &self,
             _toolchain: Toolchain,
             _command: CompileCommand,
-            _outputs: Vec<String>,
+            _outputs: OutputRequest,
             _inputs_rdr: InputsReader<'_>,
             _cache: &Mutex<TcCache>,
         ) -> Result<sccache::dist::BuildResult> {
@@ -1481,7 +2135,7 @@ mod server_upload_tests {
 
     fn tc(contents: &[u8]) -> Result<Toolchain> {
         Ok(Toolchain {
-            archive_id: Digest::reader_sync(contents)?,
+            archive_id: sccache::dist::ArchiveId::try_from(Digest::reader_sync(contents)?)?,
         })
     }
 
@@ -1501,6 +2155,144 @@ mod server_upload_tests {
             }
             self.inner.read(buf)
         }
+    }
+
+    #[test]
+    fn reconcile_removes_only_stale_unclaimed_assignments() -> Result<()> {
+        let (_dir, server) = test_server()?;
+        for id in [JobId(41), JobId(42)] {
+            server.handle_assign_job(id, tc(b"older toolchain")?)?;
+        }
+        let heartbeat_started_at = Instant::now();
+        // This assignment arrived after the heartbeat began and may be
+        // legitimately absent from the scheduler's earlier snapshot.
+        server.handle_assign_job(JobId(43), tc(b"new toolchain")?)?;
+
+        assert_eq!(
+            server.handle_reconcile_assignments(&[JobId(42)], heartbeat_started_at)?,
+            1
+        );
+        {
+            let jobs = server.job_toolchains.lock().unwrap();
+            assert!(!jobs.contains_key(&JobId(41)));
+            assert!(jobs.contains_key(&JobId(42)));
+            assert!(jobs.contains_key(&JobId(43)));
+        }
+        let next_heartbeat = Instant::now();
+        assert_eq!(
+            server.handle_reconcile_assignments(&[JobId(43)], next_heartbeat)?,
+            1
+        );
+        let jobs = server.job_toolchains.lock().unwrap();
+        assert!(!jobs.contains_key(&JobId(42)));
+        assert!(jobs.contains_key(&JobId(43)));
+        Ok(())
+    }
+
+    #[test]
+    fn removed_job_does_not_publish_ready_after_upload_finishes() -> Result<()> {
+        let (_dir, server) = test_server()?;
+        let job_id = JobId(71);
+        let bytes = b"toolchain still uploading";
+        server.handle_assign_job(job_id, tc(bytes)?)?;
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let uploader = Arc::clone(&server);
+        let upload = thread::spawn(move || {
+            let requester = RecordingRequester(Mutex::new(Vec::new()));
+            let reader = PausingReader {
+                sent: false,
+                started: started_tx,
+                resume: resume_rx,
+                inner: Cursor::new(bytes.to_vec()),
+            };
+            let outcome = uploader.handle_submit_toolchain(
+                &requester,
+                job_id,
+                ToolchainReader::new(Box::new(reader)),
+            );
+            (outcome, requester.0.lock().unwrap().clone())
+        });
+        started_rx.recv_timeout(Duration::from_secs(5))?;
+
+        let removed = server.handle_reconcile_assignments(&[], Instant::now())?;
+        // Always release the upload, even if the expected cleanup failed.
+        resume_tx.send(())?;
+        let (outcome, published) = upload.join().unwrap();
+        assert_eq!(removed, 1);
+        assert!(matches!(outcome?, SubmitToolchainResult::JobNotFound));
+        assert!(published.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_run_does_not_publish_any_job_state() -> Result<()> {
+        let (_dir, server) = test_server()?;
+        let requester = RecordingRequester(Mutex::new(Vec::new()));
+        let result = server.handle_run_job(
+            &requester,
+            JobId(999),
+            CompileCommand {
+                executable: "cc".to_owned(),
+                arguments: Vec::new(),
+                env_vars: Vec::new(),
+                cwd: "/tmp".to_owned(),
+            },
+            OutputRequest {
+                paths: Vec::new(),
+                compression_level: 3,
+            },
+            InputsReader::new(Box::new(Cursor::new(Vec::new()))),
+        )?;
+        assert!(matches!(result, RunJobResult::JobNotFound));
+        assert!(requester.0.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    struct RejectStartRequester;
+    impl ServerOutgoing for RejectStartRequester {
+        fn do_update_job_state(
+            &self,
+            _job_id: JobId,
+            _state: JobState,
+        ) -> Result<UpdateJobStateResult> {
+            bail!("synthetic failure to acknowledge Started")
+        }
+    }
+
+    #[test]
+    fn failed_started_ack_restores_unclaimed_local_job() -> Result<()> {
+        let (_dir, server) = test_server()?;
+        let job_id = JobId(42);
+        let toolchain = tc(b"custom toolchain")?;
+        server.handle_assign_job(job_id, toolchain.clone())?;
+        let failed = server.handle_run_job(
+            &RejectStartRequester,
+            job_id,
+            CompileCommand {
+                executable: "cc".to_owned(),
+                arguments: Vec::new(),
+                env_vars: Vec::new(),
+                cwd: "/tmp".to_owned(),
+            },
+            OutputRequest {
+                paths: Vec::new(),
+                compression_level: 3,
+            },
+            InputsReader::new(Box::new(Cursor::new(Vec::new()))),
+        );
+        assert!(failed.is_err());
+        assert_eq!(
+            server
+                .job_toolchains
+                .lock()
+                .unwrap()
+                .get(&job_id)
+                .map(|assigned| &assigned.toolchain),
+            Some(&toolchain)
+        );
+        Ok(())
     }
 
     #[test]

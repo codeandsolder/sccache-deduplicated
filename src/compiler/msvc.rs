@@ -1982,10 +1982,13 @@ mod test {
         assert!(msvc_show_includes);
     }
 
-    #[test]
     #[cfg(windows)]
-    fn parse_argument_output_file_trailing_backslash() {
-        let args = ovec!["-c", "foo.c", "/Fomyrelease\\folder\\"];
+    fn assert_trailing_output_file(
+        compilation_flag: &str,
+        input_file: &str,
+        output_arg: &str,
+        expected_output: &str,
+    ) {
         let ParsedArguments {
             input,
             language,
@@ -1994,18 +1997,18 @@ mod test {
             msvc_show_includes,
             common_args,
             ..
-        } = match parse_arguments(args) {
+        } = match parse_arguments(ovec![compilation_flag, input_file, output_arg]) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            other => panic!("Got unexpected parse result: {other:?}"),
         };
-        assert_eq!(Some("foo.c"), input.to_str());
+        assert_eq!(Some(input_file), input.to_str());
         assert_eq!(Language::C, language);
         assert_map_contains!(
             outputs,
             (
                 "obj",
                 ArtifactDescriptor {
-                    path: PathBuf::from("myrelease/folder/foo.obj"),
+                    path: PathBuf::from(expected_output),
                     optional: false
                 }
             )
@@ -2013,12 +2016,33 @@ mod test {
         assert!(preprocessor_args.is_empty());
         assert!(common_args.is_empty());
         assert!(!msvc_show_includes);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parse_argument_output_file_trailing_backslash() {
+        assert_trailing_output_file(
+            "-c",
+            "foo.c",
+            "/Fomyrelease\\folder\\",
+            "myrelease/folder/foo.obj",
+        );
     }
 
     #[test]
     #[cfg(windows)]
     fn parse_argument_output_file_trailing_slash_multi_extension() {
-        let args = ovec!["/c", "foo.pb.c", "-Fomyrelease\\folder/"];
+        assert_trailing_output_file(
+            "/c",
+            "foo.pb.c",
+            "-Fomyrelease\\folder/",
+            "myrelease/folder/foo.pb.obj",
+        );
+    }
+
+    // All PDB variants must preserve the same compiler arguments and produce
+    // both the object and PDB cache artifacts; only the PDB path varies.
+    fn assert_pdb_outputs(fd_arg: &str, expected_path: &str) {
         let ParsedArguments {
             input,
             language,
@@ -2027,224 +2051,66 @@ mod test {
             msvc_show_includes,
             common_args,
             ..
-        } = match parse_arguments(args) {
+        } = match parse_arguments(ovec!["-c", "foo.c", "-Zi", fd_arg, "-Fofoo.obj"]) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            other => panic!("Got unexpected parse result: {other:?}"),
         };
-        assert_eq!(Some("foo.pb.c"), input.to_str());
+        assert_eq!(Some("foo.c"), input.to_str());
         assert_eq!(Language::C, language);
         assert_map_contains!(
             outputs,
             (
                 "obj",
                 ArtifactDescriptor {
-                    path: PathBuf::from("myrelease/folder/foo.pb.obj"),
+                    path: PathBuf::from("foo.obj"),
+                    optional: false
+                }
+            ),
+            (
+                "pdb",
+                ArtifactDescriptor {
+                    path: PathBuf::from(expected_path),
                     optional: false
                 }
             )
         );
-        assert!(preprocessor_args.is_empty());
-        assert!(common_args.is_empty());
+        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
+        assert_eq!(common_args, ovec!["-Zi", fd_arg]);
         assert!(!msvc_show_includes);
     }
 
     #[test]
     fn test_parse_arguments_pdb() {
-        let args = ovec!["-c", "foo.c", "-Zi", "-Fdfoo.pdb", "-Fofoo.obj"];
-        let ParsedArguments {
-            input,
-            language,
-            outputs,
-            preprocessor_args,
-            msvc_show_includes,
-            common_args,
-            ..
-        } = match parse_arguments(args) {
-            CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {o:?}"),
-        };
-        assert_eq!(Some("foo.c"), input.to_str());
-        assert_eq!(Language::C, language);
-        assert_map_contains!(
-            outputs,
-            (
-                "obj",
-                ArtifactDescriptor {
-                    path: PathBuf::from("foo.obj"),
-                    optional: false
-                }
-            ),
-            (
-                "pdb",
-                ArtifactDescriptor {
-                    path: PathBuf::from("foo.pdb"),
-                    optional: false
-                }
-            )
-        );
-        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
-        assert_eq!(common_args, ovec!["-Zi", "-Fdfoo.pdb"]);
-        assert!(!msvc_show_includes);
+        assert_pdb_outputs("-Fdfoo.pdb", "foo.pdb");
     }
 
     #[test]
     fn test_parse_arguments_pdb_no_extension() {
-        // Test that .pdb extension is appended when /Fd argument lacks an extension
-        let args = ovec!["-c", "foo.c", "-Zi", "-Fdfoo", "-Fofoo.obj"];
-        let ParsedArguments {
-            input,
-            language,
-            outputs,
-            preprocessor_args,
-            msvc_show_includes,
-            common_args,
-            ..
-        } = match parse_arguments(args) {
-            CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {o:?}"),
-        };
-        assert_eq!(Some("foo.c"), input.to_str());
-        assert_eq!(Language::C, language);
-        assert_map_contains!(
-            outputs,
-            (
-                "obj",
-                ArtifactDescriptor {
-                    path: PathBuf::from("foo.obj"),
-                    optional: false
-                }
-            ),
-            (
-                "pdb",
-                ArtifactDescriptor {
-                    path: PathBuf::from("foo.pdb"),
-                    optional: false
-                }
-            )
-        );
-        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
-        assert_eq!(common_args, ovec!["-Zi", "-Fdfoo"]);
-        assert!(!msvc_show_includes);
+        // The .pdb extension is added when /Fd lacks an extension.
+        assert_pdb_outputs("-Fdfoo", "foo.pdb");
     }
 
     #[test]
     fn test_parse_arguments_pdb_with_extension() {
-        // Test that .pdb extension is NOT duplicated when already present
-        let args = ovec!["-c", "foo.c", "-Zi", "-Fdfoo.pdb", "-Fofoo.obj"];
-        let ParsedArguments {
-            input,
-            language,
-            outputs,
-            preprocessor_args,
-            msvc_show_includes,
-            common_args,
-            ..
-        } = match parse_arguments(args) {
-            CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {o:?}"),
-        };
-        assert_eq!(Some("foo.c"), input.to_str());
-        assert_eq!(Language::C, language);
-        assert_map_contains!(
-            outputs,
-            (
-                "obj",
-                ArtifactDescriptor {
-                    path: PathBuf::from("foo.obj"),
-                    optional: false
-                }
-            ),
-            (
-                "pdb",
-                ArtifactDescriptor {
-                    path: PathBuf::from("foo.pdb"),
-                    optional: false
-                }
-            )
-        );
-        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
-        assert_eq!(common_args, ovec!["-Zi", "-Fdfoo.pdb"]);
-        assert!(!msvc_show_includes);
+        // The .pdb extension must not be duplicated.
+        assert_pdb_outputs("-Fdfoo.pdb", "foo.pdb");
     }
 
     #[test]
     fn test_parse_arguments_pdb_custom_extension() {
-        // Test that custom extensions are preserved
-        let args = ovec!["-c", "foo.c", "-Zi", "-Fdfoo.db", "-Fofoo.obj"];
-        let ParsedArguments {
-            input,
-            language,
-            outputs,
-            preprocessor_args,
-            msvc_show_includes,
-            common_args,
-            ..
-        } = match parse_arguments(args) {
-            CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {o:?}"),
-        };
-        assert_eq!(Some("foo.c"), input.to_str());
-        assert_eq!(Language::C, language);
-        assert_map_contains!(
-            outputs,
-            (
-                "obj",
-                ArtifactDescriptor {
-                    path: PathBuf::from("foo.obj"),
-                    optional: false
-                }
-            ),
-            (
-                "pdb",
-                ArtifactDescriptor {
-                    path: PathBuf::from("foo.db"),
-                    optional: false
-                }
-            )
-        );
-        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
-        assert_eq!(common_args, ovec!["-Zi", "-Fdfoo.db"]);
-        assert!(!msvc_show_includes);
+        // Custom extensions must be preserved.
+        assert_pdb_outputs("-Fdfoo.db", "foo.db");
     }
 
     #[test]
     fn test_parse_arguments_pdb_path_with_extension() {
-        // Test that .pdb is appended only to the filename when path is given
-        let args = ovec!["-c", "foo.c", "-Zi", "-Fdoutput/foo", "-Fofoo.obj"];
-        let ParsedArguments {
-            input,
-            language,
-            outputs,
-            preprocessor_args,
-            msvc_show_includes,
-            common_args,
-            ..
-        } = match parse_arguments(args) {
-            CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {o:?}"),
-        };
-        assert_eq!(Some("foo.c"), input.to_str());
-        assert_eq!(Language::C, language);
-        assert_map_contains!(
-            outputs,
-            (
-                "obj",
-                ArtifactDescriptor {
-                    path: PathBuf::from("foo.obj"),
-                    optional: false
-                }
-            ),
-            (
-                "pdb",
-                ArtifactDescriptor {
-                    path: PathBuf::from("output/foo.pdb"),
-                    optional: false
-                }
-            )
-        );
-        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
-        assert_eq!(common_args, ovec!["-Zi", "-Fdoutput/foo"]);
-        assert!(!msvc_show_includes);
+        // The .pdb extension applies to the basename within a directory.
+        assert_pdb_outputs("-Fdoutput/foo", "output/foo.pdb");
+    }
+
+    #[test]
+    fn test_parse_arguments_pdb_custom_extension_in_directory() {
+        assert_pdb_outputs("-Fdoutput/foo.db", "output/foo.db");
     }
 
     #[test]
@@ -2754,18 +2620,27 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_responsefile_absolute_path() {
-        let td = tempfile::Builder::new()
-            .prefix("sccache")
-            .tempdir()
-            .unwrap();
-        let cmd_file_path = td.path().join("foo");
-        {
-            let mut file = File::create(&cmd_file_path).unwrap();
-            let content = b"-c foo.c -o foo.o";
-            file.write_all(content).unwrap();
-        }
+    // Keep response-file decoding, path resolution and quoting cases independent,
+    // but test them against the same set of compiler-argument invariants.
+    fn assert_response_file_parses(content: &[u8], expected_input: &str, relative: bool) {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("sccache");
+        let td = if relative {
+            // MSVC accepts response-file paths relative to the working directory.
+            builder.tempdir_in("./").unwrap()
+        } else {
+            builder.tempdir().unwrap()
+        };
+        let cmd_file_path = if relative {
+            td.path()
+                .strip_prefix(std::env::current_dir().unwrap())
+                .unwrap()
+                .join("foo")
+        } else {
+            td.path().join("foo")
+        };
+        std::fs::write(&cmd_file_path, content).unwrap();
+
         let arg = format!("@{}", cmd_file_path.display());
         let ParsedArguments {
             input,
@@ -2777,9 +2652,9 @@ mod test {
             ..
         } = match parse_arguments(ovec![arg]) {
             CompilerArguments::Ok(args) => args,
-            o => panic!("Failed to parse @-file, err: {o:?}"),
+            other => panic!("Failed to parse @-file, err: {other:?}"),
         };
-        assert_eq!(Some("foo.c"), input.to_str());
+        assert_eq!(Some(expected_input), input.to_str());
         assert_eq!(Language::C, language);
         assert_map_contains!(
             outputs,
@@ -2794,277 +2669,52 @@ mod test {
         assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
         assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
         assert!(!msvc_show_includes);
+    }
+
+    #[test]
+    fn test_responsefile_absolute_path() {
+        assert_response_file_parses(b"-c foo.c -o foo.o", "foo.c", false);
     }
 
     #[test]
     fn test_responsefile_relative_path() {
-        // Generate the tempdir in the currentdir so we can use a relative path in this test.
-        // MSVC allows relative paths to response files, so we must support that.
-        let td = tempfile::Builder::new()
-            .prefix("sccache")
-            .tempdir_in("./")
-            .unwrap();
-        let relative_to_tmp = td
-            .path()
-            .strip_prefix(std::env::current_dir().unwrap())
-            .unwrap();
-        let cmd_file_path = relative_to_tmp.join("foo");
-        {
-            let mut file = File::create(&cmd_file_path).unwrap();
-            let content = b"-c foo.c -o foo.o";
-            file.write_all(content).unwrap();
-        }
-        let arg = format!("@{}", cmd_file_path.display());
-        let ParsedArguments {
-            input,
-            language,
-            outputs,
-            preprocessor_args,
-            msvc_show_includes,
-            common_args,
-            ..
-        } = match parse_arguments(ovec![arg]) {
-            CompilerArguments::Ok(args) => args,
-            o => panic!("Failed to parse @-file, err: {o:?}"),
-        };
-        assert_eq!(Some("foo.c"), input.to_str());
-        assert_eq!(Language::C, language);
-        assert_map_contains!(
-            outputs,
-            (
-                "obj",
-                ArtifactDescriptor {
-                    path: "foo.o".into(),
-                    optional: false
-                }
-            )
-        );
-        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
-        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
-        assert!(!msvc_show_includes);
+        assert_response_file_parses(b"-c foo.c -o foo.o", "foo.c", true);
     }
 
     #[test]
     fn test_responsefile_with_quotes() {
-        let td = tempfile::Builder::new()
-            .prefix("sccache")
-            .tempdir()
-            .unwrap();
-        let cmd_file_path = td.path().join("foo");
-        {
-            let mut file = File::create(&cmd_file_path).unwrap();
-            let content = b"-c \"Foo Bar.c\" -o foo.o";
-            file.write_all(content).unwrap();
-        }
-        let arg = format!("@{}", cmd_file_path.display());
-        let ParsedArguments {
-            input,
-            language,
-            outputs,
-            preprocessor_args,
-            msvc_show_includes,
-            common_args,
-            ..
-        } = match parse_arguments(ovec![arg]) {
-            CompilerArguments::Ok(args) => args,
-            o => panic!("Failed to parse @-file, err: {o:?}"),
-        };
-        assert_eq!(Some("Foo Bar.c"), input.to_str());
-        assert_eq!(Language::C, language);
-        assert_map_contains!(
-            outputs,
-            (
-                "obj",
-                ArtifactDescriptor {
-                    path: "foo.o".into(),
-                    optional: false
-                }
-            )
-        );
-        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
-        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
-        assert!(!msvc_show_includes);
+        assert_response_file_parses(b"-c \"Foo Bar.c\" -o foo.o", "Foo Bar.c", false);
     }
 
     #[test]
     fn test_responsefile_multiline() {
-        let td = tempfile::Builder::new()
-            .prefix("sccache")
-            .tempdir()
-            .unwrap();
-        let cmd_file_path = td.path().join("foo");
-        {
-            let mut file = File::create(&cmd_file_path).unwrap();
-            let content = b"\n-c foo.c\n-o foo.o";
-            file.write_all(content).unwrap();
-        }
-        let arg = format!("@{}", cmd_file_path.display());
-        let ParsedArguments {
-            input,
-            language,
-            outputs,
-            preprocessor_args,
-            msvc_show_includes,
-            common_args,
-            ..
-        } = match parse_arguments(ovec![arg]) {
-            CompilerArguments::Ok(args) => args,
-            o => panic!("Failed to parse @-file, err: {o:?}"),
-        };
-        assert_eq!(Some("foo.c"), input.to_str());
-        assert_eq!(Language::C, language);
-        assert_map_contains!(
-            outputs,
-            (
-                "obj",
-                ArtifactDescriptor {
-                    path: "foo.o".into(),
-                    optional: false
-                }
-            )
-        );
-        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
-        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
-        assert!(!msvc_show_includes);
+        assert_response_file_parses(b"\n-c foo.c\n-o foo.o", "foo.c", false);
     }
 
     #[test]
     fn test_responsefile_multiline_cr() {
-        let td = tempfile::Builder::new()
-            .prefix("sccache")
-            .tempdir()
-            .unwrap();
-        let cmd_file_path = td.path().join("foo");
-        {
-            let mut file = File::create(&cmd_file_path).unwrap();
-            let content = b"\r-c foo.c\r-o foo.o";
-            file.write_all(content).unwrap();
-        }
-        let arg = format!("@{}", cmd_file_path.display());
-        let ParsedArguments {
-            input,
-            language,
-            outputs,
-            preprocessor_args,
-            msvc_show_includes,
-            common_args,
-            ..
-        } = match parse_arguments(ovec![arg]) {
-            CompilerArguments::Ok(args) => args,
-            o => panic!("Failed to parse @-file, err: {o:?}"),
-        };
-        assert_eq!(Some("foo.c"), input.to_str());
-        assert_eq!(Language::C, language);
-        assert_map_contains!(
-            outputs,
-            (
-                "obj",
-                ArtifactDescriptor {
-                    path: "foo.o".into(),
-                    optional: false
-                }
-            )
-        );
-        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
-        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
-        assert!(!msvc_show_includes);
+        assert_response_file_parses(b"\r-c foo.c\r-o foo.o", "foo.c", false);
     }
 
     #[test]
     fn test_responsefile_encoding_utf16le() {
-        let td = tempfile::Builder::new()
-            .prefix("sccache")
-            .tempdir()
-            .unwrap();
-        let cmd_file_path = td.path().join("foo");
-        {
-            let mut file = File::create(&cmd_file_path).unwrap();
-            // pre-encoded with utf16le
-            let content: [u8; 0x26] = [
-                0xFF, 0xFE, // little endian BOM
-                // `-c foo€.c -o foo.o`
-                0x2D, 0x00, 0x63, 0x00, 0x20, 0x00, 0x66, 0x00, 0x6F, 0x00, 0x6F, 0x00, 0xAC, 0x20,
-                0x2E, 0x00, 0x63, 0x00, 0x20, 0x00, 0x2D, 0x00, 0x6F, 0x00, 0x20, 0x00, 0x66, 0x00,
-                0x6F, 0x00, 0x6F, 0x00, 0x2E, 0x00, 0x6F, 0x00,
-            ];
-            file.write_all(&content).unwrap();
-        }
-        let arg = format!("@{}", cmd_file_path.display());
-        let ParsedArguments {
-            input,
-            language,
-            outputs,
-            preprocessor_args,
-            msvc_show_includes,
-            common_args,
-            ..
-        } = match parse_arguments(ovec![arg]) {
-            CompilerArguments::Ok(args) => args,
-            o => panic!("Failed to parse @-file, err: {o:?}"),
-        };
-        assert_eq!(Some("foo€.c"), input.to_str());
-        assert_eq!(Language::C, language);
-        assert_map_contains!(
-            outputs,
-            (
-                "obj",
-                ArtifactDescriptor {
-                    path: "foo.o".into(),
-                    optional: false
-                }
-            )
-        );
-        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
-        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
-        assert!(!msvc_show_includes);
+        // Pre-encoded UTF-16LE with BOM: -c foo€.c -o foo.o.
+        let content: [u8; 0x26] = [
+            0xFF, 0xFE, 0x2D, 0x00, 0x63, 0x00, 0x20, 0x00, 0x66, 0x00, 0x6F, 0x00, 0x6F, 0x00,
+            0xAC, 0x20, 0x2E, 0x00, 0x63, 0x00, 0x20, 0x00, 0x2D, 0x00, 0x6F, 0x00, 0x20, 0x00,
+            0x66, 0x00, 0x6F, 0x00, 0x6F, 0x00, 0x2E, 0x00, 0x6F, 0x00,
+        ];
+        assert_response_file_parses(&content, "foo€.c", false);
     }
 
     #[test]
     fn test_responsefile_encoding_win1252() {
-        let td = tempfile::Builder::new()
-            .prefix("sccache")
-            .tempdir()
-            .unwrap();
-        let cmd_file_path = td.path().join("foo");
-        {
-            let mut file = File::create(&cmd_file_path).unwrap();
-            // pre-encoded with Windows 1252
-            let content: [u8; 0x12] = [
-                // `-c foo€.c -o foo.o`
-                // the euro symbol is 0x80 in Windows 1252 (and undefined in ISO-8859-1)
-                0x2D, 0x63, 0x20, 0x66, 0x6F, 0x6F, 0x80, 0x2E, 0x63, 0x20, 0x2D, 0x6F, 0x20, 0x66,
-                0x6F, 0x6F, 0x2E, 0x6F,
-            ];
-            file.write_all(&content).unwrap();
-        }
-        let arg = format!("@{}", cmd_file_path.display());
-        let ParsedArguments {
-            input,
-            language,
-            outputs,
-            preprocessor_args,
-            msvc_show_includes,
-            common_args,
-            ..
-        } = match parse_arguments(ovec![arg]) {
-            CompilerArguments::Ok(args) => args,
-            o => panic!("Failed to parse @-file, err: {o:?}"),
-        };
-        assert_eq!(Some("foo€.c"), input.to_str());
-        assert_eq!(Language::C, language);
-        assert_map_contains!(
-            outputs,
-            (
-                "obj",
-                ArtifactDescriptor {
-                    path: "foo.o".into(),
-                    optional: false
-                }
-            )
-        );
-        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
-        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
-        assert!(!msvc_show_includes);
+        // Windows-1252 uses 0x80 for €, unlike ISO-8859-1.
+        let content: [u8; 0x12] = [
+            0x2D, 0x63, 0x20, 0x66, 0x6F, 0x6F, 0x80, 0x2E, 0x63, 0x20, 0x2D, 0x6F, 0x20, 0x66,
+            0x6F, 0x6F, 0x2E, 0x6F,
+        ];
+        assert_response_file_parses(&content, "foo€.c", false);
     }
 
     #[test]

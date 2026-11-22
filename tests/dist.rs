@@ -12,8 +12,8 @@ use crate::harness::{
 use assert_cmd::prelude::*;
 use sccache::config::HTTPUrl;
 use sccache::dist::{
-    AssignJobResult, CompileCommand, InputsReader, JobId, JobState, RunJobResult, ServerIncoming,
-    ServerOutgoing, SubmitToolchainResult, Toolchain, ToolchainReader,
+    AssignJobResult, CompileCommand, InputsReader, JobId, JobState, OutputRequest, RunJobResult,
+    ServerIncoming, ServerOutgoing, SubmitToolchainResult, Toolchain, ToolchainReader,
 };
 use std::env;
 use std::ffi::OsStr;
@@ -233,7 +233,7 @@ impl ServerIncoming for FailingServer {
         requester: &dyn ServerOutgoing,
         job_id: JobId,
         _command: CompileCommand,
-        _outputs: Vec<String>,
+        _outputs: OutputRequest,
         _inputs_rdr: InputsReader,
     ) -> Result<RunJobResult> {
         requester

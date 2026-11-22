@@ -12,68 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::command_helpers::CommandExt;
 use anyhow::{Context, Error, Result, bail};
-use flate2::read::GzDecoder;
+use sccache::compression::ZstdFrame;
+use sccache::compression::deflate::unpack_gzip;
 use sccache::dist::{
-    BuildResult, BuilderIncoming, CompileCommand, InputsReader, OutputData, ProcessOutput, TcCache,
-    Toolchain,
+    BuildResult, BuilderIncoming, CompileCommand, InputsReader, OutputRequest, ProcessOutput,
+    TcCache, Toolchain,
 };
 use sccache::lru_disk_cache::Error as LruError;
 use std::collections::{HashMap, hash_map};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdin, Command, Output, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::{hint, thread};
+use std::thread;
 use uuid::Uuid;
-
-trait CommandExt {
-    fn check_stdout_trim(&mut self) -> Result<String>;
-    fn check_piped(&mut self, pipe: &mut dyn FnMut(&mut ChildStdin) -> Result<()>) -> Result<()>;
-    fn check_run(&mut self) -> Result<()>;
-}
-
-impl CommandExt for Command {
-    fn check_stdout_trim(&mut self) -> Result<String> {
-        let output = self.output().context("Failed to start command")?;
-        check_output(&output)?;
-        let stdout =
-            String::from_utf8(output.stdout).context("Output from listing containers not UTF8")?;
-        Ok(stdout.trim().to_owned())
-    }
-    // Should really take a FnOnce/FnBox
-    fn check_piped(&mut self, pipe: &mut dyn FnMut(&mut ChildStdin) -> Result<()>) -> Result<()> {
-        let mut process = self
-            .stdin(Stdio::piped())
-            .spawn()
-            .context("Failed to start command")?;
-        let mut stdin = process
-            .stdin
-            .take()
-            .context("requested piped stdin but child did not expose it")?;
-        pipe(&mut stdin).context("Failed to pipe input to process")?;
-        let output = process
-            .wait_with_output()
-            .context("Failed to wait for process to return")?;
-        check_output(&output)
-    }
-    fn check_run(&mut self) -> Result<()> {
-        let output = self.output().context("Failed to start command")?;
-        check_output(&output)
-    }
-}
-
-fn check_output(output: &Output) -> Result<()> {
-    if !output.status.success() {
-        warn!(
-            "===========\n{}\n==========\n\n\n\n=========\n{}\n===============\n\n\n",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        bail!("Command failed with status {}", output.status)
-    }
-    Ok(())
-}
 
 // Force remove the container
 fn pot_rm(cid: &str, pot_cmd: &Path) -> Result<()> {
@@ -180,18 +134,18 @@ impl PotBuilder {
         }
     }
 
-    fn clean_container(cid: &str) -> Result<()> {
-        Command::new("pot")
+    fn clean_container(cid: &str, pot_cmd: &Path) -> Result<()> {
+        Command::new(pot_cmd)
             .args(&["stop", "-p", cid])
             .check_run()
             .context("Failed to stop container")?;
 
-        Command::new("pot")
+        Command::new(pot_cmd)
             .args(&["revert", "-p", cid])
             .check_run()
             .context("Failed to revert container")?;
 
-        Command::new("pot")
+        Command::new(pot_cmd)
             .args(&["start", "-p", cid])
             .check_run()
             .context("Failed to (re)start container")?;
@@ -206,7 +160,7 @@ impl PotBuilder {
         cid: String,
         pot_cmd: &Path,
     ) {
-        if let Err(e) = Self::clean_container(&cid) {
+        if let Err(e) = Self::clean_container(&cid, pot_cmd) {
             info!("Failed to clean container {}: {}", cid, e);
             if let Err(e) = pot_rm(&cid, pot_cmd) {
                 warn!(
@@ -240,71 +194,105 @@ impl PotBuilder {
         pot_cmd: &Path,
         pot_clone_args: &[String],
     ) -> Result<String> {
+        // Hold the LRU mutex only long enough to open the archive. Extraction
+        // may be slow, and the open descriptor remains valid after eviction.
+        let toolchain_rdr = {
+            let mut cache = tccache.lock().unwrap();
+            match cache.get(tc) {
+                Ok(rdr) => rdr,
+                Err(LruError::FileNotInCache) => {
+                    bail!("expected toolchain {}, but not available", tc.archive_id)
+                }
+                Err(e) => return Err(Error::from(e).context("failed to get toolchain from cache")),
+            }
+        };
+
         let imagename = format!("sccache-image-{}", &tc.archive_id);
         trace!("Creating toolchain image: {}", imagename);
         let mut clone_args: Vec<&str> = ["clone", "-p", &imagename, "-P", clone_from].to_vec();
-        clone_args.append(&mut pot_clone_args.iter().map(|s| s as &str).collect());
+        clone_args.extend(pot_clone_args.iter().map(String::as_str));
         Command::new(pot_cmd)
             .args(clone_args)
             .check_run()
             .context("Failed to create pot container")?;
 
-        let mut tccache = tccache.lock().unwrap();
-        let toolchain_rdr = match tccache.get(tc) {
-            Ok(rdr) => rdr,
-            Err(LruError::FileNotInCache) => {
-                bail!("expected toolchain {}, but not available", tc.archive_id)
+        // A cloned image must be destroyed if either extraction or snapshot
+        // fails, otherwise subsequent image creation can collide with it.
+        let image_result = (|| -> Result<()> {
+            trace!("Copying in toolchain");
+            if let Err(error) = unpack_gzip(
+                toolchain_rdr,
+                &pot_fs_root.join("jails").join(&imagename).join("m"),
+            ) {
+                warn!("Failed to unpack toolchain: {error:?}");
+                if let Err(cache_error) = tccache.lock().unwrap().remove(tc) {
+                    warn!(
+                        "Failed to remove corrupt toolchain {} from cache: {cache_error:#}",
+                        tc.archive_id
+                    );
+                }
+                return Err(Error::from(error).context("Failed to unpack toolchain"));
             }
-            Err(e) => return Err(Error::from(e).context("failed to get toolchain from cache")),
-        };
 
-        trace!("Copying in toolchain");
-        tar::Archive::new(GzDecoder::new(toolchain_rdr))
-            .unpack(pot_fs_root.join("jails").join(&imagename).join("m"))
-            .or_else(|e| {
-                warn!("Failed to unpack toolchain: {:?}", e);
-                tccache
-                    .remove(tc)
-                    .context("Failed to remove corrupt toolchain")?;
-                Err(Error::from(e))
-            })?;
-
-        Command::new(pot_cmd)
-            .args(&["snapshot", "-p", &imagename])
-            .check_run()
-            .context("Failed to snapshot container after build")?;
-
+            Command::new(pot_cmd)
+                .args(["snapshot", "-p", &imagename])
+                .check_run()
+                .context("Failed to snapshot container after build")
+        })();
+        if let Err(error) = image_result {
+            if let Err(cleanup_error) = pot_rm(&imagename, pot_cmd) {
+                warn!(
+                    "Failed to remove pot image {} after creation failed: {cleanup_error:#}",
+                    imagename
+                );
+            }
+            return Err(error);
+        }
         Ok(imagename)
     }
 
     fn start_container(image: &str, pot_cmd: &Path, pot_clone_args: &[String]) -> Result<String> {
         let cid = format!("sccache-builder-{}", Uuid::new_v4());
         let mut clone_args: Vec<&str> = ["clone", "-p", &cid, "-P", image].to_vec();
-        clone_args.append(&mut pot_clone_args.iter().map(|s| s as &str).collect());
+        clone_args.extend(pot_clone_args.iter().map(String::as_str));
         Command::new(pot_cmd)
             .args(&clone_args)
             .check_run()
             .context("Failed to create pot container")?;
 
-        Command::new(pot_cmd)
-            .args(&["snapshot", "-p", &cid])
-            .check_run()
-            .context("Failed to snapshotpot container")?;
-
-        Command::new(pot_cmd)
-            .args(&["start", "-p", &cid])
-            .check_run()
-            .context("Failed to start container")?;
-        Ok(cid.to_string())
+        let start_result = (|| -> Result<()> {
+            Command::new(pot_cmd)
+                .args(["snapshot", "-p", &cid])
+                .check_run()
+                .context("Failed to snapshot pot container")?;
+            Command::new(pot_cmd)
+                .args(["start", "-p", &cid])
+                .check_run()
+                .context("Failed to start container")
+        })();
+        if let Err(error) = start_result {
+            if let Err(cleanup_error) = pot_rm(&cid, pot_cmd) {
+                warn!(
+                    "Failed to remove pot container {} after startup failed: {cleanup_error:#}",
+                    cid
+                );
+            }
+            return Err(error);
+        }
+        Ok(cid)
     }
 
     fn perform_build(
         compile_command: CompileCommand,
         inputs_rdr: InputsReader,
-        output_paths: Vec<String>,
+        outputs: OutputRequest,
         cid: &str,
         pot_fs_root: &Path,
     ) -> Result<BuildResult> {
+        let OutputRequest {
+            paths: output_paths,
+            compression_level,
+        } = outputs;
         trace!("Compile environment: {:?}", compile_command.env_vars);
         trace!(
             "Compile command: {:?} {:?}",
@@ -313,8 +301,8 @@ impl PotBuilder {
 
         trace!("copying in inputs");
         // not elegant
-        tar::Archive::new(inputs_rdr)
-            .unpack(pot_fs_root.join("jails").join(cid).join("m"))
+        inputs_rdr
+            .unpack(&pot_fs_root.join("jails").join(cid).join("m"))
             .context("Failed to unpack inputs to pot")?;
 
         let CompileCommand {
@@ -326,7 +314,9 @@ impl PotBuilder {
         let cwd = Path::new(&cwd);
 
         trace!("creating output directories");
-        assert!(!output_paths.is_empty());
+        if output_paths.is_empty() {
+            bail!("Pot build requires at least one output path");
+        }
         let mut cmd = Command::new("jexec");
         cmd.args(&[cid, "mkdir", "-p"]).arg(cwd);
         for path in output_paths.iter() {
@@ -376,8 +366,8 @@ impl PotBuilder {
                 .output()
                 .context("Failed to start command to retrieve output file")?;
             if output.status.success() {
-                let output = OutputData::try_from_reader(&*output.stdout)
-                    .context("failed to decode compressed build output")?;
+                let output = ZstdFrame::try_from_reader(&*output.stdout, compression_level)
+                    .context("failed to compress build output")?;
                 outputs.push((path, output))
             } else {
                 debug!("Missing output path {:?}", path)
@@ -399,7 +389,7 @@ impl BuilderIncoming for PotBuilder {
         &self,
         tc: Toolchain,
         command: CompileCommand,
-        outputs: Vec<String>,
+        outputs: OutputRequest,
         inputs_rdr: InputsReader,
         tccache: &Mutex<TcCache>,
     ) -> Result<BuildResult> {
@@ -408,22 +398,61 @@ impl BuilderIncoming for PotBuilder {
             .get_container(&tc, tccache)
             .context("Failed to get a container for build")?;
         debug!("Performing build with container {}", cid);
-        let res = Self::perform_build(command, inputs_rdr, outputs, &cid, &self.pot_fs_root)
-            .context("Failed to perform build")?;
+        let result = Self::perform_build(command, inputs_rdr, outputs, &cid, &self.pot_fs_root)
+            .context("Failed to perform build");
         debug!("Finishing with container {}", cid);
         let cloned = self.clone();
-        let tc = tc;
-        while cloned.cleanup_thread_count.fetch_add(1, Ordering::SeqCst)
-            > self.max_cleanup_thread_count
-        {
-            cloned.cleanup_thread_count.fetch_sub(1, Ordering::SeqCst);
-            hint::spin_loop();
+        loop {
+            let active = cloned.cleanup_thread_count.load(Ordering::Relaxed);
+            if active < self.max_cleanup_thread_count
+                && cloned
+                    .cleanup_thread_count
+                    .compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                break;
+            }
+            thread::yield_now();
         }
         thread::spawn(move || {
             Self::finish_container(cloned.container_lists, tc, cid, &cloned.pot_cmd);
-            cloned.cleanup_thread_count.fetch_sub(1, Ordering::SeqCst);
+            cloned.cleanup_thread_count.fetch_sub(1, Ordering::Release);
         });
         debug!("Returning result");
-        Ok(res)
+        result
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn missing_toolchain_is_rejected_before_cloning_pot() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cache = Mutex::new(TcCache::new(&dir.path().join("toolchains"), 1024 * 1024)?);
+        let tc = Toolchain {
+            archive_id: sccache::dist::ArchiveId::try_from("d".repeat(64))?,
+        };
+        let error = PotBuilder::make_image(
+            &tc,
+            &cache,
+            dir.path(),
+            "base",
+            Path::new("/missing-pot-command"),
+            &[],
+        )
+        .expect_err("missing archive must not launch pot");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("expected toolchain {}", tc.archive_id))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_uses_configured_pot_command() -> Result<()> {
+        PotBuilder::clean_container("test-container", Path::new("/usr/bin/true"))
     }
 }

@@ -30,11 +30,11 @@ jobs:
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: "1.99.0"
+          toolchain: "nightly-2026-11-20"
       - name: Setup mandatory compiler sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@2376b14a6bc8263ab77013bd744248f49384b2fa # main
         with:
-          rust-toolchain: "1.99.0"
+          rust-toolchain: "nightly-2026-11-20"
 
       - name: Build
         run: |
@@ -42,7 +42,7 @@ jobs:
 
       - name: Finalize mandatory compiler sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@2376b14a6bc8263ab77013bd744248f49384b2fa # main
 
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -114,11 +114,11 @@ jobs:
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: "1.99.0"
+          toolchain: "nightly-2026-11-20"
       - name: Setup mandatory compiler sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@2376b14a6bc8263ab77013bd744248f49384b2fa # main
         with:
-          rust-toolchain: "1.99.0"
+          rust-toolchain: "nightly-2026-11-20"
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -158,7 +158,7 @@ jobs:
 
       - name: Finalize mandatory compiler sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@2376b14a6bc8263ab77013bd744248f49384b2fa # main
 
   test-mock-msvc:
     if: startsWith(github.ref, 'refs/tags/')
@@ -179,19 +179,19 @@ jobs:
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: "1.99.0"
+          toolchain: "nightly-2026-11-20"
           target: $TARGET
       - name: Setup mandatory compiler sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@2376b14a6bc8263ab77013bd744248f49384b2fa # main
         with:
-          rust-toolchain: "1.99.0"
+          rust-toolchain: "nightly-2026-11-20"
 
       - name: Build
         run: cargo build --bin sccache --target $env:TARGET --features=vendored-openssl
 
       - name: Finalize mandatory compiler sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@2376b14a6bc8263ab77013bd744248f49384b2fa # main
       - name: Use test-owned Windows cache daemon port
         shell: pwsh
         run: '"SCCACHE_SERVER_PORT=4226" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
@@ -295,9 +295,9 @@ jobs:
       #       core.exportVariable('ROCM_PATH', process.env.ROCM_PATH || '');
 
       - name: Setup mandatory compiler sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@2376b14a6bc8263ab77013bd744248f49384b2fa # main
         with:
-          rust-toolchain: "1.99.0"
+          rust-toolchain: "nightly-2026-11-20"
 
       - name: Install dependencies
         shell: bash
@@ -311,7 +311,7 @@ jobs:
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: "1.99.0"
+          toolchain: "nightly-2026-11-20"
 
       - name: Build & setup librandomize_readdir
         run: |
@@ -319,7 +319,7 @@ jobs:
 
       - name: Finalize mandatory compiler sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@2376b14a6bc8263ab77013bd744248f49384b2fa # main
       - name: Switch to test-owned HIP compiler cache daemon port
         shell: bash
         run: echo "SCCACHE_SERVER_PORT=4226" >> "$GITHUB_ENV"
@@ -384,11 +384,11 @@ jobs:
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: "1.99.0"
+          toolchain: "nightly-2026-11-20"
       - name: Setup mandatory compiler sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@2376b14a6bc8263ab77013bd744248f49384b2fa # main
         with:
-          rust-toolchain: "1.99.0"
+          rust-toolchain: "nightly-2026-11-20"
 
       - name: Build sccache
         run: |
@@ -396,7 +396,7 @@ jobs:
 
       - name: Finalize mandatory compiler sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@902094bd4b69dc21860a6253bbc819542a2acfa3 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@2376b14a6bc8263ab77013bd744248f49384b2fa # main
       - name: Switch to test-owned Xcode compiler cache daemon port
         shell: bash
         run: echo "SCCACHE_SERVER_PORT=4226" >> "$GITHUB_ENV"

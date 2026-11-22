@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $EUID == 0 ]] || { echo "test-host-native-metadata requires root for trusted-path fixtures" >&2; exit 2; }
+here="$(cd -- "$(dirname -- "$0")" && pwd -P)"
+work="$(mktemp -d /var/lib/sccache-host-native-test.XXXXXX)"
+trap 'rm -rf -- "$work"' EXIT
+chmod 0700 "$work"
+source_sha=0123456789abcdef0123456789abcdef01234567
+tag="sccache-ci-$source_sha"
+bundle="$work/native/$source_sha"
+published="$work/cache/$tag"
+mkdir -p "$bundle" "$published" "$work/state" "$work/mock-bin"
+
+cat > "$published/build.txt" <<EOF
+source_sha=$source_sha
+rust_toolchain=nightly-2026-11-20
+rustflags=-C target-cpu=x86-64-v2
+features=s3,gha,dist-client,dist-server,direct-metrics,vendored-openssl
+dist_protocol=3
+rollout_epoch=4
+openssl_linkage=vendored-static
+capabilities=direct-metrics
+EOF
+cp "$published/build.txt" "$bundle/build.txt"
+sed -i 's/target-cpu=x86-64-v2/target-cpu=native/' "$bundle/build.txt"
+printf 'build_kind=host-native\nhost_fingerprint=%s\n' "$("$here/host-native-metadata" fingerprint)" >> "$bundle/build.txt"
+cat > "$published/sccache-linux-x86_64-v2" <<'EOF'
+#!/bin/bash
+case "$1" in
+    --capabilities) echo direct-metrics ;;
+    --version) echo portable-fixture ;;
+    *) exit 1 ;;
+esac
+EOF
+cp "$published/sccache-linux-x86_64-v2" "$published/sccache-dist-linux-x86_64-v2"
+sed 's/portable-fixture/native-fixture/' "$published/sccache-linux-x86_64-v2" > "$bundle/sccache"
+cp "$bundle/sccache" "$bundle/sccache-dist"
+chmod 0755 "$bundle/sccache" "$bundle/sccache-dist" "$published/"sccache*-x86_64-v2
+(cd "$published" && sha256sum sccache-linux-x86_64-v2 sccache-dist-linux-x86_64-v2 > SHA256SUMS)
+refresh_hashes() { (cd "$bundle" && sha256sum sccache sccache-dist build.txt > SHA256SUMS); }
+refresh_hashes
+verify() { "$here/host-native-metadata" verify "$bundle" "$published/build.txt"; }
+reject() {
+    if verify >/dev/null 2>&1; then
+        echo "UNEXPECTED ACCEPTANCE: $1" >&2
+        exit 1
+    fi
+    printf 'rejected: %s\n' "$1"
+}
+verify
+cp "$bundle/build.txt" "$work/valid-build.txt"
+printf '\ncorruption' >> "$bundle/sccache"
+reject "changed binary"
+cp "$bundle/sccache-dist" "$bundle/sccache"
+refresh_hashes
+sed -i 's/^host_fingerprint=.*/host_fingerprint=wrong-machine/' "$bundle/build.txt"
+refresh_hashes
+reject "different host fingerprint"
+cp "$work/valid-build.txt" "$bundle/build.txt"
+sed -i 's/^source_sha=.*/source_sha=wrong-source/' "$bundle/build.txt"
+refresh_hashes
+reject "different source revision"
+cp "$work/valid-build.txt" "$bundle/build.txt"
+printf 'source_sha=%s\n' "$source_sha" >> "$bundle/build.txt"
+refresh_hashes
+reject "duplicate manifest field"
+cp "$work/valid-build.txt" "$bundle/build.txt"
+refresh_hashes
+chmod g+w "$bundle"
+reject "group writable directory"
+chmod g-w "$bundle"
+mv "$bundle/sccache" "$bundle/sccache.real"
+ln -s sccache.real "$bundle/sccache"
+reject "symlink"
+rm "$bundle/sccache"
+mv "$bundle/sccache.real" "$bundle/sccache"
+verify
+
+# Integration with the actual updater, with no network or service actions.
+cat > "$work/mock-bin/curl" <<'EOF'
+#!/bin/bash
+case "$*" in
+    *api.github.com*/releases/tags/*) echo '{"published_at":"2026-11-20T00:00:00Z"}' ;;
+    *) echo "unexpected HTTP request: $*" >&2; exit 1 ;;
+esac
+EOF
+chmod 0755 "$work/mock-bin/curl"
+export PATH="$work/mock-bin:$PATH"
+export SCCACHE_AUTOUPDATE_TAG="$tag" SCCACHE_AUTOUPDATE_STATE_DIR="$work/state"
+export SCCACHE_AUTOUPDATE_CACHE_DIR="$work/cache" SCCACHE_AUTOUPDATE_LOCK="$work/lock"
+export SCCACHE_AUTOUPDATE_EXPECTED_ROLLOUT_EPOCH=4
+export SCCACHE_AUTOUPDATE_EXPECTED_RUST_TOOLCHAIN=nightly-2026-11-20
+export SCCACHE_AUTOUPDATE_LIVE="$work/no-client" SCCACHE_AUTOUPDATE_DIST_LIVE="$work/no-worker"
+export SCCACHE_AUTOUPDATE_NATIVE_BUNDLE_ROOT="$work/native"
+actual="$("$here/sccache-release-update" --check-only)"
+hash="$(sha256sum "$bundle/sccache" | cut -d ' ' -f1)"
+[[ "$actual" == *"candidate_sha256=$hash "* ]]
+echo "selected native bundle"
+mv "$bundle" "$work/missing-bundle"
+actual="$("$here/sccache-release-update" --check-only)"
+[[ "$actual" == *"awaiting host-native bundle"* ]]
+echo "missing native bundle defers update"
+unset SCCACHE_AUTOUPDATE_NATIVE_BUNDLE_ROOT
+actual="$("$here/sccache-release-update" --check-only)"
+hash="$(sha256sum "$published/sccache-linux-x86_64-v2" | cut -d ' ' -f1)"
+[[ "$actual" == *"candidate_sha256=$hash "* ]]
+echo "selected portable bundle only when explicitly not in native mode"
+[[ -z "$(ls -A "$work/state")" ]]
+echo HOST_NATIVE_METADATA_TESTS_PASSED
+
