@@ -741,6 +741,44 @@ mod tests {
     }
 
     #[test]
+    fn discovers_registry_dependency_target_without_out_dir_or_target_env()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let registry = temp.path().join("cargo/registry/src/index/hashbrown");
+        let target = temp.path().join("workspace/target");
+        let output = target.join("debug/deps");
+        std::fs::create_dir_all(&registry)?;
+        std::fs::create_dir_all(&output)?;
+        std::fs::write(
+            registry.join("Cargo.toml"),
+            "[package]\nname='hashbrown'\nversion='0.1.0'\n",
+        )?;
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )?;
+        let dependency = output.join("liballocator_api2-abcdef.rmeta");
+        std::fs::write(&dependency, b"metadata")?;
+        let env = vec![("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into())];
+
+        let roots = CanonicalRustPaths::from_env_with_output_dir(
+            &env,
+            &registry,
+            Path::new("/rust"),
+            Some(&output),
+            None,
+        )
+        .expect("compiler output must identify the shared target");
+        assert_eq!(roots.target_root, target);
+        assert!(roots.root_is_known(&dependency));
+        assert_eq!(
+            roots.to_canonical(&dependency),
+            Path::new("/target/debug/deps/liballocator_api2-abcdef.rmeta")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn canonicalizes_separate_persistent_and_ephemeral_cargo_output_roots() {
         let temp = tempfile::tempdir().unwrap();
         let registry_crate = temp.path().join("registry/crate");
