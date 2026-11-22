@@ -2105,11 +2105,11 @@ pub mod scheduler {
         }
     }
 
-    /// Owner-configured origin for original Rust distribution archives.
+    /// Owner-configured repository prefix for original package archives.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
-    pub struct RustPackageUpstream {
-        pub origin: super::HTTPUrl,
+    pub struct PackageUpstream {
+        pub origin: reqwest::Url,
         pub timeout_secs: u64,
     }
 
@@ -2131,7 +2131,8 @@ pub mod scheduler {
         pub http_threads: usize,
         pub max_metadata_bytes: usize,
         pub package_import: Option<crate::build_runtime::PackageImportLimits>,
-        pub package_upstream: Option<RustPackageUpstream>,
+        #[serde(default)]
+        pub package_upstreams: std::collections::BTreeMap<String, PackageUpstream>,
     }
 
     impl NativeCacheConfig {
@@ -2166,19 +2167,11 @@ pub mod scheduler {
                     bail!("native package concurrency exceeds total upload capacity");
                 }
             }
-            if let Some(upstream) = &self.package_upstream {
-                let url = upstream.origin.to_url();
-                if self.package_import.is_none()
-                    || upstream.timeout_secs == 0
-                    || !matches!(url.scheme(), "http" | "https")
-                    || url.host_str().is_none()
-                    || url.path() != "/"
-                    || url.query().is_some()
-                    || url.fragment().is_some()
-                    || !url.username().is_empty()
-                    || url.password().is_some()
-                {
-                    bail!("invalid Rust package upstream configuration");
+            for (name, upstream) in &self.package_upstreams {
+                crate::dist::native::validate_upstream_name(name)?;
+                crate::dist::native::validate_upstream_base(&upstream.origin)?;
+                if self.package_import.is_none() || upstream.timeout_secs == 0 {
+                    bail!("original package upstream needs import limits and a nonzero timeout");
                 }
             }
             Ok(limits)

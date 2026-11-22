@@ -21,7 +21,10 @@ use crate::build_runtime::{
 use crate::dist::JobId;
 
 mod package;
-pub use package::{PackageAcquisition, RustPackageLocator, map_packages};
+pub use package::{
+    PackageAcquisition, PackageLocator, map_packages, validate_upstream_base,
+    validate_upstream_name,
+};
 
 type LeaseCheck<'a> = dyn Fn() -> Result<()> + Sync + 'a;
 
@@ -189,10 +192,40 @@ impl NativeCacheClient {
     /// bytes from the configured Rust distribution origin.
     /// # Errors
     /// Returns an error for unavailable provisioning, invalid provenance or transport failure.
-    pub fn acquire_rust_package(&self, locator: &RustPackageLocator) -> Result<PackageAcquisition> {
+    pub fn acquire_rust_package(
+        &self,
+        locator: &PackageLocator,
+    ) -> Result<PackageAcquisition<InstallationManifest>> {
         locator.validate()?;
-        let result: PackageAcquisition = self.package_control("package_acquire", locator)?;
-        validate_installation_manifest(locator.identity, &result.manifest)?;
+        let result: PackageAcquisition<InstallationManifest> =
+            self.package_control("rust_package_acquire", locator)?;
+        validate_installation_manifest(locator.identity, &result.package)?;
+        ensure!(
+            locator
+                .expected_size
+                .is_none_or(|size| size == result.package.source.size),
+            "incorrect original package length"
+        );
+        Ok(result)
+    }
+
+    /// Acquire a generic original archive from a configured repository.
+    /// # Errors
+    /// Returns an error for invalid provenance, unavailable package or transport failure.
+    pub fn acquire_package(
+        &self,
+        locator: &PackageLocator,
+    ) -> Result<PackageAcquisition<PackageReceipt>> {
+        locator.validate()?;
+        let result: PackageAcquisition<PackageReceipt> =
+            self.package_control("package_acquire", locator)?;
+        ensure!(
+            result.package.source.identity == locator.identity
+                && locator
+                    .expected_size
+                    .is_none_or(|size| size == result.package.source.size),
+            "incorrect original package provenance"
+        );
         Ok(result)
     }
 

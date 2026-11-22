@@ -37,7 +37,9 @@ pub enum Command {
     NativeProvisionPackage {
         client_config: std::path::PathBuf,
         archive: Option<std::path::PathBuf>,
-        source: sccache::build_runtime::PackageSource,
+        identity: sccache::build_runtime::PackageIdentity,
+        expected_size: Option<u64>,
+        locator: Option<sccache::dist::native::PackageLocator>,
     },
     NativeProvisionRust {
         client_config: std::path::PathBuf,

@@ -183,6 +183,8 @@ fn get_clap_command() -> ClapCommand {
         .subcommand(
             package_args(ClapCommand::new("native-provision-package"))
                 .about("Provision or resolve an original tar archive for native content transport")
+                .arg(flag_infer_long("upstream").requires("path").conflicts_with("archive"))
+                .arg(flag_infer_long("path").requires("upstream"))
                 .arg(flag_infer_long("client-config").value_parser(clap::value_parser!(PathBuf)).required(true))
         )
         .subcommand(
@@ -286,14 +288,35 @@ pub fn try_parse_from(
                 .get_one::<u64>("memory-bytes")
                 .context("missing memory limit")?,
         },
-        Some(("native-provision-package", matches)) => Command::NativeProvisionPackage {
-            client_config: matches
-                .get_one::<PathBuf>("client-config")
-                .context("missing client configuration")?
-                .clone(),
-            archive: matches.get_one::<PathBuf>("archive").cloned(),
-            source: package_source(matches)?,
-        },
+        Some(("native-provision-package", matches)) => {
+            let identity = package_identity(matches)?;
+            let locator = matches
+                .get_one::<String>("upstream")
+                .map(|upstream| {
+                    let locator = sccache::dist::native::PackageLocator {
+                        identity,
+                        expected_size: matches.get_one::<u64>("size").copied(),
+                        upstream: upstream.clone(),
+                        path: matches
+                            .get_one::<String>("path")
+                            .context("missing upstream path")?
+                            .clone(),
+                    };
+                    locator.validate()?;
+                    Ok::<_, anyhow::Error>(locator)
+                })
+                .transpose()?;
+            Command::NativeProvisionPackage {
+                client_config: matches
+                    .get_one::<PathBuf>("client-config")
+                    .context("missing client configuration")?
+                    .clone(),
+                archive: matches.get_one::<PathBuf>("archive").cloned(),
+                identity,
+                expected_size: matches.get_one::<u64>("size").copied(),
+                locator,
+            }
+        }
         Some(("native-provision-rust", matches)) => Command::NativeProvisionRust {
             client_config: matches
                 .get_one::<PathBuf>("client-config")
@@ -535,11 +558,7 @@ fn package_args(command: ClapCommand) -> ClapCommand {
     command
         .arg(flag_infer_long("archive").value_parser(clap::value_parser!(PathBuf)))
         .arg(flag_infer_long("sha256").required(true))
-        .arg(
-            flag_infer_long("size")
-                .value_parser(clap::value_parser!(u64))
-                .required(true),
-        )
+        .arg(flag_infer_long("size").value_parser(clap::value_parser!(u64)))
         .arg(
             flag_infer_long("compression")
                 .value_parser(["xz", "gzip", "tar", "zstd"])
@@ -549,19 +568,26 @@ fn package_args(command: ClapCommand) -> ClapCommand {
 
 fn installer_args(command: ClapCommand) -> ClapCommand {
     package_args(command)
+        .mut_arg("size", |arg| arg.required(true))
         .arg(flag_infer_long("manifest-output").value_parser(clap::value_parser!(PathBuf)))
+}
+
+fn package_identity(
+    matches: &clap::ArgMatches,
+) -> anyhow::Result<sccache::build_runtime::PackageIdentity> {
+    sccache::build_runtime::PackageIdentity::from_sha256_hex(
+        matches
+            .get_one::<String>("sha256")
+            .context("missing SHA-256")?,
+        package_compression(matches)?,
+    )
 }
 
 fn package_source(
     matches: &clap::ArgMatches,
 ) -> anyhow::Result<sccache::build_runtime::PackageSource> {
     Ok(sccache::build_runtime::PackageSource {
-        identity: sccache::build_runtime::PackageIdentity::from_sha256_hex(
-            matches
-                .get_one::<String>("sha256")
-                .context("missing SHA-256")?,
-            package_compression(matches)?,
-        )?,
+        identity: package_identity(matches)?,
         size: *matches
             .get_one::<u64>("size")
             .context("missing package size")?,

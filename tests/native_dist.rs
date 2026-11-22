@@ -171,7 +171,7 @@ struct Fleet {
 impl Fleet {
     fn start(
         root: &Path,
-        package_upstream: Option<scheduler::RustPackageUpstream>,
+        package_upstreams: BTreeMap<String, scheduler::PackageUpstream>,
     ) -> Result<Self> {
         let [scheduler_address, cache_address, worker_address] = addresses()?;
         let scheduler_url = reqwest::Url::parse(&format!("http://{scheduler_address}/"))?;
@@ -209,7 +209,7 @@ impl Fleet {
                     http_threads: 8,
                     max_metadata_bytes: 64 * 1024 * 1024,
                     package_import: Some(package_limits(true)),
-                    package_upstream,
+                    package_upstreams,
                 }),
             },
         )?;
@@ -491,10 +491,13 @@ fn rustup_sync_acquires_once_and_reuses_portable_recipe_and_catalog() -> Result<
     let upstream = OriginalUpstream::start(archives)?;
     let fleet = Fleet::start(
         root,
-        Some(scheduler::RustPackageUpstream {
-            origin: HTTPUrl::from_url(upstream.origin.clone()),
-            timeout_secs: 10,
-        }),
+        BTreeMap::from([(
+            "rust".into(),
+            scheduler::PackageUpstream {
+                origin: upstream.origin.clone(),
+                timeout_secs: 10,
+            },
+        )]),
     )?;
     let config = provisioning_config(root, &fleet.cache_url)?;
     let catalog = root.join("installation.catalog");
@@ -575,7 +578,7 @@ fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
 
     let temp = tempfile::tempdir()?;
     let root = temp.path();
-    let fleet = Fleet::start(root, None)?;
+    let fleet = Fleet::start(root, BTreeMap::new())?;
     let bytes = rust_installer_fixture("compiler", "bin/rustc", b"original compiler bytes")?;
     let archive = root.join("package.tar");
     fs::write(&archive, &bytes)?;
@@ -680,6 +683,114 @@ fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[ignore = "requires Linux native scheduler and worker processes"]
+fn named_system_upstream_provisions_original_without_client_upload() -> Result<()> {
+    use sccache::build_runtime::{PackageCompression, PackageIdentity};
+    use sccache::dist::native::PackageLocator;
+    use sha2::{Digest, Sha256};
+
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let bytes = zstd::stream::encode_all(
+        rust_installer_fixture("compiler", "bin/tool", b"system compiler payload")?.as_slice(),
+        1,
+    )?;
+    let identity = PackageIdentity {
+        sha256: Sha256::digest(&bytes).into(),
+        compression: PackageCompression::Zstd,
+    };
+    let size = u64::try_from(bytes.len())?;
+    let path = "core/gcc-16.2.1+r23-x86_64_v3.pkg.tar.zst";
+    let upstream = OriginalUpstream::start(BTreeMap::from([(format!("/repo/{path}"), bytes)]))?;
+    let fleet = Fleet::start(
+        root,
+        BTreeMap::from([(
+            "distro".into(),
+            scheduler::PackageUpstream {
+                origin: upstream.origin.join("repo/")?,
+                timeout_secs: 10,
+            },
+        )]),
+    )?;
+    let client = NativeCacheClient::new(
+        fleet.cache_url.clone(),
+        CLIENT_TOKEN.into(),
+        Duration::from_secs(30),
+        1024 * 1024,
+    )?;
+    let locator = PackageLocator {
+        identity,
+        expected_size: Some(size),
+        upstream: "distro".into(),
+        path: path.into(),
+    };
+    assert!(
+        client
+            .acquire_package(&PackageLocator {
+                upstream: "unknown".into(),
+                ..locator.clone()
+            })
+            .is_err()
+    );
+    assert!(
+        client
+            .acquire_package(&PackageLocator {
+                expected_size: Some(size - 1),
+                ..locator.clone()
+            })
+            .is_err()
+    );
+    assert!(client.lookup_package(identity)?.is_none());
+    let config = provisioning_config(root, &fleet.cache_url)?;
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sccache-dist"));
+        command
+            .args(["native-provision-package", "--client-config"])
+            .arg(&config)
+            .args([
+                "--sha256",
+                &identity.checksum_hex(),
+                "--compression",
+                "zstd",
+                "--upstream",
+                "distro",
+                "--path",
+                path,
+            ]);
+        command
+    };
+    let cold = command().output()?;
+    ensure!(
+        cold.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cold.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&cold.stdout)?;
+    assert_eq!(report["reused_original_package"], false);
+    let receipt = client
+        .lookup_package(identity)?
+        .context("original package missing")?;
+    assert_eq!(receipt.source.size, size);
+    let warm = client.acquire_package(&locator)?;
+    assert!(warm.reused);
+    assert_eq!(warm.package, receipt);
+    assert_eq!(upstream.count(), 2);
+    let warm = command().output()?;
+    ensure!(
+        warm.status.success(),
+        "{}",
+        String::from_utf8_lossy(&warm.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&warm.stdout)?["reused_original_package"],
+        true
+    );
+    assert_eq!(upstream.count(), 2);
+    fleet.finish()?;
+    Ok(())
+}
+
 fn provision_compressed_fixture(
     client: &NativeCacheClient,
     root: &Path,
@@ -738,7 +849,7 @@ fn provision_compressed_fixture(
 fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path();
-    let fleet = Fleet::start(root, None)?;
+    let fleet = Fleet::start(root, BTreeMap::new())?;
     let worker_address = fleet.worker_address;
     let cache_url = fleet.cache_url.clone();
     let client = NativeCacheClient::new(
@@ -1374,7 +1485,7 @@ fn audit_index(index: &Path, component: &str) -> Result<ComponentAudit> {
 fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;
-    let fleet = Fleet::start(&root, None)?;
+    let fleet = Fleet::start(&root, BTreeMap::new())?;
     let mut service = LocalService::start(&root, &fleet, None)?;
     let rustc = Command::new("rustc")
         .args(["--print", "sysroot"])
@@ -1500,7 +1611,7 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
 fn native_local_execution_in_networkless_namespace_shares_remote_actions() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path().canonicalize()?;
-    let fleet = Fleet::start(&root, None)?;
+    let fleet = Fleet::start(&root, BTreeMap::new())?;
     let rustc = Command::new("rustc")
         .args(["--print", "sysroot"])
         .output()?;

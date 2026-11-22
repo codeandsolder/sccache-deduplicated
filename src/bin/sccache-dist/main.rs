@@ -280,22 +280,35 @@ fn run(command: Command) -> Result<i32> {
         Command::NativeProvisionPackage {
             client_config,
             archive,
-            source,
+            identity,
+            expected_size,
+            locator,
         } => {
+            use sccache::build_runtime::PackageSource;
             let client = package_client(&client_config)?;
-            let (receipt, reused) = if let Some(receipt) = client.lookup_package(source.identity)? {
-                anyhow::ensure!(
-                    receipt.source == source,
-                    "original package length differs from verified source"
-                );
+            let (receipt, reused) = if let Some(receipt) = client.lookup_package(identity)? {
                 (receipt, true)
+            } else if let Some(locator) = locator {
+                let acquired = client.acquire_package(&locator)?;
+                (acquired.package, acquired.reused)
             } else {
-                let archive = archive.context("upstream package unavailable; supply --archive")?;
+                let archive = std::fs::File::open(archive.context(
+                    "upstream package unavailable; supply --archive or --upstream and --path",
+                )?)?;
+                let size = archive.metadata()?.len();
+                anyhow::ensure!(
+                    expected_size.is_none_or(|expected| expected == size),
+                    "original package length differs from supplied size"
+                );
                 (
-                    client.import_package(source, std::fs::File::open(archive)?)?,
+                    client.import_package(PackageSource { identity, size }, archive)?,
                     false,
                 )
             };
+            anyhow::ensure!(
+                expected_size.is_none_or(|expected| expected == receipt.source.size),
+                "original package length differs from supplied size"
+            );
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({

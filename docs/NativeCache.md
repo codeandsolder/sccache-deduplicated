@@ -457,20 +457,33 @@ compressed original's physical storage expense on the scheduler; it
 is optional and governs new ingestion. Recreate earlier draft stores
 because the package index layout has changed.
 
-### Automatic Rustup provisioning
+### Direct upstream acquisition
 
-To let the scheduler acquire missing original packages directly, additionally
-configure its allowed distribution origin and request deadline:
+To let the scheduler acquire original archives without client uploads, configure
+named repositories with their allowed URL prefix and request deadline:
 
 ```toml
-[native_cache.package_upstream]
+[native_cache.package_upstreams.rust]
 origin = "https://static.rust-lang.org/"
+timeout_secs = 180
+
+[native_cache.package_upstreams.distro]
+origin = "https://mirror.example.org/repository/"
 timeout_secs = 180
 ```
 
-The server combines the configured origin with independently validated
-distribution paths beneath /dist/, disables redirects, and does not forward
-client authorization upstream. Concurrent acquisitions of the same checksum and codec share one reservation;
+Generic archives use a named repository and a relative path from trusted
+package metadata (the mirror above is illustrative):
+
+```sh
+sccache-dist native-provision-package --client-config /path/to/client.toml \
+  --sha256 "$trusted_sha256" --compression zstd \
+  --upstream distro --path "core/gcc-<version>-<arch>.pkg.tar.zst"
+```
+
+An optional --size provides an exact compressed-length expectation. The
+server resolves independently validated path segments beneath the configured
+prefix, disables redirects, and does not forward client authorization upstream. Concurrent acquisitions of the same checksum and codec share one reservation;
 independent packages may progress within configured concurrency limits. Warm
 lookups do not wait for unrelated downloads. Clients retry busy replies
 within their configured request deadline.
@@ -478,7 +491,10 @@ The scheduler streams compressed content into staging, enforces its archive
 byte limit even without Content-Length, verifies the release SHA-256, and
 decodes into the existing CAS. Verified hits do not contact the origin.
 
-On each Rustup installation host, run:
+### Automatic Rustup provisioning
+
+Rustup uses the repository named rust and paths beneath dist/. On each
+Rustup installation host, run:
 
 ```sh
 sccache-dist native-sync-rust --root /path/to/installed/sysroot \

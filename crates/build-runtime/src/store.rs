@@ -47,8 +47,9 @@ struct ActionRecord {
     result: ResultId,
 }
 
-/// A verified immutable blob staged for publication. Dropping it before
-/// publication discards the temporary file. Closed, owner-private paths
+/// A verified immutable blob staged for publication.
+///
+/// Dropping it before publication discards the temporary file. Closed, owner-private paths
 /// keep descriptor use proportional to active transfers, not manifest size.
 pub struct StagedBlob {
     path: TempPath,

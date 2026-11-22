@@ -13,10 +13,10 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use sccache::{
     build_runtime::{
-        InstallationCatalog, InstallationRecipe, InstalledComponent, PackageCompression,
-        PackageIdentity, TreePath,
+        InstallationCatalog, InstallationManifest, InstallationRecipe, InstalledComponent,
+        PackageCompression, PackageIdentity, TreePath,
     },
-    dist::native::{NativeCacheClient, PackageAcquisition, RustPackageLocator, map_packages},
+    dist::native::{NativeCacheClient, PackageAcquisition, PackageLocator, map_packages},
 };
 use serde::Deserialize;
 
@@ -76,7 +76,7 @@ struct DistributionTarget {
 }
 
 impl DistributionTarget {
-    fn locator(&self) -> Result<RustPackageLocator> {
+    fn locator(&self) -> Result<PackageLocator> {
         ensure!(
             self.available,
             "installed component not available in release metadata"
@@ -92,13 +92,13 @@ impl DistributionTarget {
             ),
             _ => anyhow::bail!("incomplete XZ package metadata"),
         };
-        RustPackageLocator::from_url(PackageIdentity::from_sha256_hex(hash, compression)?, url)
+        PackageLocator::from_rust_url(PackageIdentity::from_sha256_hex(hash, compression)?, url)
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct SelectedComponent {
-    locator: RustPackageLocator,
+    locator: PackageLocator,
     names: Vec<String>,
 }
 
@@ -265,12 +265,12 @@ impl Inventory {
                 report.acquired_packages += 1;
                 report.downloaded_archive_bytes = report
                     .downloaded_archive_bytes
-                    .checked_add(package.manifest.source.size)
+                    .checked_add(package.package.source.size)
                     .context("original Rust download byte count overflow")?;
             }
-            let identity = package.manifest.source.identity;
+            let identity = package.package.source.identity;
             ensure!(
-                recipe.packages.insert(identity, package.manifest).is_none(),
+                recipe.packages.insert(identity, package.package).is_none(),
                 "duplicate acquired package"
             );
         }
@@ -301,9 +301,9 @@ impl Inventory {
 
 fn acquire_packages(
     client: &NativeCacheClient,
-    requests: &[&RustPackageLocator],
+    requests: &[&PackageLocator],
     jobs: NonZeroUsize,
-) -> Result<Vec<PackageAcquisition>> {
+) -> Result<Vec<PackageAcquisition<InstallationManifest>>> {
     map_packages(requests, jobs, |locator| {
         let package = client
             .acquire_rust_package(locator)

@@ -9,22 +9,24 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::build_runtime::{InstallationManifest, PackageCompression, PackageIdentity};
+use crate::build_runtime::PackageIdentity;
 
-/// The client supplies the exact checksum from its release manifest and a
-/// path inside the configured Rust distribution origin, never an arbitrary
-/// scheduler download URL.
+/// An original archive checksum and a relative path within a named,
+/// administrator-configured repository. Never a caller-supplied download URL.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RustPackageLocator {
+pub struct PackageLocator {
     pub identity: PackageIdentity,
+    pub expected_size: Option<u64>,
+    pub upstream: String,
     pub path: String,
 }
 
-impl RustPackageLocator {
-    /// Derive an upstream locator from Rust release metadata.
+impl PackageLocator {
+    /// Derive an explicit Rust distribution locator from release metadata.
+    /// The manifest URL supplies only the relative distribution path.
     /// # Errors
     /// Returns an error for an invalid distribution URL or path.
-    pub fn from_url(identity: PackageIdentity, url: &str) -> Result<Self> {
+    pub fn from_rust_url(identity: PackageIdentity, url: &str) -> Result<Self> {
         let url = reqwest::Url::parse(url)?;
         ensure!(
             matches!(url.scheme(), "https" | "http")
@@ -42,47 +44,93 @@ impl RustPackageLocator {
             .1;
         let locator = Self {
             identity,
-            path: format!("/dist/{path}"),
+            expected_size: None,
+            upstream: "rust".into(),
+            path: format!("dist/{path}"),
         };
         locator.validate()?;
         Ok(locator)
     }
 
     /// Check the wire path independently of client-side URL parsing.
+    /// Archive format is determined by the verified bytes and declared
+    /// codec, not by a filename extension.
     /// # Errors
-    /// Returns an error for traversal, URL syntax or incorrect codec suffix.
+    /// Returns an error for invalid repository identifiers or paths.
     pub fn validate(&self) -> Result<()> {
-        let path = self
-            .path
-            .strip_prefix("/dist/")
-            .context("package path outside dist directory")?;
+        validate_upstream_name(&self.upstream)?;
         ensure!(
-            path.len() <= 1024
-                && path.split('/').all(|part| {
+            self.path.len() <= 4096
+                && self.path.split('/').all(|part| {
                     !part.is_empty()
                         && part != "."
                         && part != ".."
                         && part.bytes().all(|byte| {
-                            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                            byte.is_ascii_alphanumeric()
+                                || matches!(byte, b'-' | b'_' | b'.' | b'+' | b'~' | b'@')
                         })
                 }),
-            "invalid Rust distribution path"
+            "invalid original package relative path"
         );
-        let suffix = match self.identity.compression {
-            PackageCompression::Tar => ".tar",
-            PackageCompression::Gzip => ".tar.gz",
-            PackageCompression::Xz => ".tar.xz",
-            PackageCompression::Zstd => ".tar.zst",
-        };
-        ensure!(path.ends_with(suffix), "Rust package path codec mismatch");
         Ok(())
+    }
+
+    /// Resolve beneath the configured repository prefix without URL
+    /// reference resolution, escapes, redirects or caller-controlled hosts.
+    /// # Errors
+    /// Returns an error for invalid base or locator.
+    pub fn resolve(&self, base: &reqwest::Url) -> Result<reqwest::Url> {
+        self.validate()?;
+        validate_upstream_base(base)?;
+        let mut url = base.clone();
+        url.path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("upstream URL cannot hold path segments"))?
+            .pop_if_empty()
+            .extend(self.path.split('/'));
+        ensure!(
+            url.origin() == base.origin() && url.path().starts_with(base.path()),
+            "package locator escaped repository prefix"
+        );
+        Ok(url)
     }
 }
 
-/// The scheduler reports whether it already owned the verified package.
+/// Validate an administrator-configured repository identifier.
+/// # Errors
+/// Returns an error for invalid names.
+pub fn validate_upstream_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+        "invalid package upstream name"
+    );
+    Ok(())
+}
+
+/// Validate a repository base URL, including its immutable path prefix.
+/// # Errors
+/// Returns an error for unsupported or ambiguous base URLs.
+pub fn validate_upstream_base(url: &reqwest::Url) -> Result<()> {
+    ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.path().ends_with('/')
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && url.username().is_empty()
+            && url.password().is_none(),
+        "invalid original package upstream base URL"
+    );
+    Ok(())
+}
+
+/// Whether the scheduler already owned the verified package.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct PackageAcquisition {
-    pub manifest: InstallationManifest,
+pub struct PackageAcquisition<T> {
+    pub package: T,
     pub reused: bool,
 }
 
@@ -175,34 +223,64 @@ mod tests {
 
     #[test]
     fn package_path_cannot_escape_configured_distribution_origin() -> Result<()> {
+        use crate::build_runtime::PackageCompression;
         let identity = PackageIdentity {
             sha256: [0; 32],
             compression: PackageCompression::Xz,
         };
-        let locator = RustPackageLocator::from_url(
+        let locator = PackageLocator::from_rust_url(
             identity,
             "https://mirror.example/mirror/dist/2026-11-22/rustc-nightly.tar.xz",
         )?;
-        assert_eq!(locator.path, "/dist/2026-11-22/rustc-nightly.tar.xz");
+        assert_eq!(locator.upstream, "rust");
+        assert_eq!(locator.path, "dist/2026-11-22/rustc-nightly.tar.xz");
+        let base = reqwest::Url::parse("https://configured.example/repository/")?;
+        assert_eq!(
+            locator.resolve(&base)?.as_str(),
+            "https://configured.example/repository/dist/2026-11-22/rustc-nightly.tar.xz"
+        );
         for path in [
-            "//host/dist/file.tar.xz",
-            "/dist/../file.tar.xz",
-            "/dist/%2e%2e/file.tar.xz",
-            "/dist/dir//file.tar.xz",
-            "/dist/dir\\file.tar.xz",
-            "/dist/dir/file.tar.xz?x",
-            "/dist/dir/file.tar.gz",
+            "//host/file.tar.xz",
+            "/dist/file.tar.xz",
+            "../file.tar.xz",
+            "dist/%2e%2e/file.tar.xz",
+            "dist/dir//file.tar.xz",
+            "dist/dir\\file.tar.xz",
+            "dist/dir/file.tar.xz?x",
+            "https://host/file.tar.xz",
+            "dist/./file.tar.xz",
         ] {
             assert!(
-                RustPackageLocator {
+                PackageLocator {
                     identity,
+                    expected_size: None,
+                    upstream: "rust".into(),
                     path: path.into()
                 }
-                .validate()
+                .resolve(&base)
                 .is_err(),
                 "{path}"
             );
         }
+        let system = PackageLocator {
+            identity,
+            expected_size: None,
+            upstream: "cachyos-v3".into(),
+            path: "gcc-16.2.1+r23+gd564253eb6c8-3-x86_64_v3.pkg.tar.zst".into(),
+        };
+        assert_eq!(
+            system.resolve(&base)?.as_str(),
+            "https://configured.example/repository/gcc-16.2.1+r23+gd564253eb6c8-3-x86_64_v3.pkg.tar.zst"
+        );
+        assert!(
+            PackageLocator {
+                upstream: "../wrong".into(),
+                ..system
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(validate_upstream_base(&reqwest::Url::parse("https://host/repository")?).is_err());
         Ok(())
     }
 }

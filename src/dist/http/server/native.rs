@@ -1,7 +1,7 @@
 //! Dedicated native cache listener. Reuse scheduler authentication and job
 //! ownership without running filesystem I/O on the scheduling request pool.
 
-use std::{io::Read, sync::Arc, thread, time::Duration};
+use std::{collections::BTreeMap, io::Read, sync::Arc, thread, time::Duration};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use bincode::Options;
@@ -12,13 +12,13 @@ use super::{ClientAuthCheck, ServerAuthenticator, authenticate_client, authentic
 use crate::{
     build_runtime::{
         ActionMode, ArchiveLength, ExecutionSpec, NativeServiceBusy, NativeSessions, NativeStore,
-        PackageIdentity, PackageImportLimits, PackageSource,
+        PackageIdentity, PackageImportLimits, PackageSource, VerifiedPackage,
         wire::{Publisher, ScheduleReply, UploadHeader},
     },
     config::scheduler::NativeCacheConfig,
     dist::native::{
         DownloadRequest, ExecutionRequest, ManifestRequest, OpenTreeRequest, PackageAcquisition,
-        PackagePlanRequest, RustPackageLocator, codec,
+        PackageLocator, PackagePlanRequest, codec,
     },
 };
 
@@ -27,7 +27,7 @@ pub(super) type Allocator =
 
 struct PackageService {
     limits: PackageImportLimits,
-    upstream: Option<(reqwest::Url, reqwest::blocking::Client)>,
+    upstreams: BTreeMap<String, (reqwest::Url, reqwest::blocking::Client)>,
 }
 
 impl PackageService {
@@ -35,7 +35,8 @@ impl PackageService {
         let Some(limits) = config.package_import else {
             return Ok(None);
         };
-        let upstream = if let Some(upstream) = &config.package_upstream {
+        let mut upstreams = BTreeMap::new();
+        for (name, upstream) in &config.package_upstreams {
             let client = crate::util::new_reqwest_blocking_builder()?
                 .timeout(Duration::from_secs(upstream.timeout_secs))
                 .connect_timeout(Duration::from_secs(10))
@@ -43,48 +44,46 @@ impl PackageService {
                 .pool_max_idle_per_host(0)
                 .no_proxy()
                 .build()?;
-            Some((upstream.origin.to_url(), client))
-        } else {
-            None
-        };
-        Ok(Some(Self { limits, upstream }))
+            upstreams.insert(name.clone(), (upstream.origin.clone(), client));
+        }
+        Ok(Some(Self { limits, upstreams }))
     }
 
     fn acquire(
         &self,
         sessions: &NativeSessions,
-        locator: &RustPackageLocator,
-    ) -> Result<PackageAcquisition> {
+        locator: &PackageLocator,
+    ) -> Result<(VerifiedPackage, bool)> {
         locator.validate()?;
-        let (package, reused) = sessions.provision_package(
-            locator.identity,
+        let (base, client) = self
+            .upstreams
+            .get(&locator.upstream)
+            .context("package upstream not configured")?;
+        let url = locator.resolve(base)?;
+        let length = locator.expected_size.map_or(
             ArchiveLength::AtMost(self.limits.max_archive_bytes),
+            ArchiveLength::Exact,
+        );
+        ensure!(
+            length.maximum() <= self.limits.max_archive_bytes,
+            "upstream package exceeds archive size limit"
+        );
+        sessions.provision_package(
+            locator.identity,
+            length,
             self.limits,
             &std::env::current_exe()?,
             || {
-                let (origin, client) = self
-                    .upstream
-                    .as_ref()
-                    .context("Rust package upstream not configured")?;
-                let url = origin.join(&locator.path)?;
-                ensure!(
-                    url.origin() == origin.origin(),
-                    "package locator escaped origin"
-                );
                 let response = client.get(url).send()?.error_for_status()?;
                 ensure!(
                     response
                         .content_length()
-                        .is_none_or(|size| size <= self.limits.max_archive_bytes),
-                    "upstream package exceeds archive size limit"
+                        .is_none_or(|size| length.accepts(size)),
+                    "upstream package length violates expectation"
                 );
                 Ok(response)
             },
-        )?;
-        let manifest = sessions
-            .store()
-            .publish_rust_installer(&package, self.limits.policy()?.directory)?;
-        Ok(PackageAcquisition { manifest, reused })
+        )
     }
 }
 
@@ -245,10 +244,32 @@ fn dispatch(
                 )
             }
         }
-        "package_acquire" if publisher == Publisher::Client && packages.is_some() => {
-            let locator: RustPackageLocator = metadata(request, limit)?;
+        "package_acquire" | "rust_package_acquire"
+            if publisher == Publisher::Client && packages.is_some() =>
+        {
+            let locator: PackageLocator = metadata(request, limit)?;
             let service = packages.context("native original-package provisioning disabled")?;
-            encode(&service.acquire(sessions, &locator)?, limit)
+            let (package, reused) = service.acquire(sessions, &locator)?;
+            if operation == "rust_package_acquire" {
+                let manifest = sessions
+                    .store()
+                    .publish_rust_installer(&package, service.limits.policy()?.directory)?;
+                encode(
+                    &PackageAcquisition {
+                        package: manifest,
+                        reused,
+                    },
+                    limit,
+                )
+            } else {
+                encode(
+                    &PackageAcquisition {
+                        package: package.receipt(),
+                        reused,
+                    },
+                    limit,
+                )
+            }
         }
         "package_import" | "rust_package_import"
             if publisher == Publisher::Client && packages.is_some() =>
