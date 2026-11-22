@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Install Rust nightly-2026-11-20
+      - name: Install Rust nightly-2026-11-22
         uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: "nightly-2026-11-22"
@@ -56,9 +56,9 @@ jobs:
           printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'unset SCCACHE_SERVER_UDS SCCACHE_SERVER_PORT' 'exec "$@"' > "$test_runner"
           chmod +x "$test_runner"
           export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$test_runner"
-          cargo +nightly-2026-11-20 test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-tests --lib test_job_token_verification
-          cargo +nightly-2026-11-20 test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-tests --test dist test_dist_rust_ -- --test-threads 1
-          cargo +nightly-2026-11-20 test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-tests --test dist test_dist_c_ -- --test-threads 1
+          cargo +nightly-2026-11-22 test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-tests --lib test_job_token_verification
+          cargo +nightly-2026-11-22 test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-tests --test dist test_dist_rust_ -- --test-threads 1
+          cargo +nightly-2026-11-22 test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-tests --test dist test_dist_c_ -- --test-threads 1
       - name: Finalize mandatory sccache
         if: always()
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main

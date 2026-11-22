@@ -30,7 +30,7 @@ jobs:
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: "nightly-2026-11-20"
+          toolchain: "nightly-2026-11-22"
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
         with:
@@ -114,7 +114,7 @@ jobs:
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: "nightly-2026-11-20"
+          toolchain: "nightly-2026-11-22"
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
         with:
@@ -179,7 +179,7 @@ jobs:
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: "nightly-2026-11-20"
+          toolchain: "nightly-2026-11-22"
           target: $TARGET
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
@@ -311,7 +311,7 @@ jobs:
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: "nightly-2026-11-20"
+          toolchain: "nightly-2026-11-22"
 
       - name: Build & setup librandomize_readdir
         run: |
@@ -384,7 +384,7 @@ jobs:
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
         with:
-          toolchain: "nightly-2026-11-20"
+          toolchain: "nightly-2026-11-22"
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
         with:
