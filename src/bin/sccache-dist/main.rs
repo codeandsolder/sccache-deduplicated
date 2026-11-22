@@ -788,7 +788,7 @@ impl SchedulerIncoming for Scheduler {
         server_id: ServerId,
         server_nonce: ServerNonce,
         cpu_capacity: f64,
-        running_job_ids: &[JobId],
+        active_job_ids: &[JobId],
         job_authorizer: Box<dyn JobAuthorizer>,
     ) -> Result<HeartbeatServerResult> {
         // LOCKS
@@ -812,10 +812,10 @@ impl SchedulerIncoming for Scheduler {
                 details.last_seen = now;
                 details.cpu_capacity = cpu_capacity;
 
-                // The worker heartbeat is authoritative for *executing* jobs.
-                // A Started job missing from one heartbeat can be an in-flight
-                // snapshot, so require a full heartbeat timeout of absence.
-                let running: HashSet<JobId> = running_job_ids.iter().copied().collect();
+                // Executing jobs and transfers with recent byte progress have
+                // live request owners. A Started job missing from one heartbeat
+                // can be an in-flight snapshot; require a full timeout of absence.
+                let active: HashSet<JobId> = active_job_ids.iter().copied().collect();
                 let stale_jobs: Vec<_> = details
                     .jobs_assigned
                     .iter()
@@ -823,13 +823,18 @@ impl SchedulerIncoming for Scheduler {
                     .filter(|job_id| match jobs.get_mut(job_id) {
                         Some(detail) if detail.server_id == server_id => {
                             if detail.state == JobState::Started {
-                                if running.contains(job_id) {
+                                if active.contains(job_id) {
                                     detail.missing_since = None;
                                     false
                                 } else {
                                     let since = detail.missing_since.get_or_insert(now);
                                     now.duration_since(*since) >= dist::http::HEARTBEAT_TIMEOUT
                                 }
+                            } else if active.contains(job_id) {
+                                // Renew the inactivity lease, not the maximum
+                                // duration of a progressing toolchain transfer.
+                                detail.state_since = now;
+                                false
                             } else {
                                 detail.is_stale_unclaimed(now)
                             }
@@ -1786,6 +1791,59 @@ mod scheduler_tests {
             .handle_heartbeat_server(server_id, nonce, 1.0, &[], Box::new(TestJobAuthorizer))
             .unwrap();
         assert_no_assigned_jobs(&scheduler, &server_id);
+    }
+
+    #[test]
+    fn progressing_pending_upload_renews_lease_but_inactive_upload_expires() -> Result<()> {
+        let scheduler = Scheduler::new();
+        let server_id: ServerId = "127.0.0.1:10501".parse()?;
+        let nonce = ServerNonce::new();
+        register_test_server(&scheduler, server_id, nonce.clone());
+        let AllocJobResult::Success { job_alloc, .. } =
+            scheduler.handle_alloc_job(&AcceptAssign, test_toolchain('c'))?
+        else {
+            bail!("worker should accept job");
+        };
+        let job_id = job_alloc.job_id;
+        let backdate = |scheduler: &Scheduler| {
+            scheduler
+                .jobs
+                .lock()
+                .unwrap()
+                .get_mut(&job_id)
+                .unwrap()
+                .state_since = Instant::now()
+                .checked_sub(UNCLAIMED_PENDING_TIMEOUT + Duration::from_secs(1))
+                .unwrap();
+        };
+        backdate(&scheduler);
+        scheduler.handle_heartbeat_server(
+            server_id,
+            nonce.clone(),
+            1.0,
+            &[job_id],
+            Box::new(TestJobAuthorizer),
+        )?;
+        assert!(
+            !scheduler
+                .jobs
+                .lock()
+                .unwrap()
+                .get(&job_id)
+                .unwrap()
+                .is_stale_unclaimed(Instant::now())
+        );
+        // A later snapshot without progress cannot renew that lease.
+        backdate(&scheduler);
+        scheduler.handle_heartbeat_server(
+            server_id,
+            nonce,
+            1.0,
+            &[],
+            Box::new(TestJobAuthorizer),
+        )?;
+        assert_no_assigned_jobs(&scheduler, &server_id);
+        Ok(())
     }
 
     #[test]
