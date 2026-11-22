@@ -2511,13 +2511,13 @@ pub fn relocate_raw_rust_operands(
 /// linker options, repeated options, and option spellings remain exact.
 #[cfg(target_os = "linux")]
 pub(super) fn native_link_stage_input(
-    arguments: &[OsString],
+    expanded: Vec<OsString>,
     cwd: &Path,
+    resolve_directory: impl FnMut(&Path, &Path) -> Result<PathBuf>,
 ) -> Result<super::rust_link::RustLinkStages> {
     use anyhow::ensure;
     use std::cell::Cell;
 
-    let expanded = super::rust_response::expand(arguments, cwd)?;
     let consumed = Cell::new(0);
     let mut input = None;
     let mut after_separator = false;
@@ -2584,6 +2584,7 @@ pub(super) fn native_link_stage_input(
         out_dir.as_deref(),
         output_file.as_deref(),
         &explicit_outputs,
+        resolve_directory,
     )
 }
 

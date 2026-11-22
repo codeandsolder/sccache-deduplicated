@@ -378,7 +378,25 @@ impl RustLinkStages {
     /// # Errors
     /// The input is ambiguous, not a linked compilation, or already a stage.
     pub fn new(arguments: &[OsString], cwd: &Path) -> Result<Self> {
-        super::rust::native_link_stage_input(arguments, cwd)
+        Self::from_expanded(
+            super::rust_response::expand(arguments, cwd)?,
+            cwd,
+            resolve_output_directory,
+        )
+    }
+
+    /// Construct stages from already expanded compiler arguments in a
+    /// caller-defined logical filesystem layout. The resolver must resolve
+    /// the exact output directory through the actual physical path mapping,
+    /// then return its canonical logical spelling.
+    /// # Errors
+    /// Returns an error for an ambiguous source or output layout.
+    pub fn from_expanded(
+        arguments: Vec<OsString>,
+        cwd: &Path,
+        resolve_directory: impl FnMut(&Path, &Path) -> Result<PathBuf>,
+    ) -> Result<Self> {
+        super::rust::native_link_stage_input(arguments, cwd, resolve_directory)
     }
 
     pub(super) fn from_parsed(
@@ -388,22 +406,33 @@ impl RustLinkStages {
         out_dir: Option<&Path>,
         output_file: Option<&Path>,
         explicit_outputs: &[PathBuf],
+        mut resolve_directory: impl FnMut(&Path, &Path) -> Result<PathBuf>,
     ) -> Result<Self> {
         ensure!(cwd.is_absolute(), "compiler cwd must be absolute");
         let directory = output_file.map_or_else(
             || out_dir.unwrap_or(cwd),
             |path| path.parent().unwrap_or_else(|| Path::new("")),
         );
-        let codegen_directory = resolve_output_directory(cwd, directory)?;
+        let codegen_directory = resolve_directory(cwd, directory)?;
         let mut roots = vec![codegen_directory.clone()];
         for path in explicit_outputs {
-            roots.push(resolve_output_directory(
+            roots.push(resolve_directory(
                 cwd,
                 path.parent().unwrap_or_else(|| Path::new("")),
             )?);
         }
         // Parent roots already contain any nested output directory. Keep
         // overlays disjoint, including when two paths resolve through aliases.
+        for root in &roots {
+            ensure!(
+                root.is_absolute()
+                    && root != Path::new("/")
+                    && root
+                        .components()
+                        .all(|part| matches!(part, Component::RootDir | Component::Normal(_))),
+                "invalid logical output directory"
+            );
+        }
         roots.sort_unstable();
         let mut output_roots: Vec<PathBuf> = Vec::new();
         for root in roots {
@@ -551,6 +580,17 @@ impl PrivateOutputTree {
         Ok(Self { root, upper, work })
     }
 
+    /// Reserve the upper directory as the destination of an incoming native
+    /// CAS tree. Delivery publishes the verified tree atomically at this
+    /// absent path. The overlay then uses exactly those files in place,
+    /// without an intermediate archive, copy, or second cache.
+    /// # Errors
+    /// Returns an error if the stage has already been populated.
+    pub fn prepare_delivery(&self) -> Result<&Path> {
+        fs::remove_dir(&self.upper)?;
+        Ok(&self.upper)
+    }
+
     /// Build the Bubblewrap overlay operation preserving the original path.
     /// The returned arguments must precede the sandbox command separator.
     ///
@@ -598,6 +638,103 @@ impl PrivateOutputTree {
     /// Invalid snapshot, nonempty destination, exceeded limits or I/O failure.
     pub fn restore(&self, archive: &Path, limits: CaptureLimits) -> Result<()> {
         restore_root(archive, &self.upper, &mut Budget::new(limits))
+    }
+}
+
+/// Prepared native Rust codegen delivery and local replay roots. Each
+/// returned directory is mounted over the current caller's lower directory,
+/// so native dependencies remain live at the same logical paths. There is no
+/// archive or copied staging tree between CAS delivery and linking.
+pub struct NativeLinkWorkspace {
+    stages: RustLinkStages,
+    roots: BTreeMap<PathBuf, NativeLinkRoot>,
+}
+
+struct NativeLinkRoot {
+    physical: PathBuf,
+    tree: PrivateOutputTree,
+}
+
+impl NativeLinkWorkspace {
+    /// Reserve private, absent delivery paths for every logical output root.
+    /// # Errors
+    /// Returns an error for an unavailable or overlapping physical layout,
+    /// or a staging directory that could not be created.
+    pub fn new(
+        stages: RustLinkStages,
+        scratch: &Path,
+        mut physical_path: impl FnMut(&Path) -> Result<PathBuf>,
+    ) -> Result<Self> {
+        let mut roots: BTreeMap<PathBuf, NativeLinkRoot> = BTreeMap::new();
+        for logical in stages.output_roots() {
+            let physical = fs::canonicalize(physical_path(logical)?)?;
+            ensure!(physical.is_dir(), "native link lower is not a directory");
+            ensure!(
+                roots
+                    .values()
+                    .all(|root| !root.physical.starts_with(&physical)
+                        && !physical.starts_with(&root.physical)),
+                "physical output roots overlap"
+            );
+            let tree = PrivateOutputTree::new(scratch)?;
+            tree.overlay_arguments(&physical, logical)?;
+            tree.prepare_delivery()?;
+            roots.insert(logical.clone(), NativeLinkRoot { physical, tree });
+        }
+        Ok(Self { stages, roots })
+    }
+
+    /// Exact codegen arguments in the declared logical layout.
+    #[must_use = "the worker must execute this stage instead of final linking"]
+    pub fn codegen_arguments(&self) -> Vec<OsString> {
+        self.stages.codegen_arguments()
+    }
+
+    /// Logical path, caller physical lower directory, and absent private
+    /// destination for every generated tree.
+    #[must_use = "the outputs describe the directory delivery contract"]
+    pub fn outputs(&self) -> impl Iterator<Item = (&Path, &Path, &Path)> {
+        self.roots.iter().map(|(logical, root)| {
+            (
+                logical.as_path(),
+                root.physical.as_path(),
+                root.tree.generated_root(),
+            )
+        })
+    }
+
+    /// All output overlays to append after base namespace bindings.
+    /// # Errors
+    /// Returns an error if a lower directory is no longer available.
+    pub fn overlay_arguments(&self) -> Result<Vec<OsString>> {
+        let mut arguments = Vec::new();
+        for (logical, root) in &self.roots {
+            ensure!(
+                root.tree.generated_root().is_dir(),
+                "native codegen output has not been delivered"
+            );
+            arguments.extend(root.tree.overlay_arguments(&root.physical, logical)?);
+        }
+        Ok(arguments)
+    }
+
+    /// Locate the generated artifact in the private delivery tree and prepare
+    /// the original logical command for local linking.
+    /// # Errors
+    /// Returns an error if codegen did not deliver exactly one link artifact.
+    pub fn link_arguments(&self) -> Result<Vec<OsString>> {
+        let directory = self.stages.codegen_directory();
+        let (logical, root) = self
+            .roots
+            .iter()
+            .find(|(logical, _)| directory.starts_with(logical))
+            .context("missing native codegen root")?;
+        let generated = root
+            .tree
+            .generated_root()
+            .join(directory.strip_prefix(logical)?);
+        let artifact = RustLinkStages::link_artifact(&generated, directory)?;
+        Ok(self.stages.link_arguments(&artifact))
     }
 }
 
