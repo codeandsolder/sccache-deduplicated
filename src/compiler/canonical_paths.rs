@@ -1,4 +1,6 @@
 use crate::dist;
+#[cfg(target_os = "linux")]
+use crate::util::OsStrExt;
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
@@ -72,41 +74,78 @@ fn topmost_cargo_root(start: &Path) -> Option<PathBuf> {
         .map(Path::to_owned)
 }
 
-pub(super) fn target_root_from_out_dir_path(out_dir: &Path) -> Option<PathBuf> {
-    // Cargo writes CACHEDIR.TAG (and normally .rustc_info.json) at the actual
-    // target root. Prefer that marker so cross-target layouts such as
-    // target/<triple>/<profile>/build/... still map to the whole target tree.
-    if let Some(root) = out_dir.ancestors().find(|ancestor| {
-        ancestor.join("CACHEDIR.TAG").is_file() || ancestor.join(".rustc_info.json").is_file()
-    }) {
-        return Some(root.to_owned());
+fn has_cargo_root_marker(path: &Path) -> bool {
+    path.join("CACHEDIR.TAG").is_file() || path.join(".rustc_info.json").is_file()
+}
+
+fn cargo_target_directory_name(target: &OsStr) -> Option<&OsStr> {
+    let path = Path::new(target);
+    if path.extension().is_some_and(|ext| ext == "json") {
+        path.file_stem()
+    } else {
+        path.file_name()
+    }
+}
+
+fn marked_cargo_root(path: &Path, target: Option<&OsStr>) -> Option<PathBuf> {
+    let nearest = path.ancestors().find(|path| has_cargo_root_marker(path))?;
+    // Cargo marks both the shared build root and its target-specific immediate
+    // child. A cross-target invocation can consume host proc macros and target
+    // metadata simultaneously. Promote only a directory whose name matches the
+    // actual compiler target, not an arbitrary nested marked cache directory.
+    if let Some(target_name) = target.and_then(cargo_target_directory_name)
+        && nearest.file_name() == Some(target_name)
+        && let Some(parent) = nearest.parent().filter(|path| has_cargo_root_marker(path))
+    {
+        return Some(parent.to_owned());
+    }
+    Some(nearest.to_owned())
+}
+
+pub(super) fn target_root_from_out_dir_path(
+    out_dir: &Path,
+    target: Option<&OsStr>,
+) -> Option<PathBuf> {
+    if let Some(root) = marked_cargo_root(out_dir, target) {
+        return Some(root);
     }
 
-    // During very early Cargo startup the marker may not exist yet. OUT_DIR has
-    // the stable .../<profile>/build/<package-hash>/out shape, so the profile
-    // directory is still a safe canonical root for every generated input used
-    // by that compiler invocation.
-    let package_hash = out_dir.parent()?;
-    let build_dir = package_hash.parent()?;
-    (build_dir.file_name() == Some(OsStr::new("build")))
-        .then(|| build_dir.parent().map(Path::to_owned))
+    // Before Cargo writes its root marker, OUT_DIR still identifies the
+    // profile via build/<package-hash>/out or build/<package>/<hash>/out.
+    if out_dir.file_name()? != "out" {
+        return None;
+    }
+    let unit = out_dir.parent()?;
+    let parent = unit.parent()?;
+    // Cargo's new layout separates the hexadecimal unit fingerprint from the
+    // package name. This also handles a package or a profile named "build".
+    let separate_fingerprint = unit
+        .file_name()?
+        .as_encoded_bytes()
+        .iter()
+        .all(u8::is_ascii_hexdigit);
+    let build = if separate_fingerprint {
+        parent.parent()?
+    } else {
+        parent
+    };
+    (build.file_name()? == "build")
+        .then(|| build.parent().map(Path::to_owned))
         .flatten()
 }
 
-fn target_root_from_out_dir(env: &[(OsString, OsString)]) -> Option<PathBuf> {
-    target_root_from_out_dir_path(&env_value(env, "OUT_DIR")?)
+fn target_root_from_out_dir(
+    env: &[(OsString, OsString)],
+    target: Option<&OsStr>,
+) -> Option<PathBuf> {
+    target_root_from_out_dir_path(&env_value(env, "OUT_DIR")?, target)
 }
 
-fn target_root_from_output_dir(output_dir: &Path) -> Option<PathBuf> {
+fn target_root_from_output_dir(output_dir: &Path, target: Option<&OsStr>) -> Option<PathBuf> {
     // --out-dir is not restricted to Cargo's OUT_DIR shape: it can be
     // deps/, examples/, a cross-target directory, or the build-script tree.
     // Require a Cargo root marker instead of guessing from path components.
-    output_dir
-        .ancestors()
-        .find(|ancestor| {
-            ancestor.join("CACHEDIR.TAG").is_file() || ancestor.join(".rustc_info.json").is_file()
-        })
-        .map(Path::to_owned)
+    marked_cargo_root(output_dir, target)
 }
 
 fn path_env(name: &OsStr) -> bool {
@@ -233,22 +272,30 @@ impl CanonicalRustPaths {
         // daemon would have used, including its ephemeral --out-dir. OUT_DIR
         // alone is absent for many dependency crates.
         let mut parsed_output_dir = None;
+        let mut target = None;
         let mut args = arguments.iter();
         while let Some(argument) = args.next() {
             if argument == "--out-dir" {
                 parsed_output_dir = args.next().map(PathBuf::from);
-            } else if let Some(path) = argument
-                .to_str()
-                .and_then(|value| value.strip_prefix("--out-dir="))
-            {
+            } else if let Some(path) = argument.split_prefix("--out-dir=") {
                 parsed_output_dir = Some(PathBuf::from(path));
+            } else if argument == "--target" {
+                target = args.next().cloned();
+            } else if let Some(value) = argument.split_prefix("--target=") {
+                target = Some(value);
             }
         }
         let output_dir = match parsed_output_dir {
             Some(path) => Some(physical_operand(cwd, &path)?),
             None => None,
         };
-        Self::from_env_with_output_dir(env, cwd, rust_root, output_dir.as_deref())
+        Self::from_env_with_output_dir(
+            env,
+            cwd,
+            rust_root,
+            output_dir.as_deref(),
+            target.as_deref(),
+        )
     }
 
     #[cfg(test)]
@@ -257,7 +304,7 @@ impl CanonicalRustPaths {
         cwd: &Path,
         rust_root: &Path,
     ) -> Option<Self> {
-        Self::from_env_with_output_dir(env, cwd, rust_root, None)
+        Self::from_env_with_output_dir(env, cwd, rust_root, None, None)
     }
 
     pub(crate) fn from_env_with_output_dir(
@@ -265,6 +312,7 @@ impl CanonicalRustPaths {
         cwd: &Path,
         rust_root: &Path,
         output_dir: Option<&Path>,
+        target: Option<&OsStr>,
     ) -> Option<Self> {
         if !enabled(env) {
             return None;
@@ -277,8 +325,10 @@ impl CanonicalRustPaths {
                     .and_then(|manifest_dir| topmost_cargo_root(&manifest_dir))
             })?;
 
-        let actual_build_root = target_root_from_out_dir(env)
-            .or_else(|| output_dir.and_then(target_root_from_output_dir));
+        let environment_target = env_value(env, "TARGET");
+        let target = target.or_else(|| environment_target.as_deref().map(Path::as_os_str));
+        let actual_build_root = target_root_from_out_dir(env, target)
+            .or_else(|| output_dir.and_then(|path| target_root_from_output_dir(path, target)));
         let target_root = env_value(env, "SCCACHE_CANONICAL_TARGET_ROOT")
             .or_else(|| env_value(env, "CARGO_TARGET_DIR"))
             .or_else(|| actual_build_root.clone())
@@ -736,6 +786,7 @@ mod tests {
                 &registry_crate,
                 Path::new("/rust"),
                 Some(&compiler_output),
+                None,
             )
             .unwrap();
             assert_eq!(roots.target_root, persistent_target);
@@ -789,6 +840,117 @@ mod tests {
     }
 
     #[test]
+    fn cross_target_build_root_includes_host_proc_macros() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("workspace");
+        let persistent = source.join("target");
+        std::fs::create_dir_all(&persistent).unwrap();
+        std::fs::write(source.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let tag = "Signature: 8a477f597d28d172789f06886806bc55\n";
+        std::fs::write(temp.path().join("CACHEDIR.TAG"), tag).unwrap();
+        for session in ["session-a", "session-b"] {
+            let shared = temp.path().join(session).join("workspace-hash");
+            let target = shared.join("x86_64-unknown-uefi");
+            let generated = target.join("release/build/consumer/0a25ece00a9f4300/out");
+            let output = target.join("release/build/consumer/1c1e9eb0228676a4/out");
+            let host_proc_macro = shared.join(
+                "release/build/uefi-macros/7a8cc8f45c370789/out/libuefi_macros-7a8cc8f45c370789.so",
+            );
+            for path in [
+                generated.as_path(),
+                output.as_path(),
+                host_proc_macro.parent().unwrap(),
+            ] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            std::fs::write(shared.join("CACHEDIR.TAG"), tag).unwrap();
+            std::fs::write(target.join("CACHEDIR.TAG"), tag).unwrap();
+            let base_env = vec![
+                ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+                (
+                    "SCCACHE_CANONICAL_TARGET_ROOT".into(),
+                    persistent.clone().into_os_string(),
+                ),
+            ];
+            let mut with_out_dir = base_env.clone();
+            with_out_dir.push(("OUT_DIR".into(), generated.into_os_string()));
+            for env in [&base_env, &with_out_dir] {
+                let roots = CanonicalRustPaths::from_env_with_output_dir(
+                    env,
+                    &source,
+                    Path::new("/rust"),
+                    Some(&output),
+                    Some(OsStr::new("x86_64-unknown-uefi")),
+                )
+                .unwrap();
+                assert_eq!(roots.intermediate_root.as_deref(), Some(shared.as_path()));
+                assert!(roots.root_is_known(&host_proc_macro));
+                assert_eq!(
+                    roots.to_canonical(&host_proc_macro),
+                    Path::new(
+                        "/intermediate/release/build/uefi-macros/7a8cc8f45c370789/out/libuefi_macros-7a8cc8f45c370789.so"
+                    )
+                );
+                assert_eq!(
+                    roots.to_canonical(&output),
+                    Path::new(
+                        "/intermediate/x86_64-unknown-uefi/release/build/consumer/1c1e9eb0228676a4/out"
+                    )
+                );
+            }
+            #[cfg(target_os = "linux")]
+            for (target_args, out_args) in [
+                (
+                    vec![
+                        OsString::from("--target"),
+                        OsString::from("x86_64-unknown-uefi"),
+                    ],
+                    vec![OsString::from("--out-dir"), output.clone().into_os_string()],
+                ),
+                (
+                    vec![OsString::from("--target=x86_64-unknown-uefi")],
+                    vec![OsString::from(format!("--out-dir={}", output.display()))],
+                ),
+            ] {
+                let args: Vec<_> = target_args.into_iter().chain(out_args).collect();
+                let roots = CanonicalRustPaths::from_rustc_executable(
+                    &base_env,
+                    &source,
+                    Path::new("/rust/bin/rustc"),
+                    &args,
+                )
+                .unwrap();
+                assert_eq!(roots.intermediate_root.as_deref(), Some(shared.as_path()));
+                assert!(roots.root_is_known(&host_proc_macro));
+            }
+            // An unrelated nested marked cache must not be promoted.
+            for hint in [None, Some(OsStr::new("other-target"))] {
+                assert_eq!(marked_cargo_root(&output, hint), Some(target.clone()));
+            }
+            assert_eq!(
+                marked_cargo_root(&output, Some(OsStr::new("/specs/x86_64-unknown-uefi.json"))),
+                Some(shared)
+            );
+        }
+    }
+
+    #[test]
+    fn markerless_cargo_build_unit_layouts_infer_profile_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("shared/debug");
+        for suffix in ["build/pkg-abc/out", "build/pkg/abc/out"] {
+            assert_eq!(
+                target_root_from_out_dir_path(&profile.join(suffix), None),
+                Some(profile.clone())
+            );
+        }
+        assert_eq!(
+            target_root_from_out_dir_path(&profile.join("build/pkg/abc/not-out"), None),
+            None
+        );
+    }
+
+    #[test]
     fn infers_ephemeral_build_dir_from_rustc_output_without_out_dir_env() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("workspace");
@@ -816,6 +978,7 @@ mod tests {
             &source,
             Path::new("/rust"),
             Some(&output_dir),
+            Some(OsStr::new("wasm32-unknown-unknown")),
         )
         .unwrap();
         assert_eq!(

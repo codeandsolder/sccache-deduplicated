@@ -73,3 +73,43 @@ protocol, toolchain, feature set, capabilities and machine/CPU identity
 against the published release before using its immediate restart/rollback logic.
 Build provisioning is separate from the root updater: no automatic root
 compilation and no extra cache daemons.
+
+
+## Full native-cache acceptance
+
+`test-native-cache-reuse` is an operator regression test for the actual native
+stage of `boring-sys`. Supply the patched BoringSSL source tree copied by the
+build script, an existing dedicated scratch workspace, the expected number of
+compiled objects, and the real CMake compiler/launcher/flags options. Export the
+original Cargo manifest/target environment (`CARGO_MANIFEST_DIR`,
+`SCCACHE_CANONICAL_TARGET_ROOT`, and where used `CARGO_HOME`, `CARGO_TARGET_DIR`,
+`TARGET`). Use the production compiler wrappers; the existing managed daemon
+must be available over its Unix socket. Example for the x86-64 BoringSSL 5.5.0
+workload (407 objects; flags should match the real build):
+
+```sh
+flags=' -ffunction-sections -fdata-sections -fPIC -m64 -march=x86-64 -w'
+contrib/codeandsolder/test-native-cache-reuse "$copied_boringssl" "$scratch" 407 \
+  -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+  -DCMAKE_C_COMPILER=/usr/local/libexec/sccache-strict-wrappers/cc \
+  -DCMAKE_CXX_COMPILER=/usr/local/libexec/sccache-strict-wrappers/c++ \
+  -DCMAKE_ASM_COMPILER=/usr/local/libexec/sccache-strict-wrappers/cc \
+  -DCMAKE_C_COMPILER_LAUNCHER=/usr/local/libexec/sccache-cmake-launcher \
+  -DCMAKE_CXX_COMPILER_LAUNCHER=/usr/local/libexec/sccache-cmake-launcher \
+  -DCMAKE_C_FLAGS="$flags" -DCMAKE_CXX_FLAGS="$flags" -DCMAKE_ASM_FLAGS="$flags"
+```
+
+The harness creates two independent Cargo build-unit roots, compiles every
+object in the real CMake crypto/fipsmodule/ssl targets, and records each
+managed-cache lookup separately using the client-side IPC protocol and `strace`.
+The first build may hit or miss; the second must hit every object with exactly
+the same key. It verifies byte-identical objects/archives and actual dependency
+paths, then forces a fresh compile in normal managed mode and compares all
+artifacts. A real source mutation must produce a new key and symbol.
+The lookup parser deliberately fails on unexpected protocol frames. This needs
+Linux, GNU Make, CMake, strace, ripgrep, awk, sha256sum and nm. No daemon or
+additional cache directory is started, and shared hit counters are not reset.
+The full forced-recache stage consumes production compilation capacity; run it
+when doing acceptance, not periodically. The harness removes its own copied
+source/build trees and keeps the compact lookup and SHA-256 manifests and logs
+in its unique scratch directory.
