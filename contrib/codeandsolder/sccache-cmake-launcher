@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if (( $# == 0 )); then
+    echo 'sccache-cmake-launcher: missing compiler command' >&2
+    exit 64
+fi
+compiler="$1"
+shift
+case "$compiler" in
+    /usr/local/libexec/sccache-strict-wrappers/*) exec "$compiler" "$@" ;;
+    *) exec /usr/local/libexec/sccache-client "$compiler" "$@" ;;
+esac

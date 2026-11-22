@@ -398,10 +398,15 @@ fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup
     })
 }
 
+fn auto_start_server_enabled() -> bool {
+    env::var_os("SCCACHE_NO_AUTO_START_SERVER").as_deref() != Some(OsStr::new("1"))
+}
+
 /// Attempt to connect to an sccache server listening on `addr`, or start one if no server is running.
 fn connect_or_start_server(
     addr: &crate::net::SocketAddr,
     startup_timeout: Option<Duration>,
+    auto_start: bool,
 ) -> Result<ServerConnection> {
     trace!("connect_or_start_server({addr})");
     match connect_to_server(addr) {
@@ -411,6 +416,11 @@ fn connect_or_start_server(
                 || e.kind() == io::ErrorKind::TimedOut)
                 || (e.kind() == io::ErrorKind::NotFound && addr.is_unix_path()) =>
         {
+            if !auto_start {
+                return Err(anyhow::anyhow!(
+                    "managed sccache endpoint {addr} is unavailable; automatic server startup is disabled: {e}"
+                ));
+            }
             // If the connection was refused we probably need to start
             // the server.
             match run_server_process(startup_timeout)? {
@@ -988,7 +998,8 @@ fn authenticate_dist(config: &Config) -> Result<()> {
 
 fn show_dist_status(startup_timeout: Option<Duration>) -> Result<()> {
     trace!("Command::DistStatus");
-    let server = connect_or_start_server(&get_addr(), startup_timeout)?;
+    let server =
+        connect_or_start_server(&get_addr(), startup_timeout, auto_start_server_enabled())?;
     let status = request_dist_status(server).context("failed to get dist-status from server")?;
     serde_json::to_writer(&mut io::stdout(), &status)?;
     println!();
@@ -1040,7 +1051,7 @@ fn run_compile_command(
     }
 
     let jobserver = Client::new();
-    let conn = connect_or_start_server(&get_addr(), startup_timeout)?;
+    let conn = connect_or_start_server(&get_addr(), startup_timeout, auto_start_server_enabled())?;
     let invocation = CompileInvocation {
         exe,
         cmdline,
@@ -1103,7 +1114,8 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         }
         Command::ZeroStats => {
             trace!("Command::ZeroStats");
-            let conn = connect_or_start_server(&get_addr(), startup_timeout)?;
+            let conn =
+                connect_or_start_server(&get_addr(), startup_timeout, auto_start_server_enabled())?;
             request_zero_stats(conn).context("couldn't zero stats on server")?;
             eprintln!("Statistics zeroed.");
         }
@@ -1155,6 +1167,23 @@ mod test {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unavailable_managed_endpoint_does_not_autostart() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let addr = crate::net::SocketAddr::Unix(dir.path().join("unbound.sock"));
+        let Err(error) = connect_or_start_server(&addr, None, false) else {
+            anyhow::bail!("unexpected connection");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("automatic server startup is disabled")
+        );
+        assert!(!dir.path().join("unbound.sock").exists());
+        Ok(())
     }
 
     #[test]
