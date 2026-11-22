@@ -235,8 +235,11 @@ pub(super) fn assert_simple_compile(
         Cacheable,
     )>,
 ) {
+    use crate::compiler::CompileCommandImpl;
     use crate::mock_command::{MockChild, exit_status};
+    use crate::server;
     use crate::test::{mock_storage::MockStorage, utils::*};
+    use std::sync::Arc;
 
     let fixture = TestFixture::new();
     let creator = new_creator();
