@@ -877,7 +877,7 @@ mod test {
     }
 
     #[test]
-    fn test_basename_aware_direct_index_rejects_old_keys() -> anyhow::Result<()> {
+    fn test_basename_domain_only_affects_non_device_direct_index_keys() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let file = dir.path().join("test.c");
         let source = b"int x;";
@@ -906,6 +906,8 @@ mod test {
             let mut old = Digest::new();
             old.update(b"compiler");
             old.update(&[0, FORMAT_VERSION]);
+            old.delimiter(b"direct-time-policy-v1");
+            old.update(&[0]); // default time-macro policy
             old.update(language.as_str().as_bytes());
             let mut encoded = vec![];
             encode_path(&mut encoded, &file)?;
