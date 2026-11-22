@@ -708,6 +708,50 @@ mod test {
     }
 
     #[test]
+    fn test_basename_aware_direct_index_rejects_old_keys() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("test.c");
+        let source = b"int x;";
+        std::fs::write(&file, source)?;
+        for language in [
+            Language::C,
+            Language::Cxx,
+            Language::Cuda,
+            Language::CudaFE,
+            Language::Ptx,
+            Language::Cubin,
+        ] {
+            let key = preprocessor_cache_entry_hash_key(PreprocessorCacheKey {
+                compiler_digest: "compiler",
+                language,
+                arguments: &[],
+                extra_hashes: &[],
+                assembler_digest: None,
+                env_vars: &[],
+                input_file: &file,
+                plusplus: false,
+                config: PreprocessorCacheModeConfig::activated(),
+                basedirs: &[],
+            })?
+            .context("cacheable direct key")?;
+            let mut old = Digest::new();
+            old.update(b"compiler");
+            old.update(&[0, FORMAT_VERSION]);
+            old.update(language.as_str().as_bytes());
+            let mut encoded = vec![];
+            encode_path(&mut encoded, &file)?;
+            old.update(&encoded);
+            old.update(Digest::reader_sync(&source[..])?.as_bytes());
+            let old = old.finish();
+            match language {
+                Language::CudaFE | Language::Ptx | Language::Cubin => assert_eq!(key, old),
+                _ => assert_ne!(key, old),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_preprocessor_cache_entry_hash_key_basedirs() {
         #[cfg(target_os = "windows")]
         use crate::util::normalize_win_path;
