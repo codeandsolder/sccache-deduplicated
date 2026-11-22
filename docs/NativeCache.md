@@ -128,6 +128,18 @@ A separate quota-controlled scratch filesystem is still required; per-job
 scratch limits and fleet-level capacity policy remain outstanding. The native store is not
 an additional production sccache cache tier.
 
+## Toolchain discovery and mapped trees
+
+The Linux C and Rust toolchain packagers share their existing dependency and
+path discovery between archive emission and native mapping. Native mapping
+reads selected files into verified CAS staging, normalizes toolchain modes
+and timestamps, and rebases both symlink names and targets when a logical
+sysroot mapping is applied. No archive or intermediate materialized root is
+created. Mappings also support generated file bytes and explicit directories.
+The caller must keep sources stable during capture; per-file stat checks
+detect changes but are not a filesystem snapshot. This API is available when
+the distributed client and native store features are enabled.
+
 ## Validation
 
 The runtime crate has focused tests for identity, import, tree capture,
@@ -135,5 +147,6 @@ reference accounting, publication, session leases and isolated execution.
 The native HTTP tests exercise actual wire transfers and a Bubblewrap
 execution with a captured shell root and a separate mounted source tree.
 The scheduler unit test checks platform matching and shared capacity.
+A subprocess integration test uses real assembler dependency discovery, direct CAS transfer, the scheduler, HTTPS job claiming and a native-only Bubblewrap worker; it compares object bytes against local assembly and verifies cache reuse and failed-action handling.
 The ordinary compiler frontend, production deployment, real multi-host
-benchmarking and physical quota management remain separate integration work.
+benchmarking and hard scratch quotas remain separate integration work.

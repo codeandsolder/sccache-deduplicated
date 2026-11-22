@@ -75,16 +75,26 @@ fn executes_isolated_process_with_readonly_inputs_and_private_outputs() -> Resul
     for path in ["usr", "proc", "dev", "workspace", "out", "tmp"] {
         fs::create_dir(root.path().join(path))?;
     }
-    for (target, name) in [("usr/lib", "lib"), ("usr/lib", "lib64"), ("usr/bin", "bin")] {
-        symlink(target, root.path().join(name))?;
+    let mut runtime_dirs = vec![PathBuf::from("/usr")];
+    for name in ["bin", "lib", "lib64"] {
+        let host = Path::new("/").join(name);
+        let dest = root.path().join(name);
+        match fs::symlink_metadata(&host) {
+            Ok(metadata) if metadata.is_symlink() => symlink(fs::read_link(&host)?, dest)?,
+            Ok(metadata) if metadata.is_dir() => {
+                fs::create_dir(dest)?;
+                runtime_dirs.push(host);
+            }
+            Ok(_) => anyhow::bail!("unexpected runtime path: {}", host.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
     }
     fs::write(root.path().join("workspace/input"), b"original")?;
     let mut plan = SandboxPlan::new(root.path(), MountAccess::ReadOnly)?;
-    plan.bind(
-        Path::new("/usr"),
-        SandboxPath::new(Path::new("/usr"))?,
-        MountAccess::ReadOnly,
-    )?;
+    for dir in runtime_dirs {
+        plan.bind(&dir, SandboxPath::new(&dir)?, MountAccess::ReadOnly)?;
+    }
     plan.bind(
         output.path(),
         SandboxPath::new(Path::new("/out"))?,
@@ -93,7 +103,7 @@ fn executes_isolated_process_with_readonly_inputs_and_private_outputs() -> Resul
     plan.tmpfs(SandboxPath::new(Path::new("/tmp"))?)?;
 
     let invocation = SandboxInvocation::new(
-        "/usr/bin/sh".into(),
+        "/bin/sh".into(),
         vec!["-c".into(), "test \"$PRESENT\" = value && test \"${EMPTY+x}\" = x && test -z \"${HOST_SENTINEL+x}\" && test \"$(/usr/bin/id -u)\" = 1000 && test \"$(/usr/bin/hostname)\" = sccache-build && ! (echo bad > /workspace/input) && /usr/bin/cat /workspace/input > /out/result && echo tmp > /tmp/scratch".into()],
         Path::new("/workspace"),
         [("PRESENT".into(), "value".into()), ("EMPTY".into(), "".into())],

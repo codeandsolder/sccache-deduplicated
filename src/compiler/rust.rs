@@ -4491,6 +4491,22 @@ fn test_dist_toolchain_archive_contains_only_required_installed_targets() -> Res
 ))]
 impl pkg::ToolchainPackager for RustToolchainPackager {
     fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()> {
+        (*self).discover()?.into_compressed_tar(f)
+    }
+
+    #[cfg(feature = "native-store")]
+    fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
+        (*self).discover()?.into_native_mapping()
+    }
+}
+
+#[cfg(all(
+    feature = "dist-client",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+impl RustToolchainPackager {
+    fn discover(self) -> Result<pkg::ToolchainPackageBuilder> {
         info!(
             "Packaging Rust compiler for sysroot {}",
             self.sysroot.display()
@@ -4500,7 +4516,7 @@ impl pkg::ToolchainPackager for RustToolchainPackager {
             canonical,
             host,
             target,
-        } = *self;
+        } = self;
 
         let mut package_builder = pkg::ToolchainPackageBuilder::new();
         if canonical {
@@ -4544,7 +4560,7 @@ impl pkg::ToolchainPackager for RustToolchainPackager {
             }
         }
 
-        package_builder.into_compressed_tar(f)
+        Ok(package_builder)
     }
 }
 

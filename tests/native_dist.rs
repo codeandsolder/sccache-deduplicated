@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use sccache::{
     build_runtime::{
         BuildPath, CommandSpec, ContentId, ExecutionSpec, NativeStore, OutputSpec, SpacePolicy,
@@ -20,7 +20,7 @@ use sccache::{
         wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply},
     },
     config::{HTTPUrl, scheduler, server},
-    dist::{SchedulerStatusResult, native::NativeCacheClient},
+    dist::{SchedulerStatusResult, native::NativeCacheClient, pkg::ToolchainPackageBuilder},
 };
 
 const CLIENT_TOKEN: &str = "native-integration-client";
@@ -110,25 +110,6 @@ fn addresses() -> Result<[SocketAddr; 3]> {
     addresses
         .try_into()
         .map_err(|_| anyhow::anyhow!("wrong listener count"))
-}
-
-fn assembler_root(root: &Path) -> Result<()> {
-    for mount in ["bin", "src", "out", "tmp", "dev", "proc"] {
-        fs::create_dir_all(root.join(mount))?;
-    }
-    let assembler = Path::new("/usr/bin/as");
-    fs::copy(assembler, root.join("bin/as"))?;
-    let dependencies = Command::new("ldd").arg(assembler).output()?;
-    ensure!(dependencies.status.success(), "ldd failed");
-    for library in std::str::from_utf8(&dependencies.stdout)?
-        .split_whitespace()
-        .filter(|word| word.starts_with('/'))
-    {
-        let destination = root.join(&library[1..]);
-        fs::create_dir_all(destination.parent().context("library parent")?)?;
-        fs::copy(library, destination)?;
-    }
-    Ok(())
 }
 
 #[test]
@@ -246,10 +227,12 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
             .success(),
         "local assembler failed"
     );
-    let root_dir = root.join("root");
-    assembler_root(&root_dir)?;
     let sender = NativeStore::open(&root.join("sender"))?;
-    let root_tree = sender.capture_tree(&root_dir)?;
+    let mut discovery = ToolchainPackageBuilder::new();
+    discovery.add_executable_and_deps("/usr/bin/as".into())?;
+    let mut mapping = discovery.into_native_mapping()?;
+    mapping.add_directory(TreePath::new(b"src".to_vec())?)?;
+    let root_tree = mapping.capture(&sender)?;
     let source_tree = sender.capture_tree(&source_dir)?;
     let root_pin = client.push_tree(&root_tree)?;
     let source_pin = client.push_tree(&source_tree)?;
@@ -258,7 +241,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
         root: root_tree.id(),
         mounts: BTreeMap::from([(BuildPath::new(b"/src".to_vec())?, source_tree.id())]),
         command: CommandSpec {
-            executable: BuildPath::new(b"/bin/as".to_vec())?,
+            executable: BuildPath::new(b"/usr/bin/as".to_vec())?,
             arguments: [b"-o".as_slice(), b"/out/object.o", b"/src/input.s"]
                 .map(<[u8]>::to_vec)
                 .to_vec(),

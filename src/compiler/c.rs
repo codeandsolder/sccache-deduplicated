@@ -2328,6 +2328,22 @@ impl pkg::ToolchainPackager for CToolchainPackager {
     }
 
     fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()> {
+        self.discover()?.into_compressed_tar(f)
+    }
+
+    #[cfg(feature = "native-store")]
+    fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
+        self.discover()?.into_native_mapping()
+    }
+}
+
+#[cfg(all(
+    feature = "dist-client",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+impl CToolchainPackager {
+    fn discover(&self) -> Result<pkg::ToolchainPackageBuilder> {
         use std::os::unix::ffi::OsStringExt;
 
         info!("Generating toolchain {}", self.executable.display());
@@ -2454,7 +2470,7 @@ impl pkg::ToolchainPackager for CToolchainPackager {
         }
 
         // Bundle into a compressed tarfile.
-        package_builder.into_compressed_tar(f)
+        Ok(package_builder)
     }
 }
 

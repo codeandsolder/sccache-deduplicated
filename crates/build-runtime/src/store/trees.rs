@@ -241,6 +241,10 @@ impl Drop for TreeLease {
 #[cfg(target_os = "linux")]
 mod capture;
 #[cfg(target_os = "linux")]
+mod mapped;
+#[cfg(target_os = "linux")]
+pub use mapped::{MappedMetadata, MappedTree};
+#[cfg(target_os = "linux")]
 mod materialize;
 #[cfg(target_os = "linux")]
 pub use materialize::{MaterializationStats, MaterializedTree};

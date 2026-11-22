@@ -43,4 +43,4 @@ pub mod sandbox;
 pub use execution::{CapturedExecution, ExecutionPolicy, execute};
 
 #[cfg(all(target_os = "linux", feature = "store"))]
-pub use store::{MaterializationStats, MaterializedTree};
+pub use store::{MappedMetadata, MappedTree, MaterializationStats, MaterializedTree};

@@ -119,15 +119,8 @@ impl Capture<'_> {
             Mode::empty(),
         )?);
         unchanged(stat, &fstat(&file)?)?;
-        let blob = self
-            .store
-            .stage_inner(&file, Some(u64::try_from(stat.st_size)?))?;
-        unchanged(stat, &fstat(&file)?)?;
+        let blob = capture_regular(self.store, &file, stat)?;
         let reference = blob.reference();
-        ensure!(
-            reference.size == u64::try_from(stat.st_size)?,
-            "file size changed during capture"
-        );
         self.blobs.entry(reference.id).or_insert(blob);
         if stat.st_nlink > 1 {
             self.links.insert(identity, path.clone());
@@ -139,6 +132,21 @@ impl Capture<'_> {
     }
 }
 
+pub(super) fn capture_regular(store: &NativeStore, file: &File, stat: &Stat) -> Result<StagedBlob> {
+    ensure!(
+        FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile,
+        "capture source is not a regular file"
+    );
+    let size = u64::try_from(stat.st_size)?;
+    let blob = store.stage_inner(file, Some(size))?;
+    unchanged(stat, &fstat(file)?)?;
+    ensure!(
+        blob.reference().size == size,
+        "file size changed during capture"
+    );
+    Ok(blob)
+}
+
 fn timestamp(stat: &Stat) -> Result<TreeTimestamp> {
     Ok(TreeTimestamp {
         seconds: stat.st_mtime,
@@ -146,14 +154,14 @@ fn timestamp(stat: &Stat) -> Result<TreeTimestamp> {
     })
 }
 
-fn metadata(stat: &Stat) -> Result<TreeMetadata> {
+pub(super) fn metadata(stat: &Stat) -> Result<TreeMetadata> {
     Ok(TreeMetadata {
         mode: stat.st_mode & 0o7777,
         modified: timestamp(stat)?,
     })
 }
 
-fn unchanged(before: &Stat, after: &Stat) -> Result<()> {
+pub(super) fn unchanged(before: &Stat, after: &Stat) -> Result<()> {
     ensure!(
         before.st_dev == after.st_dev
             && before.st_ino == after.st_ino
