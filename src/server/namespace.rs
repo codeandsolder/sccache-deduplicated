@@ -305,7 +305,10 @@ impl TransferSession {
                     matches!(self.state, Transfer::Idle),
                     "another transfer is active"
                 );
-                let data = read_blob(storage, kind, &key).await?;
+                let data = read_blob(storage, kind, &key)
+                    .await
+                    .with_context(|| format!("namespace storage lookup for key {key}"))
+                    .inspect_err(|error| warn!("{error:#}"))?;
                 Ok(self.begin_download(data))
             }
             TransferRequest::BeginWrite { kind, key, len } => {
@@ -659,6 +662,12 @@ mod tests {
                 storage.get_raw(&key).await?.as_deref(),
                 Some(expected.as_slice())
             );
+
+            // The transfer can return bytes successfully while the artifact
+            // itself is corrupt. That is a read error, not an absent key.
+            let error = client.get(&key).await.unwrap_err();
+            assert!(format!("{error:#}").contains(&key));
+            assert!(matches!(client.get(&other).await?, Cache::Miss));
 
             let conn = client.conn();
             crate::client::connection_task(conn, move |conn| {

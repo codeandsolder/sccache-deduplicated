@@ -40,6 +40,8 @@ impl LazyDiskCache {
     /// Read-only storage is a direct filesystem reader. Do not initialize the
     /// writable LRU (which scans, deletes and may create directories), or impose
     /// its eviction limit on an immutable cache maintained by another process.
+    /// # Errors
+    /// Returns an error for an invalid key, cache initialization failure, or filesystem read error.
     pub fn open(&mut self, key: &Path, mode: CacheMode) -> Result<Option<Box<dyn ReadSeek>>> {
         LruDiskCache::validate_key(key.as_os_str())?;
         if mode == CacheMode::ReadOnly {

@@ -336,6 +336,12 @@ mod client {
             weak_key: &str,
             create: impl FnOnce(fs::File) -> Result<()>,
         ) -> Result<Toolchain> {
+            // A warm package does not depend on an unrelated cold package
+            // finishing compression. Repeat the lookup after acquiring the
+            // creation lock to retain single-flight behavior on a miss.
+            if let Some(tc) = self.lookup_toolchain(weak_key)? {
+                return Ok(tc);
+            }
             // Only permit one toolchain creation at a time, without holding the
             // LRU cache mutex across potentially slow packaging I/O.
             let _creation_guard = self
@@ -583,6 +589,31 @@ mod client {
 
             assert_eq!(repacked, toolchain);
             assert!(second.get_toolchain(&repacked)?.is_some());
+            Ok(())
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        #[test]
+        fn cached_toolchain_lookup_does_not_wait_for_unrelated_packaging() -> Result<()> {
+            let (_td, _cache_dir, client, toolchain) = cached_toolchain()?;
+            let client = std::sync::Arc::new(client);
+            let creation = client.toolchain_creation.lock().unwrap();
+            let worker = std::sync::Arc::clone(&client);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                tx.send(worker.put_toolchain(
+                    "/my/compiler".as_ref(),
+                    "weak_key",
+                    PanicToolchainPackager::boxed(),
+                ))
+            });
+            let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+            drop(creation);
+            thread.join().expect("lookup thread panicked")?;
+            assert_eq!(result??.0, toolchain);
             Ok(())
         }
 
