@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# Managed Garage acceptance test for the complete BoringSSL native build.
+# No additional cache daemon, cache storage, or global counter resets.
+set -euo pipefail
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+# Each trace is one real compiler invocation. Match the framed StorageGetRaw
+# messages in src/protocol.rs (bincode enum discriminants and u64 key length).
+# Reject missing, ambiguous, or incompatible protocol data rather than count
+# it as a hit. The 64-byte key is ASCII hexadecimal.
+lookup() {
+    awk -F '"' '
+        function byte(s, n,   h, a, b) {
+            h = substr(s, 4*n+3, 2)
+            a = index("0123456789abcdef", substr(h,1,1))-1
+            b = index("0123456789abcdef", substr(h,2,1))-1
+            if (a < 0 || b < 0) exit 2
+            return 16*a+b
+        }
+        /sendto\(/ && substr($2,1,64) == "\\x00\\x00\\x00\\x4c\\x07\\x00\\x00\\x00\\x40\\x00\\x00\\x00\\x00\\x00\\x00\\x00" {
+            ++requests
+            key = ""
+            for (i=16;i<80;i++) key = key sprintf("%c",byte($2,i))
+        }
+        /recvfrom\(/ && substr($2,17,16) == "\\x08\\x00\\x00\\x00" {
+            ++responses
+            state = (byte($2,8)==1 ? "hit" : (byte($2,8)==0 ? "miss" : "invalid"))
+        }
+        END {
+            if (requests != 1 || responses != 1 || length(key) != 64 || key !~ /^[0-9a-f]+$/ || state == "invalid") exit 1
+            print key, state
+        }
+    ' "$1"
+}
+
+trace_compile() {
+    local output='' trace i
+    local args=("$@")
+    for ((i=0;i<${#args[@]};i++)); do
+        if [[ ${args[i]} == -o ]]; then output=${args[i+1]}; break; fi
+    done
+    [[ -n $output && $output != /* && $output != *..* ]] || die "Unexpected CMake output: $output"
+    trace="$OUT_DIR/trace/$output.ipc"
+    # strace launches its output pipe through a shell; the harness creates
+    # these paths in a controlled directory with no shell metacharacters.
+    [[ $trace =~ ^[a-zA-Z0-9_./-]+$ ]] || die "Unsupported trace path: $trace"
+    mkdir -p "$(dirname "$trace")"
+    unset SCCACHE_LOG SCCACHE_ERROR_LOG SCCACHE_LOG_MILLIS SCCACHE_RECACHE
+    export SCCACHE_CLIENT_SIDE=1
+    exec strace -f -xx -s 100 -yy -e trace=read,write,readv,writev,recvfrom,sendto,recvmsg,sendmsg \
+        -o "|rg 'UNIX-STREAM' > '$trace'" "$@"
+}
+
+manifest() {
+    (cd "$1/build"
+        find CMakeFiles/{crypto,ssl,fipsmodule}.dir -name '*.o' -type f -print0 |
+            sort -z | xargs -0 -r sha256sum
+        sha256sum libcrypto.a libssl.a
+    )
+}
+
+summarize() {
+    local root=$1 file object result n=0
+    while IFS= read -r -d '' file; do
+        object=${file#"$root/build/"}
+        result=$(lookup "$root/trace/$object.ipc") || die "Unusable trace for $object"
+        printf '%s %s\n' "$object" "$result"
+        if [[ $object == *.cc.o || $object == *.cpp.o || $object == *.c.o ]]; then
+            rg -q -F "$root/boringssl/" "$file.d" || die "Wrong depfile root: $object"
+            if rg -q -F '/__sccache/' "$file.d"; then die "Canonical name in depfile: $object"; fi
+        fi
+        n=$((n+1))
+    done < <(find "$root/build/CMakeFiles/"{crypto,ssl,fipsmodule}.dir -name '*.o' -type f -print0 | sort -z)
+    [[ $n -gt 0 && $n -eq $(find "$root/trace" -name '*.ipc' -type f | wc -l) ]] ||
+        die "Object and compiler trace counts differ at $root"
+}
+
+verify() {
+    local a=$1 b=$2 expected=$3 results=$4
+    summarize "$a" > "$results/a.lookups"
+    summarize "$b" > "$results/b.lookups"
+    for phase in a b; do
+        [[ $(wc -l < "$results/$phase.lookups") -eq $expected ]] || die "Unexpected workload size in $phase"
+        awk '{n[$3]++} END {for(k in n) print k,n[k]}' "$results/$phase.lookups"
+    done
+    diff -u <(cut -d' ' -f1,2 "$results/a.lookups") <(cut -d' ' -f1,2 "$results/b.lookups")
+    awk '$3 != "hit" {print; failed=1} END {exit failed}' "$results/b.lookups"
+    manifest "$a" > "$results/a.sha256"
+    manifest "$b" > "$results/b.sha256"
+    diff -u "$results/a.sha256" "$results/b.sha256"
+    printf '%s matching keys, all second-pass cache hits; matching artifacts\n' "$expected"
+}
+
+if [[ ${1:-} == --trace-compile ]]; then shift; trace_compile "$@"; fi
+if [[ ${1:-} == --lookup ]]; then [[ $# == 2 ]] || die "Usage: --lookup TRACE"; lookup "$2"; exit; fi
+if [[ ${1:-} == --verify ]]; then
+    [[ $# == 5 ]] || die "Usage: --verify OUT_A OUT_B EXPECTED_COUNT RESULTS_DIR"
+    verify "$2" "$3" "$4" "$5"; exit
+fi
+[[ $# -ge 3 ]] || die "Usage: $0 PATCHED_BORINGSSL_SOURCE WORKSPACE EXPECTED_COUNT [actual CMake options...]"
+source=$(realpath "$1")
+workspace=$(realpath "$2")
+expected=$3
+shift 3
+[[ -f $source/CMakeLists.txt && -d $workspace && $expected =~ ^[1-9][0-9]*$ ]] || die "Invalid source, workspace or count"
+[[ -n ${CARGO_MANIFEST_DIR:-} && -n ${SCCACHE_CANONICAL_TARGET_ROOT:-} ]] || die "Provide the actual Cargo build-script environment"
+script=$(realpath "$0")
+[[ $workspace =~ ^[a-zA-Z0-9_./-]+$ && $script =~ ^[a-zA-Z0-9_./-]+$ ]] || die "Unsupported workspace or script path"
+scratch=$(mktemp -d "$workspace/native-cache-reuse.XXXXXXXX")
+echo "Acceptance directory: $scratch"
+# Preserve small raw evidence, remove only our copied source/build trees.
+trap 'rm -rf -- "$scratch/a" "$scratch/b"' EXIT
+for phase in a b; do
+    if [[ $phase == a ]]; then fingerprint=bd00da2a08bc0b6a; else fingerprint=72223245a454eaef; fi
+    root="$scratch/$phase/workspace-$phase"
+    export OUT_DIR="$root/debug/build/boring-sys/$fingerprint/out"
+    export SCCACHE_EXPERIMENTAL_CANONICAL_RUST=1
+    mkdir -p "$OUT_DIR"
+    printf 'Signature: 8a477f597d28d172789f06886806bc55\n' > "$root/CACHEDIR.TAG"
+    cp -a "$source" "$OUT_DIR/boringssl"
+    # Use the original build-script compiler/launcher/flag options passed by
+    # the caller. Both independent source copies are real builds, not replayed
+    # preprocessed inputs or a selected sample.
+    cmake -S "$OUT_DIR/boringssl" -B "$OUT_DIR/build" -G 'Unix Makefiles' \
+        -DCMAKE_INSTALL_PREFIX="$OUT_DIR" "$@" > "$scratch/$phase-configure.log" 2>&1
+    for target in fipsmodule crypto ssl; do
+        rule="$OUT_DIR/build/CMakeFiles/$target.dir/build.make"
+        [[ -f $rule ]] || die "Missing CMake target rule: $rule"
+        cp "$rule" "$rule.native-reuse-original"
+        sed -i -E "s|^(\t)(.* -c .*)$|\1$script --trace-compile \2|" "$rule"
+    done
+    cmake --build "$OUT_DIR/build" --target ssl crypto --parallel "${JOBS:-8}" > "$scratch/$phase-build.log" 2>&1
+    printf '%s\n' "$OUT_DIR" > "$scratch/$phase.root"
+done
+a=$(cat "$scratch/a.root"); b=$(cat "$scratch/b.root")
+verify "$a" "$b" "$expected" "$scratch"
+# Verify the returned bytes against a genuine normal-mode fresh compilation.
+# Forced recache does not bypass sccache or create a new daemon.
+export OUT_DIR="$b"
+unset SCCACHE_CLIENT_SIDE
+for target in fipsmodule crypto ssl; do
+    rule="$b/build/CMakeFiles/$target.dir/build.make"
+    mv "$rule.native-reuse-original" "$rule"
+done
+SCCACHE_RECACHE=1 cmake --build "$b/build" --clean-first --target ssl crypto \
+    --parallel "${JOBS:-8}" > "$scratch/fresh-build.log" 2>&1
+manifest "$b" > "$scratch/fresh.sha256"
+diff -u "$scratch/b.sha256" "$scratch/fresh.sha256"
+printf 'All %s fresh object files and both archives equal cached bytes\n' "$expected"
+
+# A single genuine source mutation must change the key and the object. Use an
+# independent symbol name to ensure this cannot hit a previous test mutation.
+object=CMakeFiles/crypto.dir/crypto/bytestring/cbs.cc.o
+source_file="$b/boringssl/crypto/bytestring/cbs.cc"
+rule="$b/build/CMakeFiles/crypto.dir/build.make"
+[[ -f $source_file && -f $b/build/$object ]] || die "Missing mutation fixture"
+symbol="sccache_acceptance_mutation_${scratch##*.}"
+printf '\nextern "C" __attribute__((used)) int %s() { return 303; }\n' "$symbol" >> "$source_file"
+sed -i -E "s|^(\t)(.* -c .*)$|\1$script --trace-compile \2|" "$rule"
+rm -- "$b/build/$object" "$b/trace/$object.ipc"
+make -C "$b/build" -f CMakeFiles/crypto.dir/build.make "$object" > "$scratch/mutation-build.log" 2>&1
+result=$(lookup "$b/trace/$object.ipc") || die "Missing mutation lookup"
+old_key=$(awk -v object="$object" '$1 == object { print $2 }' "$scratch/b.lookups")
+[[ -n $old_key && ${result% *} != "$old_key" && ${result##* } == miss ]] || die "Mutation did not create a new cache key"
+nm "$b/build/$object" | rg -q " T $symbol$" || die "Mutation symbol missing from object"
+printf '%s %s\n' "$object" "$result" > "$scratch/mutation.lookup"
+echo 'Source mutation changed the key, missed and produced the new symbol'
