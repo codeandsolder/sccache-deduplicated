@@ -148,7 +148,8 @@ fn create_jwt_server_token(
     header: &jwt::Header,
     key: &[u8],
 ) -> Result<String> {
-    let key = jwt::EncodingKey::from_secret(key);
+    anyhow::ensure!(key.len() == 256 / 8, "Size of secret key incorrect");
+    let key = jwt::EncodingKey::from_secret(key)?;
     jwt::encode(header, &ServerJwt { exp: 0, server_id }, &key).map_err(Into::into)
 }
 fn dangerous_insecure_extract_jwt_server_token(server_token: &str) -> Result<ServerId> {
@@ -158,11 +159,10 @@ fn dangerous_insecure_extract_jwt_server_token(server_token: &str) -> Result<Ser
 }
 fn check_jwt_server_token(
     server_token: &str,
-    key: &[u8],
+    key: &jwt::DecodingKey,
     validation: &jwt::Validation,
 ) -> Option<ServerId> {
-    let key = jwt::DecodingKey::from_secret(key);
-    jwt::decode::<ServerJwt>(server_token, &key, validation)
+    jwt::decode::<ServerJwt>(server_token, key, validation)
         .map(|res| res.claims.server_id)
         .ok()
 }
@@ -230,6 +230,8 @@ fn run(command: Command) -> Result<i32> {
                     if secret_key.len() != 256 / 8 {
                         bail!("Size of secret key incorrect")
                     }
+                    let key = jwt::DecodingKey::from_secret(&secret_key)
+                        .context("Invalid JWT verification key")?;
                     let validation = {
                         let mut validation = jwt::Validation::new(jwt::Algorithm::HS256);
                         validation.leeway = 0;
@@ -238,7 +240,7 @@ fn run(command: Command) -> Result<i32> {
                         validation
                     };
                     Box::new(move |server_token| {
-                        check_jwt_server_token(server_token, &secret_key, &validation)
+                        check_jwt_server_token(server_token, &key, &validation)
                     })
                 }
             };
