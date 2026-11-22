@@ -1176,31 +1176,39 @@ pub fn daemonize(_preserve_fds: &[std::os::windows::io::RawHandle]) -> Result<()
     Ok(())
 }
 
-/// Disable connection pool to avoid broken connection between runtime
-///
-/// # TODO
-///
-/// We should refactor sccache current model to make sure that we only have
-/// one tokio runtime and keep reqwest alive inside it.
-///
-/// ---
-///
-/// More details could be found at <https://github.com/mozilla/sccache/pull/1563>
+#[cfg(all(feature = "reqwest", not(target_os = "android"), any(unix, windows)))]
+fn mozilla_root_certificates() -> reqwest::Result<Vec<reqwest::Certificate>> {
+    webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .map(|cert| reqwest::Certificate::from_der(cert.as_ref()))
+        .collect()
+}
+
+/// Use the platform verifier augmented with Mozilla roots on platforms where
+/// reqwest supports merging roots. Android uses its own platform verifier.
+#[cfg(feature = "reqwest")]
+pub(crate) fn new_reqwest_client_builder() -> reqwest::Result<reqwest::ClientBuilder> {
+    let builder = reqwest::Client::builder();
+    #[cfg(all(not(target_os = "android"), any(unix, windows)))]
+    let builder = builder.tls_certs_merge(mozilla_root_certificates()?);
+    Ok(builder)
+}
+
 #[cfg(any(feature = "dist-server", feature = "dist-client"))]
+pub(crate) fn new_reqwest_blocking_builder() -> reqwest::Result<reqwest::blocking::ClientBuilder> {
+    let builder = reqwest::blocking::Client::builder();
+    #[cfg(all(not(target_os = "android"), any(unix, windows)))]
+    let builder = builder.tls_certs_merge(mozilla_root_certificates()?);
+    Ok(builder)
+}
+
 /// Build the blocking HTTP client used by distributed components.
-///
+/// Pooling is disabled because connections may outlive their original runtime.
 /// # Errors
-///
 /// Returns an error if reqwest cannot initialize the configured client.
+#[cfg(any(feature = "dist-server", feature = "dist-client"))]
 pub fn new_reqwest_blocking_client() -> Result<reqwest::blocking::Client> {
-    let mut builder = reqwest::blocking::Client::builder();
-
-    // Query the native store; fallback if it's completely empty
-    if rustls_native_certs::load_native_certs().certs.is_empty() {
-        builder = builder.tls_certs_only(Vec::new());
-    }
-
-    builder
+    new_reqwest_blocking_builder()?
         .pool_max_idle_per_host(0)
         .build()
         .context("failed to build blocking HTTP client")
@@ -1676,6 +1684,36 @@ mod tests {
     use super::{Digest, OsStrExt, TimeMacroFinder, resolve_compiler_avoiding_wrapper};
     use std::ffi::{OsStr, OsString};
     use std::path::Path;
+
+    #[cfg(feature = "reqwest")]
+    #[test]
+    fn http_builders_load_trust_roots() -> crate::errors::Result<()> {
+        super::new_reqwest_client_builder()?.build()?;
+        #[cfg(any(feature = "dist-server", feature = "dist-client"))]
+        super::new_reqwest_blocking_client()?;
+        Ok(())
+    }
+
+    #[cfg(all(feature = "reqwest", target_os = "linux"))]
+    #[test]
+    fn http_builders_survive_missing_system_ca_store() -> crate::errors::Result<()> {
+        // Isolate the platform verifier's environment from concurrently running
+        // tests, including any other HTTP clients they construct.
+        let dir = tempfile::tempdir()?;
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "util::tests::http_builders_load_trust_roots"])
+            .env("SSL_CERT_FILE", dir.path().join("missing-ca-file"))
+            .env("SSL_CERT_DIR", dir.path().join("missing-ca-dir"))
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("1 passed"), "{stdout}");
+        Ok(())
+    }
 
     #[test]
     fn test_reader_sync_across_buffer_sizes() {

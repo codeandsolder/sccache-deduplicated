@@ -2230,6 +2230,7 @@ mod scheduler_tests {
             1.0,
             &[job_id],
             Box::new(TestJobAuthorizer),
+            dist::WorkerCapabilities::ARCHIVE,
         )?;
         assert!(
             !scheduler
@@ -2248,6 +2249,7 @@ mod scheduler_tests {
             1.0,
             &[],
             Box::new(TestJobAuthorizer),
+            dist::WorkerCapabilities::ARCHIVE,
         )?;
         assert_no_assigned_jobs(&scheduler, &server_id);
         Ok(())

@@ -15,10 +15,10 @@
 
 use crate::cache::CacheMode;
 use crate::errors::{Result, anyhow};
+use crate::util::new_reqwest_client_builder;
 use opendal::Operator;
 use opendal::{OperationContext, services::Gcs};
 use opendal_layer_logging::LoggingLayer;
-use reqwest::Client;
 use serde::Deserialize;
 use url::Url;
 
@@ -96,7 +96,9 @@ async fn fetch_taskcluster_token(url: &str, scope: &str) -> Result<String> {
     debug!("gcs: start to load token from: {url}");
 
     let user_agent = format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-    let client = Client::builder().user_agent(user_agent).build()?;
+    let client = new_reqwest_client_builder()?
+        .user_agent(user_agent)
+        .build()?;
     let res = client.get(url).send().await?;
 
     if res.status().is_success() {

@@ -3296,11 +3296,22 @@ where
             val.hash(&mut HashToDigest { digest: &mut m });
         }
         if is_clippy_driver(&self.executable) {
+            if canonical_paths.is_some() {
+                m.delimiter(b"canonical-clippy-env-v1");
+            }
             // Clippy lint flags arrive through CLIPPY_ARGS, not rustc argv.
+            // Hash the environment seen by the canonical compiler, rather
+            // than the physical spelling of the relocated policy directory.
+            // Explicit env!/option_env! observations remain separately hashed
+            // above, and the actual policy files are hashed as source inputs.
             for (var, val) in env_vars.iter().filter(|(k, _)| k.starts_with("CLIPPY_")) {
+                let value = canonical_paths.as_ref().map_or_else(
+                    || val.clone(),
+                    |paths| paths.env_value_to_canonical(var, val),
+                );
                 var.hash(&mut HashToDigest { digest: &mut m });
                 m.update(b"=");
-                val.hash(&mut HashToDigest { digest: &mut m });
+                value.hash(&mut HashToDigest { digest: &mut m });
             }
         }
         // 9. The cwd of the compile. This will wind up in the rlib.
@@ -6977,6 +6988,63 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             first, second,
             "changing the external Clippy policy must invalidate cache"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_canonical_clippy_policy_location_does_not_change_cache_key() -> Result<()> {
+        let a = TestFixture::new();
+        let b = TestFixture::new();
+        let args = [
+            "--emit",
+            "metadata",
+            "foo.rs",
+            "--out-dir",
+            "target/out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+        ];
+        let policy_env = |fixture: &TestFixture| {
+            let root = fixture.tempdir.path();
+            vec![
+                ("SCCACHE_EXPERIMENTAL_CANONICAL_RUST".into(), "1".into()),
+                (
+                    "SCCACHE_CANONICAL_BUILD_ROOT".into(),
+                    root.as_os_str().to_owned(),
+                ),
+                (
+                    "CARGO_TARGET_DIR".into(),
+                    root.join("target").into_os_string(),
+                ),
+                (
+                    "CLIPPY_CONF_DIR".into(),
+                    root.join("policy").into_os_string(),
+                ),
+                (
+                    "CLIPPY_ARGS".into(),
+                    "-Dclippy::unwrap_used__CLIPPY_HACKERY__".into(),
+                ),
+            ]
+        };
+        let policy = |fixture: &TestFixture, contents: &[u8]| -> Result<()> {
+            let dir = fixture.tempdir.path().join("policy");
+            fs::create_dir_all(&dir)?;
+            fs::write(dir.join("clippy.toml"), contents)?;
+            Ok(())
+        };
+        policy(&a, b"disallowed-names = [\"bad_one\"]\n")?;
+        policy(&b, b"disallowed-names = [\"bad_one\"]\n")?;
+        let env_a = policy_env(&a);
+        let env_b = policy_env(&b);
+        let key = |fixture: &TestFixture, env: &[(OsString, OsString)]| {
+            hash_key_for_compiler(fixture, &args, env, |_| Ok(()), false, "clippy-driver")
+        };
+        let first = key(&a, &env_a);
+        assert_eq!(first, key(&b, &env_b));
+        policy(&b, b"disallowed-names = [\"bad_two\"]\n")?;
+        assert_ne!(first, key(&b, &env_b));
         Ok(())
     }
 
