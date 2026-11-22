@@ -25,7 +25,7 @@ mod core;
 mod cudafe;
 mod diab;
 #[cfg(target_os = "linux")]
-pub(crate) mod dynamic_dependencies;
+pub mod dynamic_dependencies;
 mod gcc;
 mod msvc;
 mod nvcc;

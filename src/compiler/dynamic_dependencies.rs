@@ -28,7 +28,7 @@ use std::{
 // - static + non-PIE = ET_EXEC, ldd stderrs something like "\tnot a dynamic executable" or
 //   "ldd: a.out: Not a valid dynamic program" and exits with code 1
 //
-pub(crate) fn find_ldd_libraries(
+pub fn find_ldd_libraries(
     executable: &Path,
     environment: Option<&[(OsString, OsString)]>,
 ) -> Result<Vec<PathBuf>> {
@@ -58,7 +58,7 @@ pub(crate) fn find_ldd_libraries(
     if !status.success() {
         // Only accept a genuine static executable, not a dynamic ET_EXEC
         // whose interpreter or libraries could not be loaded.
-        use object::{Object, ObjectKind};
+        use object::{Object, ObjectKind, read::elf::ProgramHeader};
         let bytes = fs::read(executable)?;
         let elf = object::File::parse(bytes.as_slice())?;
         if elf.format() != object::BinaryFormat::Elf
@@ -72,7 +72,6 @@ pub(crate) fn find_ldd_libraries(
         }
         // An executable without imported symbols can still have PT_INTERP.
         // Check the actual ELF program headers rather than section names.
-        use object::read::elf::ProgramHeader;
         let has_interpreter = match elf {
             object::File::Elf32(file) => file
                 .elf_program_headers()
