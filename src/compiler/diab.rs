@@ -480,12 +480,11 @@ impl Iterator for ExpandAtArgs<'_> {
 #[cfg(test)]
 mod test {
     use super::{
-        ARGS, Language, OsString, ParsedArguments, dist, fs, generate_compile_commands,
+        ARGS, Language, OsString, ParsedArguments, fs, generate_compile_commands,
         parse_arguments,
     };
     use crate::compiler::c::ArtifactDescriptor;
     use crate::compiler::*;
-    use crate::test::utils::*;
     use fs::File;
     use std::io::Write;
 

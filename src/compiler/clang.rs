@@ -331,7 +331,6 @@ mod test {
     use super::*;
     use crate::compiler::gcc;
     use crate::compiler::*;
-    use crate::test::utils::*;
     use std::path::PathBuf;
 
     fn parse_arguments_(arguments: Vec<String>) -> CompilerArguments<ParsedArguments> {

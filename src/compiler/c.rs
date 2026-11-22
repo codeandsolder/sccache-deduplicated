@@ -230,7 +230,7 @@ pub(super) fn assert_simple_compile(
         &Path,
         &[(OsString, OsString)],
     ) -> Result<(
-        SingleCompileCommand,
+        super::SingleCompileCommand,
         Option<dist::CompileCommand>,
         Cacheable,
     )>,
