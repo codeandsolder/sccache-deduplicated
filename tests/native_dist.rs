@@ -32,6 +32,20 @@ const CLIENT_TOKEN: &str = "native-integration-client";
 const WORKER_TOKEN: &str = "native-integration-worker";
 const PLATFORM: &str = "native-integration-platform-v1";
 
+fn package_limits(retain_original: bool) -> sccache::build_runtime::PackageImportLimits {
+    sccache::build_runtime::PackageImportLimits {
+        retain_original,
+        max_concurrent_imports: 2,
+        max_archive_bytes: 1 << 30,
+        max_entries: 100_000,
+        max_expanded_bytes: 4 << 30,
+        max_tar_bytes: 5 << 30,
+        max_metadata_bytes: 64 << 20,
+        decoder_memory_bytes: 512 << 20,
+        decoder_timeout_secs: 120,
+    }
+}
+
 fn space() -> SpacePolicy {
     SpacePolicy {
         min_available_bytes: 1024 * 1024,
@@ -180,16 +194,7 @@ impl Fleet {
                     max_total_uploads: 4,
                     http_threads: 8,
                     max_metadata_bytes: 64 * 1024 * 1024,
-                    package_import: Some(sccache::build_runtime::PackageImportLimits {
-                        max_concurrent_imports: 2,
-                        max_archive_bytes: 1024 * 1024 * 1024,
-                        max_entries: 100_000,
-                        max_expanded_bytes: 4 * 1024 * 1024 * 1024,
-                        max_tar_bytes: 5 * 1024 * 1024 * 1024,
-                        max_metadata_bytes: 64 * 1024 * 1024,
-                        decoder_memory_bytes: 512 * 1024 * 1024,
-                        decoder_timeout_secs: 120,
-                    }),
+                    package_import: Some(package_limits(true)),
                     package_upstream,
                 }),
             },
@@ -228,6 +233,7 @@ impl Fleet {
                     execution_timeout_secs: 120,
                     max_result_bytes: 64 * 1024 * 1024,
                     max_metadata_bytes: 64 * 1024 * 1024,
+                    package_import: Some(package_limits(false)),
                 }),
             },
         )?;
@@ -523,7 +529,7 @@ fn rustup_sync_acquires_once_and_reuses_portable_recipe_and_catalog() -> Result<
     assert_eq!(warm["attestation"]["reused_files"], 2);
     assert_eq!(upstream.count(), 2);
     let (scheduler, worker) = fleet.finish()?;
-    assert_eq!(scheduler.blobs, 7);
+    assert_eq!(scheduler.blobs, 9);
     assert_eq!(scheduler.trees, 4);
     assert_eq!(worker.blobs, 0);
     drop(upstream);
@@ -648,7 +654,7 @@ fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
     client.close(offer.ticket)?;
     assert_eq!(fleet.status()?.num_servers, 1);
     let (scheduler, _) = fleet.finish()?;
-    assert_eq!(scheduler.blobs, 4);
+    assert_eq!(scheduler.blobs, 5);
     assert_eq!(scheduler.trees, 3);
     Ok(())
 }
@@ -670,7 +676,37 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let source_dir = root.join("source");
     fs::create_dir(&source_dir)?;
     let input = source_dir.join("input.s");
-    fs::write(&input, b".text\n.globl entry\nentry:\n.byte 1, 2, 3, 4\n")?;
+    // The same payload exists under a different path in an original package.
+    // Its compressed representation is much smaller than the raw source.
+    let mut assembly = b".text\n.globl entry\nentry:\n.byte 1, 2, 3, 4\n".to_vec();
+    for _ in 0..32768 {
+        assembly.extend_from_slice(b"# repeated original assembly content\n");
+    }
+    fs::write(&input, &assembly)?;
+    let original = root.join("assembly.tar");
+    fs::write(
+        &original,
+        rust_installer_fixture("assembly", "lib/assembly.s", &assembly)?,
+    )?;
+    let compressed = Command::new("xz").arg("-c").arg(&original).output()?;
+    ensure!(
+        compressed.status.success(),
+        "assembly fixture compression failed"
+    );
+    use sccache::build_runtime::{PackageCompression, PackageIdentity, PackageSource};
+    use sha2::{Digest, Sha256};
+    let package = PackageSource {
+        identity: PackageIdentity {
+            sha256: Sha256::digest(&compressed.stdout).into(),
+            compression: PackageCompression::Xz,
+        },
+        size: u64::try_from(compressed.stdout.len())?,
+    };
+    let archive = root.join("assembly.tar.xz");
+    fs::write(&archive, compressed.stdout)?;
+    let installed = client.import_rust_package(package, File::open(&archive)?)?;
+    assert_eq!(installed.source, package);
+    assert!(package.size < u64::try_from(assembly.len())? / 100);
     let reference = root.join("reference.o");
     ensure!(
         Command::new("/usr/bin/as")
@@ -744,7 +780,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     )?;
     let source_pin = client.push_tree(
         source_tree.manifest(),
-        |id| source_tree.open_blob(id),
+        |_| -> Result<File> { anyhow::bail!("preseeded original must not upload its payload") },
         Duration::from_secs(1),
     )?;
     let NativeAdmission::Compile { ticket } = client.admit(&spec)? else {
@@ -867,12 +903,34 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     assert_eq!(failed.source, NativeBuildSource::Worker(worker_address));
     assert!(!failed.output.status.success());
     assert!(!failed.output.stderr.is_empty());
+    let worker_directory = fleet.worker_directory.clone();
     let (scheduler_stats, worker_stats) = fleet.finish()?;
+    let store = NativeStore::open(&worker_directory)?;
+    let policy =
+        sccache::build_runtime::PackagePolicy::rust_installer(100000, 1 << 32, 5 << 30, 1 << 26)?;
+    let reconstructed = store
+        .lookup_package(package.identity, policy)?
+        .context("worker did not reconstruct original archive")?;
+    assert_eq!(reconstructed.tree().id(), installed.package);
+    assert_eq!(reconstructed.source(), package);
+    let missing = reconstructed
+        .tree()
+        .manifest()
+        .blobs()?
+        .into_iter()
+        .map(|(id, size)| sccache::build_runtime::BlobRef { id, size })
+        .collect::<Vec<_>>();
+    assert!(
+        store
+            .plan_package_downloads(&missing, 8, u64::MAX)?
+            .is_empty(),
+        "worker retained redundant archive"
+    );
     assert_eq!(worker_stats.actions, 0);
     assert_eq!(scheduler_stats.actions, 2);
     assert_eq!(scheduler_stats.results, 1);
-    assert_eq!(worker_stats.trees, 2);
-    assert_eq!(scheduler_stats.trees, 2);
+    assert_eq!(worker_stats.trees, 3);
+    assert_eq!(scheduler_stats.trees, 4);
     Ok(())
 }
 

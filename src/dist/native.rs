@@ -47,6 +47,14 @@ pub(super) struct OpenTreeRequest {
     pub tree: TreeId,
 }
 
+#[cfg(all(target_os = "linux", feature = "native-store"))]
+#[derive(Serialize, Deserialize)]
+pub(super) struct PackagePlanRequest {
+    pub ticket: Ticket,
+    pub missing: Vec<BlobRef>,
+    pub max_archive_bytes: u64,
+}
+
 #[derive(Clone, Copy)]
 enum Role {
     Client,
@@ -365,6 +373,7 @@ impl NativeCacheClient {
         id: TreeId,
         store: &crate::build_runtime::NativeStore,
         renewal_interval: Duration,
+        package_import: Option<crate::build_runtime::PackageImportLimits>,
     ) -> Result<crate::build_runtime::TreeLease> {
         let read = self.open_tree(action, id)?;
         let result = self.with_renewal(read.ticket, renewal_interval, |check| {
@@ -373,13 +382,39 @@ impl NativeCacheClient {
                 "native tree download identity mismatch"
             );
             let reserved = store.reserve_tree_upload(&read.manifest)?;
+            #[cfg(target_os = "linux")]
+            let packages = match package_import {
+                Some(limits) if !reserved.missing().is_empty() => self.reconstruct_packages(
+                    read.ticket,
+                    reserved.missing(),
+                    store,
+                    limits,
+                    check,
+                )?,
+                _ => Vec::new(),
+            };
+            #[cfg(not(target_os = "linux"))]
+            let _ = package_import;
+            let updated = store.reserve_tree_upload(&read.manifest)?;
+            drop(reserved);
             let mut staged = Vec::new();
-            for blob in reserved.missing() {
+            debug!(
+                "native tree {id:?}: downloading {} raw bytes after package reconstruction",
+                updated
+                    .missing()
+                    .iter()
+                    .map(|blob| u128::from(blob.size))
+                    .sum::<u128>()
+            );
+            for blob in updated.missing() {
                 check()?;
                 let response = self.download_response(read.ticket, blob.id)?;
                 staged.push(store.stage_expected(*blob, response)?);
             }
-            store.publish_tree_pinned(&read.manifest, staged)
+            let tree = store.publish_tree_pinned(&read.manifest, staged)?;
+            #[cfg(target_os = "linux")]
+            drop(packages);
+            Ok(tree)
         });
         // Best effort: the remote pin also expires automatically.
         let _ = self.close(read.ticket);

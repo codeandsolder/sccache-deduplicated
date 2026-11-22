@@ -301,12 +301,13 @@ fn run(command: Command) -> Result<i32> {
             manifest_output,
         } => {
             use sccache::build_runtime::{ArchiveLength, NativeStore, PackagePolicy};
-            let policy = PackagePolicy::rust_installer(
+            let mut policy = PackagePolicy::rust_installer(
                 max_entries,
                 max_expanded_bytes,
                 max_tar_bytes,
                 64 * 1024 * 1024,
             )?;
+            policy.retain_original = true;
             let store = NativeStore::open(&store)?;
             let (package, reused) = if let Some(existing) =
                 store.lookup_package(source.identity, policy)?

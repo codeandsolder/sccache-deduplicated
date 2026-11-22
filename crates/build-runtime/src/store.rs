@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom, Write},
     os::unix::fs::PermissionsExt,
@@ -23,8 +23,9 @@ use super::{
 
 const ACTIONS: TableDefinition<'static, &[u8; 32], &[u8]> = TableDefinition::new("actions_v1");
 const RESULTS: TableDefinition<'static, &[u8; 32], &[u8]> = TableDefinition::new("results_v1");
-const PACKAGES: TableDefinition<'static, &[u8; 32], (&[u8; 32], u64)> =
-    TableDefinition::new("packages_v1");
+const PACKAGES: TableDefinition<'static, &[u8; 32], &[u8]> = TableDefinition::new("packages_v1");
+const BLOB_PACKAGES: MultimapTableDefinition<'static, &[u8; 32], &[u8; 32]> =
+    MultimapTableDefinition::new("blob_packages_v1");
 const TREE_PACKAGES: MultimapTableDefinition<'static, &[u8; 32], &[u8; 32]> =
     MultimapTableDefinition::new("tree_packages_v1");
 const TREES: TableDefinition<'static, &[u8; 32], &[u8]> = TableDefinition::new("trees_v1");
@@ -123,6 +124,7 @@ struct Inner {
     // Readers only acquire the separate pin lock, not the publication lock.
     mutations: Mutex<()>,
     pins: Mutex<Pins>,
+    package_imports: Mutex<BTreeSet<crate::PackageIdentity>>,
     space_policy: Option<SpacePolicy>,
     space: Mutex<space::SpaceState>,
 }
@@ -289,6 +291,7 @@ impl NativeStore {
         write.open_table(TREES)?;
         write.open_table(PACKAGES)?;
         write.open_multimap_table(TREE_PACKAGES)?;
+        write.open_multimap_table(BLOB_PACKAGES)?;
         write.open_table(BLOBS)?;
         write.open_multimap_table(RESULT_ACTIONS)?;
         write.open_multimap_table(BLOB_ROOTS)?;
@@ -308,6 +311,7 @@ impl NativeStore {
             db,
             mutations: Mutex::new(()),
             pins: Mutex::new(Pins::default()),
+            package_imports: Mutex::new(BTreeSet::new()),
             space_policy,
             space: Mutex::default(),
         });
@@ -1015,7 +1019,8 @@ mod audit;
 pub use audit::{ComponentAudit, NativeIndexAudit, SchemaInventory};
 mod packages;
 pub use packages::{
-    PackageDecoder, PackageImportLimits, PackagePolicy, VerifiedPackage, decode_package_process,
+    PackageArchiveLease, PackageDecoder, PackageImportLimits, PackagePolicy, PackageSlot,
+    VerifiedPackage, decode_package_process,
 };
 mod trees;
 pub use trees::TreeLease;

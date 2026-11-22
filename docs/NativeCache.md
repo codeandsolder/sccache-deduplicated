@@ -282,7 +282,8 @@ sccache-dist native-import-rust --store /path/to/scheduler-store \
   --compression xz
 ```
 
-The checksum and length identify the original archive. Component manifests
+The upstream SHA-256 and codec identify the original archive; its compressed
+length is checked separately. Component manifests
 select installed paths; the command emits the verified package and normalized
 installation tree IDs as JSON. The component trees reuse the original file
 blobs, and can be placed as layers in a root recipe. Repeating the command
@@ -299,6 +300,7 @@ Limits here are owned by the scheduler, not supplied by build clients:
 
 ```toml
 [native_cache.package_import]
+retain_original = true
 max_concurrent_imports = 2
 max_archive_bytes = 1073741824
 max_entries = 100000
@@ -327,15 +329,61 @@ concurrency limit bounds simultaneous archive imports and decoder processes. Com
 expanded file contents, decoded tar bytes (including padding), member count,
 and path metadata are bounded separately. A memory-limited subprocess
 decodes packages with a wall-clock deadline, streaming length-delimited
-entries and raw file bytes into the owner. No generated toolchain archive or
-complete decoded tar is persisted. The same content, component and package
-identities are used whether imported offline or live.
+entries and raw file bytes into the owner. No generated toolchain archive or complete decoded tar is persisted.
+With `retain_original` enabled, the verified upstream archive is preserved
+as a separate content-addressed transport blob in addition to its decoded
+files. The archive reference shares the lifecycle of the package root and
+is accounted for and reclaimed by ordinary reference-aware eviction.
+The same content, component and package identities are used whether
+imported offline or live.
 
 The decoder subprocess is a resource-isolation boundary, not a separate
 security principal. Use the authenticated native listener and a trusted
 release checksum. The decoder deadline starts after compressed-input
 verification; transport timeouts are controlled by the client and the
 HTTP transport.
+
+### Compressed original delivery to workers
+
+Enable original-package reconstruction on workers with explicit decoder
+and transfer limits. For example:
+
+```toml
+[native_worker.package_import]
+retain_original = false
+max_concurrent_imports = 2
+max_archive_bytes = 1073741824
+max_entries = 100000
+max_expanded_bytes = 8589934592
+max_tar_bytes = 9663676416
+max_metadata_bytes = 67108864
+decoder_memory_bytes = 536870912
+decoder_timeout_secs = 600
+```
+
+When a worker needs new content, the scheduler consults a reverse index
+from missing content IDs to retained original packages. It greedily selects
+up to eight original archives whose compressed bytes cost less than the
+remaining unique raw bytes they cover. Previously selected overlapping
+content is counted only once. Each selected package remains pinned by the
+authorized tree-delivery session. The worker verifies the original SHA-256
+and size before isolated decoding, verifies the reconstructed package tree,
+and renegotiates the exact missing content. Files not present in the
+original (custom, generated, modified or host libraries) still follow the
+ordinary verified blob protocol. Failed archive reconstruction falls
+back to verified raw content. Concurrent worker jobs share per-package
+import reservations. The worker retains decoded content but discards
+the compressed input after import, so subsequent builds can use any of
+its files without another download.
+
+This is a transport optimization: package provenance, codec, and whether
+the original was retained do not alter the composed filesystem or action
+identity. A full original may contain more files than a specific build
+uses. Enable retained originals only for packages intended to be shared
+with all workers on this authenticated private fleet. Retention adds the
+compressed original's physical storage expense on the scheduler; it
+is optional and governs new ingestion. Recreate earlier draft stores
+because the package index layout has changed.
 
 ### Automatic Rustup provisioning
 

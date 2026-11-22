@@ -282,6 +282,7 @@ mod tests {
             },
             ArchiveLength::Exact(u64::try_from(bytes.len())?),
             PackagePolicy {
+                retain_original: false,
                 directory,
                 modified,
                 max_entries: 100,

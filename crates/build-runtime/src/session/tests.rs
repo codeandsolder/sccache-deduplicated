@@ -316,6 +316,34 @@ fn shared_input_tree_is_pinned_and_worker_can_fetch_only_declared_inputs() -> Re
     let read = service.open_tree(id, worker, Some(ticket))?;
     assert!(
         service
+            .plan_packages(read.ticket, Publisher::Client, &[blob], u64::MAX)
+            .is_err()
+    );
+    assert!(
+        service
+            .plan_packages(
+                read.ticket,
+                worker,
+                &[BlobRef {
+                    id: ContentId::of(b"unrelated"),
+                    size: 9
+                }],
+                u64::MAX
+            )
+            .is_err()
+    );
+    assert!(
+        service
+            .plan_packages(read.ticket, worker, &[blob, blob], u64::MAX)
+            .is_err()
+    );
+    assert!(
+        service
+            .plan_packages(read.ticket, worker, &[blob], u64::MAX)?
+            .is_empty()
+    );
+    assert!(
+        service
             .download(read.ticket, Publisher::Client, blob.id)
             .is_err()
     );
@@ -368,14 +396,14 @@ fn original_package_slots_deduplicate_identities_and_bound_parallel_imports() ->
         sha256: [byte; 32],
         compression: PackageCompression::Xz,
     };
-    let first = service.package_slot(identity(1), 2)?;
-    assert!(service.package_slot(identity(1), 2).is_err());
-    let second = service.package_slot(identity(2), 2)?;
-    assert!(service.package_slot(identity(3), 2).is_err());
+    let first = service.store().package_slot(identity(1), 2)?;
+    assert!(service.store().package_slot(identity(1), 2).is_err());
+    let second = service.store().package_slot(identity(2), 2)?;
+    assert!(service.store().package_slot(identity(3), 2).is_err());
     drop(first);
-    let third = service.package_slot(identity(3), 2)?;
-    assert!(service.package_slot(identity(1), 2).is_err());
+    let third = service.store().package_slot(identity(3), 2)?;
+    assert!(service.store().package_slot(identity(1), 2).is_err());
     drop((second, third));
-    assert!(service.package_slot(identity(1), 2).is_ok());
+    assert!(service.store().package_slot(identity(1), 2).is_ok());
     Ok(())
 }

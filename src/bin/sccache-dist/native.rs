@@ -5,7 +5,8 @@ use std::{io::Read, os::unix::process::ExitStatusExt, time::Duration};
 use anyhow::{Result, ensure};
 use sccache::{
     build_runtime::{
-        BlobRef, CapturedExecution, ContentId, ExecutionPolicy, NativeStore, wire::NativeRunResult,
+        BlobRef, CapturedExecution, ContentId, ExecutionPolicy, NativeStore, PackageImportLimits,
+        wire::NativeRunResult,
     },
     config::server::NativeWorkerConfig,
     dist::{JobId, NativeAssignment, native::NativeCacheClient},
@@ -16,6 +17,7 @@ pub(super) struct NativeWorker {
     client: NativeCacheClient,
     pub(super) policy: ExecutionPolicy,
     renewal_interval: Duration,
+    package_import: Option<PackageImportLimits>,
     pub(super) metadata_limit: usize,
 }
 
@@ -34,6 +36,13 @@ impl NativeWorker {
                 && config.max_result_bytes > 0,
             "invalid native worker configuration"
         );
+        if let Some(limits) = config.package_import {
+            limits.validate()?;
+            ensure!(
+                !limits.retain_original,
+                "workers do not retain compressed original archives"
+            );
+        }
         std::fs::create_dir_all(&config.scratch)?;
         let store = NativeStore::open_managed(&config.directory, config.space)?;
         let client = NativeCacheClient::new(
@@ -53,6 +62,7 @@ impl NativeWorker {
                 max_result_bytes: config.max_result_bytes,
             },
             renewal_interval: Duration::from_secs(config.renewal_interval_secs),
+            package_import: config.package_import,
             metadata_limit: usize::try_from(config.max_metadata_bytes)?,
         })
     }
@@ -64,6 +74,7 @@ impl NativeWorker {
             &self.store,
             &self.policy,
             self.renewal_interval,
+            self.package_import,
         )?;
         if captured.successful_result().is_some() {
             return Ok(NativeRunResult::Stored);

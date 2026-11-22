@@ -18,7 +18,7 @@ use crate::{
     config::scheduler::NativeCacheConfig,
     dist::native::{
         DownloadRequest, ExecutionRequest, ManifestRequest, OpenTreeRequest, PackageAcquisition,
-        RustPackageLocator, codec,
+        PackagePlanRequest, RustPackageLocator, codec,
     },
 };
 
@@ -280,6 +280,17 @@ fn dispatch(
         "tree_open" => {
             let OpenTreeRequest { action, tree } = metadata(request, limit)?;
             encode(&sessions.open_tree(tree, publisher, Some(action))?, limit)
+        }
+        "package_plan" if matches!(publisher, Publisher::Worker { .. }) => {
+            let PackagePlanRequest {
+                ticket,
+                missing,
+                max_archive_bytes,
+            } = metadata(request, limit)?;
+            encode(
+                &sessions.plan_packages(ticket, publisher, &missing, max_archive_bytes)?,
+                limit,
+            )
         }
         "verify" => {
             let ExecutionRequest { ticket, spec } = metadata(request, limit)?;

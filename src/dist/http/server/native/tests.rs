@@ -331,6 +331,7 @@ fn native_action_transfers_inputs_executes_and_publishes_without_worker_result_s
             &worker_store,
             &policy,
             Duration::from_secs(1),
+            None,
         )?;
         let manifest = result
             .successful_result()
