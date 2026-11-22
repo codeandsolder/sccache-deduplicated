@@ -332,6 +332,7 @@ impl DistClientContainer {
     }
 
     #[cfg(target_os = "linux")]
+    #[must_use = "the returned container owns native compiler state"]
     pub fn new_native(client: crate::compiler::NativeCompilerClient) -> Self {
         Self {
             state: futures::lock::Mutex::new(DistClientState::Disabled),

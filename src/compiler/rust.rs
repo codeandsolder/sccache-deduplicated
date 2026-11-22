@@ -1373,11 +1373,60 @@ fn canonical_bwrap_arguments(
     canonical.bwrap_arguments(executable, &arguments, cwd)
 }
 
+async fn discover_rust_sysroot<T: CommandCreatorSync>(
+    mut creator: T,
+    executable: &Path,
+    env_vars: &[(OsString, OsString)],
+    dist_archive: Option<PathBuf>,
+) -> Result<(PathBuf, Vec<PathBuf>)> {
+    let mut cmd = creator.new_command_sync(executable);
+    cmd.stdout(process::Stdio::piped())
+        .stderr(process::Stdio::null())
+        .arg("--print=sysroot")
+        .env_clear()
+        .envs(env_vars.to_vec());
+    let output = run_input_output(cmd, None).await?;
+    let outstr = String::from_utf8(output.stdout).context("Error parsing sysroot")?;
+    let sysroot = PathBuf::from(outstr.trim_end());
+    let libs_path = sysroot.join(LIBS_DIR);
+    let mut libs = fs::read_dir(&libs_path)
+        .with_context(|| {
+            format!(
+                "Failed to list rustc sysroot: `{}`",
+                crate::util::debug_display(&libs_path)
+            )
+        })?
+        .filter_map(|e| {
+            e.ok().and_then(|e| {
+                e.file_type().ok().and_then(|t| {
+                    let p = e.path();
+                    if (t.is_file() || t.is_symlink() && p.is_file())
+                        && p.extension().is_some_and(|e| e == DLL_EXTENSION)
+                    {
+                        Some(p)
+                    } else {
+                        None
+                    }
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    if let Some(path) = dist_archive {
+        trace!(
+            "Hashing {} along with rustc libs.",
+            crate::util::debug_display(&path)
+        );
+        libs.push(path);
+    }
+    libs.sort();
+    Ok((sysroot, libs))
+}
+
 impl Rust {
     /// Create a new Rust compiler instance, calculating the hashes of
     /// all the shared libraries in its sysroot.
     pub async fn new<T>(
-        mut creator: T,
+        creator: T,
         executable: PathBuf,
         env_vars: &[(OsString, OsString)],
         rustc_verbose_version: &str,
@@ -1395,56 +1444,14 @@ impl Rust {
             .context("rustc verbose version didn't have a line for `host:`")?
             .to_string();
 
-        // it's fine to use the `executable` directly no matter if proxied or not
-        let mut cmd = creator.new_command_sync(&executable);
-        cmd.stdout(process::Stdio::piped())
-            .stderr(process::Stdio::null())
-            .arg("--print=sysroot")
-            .env_clear()
-            .envs(env_vars.to_vec());
-        let dist_archive = discovery.dist_archive.clone();
-        let hashed_archive = dist_archive.clone();
-        let sysroot_and_libs = async move {
-            let output = run_input_output(cmd, None).await?;
-            //debug!("output.and_then: {}", output);
-            let outstr = String::from_utf8(output.stdout).context("Error parsing sysroot")?;
-            let sysroot = PathBuf::from(outstr.trim_end());
-            let libs_path = sysroot.join(LIBS_DIR);
-            let mut libs = fs::read_dir(&libs_path)
-                .with_context(|| {
-                    format!(
-                        "Failed to list rustc sysroot: `{}`",
-                        crate::util::debug_display(&libs_path)
-                    )
-                })?
-                .filter_map(|e| {
-                    e.ok().and_then(|e| {
-                        e.file_type().ok().and_then(|t| {
-                            let p = e.path();
-                            if (t.is_file() || t.is_symlink() && p.is_file())
-                                && p.extension().is_some_and(|e| e == DLL_EXTENSION)
-                            {
-                                Some(p)
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                })
-                .collect::<Vec<_>>();
-            if let Some(path) = hashed_archive {
-                trace!(
-                    "Hashing {} along with rustc libs.",
-                    crate::util::debug_display(&path)
-                );
-                libs.push(path);
-            }
-            libs.sort();
-            Result::Ok((sysroot, libs))
-        };
-
+        let sysroot_and_libs = discover_rust_sysroot(
+            creator,
+            &executable,
+            env_vars,
+            discovery.dist_archive.clone(),
+        );
         #[cfg(feature = "dist-client")]
-        {
+        let ((sysroot, libs), rlib_dep_reader) = {
             use futures::TryFutureExt;
             let rlib_dep_reader = {
                 let executable = executable.clone();
@@ -1465,35 +1472,21 @@ impl Rust {
                     None
                 }
             };
-            discovery
-                .hash_toolchain_files(&libs, &pool)
-                .await
-                .map(move |digests| Self {
-                    executable,
-                    host,
-                    version: rustc_verbose_version.to_string(),
-                    sysroot,
-                    compiler_shlibs_digests: digests,
-                    dist_archive,
-                    rlib_dep_reader,
-                })
-        }
-
+            ((sysroot, libs), rlib_dep_reader)
+        };
         #[cfg(not(feature = "dist-client"))]
-        {
-            let (sysroot, libs) = sysroot_and_libs.await?;
-            discovery
-                .hash_toolchain_files(&libs, &pool)
-                .await
-                .map(move |digests| Rust {
-                    executable,
-                    host,
-                    version: rustc_verbose_version.to_string(),
-                    sysroot,
-                    compiler_shlibs_digests: digests,
-                    dist_archive,
-                })
-        }
+        let (sysroot, libs) = sysroot_and_libs.await?;
+        let digests = discovery.hash_toolchain_files(&libs, &pool).await?;
+        Ok(Self {
+            executable,
+            host,
+            version: rustc_verbose_version.to_string(),
+            sysroot,
+            compiler_shlibs_digests: digests,
+            dist_archive: discovery.dist_archive,
+            #[cfg(feature = "dist-client")]
+            rlib_dep_reader,
+        })
     }
 }
 
