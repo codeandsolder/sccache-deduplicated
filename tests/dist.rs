@@ -659,3 +659,103 @@ fn test_dist_toolchain() {
         assert_eq!(1, info.stats.cache_misses.all());
     });
 }
+
+// rustc must resolve a transitive metadata dependency through -L dependency
+// even when the client command explicitly names only the immediate extern.
+#[test]
+#[cfg(unix)]
+#[cfg_attr(not(feature = "dist-tests"), ignore)]
+fn test_dist_rust_dependency_chain() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
+    system.add_scheduler();
+    let _worker = system.add_server(&[]);
+    let mut cfg = harness::sccache_client_cfg(root, false);
+    cfg.dist.scheduler_url = Some(system.scheduler_url());
+    let cfg_path = root.join("sccache-cfg.json");
+    write_json_cfg(root, "sccache-cfg.json", &cfg);
+    let cached_cfg = root.join("sccache-cached-cfg");
+    let _ = stop_local_daemon();
+    start_local_daemon(&cfg_path, &cached_cfg);
+
+    let source = root.join("source");
+    let target = root.join("target");
+    std::fs::create_dir(&source)?;
+    std::fs::create_dir(&target)?;
+    write_source(
+        &source,
+        "first.rs",
+        "pub struct Value; impl Value { pub fn get(&self) -> u32 { 42 } }",
+    );
+    write_source(
+        &source,
+        "second.rs",
+        "pub fn value() -> first::Value { first::Value }",
+    );
+    write_source(
+        &source,
+        "third.rs",
+        "pub fn result() -> u32 { second::value().get() }",
+    );
+    let compiler = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    for name in ["first", "second", "third"] {
+        let metadata = target.join(format!("lib{name}-regression.rmeta"));
+        let predecessor = match name {
+            "second" => Some("first"),
+            "third" => Some("second"),
+            _ => None,
+        };
+        let compile = || {
+            let mut command = sccache_command();
+            for (key, _) in env::vars_os() {
+                if key.to_string_lossy().starts_with("CARGO") || key == "OUT_DIR" {
+                    command.env_remove(key);
+                }
+            }
+            command
+                .current_dir(&source)
+                .arg(&compiler)
+                .args([
+                    "--edition=2021",
+                    "--crate-name",
+                    name,
+                    "--crate-type",
+                    "rlib",
+                    "--emit=metadata,dep-info",
+                    "-C",
+                    "extra-filename=-regression",
+                ])
+                .arg("--out-dir")
+                .arg(&target)
+                .arg("-L")
+                .arg(format!("dependency={}", target.display()))
+                .arg(format!("{name}.rs"))
+                .env("CARGO_PKG_NAME", name)
+                .env("SCCACHE_CONF", &cfg_path)
+                .env("SCCACHE_CACHED_CONF", &cached_cfg)
+                .env("SCCACHE_EXPERIMENTAL_CANONICAL_RUST", "1")
+                .env("SCCACHE_CANONICAL_BUILD_ROOT", &source)
+                .env("SCCACHE_CANONICAL_TARGET_ROOT", &target);
+            if let Some(dep) = predecessor {
+                command.arg("--extern").arg(format!(
+                    "{dep}={}",
+                    target.join(format!("lib{dep}-regression.rmeta")).display()
+                ));
+            }
+            command.assert().success();
+        };
+        compile();
+        let initial = std::fs::read(&metadata)?;
+        assert!(!initial.is_empty());
+        std::fs::remove_file(&metadata)?;
+        compile();
+        assert_eq!(std::fs::read(&metadata)?, initial);
+    }
+    get_stats(|info| {
+        assert_eq!(3, info.stats.dist_compiles.values().sum::<usize>());
+        assert_eq!(3, info.stats.cache_hits.all());
+        assert_eq!(0, info.stats.dist_errors);
+    });
+    Ok(())
+}
