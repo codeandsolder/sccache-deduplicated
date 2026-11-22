@@ -2605,7 +2605,7 @@ impl<'a> HashKeyParams<'a> {
     }
 
     /// Sets the file name, without its directory, of the source being compiled.
-    pub fn with_input_file_name(mut self, input_file_name: Option<&'a OsStr>) -> Self {
+    pub const fn with_input_file_name(mut self, input_file_name: Option<&'a OsStr>) -> Self {
         self.input_file_name = input_file_name;
         self
     }
