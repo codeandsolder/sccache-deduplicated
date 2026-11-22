@@ -83,11 +83,13 @@ fn worker_publication_and_client_download_are_bound_to_ticket() -> Result<()> {
         address: "127.0.0.1:10502".parse()?,
         job: 42,
     };
-    let NativeAdmission::Compile { ticket } = service.admit(request()?, worker)? else {
+    let NativeAdmission::Compile { ticket } =
+        service.admit(request()?, worker, ActionMode::Reuse)?
+    else {
         bail!("expected compilation");
     };
     assert_eq!(
-        service.admit(request()?, Publisher::Client)?,
+        service.admit(request()?, Publisher::Client, ActionMode::Reuse)?,
         NativeAdmission::InFlight
     );
     let output = manifest(b"object");
@@ -109,12 +111,7 @@ fn worker_publication_and_client_download_are_bound_to_ticket() -> Result<()> {
             .is_err()
     );
     service.upload(ticket, worker, blob, &b"object"[..])?;
-    assert!(
-        service
-            .begin(ticket, worker, output.clone())?
-            .missing
-            .is_empty()
-    );
+    assert_eq!(service.begin(ticket, worker, output.clone())?.missing, []);
     assert_eq!(service.commit(ticket, worker)?, output);
     assert_eq!(service.commit(ticket, worker)?, output);
     assert_eq!(service.status(ticket)?, NativeStatus::Ready(output.clone()));
@@ -127,7 +124,7 @@ fn worker_publication_and_client_download_are_bound_to_ticket() -> Result<()> {
     let NativeAdmission::Hit {
         ticket: second,
         manifest,
-    } = service.admit(request()?, Publisher::Client)?
+    } = service.admit(request()?, Publisher::Client, ActionMode::Reuse)?
     else {
         bail!("expected hit");
     };
@@ -150,7 +147,9 @@ fn worker_publication_and_client_download_are_bound_to_ticket() -> Result<()> {
 fn abandoned_and_failed_sessions_release_exclusive_compilation() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
-    let NativeAdmission::Compile { ticket } = service.admit(request()?, Publisher::Client)? else {
+    let NativeAdmission::Compile { ticket } =
+        service.admit(request()?, Publisher::Client, ActionMode::Reuse)?
+    else {
         bail!("expected compilation");
     };
     {
@@ -159,13 +158,15 @@ fn abandoned_and_failed_sessions_release_exclusive_compilation() -> Result<()> {
     }
     assert_eq!(service.reap()?, 1);
     assert!(service.status(ticket).is_err());
-    let NativeAdmission::Compile { ticket } = service.admit(request()?, Publisher::Client)? else {
+    let NativeAdmission::Compile { ticket } =
+        service.admit(request()?, Publisher::Client, ActionMode::Reuse)?
+    else {
         bail!("expected compilation after expiration");
     };
     service.fail(ticket, Publisher::Client)?;
     assert_eq!(service.status(ticket)?, NativeStatus::Failed);
     assert!(matches!(
-        service.admit(request()?, Publisher::Client)?,
+        service.admit(request()?, Publisher::Client, ActionMode::Reuse)?,
         NativeAdmission::Compile { .. }
     ));
     Ok(())
@@ -175,7 +176,9 @@ fn abandoned_and_failed_sessions_release_exclusive_compilation() -> Result<()> {
 fn result_contract_and_limits_control_publication() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
-    let NativeAdmission::Compile { ticket } = service.admit(request()?, Publisher::Client)? else {
+    let NativeAdmission::Compile { ticket } =
+        service.admit(request()?, Publisher::Client, ActionMode::Reuse)?
+    else {
         bail!("expected compilation");
     };
     let mut invalid = manifest(b"data");
@@ -192,7 +195,7 @@ fn result_contract_and_limits_control_publication() -> Result<()> {
     );
     service.close(ticket, Publisher::Client)?;
     assert!(matches!(
-        service.admit(request()?, Publisher::Client)?,
+        service.admit(request()?, Publisher::Client, ActionMode::Reuse)?,
         NativeAdmission::Compile { .. }
     ));
     Ok(())
@@ -202,7 +205,9 @@ fn result_contract_and_limits_control_publication() -> Result<()> {
 fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
-    let NativeAdmission::Compile { ticket } = service.admit(request()?, Publisher::Client)? else {
+    let NativeAdmission::Compile { ticket } =
+        service.admit(request()?, Publisher::Client, ActionMode::Reuse)?
+    else {
         bail!("expected compilation");
     };
     let worker = "127.0.0.1:10501".parse()?;
@@ -255,6 +260,42 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     Ok(())
 }
 
+fn verify_package_plan_authorization(
+    service: &NativeSessions,
+    ticket: Ticket,
+    worker: Publisher,
+    blob: BlobRef,
+) -> Result<()> {
+    assert!(
+        service
+            .plan_packages(ticket, Publisher::Client, &[blob], u64::MAX)
+            .is_err()
+    );
+    assert!(
+        service
+            .plan_packages(
+                ticket,
+                worker,
+                &[BlobRef {
+                    id: ContentId::of(b"unrelated"),
+                    size: 9
+                }],
+                u64::MAX
+            )
+            .is_err()
+    );
+    assert!(
+        service
+            .plan_packages(ticket, worker, &[blob, blob], u64::MAX)
+            .is_err()
+    );
+    assert_eq!(
+        service.plan_packages(ticket, worker, &[blob], u64::MAX)?,
+        []
+    );
+    Ok(())
+}
+
 #[test]
 fn shared_input_tree_is_pinned_and_worker_can_fetch_only_declared_inputs() -> Result<()> {
     use crate::{TreeEntry, TreePath};
@@ -285,7 +326,7 @@ fn shared_input_tree_is_pinned_and_worker_can_fetch_only_declared_inputs() -> Re
     let id = service.commit_tree(offer.ticket)?;
     assert_eq!(id, manifest.id()?);
     let again = service.offer_tree(manifest)?;
-    assert!(again.missing.is_empty());
+    assert_eq!(again.missing, []);
     assert_eq!(service.commit_tree(again.ticket)?, id);
 
     let mut request = request()?;
@@ -298,7 +339,9 @@ fn shared_input_tree_is_pinned_and_worker_can_fetch_only_declared_inputs() -> Re
         address: "127.0.0.1:10501".parse()?,
         job: 42,
     };
-    let NativeAdmission::Compile { ticket } = service.admit(request.clone(), worker)? else {
+    let NativeAdmission::Compile { ticket } =
+        service.admit(request.clone(), worker, ActionMode::Reuse)?
+    else {
         bail!("expected native action");
     };
     service.close(offer.ticket, Publisher::Client)?;
@@ -314,34 +357,7 @@ fn shared_input_tree_is_pinned_and_worker_can_fetch_only_declared_inputs() -> Re
     )?;
     assert!(service.open_tree(unrelated, worker, Some(ticket)).is_err());
     let read = service.open_tree(id, worker, Some(ticket))?;
-    assert!(
-        service
-            .plan_packages(read.ticket, Publisher::Client, &[blob], u64::MAX)
-            .is_err()
-    );
-    assert!(
-        service
-            .plan_packages(
-                read.ticket,
-                worker,
-                &[BlobRef {
-                    id: ContentId::of(b"unrelated"),
-                    size: 9
-                }],
-                u64::MAX
-            )
-            .is_err()
-    );
-    assert!(
-        service
-            .plan_packages(read.ticket, worker, &[blob, blob], u64::MAX)
-            .is_err()
-    );
-    assert!(
-        service
-            .plan_packages(read.ticket, worker, &[blob], u64::MAX)?
-            .is_empty()
-    );
+    verify_package_plan_authorization(&service, read.ticket, worker, blob)?;
     assert!(
         service
             .download(read.ticket, Publisher::Client, blob.id)
@@ -361,7 +377,7 @@ fn shared_input_tree_is_pinned_and_worker_can_fetch_only_declared_inputs() -> Re
         }
     );
     assert_eq!(
-        service.admit(request, Publisher::Client)?,
+        service.admit(request, Publisher::Client, ActionMode::Reuse)?,
         NativeAdmission::MissingInputs {
             trees: BTreeSet::from([id])
         }
@@ -373,7 +389,9 @@ fn shared_input_tree_is_pinned_and_worker_can_fetch_only_declared_inputs() -> Re
 fn expiry_releases_action_even_when_a_transfer_retains_the_session() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
-    let NativeAdmission::Compile { ticket } = service.admit(request()?, Publisher::Client)? else {
+    let NativeAdmission::Compile { ticket } =
+        service.admit(request()?, Publisher::Client, ActionMode::Reuse)?
+    else {
         bail!("expected compilation");
     };
     let held = service.get(ticket)?;
@@ -381,7 +399,7 @@ fn expiry_releases_action_even_when_a_transfer_retains_the_session() -> Result<(
     assert_eq!(service.reap()?, 1);
     assert!(matches!(NativeSessions::lock(&held)?.phase, Phase::Failed));
     assert!(matches!(
-        service.admit(request()?, Publisher::Client)?,
+        service.admit(request()?, Publisher::Client, ActionMode::Reuse)?,
         NativeAdmission::Compile { .. }
     ));
     Ok(())
@@ -405,5 +423,77 @@ fn original_package_slots_deduplicate_identities_and_bound_parallel_imports() ->
     assert!(service.store().package_slot(identity(1), 2).is_err());
     drop((second, third));
     assert!(service.store().package_slot(identity(1), 2).is_ok());
+    Ok(())
+}
+
+#[test]
+fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let service = service(dir.path())?;
+    let client = Publisher::Client;
+    let NativeAdmission::Compile { ticket: first } =
+        service.admit(request()?, client, ActionMode::Reuse)?
+    else {
+        bail!("expected initial compilation");
+    };
+    let old = manifest(b"old");
+    let old_blob = old.outputs["obj"].blob;
+    service.begin(first, client, old.clone())?;
+    service.upload(first, client, old_blob, &b"old"[..])?;
+    service.commit(first, client)?;
+
+    let NativeAdmission::Compile { ticket: failed } =
+        service.admit(request()?, client, ActionMode::Refresh)?
+    else {
+        bail!("expected refresh");
+    };
+    assert_eq!(
+        service.admit(request()?, client, ActionMode::Refresh)?,
+        NativeAdmission::InFlight
+    );
+    let NativeAdmission::Hit {
+        ticket: reader,
+        manifest: current,
+    } = service.admit(request()?, client, ActionMode::Reuse)?
+    else {
+        bail!("expected old hit during refresh");
+    };
+    assert_eq!(current, old);
+    service.fail(failed, client)?;
+    service.close(failed, client)?;
+
+    let NativeAdmission::Compile { ticket: next } =
+        service.admit(request()?, client, ActionMode::Refresh)?
+    else {
+        bail!("expected another refresh");
+    };
+    let new = manifest(b"new");
+    let new_blob = new.outputs["obj"].blob;
+    service.begin(next, client, new.clone())?;
+    assert!(service.commit(next, client).is_err());
+    assert_eq!(service.status(reader)?, NativeStatus::Ready(old));
+    service.upload(next, client, new_blob, &b"new"[..])?;
+    assert_eq!(service.commit(next, client)?, new);
+    let NativeAdmission::Hit {
+        ticket: latest,
+        manifest: current,
+    } = service.admit(request()?, client, ActionMode::Reuse)?
+    else {
+        bail!("expected refreshed hit");
+    };
+    assert_eq!(current, new);
+    assert_eq!(service.store().stats()?.actions, 1);
+    assert_eq!(service.store().stats()?.results, 1);
+    assert_eq!(service.store().collect_garbage(8)?.blobs, 0);
+    let mut bytes = Vec::new();
+    service
+        .download(reader, client, old_blob.id)?
+        .read_to_end(&mut bytes)?;
+    assert_eq!(bytes, b"old");
+    service.close(first, client)?;
+    service.close(reader, client)?;
+    assert_eq!(service.store().collect_garbage(8)?.blobs, 1);
+    service.close(next, client)?;
+    service.close(latest, client)?;
     Ok(())
 }

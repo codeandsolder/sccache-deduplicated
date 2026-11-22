@@ -202,6 +202,7 @@ mod tests {
             .map_err(|_| anyhow::anyhow!("poisoned memo"))?;
         assert_eq!(entries.by_path.len(), 1);
         assert!(!entries.by_path.contains_key(&path));
+        drop(entries);
         Ok(())
     }
 }

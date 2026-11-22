@@ -18,12 +18,13 @@ use tempfile::NamedTempFile;
 
 use super::{NativeCacheClient, renewal::Renewals};
 use crate::build_runtime::{
-    BlobRef, ExecutionSpec, PreparedTree, ResultManifest, TreeId, TreeManifest,
+    ActionMode, BlobRef, ExecutionSpec, PreparedTree, ResultManifest, TreeId, TreeManifest,
     wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply, Ticket},
 };
 
 /// Explicit client admission and delivery bounds.
 pub struct NativeBuildPolicy {
+    pub mode: ActionMode,
     pub timeout: Duration,
     pub renewal_interval: Duration,
     pub max_result_bytes: u64,
@@ -173,7 +174,7 @@ impl NativeCacheClient {
                 start.elapsed() < policy.timeout,
                 "native admission timed out"
             );
-            match self.admit(spec)? {
+            match self.admit(spec, policy.mode)? {
                 NativeAdmission::Hit { ticket, manifest } => {
                     let pin = Pin {
                         client: self,

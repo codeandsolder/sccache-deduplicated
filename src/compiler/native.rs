@@ -16,8 +16,8 @@ use anyhow::{Context, Result, ensure};
 
 use crate::{
     build_runtime::{
-        BuildPath, CommandSpec, ContentId, ExecutionRoot, ExecutionSpec, OutputSpec, PreparedTree,
-        SourceDigestCache, TreeRecipe,
+        ActionMode, BuildPath, CommandSpec, ContentId, ExecutionRoot, ExecutionSpec, OutputSpec,
+        PreparedTree, SourceDigestCache, TreeRecipe,
     },
     cache::FileObjectSource,
     client::{SharedConnection, connection_task},
@@ -34,6 +34,7 @@ use crate::{
 
 use super::{
     CacheControl, Cacheable, Compilation, CompileResult, CompileTransport, DistPackagers, DistType,
+    MissType,
 };
 
 struct DirectEndpoint {
@@ -198,13 +199,13 @@ impl NativeCompilerClient {
         )
     }
 
-    fn execute(&self, plan: &CompilerPlan) -> Result<NativeBuildResult> {
+    fn execute(&self, plan: &CompilerPlan, mode: ActionMode) -> Result<NativeBuildResult> {
         match &self.endpoint {
             Endpoint::Direct(_) => self.connect_http()?.run_action(
                 &plan.spec,
                 &plan.inputs,
                 &plan.destinations,
-                &self.policy.build_policy(),
+                &self.policy.build_policy(mode),
             ),
             Endpoint::Namespace {
                 connection,
@@ -214,6 +215,7 @@ impl NativeCompilerClient {
                 *chunk_bytes,
                 &self.policy,
                 &plan.spec,
+                mode,
                 &plan.inputs,
                 &plan.destinations,
             ),
@@ -345,11 +347,16 @@ pub(super) async fn compile<T: CommandCreatorSync>(
     let mut transformer = dist::PathTransformer::new();
     let (local, remote, cacheable) =
         compilation.generate_compile_commands(&mut transformer, CompileTransport::Native)?;
-    let eligible = control == CacheControl::Default
+    let eligible = control != CacheControl::ForceNoCache
         && cacheable == Cacheable::Yes
         && compilation.is_locally_preprocessed()
         && compilation.automatic_dist_toolchain_is_ready()
         && client.allows_automatic_toolchain(&local.get_executable());
+    let mode = if control == CacheControl::ForceRecache {
+        ActionMode::Refresh
+    } else {
+        ActionMode::Reuse
+    };
     let mut fallback = DistType::NoDist;
     if let Some(remote) = remote.filter(|_| eligible) {
         let result = (|| {
@@ -378,7 +385,7 @@ pub(super) async fn compile<T: CommandCreatorSync>(
                     client.policy.platform,
                     &client.toolchain_digests,
                 )?;
-                client.execute(&plan)
+                client.execute(&plan, mode)
             }))
         })();
         let result = match result {
@@ -390,9 +397,15 @@ pub(super) async fn compile<T: CommandCreatorSync>(
                 let elapsed = start.elapsed();
                 let classification = match result.source {
                     NativeBuildSource::Hit => CompileResult::CacheHit(elapsed),
-                    NativeBuildSource::Worker(addr) => {
-                        CompileResult::NativeMiss(DistType::Ok(addr.to_string()), elapsed)
-                    }
+                    NativeBuildSource::Worker(addr) => CompileResult::NativeMiss(
+                        if mode == ActionMode::Refresh {
+                            MissType::ForcedRecache
+                        } else {
+                            MissType::Normal
+                        },
+                        DistType::Ok(addr.to_string()),
+                        elapsed,
+                    ),
                 };
                 return Ok((classification, result.output));
             }

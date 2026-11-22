@@ -26,6 +26,15 @@ pub struct ActionKey(pub [u8; 32]);
 #[serde(transparent)]
 pub struct ResultId(pub [u8; 32]);
 
+/// Controls admission and successful action publication, not semantic identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActionMode {
+    /// Reuse an existing result and reject a different ordinary publication.
+    Reuse,
+    /// Compile even if a result exists, and replace it only on successful commit.
+    Refresh,
+}
+
 /// A versioned set of input-component digests suitable for cache-key auditing.
 ///
 /// Callers must account for all observable inputs. The schema identifies the

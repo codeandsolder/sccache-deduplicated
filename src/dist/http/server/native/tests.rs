@@ -145,12 +145,21 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
         assert_eq!(client.commit_tree(offer.ticket)?, root.id()?);
         let spec = action(&root)?;
 
-        assert!(unauthorized.admit(&spec).is_err());
+        assert!(
+            unauthorized
+                .admit(&spec, crate::build_runtime::ActionMode::Reuse)
+                .is_err()
+        );
 
-        let NativeAdmission::Compile { ticket } = client.admit(&spec)? else {
+        let NativeAdmission::Compile { ticket } =
+            client.admit(&spec, crate::build_runtime::ActionMode::Reuse)?
+        else {
             anyhow::bail!("expected compilation");
         };
-        assert_eq!(client.admit(&spec)?, NativeAdmission::InFlight);
+        assert_eq!(
+            client.admit(&spec, crate::build_runtime::ActionMode::Reuse)?,
+            NativeAdmission::InFlight
+        );
         let mut wrong_spec = spec.clone();
         wrong_spec.command.arguments.push(b"changed".to_vec());
         assert!(client.schedule(ticket, wrong_spec).is_err());
@@ -220,7 +229,7 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
         let NativeAdmission::Hit {
             ticket: hit,
             manifest,
-        } = client.admit(&spec)?
+        } = client.admit(&spec, crate::build_runtime::ActionMode::Reuse)?
         else {
             anyhow::bail!("expected stored hit");
         };
@@ -309,7 +318,9 @@ fn native_action_transfers_inputs_executes_and_publishes_without_worker_result_s
         spec.mounts
             .insert(BuildPath::new(b"/src".to_vec())?, source.id());
         spec.command.arguments = vec![b"-c".to_vec(), b"IFS= read -r data < /src/input; printf '%s' \"$data\" > /out/obj; printf diagnostic >&2".to_vec()];
-        let NativeAdmission::Compile { ticket } = client.admit(&spec)? else {
+        let NativeAdmission::Compile { ticket } =
+            client.admit(&spec, crate::build_runtime::ActionMode::Reuse)?
+        else {
             anyhow::bail!("expected native compilation");
         };
         assert!(matches!(
@@ -355,7 +366,7 @@ fn native_action_transfers_inputs_executes_and_publishes_without_worker_result_s
         let NativeAdmission::Hit {
             ticket: hit,
             manifest: cached,
-        } = client.admit(&spec)?
+        } = client.admit(&spec, crate::build_runtime::ActionMode::Reuse)?
         else {
             anyhow::bail!("expected cache hit");
         };

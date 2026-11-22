@@ -15,9 +15,9 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use sccache::{
     build_runtime::{
-        BuildPath, CommandSpec, ComponentAudit, ContentId, ExecutionRoot, ExecutionSpec,
-        InstallationManifest, MappedMetadata, MappedTree, NativeStore, OutputSpec, SpacePolicy,
-        TreeLayer, TreePath, TreeRecipe,
+        ActionMode, BuildPath, CommandSpec, ComponentAudit, ContentId, ExecutionRoot,
+        ExecutionSpec, InstallationManifest, MappedMetadata, MappedTree, NativeStore, OutputSpec,
+        SpacePolicy, TreeLayer, TreePath, TreeRecipe,
         wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply},
     },
     config::{Config, DistAuth, HTTPUrl, NativeClientConfig, scheduler, server},
@@ -768,7 +768,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
         )]),
     };
     assert_eq!(
-        client.admit(&spec)?,
+        client.admit(&spec, ActionMode::Reuse)?,
         NativeAdmission::MissingInputs {
             trees: [root_tree.id(), source_tree.id()].into_iter().collect()
         },
@@ -783,7 +783,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
         |_| -> Result<File> { anyhow::bail!("preseeded original must not upload its payload") },
         Duration::from_secs(1),
     )?;
-    let NativeAdmission::Compile { ticket } = client.admit(&spec)? else {
+    let NativeAdmission::Compile { ticket } = client.admit(&spec, ActionMode::Reuse)? else {
         anyhow::bail!("expected native miss");
     };
     client.close(root_pin)?;
@@ -816,7 +816,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let NativeAdmission::Hit {
         ticket: hit,
         manifest: cached,
-    } = client.admit(&spec)?
+    } = client.admit(&spec, ActionMode::Reuse)?
     else {
         anyhow::bail!("expected cache hit");
     };
@@ -830,7 +830,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let NativeAdmission::Hit {
         ticket: flattened_hit,
         manifest: cached,
-    } = client.admit(&flattened)?
+    } = client.admit(&flattened, ActionMode::Reuse)?
     else {
         anyhow::bail!("equivalent flattened root missed the cache");
     };
@@ -841,7 +841,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let NativeAdmission::Hit {
         ticket: reordered_hit,
         manifest: cached,
-    } = client.admit(&reordered)?
+    } = client.admit(&reordered, ActionMode::Reuse)?
     else {
         anyhow::bail!("equivalent reordered root missed the cache");
     };
@@ -852,11 +852,12 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     // transport trees are already available to the scheduler.
     let mut forged = spec.clone();
     forged.root.id = sccache::build_runtime::TreeId([0xA5; 32]);
-    assert!(client.admit(&forged).is_err());
+    assert!(client.admit(&forged, ActionMode::Reuse).is_err());
     assert_eq!(fleet.status()?.in_progress, 0);
 
     let inputs = [root_tree, source_tree];
     let policy = NativeBuildPolicy {
+        mode: ActionMode::Reuse,
         timeout: Duration::from_secs(30),
         renewal_interval: Duration::from_secs(1),
         max_result_bytes: 16 * 1024 * 1024,
@@ -884,7 +885,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
         .command
         .arguments
         .push(b"--invalid-native-test-flag".to_vec());
-    let NativeAdmission::Compile { ticket } = client.admit(&invalid)? else {
+    let NativeAdmission::Compile { ticket } = client.admit(&invalid, ActionMode::Reuse)? else {
         anyhow::bail!("expected failed-action miss");
     };
     let ScheduleReply::Assigned(allocation) = client.schedule(ticket, invalid.clone())? else {
@@ -1060,7 +1061,8 @@ mkdir -p build
 "$3" --crate-name probe --crate-type rlib --edition=2024 --emit=link,dep-info --out-dir build probe.rs
 cp build/probe.o gcc-reference.o
 cp build/libprobe.rlib rust-reference.rlib
-for i in 1 2; do
+for i in 1 2 ${4:+3 4}; do
+    if [ "$i" = 3 ]; then export SCCACHE_RECACHE=1; else unset SCCACHE_RECACHE; fi
     rm -f build/probe.o build/libprobe.rlib build/probe.d build/probe-c.d
     "$1" "$2" -c probe.c -o build/probe.o -MMD -MF build/probe-c.d
     "$1" "$3" --crate-name probe --crate-type rlib --edition=2024 --emit=link,dep-info --out-dir build probe.rs
@@ -1132,6 +1134,7 @@ fn namespace_compilers(
     private: &Path,
     visible: &Path,
     rustc: &Path,
+    refresh: bool,
 ) -> Result<std::process::Output> {
     Ok(service
         .command("/usr/bin/bwrap")
@@ -1159,6 +1162,7 @@ fn namespace_compilers(
             "/usr/bin/gcc",
         ])
         .arg(rustc)
+        .arg(if refresh { "refresh" } else { "" })
         .output()?)
 }
 
@@ -1260,6 +1264,7 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
             "/usr/bin/gcc",
         ])
         .arg(&rustc)
+        .arg("refresh")
         .current_dir(&direct)
         .env("SCCACHE_CONF", &direct_config)
         .output()?;
@@ -1273,9 +1278,10 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
         "direct native compiler path failed"
     );
     let stats = service.stats()?;
-    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 2);
-    assert_eq!(stats.cache_hits.all(), 2);
-    assert_eq!(stats.cache_misses.all(), 2);
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 4);
+    assert_eq!(stats.forced_recaches, 2);
+    assert_eq!(stats.cache_hits.all(), 4);
+    assert_eq!(stats.cache_misses.all(), 4);
     assert_eq!(stats.dist_errors, 0);
 
     let visible = root.join("visible");
@@ -1288,7 +1294,7 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
     )?;
     write_compiler_sources(&private)?;
     let start = Instant::now();
-    let output = namespace_compilers(&service, &private, &visible, &rustc)?;
+    let output = namespace_compilers(&service, &private, &visible, &rustc, true)?;
     eprintln!(
         "namespace compiler elapsed {:?}:\n{}",
         start.elapsed(),
@@ -1299,9 +1305,10 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
         "native namespace compiler path failed"
     );
     let stats = service.stats()?;
-    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 4);
-    assert_eq!(stats.cache_hits.all(), 4);
-    assert_eq!(stats.cache_misses.all(), 4);
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 8);
+    assert_eq!(stats.cache_hits.all(), 8);
+    assert_eq!(stats.cache_misses.all(), 8);
+    assert_eq!(stats.forced_recaches, 4);
     assert_eq!(stats.dist_errors, 0);
     assert!(private.join("build/probe.o").is_file());
     assert!(private.join("build/libprobe.rlib").is_file());
@@ -1319,7 +1326,7 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
             serde_json::to_string(&catalog)?
         ),
     )?;
-    let output = namespace_compilers(&service, &private, &visible, &rustc)?;
+    let output = namespace_compilers(&service, &private, &visible, &rustc, false)?;
     let log = String::from_utf8_lossy(&output.stderr);
     ensure!(
         output.status.success(),
@@ -1334,11 +1341,11 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
         fs::read(private.join("rust-reference.rlib"))?
     );
     let stats = service.stats()?;
-    assert_eq!(stats.cache_hits.all(), 8);
-    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 4);
+    assert_eq!(stats.cache_hits.all(), 12);
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 8);
     run_environment_audit(&service, &direct, &rustc, &direct_config)?;
     let stats = service.stats()?;
-    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 7);
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 11);
     assert_eq!(stats.dist_errors, 0);
     let index = fleet.scheduler_directory.join("index.redb");
     service.stop()?;

@@ -82,7 +82,7 @@ fn package_trees_and_actions_share_one_blob_index_across_restart() -> Result<()>
         schema: "test".into(),
         components: BTreeMap::from([("source".into(), ContentId::of(b"anything"))]),
     };
-    let published = store.publish(&action, &result, vec![])?;
+    let published = store.publish(&action, &result, vec![], crate::ActionMode::Reuse)?;
     assert_eq!(store.stats()?.blobs, 1);
     assert_eq!(store.stats()?.trees, 2);
     assert_eq!(store.stats()?.logical_bytes, blob.size);

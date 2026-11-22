@@ -11,8 +11,8 @@ use bincode::Options;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::build_runtime::{
-    BlobRef, ContentId, ExecutionSpec, InstallationManifest, PackageIdentity, PackageSource,
-    ResultManifest, TreeId, TreeManifest,
+    ActionMode, BlobRef, ContentId, ExecutionSpec, InstallationManifest, PackageIdentity,
+    PackageSource, ResultManifest, TreeId, TreeManifest,
     wire::{
         BeginResult, NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply, Ticket,
         TreeOffer, TreeRead, UploadHeader, WorkerAllocation,
@@ -237,8 +237,8 @@ impl NativeCacheClient {
     ///
     /// # Errors
     /// Returns an error on invalid metadata, authentication or transport failure.
-    pub fn admit(&self, spec: &ExecutionSpec) -> Result<NativeAdmission> {
-        self.control("admit", spec)
+    pub fn admit(&self, spec: &ExecutionSpec, mode: ActionMode) -> Result<NativeAdmission> {
+        self.control("admit", &(spec, mode))
     }
 
     /// Verify that a publisher is executing exactly the admitted specification.

@@ -341,7 +341,7 @@ mod tests {
             .context("test output")?
             .required = false;
         assert_ne!(first, key(&changed)?);
-        changed = original.clone();
+        changed = original;
         changed.mounts.clear();
         changed
             .mounts

@@ -188,8 +188,16 @@ generated; the worker's private Rust dep-info emission is retained where
 needed for identical rlib metadata.
 
 Unavailable native execution, unsupported custom toolchains, non-cacheable
-commands and forced-cache policy requests currently execute locally without
-archive caching. Forced recache does not yet replace a native action. In client-side mode, the caller needs only
+commands and force-no-cache requests execute locally without archive caching.
+For eligible native actions, forced recache reserves a fresh compilation of
+the same action key and replaces its result only upon successful publication.
+Normal readers may keep using the prior result during refresh; existing
+delivery leases protect the old content even after replacement. Failed
+or cancelled refreshes leave the previous publication intact, subject to
+ordinary eviction. Cache-policy variables are consumed at compile-request
+ingress, not included in the compiler environment or action identity.
+Decomposed subcommands inherit the invocation's policy.
+In client-side mode, the caller needs only
 `client_side_mode = true` and access to the existing managed daemon's socket.
 The daemon supplies the platform and resource policy in its namespace
 handshake; endpoint URLs, authentication and job capabilities remain private.

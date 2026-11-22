@@ -1438,7 +1438,7 @@ pub enum CompileResult {
         Pin<Box<dyn Future<Output = Result<CacheWriteInfo>> + Send>>,
     ),
     /// A native worker already published a result to the scheduler.
-    NativeMiss(DistType, Duration),
+    NativeMiss(MissType, DistType, Duration),
     /// Not in cache and do not cache the results of the compilation.
     NotCached(DistType, Duration),
     /// Not in cache, but the compilation result was determined to be not cacheable.
@@ -1465,8 +1465,8 @@ impl fmt::Debug for CompileResult {
             Self::CacheMiss(ref m, ref dt, ref d, _) => {
                 write!(f, "CompileResult::CacheMiss({d:?}, {m:?}, {dt:?}, _)")
             }
-            Self::NativeMiss(ref dt, ref d) => {
-                write!(f, "CompileResult::NativeMiss({dt:?}, {d:?})")
+            Self::NativeMiss(ref m, ref dt, ref d) => {
+                write!(f, "CompileResult::NativeMiss({m:?}, {dt:?}, {d:?})")
             }
             Self::NotCached(ref dt, ref d) => {
                 write!(f, "CompileResult::NotCached({dt:?}, {d:?}_")
@@ -1487,8 +1487,8 @@ impl PartialEq<Self> for CompileResult {
         match (self, other) {
             (&Self::Error, &Self::Error) | (&Self::CacheHit(_), &Self::CacheHit(_)) => true,
             (Self::CacheMiss(m, dt, _, _), Self::CacheMiss(n, dt2, _, _)) => m == n && dt == dt2,
-            (Self::NativeMiss(dt, _), Self::NativeMiss(dt2, _))
-            | (Self::NotCached(dt, _), Self::NotCached(dt2, _))
+            (Self::NativeMiss(m, dt, _), Self::NativeMiss(n, dt2, _)) => m == n && dt == dt2,
+            (Self::NotCached(dt, _), Self::NotCached(dt2, _))
             | (Self::NotCacheable(dt, _), Self::NotCacheable(dt2, _))
             | (Self::CompileFailed(dt, _), Self::CompileFailed(dt2, _)) => dt == dt2,
             _ => false,

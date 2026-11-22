@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use crate::{
-    Admission, ArchiveLength, BlobRef, BuildCoordinator, CompilePermit, ContentId,
+    ActionMode, Admission, ArchiveLength, BlobRef, BuildCoordinator, CompilePermit, ContentId,
     InstallationManifest, NativeStore, PackageArchive, PackageArchiveLease, PackageIdentity,
     PackageImportLimits, ResultLease, ResultManifest, StagedBlob, TreeId, TreeLease, TreeManifest,
     UploadReservation,
@@ -468,10 +468,15 @@ impl NativeSessions {
     /// # Errors
     /// Returns an error for invalid inputs, missing trees, capacity exhaustion
     /// or storage failure.
-    pub fn admit(&self, request: ActionRequest, publisher: Publisher) -> Result<NativeAdmission> {
+    pub fn admit(
+        &self,
+        request: ActionRequest,
+        publisher: Publisher,
+        mode: ActionMode,
+    ) -> Result<NativeAdmission> {
         self.reap()?;
         let fingerprint = request.action_fingerprint()?;
-        match self.coordinator.admit(fingerprint)? {
+        match self.coordinator.admit(fingerprint, mode)? {
             Admission::InFlight => Ok(NativeAdmission::InFlight),
             Admission::Cached(lease) => {
                 request.validate_result(lease.manifest())?;

@@ -20,7 +20,8 @@ pub use spec::{BuildPath, CommandSpec, ExecutionRoot, ExecutionSpec, OutputSpec}
 mod tree;
 pub mod wire;
 pub use identity::{
-    ActionFingerprint, ActionKey, Artifact, BlobRef, ContentId, ResultId, ResultManifest,
+    ActionFingerprint, ActionKey, ActionMode, Artifact, BlobRef, ContentId, ResultId,
+    ResultManifest,
 };
 pub use tree::{TreeEntry, TreeId, TreeManifest, TreeMetadata, TreePath, TreeTimestamp};
 

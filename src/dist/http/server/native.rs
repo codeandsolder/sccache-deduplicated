@@ -11,7 +11,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::{ClientAuthCheck, ServerAuthenticator, authenticate_client, authenticate_server};
 use crate::{
     build_runtime::{
-        ArchiveLength, ExecutionSpec, NativeServiceBusy, NativeSessions, NativeStore,
+        ActionMode, ArchiveLength, ExecutionSpec, NativeServiceBusy, NativeSessions, NativeStore,
         PackageIdentity, PackageImportLimits, PackageSource,
         wire::{Publisher, ScheduleReply, UploadHeader},
     },
@@ -246,8 +246,11 @@ fn dispatch(
             encode(&manifest, limit)
         }
         "admit" if publisher == Publisher::Client => {
-            let input: ExecutionSpec = metadata(request, limit)?;
-            encode(&sessions.admit(input.action_request()?, publisher)?, limit)
+            let (input, mode): (ExecutionSpec, ActionMode) = metadata(request, limit)?;
+            encode(
+                &sessions.admit(input.action_request()?, publisher, mode)?,
+                limit,
+            )
         }
         "schedule" if publisher == Publisher::Client => {
             let ExecutionRequest { ticket, spec } = metadata(request, limit)?;

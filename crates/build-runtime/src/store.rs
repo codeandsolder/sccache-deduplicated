@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 use super::{
-    ActionFingerprint, ActionKey, BlobRef, ContentId, ResultId, ResultManifest, identity::encoding,
+    ActionFingerprint, ActionKey, ActionMode, BlobRef, ContentId, ResultId, ResultManifest,
+    identity::encoding,
 };
 
 const ACTIONS: TableDefinition<'static, &[u8; 32], &[u8]> = TableDefinition::new("actions_v1");
@@ -102,8 +103,26 @@ pub struct GarbageCollected {
 struct Pins {
     actions: BTreeMap<ActionKey, usize>,
     trees: BTreeMap<crate::TreeId, usize>,
-    uploads: BTreeMap<ContentId, usize>,
+    blobs: BTreeMap<ContentId, usize>,
     last_used: BTreeMap<space::Root, Instant>,
+}
+
+impl Pins {
+    fn reserve_content<'a>(
+        &mut self,
+        ids: impl Iterator<Item = &'a ContentId> + Clone,
+    ) -> Result<()> {
+        for id in ids.clone() {
+            ensure!(
+                self.blobs.get(id).copied().unwrap_or(0) < usize::MAX,
+                "content pin count overflow"
+            );
+        }
+        for &id in ids {
+            *self.blobs.entry(id).or_default() += 1;
+        }
+        Ok(())
+    }
 }
 
 // All lease categories use the same pin reference-counting invariant.
@@ -433,17 +452,8 @@ impl NativeStore {
             }
         }
         let mut pins = self.inner.lock_pins()?;
-        // Validate every count before changing any pin, so a failed
-        // reservation cannot leave partially installed pins.
-        for id in &reserved {
-            ensure!(
-                pins.uploads.get(id).copied().unwrap_or(0) < usize::MAX,
-                "upload pin count overflow"
-            );
-        }
-        for &id in &reserved {
-            *pins.uploads.entry(id).or_default() += 1;
-        }
+        // Validate every count before changing any pin.
+        pins.reserve_content(reserved.iter())?;
         drop(pins);
         Ok(UploadReservation {
             inner: Arc::clone(&self.inner),
@@ -455,8 +465,8 @@ impl NativeStore {
     /// Atomically publish a successful result. All newly referenced blobs must
     /// be staged; blobs already in the store can be referenced without upload.
     ///
-    /// The same action and result is idempotent. A different result for an
-    /// existing action is an error, not a silent replacement.
+    /// The same action and result is idempotent. A different result requires
+    /// explicit refresh mode; a failed refresh leaves the prior action intact.
     ///
     /// # Errors
     /// Returns an error for conflicting actions, missing or inconsistent content,
@@ -466,9 +476,10 @@ impl NativeStore {
         fingerprint: &ActionFingerprint,
         manifest: &ResultManifest,
         staged: Vec<StagedBlob>,
+        mode: ActionMode,
     ) -> Result<Published> {
         let _mutation = self.inner.lock_mutations()?;
-        self.publish_locked(fingerprint, manifest, staged)
+        self.publish_locked(fingerprint, manifest, staged, mode)
     }
 
     /// Publish and pin the resulting action before eviction can remove it.
@@ -480,9 +491,10 @@ impl NativeStore {
         fingerprint: &ActionFingerprint,
         manifest: &ResultManifest,
         staged: Vec<StagedBlob>,
+        mode: ActionMode,
     ) -> Result<ResultLease> {
         let _mutation = self.inner.lock_mutations()?;
-        let published = self.publish_locked(fingerprint, manifest, staged)?;
+        let published = self.publish_locked(fingerprint, manifest, staged, mode)?;
         self.lookup(published.action)?
             .context("committed result missing")
     }
@@ -492,30 +504,43 @@ impl NativeStore {
         fingerprint: &ActionFingerprint,
         manifest: &ResultManifest,
         staged: Vec<StagedBlob>,
+        mode: ActionMode,
     ) -> Result<Published> {
         let action = fingerprint.key()?;
         let result = manifest.id()?;
         let blobs = manifest.blobs()?;
         let staged = self.prepare_staging(&blobs, staged)?;
         let write = self.inner.db.begin_write()?;
+        let new_action;
         {
             let mut actions = write.open_table(ACTIONS)?;
             let mut results = write.open_table(RESULTS)?;
             let mut result_actions = write.open_multimap_table(RESULT_ACTIONS)?;
-            if let Some(stored) = actions.get(&action.0)? {
-                let stored: ActionRecord = encoding().deserialize(stored.value())?;
+            let previous = actions
+                .get(&action.0)?
+                .map(|value| encoding().deserialize::<ActionRecord>(value.value()))
+                .transpose()?;
+            new_action = previous.is_none();
+            if let Some(stored) = &previous {
                 ensure!(
-                    stored.fingerprint == *fingerprint && stored.result == result,
+                    stored.fingerprint == *fingerprint,
+                    "conflicting native action fingerprint"
+                );
+                if stored.result == result {
+                    for (&id, &size) in &blobs {
+                        self.inner.check_blob(id, size)?;
+                    }
+                    self.inner.lock_pins()?.touch(space::Root::Action(action));
+                    return Ok(Published {
+                        action,
+                        result,
+                        new_action: false,
+                    });
+                }
+                ensure!(
+                    mode == ActionMode::Refresh,
                     "conflicting result for action {action:?}"
                 );
-                for (&id, &size) in &blobs {
-                    self.inner.check_blob(id, size)?;
-                }
-                return Ok(Published {
-                    action,
-                    result,
-                    new_action: false,
-                });
             }
             let existing_result = if let Some(stored) = results.get(&result.0)? {
                 let stored: ResultManifest = encoding().deserialize(stored.value())?;
@@ -536,6 +561,15 @@ impl NativeStore {
             let bytes = encoding().serialize(&record)?;
             actions.insert(&action.0, bytes.as_slice())?;
             result_actions.insert(&result.0, &action.0)?;
+            if let Some(previous) = previous {
+                Self::release_result_reference(
+                    &write,
+                    &mut results,
+                    &mut result_actions,
+                    action,
+                    previous.result,
+                )?;
+            }
         }
         // Files and their directory entries are durable before the index
         // exposes them. Orphans from an interrupted write are harmless.
@@ -544,7 +578,7 @@ impl NativeStore {
         Ok(Published {
             action,
             result,
-            new_action: true,
+            new_action,
         })
     }
 
@@ -684,9 +718,18 @@ impl NativeStore {
         for (&id, &size) in &blobs {
             self.inner.check_blob(id, size)?;
         }
+        let count = pins
+            .actions
+            .get(&action)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .context("action pin count overflow")?;
+        // A refresh can retire the old result while its delivery lease
+        // survives. Pin its content independently of the action mapping.
+        pins.reserve_content(blobs.keys())?;
+        pins.actions.insert(action, count);
         pins.touch(space::Root::Action(action));
-        let count = pins.actions.entry(action).or_default();
-        *count = count.checked_add(1).context("action pin count overflow")?;
         drop(pins);
         Ok(Some(ResultLease {
             inner: Arc::clone(&self.inner),
@@ -732,7 +775,7 @@ impl NativeStore {
             return Ok(Eviction::Pinned);
         }
         let write = self.inner.db.begin_write()?;
-        let mut unreferenced_logical_bytes = 0_u64;
+        let unreferenced_logical_bytes;
         {
             let mut actions = write.open_table(ACTIONS)?;
             let mut results = write.open_table(RESULTS)?;
@@ -741,19 +784,13 @@ impl NativeStore {
                 return Ok(Eviction::Missing);
             };
             let record: ActionRecord = encoding().deserialize(record.value())?;
-            let result = record.result;
-            ensure!(
-                result_actions.remove(&result.0, &action.0)?,
-                "missing result reverse reference"
-            );
-            if result_actions.get(&result.0)?.next().transpose()?.is_none() {
-                let manifest = results
-                    .remove(&result.0)?
-                    .context("missing indexed result")?;
-                let manifest: ResultManifest = encoding().deserialize(manifest.value())?;
-                unreferenced_logical_bytes =
-                    Self::detach_blobs(&write, &result.0, manifest.blobs()?)?;
-            }
+            unreferenced_logical_bytes = Self::release_result_reference(
+                &write,
+                &mut results,
+                &mut result_actions,
+                action,
+                record.result,
+            )?;
         }
         // Durable deletion intent precedes physical deletion. The collector
         // can batch work and retry failures without scanning the live store.
@@ -764,6 +801,27 @@ impl NativeStore {
         Ok(Eviction::Removed {
             unreferenced_logical_bytes,
         })
+    }
+
+    fn release_result_reference(
+        write: &WriteTransaction,
+        results: &mut redb::Table<'_, &[u8; 32], &[u8]>,
+        aliases: &mut redb::MultimapTable<'_, &[u8; 32], &[u8; 32]>,
+        action: ActionKey,
+        result: ResultId,
+    ) -> Result<u64> {
+        ensure!(
+            aliases.remove(&result.0, &action.0)?,
+            "missing result reverse reference"
+        );
+        if aliases.get(&result.0)?.next().transpose()?.is_some() {
+            return Ok(0);
+        }
+        let manifest = results
+            .remove(&result.0)?
+            .context("missing indexed result")?;
+        let manifest: ResultManifest = encoding().deserialize(manifest.value())?;
+        Self::detach_blobs(write, &result.0, manifest.blobs()?)
     }
 
     fn detach_blobs(
@@ -820,8 +878,8 @@ impl NativeStore {
         Ok(unreferenced_logical_bytes)
     }
 
-    /// Reclaim up to `limit` unreferenced content files. Active upload
-    /// reservations protect their already-transferred content from deletion.
+    /// Reclaim up to `limit` unreferenced content files. Active upload and
+    /// result-delivery reservations protect their content from deletion.
     ///
     /// # Errors
     /// Returns an error for database failures; per-file failures remain queued
@@ -838,14 +896,14 @@ impl NativeStore {
             }
             let (id, size) = entry?;
             let id = ContentId(*id.value());
-            if !pins.uploads.contains_key(&id) {
+            if !pins.blobs.contains_key(&id) {
                 candidates.push((id, size.value()));
             }
         }
         drop(pending);
         drop(read);
-        // A new upload reservation requires the mutation lock. Readers of
-        // committed results need neither these files nor that lock.
+        // A new upload reservation requires the mutation lock. Committed
+        // result readers cannot acquire new pins on pending-only content.
         drop(pins);
         let mut completed = Vec::new();
         let mut failed = Vec::new();
@@ -941,7 +999,7 @@ impl Drop for UploadReservation {
         match self.inner.lock_pins() {
             Ok(mut pins) => {
                 for id in &self.reserved {
-                    release_pin(&mut pins.uploads, id);
+                    release_pin(&mut pins.blobs, id);
                 }
             }
             Err(error) => {
@@ -990,7 +1048,12 @@ impl ResultLease {
 impl Drop for ResultLease {
     fn drop(&mut self) {
         match self.inner.lock_pins() {
-            Ok(mut pins) => release_pin(&mut pins.actions, &self.action),
+            Ok(mut pins) => {
+                release_pin(&mut pins.actions, &self.action);
+                for id in self.blobs.keys() {
+                    release_pin(&mut pins.blobs, id);
+                }
+            }
             Err(error) => log::error!("could not release native store result lease: {error:#}"),
         }
     }
