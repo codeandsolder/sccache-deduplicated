@@ -2503,6 +2503,69 @@ pub fn relocate_raw_rust_operands(
     )
 }
 
+/// Identify the source operand using the same typed argument grammar as
+/// compiler hashing. Retain the expanded argv itself, not a reserialization:
+/// linker options, repeated options, and option spellings remain exact.
+#[cfg(target_os = "linux")]
+pub(super) fn native_link_stage_input(
+    arguments: &[OsString],
+    cwd: &Path,
+) -> Result<(Vec<OsString>, usize)> {
+    use anyhow::ensure;
+    use std::cell::Cell;
+
+    let expanded = super::rust_response::expand(arguments, cwd)?;
+    let consumed = Cell::new(0);
+    let mut input = None;
+    let mut after_separator = false;
+    let mut emit = None;
+    for argument in ArgsIter::new(
+        expanded
+            .iter()
+            .cloned()
+            .inspect(|_| consumed.set(consumed.get() + 1)),
+        &ARGS[..],
+    )
+    .with_double_dashes()
+    {
+        let argument = argument?;
+        match &argument {
+            Argument::Raw(value) if value == "--" && !after_separator => after_separator = true,
+            Argument::Raw(_) => {
+                ensure!(
+                    input.replace(consumed.get() - 1).is_none(),
+                    "multiple Rust source operands"
+                );
+            }
+            _ => match argument.get_data() {
+                Some(Unstable(option))
+                    if matches!(option.opt.as_str(), "no-link" | "link-only") =>
+                {
+                    bail!("Rust invocation already specifies a link stage");
+                }
+                Some(NotCompilationFlag | NotCompilation(_)) => bail!("not a Rust compilation"),
+                Some(Emit(value)) => {
+                    ensure!(
+                        emit.replace(
+                            value
+                                .split(',')
+                                .any(|kind| kind == "link" || kind.starts_with("link="))
+                        )
+                        .is_none(),
+                        "multiple Rust emit options"
+                    );
+                }
+                _ => {}
+            },
+        }
+    }
+    ensure!(
+        emit.unwrap_or(true),
+        "Rust invocation does not emit a linked artifact"
+    );
+    Ok((expanded, input.context("missing Rust source operand")?))
+}
+
 #[async_trait]
 impl<T> CompilerHasher<T> for RustHasher
 where

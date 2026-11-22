@@ -357,6 +357,81 @@ impl LinkInvocation {
     }
 }
 
+/// A compiler-owned split-link invocation. Both stages retain the complete
+/// compiler option list, changing only the source operand and stage selector.
+/// The caller executes them in namespaces with identical logical paths.
+pub struct RustLinkStages {
+    arguments: Vec<OsString>,
+    input: usize,
+}
+
+impl RustLinkStages {
+    /// Parse the actual source operand and expand compiler response files once.
+    ///
+    /// # Errors
+    /// The input is ambiguous, not a linked compilation, or already a stage.
+    pub fn new(arguments: &[OsString], cwd: &Path) -> Result<Self> {
+        let (arguments, input) = super::rust::native_link_stage_input(arguments, cwd)?;
+        Ok(Self { arguments, input })
+    }
+
+    /// Expanded codegen arguments. Use the shared rustc response-file
+    /// preparation when launching, so literal leading @ operands survive.
+    #[must_use = "these arguments execute the codegen stage"]
+    pub fn codegen_arguments(&self) -> Vec<OsString> {
+        self.stage_arguments("no-link", None)
+    }
+
+    /// Expanded link arguments, with the .rlink artifact at its original
+    /// logical path and all current linker options retained.
+    #[must_use = "these arguments execute the compiler's native link stage"]
+    pub fn link_arguments(&self, artifact: &Path) -> Vec<OsString> {
+        self.stage_arguments("link-only", Some(artifact))
+    }
+
+    fn stage_arguments(&self, stage: &str, artifact: Option<&Path>) -> Vec<OsString> {
+        let mut arguments = Vec::with_capacity(self.arguments.len() + 2);
+        // Prefix the stage option: a trailing -- must not turn it into a
+        // source operand.
+        arguments.extend([OsString::from("-Z"), OsString::from(stage)]);
+        arguments.extend(self.arguments.iter().cloned());
+        if let Some(path) = artifact {
+            arguments[self.input + 2] = path.as_os_str().to_owned();
+        }
+        arguments
+    }
+
+    /// Locate the compiler-produced .rlink in the generated output delta.
+    /// Neither the crate name, the codegen-unit count nor file naming is
+    /// guessed. The returned path refers to the original logical namespace.
+    ///
+    /// # Errors
+    /// The output does not contain exactly one regular .rlink artifact.
+    pub fn link_artifact(generated: &Path, logical: &Path) -> Result<PathBuf> {
+        ensure!(
+            logical.is_absolute(),
+            "logical output path must be absolute"
+        );
+        let mut artifact = None;
+        for entry in WalkDir::new(generated).min_depth(1).follow_links(false) {
+            let entry = entry?;
+            if entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "rlink")
+            {
+                ensure!(entry.file_type().is_file(), "invalid .rlink artifact type");
+                let relative = entry.path().strip_prefix(generated)?;
+                ensure!(
+                    artifact.replace(logical.join(relative)).is_none(),
+                    "multiple .rlink artifacts"
+                );
+            }
+        }
+        artifact.context("compiler did not generate a .rlink artifact")
+    }
+}
+
 /// Private generated output tree over the original logical compiler output
 /// directory.
 ///

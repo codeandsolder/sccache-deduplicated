@@ -3,7 +3,8 @@
 use anyhow::{Context, Result, ensure};
 use fs_err as fs;
 use sccache::rust_link::{
-    CaptureConfig, CaptureLimits, LinkEnvironment, LinkInvocation, PrivateOutputTree, SnapshotRoot,
+    CaptureConfig, CaptureLimits, LinkEnvironment, LinkInvocation, PrivateOutputTree,
+    RustLinkStages, SnapshotRoot,
 };
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -260,14 +261,18 @@ fn main() { println!("{}", unsafe { native_value() }); }"#;
         "-l",
         "static=native",
     ];
+    let mut arguments = common.map(OsString::from).to_vec();
+    arguments.extend([
+        "--out-dir".into(),
+        output_mount.clone().into_os_string(),
+        "probe.rs".into(),
+    ]);
+    let stages = RustLinkStages::new(&arguments, &source_mount)?;
     compile
         .current_dir(&source_mount)
         .env_clear()
         .envs(&environment)
-        .args(common)
-        .arg("--out-dir")
-        .arg(&output_mount)
-        .args(["-Z", "no-link", "probe.rs"]);
+        .args(stages.codegen_arguments());
     let first = Namespace {
         source: &source_a,
         output: &output_a,
@@ -296,14 +301,11 @@ fn main() { println!("{}", unsafe { native_value() }); }"#;
         ..first
     };
     let mut link = Command::new(&rustc);
+    let artifact = RustLinkStages::link_artifact(first_tree.generated_root(), &output_mount)?;
     link.current_dir(&source_mount)
         .env_clear()
         .envs(&environment)
-        .args(common)
-        .arg("--out-dir")
-        .arg(&output_mount)
-        .args(["-Z", "link-only"])
-        .arg(output_mount.join("probe-stage.rlink"));
+        .args(stages.link_arguments(&artifact));
     let linked = second.run(&link, Some(&second_tree))?;
     let output = Command::new(second_tree.generated_root().join("probe-stage")).output()?;
     assert!(output.status.success());
@@ -327,5 +329,179 @@ fn main() { println!("{}", unsafe { native_value() }); }"#;
         }
     }
     assert_eq!(emitted, ["dep-info", "metadata", "link"]);
+    Ok(())
+}
+
+#[test]
+fn split_link_argument_plan_preserves_expanded_option_bytes() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let original = [
+        "--crate-name",
+        "probe",
+        "--emit=link,dep-info",
+        "-C",
+        "link-arg=@native.rsp",
+        "--cfg",
+        "message=\"two words\"",
+        "--out-dir",
+        "output directory",
+        "--",
+        "-source.rs",
+    ]
+    .map(OsString::from);
+    let response = root.path().join("args.txt");
+    fs::write(
+        &response,
+        original
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )?;
+    let mut at = OsString::from("@");
+    at.push(response);
+    let stages = RustLinkStages::new(&[at], root.path())?;
+    let codegen = stages.codegen_arguments();
+    assert_eq!(codegen[..2], ["-Z", "no-link"]);
+    assert_eq!(codegen[2..], original);
+    let artifact = root.path().join("probe.rlink");
+    let link = stages.link_arguments(&artifact);
+    assert_eq!(link[..2], ["-Z", "link-only"]);
+    assert_eq!(link[2..link.len() - 1], original[..original.len() - 1]);
+    assert_eq!(
+        link.last().context("missing link operand")?,
+        artifact.as_os_str()
+    );
+    assert!(RustLinkStages::new(&["-Zno-link".into(), "a.rs".into()], root.path()).is_err());
+    assert!(RustLinkStages::new(&["--emit=metadata".into(), "a.rs".into()], root.path()).is_err());
+    assert!(RustLinkStages::new(&["a.rs".into(), "b.rs".into()], root.path()).is_err());
+    Ok(())
+}
+
+/// The generated result is a tree, not a guessed list of objects: LTO can
+/// introduce codegen units from any dependency, and packed debuginfo adds .dwo.
+#[test]
+fn native_split_link_covers_library_types_lto_and_post_link_debug_output() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let src_mount = root.join("source");
+    let out_mount = root.join("output");
+    let src = root.join("actual-source");
+    let out = root.join("lower-output");
+    let invalid = root.join("invalid-source");
+    for path in [&src_mount, &out_mount, &src, &out, &invalid] {
+        fs::create_dir(path)?;
+    }
+    fs::write(
+        invalid.join("probe.rs"),
+        "compile_error!(\"codegen rerun in link stage\");",
+    )?;
+    let rustc = compiler()?;
+    let environment: LinkEnvironment = std::env::vars_os().collect();
+    let bin = "fn main(){println!(\"linked\");}";
+    let library = "#[unsafe(no_mangle)] pub extern \"C\" fn answer()->u32{42}";
+    let proc_macro = "extern crate proc_macro; #[proc_macro] pub fn identity(x:proc_macro::TokenStream)->proc_macro::TokenStream{x}";
+    let test = "#[test] fn works(){assert_eq!(2+2,4);}";
+    let cases: &[(&[&str], &str, &[&str])] = &[
+        (&["--crate-type=bin"], bin, &["probe-stage"]),
+        (
+            &["--crate-type=proc-macro"],
+            proc_macro,
+            &["libprobe-stage.so"],
+        ),
+        (&["--crate-type=cdylib"], library, &["libprobe-stage.so"]),
+        (&["--crate-type=dylib"], library, &["libprobe-stage.so"]),
+        (&["--crate-type=staticlib"], library, &["libprobe-stage.a"]),
+        (&["--crate-type=rlib"], library, &["libprobe-stage.rlib"]),
+        (
+            &["--crate-type=rlib,cdylib"],
+            library,
+            &["libprobe-stage.rlib", "libprobe-stage.so"],
+        ),
+        (&["--test", "--crate-type=lib"], test, &["probe-stage"]),
+        (&["--crate-type=bin", "-Clto=thin"], bin, &["probe-stage"]),
+        (&["--crate-type=bin", "-Clto=fat"], bin, &["probe-stage"]),
+        (
+            &[
+                "--crate-type=bin",
+                "-Cdebuginfo=2",
+                "-Csplit-debuginfo=packed",
+            ],
+            bin,
+            &["probe-stage", "probe-stage.dwp"],
+        ),
+    ];
+    let first = Namespace {
+        source: &src,
+        output: &out,
+        source_mount: &src_mount,
+        output_mount: &out_mount,
+    };
+    let second = Namespace {
+        source: &invalid,
+        ..first
+    };
+    for (flags, source, expected) in cases {
+        fs::write(src.join("probe.rs"), source)?;
+        let mut arguments = flags.iter().map(OsString::from).collect::<Vec<_>>();
+        arguments.extend(
+            [
+                "--crate-name=probe",
+                "--edition=2024",
+                "-Cextra-filename=-stage",
+                "-Ccodegen-units=4",
+                "--emit=link,dep-info",
+                "--out-dir",
+            ]
+            .map(OsString::from),
+        );
+        arguments.extend([out_mount.clone().into_os_string(), "probe.rs".into()]);
+        let stages = RustLinkStages::new(&arguments, &src)?;
+        let codegen = PrivateOutputTree::new(&root)?;
+        let mut command = Command::new(&rustc);
+        command
+            .current_dir(&src_mount)
+            .env_clear()
+            .envs(&environment)
+            .args(stages.codegen_arguments());
+        first
+            .run(&command, Some(&codegen))
+            .with_context(|| format!("codegen {flags:?}"))?;
+        for output in *expected {
+            assert!(
+                !codegen.generated_root().join(output).exists(),
+                "completed link output during codegen: {flags:?}"
+            );
+        }
+        let artifact = RustLinkStages::link_artifact(codegen.generated_root(), &out_mount)?;
+        let archive = root.join("generated.tar");
+        codegen.archive(&archive, LIMITS)?;
+        let replay = PrivateOutputTree::new(&root)?;
+        replay.restore(&archive, LIMITS)?;
+        let mut command = Command::new(&rustc);
+        command
+            .current_dir(&src_mount)
+            .env_clear()
+            .envs(&environment)
+            .args(stages.link_arguments(&artifact));
+        second
+            .run(&command, Some(&replay))
+            .with_context(|| format!("link {flags:?}"))?;
+        for name in *expected {
+            let output = replay.generated_root().join(name);
+            assert!(
+                output.is_file() && output.metadata()?.len() > 0,
+                "missing output {name}: {flags:?}"
+            );
+            if *name == "probe-stage" {
+                let result = Command::new(output).output()?;
+                ensure!(
+                    result.status.success(),
+                    "linked executable failed: {flags:?}"
+                );
+            }
+        }
+        assert_eq!(fs::read_dir(&out)?.count(), 0);
+    }
     Ok(())
 }
