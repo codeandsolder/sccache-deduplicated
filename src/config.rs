@@ -1686,8 +1686,7 @@ impl Config {
             .context("Failed to load config file")?
             .unwrap_or_default();
 
-        let mut config =
-            Self::from_env_and_file_configs_with_environment(env_conf, file_conf, environment)?;
+        let mut config = Self::from_env_and_file_configs(env_conf, file_conf)?;
         if let Some(cache_dir) = environment
             .var_os("SCCACHE_DIST_CLIENT_CACHE_DIR")
             .filter(|value| !value.is_empty())
@@ -1698,17 +1697,7 @@ impl Config {
         Ok(config)
     }
 
-    #[cfg(test)]
     fn from_env_and_file_configs(env_conf: EnvConfig, file_conf: FileConfig) -> Result<Self> {
-        let environment = Environment::capture();
-        Self::from_env_and_file_configs_with_environment(env_conf, file_conf, &environment)
-    }
-
-    fn from_env_and_file_configs_with_environment(
-        env_conf: EnvConfig,
-        file_conf: FileConfig,
-        environment: &Environment,
-    ) -> Result<Self> {
         let mut conf_caches: CacheConfigs = CacheConfigs::default();
 
         let FileConfig {
@@ -1778,12 +1767,8 @@ impl Config {
             debug!("Using basedirs for path normalization: {basedirs_str:?}");
         }
 
-        let client_side_mode = env_client_side_mode.unwrap_or(file_client_side_mode)
-            // Logging always writes to stderr in the client process, disregarding
-            // SCCACHE_ERROR_LOG; Even if SCCACHE_ERROR_LOG was handled, there would
-            // be write races from multiple processes. Until those are addressed, we
-            // can't leave the client mode enabled alongside logging.
-            && environment.var_os(crate::LOGGING_ENV).is_none();
+        // Logging must never change the filesystem namespace used to compile.
+        let client_side_mode = env_client_side_mode.unwrap_or(file_client_side_mode);
 
         let (caches, fallback_cache) = conf_caches.clone().into_fallback();
         Ok(Self {

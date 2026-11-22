@@ -147,7 +147,7 @@ fn test_dist_basic() {
 #[cfg(target_os = "linux")]
 #[test]
 #[cfg_attr(not(feature = "dist-tests"), ignore)]
-fn test_dist_rust_and_c_namespace_broker() -> Result<()> {
+fn test_dist_namespace_broker() -> Result<()> {
     use std::fs;
 
     let temp = tempfile::tempdir()?;
