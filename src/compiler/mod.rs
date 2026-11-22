@@ -24,6 +24,8 @@ mod clang;
 mod core;
 mod cudafe;
 mod diab;
+#[cfg(target_os = "linux")]
+pub mod dynamic_dependencies;
 mod gcc;
 mod msvc;
 mod nvcc;
@@ -31,6 +33,7 @@ mod nvhpc;
 mod preprocessor_cache;
 mod ptxas;
 mod rust;
+mod rust_dlltool;
 #[cfg(target_os = "linux")]
 pub mod rust_link;
 mod rust_response;
