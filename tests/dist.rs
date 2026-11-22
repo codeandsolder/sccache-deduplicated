@@ -142,6 +142,80 @@ fn test_dist_basic() {
     });
 }
 
+// A successful assembler diagnostic may intentionally leave the object
+// absent or retain an existing file. Neither result can be cached as an object.
+#[test]
+#[cfg_attr(not(feature = "dist-tests"), ignore)]
+fn test_dist_c_success_without_object() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), &root);
+    system.add_scheduler();
+    let _worker = system.add_server(&[]);
+    let mut cfg = harness::sccache_client_cfg(&root, false);
+    cfg.dist.scheduler_url = Some(system.scheduler_url());
+    let config = root.join("sccache-cfg.json");
+    write_json_cfg(&root, "sccache-cfg.json", &cfg);
+    let cached_config = root.join("sccache-cached-cfg");
+    let _ = stop_local_daemon();
+    start_local_daemon(&config, &cached_config);
+
+    let source = root.join("probe.S");
+    let object = root.join("probe.o");
+    std::fs::write(&source, ".text\n.globl probe\nprobe:\nret\n")?;
+    let compile = |diagnostic: bool| -> Result<Output> {
+        let mut command = sccache_command();
+        command
+            .arg("gcc")
+            .args(["-c", "-x", "assembler-with-cpp"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&object)
+            .env("SCCACHE_CONF", &config)
+            .env("SCCACHE_CACHED_CONF", &cached_config)
+            .current_dir(&root);
+        if diagnostic {
+            command.arg("-Wa,--version");
+        }
+        Ok(command.output()?)
+    };
+    let first = compile(true)?;
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(String::from_utf8_lossy(&first.stdout).contains("GNU assembler"));
+    assert!(!object.exists());
+    std::fs::write(&object, b"previous object")?;
+    let second = compile(true)?;
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(second.stdout, first.stdout);
+    assert_eq!(std::fs::read(&object)?, b"previous object");
+    let ordinary = compile(false)?;
+    assert!(
+        ordinary.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ordinary.stderr)
+    );
+    let expected = std::fs::read(&object)?;
+    assert_ne!(expected, b"previous object");
+    std::fs::remove_file(&object)?;
+    assert!(compile(false)?.status.success());
+    assert_eq!(std::fs::read(&object)?, expected);
+    get_stats(|info| {
+        assert_eq!(3, info.stats.dist_compiles.values().sum::<usize>());
+        assert_eq!(1, info.stats.cache_hits.all());
+        assert_eq!(2, info.stats.non_cacheable_compilations);
+        assert_eq!(0, info.stats.dist_errors);
+    });
+    Ok(())
+}
+
 #[test]
 #[cfg_attr(not(feature = "dist-tests"), ignore)]
 fn test_dist_restartedserver() {

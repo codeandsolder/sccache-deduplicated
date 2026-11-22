@@ -780,6 +780,10 @@ where
                         .await;
                 }
 
+                let existing_outputs = crate::cache::cache_io::snapshot_existing_outputs(
+                    &outputs,
+                    compilation.is_locally_preprocessed(),
+                );
                 let CompilationOutcome {
                     cacheable,
                     dist_type,
@@ -833,9 +837,16 @@ where
                     fmt_duration_as_secs(&duration_compilation)
                 );
                 let start_create_artifact = Instant::now();
-                let mut entry = CacheWrite::from_objects(outputs, remote_outputs, &pool)
-                    .await
-                    .context("failed to zip up compiler outputs")?;
+                let Some(mut entry) =
+                    CacheWrite::from_objects(outputs, remote_outputs, existing_outputs, &pool)
+                        .await
+                        .context("failed to zip up compiler outputs")?
+                else {
+                    return Ok((
+                        CompileResult::NotCacheable(dist_type, duration_compilation),
+                        compiler_result,
+                    ));
+                };
 
                 entry.put_stdout(&compiler_result.stdout)?;
                 entry.put_stderr(&compiler_result.stderr)?;
