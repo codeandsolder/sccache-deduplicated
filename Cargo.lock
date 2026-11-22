@@ -3594,7 +3594,6 @@ dependencies = [
  "tokio-serde",
  "tokio-util",
  "toml",
- "tower-service",
  "typed-path",
  "url",
  "uuid",

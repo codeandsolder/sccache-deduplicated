@@ -1895,6 +1895,29 @@ mod client {
                 .await?
         }
 
+        async fn lookup_namespace_toolchain(
+            &self,
+            compiler: PathBuf,
+            key: String,
+        ) -> Result<(Option<Toolchain>, u64)> {
+            let cache = self.tc_cache.clone();
+            self.pool
+                .spawn_blocking(move || cache.lookup_namespace_toolchain(&compiler, &key))
+                .await?
+        }
+
+        async fn import_namespace_toolchain(
+            &self,
+            compiler: PathBuf,
+            key: String,
+            package: std::fs::File,
+        ) -> Result<Toolchain> {
+            let cache = self.tc_cache.clone();
+            self.pool
+                .spawn_blocking(move || cache.import_namespace_toolchain(&compiler, &key, package))
+                .await?
+        }
+
         fn rewrite_includes_only(&self) -> bool {
             self.rewrite_includes_only
         }

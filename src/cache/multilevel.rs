@@ -662,9 +662,14 @@ impl MultiLevelStorage {
         self.backfill_faster_levels(key, idx, raw_bytes_for_backfill);
     }
 
-    async fn read_level_with_raw(&self, idx: usize, key: &str) -> (Result<Cache>, Option<Bytes>) {
+    async fn read_level_with_raw(
+        &self,
+        idx: usize,
+        key: &str,
+        need_raw: bool,
+    ) -> (Result<Cache>, Option<Bytes>) {
         let level = &self.levels[idx];
-        if idx == 0 {
+        if idx == 0 && !need_raw {
             return (level.get(key).await, None);
         }
 
@@ -672,6 +677,40 @@ impl MultiLevelStorage {
             Ok((cache, raw_bytes)) => (Ok(cache), raw_bytes),
             Err(error) => (Err(error), None),
         }
+    }
+
+    // Namespace IPC needs bytes, but should still share ordinary lookup,
+    // fallback, accounting, and backfill behavior with local compilation.
+    async fn lookup(&self, key: &str, mode: LookupMode) -> Result<(Cache, Option<Bytes>)> {
+        for idx in 0..self.levels.len() {
+            let start = Instant::now();
+            let (cache_result, raw) = self
+                .read_level_with_raw(idx, key, mode != LookupMode::Parsed)
+                .await;
+            match cache_result {
+                Ok(Cache::Hit(entry)) => {
+                    if mode == LookupMode::Raw && raw.is_none() {
+                        trace!("Cache level {idx} cannot provide raw bytes, trying next level");
+                        continue;
+                    }
+                    let returned_raw = if mode == LookupMode::Parsed {
+                        None
+                    } else {
+                        raw.clone()
+                    };
+                    self.record_hit_and_schedule_backfills(key, idx, start.elapsed(), raw);
+                    return Ok((Cache::Hit(entry), returned_raw));
+                }
+                Ok(Cache::Miss) => trace!("Cache miss at level {idx}, trying next level"),
+                Ok(other) => return Ok((other, None)),
+                Err(e) => warn!("Error checking cache level {idx}: {e}, trying next level"),
+            }
+        }
+        debug!("Cache miss at all levels");
+        for idx in 0..self.levels.len() {
+            inc_stat!(self.atomic_stats.get(idx), misses, 1);
+        }
+        Ok((Cache::Miss, None))
     }
 
     fn backfill_faster_levels(&self, key: &str, hit_level: usize, raw_bytes: Option<Bytes>) {
@@ -879,51 +918,27 @@ impl MultiLevelStorage {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LookupMode {
+    Parsed,
+    Raw,
+    Both,
+}
+
 #[async_trait]
 impl Storage for MultiLevelStorage {
     async fn get(&self, key: &str) -> Result<Cache> {
-        for idx in 0..self.levels.len() {
-            let start = Instant::now();
-            let (cache_result, raw_bytes_for_backfill) = self.read_level_with_raw(idx, key).await;
-
-            match cache_result {
-                Ok(Cache::Hit(entry)) => {
-                    self.record_hit_and_schedule_backfills(
-                        key,
-                        idx,
-                        start.elapsed(),
-                        raw_bytes_for_backfill,
-                    );
-                    return Ok(Cache::Hit(entry));
-                }
-                Ok(Cache::Miss) => {
-                    trace!("Cache miss at level {idx}, trying next level");
-                }
-                Ok(other) => {
-                    return Ok(other);
-                }
-                Err(e) => {
-                    warn!("Error checking cache level {idx}: {e}, trying next level");
-                }
-            }
-        }
-        debug!("Cache miss at all levels");
-
-        // Mark final miss for all checked levels
-        for idx in 0..self.levels.len() {
-            inc_stat!(self.atomic_stats.get(idx), misses, 1);
-        }
-
-        Ok(Cache::Miss)
+        self.lookup(key, LookupMode::Parsed)
+            .await
+            .map(|(cache, _)| cache)
     }
 
     async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {
-        for level in &self.levels {
-            if let Some(bytes) = level.get_raw(key).await? {
-                return Ok(Some(bytes));
-            }
-        }
-        Ok(None)
+        self.lookup(key, LookupMode::Raw).await.map(|(_, raw)| raw)
+    }
+
+    async fn get_with_raw(&self, key: &str) -> Result<(Cache, Option<Bytes>)> {
+        self.lookup(key, LookupMode::Both).await
     }
 
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {

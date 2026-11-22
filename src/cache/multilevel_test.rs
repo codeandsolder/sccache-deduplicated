@@ -1781,6 +1781,13 @@ fn test_multilevel_get_raw_finds_first_hit() -> Result<()> {
             "get_raw bytes should be a valid zip archive"
         );
 
+        storage.drain_background().await;
+        assert_eq!(l0.get_raw("key").await?.as_deref(), Some(bytes.as_ref()));
+        let stats = storage.stats();
+        assert_eq!(stats.0[1].hits, 1);
+        assert_eq!(stats.0[0].misses, 1);
+        assert_eq!(stats.0[0].backfills_to, 1);
+
         // A key that exists in neither level should return None.
         assert!(storage.get_raw("missing").await?.is_none());
         Ok::<(), anyhow::Error>(())

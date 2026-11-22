@@ -849,8 +849,12 @@ where
     let conn_arc = storage.conn();
     let (tx, _rx) = futures::channel::mpsc::channel(1);
     let (_, info) = server::WaitUntilZero::new();
+    #[cfg(feature = "dist-client")]
+    let dist_client = storage.dist_client(config.dist.toolchains.clone());
+    #[cfg(not(feature = "dist-client"))]
+    let dist_client = server::DistClientContainer::new_disabled();
     let service = server::SccacheService::<C>::new(
-        server::DistClientContainer::new_disabled(),
+        dist_client,
         Arc::new(storage),
         jobserver,
         runtime.handle().clone(),
@@ -1055,7 +1059,12 @@ fn run_compile_command(
     }
 
     let jobserver = Client::new();
-    let conn = connect_or_start_server(&get_addr(), startup_timeout, auto_start_server_enabled())?;
+    let conn = if config.client_side_mode {
+        connect_to_server(&get_addr())
+            .context("client-side compilation requires an existing daemon")?
+    } else {
+        connect_or_start_server(&get_addr(), startup_timeout, auto_start_server_enabled())?
+    };
     let invocation = CompileInvocation {
         exe,
         cmdline,
