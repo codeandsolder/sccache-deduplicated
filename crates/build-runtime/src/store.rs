@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom, Write},
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
     time::Instant,
@@ -15,7 +15,7 @@ use redb::{
     ReadableTableMetadata, TableDefinition, WriteTransaction,
 };
 use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempPath};
 
 use super::{
     ActionFingerprint, ActionKey, ActionMode, BlobRef, ContentId, ResultId, ResultManifest,
@@ -48,9 +48,11 @@ struct ActionRecord {
 }
 
 /// A verified immutable blob staged for publication. Dropping it before
-/// publication discards the temporary file.
+/// publication discards the temporary file. Closed, owner-private paths
+/// keep descriptor use proportional to active transfers, not manifest size.
 pub struct StagedBlob {
-    file: NamedTempFile,
+    path: TempPath,
+    metadata: fs::Metadata,
     reference: BlobRef,
     owner: Arc<Inner>,
 }
@@ -59,6 +61,34 @@ impl StagedBlob {
     #[must_use = "the reference identifies the staged content"]
     pub const fn reference(&self) -> BlobRef {
         self.reference
+    }
+
+    fn validate_metadata(&self, actual: &fs::Metadata) -> Result<()> {
+        let expected = &self.metadata;
+        ensure!(
+            actual.is_file()
+                && actual.dev() == expected.dev()
+                && actual.ino() == expected.ino()
+                && actual.len() == self.reference.size
+                && actual.mode() == expected.mode()
+                && actual.mtime() == expected.mtime()
+                && actual.mtime_nsec() == expected.mtime_nsec()
+                && actual.ctime() == expected.ctime()
+                && actual.ctime_nsec() == expected.ctime_nsec(),
+            "native staged content changed before publication"
+        );
+        Ok(())
+    }
+
+    fn open_file(&self) -> Result<File> {
+        use rustix::fs::{Mode, OFlags, open};
+        let file = File::from(open(
+            &*self.path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )?);
+        self.validate_metadata(&file.metadata()?)?;
+        Ok(file)
     }
 }
 
@@ -187,18 +217,21 @@ impl Inner {
         Ok(File::open(self.blob_path(id))?)
     }
 
-    fn install_blob(&self, blob: StagedBlob) -> Result<()> {
+    fn install_blob(&self, blob: StagedBlob, directories: &mut BTreeSet<PathBuf>) -> Result<()> {
         let path = self.blob_path(blob.reference.id);
         let parent = path.parent().context("invalid blob storage path")?;
-        match fs::create_dir(parent) {
-            Ok(()) => File::open(self.root.join("blobs"))?.sync_all()?,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
+        if directories.insert(parent.to_owned()) {
+            match fs::create_dir(parent) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            directories.insert(self.root.join("blobs"));
         }
         // An unindexed file can remain after a failed transaction; replace it
         // with verified bytes rather than trusting its name or its length.
-        blob.file.persist(&path)?;
-        File::open(parent)?.sync_all()?;
+        blob.validate_metadata(&fs::symlink_metadata(&blob.path)?)?;
+        blob.path.persist(&path)?;
         Ok(())
     }
 
@@ -282,6 +315,11 @@ impl NativeStore {
     fn open_inner(root: &Path, space_policy: Option<SpacePolicy>) -> Result<Self> {
         fs::create_dir_all(root)?;
         let root = fs::canonicalize(root)?;
+        let metadata = fs::metadata(&root)?;
+        ensure!(
+            metadata.uid() == rustix::process::geteuid().as_raw() && metadata.mode() & 0o022 == 0,
+            "native store root must be owned by the service and not writable by others"
+        );
         let index = root.join("index.redb");
         match fs::symlink_metadata(&index) {
             Ok(metadata) => ensure!(metadata.is_file(), "native index is not a regular file"),
@@ -297,11 +335,17 @@ impl NativeStore {
         for name in ["staging", "blobs"] {
             let path = root.join(name);
             fs::create_dir_all(&path)?;
+            let metadata = fs::symlink_metadata(&path)?;
             ensure!(
-                fs::symlink_metadata(&path)?.is_dir(),
-                "native store directory is not a directory: {}",
+                metadata.is_dir()
+                    && metadata.uid() == rustix::process::geteuid().as_raw()
+                    && metadata.mode() & 0o022 == 0,
+                "native store directory is not owner-controlled: {}",
                 path.display()
             );
+            if name == "staging" {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+            }
         }
         File::open(&root)?.sync_all()?;
         let write = db.begin_write()?;
@@ -389,8 +433,10 @@ impl NativeStore {
         file.as_file()
             .set_permissions(fs::Permissions::from_mode(0o400))?;
         file.as_file().sync_all()?;
+        let metadata = file.as_file().metadata()?;
         Ok(StagedBlob {
-            file,
+            path: file.into_temp_path(),
+            metadata,
             reference: BlobRef {
                 id: ContentId(*hash.finalize().as_bytes()),
                 size,
@@ -644,13 +690,14 @@ impl NativeStore {
         }
         let mut added = 0_u64;
         let mut pending_removed = 0_u64;
+        let mut directories = BTreeSet::new();
         for (&id, &size) in blobs {
             if blob_table.get(&id.0)?.is_none() {
                 if resurrected.binary_search(&id).is_err() {
                     let blob = staged
                         .remove(&id)
                         .context("validated staged content disappeared")?;
-                    self.inner.install_blob(blob)?;
+                    self.inner.install_blob(blob, &mut directories)?;
                 }
                 blob_table.insert(&id.0, size)?;
                 added = added.checked_add(size).context("store size overflow")?;
@@ -685,6 +732,11 @@ impl NativeStore {
                     .checked_sub(pending_removed)
                     .context("pending GC size underflow")?,
             )?;
+        }
+        // Every staged inode was synced before admission. Sync each affected
+        // shard once, before the transaction exposes any of its content.
+        for directory in directories.iter().rev() {
+            File::open(directory)?.sync_all()?;
         }
         Ok(())
     }

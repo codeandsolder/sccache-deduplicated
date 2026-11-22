@@ -3,7 +3,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{self, Read, Seek},
+    io::{self, Read},
     sync::Mutex,
 };
 
@@ -372,8 +372,7 @@ impl NativeStore {
             digest == source.identity.sha256,
             "incorrect original package SHA-256"
         );
-        let mut reader = archive.file.as_file().try_clone()?;
-        reader.rewind()?;
+        let reader = archive.open_file()?;
         let mut imported = ImportedTree::new(policy);
         decoder.decode(
             reader,

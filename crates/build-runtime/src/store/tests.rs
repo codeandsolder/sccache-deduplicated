@@ -506,3 +506,63 @@ fn refresh_retains_shared_aliases_and_old_result_leases() -> Result<()> {
     );
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn staging_many_blobs_does_not_hold_file_descriptors() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let store = NativeStore::open(directory.path())?;
+    let staging = directory.path().canonicalize()?.join("staging");
+    let mut staged = Vec::new();
+    for index in 0_u32..256 {
+        staged.push(store.stage(index.to_le_bytes().as_slice())?);
+    }
+    let open = fs::read_dir("/proc/self/fd")?
+        .filter_map(Result::ok)
+        .filter_map(|entry| fs::read_link(entry.path()).ok())
+        .filter(|path| path.starts_with(&staging))
+        .count();
+    assert_eq!(
+        open, 0,
+        "staging leaked descriptors for completed transfers"
+    );
+    assert_eq!(fs::read_dir(&staging)?.count(), staged.len());
+    for (index, blob) in staged.iter().enumerate() {
+        let mut bytes = Vec::new();
+        blob.open_file()?.read_to_end(&mut bytes)?;
+        assert_eq!(bytes, u32::try_from(index)?.to_le_bytes());
+    }
+    drop(staged);
+    assert_eq!(fs::read_dir(&staging)?.count(), 0);
+    Ok(())
+}
+
+#[test]
+fn replaced_or_modified_staging_file_cannot_be_published() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let store = NativeStore::open(directory.path())?;
+    let first = store.stage(b"abc".as_slice())?;
+    let path = first.path.to_path_buf();
+    fs::remove_file(&path)?;
+    fs::write(&path, b"xyz")?;
+    assert!(first.open_file().is_err());
+    assert!(
+        store
+            .inner
+            .install_blob(first, &mut BTreeSet::new())
+            .is_err()
+    );
+
+    let second = store.stage(b"abc".as_slice())?;
+    fs::set_permissions(&second.path, fs::Permissions::from_mode(0o600))?;
+    fs::write(&second.path, b"xyz")?;
+    assert!(second.open_file().is_err());
+    assert!(
+        store
+            .inner
+            .install_blob(second, &mut BTreeSet::new())
+            .is_err()
+    );
+    assert_eq!(store.stats()?.blobs, 0);
+    Ok(())
+}
