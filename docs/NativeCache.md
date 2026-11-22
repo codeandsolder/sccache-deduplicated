@@ -238,3 +238,25 @@ execute remotely, all four repeated calls must hit, and artifacts must
 match the direct compiler byte-for-byte. The service never creates either
 legacy cache. Production deployment, multi-host benchmarking and hard
 scratch quotas remain separate integration work.
+
+### Inspecting key relevance
+
+The scheduler's index records component names and digests, not the original
+environment values. Inspect a closed native index (or a consistent offline
+snapshot supported by redb) without opening a writable store:
+
+```sh
+sccache-dist native-audit --index /path/to/index.redb
+sccache-dist native-audit --index /path/to/index.redb \
+  --schema native-linux-bwrap-v3 --without environment/CARGO_SOME_SETTING
+```
+
+Repeat `--without` to evaluate a group jointly. The report counts pairs of
+distinct actions whose remaining components coincide, distinguishing identical
+complete result manifests from conflicting results. The inventory reports
+schema and component coverage. The comparison does not ignore components in
+actual admission, change the cache, or justify discarding a component on its
+own: inputs that have never varied provide no evidence. The report includes
+diagnostics and output metadata in the result identity. The audit deliberately
+uses a read-only offline index rather than adding an expensive enumeration
+endpoint to the scheduler's compilation listener.

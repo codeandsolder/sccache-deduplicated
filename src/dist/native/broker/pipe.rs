@@ -182,6 +182,7 @@ impl NativeExchange {
             .await?
             .is_err()
         {
+            self.incoming.close();
             self.join().await?;
             anyhow::bail!("native daemon stopped reading input");
         }
@@ -275,6 +276,51 @@ impl Write for CallerStream<'_> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bounded_stream_finishes_after_duplex_transfer() -> Result<()> {
+        let mut exchange = NativeExchange::start(3, Duration::from_secs(2), |mut stream| {
+            let mut bytes = [0; 6];
+            stream.read_exact(&mut bytes)?;
+            bytes.reverse();
+            stream.write_all(&bytes)?;
+            Ok(())
+        })?;
+        assert!(exchange.write(vec![]).await.is_err());
+        assert!(exchange.write(vec![0; 4]).await.is_err());
+        exchange.write(b"abc".to_vec()).await?;
+        exchange.write(b"def".to_vec()).await?;
+        let mut output = exchange.read().await?;
+        output.extend(exchange.read().await?);
+        assert_eq!(output, b"fedcba");
+        exchange.finish().await
+    }
+
+    #[tokio::test]
+    async fn premature_finish_unblocks_reader() -> Result<()> {
+        let exchange = NativeExchange::start(8, Duration::from_secs(2), |mut stream| {
+            let mut byte = [0];
+            stream.read_exact(&mut byte)?;
+            Ok(())
+        })?;
+        let error = exchange.finish().await;
+        assert!(error.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_error_propagates_without_raw_payload() -> Result<()> {
+        let mut exchange =
+            NativeExchange::start(8, Duration::from_secs(2), |_| anyhow::bail!("actor failed"))?;
+        let error = exchange.read().await;
+        assert!(error.is_err_and(|error| error.to_string() == "actor failed"));
         Ok(())
     }
 }

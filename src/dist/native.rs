@@ -3,12 +3,10 @@
 use std::{
     fs::File,
     io::{self, Cursor, Read, Write},
-    sync::mpsc,
-    thread,
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, ensure};
 use bincode::Options;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -267,9 +265,10 @@ impl NativeCacheClient {
         action: Ticket,
         id: TreeId,
         store: &crate::build_runtime::NativeStore,
+        renewal_interval: Duration,
     ) -> Result<crate::build_runtime::TreeLease> {
         let read = self.open_tree(action, id)?;
-        let result = (|| {
+        let result = self.with_renewal(read.ticket, renewal_interval, |check| {
             ensure!(
                 read.manifest.id()? == id,
                 "native tree download identity mismatch"
@@ -277,11 +276,12 @@ impl NativeCacheClient {
             let reserved = store.reserve_tree_upload(&read.manifest)?;
             let mut staged = Vec::new();
             for blob in reserved.missing() {
+                check()?;
                 let response = self.download_response(read.ticket, blob.id)?;
                 staged.push(store.stage_expected(*blob, response)?);
             }
             store.publish_tree_pinned(&read.manifest, staged)
-        })();
+        });
         // Best effort: the remote pin also expires automatically.
         let _ = self.close(read.ticket);
         result
@@ -363,35 +363,12 @@ impl NativeCacheClient {
         interval: Duration,
         operation: impl FnOnce(&mut dyn FnMut() -> Result<()>) -> Result<T>,
     ) -> Result<T> {
-        ensure!(
-            !interval.is_zero(),
-            "native renewal interval must be nonzero"
-        );
         self.renew(ticket)?;
-        let (stop_tx, stop_rx) = mpsc::channel::<()>();
-        let (failure_tx, failure_rx) = mpsc::channel::<anyhow::Error>();
-        let client = self.clone();
-        let renew = thread::Builder::new()
-            .name("native-lease-renewal".into())
-            .spawn(move || {
-                while stop_rx.recv_timeout(interval) == Err(mpsc::RecvTimeoutError::Timeout) {
-                    if let Err(error) = client.renew(ticket) {
-                        let _ = failure_tx.send(error);
-                        break;
-                    }
-                }
-            })?;
-        let mut check = || match failure_rx.try_recv() {
-            Ok(error) => Err(error).context("native scheduler lease renewal failed"),
-            Err(mpsc::TryRecvError::Empty) => Ok(()),
-            Err(mpsc::TryRecvError::Disconnected) => Err(anyhow!("native renewal loop stopped")),
-        };
-        let result = operation(&mut check);
-        drop(stop_tx);
-        renew
-            .join()
-            .map_err(|_| anyhow!("native renewal loop panicked"))?;
-        result
+        let renewals = renewal::Renewals::start(self.clone(), interval)?;
+        renewals.add(ticket)?;
+        let result = operation(&mut || renewals.check());
+        let renewed = renewals.finish();
+        result.and_then(|value| renewed.map(|()| value))
     }
     /// Observe the client's result ticket.
     ///
@@ -495,6 +472,7 @@ pub(super) fn codec() -> impl Options {
         .reject_trailing_bytes()
 }
 
+mod renewal;
 #[cfg(all(target_os = "linux", feature = "native-store"))]
 mod worker;
 

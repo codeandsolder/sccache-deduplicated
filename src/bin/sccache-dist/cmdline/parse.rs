@@ -147,6 +147,13 @@ fn get_clap_command() -> ClapCommand {
                 ),
         )
         .subcommand(
+            ClapCommand::new("native-audit")
+                .about("Inspect a closed native index or consistent offline snapshot without changing it")
+                .arg(flag_infer_long("index").value_parser(clap::value_parser!(PathBuf)).required(true))
+                .arg(flag_infer_long("schema").requires("without"))
+                .arg(flag_infer_long("without").action(clap::ArgAction::Append).requires("schema")),
+        )
+        .subcommand(
             ClapCommand::new("scheduler")
                 .about(
                     "Launch as a scheduler, to dispatch distributed builds across multiple servers",
@@ -226,6 +233,19 @@ pub fn try_parse_from(
             }
             _ => unreachable!("Subcommand is enforced by clap"),
         }),
+        Some(("native-audit", matches)) => Command::NativeAudit {
+            index: matches
+                .get_one::<PathBuf>("index")
+                .context("missing native index path")?
+                .clone(),
+            schema: matches.get_one::<String>("schema").cloned(),
+            without: matches
+                .get_many::<String>("without")
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect(),
+        },
         Some(("scheduler", matches)) => {
             if matches.contains_id("syslog") {
                 let log_level = matches

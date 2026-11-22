@@ -1,21 +1,25 @@
 //! Differential evidence for cache-key simplification, without changing keys.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use anyhow::{Context, Result, ensure};
 use bincode::Options;
-use redb::{ReadableDatabase, ReadableTable};
+use redb::{ReadOnlyDatabase, ReadableDatabase, ReadableTable};
+use serde::{Deserialize, Serialize};
 
 use super::{ACTIONS, ActionRecord, NativeStore, encoding};
 use crate::{ActionKey, ResultId};
 
-/// Observed evidence for ignoring exactly one named action component.
+/// Observed evidence for jointly ignoring selected named action components.
 ///
 /// Counts are over unordered pairs of distinct actions in the same schema
 /// whose other component digests all agree. Successful complete results,
 /// including diagnostics and metadata, are compared. Equal results are
 /// evidence to investigate, never authorization to merge action identities.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComponentAudit {
     pub examined_actions: u64,
     pub matched_groups: u64,
@@ -75,57 +79,136 @@ impl Group {
     }
 }
 
+/// Per-schema inventory of action components, including absent-vs-present
+/// coverage. No original environment values or contents are exposed.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaInventory {
+    pub actions: u64,
+    pub components: BTreeMap<String, u64>,
+}
+
+/// Inspect an existing index without creating a store, running recovery or
+/// changing any cache entries. The index must be closed by its writer or
+/// supplied as a consistent offline snapshot supported by redb.
+pub struct NativeIndexAudit {
+    db: ReadOnlyDatabase,
+}
+
+impl NativeIndexAudit {
+    /// Open an existing, read-only native index.
+    /// # Errors
+    /// Returns an error if the index cannot be opened safely.
+    pub fn open(index: &Path) -> Result<Self> {
+        Ok(Self {
+            db: ReadOnlyDatabase::open(index)?,
+        })
+    }
+
+    /// Enumerate schemas and component coverage in one consistent read.
+    /// # Errors
+    /// Returns an error for inconsistent metadata or I/O failure.
+    pub fn inventory(&self) -> Result<BTreeMap<String, SchemaInventory>> {
+        inventory(&self.db)
+    }
+
+    /// Compare action outcomes after projecting out exactly these components.
+    /// # Errors
+    /// Returns an error for invalid arguments, metadata or serialization.
+    pub fn compare(&self, schema: &str, ignored: &[String]) -> Result<ComponentAudit> {
+        compare(&self.db, schema, ignored)
+    }
+}
+
 impl NativeStore {
-    /// Audit the exact effect of dropping one component from a named schema.
+    /// Audit the exact effect of dropping a set of components from one schema.
     ///
     /// The read transaction sees a consistent snapshot. Absent and present
     /// components are compared correctly; each action is folded into one
     /// reduced-fingerprint cohort. Memory is linear in examined actions.
     ///
     /// # Errors
-    /// Returns an error for inconsistent metadata or failed serialization.
-    pub fn audit_component(&self, schema: &str, component: &str) -> Result<ComponentAudit> {
-        let read = self.inner.db.begin_read()?;
-        let actions = read.open_table(ACTIONS)?;
-        let mut groups = BTreeMap::<ActionKey, Group>::new();
-        let mut report = ComponentAudit::default();
-        for row in actions.iter()? {
-            let (key, value) = row?;
-            let key = ActionKey(*key.value());
-            let ActionRecord {
-                mut fingerprint,
-                result,
-            } = encoding().deserialize(value.value())?;
-            ensure!(
-                fingerprint.key()? == key,
-                "invalid indexed action fingerprint"
-            );
-            if fingerprint.schema != schema {
-                continue;
-            }
-            report.examined_actions = report
-                .examined_actions
-                .checked_add(1)
-                .context("action count overflow")?;
-            fingerprint.components.remove(component);
-            let reduced = fingerprint.key()?;
-            groups
-                .entry(reduced)
-                .or_default()
-                .insert(key, result, &mut report)?;
-        }
-        for group in groups.values().filter(|group| group.total > 1) {
-            report.matched_groups = report
-                .matched_groups
-                .checked_add(1)
-                .context("group count overflow")?;
-            report.matched_actions = report
-                .matched_actions
-                .checked_add(group.total)
-                .context("matched action count overflow")?;
-        }
-        Ok(report)
+    /// Returns an error for invalid arguments, metadata or serialization.
+    pub fn audit_components(&self, schema: &str, ignored: &[String]) -> Result<ComponentAudit> {
+        compare(&self.inner.db, schema, ignored)
     }
+}
+
+fn inventory(db: &impl ReadableDatabase) -> Result<BTreeMap<String, SchemaInventory>> {
+    let read = db.begin_read()?;
+    let actions = read.open_table(ACTIONS)?;
+    let mut schemas = BTreeMap::<String, SchemaInventory>::new();
+    for row in actions.iter()? {
+        let (key, value) = row?;
+        let record: ActionRecord = encoding().deserialize(value.value())?;
+        ensure!(
+            record.fingerprint.key()?.0 == *key.value(),
+            "invalid indexed action fingerprint"
+        );
+        let entry = schemas.entry(record.fingerprint.schema).or_default();
+        entry.actions = entry
+            .actions
+            .checked_add(1)
+            .context("action count overflow")?;
+        for component in record.fingerprint.components.into_keys() {
+            let count = entry.components.entry(component).or_default();
+            *count = count.checked_add(1).context("component count overflow")?;
+        }
+    }
+    Ok(schemas)
+}
+
+fn compare(db: &impl ReadableDatabase, schema: &str, ignored: &[String]) -> Result<ComponentAudit> {
+    ensure!(
+        !schema.is_empty() && !ignored.is_empty(),
+        "select a schema and components to ignore"
+    );
+    let selection: BTreeSet<_> = ignored.iter().collect();
+    ensure!(
+        selection.len() == ignored.len() && selection.iter().all(|name| !name.is_empty()),
+        "empty or duplicate component name"
+    );
+    let read = db.begin_read()?;
+    let actions = read.open_table(ACTIONS)?;
+    let mut groups = BTreeMap::<ActionKey, Group>::new();
+    let mut report = ComponentAudit::default();
+    for row in actions.iter()? {
+        let (key, value) = row?;
+        let key = ActionKey(*key.value());
+        let ActionRecord {
+            mut fingerprint,
+            result,
+        } = encoding().deserialize(value.value())?;
+        ensure!(
+            fingerprint.key()? == key,
+            "invalid indexed action fingerprint"
+        );
+        if fingerprint.schema != schema {
+            continue;
+        }
+        report.examined_actions = report
+            .examined_actions
+            .checked_add(1)
+            .context("action count overflow")?;
+        fingerprint
+            .components
+            .retain(|name, _| !selection.contains(name));
+        let reduced = fingerprint.key()?;
+        groups
+            .entry(reduced)
+            .or_default()
+            .insert(key, result, &mut report)?;
+    }
+    for group in groups.values().filter(|group| group.total > 1) {
+        report.matched_groups = report
+            .matched_groups
+            .checked_add(1)
+            .context("group count overflow")?;
+        report.matched_actions = report
+            .matched_actions
+            .checked_add(group.total)
+            .context("matched action count overflow")?;
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -172,7 +255,7 @@ mod tests {
             .insert("source".into(), ContentId::of(b"y"));
         store.publish(&other_source, &second_result, vec![])?;
 
-        let report = store.audit_component("rust", "environment/FOO")?;
+        let report = store.audit_components("rust", &["environment/FOO".into()])?;
         assert_eq!(report.examined_actions, 5);
         assert_eq!(report.matched_groups, 1);
         assert_eq!(report.matched_actions, 4);
@@ -181,10 +264,22 @@ mod tests {
         assert!(report.equivalent_example.is_some());
         assert!(report.conflicting_example.is_some());
         assert_eq!(
-            store.audit_component("rust", "unrelated")?.matched_actions,
+            store
+                .audit_components("rust", &["unrelated".into()])?
+                .matched_actions,
             0
         );
+        let joint = store.audit_components("rust", &["environment/FOO".into(), "source".into()])?;
+        assert_eq!(joint.equivalent_pairs, 3 + 1);
+        assert_eq!(joint.conflicting_pairs, 6);
         assert_eq!(store.stats()?.actions, 6);
+        drop(store);
+        let index = NativeIndexAudit::open(&dir.path().join("index.redb"))?;
+        assert_eq!(index.compare("rust", &["environment/FOO".into()])?, report);
+        let schemas = index.inventory()?;
+        assert_eq!(schemas["rust"].actions, 5);
+        assert_eq!(schemas["rust"].components["environment/FOO"], 4);
+        assert_eq!(schemas["c"].actions, 1);
         Ok(())
     }
 }

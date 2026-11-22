@@ -24,6 +24,11 @@ pub enum Command {
     Auth(AuthSubcommand),
     Scheduler(config::scheduler::Config),
     Server(config::server::Config),
+    NativeAudit {
+        index: std::path::PathBuf,
+        schema: Option<String>,
+        without: Vec<String>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]

@@ -176,6 +176,27 @@ fn check_jwt_server_token(
 
 fn run(command: Command) -> Result<i32> {
     match command {
+        Command::NativeAudit {
+            index,
+            schema,
+            without,
+        } => {
+            let audit = sccache::build_runtime::NativeIndexAudit::open(&index)?;
+            if let Some(schema) = schema {
+                let comparison = audit.compare(&schema, &without)?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema": schema,
+                        "without": without,
+                        "comparison": comparison,
+                    }))?
+                );
+            } else {
+                println!("{}", serde_json::to_string_pretty(&audit.inventory()?)?);
+            }
+            Ok(0)
+        }
         Command::Auth(AuthSubcommand::Base64 { num_bytes }) => {
             let mut bytes = vec![0; num_bytes];
             rand::fill(&mut bytes);

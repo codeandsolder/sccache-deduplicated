@@ -30,9 +30,9 @@ mod store;
 pub use coordinator::{Admission, BuildCoordinator, CompilePermit};
 #[cfg(all(unix, feature = "store"))]
 pub use store::{
-    CacheStats, ComponentAudit, Eviction, GarbageCollected, NativeStore, PackageCompression,
-    PackagePolicy, PackageSource, Published, ResultLease, SpacePolicy, SpaceReport, StagedBlob,
-    TreeLease, UploadReservation,
+    CacheStats, ComponentAudit, Eviction, GarbageCollected, NativeIndexAudit, NativeStore,
+    PackageCompression, PackagePolicy, PackageSource, Published, ResultLease, SchemaInventory,
+    SpacePolicy, SpaceReport, StagedBlob, TreeLease, UploadReservation,
 };
 
 #[cfg(all(target_os = "linux", feature = "store"))]

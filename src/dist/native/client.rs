@@ -16,7 +16,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use tempfile::NamedTempFile;
 
-use super::NativeCacheClient;
+use super::{NativeCacheClient, renewal::Renewals};
 use crate::build_runtime::{
     BlobRef, ExecutionSpec, PreparedTree, ResultManifest, TreeId, TreeManifest,
     wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply, Ticket},
@@ -165,8 +165,10 @@ impl NativeCacheClient {
         let request = spec.action_request()?;
         let start = Instant::now();
         let mut pins: BTreeMap<TreeId, Pin<'_>> = BTreeMap::new();
+        let renewals = Renewals::start(self.clone(), policy.renewal_interval)?;
 
         loop {
+            renewals.check()?;
             ensure!(
                 start.elapsed() < policy.timeout,
                 "native admission timed out"
@@ -177,6 +179,7 @@ impl NativeCacheClient {
                         client: self,
                         ticket,
                     };
+                    renewals.finish()?;
                     drop(pins);
                     return Ok(Outcome::Ready {
                         pin,
@@ -187,6 +190,7 @@ impl NativeCacheClient {
                 NativeAdmission::InFlight => {
                     // No speculative duplicate compilation. Input pins are
                     // not needed while another admitted action owns its closure.
+                    renewals.clear()?;
                     pins.clear();
                     thread::sleep(
                         Duration::from_millis(50)
@@ -207,7 +211,10 @@ impl NativeCacheClient {
                         let manifest = inputs.manifest(id)?;
                         ensure!(manifest.id()? == id, "input provider supplied wrong tree");
                         let blobs = manifest.blobs()?;
-                        pins.remove(&id);
+                        if let Some(pin) = pins.remove(&id) {
+                            renewals.remove(pin.ticket)?;
+                            drop(pin);
+                        }
                         let ticket = self.push_tree(
                             &manifest,
                             |content| {
@@ -216,6 +223,7 @@ impl NativeCacheClient {
                             },
                             policy.renewal_interval,
                         )?;
+                        renewals.add(ticket)?;
                         pins.insert(
                             id,
                             Pin {
@@ -230,6 +238,7 @@ impl NativeCacheClient {
                         client: self,
                         ticket,
                     };
+                    renewals.finish()?;
                     drop(pins);
                     return self.run_admitted(pin, spec, policy, start);
                 }
