@@ -11,7 +11,8 @@ mod installation;
 mod package;
 pub use installation::{InstallationManifest, InstallationRecipe, InstalledComponent};
 pub use package::{
-    ArchiveLength, PackageArchive, PackageCompression, PackageIdentity, PackageSource,
+    ArchiveLength, PackageArchive, PackageCompression, PackageIdentity, PackageReceipt,
+    PackageSource,
 };
 mod recipe;
 mod space_policy;

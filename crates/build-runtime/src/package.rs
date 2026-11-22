@@ -9,6 +9,34 @@ pub enum PackageCompression {
     Tar,
     Gzip,
     Xz,
+    Zstd,
+}
+
+impl PackageCompression {
+    /// Command-line name of the original archive codec.
+    #[must_use = "the name selects the decompressor"]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Tar => "tar",
+            Self::Gzip => "gzip",
+            Self::Xz => "xz",
+            Self::Zstd => "zstd",
+        }
+    }
+}
+
+impl std::str::FromStr for PackageCompression {
+    type Err = anyhow::Error;
+
+    fn from_str(name: &str) -> Result<Self> {
+        match name {
+            "tar" => Ok(Self::Tar),
+            "gzip" => Ok(Self::Gzip),
+            "xz" => Ok(Self::Xz),
+            "zstd" => Ok(Self::Zstd),
+            _ => anyhow::bail!("unsupported package compression"),
+        }
+    }
 }
 
 /// Cryptographic identity published by upstream release manifests. Archive
@@ -55,6 +83,14 @@ impl PackageIdentity {
 pub struct PackageSource {
     pub identity: PackageIdentity,
     pub size: u64,
+}
+
+/// Verified archive provenance and its normalized content tree. This is
+/// transport metadata, not a declaration of any installed filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageReceipt {
+    pub source: PackageSource,
+    pub tree: crate::TreeId,
 }
 
 /// Length expectation for original archive ingestion. A checksum is mandatory

@@ -72,6 +72,7 @@ impl RustPackageLocator {
             PackageCompression::Tar => ".tar",
             PackageCompression::Gzip => ".tar.gz",
             PackageCompression::Xz => ".tar.xz",
+            PackageCompression::Zstd => ".tar.zst",
         };
         ensure!(path.ends_with(suffix), "Rust package path codec mismatch");
         Ok(())

@@ -16,9 +16,9 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use crate::{
     ActionMode, Admission, ArchiveLength, BlobRef, BuildCoordinator, CompilePermit, ContentId,
-    InstallationManifest, NativeStore, PackageArchive, PackageArchiveLease, PackageIdentity,
-    PackageImportLimits, ResultLease, ResultManifest, StagedBlob, TreeId, TreeLease, TreeManifest,
-    UploadReservation,
+    NativeStore, PackageArchive, PackageArchiveLease, PackageIdentity, PackageImportLimits,
+    ResultLease, ResultManifest, StagedBlob, TreeId, TreeLease, TreeManifest, UploadReservation,
+    VerifiedPackage,
     wire::{
         ActionRequest, BeginResult, NativeAdmission, NativeStatus, Publisher, ScheduleReply,
         Ticket, TreeOffer, TreeRead, WorkerAllocation,
@@ -311,22 +311,16 @@ impl NativeSessions {
         self.coordinator.store()
     }
 
-    /// Resolve an original Rust installer without fetching or decoding its archive.
+    /// Resolve an original archive without fetching or decoding it again.
     /// Warm lookups do not wait for unrelated cold downloads.
     /// # Errors
     /// Returns an error for invalid metadata or storage failure.
-    pub fn lookup_rust_package(
+    pub fn lookup_package(
         &self,
         identity: PackageIdentity,
         limits: PackageImportLimits,
-    ) -> Result<Option<InstallationManifest>> {
-        let policy = limits.policy()?;
-        let Some(package) = self.store().lookup_package(identity, policy)? else {
-            return Ok(None);
-        };
-        self.store()
-            .publish_rust_installer(&package, policy.directory)
-            .map(Some)
+    ) -> Result<Option<VerifiedPackage>> {
+        self.store().lookup_package(identity, limits.policy()?)
     }
 
     /// Import or acquire an original package. The input factory is invoked
@@ -334,26 +328,23 @@ impl NativeSessions {
     /// Different packages may be acquired together within service limits.
     /// # Errors
     /// Returns an error for busy service, invalid archive or storage failures.
-    pub fn provision_rust_package<R: Read>(
+    pub fn provision_package<R: Read>(
         &self,
         identity: PackageIdentity,
         length: ArchiveLength,
         limits: PackageImportLimits,
         executable: &Path,
         acquire: impl FnOnce() -> Result<R>,
-    ) -> Result<(InstallationManifest, bool)> {
-        let store = self.store();
+    ) -> Result<(VerifiedPackage, bool)> {
         let mut upload = None;
-        let (package, reused) =
-            store.acquire_package(identity, length, limits, executable, || {
+        let result = self
+            .store()
+            .acquire_package(identity, length, limits, executable, || {
                 upload = Some(self.upload_slot()?);
                 acquire()
-            })?;
+            });
         drop(upload);
-        Ok((
-            store.publish_rust_installer(&package, limits.policy()?.directory)?,
-            reused,
-        ))
+        result
     }
 
     fn sessions(&self) -> Result<MutexGuard<'_, HashMap<Ticket, SharedSession>>> {

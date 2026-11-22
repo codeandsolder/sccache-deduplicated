@@ -16,8 +16,8 @@ use sha2::{Digest, Sha256};
 use super::{NativeStore, PACKAGES, StagedBlob, TreeLease, encoding};
 use crate::{
     ArchiveLength, BlobRef, ContentId, NativeServiceBusy, PackageArchive, PackageIdentity,
-    PackageSource, TreeEntry, TreeId, TreeManifest, TreeMetadata, TreePath, TreeTimestamp,
-    identity::typed_digest,
+    PackageReceipt, PackageSource, TreeEntry, TreeId, TreeManifest, TreeMetadata, TreePath,
+    TreeTimestamp, identity::typed_digest,
 };
 
 /// Explicit normalization and expansion limits for an original package.
@@ -72,12 +72,12 @@ impl PackageImportLimits {
         Ok(())
     }
 
-    /// Validate the service limits and return canonical installer policy.
+    /// Validate the service limits and return canonical archive policy.
     /// # Errors
     /// Returns an error for invalid limits or timestamp normalization failure.
     pub fn policy(self) -> Result<PackagePolicy> {
         self.validate()?;
-        let mut policy = PackagePolicy::rust_installer(
+        let mut policy = PackagePolicy::normalized_archive(
             self.max_entries,
             self.max_expanded_bytes,
             self.max_tar_bytes,
@@ -89,10 +89,10 @@ impl PackageImportLimits {
 }
 
 impl PackagePolicy {
-    /// Shared canonical timestamp and directory modes for Rust installer imports.
+    /// Shared canonical timestamp and directory modes for archive transport imports.
     /// # Errors
     /// Returns an error if the canonical timestamp cannot be represented.
-    pub fn rust_installer(
+    pub fn normalized_archive(
         max_entries: usize,
         max_expanded_bytes: u64,
         max_tar_bytes: u64,
@@ -173,6 +173,14 @@ impl VerifiedPackage {
     #[must_use = "the source identifies the verified upstream archive"]
     pub const fn source(&self) -> PackageSource {
         self.source
+    }
+
+    #[must_use = "the receipt identifies the verified original and its content tree"]
+    pub const fn receipt(&self) -> PackageReceipt {
+        PackageReceipt {
+            source: self.source,
+            tree: self.tree.id(),
+        }
     }
 
     #[must_use = "the tree remains pinned for this package lease"]
@@ -761,6 +769,74 @@ mod tests {
         )?;
         assert_eq!(package.source(), src);
         assert_eq!(store.stats()?.blobs, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn zstd_concatenated_frames_are_bounded_and_verified_before_publication() -> Result<()> {
+        let tar = example_tar()?;
+        let (prefix, suffix) = tar.split_at(tar.len() / 2);
+        let mut compressed = zstd::stream::encode_all(prefix, 1)?;
+        let second = zstd::stream::encode_all(suffix, 1)?;
+        compressed.extend_from_slice(&second);
+        let directory = tempfile::tempdir()?;
+        let store = NativeStore::open(directory.path())?;
+        let src = source(&compressed, PackageCompression::Zstd);
+        let mut limits = PackagePolicy {
+            max_tar_bytes: u64::try_from(tar.len())? - 1,
+            ..policy()
+        };
+        assert!(
+            store
+                .import_package(
+                    src.identity,
+                    ArchiveLength::Exact(src.size),
+                    limits,
+                    &compressed[..],
+                    PackageDecoder::InProcess
+                )
+                .is_err()
+        );
+        limits.max_tar_bytes += 1;
+        let mut truncated = compressed.clone();
+        truncated.pop();
+        for invalid in [
+            truncated,
+            [compressed.clone(), b"unexpected suffix".to_vec()].concat(),
+        ] {
+            let wrong = source(&invalid, PackageCompression::Zstd);
+            assert!(
+                store
+                    .import_package(
+                        wrong.identity,
+                        ArchiveLength::Exact(wrong.size),
+                        limits,
+                        &invalid[..],
+                        PackageDecoder::InProcess
+                    )
+                    .is_err()
+            );
+            assert!(store.lookup_package(wrong.identity, limits)?.is_none());
+        }
+        assert_eq!(store.stats()?.blobs, 0);
+        let package = store.import_package(
+            src.identity,
+            ArchiveLength::Exact(src.size),
+            limits,
+            &compressed[..],
+            PackageDecoder::InProcess,
+        )?;
+        let raw = source(&tar, PackageCompression::Tar);
+        let raw_package = store.import_package(
+            raw.identity,
+            ArchiveLength::Exact(raw.size),
+            limits,
+            &tar[..],
+            PackageDecoder::InProcess,
+        )?;
+        assert_eq!(package.tree().id(), raw_package.tree().id());
+        assert_eq!(store.stats()?.blobs, 1);
+        assert_eq!(store.stats()?.trees, 1);
         Ok(())
     }
 

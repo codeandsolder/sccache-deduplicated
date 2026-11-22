@@ -389,6 +389,31 @@ release checksum. The decoder deadline starts after compressed-input
 verification; transport timeouts are controlled by the client and the
 HTTP transport.
 
+### Generic system and tool archives
+
+The scheduler can also retain verified original tar archives without Rust
+installer component metadata. For example, after verifying a distro package
+against the package manager's trusted release checksum or signature:
+
+```sh
+sccache-dist native-provision-package --client-config /path/to/client.toml \
+  --sha256 "$trusted_sha256" --size "$archive_size" --compression zstd \
+  --archive /path/to/gcc-<version>-<arch>.pkg.tar.zst
+```
+
+The command outputs the original source identity, normalized archive tree
+ID, and whether it reused an existing entry. Omit the archive for a warm
+lookup with the same checksum, codec and length. Tar, gzip, XZ and Zstandard
+share the same bounded decoder and archive index. Zstandard accepts
+concatenated frames and has a 128 MiB maximum decompression window, in
+addition to the service decoder's address-space and time limits. The
+generic archive metadata is transport provenance, not a declaration of an
+installed root. No package scripts execute. Exact discovered compiler files
+and their installed metadata still determine the build semantics; matching
+content IDs can be covered wherever those files are mounted. Archive
+members must satisfy the build tree representation (regular files,
+directories and links; no set-ID modes or device nodes).
+
 ### Compressed original delivery to workers
 
 Enable original-package reconstruction on workers with explicit decoder

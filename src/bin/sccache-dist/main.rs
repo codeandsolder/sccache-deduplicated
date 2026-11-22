@@ -277,6 +277,33 @@ fn run(command: Command) -> Result<i32> {
             )?;
             Ok(0)
         }
+        Command::NativeProvisionPackage {
+            client_config,
+            archive,
+            source,
+        } => {
+            let client = package_client(&client_config)?;
+            let (receipt, reused) = if let Some(receipt) = client.lookup_package(source.identity)? {
+                anyhow::ensure!(
+                    receipt.source == source,
+                    "original package length differs from verified source"
+                );
+                (receipt, true)
+            } else {
+                let archive = archive.context("upstream package unavailable; supply --archive")?;
+                (
+                    client.import_package(source, std::fs::File::open(archive)?)?,
+                    false,
+                )
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "source": receipt.source, "package": receipt.tree, "reused_original_package": reused,
+                }))?
+            );
+            Ok(0)
+        }
         Command::NativeProvisionRust {
             client_config,
             archive,
@@ -301,7 +328,7 @@ fn run(command: Command) -> Result<i32> {
             manifest_output,
         } => {
             use sccache::build_runtime::{ArchiveLength, NativeStore, PackagePolicy};
-            let mut policy = PackagePolicy::rust_installer(
+            let mut policy = PackagePolicy::normalized_archive(
                 max_entries,
                 max_expanded_bytes,
                 max_tar_bytes,
