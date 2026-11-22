@@ -183,6 +183,7 @@ fn test_dist_namespace_broker() -> Result<()> {
     fs::write(private.join("config.json"), "{}")?;
     let script = r#"
 set -eu
+: </dev/null >/dev/null
 "$1" "$2" -c probe.c -o probe.o
 "$1" "$3" --crate-name probe --crate-type rlib --edition=2021 --emit=metadata,dep-info --out-dir . probe.rs
 cp probe.o initial.o
@@ -197,7 +198,7 @@ cmp initial.rmeta libprobe.rmeta
     let gcc = which::which("gcc")?;
     let mut command = harness::prune_command(std::process::Command::new("bwrap"));
     let output = command
-        .args(["--bind", "/", "/", "--bind"])
+        .args(["--bind", "/", "/", "--dev", "/dev", "--bind"])
         .arg(&private)
         .arg(&visible)
         .arg("--ro-bind")
@@ -205,6 +206,8 @@ cmp initial.rmeta libprobe.rmeta
         .arg(&config)
         .arg("--tmpfs")
         .arg(root.join("client-cache"))
+        .arg("--tmpfs")
+        .arg(root.join("client-dist-cache"))
         .arg("--chdir")
         .arg(&visible)
         .args(["--", "/bin/sh", "-c", script, "namespace-test"])
