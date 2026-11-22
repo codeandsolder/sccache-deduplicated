@@ -14,9 +14,9 @@ These are the source-of-truth copies of the machine-wide Cargo/sccache wrappers 
 - Canonical Rust inside sccache is fail-open: if the discovered cwd, output, source, extern, staticlib, or target-JSON path cannot be represented safely by the canonical map, that compilation uses ordinary sccache instead of failing the build.
 - The maintenance-drain marker remains `/dev/shm/sccache-maintenance-drain`; a marker older than 15 minutes is ignored.
 - `sccache-release-update` validates release metadata against `sccache --capabilities` and requires `direct-metrics` by default, so a canonical rollout cannot silently remove production telemetry again.
-- The updater connects to the primary managed daemon over the default `SCCACHE_AUTOUPDATE_CLIENT_UDS` or, for TCP-managed nodes, `SCCACHE_AUTOUPDATE_CLIENT_PORT`; the selected endpoint is used consistently for drain detection, restart readiness, stats, and smoke tests.
-- Canonical bundles carry an explicit `dist_protocol` version. When the live dist binary is hash-bound to the same protocol version, the updater may roll the client ahead under the local maintenance drain while distributed jobs remain active; the full `release_tag` advances only after client and dist halves converge on the same immutable bundle. A protocol-version change still requires the old all-at-once idle window. `sccache-release-update --plan-only` runs this decision logic without changing services.
-- Worker-only staging is independent of local compiler activity: if the client already runs the target release and the worker has been explicitly stopped after a separate per-worker idle check, the updater installs the verified worker binary without blocking unrelated local clients or touching their shared maintenance-drain marker. The updater leaves an already stopped worker stopped; the orchestrator must start it and verify the exact running binary and remote compile. **This is not an automatic per-worker drain protocol**: the existing fleet-global busy gate still defers an *active* worker update until a proper job-aware drain is implemented.
+- The updater connects to the primary managed daemon over the default `SCCACHE_AUTOUPDATE_CLIENT_UDS` or, for TCP-managed nodes, `SCCACHE_AUTOUPDATE_CLIENT_PORT`; the selected endpoint is used consistently for restart readiness, stats, and smoke tests.
+- Verified same-protocol releases are applied immediately, including when local compiler clients or remote jobs are active. Existing requests may be interrupted and restarted. The local admission marker covers the client replacement only; once endpoints are ready it is removed before telemetry and distributed smoke checks. Worker-only updates do not gate clients. A stopped worker stays stopped.
+- Scheduler socket activation is stopped before the scheduler and restored afterward, including on rollback. The updater does not query distributed queue occupancy before restarting. A different or unknown installed protocol requires a coordinated migration even when the queue is empty. `sccache-release-update --plan-only` verifies the candidate and displays the restart decision without changing services.
 - Canonical bundles also carry a `rollout_epoch`. The updater requires it to match `SCCACHE_AUTOUPDATE_EXPECTED_ROLLOUT_EPOCH` (default `2`) before touching live binaries. Increment the release epoch for any change that needs coordinated host-side migration; old hosts then refuse the release until the migration is performed and their expected epoch is advanced.
 
 ## Acer installation
@@ -49,6 +49,6 @@ in the updater service environment, and coordinate the protocol epoch separately
 The updater waits for a matching native build rather than reverting to
 the portable binary. It checks the local checksum manifest, source SHA,
 protocol, toolchain, feature set, capabilities and machine/CPU identity
-against the published release before using its existing drain/rollback logic.
+against the published release before using its immediate restart/rollback logic.
 Build provisioning is separate from the root updater: no automatic root
 compilation and no extra cache daemons.
