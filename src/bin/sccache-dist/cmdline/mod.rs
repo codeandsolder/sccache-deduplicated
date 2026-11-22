@@ -34,6 +34,11 @@ pub enum Command {
         max_tar_bytes: u64,
         memory_bytes: u64,
     },
+    NativeProvisionPackage {
+        client_config: std::path::PathBuf,
+        archive: Option<std::path::PathBuf>,
+        source: sccache::build_runtime::PackageSource,
+    },
     NativeProvisionRust {
         client_config: std::path::PathBuf,
         archive: Option<std::path::PathBuf>,

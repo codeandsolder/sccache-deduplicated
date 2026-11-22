@@ -56,7 +56,7 @@ impl PackageService {
         locator: &RustPackageLocator,
     ) -> Result<PackageAcquisition> {
         locator.validate()?;
-        let (manifest, reused) = sessions.provision_rust_package(
+        let (package, reused) = sessions.provision_package(
             locator.identity,
             ArchiveLength::AtMost(self.limits.max_archive_bytes),
             self.limits,
@@ -81,6 +81,9 @@ impl PackageService {
                 Ok(response)
             },
         )?;
+        let manifest = sessions
+            .store()
+            .publish_rust_installer(&package, self.limits.policy()?.directory)?;
         Ok(PackageAcquisition { manifest, reused })
     }
 }
@@ -217,33 +220,61 @@ fn dispatch(
     packages: Option<&PackageService>,
 ) -> Result<Response> {
     match operation {
-        "package_lookup" if publisher == Publisher::Client && packages.is_some() => {
+        "package_lookup" | "rust_package_lookup"
+            if publisher == Publisher::Client && packages.is_some() =>
+        {
             let identity: PackageIdentity = metadata(request, limit)?;
             let service = packages.context("native original-package provisioning disabled")?;
-            encode(
-                &sessions.lookup_rust_package(identity, service.limits)?,
-                limit,
-            )
+            let package = sessions.lookup_package(identity, service.limits)?;
+            if operation == "rust_package_lookup" {
+                let manifest = package
+                    .as_ref()
+                    .map(|package| {
+                        sessions
+                            .store()
+                            .publish_rust_installer(package, service.limits.policy()?.directory)
+                    })
+                    .transpose()?;
+                encode(&manifest, limit)
+            } else {
+                encode(
+                    &package
+                        .as_ref()
+                        .map(crate::build_runtime::VerifiedPackage::receipt),
+                    limit,
+                )
+            }
         }
         "package_acquire" if publisher == Publisher::Client && packages.is_some() => {
             let locator: RustPackageLocator = metadata(request, limit)?;
             let service = packages.context("native original-package provisioning disabled")?;
             encode(&service.acquire(sessions, &locator)?, limit)
         }
-        "package_import" if publisher == Publisher::Client && packages.is_some() => {
+        "package_import" | "rust_package_import"
+            if publisher == Publisher::Client && packages.is_some() =>
+        {
             let service = packages.context("native original-package provisioning disabled")?;
             let mut body = request.data().context("missing original package body")?;
             // Fixed width: SHA-256, u32 codec, u64 length. The remaining
             // bytes stream directly into verified archive staging.
             let source: PackageSource = codec().with_limit(44).deserialize_from(&mut body)?;
-            let (manifest, _) = sessions.provision_rust_package(
+            let (package, _) = sessions.provision_package(
                 source.identity,
                 ArchiveLength::Exact(source.size),
                 service.limits,
                 &std::env::current_exe()?,
                 || Ok(body),
             )?;
-            encode(&manifest, limit)
+            if operation == "rust_package_import" {
+                encode(
+                    &sessions
+                        .store()
+                        .publish_rust_installer(&package, service.limits.policy()?.directory)?,
+                    limit,
+                )
+            } else {
+                encode(&package.receipt(), limit)
+            }
         }
         "admit" if publisher == Publisher::Client => {
             let (input, mode): (ExecutionSpec, ActionMode) = metadata(request, limit)?;

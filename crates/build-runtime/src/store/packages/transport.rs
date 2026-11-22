@@ -168,7 +168,7 @@ mod tests {
         let fast = gzip(&tar, flate2::Compression::fast())?;
         let small = gzip(&tar, flate2::Compression::best())?;
         assert!(small.len() < fast.len());
-        let mut policy = PackagePolicy::rust_installer(100, 1 << 20, 1 << 20, 1 << 20)?;
+        let mut policy = PackagePolicy::normalized_archive(100, 1 << 20, 1 << 20, 1 << 20)?;
         policy.retain_original = true;
         let mut tree = None;
         for (bytes, codec) in [
@@ -244,7 +244,7 @@ mod tests {
         let (tar, blob) = fixture()?;
         let bytes = gzip(&tar, flate2::Compression::best())?;
         let source = source(&bytes, PackageCompression::Gzip)?;
-        let mut policy = PackagePolicy::rust_installer(100, 1 << 20, 1 << 20, 1 << 20)?;
+        let mut policy = PackagePolicy::normalized_archive(100, 1 << 20, 1 << 20, 1 << 20)?;
         let first = store.import_package(
             source.identity,
             ArchiveLength::Exact(source.size),

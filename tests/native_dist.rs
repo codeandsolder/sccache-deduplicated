@@ -653,6 +653,12 @@ fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("verified package lost"))?;
     assert_eq!(resolved.components, installed.components);
     assert_eq!(resolved.package, installed.package);
+    let raw = client
+        .lookup_package(source.identity)?
+        .context("original package absent")?;
+    assert_eq!(raw.source, source);
+    assert_eq!(raw.tree, installed.package);
+    assert!(worker.lookup_package(source.identity).is_err());
 
     // A different tree with one of the package payloads needs no upload.
     let mut tree = installed.components["compiler"].clone();
@@ -679,32 +685,52 @@ fn provision_compressed_fixture(
     root: &Path,
     component: &str,
     data: &[u8],
-) -> Result<(
-    sccache::build_runtime::PackageSource,
-    sccache::build_runtime::TreeId,
-)> {
+    compression: sccache::build_runtime::PackageCompression,
+) -> Result<sccache::build_runtime::PackageReceipt> {
     use sccache::build_runtime::{PackageCompression, PackageIdentity, PackageSource};
     use sha2::{Digest, Sha256};
-    let original = root.join(format!("{component}.tar"));
-    fs::write(
-        &original,
-        rust_installer_fixture(component, "lib/payload", data)?,
-    )?;
-    let compressed = Command::new("xz").arg("-c").arg(&original).output()?;
-    ensure!(compressed.status.success(), "fixture compression failed");
+    let bytes = match compression {
+        PackageCompression::Xz => {
+            let original = root.join(format!("{component}.tar"));
+            fs::write(
+                &original,
+                rust_installer_fixture(component, "lib/payload", data)?,
+            )?;
+            let compressed = Command::new("xz").arg("-c").arg(&original).output()?;
+            ensure!(compressed.status.success(), "fixture compression failed");
+            compressed.stdout
+        }
+        PackageCompression::Zstd => {
+            let mut tar = tar::Builder::new(Vec::new());
+            for (path, bytes) in [
+                (".PKGINFO", b"pkgname = include\n".as_slice()),
+                ("usr/include/payload", data),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_mode(0o644);
+                header.set_size(u64::try_from(bytes.len())?);
+                header.set_cksum();
+                tar.append_data(&mut header, path, bytes)?;
+            }
+            zstd::stream::encode_all(tar.into_inner()?.as_slice(), 1)?
+        }
+        _ => anyhow::bail!("unexpected fixture compression"),
+    };
     let package = PackageSource {
         identity: PackageIdentity {
-            sha256: Sha256::digest(&compressed.stdout).into(),
-            compression: PackageCompression::Xz,
+            sha256: Sha256::digest(&bytes).into(),
+            compression,
         },
-        size: u64::try_from(compressed.stdout.len())?,
+        size: u64::try_from(bytes.len())?,
     };
-    let archive = root.join(format!("{component}.tar.xz"));
-    fs::write(&archive, compressed.stdout)?;
-    let installed = client.import_rust_package(package, File::open(&archive)?)?;
-    assert_eq!(installed.source, package);
+    let archive = root.join(format!("{component}.archive"));
+    fs::write(&archive, bytes)?;
+    assert!(client.lookup_package(package.identity)?.is_none());
+    let receipt = client.import_package(package, File::open(&archive)?)?;
+    assert_eq!(receipt.source, package);
+    assert_eq!(client.lookup_package(package.identity)?, Some(receipt));
     assert!(package.size < u64::try_from(data.len())? / 100);
-    Ok((package, installed.package))
+    Ok(receipt)
 }
 
 #[test]
@@ -736,8 +762,20 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let include_path = source_dir.join("input.inc");
     fs::write(&include_path, &include)?;
     let packages = [
-        provision_compressed_fixture(&client, root, "assembly", &assembly)?,
-        provision_compressed_fixture(&client, root, "include", &include)?,
+        provision_compressed_fixture(
+            &client,
+            root,
+            "assembly",
+            &assembly,
+            sccache::build_runtime::PackageCompression::Xz,
+        )?,
+        provision_compressed_fixture(
+            &client,
+            root,
+            "include",
+            &include,
+            sccache::build_runtime::PackageCompression::Zstd,
+        )?,
     ];
     let reference = root.join("reference.o");
     ensure!(
@@ -1037,14 +1075,18 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let worker_directory = fleet.worker_directory.clone();
     let (scheduler_stats, worker_stats) = fleet.finish()?;
     let store = NativeStore::open(&worker_directory)?;
-    let policy =
-        sccache::build_runtime::PackagePolicy::rust_installer(100000, 1 << 32, 5 << 30, 1 << 26)?;
-    for (package, tree) in packages {
+    let policy = sccache::build_runtime::PackagePolicy::normalized_archive(
+        100000,
+        1 << 32,
+        5 << 30,
+        1 << 26,
+    )?;
+    for receipt in packages {
         let reconstructed = store
-            .lookup_package(package.identity, policy)?
+            .lookup_package(receipt.source.identity, policy)?
             .context("worker did not reconstruct original archive")?;
-        assert_eq!(reconstructed.tree().id(), tree);
-        assert_eq!(reconstructed.source(), package);
+        assert_eq!(reconstructed.tree().id(), receipt.tree);
+        assert_eq!(reconstructed.source(), receipt.source);
         let missing = reconstructed
             .tree()
             .manifest()
@@ -1063,7 +1105,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     assert_eq!(scheduler_stats.actions, 5);
     assert_eq!(scheduler_stats.results, 3);
     assert_eq!(worker_stats.trees, 4);
-    assert_eq!(scheduler_stats.trees, 6);
+    assert_eq!(scheduler_stats.trees, 4);
     Ok(())
 }
 

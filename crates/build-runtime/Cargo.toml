@@ -19,6 +19,7 @@ rand = { version = "0.10", optional = true }
 lzma-rust2 = { version = "0.15.8", default-features = false, features = ["std", "xz"], optional = true }
 sha2 = { version = "0.11", optional = true }
 tar = { version = "0.4", default-features = false, optional = true }
+zstd = { version = "0.14", optional = true }
 redb = { version = "4.6", optional = true }
 tempfile = { version = "3", optional = true }
 
@@ -30,7 +31,7 @@ tempfile = "3"
 [features]
 default = ["store"]
 mapping = ["dep:rustix", "dep:tempfile", "dep:log"]
-store = ["mapping", "dep:rand", "dep:redb", "dep:flate2", "dep:lzma-rust2", "dep:sha2", "dep:tar"]
+store = ["mapping", "dep:rand", "dep:redb", "dep:flate2", "dep:lzma-rust2", "dep:sha2", "dep:tar", "dep:zstd"]
 
 [lints]
 workspace = true

@@ -168,12 +168,12 @@ fn get_clap_command() -> ClapCommand {
         )
         .subcommand(
             ClapCommand::new("native-decode-package").hide(true)
-                .arg(flag_infer_long("compression").value_parser(["xz", "gzip", "tar"]).required(true))
+                .arg(flag_infer_long("compression").value_parser(["xz", "gzip", "tar", "zstd"]).required(true))
                 .arg(flag_infer_long("max-tar-bytes").value_parser(clap::value_parser!(u64)).required(true))
                 .arg(flag_infer_long("memory-bytes").value_parser(clap::value_parser!(u64)).required(true))
         )
         .subcommand(
-            package_args(ClapCommand::new("native-import-rust"))
+            installer_args(ClapCommand::new("native-import-rust"))
                 .about("Verify an original Rust installer archive in an exclusive offline store")
                 .arg(flag_infer_long("store").value_parser(clap::value_parser!(PathBuf)).required(true))
                 .arg(flag_infer_long("max-entries").value_parser(clap::value_parser!(usize)).default_value("100000"))
@@ -181,7 +181,12 @@ fn get_clap_command() -> ClapCommand {
                 .arg(flag_infer_long("max-tar-bytes").value_parser(clap::value_parser!(u64)).default_value("9663676416"))
         )
         .subcommand(
-            package_args(ClapCommand::new("native-provision-rust"))
+            package_args(ClapCommand::new("native-provision-package"))
+                .about("Provision or resolve an original tar archive for native content transport")
+                .arg(flag_infer_long("client-config").value_parser(clap::value_parser!(PathBuf)).required(true))
+        )
+        .subcommand(
+            installer_args(ClapCommand::new("native-provision-rust"))
                 .about("Provision or resolve an original Rust installer through a live scheduler")
                 .arg(flag_infer_long("client-config").value_parser(clap::value_parser!(PathBuf)).required(true))
         )
@@ -280,6 +285,14 @@ pub fn try_parse_from(
             memory_bytes: *matches
                 .get_one::<u64>("memory-bytes")
                 .context("missing memory limit")?,
+        },
+        Some(("native-provision-package", matches)) => Command::NativeProvisionPackage {
+            client_config: matches
+                .get_one::<PathBuf>("client-config")
+                .context("missing client configuration")?
+                .clone(),
+            archive: matches.get_one::<PathBuf>("archive").cloned(),
+            source: package_source(matches)?,
         },
         Some(("native-provision-rust", matches)) => Command::NativeProvisionRust {
             client_config: matches
@@ -512,15 +525,10 @@ mod tests {
 fn package_compression(
     matches: &clap::ArgMatches,
 ) -> anyhow::Result<sccache::build_runtime::PackageCompression> {
-    use sccache::build_runtime::PackageCompression;
-    Ok(
-        match matches.get_one::<String>("compression").map(String::as_str) {
-            Some("xz") => PackageCompression::Xz,
-            Some("gzip") => PackageCompression::Gzip,
-            Some("tar") => PackageCompression::Tar,
-            _ => anyhow::bail!("invalid package compression"),
-        },
-    )
+    matches
+        .get_one::<String>("compression")
+        .context("missing package compression")?
+        .parse()
 }
 
 fn package_args(command: ClapCommand) -> ClapCommand {
@@ -534,9 +542,13 @@ fn package_args(command: ClapCommand) -> ClapCommand {
         )
         .arg(
             flag_infer_long("compression")
-                .value_parser(["xz", "gzip", "tar"])
+                .value_parser(["xz", "gzip", "tar", "zstd"])
                 .required(true),
         )
+}
+
+fn installer_args(command: ClapCommand) -> ClapCommand {
+    package_args(command)
         .arg(flag_infer_long("manifest-output").value_parser(clap::value_parser!(PathBuf)))
 }
 

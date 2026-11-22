@@ -117,6 +117,13 @@ fn decode(
             max_tar_bytes,
             consume,
         ),
+        PackageCompression::Zstd => {
+            let mut decoder = zstd::stream::read::Decoder::new(reader)?;
+            // Bound the decompression window even for in-process trusted probes.
+            // The service decoder also has an independent address-space limit.
+            decoder.window_log_max(27)?;
+            read_tar(decoder, max_tar_bytes, consume)
+        }
     }
 }
 
@@ -240,15 +247,10 @@ fn decode_isolated(
         memory_bytes > 0 && !timeout.is_zero(),
         "invalid package decoder resource limits"
     );
-    let codec = match compression {
-        PackageCompression::Tar => "tar",
-        PackageCompression::Gzip => "gzip",
-        PackageCompression::Xz => "xz",
-    };
     let mut child = Command::new(executable)
         .env_clear()
         .arg("native-decode-package")
-        .args(["--compression", codec])
+        .args(["--compression", compression.name()])
         .arg("--max-tar-bytes")
         .arg(policy.max_tar_bytes.to_string())
         .arg("--memory-bytes")

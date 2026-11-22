@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::build_runtime::{
     ActionMode, BlobRef, ContentId, ExecutionSpec, InstallationManifest, PackageIdentity,
-    PackageSource, ResultManifest, TreeId, TreeManifest,
+    PackageReceipt, PackageSource, ResultManifest, TreeId, TreeManifest,
     wire::{
         BeginResult, NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply, Ticket,
         TreeOffer, TreeRead, UploadHeader, WorkerAllocation,
@@ -205,15 +205,40 @@ impl NativeCacheClient {
         identity: PackageIdentity,
     ) -> Result<Option<InstallationManifest>> {
         let manifest: Option<InstallationManifest> =
-            self.package_control("package_lookup", &identity)?;
+            self.package_control("rust_package_lookup", &identity)?;
         if let Some(manifest) = &manifest {
             validate_installation_manifest(identity, manifest)?;
         }
         Ok(manifest)
     }
 
-    /// Upload the exact original archive, allowing the store owner to decode
-    /// and index the package without a generated toolchain archive.
+    /// Resolve an already indexed original archive, without re-uploading it.
+    /// # Errors
+    /// Returns an error for invalid provenance or transport failure.
+    pub fn lookup_package(&self, identity: PackageIdentity) -> Result<Option<PackageReceipt>> {
+        let receipt: Option<PackageReceipt> = self.package_control("package_lookup", &identity)?;
+        if let Some(receipt) = receipt {
+            ensure!(
+                receipt.source.identity == identity,
+                "incorrect original package provenance"
+            );
+        }
+        Ok(receipt)
+    }
+
+    /// Upload the exact original archive for generic compressed transport.
+    /// # Errors
+    /// Returns an error on checksum, size, decoder or transport failure.
+    pub fn import_package(&self, source: PackageSource, archive: File) -> Result<PackageReceipt> {
+        let receipt: PackageReceipt = self.import_original("package_import", source, archive)?;
+        ensure!(
+            receipt.source == source,
+            "incorrect original package provenance"
+        );
+        Ok(receipt)
+    }
+
+    /// Upload a Rust installer and resolve its component installation metadata.
     /// # Errors
     /// Returns an error on checksum, size, decoder or transport failure.
     pub fn import_rust_package(
@@ -221,18 +246,28 @@ impl NativeCacheClient {
         source: PackageSource,
         archive: File,
     ) -> Result<InstallationManifest> {
-        ensure!(
-            archive.metadata()?.len() == source.size,
-            "original package file length mismatch"
-        );
-        let response = self.send_stream("package_import", &source, source.size, archive)?;
-        let manifest: InstallationManifest = decode_response(response, self.metadata_limit)?;
+        let manifest: InstallationManifest =
+            self.import_original("rust_package_import", source, archive)?;
         validate_installation_manifest(source.identity, &manifest)?;
         ensure!(
             manifest.source == source,
             "incorrect original package length"
         );
         Ok(manifest)
+    }
+
+    fn import_original<R: DeserializeOwned>(
+        &self,
+        operation: &str,
+        source: PackageSource,
+        archive: File,
+    ) -> Result<R> {
+        ensure!(
+            archive.metadata()?.len() == source.size,
+            "original package file length mismatch"
+        );
+        let response = self.send_stream(operation, &source, source.size, archive)?;
+        decode_response(response, self.metadata_limit)
     }
 
     /// Admit a complete native action.

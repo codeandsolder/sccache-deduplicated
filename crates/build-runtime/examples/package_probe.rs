@@ -4,7 +4,7 @@
 mod unix {
     use std::{fs::File, path::PathBuf, time::Instant};
 
-    use anyhow::{Context, Result, bail, ensure};
+    use anyhow::{Context, Result, ensure};
     use sccache_build::{
         ArchiveLength, NativeStore, PackageCompression, PackageDecoder, PackageIdentity,
         PackagePolicy, PackageSource, TreeLayer, TreeMetadata, TreePath, TreeRecipe, TreeTimestamp,
@@ -17,12 +17,8 @@ mod unix {
         let hash = args.next().context("expected upstream SHA-256")?;
         let hash = hash.to_str().context("non-UTF-8 checksum")?;
         let codec = args.next().context("expected package compression")?;
-        let compression = match codec.to_str() {
-            Some("gzip") => PackageCompression::Gzip,
-            Some("xz") => PackageCompression::Xz,
-            Some("tar") => PackageCompression::Tar,
-            _ => bail!("unsupported package compression"),
-        };
+        let compression: PackageCompression =
+            codec.to_str().context("non-UTF-8 compression")?.parse()?;
         ensure!(args.next().is_none(), "unexpected argument");
         let input = File::open(&package)?;
         let source = PackageSource {
