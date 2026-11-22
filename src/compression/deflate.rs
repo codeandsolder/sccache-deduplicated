@@ -109,9 +109,7 @@ mod encode {
     use super::{BUFFER_SIZE, Status};
     use std::io::{self, Write};
     use std::num::NonZeroUsize;
-    use zlib_rs_fast::{
-        BatchCompressJob, BatchCompressor, Deflate, DeflateConfig, DeflateFlush, ReturnCode,
-    };
+    use zlib_rs_fast::{BatchCodec, BatchJob, Deflate, DeflateConfig, DeflateFlush, ReturnCode};
 
     pub struct ZlibWriter<W> {
         writer: W,
@@ -207,7 +205,7 @@ mod encode {
 
     pub struct ParallelGzipWriter<W> {
         writer: W,
-        compressor: BatchCompressor,
+        compressor: BatchCodec,
         input: Vec<u8>,
         batch_capacity: usize,
         wrote_member: bool,
@@ -223,7 +221,7 @@ mod encode {
             let workers = std::thread::available_parallelism()?
                 .min(NonZeroUsize::new(8).unwrap_or(NonZeroUsize::MIN));
             let batch_capacity = workers.get() * GZIP_MEMBER_SIZE;
-            let compressor = BatchCompressor::new(workers).map_err(io::Error::other)?;
+            let compressor = BatchCodec::new(workers).map_err(io::Error::other)?;
             Ok(Self {
                 writer,
                 compressor,
@@ -247,25 +245,31 @@ mod encode {
             } else {
                 self.input.chunks(GZIP_MEMBER_SIZE).collect::<Vec<_>>()
             };
-            let mut outputs: Vec<_> = chunks
-                .iter()
-                .map(|chunk| vec![0; zlib_rs_fast::compress_bound(chunk.len()) + 32])
-                .collect();
+            let mut outputs = vec![Vec::new(); chunks.len()];
             let mut jobs: Vec<_> = chunks
                 .into_iter()
                 .zip(&mut outputs)
-                .map(|(input, output)| BatchCompressJob::new(input, output))
-                .collect();
+                .map(|(input, output)| {
+                    BatchJob::with_vec(
+                        input,
+                        output,
+                        zlib_rs_fast::compress_bound(input.len()) + 32,
+                    )
+                })
+                .collect::<Result<_, _>>()
+                .map_err(io::Error::other)?;
             let results = self.compressor.compress(&mut jobs, config);
             drop(jobs);
-            for (output, result) in outputs.iter().zip(results) {
+            for result in &results {
                 if result.code != ReturnCode::Ok {
                     return Err(io::Error::other(format!(
                         "gzip compression failed: {:?}",
                         result.code
                     )));
                 }
-                self.writer.write_all(&output[..result.written])?;
+            }
+            for output in &outputs {
+                self.writer.write_all(output)?;
             }
             self.wrote_member = true;
             self.input.clear();
@@ -329,6 +333,28 @@ mod tests {
                 .read_to_end(&mut Vec::new())
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_empty_stream_and_flush_boundaries() -> io::Result<()> {
+        let wire = ParallelGzipWriter::new(Vec::new())?.finish()?;
+        assert!(!wire.is_empty());
+        let mut decoded = Vec::new();
+        InflateReader::gzip(wire.as_slice())?.read_to_end(&mut decoded)?;
+        assert!(decoded.is_empty());
+
+        let first = b"first member";
+        let second = b"second member";
+        let mut writer = ParallelGzipWriter::new(Vec::new())?;
+        writer.flush()?;
+        writer.write_all(first)?;
+        writer.flush()?;
+        writer.flush()?;
+        writer.write_all(second)?;
+        let wire = writer.finish()?;
+        InflateReader::gzip(wire.as_slice())?.read_to_end(&mut decoded)?;
+        assert_eq!(decoded, [first.as_slice(), second.as_slice()].concat());
         Ok(())
     }
 

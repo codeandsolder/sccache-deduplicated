@@ -821,24 +821,32 @@ mod server {
 
     // Generation and verification of job auth
     struct JWTJobAuthorizer {
-        server_key: Vec<u8>,
+        encoding_key: jwt::EncodingKey,
+        decoding_key: jwt::DecodingKey,
     }
     impl JWTJobAuthorizer {
-        fn boxed(server_key: Vec<u8>) -> Box<Self> {
-            Box::new(Self { server_key })
+        fn boxed(server_key: &[u8]) -> Result<Box<Self>> {
+            anyhow::ensure!(
+                server_key.len() == JWT_KEY_LENGTH,
+                "Invalid job JWT key length"
+            );
+            Ok(Box::new(Self {
+                encoding_key: jwt::EncodingKey::from_secret(server_key)
+                    .context("Invalid job JWT signing key")?,
+                decoding_key: jwt::DecodingKey::from_secret(server_key)
+                    .context("Invalid job JWT verification key")?,
+            }))
         }
     }
     impl dist::JobAuthorizer for JWTJobAuthorizer {
         fn generate_token(&self, job_id: JobId) -> Result<String> {
             let claims = JobJwt { exp: 0, job_id };
-            let key = jwt::EncodingKey::from_secret(&self.server_key);
-            jwt::encode(&JWT_HEADER, &claims, &key)
+            jwt::encode(&JWT_HEADER, &claims, &self.encoding_key)
                 .map_err(|e| anyhow!("Failed to create JWT for job: {}", e))
         }
         fn verify_token(&self, job_id: JobId, token: &str) -> Result<()> {
             let valid_claims = JobJwt { exp: 0, job_id };
-            let key = jwt::DecodingKey::from_secret(&self.server_key);
-            jwt::decode(token, &key, &JWT_VALIDATION)
+            jwt::decode(token, &self.decoding_key, &JWT_VALIDATION)
                 .map_err(|e| anyhow!("JWT decode failed: {}", e))
                 .and_then(|res| {
                     fn identical_t<T>(_: &T, _: &T) {}
@@ -854,7 +862,7 @@ mod server {
 
     #[test]
     fn test_job_token_verification() -> Result<()> {
-        let ja = JWTJobAuthorizer::boxed(vec![1, 2, 2]);
+        let ja = JWTJobAuthorizer::boxed(&[2; JWT_KEY_LENGTH])?;
 
         let job_id = JobId(55);
         let token = ja.generate_token(job_id)?;
@@ -862,8 +870,10 @@ mod server {
         let job_id2 = JobId(56);
         let token2 = ja.generate_token(job_id2)?;
 
-        let ja2 = JWTJobAuthorizer::boxed(vec![1, 2, 3]);
+        let ja2 = JWTJobAuthorizer::boxed(&[3; JWT_KEY_LENGTH])?;
 
+        assert!(JWTJobAuthorizer::boxed(&[]).is_err());
+        assert!(JWTJobAuthorizer::boxed(&[1; JWT_KEY_LENGTH - 1]).is_err());
         // Check tokens are deterministic
         assert_eq!(token, ja.generate_token(job_id)?);
         // Check token verification works
@@ -1063,6 +1073,7 @@ mod server {
                         trace!(target: "sccache_heartbeat", "Req {}: heartbeat_server: {:?}", req_id, heartbeat_server);
 
                         let HeartbeatServerHttpRequest { num_cpus, running_job_ids, jwt_key, server_nonce, cert_digest, cert_pem } = heartbeat_server;
+                        let job_authorizer = try_or_400_log!(req_id, JWTJobAuthorizer::boxed(&jwt_key));
                         let mut requester_client = try_or_500_log!(
                             req_id,
                             requester
@@ -1081,7 +1092,6 @@ mod server {
                             &mut certs,
                             server_id, cert_digest, cert_pem
                         ));
-                        let job_authorizer = JWTJobAuthorizer::boxed(jwt_key);
                         let worker_name_nonce = server_nonce.clone();
                         let res: HeartbeatServerResult = try_or_500_log!(req_id, handler.handle_heartbeat_server(
                             server_id, server_nonce,
@@ -1266,7 +1276,7 @@ mod server {
             let heartbeat_running_jobs = Arc::clone(&running_jobs);
             let heartbeat_jwt_key = jwt_key.clone();
             let heartbeat_cert_pem = cert_pem.clone();
-            let job_authorizer = JWTJobAuthorizer::boxed(jwt_key);
+            let job_authorizer = JWTJobAuthorizer::boxed(&jwt_key)?;
             let heartbeat_url = urls::scheduler_heartbeat_server(&scheduler_url)?;
             let requester = ServerRequester {
                 client: new_reqwest_blocking_client()?,
