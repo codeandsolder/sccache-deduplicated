@@ -1391,7 +1391,7 @@ mod test {
     fn test_parse_arguments_sysroot() {
         let parse = |args| match parse_arguments_(args, false) {
             CompilerArguments::Ok(ParsedArguments { common_args, .. }) => common_args,
-            o => panic!("Got unexpected parse result: {:?}", o),
+            o => panic!("Got unexpected parse result: {o:?}"),
         };
         assert_eq!(
             ovec!["--sysroot", "/opt/sysroot"],

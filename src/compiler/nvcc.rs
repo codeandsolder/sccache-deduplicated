@@ -1644,15 +1644,17 @@ mod test {
                 )),
             );
             let commands = select_nvcc_subcommands(
-                &creator,
-                &inherited_dir.path().join("nvcc"),
-                inherited_dir.path(),
-                &mut env_vars,
-                false,
-                &[],
+                NvccSelectContext {
+                    creator: &creator,
+                    executable: &inherited_dir.path().join("nvcc"),
+                    cwd: inherited_dir.path(),
+                    env_vars: &mut env_vars,
+                    remap_filenames: false,
+                    arguments: &[],
+                    host_compiler: &NvccHostCompiler::Gcc,
+                    output_file_name: OsStr::new("kernel.o"),
+                },
                 |_| true,
-                &NvccHostCompiler::Gcc,
-                OsStr::new("kernel.o"),
             )
             .wait()
             .unwrap();
@@ -1672,15 +1674,17 @@ mod test {
         let dryrun = b"#$ host-compiler -c kernel.cu\n";
         next_command(&creator, Ok(MockChild::new(exit_status(0), dryrun, dryrun)));
         let error = select_nvcc_subcommands(
-            &creator,
-            &dir.path().join("nvcc"),
-            dir.path(),
-            &mut vec![],
-            false,
-            &[],
+            NvccSelectContext {
+                creator: &creator,
+                executable: &dir.path().join("nvcc"),
+                cwd: dir.path(),
+                env_vars: &mut vec![],
+                remap_filenames: false,
+                arguments: &[],
+                host_compiler: &NvccHostCompiler::Gcc,
+                output_file_name: OsStr::new("kernel.o"),
+            },
             |_| true,
-            &NvccHostCompiler::Gcc,
-            OsStr::new("kernel.o"),
         )
         .wait()
         .unwrap_err();
