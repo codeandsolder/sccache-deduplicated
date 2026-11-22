@@ -18,6 +18,73 @@ use std::path::{Path, PathBuf};
 #[macro_use]
 extern crate log;
 
+// The initial client invocation uses one @file argument, while the expanded
+// dependency scan and real compile exceed CreateProcessW's 32767-unit limit.
+#[test]
+#[serial]
+fn test_rust_response_file_long_command() -> Result<()> {
+    let test = SccacheTest::new(None)?;
+    let root = test.tempdir.path().join("żółć quoted folder");
+    let target = root.join("output directory");
+    fs::create_dir_all(&target)?;
+    let source = root.join("source file.rs");
+    fs::write(
+        &source,
+        r#"
+#[cfg(not(all(message = "quotes and spaces", final_flag)))]
+compile_error!("response arguments lost");
+pub fn value() -> u32 { 42 }
+"#,
+    )?;
+    let mut args = (0..600)
+        .map(|index| format!("--cfg=very_long_flag_{index}_{}", "x".repeat(80)))
+        .collect::<Vec<_>>();
+    args.extend([
+        "--cfg=message=\"quotes and spaces\"".into(),
+        "--cfg=final_flag".into(),
+        "--crate-name=long_response_probe".into(),
+        "--crate-type=rlib".into(),
+        "--edition=2024".into(),
+        "--emit=link,dep-info".into(),
+        "--out-dir".into(),
+        target.to_str().context("non-UTF8 output directory")?.into(),
+        source.to_str().context("non-UTF8 source path")?.into(),
+    ]);
+    let response = root.join("compiler arguments.txt");
+    let mut at = std::ffi::OsString::from("@");
+    at.push(&response);
+    let mut contents = args.join("\n");
+    contents.push('\n');
+    assert!(contents.encode_utf16().count() > 32_767);
+    fs::write(&response, contents)?;
+    let compile = || -> Result<()> {
+        helpers::test_sccache_command()
+            .arg("rustc")
+            .arg(&at)
+            .current_dir(&root)
+            .assert()
+            .try_success()?;
+        Ok(())
+    };
+    compile()?;
+    let output = target.join("liblong_response_probe.rlib");
+    let deps = target.join("long_response_probe.d");
+    let artifact = fs::read(&output)?;
+    let dependency_file = fs::read(&deps)?;
+    assert!(!artifact.is_empty());
+    fs::remove_file(&output)?;
+    fs::remove_file(&deps)?;
+    compile()?;
+    assert_eq!(fs::read(&output)?, artifact);
+    assert_eq!(fs::read(&deps)?, dependency_file);
+    test.show_stats()?
+        .try_stdout(predicates::str::contains(
+            r#""cache_hits":{"counts":{"Rust":1},"adv_counts":{"rust":1}}"#,
+        ))?
+        .try_success()?;
+    Ok(())
+}
+
 #[test]
 #[serial]
 fn test_rust_cargo_check() -> Result<()> {

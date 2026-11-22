@@ -60,7 +60,7 @@ use std::future::Future;
 use std::hash::Hash;
 #[cfg(feature = "dist-client")]
 use std::io::{self, Seek};
-use std::io::{BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::iter;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -391,11 +391,16 @@ where
         .tempdir()
         .context("Failed to create temp dir")?;
     let dep_file = temp_dir.path().join("deps.d");
+    let mut spawn_arguments = arguments.to_vec();
+    spawn_arguments.extend([
+        OsString::from("--emit"),
+        OsString::from("dep-info"),
+        OsString::from("-o"),
+        dep_file.as_os_str().to_owned(),
+    ]);
+    let prepared = super::rust_response::prepare(executable, &spawn_arguments)?;
     let mut cmd = creator.clone().new_command_sync(executable);
-    cmd.args(arguments)
-        .args(&["--emit", "dep-info"])
-        .arg("-o")
-        .arg(&dep_file)
+    cmd.args(&prepared.args)
         .env_clear()
         .envs(env_vars.to_vec())
         .current_dir(cwd);
@@ -597,9 +602,11 @@ async fn get_compiler_outputs<T>(
 where
     T: Clone + CommandCreatorSync,
 {
+    let mut arguments = arguments;
+    arguments.extend([OsString::from("--print"), OsString::from("file-names")]);
+    let prepared = super::rust_response::prepare(executable, &arguments)?;
     let mut cmd = creator.clone().new_command_sync(executable);
-    cmd.args(&arguments)
-        .args(&["--print", "file-names"])
+    cmd.args(&prepared.args)
         .env_clear()
         .envs(env_vars.to_vec())
         .current_dir(cwd);
@@ -2038,65 +2045,6 @@ counted_array!(static ARGS: [ArgInfo<ArgData>; _] = [
     flag!("-vV", NotCompilationFlag),
 ]);
 
-/// Split the contents of a rustc `@response` file into arguments.
-///
-/// rustc reads response files by splitting on newlines, trimming whitespace,
-/// and skipping empty lines.  It does not support quoting or backslash escaping
-/// (unlike GCC), and does not recursively expand `@file` directives found
-/// inside a response file.
-///
-/// Rustc reference: <https://github.com/rust-lang/rust/blob/main/compiler/rustc_driver_impl/src/args.rs>
-fn split_rust_response_file_args(contents: &str) -> Vec<OsString> {
-    contents
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(OsString::from)
-        .collect()
-}
-
-pub struct ExpandResponseFile<'a> {
-    cwd: &'a Path,
-    stack: Vec<OsString>,
-}
-
-impl<'a> ExpandResponseFile<'a> {
-    pub fn new(cwd: &'a Path, args: &[OsString]) -> Self {
-        ExpandResponseFile {
-            stack: args
-                .iter()
-                .rev()
-                .map(std::borrow::ToOwned::to_owned)
-                .collect(),
-            cwd,
-        }
-    }
-}
-
-impl Iterator for ExpandResponseFile<'_> {
-    type Item = OsString;
-
-    fn next(&mut self) -> Option<OsString> {
-        loop {
-            let arg = self.stack.pop()?;
-            let file = match arg.split_prefix("@") {
-                Some(arg) => self.cwd.join(arg),
-                None => return Some(arg),
-            };
-
-            let mut contents = String::new();
-            let res = fs_err::File::open(&file)
-                .and_then(|f| BufReader::new(f).read_to_string(&mut contents));
-            if let Err(e) = res {
-                debug!("failed to read @-file `{}`: {e}", file.display());
-                return Some(arg);
-            }
-            let new_args = split_rust_response_file_args(&contents);
-            self.stack.extend(new_args.into_iter().rev());
-        }
-    }
-}
-
 #[expect(
     clippy::too_many_lines,
     reason = "single-pass argument parser keeps interdependent flag state and ordering visible; splitting would require a state bag threaded through helpers"
@@ -2130,7 +2078,11 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
 
     // Custom iterator to expand `@` arguments which stand for reading a file
     // and interpreting it as a list of more arguments.
-    let it = ExpandResponseFile::new(cwd, arguments);
+    let it = try_or_cannot_cache!(
+        super::rust_response::expand(arguments, cwd),
+        "Rust response file"
+    )
+    .into_iter();
     let parsed: Vec<_> = ArgsIter::new(it, &ARGS[..]).collect();
     // Cargo commonly puts the stdin input before --print=file-names.
     // Query classification must not depend on the order of otherwise
@@ -2479,9 +2431,14 @@ pub fn relocate_raw_rust_operands(
     canonical: &CanonicalRustPaths,
     cwd: &Path,
 ) -> Option<Vec<OsString>> {
-    let mut parsed = ArgsIter::new(ExpandResponseFile::new(cwd, arguments), &ARGS[..])
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .ok()?;
+    let mut parsed = ArgsIter::new(
+        super::rust_response::expand(arguments, cwd)
+            .ok()?
+            .into_iter(),
+        &ARGS[..],
+    )
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .ok()?;
     relocate_rust_operands(&mut parsed, canonical, cwd)?;
     // An IPC fallback retains the original emit and color settings, unlike
     // the cacheable compile where dep-info has already been generated.
@@ -2521,11 +2478,17 @@ where
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
         let mut effective_arguments = self.parsed_args.arguments.clone();
+        let needs_literal_argfile = effective_arguments
+            .iter()
+            .flat_map(|arg| arg.iter_os_strings())
+            .any(|arg| arg.starts_with("@"));
         let native_target = native_target_requested(&effective_arguments);
         let native_tune = native_tune_requested(&effective_arguments);
         let native_requested = native_target || native_tune;
         let target = compilation_target(&effective_arguments, &self.host);
-        let mut allow_dist = true;
+        // Worker and bubblewrap argv are currently raw. Keep literal @
+        // operands in the local response-file-aware path.
+        let mut allow_dist = !needs_literal_argfile;
         let mut effective_cache_control = cache_control;
         let resolved_native_profile = if native_requested {
             let profile = if let Some(profile) = self.native_profile.as_ref() {
@@ -2662,15 +2625,18 @@ where
                 Some(Target(ArgTarget::Unsure(name))) => Some(name.as_os_str()),
                 _ => None,
             });
-        let mut canonical_paths = canonical_output_dir.as_ref().and_then(|output_dir| {
-            CanonicalRustPaths::from_env_with_output_dir(
-                &env_vars,
-                &cwd,
-                &self.sysroot,
-                Some(output_dir),
-                cargo_target,
-            )
-        });
+        let mut canonical_paths = canonical_output_dir
+            .as_ref()
+            .filter(|_| !needs_literal_argfile)
+            .and_then(|output_dir| {
+                CanonicalRustPaths::from_env_with_output_dir(
+                    &env_vars,
+                    &cwd,
+                    &self.sysroot,
+                    Some(output_dir),
+                    cargo_target,
+                )
+            });
         if let Some(canonical) = canonical_paths.as_ref() {
             // The sandbox mounts /build read-only and both output roots writable.
             // Validate the paths we already know before the dep-info pre-pass so
@@ -7961,39 +7927,6 @@ version='2.0.0'
     }
 
     #[test]
-    fn test_split_rust_response_file_args() {
-        // Simple one arg per line.
-        assert_eq!(
-            ovec!["--emit", "link", "foo.rs"],
-            split_rust_response_file_args("--emit\nlink\nfoo.rs\n")
-        );
-        // Lines are trimmed.
-        assert_eq!(
-            ovec!["--emit", "link", "foo.rs"],
-            split_rust_response_file_args("  --emit  \n\tlink\n  foo.rs\n")
-        );
-        // Empty lines are skipped.
-        assert_eq!(
-            ovec!["--emit", "foo.rs"],
-            split_rust_response_file_args("--emit\n\n\nfoo.rs\n")
-        );
-        // Empty input.
-        assert_eq!(
-            split_rust_response_file_args(""),
-            [] as [std::ffi::OsString; 0]
-        );
-        assert_eq!(
-            split_rust_response_file_args("\n\n  \n\t\n"),
-            [] as [std::ffi::OsString; 0]
-        );
-        // Carriage returns are trimmed.
-        assert_eq!(
-            ovec!["--emit", "foo.rs"],
-            split_rust_response_file_args("--emit\r\nfoo.rs\r\n")
-        );
-    }
-
-    #[test]
     fn test_parse_arguments_response_file() {
         let td = tempfile::Builder::new()
             .prefix("sccache")
@@ -8017,9 +7950,7 @@ version='2.0.0'
 
     #[test]
     fn test_parse_arguments_response_file_missing() {
-        // When the @file cannot be read, the raw @-arg passes through.
-        // Without other required flags it becomes the input file, leading
-        // to missing --out-dir / --emit etc.
+        // Do not generate a cache key from arguments rustc cannot expand.
         let cwd = Path::new("/nonexistent");
         let args: Vec<OsString> = vec![OsString::from("@missing_file")];
         let result = parse_arguments(&args, cwd);
