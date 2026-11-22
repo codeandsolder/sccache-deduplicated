@@ -1,5 +1,11 @@
 //! Trusted release checksums and restricted upstream package locators.
 
+use std::{
+    num::NonZeroUsize,
+    sync::atomic::{AtomicUsize, Ordering},
+    thread,
+};
+
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
@@ -79,9 +85,92 @@ pub struct PackageAcquisition {
     pub reused: bool,
 }
 
+/// Apply independent package acquisitions with bounded concurrency.
+/// Stops starting new acquisitions on a fatal error and joins all active work.
+///
+/// # Errors
+/// Returns an acquisition, thread creation or worker panic error.
+pub fn map_packages<T: Sync, U: Send>(
+    requests: &[T],
+    jobs: NonZeroUsize,
+    operation: impl Fn(&T) -> Result<U> + Sync,
+) -> Result<Vec<U>> {
+    if jobs.get() == 1 || requests.len() <= 1 {
+        return requests.iter().map(operation).collect();
+    }
+    let next = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        let mut workers = Vec::new();
+        let mut failure = None;
+        for _ in 0..jobs.get().min(requests.len()) {
+            let worker = thread::Builder::new().spawn_scoped(scope, || {
+                let mut packages = Vec::new();
+                while let Some(request) = requests.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    match operation(request) {
+                        Ok(package) => packages.push(package),
+                        Err(error) => {
+                            next.store(requests.len(), Ordering::Relaxed);
+                            return Err(error);
+                        }
+                    }
+                }
+                Ok(packages)
+            });
+            match worker {
+                Ok(worker) => workers.push(worker),
+                Err(error) => {
+                    next.store(requests.len(), Ordering::Relaxed);
+                    failure = Some(error.into());
+                    break;
+                }
+            }
+        }
+        let mut acquired = Vec::new();
+        for worker in workers {
+            match worker.join() {
+                Ok(Ok(packages)) => acquired.extend(packages),
+                Ok(Err(error)) => {
+                    failure.get_or_insert(error);
+                }
+                Err(_) => {
+                    failure.get_or_insert_with(|| {
+                        anyhow::anyhow!("package acquisition worker panicked")
+                    });
+                }
+            }
+        }
+        failure.map_or(Ok(acquired), Err)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_mapping_runs_bounded_parallel_work() -> Result<()> {
+        use std::sync::Barrier;
+        let barrier = Barrier::new(2);
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let mut result = map_packages(
+            &[0, 1, 2, 3, 4, 5],
+            NonZeroUsize::MIN.saturating_add(1),
+            |value| {
+                let concurrent = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(concurrent, Ordering::SeqCst);
+                if *value < 2 {
+                    barrier.wait();
+                }
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(*value)
+            },
+        )?;
+        result.sort_unstable();
+        assert_eq!(result, [0, 1, 2, 3, 4, 5]);
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
 
     #[test]
     fn package_path_cannot_escape_configured_distribution_origin() -> Result<()> {

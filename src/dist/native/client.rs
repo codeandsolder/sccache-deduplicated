@@ -290,7 +290,7 @@ impl NativeCacheClient {
             let tree = match local_pins.entry(id) {
                 std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(local.prepare_input(id, inputs, &mut || renewals.check())?)
+                    entry.insert(local.prepare_input(id, inputs, &|| renewals.check())?)
                 }
             };
             self.push_tree(tree.manifest(), |content| tree.open_file(content), interval)

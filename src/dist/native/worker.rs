@@ -2,11 +2,14 @@
 //! native store and results move straight from captured descriptors to the
 //! scheduler. There is no legacy archive creation or client-side reupload.
 
-use std::time::{Duration, Instant};
+use std::{
+    num::NonZeroUsize,
+    time::{Duration, Instant},
+};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 
-use super::{NativeCacheClient, PackagePlanRequest};
+use super::{LeaseCheck, NativeCacheClient, PackagePlanRequest, map_packages};
 use crate::build_runtime::{
     ArchiveLength, BlobRef, CapturedExecution, ExecutionPolicy, ExecutionSpec, NativeServiceBusy,
     NativeStore, PackageArchive, PackageImportLimits, TreeId, TreeLease, VerifiedPackage, execute,
@@ -20,7 +23,7 @@ impl NativeCacheClient {
         missing: &[BlobRef],
         store: &NativeStore,
         limits: PackageImportLimits,
-        check: &mut dyn FnMut() -> Result<()>,
+        check: &LeaseCheck<'_>,
     ) -> Result<Vec<VerifiedPackage>> {
         let plan = self.control(
             "package_plan",
@@ -37,20 +40,22 @@ impl NativeCacheClient {
                 return Ok(Vec::new());
             }
         };
-        let mut packages = Vec::new();
-        for offer in offers {
+        let jobs = NonZeroUsize::new(limits.max_concurrent_imports)
+            .context("zero package acquisition concurrency")?;
+        let packages = map_packages(&offers, jobs, |offer| {
             check()?;
-            match self.reconstruct_package(ticket, offer, store, limits, check) {
-                Ok(package) => packages.push(package),
+            match self.reconstruct_package(ticket, *offer, store, limits, check) {
+                Ok(package) => Ok(Some(package)),
                 Err(error) => {
-                    // This is a transport optimization, not an input
-                    // authority. Exact blob retrieval still verifies every
-                    // required byte if archive acquisition cannot help.
+                    check()?;
+                    // Package transport is optional. Verify all remaining
+                    // input bytes by retrieving the missing blobs directly.
                     warn!("native package reconstruction unavailable: {error:#}");
+                    Ok(None)
                 }
             }
-        }
-        Ok(packages)
+        })?;
+        Ok(packages.into_iter().flatten().collect())
     }
 
     fn reconstruct_package(
@@ -59,7 +64,7 @@ impl NativeCacheClient {
         offer: PackageArchive,
         store: &NativeStore,
         limits: PackageImportLimits,
-        check: &mut dyn FnMut() -> Result<()>,
+        check: &LeaseCheck<'_>,
     ) -> Result<VerifiedPackage> {
         ensure!(
             !limits.retain_original
@@ -134,7 +139,7 @@ impl NativeCacheClient {
         store: &NativeStore,
         policy: &ExecutionPolicy,
         renewal_interval: Duration,
-        mut fetch: impl FnMut(TreeId, &mut dyn FnMut() -> Result<()>) -> Result<TreeLease>,
+        mut fetch: impl FnMut(TreeId, &LeaseCheck<'_>) -> Result<TreeLease>,
     ) -> Result<CapturedExecution> {
         let result = self.with_renewal(ticket, renewal_interval, |check| {
             self.verify_execution(ticket, spec.clone())?;
@@ -158,7 +163,7 @@ impl NativeCacheClient {
                 };
                 inputs.push(tree);
             }
-            let captured = execute(spec, store, policy, &mut *check)?;
+            let captured = execute(spec, store, policy, check)?;
             check()?;
             if let Some(manifest) = captured.successful_result() {
                 request.validate_result(manifest)?;

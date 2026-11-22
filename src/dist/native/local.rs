@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Result, anyhow, ensure};
 
-use super::{NativeBuildPolicy, NativeCacheClient, client::InputProvider};
+use super::{LeaseCheck, NativeBuildPolicy, NativeCacheClient, client::InputProvider};
 use crate::{
     build_runtime::{
         CapturedExecution, ContentId, ExecutionPolicy, ExecutionSpec, NativeStore, TreeId,
@@ -61,12 +61,7 @@ impl LocalExecutor {
         Ok(store)
     }
 
-    fn slot(
-        &self,
-        start: Instant,
-        timeout: Duration,
-        check: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<Slot<'_>> {
+    fn slot(&self, start: Instant, timeout: Duration, check: &LeaseCheck<'_>) -> Result<Slot<'_>> {
         self.config.validate()?;
         let mut active = self
             .active
@@ -99,7 +94,7 @@ impl LocalExecutor {
         &self,
         id: TreeId,
         inputs: &mut impl InputProvider,
-        check: &mut dyn FnMut() -> Result<()>,
+        check: &LeaseCheck<'_>,
     ) -> Result<TreeLease> {
         let store = self.store()?;
         if let Some(tree) = store.lookup_tree(id)? {
@@ -202,23 +197,21 @@ mod tests {
             },
             ContentId::of(b"platform"),
         );
-        let first = executor.slot(Instant::now(), Duration::from_secs(1), &mut || Ok(()))?;
+        let first = executor.slot(Instant::now(), Duration::from_secs(1), &|| Ok(()))?;
         assert!(
             executor
-                .slot(Instant::now(), Duration::from_millis(5), &mut || Ok(()))
+                .slot(Instant::now(), Duration::from_millis(5), &|| Ok(()))
                 .is_err()
         );
         assert!(
             executor
-                .slot(
-                    Instant::now(),
-                    Duration::from_secs(1),
-                    &mut || anyhow::bail!("cancelled")
-                )
+                .slot(Instant::now(), Duration::from_secs(1), &|| anyhow::bail!(
+                    "cancelled"
+                ))
                 .is_err()
         );
         drop(first);
-        let next = executor.slot(Instant::now(), Duration::from_secs(1), &mut || Ok(()))?;
+        let next = executor.slot(Instant::now(), Duration::from_secs(1), &|| Ok(()))?;
         drop(next);
         Ok(())
     }

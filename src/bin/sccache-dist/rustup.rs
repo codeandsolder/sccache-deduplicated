@@ -8,8 +8,6 @@ use std::{
     io::Read,
     num::NonZeroUsize,
     path::Path,
-    sync::atomic::{AtomicUsize, Ordering},
-    thread,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -18,7 +16,7 @@ use sccache::{
         InstallationCatalog, InstallationRecipe, InstalledComponent, PackageCompression,
         PackageIdentity, TreePath,
     },
-    dist::native::{NativeCacheClient, PackageAcquisition, RustPackageLocator},
+    dist::native::{NativeCacheClient, PackageAcquisition, RustPackageLocator, map_packages},
 };
 use serde::Deserialize;
 
@@ -306,42 +304,15 @@ fn acquire_packages(
     requests: &[&RustPackageLocator],
     jobs: NonZeroUsize,
 ) -> Result<Vec<PackageAcquisition>> {
-    let next = AtomicUsize::new(0);
-    thread::scope(|scope| {
-        let mut workers = Vec::new();
-        for _ in 0..jobs.get().min(requests.len()) {
-            workers.push(thread::Builder::new().spawn_scoped(scope, || {
-                let mut packages = Vec::new();
-                while let Some(locator) = requests.get(next.fetch_add(1, Ordering::Relaxed)) {
-                    match client.acquire_rust_package(locator) {
-                        Ok(package) => {
-                            info!(
-                                "Resolved Rust archive {}, reused: {}",
-                                locator.path, package.reused
-                            );
-                            packages.push(package);
-                        }
-                        Err(error) => {
-                            // Do not start new work after a failed acquisition.
-                            next.store(requests.len(), Ordering::Relaxed);
-                            return Err(error).with_context(|| {
-                                format!("provision Rust archive {}", locator.path)
-                            });
-                        }
-                    }
-                }
-                Ok(packages)
-            })?);
-        }
-        let mut acquired = Vec::new();
-        for worker in workers {
-            acquired.extend(
-                worker
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("package acquisition worker panicked"))??,
-            );
-        }
-        Ok(acquired)
+    map_packages(requests, jobs, |locator| {
+        let package = client
+            .acquire_rust_package(locator)
+            .with_context(|| format!("provision Rust archive {}", locator.path))?;
+        info!(
+            "Resolved Rust archive {}, reused: {}",
+            locator.path, package.reused
+        );
+        Ok(package)
     })
 }
 
