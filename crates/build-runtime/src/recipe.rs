@@ -148,7 +148,7 @@ impl TreeRecipe {
 
 /// Project selected archive entries into their destination paths, retaining
 /// hardlink topology even when the original file is outside the selection.
-pub(crate) fn project_entries(
+pub fn project_entries(
     package: &TreeManifest,
     selected: &BTreeMap<&TreePath, TreePath>,
     output: &mut TreeManifest,

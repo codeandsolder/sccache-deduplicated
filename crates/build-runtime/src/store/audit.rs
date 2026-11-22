@@ -88,8 +88,10 @@ pub struct SchemaInventory {
 }
 
 /// Inspect an existing index without creating a store, running recovery or
-/// changing any cache entries. The index must be closed by its writer or
-/// supplied as a consistent offline snapshot supported by redb.
+/// changing any cache entries.
+///
+/// The index must be closed by its writer or supplied as a consistent
+/// offline snapshot supported by redb.
 pub struct NativeIndexAudit {
     db: ReadOnlyDatabase,
 }

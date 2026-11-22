@@ -39,8 +39,8 @@ impl PackageSource {
     /// Returns an error for an invalid hexadecimal checksum.
     pub fn from_sha256_hex(hash: &str, size: u64, compression: PackageCompression) -> Result<Self> {
         ensure!(
-            hash.len() == 64 && hash.is_ascii(),
-            "invalid SHA-256 length"
+            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "invalid SHA-256 checksum"
         );
         let mut sha256 = [0; 32];
         for (index, value) in sha256.iter_mut().enumerate() {
