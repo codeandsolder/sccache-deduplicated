@@ -1892,11 +1892,12 @@ pub mod scheduler {
         }
 
         pub fn max_jobs(self, cpu_capacity: f64) -> usize {
-            if !cpu_capacity.is_finite() || cpu_capacity <= 0.0 {
+            if !cpu_capacity.is_finite() || cpu_capacity < 0.0 {
                 return 0;
             }
             let proportional = (cpu_capacity * self.percent / 100.0).floor() as usize;
             (cpu_capacity.ceil() as usize)
+                .max(1)
                 .saturating_add(self.static_jobs)
                 .saturating_add(proportional)
         }

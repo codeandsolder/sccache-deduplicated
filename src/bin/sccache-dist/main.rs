@@ -585,22 +585,9 @@ impl Default for Scheduler {
     }
 }
 
-fn admission_weights(
-    job_count: usize,
-    cpu_capacity: f64,
-    job_slack: JobSlackConfig,
-) -> Option<(f64, f64)> {
-    if cpu_capacity <= 0.0 || !cpu_capacity.is_finite() {
-        return None;
-    }
-    let max_jobs = job_slack.max_jobs(cpu_capacity);
-    if job_count >= max_jobs {
-        return None;
-    }
-    Some((
-        (cpu_capacity - job_count as f64).max(0.0),
-        (max_jobs - job_count) as f64,
-    ))
+fn admission_weight(job_count: usize, cpu_capacity: f64, job_slack: JobSlackConfig) -> Option<f64> {
+    (job_count < job_slack.max_jobs(cpu_capacity))
+        .then_some((cpu_capacity - job_count as f64).max(0.0) + 0.5)
 }
 
 fn weighted_server(candidates: &[(ServerId, f64)], draw: f64) -> Option<ServerId> {
@@ -637,13 +624,11 @@ impl SchedulerIncoming for Scheduler {
             let mut servers = self.servers.lock().unwrap();
 
             let res = {
-                let mut free = Vec::new();
-                let mut queued = Vec::new();
-                let mut retry_free = Vec::new();
-                let mut retry_queued = Vec::new();
+                let mut healthy = Vec::new();
+                let mut retry = Vec::new();
                 let now = Instant::now();
                 for (&server_id, details) in servers.iter_mut() {
-                    let Some((free_weight, queue_weight)) = admission_weights(
+                    let Some(weight) = admission_weight(
                         details.jobs_assigned.len(),
                         details.cpu_capacity,
                         self.job_slack,
@@ -656,16 +641,12 @@ impl SchedulerIncoming for Scheduler {
                         details.last_error = None;
                     }
                     if details.last_error.is_some() {
-                        retry_free.push((server_id, free_weight));
-                        retry_queued.push((server_id, queue_weight));
+                        retry.push((server_id, weight));
                     } else {
-                        free.push((server_id, free_weight));
-                        queued.push((server_id, queue_weight));
+                        healthy.push((server_id, weight));
                     }
                 }
-                // Prefer actual free CPU capacity. Only queue ahead when no
-                // healthy worker has free compute, respecting configured slack.
-                let selected = [&free, &queued, &retry_free, &retry_queued]
+                let selected = [&healthy, &retry]
                     .into_iter()
                     .find_map(|candidates| weighted_server(candidates, rand::random::<f64>()));
                 if let Some(server_id) = selected {
@@ -1240,8 +1221,8 @@ mod scheduler_tests {
         for cores in [1, 2, 7, 8, 12, 16, 64] {
             assert_eq!(slack.max_jobs(cores as f64), cores + 1 + cores / 8);
         }
-        assert!(admission_weights(13, 12.0, slack).is_some());
-        assert!(admission_weights(14, 12.0, slack).is_none());
+        assert!(admission_weight(13, 12.0, slack).is_some());
+        assert!(admission_weight(14, 12.0, slack).is_none());
     }
 
     #[test]
@@ -1252,10 +1233,10 @@ mod scheduler_tests {
         };
 
         assert_eq!(slack.max_jobs(12.0), 36);
-        assert!(admission_weights(35, 12.0, slack).is_some());
-        assert!(admission_weights(36, 12.0, slack).is_none());
-        assert_eq!(slack.max_jobs(0.0), 0);
-        assert_eq!(JobSlackConfig::default().max_jobs(0.0), 0);
+        assert!(admission_weight(35, 12.0, slack).is_some());
+        assert!(admission_weight(36, 12.0, slack).is_none());
+        assert_eq!(slack.max_jobs(0.0), 1);
+        assert_eq!(JobSlackConfig::default().max_jobs(0.0), 2);
     }
 
     #[test]
@@ -1264,21 +1245,22 @@ mod scheduler_tests {
             static_jobs: 0,
             percent: 400.0,
         };
-        assert_eq!(admission_weights(0, 2.5, slack), Some((2.5, 13.0)));
-        assert_eq!(admission_weights(0, 0.01, slack), Some((0.01, 1.0)));
-        assert_eq!(admission_weights(1, 2.5, slack).unwrap().0, 1.5);
-        assert_eq!(admission_weights(2, 2.5, slack).unwrap().0, 0.5);
-        assert_eq!(admission_weights(3, 2.5, slack).unwrap().0, 0.0);
-        assert!(admission_weights(0, 0.0, slack).is_none());
-        assert!(admission_weights(0, f64::NAN, slack).is_none());
+        assert_eq!(admission_weight(0, 2.5, slack), Some(3.0));
+        assert_eq!(admission_weight(0, 0.01, slack), Some(0.51));
+        assert_eq!(admission_weight(1, 2.5, slack), Some(2.0));
+        assert_eq!(admission_weight(2, 2.5, slack), Some(1.0));
+        assert_eq!(admission_weight(3, 2.5, slack), Some(0.5));
+        assert_eq!(admission_weight(0, 0.0, slack), Some(0.5));
+        assert!(admission_weight(1, 0.0, slack).is_none());
+        assert!(admission_weight(0, f64::NAN, slack).is_none());
         let a: ServerId = "127.0.0.1:10501".parse().unwrap();
         let b: ServerId = "127.0.0.2:10501".parse().unwrap();
         let c: ServerId = "127.0.0.3:10501".parse().unwrap();
-        let choices = [(a, 1.0), (b, 3.0), (c, 0.0)];
+        let choices = [(a, 1.5), (b, 3.5), (c, 0.5)];
         assert_eq!(weighted_server(&choices, 0.0), Some(a));
-        assert_eq!(weighted_server(&choices, 0.249), Some(a));
-        assert_eq!(weighted_server(&choices, 0.25), Some(b));
-        assert_eq!(weighted_server(&choices, 0.999), Some(b));
+        assert_eq!(weighted_server(&choices, 0.27), Some(a));
+        assert_eq!(weighted_server(&choices, 0.28), Some(b));
+        assert_eq!(weighted_server(&choices, 0.999), Some(c));
         assert_eq!(weighted_server(&[(c, 0.0)], 0.0), None);
     }
 
@@ -1345,9 +1327,9 @@ mod scheduler_tests {
         let status = scheduler.handle_status().unwrap();
         assert_eq!(
             (status.num_cpus, status.max_jobs, status.available_jobs),
-            (4, 12, 12)
+            (4, 13, 13)
         );
-        for _ in 0..12 {
+        for _ in 0..13 {
             assert!(matches!(
                 scheduler
                     .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
@@ -1364,7 +1346,7 @@ mod scheduler_tests {
         let status = scheduler.handle_status().unwrap();
         assert_eq!(
             (status.in_progress, status.max_jobs, status.available_jobs),
-            (12, 12, 0)
+            (13, 13, 0)
         );
         scheduler
             .handle_heartbeat_server(ids[0], nonce.clone(), 0.0, &[], Box::new(TestJobAuthorizer))
@@ -1373,11 +1355,11 @@ mod scheduler_tests {
             .handle_heartbeat_server(ids[1], nonce, 4.0, &[], Box::new(TestJobAuthorizer))
             .unwrap();
         let status = scheduler.handle_status().unwrap();
-        // Three jobs remain assigned to the now-paused worker; the other worker
+        // Three jobs remain assigned to the now-busy worker; the other worker
         // can admit three more despite the fleet's nominal capacity being full.
         assert_eq!(
             (status.in_progress, status.max_jobs, status.available_jobs),
-            (12, 12, 3)
+            (13, 14, 3)
         );
     }
 
@@ -1529,10 +1511,17 @@ mod scheduler_tests {
             .filter(|&&selected| selected == ids[0])
             .count();
         assert!(
-            (180..=332).contains(&first),
+            (210..=350).contains(&first),
             "first worker received {first} jobs"
         );
-        assert!(!observed.contains(&ids[2]));
+        let busy = observed
+            .iter()
+            .filter(|&&selected| selected == ids[2])
+            .count();
+        assert!(
+            (40..=150).contains(&busy),
+            "busy worker received {busy} jobs"
+        );
     }
 
     #[test]

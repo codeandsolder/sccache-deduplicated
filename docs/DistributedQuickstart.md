@@ -29,7 +29,7 @@ Create a scheduler.conf file to configure client/server authentication. A minima
 # to listen on localhost and put a HTTPS server in front of it.
 public_addr = "127.0.0.1:10600"
 
-# Required admission policy. Maximum outstanding jobs per worker = CPUs + static_jobs + floor(CPUs * percent / 100).
+# Required admission policy. Maximum outstanding jobs per worker = max(1, ceil(CPUs)) + static_jobs + floor(CPUs * percent / 100).
 # This example admits three jobs per advertised CPU without changing worker execution width.
 [job_slack]
 static_jobs = 0
