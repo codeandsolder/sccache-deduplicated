@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use sccache::{
     build_runtime::{
         BuildPath, CommandSpec, ComponentAudit, ContentId, ExecutionRoot, ExecutionSpec,
@@ -181,6 +181,7 @@ impl Fleet {
                     http_threads: 8,
                     max_metadata_bytes: 64 * 1024 * 1024,
                     package_import: Some(sccache::build_runtime::PackageImportLimits {
+                        max_concurrent_imports: 2,
                         max_archive_bytes: 1024 * 1024 * 1024,
                         max_entries: 100_000,
                         max_expanded_bytes: 4 * 1024 * 1024 * 1024,
@@ -275,16 +276,18 @@ impl Fleet {
     }
 }
 
-fn rust_installer_fixture() -> Result<Vec<u8>> {
+fn rust_installer_fixture(component: &str, file: &str, contents: &[u8]) -> Result<Vec<u8>> {
     let mut archive = tar::Builder::new(Vec::new());
+    let components = format!("{component}\n");
+    let manifest = format!("file:{file}\n");
     for (path, bytes) in [
-        ("release/rust-installer-version", &b"3\n"[..]),
-        ("release/components", &b"compiler\n"[..]),
-        ("release/compiler/manifest.in", &b"file:bin/rustc\n"[..]),
+        ("release/rust-installer-version".to_owned(), &b"3\n"[..]),
+        ("release/components".to_owned(), components.as_bytes()),
         (
-            "release/compiler/bin/rustc",
-            &b"original compiler bytes"[..],
+            format!("release/{component}/manifest.in"),
+            manifest.as_bytes(),
         ),
+        (format!("release/{component}/{file}"), contents),
     ] {
         let mut header = tar::Header::new_gnu();
         header.set_mode(0o755);
@@ -322,33 +325,43 @@ fn provisioning_config(root: &Path, endpoint: &reqwest::Url) -> Result<PathBuf> 
 struct OriginalUpstream {
     origin: reqwest::Url,
     requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     stop: std::sync::mpsc::Sender<()>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl OriginalUpstream {
-    fn start(path: &'static str, bytes: Vec<u8>) -> Result<Self> {
+    fn start(archives: std::collections::BTreeMap<String, Vec<u8>>) -> Result<Self> {
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         };
         let requests = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&requests);
-        let bytes: Arc<[u8]> = bytes.into();
+        let archives = archives
+            .into_iter()
+            .map(|(path, bytes)| (path, Arc::<[u8]>::from(bytes)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let peak = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::clone(&peak);
+        let active = AtomicUsize::new(0);
         let server = rouille::Server::new("127.0.0.1:0", move |request| {
-            if request.method() != "GET"
-                || request.url() != path
-                || request.header("Authorization").is_some()
-            {
+            if request.method() != "GET" || request.header("Authorization").is_some() {
                 return rouille::Response::empty_404();
             }
+            let Some(bytes) = archives.get(&request.url()) else {
+                return rouille::Response::empty_404();
+            };
             count.fetch_add(1, Ordering::Relaxed);
-            // Make concurrent provisioners contend for the import slot.
-            thread::sleep(Duration::from_millis(400));
+            let concurrent = active.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum.fetch_max(concurrent, Ordering::SeqCst);
+            // Allow independent acquisitions to overlap.
+            thread::sleep(Duration::from_millis(800));
+            active.fetch_sub(1, Ordering::SeqCst);
             let mut response = rouille::Response::from_data("application/octet-stream", Vec::new());
             // Intentionally omit Content-Length.
             response.data =
-                rouille::ResponseBody::from_reader(std::io::Cursor::new(Arc::clone(&bytes)));
+                rouille::ResponseBody::from_reader(std::io::Cursor::new(Arc::clone(bytes)));
             response
         })
         .map_err(|error| anyhow::anyhow!("{error}"))?
@@ -358,6 +371,7 @@ impl OriginalUpstream {
         Ok(Self {
             origin,
             requests,
+            peak,
             stop,
             thread: Some(worker),
         })
@@ -408,17 +422,52 @@ fn rustup_sync_acquires_once_and_reuses_portable_recipe_and_catalog() -> Result<
 
     let temp = tempfile::tempdir()?;
     let root = temp.path();
-    let archive = root.join("fixture.tar");
-    fs::write(&archive, rust_installer_fixture()?)?;
-    let compressed = Command::new("xz").arg("-c").arg(&archive).output()?;
-    ensure!(compressed.status.success(), "fixture xz compression failed");
-    let identity = PackageIdentity {
-        sha256: Sha256::digest(&compressed.stdout).into(),
-        compression: PackageCompression::Xz,
-    };
-    let archive_bytes = compressed.stdout.len();
-    let path = "/dist/2026-11-22/compiler-nightly-host.tar.xz";
-    let upstream = OriginalUpstream::start(path, compressed.stdout)?;
+    let sysroot = root.join("sysroot");
+    let rustlib = sysroot.join("lib/rustlib");
+    fs::create_dir_all(&rustlib)?;
+    let mut archives = std::collections::BTreeMap::new();
+    let mut components = String::new();
+    let mut installed = String::from("config_version = \"1\"\n");
+    let mut channel = String::from("manifest-version = \"2\"\ndate = \"2026-11-22\"\n");
+    let mut archive_bytes = 0;
+    for (component, file, contents) in [
+        ("compiler", "bin/rustc", &b"original compiler bytes"[..]),
+        ("runtime", "lib/libexample", &b"original runtime bytes"[..]),
+    ] {
+        use std::fmt::Write as _;
+        let archive = root.join(format!("{component}.tar"));
+        fs::write(&archive, rust_installer_fixture(component, file, contents)?)?;
+        let compressed = Command::new("xz").arg("-c").arg(&archive).output()?;
+        ensure!(compressed.status.success(), "fixture xz compression failed");
+        let identity = PackageIdentity {
+            sha256: Sha256::digest(&compressed.stdout).into(),
+            compression: PackageCompression::Xz,
+        };
+        archive_bytes += compressed.stdout.len();
+        let path = format!("/dist/2026-11-22/{component}-nightly-host.tar.xz");
+        writeln!(components, "{component}-host")?;
+        writeln!(
+            installed,
+            "[[components]]\npkg = \"{component}\"\ntarget = \"host\""
+        )?;
+        writeln!(
+            channel,
+            "[pkg.{component}.target.host]\navailable = true\nxz_url = \"https://other-mirror.example{path}\"\nxz_hash = \"{}\"",
+            identity.checksum_hex()
+        )?;
+        archives.insert(path, compressed.stdout);
+        let destination = sysroot.join(file);
+        fs::create_dir_all(destination.parent().context("fixture parent")?)?;
+        fs::write(destination, contents)?;
+        fs::write(
+            rustlib.join(format!("manifest-{component}-host")),
+            format!("file:{file}\n"),
+        )?;
+    }
+    fs::write(rustlib.join("components"), components)?;
+    fs::write(rustlib.join("multirust-config.toml"), installed)?;
+    fs::write(rustlib.join("multirust-channel-manifest.toml"), channel)?;
+    let upstream = OriginalUpstream::start(archives)?;
     let fleet = Fleet::start(
         root,
         Some(scheduler::RustPackageUpstream {
@@ -427,24 +476,6 @@ fn rustup_sync_acquires_once_and_reuses_portable_recipe_and_catalog() -> Result<
         }),
     )?;
     let config = provisioning_config(root, &fleet.cache_url)?;
-    let sysroot = root.join("sysroot");
-    let rustlib = sysroot.join("lib/rustlib");
-    fs::create_dir_all(&rustlib)?;
-    fs::create_dir(sysroot.join("bin"))?;
-    fs::write(sysroot.join("bin/rustc"), b"original compiler bytes")?;
-    fs::write(rustlib.join("components"), "compiler-host\n")?;
-    fs::write(rustlib.join("manifest-compiler-host"), "file:bin/rustc\n")?;
-    fs::write(
-        rustlib.join("multirust-config.toml"),
-        "config_version = \"1\"\n[[components]]\npkg = \"compiler\"\ntarget = \"host\"\n",
-    )?;
-    fs::write(
-        rustlib.join("multirust-channel-manifest.toml"),
-        format!(
-            "manifest-version = \"2\"\ndate = \"2026-11-22\"\n[pkg.compiler.target.host]\navailable = true\nxz_url = \"https://other-mirror.example{path}\"\nxz_hash = \"{}\"\n",
-            identity.checksum_hex()
-        ),
-    )?;
     let catalog = root.join("installation.catalog");
     let recipe = root.join("installation.recipe");
     let catalog2 = root.join("installation-second.catalog");
@@ -463,7 +494,7 @@ fn rustup_sync_acquires_once_and_reuses_portable_recipe_and_catalog() -> Result<
         assert_eq!(
             first["packages"][field].as_u64().unwrap_or(0)
                 + second["packages"][field].as_u64().unwrap_or(0),
-            1
+            2
         );
     }
     assert_eq!(
@@ -475,24 +506,25 @@ fn rustup_sync_acquires_once_and_reuses_portable_recipe_and_catalog() -> Result<
                 .unwrap_or(0),
         u64::try_from(archive_bytes)?
     );
-    assert_eq!(upstream.count(), 1);
+    assert_eq!(upstream.count(), 2);
+    assert_eq!(upstream.peak.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert_eq!(fs::read(&recipe)?, fs::read(&recipe2)?);
     let installation = InstallationRecipe::read(File::open(&recipe)?)?;
     assert_eq!(
         installation.components["compiler-host"].component,
         "compiler"
     );
-    assert_eq!(installation.tree_recipe()?.layers.len(), 1);
-    assert_eq!(first["attestation"]["verified_files"], 1);
-    assert_eq!(second["attestation"]["verified_files"], 1);
+    assert_eq!(installation.tree_recipe()?.layers.len(), 2);
+    assert_eq!(first["attestation"]["verified_files"], 2);
+    assert_eq!(second["attestation"]["verified_files"], 2);
     let warm = json_output(sync_rustup_command(&sysroot, &config, &catalog, &recipe).output()?)?;
     assert_eq!(warm["packages"]["downloaded_archive_bytes"], 0);
-    assert_eq!(warm["packages"]["reused_packages"], 1);
-    assert_eq!(warm["attestation"]["reused_files"], 1);
-    assert_eq!(upstream.count(), 1);
+    assert_eq!(warm["packages"]["reused_packages"], 2);
+    assert_eq!(warm["attestation"]["reused_files"], 2);
+    assert_eq!(upstream.count(), 2);
     let (scheduler, worker) = fleet.finish()?;
-    assert_eq!(scheduler.blobs, 4);
-    assert_eq!(scheduler.trees, 2);
+    assert_eq!(scheduler.blobs, 7);
+    assert_eq!(scheduler.trees, 4);
     assert_eq!(worker.blobs, 0);
     drop(upstream);
 
@@ -509,7 +541,7 @@ fn rustup_sync_acquires_once_and_reuses_portable_recipe_and_catalog() -> Result<
             .arg(&catalog)
             .output()?,
     )?;
-    assert_eq!(report["reused_files"], 0);
+    assert_eq!(report["reused_files"], 1);
     assert_eq!(report["differing_files"], 1);
     Ok(())
 }
@@ -523,7 +555,7 @@ fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path();
     let fleet = Fleet::start(root, None)?;
-    let bytes = rust_installer_fixture()?;
+    let bytes = rust_installer_fixture("compiler", "bin/rustc", b"original compiler bytes")?;
     let archive = root.join("package.tar");
     fs::write(&archive, &bytes)?;
     let source = PackageSource {

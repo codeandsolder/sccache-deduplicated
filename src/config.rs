@@ -2115,6 +2115,9 @@ pub mod scheduler {
             self.space.validate()?;
             if let Some(package_import) = self.package_import {
                 package_import.validate()?;
+                if package_import.max_concurrent_imports > self.max_total_uploads {
+                    bail!("native package concurrency exceeds total upload capacity");
+                }
             }
             if let Some(upstream) = &self.package_upstream {
                 let url = upstream.origin.to_url();

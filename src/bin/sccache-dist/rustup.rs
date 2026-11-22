@@ -3,10 +3,13 @@
 //! network discovery.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Read,
+    num::NonZeroUsize,
     path::Path,
+    sync::atomic::{AtomicUsize, Ordering},
+    thread,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -15,7 +18,7 @@ use sccache::{
         InstallationCatalog, InstallationRecipe, InstalledComponent, PackageCompression,
         PackageIdentity, TreePath,
     },
-    dist::native::{NativeCacheClient, RustPackageLocator},
+    dist::native::{NativeCacheClient, PackageAcquisition, RustPackageLocator},
 };
 use serde::Deserialize;
 
@@ -242,37 +245,43 @@ impl Inventory {
     fn resolve(
         &self,
         client: &NativeCacheClient,
+        jobs: NonZeroUsize,
     ) -> Result<(InstallationRecipe, ProvisioningReport)> {
+        let unique = self
+            .selected
+            .values()
+            .map(|component| (component.locator.identity, &component.locator))
+            .collect::<BTreeMap<_, _>>();
+        let requests = unique.into_values().collect::<Vec<_>>();
+        let acquired = acquire_packages(client, &requests, jobs)?;
         let mut recipe = InstallationRecipe {
             release: self.release.clone(),
             packages: BTreeMap::new(),
             components: BTreeMap::new(),
         };
         let mut report = ProvisioningReport::default();
+        for package in acquired {
+            if package.reused {
+                report.reused_packages += 1;
+            } else {
+                report.acquired_packages += 1;
+                report.downloaded_archive_bytes = report
+                    .downloaded_archive_bytes
+                    .checked_add(package.manifest.source.size)
+                    .context("original Rust download byte count overflow")?;
+            }
+            let identity = package.manifest.source.identity;
+            ensure!(
+                recipe.packages.insert(identity, package.manifest).is_none(),
+                "duplicate acquired package"
+            );
+        }
         for (name, selected) in &self.selected {
             let identity = selected.locator.identity;
-            let manifest = match recipe.packages.entry(identity) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => {
-                    let acquired = client
-                        .acquire_rust_package(&selected.locator)
-                        .with_context(|| format!("provision Rust component {name}"))?;
-                    if acquired.reused {
-                        report.reused_packages += 1;
-                    } else {
-                        report.acquired_packages += 1;
-                        report.downloaded_archive_bytes = report
-                            .downloaded_archive_bytes
-                            .checked_add(acquired.manifest.source.size)
-                            .context("original Rust download byte count overflow")?;
-                    }
-                    info!(
-                        "Resolved Rust component {name}, reused: {}",
-                        acquired.reused
-                    );
-                    entry.insert(acquired.manifest)
-                }
-            };
+            let manifest = recipe
+                .packages
+                .get(&identity)
+                .context("missing acquired package")?;
             let component = selected
                 .names
                 .iter()
@@ -292,6 +301,50 @@ impl Inventory {
     }
 }
 
+fn acquire_packages(
+    client: &NativeCacheClient,
+    requests: &[&RustPackageLocator],
+    jobs: NonZeroUsize,
+) -> Result<Vec<PackageAcquisition>> {
+    let next = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for _ in 0..jobs.get().min(requests.len()) {
+            workers.push(thread::Builder::new().spawn_scoped(scope, || {
+                let mut packages = Vec::new();
+                while let Some(locator) = requests.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    match client.acquire_rust_package(locator) {
+                        Ok(package) => {
+                            info!(
+                                "Resolved Rust archive {}, reused: {}",
+                                locator.path, package.reused
+                            );
+                            packages.push(package);
+                        }
+                        Err(error) => {
+                            // Do not start new work after a failed acquisition.
+                            next.store(requests.len(), Ordering::Relaxed);
+                            return Err(error).with_context(|| {
+                                format!("provision Rust archive {}", locator.path)
+                            });
+                        }
+                    }
+                }
+                Ok(packages)
+            })?);
+        }
+        let mut acquired = Vec::new();
+        for worker in workers {
+            acquired.extend(
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("package acquisition worker panicked"))??,
+            );
+        }
+        Ok(acquired)
+    })
+}
+
 #[derive(Default, serde::Serialize)]
 struct ProvisioningReport {
     acquired_packages: u64,
@@ -305,6 +358,7 @@ pub(super) fn sync(
     catalog_path: &Path,
     recipe_path: &Path,
     full: bool,
+    jobs: NonZeroUsize,
 ) -> Result<()> {
     ensure!(
         catalog_path != recipe_path,
@@ -313,7 +367,7 @@ pub(super) fn sync(
     let root = root.canonicalize()?;
     let inventory = Inventory::read(&root, full)?;
     let client = super::package_client(config)?;
-    let (recipe, packages) = inventory.resolve(&client)?;
+    let (recipe, packages) = inventory.resolve(&client, jobs)?;
     let tree_recipe = recipe.tree_recipe()?;
     let selected = recipe.selected_manifests()?;
     let (catalog, attestation) = InstallationCatalog::attest(&root, &selected, Some(catalog_path))?;

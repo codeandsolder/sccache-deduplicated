@@ -56,6 +56,7 @@ pub enum Command {
         output: std::path::PathBuf,
         recipe_output: std::path::PathBuf,
         full: bool,
+        jobs: std::num::NonZeroUsize,
     },
     #[cfg(target_os = "linux")]
     NativeAttestInstallation {

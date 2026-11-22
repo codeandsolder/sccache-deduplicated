@@ -256,7 +256,23 @@ pub struct NativeSessions {
     limits: SessionLimits,
     sessions: Mutex<HashMap<Ticket, SharedSession>>,
     active_uploads: AtomicUsize,
-    package_import: Mutex<()>,
+    package_imports: Mutex<BTreeSet<PackageIdentity>>,
+}
+
+struct PackageSlot<'a> {
+    active: &'a Mutex<BTreeSet<PackageIdentity>>,
+    identity: PackageIdentity,
+}
+
+impl Drop for PackageSlot<'_> {
+    fn drop(&mut self) {
+        match self.active.lock() {
+            Ok(mut active) => {
+                active.remove(&self.identity);
+            }
+            Err(error) => log::error!("could not release native package reservation: {error:#}"),
+        }
+    }
 }
 
 /// A bounded service slot is occupied. Clients can retry without changing
@@ -284,7 +300,7 @@ impl NativeSessions {
             limits,
             sessions: Mutex::new(HashMap::new()),
             active_uploads: AtomicUsize::new(0),
-            package_import: Mutex::new(()),
+            package_imports: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -293,24 +309,31 @@ impl NativeSessions {
         self.coordinator.store()
     }
 
-    fn package_slot(&self) -> Result<MutexGuard<'_, ()>> {
-        match self.package_import.try_lock() {
-            Ok(guard) => Ok(guard),
-            Err(std::sync::TryLockError::WouldBlock) => Err(NativeServiceBusy.into()),
-            Err(std::sync::TryLockError::Poisoned(_)) => bail!("native package lock poisoned"),
+    fn package_slot(&self, identity: PackageIdentity, maximum: usize) -> Result<PackageSlot<'_>> {
+        let mut active = self
+            .package_imports
+            .lock()
+            .map_err(|_| anyhow!("native package reservation lock poisoned"))?;
+        if active.len() >= maximum || !active.insert(identity) {
+            return Err(NativeServiceBusy.into());
         }
+        drop(active);
+        Ok(PackageSlot {
+            active: &self.package_imports,
+            identity,
+        })
     }
 
     /// Resolve an original Rust installer without fetching or decoding its archive.
+    /// Warm lookups do not wait for unrelated cold downloads.
     /// # Errors
-    /// Returns an error for busy service, invalid metadata or storage failure.
+    /// Returns an error for invalid metadata or storage failure.
     pub fn lookup_rust_package(
         &self,
         identity: PackageIdentity,
         limits: PackageImportLimits,
     ) -> Result<Option<InstallationManifest>> {
         let policy = limits.policy()?;
-        let _provisioning = self.package_slot()?;
         let Some(package) = self.store().lookup_package(identity, policy)? else {
             return Ok(None);
         };
@@ -320,8 +343,8 @@ impl NativeSessions {
     }
 
     /// Import or acquire an original package. The input factory is invoked
-    /// only after admission and a verified-cache miss, while holding the
-    /// shared provisioning slot.
+    /// only after reserving that original identity and rechecking availability.
+    /// Different packages may be acquired together within service limits.
     /// # Errors
     /// Returns an error for busy service, invalid archive or storage failures.
     pub fn provision_rust_package<R: Read>(
@@ -333,9 +356,17 @@ impl NativeSessions {
         acquire: impl FnOnce() -> Result<R>,
     ) -> Result<(InstallationManifest, bool)> {
         let policy = limits.policy()?;
-        let provisioning = self.package_slot()?;
         let store = self.store();
-        let (package, reused) = if let Some(package) = store.lookup_package(identity, policy)? {
+        let mut package = store.lookup_package(identity, policy)?;
+        let _provisioning = if package.is_none() {
+            let reservation = self.package_slot(identity, limits.max_concurrent_imports)?;
+            // Another owner may have published after the first lookup.
+            package = store.lookup_package(identity, policy)?;
+            Some(reservation)
+        } else {
+            None
+        };
+        let (package, reused) = if let Some(package) = package {
             if let ArchiveLength::Exact(size) = length {
                 ensure!(
                     package.source().size == size,
@@ -363,9 +394,10 @@ impl NativeSessions {
             drop(slot);
             (package, false)
         };
-        let result = store.publish_rust_installer(&package, policy.directory);
-        drop(provisioning);
-        Ok((result?, reused))
+        Ok((
+            store.publish_rust_installer(&package, policy.directory)?,
+            reused,
+        ))
     }
 
     fn sessions(&self) -> Result<MutexGuard<'_, HashMap<Ticket, SharedSession>>> {
