@@ -88,9 +88,7 @@ reqwest = { version = "0.13", features = [
   "blocking",
   "stream",
   "rustls",
-  "hickory-dns",
 ], optional = true }
-rustls-native-certs = { version = "0.8", optional = true }
 semver = "1.0"
 sccache-build = { path = "crates/build-runtime", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
@@ -115,6 +113,7 @@ typed-path = "0.13.0"
 url = { version = "2", optional = true }
 uuid = { version = "1.9", features = ["v4"] }
 walkdir = "2"
+webpki-root-certs = { version = "1", optional = true }
 # by default which pulls in an outdated failure version
 which = { version = "8", default-features = false, features = ["real-sys"] }
 zip = { version = "9", default-features = false }
@@ -215,6 +214,7 @@ oss = [
   "reqwest",
 ]
 redis = ["url", "opendal/services-redis", "opendal-layer-logging"]
+reqwest = ["dep:reqwest", "dep:webpki-root-certs"]
 s3 = [
   "opendal/services-s3",
   "opendal-layer-logging",
@@ -244,7 +244,6 @@ dist-client = [
   "reqwest",
   "url",
   "sha2",
-  "rustls-native-certs",
 ]
 # Enables the sccache-dist binary
 dist-server = [
@@ -258,7 +257,6 @@ dist-server = [
   "rouille",
   "syslog",
   "version-compare",
-  "rustls-native-certs",
   "dep:hostname",
 ]
 # Enables dist tests with external requirements
