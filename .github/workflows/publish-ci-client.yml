@@ -113,7 +113,7 @@ jobs:
           set -euo pipefail
           rustup toolchain install ${{ steps.protocol.outputs.rust_toolchain }} --profile minimal
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ecf97ef6708aaba39d6afad83bb82ebcca84723a # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
         with:
           rust-toolchain: "${{ steps.protocol.outputs.rust_toolchain }}"
 
@@ -184,7 +184,7 @@ jobs:
 
       - name: Finalize mandatory sccache before publishing binaries
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ecf97ef6708aaba39d6afad83bb82ebcca84723a # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
 
       - name: Publish immutable release
         shell: bash
