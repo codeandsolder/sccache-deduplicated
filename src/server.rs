@@ -1289,15 +1289,12 @@ where
 
         let me = Arc::new(self);
 
-        // The reader loop below feeds requests into `reqs_tx`; this task drains
-        // them, calls the service, and writes responses back to the sink.
-        //
-        // `_handle` must stay bound for the lifetime of `bind` (not `let _ =`,
-        // which would drop it immediately): it is an `AbortOnDropHandle`, so
-        // dropping it aborts this task and its in-flight compile subtasks. That
-        // is the cancellation we want once the client disconnects and the reader
-        // loop below exits.
-        let _handle = util::spawn(async move {
+        // Both halves own the framed socket. Observe the response task as
+        // well as the reader: an errored or panicked writer must close the
+        // connection even when the peer is still waiting for its response.
+        // Conversely, a disconnected reader drops the abort-on-drop writer
+        // and all of its pending compiler futures.
+        let mut handler = util::spawn(async move {
             let mut transfers = TransferSession::new(
                 chunk_bytes,
                 #[cfg(feature = "dist-client")]
@@ -1322,14 +1319,20 @@ where
             Ok::<_, Error>(())
         });
 
-        // Read requests until the client disconnects (stream ends) or the
-        // stream errors. A send error means the handler task above has ended,
-        // so we stop reading in that case too.
-        while let Some(req) = stream.next().await {
-            reqs_tx.send(req?).await?;
+        let reader = async {
+            while let Some(req) = stream.next().await {
+                reqs_tx
+                    .send(req?)
+                    .await
+                    .map_err(|_| anyhow!("response handler terminated"))?;
+            }
+            Ok::<_, Error>(())
+        };
+        tokio::select! {
+            biased;
+            result = &mut handler => result.context("response handler task failed")?,
+            result = reader => result,
         }
-
-        Ok(())
     }
 
     /// Get dist status.
@@ -2784,6 +2787,50 @@ mod tests {
         fn write(&mut self, text: &str) {
             self.buffer.push_str(&format!("{text}\n"));
         }
+    }
+
+    #[tokio::test]
+    async fn failed_response_handler_closes_connection_without_waiting_for_peer() -> Result<()> {
+        let mut storage = crate::test::mock_storage::MockStorage::new(None, false);
+        storage.fail_current_size();
+        let service = SccacheService::<ProcessCommandCreator>::mock_with_storage(
+            Arc::new(storage),
+            tokio::runtime::Handle::current(),
+        );
+        let (client, server) = tokio::io::duplex(4096);
+        let handler = util::spawn(service.clone().bind(server));
+        let mut client = tokio_util::codec::Framed::new(client, LengthDelimitedCodec::new());
+        client
+            .send(Bytes::from(bincode::serialize(&Request::GetStats)?))
+            .await?;
+        // Keep the client's write half alive while waiting for a reply.
+        // Previously the server's reader retained the socket after its writer
+        // returned an error, so this timed out instead of observing EOF.
+        assert!(
+            time::timeout(Duration::from_secs(2), client.next())
+                .await?
+                .is_none()
+        );
+        let error = handler.await?.expect_err("size query should fail");
+        assert!(format!("{error:#}").contains("injected size query failure"));
+
+        // The failure is scoped to this connection, not the shared service.
+        let (client, server) = tokio::io::duplex(4096);
+        let handler = util::spawn(service.bind(server));
+        let mut client = tokio_util::codec::Framed::new(client, LengthDelimitedCodec::new());
+        client
+            .send(Bytes::from(bincode::serialize(&Request::ZeroStats)?))
+            .await?;
+        let frame = time::timeout(Duration::from_secs(2), client.next())
+            .await?
+            .context("healthy connection closed")??;
+        assert!(matches!(
+            bincode::deserialize::<Response>(&frame)?,
+            Response::ZeroStats
+        ));
+        drop(client);
+        time::timeout(Duration::from_secs(2), handler).await???;
+        Ok(())
     }
 
     #[test]

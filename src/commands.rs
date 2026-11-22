@@ -16,8 +16,6 @@ use crate::cache::{IpcStorage, storage_from_config};
 use crate::client::{ServerConnection, connect_to_server, connect_with_retry};
 use crate::cmdline::{Command, StatsFormat};
 use crate::compiler::ColorMode;
-#[cfg(target_os = "linux")]
-use crate::compiler::canonical_paths::CanonicalRustPaths;
 use crate::config::{Config, default_disk_cache_dir};
 use crate::jobserver::Client;
 use crate::mock_command::{CommandChild, CommandCreatorSync, ProcessCommandCreator, RunCommand};
@@ -129,12 +127,6 @@ fn get_addr() -> crate::net::SocketAddr {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_PORT);
     crate::net::SocketAddr::with_port(port)
-}
-
-/// Check if ignoring all response errors
-fn ignore_all_server_io_errors() -> bool {
-    env::var("SCCACHE_IGNORE_SERVER_IO_ERROR")
-        .is_ok_and(|ignore_server_error| ignore_server_error == "1")
 }
 
 async fn read_server_startup_status<R: AsyncReadExt + Unpin>(
@@ -620,9 +612,9 @@ pub struct CompileInvocation<'a> {
 
 /// Handle `response`, the response from sending a `Compile` request to the server.
 ///
-/// If the server returned `CompileStarted`, reads the follow-up `CompileFinished`
-/// from `conn`, falling back to local execution if the server disconnects
-/// unexpectedly.  Delegates to `handle_compile_result` for the final dispatch.
+/// If the server returned `CompileStarted`, read its terminal result.
+/// An ambiguous disconnect must not launch another compiler against the
+/// same outputs. Only an explicit unhandled response permits local execution.
 fn handle_compile_response<T>(
     creator: T,
     runtime: &Runtime,
@@ -638,33 +630,11 @@ where
     let result = match &response {
         CompileResponse::CompileStarted => {
             debug!("Server sent CompileStarted");
-            // Wait for CompileFinished.
-            match conn.read_one_response() {
-                Ok(Response::CompileFinished(result)) => Some(result),
-                Ok(_) => bail!("unexpected response from server"),
-                Err(e) => {
-                    match e.downcast_ref::<io::Error>() {
-                        Some(io_e) if io_e.kind() == io::ErrorKind::UnexpectedEof => {
-                            eprintln!(
-                                "sccache: warning: The server looks like it shut down \
-                                 unexpectedly, compiling locally instead"
-                            );
-                        }
-                        _ => {
-                            //TODO: something better here?
-                            if ignore_all_server_io_errors() {
-                                eprintln!(
-                                    "sccache: warning: error reading compile response from server \
-                                     compiling locally instead"
-                                );
-                            } else {
-                                return Err(e)
-                                    .context("error reading compile response from server");
-                            }
-                        }
-                    }
-                    None
-                }
+            match conn.read_one_response().context(
+                "accepted compile lost its terminal response; outcome unknown, refusing duplicate local compilation",
+            )? {
+                Response::CompileFinished(result) => Some(result),
+                _ => bail!("unexpected response after compiler request was accepted"),
             }
         }
         _ => None,
@@ -689,18 +659,13 @@ fn handle_compile_result<T>(
 where
     T: CommandCreatorSync,
 {
-    #[cfg(not(target_os = "linux"))]
-    let _ = &invocation.env_vars;
-
-    #[cfg(target_os = "linux")]
-    let use_canonical_fallback = matches!(&response, CompileResponse::CompileStarted);
-
     match response {
         CompileResponse::CompileStarted => {
-            if let Some(finished) = finished {
-                return handle_compile_finished(&finished, stdout, stderr);
-            }
-            // Server disconnected before sending CompileFinished; fall back to local compilation.
+            return handle_compile_finished(
+                &finished.context("accepted compile has no terminal result")?,
+                stdout,
+                stderr,
+            );
         }
         CompileResponse::UnsupportedCompiler(s) => {
             debug!(
@@ -714,48 +679,13 @@ where
         }
     }
 
-    #[cfg(target_os = "linux")]
-    let canonical_rust = if use_canonical_fallback {
-        CanonicalRustPaths::from_rustc_executable(
-            &invocation.env_vars,
-            invocation.cwd,
-            invocation.exe,
-            &invocation.cmdline,
-        )
-    } else {
-        // The daemon rejected this invocation before canonical compilation began.
-        // Canonicalizing the raw fallback would change caller-visible outputs such
-        // as rustc dep-info from physical paths to /build and /target.
-        None
-    };
-
-    #[cfg(target_os = "linux")]
-    let mut cmd = if let Some(canonical) = canonical_rust
-        && let Some(arguments) = crate::compiler::relocate_raw_rust_operands(
-            &invocation.cmdline,
-            &canonical,
-            invocation.cwd,
-        ) {
-        let mut cmd = creator.new_command_sync("/usr/bin/bwrap");
-        let bwrap_args = canonical.bwrap_arguments(invocation.exe, &arguments, invocation.cwd);
-        cmd.args(&bwrap_args)
-            .env_clear()
-            .envs(canonical.env_to_canonical(&invocation.env_vars))
-            .current_dir("/");
-        cmd.share_jobserver();
-        cmd
-    } else {
-        let mut cmd = creator.new_command_sync(invocation.exe);
-        cmd.args(&invocation.cmdline).current_dir(invocation.cwd);
-        cmd
-    };
-
-    #[cfg(not(target_os = "linux"))]
-    let mut cmd = {
-        let mut cmd = creator.new_command_sync(invocation.exe);
-        cmd.args(&invocation.cmdline).current_dir(invocation.cwd);
-        cmd
-    };
+    // Only an explicit UnhandledCompile reaches this point. Preserve the
+    // original path and environment rather than inventing a canonical layout.
+    let mut cmd = creator.new_command_sync(invocation.exe);
+    cmd.args(&invocation.cmdline)
+        .env_clear()
+        .envs(invocation.env_vars.clone())
+        .current_dir(invocation.cwd);
     if log_enabled!(Trace) {
         trace!("running command: {cmd:?}");
     }
@@ -1177,9 +1107,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
 mod test {
     use super::*;
     use crate::jobserver::Client;
-    use crate::mock_command::{
-        CommandCreator, ExitStatusValue, MockChild, MockCommandCreator, exit_status,
-    };
+    use crate::mock_command::{CommandCreator, MockChild, MockCommandCreator, exit_status};
     use crate::net::Connection;
     use std::sync::{Arc, Mutex};
 
@@ -1321,50 +1249,35 @@ mod test {
         Ok(())
     }
 
-    /// A mid-compile server disconnect: the server sends `CompileStarted` then drops the
-    /// connection before `CompileFinished`.  `handle_compile_response` must fall back to
-    /// local compilation rather than panic.
     #[test]
-    fn test_handle_compile_response_disconnect_falls_back_to_local() {
+    fn test_handle_compile_response_disconnect_rejects_duplicate_local_compile() -> Result<()> {
         let runtime = make_runtime();
         let client = Client::new_num(1);
+        // No mock process is queued: attempting any local compilation is
+        // itself a test failure, even if the compiler would have succeeded.
         let creator = Arc::new(Mutex::new(MockCommandCreator::new(&client)));
-        // exit_status takes a raw platform value: on Unix the wait(2) encoding
-        // puts the exit code in bits 15:8, so exit code 1 is `1 << 8`.
-        // On Windows the raw value is the exit code directly.
-        #[cfg(unix)]
-        let exit_val: ExitStatusValue = 1 << 8;
-        #[cfg(windows)]
-        let exit_val: ExitStatusValue = 1;
-        creator
-            .lock()
-            .unwrap()
-            .next_command_spawns(Ok(MockChild::new(exit_status(exit_val), "", "")));
-
-        let mut conn = ServerConnection::new(Box::new(DisconnectedConnection)).unwrap();
-        let exe = Path::new("cc");
-        let cmdline = vec![OsString::from("foo.c")];
-        let cwd = Path::new("/");
-        let mut stdout = vec![];
-        let mut stderr = vec![];
-
+        let mut conn = ServerConnection::new(Box::new(DisconnectedConnection))?;
         let invocation = CompileInvocation {
-            exe,
-            cmdline,
-            cwd,
+            exe: Path::new("cc"),
+            cmdline: vec![OsString::from("foo.c")],
+            cwd: Path::new("/"),
             env_vars: vec![],
         };
-        let code = handle_compile_response(
+        let error = handle_compile_response(
             creator,
             &runtime,
             &mut conn,
             CompileResponse::CompileStarted,
             &invocation,
-            &mut stdout,
-            &mut stderr,
+            &mut Vec::new(),
+            &mut Vec::new(),
         )
-        .unwrap();
-
-        assert_eq!(code, 1);
+        .expect_err("ambiguous compiler result must be terminal");
+        assert!(format!("{error:#}").contains("refusing duplicate local compilation"));
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::UnexpectedEof)
+        );
+        Ok(())
     }
 }
