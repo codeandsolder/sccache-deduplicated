@@ -573,6 +573,25 @@ fn prepare_dispatch(
     Ok((outputs, layout, packagers))
 }
 
+fn classify_source(
+    source: NativeBuildSource,
+    mode: ActionMode,
+    elapsed: Duration,
+) -> CompileResult {
+    let miss = if mode == ActionMode::Refresh {
+        MissType::ForcedRecache
+    } else {
+        MissType::Normal
+    };
+    match source {
+        NativeBuildSource::Hit => CompileResult::CacheHit(elapsed),
+        NativeBuildSource::Local => CompileResult::NativeMiss(miss, DistType::NoDist, elapsed),
+        NativeBuildSource::Worker(addr) => {
+            CompileResult::NativeMiss(miss, DistType::Ok(addr.to_string()), elapsed)
+        }
+    }
+}
+
 pub(super) async fn compile<T: CommandCreatorSync>(
     client: Arc<NativeCompilerClient>,
     service: &SccacheService<T>,
@@ -647,21 +666,7 @@ pub(super) async fn compile<T: CommandCreatorSync>(
         match result {
             Ok(result) if result.output.status.success() => {
                 let elapsed = start.elapsed();
-                let classification = match result.source {
-                    NativeBuildSource::Hit => CompileResult::CacheHit(elapsed),
-                    source => CompileResult::NativeMiss(
-                        if mode == ActionMode::Refresh {
-                            MissType::ForcedRecache
-                        } else {
-                            MissType::Normal
-                        },
-                        match source {
-                            NativeBuildSource::Local | NativeBuildSource::Hit => DistType::NoDist,
-                            NativeBuildSource::Worker(addr) => DistType::Ok(addr.to_string()),
-                        },
-                        elapsed,
-                    ),
-                };
+                let classification = classify_source(result.source, mode, elapsed);
                 return Ok((classification, result.output));
             }
             Ok(result) => {
