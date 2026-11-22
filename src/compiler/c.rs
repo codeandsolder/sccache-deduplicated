@@ -2462,12 +2462,14 @@ impl pkg::ToolchainPackager for CToolchainPackager {
     }
 }
 
+pub(super) const INPUT_FILE_NAME_DOMAIN: &[u8] = b"c-input-file-name-v1";
+
 /// The file name of `input` to put in the hash key, if any.
 ///
 /// The inputs of nvcc's device-code steps are its own temporaries, named after
 /// the source, and identical device code from different sources is meant to be
 /// shared.
-fn hashed_input_file_name(language: Language, input: &Path) -> Option<&OsStr> {
+pub(super) fn hashed_input_file_name(language: Language, input: &Path) -> Option<&OsStr> {
     match language {
         Language::CudaFE | Language::Ptx | Language::Cubin => None,
         _ => input.file_name(),
@@ -2638,6 +2640,7 @@ impl<'a> HashKeyParams<'a> {
         // symbol does not record it, and keeping it would cost cache hits
         // across checkouts.
         if let Some(input_file_name) = self.input_file_name {
+            m.delimiter(INPUT_FILE_NAME_DOMAIN);
             input_file_name.hash(&mut HashToDigest { digest: &mut m });
         }
 

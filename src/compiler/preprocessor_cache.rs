@@ -38,7 +38,7 @@ use crate::{
 };
 
 use super::Language;
-use super::c::hash_arguments;
+use super::c::{INPUT_FILE_NAME_DOMAIN, hash_arguments, hashed_input_file_name};
 
 /// The current format is 1 header byte for the version + bincode encoding
 /// of the [`PreprocessorCacheEntry`] struct.
@@ -412,6 +412,9 @@ pub fn preprocessor_cache_entry_hash_key(
     // A hit on a preprocessor cache entry hands back the object cache key that
     // was stored in it, so everything the object key is made of has to be here
     // too or the assembler would be forgotten on that path.
+    if hashed_input_file_name(language, input_file).is_some() {
+        m.delimiter(INPUT_FILE_NAME_DOMAIN);
+    }
     if let Some(assembler_digest) = assembler_digest {
         m.update(assembler_digest.as_bytes());
     }
