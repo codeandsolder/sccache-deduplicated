@@ -4,7 +4,9 @@ extern crate log;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use sccache::config::{
-    INSECURE_DIST_CLIENT_TOKEN, scheduler as scheduler_config, server as server_config,
+    INSECURE_DIST_CLIENT_TOKEN,
+    scheduler::{self as scheduler_config, JobSlackConfig},
+    server as server_config,
 };
 use sccache::dist::{
     self, AllocJobResult, AssignJobResult, BuilderIncoming, CompileCommand, HeartbeatServerResult,
@@ -193,6 +195,7 @@ fn run(command: Command) -> Result<i32> {
             client_auth,
             server_auth,
             maintenance_drain_file,
+            job_slack,
         }) => {
             let check_client_auth: Box<dyn dist::http::ClientAuthCheck> = match client_auth {
                 scheduler_config::ClientAuth::Insecure => Box::new(token_check::EqCheck::new(
@@ -252,7 +255,12 @@ fn run(command: Command) -> Result<i32> {
                 bail!("scheduler maintenance_drain_file must be absolute")
             }
             daemonize(&[])?;
-            let scheduler = Scheduler::from_env(maintenance_drain_file)?;
+            info!(
+                "Distributed scheduler job slack: static={} percent={}%",
+                job_slack.static_jobs, job_slack.percent
+            );
+            let scheduler =
+                Scheduler::new_with_job_slack_and_drain(job_slack, maintenance_drain_file);
             let http_scheduler = dist::http::Scheduler::new(
                 public_addr,
                 scheduler,
@@ -362,63 +370,9 @@ fn init_logging() {
     }
 }
 
-const DEFAULT_JOB_SLACK_STATIC: usize = 1;
-const DEFAULT_JOB_SLACK_PERCENT: f64 = 12.5;
-const JOB_SLACK_STATIC_ENV: &str = "SCCACHE_DIST_JOB_SLACK_STATIC";
-const JOB_SLACK_PERCENT_ENV: &str = "SCCACHE_DIST_JOB_SLACK_PERCENT";
 const SERVER_REMEMBER_ERROR_TIMEOUT: Duration = Duration::from_secs(300);
 const UNCLAIMED_PENDING_TIMEOUT: Duration = Duration::from_secs(300);
 const UNCLAIMED_READY_TIMEOUT: Duration = Duration::from_secs(60);
-
-#[derive(Copy, Clone, Debug, PartialEq)]
-struct JobSlackConfig {
-    static_jobs: usize,
-    percent: f64,
-}
-
-impl Default for JobSlackConfig {
-    fn default() -> Self {
-        Self {
-            static_jobs: DEFAULT_JOB_SLACK_STATIC,
-            percent: DEFAULT_JOB_SLACK_PERCENT,
-        }
-    }
-}
-
-impl JobSlackConfig {
-    fn from_env() -> Result<Self> {
-        let static_jobs = match env::var(JOB_SLACK_STATIC_ENV) {
-            Ok(value) => value.parse::<usize>().with_context(|| {
-                format!("{JOB_SLACK_STATIC_ENV} must be a non-negative integer")
-            })?,
-            Err(env::VarError::NotPresent) => DEFAULT_JOB_SLACK_STATIC,
-            Err(err) => return Err(err).context(format!("reading {JOB_SLACK_STATIC_ENV}")),
-        };
-
-        let percent = match env::var(JOB_SLACK_PERCENT_ENV) {
-            Ok(value) => value
-                .parse::<f64>()
-                .with_context(|| format!("{JOB_SLACK_PERCENT_ENV} must be a number"))?,
-            Err(env::VarError::NotPresent) => DEFAULT_JOB_SLACK_PERCENT,
-            Err(err) => return Err(err).context(format!("reading {JOB_SLACK_PERCENT_ENV}")),
-        };
-        if !percent.is_finite() || percent < 0.0 {
-            bail!("{JOB_SLACK_PERCENT_ENV} must be finite and non-negative");
-        }
-
-        Ok(Self {
-            static_jobs,
-            percent,
-        })
-    }
-
-    fn max_jobs(self, core_count: usize) -> usize {
-        let proportional = ((core_count as f64) * self.percent / 100.0).floor() as usize;
-        core_count
-            .saturating_add(self.static_jobs)
-            .saturating_add(proportional)
-    }
-}
 
 #[derive(Copy, Clone)]
 struct JobDetail {
@@ -522,18 +476,6 @@ struct ServerDetails {
 impl Scheduler {
     pub fn new() -> Self {
         Self::new_with_job_slack(JobSlackConfig::default())
-    }
-
-    fn from_env(maintenance_drain_file: Option<PathBuf>) -> Result<Self> {
-        let job_slack = JobSlackConfig::from_env()?;
-        info!(
-            "Distributed scheduler job slack: static={} percent={}%",
-            job_slack.static_jobs, job_slack.percent
-        );
-        Ok(Self::new_with_job_slack_and_drain(
-            job_slack,
-            maintenance_drain_file,
-        ))
     }
 
     fn new_with_job_slack(job_slack: JobSlackConfig) -> Self {
@@ -1084,6 +1026,22 @@ impl SchedulerIncoming for Scheduler {
             // Reservations are already consuming capacity while the assignment
             // RPC runs. Count them too, especially for maintenance drain checks.
             in_progress: servers.values().map(|v| v.jobs_assigned.len()).sum(),
+            max_jobs: servers
+                .values()
+                .map(|v| self.job_slack.max_jobs(v.num_cpus))
+                .fold(0, usize::saturating_add),
+            available_jobs: if self.is_draining() {
+                0
+            } else {
+                servers
+                    .values()
+                    .map(|v| {
+                        self.job_slack
+                            .max_jobs(v.num_cpus)
+                            .saturating_sub(v.jobs_assigned.len())
+                    })
+                    .fold(0, usize::saturating_add)
+            },
         })
     }
 }
@@ -1284,12 +1242,14 @@ mod scheduler_tests {
     fn configured_job_slack_can_queue_well_beyond_worker_width() {
         let slack = JobSlackConfig {
             static_jobs: 0,
-            percent: 400.0,
+            percent: 200.0,
         };
 
-        assert_eq!(slack.max_jobs(12), 60);
-        assert!(load_weight(59, 12, slack).is_some());
-        assert!(load_weight(60, 12, slack).is_none());
+        assert_eq!(slack.max_jobs(12), 36);
+        assert!(load_weight(35, 12, slack).is_some());
+        assert!(load_weight(36, 12, slack).is_none());
+        assert_eq!(slack.max_jobs(0), 0);
+        assert_eq!(JobSlackConfig::default().max_jobs(0), 0);
     }
 
     struct TestJobAuthorizer;
@@ -1335,6 +1295,62 @@ mod scheduler_tests {
         }
     }
 
+    #[test]
+    fn scheduler_status_tracks_per_worker_admission_and_capacity_changes() {
+        let scheduler = Scheduler::new_with_job_slack(JobSlackConfig {
+            static_jobs: 0,
+            percent: 200.0,
+        });
+        let ids: [ServerId; 3] = [
+            "127.0.0.1:10501".parse().unwrap(),
+            "127.0.0.1:10502".parse().unwrap(),
+            "127.0.0.1:10503".parse().unwrap(),
+        ];
+        let nonce = ServerNonce::new();
+        for (id, cpus) in ids.into_iter().zip([1, 3, 0]) {
+            scheduler
+                .handle_heartbeat_server(id, nonce.clone(), cpus, &[], Box::new(TestJobAuthorizer))
+                .unwrap();
+        }
+        let status = scheduler.handle_status().unwrap();
+        assert_eq!(
+            (status.num_cpus, status.max_jobs, status.available_jobs),
+            (4, 12, 12)
+        );
+        for _ in 0..12 {
+            assert!(matches!(
+                scheduler
+                    .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
+                    .unwrap(),
+                AllocJobResult::Success { .. }
+            ));
+        }
+        assert!(matches!(
+            scheduler
+                .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
+                .unwrap(),
+            AllocJobResult::Fail { .. }
+        ));
+        let status = scheduler.handle_status().unwrap();
+        assert_eq!(
+            (status.in_progress, status.max_jobs, status.available_jobs),
+            (12, 12, 0)
+        );
+        scheduler
+            .handle_heartbeat_server(ids[0], nonce.clone(), 0, &[], Box::new(TestJobAuthorizer))
+            .unwrap();
+        scheduler
+            .handle_heartbeat_server(ids[1], nonce, 4, &[], Box::new(TestJobAuthorizer))
+            .unwrap();
+        let status = scheduler.handle_status().unwrap();
+        // Three jobs remain assigned to the now-paused worker; the other worker
+        // can admit three more despite the fleet's nominal capacity being full.
+        assert_eq!(
+            (status.in_progress, status.max_jobs, status.available_jobs),
+            (12, 12, 3)
+        );
+    }
+
     struct StatusDuringAssign<'a>(&'a Scheduler);
 
     impl SchedulerOutgoing for StatusDuringAssign<'_> {
@@ -1346,7 +1362,9 @@ mod scheduler_tests {
             _auth: String,
         ) -> Result<AssignJobResult> {
             // Status must include reservations even before a JobDetail exists.
-            assert_eq!(self.0.handle_status()?.in_progress, 1);
+            let status = self.0.handle_status()?;
+            assert_eq!(status.in_progress, 1);
+            assert_eq!(status.available_jobs, status.max_jobs - 1);
             Ok(AssignJobResult {
                 state: JobState::Pending,
                 need_toolchain: false,
@@ -1499,6 +1517,7 @@ mod scheduler_tests {
 
         std::fs::write(&drain, b"drain").unwrap();
         assert!(scheduler.handle_is_draining());
+        assert_eq!(scheduler.handle_status().unwrap().available_jobs, 0);
         let allocation = scheduler
             .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
             .unwrap();

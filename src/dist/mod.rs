@@ -872,6 +872,8 @@ pub struct SchedulerStatusResult {
     pub num_servers: usize,
     pub num_cpus: usize,
     pub in_progress: usize,
+    pub max_jobs: usize,
+    pub available_jobs: usize,
 }
 
 // SubmitToolchain

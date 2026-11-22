@@ -372,6 +372,16 @@ impl Publisher {
                 usize_to_u64(status.in_progress),
                 [("kind", "in_progress")],
             )?;
+            self.set_u64(
+                "sccache_dist_status",
+                usize_to_u64(status.max_jobs),
+                [("kind", "max_jobs")],
+            )?;
+            self.set_u64(
+                "sccache_dist_status",
+                usize_to_u64(status.available_jobs),
+                [("kind", "available_jobs")],
+            )?;
         }
         Ok(())
     }

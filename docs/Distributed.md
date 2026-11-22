@@ -97,7 +97,11 @@ The HTTP implementation of sccache has the following API, where all HTTP body co
         acknowledged again for the same worker if the scheduler already
         completed that job, within its bounded acknowledgment retry window.
    - `GET /api/v1/scheduler/status`
-      - Returns information about the scheduler.
+      - Returns information about the scheduler, including total outstanding-job
+        capacity and currently available admission slots. Capacity is computed
+        per worker from its current advertised CPU count and the scheduler's
+        `[job_slack]` configuration; zero-width workers admit no jobs.
+      - Protocol 4 / rollout epoch 5 adds these fields to the status wire format.
  - `server`
    - `POST /api/v1/distserver/assign_job`
       - Called by the scheduler to inform of a new job being assigned to this server.
@@ -355,6 +359,10 @@ public_addr = "127.0.0.1:10600"
 # Existing distributed jobs can therefore drain without being interrupted.
 maintenance_drain_file = "/run/sccache-scheduler-maintenance-drain"
 
+[job_slack]
+static_jobs = 0
+percent = 200.0
+
 [client_auth]
 type = "token"
 token = "my client token"
@@ -365,9 +373,28 @@ secret_key = "my secret key"
 ```
 
 
+#### Admission policy
+
+The `[job_slack]` section is required. For a worker advertising `C` CPUs,
+the limit on outstanding assignments is `C + static_jobs + floor(C * percent / 100)`.
+A worker advertising zero CPUs always has zero admission capacity. The
+example admits three assignments per advertised CPU, including assignments
+waiting for toolchain transfer and assignment RPCs. It does not change the
+worker's execution width. Negative or nonfinite percentages are rejected.
+
+Status reports `max_jobs` (the sum of individual worker limits) and
+`available_jobs` (the sum of each worker's remaining slots, or zero while
+draining). When a worker reduces its advertised width, its existing jobs
+are not cancelled. Consequently available slots need not equal the fleet
+limit minus aggregate in-progress jobs.
+
+Upgrade all clients and the scheduler together for protocol 4, adding the
+required configuration before starting the new scheduler. Remove the former
+scheduler slack environment variables; they no longer participate in admission.
+
 #### Maintenance drain
 
-If `maintenance_drain_file` is configured, creating that file makes the scheduler refuse new job allocations with the normal allocation-failure response while continuing to accept worker heartbeats and job-state transitions for already assigned jobs. Clients therefore fall back to local compilation while the existing distributed queue drains. Removing the file immediately restores allocations. The additive `GET /api/v1/scheduler/drain_status` endpoint returns `1` while draining and `0` otherwise; the existing scheduler status response is unchanged.
+If `maintenance_drain_file` is configured, creating that file makes the scheduler refuse new job allocations with the normal allocation-failure response while continuing to accept worker heartbeats and job-state transitions for already assigned jobs. Clients therefore fall back to local compilation while the existing distributed queue drains. Removing the file immediately restores allocations. The additive `GET /api/v1/scheduler/drain_status` endpoint returns `1` while draining and `0` otherwise; the scheduler status reports zero available admission slots while draining.
 
 The drain file path must be absolute. The scheduler only checks for its existence; a privileged service manager or deployment tool should create and remove it.
 

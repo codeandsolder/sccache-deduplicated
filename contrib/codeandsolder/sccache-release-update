@@ -480,15 +480,9 @@ dist_status_value() {
     fi
 
     curl -fsS --connect-timeout 3 --max-time 5 \
-        "$SCHEDULER_URL/api/v1/scheduler/status" |
-        python3 -c 'import struct,sys
-field=sys.argv[1]
-data=sys.stdin.buffer.read()
-if len(data) != 24:
-    raise SystemExit(1)
-num_servers,num_cpus,in_progress=struct.unpack("<QQQ", data)
-values={"num_servers":num_servers,"num_cpus":num_cpus,"in_progress":in_progress}
-print(values[field])' "$field"
+        -H 'Accept: application/json' "$SCHEDULER_URL/api/v1/scheduler/status" |
+        python3 -c 'import json,sys
+print(json.load(sys.stdin)[sys.argv[1]])' "$field"
 }
 
 dist_num_servers() {

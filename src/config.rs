@@ -1867,6 +1867,41 @@ pub mod scheduler {
         Token { token: String },
     }
 
+    #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct JobSlackConfig {
+        pub static_jobs: usize,
+        pub percent: f64,
+    }
+
+    impl Default for JobSlackConfig {
+        fn default() -> Self {
+            Self {
+                static_jobs: 1,
+                percent: 12.5,
+            }
+        }
+    }
+
+    impl JobSlackConfig {
+        pub fn validate(self) -> Result<()> {
+            if !self.percent.is_finite() || self.percent < 0.0 {
+                bail!("scheduler job_slack.percent must be finite and non-negative");
+            }
+            Ok(())
+        }
+
+        pub fn max_jobs(self, core_count: usize) -> usize {
+            if core_count == 0 {
+                return 0;
+            }
+            let proportional = (core_count as f64 * self.percent / 100.0).floor() as usize;
+            core_count
+                .saturating_add(self.static_jobs)
+                .saturating_add(proportional)
+        }
+    }
+
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct Config {
@@ -1875,10 +1910,49 @@ pub mod scheduler {
         pub server_auth: ServerAuth,
         #[serde(default)]
         pub maintenance_drain_file: Option<PathBuf>,
+        pub job_slack: JobSlackConfig,
     }
 
     pub fn from_path(conf_path: &Path) -> Result<Option<Config>> {
-        super::try_read_config_file(conf_path).context("Failed to load scheduler config file")
+        let config: Option<Config> = super::try_read_config_file(conf_path)
+            .context("Failed to load scheduler config file")?;
+        if let Some(config) = &config {
+            config.job_slack.validate()?;
+        }
+        Ok(config)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn scheduler_requires_explicit_valid_admission_policy() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("scheduler.toml");
+            let base = r#"
+public_addr = "127.0.0.1:10600"
+[client_auth]
+type = "DANGEROUSLY_INSECURE"
+[server_auth]
+type = "DANGEROUSLY_INSECURE"
+"#;
+            for (policy, valid) in [
+                ("", false),
+                ("[job_slack]\nstatic_jobs = 0\n", false),
+                ("[job_slack]\nstatic_jobs = 0\npercent = -1.0\n", false),
+                ("[job_slack]\nstatic_jobs = 0\npercent = nan\n", false),
+                ("[job_slack]\nstatic_jobs = 0\npercent = inf\n", false),
+                ("[job_slack]\nstatic_jobs = 0\npercent = 200.0\n", true),
+            ] {
+                std::fs::write(&path, format!("{base}\n{policy}")).unwrap();
+                let loaded = from_path(&path);
+                assert_eq!(loaded.is_ok(), valid, "{policy}");
+                if valid {
+                    assert_eq!(loaded.unwrap().unwrap().job_slack.max_jobs(12), 36);
+                }
+            }
+        }
     }
 }
 
