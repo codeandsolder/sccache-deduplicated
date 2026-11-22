@@ -84,28 +84,30 @@ const RLIB_EXTENSION: &str = "rlib";
 #[cfg(feature = "dist-client")]
 const RMETA_EXTENSION: &str = "rmeta";
 
-/// Resolve Clippy's explicit policy directory relative to the compiler cwd.
+/// Resolve an environment path relative to the compiler cwd, preserving its
+/// lexical spelling until the archive layout has recorded its traversal.
+fn absolute_env_path(env_vars: &[(OsString, OsString)], name: &str, cwd: &Path) -> Option<PathBuf> {
+    let value = env_vars
+        .iter()
+        .rev()
+        .find_map(|(key, value)| (key == name).then_some(value))?;
+    if value.is_empty() {
+        return None;
+    }
+    Some(cwd.join(value))
+}
+
+/// Clippy tracks the resolved policy file, while the environment dependency
+/// tracks the literal directory spelling. Keep those two identities separate.
 fn clippy_config_dir(
     executable: &Path,
     env_vars: &[(OsString, OsString)],
     cwd: &Path,
 ) -> Option<PathBuf> {
-    if !is_clippy_driver(executable) {
-        return None;
-    }
-    let value = env_vars
-        .iter()
-        .find_map(|(name, value)| (name == "CLIPPY_CONF_DIR").then_some(value))?;
-    if value.is_empty() {
-        return None;
-    }
-    let path = Path::new(value);
-    let absolute = if path.is_absolute() {
-        path.to_owned()
-    } else {
-        cwd.join(path)
-    };
-    Some(absolute.canonicalize().unwrap_or(absolute))
+    is_clippy_driver(executable)
+        .then(|| absolute_env_path(env_vars, "CLIPPY_CONF_DIR", cwd))
+        .flatten()
+        .map(|path| path.canonicalize().unwrap_or(path))
 }
 
 /// Both supported Clippy policy filenames affect diagnostics and cache reuse.
@@ -3443,7 +3445,9 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                             }
                             *v = dist_out_dir;
                         }
-                        "TMPDIR" => {
+                        "TMPDIR"
+                            if !cfg!(unix) || !env_dep_names.contains(std::ffi::OsStr::new(k)) =>
+                        {
                             v.clear();
                         }
                         "CARGO" => {
@@ -3460,6 +3464,10 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                         "CARGO_MANIFEST_DIR" => {
                             *v = path_transformer.as_dist(Path::new(v))?;
                         }
+                        // Unix physical-layout archives preserve both the
+                        // original spelling and the filesystem topology. On
+                        // other platforms retain the existing path transform.
+                        #[cfg(not(unix))]
                         "CLIPPY_CONF_DIR" if is_clippy_driver(executable) => {
                             let local_dir = clippy_config_dir(executable, &self.env_vars, cwd)?;
                             *v = path_transformer.as_dist(&local_dir)?;
@@ -3559,6 +3567,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             can_trim_rlibs,
             rlib_dep_reader,
             env_vars,
+            env_dep_names,
             canonical_paths,
             host,
             arguments,
@@ -3566,12 +3575,44 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             cwd,
             ..
         } = *{ self };
-        let clippy_dir = clippy_config_dir(&executable, &env_vars, &cwd);
+        let mut input_dirs = Vec::new();
+        if cfg!(unix) && canonical_paths.is_none() {
+            // These are directory-valued compiler inputs, not arbitrary
+            // environment strings. Archive only their path topology, not the
+            // contents of unrelated directories.
+            input_dirs.push(cwd.clone());
+            for name in [
+                "OUT_DIR",
+                "CARGO_MANIFEST_DIR",
+                "CARGO_HOME",
+                "CARGO_TARGET_DIR",
+                "RUSTUP_HOME",
+                "TMPDIR",
+                "TMP",
+                "TEMP",
+                "TEMPDIR",
+                "HOME",
+            ] {
+                if env_dep_names.contains(std::ffi::OsStr::new(name))
+                    && let Some(path) = absolute_env_path(&env_vars, name, &cwd)
+                    && path.is_dir()
+                {
+                    input_dirs.push(path);
+                }
+            }
+            if is_clippy_driver(&executable)
+                && let Some(path) = absolute_env_path(&env_vars, "CLIPPY_CONF_DIR", &cwd)
+            {
+                input_dirs.push(path);
+            }
+        } else if let Some(path) = clippy_config_dir(&executable, &env_vars, &cwd) {
+            input_dirs.push(path);
+        }
         trace!("Dist inputs: inputs={inputs:?} crate_link_paths={crate_link_paths:?}");
 
         let inputs_packager = Box::new(RustInputsPackager {
             env_vars,
-            clippy_dir,
+            input_dirs,
             crate_link_paths,
             can_trim_rlibs,
             inputs,
@@ -3612,7 +3653,7 @@ fn get_path_mappings(
 #[cfg(feature = "dist-client")]
 struct RustInputsPackager {
     env_vars: Vec<(OsString, OsString)>,
-    clippy_dir: Option<PathBuf>,
+    input_dirs: Vec<PathBuf>,
     crate_link_paths: Vec<PathBuf>,
     can_trim_rlibs: bool,
     inputs: Vec<PathBuf>,
@@ -3841,7 +3882,7 @@ version = "6.1.0"
         inputs,
         path_transformer,
         rlib_dep_reader: None,
-        clippy_dir: None,
+        input_dirs: vec![],
     };
 
     let mut package = Vec::new();
@@ -3890,7 +3931,7 @@ fn test_dist_archive_includes_clippy_config_files_and_empty_directory() -> Resul
         transformer.add_root_mapping(policy.clone(), "/clippy-config");
         let packager = RustInputsPackager {
             env_vars: vec![],
-            clippy_dir: Some(policy.clone()),
+            input_dirs: vec![policy.clone()],
             crate_link_paths: vec![],
             can_trim_rlibs: true,
             inputs: if empty {
@@ -3962,8 +4003,7 @@ fn rust_dependency_candidates(
 ) -> Result<Vec<PathBuf>> {
     let mut candidates = Vec::new();
     for directory in crate_link_paths {
-        let directory = pkg::simplify_path(directory)?;
-        let entries = match fs::read_dir(&directory) {
+        let entries = match fs::read_dir(directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error).context("Failed to read Rust crate search directory"),
@@ -4019,7 +4059,7 @@ fn test_dist_dependency_inspection_failure_keeps_all_candidates() -> Result<()> 
     transformer.add_root_mapping(tmp.path().to_owned(), "/target");
     let packager = RustInputsPackager {
         env_vars,
-        clippy_dir: None,
+        input_dirs: vec![],
         crate_link_paths: vec![deps],
         can_trim_rlibs: true,
         inputs,
@@ -4079,20 +4119,16 @@ fn test_dist_rlib_trimming_preserves_recognized_metadata() -> Result<()> {
 
 #[cfg(feature = "dist-client")]
 impl pkg::InputsPackager for RustInputsPackager {
-    #[expect(
-        clippy::too_many_lines,
-        reason = "toolchain input packaging is an ordered archive manifest; keeping path transforms beside emitted entries makes the archive contract auditable"
-    )]
     fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<()> {
         debug!("Packaging compile inputs for compile");
         let Self {
             crate_link_paths,
             can_trim_rlibs,
             inputs,
-            mut path_transformer,
+            path_transformer,
             rlib_dep_reader,
             env_vars,
-            clippy_dir,
+            input_dirs,
         } = *{ self };
 
         let dependency_names =
@@ -4100,27 +4136,9 @@ impl pkg::InputsPackager for RustInputsPackager {
         let crate_libraries =
             rust_dependency_candidates(&crate_link_paths, dependency_names.as_ref())?;
 
-        let mut tar_inputs = vec![];
-        let mut tar_traversal_dirs = vec![];
-        for input_path in inputs {
-            for traversal_dir in pkg::lexical_parent_traversal_dirs(&input_path) {
-                if !traversal_dir.is_dir() {
-                    bail!(
-                        "distributed Rust input requires missing traversal directory {}",
-                        traversal_dir.display()
-                    );
-                }
-                let dist_traversal_dir =
-                    path_transformer.as_dist(&traversal_dir).with_context(|| {
-                        format!(
-                            "unable to transform traversal directory {}",
-                            traversal_dir.display()
-                        )
-                    })?;
-                tar_traversal_dirs.push((traversal_dir, dist_traversal_dir));
-            }
-
-            let input_path = pkg::simplify_path(&input_path)?;
+        let mut paths = pkg::InputArchivePaths::new(path_transformer);
+        let mut all_tar_inputs = Vec::with_capacity(inputs.len() + crate_libraries.len());
+        for input_path in inputs.into_iter().chain(crate_libraries) {
             if !super::CAN_DIST_DYLIBS
                 && input_path
                     .extension()
@@ -4131,52 +4149,17 @@ impl pkg::InputsPackager for RustInputsPackager {
                     input_path.display()
                 );
             }
-
-            let dist_input_path = path_transformer.as_dist(&input_path).with_context(|| {
-                format!("unable to transform input path {}", input_path.display())
-            })?;
-
-            tar_inputs.push((input_path, dist_input_path));
+            all_tar_inputs.push(paths.file(&input_path)?);
         }
-
-        let mut tar_crate_libs = Vec::with_capacity(crate_libraries.len());
-        for path in crate_libraries {
-            let dist_path = path_transformer
-                .as_dist(&path)
-                .with_context(|| format!("unable to transform lib path {}", path.display()))?;
-            tar_crate_libs.push((path, dist_path));
-        }
-
-        let mut all_tar_inputs: Vec<_> = tar_inputs.into_iter().chain(tar_crate_libs).collect();
-        all_tar_inputs.sort();
-        // There are almost certainly duplicates from explicit externs also within the lib search paths
+        // The explicit externs and implicit search directories can refer to
+        // the same file, including via symlink aliases.
+        all_tar_inputs.sort_unstable();
         all_tar_inputs.dedup();
-
-        tar_traversal_dirs.sort_by(|a, b| a.1.cmp(&b.1));
-        tar_traversal_dirs.dedup_by(|a, b| a.1 == b.1);
+        for directory in input_dirs {
+            paths.directory(&directory)?;
+        }
 
         let mut builder = tar::Builder::new(wtr);
-
-        // Clippy checks that CLIPPY_CONF_DIR exists even when it has no
-        // configuration files. Include the directory and its tracked files.
-        if let Some(config_dir) = clippy_dir {
-            let dist_dir = path_transformer
-                .as_dist(&config_dir)
-                .context("Clippy config directory is not distributable")?;
-            let tar_dir = dist_dir.trim_start_matches('/');
-            if tar_dir.is_empty() || tar_dir.split('/').any(|part| part == "..") {
-                bail!("unsafe distributed Clippy config directory {dist_dir}");
-            }
-            builder.append_dir(tar_dir, config_dir)?;
-        }
-
-        for (local_dir, dist_dir) in tar_traversal_dirs {
-            let tar_dir = dist_dir.trim_start_matches('/');
-            if tar_dir.is_empty() || tar_dir.split('/').any(|part| part == "..") {
-                bail!("unsafe distributed traversal directory {dist_dir}");
-            }
-            builder.append_dir(tar_dir, local_dir)?;
-        }
 
         for (input_path, dist_input_path) in &all_tar_inputs {
             let mut file_header = pkg::make_tar_header(input_path, dist_input_path)?;
@@ -4204,6 +4187,7 @@ impl pkg::InputsPackager for RustInputsPackager {
             builder.append(&file_header, file)?;
         }
 
+        paths.append_support_entries(&mut builder)?;
         // Finish archive
         builder.into_inner()?;
         Ok(())
@@ -6582,8 +6566,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 Some("/clippy-config")
             );
 
-            // Legacy/noncanonical distributed commands must not forward a
-            // relative host path; resolve it against the *local* crate cwd.
+            // Physical Unix archives reconstruct the input path relative to
+            // the original cwd, so the observed relative value is unchanged.
             let mut noncanonical = compilation.clone();
             noncanonical.canonical_paths = None;
             let (_, config_value) = noncanonical
@@ -6604,7 +6588,11 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 legacy_dist.env_vars.iter().find_map(|(name, value)| {
                     (name == "CLIPPY_CONF_DIR").then_some(value.as_str())
                 }),
-                Some(policy.to_str().context("non-UTF8 policy path")?)
+                if cfg!(unix) {
+                    Some("../external-policy")
+                } else {
+                    Some(policy.to_str().context("non-UTF8 policy path")?)
+                }
             );
         }
         #[cfg(not(feature = "dist-client"))]
