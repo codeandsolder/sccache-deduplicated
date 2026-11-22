@@ -564,7 +564,7 @@ async fn store_blob(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::{Cache, CacheMode, CacheRead, CacheWrite, GetPathResult, IpcStorage};
+    use crate::cache::{Cache, CacheMode, CacheRead, CacheWrite, IpcStorage};
     use crate::client::ServerConnection;
     use crate::mock_command::ProcessCommandCreator;
     use crate::server::SccacheService;
@@ -615,10 +615,6 @@ mod tests {
 
         async fn max_size(&self) -> Result<Option<u64>> {
             Ok(Some(64 * 1024 * 1024))
-        }
-
-        async fn get_path(&self, _: &str) -> GetPathResult {
-            panic!("namespace IPC must not request a daemon filesystem path")
         }
     }
 

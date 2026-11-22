@@ -4456,7 +4456,22 @@ fn test_dist_toolchain_archive_contains_only_required_installed_targets() -> Res
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 impl pkg::ToolchainPackager for RustToolchainPackager {
+    fn prepare_namespace(self: Box<Self>) -> Result<(String, Box<dyn pkg::ToolchainPackager>)> {
+        self.package_builder()?.prepare_namespace()
+    }
+
     fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()> {
+        self.package_builder()?.into_compressed_tar(f)
+    }
+}
+
+#[cfg(all(
+    feature = "dist-client",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+impl RustToolchainPackager {
+    fn package_builder(self) -> Result<pkg::ToolchainPackageBuilder> {
         info!(
             "Packaging Rust compiler for sysroot {}",
             self.sysroot.display()
@@ -4466,7 +4481,7 @@ impl pkg::ToolchainPackager for RustToolchainPackager {
             canonical,
             host,
             target,
-        } = *self;
+        } = self;
 
         let mut package_builder = pkg::ToolchainPackageBuilder::new();
         if canonical {
@@ -4510,7 +4525,7 @@ impl pkg::ToolchainPackager for RustToolchainPackager {
             }
         }
 
-        package_builder.into_compressed_tar(f)
+        Ok(package_builder)
     }
 }
 

@@ -60,32 +60,6 @@ impl NamespaceClient {
     }
 }
 
-/// Isolate weak toolchain identities across independent filesystem namespaces.
-/// The packager still supplies its normal compiler/helper dependency identity.
-/// If namespace identity is unavailable, use the actual package digest instead
-/// of assuming that an identically named compiler belongs to this namespace.
-#[cfg(target_os = "linux")]
-fn namespace_fingerprint() -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
-    let namespace = std::fs::metadata("/proc/self/ns/mnt").ok()?;
-    let root = std::fs::metadata("/").ok()?;
-    let mountinfo = std::fs::read("/proc/self/mountinfo").ok()?;
-    let boot = std::fs::read("/proc/sys/kernel/random/boot_id").ok()?;
-    let mut digest = Digest::new();
-    digest.delimiter(b"mount-namespace-v1");
-    for value in [namespace.dev(), namespace.ino(), root.dev(), root.ino()] {
-        digest.update(&value.to_le_bytes());
-    }
-    digest.delimiter(&boot);
-    digest.delimiter(&mountinfo);
-    Some(digest.finish())
-}
-
-#[cfg(not(target_os = "linux"))]
-const fn namespace_fingerprint() -> Option<String> {
-    None
-}
-
 enum PackageSource {
     File(std::fs::File),
     Packager(Box<dyn ToolchainPackager>),
@@ -198,7 +172,7 @@ impl Client for NamespaceClient {
     async fn put_toolchain(
         &self,
         compiler: PathBuf,
-        weak_key: String,
+        _weak_key: String,
         packager: Box<dyn ToolchainPackager>,
     ) -> Result<(Toolchain, Option<CustomToolchainOverride>)> {
         ensure!(!self.toolchains.iter().any(|config| matches!(config, DistToolchainConfig::NoDist { compiler_executable } if *compiler_executable == compiler)), "compiler distribution is disabled in this namespace");
@@ -211,19 +185,9 @@ impl Client for NamespaceClient {
                 let key = Digest::reader_sync(&mut file)?;
                 file.seek(SeekFrom::Start(0))?;
                 (key, PackageSource::File(file))
-            } else if let Some(namespace) = namespace_fingerprint() {
-                let mut digest = Digest::new();
-                digest.delimiter(namespace.as_bytes());
-                digest.delimiter(weak_key.as_bytes());
-                if let Some(extra) = packager.cache_key_extension()? {
-                    digest.delimiter(extra.as_bytes());
-                }
-                (digest.finish(), PackageSource::Packager(packager))
             } else {
-                let mut file = construct_package(packager)?;
-                let key = Digest::reader_sync(&mut file)?;
-                file.seek(SeekFrom::Start(0))?;
-                (key, PackageSource::File(file))
+                let (key, prepared) = packager.prepare_namespace()?;
+                (key, PackageSource::Packager(prepared))
             };
             let TransferReply::Toolchain(found) =
                 conn.transfer(TransferRequest::LookupToolchain {

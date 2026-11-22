@@ -75,7 +75,6 @@ use crate::config::{self, CacheType};
 use crate::config::{Config, PreprocessorCacheModeConfig};
 use async_trait::async_trait;
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
 
 #[cfg(any(
     feature = "azure",
@@ -89,7 +88,6 @@ use serde::{Deserialize, Serialize};
     feature = "cos"
 ))]
 use std::io;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -106,17 +104,6 @@ use std::time::Duration;
 ))]
 use crate::errors::bail;
 use crate::errors::{Result, anyhow};
-
-/// Result of [`Storage::get_path`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum GetPathResult {
-    /// Cache hit: the entry lives at this filesystem path.
-    Found(PathBuf),
-    /// Cache miss: the key is not in the cache.
-    Miss,
-    /// This backend does not support direct file access; use `get`/`get_raw` instead.
-    Unsupported,
-}
 
 /// An interface to cache storage.
 #[async_trait]
@@ -224,12 +211,6 @@ pub trait Storage: Send + Sync {
     fn basedirs(&self) -> &[Vec<u8>] {
         &[]
     }
-    /// Return the filesystem path of the cached entry for `key`.
-    /// Default impl returns [`GetPathResult::Unsupported`].
-    async fn get_path(&self, _key: &str) -> GetPathResult {
-        GetPathResult::Unsupported
-    }
-
     /// Return the preprocessor cache entry for a given preprocessor key,
     /// if it exists.
     /// Only applicable when using preprocessor cache mode.
