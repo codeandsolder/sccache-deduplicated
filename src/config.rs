@@ -1083,7 +1083,7 @@ impl Environment {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct EnvConfig {
     cache: CacheConfigs,
     basedirs: Option<Vec<String>>,
