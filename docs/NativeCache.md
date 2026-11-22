@@ -260,3 +260,25 @@ own: inputs that have never varied provide no evidence. The report includes
 diagnostics and output metadata in the result identity. The audit deliberately
 uses a read-only offline index rather than adding an expensive enumeration
 endpoint to the scheduler's compilation listener.
+
+### Provisioning original Rust distribution packages
+
+An exclusive offline store can be preseeded with original Rust installer v3
+archives without running their install scripts or constructing toolchain tarballs:
+
+```sh
+sccache-dist native-import-rust --store /path/to/scheduler-store \
+  --archive rustc-nightly-x86_64-unknown-linux-gnu.tar.xz \
+  --sha256 CHECKSUM_FROM_RELEASE_MANIFEST --size COMPRESSED_BYTE_LENGTH \
+  --compression xz
+```
+
+The checksum and length identify the original archive. Component manifests
+select installed paths; the command emits the verified package and normalized
+installation tree IDs as JSON. The component trees reuse the original file
+blobs, and can be placed as layers in a root recipe. Repeating the command
+without `--archive` uses an already indexed original package. The operation
+requires exclusive access to the store, so provision it before starting its
+owner. Preseeded content is also available to ordinary mapped-tree upload
+negotiation. A release name alone does not attest an installed local sysroot;
+regular compiler discovery still hashes its observed installed contents.

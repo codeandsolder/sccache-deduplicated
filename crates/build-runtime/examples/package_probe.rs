@@ -16,14 +16,6 @@ mod unix {
         let package = PathBuf::from(args.next().context("expected package path")?);
         let hash = args.next().context("expected upstream SHA-256")?;
         let hash = hash.to_str().context("non-UTF-8 checksum")?;
-        let mut sha256 = [0_u8; 32];
-        ensure!(
-            hash.len() == 64 && hash.is_ascii(),
-            "invalid SHA-256 length"
-        );
-        for (index, value) in sha256.iter_mut().enumerate() {
-            *value = u8::from_str_radix(&hash[index * 2..index * 2 + 2], 16)?;
-        }
         let codec = args.next().context("expected package compression")?;
         let compression = match codec.to_str() {
             Some("gzip") => PackageCompression::Gzip,
@@ -33,11 +25,7 @@ mod unix {
         };
         ensure!(args.next().is_none(), "unexpected argument");
         let input = File::open(&package)?;
-        let source = PackageSource {
-            sha256,
-            size: input.metadata()?.len(),
-            compression,
-        };
+        let source = PackageSource::from_sha256_hex(hash, input.metadata()?.len(), compression)?;
         let modified = TreeTimestamp {
             seconds: 1_700_000_000,
             nanoseconds: 0,

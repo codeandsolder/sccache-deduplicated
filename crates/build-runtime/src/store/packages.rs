@@ -33,6 +33,27 @@ pub struct PackageSource {
     pub compression: PackageCompression,
 }
 
+impl PackageSource {
+    /// Parse an upstream SHA-256 checksum, with explicit archive length and codec.
+    /// # Errors
+    /// Returns an error for an invalid hexadecimal checksum.
+    pub fn from_sha256_hex(hash: &str, size: u64, compression: PackageCompression) -> Result<Self> {
+        ensure!(
+            hash.len() == 64 && hash.is_ascii(),
+            "invalid SHA-256 length"
+        );
+        let mut sha256 = [0; 32];
+        for (index, value) in sha256.iter_mut().enumerate() {
+            *value = u8::from_str_radix(&hash[index * 2..index * 2 + 2], 16)?;
+        }
+        Ok(Self {
+            sha256,
+            size,
+            compression,
+        })
+    }
+}
+
 /// Explicit normalization and expansion limits for an original package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackagePolicy {
@@ -328,6 +349,8 @@ fn normalize_path(mut bytes: &[u8], directory: bool) -> Result<Option<TreePath>>
     }
     Ok(Some(TreePath::new(bytes.to_vec())?))
 }
+
+mod rust_installer;
 
 #[cfg(test)]
 mod tests {

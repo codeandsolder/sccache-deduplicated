@@ -122,35 +122,7 @@ impl TreeRecipe {
                 selected.insert(path, mapped);
             }
         }
-        let mut external_hardlinks = BTreeMap::<&TreePath, TreePath>::new();
-        for (&path, mapped) in &selected {
-            let entry = package.entries.get(path).context("recipe entry missing")?;
-            let entry = match entry {
-                TreeEntry::Directory(_) => TreeEntry::Directory(self.directories),
-                TreeEntry::Hardlink(target) => {
-                    if let Some(target) = selected.get(target) {
-                        TreeEntry::Hardlink(target.clone())
-                    } else {
-                        match external_hardlinks.entry(target) {
-                            Entry::Occupied(previous) => {
-                                TreeEntry::Hardlink(previous.get().clone())
-                            }
-                            Entry::Vacant(first) => {
-                                first.insert(mapped.clone());
-                                package
-                                    .entries
-                                    .get(target)
-                                    .context("recipe external hardlink missing")?
-                                    .clone()
-                            }
-                        }
-                    }
-                }
-                other => other.clone(),
-            };
-            insert(&mut output.entries, mapped.clone(), entry)?;
-        }
-        Ok(())
+        project_entries(package, &selected, output)
     }
 
     fn add_directories(
@@ -172,6 +144,42 @@ impl TreeRecipe {
         }
         Ok(())
     }
+}
+
+/// Project selected archive entries into their destination paths, retaining
+/// hardlink topology even when the original file is outside the selection.
+pub(crate) fn project_entries(
+    package: &TreeManifest,
+    selected: &BTreeMap<&TreePath, TreePath>,
+    output: &mut TreeManifest,
+) -> Result<()> {
+    let mut external_hardlinks = BTreeMap::<&TreePath, TreePath>::new();
+    for (&path, mapped) in selected {
+        let entry = package.entries.get(path).context("recipe entry missing")?;
+        let entry = match entry {
+            TreeEntry::Directory(_) => TreeEntry::Directory(output.root),
+            TreeEntry::Hardlink(target) => {
+                if let Some(target) = selected.get(target) {
+                    TreeEntry::Hardlink(target.clone())
+                } else {
+                    match external_hardlinks.entry(target) {
+                        Entry::Occupied(previous) => TreeEntry::Hardlink(previous.get().clone()),
+                        Entry::Vacant(first) => {
+                            first.insert(mapped.clone());
+                            package
+                                .entries
+                                .get(target)
+                                .context("recipe external hardlink missing")?
+                                .clone()
+                        }
+                    }
+                }
+            }
+            other => other.clone(),
+        };
+        insert(&mut output.entries, mapped.clone(), entry)?;
+    }
+    Ok(())
 }
 
 fn map_path(path: &TreePath, layer: &TreeLayer) -> Result<Option<TreePath>> {

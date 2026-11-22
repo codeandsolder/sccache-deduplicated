@@ -176,6 +176,57 @@ fn check_jwt_server_token(
 
 fn run(command: Command) -> Result<i32> {
     match command {
+        Command::NativeImportRust {
+            store,
+            archive,
+            source,
+            max_entries,
+            max_expanded_bytes,
+        } => {
+            use sccache::build_runtime::{NativeStore, PackagePolicy, TreeMetadata, TreeTimestamp};
+            let modified = TreeTimestamp {
+                seconds: i64::try_from(tar::DETERMINISTIC_TIMESTAMP)?,
+                nanoseconds: 0,
+            };
+            let policy = PackagePolicy {
+                directory: TreeMetadata {
+                    mode: 0o755,
+                    modified,
+                },
+                modified,
+                max_entries,
+                max_expanded_bytes,
+            };
+            let store = NativeStore::open(&store)?;
+            let (package, reused) = if let Some(existing) = store.lookup_package(source, policy)? {
+                (existing.id(), true)
+            } else {
+                let archive = archive.context("upstream package unavailable; supply --archive")?;
+                (
+                    store.import_package(source, policy, std::fs::File::open(archive)?)?,
+                    false,
+                )
+            };
+            let before = store.stats()?;
+            let components = store.publish_rust_installer(package, policy.directory)?;
+            let after = store.stats()?;
+            anyhow::ensure!(
+                before.logical_bytes == after.logical_bytes && before.blobs == after.blobs,
+                "installer projection unexpectedly created content"
+            );
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "source": source,
+                    "package": package,
+                    "components": components,
+                    "reused_original_package": reused,
+                    "logical_bytes": after.logical_bytes,
+                    "blobs": after.blobs,
+                }))?
+            );
+            Ok(0)
+        }
         Command::NativeAudit {
             index,
             schema,

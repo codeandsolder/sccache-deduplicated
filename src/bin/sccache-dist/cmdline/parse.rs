@@ -147,6 +147,17 @@ fn get_clap_command() -> ClapCommand {
                 ),
         )
         .subcommand(
+            ClapCommand::new("native-import-rust")
+                .about("Verify an original Rust installer archive and index its component trees")
+                .arg(flag_infer_long("store").value_parser(clap::value_parser!(PathBuf)).required(true))
+                .arg(flag_infer_long("archive").value_parser(clap::value_parser!(PathBuf)))
+                .arg(flag_infer_long("sha256").required(true))
+                .arg(flag_infer_long("size").value_parser(clap::value_parser!(u64)).required(true))
+                .arg(flag_infer_long("compression").value_parser(["xz", "gzip", "tar"]).required(true))
+                .arg(flag_infer_long("max-entries").value_parser(clap::value_parser!(usize)).default_value("100000"))
+                .arg(flag_infer_long("max-expanded-bytes").value_parser(clap::value_parser!(u64)).default_value("8589934592"))
+        )
+        .subcommand(
             ClapCommand::new("native-audit")
                 .about("Inspect a closed native index or consistent offline snapshot without changing it")
                 .arg(flag_infer_long("index").value_parser(clap::value_parser!(PathBuf)).required(true))
@@ -233,6 +244,38 @@ pub fn try_parse_from(
             }
             _ => unreachable!("Subcommand is enforced by clap"),
         }),
+        Some(("native-import-rust", matches)) => {
+            use sccache::build_runtime::{PackageCompression, PackageSource};
+            let compression = match matches.get_one::<String>("compression").map(String::as_str) {
+                Some("xz") => PackageCompression::Xz,
+                Some("gzip") => PackageCompression::Gzip,
+                Some("tar") => PackageCompression::Tar,
+                _ => bail!("invalid package compression"),
+            };
+            let source = PackageSource::from_sha256_hex(
+                matches
+                    .get_one::<String>("sha256")
+                    .context("missing SHA-256")?,
+                *matches
+                    .get_one::<u64>("size")
+                    .context("missing package size")?,
+                compression,
+            )?;
+            Command::NativeImportRust {
+                store: matches
+                    .get_one::<PathBuf>("store")
+                    .context("missing store path")?
+                    .clone(),
+                archive: matches.get_one::<PathBuf>("archive").cloned(),
+                source,
+                max_entries: *matches
+                    .get_one::<usize>("max-entries")
+                    .context("missing entry limit")?,
+                max_expanded_bytes: *matches
+                    .get_one::<u64>("max-expanded-bytes")
+                    .context("missing expansion limit")?,
+            }
+        }
         Some(("native-audit", matches)) => Command::NativeAudit {
             index: matches
                 .get_one::<PathBuf>("index")
