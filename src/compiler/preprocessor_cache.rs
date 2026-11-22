@@ -25,6 +25,7 @@ use std::{
     hash::Hash,
     io::Write,
     path::{Path, PathBuf},
+    sync::LazyLock,
     time::SystemTime,
 };
 
