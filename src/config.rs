@@ -2211,6 +2211,22 @@ pub mod server {
         Token { token: String },
     }
 
+    /// Explicit native worker execution and store configuration.
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    #[serde(deny_unknown_fields)]
+    pub struct NativeWorkerConfig {
+        pub cache_url: HTTPUrl,
+        pub directory: PathBuf,
+        pub scratch: PathBuf,
+        pub bubblewrap: PathBuf,
+        pub platform_contract: String,
+        pub renewal_interval_secs: u64,
+        pub request_timeout_secs: u64,
+        pub execution_timeout_secs: u64,
+        pub max_result_bytes: u64,
+        pub max_metadata_bytes: u64,
+    }
+
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
     #[serde(deny_unknown_fields)]
     pub struct Config {
@@ -2225,6 +2241,7 @@ pub mod server {
         /// Other local archive-cache roots eligible for hash-verified reflink reuse.
         #[serde(default)]
         pub toolchain_archive_sources: Vec<PathBuf>,
+        pub native_worker: Option<NativeWorkerConfig>,
     }
 
     pub fn from_path(conf_path: &Path) -> Result<Option<Config>> {
@@ -3639,6 +3656,7 @@ fn server_toml_parse() {
             },
             toolchain_cache_size: 10737418240,
             toolchain_archive_sources: vec![],
+            native_worker: None,
         }
     )
 }

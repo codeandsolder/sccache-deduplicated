@@ -263,6 +263,7 @@ fn sccache_server_cfg(
         },
         toolchain_cache_size: TC_CACHE_SIZE,
         toolchain_archive_sources: vec![],
+        native_worker: None,
     }
 }
 

@@ -159,3 +159,42 @@ pub struct TreeRead {
     pub ticket: Ticket,
     pub manifest: TreeManifest,
 }
+
+/// Scheduler-issued capability to run exactly one native assignment over the
+/// worker's existing authenticated HTTPS service.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerAllocation {
+    pub address: std::net::SocketAddr,
+    pub job: u64,
+    pub auth: String,
+    pub certificate: Vec<u8>,
+}
+
+impl std::fmt::Debug for WorkerAllocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerAllocation")
+            .field("address", &self.address)
+            .field("job", &self.job)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScheduleReply {
+    Assigned(WorkerAllocation),
+    Unavailable { message: String },
+}
+
+/// Successful output bytes are retrieved from the scheduler. Failed
+/// compilations deliver their diagnostics once, without creating a cache hit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeRunResult {
+    Stored,
+    Failed {
+        code: Option<i32>,
+        signal: Option<i32>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+    JobNotFound,
+}

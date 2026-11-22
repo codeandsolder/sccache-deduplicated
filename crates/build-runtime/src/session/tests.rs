@@ -182,15 +182,29 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
         bail!("expected compilation");
     };
     let worker = "127.0.0.1:10501".parse()?;
-    service.delegate(ticket, worker, 42)?;
-    service.delegate(ticket, worker, 42)?;
-    assert!(
-        service
-            .delegate(ticket, "127.0.0.1:10502".parse()?, 42)
-            .is_err()
+    let allocation = WorkerAllocation {
+        address: worker,
+        job: 42,
+        auth: "proof".into(),
+        certificate: vec![1],
+    };
+    let expected = ScheduleReply::Assigned(allocation);
+    assert_eq!(
+        service.schedule(ticket, &request(), || Ok(expected.clone()))?,
+        expected
+    );
+    assert_eq!(
+        service.schedule(ticket, &request(), || bail!("duplicate allocation"))?,
+        expected
     );
     assert!(service.renew(ticket, Publisher::Client).is_err());
-    assert!(service.delegate(ticket, worker, 43).is_err());
+    let mut changed = request();
+    changed.required_outputs.insert("other".into());
+    assert!(
+        service
+            .schedule(ticket, &changed, || bail!("wrong declaration"))
+            .is_err()
+    );
     service.renew(
         ticket,
         Publisher::Worker {
@@ -210,7 +224,10 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
         },
         manifest(b"object"),
     )?;
-    assert!(service.delegate(ticket, worker, 42).is_err());
+    assert_eq!(
+        service.schedule(ticket, &request(), || bail!("duplicate assignment"))?,
+        expected
+    );
     Ok(())
 }
 

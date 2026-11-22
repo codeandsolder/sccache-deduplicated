@@ -11,18 +11,18 @@ use bincode::Options;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::build_runtime::{
-    BlobRef, ContentId, ResultManifest, TreeId, TreeManifest,
+    BlobRef, ContentId, ExecutionSpec, ResultManifest, TreeId, TreeManifest,
     wire::{
-        ActionRequest, BeginResult, NativeAdmission, NativeStatus, Ticket, TreeOffer, TreeRead,
-        UploadHeader,
+        BeginResult, NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply, Ticket,
+        TreeOffer, TreeRead, UploadHeader, WorkerAllocation,
     },
 };
-use crate::dist::{JobAlloc, JobId};
+use crate::dist::JobId;
 
 #[derive(Serialize, Deserialize)]
-pub(super) struct DelegateRequest {
+pub(super) struct ExecutionRequest {
     pub ticket: Ticket,
-    pub job: JobAlloc,
+    pub spec: ExecutionSpec,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -134,33 +134,65 @@ impl NativeCacheClient {
             .body(data)
             .send()?
             .error_for_status()?;
-        let mut bytes = Vec::new();
-        response
-            .take(self.metadata_limit + 1)
-            .read_to_end(&mut bytes)?;
-        ensure!(
-            u64::try_from(bytes.len())? <= self.metadata_limit,
-            "native response exceeds configured metadata limit"
-        );
-        Ok(codec()
-            .with_limit(self.metadata_limit)
-            .deserialize(&bytes)?)
+        decode_response(response, self.metadata_limit)
     }
 
     /// Admit a complete native action.
     ///
     /// # Errors
     /// Returns an error on invalid metadata, authentication or transport failure.
-    pub fn admit(&self, request: &ActionRequest) -> Result<NativeAdmission> {
-        self.control("admit", request)
+    pub fn admit(&self, spec: &ExecutionSpec) -> Result<NativeAdmission> {
+        self.control("admit", spec)
     }
 
-    /// Bind the ticket to a real scheduler allocation, using its capability.
+    /// Verify that a publisher is executing exactly the admitted specification.
     ///
     /// # Errors
-    /// Returns an error if the allocation or ticket is invalid.
-    pub fn delegate(&self, ticket: Ticket, job: JobAlloc) -> Result<()> {
-        self.control("delegate", &DelegateRequest { ticket, job })
+    /// Returns an error if the ticket, publisher or specification differs.
+    pub fn verify_execution(&self, ticket: Ticket, spec: ExecutionSpec) -> Result<()> {
+        self.control("verify", &ExecutionRequest { ticket, spec })
+    }
+
+    /// Allocate a compatible worker, replaying the same reservation on retry.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid or expired action.
+    pub fn schedule(&self, ticket: Ticket, spec: ExecutionSpec) -> Result<ScheduleReply> {
+        self.control("schedule", &ExecutionRequest { ticket, spec })
+    }
+
+    /// Claim a scheduler-assigned worker job over its authenticated HTTPS
+    /// endpoint. Successful outputs are read separately from the scheduler.
+    ///
+    /// # Errors
+    /// Returns an error for a rejected job, invalid certificate or transport
+    /// failure, or an oversized failure response.
+    pub fn run_worker(
+        allocation: &WorkerAllocation,
+        timeout: Duration,
+        max_response_bytes: u64,
+    ) -> Result<NativeRunResult> {
+        ensure!(
+            !timeout.is_zero() && max_response_bytes > 0 && max_response_bytes < u64::MAX,
+            "invalid native run limits"
+        );
+        let certificate = reqwest::Certificate::from_pem(&allocation.certificate)?;
+        let http = reqwest::blocking::Client::builder()
+            .tls_certs_only([certificate])
+            .timeout(timeout)
+            .connect_timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let url = crate::dist::http::urls::server_run_native_job(
+            crate::dist::ServerId::new(allocation.address),
+            JobId(allocation.job),
+        )?;
+        let response = http
+            .post(url)
+            .bearer_auth(&allocation.auth)
+            .send()?
+            .error_for_status()?;
+        decode_response(response, max_response_bytes)
     }
 
     /// Negotiate and upload a tree using the sender's immutable content.
@@ -385,9 +417,25 @@ impl NativeCacheClient {
     }
 }
 
+fn decode_response<T: DeserializeOwned>(
+    response: reqwest::blocking::Response,
+    limit: u64,
+) -> Result<T> {
+    let mut bytes = Vec::new();
+    response.take(limit + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        u64::try_from(bytes.len())? <= limit,
+        "native response exceeds configured limit"
+    );
+    Ok(codec().with_limit(limit).deserialize(&bytes)?)
+}
+
 pub(super) fn codec() -> impl Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .with_little_endian()
         .reject_trailing_bytes()
 }
+
+#[cfg(all(target_os = "linux", feature = "native-store"))]
+mod worker;

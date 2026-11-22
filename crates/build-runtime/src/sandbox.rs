@@ -16,7 +16,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
-use crate::{ContentId, identity::typed_digest};
+use crate::{BuildPath, CommandSpec, ContentId, identity::typed_digest};
 
 /// Canonical absolute path in the isolated mount namespace.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -320,37 +320,48 @@ impl SandboxInvocation {
         })
     }
 
-    /// Per-component digests for exact command and environment differences.
-    /// These are only part of a complete action fingerprint; the sandbox
-    /// policy, input trees and toolchain identity are separate components.
+    /// Construct the actual invocation from the portable action declaration.
     ///
     /// # Errors
-    /// Returns an error if encoding the argument sequence fails.
+    /// Returns an error if the declaration is invalid.
+    pub fn from_spec(spec: &CommandSpec) -> Result<Self> {
+        spec.validate()?;
+        Self::new(
+            OsStr::from_bytes(spec.executable.as_bytes()).to_os_string(),
+            spec.arguments
+                .iter()
+                .map(|arg| OsStr::from_bytes(arg).to_os_string())
+                .collect(),
+            Path::new(OsStr::from_bytes(spec.cwd.as_bytes())),
+            spec.environment.iter().map(|(key, value)| {
+                (
+                    OsStr::from_bytes(key).to_os_string(),
+                    OsStr::from_bytes(value).to_os_string(),
+                )
+            }),
+        )
+    }
+
+    /// Per-component digests for exact command and environment differences.
+    ///
+    /// # Errors
+    /// Returns an error for invalid or unencodable process inputs.
     pub fn input_components(&self) -> Result<BTreeMap<String, ContentId>> {
-        let arguments: Vec<_> = self.arguments.iter().map(|arg| arg.as_bytes()).collect();
-        let mut components = BTreeMap::from([
-            (
-                "command/executable".into(),
-                ContentId::of(self.executable.as_bytes()),
-            ),
-            (
-                "command/arguments".into(),
-                ContentId(typed_digest(b"sccache-sandbox-argv-v1\0", &arguments)?),
-            ),
-            (
-                "command/cwd".into(),
-                ContentId::of(self.cwd.as_path().as_os_str().as_bytes()),
-            ),
-        ]);
-        for (name, value) in &self.environment {
-            // Escape raw bytes injectively, preserving useful names for
-            // auditing without storing observed environment values.
-            components.insert(
-                format!("environment/{}", name.as_bytes().escape_ascii()),
-                ContentId::of(value.as_bytes()),
-            );
+        CommandSpec {
+            executable: BuildPath::new(self.executable.as_bytes().to_vec())?,
+            arguments: self
+                .arguments
+                .iter()
+                .map(|arg| arg.as_bytes().to_vec())
+                .collect(),
+            cwd: BuildPath::new(self.cwd.as_path().as_os_str().as_bytes().to_vec())?,
+            environment: self
+                .environment
+                .iter()
+                .map(|(key, value)| (key.as_bytes().to_vec(), value.as_bytes().to_vec()))
+                .collect(),
         }
-        Ok(components)
+        .input_components()
     }
 }
 

@@ -4,7 +4,6 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs::File,
     io::Read,
-    net::SocketAddr,
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicUsize, Ordering},
@@ -18,8 +17,8 @@ use crate::{
     Admission, BlobRef, BuildCoordinator, CompilePermit, ContentId, NativeStore, ResultLease,
     ResultManifest, StagedBlob, TreeId, TreeLease, TreeManifest, UploadReservation,
     wire::{
-        ActionRequest, BeginResult, NativeAdmission, NativeStatus, Publisher, Ticket, TreeOffer,
-        TreeRead,
+        ActionRequest, BeginResult, NativeAdmission, NativeStatus, Publisher, ScheduleReply,
+        Ticket, TreeOffer, TreeRead, WorkerAllocation,
     },
 };
 
@@ -144,6 +143,7 @@ struct PendingAction {
     permit: CompilePermit,
     inputs: Vec<TreeLease>,
     upload: Option<(ResultManifest, Transfer)>,
+    allocation: Option<WorkerAllocation>,
 }
 
 enum Pending {
@@ -415,6 +415,7 @@ impl NativeSessions {
                     permit,
                     inputs,
                     upload: None,
+                    allocation: None,
                 }));
                 let ticket =
                     self.register(Kind::Action, publisher, Phase::Pending(Box::new(pending)))?;
@@ -423,24 +424,76 @@ impl NativeSessions {
         }
     }
 
-    /// Bind an unstarted client ticket to the scheduler-selected worker.
+    /// Allocate one scheduler job for a pending action, or replay the
+    /// original allocation after a lost response. The per-action lock
+    /// serializes allocation without blocking unrelated actions.
     ///
     /// # Errors
-    /// Returns an error if the ticket has begun publication or is delegated.
-    pub fn delegate(&self, ticket: Ticket, address: SocketAddr, job: u64) -> Result<()> {
+    /// Returns an error if the declaration differs, the ticket is not pending,
+    /// or allocation fails.
+    pub fn schedule(
+        &self,
+        ticket: Ticket,
+        request: &ActionRequest,
+        allocate: impl FnOnce() -> Result<ScheduleReply>,
+    ) -> Result<ScheduleReply> {
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
         self.touch(&mut state)?;
+        let publisher = state.publisher;
+        let Phase::Pending(pending) = &mut state.phase else {
+            bail!("native ticket is no longer pending");
+        };
+        let Pending::Action(action) = &mut **pending else {
+            bail!("native ticket is not an action");
+        };
         ensure!(
-            matches!(&state.phase, Phase::Pending(pending) if matches!(&**pending, Pending::Action(action) if action.upload.is_none())),
-            "native ticket is no longer delegatable"
+            &action.request == request,
+            "allocation declaration differs from admission"
         );
-        let publisher = Publisher::Worker { address, job };
+        if let Some(allocation) = &action.allocation {
+            return Ok(ScheduleReply::Assigned(allocation.clone()));
+        }
         ensure!(
-            state.publisher == Publisher::Client || state.publisher == publisher,
-            "native ticket already delegated"
+            publisher == Publisher::Client && action.upload.is_none(),
+            "native action already has a publisher"
         );
-        state.publisher = publisher;
+        let reply = allocate()?;
+        if let ScheduleReply::Assigned(allocation) = &reply {
+            action.allocation = Some(allocation.clone());
+            state.publisher = Publisher::Worker {
+                address: allocation.address,
+                job: allocation.job,
+            };
+        }
+        state.expires = self.deadline();
+        drop(state);
+        Ok(reply)
+    }
+
+    /// Verify that the executing worker received the admitted declaration.
+    ///
+    /// # Errors
+    /// Returns an error for unauthorized, expired or mismatched actions.
+    pub fn verify_execution(
+        &self,
+        ticket: Ticket,
+        publisher: Publisher,
+        request: &ActionRequest,
+    ) -> Result<()> {
+        let session = self.get(ticket)?;
+        let mut state = Self::lock(&session)?;
+        self.authorize(&mut state, publisher)?;
+        let Phase::Pending(pending) = &state.phase else {
+            bail!("native action no longer pending");
+        };
+        let Pending::Action(action) = &**pending else {
+            bail!("native ticket is not an action");
+        };
+        ensure!(
+            &action.request == request,
+            "execution declaration differs from admission"
+        );
         drop(state);
         Ok(())
     }
@@ -561,12 +614,13 @@ impl NativeSessions {
         action_ticket: Option<Ticket>,
     ) -> Result<TreeRead> {
         self.reap()?;
-        let lease = if reader == Publisher::Client {
-            self.store().lookup_tree(id)?
+        let action = if reader == Publisher::Client {
+            None
         } else {
-            let action =
-                self.get(action_ticket.context("worker tree request needs its action ticket")?)?;
-            let mut state = Self::lock(&action)?;
+            Some(self.get(action_ticket.context("worker tree request needs its action ticket")?)?)
+        };
+        let state = if let Some(action) = &action {
+            let mut state = Self::lock(action)?;
             self.authorize(&mut state, reader)?;
             let Phase::Pending(pending) = &state.phase else {
                 bail!("worker action no longer pending");
@@ -578,10 +632,16 @@ impl NativeSessions {
                 action.request.input_trees.contains(&id),
                 "tree is not an input of this action"
             );
-            // The action pins this tree while the delivery lease is acquired.
-            self.store().lookup_tree(id)?
-        }
-        .context("native input tree unavailable")?;
+            Some(state)
+        } else {
+            None
+        };
+        // The action pins this tree until the delivery lease is acquired.
+        let lease = self
+            .store()
+            .lookup_tree(id)?
+            .context("native input tree unavailable")?;
+        drop(state);
         let manifest = lease.manifest().clone();
         let ticket = self.register(Kind::Tree, reader, Phase::Ready(Ready::Tree(lease)))?;
         Ok(TreeRead { ticket, manifest })

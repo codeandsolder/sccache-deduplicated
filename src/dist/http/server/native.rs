@@ -11,19 +11,19 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::{ClientAuthCheck, ServerAuthenticator, authenticate_client, authenticate_server};
 use crate::{
     build_runtime::{
-        NativeSessions, NativeStore,
-        wire::{ActionRequest, Publisher, UploadHeader},
+        ExecutionSpec, NativeSessions, NativeStore,
+        wire::{Publisher, ScheduleReply, UploadHeader},
     },
     config::scheduler::NativeCacheConfig,
-    dist::{
-        JobAlloc, SchedulerIncoming,
-        native::{DelegateRequest, DownloadRequest, ManifestRequest, OpenTreeRequest, codec},
-    },
+    dist::native::{DownloadRequest, ExecutionRequest, ManifestRequest, OpenTreeRequest, codec},
 };
 
-pub(super) fn spawn<S: SchedulerIncoming + 'static>(
+pub(super) type Allocator =
+    dyn Fn(crate::dist::NativeAssignment) -> Result<ScheduleReply> + Send + Sync;
+
+pub(super) fn spawn(
     config: NativeCacheConfig,
-    handler: Arc<S>,
+    allocate: impl Fn(crate::dist::NativeAssignment) -> Result<ScheduleReply> + Send + Sync + 'static,
     client_auth: Arc<dyn ClientAuthCheck>,
     server_auth: Arc<ServerAuthenticator>,
 ) -> Result<()> {
@@ -38,7 +38,7 @@ pub(super) fn spawn<S: SchedulerIncoming + 'static>(
         respond(
             request,
             &sessions,
-            &|job| handler.handle_authorize_native_job(job),
+            &allocate,
             &*client_auth,
             &*server_auth,
             metadata_limit,
@@ -74,7 +74,7 @@ const PREFIX: &str = "/api/v2/native/";
 fn respond(
     request: &Request,
     sessions: &NativeSessions,
-    authorize_job: &dyn Fn(&JobAlloc) -> Result<()>,
+    allocate: &Allocator,
     client_auth: &dyn ClientAuthCheck,
     server_auth: &ServerAuthenticator,
     limit: usize,
@@ -117,14 +117,7 @@ fn respond(
     if request.header("Content-Type") != Some("application/octet-stream") {
         return Response::empty_400();
     }
-    match dispatch(
-        request,
-        sessions,
-        authorize_job,
-        publisher,
-        operation,
-        limit,
-    ) {
+    match dispatch(request, sessions, allocate, publisher, operation, limit) {
         Ok(response) => response,
         Err(error) => {
             // Do not return host paths, auth tokens or raw internal metadata
@@ -138,21 +131,25 @@ fn respond(
 fn dispatch(
     request: &Request,
     sessions: &NativeSessions,
-    authorize_job: &dyn Fn(&JobAlloc) -> Result<()>,
+    allocate: &Allocator,
     publisher: Publisher,
     operation: &str,
     limit: usize,
 ) -> Result<Response> {
     match operation {
         "admit" if publisher == Publisher::Client => {
-            let input: ActionRequest = metadata(request, limit)?;
-            encode(&sessions.admit(input, publisher)?, limit)
+            let input: ExecutionSpec = metadata(request, limit)?;
+            encode(&sessions.admit(input.action_request()?, publisher)?, limit)
         }
-        "delegate" if publisher == Publisher::Client => {
-            let DelegateRequest { ticket, job } = metadata(request, limit)?;
-            authorize_job(&job)?;
-            sessions.delegate(ticket, job.server_id.addr(), job.job_id.0)?;
-            encode(&(), limit)
+        "schedule" if publisher == Publisher::Client => {
+            let ExecutionRequest { ticket, spec } = metadata(request, limit)?;
+            let request = spec.action_request()?;
+            encode(
+                &sessions.schedule(ticket, &request, || {
+                    allocate(crate::dist::NativeAssignment { ticket, spec })
+                })?,
+                limit,
+            )
         }
         "status" if publisher == Publisher::Client => {
             encode(&sessions.status(metadata(request, limit)?)?, limit)
@@ -175,6 +172,11 @@ fn dispatch(
         "tree_open" => {
             let OpenTreeRequest { action, tree } = metadata(request, limit)?;
             encode(&sessions.open_tree(tree, publisher, Some(action))?, limit)
+        }
+        "verify" => {
+            let ExecutionRequest { ticket, spec } = metadata(request, limit)?;
+            sessions.verify_execution(ticket, publisher, &spec.action_request()?)?;
+            encode(&(), limit)
         }
         "begin" => {
             let ManifestRequest { ticket, manifest } = metadata(request, limit)?;
@@ -203,7 +205,7 @@ fn dispatch(
     }
 }
 
-fn metadata<T: DeserializeOwned>(request: &Request, limit: usize) -> Result<T> {
+pub(super) fn metadata<T: DeserializeOwned>(request: &Request, limit: usize) -> Result<T> {
     let limit = u64::try_from(limit)?;
     let max_read = limit
         .checked_add(1)

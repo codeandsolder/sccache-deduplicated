@@ -966,6 +966,21 @@ impl<'a> InputsReader<'a> {
 #[cfg(feature = "dist-server")]
 type ExtResult<T, E> = ::std::result::Result<T, E>;
 
+/// Native assignment contains the exact declaration admitted by the cache.
+#[cfg(feature = "dist-server")]
+#[derive(Clone, Serialize, Deserialize)]
+pub struct NativeAssignment {
+    pub ticket: crate::build_runtime::wire::Ticket,
+    pub spec: crate::build_runtime::ExecutionSpec,
+}
+
+/// One scheduler assignment routed through the common capacity accounting.
+#[cfg(feature = "dist-server")]
+pub enum JobAssignment {
+    Archive(Toolchain),
+    Native(Box<NativeAssignment>),
+}
+
 #[cfg(feature = "dist-server")]
 pub trait SchedulerOutgoing {
     // To Server
@@ -973,7 +988,7 @@ pub trait SchedulerOutgoing {
         &self,
         server_id: ServerId,
         job_id: JobId,
-        tc: Toolchain,
+        assignment: JobAssignment,
         auth: String,
     ) -> Result<AssignJobResult>;
 }
@@ -999,9 +1014,17 @@ pub trait SchedulerIncoming: Send + Sync {
         requester: &dyn SchedulerOutgoing,
         tc: Toolchain,
     ) -> ExtResult<AllocJobResult, Error>;
-    /// Verify the allocation capability and return the currently assigned
-    /// publisher for native result delivery.
-    fn handle_authorize_native_job(&self, job: &JobAlloc) -> ExtResult<(), Error>;
+    fn handle_alloc_native_job(
+        &self,
+        requester: &dyn SchedulerOutgoing,
+        assignment: NativeAssignment,
+    ) -> ExtResult<AllocJobResult, Error>;
+    fn handle_update_native_platform(
+        &self,
+        server_id: ServerId,
+        nonce: ServerNonce,
+        platform: Option<crate::build_runtime::ContentId>,
+    ) -> ExtResult<(), Error>;
     // From Server
     fn handle_heartbeat_server(
         &self,
@@ -1044,6 +1067,18 @@ pub trait SchedulerIncoming: Send + Sync {
 pub trait ServerIncoming: Send + Sync {
     // From Scheduler
     fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> ExtResult<AssignJobResult, Error>;
+    fn native_platform(&self) -> Option<crate::build_runtime::ContentId>;
+    fn native_metadata_limit(&self) -> Option<usize>;
+    fn handle_assign_native_job(
+        &self,
+        job_id: JobId,
+        assignment: NativeAssignment,
+    ) -> ExtResult<AssignJobResult, Error>;
+    fn handle_run_native_job(
+        &self,
+        requester: &dyn ServerOutgoing,
+        job_id: JobId,
+    ) -> ExtResult<crate::build_runtime::wire::NativeRunResult, Error>;
     // Reconcile scheduler-side reservations against local unclaimed jobs.
     // The cutoff predates the heartbeat request; later assignments must survive.
     fn handle_reconcile_assignments(

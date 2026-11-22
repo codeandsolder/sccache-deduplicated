@@ -8,7 +8,9 @@
 
 mod identity;
 mod recipe;
+mod spec;
 pub use recipe::{TreeLayer, TreeRecipe};
+pub use spec::{BuildPath, CommandSpec, ExecutionSpec, OutputSpec};
 mod tree;
 pub mod wire;
 pub use identity::{
@@ -32,8 +34,12 @@ pub use store::{
     PackagePolicy, PackageSource, Published, ResultLease, StagedBlob, TreeLease, UploadReservation,
 };
 
+#[cfg(all(target_os = "linux", feature = "store"))]
+mod execution;
 #[cfg(target_os = "linux")]
 pub mod sandbox;
+#[cfg(all(target_os = "linux", feature = "store"))]
+pub use execution::{CapturedExecution, ExecutionPolicy, execute};
 
 #[cfg(all(target_os = "linux", feature = "store"))]
 pub use store::{MaterializationStats, MaterializedTree};

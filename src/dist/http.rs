@@ -282,6 +282,20 @@ pub mod urls {
     /// # Errors
     ///
     /// Returns an error if the generated server URL is invalid.
+    pub fn server_assign_native_job(server_id: ServerId, job_id: JobId) -> Result<reqwest::Url> {
+        Ok(reqwest::Url::parse(&format!(
+            "https://{}/api/v3/distserver/assign_native_job/{job_id}",
+            server_id.addr()
+        ))?)
+    }
+
+    pub fn server_run_native_job(server_id: ServerId, job_id: JobId) -> Result<reqwest::Url> {
+        Ok(reqwest::Url::parse(&format!(
+            "https://{}/api/v3/distserver/run_native_job/{job_id}",
+            server_id.addr()
+        ))?)
+    }
+
     pub fn server_assign_job(server_id: ServerId, job_id: JobId) -> Result<reqwest::Url> {
         let url = format!(
             "https://{}/api/v1/distserver/assign_job/{job_id}",
@@ -338,12 +352,19 @@ mod server {
         RunJobHttpRequest, ServerCertificateHttpResponse, WorkerNameHttpResponse,
     };
     use super::urls;
+    use crate::build_runtime::{
+        ContentId,
+        wire::{ScheduleReply, WorkerAllocation},
+    };
     use crate::dist::{
-        self, AllocJobResult, AssignJobResult, HeartbeatServerResult, InputsReader, JobAuthorizer,
-        JobId, JobState, RunJobResult, SchedulerStatusResult, ServerId, ServerNonce,
-        SubmitToolchainResult, Toolchain, ToolchainReader, UpdateJobStateResult,
+        self, AllocJobResult, AssignJobResult, HeartbeatServerResult, InputsReader, JobAssignment,
+        JobAuthorizer, JobId, JobState, NativeAssignment, RunJobResult, SchedulerStatusResult,
+        ServerId, ServerNonce, SubmitToolchainResult, ToolchainReader, UpdateJobStateResult,
     };
     use crate::errors::{Context, Result, anyhow};
+    use crate::util::BASE64_URL_SAFE_ENGINE;
+    use base64::Engine;
+    use bincode::Options;
 
     mod native;
 
@@ -970,17 +991,47 @@ mod server {
                 check_server_auth,
                 native_cache,
             } = self;
-            let requester = SchedulerRequester {
+            let requester = Arc::new(SchedulerRequester {
                 client: Mutex::new(new_reqwest_blocking_client()?),
-            };
+            });
+            let server_certificates =
+                Arc::new(Mutex::new(HashMap::<ServerId, (Vec<u8>, Vec<u8>)>::new()));
 
             let handler = Arc::new(handler);
             let check_client_auth: Arc<dyn ClientAuthCheck> = Arc::from(check_client_auth);
             let check_server_auth: Arc<ServerAuthenticator> = Arc::from(check_server_auth);
             if let Some(config) = native_cache {
+                let handler = Arc::clone(&handler);
+                let requester = Arc::clone(&requester);
+                let certs = Arc::clone(&server_certificates);
                 native::spawn(
                     config,
-                    Arc::clone(&handler),
+                    move |assignment| match handler
+                        .handle_alloc_native_job(&*requester, assignment)?
+                    {
+                        AllocJobResult::Success {
+                            job_alloc,
+                            need_toolchain,
+                        } => {
+                            anyhow::ensure!(!need_toolchain, "native allocation requested archive");
+                            let certificate = certs
+                                .lock()
+                                .map_err(|_| anyhow!("server certificate mutex poisoned"))?
+                                .get(&job_alloc.server_id)
+                                .context("native worker certificate unavailable")?
+                                .1
+                                .clone();
+                            Ok(ScheduleReply::Assigned(WorkerAllocation {
+                                address: job_alloc.server_id.addr(),
+                                job: job_alloc.job_id.0,
+                                auth: job_alloc.auth,
+                                certificate,
+                            }))
+                        }
+                        AllocJobResult::Fail { msg } => {
+                            Ok(ScheduleReply::Unavailable { message: msg })
+                        }
+                    },
                     Arc::clone(&check_client_auth),
                     Arc::clone(&check_server_auth),
                 )?;
@@ -1039,8 +1090,6 @@ mod server {
             info!("Scheduler listening for clients on {}", public_addr);
             let request_count = atomic::AtomicUsize::new(0);
             // From server_id -> cert_digest, cert_pem
-            let server_certificates: Mutex<HashMap<ServerId, (Vec<u8>, Vec<u8>)>> =
-                Default::default();
 
             let server = rouille::Server::new(public_addr, move |request| {
                 let req_id = request_count.fetch_add(1, atomic::Ordering::Relaxed);
@@ -1053,7 +1102,7 @@ mod server {
                         let toolchain = try_or_400_log!(req_id, bincode_input(request));
                         trace!("Req {}: alloc_job: {:?}", req_id, toolchain);
 
-                        let alloc_job_res: AllocJobResult = try_or_500_log!(req_id, handler.handle_alloc_job(&requester, toolchain));
+                        let alloc_job_res: AllocJobResult = try_or_500_log!(req_id, handler.handle_alloc_job(&*requester, toolchain));
                         let certs = try_or_500_log!(
                             req_id,
                             server_certificates
@@ -1097,6 +1146,10 @@ mod server {
                         let worker_name = request
                             .header("X-Sccache-Worker-Name")
                             .map(ToOwned::to_owned);
+                        let native_platform = try_or_400_log!(req_id, request.header("X-Sccache-Native-Platform").map(|value| -> Result<ContentId> {
+                            let bytes = BASE64_URL_SAFE_ENGINE.decode(value)?;
+                            Ok(ContentId(bytes.try_into().map_err(|_| anyhow!("invalid native platform digest"))?))
+                        }).transpose());
                         let heartbeat_server = try_or_400_log!(req_id, bincode_input(request));
                         trace!(target: "sccache_heartbeat", "Req {}: heartbeat_server: {:?}", req_id, heartbeat_server);
 
@@ -1126,6 +1179,7 @@ mod server {
                             cpu_capacity, &running_job_ids,
                             job_authorizer
                         ));
+                        try_or_500_log!(req_id, handler.handle_update_native_platform(server_id, worker_name_nonce.clone(), native_platform));
                         if let Some(worker_name) = worker_name
                             && let Err(error) = handler.handle_update_worker_name(
                                 server_id,
@@ -1184,10 +1238,13 @@ mod server {
             &self,
             server_id: ServerId,
             job_id: JobId,
-            tc: Toolchain,
+            assignment: JobAssignment,
             auth: String,
         ) -> Result<AssignJobResult> {
-            let url = urls::server_assign_job(server_id, job_id)?;
+            let url = match &assignment {
+                JobAssignment::Archive(_) => urls::server_assign_job(server_id, job_id)?,
+                JobAssignment::Native(_) => urls::server_assign_native_job(server_id, job_id)?,
+            };
             let req = {
                 let client = self
                     .client
@@ -1195,8 +1252,14 @@ mod server {
                     .map_err(|_| anyhow!("scheduler HTTP client mutex poisoned"))?;
                 client.post(url)
             };
-            bincode_req(req.bearer_auth(auth).bincode(&tc)?)
-                .context("POST to scheduler assign_job failed")
+            let req = req.bearer_auth(auth).timeout(HEARTBEAT_TIMEOUT);
+            let req = match assignment {
+                JobAssignment::Archive(tc) => req.bincode(&tc)?,
+                JobAssignment::Native(assignment) => req
+                    .header("Content-Type", "application/octet-stream")
+                    .body(crate::dist::native::codec().serialize(&*assignment)?),
+            };
+            bincode_req(req).context("POST to worker assignment failed")
         }
     }
 
@@ -1300,6 +1363,7 @@ mod server {
             let mut load_aware_capacity = LoadAwareCapacity::new();
             let handler = Arc::new(handler);
             let heartbeat_handler = Arc::clone(&handler);
+            let native_platform = handler.native_platform();
             let running_jobs = Arc::new(Mutex::new(HashSet::<JobId>::new()));
             let heartbeat_running_jobs = Arc::clone(&running_jobs);
             let heartbeat_jwt_key = jwt_key.clone();
@@ -1346,6 +1410,12 @@ mod server {
                     if let Some(worker_name) = worker_name.as_ref() {
                         heartbeat_request =
                             heartbeat_request.header("X-Sccache-Worker-Name", worker_name);
+                    }
+                    if let Some(platform) = native_platform {
+                        heartbeat_request = heartbeat_request.header(
+                            "X-Sccache-Native-Platform",
+                            BASE64_URL_SAFE_ENGINE.encode(platform.0),
+                        );
                     }
                     let heartbeat_result = heartbeat_request
                         .bincode(&heartbeat_req)
@@ -1396,6 +1466,20 @@ mod server {
 
                         let res: AssignJobResult = try_or_500_log!(req_id, handler.handle_assign_job(job_id, toolchain));
                         prepare_response(request, &res)
+                    },
+                    (POST) (/api/v3/distserver/assign_native_job/{job_id: JobId}) => {
+                        job_auth_or_401!(request, &job_authorizer, job_id);
+                        let limit = try_or_400_log!(req_id, handler.native_metadata_limit().context("native worker disabled"));
+                        let assignment: NativeAssignment = try_or_400_log!(req_id, native::metadata(request, limit));
+                        let res = try_or_500_log!(req_id, handler.handle_assign_native_job(job_id, assignment));
+                        prepare_response(request, &res)
+                    },
+                    (POST) (/api/v3/distserver/run_native_job/{job_id: JobId}) => {
+                        job_auth_or_401!(request, &job_authorizer, job_id);
+                        let _running_job = try_or_500_log!(req_id, RunningJobGuard::new(&running_jobs, job_id));
+                        let res = try_or_500_log!(req_id, handler.handle_run_native_job(&requester, job_id));
+                        let data = try_or_500_log!(req_id, crate::dist::native::codec().serialize(&res));
+                        rouille::Response::from_data("application/octet-stream", data)
                     },
                     (POST) (/api/v1/distserver/submit_toolchain/{job_id: JobId}) => {
                         job_auth_or_401!(request, &job_authorizer, job_id);

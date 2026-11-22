@@ -383,6 +383,27 @@ fn test_dist_nobuilder() {
 
 struct FailingServer;
 impl ServerIncoming for FailingServer {
+    fn native_metadata_limit(&self) -> Option<usize> {
+        None
+    }
+
+    fn native_platform(&self) -> Option<sccache::build_runtime::ContentId> {
+        None
+    }
+    fn handle_assign_native_job(
+        &self,
+        _job_id: JobId,
+        _assignment: sccache::dist::NativeAssignment,
+    ) -> Result<AssignJobResult> {
+        anyhow::bail!("mock does not accept native assignments")
+    }
+    fn handle_run_native_job(
+        &self,
+        _requester: &dyn ServerOutgoing,
+        _job_id: JobId,
+    ) -> Result<sccache::build_runtime::wire::NativeRunResult> {
+        anyhow::bail!("mock does not execute native assignments")
+    }
     fn handle_reconcile_assignments(
         &self,
         _assigned_job_ids: &[JobId],
