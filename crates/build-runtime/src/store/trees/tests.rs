@@ -218,7 +218,7 @@ fn result_tree_and_input_tree_share_and_retain_leaf_blobs() -> Result<()> {
         schema: "generated-tree-test".into(),
         components: BTreeMap::from([("compiler".into(), ContentId::of(b"rustc"))]),
     };
-    let published = store.publish(&fingerprint, &result, vec![])?;
+    let published = store.publish(&fingerprint, &result, vec![], crate::ActionMode::Reuse)?;
     assert_eq!(store.stats()?.blobs, 1);
     let lease = store
         .lookup(published.action)?

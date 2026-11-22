@@ -1501,8 +1501,8 @@ impl PartialEq<Self> for CompileResult {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (&Self::Error, &Self::Error) | (&Self::CacheHit(_), &Self::CacheHit(_)) => true,
-            (Self::CacheMiss(m, dt, _, _), Self::CacheMiss(n, dt2, _, _)) => m == n && dt == dt2,
-            (Self::NativeMiss(m, dt, _), Self::NativeMiss(n, dt2, _)) => m == n && dt == dt2,
+            (Self::CacheMiss(m, dt, _, _), Self::CacheMiss(n, dt2, _, _))
+            | (Self::NativeMiss(m, dt, _), Self::NativeMiss(n, dt2, _)) => m == n && dt == dt2,
             (Self::NotCached(dt, _), Self::NotCached(dt2, _))
             | (Self::NotCacheable(dt, _), Self::NotCacheable(dt2, _))
             | (Self::CompileFailed(dt, _), Self::CompileFailed(dt2, _)) => dt == dt2,

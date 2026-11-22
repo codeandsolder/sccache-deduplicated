@@ -151,7 +151,13 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
         result.diagnostics().1.context("stderr missing")?.id,
         ContentId::of(b"failed")
     );
-    verify_writable_mounts_and_invalid_outputs(&mut spec, &store, &policy, src)?;
+    verify_writable_mounts_and_invalid_outputs(
+        &mut spec,
+        &store,
+        &policy,
+        src,
+        &original_manifest,
+    )?;
     Ok(())
 }
 
@@ -160,6 +166,7 @@ fn verify_writable_mounts_and_invalid_outputs(
     store: &NativeStore,
     policy: &ExecutionPolicy,
     src: crate::TreeId,
+    original_manifest: &TreeManifest,
 ) -> Result<()> {
     // Two mounts of the same tree must be independent even when one is
     // writable. Preserve the compiler's relative output path and input
@@ -238,7 +245,7 @@ fn verify_writable_mounts_and_invalid_outputs(
             .lookup_tree(src)?
             .context("original input")?
             .manifest(),
-        &original_manifest
+        original_manifest
     );
     // Generated-only mode never returns existing input files, even if the
     // original logical output directory also contains compiler dependencies.

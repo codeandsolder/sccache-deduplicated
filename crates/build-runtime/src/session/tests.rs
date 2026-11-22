@@ -416,7 +416,8 @@ fn tree_result_contract_rejects_wrong_kinds_and_duplicate_logical_overflow() -> 
     request
         .required_outputs
         .insert("obj".into(), OutputKind::Tree);
-    let NativeAdmission::Compile { ticket } = service.admit(request.clone(), Publisher::Client)?
+    let NativeAdmission::Compile { ticket } =
+        service.admit(request.clone(), Publisher::Client, ActionMode::Reuse)?
     else {
         bail!("expected tree miss");
     };
@@ -475,7 +476,8 @@ fn tree_result_contract_rejects_wrong_kinds_and_duplicate_logical_overflow() -> 
     service.upload(ticket, Publisher::Client, blob, data.as_slice())?;
     assert_eq!(service.commit(ticket, Publisher::Client)?, result);
     service.close(ticket, Publisher::Client)?;
-    let NativeAdmission::Hit { ticket, manifest } = service.admit(request, Publisher::Client)?
+    let NativeAdmission::Hit { ticket, manifest } =
+        service.admit(request, Publisher::Client, ActionMode::Reuse)?
     else {
         bail!("expected tree hit");
     };
@@ -520,7 +522,7 @@ fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result
         bail!("expected initial compilation");
     };
     let old = manifest(b"old");
-    let old_blob = old.outputs["obj"].blob;
+    let old_blob = old.outputs["obj"].test_file_blob();
     service.begin(first, client, old.clone())?;
     service.upload(first, client, old_blob, &b"old"[..])?;
     service.commit(first, client)?;
@@ -551,7 +553,7 @@ fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result
         bail!("expected another refresh");
     };
     let new = manifest(b"new");
-    let new_blob = new.outputs["obj"].blob;
+    let new_blob = new.outputs["obj"].test_file_blob();
     service.begin(next, client, new.clone())?;
     assert!(service.commit(next, client).is_err());
     assert_eq!(service.status(reader)?, NativeStatus::Ready(old));
