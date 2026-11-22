@@ -216,27 +216,34 @@ pub async fn connection_task<T: Send + 'static>(
 ) -> Result<T> {
     // Waiting for the lock is itself cancellable and occupies no blocking
     // thread. Only the owner of a transaction may invalidate its socket.
-    let mut connection = connection.lock_owned().await;
+    let connection = connection.lock_owned().await;
     ensure!(!connection.closed.is_cancelled(), IpcTransportFailure);
     let mut abort = AbortTransfer {
         socket: connection
-            .reader
-            .get_ref()
-            .try_clone()
-            .context(IpcTransportFailure)?,
+            .invalidate(connection.reader.get_ref().try_clone().map_err(Into::into))?,
         closed: connection.closed.clone(),
         armed: true,
     };
-    let result = tokio::task::spawn_blocking(move || {
-        ensure!(!connection.closed.is_cancelled(), IpcTransportFailure);
-        let result = task(&mut connection);
-        drop(connection);
-        result
-    })
-    .await
-    .context(IpcTransportFailure)?;
+    let (guard, result) = tokio::task::spawn_blocking(move || run_transaction(connection, task))
+        .await
+        .context(IpcTransportFailure)?;
+    // Keep exclusive ownership until the cancellation guard is disarmed.
+    // No next transaction may start in the completion/cancellation race.
     abort.armed = false;
+    drop(guard);
     result
+}
+
+fn run_transaction<T>(
+    mut connection: tokio::sync::OwnedMutexGuard<ServerConnection>,
+    task: impl FnOnce(&mut ServerConnection) -> Result<T>,
+) -> (tokio::sync::OwnedMutexGuard<ServerConnection>, Result<T>) {
+    let result = if connection.closed.is_cancelled() {
+        Err(IpcTransportFailure.into())
+    } else {
+        task(&mut connection)
+    };
+    (connection, result)
 }
 
 /// Establish a TCP connection to an sccache server listening on `addr`.
