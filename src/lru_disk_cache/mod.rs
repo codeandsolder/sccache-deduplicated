@@ -207,7 +207,7 @@ impl LruDiskCache {
     }
 
     /// Return the current size of all the files in the cache.
-    #[must_use]
+    #[must_use = "the returned size is needed for cache capacity accounting"]
     pub fn size(&self) -> u64 {
         self.lru
             .size()
@@ -215,24 +215,24 @@ impl LruDiskCache {
     }
 
     /// Return the count of entries in the cache.
-    #[must_use]
+    #[must_use = "the entry count is returned without modifying the cache"]
     pub fn len(&self) -> usize {
         self.lru.len()
     }
 
-    #[must_use]
+    #[must_use = "the result describes whether the cache contains any entries"]
     pub fn is_empty(&self) -> bool {
         self.lru.len() == 0
     }
 
     /// Return the maximum size of the cache.
-    #[must_use]
+    #[must_use = "the configured byte limit is returned without changing it"]
     pub const fn capacity(&self) -> u64 {
         self.lru.capacity()
     }
 
     /// Return the path in which the cache is stored.
-    #[must_use]
+    #[must_use = "the returned path identifies the cache storage location"]
     pub fn path(&self) -> &Path {
         self.root.as_path()
     }
@@ -288,7 +288,7 @@ impl LruDiskCache {
     }
 
     /// Returns `true` if the disk cache can store a file of `size` bytes.
-    #[must_use]
+    #[must_use = "the result determines whether the entry fits within the cache capacity"]
     pub const fn can_store(&self, size: u64) -> bool {
         size <= self.lru.capacity()
     }

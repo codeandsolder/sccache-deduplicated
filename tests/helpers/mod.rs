@@ -21,7 +21,7 @@ pub static SCCACHE_BIN: LazyLock<&Path> =
 /// The canonical CI compiler cache can use a separate TCP port or Unix socket.
 /// System tests deliberately start and stop their own daemon and must never
 /// accidentally stop that externally managed compiler cache.
-#[must_use]
+#[must_use = "the returned command must be executed to invoke the test client"]
 pub fn test_sccache_command() -> Command {
     let mut cmd = Command::new(SCCACHE_BIN.as_os_str());
     cmd.env_remove("SCCACHE_SERVER_PORT")
@@ -31,7 +31,7 @@ pub fn test_sccache_command() -> Command {
 
 /// Test Cargo invocations compile through the test-built sccache binary,
 /// not an inherited CI compiler-cache endpoint.
-#[must_use]
+#[must_use = "the returned command must be executed to invoke Cargo"]
 pub fn test_cargo_command() -> Command {
     let mut cmd = Command::new(CARGO.as_os_str());
     cmd.env_remove("SCCACHE_SERVER_PORT")

@@ -249,7 +249,10 @@ impl OverlayBuilder {
             .sum();
         let capacity = u128::from(self.extracted_toolchain_cache_size);
         let mut candidates: Vec<_> = {
-            let cache = tccache.lock().unwrap();
+            let Ok(cache) = tccache.lock() else {
+                warn!("Cannot prune extracted toolchains: toolchain cache mutex poisoned");
+                return;
+            };
             dir_map
                 .iter()
                 .filter(|(_, entry)| Arc::strong_count(&entry.active_lease) == 1)
@@ -298,7 +301,10 @@ impl OverlayBuilder {
             active_lease,
             ..
         } = {
-            let mut toolchain_dir_map = self.toolchain_dir_map.lock().unwrap();
+            let mut toolchain_dir_map = self
+                .toolchain_dir_map
+                .lock()
+                .map_err(|_| anyhow!("toolchain directory map mutex poisoned"))?;
             // Create the toolchain dir (if necessary) while we have an exclusive lock
             let toolchain_dir = self.dir.join("toolchains").join(&tc.archive_id);
             if toolchain_dir_map.contains_key(tc) && toolchain_dir.exists() {
@@ -314,7 +320,9 @@ impl OverlayBuilder {
                 // hold the global LRU mutex. The open descriptor remains valid
                 // even if another cache operation evicts the directory entry.
                 let toolchain_rdr = {
-                    let mut cache = tccache.lock().unwrap();
+                    let mut cache = tccache
+                        .lock()
+                        .map_err(|_| anyhow!("toolchain cache mutex poisoned"))?;
                     match cache.get(tc) {
                         Ok(rdr) => rdr,
                         Err(LruError::FileNotInCache) => {
@@ -340,7 +348,11 @@ impl OverlayBuilder {
                             toolchain_dir.display()
                         );
                     }
-                    if let Err(cache_error) = tccache.lock().unwrap().remove(tc) {
+                    if let Err(cache_error) = tccache
+                        .lock()
+                        .map_err(|_| anyhow!("toolchain cache mutex poisoned"))
+                        .and_then(|mut cache| cache.remove(tc).map_err(Into::into))
+                    {
                         warn!(
                             "Failed to remove corrupt toolchain {} from cache: {cache_error:#}",
                             tc.archive_id
@@ -399,11 +411,7 @@ impl OverlayBuilder {
             paths: output_paths,
             compression_level,
         } = outputs;
-        trace!("Compile environment: {:?}", compile_command.env_vars);
-        trace!(
-            "Compile command: {:?} {:?}",
-            compile_command.executable, compile_command.arguments
-        );
+        trace!("Compile command: {:?}", compile_command);
 
         std::thread::scope(|scope| {
             scope
@@ -581,7 +589,10 @@ impl OverlayBuilder {
         // before pruning so this toolchain can be collected if its archive is
         // no longer cached and no other builds are using it.
         drop(overlay);
-        let mut dir_map = self.toolchain_dir_map.lock().unwrap();
+        let Ok(mut dir_map) = self.toolchain_dir_map.lock() else {
+            warn!("Cannot prune extracted toolchains: directory map mutex poisoned");
+            return;
+        };
         self.prune_unused_toolchain_dirs(&mut dir_map, tccache);
     }
 }
@@ -713,7 +724,10 @@ impl DockerBuilder {
     // the way)
     fn get_container(&self, tc: &Toolchain, tccache: &Mutex<TcCache>) -> Result<String> {
         let container = {
-            let mut map = self.container_lists.lock().unwrap();
+            let mut map = self
+                .container_lists
+                .lock()
+                .map_err(|_| anyhow!("container list mutex poisoned"))?;
             map.entry(tc.clone()).or_default().pop()
         };
         match container {
@@ -722,7 +736,10 @@ impl DockerBuilder {
                 // TODO: can improve parallelism (of creating multiple images at a time) by using another
                 // (more fine-grained) mutex around the entry value and checking if its empty a second time
                 let image = {
-                    let mut map = self.image_map.lock().unwrap();
+                    let mut map = self
+                        .image_map
+                        .lock()
+                        .map_err(|_| anyhow!("image map mutex poisoned"))?;
                     match map.entry(tc.clone()) {
                         hash_map::Entry::Occupied(e) => e.get().clone(),
                         hash_map::Entry::Vacant(e) => {
@@ -817,14 +834,27 @@ impl DockerBuilder {
             return;
         }
 
-        // Good as new, add it back to the container list
-        if let Some(entry) = self.container_lists.lock().unwrap().get_mut(tc) {
-            debug!("Reclaimed container {}", cid);
-            entry.push(cid)
-        } else {
+        // Good as new, add it back to the container list. If the bookkeeping lock is poisoned,
+        // discard the container rather than turning cleanup into a process-wide panic.
+        let reclaimed = match self.container_lists.lock() {
+            Ok(mut containers) => {
+                if let Some(entry) = containers.get_mut(tc) {
+                    debug!("Reclaimed container {}", cid);
+                    entry.push(cid.clone());
+                    true
+                } else {
+                    false
+                }
+            }
+            Err(_) => {
+                warn!("Container list mutex poisoned while reclaiming {}", cid);
+                false
+            }
+        };
+        if !reclaimed {
             warn!(
-                "Was ready to reclaim container {} but toolchain went missing",
-                cid
+                "Could not reclaim container {} for toolchain {}; removing it",
+                cid, tc.archive_id
             );
             if let Err(e) = docker_rm(&cid) {
                 warn!("Failed to remove container {}: {}", cid, e);
@@ -836,7 +866,9 @@ impl DockerBuilder {
         // The open archive remains readable after we release the LRU lock.
         // Docker operations must not block other toolchain-cache users.
         let mut toolchain_rdr = {
-            let mut cache = tccache.lock().unwrap();
+            let mut cache = tccache
+                .lock()
+                .map_err(|_| anyhow!("toolchain cache mutex poisoned"))?;
             match cache.get(tc) {
                 Ok(rdr) => rdr,
                 Err(LruError::FileNotInCache) => bail!(
@@ -916,11 +948,7 @@ impl DockerBuilder {
             paths: output_paths,
             compression_level,
         } = outputs;
-        trace!("Compile environment: {:?}", compile_command.env_vars);
-        trace!(
-            "Compile command: {:?} {:?}",
-            compile_command.executable, compile_command.arguments
-        );
+        trace!("Compile command: {:?}", compile_command);
 
         trace!("copying in inputs");
         let mut inputs_rdr = inputs_rdr.into_decoded()?;

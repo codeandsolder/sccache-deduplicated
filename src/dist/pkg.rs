@@ -103,7 +103,7 @@ mod toolchain_imp {
     }
 
     impl ToolchainPackageBuilder {
-        #[must_use]
+        #[must_use = "the returned archive input set must be populated by the caller"]
         pub const fn new() -> Self {
             Self {
                 dir_set: BTreeMap::new(),
@@ -620,7 +620,7 @@ pub fn make_tar_header(src: &Path, dest: &str) -> io::Result<tar::Header> {
 /// intentionally retain their original lexical spelling. Every parent step requires the
 /// directory immediately before it to exist on the worker, even when that directory is not
 /// part of the simplified target path.
-#[must_use]
+#[must_use = "the returned directories are needed to reproduce parent traversal on the worker"]
 pub fn lexical_parent_traversal_dirs(path: &Path) -> Vec<PathBuf> {
     let mut current = PathBuf::new();
     let mut required = Vec::new();

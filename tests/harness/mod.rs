@@ -80,7 +80,7 @@ pub fn start_local_daemon(cfg_path: &Path, cached_cfg_path: &Path) {
     }
 }
 
-#[must_use]
+#[must_use = "the result indicates whether daemon shutdown succeeded"]
 pub fn stop_local_daemon() -> bool {
     trace!("sccache --stop-server");
     sccache_command()
@@ -91,7 +91,7 @@ pub fn stop_local_daemon() -> bool {
         .is_ok_and(|status| status.success())
 }
 
-#[must_use]
+#[must_use = "the result indicates whether the cache was cleared"]
 pub fn clear_cache_local_daemon(tmpdir: &Path) -> bool {
     trace!("clear local cache daemon");
     let client_build_dir = tmpdir.join(DIST_CACHE_RELPATH);
@@ -142,7 +142,7 @@ pub fn write_source(path: &Path, filename: &str, contents: &str) {
     f.write_all(contents.as_bytes()).unwrap();
 }
 
-#[must_use]
+#[must_use = "the returned path is the initialized test project directory"]
 pub fn init_cargo(path: &Path, cargo_name: &str) -> PathBuf {
     let cargo_path = path.join(cargo_name);
     let source_path = "src";
@@ -151,7 +151,7 @@ pub fn init_cargo(path: &Path, cargo_name: &str) -> PathBuf {
 }
 
 // Prune any environment variables that could adversely affect test execution.
-#[must_use]
+#[must_use = "the returned command contains the filtered environment"]
 pub fn prune_command(mut cmd: Command) -> Command {
     use sccache::util::OsStrExt;
 
@@ -163,12 +163,12 @@ pub fn prune_command(mut cmd: Command) -> Command {
     cmd
 }
 
-#[must_use]
+#[must_use = "the returned command must be executed to invoke the test client"]
 pub fn sccache_command() -> Command {
     prune_command(Command::new(env!("CARGO_BIN_EXE_sccache")))
 }
 
-#[must_use]
+#[must_use = "the returned command must be executed to invoke Cargo"]
 pub fn cargo_command() -> Command {
     prune_command(Command::new("cargo"))
 }
@@ -178,7 +178,7 @@ pub fn sccache_dist_path() -> PathBuf {
     env!("CARGO_BIN_EXE_sccache-dist").into()
 }
 
-#[must_use]
+#[must_use = "the returned configuration must be used to configure the test client"]
 pub fn sccache_client_cfg(
     tmpdir: &Path,
     preprocessor_cache_mode: bool,

@@ -632,7 +632,10 @@ impl SchedulerIncoming for Scheduler {
         }
         let (job_id, server_id, auth) = {
             // LOCKS
-            let mut servers = self.servers.lock().unwrap();
+            let mut servers = self
+                .servers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
 
             let res = {
                 let mut healthy = Vec::new();
@@ -661,9 +664,9 @@ impl SchedulerIncoming for Scheduler {
                     .into_iter()
                     .find_map(|candidates| weighted_server(candidates, rand::random::<f64>()));
                 if let Some(server_id) = selected {
-                    let server_details = servers
-                        .get_mut(&server_id)
-                        .expect("selected worker remains registered");
+                    let server_details = servers.get_mut(&server_id).ok_or_else(|| {
+                        anyhow::anyhow!("selected worker disappeared while scheduler lock held")
+                    })?;
                     let job_id = self.next_job_id();
                     // Unique while holding the servers lock: every allocation
                     // advances job_count, including assignments that later fail.
@@ -708,7 +711,9 @@ impl SchedulerIncoming for Scheduler {
             .do_assign_job(server_id, job_id, tc, auth.clone())
             .with_context(|| {
                 // LOCKS
-                let mut servers = self.servers.lock().unwrap();
+                let Ok(mut servers) = self.servers.lock() else {
+                    return "assign job failed and server state mutex is poisoned";
+                };
                 if let Some(entry) = servers.get_mut(&server_id) {
                     entry.last_error = Some(Instant::now());
                     entry.jobs_assigning.remove(&job_id);
@@ -723,8 +728,14 @@ impl SchedulerIncoming for Scheduler {
             })?;
         {
             // LOCKS
-            let mut jobs = self.jobs.lock().unwrap();
-            let mut servers = self.servers.lock().unwrap();
+            let mut jobs = self
+                .jobs
+                .lock()
+                .map_err(|_| anyhow::anyhow!("jobs mutex poisoned"))?;
+            let mut servers = self
+                .servers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
 
             let Some(details) = servers.get_mut(&server_id) else {
                 let msg = format!("Job {job_id} assignment completed after server disappeared");
@@ -781,8 +792,14 @@ impl SchedulerIncoming for Scheduler {
         job_authorizer: Box<dyn JobAuthorizer>,
     ) -> Result<HeartbeatServerResult> {
         // LOCKS
-        let mut jobs = self.jobs.lock().unwrap();
-        let mut servers = self.servers.lock().unwrap();
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("jobs mutex poisoned"))?;
+        let mut servers = self
+            .servers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
 
         self.prune_servers(&mut servers, &mut jobs);
 
@@ -891,8 +908,14 @@ impl SchedulerIncoming for Scheduler {
         let worker_name = validate_worker_name(worker_name)?;
         // Match heartbeat lock ordering so a stale named worker cannot reserve
         // a display name after it has stopped heartbeating.
-        let mut jobs = self.jobs.lock().unwrap();
-        let mut servers = self.servers.lock().unwrap();
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("jobs mutex poisoned"))?;
+        let mut servers = self
+            .servers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
         self.prune_servers(&mut servers, &mut jobs);
         drop(jobs);
         let details = servers.get(&server_id).ok_or_else(|| {
@@ -927,7 +950,7 @@ impl SchedulerIncoming for Scheduler {
         }
         servers
             .get_mut(&server_id)
-            .expect("server disappeared while scheduler lock was held")
+            .ok_or_else(|| anyhow::anyhow!("server disappeared while scheduler lock held"))?
             .worker_name = Some(worker_name.clone());
         info!(
             "Server {:?} registered worker name {:?}",
@@ -940,7 +963,7 @@ impl SchedulerIncoming for Scheduler {
         Ok(self
             .servers
             .lock()
-            .unwrap()
+            .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?
             .get(&server_id)
             .and_then(|details| details.worker_name.clone()))
     }
@@ -952,8 +975,14 @@ impl SchedulerIncoming for Scheduler {
         job_state: JobState,
     ) -> Result<UpdateJobStateResult> {
         // LOCKS
-        let mut jobs = self.jobs.lock().unwrap();
-        let mut servers = self.servers.lock().unwrap();
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("jobs mutex poisoned"))?;
+        let mut servers = self
+            .servers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
 
         if let btree_map::Entry::Occupied(mut entry) = jobs.entry(job_id) {
             let job_detail = entry.get();
@@ -981,7 +1010,10 @@ impl SchedulerIncoming for Scheduler {
                     entry.get_mut().transition_to(job_state, now);
                 }
                 (JobState::Started, JobState::Complete) => {
-                    let mut acks = self.completed_acks.lock().unwrap();
+                    let mut acks = self
+                        .completed_acks
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("completion acknowledgment mutex poisoned"))?;
                     details.jobs_assigned.remove(&job_id);
                     entry.remove_entry();
                     acks.record(job_id, server_id, now);
@@ -993,7 +1025,7 @@ impl SchedulerIncoming for Scheduler {
             && self
                 .completed_acks
                 .lock()
-                .unwrap()
+                .map_err(|_| anyhow::anyhow!("completion acknowledgment mutex poisoned"))?
                 .contains(job_id, server_id, Instant::now())
         {
             // The scheduler applied a prior completion, but its reply was lost.
@@ -1010,8 +1042,14 @@ impl SchedulerIncoming for Scheduler {
 
     fn handle_status(&self) -> Result<SchedulerStatusResult> {
         // LOCKS
-        let mut jobs = self.jobs.lock().unwrap();
-        let mut servers = self.servers.lock().unwrap();
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("jobs mutex poisoned"))?;
+        let mut servers = self
+            .servers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
 
         self.prune_servers(&mut servers, &mut jobs);
 
@@ -1092,9 +1130,14 @@ impl Server {
 
     /// Try local archive sources before asking the client to upload. The
     /// cache mutex is not held while cloning or verifying archive contents.
-    fn has_or_reuse_toolchain(&self, tc: &Toolchain) -> bool {
-        if self.cache.lock().unwrap().contains_toolchain(tc) {
-            return true;
+    fn has_or_reuse_toolchain(&self, tc: &Toolchain) -> Result<bool> {
+        if self
+            .cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?
+            .contains_toolchain(tc)
+        {
+            return Ok(true);
         }
         #[cfg(target_os = "linux")]
         for source in &self.toolchain_archive_sources {
@@ -1105,11 +1148,14 @@ impl Server {
                 self.toolchain_cache_size,
             ) {
                 Ok(staged) => {
-                    let mut cache = self.cache.lock().unwrap();
+                    let mut cache = self
+                        .cache
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?;
                     match cache.insert_staged(staged) {
                         Ok(()) => {
                             debug!("Reused local toolchain archive {}", tc.archive_id);
-                            return true;
+                            return Ok(true);
                         }
                         Err(error) => debug!("Could not install cloned archive: {error:#}"),
                     }
@@ -1120,7 +1166,11 @@ impl Server {
                 ),
             }
         }
-        self.cache.lock().unwrap().contains_toolchain(tc)
+        Ok(self
+            .cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?
+            .contains_toolchain(tc))
     }
 }
 
@@ -1131,7 +1181,10 @@ impl ServerIncoming for Server {
         heartbeat_started_at: Instant,
     ) -> Result<usize> {
         let known: HashSet<_> = assigned_job_ids.iter().copied().collect();
-        let mut local = self.job_toolchains.lock().unwrap();
+        let mut local = self
+            .job_toolchains
+            .lock()
+            .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?;
         let before = local.len();
         local.retain(|id, assignment| {
             // A scheduler reservation precedes receipt by the worker. Do not
@@ -1144,20 +1197,23 @@ impl ServerIncoming for Server {
     }
 
     fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> Result<AssignJobResult> {
-        let need_toolchain = !self.has_or_reuse_toolchain(&tc);
-        assert!(
-            self.job_toolchains
-                .lock()
-                .unwrap()
-                .insert(
-                    job_id,
-                    LocalAssignment {
-                        toolchain: tc,
-                        accepted_at: Instant::now(),
-                    }
-                )
-                .is_none()
-        );
+        let need_toolchain = !self.has_or_reuse_toolchain(&tc)?;
+        let mut assignments = self
+            .job_toolchains
+            .lock()
+            .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?;
+        match assignments.entry(job_id) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                bail!("duplicate assignment for job {job_id}")
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(LocalAssignment {
+                    toolchain: tc,
+                    accepted_at: Instant::now(),
+                });
+            }
+        }
+        drop(assignments);
         let state = if need_toolchain {
             JobState::Pending
         } else {
@@ -1175,7 +1231,12 @@ impl ServerIncoming for Server {
         job_id: JobId,
         tc_rdr: ToolchainReader,
     ) -> Result<SubmitToolchainResult> {
-        let tc = match self.job_toolchains.lock().unwrap().get(&job_id) {
+        let tc = match self
+            .job_toolchains
+            .lock()
+            .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?
+            .get(&job_id)
+        {
             Some(assigned) => assigned.toolchain.clone(),
             None => return Ok(SubmitToolchainResult::JobNotFound),
         };
@@ -1193,14 +1254,23 @@ impl ServerIncoming for Server {
                 return Ok(SubmitToolchainResult::CannotCache);
             }
         };
-        let inserted = self.cache.lock().unwrap().insert_staged(staged);
+        let inserted = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?
+            .insert_staged(staged);
         if let Err(error) = inserted {
             warn!("Could not install verified toolchain archive: {error:#}");
             return Ok(SubmitToolchainResult::CannotCache);
         }
         // Uploads can outlive a scheduler-side timeout. Never publish Ready
         // for a job that has since been removed by heartbeat reconciliation.
-        if !self.job_toolchains.lock().unwrap().contains_key(&job_id) {
+        if !self
+            .job_toolchains
+            .lock()
+            .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?
+            .contains_key(&job_id)
+        {
             return Ok(SubmitToolchainResult::JobNotFound);
         }
         requester
@@ -1218,12 +1288,19 @@ impl ServerIncoming for Server {
     ) -> Result<RunJobResult> {
         // Claim the local job before sending any scheduler transition. A
         // duplicate/unknown run must never mark someone else's job Started.
-        let assigned = self.job_toolchains.lock().unwrap().remove(&job_id);
+        let assigned = self
+            .job_toolchains
+            .lock()
+            .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?
+            .remove(&job_id);
         let Some(assigned) = assigned else {
             return Ok(RunJobResult::JobNotFound);
         };
         if let Err(error) = requester.do_update_job_state(job_id, JobState::Started) {
-            let mut jobs = self.job_toolchains.lock().unwrap();
+            let mut jobs = self
+                .job_toolchains
+                .lock()
+                .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?;
             if jobs.insert(job_id, assigned).is_some() {
                 bail!("job {job_id} reappeared while restoring failed start transition");
             }

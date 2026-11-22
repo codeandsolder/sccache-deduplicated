@@ -33,7 +33,7 @@ pub struct S3Cache {
 }
 
 impl S3Cache {
-    #[must_use]
+    #[must_use = "the returned S3 configuration contains the supplied bucket and credentials policy"]
     pub const fn new(bucket: String, key_prefix: String, no_credentials: bool) -> Self {
         Self {
             bucket,
@@ -48,22 +48,22 @@ impl S3Cache {
             enable_virtual_host_style: None,
         }
     }
-    #[must_use]
+    #[must_use = "the returned S3 configuration contains the selected region"]
     pub fn with_region(mut self, region: Option<String>) -> Self {
         self.region = region;
         self
     }
-    #[must_use]
+    #[must_use = "the returned S3 configuration contains the selected endpoint"]
     pub fn with_endpoint(mut self, endpoint: Option<String>) -> Self {
         self.endpoint = endpoint;
         self
     }
-    #[must_use]
+    #[must_use = "the returned S3 configuration contains the TLS policy"]
     pub const fn with_use_ssl(mut self, use_ssl: Option<bool>) -> Self {
         self.use_ssl = use_ssl;
         self
     }
-    #[must_use]
+    #[must_use = "the returned S3 configuration contains the server-side encryption setting"]
     pub const fn with_server_side_encryption(
         mut self,
         server_side_encryption: Option<bool>,
@@ -71,7 +71,7 @@ impl S3Cache {
         self.server_side_encryption = server_side_encryption;
         self
     }
-    #[must_use]
+    #[must_use = "the returned S3 configuration contains the KMS encryption setting"]
     pub const fn with_server_side_encryption_aws_kms(
         mut self,
         server_side_encryption_aws_kms: Option<bool>,
@@ -79,7 +79,7 @@ impl S3Cache {
         self.server_side_encryption_aws_kms = server_side_encryption_aws_kms;
         self
     }
-    #[must_use]
+    #[must_use = "the returned S3 configuration contains the selected KMS key identifier"]
     pub fn with_server_side_encryption_kms_key_id(
         mut self,
         server_side_encryption_kms_key_id: Option<String>,
@@ -87,7 +87,7 @@ impl S3Cache {
         self.server_side_encryption_kms_key_id = server_side_encryption_kms_key_id;
         self
     }
-    #[must_use]
+    #[must_use = "the returned S3 configuration contains the addressing mode"]
     pub const fn with_enable_virtual_host_style(
         mut self,
         enable_virtual_host_style: Option<bool>,

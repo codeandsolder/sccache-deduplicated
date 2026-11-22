@@ -355,7 +355,7 @@ mod path_transform {
     }
 
     impl PathTransformer {
-        #[must_use]
+        #[must_use = "the returned path transformer records paths for the distributed compilation"]
         pub fn new() -> Self {
             Self {
                 dist_to_local_path: HashMap::new(),
@@ -451,7 +451,7 @@ mod path_transform {
     }
 }
 
-#[must_use]
+#[must_use = "conversion failure indicates a non-Unicode argument"]
 pub fn osstrings_to_strings(osstrings: &[OsString]) -> Option<Vec<String>> {
     osstrings
         .iter()
@@ -459,7 +459,7 @@ pub fn osstrings_to_strings(osstrings: &[OsString]) -> Option<Vec<String>> {
         .collect::<Option<_>>()
 }
 
-#[must_use]
+#[must_use = "conversion failure indicates a non-Unicode environment entry"]
 pub fn osstring_tuples_to_strings(
     osstring_tuples: &[(OsString, OsString)],
 ) -> Option<Vec<(String, String)>> {
@@ -469,7 +469,7 @@ pub fn osstring_tuples_to_strings(
         .collect::<Option<_>>()
 }
 
-#[must_use]
+#[must_use = "the converted argument vector is returned rather than mutated in place"]
 pub fn strings_to_osstrings(strings: &[String]) -> Vec<OsString> {
     strings
         .iter()
@@ -478,7 +478,7 @@ pub fn strings_to_osstrings(strings: &[String]) -> Vec<OsString> {
 }
 
 // TODO: TryFrom
-#[must_use]
+#[must_use = "the result determines whether the compile command is representable on a worker"]
 pub fn try_compile_command_to_dist(
     command: compiler::SingleCompileCommand,
 ) -> Option<CompileCommand> {
@@ -513,7 +513,7 @@ pub fn try_compile_command_to_dist(
 pub struct ArchiveId(String);
 
 impl ArchiveId {
-    #[must_use]
+    #[must_use = "the returned archive identifier is required to address the archive"]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -650,11 +650,11 @@ impl FromStr for JobId {
 #[serde(deny_unknown_fields)]
 pub struct ServerId(SocketAddr);
 impl ServerId {
-    #[must_use]
+    #[must_use = "the returned server identifier contains the selected address"]
     pub const fn new(addr: SocketAddr) -> Self {
         Self(addr)
     }
-    #[must_use]
+    #[must_use = "the address is returned without changing the server identity"]
     pub const fn addr(&self) -> SocketAddr {
         self.0
     }
@@ -669,7 +669,7 @@ impl FromStr for ServerId {
 #[serde(deny_unknown_fields)]
 pub struct ServerNonce(u64);
 impl ServerNonce {
-    #[must_use]
+    #[must_use = "the generated nonce must identify this worker incarnation"]
     pub fn new() -> Self {
         Self(rand::random())
     }
@@ -701,13 +701,24 @@ impl fmt::Display for JobState {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompileCommand {
     pub executable: String,
     pub arguments: Vec<String>,
     pub env_vars: Vec<(String, String)>,
     pub cwd: String,
+}
+impl fmt::Debug for CompileCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let env_var_names: Vec<_> = self.env_vars.iter().map(|(name, _)| name).collect();
+        f.debug_struct("CompileCommand")
+            .field("executable", &self.executable)
+            .field("argument_count", &self.arguments.len())
+            .field("env_var_names", &env_var_names)
+            .field("cwd", &self.cwd)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -747,7 +758,7 @@ impl ProcessOutput {
         })
     }
     #[cfg(test)]
-    #[must_use]
+    #[must_use = "the constructed compiler output must be returned to the invoking test or caller"]
     pub const fn fake_output(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
         Self {
             code,
@@ -905,7 +916,7 @@ pub struct BuildResult {
 pub struct ToolchainReader<'a>(Box<dyn Read + 'a>);
 impl<'a> ToolchainReader<'a> {
     /// Wrap a reader for a distributed toolchain upload.
-    #[must_use]
+    #[must_use = "the returned reader owns the toolchain upload stream"]
     pub fn new(reader: Box<dyn Read + 'a>) -> Self {
         Self(reader)
     }
@@ -921,7 +932,7 @@ pub struct InputsReader<'a>(Box<dyn Read + Send + 'a>);
 #[cfg(feature = "dist-server")]
 impl<'a> InputsReader<'a> {
     /// Wrap a reader for a distributed compilation's input stream.
-    #[must_use]
+    #[must_use = "the returned reader owns the compiler input upload stream"]
     pub fn new(reader: Box<dyn Read + Send + 'a>) -> Self {
         Self(reader)
     }

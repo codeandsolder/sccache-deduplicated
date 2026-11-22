@@ -59,12 +59,16 @@ impl ClientAuthCheck for EqCheck {
         if self.s == token {
             Ok(())
         } else {
-            warn!("User token did not match expected token");
+            warn!("{}", fixed_token_mismatch_log_message());
             Err(ClientVisibleMsg::from_nonsensitive(
                 "Fixed token mismatch".to_owned(),
             ))
         }
     }
+}
+
+fn fixed_token_mismatch_log_message() -> &'static str {
+    "User token did not match configured fixed token"
 }
 
 impl EqCheck {
@@ -78,7 +82,7 @@ impl EqCheck {
 pub struct ProxyTokenCheck {
     client: reqwest::blocking::Client,
     maybe_auth_cache: Option<Mutex<(HashMap<String, Instant>, Duration)>>,
-    url: String,
+    url: reqwest::Url,
 }
 
 impl ClientAuthCheck for ProxyTokenCheck {
@@ -95,6 +99,23 @@ impl ClientAuthCheck for ProxyTokenCheck {
     }
 }
 
+fn url_without_query(url: &reqwest::Url) -> String {
+    let mut safe = url.clone();
+    safe.set_query(None);
+    safe.set_fragment(None);
+    safe.to_string()
+}
+
+fn cached_token_is_valid(
+    auth_cache: &mut HashMap<String, Instant>,
+    cache_duration: Duration,
+    token: &str,
+    now: Instant,
+) -> bool {
+    auth_cache.retain(|_, cached_at| now.saturating_duration_since(*cached_at) < cache_duration);
+    auth_cache.contains_key(token)
+}
+
 impl ProxyTokenCheck {
     /// Build a proxy-backed token checker.
     ///
@@ -107,34 +128,38 @@ impl ProxyTokenCheck {
         Ok(Self {
             client: new_reqwest_blocking_client()?,
             maybe_auth_cache,
-            url,
+            url: url.parse().context("Invalid proxy token validation URL")?,
         })
     }
 
     fn check_token_with_forwarding(&self, token: &str) -> Result<()> {
-        trace!("Validating token by forwarding to {}", self.url);
+        trace!(
+            "Validating token by forwarding to {}",
+            url_without_query(&self.url)
+        );
         // If the token is cached and not cache has not expired, return it
         if let Some(ref auth_cache) = self.maybe_auth_cache {
             let mut auth_cache = auth_cache
                 .lock()
                 .map_err(|_| anyhow::anyhow!("proxy token auth cache mutex poisoned"))?;
             let (ref mut auth_cache, cache_duration) = *auth_cache;
-            if let Some(cached_at) = auth_cache.get(token) {
-                if cached_at.elapsed() < cache_duration {
-                    return Ok(());
-                }
+            if cached_token_is_valid(auth_cache, cache_duration, token, Instant::now()) {
+                return Ok(());
             }
-            auth_cache.remove(token);
         }
         // Make a request to another API, which as a side effect should actually check the token
         let res = self
             .client
-            .get(&self.url)
+            .get(self.url.clone())
             .bearer_auth(token)
             .send()
             .context("Failed to make request to proxying url")?;
         if !res.status().is_success() {
-            bail!("Token forwarded to {} returned {}", self.url, res.status());
+            bail!(
+                "Token forwarded to {} returned {}",
+                url_without_query(&self.url),
+                res.status()
+            );
         }
         // Cache the token
         if let Some(ref auth_cache) = self.maybe_auth_cache {
@@ -208,5 +233,47 @@ impl ValidJWTCheck {
         let _tokendata = jwt::decode::<Claims>(token, &pkcs1, &validation)
             .context("Unable to validate and decode jwt")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cached_token_is_valid, fixed_token_mismatch_log_message, url_without_query};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn proxy_validation_url_logs_without_query_or_fragment() -> anyhow::Result<()> {
+        let url: reqwest::Url = "https://example.test/check?api_key=secret#fragment".parse()?;
+        let safe = url_without_query(&url);
+        assert_eq!(safe, "https://example.test/check");
+        assert!(!safe.contains("secret"));
+        assert!(!safe.contains("fragment"));
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_token_cache_prunes_expired_entries() {
+        let now = Instant::now();
+        let mut cache = HashMap::from([
+            ("expired".to_owned(), now - Duration::from_secs(20)),
+            ("fresh".to_owned(), now - Duration::from_secs(2)),
+        ]);
+
+        assert!(cached_token_is_valid(
+            &mut cache,
+            Duration::from_secs(10),
+            "fresh",
+            now,
+        ));
+        assert!(!cache.contains_key("expired"));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn fixed_token_mismatch_log_has_no_token_material() {
+        let message = fixed_token_mismatch_log_message();
+        assert!(!message.contains("supplied-secret"));
+        assert!(!message.contains("configured-secret"));
     }
 }

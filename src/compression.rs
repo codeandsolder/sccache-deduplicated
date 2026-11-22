@@ -44,7 +44,7 @@ impl ZstdFrame {
         })
     }
 
-    #[must_use]
+    #[must_use = "the frame lengths are needed to validate or account for the compressed data"]
     pub const fn lens(&self) -> FrameSize {
         FrameSize {
             actual: self.uncompressed_len,
@@ -81,7 +81,7 @@ impl ZstdFrame {
 pub struct VerifiedZstdFrame(ZstdFrame);
 
 impl VerifiedZstdFrame {
-    #[must_use]
+    #[must_use = "the compressed payload must be consumed by the caller"]
     pub(crate) fn compressed_bytes(&self) -> &[u8] {
         &self.0.compressed
     }

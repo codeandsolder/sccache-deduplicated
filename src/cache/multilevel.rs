@@ -222,7 +222,7 @@ fn duration_nanos_u64(duration: Duration) -> u64 {
 
 impl LevelStats {
     /// Calculate hit rate as a percentage
-    #[must_use]
+    #[must_use = "the calculated hit rate is returned without updating counters"]
     pub fn hit_rate(&self) -> f64 {
         const SCALE: u128 = 100_000_000;
 
@@ -236,13 +236,13 @@ impl LevelStats {
     }
 
     /// Calculate average hit latency in milliseconds
-    #[must_use]
+    #[must_use = "the calculated read latency is returned without updating counters"]
     pub fn avg_hit_latency_ms(&self) -> f64 {
         average_duration(self.hit_duration, self.hits).as_secs_f64() * 1000.0
     }
 
     /// Calculate average write latency in milliseconds
-    #[must_use]
+    #[must_use = "the calculated write latency is returned without updating counters"]
     pub fn avg_write_latency_ms(&self) -> f64 {
         average_duration(self.write_duration, self.writes).as_secs_f64() * 1000.0
     }
@@ -251,7 +251,7 @@ impl LevelStats {
     /// Returns a vector of (label, `value_with_suffix`, `suffix_length`) tuples
     /// `suffix_length` is used for width calculations in formatting
     /// Order: hits, misses, rate, writes, failures, backfills, write timing, read timing
-    #[must_use]
+    #[must_use = "the formatted statistics must be consumed to present them"]
     pub fn format_stats(&self) -> Vec<(String, String, usize)> {
         let mut stats = vec![];
 
@@ -320,7 +320,7 @@ impl LevelStats {
 impl MultiLevelStats {
     /// Format all stats for human-readable display.
     /// Returns a vector of (label, value, `suffix_type`) tuples.
-    #[must_use]
+    #[must_use = "the formatted statistics must be consumed to present them"]
     pub fn format_stats(&self) -> Vec<(String, String, usize)> {
         let mut result = vec![];
 
@@ -414,13 +414,13 @@ impl MultiLevelStorage {
     ///
     /// Levels are checked in order (L0, L1, L2, ...) during reads.
     /// All levels receive writes in parallel.
-    #[must_use]
+    #[must_use = "the returned multilevel cache owns the supplied storage levels"]
     pub fn new(levels: Vec<Arc<dyn Storage>>) -> Self {
         Self::with_write_error_policy(levels, WriteErrorPolicy::default())
     }
 
     /// Create a new multi-level storage with explicit write error policy.
-    #[must_use]
+    #[must_use = "the returned multilevel cache contains the selected write-error policy"]
     pub fn with_write_error_policy(
         levels: Vec<Arc<dyn Storage>>,
         write_error_policy: WriteErrorPolicy,
@@ -451,7 +451,7 @@ impl MultiLevelStorage {
     }
 
     /// Get a snapshot of current multi-level cache statistics.
-    #[must_use]
+    #[must_use = "the returned snapshot contains the current per-level statistics"]
     pub fn stats(&self) -> MultiLevelStats {
         MultiLevelStats(self.atomic_stats.iter().map(|s| s.snapshot()).collect())
     }

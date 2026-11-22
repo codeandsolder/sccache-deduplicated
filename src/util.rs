@@ -54,7 +54,7 @@ impl<T: fmt::Debug + ?Sized> fmt::Display for DebugDisplay<'_, T> {
     }
 }
 
-#[must_use]
+#[must_use = "the returned display adapter must be formatted to produce text"]
 pub const fn debug_display<T: fmt::Debug + ?Sized>(value: &T) -> DebugDisplay<'_, T> {
     DebugDisplay(value)
 }
@@ -65,7 +65,7 @@ pub struct Digest {
 }
 
 impl Digest {
-    #[must_use]
+    #[must_use = "the returned hasher must receive the bytes to be hashed"]
     pub fn new() -> Self {
         Self {
             inner: blake3_Hasher::new(),
@@ -186,7 +186,7 @@ impl Digest {
         self.update(b"\0");
     }
 
-    #[must_use]
+    #[must_use = "the returned digest is the calculated content identifier"]
     pub fn finish(self) -> String {
         hex(self.inner.finalize().as_bytes())
     }
@@ -371,7 +371,7 @@ impl TimeMacroFinder {
         self.found_timestamp.get()
     }
 
-    #[must_use]
+    #[must_use = "the returned digest state must be updated with the input bytes"]
     pub fn new() -> Self {
         Self::default()
     }
@@ -384,7 +384,7 @@ const fn hex_nibble(byte: u8) -> char {
     }
 }
 
-#[must_use]
+#[must_use = "the encoded hexadecimal text is returned rather than modifying the bytes"]
 pub fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
@@ -484,7 +484,7 @@ fn hash_regular_archive(m: &mut Digest, data: &[u8]) -> Result<()> {
 
 /// Return the average of a total duration over `samples` without truncating
 /// a 64-bit sample count to the `u32` divisor supported by `Duration`.
-#[must_use]
+#[must_use = "the calculated average is returned without changing the samples"]
 pub fn average_duration(total: Duration, samples: u64) -> Duration {
     const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
@@ -498,7 +498,7 @@ pub fn average_duration(total: Duration, samples: u64) -> Duration {
 }
 
 /// Format `duration` as seconds with a fractional component.
-#[must_use]
+#[must_use = "the formatted duration is returned rather than printed"]
 pub fn fmt_duration_as_secs(duration: &Duration) -> String {
     format!("{}.{:03} s", duration.as_secs(), duration.subsec_millis())
 }
@@ -600,7 +600,7 @@ where
 /// Unix `from_raw` expects a wait status, not an exit code. Passing 1 directly
 /// would incorrectly report termination by SIGHUP instead of exit code 1.
 #[cfg(unix)]
-#[must_use]
+#[must_use = "the returned exit status represents the supplied process code"]
 pub fn exit_status_from_code(code: i32) -> process::ExitStatus {
     use std::os::unix::process::ExitStatusExt;
     process::ExitStatus::from_raw((code & 0xff) << 8)
@@ -608,7 +608,7 @@ pub fn exit_status_from_code(code: i32) -> process::ExitStatus {
 
 /// Convert an ordinary numeric process exit code into an `ExitStatus`.
 #[cfg(windows)]
-#[must_use]
+#[must_use = "the returned exit status represents the supplied process code"]
 pub fn exit_status_from_code(code: i32) -> process::ExitStatus {
     use std::os::windows::process::ExitStatusExt;
     process::ExitStatus::from_raw(code as u32)
@@ -959,7 +959,7 @@ impl PartialEq<SystemTime> for Timestamp {
 }
 
 impl Timestamp {
-    #[must_use]
+    #[must_use = "the returned timestamp represents the supplied seconds and nanoseconds"]
     pub const fn new(seconds: i64, nanoseconds: u32) -> Self {
         Self {
             seconds,
@@ -1291,7 +1291,7 @@ pub fn num_cpus() -> usize {
 ///
 /// Only paths that start with one of the basedirs are modified. The paths are expected to be
 /// in the format found in preprocessor output (e.g., `# 1 "/path/to/file"`).
-#[must_use]
+#[must_use = "the returned bytes contain the normalized preprocessor output"]
 pub fn strip_basedirs<'a>(preprocessor_output: &'a [u8], basedirs: &[Vec<u8>]) -> Cow<'a, [u8]> {
     if basedirs.is_empty() || preprocessor_output.is_empty() {
         return Cow::Borrowed(preprocessor_output);
@@ -1411,7 +1411,7 @@ pub fn strip_basedirs<'a>(preprocessor_output: &'a [u8], basedirs: &[Vec<u8>]) -
 /// also has to end where a path component ends, so `/home/user/project` does not
 /// match the start of `/home/user/project-docs`.  The longest basedir wins, so a
 /// nested one takes precedence over the tree that contains it.
-#[must_use]
+#[must_use = "the returned bytes contain the normalized argument"]
 pub fn strip_basedirs_from_arg<'a>(arg: &'a [u8], basedirs: &[Vec<u8>]) -> Cow<'a, [u8]> {
     if basedirs.is_empty() || arg.is_empty() {
         return Cow::Borrowed(arg);
@@ -1527,7 +1527,7 @@ fn double_path_separators(path: &[u8]) -> Vec<u8> {
 ///     - `basedir_path`: already normalized by `std::path::absolute`
 ///     - `preprocessor_output`: plain text that may contain invalid UTF-8
 /// Leave it for any platform for testing purposes.
-#[must_use]
+#[must_use = "the normalized path is returned rather than modifying the input"]
 pub fn normalize_win_path(path: &[u8]) -> Vec<u8> {
     let mut result = Vec::with_capacity(path.len());
     let mut i = 0;
@@ -1597,7 +1597,7 @@ pub fn normalize_win_path(path: &[u8]) -> Vec<u8> {
 ///
 /// If the executable is already an absolute path and resolves to a wrapper,
 /// PATH is searched for a non-wrapper compiler matching the executable name.
-#[must_use]
+#[must_use = "the result identifies the executable selected without recursing through its wrapper"]
 pub fn resolve_compiler_avoiding_wrapper(
     executable: &Path,
     env_vars: &[(OsString, OsString)],
