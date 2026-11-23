@@ -1135,15 +1135,22 @@ impl Server {
         })
     }
 
+    fn has_cached_toolchain(&self, tc: &Toolchain) -> Result<bool> {
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?;
+        match cache.get_file(tc) {
+            Ok(_) => Ok(true),
+            Err(sccache::lru_disk_cache::Error::FileNotInCache) => Ok(false),
+            Err(error) => Err(error).context("checking worker toolchain cache"),
+        }
+    }
+
     /// Try local archive sources before asking the client to upload. The
     /// cache mutex is not held while cloning or verifying archive contents.
     fn has_or_reuse_toolchain(&self, tc: &Toolchain) -> Result<bool> {
-        if self
-            .cache
-            .lock()
-            .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?
-            .contains_toolchain(tc)
-        {
+        if self.has_cached_toolchain(tc)? {
             return Ok(true);
         }
         #[cfg(target_os = "linux")]
@@ -1173,11 +1180,7 @@ impl Server {
                 ),
             }
         }
-        Ok(self
-            .cache
-            .lock()
-            .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?
-            .contains_toolchain(tc))
+        self.has_cached_toolchain(tc)
     }
 }
 
@@ -2580,6 +2583,34 @@ mod server_upload_tests {
         );
         assert!(matches!(upload_result?, SubmitToolchainResult::Success));
         assert_eq!(states, vec![JobState::Ready]);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_cached_archive_requires_fresh_upload_on_assignment() -> Result<()> {
+        let (dir, server) = test_server()?;
+        let contents = b"verified archive removed after publication";
+        let toolchain = tc(contents)?;
+        let root = dir.path().join("tc");
+        let staged = StagedToolchainArchive::receive(
+            &root,
+            toolchain.clone(),
+            contents.as_slice(),
+            1024 * 1024,
+        )?;
+        server.cache.lock().unwrap().insert_staged(staged)?;
+
+        let first = server.handle_assign_job(JobId(45), toolchain.clone())?;
+        assert!(!first.need_toolchain);
+        assert!(matches!(first.state, JobState::Ready));
+
+        let key = toolchain.archive_id.as_str();
+        std::fs::remove_file(root.join(&key[..1]).join(&key[1..2]).join(key))?;
+
+        let next = server.handle_assign_job(JobId(46), toolchain.clone())?;
+        assert!(next.need_toolchain);
+        assert!(matches!(next.state, JobState::Pending));
+        assert!(!server.cache.lock().unwrap().contains_toolchain(&toolchain));
         Ok(())
     }
 
