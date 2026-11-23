@@ -79,6 +79,47 @@ mod client {
         }
     }
 
+    /// Read a best-effort shortcut index; archive contents live in the disk LRU.
+    /// A malformed JSON document is disposable, but filesystem errors are not.
+    fn load_weak_map(cache_dir: &Path) -> Result<HashMap<String, String>> {
+        let weak_map_path = cache_dir.join("weak_map.json");
+        if !weak_map_path.exists() {
+            fs::File::create(&weak_map_path)
+                .and_then(|mut f| f.write_all(b"{}"))
+                .context(format!(
+                    "failed to create new toolchain weak map file: {}",
+                    weak_map_path.display()
+                ))?;
+        }
+        let weak_map_file = fs::File::open(&weak_map_path).with_context(|| {
+            format!(
+                "failed to open toolchain weak map: {}",
+                weak_map_path.display()
+            )
+        })?;
+        // This index is only a shortcut. A truncated or malformed JSON file
+        // must not stop sccache from starting or discard cached archives.
+        let weak_map: HashMap<String, String> = match serde_json::from_reader(weak_map_file) {
+            Ok(map) => map,
+            Err(error) if !error.is_io() => {
+                warn!(
+                    "Ignoring invalid toolchain weak map {}: {error}",
+                    weak_map_path.display()
+                );
+                HashMap::new()
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to read toolchain weak map: {}",
+                        weak_map_path.display()
+                    )
+                });
+            }
+        };
+        Ok(weak_map)
+    }
+
     pub struct ClientToolchains {
         cache_dir: PathBuf,
         cache: Mutex<TcCache>,
@@ -121,41 +162,7 @@ mod client {
                 toolchain_creation_dir.display()
             ))?;
 
-            let weak_map_path = cache_dir.join("weak_map.json");
-            if !weak_map_path.exists() {
-                fs::File::create(&weak_map_path)
-                    .and_then(|mut f| f.write_all(b"{}"))
-                    .context(format!(
-                        "failed to create new toolchain weak map file: {}",
-                        weak_map_path.display()
-                    ))?;
-            }
-            let weak_map_file = fs::File::open(&weak_map_path).with_context(|| {
-                format!(
-                    "failed to open toolchain weak map: {}",
-                    weak_map_path.display()
-                )
-            })?;
-            // This index is only a shortcut. A truncated or malformed JSON file
-            // must not stop sccache from starting or discard cached archives.
-            let weak_map: HashMap<String, String> = match serde_json::from_reader(weak_map_file) {
-                Ok(map) => map,
-                Err(error) if !error.is_io() => {
-                    warn!(
-                        "Ignoring invalid toolchain weak map {}: {error}",
-                        weak_map_path.display()
-                    );
-                    HashMap::new()
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "failed to read toolchain weak map: {}",
-                            weak_map_path.display()
-                        )
-                    });
-                }
-            };
+            let weak_map = load_weak_map(&cache_dir)?;
 
             let tc_cache_dir = cache_dir.join("tc");
             let cache = TcCache::new(&tc_cache_dir, cache_size)
