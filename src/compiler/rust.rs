@@ -732,7 +732,7 @@ struct RustShadowRecord {
     sysroot_key: String,
     arguments_raw: Vec<String>,
     arguments_canonical: Vec<String>,
-    arguments_hashed_blob: String,
+    arguments_hashed_pairs: Vec<(String, Option<String>)>,
     source_inputs: Vec<RustShadowInput>,
     extern_inputs: Vec<RustShadowInput>,
     staticlib_inputs: Vec<RustShadowInput>,
@@ -3215,7 +3215,20 @@ where
             // out, sort them, and append them to the rest of the arguments.
             .partition(|&(arg, _)| arg == "--cfg");
         sortables.sort();
-        hash_rust_argument_pairs(&mut m, rest.into_iter().chain(sortables));
+        hash_rust_argument_pairs(&mut m, rest.iter().chain(sortables.iter()).copied());
+        let hashed_argument_pairs = shadow_log_path.is_some().then(|| {
+            rest.iter()
+                .chain(sortables.iter())
+                .map(|(name, value)| {
+                    (
+                        name.to_string_lossy().into_owned(),
+                        value
+                            .as_ref()
+                            .map(|value| value.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
         if native_requested {
             // Keep the resolved host profile in the cache identity even when
             // `native` was rewritten to a proven-equivalent explicit CPU for
@@ -3460,7 +3473,7 @@ where
             )) = shadow_inputs
             {
                 let record = RustShadowRecord {
-                    schema: 1,
+                    schema: 2,
                     timestamp_unix_ms,
                     normalization_policy: if canonical.is_some() {
                         "canonical-rust-layout-v2".to_owned()
@@ -3498,7 +3511,7 @@ where
                         .into_owned(),
                     arguments_raw: rust_shadow_args(&os_string_arguments),
                     arguments_canonical: rust_shadow_args(&hash_os_string_arguments),
-                    arguments_hashed_blob: args.to_string_lossy().into_owned(),
+                    arguments_hashed_pairs: hashed_argument_pairs.unwrap_or_default(),
                     source_inputs: shadow_source_inputs,
                     extern_inputs: shadow_extern_inputs,
                     staticlib_inputs: shadow_staticlib_inputs,
