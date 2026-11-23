@@ -245,20 +245,20 @@ impl<T: ArgumentValue, F: FnMut(&Path) -> Option<String>> Iterator for IterStrin
                 _ => None,
             },
             Argument::WithValue(s, ref v, ref d) => match (self.emitted, d) {
-                (0, &ArgDisposition::CanBeSeparated(d) | &ArgDisposition::Concatenated(d)) => {
-                    let mut s = s.to_owned();
-                    let v = match v.clone().into_arg_string(&mut self.path_transformer) {
-                        Ok(s) => s,
-                        Err(e) => return Some(Err(e)),
-                    };
-                    if let Some(d) = d
-                        && !v.is_empty()
-                    {
-                        s.push(char::from(d));
-                    }
-                    s.push_str(&v);
-                    Some(Ok(s))
-                }
+                (0, &ArgDisposition::CanBeSeparated(d) | &ArgDisposition::Concatenated(d)) => Some(
+                    v.clone()
+                        .into_arg_string(&mut self.path_transformer)
+                        .map(|v| {
+                            let mut arg = s.to_owned();
+                            if let Some(d) = d
+                                && !v.is_empty()
+                            {
+                                arg.push(char::from(d));
+                            }
+                            arg.push_str(&v);
+                            arg
+                        }),
+                ),
                 (0, &ArgDisposition::Separated | &ArgDisposition::CanBeConcatenated(_)) => {
                     Some(Ok(s.to_owned()))
                 }
@@ -1088,6 +1088,50 @@ mod tests {
 
         let arg = arg!(WithValue("-foo", Foo("bar"), Separated));
         assert_eq!(arg.iter_os_strings().collect_vec(), ovec!["-foo", "bar"]);
+    }
+
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn concatenated_argument_path_error_is_emitted_only_once() {
+        let value = PathBuf::from("unmappable-header");
+        for disposition in [
+            ArgDisposition::Concatenated(Some(b'=')),
+            ArgDisposition::CanBeSeparated(Some(b'=')),
+        ] {
+            let argument = Argument::WithValue("-I", value.clone(), disposition);
+            let mut transformations = 0;
+            let mut args = argument.iter_strings(|path| {
+                transformations += 1;
+                assert_eq!(path, Path::new("unmappable-header"));
+                None
+            });
+            assert_eq!(
+                args.next(),
+                Some(Err(ArgToStringError::FailedPathTransform(value.clone())))
+            );
+            assert_eq!(args.next(), None);
+            assert_eq!(args.next(), None);
+            assert_eq!(transformations, 1);
+        }
+    }
+
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn separated_argument_path_error_advances_past_value() {
+        let argument = Argument::WithValue(
+            "-I",
+            PathBuf::from("unmappable-header"),
+            ArgDisposition::Separated,
+        );
+        let mut args = argument.iter_strings(|_| None);
+        assert_eq!(args.next(), Some(Ok("-I".to_owned())));
+        assert_eq!(
+            args.next(),
+            Some(Err(ArgToStringError::FailedPathTransform(PathBuf::from(
+                "unmappable-header",
+            ))))
+        );
+        assert_eq!(args.next(), None);
     }
 
     #[cfg(unix)]
