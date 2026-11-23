@@ -241,7 +241,7 @@ impl Digest {
             };
             let is_directory = target_type.as_ref().is_some_and(std::fs::FileType::is_dir);
             let is_file = target_type.as_ref().is_some_and(std::fs::FileType::is_file);
-            if !(is_directory || is_file || symlink_target.is_some()) {
+            if target_type.is_some() && !(is_directory || is_file) {
                 anyhow::bail!(
                     "Unsupported special file in tracked directory: {}",
                     debug_display(&path)
@@ -2507,6 +2507,26 @@ mod tests {
         std::fs::create_dir(tree.join("new-empty-directory")).unwrap();
         let after = Digest::reader(tree, &pool).await.unwrap();
         assert_ne!(before, after);
+    }
+
+    #[tokio::test]
+    async fn test_digest_reader_directory_frames_file_contents() {
+        // The old hash concatenated raw file bytes after path delimiters:
+        // a file could impersonate a subsequent path and cause a cache collision.
+        let single = tempfile::tempdir().unwrap();
+        let split = tempfile::tempdir().unwrap();
+        std::fs::write(single.path().join("a"), b"x\0SCCACHE\0b\0y").unwrap();
+        std::fs::write(split.path().join("a"), b"x").unwrap();
+        std::fs::write(split.path().join("b"), b"y").unwrap();
+        let pool = tokio::runtime::Handle::current();
+        assert_ne!(
+            Digest::reader(single.path().to_path_buf(), &pool)
+                .await
+                .unwrap(),
+            Digest::reader(split.path().to_path_buf(), &pool)
+                .await
+                .unwrap(),
+        );
     }
 
     #[cfg(unix)]
