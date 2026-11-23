@@ -172,11 +172,6 @@ pub trait ReadSeek: Read + Seek + Send {}
 
 impl<T: Read + Seek + Send> ReadSeek for T {}
 
-enum AddFile<'a> {
-    AbsPath(PathBuf),
-    RelPath(&'a OsStr),
-}
-
 struct PendingReservation {
     pending_size: Arc<AtomicU64>,
     size: u64,
@@ -330,8 +325,7 @@ impl LruDiskCache {
                     );
                 }
             } else {
-                let add_file = AddFile::AbsPath(file);
-                self.add_file(&add_file, size)
+                self.add_file(&file, size)
                     .unwrap_or_else(|e| error!("Error adding file: {e}"));
             }
         }
@@ -371,18 +365,47 @@ impl LruDiskCache {
         Ok(())
     }
 
-    /// Add the file at `path` of size `size` to the cache.
-    fn add_file(&mut self, addfile_path: &AddFile<'_>, size: u64) -> Result<()> {
-        let rel_path = match addfile_path {
-            AddFile::AbsPath(path) => path
-                .strip_prefix(&self.root)
-                .map_err(|_| Error::InvalidCacheKey(path.clone()))?
-                .as_os_str(),
-            AddFile::RelPath(path) => *path,
-        };
+    /// Index an existing file while scanning the cache at startup.
+    fn add_file(&mut self, path: &Path, size: u64) -> Result<()> {
+        let rel_path = path
+            .strip_prefix(&self.root)
+            .map_err(|_| Error::InvalidCacheKey(path.to_owned()))?
+            .as_os_str();
         Self::validate_key(rel_path)?;
         self.make_space(size)?;
         self.lru.insert(rel_path.to_owned(), size);
+        Ok(())
+    }
+
+    // Retain the previous on-disk value and restore its LRU accounting if
+    // admission or atomic publication fails.
+    fn commit_replacement<F: FnOnce(&Path) -> io::Result<()>>(
+        &mut self,
+        key: &OsStr,
+        size: u64,
+        publish: F,
+    ) -> Result<()> {
+        Self::validate_key(key)?;
+        if !self.can_store(size) {
+            return Err(Error::FileTooLarge);
+        }
+        let destination = self.rel_to_abs_path(key);
+        let parent = destination
+            .parent()
+            .ok_or_else(|| Error::InvalidCacheKey(PathBuf::from(key)))?;
+        fs::create_dir_all(parent)?;
+
+        let previous = self.lru.remove(key);
+        let published = self
+            .make_space(size)
+            .and_then(|()| publish(&destination).map_err(Error::Io));
+        if let Err(error) = published {
+            if let Some(previous_size) = previous {
+                self.lru.insert(key.to_owned(), previous_size);
+            }
+            return Err(error);
+        }
+        self.lru.insert(key.to_owned(), size);
         Ok(())
     }
 
@@ -392,38 +415,24 @@ impl LruDiskCache {
         size: Option<u64>,
         by: F,
     ) -> Result<()> {
-        if let Some(size) = size
-            && !self.can_store(size)
-        {
+        let key = key.as_ref();
+        Self::validate_key(key)?;
+        if size.is_some_and(|size| !self.can_store(size)) {
             return Err(Error::FileTooLarge);
         }
-        let rel_path = key.as_ref();
-        Self::validate_key(rel_path)?;
-        let path = self.rel_to_abs_path(rel_path);
-        let parent = path
-            .parent()
-            .ok_or_else(|| Error::InvalidCacheKey(PathBuf::from(rel_path)))?;
-        fs::create_dir_all(parent)?;
-        by(&path)?;
-        let size = match size {
-            Some(size) => size,
-            None => fs::metadata(path)?.len(),
-        };
-        self.add_file(&AddFile::RelPath(rel_path), size)
-            .map_err(|e| {
-                error!(
-                    "Failed to insert file `{}`: {e}",
-                    rel_path.to_string_lossy()
-                );
-                let cleanup_path = self.rel_to_abs_path(rel_path);
-                if let Err(cleanup_error) = fs::remove_file(&cleanup_path) {
-                    warn!(
-                        "Failed to remove rejected cache file {}: {cleanup_error}",
-                        cleanup_path.display()
-                    );
-                }
-                e
-            })
+        // The callback must never write the existing live entry. Staged names
+        // are also discarded if a process restarts before publication.
+        let staged = tempfile::Builder::new()
+            .prefix(TEMPFILE_PREFIX)
+            .tempfile_in(&self.root)?;
+        by(staged.path())?;
+        let actual_size = staged.as_file().metadata()?.len();
+        self.commit_replacement(key, actual_size, |destination| {
+            staged
+                .persist(destination)
+                .map_err(|error| error.error)
+                .map(|_| ())
+        })
     }
 
     /// Add a file by calling `with` with the open `File` corresponding to the cache at path `key`.
@@ -458,16 +467,25 @@ impl LruDiskCache {
     ///
     /// Returns an error if the source cannot be read/moved, the key is invalid, or the cache cannot make space.
     pub fn insert_file<K: AsRef<OsStr>, P: AsRef<OsStr>>(&mut self, key: K, path: P) -> Result<()> {
-        let size = fs::metadata(path.as_ref())?.len();
-        self.insert_by(key, Some(size), |new_path| {
-            fs::rename(path.as_ref(), new_path).or_else(|_| {
-                warn!("fs::rename failed, falling back to copy!");
-                fs::copy(path.as_ref(), new_path)?;
-                fs::remove_file(path.as_ref()).unwrap_or_else(|e| {
-                    error!("Failed to remove original file in insert_file: {e}");
-                });
-                Ok(())
-            })
+        let source = Path::new(path.as_ref());
+        let size = fs::metadata(source)?.len();
+        let root = self.root.clone();
+        self.commit_replacement(key.as_ref(), size, |destination| {
+            if source == destination || fs::rename(source, destination).is_ok() {
+                return Ok(());
+            }
+            // Cross-device copies must also be staged; copying onto an existing
+            // entry would destroy it if the transfer failed midway through.
+            warn!("fs::rename failed, falling back to copy!");
+            let staged = tempfile::Builder::new()
+                .prefix(TEMPFILE_PREFIX)
+                .tempfile_in(root)?;
+            fs::copy(source, staged.path())?;
+            staged.persist(destination).map_err(|error| error.error)?;
+            if let Err(error) = fs::remove_file(source) {
+                error!("Failed to remove original file in insert_file: {error}");
+            }
+            Ok(())
         })
     }
 
@@ -517,18 +535,11 @@ impl LruDiskCache {
 
         file.flush()?;
         let real_size = file.as_file().metadata()?.len();
-        self.make_space(real_size)?;
-
-        let path = self.rel_to_abs_path(&key);
-        let parent = path.parent().ok_or_else(|| {
-            Error::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cache entry path has no parent directory",
-            ))
+        self.commit_replacement(&key, real_size, |destination| {
+            file.persist(destination)
+                .map_err(|error| error.error)
+                .map(|_| ())
         })?;
-        fs::create_dir_all(parent)?;
-        file.persist(path).map_err(|error| error.error)?;
-        self.lru.insert(key, real_size);
         Ok(())
     }
 
@@ -919,6 +930,62 @@ mod tests {
         assert!(!p2.exists());
         assert!(!p3.exists());
 
+        Ok(())
+    }
+
+    #[test]
+    fn failed_streaming_replacement_preserves_live_entry_and_restart_state() -> Result<()> {
+        let fixture = TestFixture::new()?;
+        let root = fixture.tmp().join("cache");
+        let mut cache = LruDiskCache::new(&root, 8)?;
+        cache.insert_bytes("key", b"original")?;
+
+        let failure = cache.insert_with("key", |mut file| {
+            file.write_all(b"partial")?;
+            Err(io::Error::other("stream interrupted"))
+        });
+        assert!(failure.is_err());
+        assert_eq!(read_all(&mut cache.get("key")?)?, b"original");
+        assert_eq!(cache.size(), 8);
+        assert!(matches!(
+            cache.insert_with("key", |mut file| file.write_all(b"oversized")),
+            Err(Error::FileTooLarge)
+        ));
+        assert_eq!(read_all(&mut cache.get("key")?)?, b"original");
+
+        cache.insert_bytes("key", b"updated!")?;
+        assert_eq!(cache.size(), 8);
+        assert_eq!(read_all(&mut cache.get("key")?)?, b"updated!");
+        drop(cache);
+        let mut cache = LruDiskCache::new(&root, 8)?;
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.size(), 8);
+        assert_eq!(read_all(&mut cache.get("key")?)?, b"updated!");
+        Ok(())
+    }
+
+    #[test]
+    fn file_replacement_preserves_source_and_cached_entry_on_admission_failure() -> Result<()> {
+        let fixture = TestFixture::new()?;
+        let root = fixture.tmp().join("cache");
+        let mut cache = LruDiskCache::new(&root, 8)?;
+        cache.insert_bytes("key", b"original")?;
+
+        let too_large = fixture.tmp().join("large-source");
+        fs::write(&too_large, b"ninebytes")?;
+        assert!(matches!(
+            cache.insert_file("key", &too_large),
+            Err(Error::FileTooLarge)
+        ));
+        assert_eq!(fs::read(&too_large)?, b"ninebytes");
+        assert_eq!(read_all(&mut cache.get("key")?)?, b"original");
+
+        let replacement = fixture.tmp().join("new-source");
+        fs::write(&replacement, b"replaced")?;
+        cache.insert_file("key", &replacement)?;
+        assert!(!replacement.exists());
+        assert_eq!(cache.size(), 8);
+        assert_eq!(read_all(&mut cache.get("key")?)?, b"replaced");
         Ok(())
     }
 
