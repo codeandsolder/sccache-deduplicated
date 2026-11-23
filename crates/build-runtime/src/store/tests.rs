@@ -27,6 +27,43 @@ fn result(blob: BlobRef) -> ResultManifest {
 }
 
 #[test]
+fn blob_identity_is_exact_content_and_independent_of_read_chunking() -> Result<()> {
+    struct Chunked<'a> {
+        data: &'a [u8],
+        maximum: usize,
+    }
+
+    impl Read for Chunked<'_> {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            let count = output.len().min(self.maximum).min(self.data.len());
+            output[..count].copy_from_slice(&self.data[..count]);
+            self.data = &self.data[count..];
+            Ok(count)
+        }
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let data: Vec<u8> = (0..131_071).map(|index| (index % 251) as u8).collect();
+    let expected = BlobRef {
+        id: ContentId(*blake3::hash(&data).as_bytes()),
+        size: data.len().try_into()?,
+    };
+
+    for maximum in [1, 31, 4096, 65_536, data.len()] {
+        let staged = store.stage(Chunked {
+            data: &data,
+            maximum,
+        })?;
+        assert_eq!(staged.reference(), expected);
+    }
+
+    let empty = store.stage(io::empty())?;
+    assert_eq!(empty.reference().id, ContentId::of(b""));
+    Ok(())
+}
+
+#[test]
 fn aliases_and_shared_artifacts_reclaim_only_last_reference() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let store = NativeStore::open(dir.path())?;
