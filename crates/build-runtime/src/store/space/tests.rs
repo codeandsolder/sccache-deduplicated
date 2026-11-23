@@ -634,3 +634,45 @@ fn eviction_prefers_exclusive_tree_content_over_shared_tree_blobs() -> Result<()
     );
     Ok(())
 }
+
+#[test]
+fn physical_reclaim_estimate_uses_file_allocation_not_logical_size() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = NativeStore::open(temp.path())?;
+    let name = "compressible-allocation-".repeat(4096);
+    let action = publish(&store, &name)?;
+    let lease = store.lookup(action)?.context("missing action")?;
+    let result = lease.manifest().id()?;
+    let id = ContentId::of(name.as_bytes());
+    let size = u64::try_from(name.len())?;
+    let blobs = BTreeMap::from([(id, size)]);
+    let disappearing = BTreeSet::from([result.0]);
+    let read = store.inner.db.begin_read()?;
+    let owners = read.open_multimap_table(BLOB_ROOTS)?;
+    let actual_blocks = std::fs::metadata(store.inner.blob_path(id))?
+        .blocks()
+        .checked_mul(512)
+        .context("allocation block overflow")?;
+    assert_eq!(
+        store.reclaimable_potential(&blobs, &disappearing, &BTreeSet::new(), &owners, true)?,
+        actual_blocks
+    );
+    assert_eq!(
+        store.reclaimable_potential(&blobs, &disappearing, &BTreeSet::new(), &owners, false)?,
+        size
+    );
+    let pinned = store
+        .inner
+        .lock_pins()?
+        .blobs
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert!(pinned.contains(&id));
+    assert_eq!(
+        store.reclaimable_potential(&blobs, &disappearing, &pinned, &owners, true)?,
+        0
+    );
+    drop(lease);
+    Ok(())
+}
