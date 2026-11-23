@@ -567,26 +567,33 @@ impl LruDiskCache {
     pub fn get_file<K: AsRef<OsStr>>(&mut self, key: K) -> Result<File> {
         let rel_path = key.as_ref();
         let path = self.rel_to_abs_path(rel_path);
-        self.lru
-            .get(rel_path)
-            .ok_or(Error::FileNotInCache)
-            .and_then(|_| {
-                let mut options = File::options();
-                options.read(true);
-                // Windows requires FILE_WRITE_ATTRIBUTES to set timestamps on
-                // an otherwise read-only handle; do not request write-data access.
-                #[cfg(windows)]
-                {
-                    use fs_err::os::windows::fs::OpenOptionsExt;
-                    use windows_sys::Win32::Foundation::GENERIC_READ;
-                    use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
-                    options.access_mode(GENERIC_READ | FILE_WRITE_ATTRIBUTES);
-                }
-                let file = options.open(path)?;
-                let now = SystemTime::now();
-                file.set_times(FileTimes::new().set_accessed(now).set_modified(now))?;
-                Ok(file)
-            })
+        if self.lru.get(rel_path).is_none() {
+            return Err(Error::FileNotInCache);
+        }
+        let mut options = File::options();
+        options.read(true);
+        // Windows requires FILE_WRITE_ATTRIBUTES to set timestamps on
+        // an otherwise read-only handle; do not request write-data access.
+        #[cfg(windows)]
+        {
+            use fs_err::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Foundation::GENERIC_READ;
+            use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
+            options.access_mode(GENERIC_READ | FILE_WRITE_ATTRIBUTES);
+        }
+        let file = match options.open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // An externally removed cache file is a miss, not an I/O failure.
+                // Forget its size now instead of retaining a phantom LRU entry.
+                self.lru.remove(rel_path);
+                return Err(Error::FileNotInCache);
+            }
+            Err(error) => return Err(Error::Io(error)),
+        };
+        let now = SystemTime::now();
+        file.set_times(FileTimes::new().set_accessed(now).set_modified(now))?;
+        Ok(file)
     }
 
     /// Get an opened readable and seekable handle to the file at `key`, if one exists and can
@@ -1121,6 +1128,40 @@ mod tests {
         assert!(!cache.contains_key("entry"));
         assert_eq!(cache.len(), 0);
         assert_eq!(cache.size(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn vanished_cache_file_becomes_a_miss_and_releases_accounting() -> Result<()> {
+        let fixture = TestFixture::new()?;
+        let root = fixture.tmp().join("cache");
+        let mut cache = LruDiskCache::new(&root, 32)?;
+        cache.insert_bytes("entry", b"original")?;
+        let path = root.join("entry");
+        fs::remove_file(&path)?;
+
+        #[cfg(unix)]
+        {
+            // A broken path which is not simply missing must keep its
+            // accounting until the filesystem error is resolved.
+            std::os::unix::fs::symlink("entry", &path)?;
+            assert!(matches!(cache.get_file("entry"), Err(Error::Io(_))));
+            assert!(cache.contains_key("entry"));
+            assert_eq!(cache.size(), 8);
+            fs::remove_file(&path)?;
+        }
+
+        assert!(matches!(
+            cache.get_file("entry"),
+            Err(Error::FileNotInCache)
+        ));
+        assert!(!cache.contains_key("entry"));
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.size(), 0);
+
+        cache.insert_bytes("entry", b"replacement")?;
+        assert_eq!(read_all(&mut cache.get("entry")?)?, b"replacement");
+        assert_eq!(cache.size(), 11);
         Ok(())
     }
 
