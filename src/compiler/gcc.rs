@@ -1298,31 +1298,35 @@ impl Iterator for ExpandIncludeFile<'_> {
 ///  - A backslash escapes the following character, which is taken literally.
 ///    Backslashes are literal inside single quotes, but still escape inside
 ///    double quotes.
-///  - Empty quoted strings (`""`) produce no argument. This matches Clang;
-///    GCC's `buildargv` would instead emit an empty argument, but a bare `""`
-///    argument is meaningless to a compiler so the difference is immaterial.
+///  - Empty quoted strings, whether single or double quoted, remain empty
+///    arguments. Omitting them would shift the next compiler flag into the
+///    previous flag value and can change the invocation.
 ///
 /// Whitespace is restricted to ASCII, matching the compilers' own tokenizers
 /// (a non-ASCII Unicode space inside a filename must not split an argument).
 fn split_gnu_response_file_args(contents: &str) -> Vec<OsString> {
     let mut args = Vec::new();
     let mut token = String::new();
+    let mut token_started = false;
     let mut chars = contents.chars();
 
     while let Some(c) = chars.next() {
         match c {
             c if c.is_ascii_whitespace() => {
-                if !token.is_empty() {
+                if token_started {
                     args.push(OsString::from(std::mem::take(&mut token)));
+                    token_started = false;
                 }
             }
             '\\' => {
                 // A backslash escapes the next character, if any.
                 if let Some(next) = chars.next() {
+                    token_started = true;
                     token.push(next);
                 }
             }
             '\'' | '"' => {
+                token_started = true;
                 let quote = c;
                 while let Some(qc) = chars.next() {
                     if qc == quote {
@@ -1338,11 +1342,14 @@ fn split_gnu_response_file_args(contents: &str) -> Vec<OsString> {
                     }
                 }
             }
-            c => token.push(c),
+            c => {
+                token_started = true;
+                token.push(c);
+            }
         }
     }
 
-    if !token.is_empty() {
+    if token_started {
         args.push(OsString::from(token));
     }
 
@@ -2834,10 +2841,18 @@ mod test {
             ovec!["a\"b", "c\\d"],
             split_gnu_response_file_args("\"a\\\"b\" 'c\\d'")
         );
-        // Empty quoted strings produce no argument.
+        // Empty quotes represent a real empty argument, not absent input.
         assert_eq!(
-            ovec!["-c", "foo.c"],
+            ovec!["-c", "", "foo.c"],
             split_gnu_response_file_args("-c \"\" foo.c")
+        );
+        assert_eq!(
+            ovec!["-I", "", "-c", "src.c", "-o", "src.o"],
+            split_gnu_response_file_args("-I \"\" -c src.c -o src.o")
+        );
+        assert_eq!(
+            ovec!["", "", "ab"],
+            split_gnu_response_file_args("'' \"\" a\"\"b")
         );
         // Empty or whitespace-only input produces no arguments.
         assert_eq!(
@@ -2895,6 +2910,29 @@ mod test {
         );
         assert_eq!(ovec!["-DGREETING=hello world"], preprocessor_args);
         assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
+    }
+
+    #[test]
+    fn response_file_preserves_empty_include_argument_for_gcc_and_clang() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("args.rsp");
+        fs::write(&path, b"-I \"\" -c source.c -o source.o")?;
+        let args = [OsString::from(format!("@{}", path.display()))];
+
+        assert_eq!(
+            ExpandIncludeFile::new(temp.path(), &args).collect::<Vec<_>>(),
+            ovec!["-I", "", "-c", "source.c", "-o", "source.o"]
+        );
+        for kind in [CCompilerKind::Gcc, CCompilerKind::Clang] {
+            let parsed = parse_arguments(&args, temp.path(), &ARGS[..], false, kind);
+            let CompilerArguments::Ok(parsed) = parsed else {
+                panic!("response file lost compilation semantics for {kind:?}: {parsed:?}");
+            };
+            assert_eq!(parsed.input, PathBuf::from("source.c"));
+            assert_eq!(parsed.compilation_flag, OsString::from("-c"));
+            assert_eq!(parsed.preprocessor_args, ovec!["-I", ""]);
+        }
+        Ok(())
     }
 
     #[test]
