@@ -337,13 +337,14 @@ fn compiler_target_matches(requested: &str, reported: &str) -> Result<bool> {
         && requested.binary_format == reported.binary_format)
 }
 
-fn validate_c_codegen(compiler: &Path, flags: &[String]) -> Result<()> {
-    // Compile a translation unit without linking or filesystem artifacts.
-    // This checks actual compiler backend support, not just Archspec's
-    // compiler-version table (which may be newer than the installed binary).
+fn validate_c_target_flags(compiler: &Path, flags: &[String]) -> Result<()> {
+    // Parse a translation unit with the selected compiler but perform no
+    // code generation. GCC and Clang both validate -march/-mcpu with
+    // -fsyntax-only, so no local compilation artifact is created.
+    // This catches CPU models unsupported by the installed compiler.
     let output = Command::new(compiler)
         .args(flags)
-        .args(["-S", "-x", "c", "-o", "-", "-"])
+        .args(["-fsyntax-only", "-x", "c", "-"])
         .stdin(Stdio::null())
         .output()
         .with_context(|| format!("cannot probe C compiler {}", compiler.display()))?;
@@ -389,7 +390,7 @@ pub fn selected_c_flags(
         // arguments, hashed by the existing C compiler-specific cache key.
         flags.insert(0, format!("--target={}", profile.target_triple));
     }
-    validate_c_codegen(compiler, &flags)?;
+    validate_c_target_flags(compiler, &flags)?;
     Ok(flags)
 }
 
@@ -585,14 +586,14 @@ mod tests {
     #[test]
     fn toolchain_probe_checks_actual_backend_support() {
         assert!(
-            validate_c_codegen(
+            validate_c_target_flags(
                 Path::new("gcc"),
                 &["-march=cpu-definitely-not-present-in-any-gcc".to_owned()]
             )
             .is_err()
         );
         assert!(
-            validate_c_codegen(
+            validate_c_target_flags(
                 Path::new("clang"),
                 &[
                     "--target=aarch64-unknown-linux-gnu".to_owned(),

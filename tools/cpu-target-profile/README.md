@@ -53,9 +53,10 @@ cargo --config cargo-target.toml build --target x86_64-unknown-linux-gnu
 C output validates the actual compiler against the destination ABI:
 GCC must report a compatible architecture/OS/environment via `-dumpmachine`
 (the vendor field can differ), and Clang receives an explicit
-`--target=DESTINATION_TRIPLE` argument. Both backends are checked by compiling
-an empty translation unit with the emitted optimization flags, without
-linking or producing artifacts. This rejects native GCC for foreign
+`--target=DESTINATION_TRIPLE` argument. Both backends are checked with a
+syntax-only compiler invocation (`-fsyntax-only -x c -`) using the
+generated optimization flags. This validates CPU flag support without
+compiling client-side code, linking or producing artifacts. This rejects native GCC for foreign
 architectures, instead of silently generating unusable configurations.
 The cross-toolchain and any required sysroot are selected independently.
 
