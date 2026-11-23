@@ -1067,9 +1067,13 @@ impl TcCache {
     /// Returns an error if the cache cannot install the archive.
     pub fn insert_staged(&mut self, staged: StagedToolchainArchive) -> Result<()> {
         let StagedToolchainArchive { toolchain, file } = staged;
-        if !self.contains_toolchain(&toolchain) {
-            self.inner
-                .insert_file(make_lru_key_path(&toolchain.archive_id), file.path())?;
+        match self.get_file(&toolchain) {
+            Ok(_) => {}
+            Err(crate::lru_disk_cache::Error::FileNotInCache) => {
+                self.inner
+                    .insert_file(make_lru_key_path(&toolchain.archive_id), file.path())?;
+            }
+            Err(error) => return Err(error.into()),
         }
         Ok(())
     }
@@ -1234,6 +1238,63 @@ mod cache_validation_tests {
         assert_eq!(actual, payload);
         fs::remove_file(&source_file)?;
         assert!(cache.contains_toolchain(&tc));
+        Ok(())
+    }
+
+    #[test]
+    fn staged_archive_replaces_missing_cached_file_without_trusting_stale_index() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let bytes = b"toolchain from verified upload";
+        let toolchain = Toolchain {
+            archive_id: ArchiveId::try_from(Digest::reader_sync(bytes.as_slice())?)?,
+        };
+        let mut cache = TcCache::new(temp.path(), 1024)?;
+        let staged = StagedToolchainArchive::receive(
+            temp.path(),
+            toolchain.clone(),
+            bytes.as_slice(),
+            1024,
+        )?;
+        cache.insert_staged(staged)?;
+        let key = make_lru_key_path(&toolchain.archive_id);
+        fs::remove_file(temp.path().join(&key))?;
+        assert!(cache.contains_toolchain(&toolchain));
+
+        let retry = StagedToolchainArchive::receive(
+            temp.path(),
+            toolchain.clone(),
+            bytes.as_slice(),
+            1024,
+        )?;
+        cache.insert_staged(retry)?;
+        let mut actual = Vec::new();
+        cache.get(&toolchain)?.read_to_end(&mut actual)?;
+        assert_eq!(actual, bytes);
+        assert_eq!(cache.len(), 1);
+
+        #[cfg(unix)]
+        {
+            fs::remove_file(temp.path().join(&key))?;
+            std::os::unix::fs::symlink(
+                key.file_name()
+                    .ok_or_else(|| anyhow!("cache path has no filename"))?,
+                temp.path().join(&key),
+            )?;
+            let retry = StagedToolchainArchive::receive(
+                temp.path(),
+                toolchain.clone(),
+                bytes.as_slice(),
+                1024,
+            )?;
+            assert!(cache.insert_staged(retry).is_err());
+            assert!(
+                fs::symlink_metadata(temp.path().join(&key))?
+                    .file_type()
+                    .is_symlink()
+            );
+            // The cache index is retained for an actionable filesystem error.
+            assert!(cache.contains_toolchain(&toolchain));
+        }
         Ok(())
     }
 
