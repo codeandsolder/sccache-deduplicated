@@ -812,6 +812,10 @@ fn named_system_upstream_provisions_original_without_client_upload() -> Result<(
 #[ignore = "requires pacman with a cached, installed GCC release, plus isolated scheduler and worker"]
 fn pacman_discovery_seeds_real_gcc_and_compiles_with_exact_results() -> Result<()> {
     use sccache::build_runtime::{PackageCompression, PackageIdentity};
+    if !Path::new("/usr/bin/pacman").is_file() || !Path::new("/usr/bin/gcc").is_file() {
+        eprintln!("SKIP: native pacman GCC integration requires pacman and GCC");
+        return Ok(());
+    }
     let installed = Command::new("/usr/bin/pacman")
         .args(["-Q", "gcc"])
         .output()?;

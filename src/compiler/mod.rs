@@ -36,6 +36,7 @@ mod nvcc;
 mod nvhpc;
 mod preprocessor_cache;
 mod ptxas;
+mod response_files;
 mod rust;
 mod rust_dlltool;
 #[cfg(target_os = "linux")]

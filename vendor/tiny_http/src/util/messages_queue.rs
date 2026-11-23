@@ -78,7 +78,8 @@ where
                 None => (),
             }
             let now = Instant::now();
-            let (_queue, result) = self.condvar.wait_timeout(queue, timeout).unwrap();
+            // Spurious wakeups must not restart the full deadline.
+            let (_queue, result) = self.condvar.wait_timeout(queue, duration).unwrap();
             queue = _queue;
             let sleep_time = now.elapsed();
             duration = if duration > sleep_time {
@@ -92,5 +93,31 @@ where
                 return None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::MessagesQueue;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn unsolicited_notification_does_not_restart_deadline() {
+        let queue = MessagesQueue::<u8>::with_capacity(1);
+        let wake = Arc::clone(&queue);
+        let notifier = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            wake.condvar.notify_all();
+        });
+
+        let started = Instant::now();
+        assert_eq!(queue.pop_timeout(Duration::from_millis(250)), None);
+        assert!(
+            started.elapsed() < Duration::from_millis(350),
+            "a spurious wakeup restarted the timeout",
+        );
+        notifier.join().expect("notifier");
     }
 }

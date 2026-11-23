@@ -162,7 +162,11 @@ impl NativeCompilerClient {
                     let client = crate::util::new_reqwest_client_builder()?
                         .timeout(Duration::from_secs(config.request_timeout_secs))
                         .build()?;
-                    dist::http::common::bincode_req_fut(client.get(url)).await
+                    dist::http::transport::send_async(
+                        client.get(url),
+                        dist::http::transport::RequestClass::Control,
+                    )
+                    .await
                 }
                 .await;
                 match result {

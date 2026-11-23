@@ -2,6 +2,7 @@
 
 #[cfg(unix)]
 use std::os::unix::net as unix_net;
+use std::time::Duration;
 use std::{
     net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::PathBuf,
@@ -84,6 +85,22 @@ impl Connection {
             Self::Tcp(s) => s.peer_addr().map(Some),
             #[cfg(unix)]
             Self::Unix(_) => Ok(None),
+        }
+    }
+
+    /// Bound idle reads and writes without imposing a duration on whole
+    /// requests: large, actively streaming uploads are allowed to continue.
+    pub(crate) fn set_io_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(stream) => {
+                stream.set_read_timeout(timeout)?;
+                stream.set_write_timeout(timeout)
+            }
+            #[cfg(unix)]
+            Self::Unix(stream) => {
+                stream.set_read_timeout(timeout)?;
+                stream.set_write_timeout(timeout)
+            }
         }
     }
 
@@ -190,5 +207,28 @@ impl std::fmt::Display for ListenAddr {
             #[cfg(unix)]
             Self::Unix(s) => std::fmt::Debug::fmt(s, f),
         }
+    }
+}
+
+#[cfg(test)]
+mod socket_timeout_tests {
+    use super::{Connection, TcpListener, TcpStream};
+    use std::io::{ErrorKind, Read};
+    use std::time::Duration;
+
+    #[test]
+    fn idle_socket_read_does_not_hold_thread_forever() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let _peer = TcpStream::connect(listener.local_addr().expect("address")).expect("connect");
+        let (socket, _) = listener.accept().expect("accept");
+        let mut conn = Connection::from(socket);
+        conn.set_io_timeout(Some(Duration::from_millis(120)))
+            .expect("configure timeout");
+        let error = conn.read(&mut [0u8; 1]).expect_err("idle read must end");
+        assert!(
+            matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+            "unexpected error: {:?}",
+            error,
+        );
     }
 }

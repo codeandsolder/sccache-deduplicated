@@ -121,6 +121,12 @@ impl<T: ArgumentValue> Argument<T> {
             Self::WithValue(
                 s,
                 v,
+                original @ (ArgDisposition::CanBeConcatenated(_)
+                | ArgDisposition::CanBeSeparated(_)),
+            ) if v.is_empty_arg_value() => Self::WithValue(s, v, original),
+            Self::WithValue(
+                s,
+                v,
                 ArgDisposition::CanBeConcatenated(d) | ArgDisposition::CanBeSeparated(d),
             ) => Self::WithValue(
                 s,
@@ -199,9 +205,7 @@ impl<T: ArgumentValue> Iterator for Iter<'_, T> {
                 (0, &ArgDisposition::CanBeSeparated(d) | &ArgDisposition::Concatenated(d)) => {
                     let mut s = OsString::from(s);
                     let v = v.clone().into_arg_os_string();
-                    if let Some(d) = d
-                        && !v.is_empty()
-                    {
+                    if let Some(d) = d {
                         s.push(char::from(d).to_string());
                     }
                     s.push(v);
@@ -245,20 +249,18 @@ impl<T: ArgumentValue, F: FnMut(&Path) -> Option<String>> Iterator for IterStrin
                 _ => None,
             },
             Argument::WithValue(s, ref v, ref d) => match (self.emitted, d) {
-                (0, &ArgDisposition::CanBeSeparated(d) | &ArgDisposition::Concatenated(d)) => {
-                    let mut s = s.to_owned();
-                    let v = match v.clone().into_arg_string(&mut self.path_transformer) {
-                        Ok(s) => s,
-                        Err(e) => return Some(Err(e)),
-                    };
-                    if let Some(d) = d
-                        && !v.is_empty()
-                    {
-                        s.push(char::from(d));
-                    }
-                    s.push_str(&v);
-                    Some(Ok(s))
-                }
+                (0, &ArgDisposition::CanBeSeparated(d) | &ArgDisposition::Concatenated(d)) => Some(
+                    v.clone()
+                        .into_arg_string(&mut self.path_transformer)
+                        .map(|v| {
+                            let mut arg = s.to_owned();
+                            if let Some(d) = d {
+                                arg.push(char::from(d));
+                            }
+                            arg.push_str(&v);
+                            arg
+                        }),
+                ),
                 (0, &ArgDisposition::Separated | &ArgDisposition::CanBeConcatenated(_)) => {
                     Some(Ok(s.to_owned()))
                 }
@@ -301,6 +303,10 @@ macro_rules! ArgData {
 
     { __impl $( $tok:tt )+ } => {
         impl IntoArg for ArgData {
+            fn is_empty_arg_value(&self) -> bool {
+                ArgData!{ __matchify self is_empty_arg_value () () $($tok)+ }
+            }
+
             fn into_arg_os_string(self) -> OsString {
                 ArgData!{ __matchify self into_arg_os_string () () $($tok)+ }
             }
@@ -337,6 +343,17 @@ pub trait FromArg: Sized {
 }
 
 pub trait IntoArg: Sized {
+    /// Whether this value would become an empty compiler argument.
+    ///
+    /// Implementations should inspect the borrowed value without cloning
+    /// when possible; this is used when normalizing compiler argument layout.
+    fn is_empty_arg_value(&self) -> bool
+    where
+        Self: Clone,
+    {
+        self.clone().into_arg_os_string().is_empty()
+    }
+
     fn into_arg_os_string(self) -> OsString;
     fn into_arg_string(self, transformer: PathTransformerFn<'_>) -> ArgToStringResult;
 }
@@ -358,6 +375,10 @@ impl FromArg for String {
 }
 
 impl IntoArg for OsString {
+    fn is_empty_arg_value(&self) -> bool {
+        self.as_os_str().is_empty()
+    }
+
     fn into_arg_os_string(self) -> OsString {
         self
     }
@@ -366,6 +387,10 @@ impl IntoArg for OsString {
     }
 }
 impl IntoArg for PathBuf {
+    fn is_empty_arg_value(&self) -> bool {
+        self.as_os_str().is_empty()
+    }
+
     fn into_arg_os_string(self) -> OsString {
         self.into()
     }
@@ -374,6 +399,10 @@ impl IntoArg for PathBuf {
     }
 }
 impl IntoArg for String {
+    fn is_empty_arg_value(&self) -> bool {
+        self.is_empty()
+    }
+
     fn into_arg_os_string(self) -> OsString {
         self.into()
     }
@@ -382,6 +411,10 @@ impl IntoArg for String {
     }
 }
 impl IntoArg for () {
+    fn is_empty_arg_value(&self) -> bool {
+        true
+    }
+
     fn into_arg_os_string(self) -> OsString {
         OsString::new()
     }
@@ -442,12 +475,23 @@ impl<T: ArgumentValue> ArgInfo<T> {
                         "argument does not start with its flag",
                     ));
                 };
-                if let Some(d) = d
-                    && let Some(stripped) = value.split_prefix(&char::from(d).to_string())
-                {
-                    value = stripped;
-                }
-                Argument::WithValue(s, create(value)?, ArgDisposition::Concatenated(d))
+                // Keep a bare flag distinct from a flag with an explicit
+                // empty value: "-foo" and "-foo=" can have different meaning.
+                // Some compilers also permit bare spellings of flags declared
+                // with a concatenation delimiter.
+                let delimiter = match d {
+                    Some(_) if value.is_empty() => None,
+                    Some(d) => {
+                        value = value.split_prefix(&char::from(d).to_string()).ok_or(
+                            ArgParseError::Other(
+                                "concatenated argument is missing the configured delimiter",
+                            ),
+                        )?;
+                        Some(d)
+                    }
+                    None => None,
+                };
+                Argument::WithValue(s, create(value)?, ArgDisposition::Concatenated(delimiter))
             }
             Self::TakeArg(
                 s,
@@ -1088,6 +1132,137 @@ mod tests {
 
         let arg = arg!(WithValue("-foo", Foo("bar"), Separated));
         assert_eq!(arg.iter_os_strings().collect_vec(), ovec!["-foo", "bar"]);
+    }
+
+    #[test]
+    fn normalization_preserves_which_empty_values_are_separated() {
+        let empty_separated = Argument::WithValue(
+            "-I",
+            OsString::new(),
+            ArgDisposition::CanBeConcatenated(None),
+        );
+        assert_eq!(
+            empty_separated
+                .normalize(NormalizedDisposition::Concatenated)
+                .iter_os_strings()
+                .collect_vec(),
+            ovec!["-I", ""]
+        );
+
+        let empty_concatenated = Argument::WithValue(
+            "--flag",
+            OsString::new(),
+            ArgDisposition::CanBeSeparated(Some(b'=')),
+        );
+        assert_eq!(
+            empty_concatenated
+                .normalize(NormalizedDisposition::Separated)
+                .iter_os_strings()
+                .collect_vec(),
+            ovec!["--flag="]
+        );
+
+        let nonempty = Argument::WithValue(
+            "-I",
+            OsString::from("include"),
+            ArgDisposition::CanBeConcatenated(None),
+        );
+        assert_eq!(
+            nonempty
+                .normalize(NormalizedDisposition::Concatenated)
+                .iter_os_strings()
+                .collect_vec(),
+            ovec!["-Iinclude"]
+        );
+    }
+
+    #[test]
+    fn explicit_delimiter_is_preserved_for_empty_values() -> ArgParseResult<()> {
+        let concatenated = take_arg!("-foo", OsString, Concatenated(b'='), Foo);
+        let argument = concatenated.clone().process("-foo=", || None)?;
+        assert_eq!(argument.iter_os_strings().collect_vec(), ovec!["-foo="]);
+        let bare = concatenated.clone().process("-foo", || None)?;
+        assert_eq!(bare.iter_os_strings().collect_vec(), ovec!["-foo"]);
+        assert!(matches!(
+            concatenated.process("-foobar", || None),
+            Err(ArgParseError::Other(_))
+        ));
+
+        let optional_separation = take_arg!("-foo", OsString, CanBeSeparated(b'='), Foo);
+        let argument = optional_separation.process("-foo=", || None)?;
+        assert_eq!(argument.iter_os_strings().collect_vec(), ovec!["-foo="]);
+
+        #[cfg(feature = "dist-client")]
+        {
+            assert_eq!(
+                argument.iter_strings(|_| None).collect::<Vec<_>>(),
+                vec![Ok("-foo=".to_owned())]
+            );
+            assert_eq!(
+                bare.iter_strings(|_| None).collect::<Vec<_>>(),
+                vec![Ok("-foo".to_owned())]
+            );
+            let empty_path = Argument::WithValue(
+                "-I",
+                PathBuf::new(),
+                ArgDisposition::Concatenated(Some(b'=')),
+            );
+            assert_eq!(
+                empty_path
+                    .iter_strings(|_| Some(String::new()))
+                    .collect::<Vec<_>>(),
+                vec![Ok("-I=".to_owned())]
+            );
+        }
+
+        let no_delimiter =
+            take_arg!("-foo", OsString, Concatenated, Foo).process("-foo", || None)?;
+        assert_eq!(no_delimiter.iter_os_strings().collect_vec(), ovec!["-foo"]);
+        Ok(())
+    }
+
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn concatenated_argument_path_error_is_emitted_only_once() {
+        let value = PathBuf::from("unmappable-header");
+        for disposition in [
+            ArgDisposition::Concatenated(Some(b'=')),
+            ArgDisposition::CanBeSeparated(Some(b'=')),
+        ] {
+            let argument = Argument::WithValue("-I", value.clone(), disposition);
+            let mut transformations = 0;
+            let mut args = argument.iter_strings(|path| {
+                transformations += 1;
+                assert_eq!(path, Path::new("unmappable-header"));
+                None
+            });
+            assert_eq!(
+                args.next(),
+                Some(Err(ArgToStringError::FailedPathTransform(value.clone())))
+            );
+            assert_eq!(args.next(), None);
+            assert_eq!(args.next(), None);
+            assert_eq!(transformations, 1);
+        }
+    }
+
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn separated_argument_path_error_advances_past_value() {
+        let argument = Argument::WithValue(
+            "-I",
+            PathBuf::from("unmappable-header"),
+            ArgDisposition::Separated,
+        );
+        let mut args = argument.iter_strings(|_| None);
+        assert_eq!(args.next(), Some(Ok("-I".to_owned())));
+        assert_eq!(
+            args.next(),
+            Some(Err(ArgToStringError::FailedPathTransform(PathBuf::from(
+                "unmappable-header",
+            ))))
+        );
+        assert_eq!(args.next(), None);
     }
 
     #[cfg(unix)]

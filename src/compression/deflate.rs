@@ -10,6 +10,16 @@ use zlib_rs_fast::{Inflate, InflateFlush, Status};
 
 const BUFFER_SIZE: usize = 64 * 1024;
 
+/// The zlib-rs stable stream constructors defer initialization failures until
+/// first use. Preserve our fallible I/O constructor contract by checking now.
+fn initialize_decoder(window_bits: u8) -> io::Result<Inflate> {
+    let decoder = Inflate::new(true, window_bits);
+    if let Some(error) = decoder.error_message() {
+        return Err(io::Error::other(error));
+    }
+    Ok(decoder)
+}
+
 pub struct InflateReader<R> {
     reader: BufReader<R>,
     decoder: Inflate,
@@ -19,7 +29,7 @@ pub struct InflateReader<R> {
 
 impl<R: Read> InflateReader<R> {
     fn new(reader: R, window_bits: u8) -> io::Result<Self> {
-        let decoder = Inflate::new(true, window_bits).map_err(|e| io::Error::other(e.as_str()))?;
+        let decoder = initialize_decoder(window_bits)?;
         Ok(Self {
             reader: BufReader::with_capacity(BUFFER_SIZE, reader),
             decoder,
@@ -64,7 +74,7 @@ impl<R: Read> Read for InflateReader<R> {
                         "trailing bytes after zlib stream",
                     ));
                 }
-                self.decoder = Inflate::new(true, 31).map_err(|e| io::Error::other(e.as_str()))?;
+                self.decoder = initialize_decoder(31)?;
                 self.member_finished = false;
             }
             let before_in = self.decoder.total_in();
@@ -124,9 +134,13 @@ mod encode {
         ///
         /// Returns an error if codec initialization fails.
         pub fn new(writer: W) -> io::Result<Self> {
+            let encoder = Deflate::new(1, true, 15);
+            if let Some(error) = encoder.error_message() {
+                return Err(io::Error::other(error));
+            }
             Ok(Self {
                 writer,
-                encoder: Deflate::new(1, true, 15).map_err(|e| io::Error::other(e.as_str()))?,
+                encoder,
                 buffer: vec![0; BUFFER_SIZE],
             })
         }
@@ -316,6 +330,15 @@ pub use encode::{ParallelGzipWriter, ZlibWriter};
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn invalid_inflate_configuration_is_reported_on_construction() {
+        // The upstream stable API holds initialization errors in the stream,
+        // and must not silently return a reader that fails only later.
+        assert!(InflateReader::new(&b""[..], 3).is_err());
+        assert!(InflateReader::new(&b""[..], 15).is_ok());
+        assert!(InflateReader::new(&b""[..], 31).is_ok());
+    }
 
     #[test]
     fn zlib_stream_round_trips_and_rejects_truncation() -> io::Result<()> {

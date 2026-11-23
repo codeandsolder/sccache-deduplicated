@@ -5,6 +5,10 @@
 //! trait contract and specific implementations are re-exported as [`SslContextImpl`] and [`SslStream`].
 //! The concrete type of these aliases will depend on which module you enable in `Cargo.toml`.
 
+/// Per-I/O TLS negotiation timeout, not an HTTP request deadline.
+#[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
+pub(crate) const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[cfg(feature = "ssl-openssl")]
 pub(crate) mod openssl;
 #[cfg(feature = "ssl-openssl")]
