@@ -43,6 +43,7 @@ use std::io::BufRead;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
 use which::which_in;
 
 #[cfg(test)]
@@ -402,11 +403,6 @@ pub fn generate_compile_commands(
         .cloned()
         .collect::<Vec<_>>();
 
-    let temp_dir = tempfile::Builder::new()
-        .prefix("sccache_nvcc")
-        .tempdir()?
-        .keep();
-
     let mut arguments = vec![];
 
     if let Some(lang) = gcc::language_to_gcc_arg(parsed_args.language) {
@@ -474,6 +470,10 @@ pub fn generate_compile_commands(
     };
     arguments.push(input.into());
 
+    // Keep the scratch directory owned until the final command clone is dropped.
+    // All validation errors above must leave no persisted scratch files.
+    let temp_dir = Arc::new(tempfile::Builder::new().prefix("sccache_nvcc").tempdir()?);
+
     let command = NvccCompileCommand {
         temp_dir,
         keep_dir,
@@ -506,7 +506,7 @@ pub fn generate_compile_commands(
 
 #[derive(Clone, Debug)]
 pub struct NvccCompileCommand {
-    pub temp_dir: PathBuf,
+    pub temp_dir: Arc<tempfile::TempDir>,
     pub keep_dir: Option<PathBuf>,
     pub num_parallel: usize,
     pub executable: PathBuf,
@@ -561,7 +561,7 @@ impl CompileCommandImpl for NvccCompileCommand {
                 arguments,
                 compilation_flag,
                 cwd,
-                tmp: temp_dir.as_path(),
+                tmp: temp_dir.path(),
                 keep_dir: keep_dir.as_deref(),
                 env_vars,
                 host_compiler,
@@ -569,32 +569,27 @@ impl CompileCommandImpl for NvccCompileCommand {
             })
             .await?;
 
-        let maybe_keep_temps_then_clean = || {
+        let maybe_keep_temps = || {
             // If the caller passed `-keep` or `-keep-dir`, copy the
             // temp files to the requested location. We do this because we
             // override `-keep` and `-keep-dir` in our `nvcc --dryrun` call.
-            let maybe_keep_temps = keep_dir.as_ref().and_then(|dst| {
-                fs::create_dir_all(dst)
-                    .and_then(|()| fs::read_dir(temp_dir))
-                    .and_then(|files| {
-                        files
-                            .filter_map(std::result::Result::ok)
-                            .filter_map(|path| {
-                                path.file_name()
-                                    .to_str()
-                                    .map(|file| (path.path(), file.to_owned()))
-                            })
-                            .try_fold((), |(), (path, file)| fs::rename(path, dst.join(file)))
+            if let Some(dst) = keep_dir.as_ref() {
+                // The TempDir owner deletes every remaining file on last drop.
+                if let Err(err) = fs::create_dir_all(dst)
+                    .and_then(|()| fs::read_dir(temp_dir.path()))
+                    .and_then(|mut files| {
+                        files.try_fold((), |(), entry| {
+                            let entry = entry?;
+                            fs::rename(entry.path(), dst.join(entry.file_name()))
+                        })
                     })
-                    .ok()
-            });
-
-            maybe_keep_temps
-                .map_or_else(
-                    || fs::remove_dir_all(temp_dir).ok(),
-                    |()| fs::remove_dir_all(temp_dir).ok(),
-                )
-                .unwrap_or(());
+                {
+                    log::warn!(
+                        "Could not preserve NVCC intermediate files in {}: {err}",
+                        dst.display()
+                    );
+                }
+            }
         };
 
         let mut output = process::Output {
@@ -629,7 +624,7 @@ impl CompileCommandImpl for NvccCompileCommand {
                 if !output.status.success() {
                     output.stdout.shrink_to_fit();
                     output.stderr.shrink_to_fit();
-                    maybe_keep_temps_then_clean();
+                    maybe_keep_temps();
                     return Err(ProcessError(output).into());
                 }
             }
@@ -637,7 +632,7 @@ impl CompileCommandImpl for NvccCompileCommand {
 
         output.stdout.shrink_to_fit();
         output.stderr.shrink_to_fit();
-        maybe_keep_temps_then_clean();
+        maybe_keep_temps();
         Ok(output)
     }
 }
@@ -1546,6 +1541,49 @@ mod test {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[tokio::test]
+    async fn nvcc_scratch_dir_is_removed_after_last_clone_and_cancellation() -> Result<()> {
+        let parent = tempfile::tempdir()?;
+        let scratch = Arc::new(
+            tempfile::Builder::new()
+                .prefix("sccache_nvcc_test")
+                .tempdir_in(parent.path())?,
+        );
+        let path = scratch.path().to_owned();
+        fs::write(path.join("intermediate.ptx"), b"device stage")?;
+        let command = NvccCompileCommand {
+            temp_dir: scratch,
+            keep_dir: None,
+            num_parallel: 1,
+            executable: PathBuf::from("nvcc"),
+            arguments: vec![],
+            compilation_flag: OsString::from("-c"),
+            env_vars: vec![],
+            cwd: parent.path().to_owned(),
+            host_compiler: NvccHostCompiler::Gcc,
+            output_file_name: OsString::from("kernel.o"),
+        };
+        let pending_command = command.clone();
+        drop(command);
+        assert!(path.join("intermediate.ptx").exists());
+
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let owned = pending_command;
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+            drop(owned);
+        });
+        ready.await?;
+        assert!(
+            path.exists(),
+            "scratch directory dropped while clone was running"
+        );
+        task.abort();
+        assert!(task.await.is_err(), "pending command was not cancelled");
+        assert!(!path.exists(), "scratch directory survived cancellation");
+        Ok(())
+    }
     fn parse_arguments_gcc(arguments: Vec<String>) -> CompilerArguments<ParsedArguments> {
         let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
         Nvcc {
