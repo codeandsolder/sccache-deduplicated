@@ -479,6 +479,7 @@ impl NativeCacheClient {
                     .sum::<u128>(),
                 transport.parallelism()
             );
+            let raw_missing = updated.missing().to_vec();
             let staged = map_packages(updated.missing(), transport.parallelism(), |blob| {
                 check()?;
                 let _slot = transport.raw_slot(check)?;
@@ -489,6 +490,21 @@ impl NativeCacheClient {
                 Ok(staged)
             })?;
             let tree = store.publish_tree_pinned(&read.manifest, staged)?;
+            if log::log_enabled!(target: "native_cas_replay", log::Level::Trace) {
+                log::trace!(
+                    target: "native_cas_replay",
+                    "{}",
+                    serde_json::json!({
+                        "kind": "tree_transfer",
+                        "tree": id,
+                        "raw_missing_blobs": raw_missing.len(),
+                        "raw_missing_bytes": raw_missing
+                            .iter()
+                            .map(|blob| u128::from(blob.size))
+                            .sum::<u128>(),
+                    })
+                );
+            }
             #[cfg(target_os = "linux")]
             drop(packages);
             Ok(tree)

@@ -439,10 +439,30 @@ impl NativeCacheClient {
             let mut inputs = Vec::new();
             for id in &request.input_trees {
                 check()?;
-                let tree = match store.lookup_tree(*id)? {
+                let cached = store.lookup_tree(*id)?;
+                let hit = cached.is_some();
+                let tree = match cached {
                     Some(tree) => tree,
                     None => fetch(*id, check)?,
                 };
+                if log::log_enabled!(target: "native_cas_replay", log::Level::Trace) {
+                    let blobs = tree
+                        .manifest()
+                        .blobs()?
+                        .into_iter()
+                        .map(|(id, size)| BlobRef { id, size })
+                        .collect::<Vec<_>>();
+                    log::trace!(
+                        target: "native_cas_replay",
+                        "{}",
+                        serde_json::json!({
+                            "kind": "tree_access",
+                            "tree": id,
+                            "hit": hit,
+                            "blobs": blobs,
+                        })
+                    );
+                }
                 inputs.push(tree);
             }
             let captured = execute(spec, store, policy, check)?;
