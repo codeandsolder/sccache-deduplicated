@@ -1069,10 +1069,26 @@ impl Storage for MultiLevelStorage {
         &self,
         key: &str,
     ) -> Result<Option<Box<dyn crate::lru_disk_cache::ReadSeek>>> {
-        for level in &self.levels {
-            if let Some(entry) = level.get_preprocessor_cache_entry(key).await? {
-                return Ok(Some(entry));
+        let mut first_error = None;
+        for (idx, level) in self.levels.iter().enumerate() {
+            match level.get_preprocessor_cache_entry(key).await {
+                Ok(Some(entry)) => return Ok(Some(entry)),
+                Ok(None) => {}
+                Err(error) => {
+                    inc_stat!(self.atomic_stats.get(idx), read_errors, 1);
+                    warn!(
+                        "Error checking preprocessor cache level {idx}: {error:#}, trying next level"
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(error.context(format!(
+                            "preprocessor cache level {idx} lookup failed for key {key}"
+                        )));
+                    }
+                }
             }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(None)
     }
