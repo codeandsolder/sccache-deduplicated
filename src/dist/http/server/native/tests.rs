@@ -344,9 +344,11 @@ fn native_action_transfers_inputs_executes_and_publishes_without_worker_result_s
             &spec,
             &worker_store,
             &policy,
-            Duration::from_secs(1),
-            None,
-            &transport,
+            crate::dist::native::WorkerDelivery {
+                renewal_interval: Duration::from_secs(1),
+                package_import: None,
+                transport: &transport,
+            },
         )?;
         let manifest = result
             .successful_result()

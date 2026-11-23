@@ -10,7 +10,7 @@ use sccache::{
     config::server::NativeWorkerConfig,
     dist::{
         JobId, NativeAssignment,
-        native::{NativeCacheClient, PackageTransportTracker},
+        native::{NativeCacheClient, PackageTransportTracker, WorkerDelivery},
     },
 };
 
@@ -78,9 +78,11 @@ impl NativeWorker {
             &assignment.spec,
             &self.store,
             &self.policy,
-            self.renewal_interval,
-            self.package_import,
-            &self.package_transfer,
+            WorkerDelivery {
+                renewal_interval: self.renewal_interval,
+                package_import: self.package_import,
+                transport: &self.package_transfer,
+            },
         )?;
         if captured.successful_result().is_some() {
             return Ok(NativeRunResult::Stored);

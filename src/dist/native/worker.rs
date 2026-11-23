@@ -17,9 +17,10 @@ use crate::build_runtime::{
     VerifiedPackage, execute, wire::Ticket,
 };
 
-/// Per-worker observed transfer and decoding rates. The initial estimates
-/// come from worker configuration and are updated without holding locks during
-/// I/O. A poisoned estimate is advisory, so it can be recovered safely.
+/// Per-worker observed transfer and decoding rates.
+///
+/// Initial estimates come from worker configuration and are updated without
+/// holding locks during I/O. A poisoned estimate is advisory and recoverable.
 #[derive(Clone)]
 pub struct PackageTransportTracker {
     rates: Arc<Mutex<PackageTransferCost>>,
@@ -90,6 +91,14 @@ impl PackageTransportTracker {
             );
         }
     }
+}
+
+/// Explicit worker delivery policy for a complete admitted action.
+#[derive(Clone, Copy)]
+pub struct WorkerDelivery<'a> {
+    pub renewal_interval: Duration,
+    pub package_import: Option<PackageImportLimits>,
+    pub transport: &'a PackageTransportTracker,
 }
 
 #[cfg(test)]
@@ -254,20 +263,25 @@ impl NativeCacheClient {
         spec: &ExecutionSpec,
         store: &NativeStore,
         policy: &ExecutionPolicy,
-        renewal_interval: Duration,
-        package_import: Option<PackageImportLimits>,
-        transport: &PackageTransportTracker,
+        delivery: WorkerDelivery<'_>,
     ) -> Result<CapturedExecution> {
-        self.execute_admitted(ticket, spec, store, policy, renewal_interval, |id, _| {
-            self.fetch_tree(
-                ticket,
-                id,
-                store,
-                renewal_interval,
-                package_import,
-                transport,
-            )
-        })
+        self.execute_admitted(
+            ticket,
+            spec,
+            store,
+            policy,
+            delivery.renewal_interval,
+            |id, _| {
+                self.fetch_tree(
+                    ticket,
+                    id,
+                    store,
+                    delivery.renewal_interval,
+                    delivery.package_import,
+                    delivery.transport,
+                )
+            },
+        )
     }
 
     pub(super) fn execute_admitted(
