@@ -227,7 +227,8 @@ mod socket_timeout_tests {
         let error = conn.read(&mut [0u8; 1]).expect_err("idle read must end");
         assert!(
             matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
-            "unexpected error: {error:?}",
+            "unexpected error: {:?}",
+            error,
         );
     }
 }

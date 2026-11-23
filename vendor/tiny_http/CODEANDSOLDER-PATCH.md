@@ -40,3 +40,8 @@ per-connection backpressure as TLS: it cannot push unbounded requests into the
 shared messages queue or Rouille executor. Notification sends tolerate a peer
 connection that has already vanished rather than panicking during response
 completion or cleanup.
+
+An unrelated but adjacent timeout bug in the internal message queue passed the
+full original timeout to each condvar wait even after a spurious wakeup,
+allowing recv_timeout to run beyond its requested deadline. Subsequent waits
+now use the remaining duration.
