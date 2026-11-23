@@ -71,21 +71,36 @@ fn run_with_scope(
     #[cfg(target_os = "linux")]
     if let Some((sender, monitor)) = monitor {
         let _ = sender.send(());
-        let peaks = monitor.join().unwrap_or_default();
-        match &output {
-            Ok(result) => info!(
-                "dist_job_process_exit job_id={job_id} wrapper_pid={wrapper_pid} termination={} elapsed_ms={} sampled_peak_rss_bytes={} sampled_peak_swap_bytes={} sampled_peak_combined_bytes={}",
+        let peaks = monitor.join();
+        if peaks.is_err() {
+            error!(
+                "dist_job_monitor_failed job_id={job_id} wrapper_pid={wrapper_pid} error=monitor_thread_panicked"
+            );
+        }
+        match (&output, peaks) {
+            (Ok(result), Ok(peaks)) => info!(
+                "dist_job_process_exit job_id={job_id} wrapper_pid={wrapper_pid} termination={} elapsed_ms={} sampled_peak_rss_bytes={} sampled_peak_swap_bytes={} sampled_peak_combined_bytes={} observed_processes={}",
                 termination(&result.status),
                 started.elapsed().as_millis(),
                 peaks.rss,
                 peaks.swap,
                 peaks.combined,
+                peaks.processes_seen,
             ),
-            Err(error) => warn!(
+            (Ok(result), Err(_)) => info!(
+                "dist_job_process_exit job_id={job_id} wrapper_pid={wrapper_pid} termination={} elapsed_ms={} resource_metrics=unavailable",
+                termination(&result.status),
+                started.elapsed().as_millis(),
+            ),
+            (Err(error), Ok(peaks)) => warn!(
                 "dist_job_process_wait_failed job_id={job_id} wrapper_pid={wrapper_pid} elapsed_ms={} sampled_peak_rss_bytes={} sampled_peak_swap_bytes={} error={error}",
                 started.elapsed().as_millis(),
                 peaks.rss,
                 peaks.swap,
+            ),
+            (Err(error), Err(_)) => warn!(
+                "dist_job_process_wait_failed job_id={job_id} wrapper_pid={wrapper_pid} elapsed_ms={} resource_metrics=unavailable error={error}",
+                started.elapsed().as_millis(),
             ),
         }
     } else {
@@ -137,6 +152,7 @@ struct Peaks {
     rss: u64,
     swap: u64,
     combined: u64,
+    processes_seen: usize,
 }
 
 #[cfg(target_os = "linux")]
@@ -210,6 +226,7 @@ fn monitor_process_tree(
             Err(RecvTimeoutError::Timeout) => {}
         }
     }
+    peaks.processes_seen = seen.len();
     peaks
 }
 
@@ -276,15 +293,38 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn observes_child_processes_and_memory() -> io::Result<()> {
+        use std::time::Duration;
+
+        let mut child = Command::new("sh").args(["-c", "sleep 1 & wait"]).spawn()?;
+        let root_pid = child.id();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let sampler =
+            std::thread::spawn(move || monitor_process_tree(JobId(144), root_pid, &receiver));
+        std::thread::sleep(Duration::from_millis(400));
+        let _ = sender.send(());
+        let peaks = sampler
+            .join()
+            .map_err(|_| io::Error::other("process-tree monitor panicked"))?;
+        let status = child.wait()?;
+        assert!(status.success());
+        assert!(peaks.rss > 0);
+        assert!(peaks.processes_seen >= 2);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn parses_process_status_memory_in_kib() {
         let status = "Name:\trustc\nVmRSS:\t  4714936 kB\nVmSwap:\t12560000 kB\n";
         assert_eq!(parse_status_memory(status), (4_828_094_464, 12_861_440_000));
     }
 
     #[test]
-    fn distinguishes_nonzero_exit() {
-        let status = Command::new("sh").args(["-c", "exit 7"]).status().unwrap();
+    fn distinguishes_nonzero_exit() -> io::Result<()> {
+        let status = Command::new("sh").args(["-c", "exit 7"]).status()?;
         assert_eq!(termination(&status), "exit:7");
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -296,12 +336,13 @@ mod tests {
     }
 
     #[test]
-    fn captures_output_and_process_exit() {
+    fn captures_output_and_process_exit() -> io::Result<()> {
         let mut command = Command::new("sh");
         command.args(["-c", "printf stdout; printf stderr >&2; exit 7"]);
-        let output = run(JobId(123), &mut command).unwrap();
+        let output = run(JobId(123), &mut command)?;
         assert_eq!(output.status.code(), Some(7));
         assert_eq!(output.stdout, b"stdout");
         assert_eq!(output.stderr, b"stderr");
+        Ok(())
     }
 }
