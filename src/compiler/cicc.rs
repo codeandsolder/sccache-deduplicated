@@ -130,7 +130,6 @@ pub fn parse_arguments<S>(
 where
     S: SearchableArgInfo<ArgData>,
 {
-    let mut args = arguments.to_vec();
     let input_loc = match language {
         Language::Ptx => arguments.iter().position(is_cicc_input),
         Language::Cubin => arguments.iter().position(is_ptxas_input),
@@ -141,11 +140,18 @@ where
     // `unwrap_or` would evaluate a potentially underflowing subtraction
     // even when an input suffix had already been located.
     .or_else(|| arguments.len().checked_sub(input_arg_offset_from_end));
-    let Some(input) = input_loc.and_then(|index| (index < args.len()).then(|| args.remove(index)))
+    let Some((input_loc, input)) =
+        input_loc.and_then(|index| arguments.get(index).map(|input| (index, input)))
     else {
         return CompilerArguments::CannotCache("missing compiler input", None);
     };
 
+    // Borrow the source and parse the remaining options directly instead of
+    // allocating a temporary Vec and cloning every option twice.
+    let args = arguments[..input_loc]
+        .iter()
+        .chain(arguments[input_loc + 1..].iter())
+        .cloned();
     let mut take_next = false;
     let mut outputs = HashMap::new();
     let mut extra_dist_files = vec![];
@@ -155,7 +161,7 @@ where
     let mut common_args = vec![];
     let mut unhashed_args = vec![];
 
-    for arg in ArgsIter::new(args.iter().cloned(), arg_info) {
+    for arg in ArgsIter::new(args, arg_info) {
         let arg = match arg {
             Ok(arg) => arg,
             Err(error) => {
@@ -246,7 +252,7 @@ where
     }
 
     CompilerArguments::Ok(ParsedArguments {
-        input: input.into(),
+        input: input.clone().into(),
         outputs,
         double_dash_input: false,
         language,
