@@ -17,10 +17,7 @@ use crate::compiler::args::{
     ArgDisposition, ArgInfo, ArgToStringResult, ArgsIter, Argument, FromArg, IntoArg,
     PathTransformerFn, SearchableArgInfo,
 };
-use crate::compiler::c::{
-    ArtifactDescriptor, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
-    ParsedArguments,
-};
+use crate::compiler::c::{ArtifactDescriptor, CCompileContext, CCompilerKind, ParsedArguments};
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
     SingleCompileCommand,
@@ -28,8 +25,6 @@ use crate::compiler::{
 use crate::{counted_array, dist};
 
 use crate::mock_command::CommandCreatorSync;
-
-use async_trait::async_trait;
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -55,45 +50,63 @@ pub fn is_ptxas_input(arg: impl AsRef<OsStr>) -> bool {
     arg.as_ref().to_string_lossy().ends_with(PTXAS_INPUT_SUFFIX)
 }
 
-#[async_trait]
-impl CCompilerImpl for Cicc {
-    fn kind(&self) -> CCompilerKind {
-        CCompilerKind::Cicc
-    }
-    fn plusplus(&self) -> bool {
-        true
-    }
-    fn version(&self) -> Option<String> {
-        self.version.clone()
-    }
-    fn parse_arguments(
-        &self,
-        arguments: &[OsString],
-        cwd: &Path,
-        _env_vars: &[(OsString, OsString)],
-    ) -> CompilerArguments<ParsedArguments> {
-        parse_arguments(arguments, cwd, Language::Ptx, &ARGS[..], 3)
-    }
-    async fn preprocess<T>(&self, context: CPreprocessContext<'_, T>) -> Result<process::Output>
-    where
-        T: CommandCreatorSync,
-    {
-        preprocess(context.cwd, context.parsed_args)
-    }
-    fn generate_compile_commands<T>(
-        &self,
-        context: CCompileContext<'_>,
-    ) -> Result<(
-        Box<dyn CompileCommand<T>>,
-        Option<dist::CompileCommand>,
-        Cacheable,
-    )>
-    where
-        T: CommandCreatorSync,
-    {
-        boxed_compile_commands(context, OutputStyle::ObjectFile)
-    }
+// Three CUDA compiler frontends share the same CCompilerImpl lifecycle.
+// Only their compiler kind, input syntax and output style differ. Keep the
+// complete lifecycle in one place rather than duplicating trait impls.
+macro_rules! impl_cuda_stage_compiler {
+    ($stage:ident, $kind:expr, $language:expr, $args:expr, $offset:expr, $style:expr) => {
+        #[async_trait::async_trait]
+        impl crate::compiler::c::CCompilerImpl for $stage {
+            fn kind(&self) -> crate::compiler::c::CCompilerKind {
+                $kind
+            }
+            fn plusplus(&self) -> bool {
+                true
+            }
+            fn version(&self) -> Option<String> {
+                self.version.clone()
+            }
+            fn parse_arguments(
+                &self,
+                arguments: &[std::ffi::OsString],
+                cwd: &std::path::Path,
+                _env_vars: &[(std::ffi::OsString, std::ffi::OsString)],
+            ) -> crate::compiler::CompilerArguments<crate::compiler::c::ParsedArguments> {
+                crate::compiler::cicc::parse_arguments(arguments, cwd, $language, $args, $offset)
+            }
+            async fn preprocess<T>(
+                &self,
+                context: crate::compiler::c::CPreprocessContext<'_, T>,
+            ) -> crate::errors::Result<std::process::Output>
+            where
+                T: crate::mock_command::CommandCreatorSync,
+            {
+                crate::compiler::cicc::preprocess(context.cwd, context.parsed_args)
+            }
+            fn generate_compile_commands<T>(
+                &self,
+                context: crate::compiler::c::CCompileContext<'_>,
+            ) -> crate::errors::Result<(
+                Box<dyn crate::compiler::CompileCommand<T>>,
+                Option<crate::dist::CompileCommand>,
+                crate::compiler::Cacheable,
+            )>
+            where
+                T: crate::mock_command::CommandCreatorSync,
+            {
+                crate::compiler::cicc::boxed_compile_commands(context, $style)
+            }
+        }
+    };
 }
+impl_cuda_stage_compiler!(
+    Cicc,
+    CCompilerKind::Cicc,
+    Language::Ptx,
+    &ARGS[..],
+    3,
+    OutputStyle::ObjectFile,
+);
 
 #[expect(
     clippy::too_many_lines,

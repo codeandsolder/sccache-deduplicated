@@ -13,69 +13,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::compiler::Language;
 use crate::compiler::args::{ArgDisposition, ArgInfo, FromArg};
-use crate::compiler::c::{
-    CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext, ParsedArguments,
-};
+use crate::compiler::c::CCompilerKind;
 use crate::compiler::cicc;
-use crate::compiler::{Cacheable, CompileCommand, CompilerArguments, Language};
-use crate::{counted_array, dist};
-
-use crate::mock_command::CommandCreatorSync;
-
-use async_trait::async_trait;
+use crate::counted_array;
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
-use std::process;
-
-use crate::errors::Result;
-
+use std::path::PathBuf;
 /// A unit struct on which to implement `CCompilerImpl`.
 #[derive(Clone, Debug)]
 pub struct CudaFE {
     pub version: Option<String>,
 }
 
-#[async_trait]
-impl CCompilerImpl for CudaFE {
-    fn kind(&self) -> CCompilerKind {
-        CCompilerKind::CudaFE
-    }
-    fn plusplus(&self) -> bool {
-        true
-    }
-    fn version(&self) -> Option<String> {
-        self.version.clone()
-    }
-    fn parse_arguments(
-        &self,
-        arguments: &[OsString],
-        cwd: &Path,
-        _env_vars: &[(OsString, OsString)],
-    ) -> CompilerArguments<ParsedArguments> {
-        cicc::parse_arguments(arguments, cwd, Language::CudaFE, &ARGS[..], 1)
-    }
-    async fn preprocess<T>(&self, context: CPreprocessContext<'_, T>) -> Result<process::Output>
-    where
-        T: CommandCreatorSync,
-    {
-        cicc::preprocess(context.cwd, context.parsed_args)
-    }
-    fn generate_compile_commands<T>(
-        &self,
-        context: CCompileContext<'_>,
-    ) -> Result<(
-        Box<dyn CompileCommand<T>>,
-        Option<dist::CompileCommand>,
-        Cacheable,
-    )>
-    where
-        T: CommandCreatorSync,
-    {
-        cicc::boxed_compile_commands(context, cicc::OutputStyle::ModuleIdFile)
-    }
-}
+impl_cuda_stage_compiler!(
+    CudaFE,
+    CCompilerKind::CudaFE,
+    Language::CudaFE,
+    &ARGS[..],
+    1,
+    cicc::OutputStyle::ModuleIdFile,
+);
 
 use cicc::ArgData::{GenModuleIdFileFlag, Output, UnhashedOutput, UnhashedPassThrough};
 

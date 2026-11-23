@@ -17,6 +17,7 @@ mod args;
 mod c;
 mod canonical_native;
 pub mod canonical_paths;
+#[macro_use]
 mod cicc;
 mod clang;
 #[path = "compiler.rs"]
