@@ -46,7 +46,7 @@ jobs:
       - name: Install Rust nightly-2026-11-22
         uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
-          toolchain: "nightly-2026-11-22"
+          toolchain: "nightly-2026-11-23"
           components: clippy
           targets: x86_64-pc-windows-gnu
       - name: Isolate build cache from regression test services
