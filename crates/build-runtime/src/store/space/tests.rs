@@ -676,3 +676,55 @@ fn physical_reclaim_estimate_uses_file_allocation_not_logical_size() -> Result<(
     drop(lease);
     Ok(())
 }
+
+#[test]
+fn eviction_counts_retained_package_archive_even_when_tree_files_are_shared() -> Result<()> {
+    use crate::{
+        ArchiveLength, PackageCompression, PackageDecoder, PackageIdentity, PackagePolicy,
+    };
+    use sha2::{Digest as _, Sha256};
+
+    let mut tar = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_size(4);
+    header.set_mode(0o644);
+    header.set_cksum();
+    tar.append_data(&mut header, "pkg/file", &b"DATA"[..])?;
+    let compressed = zstd::stream::encode_all(&tar.into_inner()?[..], 1)?;
+
+    let mut limits = PackagePolicy::normalized_archive(20, 16_384, 65_536, 16_384)?;
+    limits.retain_original = true;
+    let temp = tempfile::tempdir()?;
+    let store = NativeStore::open(temp.path())?;
+    let original = store.import_package(
+        PackageIdentity {
+            sha256: Sha256::digest(&compressed).into(),
+            compression: PackageCompression::Zstd,
+        },
+        ArchiveLength::Exact(u64::try_from(compressed.len())?),
+        limits,
+        &compressed[..],
+        PackageDecoder::InProcess,
+    )?;
+    let original_id = original.tree().id();
+    let mut sibling_manifest = original.tree().manifest().clone();
+    sibling_manifest.root.mode = 0o700;
+    let sibling = store.publish_tree(&sibling_manifest, vec![])?;
+    drop(original);
+
+    // The expanded file remains shared with sibling, but the original
+    // compressed archive belongs exclusively to the package tree.
+    assert_eq!(
+        store.eviction_candidates(1, false)?,
+        vec![Root::Tree(original_id)]
+    );
+    assert!(matches!(
+        store.evict_tree(original_id)?,
+        Eviction::Removed {
+            unreferenced_logical_bytes
+        } if unreferenced_logical_bytes == u64::try_from(compressed.len())?
+    ));
+    assert_eq!(store.stats()?.blobs, 1);
+    assert!(store.lookup_tree(sibling)?.is_some());
+    Ok(())
+}
