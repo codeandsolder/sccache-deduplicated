@@ -111,8 +111,16 @@ done
 for literal in 'source contrib/codeandsolder/release-protocol.env' 'vendored-openssl' \
     'openssl_linkage=vendored-static' 'Reject unsupported fleet native shared library ABIs' \
     'Reject binaries requiring a newer GNU libc ABI' 'steps.protocol.outputs.dist_protocol' \
-    'steps.protocol.outputs.rollout_epoch' 'Skipping superseded main revision' \
-    'Skipping superseded main release'; do
+    'steps.protocol.outputs.rollout_epoch' 'not current main' \
+    'Skipping superseded main release' "sccache-ci-\${{ needs.required-gates.outputs.sha }}"; do
     rg -Fq -- "$literal" "$publisher"
 done
+# Development pushes still run CI, but only an explicit operator action may
+# publish a new fleet release. A manual run must recheck both CI gates.
+rg -q '^  workflow_dispatch:' "$publisher"
+if rg -q '^  workflow_run:' "$publisher"; then
+    echo 'Fleet publisher must not run automatically after CI' >&2
+    exit 1
+fi
+rg -Fq 'for workflow in ci.yml rust-skills2-strict.yml; do' "$publisher"
 echo 'Release updater and publisher contract checks passed'
