@@ -29,7 +29,7 @@ use crate::compiler::{
     cicc, gcc,
 };
 use crate::mock_command::{CommandCreatorSync, ExitStatusValue, RunCommand, exit_status};
-use crate::util::{OsStrExt, resolve_compiler_avoiding_wrapper, run_input_output};
+use crate::util::{resolve_compiler_avoiding_wrapper, run_input_output};
 use crate::{counted_array, dist, protocol, server};
 use async_trait::async_trait;
 use fs_err as fs;
@@ -292,6 +292,55 @@ impl CCompilerImpl for Nvcc {
     }
 }
 
+/// Strip only NVCC thread-control options from the dry-run arguments and
+/// retain their original order when applying the last-option-wins rule.
+fn extract_nvcc_threads(args: &mut Vec<OsString>) -> Result<usize> {
+    let mut remaining = Vec::with_capacity(args.len());
+    let mut options = std::mem::take(args).into_iter();
+    let mut threads = 1;
+    while let Some(arg) = options.next() {
+        let value = match arg.to_str() {
+            Some("-t" | "--threads") => options
+                .next()
+                .context("NVCC -t/--threads requires a numeric value")?,
+            Some(flag) => {
+                let count = flag
+                    .strip_prefix("-t=")
+                    .or_else(|| flag.strip_prefix("--threads="))
+                    .or_else(|| {
+                        flag.strip_prefix("-t").filter(|suffix| {
+                            suffix.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                        })
+                    });
+                let Some(count) = count else {
+                    remaining.push(arg);
+                    continue;
+                };
+                OsString::from(count)
+            }
+            None => {
+                remaining.push(arg);
+                continue;
+            }
+        };
+        threads = value
+            .to_str()
+            .context("NVCC thread count is not valid UTF-8")?
+            .parse::<usize>()
+            .context("NVCC -t/--threads requires a non-negative integer")?;
+    }
+    *args = remaining;
+    Ok(threads)
+}
+fn effective_nvcc_threads(requested: usize, device_groups: usize) -> usize {
+    let available = if requested == 0 {
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+    } else {
+        requested
+    };
+    // chunks(0) would panic when a compilation has no device-stage groups.
+    device_groups.min(available).max(1)
+}
 #[expect(
     clippy::too_many_lines,
     reason = "NVCC expands one logical compile into an ordered multi-stage command graph; keeping stage construction contiguous makes dependencies visible"
@@ -345,42 +394,7 @@ pub fn generate_compile_commands(
         keep.then_some(()).and(keep_dir)
     };
 
-    let num_parallel = {
-        let mut num_parallel = 1;
-        // Remove all occurrences of `-t=` or `--threads` because it's incompatible with --dryrun
-        // Prefer the last occurrence of `-t=` or `--threads` to match nvcc behavior
-        loop {
-            if let Some(idx) = unhashed_args.iter().position(|x| x.starts_with("-t")) {
-                let arg = unhashed_args.get(idx);
-                if let Some(arg) = arg.and_then(|arg| arg.to_str()) {
-                    let range = if arg.contains('=') {
-                        3..arg.len()
-                    } else {
-                        2..arg.len()
-                    };
-                    if let Ok(arg) = arg[range].parse::<usize>() {
-                        num_parallel = arg;
-                    }
-                }
-                unhashed_args.splice(idx..=idx, []);
-                continue;
-            }
-            if let Some(idx) = unhashed_args.iter().position(|x| x == "--threads") {
-                let arg = unhashed_args
-                    .get(idx + 1)
-                    .context("NVCC --threads requires a numeric value")?
-                    .to_str()
-                    .context("NVCC --threads value is not valid UTF-8")?;
-                if let Ok(arg) = arg.parse::<usize>() {
-                    num_parallel = arg;
-                }
-                unhashed_args.splice(idx..(idx + 2), []);
-                continue;
-            }
-            break;
-        }
-        num_parallel
-    };
+    let num_parallel = extract_nvcc_threads(&mut unhashed_args)?;
 
     let env_vars = env_vars
         .iter()
@@ -594,7 +608,7 @@ impl CompileCommandImpl for NvccCompileCommand {
         let final_assembly_range = if n > 1 { n - 1..n } else { 0..0 };
         let device_compile_range = if n > 2 { 1..n - 1 } else { 0..0 };
 
-        let num_parallel = device_compile_range.len().min(*num_parallel).max(1);
+        let num_parallel = effective_nvcc_threads(*num_parallel, device_compile_range.len());
 
         for command_group_chunks in [
             nvcc_subcommand_groups[cuda_front_end_range].chunks(1),
@@ -2072,6 +2086,73 @@ mod test {
         );
     }
 
+    #[test]
+    fn test_nvcc_threads_are_parsed_in_cli_order() -> Result<()> {
+        let mut parsed = parses!(
+            "--threads=2",
+            "-t4",
+            "--threads",
+            "3",
+            "-t=7",
+            "-c",
+            "foo.cu",
+            "-o",
+            "foo.o"
+        );
+        assert_eq!(extract_nvcc_threads(&mut parsed.unhashed_args)?, 7);
+        assert!(parsed.unhashed_args.is_empty());
+
+        let mut reversed = ovec!["-t=7", "--threads", "3"];
+        assert_eq!(extract_nvcc_threads(&mut reversed)?, 3);
+        assert!(reversed.is_empty());
+
+        let mut unrelated: Vec<OsString> = [
+            "-target=sm_80",
+            "--keep",
+            "-t2",
+            "-target",
+            "compute_90",
+            "--threads=5",
+            "-t=0",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(extract_nvcc_threads(&mut unrelated)?, 0);
+        assert_eq!(
+            unrelated,
+            ovec!["-target=sm_80", "--keep", "-target", "compute_90"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_nvcc_threads_reject_malformed_values() {
+        for bad in [
+            ovec!["-t"],
+            ovec!["--threads"],
+            ovec!["-t=bad"],
+            ovec!["--threads", "NaN"],
+            ovec!["--threads="],
+            ovec!["-t184467440737095516160"],
+        ] {
+            let mut args = bad.clone();
+            assert!(
+                extract_nvcc_threads(&mut args).is_err(),
+                "NVCC accepted malformed thread count: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nvcc_zero_threads_uses_available_cpus_and_clamps_device_groups() {
+        let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        assert_eq!(effective_nvcc_threads(0, usize::MAX), cpus);
+        assert_eq!(effective_nvcc_threads(0, 1), 1);
+        assert_eq!(effective_nvcc_threads(2, 10), 2);
+        assert_eq!(effective_nvcc_threads(100, 3), 3);
+        assert_eq!(effective_nvcc_threads(0, 0), 1);
+    }
     #[test]
     fn test_generate_compile_commands_rejects_missing_unhashed_option_values() -> Result<()> {
         let tempdir = tempfile::tempdir()?;
