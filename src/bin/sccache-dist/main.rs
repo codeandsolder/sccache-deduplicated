@@ -19,7 +19,7 @@ use sccache::dist::{
 use sccache::util::BASE64_URL_SAFE_ENGINE;
 use sccache::util::daemonize;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque, btree_map};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, btree_map};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -921,6 +921,25 @@ fn admission_weight(job_count: usize, cpu_capacity: f64, job_slack: JobSlackConf
         .then_some((cpu_capacity - job_count as f64).max(0.0) + 0.5)
 }
 
+/// Advisory locality: up to four matched immutable input trees make an
+/// otherwise similarly loaded worker more attractive. The normal capacity
+/// gate and unhealthy-worker fallback still take precedence.
+fn native_locality_weight(
+    capacity_weight: f64,
+    cached_trees: &[sccache::build_runtime::TreeId],
+    requested_trees: Option<&BTreeSet<sccache::build_runtime::TreeId>>,
+) -> f64 {
+    let Some(requested_trees) = requested_trees else {
+        return capacity_weight;
+    };
+    let matches = cached_trees
+        .iter()
+        .filter(|tree| requested_trees.contains(*tree))
+        .count()
+        .min(4);
+    capacity_weight * (1.0 + 0.3 * matches as f64)
+}
+
 fn weighted_server(candidates: &[(ServerId, f64)], draw: f64) -> Option<ServerId> {
     let total: f64 = candidates.iter().map(|(_, weight)| weight).sum();
     let mut ticket = draw * total;
@@ -950,9 +969,12 @@ impl Scheduler {
                 msg: "scheduler is draining for maintenance".to_owned(),
             });
         }
-        let native_platform = match &assignment {
-            JobAssignment::Archive(_) => None,
-            JobAssignment::Native(native) => Some(native.spec.platform),
+        let (native_platform, requested_trees) = match &assignment {
+            JobAssignment::Archive(_) => (None, None),
+            JobAssignment::Native(native) => (
+                Some(native.spec.platform),
+                Some(native.spec.action_request()?.input_trees),
+            ),
         };
         let (job_id, server_id, auth) = {
             // LOCKS
@@ -980,6 +1002,11 @@ impl Scheduler {
                     ) else {
                         continue;
                     };
+                    let weight = native_locality_weight(
+                        weight,
+                        &details.capabilities.cached_trees,
+                        requested_trees.as_ref(),
+                    );
                     if details.last_error.is_some_and(|when| {
                         now.duration_since(when) > SERVER_REMEMBER_ERROR_TIMEOUT
                     }) {
@@ -1160,6 +1187,19 @@ impl SchedulerIncoming for Scheduler {
         anyhow::ensure!(
             capabilities.archive || capabilities.native_platform.is_some(),
             "worker advertises no build engine"
+        );
+        anyhow::ensure!(
+            capabilities.cached_trees.len() <= dist::WorkerCapabilities::MAX_CACHED_TREES
+                && (capabilities.native_platform.is_some() || capabilities.cached_trees.is_empty()),
+            "invalid native worker cache residency inventory"
+        );
+        let mut unique = HashSet::new();
+        anyhow::ensure!(
+            capabilities
+                .cached_trees
+                .iter()
+                .all(|tree| unique.insert(*tree)),
+            "duplicate native cache residency hint"
         );
         match servers.get_mut(&server_id) {
             Some(ref mut details) if details.server_nonce == server_nonce => {
@@ -1628,9 +1668,23 @@ impl ServerIncoming for Server {
             .map(|worker| worker.policy.platform);
         #[cfg(not(target_os = "linux"))]
         let native_platform = None;
+        #[cfg(target_os = "linux")]
+        let cached_trees = self
+            .native_worker
+            .as_ref()
+            .map(|worker| {
+                worker.cached_trees().unwrap_or_else(|error| {
+                    warn!("Native worker cache hints unavailable: {error:#}");
+                    Vec::new()
+                })
+            })
+            .unwrap_or_default();
+        #[cfg(not(target_os = "linux"))]
+        let cached_trees = Vec::new();
         dist::WorkerCapabilities {
             archive: self.archive.is_some(),
             native_platform,
+            cached_trees,
         }
     }
 
@@ -1953,6 +2007,63 @@ mod scheduler_tests {
     }
 
     #[test]
+    fn native_locality_is_bounded_advisory_weight() {
+        use sccache::build_runtime::TreeId;
+        let a = TreeId([1; 32]);
+        let b = TreeId([2; 32]);
+        let expected = BTreeSet::from([a, b]);
+        assert!((native_locality_weight(2.0, &[a], None) - 2.0).abs() < 1e-9);
+        assert!((native_locality_weight(2.0, &[], Some(&expected)) - 2.0).abs() < 1e-9);
+        assert!((native_locality_weight(2.0, &[a], Some(&expected)) - 2.6).abs() < 1e-9);
+        assert!((native_locality_weight(2.0, &[a, b], Some(&expected)) - 3.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn native_cache_hints_are_bounded_and_unique() -> Result<()> {
+        use sccache::build_runtime::{ContentId, TreeId};
+        let scheduler = Scheduler::new();
+        let server: ServerId = "127.0.0.1:10501".parse()?;
+        let platform = ContentId::of(b"native-platform");
+        let capabilities = dist::WorkerCapabilities {
+            archive: false,
+            native_platform: Some(platform),
+            cached_trees: vec![TreeId([1; 32]); 2],
+        };
+        assert!(
+            scheduler
+                .handle_heartbeat_server(
+                    server,
+                    ServerNonce::new(),
+                    2.0,
+                    &[],
+                    Box::new(TestJobAuthorizer),
+                    capabilities,
+                )
+                .is_err()
+        );
+        let capabilities = dist::WorkerCapabilities {
+            archive: false,
+            native_platform: Some(platform),
+            cached_trees: (0..=dist::WorkerCapabilities::MAX_CACHED_TREES)
+                .map(|i| Ok(TreeId([u8::try_from(i)?; 32])))
+                .collect::<Result<Vec<_>>>()?,
+        };
+        assert!(
+            scheduler
+                .handle_heartbeat_server(
+                    server,
+                    ServerNonce::new(),
+                    2.0,
+                    &[],
+                    Box::new(TestJobAuthorizer),
+                    capabilities,
+                )
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn native_jobs_select_compatible_workers_using_shared_capacity() -> Result<()> {
         use sccache::build_runtime::{
             BuildPath, CommandSpec, ContentId, ExecutionRoot, ExecutionSpec, TreeId, TreeMetadata,
@@ -1976,6 +2087,7 @@ mod scheduler_tests {
             dist::WorkerCapabilities {
                 archive: false,
                 native_platform: Some(platform),
+                cached_trees: Vec::new(),
             },
         )?;
         scheduler.handle_heartbeat_server(
@@ -1987,6 +2099,7 @@ mod scheduler_tests {
             dist::WorkerCapabilities {
                 archive: true,
                 native_platform: Some(ContentId::of(b"other")),
+                cached_trees: Vec::new(),
             },
         )?;
         let assignment = NativeAssignment {

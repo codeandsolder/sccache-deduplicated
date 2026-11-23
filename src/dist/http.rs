@@ -132,6 +132,8 @@ mod common {
         pub cpu_capacity: f64,
         // Executing jobs and pending jobs receiving bytes from a client.
         pub active_job_ids: Vec<dist::JobId>,
+        /// Small recent immutable-tree inventory, only a scheduling hint.
+        pub cached_trees: Vec<crate::build_runtime::TreeId>,
         pub server_nonce: dist::ServerNonce,
         pub cert_digest: Vec<u8>,
         pub cert_pem: Vec<u8>,
@@ -143,6 +145,7 @@ mod common {
             f.debug_struct("HeartbeatServerHttpRequest")
                 .field("cpu_capacity", &self.cpu_capacity)
                 .field("active_job_ids", &self.active_job_ids)
+                .field("cached_tree_count", &self.cached_trees.len())
                 .field("server_nonce", &self.server_nonce)
                 .field(
                     "cert_digest",
@@ -163,6 +166,7 @@ mod common {
                 jwt_key,
                 cpu_capacity: 4.0,
                 active_job_ids: Vec::new(),
+                cached_trees: Vec::new(),
                 server_nonce: dist::ServerNonce::new(),
                 cert_digest: vec![1, 2, 3],
                 cert_pem: b"certificate".to_vec(),
@@ -1236,7 +1240,10 @@ mod server {
 
                         trace!(target: "sccache_heartbeat", "Req {}: heartbeat_server: {:?}", req_id, heartbeat_server);
 
-                        let HeartbeatServerHttpRequest { cpu_capacity, active_job_ids, jwt_key, server_nonce, cert_digest, cert_pem } = heartbeat_server;
+                        let HeartbeatServerHttpRequest {
+                            cpu_capacity, active_job_ids, cached_trees, jwt_key,
+                            server_nonce, cert_digest, cert_pem,
+                        } = heartbeat_server;
                         let job_authorizer = try_or_400_log!(req_id, JWTJobAuthorizer::boxed(&jwt_key));
                         let mut requester_client = try_or_500_log!(
                             req_id,
@@ -1260,7 +1267,9 @@ mod server {
                         let res: HeartbeatServerResult = try_or_500_log!(req_id, handler.handle_heartbeat_server(
                             server_id, server_nonce,
                             cpu_capacity, &active_job_ids,
-                            job_authorizer, dist::WorkerCapabilities { archive, native_platform }
+                            job_authorizer, dist::WorkerCapabilities {
+                                archive, native_platform, cached_trees,
+                            }
                         ));
                         if let Some(worker_name) = worker_name
                             && let Err(error) = handler.handle_update_worker_name(
@@ -1445,7 +1454,6 @@ mod server {
             let mut load_aware_capacity = LoadAwareCapacity::new();
             let handler = Arc::new(handler);
             let heartbeat_handler = Arc::clone(&handler);
-            let capabilities = handler.capabilities();
             let running_jobs = Arc::new(Mutex::new(HashSet::<JobId>::new()));
             let heartbeat_running_jobs = Arc::clone(&running_jobs);
             let upload_activity = UploadActivity::default();
@@ -1478,6 +1486,7 @@ mod server {
                         .collect();
                     let advertised_cpus =
                         load_aware_capacity.advertised_cpus(running_job_ids.len());
+                    let capabilities = heartbeat_handler.capabilities();
                     // Transfers keep their assignment alive, but do not count as
                     // executing compiler processes for CPU-capacity restoration.
                     let active_job_ids = running_job_ids
@@ -1492,6 +1501,7 @@ mod server {
                     let heartbeat_req = HeartbeatServerHttpRequest {
                         cpu_capacity: advertised_cpus,
                         active_job_ids,
+                        cached_trees: capabilities.cached_trees,
                         jwt_key: heartbeat_jwt_key.clone(),
                         server_nonce: server_nonce.clone(),
                         cert_digest: cert_digest.clone(),

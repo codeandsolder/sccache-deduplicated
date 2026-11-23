@@ -118,6 +118,35 @@ impl NativeStore {
         Ok(())
     }
 
+    /// Recent resident tree IDs for advisory worker selection. These are
+    /// verified immutable roots known to this process, not a guarantee that
+    /// every referenced inode is still healthy when an assignment arrives.
+    /// The list is bounded without sorting the whole store.
+    ///
+    /// # Errors
+    /// Returns an error when the native index's pin state is unavailable.
+    pub fn recent_trees(&self, limit: usize) -> Result<Vec<TreeId>> {
+        use std::cmp::Reverse;
+        let pins = self.inner.lock_pins()?;
+        let mut latest = BinaryHeap::new();
+        for (&root, stats) in &pins.usage {
+            if let Root::Tree(id) = root {
+                let hint = Reverse((stats.last_used_ms, stats.hits, id));
+                if latest.len() < limit {
+                    latest.push(hint);
+                } else if latest.peek().is_some_and(|oldest| hint < *oldest) {
+                    latest.pop();
+                    latest.push(hint);
+                }
+            }
+        }
+        Ok(latest
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Reverse((_, _, id))| id)
+            .collect())
+    }
+
     /// Persist only dirty usage records in one bounded write transaction,
     /// avoiding synchronous database writes on cache hits.
     ///

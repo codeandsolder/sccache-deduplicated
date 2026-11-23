@@ -72,6 +72,11 @@ impl NativeWorker {
         })
     }
 
+    pub(super) fn cached_trees(&self) -> Result<Vec<sccache::build_runtime::TreeId>> {
+        self.store
+            .recent_trees(sccache::dist::WorkerCapabilities::MAX_CACHED_TREES)
+    }
+
     pub(super) fn run(&self, job: JobId, assignment: &NativeAssignment) -> Result<NativeRunResult> {
         let captured = self.client.clone().for_worker(job).execute_on_worker(
             assignment.ticket,

@@ -436,3 +436,41 @@ fn committed_tree_releases_staging_reservations_into_resident_accounting() -> Re
     assert!(store.lookup_tree(tree_id)?.is_some());
     Ok(())
 }
+
+#[test]
+fn worker_cache_hints_are_bounded_recent_and_survive_restart() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (hot, warm, cold) = {
+        let store = NativeStore::open(dir.path())?;
+        let mut manifest = TreeManifest {
+            root: TreeMetadata {
+                mode: 0o755,
+                modified: TreeTimestamp {
+                    seconds: 0,
+                    nanoseconds: 0,
+                },
+            },
+            entries: BTreeMap::new(),
+        };
+        let cold = store.publish_tree(&manifest, vec![])?;
+        manifest.root.mode = 0o700;
+        let warm = store.publish_tree(&manifest, vec![])?;
+        manifest.root.mode = 0o750;
+        let hot = store.publish_tree(&manifest, vec![])?;
+        for _ in 0..4 {
+            drop(store.lookup_tree(warm)?.context("missing warm tree")?);
+        }
+        for _ in 0..32 {
+            drop(store.lookup_tree(hot)?.context("missing hot tree")?);
+        }
+        assert_eq!(store.recent_trees(0)?, Vec::new());
+        assert_eq!(store.recent_trees(1)?, vec![hot]);
+        assert_eq!(store.recent_trees(2)?, vec![hot, warm]);
+        (hot, warm, cold)
+    };
+    let store = NativeStore::open(dir.path())?;
+    assert_eq!(store.recent_trees(3)?, vec![hot, warm, cold]);
+    assert!(matches!(store.evict_tree(warm)?, Eviction::Removed { .. }));
+    assert_eq!(store.recent_trees(3)?, vec![hot, cold]);
+    Ok(())
+}

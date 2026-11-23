@@ -1010,17 +1010,21 @@ pub trait JobAuthorizer: Send {
 
 /// Worker build engines advertised atomically with its scheduler heartbeat.
 #[cfg(feature = "dist-server")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerCapabilities {
     pub archive: bool,
     pub native_platform: Option<crate::build_runtime::ContentId>,
+    /// Advisory recent native tree residency, bounded by MAX_CACHED_TREES.
+    pub cached_trees: Vec<crate::build_runtime::TreeId>,
 }
 
 #[cfg(feature = "dist-server")]
 impl WorkerCapabilities {
+    pub const MAX_CACHED_TREES: usize = 32;
     pub const ARCHIVE: Self = Self {
         archive: true,
         native_platform: None,
+        cached_trees: Vec::new(),
     };
 }
 
