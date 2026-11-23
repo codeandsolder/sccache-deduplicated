@@ -18,6 +18,7 @@ use crate::cmdline::{Command, StatsFormat};
 use crate::compiler::ColorMode;
 use crate::config::{Config, default_disk_cache_dir};
 use crate::jobserver::Client;
+use crate::lru_disk_cache::CACHEDIR_TAG_FILE_NAME;
 use crate::mock_command::{CommandChild, CommandCreatorSync, ProcessCommandCreator, RunCommand};
 use crate::protocol::{Compile, CompileFinished, CompileResponse, Request, Response};
 use crate::server::{self, DistInfo, ServerInfo, ServerStartup, ServerStats};
@@ -873,7 +874,7 @@ fn debug_preprocessor_cache_entries() -> Result<()> {
     for entry in WalkDir::new(entries_dir).sort_by_file_name() {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_file() {
+        if !path.is_file() || entry.file_name() == CACHEDIR_TAG_FILE_NAME {
             continue;
         }
         println!("=========================");

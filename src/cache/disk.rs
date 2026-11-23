@@ -14,7 +14,7 @@
 
 use crate::cache::{Cache, CacheMode, CacheRead, CacheWrite, Storage};
 use crate::compiler::PreprocessorCacheEntry;
-use crate::lru_disk_cache::{Error as LruError, ReadSeek};
+use crate::lru_disk_cache::ReadSeek;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::ffi::OsStr;
@@ -75,34 +75,28 @@ fn make_key_path(key: &str) -> PathBuf {
     Path::new(&key[0..1]).join(&key[1..2]).join(key)
 }
 
+/// Preserve the remote preprocessor key layout, using native separators on disk.
+fn preprocessor_key_path(key: &str) -> PathBuf {
+    normalize_key(key).split('/').collect()
+}
+
 #[async_trait]
 impl Storage for DiskCache {
     async fn get(&self, key: &str) -> Result<Cache> {
         trace!("DiskCache::get({key})");
         let path = make_key_path(key);
         let lru = self.lru.clone();
-        let key = key.to_owned();
+        let mode = self.rw_mode;
 
         self.pool
             .spawn_blocking(move || {
-                let io = {
-                    let mut guard = lru
-                        .lock()
-                        .map_err(|_| anyhow!("disk cache mutex poisoned"))?;
-                    match guard.get_or_init()?.get(&path) {
-                        Ok(file) => file,
-                        Err(LruError::FileNotInCache) => {
-                            trace!("DiskCache::get({key}): FileNotInCache");
-                            return Ok(Cache::Miss);
-                        }
-                        Err(error) => {
-                            trace!("DiskCache::get({key}): {error}");
-                            return Err(error.into());
-                        }
-                    }
-                };
-                let hit = CacheRead::from(io)?;
-                Ok(Cache::Hit(hit))
+                let file = lru
+                    .lock()
+                    .map_err(|_| anyhow!("disk cache mutex poisoned"))?
+                    .open(&path, mode)?;
+                file.map_or(Ok(Cache::Miss), |file| {
+                    CacheRead::from(file).map(Cache::Hit)
+                })
             })
             .await?
     }
@@ -121,29 +115,20 @@ impl Storage for DiskCache {
         trace!("DiskCache::get_raw({key})");
         let path = make_key_path(key);
         let lru = self.lru.clone();
-        let key = key.to_owned();
+        let mode = self.rw_mode;
 
         self.pool
             .spawn_blocking(move || {
-                let mut guard = lru
+                let file = lru
                     .lock()
-                    .map_err(|_| anyhow!("disk cache mutex poisoned"))?;
-                match guard.get_or_init()?.get(&path) {
-                    Ok(mut io) => {
-                        let mut data = Vec::new();
-                        io.read_to_end(&mut data)?;
-                        trace!("DiskCache::get_raw({key}): Found {} bytes", data.len());
-                        Ok(Some(Bytes::from(data)))
-                    }
-                    Err(LruError::FileNotInCache) => {
-                        trace!("DiskCache::get_raw({key}): FileNotInCache");
-                        Ok(None)
-                    }
-                    Err(e) => {
-                        trace!("DiskCache::get_raw({key}): {e}");
-                        Err(e.into())
-                    }
-                }
+                    .map_err(|_| anyhow!("disk cache mutex poisoned"))?
+                    .open(&path, mode)?;
+                let Some(mut file) = file else {
+                    return Ok(None);
+                };
+                let mut data = Vec::new();
+                file.read_to_end(&mut data)?;
+                Ok(Some(data.into()))
             })
             .await?
     }
@@ -226,16 +211,17 @@ impl Storage for DiskCache {
         &self.basedirs
     }
     async fn get_preprocessor_cache_entry(&self, key: &str) -> Result<Option<Box<dyn ReadSeek>>> {
-        let key = normalize_key(key);
-        let mut guard = self
-            .preprocessor_cache
-            .lock()
-            .map_err(|_| anyhow!("preprocessor cache mutex poisoned"))?;
-        match guard.get_or_init()?.get(key) {
-            Ok(entry) => Ok(Some(entry)),
-            Err(LruError::FileNotInCache) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
+        let key = preprocessor_key_path(key);
+        let cache = self.preprocessor_cache.clone();
+        let mode = self.rw_mode;
+        self.pool
+            .spawn_blocking(move || {
+                cache
+                    .lock()
+                    .map_err(|_| anyhow!("preprocessor cache mutex poisoned"))?
+                    .open(&key, mode)
+            })
+            .await?
     }
     async fn put_preprocessor_cache_entry(
         &self,
@@ -246,7 +232,7 @@ impl Storage for DiskCache {
             return Err(anyhow!("Cannot write to a read-only cache"));
         }
 
-        let key = normalize_key(key);
+        let key = preprocessor_key_path(key);
         let mut f = {
             let mut guard = self
                 .preprocessor_cache
@@ -269,6 +255,98 @@ impl Storage for DiskCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const KEY: &str = "0123456789abcdef";
+
+    fn disk_cache(
+        root: &Path,
+        runtime: &tokio::runtime::Runtime,
+        mode: CacheMode,
+        size: u64,
+    ) -> DiskCache {
+        DiskCache::new(
+            root,
+            size,
+            runtime.handle(),
+            PreprocessorCacheModeConfig::activated(),
+            mode,
+            vec![],
+        )
+    }
+
+    #[test]
+    fn read_only_disk_does_not_initialize_or_prune_the_cache() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("cache");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let reader = disk_cache(&root, &runtime, CacheMode::ReadOnly, 1);
+            assert!(matches!(reader.get(KEY).await?, Cache::Miss));
+            assert!(reader.get_raw(KEY).await?.is_none());
+            assert!(reader.get_preprocessor_cache_entry(KEY).await?.is_none());
+            assert!(!root.exists());
+
+            let writer = disk_cache(&root, &runtime, CacheMode::ReadWrite, 1024 * 1024);
+            writer.put(KEY, CacheWrite::new()).await?;
+            writer
+                .put_preprocessor_cache_entry(KEY, PreprocessorCacheEntry::new())
+                .await?;
+            drop(writer);
+            let artifact = root.join(make_key_path(KEY));
+            let preprocessor = root.join("preprocessor").join(preprocessor_key_path(KEY));
+            let temporary = root.join(".sccachetmp_test");
+            std::fs::write(&temporary, b"other process temporary file")?;
+            let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+            for path in [&artifact, &preprocessor] {
+                std::fs::File::options()
+                    .write(true)
+                    .open(path)?
+                    .set_times(std::fs::FileTimes::new().set_modified(old))?;
+            }
+            assert!(matches!(reader.get(KEY).await?, Cache::Hit(_)));
+            assert_eq!(
+                reader.get_raw(KEY).await?.as_deref(),
+                Some(std::fs::read(&artifact)?.as_slice())
+            );
+            let (hit, raw) = reader.get_with_raw(KEY).await?;
+            assert!(matches!(hit, Cache::Hit(_)));
+            assert!(raw.is_some());
+            assert!(reader.get_preprocessor_cache_entry(KEY).await?.is_some());
+            assert!(reader.put(KEY, CacheWrite::new()).await.is_err());
+            assert!(
+                reader
+                    .put_preprocessor_cache_entry(KEY, PreprocessorCacheEntry::new())
+                    .await
+                    .is_err()
+            );
+            assert!(reader.current_size().await?.is_none());
+            assert!(temporary.exists());
+            for path in [&artifact, &preprocessor] {
+                assert_eq!(std::fs::metadata(path)?.modified()?, old);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn preprocessor_entry_survives_reopening_disk_cache() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let writer = disk_cache(dir.path(), &runtime, CacheMode::ReadWrite, 1024 * 1024);
+            writer
+                .put_preprocessor_cache_entry(KEY, PreprocessorCacheEntry::new())
+                .await?;
+            drop(writer);
+            let reader = disk_cache(dir.path(), &runtime, CacheMode::ReadWrite, 1024 * 1024);
+            assert!(reader.get_preprocessor_cache_entry(KEY).await?.is_some());
+            Ok(())
+        })
+    }
 
     #[test]
     fn test_disk_cache_type_name() -> Result<()> {
