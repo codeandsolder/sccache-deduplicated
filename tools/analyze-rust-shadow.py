@@ -49,7 +49,7 @@ class Record(TypedDict, total=False):
     target: str
     compiler_version: str
     compiler_shlibs_digests: list[str]
-    arguments_hashed_blob: str
+    arguments_hashed_pairs: list[list[str | None]]
     source_inputs: list[InputItem]
     extern_inputs: list[InputItem]
     staticlib_inputs: list[InputItem]
@@ -158,7 +158,7 @@ def signature(record: Record, drops: Iterable[str] = ()) -> str:
         "target": record.get("target"),
         "compiler_version": record.get("compiler_version"),
         "compiler_shlibs_digests": tuple(record.get("compiler_shlibs_digests", [])),
-        "arguments_hashed_blob": record.get("arguments_hashed_blob"),
+        "arguments_hashed_pairs": record.get("arguments_hashed_pairs"),
         "source": input_digests(record, "source_inputs"),
         "extern": input_digests(record, "extern_inputs"),
         "staticlib": input_digests(record, "staticlib_inputs"),
@@ -172,7 +172,7 @@ def signature(record: Record, drops: Iterable[str] = ()) -> str:
 
     drop_map = {
         "cwd": "cwd_key",
-        "arguments": "arguments_hashed_blob",
+        "arguments": "arguments_hashed_pairs",
         "native_profile": "native",
         "compiler_shlibs": "compiler_shlibs_digests",
     }
@@ -220,7 +220,7 @@ def recover_embedded_records(line: str) -> list[Record]:
             continue
         if (
             isinstance(record, dict)
-            and record.get("schema") == 1
+            and record.get("schema") == 2
             and "cache_key" in record
         ):
             recovered.append(cast(Record, record))
@@ -253,7 +253,7 @@ def load_records(paths: Iterable[pathlib.Path]) -> tuple[list[Record], int, int]
                 continue
             if (
                 not isinstance(candidate, dict)
-                or candidate.get("schema") != 1
+                or candidate.get("schema") != 2
                 or "cache_key" not in candidate
             ):
                 bad += 1

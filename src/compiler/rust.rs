@@ -345,7 +345,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"8";
+const CACHE_VERSION: &[u8] = b"9";
 
 struct RustDepInfoRequest<'a, T> {
     creator: &'a T,
@@ -732,7 +732,7 @@ struct RustShadowRecord {
     sysroot_key: String,
     arguments_raw: Vec<String>,
     arguments_canonical: Vec<String>,
-    arguments_hashed_blob: String,
+    arguments_hashed_pairs: Vec<(String, Option<String>)>,
     source_inputs: Vec<RustShadowInput>,
     extern_inputs: Vec<RustShadowInput>,
     staticlib_inputs: Vec<RustShadowInput>,
@@ -949,6 +949,42 @@ fn rust_shadow_args(args: &[(OsString, Option<OsString>)]) -> Vec<String> {
         .flat_map(|(arg, value)| std::iter::once(arg).chain(value.as_ref()))
         .map(|value| value.to_string_lossy().into_owned())
         .collect()
+}
+
+// Encode argument records, not an unframed concatenation of their text.
+// Otherwise one -C link-arg containing "-Clink-arg=" can alias two -C options.
+fn hash_rust_argument_pairs<'a>(
+    digest: &mut Digest,
+    arg_count: usize,
+    args: impl Iterator<Item = &'a (OsString, Option<OsString>)>,
+) {
+    digest.delimiter(b"rust-argv-v1");
+    digest.update(&(arg_count as u128).to_le_bytes());
+    for (name, value) in args {
+        let name_bytes = name.as_encoded_bytes();
+        digest.update(&(name_bytes.len() as u128).to_le_bytes());
+        digest.update(name_bytes);
+        if let Some(value) = value {
+            digest.update(&[1]);
+            let value_bytes = value.as_encoded_bytes();
+            digest.update(&(value_bytes.len() as u128).to_le_bytes());
+            digest.update(value_bytes);
+        } else {
+            digest.update(&[0]);
+        }
+    }
+}
+
+/// Distinguish source, extern, archive and target JSON inputs even if their
+/// content digests are equal. The previous flat concatenation lost group sizes.
+fn hash_rust_input_group(digest: &mut Digest, domain: &[u8], hashes: &[String]) {
+    digest.delimiter(domain);
+    digest.update(&(hashes.len() as u128).to_le_bytes());
+    for hash in hashes {
+        let bytes = hash.as_bytes();
+        digest.update(&(bytes.len() as u128).to_le_bytes());
+        digest.update(bytes);
+    }
 }
 
 fn rust_shadow_root(canonical: &CanonicalRustPaths) -> RustShadowRoots {
@@ -3169,39 +3205,47 @@ where
         // A few argument types are not passed in a deterministic order
         // by cargo: --extern, -L, --cfg. We'll filter those out, sort them,
         // and append them to the rest of the arguments.
-        let args = {
-            let (mut sortables, rest): (Vec<_>, Vec<_>) = hash_os_string_arguments
-                .iter()
-                // We exclude a few arguments from the hash:
-                //   -L, --extern, --out-dir, --diagnostic-width
-                // These contain paths which aren't relevant to the output, and the compiler inputs
-                // in those paths (rlibs and static libs used in the compilation) are used as hash
-                // inputs below.
-                .filter(|&(arg, _)| {
-                    !(arg == "--extern"
-                        || arg == "-L"
-                        || arg == "--check-cfg"
-                        || arg == "--out-dir"
-                        || arg == "--diagnostic-width")
+        let (mut sortables, rest): (Vec<_>, Vec<_>) = hash_os_string_arguments
+            .iter()
+            // We exclude a few arguments from the hash:
+            //   -L, --extern, --out-dir, --diagnostic-width
+            // These contain paths which aren't relevant to the output, and the compiler inputs
+            // in those paths (rlibs and static libs used in the compilation) are used as hash
+            // inputs below.
+            .filter(|&(arg, _)| {
+                !(arg == "--extern"
+                    || arg == "-L"
+                    || arg == "--check-cfg"
+                    || arg == "--out-dir"
+                    || arg == "--diagnostic-width")
+            })
+            // We also exclude `--target` if it specifies a path to a .json file. The file content
+            // is used as hash input below.
+            // If `--target` specifies a string, it continues to be hashed as part of the arguments.
+            .filter(|&(arg, _)| self.parsed_args.target_json.is_none() || arg != "--target")
+            // A few argument types were not passed in a deterministic order
+            // by older versions of cargo: --extern, -L, --cfg. We'll filter the rest of those
+            // out, sort them, and append them to the rest of the arguments.
+            .partition(|&(arg, _)| arg == "--cfg");
+        sortables.sort();
+        hash_rust_argument_pairs(
+            &mut m,
+            rest.len() + sortables.len(),
+            rest.iter().chain(sortables.iter()).copied(),
+        );
+        let hashed_argument_pairs = shadow_log_path.is_some().then(|| {
+            rest.iter()
+                .chain(sortables.iter())
+                .map(|(name, value)| {
+                    (
+                        name.to_string_lossy().into_owned(),
+                        value
+                            .as_ref()
+                            .map(|value| value.to_string_lossy().into_owned()),
+                    )
                 })
-                // We also exclude `--target` if it specifies a path to a .json file. The file content
-                // is used as hash input below.
-                // If `--target` specifies a string, it continues to be hashed as part of the arguments.
-                .filter(|&(arg, _)| self.parsed_args.target_json.is_none() || arg != "--target")
-                // A few argument types were not passed in a deterministic order
-                // by older versions of cargo: --extern, -L, --cfg. We'll filter the rest of those
-                // out, sort them, and append them to the rest of the arguments.
-                .partition(|&(arg, _)| arg == "--cfg");
-            sortables.sort();
-            rest.into_iter()
-                .chain(sortables)
-                .flat_map(|(arg, val)| iter::once(arg).chain(val.as_ref()))
-                .fold(OsString::new(), |mut a, b| {
-                    a.push(b);
-                    a
-                })
-        };
-        args.hash(&mut HashToDigest { digest: &mut m });
+                .collect::<Vec<_>>()
+        });
         if native_requested {
             // Keep the resolved host profile in the cache identity even when
             // `native` was rewritten to a proven-equivalent explicit CPU for
@@ -3217,14 +3261,10 @@ where
         // 5. The digest of all files listed on the commandline (self.externs).
         // 6. The digest of all static libraries listed on the commandline (self.staticlibs).
         // 7. The digest of the content of the target json file specified via `--target` (if any).
-        for h in source_hashes
-            .iter()
-            .chain(extern_hashes.iter())
-            .chain(staticlib_hashes.iter())
-            .chain(target_json_hash.iter())
-        {
-            m.update(h.as_bytes());
-        }
+        hash_rust_input_group(&mut m, b"rust-sources-v1", &source_hashes);
+        hash_rust_input_group(&mut m, b"rust-externs-v1", &extern_hashes);
+        hash_rust_input_group(&mut m, b"rust-staticlibs-v1", &staticlib_hashes);
+        hash_rust_input_group(&mut m, b"rust-target-json-v1", &target_json_hash);
         // 8. Environment variables: Hash all environment variables listed in the rustc dep-info
         //    output. Additionally also has all environment variables starting with `CARGO_`,
         //    since those are not listed in dep-info but affect cacheability.
@@ -3446,7 +3486,7 @@ where
             )) = shadow_inputs
             {
                 let record = RustShadowRecord {
-                    schema: 1,
+                    schema: 2,
                     timestamp_unix_ms,
                     normalization_policy: if canonical.is_some() {
                         "canonical-rust-layout-v2".to_owned()
@@ -3484,7 +3524,7 @@ where
                         .into_owned(),
                     arguments_raw: rust_shadow_args(&os_string_arguments),
                     arguments_canonical: rust_shadow_args(&hash_os_string_arguments),
-                    arguments_hashed_blob: args.to_string_lossy().into_owned(),
+                    arguments_hashed_pairs: hashed_argument_pairs.unwrap_or_default(),
                     source_inputs: shadow_source_inputs,
                     extern_inputs: shadow_extern_inputs,
                     staticlib_inputs: shadow_staticlib_inputs,
@@ -6673,16 +6713,23 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         // sysroot shlibs digests.
         m.update(FAKE_DIGEST.as_bytes());
         // Arguments, with cfgs sorted at the end.
-        OsStr::new("ab--cfgabc--cfgxyz").hash(&mut HashToDigest { digest: &mut m });
-        // bar.rs (source file, from dep-info)
-        m.update(empty_digest.as_bytes());
-        // foo.rs (source file, from dep-info)
-        m.update(empty_digest.as_bytes());
-        // bar.rlib (extern crate, from externs)
-        m.update(empty_digest.as_bytes());
-        // libbaz.a (static library, from staticlibs), containing a single
-        // file, baz.o, consisting of 1024 bytes of zeroes.
-        m.update(libbaz_a_digest.as_bytes());
+        let args = [
+            (OsString::from("a"), None),
+            (OsString::from("b"), None),
+            (OsString::from("--cfg"), Some(OsString::from("abc"))),
+            (OsString::from("--cfg"), Some(OsString::from("xyz"))),
+        ];
+        hash_rust_argument_pairs(&mut m, args.len(), args.iter());
+        // Source inputs, extern crates, archives and target JSON retain their
+        // group identities even when their digest strings happen to match.
+        hash_rust_input_group(
+            &mut m,
+            b"rust-sources-v1",
+            &[empty_digest.clone(), empty_digest.clone()],
+        );
+        hash_rust_input_group(&mut m, b"rust-externs-v1", &[empty_digest]);
+        hash_rust_input_group(&mut m, b"rust-staticlibs-v1", &[libbaz_a_digest]);
+        hash_rust_input_group(&mut m, b"rust-target-json-v1", &[]);
         // Env vars
         OsStr::new("CARGO_BLAH").hash(&mut HashToDigest { digest: &mut m });
         m.update(b"=");
@@ -6697,6 +6744,64 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         let mut out = res.compilation.outputs().map(|k| k.key).collect::<Vec<_>>();
         out.sort();
         assert_eq!(out, vec!["foo.a", "foo.rlib", "foo.rmeta"]);
+    }
+
+    #[test]
+    fn rust_cache_argument_hash_preserves_boundaries() {
+        let single = [(
+            OsString::from("-C"),
+            Some(OsString::from("link-arg=a-Clink-arg=b")),
+        )];
+        let split = [
+            (OsString::from("-C"), Some(OsString::from("link-arg=a"))),
+            (OsString::from("-C"), Some(OsString::from("link-arg=b"))),
+        ];
+        let legacy_join = |args: &[(OsString, Option<OsString>)]| {
+            args.iter()
+                .flat_map(|(flag, value)| std::iter::once(flag).chain(value.as_ref()))
+                .fold(OsString::new(), |mut joined, part| {
+                    joined.push(part);
+                    joined
+                })
+        };
+        assert_eq!(legacy_join(&single), legacy_join(&split));
+
+        let framed_hash = |args: &[(OsString, Option<OsString>)]| {
+            let mut digest = Digest::new();
+            hash_rust_argument_pairs(&mut digest, args.len(), args.iter());
+            digest.finish()
+        };
+        assert_ne!(framed_hash(&single), framed_hash(&split));
+        assert_ne!(
+            framed_hash(&[(OsString::from("-C"), None)]),
+            framed_hash(&[(OsString::from("-C"), Some(OsString::new()))])
+        );
+        assert_ne!(
+            framed_hash(&[(OsString::from("ab"), None)]),
+            framed_hash(&[(OsString::from("a"), None), (OsString::from("b"), None),])
+        );
+    }
+
+    #[test]
+    fn rust_cache_input_hash_preserves_roles_and_group_lengths() {
+        let identical = "0123456789abcdef".repeat(4);
+        let source = [identical.clone()];
+        let external = [identical.clone()];
+
+        // Both old layouts produced the same flat stream of digest bytes.
+        let mut legacy_source = Digest::new();
+        legacy_source.update(source[0].as_bytes());
+        let mut legacy_external = Digest::new();
+        legacy_external.update(external[0].as_bytes());
+        assert_eq!(legacy_source.finish(), legacy_external.finish());
+
+        let mut by_source = Digest::new();
+        hash_rust_input_group(&mut by_source, b"rust-sources-v1", &source);
+        hash_rust_input_group(&mut by_source, b"rust-externs-v1", &[]);
+        let mut by_extern = Digest::new();
+        hash_rust_input_group(&mut by_extern, b"rust-sources-v1", &[]);
+        hash_rust_input_group(&mut by_extern, b"rust-externs-v1", &external);
+        assert_ne!(by_source.finish(), by_extern.finish());
     }
 
     #[test]
