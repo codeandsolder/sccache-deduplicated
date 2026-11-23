@@ -1,14 +1,15 @@
 //! Shared resident-cache accounting, admission, and restart-safe reuse policy.
 //! ZFS controls physical compression and allocation. Logical byte limits are
 //! deliberately conservative and do not replace filesystem free-space checks.
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, ensure};
-use bincode::Options;
 use redb::{ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
 
-use super::{ACTIONS, ActionRecord, Eviction, NativeStore, RESULTS, TREES, USAGE, encoding};
+use super::{
+    ACTIONS, ActionRecord, Eviction, NativeStore, RESULTS, TREES, encoding, persist_usage,
+};
 use crate::{ActionKey, ResultManifest, SpacePolicy, TreeId, TreeManifest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -109,21 +110,21 @@ impl NativeStore {
     pub fn checkpoint_usage(&self) -> Result<()> {
         let _mutation = self.inner.lock_mutations()?;
         let mut pins = self.inner.lock_pins()?;
-        if pins.dirty_usage.is_empty() {
-            return Ok(());
+        persist_usage(&self.inner.db, &mut pins)
+    }
+
+    fn checkpoint_usage_if_due(&self) -> Result<()> {
+        const INTERVAL: Duration = Duration::from_secs(60);
+        let due = {
+            let pins = self.inner.lock_pins()?;
+            !pins.dirty_usage.is_empty()
+                && pins
+                    .last_usage_checkpoint
+                    .is_none_or(|last| last.elapsed() >= INTERVAL)
+        };
+        if due {
+            self.checkpoint_usage()?;
         }
-        let write = self.inner.db.begin_write()?;
-        {
-            let mut usage = write.open_table(USAGE)?;
-            for root in &pins.dirty_usage {
-                if let Some(record) = pins.usage.get(root) {
-                    let bytes = encoding().serialize(record)?;
-                    usage.insert(&root.key(), bytes.as_slice())?;
-                }
-            }
-        }
-        write.commit()?;
-        pins.dirty_usage.clear();
         Ok(())
     }
 
@@ -136,7 +137,7 @@ impl NativeStore {
         let Some(policy) = self.inner.space_policy else {
             return Ok(None);
         };
-        self.checkpoint_usage()?;
+        self.checkpoint_usage_if_due()?;
         let state = self
             .inner
             .space

@@ -147,7 +147,8 @@ ZFS separately compresses them and the filesystem free-space watermarks still
 apply. For actual physical cache isolation, place each store on a quota-managed
 dataset. Worker replicas are persistent and reuse the same verified blobs and
 package trees, fetching missing inputs only. Access frequency and recency are
-buffered and checkpointed during maintenance without write I/O on hits.
+buffered and checkpointed at most once per minute during maintenance,
+plus on orderly shutdown, without write I/O on cache hits.
 
 The worker advertises the BLAKE3 digest of the exact platform contract.
 Clients use the same digest in `ExecutionSpec.platform`. The renewal

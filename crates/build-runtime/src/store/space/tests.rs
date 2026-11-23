@@ -232,3 +232,27 @@ fn active_content_is_never_evicted_to_meet_a_worker_budget() -> Result<()> {
     assert_eq!(report.resident_bytes, 0);
     Ok(())
 }
+
+#[test]
+fn clean_shutdown_checkpoints_unflushed_accesses() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let hot = {
+        let store = NativeStore::open(temp.path())?;
+        let key = publish(&store, "restart")?;
+        for _ in 0..6 {
+            drop(store.lookup(key)?.context("missing action")?);
+        }
+        // No explicit checkpoint or maintenance call.
+        key
+    };
+    let reopened = NativeStore::open(temp.path())?;
+    let pins = reopened.inner.lock_pins()?;
+    assert!(
+        pins.usage
+            .get(&Root::Action(hot))
+            .context("orderly shutdown lost usage")?
+            .hits
+            >= 7
+    );
+    Ok(())
+}
