@@ -78,10 +78,7 @@ impl CCompilerImpl for Cicc {
     where
         T: CommandCreatorSync,
     {
-        let CPreprocessContext {
-            parsed_args, cwd, ..
-        } = context;
-        preprocess(cwd, parsed_args)
+        preprocess(context.cwd, context.parsed_args)
     }
     fn generate_compile_commands<T>(
         &self,
@@ -94,25 +91,7 @@ impl CCompilerImpl for Cicc {
     where
         T: CommandCreatorSync,
     {
-        let CCompileContext {
-            path_transformer,
-            executable,
-            parsed_args,
-            cwd,
-            env_vars,
-            ..
-        } = context;
-        generate_compile_commands(
-            path_transformer,
-            executable,
-            parsed_args,
-            cwd,
-            env_vars,
-            OutputStyle::ObjectFile,
-        )
-        .map(|(command, dist_command, cacheable)| {
-            (CCompileCommand::boxed(command), dist_command, cacheable)
-        })
+        boxed_compile_commands(context, OutputStyle::ObjectFile)
     }
 }
 
@@ -342,6 +321,36 @@ impl OutputStyle {
     }
 }
 
+/// Box a CUDA device compiler command using the frontend-specific output style.
+/// The three stage adapters share path transformation and command ownership.
+pub(super) fn boxed_compile_commands<T: CommandCreatorSync>(
+    context: CCompileContext<'_>,
+    output_style: OutputStyle,
+) -> Result<(
+    Box<dyn CompileCommand<T>>,
+    Option<dist::CompileCommand>,
+    Cacheable,
+)> {
+    let CCompileContext {
+        path_transformer,
+        executable,
+        parsed_args,
+        cwd,
+        env_vars,
+        ..
+    } = context;
+    generate_compile_commands(
+        path_transformer,
+        executable,
+        parsed_args,
+        cwd,
+        env_vars,
+        output_style,
+    )
+    .map(|(command, dist_command, cacheable)| {
+        (CCompileCommand::boxed(command), dist_command, cacheable)
+    })
+}
 pub fn generate_compile_commands(
     path_transformer: &mut dist::PathTransformer,
     executable: &Path,

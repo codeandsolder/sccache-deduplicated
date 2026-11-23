@@ -18,7 +18,7 @@ use crate::compiler::c::{
     CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext, ParsedArguments,
 };
 use crate::compiler::cicc;
-use crate::compiler::{CCompileCommand, Cacheable, CompileCommand, CompilerArguments, Language};
+use crate::compiler::{Cacheable, CompileCommand, CompilerArguments, Language};
 use crate::{counted_array, dist};
 
 use crate::mock_command::CommandCreatorSync;
@@ -60,10 +60,7 @@ impl CCompilerImpl for Ptxas {
     where
         T: CommandCreatorSync,
     {
-        let CPreprocessContext {
-            parsed_args, cwd, ..
-        } = context;
-        cicc::preprocess(cwd, parsed_args)
+        cicc::preprocess(context.cwd, context.parsed_args)
     }
     fn generate_compile_commands<T>(
         &self,
@@ -76,25 +73,7 @@ impl CCompilerImpl for Ptxas {
     where
         T: CommandCreatorSync,
     {
-        let CCompileContext {
-            path_transformer,
-            executable,
-            parsed_args,
-            cwd,
-            env_vars,
-            ..
-        } = context;
-        cicc::generate_compile_commands(
-            path_transformer,
-            executable,
-            parsed_args,
-            cwd,
-            env_vars,
-            cicc::OutputStyle::ObjectFile,
-        )
-        .map(|(command, dist_command, cacheable)| {
-            (CCompileCommand::boxed(command), dist_command, cacheable)
-        })
+        cicc::boxed_compile_commands(context, cicc::OutputStyle::ObjectFile)
     }
 }
 
