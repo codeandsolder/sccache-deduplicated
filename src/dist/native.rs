@@ -11,8 +11,9 @@ use bincode::Options;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::build_runtime::{
-    ActionMode, BlobRef, ContentId, ExecutionSpec, InstallationManifest, PackageIdentity,
-    PackageReceipt, PackageSource, PackageTransferCost, ResultManifest, TreeId, TreeManifest,
+    ActionMode, BlobEncoding, BlobRef, ContentId, ExecutionSpec, InstallationManifest,
+    PackageIdentity, PackageReceipt, PackageSource, PackageTransferCost, ResultManifest, TreeId,
+    TreeManifest,
     wire::{
         BeginResult, NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply, Ticket,
         TreeOffer, TreeRead, UploadHeader, WorkerAllocation,
@@ -406,14 +407,15 @@ impl NativeCacheClient {
     ///
     /// # Errors
     /// Returns an error if a reserved blob is absent or fails remote validation.
-    pub fn push_tree_encoded(
+    pub fn push_tree_stored(
         &self,
         manifest: &TreeManifest,
-        mut open: impl FnMut(ContentId) -> Result<File>,
+        mut open: impl FnMut(ContentId) -> Result<(File, BlobEncoding)>,
         renewal_interval: Duration,
     ) -> Result<Ticket> {
         self.push_tree_with(manifest, renewal_interval, |ticket, blob| {
-            self.upload_encoded_file(ticket, blob, open(blob.id)?)
+            let (file, encoding) = open(blob.id)?;
+            self.upload_stored_file(ticket, blob, encoding, file)
         })
     }
 
@@ -510,8 +512,8 @@ impl NativeCacheClient {
                 check()?;
                 let _slot = transport.raw_slot(check)?;
                 let start = Instant::now();
-                let response = self.download_response(read.ticket, blob.id)?;
-                let staged = store.stage_expected_encoded(*blob, response)?;
+                let (response, encoding) = self.download_response(read.ticket, blob.id)?;
+                let staged = store.stage_expected_physical(*blob, encoding, response)?;
                 transport.observe_raw(blob.size, start.elapsed());
                 Ok(staged)
             })?;
@@ -553,7 +555,7 @@ impl NativeCacheClient {
             "native upload content digest or length mismatch"
         );
         encoded.rewind()?;
-        self.upload_encoded_file(ticket, blob, encoded)
+        self.upload_stored_file(ticket, blob, BlobEncoding::ZstdChunks, encoded)
     }
 
     /// Transfer an already-compressed immutable CAS blob without encoding again.
@@ -561,9 +563,27 @@ impl NativeCacheClient {
     ///
     /// # Errors
     /// Returns an error for a missing physical file or rejected transfer.
-    pub fn upload_encoded_file(&self, ticket: Ticket, blob: BlobRef, file: File) -> Result<()> {
+    pub fn upload_stored_file(
+        &self,
+        ticket: Ticket,
+        blob: BlobRef,
+        encoding: BlobEncoding,
+        file: File,
+    ) -> Result<()> {
         let size = file.metadata()?.len();
-        self.send_stream("upload", &UploadHeader { ticket, blob }, size, file)?;
+        if encoding == BlobEncoding::Raw {
+            ensure!(size == blob.size, "native raw upload size mismatch");
+        }
+        self.send_stream(
+            "upload",
+            &UploadHeader {
+                ticket,
+                blob,
+                encoding: encoding as u8,
+            },
+            size,
+            file,
+        )?;
         Ok(())
     }
 
@@ -653,11 +673,13 @@ impl NativeCacheClient {
         blob: BlobRef,
         mut destination: impl Write,
     ) -> Result<()> {
+        let (response, encoding) = self.download_response(ticket, blob.id)?;
         crate::build_runtime::transfer_native_blob(
-            self.download_response(ticket, blob.id)?,
+            response,
             io::sink(),
             &mut destination,
             blob,
+            encoding,
         )
     }
 
@@ -665,13 +687,20 @@ impl NativeCacheClient {
         &self,
         ticket: Ticket,
         id: ContentId,
-    ) -> Result<reqwest::blocking::Response> {
+    ) -> Result<(reqwest::blocking::Response, BlobEncoding)> {
         let request = codec().serialize(&DownloadRequest { ticket, id })?;
-        Ok(self
+        let response = self
             .request("download")?
             .body(request)
             .send()?
-            .error_for_status()?)
+            .error_for_status()?;
+        let descriptor = response
+            .headers()
+            .get("x-sccache-cas-encoding")
+            .context("native download missing physical encoding")?
+            .to_str()?;
+        let encoding = BlobEncoding::from_http_value(descriptor)?;
+        Ok((response, encoding))
     }
 }
 

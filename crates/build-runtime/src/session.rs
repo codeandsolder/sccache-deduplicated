@@ -15,10 +15,10 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use crate::{
-    ActionMode, Admission, ArchiveLength, BlobRef, BuildCoordinator, CompilePermit, ContentId,
-    NativeStore, PackageArchive, PackageArchiveLease, PackageIdentity, PackageImportLimits,
-    PackageTransferCost, ResultLease, ResultManifest, StagedBlob, TreeId, TreeLease, TreeManifest,
-    UploadReservation, VerifiedPackage,
+    ActionMode, Admission, ArchiveLength, BlobEncoding, BlobRef, BuildCoordinator, CompilePermit,
+    ContentId, NativeStore, PackageArchive, PackageArchiveLease, PackageIdentity,
+    PackageImportLimits, PackageTransferCost, ResultLease, ResultManifest, StagedBlob, TreeId,
+    TreeLease, TreeManifest, UploadReservation, VerifiedPackage,
     wire::{
         ActionRequest, BeginResult, NativeAdmission, NativeStatus, Publisher, ScheduleReply,
         Ticket, TreeOffer, TreeRead, WorkerAllocation,
@@ -211,11 +211,11 @@ impl TreeDelivery {
         }
     }
 
-    fn open_file(&self, id: ContentId) -> Result<File> {
+    fn open_physical(&self, id: ContentId) -> Result<(File, BlobEncoding)> {
         if let Some(package) = self.packages.get(&id) {
-            return package.open_file();
+            return Ok((package.open_file()?, BlobEncoding::Raw));
         }
-        self.tree.open_file(id)
+        Ok((self.tree.open_file(id)?, self.tree.physical_encoding(id)?))
     }
 }
 
@@ -225,10 +225,10 @@ enum Ready {
 }
 
 impl Ready {
-    fn open_file(&self, id: ContentId) -> Result<File> {
+    fn open_physical(&self, id: ContentId) -> Result<(File, BlobEncoding)> {
         match self {
-            Self::Result(lease) => lease.open_file(id),
-            Self::Tree(lease) => lease.open_file(id),
+            Self::Result(lease) => Ok((lease.open_file(id)?, lease.physical_encoding(id)?)),
+            Self::Tree(lease) => lease.open_physical(id),
         }
     }
 
@@ -791,6 +791,7 @@ impl NativeSessions {
         ticket: Ticket,
         publisher: Publisher,
         blob: BlobRef,
+        encoding: BlobEncoding,
         reader: impl Read,
     ) -> Result<()> {
         let _slot = self.upload_slot()?;
@@ -807,7 +808,7 @@ impl NativeSessions {
                 .start(blob, self.limits.max_concurrent_uploads)?;
             drop(state);
         }
-        let result = self.store().stage_expected_encoded(blob, reader);
+        let result = self.store().stage_expected_physical(blob, encoding, reader);
         let mut state = Self::lock(&session)?;
         // Clear the active marker even if this upload exceeded its lease.
         if let Phase::Pending(pending) = &mut state.phase
@@ -916,14 +917,19 @@ impl NativeSessions {
     ///
     /// # Errors
     /// Returns an error for unknown tickets, unavailable or undeclared content.
-    pub fn download(&self, ticket: Ticket, reader: Publisher, id: ContentId) -> Result<File> {
+    pub fn download(
+        &self,
+        ticket: Ticket,
+        reader: Publisher,
+        id: ContentId,
+    ) -> Result<(File, BlobEncoding)> {
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
         self.authorize_reader(&mut state, reader)?;
         let Phase::Ready(lease) = &state.phase else {
             bail!("native content not available");
         };
-        let file = lease.open_file(id);
+        let file = lease.open_physical(id);
         drop(state);
         file
     }

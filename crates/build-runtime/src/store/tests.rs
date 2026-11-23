@@ -58,7 +58,9 @@ fn literal_magic_prefix_in_raw_cas_blob_survives_restart() -> Result<()> {
     let mut decoded = Vec::new();
     lease.open_blob(reference.id)?.read_to_end(&mut decoded)?;
     assert_eq!(decoded, content);
-    assert_eq!(std::fs::read(lease.open_file(reference.id)?)?, content);
+    let mut physical = Vec::new();
+    lease.open_file(reference.id)?.read_to_end(&mut physical)?;
+    assert_eq!(physical, content);
     drop(lease);
     drop(store);
 

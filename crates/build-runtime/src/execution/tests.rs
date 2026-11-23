@@ -222,6 +222,7 @@ fn rejects_symlink_and_fifo_outputs_without_following_or_blocking() -> Result<()
     let mut capture = Capture {
         files: BTreeMap::new(),
         remaining: 100,
+        scratch: dir.path().to_path_buf(),
     };
     let spec = ExecutionSpec {
         platform: ContentId::of(b"platform"),

@@ -322,6 +322,15 @@ impl TreeLease {
         self.inner.open_declared(&self.blobs, id)
     }
 
+    /// The immutable physical CAS encoding of a declared tree blob.
+    ///
+    /// # Errors
+    /// Returns an error for undeclared content or missing index metadata.
+    pub fn physical_encoding(&self, id: ContentId) -> Result<crate::BlobEncoding> {
+        ensure!(self.blobs.contains_key(&id), "undeclared tree content");
+        self.inner.blob_encoding(id)
+    }
+
     /// Open decoded content as an owned reader. The file descriptor remains
     /// valid independently of the tree lease, including during a network upload.
     ///

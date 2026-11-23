@@ -630,15 +630,16 @@ impl NativeStore {
     ///
     /// # Errors
     /// Returns an error for corruption, truncation or unexpected content.
-    pub fn stage_expected_encoded(
+    pub fn stage_expected_physical(
         &self,
         expected: BlobRef,
+        encoding: BlobEncoding,
         reader: impl Read,
     ) -> Result<StagedBlob> {
         let mut budget = space::StageBudget::new(self);
         budget.grow_to(expected.size)?;
         let mut staged = NamedTempFile::new_in(self.inner.root.join("staging"))?;
-        blob_codec::transfer(reader, staged.as_file_mut(), io::sink(), expected)?;
+        blob_codec::transfer(reader, staged.as_file_mut(), io::sink(), expected, encoding)?;
         staged
             .as_file()
             .set_permissions(fs::Permissions::from_mode(0o400))?;
@@ -648,7 +649,7 @@ impl NativeStore {
             path: staged.into_temp_path(),
             metadata,
             reference: expected,
-            encoding: BlobEncoding::ZstdChunks,
+            encoding,
             owner: Arc::clone(&self.inner),
         })
     }
@@ -1301,6 +1302,15 @@ impl ResultLease {
     /// Returns an error for undeclared content or filesystem failure.
     pub fn open_file(&self, id: ContentId) -> Result<File> {
         self.inner.open_declared(&self.blobs, id)
+    }
+
+    /// The immutable physical CAS encoding of a declared result blob.
+    ///
+    /// # Errors
+    /// Returns an error for undeclared content or missing index metadata.
+    pub fn physical_encoding(&self, id: ContentId) -> Result<BlobEncoding> {
+        ensure!(self.blobs.contains_key(&id), "undeclared result content");
+        self.inner.blob_encoding(id)
     }
 
     /// Open a blob belonging to this result. The reader borrows the lease and

@@ -24,6 +24,28 @@ pub enum BlobEncoding {
     ZstdChunks = 1,
 }
 
+impl BlobEncoding {
+    #[must_use]
+    pub const fn http_value(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::ZstdChunks => "zstd-chunks",
+        }
+    }
+
+    /// Decode the representation descriptor returned by the native CAS server.
+    ///
+    /// # Errors
+    /// Returns an error for unsupported or absent physical formats.
+    pub fn from_http_value(value: &str) -> Result<Self> {
+        match value {
+            "raw" => Ok(Self::Raw),
+            "zstd-chunks" => Ok(Self::ZstdChunks),
+            _ => anyhow::bail!("unsupported CAS physical format: {value}"),
+        }
+    }
+}
+
 impl TryFrom<u8> for BlobEncoding {
     type Error = anyhow::Error;
 
@@ -292,13 +314,64 @@ pub fn encode(mut reader: impl Read, file: &mut File, bound: Option<u64>) -> Res
     })
 }
 
-/// Read a transported physical payload into a staged file while verifying all
-/// decoded bytes against the advertised content digest. Encoded bytes are
-/// retained verbatim for subsequent transfers.
+/// Read and validate a transported physical CAS payload.
+///
+/// Both encodings preserve content identity over the decoded bytes and reject
+/// streams with incorrect length or digest.
 ///
 /// # Errors
-/// Returns an error for malformed frames, hash/length mismatches, or I/O failure.
+/// Returns an error for invalid content, truncation, or an I/O failure.
 pub fn transfer(
+    reader: impl Read,
+    physical: impl Write,
+    plaintext: impl Write,
+    expected: BlobRef,
+    encoding: BlobEncoding,
+) -> Result<()> {
+    match encoding {
+        BlobEncoding::Raw => transfer_raw(reader, physical, plaintext, expected),
+        BlobEncoding::ZstdChunks => transfer_zstd_chunks(reader, physical, plaintext, expected),
+    }
+}
+
+fn transfer_raw(
+    mut reader: impl Read,
+    mut physical: impl Write,
+    mut plaintext: impl Write,
+    expected: BlobRef,
+) -> Result<()> {
+    let mut digest = blake3::Hasher::new();
+    let mut decoded = 0_u64;
+    let mut block = vec![0_u8; 64 * 1024];
+    loop {
+        let n = match reader.read(&mut block) {
+            Ok(n) => n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if n == 0 {
+            break;
+        }
+        decoded = decoded
+            .checked_add(u64::try_from(n)?)
+            .context("raw CAS length overflow")?;
+        ensure!(
+            decoded <= expected.size,
+            "raw CAS exceeds advertised length"
+        );
+        let contents = &block[..n];
+        digest.update(contents);
+        physical.write_all(contents)?;
+        plaintext.write_all(contents)?;
+    }
+    ensure!(
+        decoded == expected.size && ContentId(*digest.finalize().as_bytes()) == expected.id,
+        "raw CAS digest or length mismatch"
+    );
+    Ok(())
+}
+
+fn transfer_zstd_chunks(
     mut reader: impl Read,
     mut physical: impl Write,
     mut plaintext: impl Write,
@@ -396,7 +469,13 @@ mod tests {
         assert_eq!(output, input);
         let received = tmp.path().join("received");
         let mut saved = File::create(&received)?;
-        transfer(File::open(&p)?, &mut saved, io::sink(), reference)?;
+        transfer(
+            File::open(&p)?,
+            &mut saved,
+            io::sink(),
+            reference,
+            BlobEncoding::ZstdChunks,
+        )?;
         drop(saved);
         assert_eq!(std::fs::read(p)?, std::fs::read(received)?);
         Ok(())
@@ -435,7 +514,13 @@ mod tests {
         decoded.read_to_end(&mut output)?;
         assert_eq!(output, bytes);
         let mut copied = File::create(temporary.path().join("wire"))?;
-        transfer(File::open(file_path)?, &mut copied, io::sink(), reference)?;
+        transfer(
+            File::open(file_path)?,
+            &mut copied,
+            io::sink(),
+            reference,
+            BlobEncoding::ZstdChunks,
+        )?;
         Ok(())
     }
 
@@ -449,10 +534,28 @@ mod tests {
         let mut data = std::fs::read(&path)?;
         data.extend(b"trailing");
         let mut dest = File::create(tmp.path().join("result"))?;
-        assert!(transfer(data.as_slice(), &mut dest, io::sink(), expected).is_err());
+        assert!(
+            transfer(
+                data.as_slice(),
+                &mut dest,
+                io::sink(),
+                expected,
+                BlobEncoding::ZstdChunks
+            )
+            .is_err()
+        );
         data.truncate(data.len() - 8);
         data[35] ^= 0x01;
-        assert!(transfer(data.as_slice(), &mut dest, io::sink(), expected).is_err());
+        assert!(
+            transfer(
+                data.as_slice(),
+                &mut dest,
+                io::sink(),
+                expected,
+                BlobEncoding::ZstdChunks
+            )
+            .is_err()
+        );
         Ok(())
     }
 }

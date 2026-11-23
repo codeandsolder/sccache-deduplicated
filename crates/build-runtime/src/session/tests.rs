@@ -36,7 +36,13 @@ fn upload_encoded(
     let mut encoded = tempfile::tempfile()?;
     crate::encode_native_blob(contents, &mut encoded, None)?;
     encoded.seek(SeekFrom::Start(0))?;
-    service.upload(ticket, publisher, declared, encoded)
+    service.upload(
+        ticket,
+        publisher,
+        declared,
+        crate::BlobEncoding::ZstdChunks,
+        encoded,
+    )
 }
 
 fn decoded_download(
@@ -45,10 +51,10 @@ fn decoded_download(
     publisher: Publisher,
     id: ContentId,
 ) -> Result<crate::BlobReader> {
-    crate::BlobReader::open(
-        service.download(ticket, publisher, id)?,
-        crate::BlobEncoding::ZstdChunks,
-    )
+    {
+        let (file, encoding) = service.download(ticket, publisher, id)?;
+        crate::BlobReader::open(file, encoding)
+    }
 }
 
 fn empty_root() -> TreeManifest {

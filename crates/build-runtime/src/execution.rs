@@ -1,17 +1,13 @@
 //! Run a declared native action and retain independently readable output
-//! descriptors. The worker uploads the captured bytes directly; no result
-//! archive, local CAS publication, or intermediary copy is required.
+//! descriptors. Each captured output is compressed and hashed once. The
+//! worker uploads that representation directly, without an intermediary archive.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     fs::File,
-    io::{self, Read, Seek, SeekFrom},
-    os::unix::{
-        ffi::OsStrExt,
-        fs::{FileExt, MetadataExt},
-        process::ExitStatusExt,
-    },
+    io::{Read, Seek, SeekFrom},
+    os::unix::{ffi::OsStrExt, fs::MetadataExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::{Child, ExitStatus, Stdio},
     thread,
@@ -100,28 +96,22 @@ impl CapturedExecution {
     /// # Errors
     /// Returns an error for an undeclared blob or descriptor failure.
     pub fn open_blob(&self, id: ContentId) -> Result<impl Read + Send + 'static> {
-        let file = self
+        crate::BlobReader::open(self.open_file(id)?, crate::BlobEncoding::ZstdChunks)
+    }
+
+    /// Open the immutable physical CAS representation without decoding it,
+    /// suitable for verified scheduler upload without another compression.
+    ///
+    /// # Errors
+    /// Returns an error for undeclared content or descriptor failure.
+    pub fn open_file(&self, id: ContentId) -> Result<File> {
+        let mut file = self
             .files
             .get(&id)
             .context("uncaptured result blob")?
             .try_clone()?;
-        Ok(PositionalReader { file, offset: 0 })
-    }
-}
-
-struct PositionalReader {
-    file: File,
-    offset: u64,
-}
-
-impl Read for PositionalReader {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let count = self.file.read_at(buffer, self.offset)?;
-        self.offset = self
-            .offset
-            .checked_add(count as u64)
-            .ok_or_else(|| io::Error::other("result read offset overflow"))?;
-        Ok(count)
+        file.rewind()?;
+        Ok(file)
     }
 }
 
@@ -415,6 +405,7 @@ pub fn execute(
     let mut capture = Capture {
         files: BTreeMap::new(),
         remaining: policy.max_result_bytes,
+        scratch: policy.scratch.clone(),
     };
     let stdout = capture.diagnostic(stdout)?;
     let stderr = capture.diagnostic(stderr)?;
@@ -437,6 +428,7 @@ pub fn execute(
 struct Capture {
     files: BTreeMap<ContentId, File>,
     remaining: u64,
+    scratch: PathBuf,
 }
 
 impl Capture {
@@ -454,16 +446,18 @@ impl Capture {
         let size = metadata.len();
         ensure!(size <= self.remaining, "native result byte limit exceeded");
         file.seek(SeekFrom::Start(0))?;
-        let mut hash = blake3::Hasher::new();
-        hash.update_reader((&mut file).take(size.checked_add(1).context("result size overflow")?))?;
+        let mut physical = tempfile::tempfile_in(&self.scratch)?;
+        let reference = crate::encode_native_blob(&mut file, &mut physical, Some(size))?;
         ensure!(
-            file.stream_position()? == size && file.metadata()?.len() == size,
-            "native output changed while hashing"
+            reference.size == size
+                && file.stream_position()? == size
+                && file.metadata()?.len() == size,
+            "native output changed during compression and hashing"
         );
+        physical.rewind()?;
         self.remaining -= size;
-        let id = ContentId(*hash.finalize().as_bytes());
-        self.files.entry(id).or_insert(file);
-        Ok(BlobRef { id, size })
+        self.files.entry(reference.id).or_insert(physical);
+        Ok(reference)
     }
 
     fn outputs(
