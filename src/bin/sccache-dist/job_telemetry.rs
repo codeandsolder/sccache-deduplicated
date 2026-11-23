@@ -47,7 +47,7 @@ fn run_with_scope(
     monitor_descendants: bool,
 ) -> io::Result<Output> {
     // Match Command::output(): stdin must not inherit the worker's stdin.
-    let mut child = command
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
