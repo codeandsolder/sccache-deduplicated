@@ -380,9 +380,10 @@ fn init_logging() {
     if env::var("SCCACHE_LOG_MILLIS").is_ok() {
         builder.format_timestamp_millis();
     }
-    builder
-        .try_init()
-        .expect("Failed to initialize sccache-dist logging");
+    if let Err(error) = builder.try_init() {
+        eprintln!("sccache-dist: failed to initialize logging: {error}");
+        std::process::exit(2);
+    }
 }
 
 const SERVER_REMEMBER_ERROR_TIMEOUT: Duration = Duration::from_secs(300);
