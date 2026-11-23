@@ -2330,6 +2330,10 @@ pub mod server {
         Token { token: String },
     }
 
+    const fn default_artifact_grace_secs() -> u64 {
+        300
+    }
+
     /// Explicit native worker execution and store configuration.
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
@@ -2345,6 +2349,9 @@ pub mod server {
         pub execution_timeout_secs: u64,
         pub max_result_bytes: u64,
         pub max_metadata_bytes: u64,
+        #[serde(default = "default_artifact_grace_secs")]
+        pub artifact_grace_secs: u64,
+        pub artifact_grace_bytes: Option<u64>,
         pub package_import: Option<crate::build_runtime::PackageImportLimits>,
         #[serde(default)]
         pub package_transfer: crate::build_runtime::PackageTransferCost,

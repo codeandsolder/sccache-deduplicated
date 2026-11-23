@@ -487,6 +487,9 @@ fn test_dist_nobuilder() {
 
 struct FailingServer;
 impl ServerIncoming for FailingServer {
+    fn executing_jobs(&self) -> usize {
+        0
+    }
     fn native_metadata_limit(&self) -> Option<usize> {
         None
     }

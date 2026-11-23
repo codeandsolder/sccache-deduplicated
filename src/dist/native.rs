@@ -724,9 +724,13 @@ pub(super) fn codec() -> impl Options {
         .reject_trailing_bytes()
 }
 
+#[cfg(all(target_os = "linux", feature = "native-store"))]
+mod grace;
 mod renewal;
 #[cfg(all(target_os = "linux", feature = "native-store"))]
 mod worker;
+#[cfg(all(target_os = "linux", feature = "native-store"))]
+pub use grace::ArtifactGrace;
 #[cfg(all(target_os = "linux", feature = "native-store"))]
 pub use worker::{PackageTransportTracker, WorkerDelivery};
 

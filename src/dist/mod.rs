@@ -39,6 +39,8 @@ mod cache;
 #[cfg(feature = "dist-client")]
 pub mod client_auth;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
+pub mod execution_queue;
+#[cfg(any(feature = "dist-client", feature = "dist-server"))]
 pub mod http;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 pub mod native;
@@ -1086,6 +1088,8 @@ pub trait SchedulerIncoming: Send + Sync {
 
 #[cfg(feature = "dist-server")]
 pub trait ServerIncoming: Send + Sync {
+    /// Compiler slots in use, excluding jobs waiting for input or a slot.
+    fn executing_jobs(&self) -> usize;
     // From Scheduler
     fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> ExtResult<AssignJobResult, Error>;
     fn capabilities(&self) -> WorkerCapabilities;

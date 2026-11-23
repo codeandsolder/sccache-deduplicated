@@ -786,7 +786,8 @@ pub struct Scheduler {
 }
 
 struct ServerDetails {
-    jobs_assigned: HashSet<JobId>,
+    // Native input closures are reserved with the assignment, even before transfer.
+    jobs_assigned: HashMap<JobId, BTreeSet<sccache::build_runtime::TreeId>>,
     // Reservations for assignment RPCs still in flight. Once assigned,
     // the state and unclaimed timeout are owned exclusively by JobDetail.
     jobs_assigning: HashMap<JobId, Instant>,
@@ -892,7 +893,7 @@ impl Scheduler {
                 error!("server {server_id:?} disappeared while pruning");
                 continue;
             };
-            for job_id in server_details.jobs_assigned {
+            for job_id in server_details.jobs_assigned.into_keys() {
                 warn!(
                     "Non-terminated job {} was cleaned up in server pruning",
                     job_id
@@ -926,17 +927,19 @@ fn admission_weight(job_count: usize, cpu_capacity: f64, job_slack: JobSlackConf
 /// gate and unhealthy-worker fallback still take precedence.
 fn native_locality_weight(
     capacity_weight: f64,
-    cached_trees: &[sccache::build_runtime::TreeId],
+    cached_trees: impl IntoIterator<Item = sccache::build_runtime::TreeId>,
     requested_trees: Option<&BTreeSet<sccache::build_runtime::TreeId>>,
 ) -> f64 {
     let Some(requested_trees) = requested_trees else {
         return capacity_weight;
     };
-    let matches = cached_trees
-        .iter()
-        .filter(|tree| requested_trees.contains(*tree))
-        .count()
-        .min(4);
+    let mut matched = BTreeSet::new();
+    for tree in cached_trees {
+        if requested_trees.contains(&tree) && matched.insert(tree) && matched.len() == 4 {
+            break;
+        }
+    }
+    let matches = matched.len();
     // The count is clamped to four; conversion cannot truncate it.
     let matches = u8::try_from(matches).unwrap_or(4);
     capacity_weight * (1.0 + 0.3 * f64::from(matches))
@@ -1006,7 +1009,12 @@ impl Scheduler {
                     };
                     let weight = native_locality_weight(
                         weight,
-                        &details.capabilities.cached_trees,
+                        details
+                            .capabilities
+                            .cached_trees
+                            .iter()
+                            .copied()
+                            .chain(details.jobs_assigned.values().flatten().copied()),
                         requested_trees.as_ref(),
                     );
                     if details.last_error.is_some_and(|when| {
@@ -1036,7 +1044,12 @@ impl Scheduler {
                         .job_authorizer
                         .generate_token(job_id)
                         .context("Could not create an auth token for this job")?;
-                    assert!(server_details.jobs_assigned.insert(job_id));
+                    assert!(
+                        server_details
+                            .jobs_assigned
+                            .insert(job_id, requested_trees.unwrap_or_default())
+                            .is_none()
+                    );
                     assert!(
                         server_details
                             .jobs_assigning
@@ -1077,7 +1090,7 @@ impl Scheduler {
                 if let Some(entry) = servers.get_mut(&server_id) {
                     entry.last_error = Some(Instant::now());
                     entry.jobs_assigning.remove(&job_id);
-                    if !entry.jobs_assigned.remove(&job_id) {
+                    if entry.jobs_assigned.remove(&job_id).is_none() {
                         "assign job failed and job not known to the server"
                     } else {
                         "assign job failed, job un-assigned from the server"
@@ -1102,7 +1115,7 @@ impl Scheduler {
                 warn!("{msg}");
                 return Ok(AllocJobResult::Fail { msg });
             };
-            if !details.jobs_assigned.contains(&job_id)
+            if !details.jobs_assigned.contains_key(&job_id)
                 || !details.jobs_assigning.contains_key(&job_id)
             {
                 let msg = format!(
@@ -1216,7 +1229,7 @@ impl SchedulerIncoming for Scheduler {
                 let active: HashSet<JobId> = active_job_ids.iter().copied().collect();
                 let stale_jobs: Vec<_> = details
                     .jobs_assigned
-                    .iter()
+                    .keys()
                     .copied()
                     .filter(|job_id| match jobs.get_mut(job_id) {
                         Some(detail) if detail.server_id == server_id => {
@@ -1250,7 +1263,7 @@ impl SchedulerIncoming for Scheduler {
                         stale_jobs
                     );
                     for job_id in stale_jobs {
-                        if !details.jobs_assigned.remove(&job_id) {
+                        if details.jobs_assigned.remove(&job_id).is_none() {
                             warn!(
                                 "Stale job for server {} not assigned: {}",
                                 server_id.addr(),
@@ -1262,7 +1275,7 @@ impl SchedulerIncoming for Scheduler {
                     }
                 }
 
-                let mut assigned_job_ids: Vec<_> = details.jobs_assigned.iter().copied().collect();
+                let mut assigned_job_ids: Vec<_> = details.jobs_assigned.keys().copied().collect();
                 assigned_job_ids.sort_unstable();
                 return Ok(HeartbeatServerResult {
                     is_new: false,
@@ -1270,7 +1283,7 @@ impl SchedulerIncoming for Scheduler {
                 });
             }
             Some(ref mut details) if details.server_nonce != server_nonce => {
-                for job_id in details.jobs_assigned.iter() {
+                for job_id in details.jobs_assigned.keys() {
                     if jobs.remove(job_id).is_none() {
                         warn!(
                             "Unknown job found when replacing server {}: {}",
@@ -1288,7 +1301,7 @@ impl SchedulerIncoming for Scheduler {
             ServerDetails {
                 last_seen: Instant::now(),
                 last_error: None,
-                jobs_assigned: HashSet::new(),
+                jobs_assigned: HashMap::new(),
                 jobs_assigning: HashMap::new(),
                 cpu_capacity,
                 server_nonce,
@@ -1401,7 +1414,7 @@ impl SchedulerIncoming for Scheduler {
             let details = servers.get_mut(&server_id).ok_or_else(|| {
                 anyhow::anyhow!("Job state updated, but server is not known to scheduler")
             })?;
-            if !details.jobs_assigned.contains(&job_id) {
+            if !details.jobs_assigned.contains_key(&job_id) {
                 bail!("job {job_id} was not assigned to server {server_id:?}");
             }
 
@@ -1488,6 +1501,8 @@ impl SchedulerIncoming for Scheduler {
 
 struct LocalAssignment {
     assignment: JobAssignment,
+    // Retain already-resident input trees from assignment until execution finishes or reconciliation cancels it.
+    _input_pins: Vec<sccache::build_runtime::TreeLease>,
     // Local time of receipt, not the scheduler's assignment timestamp.
     accepted_at: Instant,
 }
@@ -1578,6 +1593,7 @@ impl ArchiveWorker {
 
 pub struct Server {
     archive: Option<ArchiveWorker>,
+    execution_queue: dist::execution_queue::ExecutionQueue,
     job_toolchains: Mutex<HashMap<JobId, LocalAssignment>>,
     #[cfg(target_os = "linux")]
     native_worker: Option<NativeWorker>,
@@ -1587,6 +1603,10 @@ impl Server {
     fn new(archive: Option<ArchiveWorker>) -> Self {
         Self {
             archive,
+            execution_queue: dist::execution_queue::ExecutionQueue::new(
+                std::num::NonZeroUsize::new(sccache::util::num_cpus())
+                    .unwrap_or(std::num::NonZeroUsize::MIN),
+            ),
             job_toolchains: Mutex::new(HashMap::new()),
             #[cfg(target_os = "linux")]
             native_worker: None,
@@ -1595,6 +1615,24 @@ impl Server {
 }
 
 impl Server {
+    fn pin_resident_inputs(
+        &self,
+        spec: &sccache::build_runtime::ExecutionSpec,
+    ) -> Result<Vec<sccache::build_runtime::TreeLease>> {
+        #[cfg(target_os = "linux")]
+        {
+            self.native_worker
+                .as_ref()
+                .context("native worker unavailable")?
+                .pin_resident_inputs(spec)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = spec;
+            bail!("native worker requires Linux")
+        }
+    }
+
     fn begin_execution(
         &self,
         requester: &dyn ServerOutgoing,
@@ -1641,6 +1679,9 @@ impl Server {
 }
 
 impl ServerIncoming for Server {
+    fn executing_jobs(&self) -> usize {
+        self.execution_queue.active()
+    }
     fn handle_reconcile_assignments(
         &self,
         assigned_job_ids: &[JobId],
@@ -1709,10 +1750,7 @@ impl ServerIncoming for Server {
         assignment: NativeAssignment,
     ) -> Result<AssignJobResult> {
         assignment.spec.validate()?;
-        anyhow::ensure!(
-            self.capabilities().native_platform == Some(assignment.spec.platform),
-            "native worker platform unavailable"
-        );
+        let input_pins = self.pin_resident_inputs(&assignment.spec)?;
         let mut assignments = self
             .job_toolchains
             .lock()
@@ -1724,6 +1762,7 @@ impl ServerIncoming for Server {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(LocalAssignment {
                     assignment: JobAssignment::Native(Box::new(assignment)),
+                    _input_pins: input_pins,
                     accepted_at: Instant::now(),
                 });
             }
@@ -1752,7 +1791,7 @@ impl ServerIncoming for Server {
             .native_worker
             .as_ref()
             .context("native worker unavailable")
-            .and_then(|worker| worker.run(job_id, &assignment));
+            .and_then(|worker| worker.run(job_id, &assignment, &self.execution_queue));
         #[cfg(not(target_os = "linux"))]
         let result = {
             let _ = assignment;
@@ -1781,6 +1820,7 @@ impl ServerIncoming for Server {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(LocalAssignment {
                     assignment: JobAssignment::Archive(tc),
+                    _input_pins: Vec::new(),
                     accepted_at: Instant::now(),
                 });
             }
@@ -1871,9 +1911,14 @@ impl ServerIncoming for Server {
         };
 
         let archive = self.archive.as_ref().context("archive worker disabled")?;
-        let res = archive
-            .builder
-            .run_build(toolchain, command, outputs, inputs_rdr, &archive.cache)
+        let res = self
+            .execution_queue
+            .acquire(|| Ok(()))
+            .and_then(|_permit| {
+                archive
+                    .builder
+                    .run_build(toolchain, command, outputs, inputs_rdr, &archive.cache)
+            })
             .map(|res| {
                 RunJobResult::Complete(JobComplete {
                     output: res.output,
@@ -2014,10 +2059,10 @@ mod scheduler_tests {
         let a = TreeId([1; 32]);
         let b = TreeId([2; 32]);
         let expected = BTreeSet::from([a, b]);
-        assert!((native_locality_weight(2.0, &[a], None) - 2.0).abs() < 1e-9);
-        assert!((native_locality_weight(2.0, &[], Some(&expected)) - 2.0).abs() < 1e-9);
-        assert!((native_locality_weight(2.0, &[a], Some(&expected)) - 2.6).abs() < 1e-9);
-        assert!((native_locality_weight(2.0, &[a, b], Some(&expected)) - 3.2).abs() < 1e-9);
+        assert!((native_locality_weight(2.0, [a], None) - 2.0).abs() < 1e-9);
+        assert!((native_locality_weight(2.0, [], Some(&expected)) - 2.0).abs() < 1e-9);
+        assert!((native_locality_weight(2.0, [a], Some(&expected)) - 2.6).abs() < 1e-9);
+        assert!((native_locality_weight(2.0, [a, b, a], Some(&expected)) - 3.2).abs() < 1e-9);
     }
 
     #[test]
@@ -2137,6 +2182,10 @@ mod scheduler_tests {
             bail!("compatible worker unavailable");
         };
         assert_eq!(job_alloc.server_id, a);
+        assert_eq!(
+            scheduler.servers.lock().unwrap()[&a].jobs_assigned[&job_alloc.job_id],
+            BTreeSet::from([TreeId([0; 32])])
+        );
         assert!(matches!(
             scheduler.handle_alloc_native_job(&AcceptAssign, assignment)?,
             AllocJobResult::Fail { .. }
@@ -2737,7 +2786,7 @@ mod scheduler_tests {
                 .get_mut(&server_id)
                 .unwrap()
                 .jobs_assigned
-                .insert(job_alloc.job_id);
+                .insert(job_alloc.job_id, BTreeSet::new());
         }
         scheduler
             .handle_update_job_state(job_alloc.job_id, server_id, JobState::Complete)

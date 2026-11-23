@@ -177,6 +177,14 @@ pub struct WorkerDelivery<'a> {
     pub renewal_interval: Duration,
     pub package_import: Option<PackageImportLimits>,
     pub transport: &'a PackageTransportTracker,
+    pub execution_queue: &'a crate::dist::execution_queue::ExecutionQueue,
+    pub artifact_grace: &'a super::ArtifactGrace,
+}
+
+pub(super) struct ExecutionControl<'a> {
+    pub renewal_interval: Duration,
+    pub queue: Option<&'a crate::dist::execution_queue::ExecutionQueue>,
+    pub grace: Option<&'a super::ArtifactGrace>,
 }
 
 #[cfg(test)]
@@ -400,7 +408,11 @@ impl NativeCacheClient {
             spec,
             store,
             policy,
-            delivery.renewal_interval,
+            ExecutionControl {
+                renewal_interval: delivery.renewal_interval,
+                queue: Some(delivery.execution_queue),
+                grace: Some(delivery.artifact_grace),
+            },
             |id, _| {
                 self.fetch_tree(
                     ticket,
@@ -420,10 +432,10 @@ impl NativeCacheClient {
         spec: &ExecutionSpec,
         store: &NativeStore,
         policy: &ExecutionPolicy,
-        renewal_interval: Duration,
+        control: ExecutionControl<'_>,
         mut fetch: impl FnMut(TreeId, &LeaseCheck<'_>) -> Result<TreeLease>,
     ) -> Result<CapturedExecution> {
-        let result = self.with_renewal(ticket, renewal_interval, |check| {
+        let result = self.with_renewal(ticket, control.renewal_interval, |check| {
             self.verify_execution(ticket, spec.clone())?;
             if let Some(report) = store.maintain_space()? {
                 ensure!(
@@ -465,11 +477,24 @@ impl NativeCacheClient {
                 }
                 inputs.push(tree);
             }
-            let captured = execute(spec, store, policy, check)?;
+            // Keep input leases through the ready queue wait. Only execution consumes compiler capacity.
+            let captured = {
+                let _permit = control.queue
+                    .map(|queue| queue.acquire(check))
+                    .transpose()?;
+                execute(spec, store, policy, check)?
+            };
             check()?;
             if let Some(manifest) = captured.successful_result() {
                 request.validate_result(manifest)?;
                 let blobs = manifest.blobs()?;
+                if let Some(grace) = control.grace {
+                    match grace.retain(store, &request.action_fingerprint()?, manifest, &captured) {
+                        Ok(true) => {},
+                        Ok(false) => warn!("Native worker artifact grace budget exhausted; publishing only to scheduler"),
+                        Err(error) => warn!("Native worker artifact retention failed; publishing only to scheduler: {error:#}"),
+                    }
+                }
                 for missing in self.begin(ticket, manifest.clone())?.missing {
                     check()?;
                     ensure!(

@@ -1486,7 +1486,7 @@ mod server {
                         .copied()
                         .collect();
                     let advertised_cpus =
-                        load_aware_capacity.advertised_cpus(running_job_ids.len());
+                        load_aware_capacity.advertised_cpus(heartbeat_handler.executing_jobs());
                     let capabilities = heartbeat_handler.capabilities();
                     // Transfers keep their assignment alive, but do not count as
                     // executing compiler processes for CPU-capacity restoration.

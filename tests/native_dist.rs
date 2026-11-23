@@ -268,6 +268,8 @@ impl Fleet {
                     execution_timeout_secs: 120,
                     max_result_bytes: 64 * 1024 * 1024,
                     max_metadata_bytes: 64 * 1024 * 1024,
+                    artifact_grace_secs: 300,
+                    artifact_grace_bytes: None,
                     package_import: Some(package_limits(false)),
                     package_transfer: transfer,
                 }),
@@ -934,7 +936,7 @@ fn pacman_discovery_seeds_real_gcc_and_compiles_with_exact_results() -> Result<(
     service.stop()?;
     let (scheduler, worker) = fleet.finish()?;
     assert_eq!(scheduler.actions, 1);
-    assert_eq!(worker.actions, 0);
+    assert_eq!(worker.actions, 1);
     let store = NativeStore::open(&worker_store)?;
     let policy = sccache::build_runtime::PackagePolicy::normalized_archive(
         100_000,
@@ -1328,7 +1330,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
             "worker retained redundant archive"
         );
     }
-    assert_eq!(worker_stats.actions, 0);
+    assert_eq!(worker_stats.actions, 2);
     assert_eq!(scheduler_stats.actions, 3);
     assert_eq!(scheduler_stats.results, 1);
     assert_eq!(worker_stats.trees, 4);
@@ -1765,7 +1767,7 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
     assert_eq!(observed.conflicting_pairs, 1);
     assert_eq!(unused.examined_actions, 7);
     eprintln!("actual Rust environment audit: {unused:?}; {observed:?}");
-    assert_eq!(worker.actions, 0);
+    assert_eq!(worker.actions, 7);
     Ok(())
 }
 
@@ -1832,6 +1834,6 @@ fn native_local_execution_in_networkless_namespace_shares_remote_actions() -> Re
     service.stop()?;
     let (scheduler, worker) = fleet.finish()?;
     assert_eq!(scheduler.actions, 2);
-    assert_eq!(worker.actions, 0);
+    assert_eq!(worker.actions, 2);
     Ok(())
 }

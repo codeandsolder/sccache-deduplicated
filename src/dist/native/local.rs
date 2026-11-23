@@ -152,7 +152,11 @@ impl LocalExecutor {
                 timeout,
                 max_result_bytes: policy.max_result_bytes,
             },
-            policy.renewal_interval,
+            super::worker::ExecutionControl {
+                renewal_interval: policy.renewal_interval,
+                queue: None,
+                grace: None,
+            },
             |id, check| self.prepare_input(id, inputs, check),
         )
     }

@@ -372,6 +372,10 @@ fn native_action_transfers_inputs_executes_and_publishes_without_worker_result_s
         let transport = crate::dist::native::PackageTransportTracker::new(
             crate::build_runtime::PackageTransferCost::default(),
         )?;
+        let execution_queue =
+            crate::dist::execution_queue::ExecutionQueue::new(std::num::NonZeroUsize::MIN);
+        let artifact_grace =
+            crate::dist::native::ArtifactGrace::new(Duration::from_secs(300), 1024)?;
         let result = worker.execute_on_worker(
             ticket,
             &spec,
@@ -381,6 +385,8 @@ fn native_action_transfers_inputs_executes_and_publishes_without_worker_result_s
                 renewal_interval: Duration::from_secs(1),
                 package_import: None,
                 transport: &transport,
+                execution_queue: &execution_queue,
+                artifact_grace: &artifact_grace,
             },
         )?;
         let manifest = result
@@ -400,7 +406,19 @@ fn native_action_transfers_inputs_executes_and_publishes_without_worker_result_s
             &mut bytes,
         )?;
         assert_eq!(bytes, b"diagnostic");
-        assert_eq!(worker_store.stats()?.actions, 0);
+        assert_eq!(worker_store.stats()?.actions, 1);
+        let key = spec.action_request()?.action_fingerprint()?.key()?;
+        assert_eq!(
+            worker_store.evict(key)?,
+            crate::build_runtime::Eviction::Pinned
+        );
+        assert_eq!(
+            worker_store
+                .lookup(key)?
+                .context("worker output missing")?
+                .manifest(),
+            manifest
+        );
         assert_eq!(sessions.store().stats()?.actions, 1);
         let NativeAdmission::Hit {
             ticket: hit,

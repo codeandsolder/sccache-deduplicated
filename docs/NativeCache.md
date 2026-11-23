@@ -717,3 +717,27 @@ No action identity or sandbox tree identity changes solely because a catalog
 is present. Preseeding the scheduler with original package bytes lets the
 same content-addressed tree negotiation avoid uploads of already-known
 files. The catalog alone does not place a package in the scheduler.
+
+### Worker execution and protected artifact residency
+
+The worker uses a bounded FIFO ready queue shared by native and legacy
+execution, with compiler slots derived from available logical CPUs. Native
+inputs are staged and leased before acquiring a compiler slot; publication
+does not consume a compiler slot. Already cached input trees are pinned when
+the assignment is accepted, and released on completion or reconciliation.
+Heartbeats use actual occupied execution slots for CPU restoration, separately
+from active HTTP requests that maintain job liveness. The scheduler includes
+the input closures of outstanding assignments in advisory tree-locality
+scoring (counting each matching tree once), before those transfers complete.
+
+Newly generated native outputs are also retained in the same worker CAS
+with a default 300-second grace lease. The optional native worker settings
+`artifact_grace_secs` and `artifact_grace_bytes` control the lease lifetime
+and a separate logical byte budget. The default budget is the larger of one
+result limit and 25% of the worker resident budget, capped by that resident
+budget. Shared output content is charged only once. Expiry releases the
+lease, not the content itself; ordinary eviction can then reclaim it.
+If the worker grace quota or physical storage cannot admit another result,
+the worker logs that local retention was skipped and still publishes the
+verified result to the scheduler. It never evicts another unexpired grace
+lease to make room. Input leases remain independent of grace expiration.
