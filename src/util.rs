@@ -2536,19 +2536,18 @@ mod tests {
 
         let left = tempfile::tempdir().unwrap();
         let right = tempfile::tempdir().unwrap();
-        std::fs::write(
-            left.path()
-                .join(std::ffi::OsString::from_vec(vec![b'n', 0xff])),
-            b"same contents",
-        )
-        .unwrap();
-        std::fs::write(
-            right
-                .path()
-                .join(std::ffi::OsString::from_vec(vec![b'n', 0xfe])),
-            b"same contents",
-        )
-        .unwrap();
+        for (dir, name) in [(left.path(), 0xff), (right.path(), 0xfe)] {
+            let path = dir.join(std::ffi::OsString::from_vec(vec![b'n', name]));
+            if let Err(error) = std::fs::write(path, b"same contents") {
+                // ZFS datasets configured with utf8only=on reject non-UTF8
+                // pathnames. The full regression runs on filesystems that
+                // support raw Unix filename bytes (including CI).
+                if error.raw_os_error() == Some(libc::EILSEQ) {
+                    return;
+                }
+                panic!("Failed to write invalid-UTF8 test fixture: {error}");
+            }
+        }
         let pool = tokio::runtime::Handle::current();
         assert_ne!(
             Digest::reader(left.path().to_path_buf(), &pool)
