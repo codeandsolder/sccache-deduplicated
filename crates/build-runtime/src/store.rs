@@ -4,7 +4,7 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, atomic::AtomicU64},
     time::Instant,
 };
 
@@ -203,6 +203,9 @@ struct Inner {
     package_imports: Mutex<BTreeSet<crate::PackageIdentity>>,
     space_policy: Option<SpacePolicy>,
     space: Mutex<space::SpaceState>,
+    // Releases never acquire the space admission lock, avoiding lock-order
+    // inversion with transactional publication and eviction.
+    space_released: AtomicU64,
 }
 
 impl Inner {
@@ -430,6 +433,7 @@ impl NativeStore {
             package_imports: Mutex::new(BTreeSet::new()),
             space_policy,
             space: Mutex::default(),
+            space_released: AtomicU64::new(0),
         });
         inner.recover_orphans()?;
         Ok(Self { inner })

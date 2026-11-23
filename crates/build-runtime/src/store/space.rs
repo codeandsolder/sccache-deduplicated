@@ -2,7 +2,7 @@
 //! ZFS controls physical compression and allocation. Logical byte limits are
 //! deliberately conservative and do not replace filesystem free-space checks.
 use std::{
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -106,6 +106,17 @@ impl NativeStore {
             .context("native resident byte overflow")
     }
 
+    fn apply_releases(&self, state: &mut SpaceState) -> Result<()> {
+        // The only additive reservations are serialized under the space lock.
+        // Concurrent drops only subtract, and therefore cannot overcommit.
+        let released = self.inner.space_released.swap(0, Ordering::AcqRel);
+        state.reserved = state
+            .reserved
+            .checked_sub(released)
+            .context("native staging reservation underflow")?;
+        Ok(())
+    }
+
     /// Persist only dirty usage records in one bounded write transaction,
     /// avoiding synchronous database writes on cache hits.
     ///
@@ -142,11 +153,12 @@ impl NativeStore {
             return Ok(None);
         };
         self.checkpoint_usage_if_due()?;
-        let state = self
+        let mut state = self
             .inner
             .space
             .lock()
             .map_err(|_| anyhow!("native space lock poisoned"))?;
+        self.apply_releases(&mut state)?;
         let report = self.reclaim(policy, state.reserved, 0, || self.available_bytes());
         drop(state);
         report.map(Some)
@@ -320,6 +332,7 @@ impl<'a> StageBudget<'a> {
             .space
             .lock()
             .map_err(|_| anyhow!("native space lock poisoned"))?;
+        self.store.apply_releases(&mut state)?;
         let need = state
             .reserved
             .checked_add(extra)
@@ -357,18 +370,11 @@ impl<'a> StageBudget<'a> {
             );
         }
         if actual_bytes < self.reserved {
-            let mut state = self
-                .store
-                .inner
-                .space
-                .lock()
-                .map_err(|_| anyhow!("native stage space lock poisoned"))?;
             let surplus = self.reserved - actual_bytes;
-            state.reserved = state
-                .reserved
-                .checked_sub(surplus)
-                .context("native staging reservation underflow")?;
-            drop(state);
+            self.store
+                .inner
+                .space_released
+                .fetch_add(surplus, Ordering::Release);
             self.reserved = actual_bytes;
         }
         let reserved = std::mem::take(&mut self.reserved);
@@ -387,10 +393,9 @@ pub(super) struct StagingReservation {
 impl Drop for StagingReservation {
     fn drop(&mut self) {
         if self.reserved > 0 {
-            match self.inner.space.lock() {
-                Ok(mut state) => state.reserved -= self.reserved,
-                Err(error) => log::error!("native staged blob reservation release failed: {error}"),
-            }
+            self.inner
+                .space_released
+                .fetch_add(self.reserved, Ordering::Release);
         }
     }
 }
@@ -398,10 +403,10 @@ impl Drop for StagingReservation {
 impl Drop for StageBudget<'_> {
     fn drop(&mut self) {
         if self.reserved > 0 {
-            match self.store.inner.space.lock() {
-                Ok(mut state) => state.reserved -= self.reserved,
-                Err(error) => log::error!("native space reservation release failed: {error}"),
-            }
+            self.store
+                .inner
+                .space_released
+                .fetch_add(self.reserved, Ordering::Release);
         }
     }
 }

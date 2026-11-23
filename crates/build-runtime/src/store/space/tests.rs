@@ -331,3 +331,31 @@ fn exact_budget_allows_exact_verified_blob_but_rejects_oversize() -> Result<()> 
     );
     Ok(())
 }
+
+#[test]
+fn staged_release_never_waits_for_space_admission_lock() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = NativeStore::open_managed(temp.path(), policy())?;
+    let staged = store.stage(&b"reservation"[..])?;
+    let held = store
+        .inner
+        .space
+        .lock()
+        .map_err(|_| anyhow!("poisoned admission lock"))?;
+    // Publication can hold a separate mutation lock. A staged-file drop
+    // cannot need the space mutex or we would admit an ABBA deadlock.
+    drop(staged);
+    assert_eq!(
+        store.inner.space_released.load(Ordering::Acquire),
+        u64::try_from(b"reservation".len())?
+    );
+    drop(held);
+    assert_eq!(
+        store
+            .maintain_space()?
+            .context("missing policy")?
+            .reserved_bytes,
+        0
+    );
+    Ok(())
+}
