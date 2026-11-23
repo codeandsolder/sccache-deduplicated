@@ -29,7 +29,7 @@ use crate::compiler::{
     cicc, gcc,
 };
 use crate::mock_command::{CommandCreatorSync, ExitStatusValue, RunCommand, exit_status};
-use crate::util::{OsStrExt, resolve_compiler_avoiding_wrapper, run_input_output};
+use crate::util::{resolve_compiler_avoiding_wrapper, run_input_output};
 use crate::{counted_array, dist, protocol, server};
 use async_trait::async_trait;
 use fs_err as fs;
