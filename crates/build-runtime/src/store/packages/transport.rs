@@ -7,7 +7,7 @@ use redb::ReadableDatabase;
 
 use super::{PackageArchiveLease, PackageRecord};
 use crate::store::{BLOB_PACKAGES, PACKAGES, encoding};
-use crate::{BlobRef, ContentId, NativeStore, PackageArchive};
+use crate::{BlobRef, ContentId, NativeStore, PackageArchive, PackageTransferCost};
 
 struct Candidate {
     archive: PackageArchive,
@@ -26,7 +26,9 @@ impl NativeStore {
         missing: &[BlobRef],
         maximum: usize,
         max_archive_bytes: u64,
+        cost: PackageTransferCost,
     ) -> Result<Vec<PackageArchiveLease>> {
+        cost.validate()?;
         let mut remaining: BTreeMap<_, _> =
             missing.iter().map(|blob| (blob.id, blob.size)).collect();
         ensure!(
@@ -79,8 +81,8 @@ impl NativeStore {
                         .filter_map(|id| remaining.get(id))
                         .map(|size| u128::from(*size))
                         .sum();
-                    let saving = raw.checked_sub(u128::from(candidate.archive.blob.size))?;
-                    (saving > 0).then_some((saving, *key))
+                    cost.predicted_savings_nanoseconds(raw, candidate.archive)
+                        .map(|saving| (saving, *key))
                 })
                 .max();
             let Some((_, key)) = best else { break };
@@ -128,6 +130,14 @@ mod tests {
     };
     use sha2::{Digest, Sha256};
     use std::io::{Read, Write};
+
+    fn slow_link() -> PackageTransferCost {
+        PackageTransferCost {
+            download_bytes_per_second: 1 << 20,
+            startup_nanoseconds: 0,
+            ..PackageTransferCost::default()
+        }
+    }
 
     fn fixture() -> Result<(Vec<u8>, BlobRef)> {
         let contents = b"original payload".repeat(8192);
@@ -195,14 +205,18 @@ mod tests {
         assert_eq!(store.stats()?.blobs, 4);
         let logical = blob.size + u64::try_from(fast.len() + small.len() + tar.len())?;
         assert_eq!(store.stats()?.logical_bytes, logical);
-        assert!(store.plan_package_downloads(&[blob], 8, 1)?.is_empty());
         assert!(
             store
-                .plan_package_downloads(&[blob, blob], 8, u64::MAX)
+                .plan_package_downloads(&[blob], 8, 1, slow_link())?
+                .is_empty()
+        );
+        assert!(
+            store
+                .plan_package_downloads(&[blob, blob], 8, u64::MAX, slow_link())
                 .is_err()
         );
 
-        let selected = store.plan_package_downloads(&[blob], 8, u64::MAX)?;
+        let selected = store.plan_package_downloads(&[blob], 8, u64::MAX, slow_link())?;
         assert_eq!(selected.len(), 1);
         assert_eq!(
             selected[0].archive().source,
@@ -217,7 +231,7 @@ mod tests {
         // The archive delivery pin also holds the store owner alive.
         drop(selected);
         let store = NativeStore::open(directory.path())?;
-        let selected = store.plan_package_downloads(&[blob], 8, u64::MAX)?;
+        let selected = store.plan_package_downloads(&[blob], 8, u64::MAX, slow_link())?;
         assert_eq!(selected.len(), 1);
         drop(selected);
         assert_eq!(
@@ -228,7 +242,7 @@ mod tests {
         );
         assert!(
             store
-                .plan_package_downloads(&[blob], 8, u64::MAX)?
+                .plan_package_downloads(&[blob], 8, u64::MAX, slow_link())?
                 .is_empty()
         );
         assert_eq!(store.stats()?.pending_gc_blobs, 4);
@@ -254,7 +268,7 @@ mod tests {
         )?;
         assert!(
             store
-                .plan_package_downloads(&[blob], 8, u64::MAX)?
+                .plan_package_downloads(&[blob], 8, u64::MAX, slow_link())?
                 .is_empty()
         );
         policy.retain_original = true;
@@ -267,7 +281,7 @@ mod tests {
         )?;
         assert_eq!(first.tree().id(), second.tree().id());
         assert_eq!(store.stats()?.blobs, 2);
-        let offer = store.plan_package_downloads(&[blob], 8, u64::MAX)?;
+        let offer = store.plan_package_downloads(&[blob], 8, u64::MAX, slow_link())?;
         assert_eq!(offer.len(), 1);
         policy.retain_original = false;
         let third = store.import_package(
@@ -279,7 +293,12 @@ mod tests {
         )?;
         assert_eq!(second.tree().id(), third.tree().id());
         assert_eq!(store.stats()?.blobs, 2);
-        assert_eq!(store.plan_package_downloads(&[blob], 8, u64::MAX)?.len(), 1);
+        assert_eq!(
+            store
+                .plan_package_downloads(&[blob], 8, u64::MAX, slow_link())?
+                .len(),
+            1
+        );
         Ok(())
     }
 }

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::build_runtime::{
     ActionMode, BlobRef, ContentId, ExecutionSpec, InstallationManifest, PackageIdentity,
-    PackageReceipt, PackageSource, ResultManifest, TreeId, TreeManifest,
+    PackageReceipt, PackageSource, PackageTransferCost, ResultManifest, TreeId, TreeManifest,
     wire::{
         BeginResult, NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply, Ticket,
         TreeOffer, TreeRead, UploadHeader, WorkerAllocation,
@@ -58,6 +58,7 @@ pub(super) struct PackagePlanRequest {
     pub ticket: Ticket,
     pub missing: Vec<BlobRef>,
     pub max_archive_bytes: u64,
+    pub cost: PackageTransferCost,
 }
 
 #[derive(Clone, Copy)]
@@ -436,7 +437,7 @@ impl NativeCacheClient {
     ///
     /// # Errors
     /// Returns an error for an invalid manifest or failed transfer.
-    #[cfg(all(unix, feature = "native-store"))]
+    #[cfg(all(target_os = "linux", feature = "native-store"))]
     pub fn fetch_tree(
         &self,
         action: Ticket,
@@ -444,6 +445,7 @@ impl NativeCacheClient {
         store: &crate::build_runtime::NativeStore,
         renewal_interval: Duration,
         package_import: Option<crate::build_runtime::PackageImportLimits>,
+        transport: &worker::PackageTransportTracker,
     ) -> Result<crate::build_runtime::TreeLease> {
         let read = self.open_tree(action, id)?;
         let result = self.with_renewal(read.ticket, renewal_interval, |check| {
@@ -459,6 +461,7 @@ impl NativeCacheClient {
                     reserved.missing(),
                     store,
                     limits,
+                    transport,
                     check,
                 )?,
                 _ => Vec::new(),
@@ -478,8 +481,10 @@ impl NativeCacheClient {
             );
             for blob in updated.missing() {
                 check()?;
+                let start = Instant::now();
                 let response = self.download_response(read.ticket, blob.id)?;
                 staged.push(store.stage_expected(*blob, response)?);
+                transport.observe_raw(blob.size, start.elapsed());
             }
             let tree = store.publish_tree_pinned(&read.manifest, staged)?;
             #[cfg(target_os = "linux")]
@@ -700,6 +705,8 @@ pub(super) fn codec() -> impl Options {
 mod renewal;
 #[cfg(all(target_os = "linux", feature = "native-store"))]
 mod worker;
+#[cfg(all(target_os = "linux", feature = "native-store"))]
+pub use worker::PackageTransportTracker;
 
 #[cfg(all(target_os = "linux", feature = "dist-client"))]
 mod client;

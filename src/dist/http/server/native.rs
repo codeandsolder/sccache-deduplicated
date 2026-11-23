@@ -341,9 +341,10 @@ fn dispatch(
                 ticket,
                 missing,
                 max_archive_bytes,
+                cost,
             } = metadata(request, limit)?;
             encode(
-                &sessions.plan_packages(ticket, publisher, &missing, max_archive_bytes)?,
+                &sessions.plan_packages(ticket, publisher, &missing, max_archive_bytes, cost)?,
                 limit,
             )
         }

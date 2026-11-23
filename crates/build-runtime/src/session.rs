@@ -17,8 +17,8 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use crate::{
     ActionMode, Admission, ArchiveLength, BlobRef, BuildCoordinator, CompilePermit, ContentId,
     NativeStore, PackageArchive, PackageArchiveLease, PackageIdentity, PackageImportLimits,
-    ResultLease, ResultManifest, StagedBlob, TreeId, TreeLease, TreeManifest, UploadReservation,
-    VerifiedPackage,
+    PackageTransferCost, ResultLease, ResultManifest, StagedBlob, TreeId, TreeLease, TreeManifest,
+    UploadReservation, VerifiedPackage,
     wire::{
         ActionRequest, BeginResult, NativeAdmission, NativeStatus, Publisher, ScheduleReply,
         Ticket, TreeOffer, TreeRead, WorkerAllocation,
@@ -747,7 +747,9 @@ impl NativeSessions {
         reader: Publisher,
         missing: &[BlobRef],
         max_archive_bytes: u64,
+        cost: PackageTransferCost,
     ) -> Result<Vec<PackageArchive>> {
+        cost.validate()?;
         ensure!(
             matches!(reader, Publisher::Worker { .. }),
             "package delivery requires a worker"
@@ -770,7 +772,7 @@ impl NativeSessions {
         // the ordinary exact-blob protocol.
         let packages = self
             .store()
-            .plan_package_downloads(missing, 8, max_archive_bytes)?;
+            .plan_package_downloads(missing, 8, max_archive_bytes, cost)?;
         let offers = packages.iter().map(PackageArchiveLease::archive).collect();
         delivery.packages = packages
             .into_iter()

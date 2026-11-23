@@ -268,7 +268,13 @@ fn verify_package_plan_authorization(
 ) -> Result<()> {
     assert!(
         service
-            .plan_packages(ticket, Publisher::Client, &[blob], u64::MAX)
+            .plan_packages(
+                ticket,
+                Publisher::Client,
+                &[blob],
+                u64::MAX,
+                crate::PackageTransferCost::default()
+            )
             .is_err()
     );
     assert!(
@@ -280,17 +286,30 @@ fn verify_package_plan_authorization(
                     id: ContentId::of(b"unrelated"),
                     size: 9
                 }],
-                u64::MAX
+                u64::MAX,
+                crate::PackageTransferCost::default()
             )
             .is_err()
     );
     assert!(
         service
-            .plan_packages(ticket, worker, &[blob, blob], u64::MAX)
+            .plan_packages(
+                ticket,
+                worker,
+                &[blob, blob],
+                u64::MAX,
+                crate::PackageTransferCost::default()
+            )
             .is_err()
     );
     assert_eq!(
-        service.plan_packages(ticket, worker, &[blob], u64::MAX)?,
+        service.plan_packages(
+            ticket,
+            worker,
+            &[blob],
+            u64::MAX,
+            crate::PackageTransferCost::default()
+        )?,
         []
     );
     Ok(())

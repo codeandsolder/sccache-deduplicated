@@ -2346,6 +2346,8 @@ pub mod server {
         pub max_result_bytes: u64,
         pub max_metadata_bytes: u64,
         pub package_import: Option<crate::build_runtime::PackageImportLimits>,
+        #[serde(default)]
+        pub package_transfer: crate::build_runtime::PackageTransferCost,
     }
 
     #[derive(Debug, Serialize, Deserialize, PartialEq)]

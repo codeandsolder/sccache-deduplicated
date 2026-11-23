@@ -457,10 +457,35 @@ decoder_memory_bytes = 536870912
 decoder_timeout_secs = 600
 ```
 
+The optional worker `[native_worker.package_transfer]` table controls
+the initial transfer-cost estimate. The default models a 128 MiB/s raw
+download path, full-package Zstandard expansion at 64 MiB/s, XZ at
+24 MiB/s, Gzip at 128 MiB/s and uncompressed tar at 512 MiB/s,
+plus 20 microseconds per archive entry and 75 ms of fixed work.
+These are **starting estimates, not measured universal rates**. The worker
+smooths real raw download+staging throughput and successful full-package
+reconstruction throughput across jobs to adjust its future choices. Samples
+below 1 MiB are ignored, and a package's predicted transfer time is
+subtracted from its measured reconstruction time before updating the
+codec's decode rate. Override initial values for the network and hardware:
+
+```toml
+[native_worker.package_transfer]
+download_bytes_per_second = 20971520
+decode_tar_bytes_per_second = 536870912
+decode_gzip_bytes_per_second = 134217728
+decode_xz_bytes_per_second = 25165824
+decode_zstd_bytes_per_second = 67108864
+per_entry_nanoseconds = 20000
+startup_nanoseconds = 75000000
+```
+
 When a worker needs new content, the scheduler consults a reverse index
 from missing content IDs to retained original packages. It greedily selects
-up to eight original archives whose compressed bytes cost less than the
-remaining unique raw bytes they cover. Previously selected overlapping
+up to eight originals only when the worker's estimated download-time
+saving exceeds the cost of decoding *every* file in that archive,
+indexing its entries and starting the decoder. Fast connections can
+therefore use direct file delivery even when an archive is smaller. Previously selected overlapping
 content is counted only once. Each selected package remains pinned by the
 authorized tree-delivery session. The worker verifies the original SHA-256
 and size before isolated decoding, verifies the reconstructed package tree,

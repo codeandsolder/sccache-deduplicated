@@ -336,6 +336,9 @@ fn native_action_transfers_inputs_executes_and_publishes_without_worker_result_s
             timeout: Duration::from_secs(10),
             max_result_bytes: 1024,
         };
+        let transport = crate::dist::native::PackageTransportTracker::new(
+            crate::build_runtime::PackageTransferCost::default(),
+        )?;
         let result = worker.execute_on_worker(
             ticket,
             &spec,
@@ -343,6 +346,7 @@ fn native_action_transfers_inputs_executes_and_publishes_without_worker_result_s
             &policy,
             Duration::from_secs(1),
             None,
+            &transport,
         )?;
         let manifest = result
             .successful_result()

@@ -248,6 +248,11 @@ impl Fleet {
                     max_result_bytes: 64 * 1024 * 1024,
                     max_metadata_bytes: 64 * 1024 * 1024,
                     package_import: Some(package_limits(false)),
+                    package_transfer: sccache::build_runtime::PackageTransferCost {
+                        download_bytes_per_second: 1 << 20,
+                        startup_nanoseconds: 0,
+                        ..Default::default()
+                    },
                 }),
             },
         )?;
@@ -1276,7 +1281,12 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
             .collect::<Vec<_>>();
         assert!(
             store
-                .plan_package_downloads(&missing, 8, u64::MAX)?
+                .plan_package_downloads(
+                    &missing,
+                    8,
+                    u64::MAX,
+                    sccache::build_runtime::PackageTransferCost::default()
+                )?
                 .is_empty(),
             "worker retained redundant archive"
         );

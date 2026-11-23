@@ -125,6 +125,8 @@ pub(super) struct PackageRecord {
     pub source: PackageSource,
     pub tree: TreeId,
     pub archive: Option<BlobRef>,
+    pub expanded_bytes: u64,
+    pub entry_count: u64,
 }
 
 impl PackageRecord {
@@ -133,6 +135,8 @@ impl PackageRecord {
             source: self.source,
             tree: self.tree,
             blob: self.archive?,
+            expanded_bytes: self.expanded_bytes,
+            entry_count: self.entry_count,
         })
     }
 }

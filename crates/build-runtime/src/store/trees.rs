@@ -89,14 +89,29 @@ impl NativeStore {
                     .get(&package.0)?
                     .map(|entry| encoding().deserialize::<PackageRecord>(entry.value()))
                     .transpose()?;
+                let expanded_bytes =
+                    manifest.entries.values().try_fold(0_u64, |total, entry| {
+                        let bytes = match entry {
+                            crate::TreeEntry::File { blob, .. } => blob.size,
+                            _ => 0,
+                        };
+                        total
+                            .checked_add(bytes)
+                            .context("original package expanded size overflow")
+                    })?;
                 let mut record = PackageRecord {
                     source,
                     tree: id,
                     archive: original.as_ref().map(StagedBlob::reference),
+                    expanded_bytes,
+                    entry_count: u64::try_from(manifest.entries.len())?,
                 };
                 if let Some(previous) = previous {
                     ensure!(
-                        previous.source == source && previous.tree == id,
+                        previous.source == source
+                            && previous.tree == id
+                            && previous.expanded_bytes == record.expanded_bytes
+                            && previous.entry_count == record.entry_count,
                         "conflicting upstream package tree"
                     );
                     if let Some(archive) = previous.archive {

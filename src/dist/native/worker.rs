@@ -4,6 +4,7 @@
 
 use std::{
     num::NonZeroUsize,
+    sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -12,9 +13,129 @@ use anyhow::{Context, Result, ensure};
 use super::{LeaseCheck, NativeCacheClient, PackagePlanRequest, map_packages};
 use crate::build_runtime::{
     ArchiveLength, BlobRef, CapturedExecution, ExecutionPolicy, ExecutionSpec, NativeServiceBusy,
-    NativeStore, PackageArchive, PackageImportLimits, TreeId, TreeLease, VerifiedPackage, execute,
-    wire::Ticket,
+    NativeStore, PackageArchive, PackageImportLimits, PackageTransferCost, TreeId, TreeLease,
+    VerifiedPackage, execute, wire::Ticket,
 };
+
+/// Per-worker observed transfer and decoding rates. The initial estimates
+/// come from worker configuration and are updated without holding locks during
+/// I/O. A poisoned estimate is advisory, so it can be recovered safely.
+#[derive(Clone)]
+pub struct PackageTransportTracker {
+    rates: Arc<Mutex<PackageTransferCost>>,
+}
+
+impl PackageTransportTracker {
+    /// Construct a rate tracker from administrator-provided initial costs.
+    /// # Errors
+    /// Returns an error when the initial costs are invalid.
+    pub fn new(initial: PackageTransferCost) -> Result<Self> {
+        initial.validate()?;
+        Ok(Self {
+            rates: Arc::new(Mutex::new(initial)),
+        })
+    }
+
+    /// A point-in-time estimate to send with a package selection request.
+    #[must_use = "the estimate changes as the worker observes real work"]
+    pub fn estimate(&self) -> PackageTransferCost {
+        *self.rates.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn smooth(rate: &mut u64, bytes: u64, duration: Duration) {
+        let nanos = duration.as_nanos();
+        if bytes < (1 << 20) || nanos < 1_000_000 {
+            return;
+        }
+        let observed = (u128::from(bytes) * 1_000_000_000 / nanos).clamp(1, 1_000_000_000_000);
+        let updated = (u128::from(*rate) + observed).div_ceil(2);
+        *rate = u64::try_from(updated).unwrap_or(1_000_000_000_000);
+    }
+
+    /// Observe actual download and staging time for a verified raw blob.
+    pub fn observe_raw(&self, bytes: u64, duration: Duration) {
+        let mut rates = self.rates.lock().unwrap_or_else(PoisonError::into_inner);
+        Self::smooth(&mut rates.download_bytes_per_second, bytes, duration);
+    }
+
+    /// Observe original delivery plus verified full-package reconstruction.
+    /// Subtract the current predicted download cost before attributing the
+    /// remainder to the decoder. Queue-wait time is excluded by the caller.
+    pub fn observe_archive(&self, archive: PackageArchive, duration: Duration) {
+        let mut rates = self.rates.lock().unwrap_or_else(PoisonError::into_inner);
+        let transfer_ns = u128::from(archive.source.size) * 1_000_000_000
+            / u128::from(rates.download_bytes_per_second);
+        let overhead_ns = u128::from(rates.startup_nanoseconds)
+            + u128::from(rates.per_entry_nanoseconds) * u128::from(archive.entry_count);
+        let decode_ns = duration
+            .as_nanos()
+            .saturating_sub(transfer_ns.saturating_add(overhead_ns));
+        let rate = match archive.source.identity.compression {
+            crate::build_runtime::PackageCompression::Tar => &mut rates.decode_tar_bytes_per_second,
+            crate::build_runtime::PackageCompression::Gzip => {
+                &mut rates.decode_gzip_bytes_per_second
+            }
+            crate::build_runtime::PackageCompression::Xz => &mut rates.decode_xz_bytes_per_second,
+            crate::build_runtime::PackageCompression::Zstd => {
+                &mut rates.decode_zstd_bytes_per_second
+            }
+        };
+        // The observed decompression time can be zero when the network was
+        // slower than predicted; it is then not a useful decoder sample.
+        if decode_ns >= 1_000_000 {
+            Self::smooth(
+                rate,
+                archive.expanded_bytes,
+                Duration::from_nanos(u64::try_from(decode_ns).unwrap_or(u64::MAX)),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use crate::build_runtime::{
+        BlobRef, ContentId, PackageCompression, PackageIdentity, PackageSource, TreeId,
+    };
+
+    #[test]
+    fn observed_rates_change_future_costs_without_overreacting_to_tiny_files() -> Result<()> {
+        let tracker = PackageTransportTracker::new(PackageTransferCost::default())?;
+        let initial = tracker.estimate();
+        tracker.observe_raw(100, Duration::from_secs(20));
+        assert_eq!(tracker.estimate(), initial);
+        tracker.observe_raw(32 << 20, Duration::from_secs(2));
+        let observed = tracker.estimate();
+        assert!(observed.download_bytes_per_second < initial.download_bytes_per_second);
+        assert!(observed.download_bytes_per_second > (16 << 20));
+        let archive = PackageArchive {
+            source: PackageSource {
+                identity: PackageIdentity {
+                    sha256: [5; 32],
+                    compression: PackageCompression::Zstd,
+                },
+                size: 16 << 20,
+            },
+            tree: TreeId([4; 32]),
+            blob: BlobRef {
+                id: ContentId([3; 32]),
+                size: 16 << 20,
+            },
+            expanded_bytes: 64 << 20,
+            entry_count: 250,
+        };
+        tracker.observe_archive(archive, Duration::from_secs(6));
+        assert!(
+            tracker.estimate().decode_zstd_bytes_per_second < observed.decode_zstd_bytes_per_second
+        );
+        assert_eq!(
+            tracker.estimate().decode_xz_bytes_per_second,
+            observed.decode_xz_bytes_per_second
+        );
+        Ok(())
+    }
+}
 
 impl NativeCacheClient {
     pub(super) fn reconstruct_packages(
@@ -23,6 +144,7 @@ impl NativeCacheClient {
         missing: &[BlobRef],
         store: &NativeStore,
         limits: PackageImportLimits,
+        transport: &PackageTransportTracker,
         check: &LeaseCheck<'_>,
     ) -> Result<Vec<VerifiedPackage>> {
         let plan = self.control(
@@ -31,6 +153,7 @@ impl NativeCacheClient {
                 ticket,
                 missing: missing.to_vec(),
                 max_archive_bytes: limits.max_archive_bytes,
+                cost: transport.estimate(),
             },
         );
         let offers: Vec<PackageArchive> = match plan {
@@ -44,7 +167,7 @@ impl NativeCacheClient {
             .context("zero package acquisition concurrency")?;
         let packages = map_packages(&offers, jobs, |offer| {
             check()?;
-            match self.reconstruct_package(ticket, *offer, store, limits, check) {
+            match self.reconstruct_package(ticket, *offer, store, limits, transport, check) {
                 Ok(package) => Ok(Some(package)),
                 Err(error) => {
                     check()?;
@@ -64,6 +187,7 @@ impl NativeCacheClient {
         offer: PackageArchive,
         store: &NativeStore,
         limits: PackageImportLimits,
+        transport: &PackageTransportTracker,
         check: &LeaseCheck<'_>,
     ) -> Result<VerifiedPackage> {
         ensure!(
@@ -76,6 +200,7 @@ impl NativeCacheClient {
         let executable = std::env::current_exe()?;
         loop {
             check()?;
+            let attempted = Instant::now();
             let (package, reused) = match store.acquire_package(
                 offer.source.identity,
                 ArchiveLength::Exact(offer.source.size),
@@ -99,6 +224,11 @@ impl NativeCacheClient {
                 "reconstructed original package identity mismatch"
             );
             if !reused {
+                transport.observe_archive(offer, attempted.elapsed());
+                debug!(
+                    "native package transfer estimate after import: {:?}",
+                    transport.estimate()
+                );
                 info!(
                     "native original package reconstructed from {} compressed bytes in {:.3}s",
                     offer.source.size,
@@ -126,9 +256,17 @@ impl NativeCacheClient {
         policy: &ExecutionPolicy,
         renewal_interval: Duration,
         package_import: Option<PackageImportLimits>,
+        transport: &PackageTransportTracker,
     ) -> Result<CapturedExecution> {
         self.execute_admitted(ticket, spec, store, policy, renewal_interval, |id, _| {
-            self.fetch_tree(ticket, id, store, renewal_interval, package_import)
+            self.fetch_tree(
+                ticket,
+                id,
+                store,
+                renewal_interval,
+                package_import,
+                transport,
+            )
         })
     }
 

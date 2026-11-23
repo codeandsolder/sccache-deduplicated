@@ -8,7 +8,10 @@ use sccache::{
         ContentId, ExecutionPolicy, NativeStore, PackageImportLimits, wire::NativeRunResult,
     },
     config::server::NativeWorkerConfig,
-    dist::{JobId, NativeAssignment, native::NativeCacheClient},
+    dist::{
+        JobId, NativeAssignment,
+        native::{NativeCacheClient, PackageTransportTracker},
+    },
 };
 
 pub(super) struct NativeWorker {
@@ -17,6 +20,7 @@ pub(super) struct NativeWorker {
     pub(super) policy: ExecutionPolicy,
     renewal_interval: Duration,
     package_import: Option<PackageImportLimits>,
+    package_transfer: PackageTransportTracker,
     pub(super) metadata_limit: usize,
 }
 
@@ -35,6 +39,7 @@ impl NativeWorker {
                 && config.max_result_bytes > 0,
             "invalid native worker configuration"
         );
+        let package_transfer = PackageTransportTracker::new(config.package_transfer)?;
         if let Some(limits) = config.package_import {
             limits.validate()?;
             ensure!(
@@ -62,6 +67,7 @@ impl NativeWorker {
             },
             renewal_interval: Duration::from_secs(config.renewal_interval_secs),
             package_import: config.package_import,
+            package_transfer,
             metadata_limit: usize::try_from(config.max_metadata_bytes)?,
         })
     }
@@ -74,6 +80,7 @@ impl NativeWorker {
             &self.policy,
             self.renewal_interval,
             self.package_import,
+            &self.package_transfer,
         )?;
         if captured.successful_result().is_some() {
             return Ok(NativeRunResult::Stored);
