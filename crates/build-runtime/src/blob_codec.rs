@@ -1,9 +1,12 @@
 //! Immutable, seekable compressed CAS payloads. Blob identity always hashes decoded bytes.
 //! Original upstream archives can retain their exact source bytes without an envelope.
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 use std::{
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
-    os::unix::fs::FileExt,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -79,7 +82,16 @@ pub struct BlobReader {
 
 fn read_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> io::Result<()> {
     while !buffer.is_empty() {
+        #[cfg(unix)]
         let n = file.read_at(buffer, offset)?;
+        #[cfg(windows)]
+        let n = file.seek_read(buffer, offset)?;
+        #[cfg(not(any(unix, windows)))]
+        let n = {
+            let mut cloned = file.try_clone()?;
+            cloned.seek(SeekFrom::Start(offset))?;
+            cloned.read(buffer)?
+        };
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -88,6 +100,30 @@ fn read_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> io::Result<()
         }
         offset += n as u64;
         buffer = &mut buffer[n..];
+    }
+    Ok(())
+}
+
+fn write_at(file: &File, mut bytes: &[u8], mut offset: u64) -> io::Result<()> {
+    while !bytes.is_empty() {
+        #[cfg(unix)]
+        let n = file.write_at(bytes, offset)?;
+        #[cfg(windows)]
+        let n = file.seek_write(bytes, offset)?;
+        #[cfg(not(any(unix, windows)))]
+        let n = {
+            let mut cloned = file.try_clone()?;
+            cloned.seek(SeekFrom::Start(offset))?;
+            cloned.write(bytes)?
+        };
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short CAS header write",
+            ));
+        }
+        offset += n as u64;
+        bytes = &bytes[n..];
     }
     Ok(())
 }
@@ -314,9 +350,9 @@ pub fn encode(mut reader: impl Read, file: &mut File, bound: Option<u64>) -> Res
         chunks = chunks.checked_add(1).context("too many CAS chunks")?;
     }
     file.write_all(&[])?;
-    file.write_all_at(&size.to_le_bytes(), 16)?;
-    file.write_all_at(&u32::try_from(CHUNK)?.to_le_bytes(), 24)?;
-    file.write_all_at(&chunks.to_le_bytes(), 28)?;
+    write_at(file, &size.to_le_bytes(), 16)?;
+    write_at(file, &u32::try_from(CHUNK)?.to_le_bytes(), 24)?;
+    write_at(file, &chunks.to_le_bytes(), 28)?;
     Ok(BlobRef {
         id: ContentId(*hash.finalize().as_bytes()),
         size,
