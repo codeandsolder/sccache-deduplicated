@@ -975,6 +975,18 @@ fn hash_rust_argument_pairs<'a>(
     }
 }
 
+/// Distinguish source, extern, archive and target JSON inputs even if their
+/// content digests are equal. The previous flat concatenation lost group sizes.
+fn hash_rust_input_group(digest: &mut Digest, domain: &[u8], hashes: &[String]) {
+    digest.delimiter(domain);
+    digest.update(&(hashes.len() as u128).to_le_bytes());
+    for hash in hashes {
+        let bytes = hash.as_bytes();
+        digest.update(&(bytes.len() as u128).to_le_bytes());
+        digest.update(bytes);
+    }
+}
+
 fn rust_shadow_root(canonical: &CanonicalRustPaths) -> RustShadowRoots {
     RustShadowRoots {
         build_root: canonical.build_root.to_string_lossy().into_owned(),
@@ -3249,14 +3261,10 @@ where
         // 5. The digest of all files listed on the commandline (self.externs).
         // 6. The digest of all static libraries listed on the commandline (self.staticlibs).
         // 7. The digest of the content of the target json file specified via `--target` (if any).
-        for h in source_hashes
-            .iter()
-            .chain(extern_hashes.iter())
-            .chain(staticlib_hashes.iter())
-            .chain(target_json_hash.iter())
-        {
-            m.update(h.as_bytes());
-        }
+        hash_rust_input_group(&mut m, b"rust-sources-v1", &source_hashes);
+        hash_rust_input_group(&mut m, b"rust-externs-v1", &extern_hashes);
+        hash_rust_input_group(&mut m, b"rust-staticlibs-v1", &staticlib_hashes);
+        hash_rust_input_group(&mut m, b"rust-target-json-v1", &target_json_hash);
         // 8. Environment variables: Hash all environment variables listed in the rustc dep-info
         //    output. Additionally also has all environment variables starting with `CARGO_`,
         //    since those are not listed in dep-info but affect cacheability.
@@ -6712,15 +6720,16 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             (OsString::from("--cfg"), Some(OsString::from("xyz"))),
         ];
         hash_rust_argument_pairs(&mut m, args.len(), args.iter());
-        // bar.rs (source file, from dep-info)
-        m.update(empty_digest.as_bytes());
-        // foo.rs (source file, from dep-info)
-        m.update(empty_digest.as_bytes());
-        // bar.rlib (extern crate, from externs)
-        m.update(empty_digest.as_bytes());
-        // libbaz.a (static library, from staticlibs), containing a single
-        // file, baz.o, consisting of 1024 bytes of zeroes.
-        m.update(libbaz_a_digest.as_bytes());
+        // Source inputs, extern crates, archives and target JSON retain their
+        // group identities even when their digest strings happen to match.
+        hash_rust_input_group(
+            &mut m,
+            b"rust-sources-v1",
+            &[empty_digest.clone(), empty_digest.clone()],
+        );
+        hash_rust_input_group(&mut m, b"rust-externs-v1", &[empty_digest]);
+        hash_rust_input_group(&mut m, b"rust-staticlibs-v1", &[libbaz_a_digest]);
+        hash_rust_input_group(&mut m, b"rust-target-json-v1", &[]);
         // Env vars
         OsStr::new("CARGO_BLAH").hash(&mut HashToDigest { digest: &mut m });
         m.update(b"=");
@@ -6771,6 +6780,28 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             framed_hash(&[(OsString::from("ab"), None)]),
             framed_hash(&[(OsString::from("a"), None), (OsString::from("b"), None),])
         );
+    }
+
+    #[test]
+    fn rust_cache_input_hash_preserves_roles_and_group_lengths() {
+        let identical = "0123456789abcdef".repeat(4);
+        let source = [identical.clone()];
+        let external = [identical.clone()];
+
+        // Both old layouts produced the same flat stream of digest bytes.
+        let mut legacy_source = Digest::new();
+        legacy_source.update(source[0].as_bytes());
+        let mut legacy_external = Digest::new();
+        legacy_external.update(external[0].as_bytes());
+        assert_eq!(legacy_source.finish(), legacy_external.finish());
+
+        let mut by_source = Digest::new();
+        hash_rust_input_group(&mut by_source, b"rust-sources-v1", &source);
+        hash_rust_input_group(&mut by_source, b"rust-externs-v1", &[]);
+        let mut by_extern = Digest::new();
+        hash_rust_input_group(&mut by_extern, b"rust-sources-v1", &[]);
+        hash_rust_input_group(&mut by_extern, b"rust-externs-v1", &external);
+        assert_ne!(by_source.finish(), by_extern.finish());
     }
 
     #[test]
