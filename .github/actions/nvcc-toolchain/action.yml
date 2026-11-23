@@ -1,4 +1,5 @@
 name: nvcc-toolchain
+description: Install the requested NVIDIA CUDA compilation toolkit
 inputs:
   cuda-version:
     description: CUDA Toolkit version

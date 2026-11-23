@@ -1,4 +1,9 @@
 name: rust-toolchain
+description: Select a Rust compiler and expose its toolchain to callers
+outputs:
+  name:
+    description: The Rust toolchain selected for the current job
+    value: ${{ steps.install.outputs.name }}
 inputs:
   toolchain:
     description: |
@@ -15,11 +20,13 @@ inputs:
 runs:
   using: composite
   steps:
-    - shell: bash
+    - id: install
+      shell: bash
       run: |
-        set -x
+        set -euo pipefail
         rustup override set ${{ inputs.toolchain || 'stable' }}
         ${{ inputs.target && format('rustup target add {0}', inputs.target) }}
         ${{ inputs.components && format('rustup component add {0}', inputs.components) }}
+        printf 'name=%s\n' '${{ inputs.toolchain || 'stable' }}' >> "$GITHUB_OUTPUT"
         cargo --version
         rustc --version
