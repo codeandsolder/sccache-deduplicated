@@ -22,6 +22,7 @@ use crate::compiler::c::{
     ArtifactDescriptor, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
     ParsedArguments, assembler_include_dirs,
 };
+use crate::compiler::response_files::ResponseFileExpansion;
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
     SingleCompileCommand, clang,
@@ -33,7 +34,7 @@ use async_trait::async_trait;
 use fs::File;
 use fs_err as fs;
 use log::Level::Trace;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
@@ -1215,44 +1216,25 @@ where
     Ok((command, dist_command, Cacheable::Yes))
 }
 
-enum ResponseFileEntry {
-    Argument(OsString),
-    EndFile(PathBuf),
-}
-
 pub struct ExpandIncludeFile<'a> {
     cwd: &'a Path,
-    stack: Vec<ResponseFileEntry>,
-    // Only active ancestors form cycles; repeated non-recursive @file use is legal.
-    active_files: HashSet<PathBuf>,
+    expansion: ResponseFileExpansion,
 }
 
 impl<'a> ExpandIncludeFile<'a> {
     pub fn new(cwd: &'a Path, args: &[OsString]) -> Self {
-        ExpandIncludeFile {
-            stack: args
-                .iter()
-                .rev()
-                .map(|arg| ResponseFileEntry::Argument(arg.clone()))
-                .collect(),
+        Self {
             cwd,
-            active_files: HashSet::new(),
+            expansion: ResponseFileExpansion::new(args),
         }
     }
 }
-
 impl Iterator for ExpandIncludeFile<'_> {
     type Item = OsString;
 
     fn next(&mut self) -> Option<OsString> {
         loop {
-            let arg = match self.stack.pop()? {
-                ResponseFileEntry::Argument(arg) => arg,
-                ResponseFileEntry::EndFile(path) => {
-                    self.active_files.remove(&path);
-                    continue;
-                }
-            };
+            let arg = self.expansion.next_argument()?;
             let file = match arg.split_prefix("@") {
                 Some(arg) => self.cwd.join(arg),
                 None => return Some(arg),
@@ -1289,33 +1271,17 @@ impl Iterator for ExpandIncludeFile<'_> {
             // back to invoking the compiler directly.
             //
             // [1]: https://gcc.gnu.org/onlinedocs/gcc/Overall-Options.html#Overall-Options
-            // GNU response files expand recursively. Resolve aliases and
-            // reject an active ancestor, rather than recursing without ever
-            // producing an argument. Returning the literal @file is safe:
-            // GCC/Clang argument parsing classifies it as uncacheable and
-            // runs the original compiler invocation.
-            let canonical = match file.canonicalize() {
-                Ok(canonical) => canonical,
-                Err(e) => {
-                    debug!("failed to resolve @-file `{}`: {e}", file.display());
-                    return Some(arg);
+            if !self.expansion.expand(&file, || {
+                let mut contents = String::new();
+                let res = File::open(&file).and_then(|mut f| f.read_to_string(&mut contents));
+                if let Err(error) = res {
+                    debug!("failed to read response file {}: {error}", file.display());
+                    return None;
                 }
-            };
-            if self.active_files.contains(&canonical) {
-                debug!("cyclic @-file reference at {}", file.display());
+                Some(split_gnu_response_file_args(&contents))
+            }) {
                 return Some(arg);
             }
-            let mut contents = String::new();
-            let res = File::open(&file).and_then(|mut f| f.read_to_string(&mut contents));
-            if let Err(e) = res {
-                debug!("failed to read @-file `{}`: {e}", file.display());
-                return Some(arg);
-            }
-            let new_args = split_gnu_response_file_args(&contents);
-            self.active_files.insert(canonical.clone());
-            self.stack.push(ResponseFileEntry::EndFile(canonical));
-            self.stack
-                .extend(new_args.into_iter().rev().map(ResponseFileEntry::Argument));
         }
     }
 }
