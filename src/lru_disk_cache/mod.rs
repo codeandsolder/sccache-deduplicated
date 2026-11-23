@@ -468,7 +468,14 @@ impl LruDiskCache {
     /// Returns an error if the source cannot be read/moved, the key is invalid, or the cache cannot make space.
     pub fn insert_file<K: AsRef<OsStr>, P: AsRef<OsStr>>(&mut self, key: K, path: P) -> Result<()> {
         let source = Path::new(path.as_ref());
-        let size = fs::metadata(source)?.len();
+        let metadata = fs::symlink_metadata(source)?;
+        if !metadata.file_type().is_file() {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cache source must be a regular file",
+            )));
+        }
+        let size = metadata.len();
         let root = self.root.clone();
         self.commit_replacement(key.as_ref(), size, |destination| {
             if source == destination || fs::rename(source, destination).is_ok() {
@@ -994,6 +1001,38 @@ mod tests {
         assert!(!replacement.exists());
         assert_eq!(cache.size(), 8);
         assert_eq!(read_all(&mut cache.get("key")?)?, b"replaced");
+        Ok(())
+    }
+
+    #[test]
+    fn non_file_sources_do_not_replace_cached_content() -> Result<()> {
+        let fixture = TestFixture::new()?;
+        let mut cache = LruDiskCache::new(fixture.tmp().join("cache"), 32)?;
+        cache.insert_bytes("entry", b"original")?;
+
+        let directory = fixture.tmp().join("source-directory");
+        fs::create_dir(&directory)?;
+        assert!(matches!(
+            cache.insert_file("entry", &directory),
+            Err(Error::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
+        ));
+
+        #[cfg(unix)]
+        {
+            let source = fixture.tmp().join("external-source");
+            fs::write(&source, b"other")?;
+            let symlink = fixture.tmp().join("source-symlink");
+            std::os::unix::fs::symlink(&source, &symlink)?;
+            assert!(matches!(
+                cache.insert_file("entry", &symlink),
+                Err(Error::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
+            ));
+            assert!(fs::symlink_metadata(&symlink)?.file_type().is_symlink());
+            assert_eq!(fs::read(&source)?, b"other");
+        }
+
+        assert_eq!(read_all(&mut cache.get("entry")?)?, b"original");
+        assert_eq!(cache.size(), 8);
         Ok(())
     }
 
