@@ -272,8 +272,8 @@ mod tests {
         let mut cache = vec![Budget::new(100)];
         let mut payload = serde_json::json!({
             "kind":"tree_access",
-            "tree":[1u8; 32],
-            "blobs":[{"id":[2u8; 32],"size":16}],
+            "tree":vec![1u8; 32],
+            "blobs":[{"id":vec![2u8; 32],"size":16}],
         });
         let log = format!("garbage\nprefix {}\nother log\n", payload);
         assert_eq!(run(&mut cache, log.as_bytes())?, 1);
