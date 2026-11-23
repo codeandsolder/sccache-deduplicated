@@ -49,7 +49,7 @@ impl MaterializedTree {
 
     /// Enable cleanup of a private view that may be modified by a build.
     /// No CAS inode is shared with the view, even when block cloning succeeds.
-    pub(crate) fn mark_writable(&mut self, relative: &Path) {
+    pub fn mark_writable(&mut self, relative: &Path) {
         self.writable.push(self.root.join(relative));
     }
 

@@ -25,13 +25,17 @@ tempfile = { version = "3", optional = true }
 
 rustix = { version = "1", features = ["fs", "time", "process"], optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.16", default-features = false, features = ["abi-7-31"], optional = true }
+libc = { version = "0.2", optional = true }
+
 [dev-dependencies]
 tempfile = "3"
 
 [features]
 default = ["store"]
 mapping = ["dep:rustix", "dep:log"]
-store = ["mapping", "dep:rand", "dep:redb", "dep:tempfile", "dep:flate2", "dep:lzma-rust2", "dep:sha2", "dep:tar", "dep:zstd"]
+store = ["mapping", "dep:rand", "dep:redb", "dep:tempfile", "dep:flate2", "dep:lzma-rust2", "dep:sha2", "dep:tar", "dep:zstd", "dep:fuser", "dep:libc"]
 
 [lints]
 workspace = true

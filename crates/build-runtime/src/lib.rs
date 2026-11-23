@@ -59,7 +59,7 @@ pub mod sandbox;
 pub use execution::{CapturedExecution, ExecutionPolicy, execute};
 
 #[cfg(all(target_os = "linux", feature = "store"))]
-pub use store::{MaterializationStats, MaterializedTree};
+pub use store::{MaterializationStats, MaterializedTree, MountedTree};
 
 #[cfg(all(target_os = "linux", feature = "mapping"))]
 mod mapped;

@@ -25,7 +25,7 @@ use rustix::{
 };
 
 use crate::{
-    Artifact, BlobRef, BuildPath, ContentId, ExecutionSpec, MaterializedTree, NativeStore,
+    Artifact, BlobRef, BuildPath, ContentId, ExecutionSpec, MountedTree, NativeStore,
     ResultManifest, TreeEntry, TreeLease, TreePath,
     sandbox::{MountAccess, SandboxInvocation, SandboxPath, SandboxPlan},
 };
@@ -135,7 +135,7 @@ struct PreparedBuild {
     outputs: BTreeMap<String, OutputLocation>,
     // One independently cloned view per namespace location, even when two
     // locations reference the same tree ID.
-    _views: BTreeMap<BuildPath, MaterializedTree>,
+    _views: BTreeMap<BuildPath, MountedTree>,
 }
 
 fn host_path(bytes: &[u8]) -> &Path {
@@ -244,55 +244,84 @@ impl PreparedBuild {
             require_directory(root, host_path(&path[1..]))?;
         }
         let writable = writable_locations(spec, &leases)?;
-        let mut views: BTreeMap<BuildPath, MaterializedTree> = leases
-            .iter()
-            .map(|(path, lease)| Ok((path.clone(), lease.materialize(scratch)?)))
+        // Each immutable input remains encoded in CAS. Mount a read-only tree
+        // and construct writable scratch only for explicitly declared output
+        // parents. The mounted lease pins its backing blobs through execution.
+        let mut views: BTreeMap<BuildPath, MountedTree> = leases
+            .into_iter()
+            .map(|(path, lease)| Ok((path, lease.mount_readonly(scratch)?)))
             .collect::<Result<_>>()?;
         for path in &writable {
-            let (point, _) = backing(&leases, path)?;
+            let (point, _) = backing(&views, path)?;
+            let point = point.clone();
+            let relative = relative(path, &point)?.to_owned();
             views
-                .get_mut(point)
-                .context("native view missing")?
-                .mark_writable(relative(path, point)?);
+                .get_mut(&point)
+                .context("native input view missing")?
+                .mark_writable(&relative)?;
         }
-        let access = |path: &BuildPath| {
-            if writable.contains(path) {
+        let root = views.get(&root_point).context("native root view missing")?;
+        let root_writable = writable.contains(&root_point);
+        let root_source = if root_writable {
+            root.writable_path(Path::new(""))?
+        } else {
+            root.root()
+        };
+        let mut plan = SandboxPlan::new(
+            root_source,
+            if root_writable {
                 MountAccess::Writable
             } else {
                 MountAccess::ReadOnly
-            }
-        };
-        let root = views.get(&root_point).context("native root view missing")?;
-        let mut plan = SandboxPlan::new(root.root(), access(&root_point))?;
+            },
+        )?;
         for (path, view) in &views {
             if path != &root_point {
+                let is_writable = writable.contains(path);
+                let source = if is_writable {
+                    view.writable_path(Path::new(""))?
+                } else {
+                    view.root()
+                };
                 plan.bind(
-                    view.root(),
+                    source,
                     SandboxPath::new(host_path(path.as_bytes()))?,
-                    access(path),
+                    if is_writable {
+                        MountAccess::Writable
+                    } else {
+                        MountAccess::ReadOnly
+                    },
                 )?;
             }
         }
         for path in &writable {
-            // The mount root itself already has the correct access mode.
+            // A writable view root is bound above; nested paths override the
+            // immutable source with a private writable directory.
             if views.contains_key(path) {
                 continue;
             }
             let (point, view) = backing(&views, path)?;
             plan.bind(
-                &view.root().join(relative(path, point)?),
+                view.writable_path(relative(path, point)?)?,
                 SandboxPath::new(host_path(path.as_bytes()))?,
                 MountAccess::Writable,
             )?;
         }
         let mut outputs = BTreeMap::new();
         for (name, output) in &spec.outputs {
-            let (point, view) = backing(&views, &output.path)?;
+            // Capture from the *writable bind's* backing directory, not the
+            // underlying immutable FUSE tree hidden by that bind.
+            let parent = writable
+                .iter()
+                .filter(|path| output.path.within(path.as_bytes()))
+                .max_by_key(|path| path.as_bytes().len())
+                .context("output is not in a declared writable mount")?;
+            let (point, view) = backing(&views, parent)?;
             outputs.insert(
                 name.clone(),
                 OutputLocation {
-                    directory: File::open(view.root())?,
-                    relative: relative(&output.path, point)?.to_owned(),
+                    directory: File::open(view.writable_path(relative(parent, point)?)?)?,
+                    relative: relative(&output.path, parent)?.to_owned(),
                 },
             );
         }

@@ -1226,7 +1226,7 @@ pub use packages::{
 mod trees;
 pub use trees::TreeLease;
 #[cfg(target_os = "linux")]
-pub use trees::{MaterializationStats, MaterializedTree};
+pub use trees::{MaterializationStats, MaterializedTree, MountedTree};
 
 #[cfg(test)]
 mod tests;
