@@ -321,6 +321,10 @@ impl NativeStore {
     fn eviction_candidates(&self, limit: usize, physical_pressure: bool) -> Result<Vec<Root>> {
         // This is intentionally a pressure-only path: query committed reverse
         // references and actual file allocation, never the lookup hot path.
+        // Freeze publications/GC until the file-allocation snapshot has been
+        // ranked, so a concurrent unlink cannot invalidate the blob metadata.
+        // The mutation lock is released before any candidate is evicted.
+        let _mutation = self.inner.lock_mutations()?;
         let read = self.inner.db.begin_read()?;
         let actions = read.open_table(ACTIONS)?;
         let results = read.open_table(RESULTS)?;
