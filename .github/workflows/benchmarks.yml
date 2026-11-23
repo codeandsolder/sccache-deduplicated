@@ -29,21 +29,22 @@ jobs:
           persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        id: rust
         with:
           toolchain: "nightly-2026-11-23"
 
       - name: Setup mandatory sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
         with:
-          rust-toolchain: "nightly-2026-11-22"
+          rust-toolchain: ${{ steps.rust.outputs.name }}
 
       - name: Install cargo-codspeed
         shell: bash
-        run: cargo install cargo-codspeed --locked
+        run: cargo +${{ steps.rust.outputs.name }} install cargo-codspeed --locked
 
       - name: Build benchmarks
         shell: bash
-        run: cargo codspeed build
+        run: cargo +${{ steps.rust.outputs.name }} codspeed build
 
       - name: Run benchmarks
         uses: CodSpeedHQ/action@b1f28b5eccf7cb5bfe6a2a89cb3053eb67f1150c # v5
@@ -51,7 +52,7 @@ jobs:
           CODSPEED_LOG: debug
         with:
           mode: ${{ matrix.mode }}
-          run: cargo codspeed run > /dev/null
+          run: cargo +${{ steps.rust.outputs.name }} codspeed run > /dev/null
           token: ${{ secrets.CODSPEED_TOKEN }}
 
       - name: Finalize mandatory sccache
