@@ -153,6 +153,24 @@ hold admission reservations through publication; their releases are applied
 atomically without taking the admission lock, preventing lock-order cycles
 with concurrent eviction and index publication.
 
+Native workers include up to 32 recently used immutable tree IDs in each
+scheduler heartbeat. The scheduler considers their overlap with the native
+action's input-tree closure when weighing eligible workers; this modest
+locality bonus supplements (never replaces) CPU capacity, compatibility and
+the unhealthy-worker fallback. The inventory is advisory and can be stale;
+actual worker retrieval still verifies the tree and downloads its missing
+blobs. The heartbeat protocol changed with native support; update scheduler
+and worker binaries together.
+
+Native blob downloads negotiate Zstandard independently from the immutable
+blob representation. The scheduler samples at most 128 KiB of each requested
+blob; for files at least 32 KiB long it streams a level-1 Zstandard frame
+only when the sample predicts at least 15% transfer savings. Otherwise the
+file is streamed raw. Clients decode before BLAKE3 and exact-length checks.
+Neither path leaves a second compressed copy in the store, and the underlying
+ZFS dataset retains transparent compression. These request paths are bounded
+by existing session and concurrency limits.
+
 The worker advertises the BLAKE3 digest of the exact platform contract.
 Clients use the same digest in `ExecutionSpec.platform`. The renewal
 interval must be shorter than the scheduler idle timeout.
