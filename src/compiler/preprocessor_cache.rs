@@ -21,7 +21,6 @@
 use std::{
     collections::{BTreeMap, HashSet},
     ffi::{OsStr, OsString},
-    hash::Hash,
     io::Write,
     path::{Path, PathBuf},
     sync::LazyLock,
@@ -34,11 +33,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::PreprocessorCacheModeConfig,
-    util::{Digest, HashToDigest, MetadataCtimeExt, Timestamp, encode_path, strip_basedirs},
+    util::{Digest, MetadataCtimeExt, Timestamp, encode_path, strip_basedirs},
 };
 
 use super::Language;
-use super::c::{INPUT_FILE_NAME_DOMAIN, hash_arguments, hashed_input_file_name};
+use super::c::{
+    hash_arguments, hash_auxiliary_inputs, hash_cached_env_vars, hash_input_file_name_marker,
+    hash_length_prefixed, hashed_input_file_name,
+};
 
 /// The current format is 1 header byte for the version + bincode encoding
 /// of the [`PreprocessorCacheEntry`] struct.
@@ -406,26 +408,14 @@ pub fn preprocessor_cache_entry_hash_key(
     m.update(&[FORMAT_VERSION]);
     m.update(language.as_str().as_bytes());
     hash_arguments(&mut m, arguments, basedirs);
-    for hash in extra_hashes {
-        m.update(hash.as_bytes());
-    }
-    // A hit on a preprocessor cache entry hands back the object cache key that
-    // was stored in it, so everything the object key is made of has to be here
-    // too or the assembler would be forgotten on that path.
-    if hashed_input_file_name(language, input_file).is_some() {
-        m.delimiter(INPUT_FILE_NAME_DOMAIN);
-    }
-    if let Some(assembler_digest) = assembler_digest {
-        m.update(assembler_digest.as_bytes());
-    }
-
-    for (var, val) in env_vars {
-        if CACHED_ENV_VARS.contains(var.as_os_str()) {
-            var.hash(&mut HashToDigest { digest: &mut m });
-            m.update(&b"="[..]);
-            val.hash(&mut HashToDigest { digest: &mut m });
-        }
-    }
+    // Include every value that participates in the result key before storing
+    // the direct-mode entry that points to that result.
+    hash_auxiliary_inputs(&mut m, extra_hashes, assembler_digest);
+    hash_input_file_name_marker(
+        &mut m,
+        hashed_input_file_name(language, input_file).is_some(),
+    );
+    hash_cached_env_vars(&mut m, env_vars, &CACHED_ENV_VARS);
 
     // Hash the input file otherwise:
     // - a/r.h exists.
@@ -439,7 +429,7 @@ pub fn preprocessor_cache_entry_hash_key(
 
     // Strip basedirs from the input file path if configured
     let buf_to_hash = strip_basedirs(&buf, basedirs);
-    m.update(&buf_to_hash);
+    hash_length_prefixed(&mut m, &buf_to_hash);
     let reader = std::fs::File::open(input_file)
         .with_context(|| format!("while hashing the input file '{}'", input_file.display()))?;
 
@@ -540,6 +530,31 @@ mod test {
             key(&merged)?.expect("valid input"),
             key(&split)?.expect("valid input")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_preprocessor_cache_tracks_include_environment_separately() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("unit.c");
+        std::fs::write(&source, b"int main(void) { return 0; }")?;
+        let first = [(OsString::from("CPATH"), OsString::from("include/first"))];
+        let second = [(OsString::from("CPATH"), OsString::from("include/second"))];
+        let hash = |env: &[(OsString, OsString)]| {
+            preprocessor_cache_entry_hash_key(PreprocessorCacheKey {
+                compiler_digest: "same-compiler",
+                language: Language::C,
+                arguments: &[],
+                extra_hashes: &[],
+                assembler_digest: None,
+                env_vars: env,
+                input_file: &source,
+                plusplus: false,
+                config: PreprocessorCacheModeConfig::activated(),
+                basedirs: &[],
+            })
+        };
+        assert_ne!(hash(&first)?, hash(&second)?);
         Ok(())
     }
 
@@ -765,18 +780,26 @@ mod test {
                 basedirs: &[],
             })?
             .context("cacheable direct key")?;
-            let mut old = Digest::new();
-            old.update(b"compiler");
-            old.update(&[0, FORMAT_VERSION]);
-            old.update(language.as_str().as_bytes());
+            // Reconstruct the cache-key schema with the optional source-name
+            // marker disabled, to verify which C languages require it.
+            let mut without_name = Digest::new();
+            without_name.update(b"compiler");
+            without_name.update(&[0, FORMAT_VERSION]);
+            without_name.update(language.as_str().as_bytes());
+            hash_arguments(&mut without_name, &[], &[]);
+            hash_auxiliary_inputs(&mut without_name, &[], None);
+            hash_input_file_name_marker(&mut without_name, false);
+            hash_cached_env_vars(&mut without_name, &[], &CACHED_ENV_VARS);
             let mut encoded = vec![];
             encode_path(&mut encoded, &file)?;
-            old.update(&encoded);
-            old.update(Digest::reader_sync(&source[..])?.as_bytes());
-            let old = old.finish();
+            hash_length_prefixed(&mut without_name, &encoded);
+            without_name.update(Digest::reader_sync(&source[..])?.as_bytes());
+            let without_name = without_name.finish();
             match language {
-                Language::CudaFE | Language::Ptx | Language::Cubin => assert_eq!(key, old),
-                _ => assert_ne!(key, old),
+                Language::CudaFE | Language::Ptx | Language::Cubin => {
+                    assert_eq!(key, without_name)
+                }
+                _ => assert_ne!(key, without_name),
             }
         }
         Ok(())
