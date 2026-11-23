@@ -1751,7 +1751,7 @@ mod test {
             std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_500_000_000);
         std::fs::File::open(&stage)?.set_times(std::fs::FileTimes::new().set_modified(modified))?;
         #[cfg(unix)]
-        fs::set_permissions(&stage, fs::Permissions::from_mode(0o640))?;
+        fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o640))?;
 
         preserve_nvcc_intermediates(&scratch, &destination)?;
         let copied = destination.join("nested/replace.ptx");
