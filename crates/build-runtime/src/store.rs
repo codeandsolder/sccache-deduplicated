@@ -247,7 +247,11 @@ impl Inner {
         Ok(File::open(self.blob_path(id))?)
     }
 
-    fn install_blob(&self, blob: StagedBlob, directories: &mut BTreeSet<PathBuf>) -> Result<()> {
+    fn install_blob(
+        &self,
+        blob: StagedBlob,
+        directories: &mut BTreeSet<PathBuf>,
+    ) -> Result<space::StagingReservation> {
         let path = self.blob_path(blob.reference.id);
         let parent = path.parent().context("invalid blob storage path")?;
         if directories.insert(parent.to_owned()) {
@@ -261,8 +265,15 @@ impl Inner {
         // An unindexed file can remain after a failed transaction; replace it
         // with verified bytes rather than trusting its name or its length.
         blob.validate_metadata(&fs::symlink_metadata(&blob.path)?)?;
-        blob.path.persist(&path)?;
-        Ok(())
+        let StagedBlob {
+            path: staged_path,
+            _reservation: reservation,
+            ..
+        } = blob;
+        staged_path.persist(&path)?;
+        // The caller keeps this reservation alive until the redb transaction
+        // commits the blob's index entry and its resident-byte accounting.
+        Ok(reservation)
     }
 
     fn remove_blob(&self, id: ContentId) -> Result<()> {
@@ -627,6 +638,7 @@ impl NativeStore {
         let blobs = manifest.blobs()?;
         let staged = self.prepare_staging(&blobs, staged)?;
         let write = self.inner.db.begin_write()?;
+        let mut staged_reservations = Vec::new();
         let new_action;
         {
             let mut actions = write.open_table(ACTIONS)?;
@@ -665,7 +677,14 @@ impl NativeStore {
             } else {
                 false
             };
-            self.attach_blobs(&write, &result.0, &blobs, staged, existing_result)?;
+            self.attach_blobs(
+                &write,
+                &result.0,
+                &blobs,
+                staged,
+                existing_result,
+                &mut staged_reservations,
+            )?;
             if !existing_result {
                 let bytes = encoding().serialize(manifest)?;
                 results.insert(&result.0, bytes.as_slice())?;
@@ -690,6 +709,9 @@ impl NativeStore {
         // Files and their directory entries are durable before the index
         // exposes them. Orphans from an interrupted write are harmless.
         write.commit()?;
+        // Do not let a concurrent staging admission spend this space before
+        // the committed resident byte count includes the new content.
+        drop(staged_reservations);
         self.inner.lock_pins()?.touch(space::Root::Action(action));
         Ok(Published {
             action,
@@ -727,6 +749,7 @@ impl NativeStore {
         blobs: &BTreeMap<ContentId, u64>,
         mut staged: BTreeMap<ContentId, StagedBlob>,
         existing_result: bool,
+        reservations: &mut Vec<space::StagingReservation>,
     ) -> Result<()> {
         let mut blob_table = write.open_table(BLOBS)?;
         let mut blob_roots = write.open_multimap_table(BLOB_ROOTS)?;
@@ -767,7 +790,7 @@ impl NativeStore {
                     let blob = staged
                         .remove(&id)
                         .context("validated staged content disappeared")?;
-                    self.inner.install_blob(blob, &mut directories)?;
+                    reservations.push(self.inner.install_blob(blob, &mut directories)?);
                 }
                 blob_table.insert(&id.0, size)?;
                 added = added.checked_add(size).context("store size overflow")?;

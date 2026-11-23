@@ -386,3 +386,19 @@ fn bounded_eviction_selection_keeps_only_lowest_utility_roots() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn committed_action_releases_staging_reservations_into_resident_accounting() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut limit = policy();
+    limit.max_resident_bytes = 6;
+    limit.target_resident_bytes = 5;
+    let store = NativeStore::open_managed(temp.path(), limit)?;
+    let key = publish(&store, "12345")?;
+    let report = store.maintain_space()?.context("missing policy")?;
+    assert_eq!(report.reserved_bytes, 0);
+    assert_eq!(report.resident_bytes, 5);
+    assert!(report.minimum_satisfied);
+    assert!(store.lookup(key)?.is_some());
+    Ok(())
+}

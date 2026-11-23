@@ -70,6 +70,7 @@ impl NativeStore {
         let blobs = manifest.blobs()?;
         let staged = self.prepare_staging(&blobs, staged)?;
         let write = self.inner.db.begin_write()?;
+        let mut staged_reservations = Vec::new();
         {
             let mut trees = write.open_table(TREES)?;
             let exists = if let Some(stored) = trees.get(&id.0)? {
@@ -79,7 +80,14 @@ impl NativeStore {
             } else {
                 false
             };
-            self.attach_blobs(&write, &id.0, &blobs, staged, exists)?;
+            self.attach_blobs(
+                &write,
+                &id.0,
+                &blobs,
+                staged,
+                exists,
+                &mut staged_reservations,
+            )?;
             if !exists {
                 trees.insert(&id.0, encoding().serialize(manifest)?.as_slice())?;
             }
@@ -122,10 +130,22 @@ impl NativeStore {
                         record.archive = Some(archive);
                         self.inner.check_blob(archive.id, archive.size)?;
                     } else if let Some(original) = original {
-                        self.attach_package_archive(&write, package, original, &blobs)?;
+                        self.attach_package_archive(
+                            &write,
+                            package,
+                            original,
+                            &blobs,
+                            &mut staged_reservations,
+                        )?;
                     }
                 } else if let Some(original) = original {
-                    self.attach_package_archive(&write, package, original, &blobs)?;
+                    self.attach_package_archive(
+                        &write,
+                        package,
+                        original,
+                        &blobs,
+                        &mut staged_reservations,
+                    )?;
                 }
                 packages.insert(&package.0, encoding().serialize(&record)?.as_slice())?;
                 write
@@ -134,6 +154,7 @@ impl NativeStore {
             }
         }
         write.commit()?;
+        drop(staged_reservations);
         self.inner.lock_pins()?.touch(Root::Tree(id));
         Ok(id)
     }
@@ -144,11 +165,12 @@ impl NativeStore {
         package: ContentId,
         original: StagedBlob,
         contents: &BTreeMap<ContentId, u64>,
+        reservations: &mut Vec<super::space::StagingReservation>,
     ) -> Result<()> {
         let BlobRef { id, size } = original.reference();
         let blobs = BTreeMap::from([(id, size)]);
         let staged = self.prepare_staging(&blobs, vec![original])?;
-        self.attach_blobs(write, &package.0, &blobs, staged, false)?;
+        self.attach_blobs(write, &package.0, &blobs, staged, false, reservations)?;
         let mut reverse = write.open_multimap_table(BLOB_PACKAGES)?;
         for id in contents.keys() {
             reverse.insert(&id.0, &package.0)?;
