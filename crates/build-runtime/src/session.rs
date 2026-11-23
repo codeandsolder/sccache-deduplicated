@@ -807,7 +807,7 @@ impl NativeSessions {
                 .start(blob, self.limits.max_concurrent_uploads)?;
             drop(state);
         }
-        let result = self.store().stage_expected(blob, reader);
+        let result = self.store().stage_expected_encoded(blob, reader);
         let mut state = Self::lock(&session)?;
         // Clear the active marker even if this upload exceeded its lease.
         if let Phase::Pending(pending) = &mut state.phase

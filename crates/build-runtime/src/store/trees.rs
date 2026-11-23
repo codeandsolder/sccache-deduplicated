@@ -320,13 +320,22 @@ impl TreeLease {
         self.inner.open_declared(&self.blobs, id)
     }
 
+    /// Open decoded content as an owned reader. The file descriptor remains
+    /// valid independently of the tree lease, including during a network upload.
+    ///
+    /// # Errors
+    /// Returns an error for missing content or an invalid physical payload.
+    pub fn open_decoded(&self, id: ContentId) -> Result<crate::BlobReader> {
+        crate::BlobReader::open(self.open_file(id)?)
+    }
+
     /// Open an independent reader for content declared by this tree.
     ///
     /// # Errors
     /// Returns an error for undeclared content or filesystem failure.
     pub fn open_blob(&self, id: ContentId) -> Result<impl Read + Seek + '_> {
         Ok(LeasedReader {
-            file: self.open_file(id)?,
+            file: crate::BlobReader::open(self.open_file(id)?)?,
             _lease: self,
         })
     }

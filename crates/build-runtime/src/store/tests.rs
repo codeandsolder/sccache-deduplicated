@@ -529,7 +529,7 @@ fn staging_many_blobs_does_not_hold_file_descriptors() -> Result<()> {
     assert_eq!(fs::read_dir(&staging)?.count(), staged.len());
     for (index, blob) in staged.iter().enumerate() {
         let mut bytes = Vec::new();
-        blob.open_file()?.read_to_end(&mut bytes)?;
+        crate::BlobReader::open(blob.open_file()?)?.read_to_end(&mut bytes)?;
         assert_eq!(bytes, u32::try_from(index)?.to_le_bytes());
     }
     drop(staged);

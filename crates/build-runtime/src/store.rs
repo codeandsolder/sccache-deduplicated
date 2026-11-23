@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use tempfile::{NamedTempFile, TempPath};
 
 use super::{
-    ActionFingerprint, ActionKey, ActionMode, BlobRef, ContentId, ResultId, ResultManifest,
-    identity::encoding,
+    ActionFingerprint, ActionKey, ActionMode, BlobReader, BlobRef, ContentId, ResultId,
+    ResultManifest, blob_codec, identity::encoding,
 };
 
 const ACTIONS: TableDefinition<'static, &[u8; 32], &[u8]> = TableDefinition::new("actions_v1");
@@ -70,7 +70,7 @@ impl StagedBlob {
             actual.is_file()
                 && actual.dev() == expected.dev()
                 && actual.ino() == expected.ino()
-                && actual.len() == self.reference.size
+                && actual.len() == expected.len()
                 && actual.mode() == expected.mode()
                 && actual.mtime() == expected.mtime()
                 && actual.mtime_nsec() == expected.mtime_nsec()
@@ -203,8 +203,9 @@ impl Inner {
         let path = self.blob_path(id);
         let metadata = fs::symlink_metadata(&path)
             .with_context(|| format!("missing native store content {id:?}"))?;
+        ensure!(metadata.is_file(), "invalid native store content {id:?}");
         ensure!(
-            metadata.is_file() && metadata.len() == size,
+            BlobReader::open(File::open(&path)?)?.len() == size,
             "invalid native store content {id:?}"
         );
         Ok(())
@@ -383,15 +384,16 @@ impl NativeStore {
         Ok(Self { inner })
     }
 
-    /// Stream uncompressed content into a temporary file, hashing it in the
-    /// same pass. This is independent of the index lock.
+    /// Encode generated content exactly once with indexed Zstandard blocks.
+    /// Physical bytes are portable across worker filesystems and transports.
     ///
     /// # Errors
     /// Returns an error if the stream or filesystem fails.
     pub fn stage(&self, reader: impl Read) -> Result<StagedBlob> {
-        self.stage_inner(reader, None)
+        self.stage_compressed_inner(reader, None)
     }
 
+    // Original upstream package archives retain their exact bytes.
     // Size is an upper bound, not a substitute for digest/length validation.
     fn stage_inner(&self, mut reader: impl Read, bound: Option<u64>) -> Result<StagedBlob> {
         let mut budget = space::StageBudget::new(self);
@@ -446,6 +448,88 @@ impl NativeStore {
         })
     }
 
+    // Reserve the raw upper bound even though actual physical storage is compressed.
+    // This preserves the managed store's conservative allocation policy.
+    pub(crate) fn stage_compressed_inner(
+        &self,
+        reader: impl Read,
+        bound: Option<u64>,
+    ) -> Result<StagedBlob> {
+        let mut budget = space::StageBudget::new(self);
+        if let Some(bound) = bound {
+            budget.grow_to(bound)?;
+        }
+        struct ReservingReader<'a, 's, R> {
+            source: R,
+            budget: &'a mut space::StageBudget<'s>,
+            seen: u64,
+            bounded: bool,
+        }
+        impl<R: Read> Read for ReservingReader<'_, '_, R> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if !self.bounded {
+                    let next = self
+                        .seen
+                        .checked_add(buffer.len() as u64)
+                        .ok_or_else(|| io::Error::other("native stage size overflow"))?;
+                    self.budget.grow_to(next).map_err(io::Error::other)?;
+                }
+                let count = self.source.read(buffer)?;
+                self.seen += count as u64;
+                Ok(count)
+            }
+        }
+        let mut staged = NamedTempFile::new_in(self.inner.root.join("staging"))?;
+        let reference = blob_codec::encode(
+            ReservingReader {
+                source: reader,
+                budget: &mut budget,
+                seen: 0,
+                bounded: bound.is_some(),
+            },
+            staged.as_file_mut(),
+            bound,
+        )?;
+        staged
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o400))?;
+        staged.as_file().sync_all()?;
+        let metadata = staged.as_file().metadata()?;
+        Ok(StagedBlob {
+            path: staged.into_temp_path(),
+            metadata,
+            reference,
+            owner: Arc::clone(&self.inner),
+        })
+    }
+
+    /// Retain an already encoded CAS object without re-encoding it.
+    /// The decoded bytes must match the advertised original content ID.
+    ///
+    /// # Errors
+    /// Returns an error for corruption, truncation or unexpected content.
+    pub fn stage_expected_encoded(
+        &self,
+        expected: BlobRef,
+        reader: impl Read,
+    ) -> Result<StagedBlob> {
+        let mut budget = space::StageBudget::new(self);
+        budget.grow_to(expected.size)?;
+        let mut staged = NamedTempFile::new_in(self.inner.root.join("staging"))?;
+        blob_codec::transfer(reader, staged.as_file_mut(), io::sink(), expected)?;
+        staged
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o400))?;
+        staged.as_file().sync_all()?;
+        let metadata = staged.as_file().metadata()?;
+        Ok(StagedBlob {
+            path: staged.into_temp_path(),
+            metadata,
+            reference: expected,
+            owner: Arc::clone(&self.inner),
+        })
+    }
+
     /// Stage an advertised blob, rejecting short, long or wrong-content streams.
     /// The length bounds the amount read even if the sender never ends input.
     ///
@@ -456,7 +540,7 @@ impl NativeStore {
             .size
             .checked_add(1)
             .context("blob length overflow")?;
-        let staged = self.stage_inner(reader.take(limit), Some(limit))?;
+        let staged = self.stage_compressed_inner(reader.take(limit), Some(limit))?;
         ensure!(
             staged.reference() == expected,
             "uploaded content does not match its declared digest and length"
@@ -1092,7 +1176,7 @@ impl ResultLease {
     /// Returns an error for an undeclared blob or filesystem failure.
     pub fn open_blob(&self, id: ContentId) -> Result<impl Read + Seek + '_> {
         Ok(LeasedReader {
-            file: self.open_file(id)?,
+            file: BlobReader::open(self.open_file(id)?)?,
             _lease: self,
         })
     }
@@ -1113,7 +1197,7 @@ impl Drop for ResultLease {
 }
 
 struct LeasedReader<'a, L> {
-    file: File,
+    file: BlobReader,
     _lease: &'a L,
 }
 

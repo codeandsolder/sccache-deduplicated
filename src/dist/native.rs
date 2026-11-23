@@ -2,7 +2,7 @@
 
 use std::{
     fs::File,
-    io::{self, Cursor, Read, Write},
+    io::{self, Cursor, Read, Seek, Write},
     time::{Duration, Instant},
 };
 
@@ -396,11 +396,38 @@ impl NativeCacheClient {
         mut open: impl FnMut(ContentId) -> Result<R>,
         renewal_interval: Duration,
     ) -> Result<Ticket> {
+        self.push_tree_with(manifest, renewal_interval, |ticket, blob| {
+            self.upload(ticket, blob, open(blob.id)?)
+        })
+    }
+
+    /// Publish a tree that is already resident as encoded CAS objects.
+    /// The wire bytes are sent exactly as stored, without another compression pass.
+    ///
+    /// # Errors
+    /// Returns an error if a reserved blob is absent or fails remote validation.
+    pub fn push_tree_encoded(
+        &self,
+        manifest: &TreeManifest,
+        mut open: impl FnMut(ContentId) -> Result<File>,
+        renewal_interval: Duration,
+    ) -> Result<Ticket> {
+        self.push_tree_with(manifest, renewal_interval, |ticket, blob| {
+            self.upload_encoded_file(ticket, blob, open(blob.id)?)
+        })
+    }
+
+    fn push_tree_with(
+        &self,
+        manifest: &TreeManifest,
+        renewal_interval: Duration,
+        mut upload: impl FnMut(Ticket, BlobRef) -> Result<()>,
+    ) -> Result<Ticket> {
         let id = manifest.id()?;
         let blobs = manifest.blobs()?;
         let offer = self.offer_tree(manifest)?;
         debug!(
-            "native tree {id:?}: upload {}/{} blobs, {}/{} content bytes",
+            "native tree {id:?}: upload {}/{} blobs, {}/{} logical bytes",
             offer.missing.len(),
             blobs.len(),
             offer
@@ -419,7 +446,7 @@ impl NativeCacheClient {
                     blobs.get(&blob.id) == Some(&blob.size) && seen.insert(blob.id),
                     "scheduler requested undeclared or duplicate input content"
                 );
-                self.upload(offer.ticket, blob, open(blob.id)?)?;
+                upload(offer.ticket, blob)?;
             }
             ensure!(
                 self.commit_tree(offer.ticket)? == id,
@@ -484,7 +511,7 @@ impl NativeCacheClient {
                 let _slot = transport.raw_slot(check)?;
                 let start = Instant::now();
                 let response = self.download_response(read.ticket, blob.id)?;
-                let staged = store.stage_expected(*blob, response)?;
+                let staged = store.stage_expected_encoded(*blob, response)?;
                 transport.observe_raw(blob.size, start.elapsed());
                 Ok(staged)
             })?;
@@ -518,8 +545,9 @@ impl NativeCacheClient {
         self.upload(ticket, blob, file)
     }
 
-    /// Send raw content without buffering it in memory. The scheduler verifies
-    /// the full digest and declared length before admitting it.
+    /// Compress a new blob once and upload the encoded representation.
+    /// The scheduler verifies the original digest while retaining the exact
+    /// compressed bytes; no transfer-side recompression is necessary.
     ///
     /// # Errors
     /// Returns an error on transport or verification failure.
@@ -529,7 +557,25 @@ impl NativeCacheClient {
         blob: BlobRef,
         reader: impl Read + Send + 'static,
     ) -> Result<()> {
-        self.send_stream("upload", &UploadHeader { ticket, blob }, blob.size, reader)?;
+        let mut encoded = tempfile::tempfile()?;
+        let reference =
+            crate::build_runtime::encode_native_blob(reader, &mut encoded, Some(blob.size))?;
+        ensure!(
+            reference == blob,
+            "native upload content digest or length mismatch"
+        );
+        encoded.rewind()?;
+        self.upload_encoded_file(ticket, blob, encoded)
+    }
+
+    /// Transfer an already-compressed immutable CAS blob without encoding again.
+    /// Encoded bytes are independently verified by the receiving scheduler.
+    ///
+    /// # Errors
+    /// Returns an error for a missing physical file or rejected transfer.
+    pub fn upload_encoded_file(&self, ticket: Ticket, blob: BlobRef, file: File) -> Result<()> {
+        let size = file.metadata()?.len();
+        self.send_stream("upload", &UploadHeader { ticket, blob }, size, file)?;
         Ok(())
     }
 
@@ -619,10 +665,11 @@ impl NativeCacheClient {
         blob: BlobRef,
         mut destination: impl Write,
     ) -> Result<()> {
-        copy_verified(
+        crate::build_runtime::transfer_native_blob(
             self.download_response(ticket, blob.id)?,
-            blob,
+            io::sink(),
             &mut destination,
+            blob,
         )
     }
 

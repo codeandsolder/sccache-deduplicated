@@ -136,7 +136,7 @@ fn recipe_lease_pins_original_packages_without_creating_an_indexed_root() -> Res
     assert!(store.lookup_tree(lease.id())?.is_none());
     assert_eq!(store.stats()?.trees, 1);
     assert_eq!(store.evict_tree(package)?, Eviction::Pinned);
-    assert_eq!(lease.open_file(blob.id)?.metadata()?.len(), blob.size);
+    assert_eq!(lease.open_decoded(blob.id)?.len(), blob.size);
     drop(lease);
     assert!(matches!(
         store.evict_tree(package)?,

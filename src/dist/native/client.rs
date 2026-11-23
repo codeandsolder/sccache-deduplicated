@@ -293,7 +293,7 @@ impl NativeCacheClient {
                     entry.insert(local.prepare_input(id, inputs, &|| renewals.check())?)
                 }
             };
-            self.push_tree(tree.manifest(), |content| tree.open_file(content), interval)
+            self.push_tree_encoded(tree.manifest(), |content| tree.open_file(content), interval)
         } else {
             let manifest = inputs.manifest(id)?;
             ensure!(manifest.id()? == id, "input provider supplied wrong tree");

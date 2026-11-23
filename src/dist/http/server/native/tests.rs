@@ -306,12 +306,12 @@ fn native_action_transfers_inputs_executes_and_publishes_without_worker_result_s
         let worker = make_client(url, "worker-token")?.for_worker(JobId(42));
         let root_pin = client.push_tree(
             root.manifest(),
-            |id| root.open_file(id),
+            |id| root.open_decoded(id),
             Duration::from_secs(1),
         )?;
         let source_pin = client.push_tree(
             source.manifest(),
-            |id| source.open_file(id),
+            |id| source.open_decoded(id),
             Duration::from_secs(1),
         )?;
         let mut spec = action(root.manifest())?;

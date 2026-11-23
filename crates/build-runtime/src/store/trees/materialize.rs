@@ -184,9 +184,15 @@ impl TreeLease {
         path: &Path,
         stats: &mut MaterializationStats,
     ) -> Result<()> {
-        let mut source = File::open(self.inner.blob_path(blob.id))?;
+        let source = File::open(self.inner.blob_path(blob.id))?;
+        let mut decoded = crate::BlobReader::open(source.try_clone()?)?;
         let mut destination = OpenOptions::new().write(true).create_new(true).open(path)?;
-        match rustix::fs::ioctl_ficlone(&destination, &source) {
+        let cloned = if decoded.is_compressed() {
+            Err(Errno::OPNOTSUPP)
+        } else {
+            rustix::fs::ioctl_ficlone(&destination, &source)
+        };
+        match cloned {
             Ok(()) => {
                 stats.cloned_files = stats
                     .cloned_files
@@ -197,7 +203,7 @@ impl TreeLease {
                 // The destination belongs exclusively to us, including if
                 // an unsupported clone attempt modified part of its size.
                 destination.set_len(0)?;
-                let copied = io::copy(&mut source, &mut destination)?;
+                let copied = io::copy(&mut decoded, &mut destination)?;
                 ensure!(copied == blob.size, "incomplete tree file copy");
                 stats.copied_files = stats
                     .copied_files
