@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, ensure};
 use bincode::Options;
-use redb::{ReadableDatabase, ReadableMultimapTable, ReadableTable};
+use redb::{ReadOnlyMultimapTable, ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -234,6 +234,90 @@ impl NativeStore {
         })
     }
 
+    fn reclaimable_potential(
+        &self,
+        blobs: &BTreeMap<ContentId, u64>,
+        disappearing: &BTreeSet<[u8; 32]>,
+        pinned_blobs: &BTreeSet<ContentId>,
+        owners: &ReadOnlyMultimapTable<&[u8; 32], &[u8; 32]>,
+        physical_pressure: bool,
+    ) -> Result<u64> {
+        let mut potential = 0_u64;
+        for (&id, &size) in blobs {
+            if pinned_blobs.contains(&id) || disappearing.is_empty() {
+                continue;
+            }
+            let mut has_owner = false;
+            let mut exclusive = true;
+            for reference in owners.get(&id.0)? {
+                has_owner = true;
+                if !disappearing.contains(reference?.value()) {
+                    exclusive = false;
+                    break;
+                }
+            }
+            ensure!(has_owner, "indexed eviction blob has no reverse reference");
+            if exclusive {
+                // st_blocks reports allocated blocks, including compression,
+                // but not snapshot/reflink exclusivity on ZFS. Validate real
+                // free space after GC rather than claiming exact release.
+                let bytes = if physical_pressure {
+                    std::fs::metadata(self.inner.blob_path(id))?
+                        .blocks()
+                        .checked_mul(512)
+                        .context("estimated allocated bytes overflow")?
+                } else {
+                    size
+                };
+                potential = potential
+                    .checked_add(bytes)
+                    .context("estimated reclaimable bytes overflow")?;
+            }
+        }
+        Ok(potential)
+    }
+
+    fn rank_eviction_candidate(
+        &self,
+        root: Root,
+        blobs: &BTreeMap<ContentId, u64>,
+        disappearing: &BTreeSet<[u8; 32]>,
+        owners: &ReadOnlyMultimapTable<&[u8; 32], &[u8; 32]>,
+        physical_pressure: bool,
+        observed: u64,
+    ) -> Result<(u8, u128, std::cmp::Reverse<u64>, u64, Root)> {
+        // The pin lock must not be held while consulting filesystem blocks:
+        // a slow ZFS metadata lookup must not delay normal cache hits.
+        let pins = self.inner.lock_pins()?;
+        let usage = pins.usage.get(&root).copied();
+        let pinned_blobs = blobs
+            .keys()
+            .filter(|id| pins.blobs.contains_key(*id))
+            .copied()
+            .collect::<BTreeSet<_>>();
+        drop(pins);
+        let total_bytes = blobs.values().try_fold(0_u64, |sum, &size| {
+            sum.checked_add(size)
+                .context("eviction root bytes overflow")
+        })?;
+        let potential = self.reclaimable_potential(
+            blobs,
+            disappearing,
+            &pinned_blobs,
+            owners,
+            physical_pressure,
+        )?;
+        Ok((
+            u8::from(potential == 0),
+            u128::from(reuse_utility(usage.as_ref(), total_bytes, observed))
+                .saturating_mul(1 << 20)
+                / u128::from(potential.max(1)),
+            std::cmp::Reverse(potential),
+            usage.map_or(0, |record| record.last_used_ms),
+            root,
+        ))
+    }
+
     fn eviction_candidates(&self, limit: usize, physical_pressure: bool) -> Result<Vec<Root>> {
         // This is intentionally a pressure-only path: query committed reverse
         // references and actual file allocation, never the lookup hot path.
@@ -245,73 +329,21 @@ impl NativeStore {
         let tree_packages = read.open_multimap_table(TREE_PACKAGES)?;
         let packages = read.open_table(PACKAGES)?;
         let blob_roots = read.open_multimap_table(BLOB_ROOTS)?;
-        let pins = self.inner.lock_pins()?;
         let observed = now_ms();
-        // Lowest cost-per-reclaimed-byte first; zero-release aliases come
-        // last, but can still be evicted to uncover the final shared owner.
-        // Keep at most K candidates even for very large stores.
+        // Bound memory to K candidates even when the backing index is huge.
         let mut candidates = BinaryHeap::new();
         let mut consider = |root: Root,
                             blobs: &BTreeMap<ContentId, u64>,
                             disappearing: &BTreeSet<[u8; 32]>|
          -> Result<()> {
-            let total_bytes = blobs.values().try_fold(0_u64, |sum, &size| {
-                sum.checked_add(size)
-                    .context("eviction root bytes overflow")
-            })?;
-            let mut unique_logical = 0_u64;
-            let mut estimated_blocks = 0_u64;
-            for (&id, &size) in blobs {
-                // A live descriptor may keep even an unreferenced blob in the
-                // pending-GC queue, so its bytes cannot relieve this pass.
-                if pins.blobs.contains_key(&id) || disappearing.is_empty() {
-                    continue;
-                }
-                let mut has_reference = false;
-                let mut exclusive = true;
-                for reference in blob_roots.get(&id.0)? {
-                    has_reference = true;
-                    if !disappearing.contains(reference?.value()) {
-                        exclusive = false;
-                        break;
-                    }
-                }
-                ensure!(
-                    has_reference,
-                    "indexed eviction blob has no reverse reference"
-                );
-                if !exclusive {
-                    continue;
-                }
-                unique_logical = unique_logical
-                    .checked_add(size)
-                    .context("reclaimable logical bytes overflow")?;
-                if physical_pressure {
-                    let allocated = std::fs::metadata(self.inner.blob_path(id))?
-                        .blocks()
-                        .checked_mul(512)
-                        .context("estimated allocated bytes overflow")?;
-                    estimated_blocks = estimated_blocks
-                        .checked_add(allocated)
-                        .context("estimated reclaimable bytes overflow")?;
-                }
-            }
-            let potential = if physical_pressure {
-                estimated_blocks
-            } else {
-                unique_logical
-            };
-            let usage = pins.usage.get(&root);
-            // A zero-potential root is only useful as a prerequisite for
-            // breaking a shared chain of owners. Prefer any direct recovery.
-            let rank = (
-                u8::from(potential == 0),
-                u128::from(reuse_utility(usage, total_bytes, observed)).saturating_mul(1 << 20)
-                    / u128::from(potential.max(1)),
-                std::cmp::Reverse(potential),
-                usage.map_or(0, |record| record.last_used_ms),
+            let rank = self.rank_eviction_candidate(
                 root,
-            );
+                blobs,
+                disappearing,
+                &blob_roots,
+                physical_pressure,
+                observed,
+            )?;
             if candidates.len() < limit {
                 candidates.push(rank);
             } else if candidates.peek().is_some_and(|worst| rank < *worst) {
@@ -323,7 +355,7 @@ impl NativeStore {
         for entry in actions.iter()? {
             let (key, value) = entry?;
             let key = ActionKey(*key.value());
-            if pins.actions.contains_key(&key) {
+            if self.inner.lock_pins()?.actions.contains_key(&key) {
                 continue;
             }
             let record: ActionRecord = encoding().deserialize(value.value())?;
@@ -346,7 +378,7 @@ impl NativeStore {
         for entry in trees.iter()? {
             let (id, value) = entry?;
             let id = TreeId(*id.value());
-            if pins.trees.contains_key(&id) {
+            if self.inner.lock_pins()?.trees.contains_key(&id) {
                 continue;
             }
             let manifest: TreeManifest = encoding().deserialize(value.value())?;
@@ -360,15 +392,14 @@ impl NativeStore {
                 let record: PackageRecord = encoding().deserialize(record.value())?;
                 ensure!(record.tree == id, "inconsistent native package tree");
                 disappearing.insert(package);
-                if let Some(BlobRef { id, size }) = record.archive {
-                    if let Some(previous) = blobs.insert(id, size) {
-                        ensure!(previous == size, "inconsistent archive content size");
-                    }
+                if let Some(BlobRef { id, size }) = record.archive
+                    && let Some(previous) = blobs.insert(id, size)
+                {
+                    ensure!(previous == size, "inconsistent archive content size");
                 }
             }
             consider(Root::Tree(id), &blobs, &disappearing)?;
         }
-        drop(pins);
         Ok(candidates
             .into_sorted_vec()
             .into_iter()
