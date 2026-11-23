@@ -347,12 +347,11 @@ fn validate_c_codegen(compiler: &Path, flags: &[String]) -> Result<()> {
         .stdin(Stdio::null())
         .output()
         .with_context(|| format!("cannot probe C compiler {}", compiler.display()))?;
+    let path = compiler.display();
+    let stderr = String::from_utf8_lossy(&output.stderr);
     ensure!(
         output.status.success(),
-        "C compiler {} rejected target flags {:?}: {}",
-        compiler.display(),
-        flags,
-        String::from_utf8_lossy(&output.stderr)
+        "C compiler {path} rejected target flags {flags:?}: {stderr}"
     );
     Ok(())
 }
@@ -580,6 +579,28 @@ mod tests {
             "x86_64-pc-linux-gnu"
         )?);
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn toolchain_probe_checks_actual_backend_support() {
+        assert!(
+            validate_c_codegen(
+                Path::new("gcc"),
+                &["-march=cpu-definitely-not-present-in-any-gcc".to_owned()]
+            )
+            .is_err()
+        );
+        assert!(
+            validate_c_codegen(
+                Path::new("clang"),
+                &[
+                    "--target=aarch64-unknown-linux-gnu".to_owned(),
+                    "-mcpu=this-does-not-exist".to_owned()
+                ]
+            )
+            .is_err()
+        );
     }
 
     #[cfg(target_os = "linux")]
