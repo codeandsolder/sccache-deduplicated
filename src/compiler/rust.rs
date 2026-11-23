@@ -1769,42 +1769,33 @@ impl FromArg for ArgCrateTypes {
         Ok(crate_types)
     }
 }
+impl ArgCrateTypes {
+    fn into_canonical_arg(self) -> String {
+        let Self {
+            rlib,
+            staticlib,
+            cdylib,
+            others,
+        } = self;
+        let mut types: Vec<_> = others
+            .iter()
+            .map(String::as_str)
+            .chain(if rlib { Some("rlib") } else { None })
+            .chain(if staticlib { Some("staticlib") } else { None })
+            .chain(if cdylib { Some("cdylib") } else { None })
+            .collect();
+        types.sort_unstable();
+        types.join(",")
+    }
+}
+
 impl IntoArg for ArgCrateTypes {
     fn into_arg_os_string(self) -> OsString {
-        let Self {
-            rlib,
-            staticlib,
-            cdylib,
-            others,
-        } = self;
-        let mut types: Vec<_> = others
-            .iter()
-            .map(String::as_str)
-            .chain(if rlib { Some("rlib") } else { None })
-            .chain(if staticlib { Some("staticlib") } else { None })
-            .chain(if cdylib { Some("cdylib") } else { None })
-            .collect();
-        types.sort_unstable();
-        let types_string = types.join(",");
-        types_string.into()
+        self.into_canonical_arg().into()
     }
+
     fn into_arg_string(self, _transformer: PathTransformerFn<'_>) -> ArgToStringResult {
-        let Self {
-            rlib,
-            staticlib,
-            cdylib,
-            others,
-        } = self;
-        let mut types: Vec<_> = others
-            .iter()
-            .map(String::as_str)
-            .chain(if rlib { Some("rlib") } else { None })
-            .chain(if staticlib { Some("staticlib") } else { None })
-            .chain(if cdylib { Some("cdylib") } else { None })
-            .collect();
-        types.sort_unstable();
-        let types_string = types.join(",");
-        Ok(types_string)
+        Ok(self.into_canonical_arg())
     }
 }
 
@@ -5061,6 +5052,28 @@ mod test {
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
     use test_case::test_case;
+
+    #[test]
+    fn crate_types_have_one_canonical_argument_for_hashing_and_execution() -> Result<()> {
+        for (input, expected) in [
+            (
+                "lib,cdylib,staticlib,proc-macro,custom",
+                "cdylib,custom,proc-macro,rlib,staticlib",
+            ),
+            ("staticlib,rlib,lib,bin,bin", "bin,rlib,staticlib"),
+            ("cdylib,rlib", "cdylib,rlib"),
+            ("", ""),
+        ] {
+            let parsed = ArgCrateTypes::process(input.into())?;
+            let command = parsed.clone().into_arg_os_string();
+            let cache_key = parsed.into_arg_string(&mut |_| None)?;
+
+            assert_eq!(command, OsString::from(expected));
+            assert_eq!(cache_key, expected);
+        }
+
+        Ok(())
+    }
 
     #[test]
     fn test_parse_native_profile() {
