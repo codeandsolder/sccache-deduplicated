@@ -13,90 +13,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::compiler::Language;
 use crate::compiler::args::{ArgDisposition, ArgInfo, FromArg};
-use crate::compiler::c::{
-    CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext, ParsedArguments,
-};
+use crate::compiler::c::CCompilerKind;
 use crate::compiler::cicc;
-use crate::compiler::{CCompileCommand, Cacheable, CompileCommand, CompilerArguments, Language};
-use crate::{counted_array, dist};
-
-use crate::mock_command::CommandCreatorSync;
-
-use async_trait::async_trait;
+use crate::counted_array;
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
-use std::process;
-
-use crate::errors::Result;
-
+use std::path::PathBuf;
 /// A unit struct on which to implement `CCompilerImpl`.
 #[derive(Clone, Debug)]
 pub struct Ptxas {
     pub version: Option<String>,
 }
 
-#[async_trait]
-impl CCompilerImpl for Ptxas {
-    fn kind(&self) -> CCompilerKind {
-        CCompilerKind::Ptxas
-    }
-    fn plusplus(&self) -> bool {
-        true
-    }
-    fn version(&self) -> Option<String> {
-        self.version.clone()
-    }
-    fn parse_arguments(
-        &self,
-        arguments: &[OsString],
-        cwd: &Path,
-        _env_vars: &[(OsString, OsString)],
-    ) -> CompilerArguments<ParsedArguments> {
-        cicc::parse_arguments(arguments, cwd, Language::Cubin, &ARGS[..], 3)
-    }
-    async fn preprocess<T>(&self, context: CPreprocessContext<'_, T>) -> Result<process::Output>
-    where
-        T: CommandCreatorSync,
-    {
-        let CPreprocessContext {
-            parsed_args, cwd, ..
-        } = context;
-        cicc::preprocess(cwd, parsed_args)
-    }
-    fn generate_compile_commands<T>(
-        &self,
-        context: CCompileContext<'_>,
-    ) -> Result<(
-        Box<dyn CompileCommand<T>>,
-        Option<dist::CompileCommand>,
-        Cacheable,
-    )>
-    where
-        T: CommandCreatorSync,
-    {
-        let CCompileContext {
-            path_transformer,
-            executable,
-            parsed_args,
-            cwd,
-            env_vars,
-            ..
-        } = context;
-        cicc::generate_compile_commands(
-            path_transformer,
-            executable,
-            parsed_args,
-            cwd,
-            env_vars,
-            cicc::OutputStyle::ObjectFile,
-        )
-        .map(|(command, dist_command, cacheable)| {
-            (CCompileCommand::boxed(command), dist_command, cacheable)
-        })
-    }
-}
+impl_cuda_stage_compiler!(
+    Ptxas,
+    CCompilerKind::Ptxas,
+    Language::Cubin,
+    &ARGS[..],
+    3,
+    cicc::OutputStyle::ObjectFile,
+);
 
 use cicc::ArgData::{Output, PassThrough};
 
