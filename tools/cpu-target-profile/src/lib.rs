@@ -56,12 +56,20 @@ pub struct DestinationProfile {
 }
 
 impl DestinationProfile {
+    /// Detect current CPU for the provided target triple.
+    ///
+    /// # Errors
+    /// CPU detection fails or the target architecture is incompatible.
     pub fn capture(target_triple: &str) -> Result<Self> {
         let detected =
             archspec::cpu::host().map_err(|_| anyhow::anyhow!("cannot detect destination CPU"))?;
         Self::from_microarchitecture(target_triple, &detected, ProfileOrigin::Detected)
     }
 
+    /// Define a destination CPU model independently of the build host.
+    ///
+    /// # Errors
+    /// The CPU is unknown or the target architecture is incompatible.
     pub fn named(target_triple: &str, name: &str) -> Result<Self> {
         let cpu = Microarchitecture::known_targets()
             .get(name)
@@ -96,6 +104,10 @@ impl DestinationProfile {
         })
     }
 
+    /// Resolve a requested CPU against a destination profile.
+    ///
+    /// # Errors
+    /// The CPU is unknown, requires unavailable features or the profile is inconsistent.
     pub fn resolve(&self, requested: Option<&str>) -> Result<&'static Microarchitecture> {
         ensure!(
             self.schema_version == SCHEMA_VERSION,
@@ -150,12 +162,20 @@ impl DestinationProfile {
         Ok(selected)
     }
 
+    /// Read an exported JSON destination CPU profile.
+    ///
+    /// # Errors
+    /// The profile file cannot be read or decoded.
     pub fn read(path: &Path) -> Result<Self> {
         let input =
             std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
         serde_json::from_slice(&input).context("invalid CPU profile JSON")
     }
 
+    /// Write the exported JSON destination CPU profile.
+    ///
+    /// # Errors
+    /// The profile cannot be serialized or written.
     pub fn write(&self, path: &Path) -> Result<()> {
         let serialized = serde_json::to_vec_pretty(self)?;
         std::fs::write(path, serialized).with_context(|| format!("cannot write {}", path.display()))
@@ -204,8 +224,12 @@ fn compiler_entries(set: &CompilerSet) -> Vec<&Compiler> {
     }
 }
 
-/// Resolve the compiler/version-specific Archspec mapping without choosing a
-/// different CPU if the requested target is unsupported by that compiler.
+/// Resolve Archspec flags for a specific compiler family and version.
+///
+/// Never substitute another CPU model when the requested target is unsupported.
+///
+/// # Errors
+/// The compiler version or the CPU/compiler mapping is unsupported.
 pub fn c_compiler_flags(
     cpu: &Microarchitecture,
     compiler: &str,
@@ -245,7 +269,7 @@ pub fn c_compiler_flags(
     }
     let flag_template = selected
         .with_context(|| format!("{compiler} {version} cannot compile for {}", cpu.name()))?;
-    let cpu_name = flag_template.name.as_deref().unwrap_or(cpu.name());
+    let cpu_name = flag_template.name.as_deref().unwrap_or_else(|| cpu.name());
     let expanded = flag_template.flags.replace("{name}", cpu_name);
     ensure!(
         !expanded.contains('{'),
@@ -288,6 +312,10 @@ fn compiler_version(compiler: &Path, family: &str) -> Result<String> {
     Ok(numeric.to_owned())
 }
 
+/// Select explicit C compiler flags from a real compiler binary.
+///
+/// # Errors
+/// The compiler cannot be probed or is incompatible with the destination.
 pub fn selected_c_flags(
     profile: &DestinationProfile,
     target_cpu: Option<&str>,
@@ -303,6 +331,10 @@ pub fn selected_c_flags(
     c_compiler_flags(cpu, family, &version)
 }
 
+/// Generate an explicit Rust CPU target for a compiler binary.
+///
+/// # Errors
+/// Rustc cannot be probed or does not support the destination CPU.
 pub fn rustc_flags(
     profile: &DestinationProfile,
     target_cpu: Option<&str>,
@@ -367,6 +399,10 @@ struct CargoConfig {
     target: BTreeMap<String, CargoTarget>,
 }
 
+/// Generate Cargo target-specific rustc configuration only.
+///
+/// # Errors
+/// The CPU is unsupported or configuration serialization fails.
 pub fn cargo_toml(
     profile: &DestinationProfile,
     target_cpu: Option<&str>,
@@ -385,6 +421,7 @@ fn cmake_quote(value: &str) -> String {
         .replace(';', "\\;")
 }
 
+#[must_use = "The CMake configuration must be used by the native build"]
 pub fn cmake_toolchain(flags: &[String]) -> String {
     let flags = cmake_quote(&flags.join(" "));
     format!("set(CMAKE_C_FLAGS_INIT \"{flags}\")\nset(CMAKE_CXX_FLAGS_INIT \"{flags}\")\n")
@@ -394,6 +431,7 @@ fn meson_quote(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
+#[must_use = "The Meson configuration must be passed to the native build"]
 pub fn meson_options(flags: &[String]) -> String {
     let flags = flags
         .iter()
@@ -423,8 +461,8 @@ pub fn show_flags(flags: &[String]) -> String {
 mod tests {
     use super::*;
 
-    fn mock_profile(name: &str) -> DestinationProfile {
-        DestinationProfile::named("x86_64-unknown-linux-gnu", name).unwrap()
+    fn mock_profile(name: &str) -> Result<DestinationProfile> {
+        DestinationProfile::named("x86_64-unknown-linux-gnu", name)
     }
 
     #[test]
@@ -442,7 +480,7 @@ mod tests {
 
     #[test]
     fn gcc_and_clang_select_independent_flags() -> Result<()> {
-        let profile = mock_profile("x86_64_v3");
+        let profile = mock_profile("x86_64_v3")?;
         let cpu = profile.resolve(None)?;
         let gcc = c_compiler_flags(cpu, "gcc", "16.2.1")?;
         let clang = c_compiler_flags(cpu, "clang", "23.1.5")?;
@@ -453,8 +491,24 @@ mod tests {
     }
 
     #[test]
+    fn rust_flags_do_not_depend_on_gcc_flag_mappings() -> Result<()> {
+        let profile = mock_profile("x86_64_v3")?;
+        let cpu = profile.resolve(None)?;
+        let cargo_before = cargo_toml(&profile, None, Path::new("rustc"))?;
+        let gcc_old = c_compiler_flags(cpu, "gcc", "10.2.0")?;
+        let gcc_new = c_compiler_flags(cpu, "gcc", "16.2.1")?;
+        assert_ne!(gcc_old, gcc_new);
+        assert_eq!(
+            cargo_toml(&profile, None, Path::new("rustc"))?,
+            cargo_before
+        );
+        assert!(!cargo_before.contains("-march="));
+        Ok(())
+    }
+
+    #[test]
     fn reject_target_incompatible_with_captured_destination() -> Result<()> {
-        let profile = mock_profile("x86_64_v2");
+        let profile = mock_profile("x86_64_v2")?;
         assert!(profile.resolve(Some("x86_64_v4")).is_err());
         assert!(profile.resolve(Some("neoverse_n2")).is_err());
         Ok(())
@@ -462,7 +516,7 @@ mod tests {
 
     #[test]
     fn cargo_flags_do_not_include_c_compiler_options() -> Result<()> {
-        let profile = mock_profile("x86_64_v3");
+        let profile = mock_profile("x86_64_v3")?;
         let doc = cargo_toml(&profile, None, Path::new("rustc"))?;
         assert!(doc.contains("target-cpu=x86-64-v3"));
         assert!(!doc.contains("-march="));
@@ -472,12 +526,12 @@ mod tests {
 
     #[test]
     fn named_profiles_can_target_a_cpu_absent_from_build_host() -> Result<()> {
-        let profile = mock_profile("x86_64_v4");
+        let profile = mock_profile("x86_64_v4")?;
         let flags = rustc_flags(&profile, None, Path::new("rustc"))?;
         assert_eq!(flags, ["-C", "target-cpu=x86-64-v4"]);
         assert_eq!(profile.origin, ProfileOrigin::NamedModel);
         assert!(
-            mock_profile("x86_64_v3")
+            mock_profile("x86_64_v3")?
                 .resolve(Some("x86_64_v4"))
                 .is_err()
         );

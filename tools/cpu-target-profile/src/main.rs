@@ -64,7 +64,7 @@ enum CCompiler {
     Clang,
 }
 impl CCompiler {
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Self::Gcc => "gcc",
             Self::Clang => "clang",
@@ -95,26 +95,28 @@ fn main() -> Result<()> {
                 OutputFormat::Cargo => cargo_toml(
                     &profile,
                     cpu,
-                    compiler.as_deref().unwrap_or(Path::new("rustc")),
+                    compiler.as_deref().unwrap_or_else(|| Path::new("rustc")),
                 )?,
                 OutputFormat::Gcc => show_flags(&selected_c_flags(
                     &profile,
                     cpu,
                     "gcc",
-                    compiler.as_deref().unwrap_or(Path::new("gcc")),
+                    compiler.as_deref().unwrap_or_else(|| Path::new("gcc")),
                 )?),
                 OutputFormat::Clang => show_flags(&selected_c_flags(
                     &profile,
                     cpu,
                     "clang",
-                    compiler.as_deref().unwrap_or(Path::new("clang")),
+                    compiler.as_deref().unwrap_or_else(|| Path::new("clang")),
                 )?),
                 OutputFormat::Cmake | OutputFormat::Meson => {
                     let flags = selected_c_flags(
                         &profile,
                         cpu,
                         c_compiler.name(),
-                        compiler.as_deref().unwrap_or(Path::new(c_compiler.name())),
+                        compiler
+                            .as_deref()
+                            .unwrap_or_else(|| Path::new(c_compiler.name())),
                     )?;
                     if matches!(format, OutputFormat::Cmake) {
                         cmake_toolchain(&flags)
