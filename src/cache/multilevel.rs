@@ -1031,23 +1031,23 @@ impl Storage for MultiLevelStorage {
     }
 
     async fn current_size(&self) -> Result<Option<u64>> {
-        let mut total = 0u64;
+        let mut total = None;
         for level in &self.levels {
             if let Some(size) = level.current_size().await? {
-                total = total.saturating_add(size);
+                total = Some(total.unwrap_or(0u64).saturating_add(size));
             }
         }
-        if total > 0 { Ok(Some(total)) } else { Ok(None) }
+        Ok(total)
     }
 
     async fn max_size(&self) -> Result<Option<u64>> {
-        let mut total = 0u64;
+        let mut total = None;
         for level in &self.levels {
             if let Some(size) = level.max_size().await? {
-                total = total.saturating_add(size);
+                total = Some(total.unwrap_or(0u64).saturating_add(size));
             }
         }
-        if total > 0 { Ok(Some(total)) } else { Ok(None) }
+        Ok(total)
     }
 
     fn multilevel_stats(&self) -> Option<crate::cache::multilevel::MultiLevelStats> {
