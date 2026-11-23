@@ -300,3 +300,34 @@ fn staged_files_keep_exact_reservations_until_commit_or_drop() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn exact_budget_allows_exact_verified_blob_but_rejects_oversize() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut limit = policy();
+    limit.max_resident_bytes = 3;
+    limit.target_resident_bytes = 3;
+    let store = NativeStore::open_managed(temp.path(), limit)?;
+    let expected = BlobRef {
+        id: ContentId::of(b"abc"),
+        size: 3,
+    };
+    let exact = store.stage_expected(expected, &b"abc"[..])?;
+    assert_eq!(
+        store
+            .maintain_space()?
+            .context("missing policy")?
+            .reserved_bytes,
+        3
+    );
+    drop(exact);
+    assert!(store.stage_expected(expected, &b"abcd"[..]).is_err());
+    assert_eq!(
+        store
+            .maintain_space()?
+            .context("missing policy")?
+            .reserved_bytes,
+        0
+    );
+    Ok(())
+}

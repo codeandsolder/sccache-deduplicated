@@ -519,7 +519,9 @@ impl NativeStore {
             .size
             .checked_add(1)
             .context("blob length overflow")?;
-        let staged = self.stage_inner(reader.take(limit), Some(limit))?;
+        // Read one extra byte to detect overflow, but reserve only the
+        // declared content size against the worker's resident limit.
+        let staged = self.stage_inner(reader.take(limit), Some(expected.size))?;
         ensure!(
             staged.reference() == expected,
             "uploaded content does not match its declared digest and length"
