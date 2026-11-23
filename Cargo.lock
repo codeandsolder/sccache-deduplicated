@@ -3449,7 +3449,7 @@ dependencies = [
  "which",
  "windows-sys 0.61.2",
  "zip",
- "zlib-rs 0.6.8 (git+https://github.com/codeandsolder/zlib-rs-fast?rev=2c1738816c8ff05398c406572d40eec67f0a001e)",
+ "zlib-rs 0.6.8 (git+https://github.com/codeandsolder/zlib-rs-fast?rev=3674828ec79cdb974b95b13428853d6ff6bdc85f)",
  "zstd",
 ]
 
@@ -5010,7 +5010,7 @@ checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 [[package]]
 name = "zlib-rs"
 version = "0.6.8"
-source = "git+https://github.com/codeandsolder/zlib-rs-fast?rev=2c1738816c8ff05398c406572d40eec67f0a001e#2c1738816c8ff05398c406572d40eec67f0a001e"
+source = "git+https://github.com/codeandsolder/zlib-rs-fast?rev=3674828ec79cdb974b95b13428853d6ff6bdc85f#3674828ec79cdb974b95b13428853d6ff6bdc85f"
 dependencies = [
  "rayon-core",
 ]
