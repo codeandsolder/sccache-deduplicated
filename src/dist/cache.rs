@@ -79,6 +79,47 @@ mod client {
         }
     }
 
+    /// Read a best-effort shortcut index; archive contents live in the disk LRU.
+    /// A malformed JSON document is disposable, but filesystem errors are not.
+    fn load_weak_map(cache_dir: &Path) -> Result<HashMap<String, String>> {
+        let weak_map_path = cache_dir.join("weak_map.json");
+        if !weak_map_path.exists() {
+            fs::File::create(&weak_map_path)
+                .and_then(|mut f| f.write_all(b"{}"))
+                .context(format!(
+                    "failed to create new toolchain weak map file: {}",
+                    weak_map_path.display()
+                ))?;
+        }
+        let weak_map_file = fs::File::open(&weak_map_path).with_context(|| {
+            format!(
+                "failed to open toolchain weak map: {}",
+                weak_map_path.display()
+            )
+        })?;
+        // This index is only a shortcut. A truncated or malformed JSON file
+        // must not stop sccache from starting or discard cached archives.
+        let weak_map: HashMap<String, String> = match serde_json::from_reader(weak_map_file) {
+            Ok(map) => map,
+            Err(error) if !error.is_io() => {
+                warn!(
+                    "Ignoring invalid toolchain weak map {}: {error}",
+                    weak_map_path.display()
+                );
+                HashMap::new()
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to read toolchain weak map: {}",
+                        weak_map_path.display()
+                    )
+                });
+            }
+        };
+        Ok(weak_map)
+    }
+
     pub struct ClientToolchains {
         cache_dir: PathBuf,
         cache: Mutex<TcCache>,
@@ -121,22 +162,7 @@ mod client {
                 toolchain_creation_dir.display()
             ))?;
 
-            let weak_map_path = cache_dir.join("weak_map.json");
-            if !weak_map_path.exists() {
-                fs::File::create(&weak_map_path)
-                    .and_then(|mut f| f.write_all(b"{}"))
-                    .context(format!(
-                        "failed to create new toolchain weak map file: {}",
-                        weak_map_path.display()
-                    ))?;
-            }
-            let weak_map = fs::File::open(&weak_map_path)
-                .map_err(Error::from)
-                .and_then(|f| serde_json::from_reader(f).map_err(Error::from))
-                .context(format!(
-                    "failed to load toolchain weak map: {}",
-                    weak_map_path.display()
-                ))?;
+            let weak_map = load_weak_map(&cache_dir)?;
 
             let tc_cache_dir = cache_dir.join("tc");
             let cache = TcCache::new(&tc_cache_dir, cache_size)
@@ -644,6 +670,38 @@ mod client {
             let persisted: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(cache_dir.join("weak_map.json"))?)?;
             assert_eq!(persisted["weak_key"], toolchain.archive_id.to_string());
+            Ok(())
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        #[test]
+        fn malformed_weak_map_json_recovers_without_losing_archives() -> Result<()> {
+            for broken in [
+                b"{".as_slice(),
+                b"[]".as_slice(),
+                b"{\"weak_key\":false}".as_slice(),
+            ] {
+                let (_td, cache_dir, first, expected) = cached_toolchain()?;
+                drop(first);
+                std::fs::write(cache_dir.join("weak_map.json"), broken)?;
+
+                let recovered = ClientToolchains::new(&cache_dir, 1024 * 1024, &[])?;
+                assert!(recovered.get_toolchain(&expected)?.is_some());
+                assert_eq!(recovered.weak_to_strong("weak_key")?, None);
+
+                let (toolchain, _) = recovered.put_toolchain(
+                    "/my/compiler".as_ref(),
+                    "weak_key",
+                    Box::new(StaticToolchainPackager),
+                )?;
+                assert_eq!(toolchain, expected);
+                let persisted: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(cache_dir.join("weak_map.json"))?)?;
+                assert_eq!(persisted["weak_key"], expected.archive_id.to_string());
+            }
             Ok(())
         }
 
