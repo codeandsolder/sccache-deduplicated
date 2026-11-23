@@ -57,6 +57,7 @@ pub struct StagedBlob {
     metadata: fs::Metadata,
     reference: BlobRef,
     owner: Arc<Inner>,
+    _reservation: space::StagingReservation,
 }
 
 impl StagedBlob {
@@ -467,11 +468,20 @@ impl NativeStore {
                     } else {
                         // Grow unknown-length streams in 4 MiB increments.
                         const CHUNK: u64 = 4 * 1024 * 1024;
-                        budget.grow_to(
-                            size.div_ceil(CHUNK)
-                                .checked_mul(CHUNK)
-                                .context("staging budget overflow")?,
-                        )?;
+                        let reservation = size
+                            .div_ceil(CHUNK)
+                            .checked_mul(CHUNK)
+                            .context("staging budget overflow")?;
+                        // A small managed worker must be able to stage a
+                        // small object even with a budget below one chunk.
+                        let reservation = self.inner.space_policy.map_or(reservation, |policy| {
+                            reservation.min(policy.max_resident_bytes)
+                        });
+                        ensure!(
+                            size <= reservation,
+                            "native staged content exceeds resident budget"
+                        );
+                        budget.grow_to(reservation)?;
                     }
                     file.write_all(bytes)?;
                     hash.update(bytes);
@@ -486,6 +496,7 @@ impl NativeStore {
             .set_permissions(fs::Permissions::from_mode(0o400))?;
         file.as_file().sync_all()?;
         let metadata = file.as_file().metadata()?;
+        let reservation = budget.finish(size)?;
         Ok(StagedBlob {
             path: file.into_temp_path(),
             metadata,
@@ -494,6 +505,7 @@ impl NativeStore {
                 size,
             },
             owner: Arc::clone(&self.inner),
+            _reservation: reservation,
         })
     }
 

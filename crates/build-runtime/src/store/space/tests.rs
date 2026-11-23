@@ -185,8 +185,8 @@ fn usage_survives_restart_and_is_removed_with_evicted_roots() -> Result<()> {
             .inner
             .lock_pins()?
             .usage
-            .get(&Root::Action(cold))
-            .is_none()
+            .contains_key(&Root::Action(cold))
+            == false
     );
     Ok(())
 }
@@ -253,6 +253,51 @@ fn clean_shutdown_checkpoints_unflushed_accesses() -> Result<()> {
             .context("orderly shutdown lost usage")?
             .hits
             >= 7
+    );
+    drop(pins);
+    Ok(())
+}
+
+#[test]
+fn staged_files_keep_exact_reservations_until_commit_or_drop() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut limit = policy();
+    limit.max_resident_bytes = 10;
+    limit.target_resident_bytes = 8;
+    let store = NativeStore::open_managed(temp.path(), limit)?;
+    let first = store.stage(&b"12345"[..])?;
+    assert_eq!(
+        store
+            .maintain_space()?
+            .context("missing policy")?
+            .reserved_bytes,
+        5
+    );
+    // A second concurrent upload cannot overcommit the worker budget.
+    assert!(store.stage(&b"abcdef"[..]).is_err());
+    assert_eq!(
+        store
+            .maintain_space()?
+            .context("missing policy")?
+            .reserved_bytes,
+        5
+    );
+    drop(first);
+    let second = store.stage(&b"abcdef"[..])?;
+    assert_eq!(
+        store
+            .maintain_space()?
+            .context("missing policy")?
+            .reserved_bytes,
+        6
+    );
+    drop(second);
+    assert_eq!(
+        store
+            .maintain_space()?
+            .context("missing policy")?
+            .reserved_bytes,
+        0
     );
     Ok(())
 }

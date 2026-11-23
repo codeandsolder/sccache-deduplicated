@@ -1,7 +1,10 @@
 //! Shared resident-cache accounting, admission, and restart-safe reuse policy.
 //! ZFS controls physical compression and allocation. Logical byte limits are
 //! deliberately conservative and do not replace filesystem free-space checks.
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use bincode::Options;
@@ -9,7 +12,7 @@ use redb::{ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ACTIONS, ActionRecord, Eviction, NativeStore, RESULTS, TREES, encoding, persist_usage,
+    ACTIONS, ActionRecord, Eviction, Inner, NativeStore, RESULTS, TREES, encoding, persist_usage,
 };
 use crate::{ActionKey, ResultManifest, SpacePolicy, TreeId, TreeManifest};
 
@@ -343,6 +346,51 @@ impl<'a> StageBudget<'a> {
         self.reserved = size;
         drop(state);
         Ok(())
+    }
+    /// Hold exact staged bytes until the file is committed or discarded.
+    /// Streaming round-up is released to avoid inflating small blob charges.
+    pub(super) fn finish(mut self, actual_bytes: u64) -> Result<StagingReservation> {
+        if self.store.inner.space_policy.is_some() {
+            ensure!(
+                actual_bytes <= self.reserved,
+                "native staging content exceeds its reservation"
+            );
+        }
+        if actual_bytes < self.reserved {
+            let mut state = self
+                .store
+                .inner
+                .space
+                .lock()
+                .map_err(|_| anyhow!("native stage space lock poisoned"))?;
+            let surplus = self.reserved - actual_bytes;
+            state.reserved = state
+                .reserved
+                .checked_sub(surplus)
+                .context("native staging reservation underflow")?;
+            self.reserved = actual_bytes;
+        }
+        let reserved = std::mem::take(&mut self.reserved);
+        Ok(StagingReservation {
+            inner: Arc::clone(&self.store.inner),
+            reserved,
+        })
+    }
+}
+
+pub(super) struct StagingReservation {
+    inner: Arc<Inner>,
+    reserved: u64,
+}
+
+impl Drop for StagingReservation {
+    fn drop(&mut self) {
+        if self.reserved > 0 {
+            match self.inner.space.lock() {
+                Ok(mut state) => state.reserved -= self.reserved,
+                Err(error) => log::error!("native staged blob reservation release failed: {error}"),
+            }
+        }
     }
 }
 
