@@ -475,21 +475,60 @@ impl LruDiskCache {
                 "cache source must be a regular file",
             )));
         }
+        // A renamed hard link would keep the cache sharing an inode with a
+        // mutable external path. Only the unique-link fast path may rename.
+        #[cfg(unix)]
+        let has_external_links = {
+            use std::os::unix::fs::MetadataExt;
+            metadata.nlink() > 1
+        };
+        #[cfg(windows)]
+        let has_external_links = {
+            use std::mem::MaybeUninit;
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+            };
+
+            let check = || -> io::Result<bool> {
+                let file = File::open(source)?;
+                let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+                // SAFETY: the open File owns a valid live handle; Windows fills
+                // the complete output record on success and retains no pointer.
+                let status =
+                    unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) };
+                if status == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: the API successfully initialized every field.
+                Ok(unsafe { info.assume_init() }.nNumberOfLinks > 1)
+            };
+            check().unwrap_or_else(|error| {
+                warn!("Cannot inspect cache source hard links: {error}; copying instead");
+                true
+            })
+        };
+        #[cfg(not(any(unix, windows)))]
+        let has_external_links = true;
+
         let size = metadata.len();
         let root = self.root.clone();
         self.commit_replacement(key.as_ref(), size, |destination| {
-            if source == destination || fs::rename(source, destination).is_ok() {
+            if !has_external_links
+                && (source == destination || fs::rename(source, destination).is_ok())
+            {
                 return Ok(());
             }
-            // Cross-device copies must also be staged; copying onto an existing
-            // entry would destroy it if the transfer failed midway through.
-            warn!("fs::rename failed, falling back to copy!");
+            // Shared inodes and cross-device imports need their own contents;
+            // stage the copy so a failure cannot truncate a live cache entry.
             let staged = tempfile::Builder::new()
                 .prefix(TEMPFILE_PREFIX)
                 .tempfile_in(root)?;
             fs::copy(source, staged.path())?;
             staged.persist(destination).map_err(|error| error.error)?;
-            if let Err(error) = fs::remove_file(source) {
+            if source != destination
+                && let Err(error) = fs::remove_file(source)
+            {
                 error!("Failed to remove original file in insert_file: {error}");
             }
             Ok(())
@@ -1039,6 +1078,34 @@ mod tests {
         }
 
         assert_eq!(read_all(&mut cache.get("entry")?)?, b"original");
+        assert_eq!(cache.size(), 8);
+        Ok(())
+    }
+
+    #[test]
+    fn importing_hardlinks_detaches_external_mutable_inodes() -> Result<()> {
+        let fixture = TestFixture::new()?;
+        let root = fixture.tmp().join("cache");
+        let mut cache = LruDiskCache::new(&root, 32)?;
+        let source = fixture.tmp().join("source");
+        let alias = fixture.tmp().join("external-alias");
+        fs::write(&source, b"original")?;
+        fs::hard_link(&source, &alias)?;
+
+        cache.insert_file("entry", &source)?;
+        assert!(!source.exists());
+        assert_eq!(fs::read(&alias)?, b"original");
+        fs::write(&alias, b"changed!")?;
+        assert_eq!(read_all(&mut cache.get("entry")?)?, b"original");
+
+        // Reimporting the cache's own pathname must also detach any newly
+        // created outside hard link, without deleting the destination.
+        let external = fixture.tmp().join("second-alias");
+        fs::hard_link(root.join("entry"), &external)?;
+        cache.insert_file("entry", root.join("entry"))?;
+        fs::write(&external, b"mutated!")?;
+        assert_eq!(read_all(&mut cache.get("entry")?)?, b"original");
+        assert_eq!(cache.len(), 1);
         assert_eq!(cache.size(), 8);
         Ok(())
     }
