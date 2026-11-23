@@ -345,7 +345,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"8";
+const CACHE_VERSION: &[u8] = b"9";
 
 struct RustDepInfoRequest<'a, T> {
     creator: &'a T,
@@ -949,6 +949,29 @@ fn rust_shadow_args(args: &[(OsString, Option<OsString>)]) -> Vec<String> {
         .flat_map(|(arg, value)| std::iter::once(arg).chain(value.as_ref()))
         .map(|value| value.to_string_lossy().into_owned())
         .collect()
+}
+
+// Encode argument records, not an unframed concatenation of their text.
+// Otherwise one -C link-arg containing "-Clink-arg=" can alias two -C options.
+fn hash_rust_argument_pairs<'a>(
+    digest: &mut Digest,
+    args: impl ExactSizeIterator<Item = &'a (OsString, Option<OsString>)>,
+) {
+    digest.delimiter(b"rust-argv-v1");
+    digest.update(&(args.len() as u128).to_le_bytes());
+    for (name, value) in args {
+        let name_bytes = name.as_encoded_bytes();
+        digest.update(&(name_bytes.len() as u128).to_le_bytes());
+        digest.update(name_bytes);
+        if let Some(value) = value {
+            digest.update(&[1]);
+            let value_bytes = value.as_encoded_bytes();
+            digest.update(&(value_bytes.len() as u128).to_le_bytes());
+            digest.update(value_bytes);
+        } else {
+            digest.update(&[0]);
+        }
+    }
 }
 
 fn rust_shadow_root(canonical: &CanonicalRustPaths) -> RustShadowRoots {
@@ -3169,39 +3192,30 @@ where
         // A few argument types are not passed in a deterministic order
         // by cargo: --extern, -L, --cfg. We'll filter those out, sort them,
         // and append them to the rest of the arguments.
-        let args = {
-            let (mut sortables, rest): (Vec<_>, Vec<_>) = hash_os_string_arguments
-                .iter()
-                // We exclude a few arguments from the hash:
-                //   -L, --extern, --out-dir, --diagnostic-width
-                // These contain paths which aren't relevant to the output, and the compiler inputs
-                // in those paths (rlibs and static libs used in the compilation) are used as hash
-                // inputs below.
-                .filter(|&(arg, _)| {
-                    !(arg == "--extern"
-                        || arg == "-L"
-                        || arg == "--check-cfg"
-                        || arg == "--out-dir"
-                        || arg == "--diagnostic-width")
-                })
-                // We also exclude `--target` if it specifies a path to a .json file. The file content
-                // is used as hash input below.
-                // If `--target` specifies a string, it continues to be hashed as part of the arguments.
-                .filter(|&(arg, _)| self.parsed_args.target_json.is_none() || arg != "--target")
-                // A few argument types were not passed in a deterministic order
-                // by older versions of cargo: --extern, -L, --cfg. We'll filter the rest of those
-                // out, sort them, and append them to the rest of the arguments.
-                .partition(|&(arg, _)| arg == "--cfg");
-            sortables.sort();
-            rest.into_iter()
-                .chain(sortables)
-                .flat_map(|(arg, val)| iter::once(arg).chain(val.as_ref()))
-                .fold(OsString::new(), |mut a, b| {
-                    a.push(b);
-                    a
-                })
-        };
-        args.hash(&mut HashToDigest { digest: &mut m });
+        let (mut sortables, rest): (Vec<_>, Vec<_>) = hash_os_string_arguments
+            .iter()
+            // We exclude a few arguments from the hash:
+            //   -L, --extern, --out-dir, --diagnostic-width
+            // These contain paths which aren't relevant to the output, and the compiler inputs
+            // in those paths (rlibs and static libs used in the compilation) are used as hash
+            // inputs below.
+            .filter(|&(arg, _)| {
+                !(arg == "--extern"
+                    || arg == "-L"
+                    || arg == "--check-cfg"
+                    || arg == "--out-dir"
+                    || arg == "--diagnostic-width")
+            })
+            // We also exclude `--target` if it specifies a path to a .json file. The file content
+            // is used as hash input below.
+            // If `--target` specifies a string, it continues to be hashed as part of the arguments.
+            .filter(|&(arg, _)| self.parsed_args.target_json.is_none() || arg != "--target")
+            // A few argument types were not passed in a deterministic order
+            // by older versions of cargo: --extern, -L, --cfg. We'll filter the rest of those
+            // out, sort them, and append them to the rest of the arguments.
+            .partition(|&(arg, _)| arg == "--cfg");
+        sortables.sort();
+        hash_rust_argument_pairs(&mut m, rest.into_iter().chain(sortables));
         if native_requested {
             // Keep the resolved host profile in the cache identity even when
             // `native` was rewritten to a proven-equivalent explicit CPU for
@@ -6673,7 +6687,12 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         // sysroot shlibs digests.
         m.update(FAKE_DIGEST.as_bytes());
         // Arguments, with cfgs sorted at the end.
-        OsStr::new("ab--cfgabc--cfgxyz").hash(&mut HashToDigest { digest: &mut m });
+        let args = [
+            (OsString::from("ab"), None),
+            (OsString::from("--cfg"), Some(OsString::from("abc"))),
+            (OsString::from("--cfg"), Some(OsString::from("xyz"))),
+        ];
+        hash_rust_argument_pairs(&mut m, args.iter());
         // bar.rs (source file, from dep-info)
         m.update(empty_digest.as_bytes());
         // foo.rs (source file, from dep-info)
@@ -6697,6 +6716,42 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         let mut out = res.compilation.outputs().map(|k| k.key).collect::<Vec<_>>();
         out.sort();
         assert_eq!(out, vec!["foo.a", "foo.rlib", "foo.rmeta"]);
+    }
+
+    #[test]
+    fn rust_cache_argument_hash_preserves_boundaries() {
+        let single = [(
+            OsString::from("-C"),
+            Some(OsString::from("link-arg=a-Clink-arg=b")),
+        )];
+        let split = [
+            (OsString::from("-C"), Some(OsString::from("link-arg=a"))),
+            (OsString::from("-C"), Some(OsString::from("link-arg=b"))),
+        ];
+        let legacy_join = |args: &[(OsString, Option<OsString>)]| {
+            args.iter()
+                .flat_map(|(flag, value)| std::iter::once(flag).chain(value.as_ref()))
+                .fold(OsString::new(), |mut joined, part| {
+                    joined.push(part);
+                    joined
+                })
+        };
+        assert_eq!(legacy_join(&single), legacy_join(&split));
+
+        let framed_hash = |args: &[(OsString, Option<OsString>)]| {
+            let mut digest = Digest::new();
+            hash_rust_argument_pairs(&mut digest, args.iter());
+            digest.finish()
+        };
+        assert_ne!(framed_hash(&single), framed_hash(&split));
+        assert_ne!(
+            framed_hash(&[(OsString::from("-C"), None)]),
+            framed_hash(&[(OsString::from("-C"), Some(OsString::new()))])
+        );
+        assert_ne!(
+            framed_hash(&[(OsString::from("ab"), None)]),
+            framed_hash(&[(OsString::from("a"), None), (OsString::from("b"), None),])
+        );
     }
 
     #[test]
