@@ -137,6 +137,15 @@ impl BlobReader {
             let stored = usize::try_from(word & !RAW_CHUNK)?;
             let plain = usize::try_from(u32::from_le_bytes(widths[4..].try_into()?))?;
             let compressed = word & RAW_CHUNK == 0;
+            // Logical seeking divides by CHUNK; every chunk except the last
+            // must therefore cover exactly CHUNK decoded bytes.
+            let remaining = plain_len
+                .checked_sub(decoded)
+                .context("CAS chunk position exceeds content")?;
+            ensure!(
+                plain == usize::try_from(remaining.min(CHUNK as u64))?,
+                "noncanonical CAS chunk position"
+            );
             ensure!(
                 stored > 0
                     && stored <= zstd::zstd_safe::compress_bound(CHUNK)
@@ -404,6 +413,13 @@ fn transfer_zstd_chunks(
         let word = u32::from_le_bytes(widths[..4].try_into()?);
         let stored = usize::try_from(word & !RAW_CHUNK)?;
         let plain = usize::try_from(u32::from_le_bytes(widths[4..].try_into()?))?;
+        let remaining = size
+            .checked_sub(decoded)
+            .context("CAS transfer chunk position overflow")?;
+        ensure!(
+            plain == usize::try_from(remaining.min(CHUNK as u64))?,
+            "noncanonical transported CAS chunk position"
+        );
         ensure!(
             stored > 0
                 && stored <= zstd::zstd_safe::compress_bound(CHUNK)
@@ -521,6 +537,37 @@ mod tests {
             reference,
             BlobEncoding::ZstdChunks,
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn reject_noncanonical_chunk_layout_even_when_total_plaintext_matches() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("tampered");
+        let data = vec![0x44_u8; CHUNK + 8000];
+        let mut file = File::create(&path)?;
+        let reference = encode(data.as_slice(), &mut file, None)?;
+        drop(file);
+        let mut corrupted = std::fs::read(&path)?;
+        let first_stored =
+            usize::try_from(u32::from_le_bytes(corrupted[32..36].try_into()?) & !RAW_CHUNK)?;
+        let second_header = 40 + first_stored;
+        let first = u32::try_from(CHUNK - 10)?;
+        let last = 8010_u32;
+        corrupted[36..40].copy_from_slice(&first.to_le_bytes());
+        corrupted[second_header + 4..second_header + 8].copy_from_slice(&last.to_le_bytes());
+        std::fs::write(&path, &corrupted)?;
+        assert!(BlobReader::open(File::open(&path)?, BlobEncoding::ZstdChunks).is_err());
+        assert!(
+            transfer(
+                corrupted.as_slice(),
+                io::sink(),
+                io::sink(),
+                reference,
+                BlobEncoding::ZstdChunks,
+            )
+            .is_err()
+        );
         Ok(())
     }
 
