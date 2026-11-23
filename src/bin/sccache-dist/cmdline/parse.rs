@@ -110,6 +110,18 @@ fn get_clap_command() -> ClapCommand {
     let command = ClapCommand::new(env!("CARGO_PKG_NAME"));
     #[cfg(target_os = "linux")]
     let command = command.subcommand(
+        ClapCommand::new("native-sync-system")
+            .about("Discover original packages owning selected installed system files using pacman metadata")
+            .arg(flag_infer_long("client-config").value_parser(clap::value_parser!(PathBuf)).required(true))
+            .arg(flag_infer_long("path").value_parser(clap::value_parser!(PathBuf))
+                .action(clap::ArgAction::Append).required(true)
+                .help("Installed file whose owning package should be provisioned; repeat for the discovered toolchain closure"))
+            .arg(flag_infer_long("cache-dir").value_parser(clap::value_parser!(PathBuf))
+                .default_value("/var/cache/pacman/pkg"))
+            .arg(flag_infer_long("jobs").value_parser(clap::value_parser!(std::num::NonZeroUsize))
+                .default_value("2")),
+    );
+    let command = command.subcommand(
         ClapCommand::new("native-sync-rust")
             .about("Acquire original packages for an installed Rustup sysroot and emit its recipe and verified catalog")
             .arg(flag_infer_long("root").value_parser(clap::value_parser!(PathBuf)).required(true))
@@ -347,6 +359,25 @@ pub fn try_parse_from(
                 manifest_output: matches.get_one::<PathBuf>("manifest-output").cloned(),
             }
         }
+        #[cfg(target_os = "linux")]
+        Some(("native-sync-system", matches)) => Command::NativeSyncSystem {
+            client_config: matches
+                .get_one::<PathBuf>("client-config")
+                .context("missing client configuration")?
+                .clone(),
+            paths: matches
+                .get_many::<PathBuf>("path")
+                .context("missing selected paths")?
+                .cloned()
+                .collect(),
+            cache_dir: matches
+                .get_one::<PathBuf>("cache-dir")
+                .context("missing pacman package cache directory")?
+                .clone(),
+            jobs: *matches
+                .get_one::<std::num::NonZeroUsize>("jobs")
+                .context("missing acquisition concurrency")?,
+        },
         #[cfg(target_os = "linux")]
         Some(("native-sync-rust", matches)) => Command::NativeSyncRust {
             root: matches

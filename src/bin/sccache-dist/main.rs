@@ -35,6 +35,8 @@ mod command_helpers;
 mod native;
 #[cfg(target_os = "linux")]
 mod rustup;
+#[cfg(target_os = "linux")]
+mod system_packages;
 mod token_check;
 #[cfg(target_os = "linux")]
 use native::NativeWorker;
@@ -391,6 +393,17 @@ fn run(command: Command) -> Result<i32> {
             Ok(0)
         }
         #[cfg(target_os = "linux")]
+        Command::NativeSyncSystem {
+            client_config,
+            paths,
+            cache_dir,
+            jobs,
+        } => {
+            let client = package_client(&client_config)?;
+            let report = system_packages::sync_packages(&client, &paths, &cache_dir, jobs)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(0)
+        }
         Command::NativeSyncRust {
             root,
             client_config,

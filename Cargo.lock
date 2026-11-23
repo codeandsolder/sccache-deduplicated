@@ -3436,6 +3436,7 @@ dependencies = [
  "opendal-http-transport-reqwest",
  "opendal-layer-logging",
  "openssl",
+ "percent-encoding",
  "predicates",
  "rand 0.10.4",
  "regex",

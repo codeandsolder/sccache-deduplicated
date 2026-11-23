@@ -57,6 +57,13 @@ pub enum Command {
         manifest_output: Option<std::path::PathBuf>,
     },
     #[cfg(target_os = "linux")]
+    NativeSyncSystem {
+        client_config: std::path::PathBuf,
+        paths: Vec<std::path::PathBuf>,
+        cache_dir: std::path::PathBuf,
+        jobs: std::num::NonZeroUsize,
+    },
+    #[cfg(target_os = "linux")]
     NativeSyncRust {
         root: std::path::PathBuf,
         client_config: std::path::PathBuf,

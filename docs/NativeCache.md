@@ -414,6 +414,31 @@ content IDs can be covered wherever those files are mounted. Archive
 members must satisfy the build tree representation (regular files,
 directories and links; no set-ID modes or device nodes).
 
+### Installed system package discovery (pacman)
+
+Provision releases from the files actually selected by a compiler or
+toolchain closure, using the package manager's installed ownership and
+synchronized repository SHA-256 metadata:
+
+```sh
+sccache-dist native-sync-system --client-config /path/to/client.toml \
+  --path /usr/bin/gcc --path /usr/bin/as --path /usr/include/stdio.h \
+  --jobs 2
+```
+
+For each distinct owner, the command checks its installed version against
+the selected repository release and reads the release's SHA-256, repository
+name and original archive filename. It reuses existing verified packages,
+imports exact cached originals from /var/cache/pacman/pkg when present,
+otherwise requests direct acquisition from a named upstream. Repository
+names must match the configured scheduler prefixes. A custom cache path
+can be provided with `--cache-dir`. It reports unowned paths and release
+version mismatches explicitly rather than fabricating package provenance.
+This does not replace the compiler's actual source discovery or hash
+validation: locally modified files remain distinct semantic inputs. The
+command is opt-in and is intended for provisioning the toolchain closure,
+not automatically importing the entire installed operating system.
+
 ### Compressed original delivery to workers
 
 Enable original-package reconstruction on workers with explicit decoder

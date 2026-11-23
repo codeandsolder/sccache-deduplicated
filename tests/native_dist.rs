@@ -791,6 +791,122 @@ fn named_system_upstream_provisions_original_without_client_upload() -> Result<(
     Ok(())
 }
 
+#[test]
+#[ignore = "requires pacman with a cached, installed GCC release, plus isolated scheduler and worker"]
+fn pacman_discovery_seeds_real_gcc_and_compiles_with_exact_results() -> Result<()> {
+    use sccache::build_runtime::{PackageCompression, PackageIdentity};
+    let installed = Command::new("/usr/bin/pacman")
+        .args(["-Q", "gcc"])
+        .output()?;
+    ensure!(
+        installed.status.success(),
+        "test host must provide installed GCC"
+    );
+    let metadata = Command::new("/usr/bin/pacman")
+        .args(["-Sp", "--print-format", "%n|%v|%a|%h|%r|%l", "gcc"])
+        .output()?;
+    ensure!(
+        metadata.status.success(),
+        "test requires synchronized GCC release metadata"
+    );
+    let release = String::from_utf8(metadata.stdout)?;
+    let (_, fields) = release
+        .split_once('|')
+        .context("pacman GCC record missing")?;
+    let values: Vec<_> = fields.trim().split('|').collect();
+    ensure!(values.len() == 5, "unexpected GCC release record");
+    let installed_version = String::from_utf8(installed.stdout)?
+        .trim()
+        .split_once(' ')
+        .context("installed GCC version missing")?
+        .1
+        .to_owned();
+    ensure!(
+        values[0] == installed_version,
+        "installed GCC differs from sync repository"
+    );
+    let identity = PackageIdentity::from_sha256_hex(values[2], PackageCompression::Zstd)?;
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let fleet = Fleet::start(root, BTreeMap::new())?;
+    let config = provisioning_config(root, &fleet.cache_url)?;
+    let discover = || {
+        Command::new(env!("CARGO_BIN_EXE_sccache-dist"))
+            .args(["native-sync-system", "--client-config"])
+            .arg(&config)
+            .args([
+                "--path",
+                "/usr/bin/gcc",
+                "--cache-dir",
+                "/var/cache/pacman/pkg",
+            ])
+            .output()
+    };
+    let first = discover()?;
+    ensure!(
+        first.status.success(),
+        "system sync failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&first.stdout)?;
+    assert_eq!(report["provisioned"][0]["name"], "gcc");
+    assert_eq!(report["provisioned"][0]["reused"], false);
+    assert_eq!(report["provisioned"][0]["transfer"], "local-original");
+    let second = discover()?;
+    ensure!(
+        second.status.success(),
+        "warm system sync failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let warm: serde_json::Value = serde_json::from_slice(&second.stdout)?;
+    assert_eq!(warm["provisioned"][0]["reused"], true);
+    assert_eq!(warm["provisioned"][0]["transfer"], "existing");
+    let client = NativeCacheClient::new(
+        fleet.cache_url.clone(),
+        CLIENT_TOKEN.into(),
+        Duration::from_secs(60),
+        1024 * 1024,
+    )?;
+    let receipt = client
+        .lookup_package(identity)?
+        .context("original GCC missing from scheduler")?;
+    assert_eq!(receipt.source.identity, identity);
+
+    let mut service = LocalService::start(root, &fleet, None)?;
+    let directory = root.join("source");
+    fs::create_dir(&directory)?;
+    fs::write(
+        directory.join("probe.c"),
+        b"int native_pacman_probe(int value) { return value * 7 + 2; }\n",
+    )?;
+    let reference = Command::new("/usr/bin/gcc")
+        .args(["-c", "probe.c", "-O2", "-o", "reference.o"])
+        .current_dir(&directory)
+        .output()?;
+    ensure!(reference.status.success(), "local GCC compilation failed");
+    let result = service
+        .command(env!("CARGO_BIN_EXE_sccache"))
+        .arg("/usr/bin/gcc")
+        .args(["-c", "probe.c", "-O2", "-o", "native.o"])
+        .current_dir(&directory)
+        .output()?;
+    ensure!(
+        result.status.success(),
+        "native GCC compilation failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read(directory.join("native.o"))?,
+        fs::read(directory.join("reference.o"))?
+    );
+    assert_eq!(service.stats()?.dist_compiles.values().sum::<usize>(), 1);
+    service.stop()?;
+    let (scheduler, worker) = fleet.finish()?;
+    assert_eq!(scheduler.actions, 1);
+    assert_eq!(worker.actions, 0);
+    Ok(())
+}
+
 fn provision_compressed_fixture(
     client: &NativeCacheClient,
     root: &Path,
