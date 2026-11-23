@@ -6,11 +6,17 @@ use std::io::{BufReader, BufWriter, ErrorKind, Read};
 
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 use crate::common::{HTTPVersion, Method};
 use crate::util::RefinedTcpStream;
 use crate::util::{SequentialReader, SequentialReaderBuilder, SequentialWriterBuilder};
 use crate::Request;
+
+// A whole header section has a fixed budget, including CRLF delimiters;
+// arbitrary-length headers must not consume unbounded memory.
+const MAX_REQUEST_HEADER_BYTES: usize = 64 * 1024;
+const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A ClientConnection is an object that will store a socket to a client
 /// and return Request objects.
@@ -75,35 +81,41 @@ impl ClientConnection {
         }
     }
 
-    /// true if the connection is HTTPS
-    pub fn secure(&self) -> bool {
-        self.secure
-    }
-
-    /// Reads the next line from self.next_header_source.
-    ///
-    /// Reads until `CRLF` is reached. The next read will start
-    ///  at the first byte of the new line.
-    fn read_next_line(&mut self) -> IoResult<AsciiString> {
+    /// Read one CRLF-terminated line within the remaining section budget.
+    /// The returned byte count includes CRLF for precise cumulative limits.
+    fn read_next_line(
+        &mut self,
+        remaining: usize,
+        started: Instant,
+    ) -> IoResult<(AsciiString, usize)> {
         let mut buf = Vec::new();
         let mut prev_byte_was_cr = false;
-
         loop {
             let byte = self.next_header_source.by_ref().bytes().next();
-
             let byte = match byte {
                 Some(b) => b?,
                 None => return Err(IoError::new(ErrorKind::ConnectionAborted, "Unexpected EOF")),
             };
-
+            if started.elapsed() > REQUEST_HEADER_TIMEOUT {
+                return Err(IoError::new(
+                    ErrorKind::TimedOut,
+                    "HTTP request header deadline exceeded",
+                ));
+            }
             if byte == b'\n' && prev_byte_was_cr {
-                buf.pop(); // removing the '\r'
+                buf.pop(); // discard CR
+                let used = buf.len() + 2;
                 return AsciiString::from_ascii(buf)
+                    .map(|line| (line, used))
                     .map_err(|_| IoError::new(ErrorKind::InvalidInput, "Header is not in ASCII"));
             }
-
+            if buf.len() + 1 >= remaining {
+                return Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    "HTTP request header exceeds maximum size",
+                ));
+            }
             prev_byte_was_cr = byte == b'\r';
-
             buf.push(byte);
         }
     }
@@ -112,21 +124,21 @@ impl ClientConnection {
     /// Blocks until the header has been read.
     fn read(&mut self) -> Result<Request, ReadError> {
         let (method, path, version, headers) = {
-            // reading the request line
-            let (method, path, version) = {
-                let line = self.read_next_line().map_err(ReadError::ReadIoError)?;
-
-                parse_request_line(
-                    line.as_str().trim(), // TODO: remove this conversion
-                )?
-            };
+            let started = Instant::now();
+            let (line, used) = self
+                .read_next_line(MAX_REQUEST_HEADER_BYTES, started)
+                .map_err(ReadError::ReadIoError)?;
+            let mut remaining = MAX_REQUEST_HEADER_BYTES - used;
+            let (method, path, version) = parse_request_line(line.as_str().trim())?;
 
             // getting all headers
             let headers = {
                 let mut headers = Vec::new();
                 loop {
-                    let line = self.read_next_line().map_err(ReadError::ReadIoError)?;
-
+                    let (line, used) = self
+                        .read_next_line(remaining, started)
+                        .map_err(ReadError::ReadIoError)?;
+                    remaining -= used;
                     if line.is_empty() {
                         break;
                     };
@@ -210,7 +222,9 @@ impl Iterator for ClientConnection {
                                  // se we have to close
                 }
 
-                Err(ReadError::ReadIoError(ref err)) if err.kind() == ErrorKind::TimedOut => {
+                Err(ReadError::ReadIoError(ref err))
+                    if matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) =>
+                {
                     // request timeout
                     let writer = self.sink.next().unwrap();
                     let response = Response::new_empty(StatusCode(408));
@@ -218,6 +232,15 @@ impl Iterator for ClientConnection {
                         .raw_print(writer, HTTPVersion(1, 1), &[], false, None)
                         .ok();
                     return None; // closing the connection
+                }
+
+                Err(ReadError::ReadIoError(ref err)) if err.kind() == ErrorKind::InvalidData => {
+                    let writer = self.sink.next().unwrap();
+                    let response = Response::new_empty(StatusCode(431));
+                    response
+                        .raw_print(writer, HTTPVersion(1, 1), &[], false, None)
+                        .ok();
+                    return None;
                 }
 
                 Err(ReadError::ExpectationFailed(ver)) => {

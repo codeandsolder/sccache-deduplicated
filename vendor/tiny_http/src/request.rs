@@ -96,7 +96,7 @@ impl<R: Write> Write for NotifyOnDrop<R> {
 }
 impl<R> Drop for NotifyOnDrop<R> {
     fn drop(&mut self) {
-        self.sender.send(()).unwrap();
+        let _ = self.sender.send(());
     }
 }
 
@@ -435,7 +435,7 @@ impl Request {
     {
         let res = self.respond_impl(response);
         if let Some(sender) = self.notify_when_responded.take() {
-            sender.send(()).unwrap();
+            let _ = sender.send(());
         }
         res
     }
@@ -491,7 +491,7 @@ impl Drop for Request {
             let response = Response::empty(500);
             let _ = self.respond_impl(response); // ignoring any potential error
             if let Some(sender) = self.notify_when_responded.take() {
-                sender.send(()).unwrap();
+                let _ = sender.send(());
             }
         }
     }
@@ -506,6 +506,44 @@ impl<T> ReadWrite for T where T: Read + Write {}
 #[cfg(test)]
 mod tests {
     use super::Request;
+
+    fn standalone_request() -> super::Request {
+        super::new_request(
+            false,
+            crate::Method::Get,
+            "/".to_owned(),
+            crate::common::HTTPVersion(1, 1),
+            Vec::new(),
+            None,
+            std::io::empty(),
+            std::io::sink(),
+        )
+        .expect("construct request")
+    }
+
+    #[test]
+    fn disconnected_response_receiver_does_not_panic() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(receiver);
+        standalone_request()
+            .with_notify_sender(sender)
+            .respond(crate::Response::from_string("ok"))
+            .expect("write response");
+    }
+
+    #[test]
+    fn disconnected_cleanup_receiver_does_not_panic() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(receiver);
+        drop(standalone_request().with_notify_sender(sender));
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(receiver);
+        let writer = standalone_request()
+            .with_notify_sender(sender)
+            .into_writer();
+        drop(writer);
+    }
 
     #[test]
     fn must_be_send() {

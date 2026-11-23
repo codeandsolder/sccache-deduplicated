@@ -101,7 +101,6 @@ use std::io::Result as IoResult;
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
-#[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -127,13 +126,14 @@ mod ssl;
 mod test;
 mod util;
 
-/// A bounded admission permit for TLS handshakes. Accepted connections
-/// must never stall the single listener thread.
-#[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
-struct HandshakePermit(Arc<AtomicUsize>);
+// Bound idle reads and writes, not the duration of an actively streaming upload.
+pub(crate) const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(60);
 
-#[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
-impl HandshakePermit {
+/// Admission permits bound both connection and handshake tasks to avoid
+/// resource exhaustion from clients that stall at any protocol stage.
+struct AdmissionPermit(Arc<AtomicUsize>);
+
+impl AdmissionPermit {
     fn acquire(active: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
         let mut count = active.load(Ordering::Acquire);
         loop {
@@ -153,8 +153,7 @@ impl HandshakePermit {
     }
 }
 
-#[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
-impl Drop for HandshakePermit {
+impl Drop for AdmissionPermit {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Release);
     }
@@ -318,6 +317,11 @@ impl Server {
         // and ClientConnection objects are pushed in the messages queue
         let messages = MessagesQueue::with_capacity(8);
 
+        let active_connections = Arc::new(AtomicUsize::new(0));
+        let max_connections = thread::available_parallelism()
+            .map(|cpus| cpus.get().saturating_mul(32))
+            .unwrap_or(128)
+            .clamp(128, 512);
         #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
         let active_handshakes = Arc::new(AtomicUsize::new(0));
         #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
@@ -336,11 +340,25 @@ impl Server {
             while !inside_close_trigger.load(Relaxed) {
                 match server.accept() {
                     Ok((sock, _)) => {
+                        let connection_permit =
+                            match AdmissionPermit::acquire(&active_connections, max_connections) {
+                                Some(permit) => permit,
+                                None => {
+                                    log::warn!("Too many concurrent HTTP connections");
+                                    continue;
+                                }
+                            };
+                        // Incomplete HTTP headers and abandoned uploads must
+                        // not occupy connection threads indefinitely.
+                        if let Err(error) = sock.set_io_timeout(Some(SOCKET_IO_TIMEOUT)) {
+                            log::warn!("Could not configure HTTP socket timeout: {}", error);
+                            continue;
+                        }
                         // A silent TLS peer must not block the accept loop, and
                         // many such peers must not create unbounded threads.
                         #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
                         let mut permit = if ssl.is_some() {
-                            match HandshakePermit::acquire(&active_handshakes, max_handshakes) {
+                            match AdmissionPermit::acquire(&active_handshakes, max_handshakes) {
                                 Some(permit) => Some(permit),
                                 None => {
                                     log::warn!("Too many concurrent TLS handshakes");
@@ -354,6 +372,7 @@ impl Server {
                         let messages = inside_messages.clone();
                         let mut sock = Some(sock);
                         tasks_pool.spawn(Box::new(move || {
+                            let _connection_permit = &connection_permit;
                             let Some(sock) = sock.take() else { return };
                             use util::RefinedTcpStream;
                             let (read_closable, write_closable) = match ssl {
@@ -379,18 +398,15 @@ impl Server {
                             drop(permit.take());
 
                             let client = ClientConnection::new(write_closable, read_closable);
-                            // Synchronization avoids concurrent TLS reads and writes.
-                            if client.secure() {
-                                let (sender, receiver) = mpsc::channel();
-                                for rq in client {
-                                    messages.push(rq.with_notify_sender(sender.clone()).into());
-                                    if receiver.recv().is_err() {
-                                        break;
-                                    }
-                                }
-                            } else {
-                                for rq in client {
-                                    messages.push(rq.into());
+                            // A pipelining client must not enqueue unbounded
+                            // requests; allow the next request only after its
+                            // predecessor is answered. TLS also needs this to
+                            // serialize reader and writer access.
+                            let (sender, receiver) = mpsc::channel();
+                            for rq in client {
+                                messages.push(rq.with_notify_sender(sender.clone()).into());
+                                if receiver.recv().is_err() {
+                                    break;
                                 }
                             }
                         }));
@@ -509,13 +525,13 @@ mod handshake_permit_tests {
     #[test]
     fn handshake_slots_are_bounded_and_released() {
         let active = Arc::new(AtomicUsize::new(0));
-        let first = HandshakePermit::acquire(&active, 2).expect("first slot");
-        let second = HandshakePermit::acquire(&active, 2).expect("second slot");
-        assert!(HandshakePermit::acquire(&active, 2).is_none());
+        let first = AdmissionPermit::acquire(&active, 2).expect("first slot");
+        let second = AdmissionPermit::acquire(&active, 2).expect("second slot");
+        assert!(AdmissionPermit::acquire(&active, 2).is_none());
         assert_eq!(active.load(Ordering::Acquire), 2);
         drop(first);
         assert_eq!(active.load(Ordering::Acquire), 1);
-        let third = HandshakePermit::acquire(&active, 2).expect("reused slot");
+        let third = AdmissionPermit::acquire(&active, 2).expect("reused slot");
         drop(second);
         drop(third);
         assert_eq!(active.load(Ordering::Acquire), 0);
