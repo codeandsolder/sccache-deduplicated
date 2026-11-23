@@ -17,6 +17,20 @@ use serde::Deserialize;
 struct TreeAccess {
     tree: TreeId,
     blobs: Vec<BlobRef>,
+    hit: bool,
+}
+
+#[derive(Deserialize)]
+struct TreeTransfer {
+    raw_missing_bytes: u128,
+}
+
+#[derive(Default)]
+struct Observed {
+    requests: u64,
+    hits: u64,
+    raw_bytes: u128,
+    transfers: u64,
 }
 
 struct Budget {
@@ -154,8 +168,8 @@ fn unique(blobs: &[BlobRef]) -> Result<Vec<BlobRef>> {
         .collect())
 }
 
-fn run(budgets: &mut [Budget], lines: impl BufRead) -> Result<u64> {
-    let mut events = 0_u64;
+fn run(budgets: &mut [Budget], lines: impl BufRead) -> Result<Observed> {
+    let mut observed = Observed::default();
     for (line_number, line) in lines.lines().enumerate() {
         let line = line?;
         let Some(start) = line.find('{') else {
@@ -165,17 +179,30 @@ fn run(budgets: &mut [Budget], lines: impl BufRead) -> Result<u64> {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
             continue;
         };
-        if value.get("kind").and_then(serde_json::Value::as_str) != Some("tree_access") {
-            continue;
+        match value.get("kind").and_then(serde_json::Value::as_str) {
+            Some("tree_access") => {
+                let event: TreeAccess = serde_json::from_value(value)
+                    .with_context(|| format!("invalid tree_access at line {}", line_number + 1))?;
+                observed.requests = observed.requests.saturating_add(1);
+                observed.hits += u64::from(event.hit);
+                for budget in budgets.iter_mut() {
+                    budget.access(&event)?;
+                }
+            }
+            Some("tree_transfer") => {
+                let event: TreeTransfer = serde_json::from_value(value).with_context(|| {
+                    format!("invalid tree_transfer at line {}", line_number + 1)
+                })?;
+                observed.transfers = observed.transfers.saturating_add(1);
+                observed.raw_bytes = observed
+                    .raw_bytes
+                    .checked_add(event.raw_missing_bytes)
+                    .context("observed transfer bytes overflow")?;
+            }
+            _ => {}
         }
-        let event: TreeAccess = serde_json::from_value(value)
-            .with_context(|| format!("invalid tree_access at line {}", line_number + 1))?;
-        for budget in budgets.iter_mut() {
-            budget.access(&event)?;
-        }
-        events += 1;
     }
-    Ok(events)
+    Ok(observed)
 }
 
 fn main() -> Result<()> {
@@ -191,8 +218,11 @@ fn main() -> Result<()> {
         sizes.insert(budget);
     }
     let mut budgets = sizes.into_iter().map(Budget::new).collect::<Vec<_>>();
-    let events = run(&mut budgets, io::stdin().lock())?;
-    ensure!(events > 0, "no native tree_access events in input");
+    let observed = run(&mut budgets, io::stdin().lock())?;
+    ensure!(
+        observed.requests > 0,
+        "no native tree_access events in input"
+    );
     println!("budget_bytes\trequests\thits\thit_pct\tdownload_bytes\tevictions\tpeak_bytes");
     for budget in budgets {
         let percent_tenths = u128::from(budget.hits) * 1000 / u128::from(budget.requests);
@@ -208,6 +238,10 @@ fn main() -> Result<()> {
             budget.peak
         );
     }
+    eprintln!(
+        "Observed native canary: {} tree accesses, {} local-tree hits, {} raw transfer sessions, {} raw logical bytes fetched",
+        observed.requests, observed.hits, observed.transfers, observed.raw_bytes
+    );
     Ok(())
 }
 
@@ -218,6 +252,7 @@ mod tests {
     fn event(tree: u8, blobs: &[(u8, u64)]) -> TreeAccess {
         TreeAccess {
             tree: TreeId([tree; 32]),
+            hit: false,
             blobs: blobs
                 .iter()
                 .map(|&(id, size)| BlobRef {
@@ -267,15 +302,49 @@ mod tests {
     }
 
     #[test]
+    fn observed_transfer_bytes_are_independent_from_simulated_lru() -> Result<()> {
+        let mut cache = vec![Budget::new(100)];
+        let access = serde_json::json!({
+            "kind": "tree_access",
+            "tree": vec![1u8; 32],
+            "blobs": [{"id": vec![2u8; 32], "size": 50}],
+            "hit": false,
+        });
+        let transfer = serde_json::json!({
+            "kind": "tree_transfer",
+            "tree": vec![1u8; 32],
+            "raw_missing_blobs": 0,
+            "raw_missing_bytes": 0,
+        });
+        let input = format!(
+            "{access}
+{transfer}
+"
+        );
+        let observed = run(&mut cache, input.as_bytes())?;
+        assert_eq!(observed.requests, 1);
+        assert_eq!(observed.raw_bytes, 0);
+        assert_eq!(observed.transfers, 1);
+        // Reconstructing a previously unknown tree can reuse blob content
+        // already in another root; the independent LRU baseline has no
+        // knowledge of that prior state.
+        assert_eq!(cache[0].downloaded, 50);
+        Ok(())
+    }
+
+    #[test]
     fn parser_ignores_other_logs_but_rejects_bad_access_events() -> Result<()> {
         let mut cache = vec![Budget::new(100)];
         let mut payload = serde_json::json!({
             "kind":"tree_access",
+            "hit":true,
             "tree":vec![1u8; 32],
             "blobs":[{"id":vec![2u8; 32],"size":16}],
         });
         let log = format!("garbage\nprefix {}\nother log\n", payload);
-        assert_eq!(run(&mut cache, log.as_bytes())?, 1);
+        let stats = run(&mut cache, log.as_bytes())?;
+        assert_eq!(stats.requests, 1);
+        assert_eq!(stats.hits, 1);
         assert_eq!(cache[0].downloaded, 16);
         payload["tree"] = serde_json::json!("not a digest");
         assert!(run(&mut cache, format!("{payload}\n").as_bytes()).is_err());
