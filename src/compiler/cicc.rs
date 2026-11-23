@@ -130,17 +130,28 @@ pub fn parse_arguments<S>(
 where
     S: SearchableArgInfo<ArgData>,
 {
-    let mut args = arguments.to_vec();
     let input_loc = match language {
         Language::Ptx => arguments.iter().position(is_cicc_input),
         Language::Cubin => arguments.iter().position(is_ptxas_input),
         _ => None,
     }
-    .unwrap_or(arguments.len() - input_arg_offset_from_end);
-    let Some(input) = args.splice(input_loc..=input_loc, []).next() else {
+    // The expected trailing position is a fallback, not a precondition:
+    // explicit PTX/CICC inputs may occur even in shorter argument lists.
+    // `unwrap_or` would evaluate a potentially underflowing subtraction
+    // even when an input suffix had already been located.
+    .or_else(|| arguments.len().checked_sub(input_arg_offset_from_end));
+    let Some((input_loc, input)) =
+        input_loc.and_then(|index| arguments.get(index).map(|input| (index, input)))
+    else {
         return CompilerArguments::CannotCache("missing compiler input", None);
     };
 
+    // Borrow the source and parse the remaining options directly instead of
+    // allocating a temporary Vec and cloning every option twice.
+    let args = arguments[..input_loc]
+        .iter()
+        .chain(arguments[input_loc + 1..].iter())
+        .cloned();
     let mut take_next = false;
     let mut outputs = HashMap::new();
     let mut extra_dist_files = vec![];
@@ -150,9 +161,12 @@ where
     let mut common_args = vec![];
     let mut unhashed_args = vec![];
 
-    for arg in ArgsIter::new(args.iter().cloned(), arg_info) {
-        let Ok(arg) = arg else {
-            continue;
+    for arg in ArgsIter::new(args, arg_info) {
+        let arg = match arg {
+            Ok(arg) => arg,
+            Err(error) => {
+                return CompilerArguments::CannotCache("argument parse", Some(error.to_string()));
+            }
         };
         let args = match arg.get_data() {
             Some(PassThrough(_)) => {
@@ -200,12 +214,18 @@ where
                 &mut unhashed_args
             }
             None => match arg {
-                Argument::Raw(_) => {
+                Argument::Raw(ref operand) => {
                     if take_next {
                         take_next = false;
                         &mut common_args
                     } else {
-                        continue;
+                        // Device compilation handles exactly one positional
+                        // input. Dropping another would change both the
+                        // executed argv and the input-dependent cache key.
+                        return CompilerArguments::CannotCache(
+                            "unexpected positional compiler argument",
+                            Some(operand.to_string_lossy().into_owned()),
+                        );
                     }
                 }
                 Argument::UnknownFlag(ref p) => {
@@ -233,8 +253,12 @@ where
         }
     }
 
+    if !outputs.contains_key("obj") {
+        return CompilerArguments::CannotCache("missing compiler output", None);
+    }
+
     CompilerArguments::Ok(ParsedArguments {
-        input: input.into(),
+        input: input.clone().into(),
         outputs,
         double_dash_input: false,
         language,
@@ -522,5 +546,142 @@ mod test {
                 parsed.outputs.get("obj")
             );
         }
+    }
+
+    #[test]
+    fn truncated_cuda_arguments_never_select_invalid_input() {
+        for (arguments, language, arg_info, offset) in [
+            (os_strings(&[]), Language::Ptx, &ARGS[..], 3),
+            (os_strings(&["-arch"]), Language::Cubin, &ptxas::ARGS[..], 3),
+            (
+                os_strings(&["--output-file=kernel.cubin", "not-a-source"]),
+                Language::Cubin,
+                &ptxas::ARGS[..],
+                3,
+            ),
+            (os_strings(&[]), Language::CudaFE, &ARGS[..], 1),
+        ] {
+            let parsed = parse_arguments(&arguments, Path::new("."), language, arg_info, offset);
+            assert!(
+                matches!(parsed, CompilerArguments::CannotCache(_, _)),
+                "truncated argument list unexpectedly cacheable: {arguments:?} -> {parsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn suffix_selected_before_fallback_even_for_short_invocations() {
+        // The input suffix is authoritative; a fixed-position fallback must
+        // not be evaluated eagerly when the source is already known.
+        let arguments = os_strings(&["kernel.ptx", "-o=kernel.cubin"]);
+        let parsed = parse_arguments(
+            &arguments,
+            Path::new("."),
+            Language::Cubin,
+            &ptxas::ARGS[..],
+            3,
+        );
+        let CompilerArguments::Ok(parsed) = parsed else {
+            panic!("short valid PTX invocation was rejected: {parsed:?}");
+        };
+        assert_eq!(parsed.input, PathBuf::from("kernel.ptx"));
+        assert_eq!(
+            parsed
+                .outputs
+                .get("obj")
+                .map(|output| output.path.as_path()),
+            Some(Path::new("./kernel.cubin"))
+        );
+    }
+
+    #[test]
+    fn malformed_cuda_flags_and_missing_outputs_are_not_cacheable() {
+        let trailing_missing_value =
+            os_strings(&["kernel.ptx", "--output-file=kernel.cubin", "-arch"]);
+        assert!(matches!(
+            parse_arguments(
+                &trailing_missing_value,
+                Path::new("."),
+                Language::Cubin,
+                &ptxas::ARGS[..],
+                3
+            ),
+            CompilerArguments::CannotCache("argument parse", Some(_))
+        ));
+
+        for (arguments, language, arg_info, offset) in [
+            (
+                os_strings(&["kernel.ptx"]),
+                Language::Cubin,
+                &ptxas::ARGS[..],
+                3,
+            ),
+            (
+                os_strings(&["kernel.cpp1.ii", "--gen_module_id_file"]),
+                Language::Ptx,
+                &ARGS[..],
+                3,
+            ),
+        ] {
+            assert!(matches!(
+                parse_arguments(&arguments, Path::new("."), language, arg_info, offset),
+                CompilerArguments::CannotCache("missing compiler output", None)
+            ));
+        }
+    }
+
+    #[test]
+    fn additional_positional_cuda_inputs_cannot_disappear_from_cache_keys() {
+        for (arguments, language, arg_info) in [
+            (
+                os_strings(&["kernel.ptx", "second.ptx", "-o=kernel.cubin"]),
+                Language::Cubin,
+                &ptxas::ARGS[..],
+            ),
+            (
+                os_strings(&["extra-file", "kernel.ptx", "-o=kernel.cubin"]),
+                Language::Cubin,
+                &ptxas::ARGS[..],
+            ),
+            (
+                os_strings(&["kernel.cpp1.ii", "other.cpp1.ii", "-o", "kernel.ptx"]),
+                Language::Ptx,
+                &ARGS[..],
+            ),
+        ] {
+            assert!(
+                matches!(
+                    parse_arguments(&arguments, Path::new("."), language, arg_info, 3),
+                    CompilerArguments::CannotCache(
+                        "unexpected positional compiler argument",
+                        Some(_)
+                    )
+                ),
+                "extra source was silently discarded: {arguments:?}"
+            );
+        }
+
+        // An unknown flag's following value is not an extra source: the
+        // frontend must preserve both tokens in its pass-through argument list.
+        let arguments = os_strings(&[
+            "--vendor-flag",
+            "vendor-option-value",
+            "kernel.ptx",
+            "-o=kernel.cubin",
+        ]);
+        let parsed = parse_arguments(
+            &arguments,
+            Path::new("."),
+            Language::Cubin,
+            &ptxas::ARGS[..],
+            3,
+        );
+        let CompilerArguments::Ok(parsed) = parsed else {
+            panic!("flag value incorrectly classified as a second input: {parsed:?}");
+        };
+        assert_eq!(
+            parsed.common_args,
+            os_strings(&["--vendor-flag", "vendor-option-value"])
+        );
     }
 }
