@@ -21,6 +21,8 @@ mod client {
     use fs_err as fs;
     use std::collections::{HashMap, HashSet};
     use std::io::{self, Write};
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::SystemTime;
@@ -51,9 +53,6 @@ mod client {
             if !metadata.is_file() {
                 bail!("custom toolchain archive is not a regular file");
             }
-            #[cfg(unix)]
-            use std::os::unix::fs::MetadataExt;
-
             #[cfg(windows)]
             let (volume, index) = {
                 use std::mem::MaybeUninit;
@@ -501,7 +500,9 @@ mod client {
                 let Some(custom) = registry.configured.get(compiler_path) else {
                     return Ok(None);
                 };
-                (custom.archive.clone(), Arc::clone(&custom.hash_lock))
+                let values = (custom.archive.clone(), Arc::clone(&custom.hash_lock));
+                drop(registry);
+                values
             };
             // Fast path checks only inode/version metadata, never rehashes
             // an unchanged large archive. The bytes sent to workers always
