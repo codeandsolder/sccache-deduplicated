@@ -214,12 +214,18 @@ where
                 &mut unhashed_args
             }
             None => match arg {
-                Argument::Raw(_) => {
+                Argument::Raw(ref operand) => {
                     if take_next {
                         take_next = false;
                         &mut common_args
                     } else {
-                        continue;
+                        // Device compilation handles exactly one positional
+                        // input. Dropping another would change both the
+                        // executed argv and the input-dependent cache key.
+                        return CompilerArguments::CannotCache(
+                            "unexpected positional compiler argument",
+                            Some(operand.to_string_lossy().into_owned()),
+                        );
                     }
                 }
                 Argument::UnknownFlag(ref p) => {
@@ -622,5 +628,60 @@ mod test {
                 CompilerArguments::CannotCache("missing compiler output", None)
             ));
         }
+    }
+
+    #[test]
+    fn additional_positional_cuda_inputs_cannot_disappear_from_cache_keys() {
+        for (arguments, language, arg_info) in [
+            (
+                os_strings(&["kernel.ptx", "second.ptx", "-o=kernel.cubin"]),
+                Language::Cubin,
+                &ptxas::ARGS[..],
+            ),
+            (
+                os_strings(&["extra-file", "kernel.ptx", "-o=kernel.cubin"]),
+                Language::Cubin,
+                &ptxas::ARGS[..],
+            ),
+            (
+                os_strings(&["kernel.cpp1.ii", "other.cpp1.ii", "-o", "kernel.ptx"]),
+                Language::Ptx,
+                &ARGS[..],
+            ),
+        ] {
+            assert!(
+                matches!(
+                    parse_arguments(&arguments, Path::new("."), language, arg_info, 3),
+                    CompilerArguments::CannotCache(
+                        "unexpected positional compiler argument",
+                        Some(_)
+                    )
+                ),
+                "extra source was silently discarded: {arguments:?}"
+            );
+        }
+
+        // An unknown flag's following value is not an extra source: the
+        // frontend must preserve both tokens in its pass-through argument list.
+        let arguments = os_strings(&[
+            "--vendor-flag",
+            "vendor-option-value",
+            "kernel.ptx",
+            "-o=kernel.cubin",
+        ]);
+        let parsed = parse_arguments(
+            &arguments,
+            Path::new("."),
+            Language::Cubin,
+            &ptxas::ARGS[..],
+            3,
+        );
+        let CompilerArguments::Ok(parsed) = parsed else {
+            panic!("flag value incorrectly classified as a second input: {parsed:?}");
+        };
+        assert_eq!(
+            parsed.common_args,
+            os_strings(&["--vendor-flag", "vendor-option-value"])
+        );
     }
 }
