@@ -50,6 +50,15 @@ scripts and proc macros at an incompatible ISA:
 cargo --config cargo-target.toml build --target x86_64-unknown-linux-gnu
 ~~~
 
+C output validates the actual compiler against the destination ABI:
+GCC must report a compatible architecture/OS/environment via `-dumpmachine`
+(the vendor field can differ), and Clang receives an explicit
+`--target=DESTINATION_TRIPLE` argument. Both backends are checked by compiling
+an empty translation unit with the emitted optimization flags, without
+linking or producing artifacts. This rejects native GCC for foreign
+architectures, instead of silently generating unusable configurations.
+The cross-toolchain and any required sysroot are selected independently.
+
 C flags are used only by native C/C++ invocations. For Cargo packages that
 compile C through build scripts, separately configure the actual C compiler
 using its generated flags; this tool deliberately does not inject GCC flags

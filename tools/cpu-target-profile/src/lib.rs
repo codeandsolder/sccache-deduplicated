@@ -9,9 +9,9 @@ use archspec::cpu::Microarchitecture;
 use archspec::schema::{Compiler, CompilerSet, MicroarchitecturesSchema};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use target_lexicon::Triple;
 
 #[cfg(target_os = "linux")]
 mod linux_capabilities;
@@ -322,6 +322,41 @@ fn compiler_version(compiler: &Path, family: &str) -> Result<String> {
     Ok(numeric.to_owned())
 }
 
+fn compiler_target_matches(requested: &str, reported: &str) -> Result<bool> {
+    let requested: Triple = requested
+        .parse()
+        .with_context(|| format!("unrecognized destination target triple {requested}"))?;
+    let reported: Triple = reported
+        .parse()
+        .with_context(|| format!("unrecognized GCC target triple {reported}"))?;
+    // Toolchain vendors are not part of the target ISA/ABI: both
+    // x86_64-pc-linux-gnu and x86_64-unknown-linux-gnu target the same ABI.
+    Ok(requested.architecture == reported.architecture
+        && requested.operating_system == reported.operating_system
+        && requested.environment == reported.environment
+        && requested.binary_format == reported.binary_format)
+}
+
+fn validate_c_codegen(compiler: &Path, flags: &[String]) -> Result<()> {
+    // Compile a translation unit without linking or filesystem artifacts.
+    // This checks actual compiler backend support, not just Archspec's
+    // compiler-version table (which may be newer than the installed binary).
+    let output = Command::new(compiler)
+        .args(flags)
+        .args(["-S", "-x", "c", "-o", "-", "-"])
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("cannot probe C compiler {}", compiler.display()))?;
+    ensure!(
+        output.status.success(),
+        "C compiler {} rejected target flags {:?}: {}",
+        compiler.display(),
+        flags,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
 /// Select explicit C compiler flags from a real compiler binary.
 ///
 /// # Errors
@@ -338,7 +373,25 @@ pub fn selected_c_flags(
     );
     let cpu = profile.resolve(target_cpu)?;
     let version = compiler_version(compiler, family)?;
-    c_compiler_flags(cpu, family, &version)
+    let mut flags = c_compiler_flags(cpu, family, &version)?;
+    if family == "gcc" {
+        let machine = tool_output(compiler, &["-dumpmachine"])?;
+        let machine = machine.trim();
+        ensure!(
+            compiler_target_matches(&profile.target_triple, machine)?,
+            "GCC {} targets {machine}, not {}; choose a cross-GCC toolchain for the destination instead of exporting unusable flags",
+            compiler.display(),
+            profile.target_triple
+        );
+    } else {
+        // Clang is natively cross-target. Make the destination explicit in
+        // the actual invocation as well as in the target-profile document.
+        // Both the target and optimization flags are now normal clang
+        // arguments, hashed by the existing C compiler-specific cache key.
+        flags.insert(0, format!("--target={}", profile.target_triple));
+    }
+    validate_c_codegen(compiler, &flags)?;
+    Ok(flags)
 }
 
 /// Generate an explicit Rust CPU target for a compiler binary.
@@ -460,11 +513,22 @@ pub fn show_flags(flags: &[String]) -> String {
         if index != 0 {
             result.push(' ');
         }
-        let _ = write!(
-            &mut result,
-            "{}",
-            shlex::try_quote(flag).map_or_else(|_| flag.clone(), std::borrow::Cow::into_owned)
-        );
+        // Plain compiler options should remain easy to paste into a shell
+        // command, while values requiring quoting must round-trip faithfully.
+        let shell_safe = flag.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'_' | b'=' | b'.' | b'/' | b':' | b'+' | b',' | b'@'
+                )
+        });
+        if shell_safe {
+            result.push_str(flag);
+        } else {
+            result.push_str(
+                &shlex::try_quote(flag).map_or_else(|_| flag.clone(), std::borrow::Cow::into_owned),
+            );
+        }
     }
     result.push('\n');
     result
@@ -476,6 +540,72 @@ mod tests {
 
     fn mock_profile(name: &str) -> Result<DestinationProfile> {
         DestinationProfile::named("x86_64-unknown-linux-gnu", name)
+    }
+
+    #[test]
+    fn shell_flag_output_remains_readable_and_round_trippable() -> Result<()> {
+        let ordinary = vec![
+            "--target=aarch64-unknown-linux-gnu".to_owned(),
+            "-mcpu=neoverse-n2".to_owned(),
+        ];
+        assert_eq!(
+            show_flags(&ordinary),
+            "--target=aarch64-unknown-linux-gnu -mcpu=neoverse-n2\n"
+        );
+        let quoted = vec!["-DNAME=two words".to_owned(), "-DQUOTE=can't".to_owned()];
+        let encoded = show_flags(&quoted);
+        assert_eq!(
+            shlex::split(&encoded).context("shell flag serialization produced invalid tokens")?,
+            quoted
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn c_target_machine_accepts_vendor_aliases_but_not_abi_or_architecture_changes() -> Result<()> {
+        assert!(compiler_target_matches(
+            "x86_64-unknown-linux-gnu",
+            "x86_64-pc-linux-gnu"
+        )?);
+        assert!(!compiler_target_matches(
+            "x86_64-unknown-linux-musl",
+            "x86_64-pc-linux-gnu"
+        )?);
+        assert!(!compiler_target_matches(
+            "aarch64-unknown-linux-gnu",
+            "x86_64-pc-linux-gnu"
+        )?);
+        assert!(!compiler_target_matches(
+            "x86_64-pc-windows-gnu",
+            "x86_64-pc-linux-gnu"
+        )?);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn toolchain_probe_rejects_native_gcc_for_foreign_cpu() -> Result<()> {
+        let profile = DestinationProfile::named("aarch64-unknown-linux-gnu", "neoverse_n2")?;
+        let result = selected_c_flags(&profile, None, "gcc", Path::new("gcc"));
+        assert!(result.is_err());
+        let error = result
+            .err()
+            .context("native GCC unexpectedly accepted cross target")?;
+        assert!(error.to_string().contains("cross-GCC toolchain"));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clang_cross_target_is_part_of_compiler_arguments() -> Result<()> {
+        let profile = DestinationProfile::named("aarch64-unknown-linux-gnu", "neoverse_n2")?;
+        let flags = selected_c_flags(&profile, None, "clang", Path::new("clang"))?;
+        assert_eq!(
+            flags.first().map(String::as_str),
+            Some("--target=aarch64-unknown-linux-gnu")
+        );
+        assert!(flags.iter().any(|flag| flag == "-mcpu=neoverse-n2"));
+        Ok(())
     }
 
     #[test]

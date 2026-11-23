@@ -146,6 +146,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shlex",
+ "target-lexicon",
  "toml",
 ]
 
@@ -360,6 +361,12 @@ dependencies = [
  "thiserror",
  "walkdir",
 ]
+
+[[package]]
+name = "target-lexicon"
+version = "0.13.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c447be3a2abfa84b2d91680c56600bd6b2873866de27b36ec911be705e291da"
 
 [[package]]
 name = "thiserror"
