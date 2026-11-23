@@ -86,11 +86,7 @@ macro_rules! impl_cuda_stage_compiler {
             fn generate_compile_commands<T>(
                 &self,
                 context: crate::compiler::c::CCompileContext<'_>,
-            ) -> crate::errors::Result<(
-                Box<dyn crate::compiler::CompileCommand<T>>,
-                Option<crate::dist::CompileCommand>,
-                crate::compiler::Cacheable,
-            )>
+            ) -> crate::errors::Result<crate::compiler::cicc::CudaStageCompileCommands<T>>
             where
                 T: crate::mock_command::CommandCreatorSync,
             {
@@ -334,16 +330,18 @@ impl OutputStyle {
     }
 }
 
+/// Common CCompilerImpl result for all three CUDA device compiler stages.
+pub(super) type CudaStageCompileCommands<T> = (
+    Box<dyn CompileCommand<T>>,
+    Option<dist::CompileCommand>,
+    Cacheable,
+);
 /// Box a CUDA device compiler command using the frontend-specific output style.
 /// The three stage adapters share path transformation and command ownership.
 pub(super) fn boxed_compile_commands<T: CommandCreatorSync>(
     context: CCompileContext<'_>,
     output_style: OutputStyle,
-) -> Result<(
-    Box<dyn CompileCommand<T>>,
-    Option<dist::CompileCommand>,
-    Cacheable,
-)> {
+) -> Result<CudaStageCompileCommands<T>> {
     let CCompileContext {
         path_transformer,
         executable,
@@ -471,6 +469,75 @@ mod test {
 
     fn os_strings(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn cuda_stage_trait_dispatch_keeps_compiler_specific_semantics() {
+        use crate::compiler::c::CCompilerImpl;
+        use crate::compiler::cudafe::CudaFE;
+        use crate::compiler::ptxas::Ptxas;
+
+        fn verify<C: CCompilerImpl>(
+            compiler: &C,
+            kind: CCompilerKind,
+            language: Language,
+            arguments: &[&str],
+            input: &str,
+            output: &str,
+        ) {
+            assert_eq!(compiler.kind(), kind);
+            assert!(compiler.plusplus());
+            assert_eq!(compiler.version().as_deref(), Some("device stage"));
+            let parsed = compiler.parse_arguments(&os_strings(arguments), Path::new("."), &[]);
+            let CompilerArguments::Ok(parsed) = parsed else {
+                panic!("stage {kind:?} rejected valid arguments: {parsed:?}");
+            };
+            assert_eq!(parsed.language, language);
+            assert_eq!(parsed.input, PathBuf::from(input));
+            let expected_output = Path::new(".").join(output);
+            assert_eq!(
+                parsed
+                    .outputs
+                    .get("obj")
+                    .map(|descriptor| descriptor.path.as_path()),
+                Some(expected_output.as_path()),
+            );
+        }
+
+        verify(
+            &Cicc {
+                version: Some("device stage".into()),
+            },
+            CCompilerKind::Cicc,
+            Language::Ptx,
+            &["kernel.cpp1.ii", "-o", "kernel.ptx"],
+            "kernel.cpp1.ii",
+            "kernel.ptx",
+        );
+        verify(
+            &CudaFE {
+                version: Some("device stage".into()),
+            },
+            CCompilerKind::CudaFE,
+            Language::CudaFE,
+            &[
+                "--module_id_file_name",
+                "kernel.module_id",
+                "kernel.cpp1.ii",
+            ],
+            "kernel.cpp1.ii",
+            "kernel.module_id",
+        );
+        verify(
+            &Ptxas {
+                version: Some("device stage".into()),
+            },
+            CCompilerKind::Ptxas,
+            Language::Cubin,
+            &["kernel.ptx", "-o=kernel.cubin"],
+            "kernel.ptx",
+            "kernel.cubin",
+        );
     }
 
     #[test]
