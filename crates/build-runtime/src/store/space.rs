@@ -262,14 +262,26 @@ impl NativeStore {
         // sorting/materializing the entire action and tree index under disk
         // pressure, while still scanning every eligible root for fairness.
         let mut candidates = BinaryHeap::new();
-        let mut consider = |utility: u64, last_used: u64, root: Root| {
-            let candidate = (utility, last_used, root);
+        // Both action and tree manifests share the same content-aware
+        // scoring and bounded admission into the eviction candidate heap.
+        let mut consider = |root: Root, blobs: &std::collections::BTreeMap<_, u64>| -> Result<()> {
+            let bytes = blobs.values().try_fold(0_u64, |sum, &size| {
+                sum.checked_add(size)
+                    .context("eviction root bytes overflow")
+            })?;
+            let usage = pins.usage.get(&root);
+            let candidate = (
+                reuse_utility(usage, bytes, observed),
+                usage.map_or(0, |record| record.last_used_ms),
+                root,
+            );
             if candidates.len() < limit {
                 candidates.push(candidate);
             } else if candidates.peek().is_some_and(|worst| candidate < *worst) {
                 candidates.pop();
                 candidates.push(candidate);
             }
+            Ok(())
         };
         for entry in actions.iter()? {
             let (key, value) = entry?;
@@ -280,16 +292,7 @@ impl NativeStore {
                     .get(&record.result.0)?
                     .context("missing native eviction result")?;
                 let manifest: ResultManifest = encoding().deserialize(manifest.value())?;
-                let bytes = manifest.blobs()?.values().try_fold(0_u64, |acc, &n| {
-                    acc.checked_add(n).context("eviction action bytes overflow")
-                })?;
-                let root = Root::Action(key);
-                let usage = pins.usage.get(&root);
-                consider(
-                    reuse_utility(usage, bytes, observed),
-                    usage.map_or(0, |u| u.last_used_ms),
-                    root,
-                );
+                consider(Root::Action(key), &manifest.blobs()?)?;
             }
         }
         for entry in trees.iter()? {
@@ -297,16 +300,7 @@ impl NativeStore {
             let id = TreeId(*id.value());
             if !pins.trees.contains_key(&id) {
                 let manifest: TreeManifest = encoding().deserialize(value.value())?;
-                let bytes = manifest.blobs()?.values().try_fold(0_u64, |acc, &n| {
-                    acc.checked_add(n).context("eviction tree bytes overflow")
-                })?;
-                let root = Root::Tree(id);
-                let usage = pins.usage.get(&root);
-                consider(
-                    reuse_utility(usage, bytes, observed),
-                    usage.map_or(0, |u| u.last_used_ms),
-                    root,
-                );
+                consider(Root::Tree(id), &manifest.blobs()?)?;
             }
         }
         drop(pins);
