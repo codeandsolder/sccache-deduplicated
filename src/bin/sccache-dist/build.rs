@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::command_helpers::{CommandExt, run_with_environment};
+use crate::job_telemetry;
 use anyhow::{Context, Error, Result, anyhow, bail};
 use fs_err as fs;
 use libmount::Overlay;
@@ -22,8 +23,8 @@ use nix::sys::stat::{Mode, mkdirat};
 use sccache::compression::ZstdFrame;
 use sccache::compression::deflate::unpack_gzip;
 use sccache::dist::{
-    BuildResult, BuilderIncoming, CompileCommand, InputsReader, OutputRequest, ProcessOutput,
-    TcCache, Toolchain,
+    BuildResult, BuilderIncoming, CompileCommand, InputsReader, JobId, OutputRequest,
+    ProcessOutput, TcCache, Toolchain,
 };
 use sccache::lru_disk_cache::Error as LruError;
 use std::collections::{HashMap, HashSet, hash_map};
@@ -401,6 +402,7 @@ impl OverlayBuilder {
     }
 
     fn perform_build(
+        job_id: JobId,
         bubblewrap: &Path,
         compile_command: CompileCommand,
         inputs_rdr: InputsReader,
@@ -533,8 +535,7 @@ impl OverlayBuilder {
                     cmd.arg("--");
                     cmd.arg(executable);
                     cmd.args(arguments);
-                    let compile_output = cmd
-                        .output()
+                    let compile_output = job_telemetry::run(job_id, &mut cmd)
                         .context("Failed to retrieve output from compile")?;
                     trace!("compile_output: {:?}", compile_output);
 
@@ -600,6 +601,7 @@ impl OverlayBuilder {
 impl BuilderIncoming for OverlayBuilder {
     fn run_build(
         &self,
+        job_id: JobId,
         tc: Toolchain,
         command: CompileCommand,
         outputs: OutputRequest,
@@ -611,7 +613,14 @@ impl BuilderIncoming for OverlayBuilder {
             .prepare_overlay_dirs(&tc, tccache)
             .context("failed to prepare overlay dirs")?;
         debug!("Performing build in {:?}", overlay);
-        let res = Self::perform_build(&self.bubblewrap, command, inputs_rdr, outputs, &overlay);
+        let res = Self::perform_build(
+            job_id,
+            &self.bubblewrap,
+            command,
+            inputs_rdr,
+            outputs,
+            &overlay,
+        );
         debug!("Finishing with overlay");
         self.finish_overlay(&tc, overlay, tccache);
         debug!("Returning result");
@@ -939,6 +948,7 @@ impl DockerBuilder {
     }
 
     fn perform_build(
+        job_id: JobId,
         compile_command: CompileCommand,
         inputs_rdr: InputsReader,
         outputs: OutputRequest,
@@ -993,7 +1003,8 @@ impl DockerBuilder {
         cmd.args(["exec", "--workdir"])
             .arg(cwd)
             .args([cid, "/busybox", "env", "-i", "--"]);
-        let compile_output = run_with_environment(&mut cmd, env_vars, executable, arguments)?;
+        let compile_output =
+            run_with_environment(job_id, &mut cmd, env_vars, executable, arguments)?;
         trace!("compile_output: {:?}", compile_output);
 
         let mut outputs = vec![];
@@ -1028,6 +1039,7 @@ impl BuilderIncoming for DockerBuilder {
     // From Server
     fn run_build(
         &self,
+        job_id: JobId,
         tc: Toolchain,
         command: CompileCommand,
         outputs: OutputRequest,
@@ -1039,7 +1051,7 @@ impl BuilderIncoming for DockerBuilder {
             .get_container(&tc, tccache)
             .context("Failed to get a container for build")?;
         debug!("Performing build with container {}", cid);
-        let result = Self::perform_build(command, inputs_rdr, outputs, &cid)
+        let result = Self::perform_build(job_id, command, inputs_rdr, outputs, &cid)
             .context("Failed to perform build");
         debug!("Finishing with container {}", cid);
         self.finish_container(&tc, cid);

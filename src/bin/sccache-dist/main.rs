@@ -30,6 +30,7 @@ mod build;
 
 mod cmdline;
 mod command_helpers;
+mod job_telemetry;
 mod token_check;
 
 use cmdline::{AuthSubcommand, Command};
@@ -366,19 +367,22 @@ fn run(command: Command) -> Result<i32> {
 }
 
 fn init_logging() {
-    if env::var(sccache::LOGGING_ENV).is_ok() {
-        let mut builder = env_logger::Builder::from_env(sccache::LOGGING_ENV);
-
-        // Enable millisecond precision timestamps if SCCACHE_LOG_MILLIS is set
-        if env::var("SCCACHE_LOG_MILLIS").is_ok() {
-            builder.format_timestamp_millis();
-        }
-
-        match builder.try_init() {
-            Ok(_) => (),
-            Err(e) => panic!("Failed to initialize logging: {:?}", e),
-        }
+    // Job/PID mappings are only useful after a fatal worker failure if they
+    // are in the journal by default; do not require an opt-in debug setting.
+    let mut builder = env_logger::Builder::new();
+    // Keep third-party dependencies quiet; the binary's job/scheduler
+    // lifecycle is the information needed for postmortem reconstruction.
+    builder.filter_level(log::LevelFilter::Warn);
+    builder.filter_module(module_path!(), log::LevelFilter::Info);
+    if let Ok(filters) = env::var(sccache::LOGGING_ENV) {
+        builder.parse_filters(&filters);
     }
+    if env::var("SCCACHE_LOG_MILLIS").is_ok() {
+        builder.format_timestamp_millis();
+    }
+    builder
+        .try_init()
+        .expect("Failed to initialize sccache-dist logging");
 }
 
 const SERVER_REMEMBER_ERROR_TIMEOUT: Duration = Duration::from_secs(300);
@@ -576,8 +580,9 @@ impl Scheduler {
             };
             for job_id in server_details.jobs_assigned {
                 warn!(
-                    "Non-terminated job {} was cleaned up in server pruning",
-                    job_id
+                    "dist_job_lost job_id={job_id} worker={} reason=heartbeat_timeout previous_state={:?}",
+                    server_id.addr(),
+                    jobs.get(&job_id).map(|detail| detail.state)
                 );
                 // A job may be missing here if it failed to allocate
                 // initially, so just warn if it's not present.
@@ -854,6 +859,11 @@ impl SchedulerIncoming for Scheduler {
                         stale_jobs
                     );
                     for job_id in stale_jobs {
+                        warn!(
+                            "dist_job_lost job_id={job_id} worker={} reason=stale_assignment previous_state={:?}",
+                            server_id.addr(),
+                            jobs.get(&job_id).map(|detail| detail.state)
+                        );
                         if !details.jobs_assigned.remove(&job_id) {
                             warn!(
                                 "Stale job for server {} not assigned: {}",
@@ -875,6 +885,11 @@ impl SchedulerIncoming for Scheduler {
             }
             Some(ref mut details) if details.server_nonce != server_nonce => {
                 for job_id in details.jobs_assigned.iter() {
+                    warn!(
+                        "dist_job_lost job_id={job_id} worker={} reason=worker_restarted previous_state={:?}",
+                        server_id.addr(),
+                        jobs.get(job_id).map(|detail| detail.state)
+                    );
                     if jobs.remove(job_id).is_none() {
                         warn!(
                             "Unknown job found when replacing server {}: {}",
@@ -1314,9 +1329,18 @@ impl ServerIncoming for Server {
             return Err(error).context("Updating job state failed");
         }
 
+        let (crate_name, command_fingerprint) = job_telemetry::identity(&command);
+        info!(
+            "dist_job_start job_id={job_id} compiler={:?} crate_name={:?} command_fingerprint={command_fingerprint:016x} argument_count={}",
+            command.executable,
+            crate_name,
+            command.arguments.len()
+        );
+        let started = Instant::now();
         let res = self
             .builder
             .run_build(
+                job_id,
                 assigned.toolchain,
                 command,
                 outputs,
@@ -1324,12 +1348,24 @@ impl ServerIncoming for Server {
                 &self.cache,
             )
             .map(|res| {
+                info!(
+                    "dist_job_result job_id={job_id} result=complete exit_code={} output_count={} elapsed_ms={}",
+                    res.output.code,
+                    res.outputs.len(),
+                    started.elapsed().as_millis()
+                );
                 RunJobResult::Complete(JobComplete {
                     output: res.output,
                     outputs: res.outputs,
                 })
             })
-            .map_err(|e| e.context("run build failed"));
+            .map_err(|error| {
+                warn!(
+                    "dist_job_result job_id={job_id} result=error elapsed_ms={} error={error:#}",
+                    started.elapsed().as_millis()
+                );
+                error.context("run build failed")
+            });
         requester
             .do_update_job_state(job_id, JobState::Complete)
             .context("Updating job state failed")?;
@@ -2345,6 +2381,7 @@ mod server_upload_tests {
     impl BuilderIncoming for NoopBuilder {
         fn run_build(
             &self,
+            _job_id: JobId,
             _toolchain: Toolchain,
             _command: CompileCommand,
             _outputs: OutputRequest,
