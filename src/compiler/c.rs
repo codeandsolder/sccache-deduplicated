@@ -28,8 +28,8 @@ use crate::dist;
 use crate::dist::pkg;
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::{
-    Digest, HashToDigest, MetadataCtimeExt, TimeMacroFinder, Timestamp, decode_path, encode_path,
-    hash_all, run_input_output, strip_basedirs, strip_basedirs_from_arg,
+    Digest, MetadataCtimeExt, TimeMacroFinder, Timestamp, decode_path, encode_path, hash_all,
+    run_input_output, strip_basedirs, strip_basedirs_from_arg,
 };
 use async_trait::async_trait;
 use fs_err as fs;
@@ -37,7 +37,6 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::hash::Hash;
 use std::io;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -2521,7 +2520,7 @@ pub(super) fn hashed_input_file_name(language: Language, input: &Path) -> Option
 }
 
 /// The cache is versioned by the inputs to `HashKeyParams::compute`.
-pub const CACHE_VERSION: &[u8] = b"14";
+pub const CACHE_VERSION: &[u8] = b"15";
 
 /// Environment variables that are factored into the cache key.
 static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
@@ -2543,17 +2542,71 @@ static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
     .collect()
 });
 
-/// Feed the compiler arguments into `m`, with the base directories stripped.
+/// Feed normalized compiler arguments into the digest with unambiguous boundaries.
 ///
-/// The arguments are hashed verbatim, so any that spell out an absolute path -
-/// `-ffile-prefix-map=/home/user/project=.` above all - would tie the cache
-/// entry to one checkout of the tree. See [`strip_basedirs_from_arg`].
+/// C compiler argv may contain non-UTF-8 bytes, including 0xff on Unix.
+/// A one-byte separator therefore aliases a single argument containing that
+/// byte with two distinct arguments. Frame both count and byte lengths.
 pub fn hash_arguments(m: &mut Digest, arguments: &[OsString], basedirs: &[Vec<u8>]) {
+    m.delimiter(b"c-argv-v1");
+    m.update(&(arguments.len() as u128).to_le_bytes());
     for arg in arguments {
-        // Same shape as OsString's own Hash impl: the bytes, then a separator
-        // that cannot occur in them.
-        m.update(&strip_basedirs_from_arg(arg.as_encoded_bytes(), basedirs));
-        m.update(&[0xff]);
+        let normalized = strip_basedirs_from_arg(arg.as_encoded_bytes(), basedirs);
+        hash_length_prefixed(m, &normalized);
+    }
+}
+
+/// Distinguish length and payload even when arbitrary, non-UTF8 bytes occur.
+pub(super) fn hash_length_prefixed(m: &mut Digest, bytes: &[u8]) {
+    m.update(&(bytes.len() as u128).to_le_bytes());
+    m.update(bytes);
+}
+
+/// Preserve the identity and cardinality of auxiliary inputs separately from
+/// the optional external assembler. They may coincidentally have equal digests.
+pub(super) fn hash_auxiliary_inputs(
+    m: &mut Digest,
+    extra_hashes: &[String],
+    assembler_digest: Option<&str>,
+) {
+    m.delimiter(b"c-auxiliary-inputs-v1");
+    m.update(&(extra_hashes.len() as u128).to_le_bytes());
+    for hash in extra_hashes {
+        hash_length_prefixed(m, hash.as_bytes());
+    }
+    if let Some(digest) = assembler_digest {
+        m.update(&[1]);
+        hash_length_prefixed(m, digest.as_bytes());
+    } else {
+        m.update(&[0]);
+    }
+}
+
+/// A source filename is embedded in some C objects but not in others.
+/// Keep presence distinct from the next hash field, even for empty names.
+pub(super) fn hash_input_file_name_marker(m: &mut Digest, present: bool) {
+    m.delimiter(INPUT_FILE_NAME_DOMAIN);
+    m.update(&[u8::from(present)]);
+}
+
+/// Hash only the declared compiler environment dependencies, preserving
+/// ordering, duplicates, field boundaries and arbitrary OS string bytes.
+pub(super) fn hash_cached_env_vars(
+    m: &mut Digest,
+    env_vars: &[(OsString, OsString)],
+    dependencies: &HashSet<&'static OsStr>,
+) {
+    m.delimiter(b"c-cached-env-v1");
+    let count = env_vars
+        .iter()
+        .filter(|(name, _)| dependencies.contains(name.as_os_str()))
+        .count();
+    m.update(&(count as u128).to_le_bytes());
+    for (name, value) in env_vars {
+        if dependencies.contains(name.as_os_str()) {
+            hash_length_prefixed(m, name.as_encoded_bytes());
+            hash_length_prefixed(m, value.as_encoded_bytes());
+        }
     }
 }
 
@@ -2671,30 +2724,19 @@ impl<'a> HashKeyParams<'a> {
         m.update(CACHE_VERSION);
         m.update(self.language.as_str().as_bytes());
         hash_arguments(&mut m, self.arguments, self.basedirs);
-        for hash in self.extra_hashes {
-            m.update(hash.as_bytes());
-        }
-        if let Some(assembler_digest) = self.assembler_digest {
-            m.update(assembler_digest.as_bytes());
-        }
+        hash_auxiliary_inputs(&mut m, self.extra_hashes, self.assembler_digest);
         // The compiler writes the source's file name into the object (the
         // STT_FILE symbol on ELF), and -P leaves it out of the preprocessed
         // output, so two sources that preprocess the same would share an
         // object naming only one of them. The directory is left out: the
         // symbol does not record it, and keeping it would cost cache hits
         // across checkouts.
+        hash_input_file_name_marker(&mut m, self.input_file_name.is_some());
         if let Some(input_file_name) = self.input_file_name {
-            m.delimiter(INPUT_FILE_NAME_DOMAIN);
-            input_file_name.hash(&mut HashToDigest { digest: &mut m });
+            hash_length_prefixed(&mut m, input_file_name.as_encoded_bytes());
         }
 
-        for (var, val) in self.env_vars {
-            if CACHED_ENV_VARS.contains(var.as_os_str()) {
-                var.hash(&mut HashToDigest { digest: &mut m });
-                m.update(&b"="[..]);
-                val.hash(&mut HashToDigest { digest: &mut m });
-            }
-        }
+        hash_cached_env_vars(&mut m, self.env_vars, &CACHED_ENV_VARS);
 
         // Strip basedirs from preprocessor output if configured
         let preprocessor_output_to_hash = strip_basedirs(self.preprocessor_output, self.basedirs);
@@ -3251,6 +3293,73 @@ mod test {
         assert_neq!(h_abc, h_xyz);
         assert_neq!(h_abc, h_ab);
         assert_neq!(h_abc, h_a);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_hash_key_non_unicode_argument_boundaries() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let merged = [OsString::from_vec(b"-DVALUE=a\xff-DOTHER=b".to_vec())];
+        let split = [OsString::from("-DVALUE=a"), OsString::from("-DOTHER=b")];
+        let old_hash = |args: &[OsString]| {
+            let mut digest = Digest::new();
+            for arg in args {
+                digest.update(arg.as_encoded_bytes());
+                digest.update(&[0xff]);
+            }
+            digest.finish()
+        };
+        assert_eq!(old_hash(&merged), old_hash(&split));
+
+        let key = |args: &[OsString]| {
+            HashKeyParams::new("compiler", Language::C, args, b"same preprocessed content")
+                .compute()
+        };
+        assert_ne!(key(&merged), key(&split));
+    }
+
+    #[test]
+    fn test_hash_key_separates_auxiliary_hashes_from_external_assembler() {
+        let compiler_args = [OsString::from("-c")];
+        let digest = "1234567890abcdef".repeat(4);
+        let hashes = [digest.clone()];
+        // The former raw-concatenation scheme cannot tell these apart:
+        // a single extra input and the same digest for the assembler.
+        let mut old_extra = Digest::new();
+        old_extra.update(digest.as_bytes());
+        let mut old_assembler = Digest::new();
+        old_assembler.update(digest.as_bytes());
+        assert_eq!(old_extra.finish(), old_assembler.finish());
+
+        let extra = HashKeyParams::new("compiler", Language::C, &compiler_args, b"input")
+            .with_extra_hashes(&hashes)
+            .compute();
+        let assembler = HashKeyParams::new("compiler", Language::C, &compiler_args, b"input")
+            .with_assembler_digest(Some(&digest))
+            .compute();
+        assert_ne!(extra, assembler);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_hash_key_environment_field_boundaries() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let name = OsString::from("SCCACHE_C_CUSTOM_CACHE_BUSTER");
+        let other = OsString::from("MACOSX_DEPLOYMENT_TARGET");
+        let collapsed = [(
+            name.clone(),
+            OsString::from_vec(b"a\xffMACOSX_DEPLOYMENT_TARGET\xff=b".to_vec()),
+        )];
+        let split = [(name, OsString::from("a")), (other, OsString::from("b"))];
+        let args = [OsString::from("-c")];
+        let key = |env: &[(OsString, OsString)]| {
+            HashKeyParams::new("compiler", Language::C, &args, b"input")
+                .with_env_vars(env)
+                .compute()
+        };
+        assert_ne!(key(&collapsed), key(&split));
     }
 
     #[test]
