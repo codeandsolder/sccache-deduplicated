@@ -6706,7 +6706,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         m.update(FAKE_DIGEST.as_bytes());
         // Arguments, with cfgs sorted at the end.
         let args = [
-            (OsString::from("ab"), None),
+            (OsString::from("a"), None),
+            (OsString::from("b"), None),
             (OsString::from("--cfg"), Some(OsString::from("abc"))),
             (OsString::from("--cfg"), Some(OsString::from("xyz"))),
         ];
