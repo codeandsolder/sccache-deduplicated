@@ -156,7 +156,12 @@ where
     let mut unhashed_args = vec![];
 
     for arg in ArgsIter::new(args.iter().cloned(), arg_info) {
-        let arg = try_or_cannot_cache!(arg, "argument parse");
+        let arg = match arg {
+            Ok(arg) => arg,
+            Err(error) => {
+                return CompilerArguments::CannotCache("argument parse", Some(error.to_string()));
+            }
+        };
         let args = match arg.get_data() {
             Some(PassThrough(_)) => {
                 take_next = false;
