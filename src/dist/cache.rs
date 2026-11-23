@@ -1078,39 +1078,6 @@ impl TcCache {
         Ok(())
     }
 
-    /// Insert a toolchain archive produced by `with` and verify its content hash.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if writing, reading, hashing, or validating the archive fails.
-    pub fn insert_with<F: FnOnce(fs::File) -> io::Result<()>>(
-        &mut self,
-        tc: &Toolchain,
-        with: F,
-    ) -> Result<()> {
-        self.inner
-            .insert_with(make_lru_key_path(&tc.archive_id), with)?;
-        let verified = (|| -> Result<()> {
-            let verified_archive_id = file_key(self.get(tc)?)?;
-            if verified_archive_id == tc.archive_id.as_str() {
-                Ok(())
-            } else {
-                Err(anyhow!("written file does not match expected hash key"))
-            }
-        })();
-        if verified.is_err() {
-            // Never retain an incorrectly keyed archive in the LRU index,
-            // including when validation failed because of a read error.
-            if let Err(error) = self.remove(tc) {
-                log::warn!(
-                    "Failed to remove invalid toolchain archive {}: {error}",
-                    tc.archive_id
-                );
-            }
-        }
-        verified
-    }
-
     /// Open a cached toolchain archive as a file.
     ///
     /// # Errors
@@ -1301,19 +1268,45 @@ mod cache_validation_tests {
     #[test]
     fn rejected_digest_does_not_leave_a_cached_archive() -> Result<()> {
         let tempdir = tempfile::tempdir()?;
+        let expected = b"expected";
         let tc = Toolchain {
-            archive_id: ArchiveId::try_from(Digest::reader_sync(b"expected".as_slice())?)?,
+            archive_id: ArchiveId::try_from(Digest::reader_sync(expected.as_slice())?)?,
         };
         let mut cache = TcCache::new(tempdir.path(), 1024 * 1024)?;
-        let failure = cache
-            .insert_with(&tc, |mut file| file.write_all(b"not the expected archive"))
-            .expect_err("mismatched archive digest must fail");
-        assert!(failure.to_string().contains("written file does not match"));
+        assert!(
+            StagedToolchainArchive::receive(
+                tempdir.path(),
+                tc.clone(),
+                b"not the expected archive".as_slice(),
+                1024 * 1024,
+            )
+            .is_err()
+        );
         assert!(!cache.contains_toolchain(&tc));
         assert!(matches!(
             cache.get(&tc),
             Err(crate::lru_disk_cache::Error::FileNotInCache)
         ));
+
+        let staged = StagedToolchainArchive::receive(
+            tempdir.path(),
+            tc.clone(),
+            expected.as_slice(),
+            1024 * 1024,
+        )?;
+        cache.insert_staged(staged)?;
+        assert!(
+            StagedToolchainArchive::receive(
+                tempdir.path(),
+                tc.clone(),
+                b"invalid replacement".as_slice(),
+                1024 * 1024,
+            )
+            .is_err()
+        );
+        let mut persisted = Vec::new();
+        cache.get(&tc)?.read_to_end(&mut persisted)?;
+        assert_eq!(persisted, expected);
         Ok(())
     }
 }

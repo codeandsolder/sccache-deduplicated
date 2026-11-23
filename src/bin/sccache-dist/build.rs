@@ -1169,7 +1169,6 @@ mod overlay_lifecycle_tests {
 
     #[test]
     fn extracted_byte_budget_evicts_oldest_idle_cache_entries() -> Result<()> {
-        use std::io::Write as _;
         use std::time::Duration;
 
         let tempdir = tempfile::tempdir()?;
@@ -1179,7 +1178,8 @@ mod overlay_lifecycle_tests {
             toolchain_dir_map: Mutex::new(HashMap::new()),
             extracted_toolchain_cache_size: 20,
         };
-        let mut tc_cache = TcCache::new(&tempdir.path().join("archives"), 1024)?;
+        let cache_root = tempdir.path().join("archives");
+        let mut tc_cache = TcCache::new(&cache_root, 1024)?;
         let mut map = builder.toolchain_dir_map.lock().unwrap();
         let now = Instant::now();
         let mut ids = Vec::new();
@@ -1190,7 +1190,13 @@ mod overlay_lifecycle_tests {
                     sccache::util::Digest::reader_sync(bytes.as_slice())?,
                 )?,
             };
-            tc_cache.insert_with(&tc, |mut file| file.write_all(&bytes))?;
+            let staged = sccache::dist::StagedToolchainArchive::receive(
+                &cache_root,
+                tc.clone(),
+                bytes.as_slice(),
+                1024,
+            )?;
+            tc_cache.insert_staged(staged)?;
             let path = tempdir.path().join(tc.archive_id.as_str());
             fs::create_dir(&path)?;
             map.insert(
@@ -1225,8 +1231,6 @@ mod overlay_lifecycle_tests {
 
     #[test]
     fn active_extracted_toolchain_is_pruned_only_after_last_build_finishes() -> Result<()> {
-        use std::io::Write as _;
-
         let tempdir = tempfile::tempdir()?;
         let toolchains_dir = tempdir.path().join("toolchains");
         fs::create_dir(&toolchains_dir)?;
@@ -1259,8 +1263,15 @@ mod overlay_lifecycle_tests {
                 _active_lease: Arc::clone(&lease),
             })
             .collect();
-        let mut tc_cache = TcCache::new(&tempdir.path().join("tc-cache"), 1024 * 1024)?;
-        tc_cache.insert_with(&cached_tc, |mut file| file.write_all(archive))?;
+        let cache_root = tempdir.path().join("tc-cache");
+        let mut tc_cache = TcCache::new(&cache_root, 1024 * 1024)?;
+        let staged = sccache::dist::StagedToolchainArchive::receive(
+            &cache_root,
+            cached_tc.clone(),
+            archive.as_slice(),
+            1024 * 1024,
+        )?;
+        tc_cache.insert_staged(staged)?;
         let cache = Mutex::new(tc_cache);
         let mut dir_map = builder.toolchain_dir_map.lock().unwrap();
         dir_map.insert(
