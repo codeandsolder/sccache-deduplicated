@@ -361,3 +361,28 @@ fn staged_release_never_waits_for_space_admission_lock() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn bounded_eviction_selection_keeps_only_lowest_utility_roots() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = NativeStore::open(temp.path())?;
+    let hot = publish(&store, "hot")?;
+    let cold = publish(&store, "cold")?;
+    let warm = publish(&store, "warm")?;
+    for _ in 0..32 {
+        drop(store.lookup(hot)?.context("missing hot root")?);
+    }
+    for _ in 0..8 {
+        drop(store.lookup(warm)?.context("missing warm root")?);
+    }
+    assert_eq!(store.eviction_candidates(1)?, vec![Root::Action(cold)]);
+    assert_eq!(
+        store.eviction_candidates(2)?,
+        vec![Root::Action(cold), Root::Action(warm)]
+    );
+    assert_eq!(
+        store.eviction_candidates(3)?,
+        vec![Root::Action(cold), Root::Action(warm), Root::Action(hot)]
+    );
+    Ok(())
+}

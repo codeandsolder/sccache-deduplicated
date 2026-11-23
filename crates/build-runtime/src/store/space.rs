@@ -2,6 +2,7 @@
 //! ZFS controls physical compression and allocation. Logical byte limits are
 //! deliberately conservative and do not replace filesystem free-space checks.
 use std::{
+    collections::BinaryHeap,
     sync::{Arc, atomic::Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -191,9 +192,8 @@ impl NativeStore {
         let mut evicted_roots = 0;
         if free < minimum || resident > policy.max_resident_bytes {
             for root in self
-                .eviction_candidates()?
+                .eviction_candidates(policy.max_evictions_per_pass)?
                 .into_iter()
-                .take(policy.max_evictions_per_pass)
             {
                 let result = match root {
                     Root::Action(key) => self.evict(key)?,
@@ -222,7 +222,7 @@ impl NativeStore {
         })
     }
 
-    fn eviction_candidates(&self) -> Result<Vec<Root>> {
+    fn eviction_candidates(&self, limit: usize) -> Result<Vec<Root>> {
         // Rank only under pressure. Do not scan manifests or write usage data
         // on the critical lookup path.
         let read = self.inner.db.begin_read()?;
@@ -231,7 +231,19 @@ impl NativeStore {
         let trees = read.open_table(TREES)?;
         let pins = self.inner.lock_pins()?;
         let observed = now_ms();
-        let mut candidates = Vec::new();
+        // Only the worst limited roots are needed. A bounded heap avoids
+        // sorting/materializing the entire action and tree index under disk
+        // pressure, while still scanning every eligible root for fairness.
+        let mut candidates = BinaryHeap::new();
+        let mut consider = |utility: u64, last_used: u64, root: Root| {
+            let candidate = (utility, last_used, root);
+            if candidates.len() < limit {
+                candidates.push(candidate);
+            } else if candidates.peek().is_some_and(|worst| candidate < *worst) {
+                candidates.pop();
+                candidates.push(candidate);
+            }
+        };
         for entry in actions.iter()? {
             let (key, value) = entry?;
             let key = ActionKey(*key.value());
@@ -246,11 +258,11 @@ impl NativeStore {
                 })?;
                 let root = Root::Action(key);
                 let usage = pins.usage.get(&root);
-                candidates.push((
+                consider(
                     reuse_utility(usage, bytes, observed),
                     usage.map_or(0, |u| u.last_used_ms),
                     root,
-                ));
+                );
             }
         }
         for entry in trees.iter()? {
@@ -263,17 +275,20 @@ impl NativeStore {
                 })?;
                 let root = Root::Tree(id);
                 let usage = pins.usage.get(&root);
-                candidates.push((
+                consider(
                     reuse_utility(usage, bytes, observed),
                     usage.map_or(0, |u| u.last_used_ms),
                     root,
-                ));
+                );
             }
         }
         drop(pins);
-        // Low expected future reuse per retained byte is evicted first.
-        candidates.sort_unstable();
-        Ok(candidates.into_iter().map(|(_, _, root)| root).collect())
+        // Heap sorting produces the least useful roots first.
+        Ok(candidates
+            .into_sorted_vec()
+            .into_iter()
+            .map(|(_, _, root)| root)
+            .collect())
     }
 }
 
