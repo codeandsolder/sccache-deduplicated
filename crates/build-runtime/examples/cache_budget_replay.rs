@@ -1,8 +1,8 @@
-//! Read native_cas_replay JSONL tree_access records from standard input and
+//! Read `native_cas_replay` JSONL `tree_access` records from standard input and
 //! compare cache capacity budgets with a deduplicated LRU baseline.
 //!
-//! Usage: cargo run -p sccache-build --example cache_budget_replay -- 1073741824 4294967296
-//! Input may contain journal/syslog prefixes: only JSON tree_access events
+//! Usage: `cargo run -p sccache-build --example cache_budget_replay -- 1073741824 4294967296`
+//! Input may contain journal/syslog prefixes: only JSON `tree_access` events
 //! are considered, and other log lines are ignored.
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -34,7 +34,7 @@ struct Budget {
 }
 
 impl Budget {
-    fn new(max: u64) -> Self {
+    const fn new(max: u64) -> Self {
         Self {
             max,
             target: max.saturating_mul(3) / 4,
@@ -116,15 +116,12 @@ impl Budget {
         );
         self.downloaded += u128::from(missing);
         for blob in &blobs {
-            match self.content.get_mut(&blob.id) {
-                Some((size, count)) => {
-                    ensure!(*size == blob.size, "conflicting content length");
-                    *count = count.checked_add(1).context("reference count overflow")?;
-                }
-                None => {
-                    self.content.insert(blob.id, (blob.size, 1));
-                    self.resident += blob.size;
-                }
+            if let Some((size, count)) = self.content.get_mut(&blob.id) {
+                ensure!(*size == blob.size, "conflicting content length");
+                *count = count.checked_add(1).context("reference count overflow")?;
+            } else {
+                self.content.insert(blob.id, (blob.size, 1));
+                self.resident += blob.size;
             }
         }
         self.cached.insert(event.tree, blobs);
@@ -198,12 +195,14 @@ fn main() -> Result<()> {
     ensure!(events > 0, "no native tree_access events in input");
     println!("budget_bytes\trequests\thits\thit_pct\tdownload_bytes\tevictions\tpeak_bytes");
     for budget in budgets {
+        let percent_tenths = u128::from(budget.hits) * 1000 / u128::from(budget.requests);
         println!(
-            "{}\t{}\t{}\t{:.1}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}.{}\t{}\t{}\t{}",
             budget.max,
             budget.requests,
             budget.hits,
-            (budget.hits as f64 * 100.0) / budget.requests as f64,
+            percent_tenths / 10,
+            percent_tenths % 10,
             budget.downloaded,
             budget.evictions,
             budget.peak
