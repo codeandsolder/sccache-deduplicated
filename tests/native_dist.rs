@@ -173,6 +173,22 @@ impl Fleet {
         root: &Path,
         package_upstreams: BTreeMap<String, scheduler::PackageUpstream>,
     ) -> Result<Self> {
+        Self::start_with_transfer(
+            root,
+            package_upstreams,
+            sccache::build_runtime::PackageTransferCost {
+                download_bytes_per_second: 1 << 20,
+                startup_nanoseconds: 0,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn start_with_transfer(
+        root: &Path,
+        package_upstreams: BTreeMap<String, scheduler::PackageUpstream>,
+        transfer: sccache::build_runtime::PackageTransferCost,
+    ) -> Result<Self> {
         let [scheduler_address, cache_address, worker_address] = addresses()?;
         let scheduler_url = reqwest::Url::parse(&format!("http://{scheduler_address}/"))?;
         let cache_url = reqwest::Url::parse(&format!("http://{cache_address}/"))?;
@@ -248,11 +264,7 @@ impl Fleet {
                     max_result_bytes: 64 * 1024 * 1024,
                     max_metadata_bytes: 64 * 1024 * 1024,
                     package_import: Some(package_limits(false)),
-                    package_transfer: sccache::build_runtime::PackageTransferCost {
-                        download_bytes_per_second: 1 << 20,
-                        startup_nanoseconds: 0,
-                        ..Default::default()
-                    },
+                    package_transfer: transfer,
                 }),
             },
         )?;
@@ -833,7 +845,12 @@ fn pacman_discovery_seeds_real_gcc_and_compiles_with_exact_results() -> Result<(
     let identity = PackageIdentity::from_sha256_hex(values[2], PackageCompression::Zstd)?;
     let temp = tempfile::tempdir()?;
     let root = temp.path();
-    let fleet = Fleet::start(root, BTreeMap::new())?;
+    let fleet = Fleet::start_with_transfer(
+        root,
+        BTreeMap::new(),
+        sccache::build_runtime::PackageTransferCost::default(),
+    )?;
+    let worker_store = fleet.worker_directory.clone();
     let config = provisioning_config(root, &fleet.cache_url)?;
     let discover = || {
         Command::new(env!("CARGO_BIN_EXE_sccache-dist"))
@@ -909,6 +926,17 @@ fn pacman_discovery_seeds_real_gcc_and_compiles_with_exact_results() -> Result<(
     let (scheduler, worker) = fleet.finish()?;
     assert_eq!(scheduler.actions, 1);
     assert_eq!(worker.actions, 0);
+    let store = NativeStore::open(&worker_store)?;
+    let policy = sccache::build_runtime::PackagePolicy::normalized_archive(
+        100_000,
+        4 << 30,
+        5 << 30,
+        64 << 20,
+    )?;
+    assert!(
+        store.lookup_package(identity, policy)?.is_none(),
+        "fast worker link should favor requested raw GCC content over full-package expansion"
+    );
     Ok(())
 }
 
