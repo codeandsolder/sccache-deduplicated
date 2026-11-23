@@ -2,6 +2,8 @@
 
 #[cfg(unix)]
 use std::os::unix::net as unix_net;
+#[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
+use std::time::Duration;
 use std::{
     net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::PathBuf,
@@ -84,6 +86,23 @@ impl Connection {
             Self::Tcp(s) => s.peer_addr().map(Some),
             #[cfg(unix)]
             Self::Unix(_) => Ok(None),
+        }
+    }
+
+    /// A per-I/O timeout for initial TLS negotiation only. Clear it after
+    /// completing the handshake so large request bodies are unaffected.
+    #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
+    pub(crate) fn set_handshake_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(stream) => {
+                stream.set_read_timeout(timeout)?;
+                stream.set_write_timeout(timeout)
+            }
+            #[cfg(unix)]
+            Self::Unix(stream) => {
+                stream.set_read_timeout(timeout)?;
+                stream.set_write_timeout(timeout)
+            }
         }
     }
 

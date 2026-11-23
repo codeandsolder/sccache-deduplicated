@@ -101,6 +101,8 @@ use std::io::Result as IoResult;
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
+#[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -124,6 +126,39 @@ mod response;
 mod ssl;
 mod test;
 mod util;
+
+/// A bounded admission permit for TLS handshakes. Accepted connections
+/// must never stall the single listener thread.
+#[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
+struct HandshakePermit(Arc<AtomicUsize>);
+
+#[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
+impl HandshakePermit {
+    fn acquire(active: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        let mut count = active.load(Ordering::Acquire);
+        loop {
+            if count >= limit {
+                return None;
+            }
+            match active.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self(Arc::clone(active))),
+                Err(observed) => count = observed,
+            }
+        }
+    }
+}
+
+#[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
+impl Drop for HandshakePermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
 
 /// The main class of this library.
 ///
@@ -263,13 +298,13 @@ impl Server {
         type SslContext = ();
         #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
         type SslContext = crate::ssl::SslContextImpl;
-        let ssl: Option<SslContext> = {
+        let ssl: Option<Arc<SslContext>> = {
             match ssl_config {
                 #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
-                Some(config) => Some(SslContext::from_pem(
+                Some(config) => Some(Arc::new(SslContext::from_pem(
                     config.certificate,
                     Zeroizing::new(config.private_key),
-                )?),
+                )?)),
                 #[cfg(not(any(feature = "ssl-openssl", feature = "ssl-rustls")))]
                 Some(_) => return Err(
                     "Building a server with SSL requires enabling the `ssl` feature in tiny-http"
@@ -283,6 +318,14 @@ impl Server {
         // and ClientConnection objects are pushed in the messages queue
         let messages = MessagesQueue::with_capacity(8);
 
+        #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
+        let active_handshakes = Arc::new(AtomicUsize::new(0));
+        #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
+        let max_handshakes = thread::available_parallelism()
+            .map(|cpus| cpus.get().saturating_mul(8))
+            .unwrap_or(32)
+            .clamp(32, 256);
+
         let inside_close_trigger = close_trigger.clone();
         let inside_messages = messages.clone();
         thread::spawn(move || {
@@ -291,48 +334,63 @@ impl Server {
 
             log::debug!("Running accept thread");
             while !inside_close_trigger.load(Relaxed) {
-                let new_client = match server.accept() {
+                match server.accept() {
                     Ok((sock, _)) => {
-                        use util::RefinedTcpStream;
-                        let (read_closable, write_closable) = match ssl {
-                            None => RefinedTcpStream::new(sock),
-                            #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
-                            Some(ref ssl) => {
-                                // trying to apply SSL over the connection
-                                // if an error occurs, we just close the socket and resume listening
-                                let sock = match ssl.accept(sock) {
-                                    Ok(s) => s,
-                                    Err(_) => continue,
-                                };
-
-                                RefinedTcpStream::new(sock)
+                        // A silent TLS peer must not block the accept loop, and
+                        // many such peers must not create unbounded threads.
+                        #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
+                        let mut permit = if ssl.is_some() {
+                            match HandshakePermit::acquire(&active_handshakes, max_handshakes) {
+                                Some(permit) => Some(permit),
+                                None => {
+                                    log::warn!("Too many concurrent TLS handshakes");
+                                    continue;
+                                }
                             }
-                            #[cfg(not(any(feature = "ssl-openssl", feature = "ssl-rustls")))]
-                            Some(ref _ssl) => unreachable!(),
+                        } else {
+                            None
                         };
-
-                        Ok(ClientConnection::new(write_closable, read_closable))
-                    }
-                    Err(e) => Err(e),
-                };
-
-                match new_client {
-                    Ok(client) => {
+                        let ssl = ssl.clone();
                         let messages = inside_messages.clone();
-                        let mut client = Some(client);
+                        let mut sock = Some(sock);
                         tasks_pool.spawn(Box::new(move || {
-                            if let Some(client) = client.take() {
-                                // Synchronization is needed for HTTPS requests to avoid a deadlock
-                                if client.secure() {
-                                    let (sender, receiver) = mpsc::channel();
-                                    for rq in client {
-                                        messages.push(rq.with_notify_sender(sender.clone()).into());
-                                        receiver.recv().unwrap();
+                            let Some(sock) = sock.take() else { return };
+                            use util::RefinedTcpStream;
+                            let (read_closable, write_closable) = match ssl {
+                                None => RefinedTcpStream::new(sock),
+                                #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
+                                Some(ref ssl) => {
+                                    let sock = match ssl.accept(sock) {
+                                        Ok(sock) => sock,
+                                        Err(error) => {
+                                            log::debug!("TLS handshake failed: {}", error);
+                                            return;
+                                        }
+                                    };
+                                    RefinedTcpStream::new(sock)
+                                }
+                                #[cfg(not(any(feature = "ssl-openssl", feature = "ssl-rustls")))]
+                                Some(ref _ssl) => unreachable!(),
+                            };
+
+                            // Release handshake capacity before reading normal
+                            // HTTP bodies, which can take arbitrarily longer.
+                            #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
+                            drop(permit.take());
+
+                            let client = ClientConnection::new(write_closable, read_closable);
+                            // Synchronization avoids concurrent TLS reads and writes.
+                            if client.secure() {
+                                let (sender, receiver) = mpsc::channel();
+                                for rq in client {
+                                    messages.push(rq.with_notify_sender(sender.clone()).into());
+                                    if receiver.recv().is_err() {
+                                        break;
                                     }
-                                } else {
-                                    for rq in client {
-                                        messages.push(rq.into());
-                                    }
+                                }
+                            } else {
+                                for rq in client {
+                                    messages.push(rq.into());
                                 }
                             }
                         }));
@@ -441,5 +499,25 @@ impl Drop for Server {
                 let _ = std::fs::remove_file(path);
             }
         }
+    }
+}
+
+#[cfg(all(test, any(feature = "ssl-openssl", feature = "ssl-rustls")))]
+mod handshake_permit_tests {
+    use super::*;
+
+    #[test]
+    fn handshake_slots_are_bounded_and_released() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let first = HandshakePermit::acquire(&active, 2).expect("first slot");
+        let second = HandshakePermit::acquire(&active, 2).expect("second slot");
+        assert!(HandshakePermit::acquire(&active, 2).is_none());
+        assert_eq!(active.load(Ordering::Acquire), 2);
+        drop(first);
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        let third = HandshakePermit::acquire(&active, 2).expect("reused slot");
+        drop(second);
+        drop(third);
+        assert_eq!(active.load(Ordering::Acquire), 0);
     }
 }

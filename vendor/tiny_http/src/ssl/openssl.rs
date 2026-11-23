@@ -97,8 +97,10 @@ impl OpenSslContext {
         stream: Connection,
     ) -> Result<OpenSslStream, Box<dyn Error + Send + Sync + 'static>> {
         use openssl::ssl::Ssl;
+        stream.set_handshake_timeout(Some(super::HANDSHAKE_TIMEOUT))?;
         let session = Ssl::new(&self.0).expect("Failed to create new OpenSSL session");
         let stream = session.accept(stream)?;
+        stream.get_ref().set_handshake_timeout(None)?;
         Ok(OpenSslStream { inner: stream })
     }
 }
