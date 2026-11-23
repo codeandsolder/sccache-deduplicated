@@ -937,7 +937,9 @@ fn native_locality_weight(
         .filter(|tree| requested_trees.contains(*tree))
         .count()
         .min(4);
-    capacity_weight * (1.0 + 0.3 * matches as f64)
+    // The count is clamped to four; conversion cannot truncate it.
+    let matches = u8::try_from(matches).unwrap_or(4);
+    capacity_weight * (1.0 + 0.3 * f64::from(matches))
 }
 
 fn weighted_server(candidates: &[(ServerId, f64)], draw: f64) -> Option<ServerId> {
