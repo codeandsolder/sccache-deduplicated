@@ -309,6 +309,7 @@ impl NativeStore {
         write.commit()?;
         pins.usage.remove(&Root::Tree(id));
         pins.dirty_usage.remove(&Root::Tree(id));
+        pins.cached_trees.retain(|cached| *cached != id);
         drop(pins);
         Ok(Eviction::Removed {
             unreferenced_logical_bytes: bytes,

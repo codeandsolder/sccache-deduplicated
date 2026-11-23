@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom, Write},
     os::unix::fs::{MetadataExt, PermissionsExt},
@@ -139,6 +139,8 @@ struct Pins {
     blobs: BTreeMap<ContentId, usize>,
     usage: BTreeMap<space::Root, space::UsageRecord>,
     dirty_usage: BTreeSet<space::Root>,
+    /// Bounded MRU native-tree inventory, updated under the existing pin lock.
+    cached_trees: VecDeque<crate::TreeId>,
     last_usage_checkpoint: Option<Instant>,
 }
 
@@ -436,6 +438,7 @@ impl NativeStore {
                 pins.usage.insert(root, record);
             }
         }
+        pins.restore_tree_hints();
         let inner = Arc::new(Inner {
             root,
             db,

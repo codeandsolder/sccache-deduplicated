@@ -474,3 +474,39 @@ fn worker_cache_hints_are_bounded_recent_and_survive_restart() -> Result<()> {
     assert_eq!(store.recent_trees(3)?, vec![hot, cold]);
     Ok(())
 }
+
+#[test]
+fn worker_cache_heartbeat_hints_remain_bounded_as_store_grows() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let mut manifest = TreeManifest {
+        root: TreeMetadata {
+            mode: 0o755,
+            modified: TreeTimestamp {
+                seconds: 0,
+                nanoseconds: 0,
+            },
+        },
+        entries: BTreeMap::new(),
+    };
+    let mut published = Vec::new();
+    for second in 0..64 {
+        manifest.root.modified.seconds = second;
+        published.push(store.publish_tree(&manifest, vec![])?);
+    }
+    assert_eq!(
+        store.recent_trees(64)?,
+        published.iter().rev().take(32).copied().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        store.recent_trees(1)?,
+        vec![*published.last().context("missing last tree")?]
+    );
+    let evicted = published[63];
+    assert!(matches!(
+        store.evict_tree(evicted)?,
+        Eviction::Removed { .. }
+    ));
+    assert_eq!(store.recent_trees(1)?, vec![published[62]]);
+    Ok(())
+}

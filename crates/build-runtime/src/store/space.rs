@@ -118,34 +118,17 @@ impl NativeStore {
         Ok(())
     }
 
-    /// Recent resident tree IDs for advisory worker selection. These are
-    /// verified immutable roots known to this process, not a guarantee that
-    /// every referenced inode is still healthy when an assignment arrives.
-    /// The list is bounded without sorting the whole store.
+    /// Recent immutable tree IDs for advisory worker placement. Heartbeats
+    /// only clone a bounded MRU index; they never scan the full usage map or
+    /// hold the pin lock across filesystem or index I/O.
     ///
     /// # Errors
-    /// Returns an error when the native index's pin state is unavailable.
+    /// Returns an error when the store's in-memory pin lock is unavailable.
     pub fn recent_trees(&self, limit: usize) -> Result<Vec<TreeId>> {
-        use std::cmp::Reverse;
         let pins = self.inner.lock_pins()?;
-        let mut latest = BinaryHeap::new();
-        for (&root, stats) in &pins.usage {
-            if let Root::Tree(id) = root {
-                let hint = Reverse((stats.last_used_ms, stats.hits, id));
-                if latest.len() < limit {
-                    latest.push(hint);
-                } else if latest.peek().is_some_and(|oldest| hint < *oldest) {
-                    latest.pop();
-                    latest.push(hint);
-                }
-            }
-        }
+        let ids = pins.cached_trees.iter().take(limit).copied().collect();
         drop(pins);
-        Ok(latest
-            .into_sorted_vec()
-            .into_iter()
-            .map(|Reverse((_, _, id))| id)
-            .collect())
+        Ok(ids)
     }
 
     /// Persist only dirty usage records in one bounded write transaction,
@@ -333,11 +316,41 @@ fn reuse_utility(usage: Option<&UsageRecord>, bytes: u64, now: u64) -> u64 {
 }
 
 impl super::Pins {
+    const RECENT_TREE_LIMIT: usize = 32;
+
+    /// Reconstruct the bounded MRU list once on store open. Usage history is
+    /// authoritative; the recent-tree list is just a cheap scheduling hint.
+    pub(super) fn restore_tree_hints(&mut self) {
+        use std::cmp::Reverse;
+        let mut recent = BinaryHeap::new();
+        for (&root, stats) in &self.usage {
+            if let Root::Tree(id) = root {
+                let rank = Reverse((stats.last_used_ms, stats.hits, id));
+                if recent.len() < Self::RECENT_TREE_LIMIT {
+                    recent.push(rank);
+                } else if recent.peek().is_some_and(|oldest| rank < *oldest) {
+                    recent.pop();
+                    recent.push(rank);
+                }
+            }
+        }
+        self.cached_trees = recent
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Reverse((_, _, id))| id)
+            .collect();
+    }
+
     pub(super) fn touch(&mut self, root: Root) {
         let record = self.usage.entry(root).or_default();
         record.hits = record.hits.saturating_add(1);
         record.last_used_ms = now_ms();
         self.dirty_usage.insert(root);
+        if let Root::Tree(id) = root {
+            self.cached_trees.retain(|cached| *cached != id);
+            self.cached_trees.push_front(id);
+            self.cached_trees.truncate(Self::RECENT_TREE_LIMIT);
+        }
     }
 }
 
