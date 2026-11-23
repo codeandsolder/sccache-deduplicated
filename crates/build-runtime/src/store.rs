@@ -8,6 +8,9 @@ use std::{
     time::Instant,
 };
 
+#[cfg(target_os = "linux")]
+use std::collections::VecDeque;
+
 use anyhow::{Context, Result, anyhow, ensure};
 use bincode::Options;
 use redb::{
@@ -18,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use tempfile::{NamedTempFile, TempPath};
 
 use super::{
-    ActionFingerprint, ActionKey, ActionMode, BlobReader, BlobRef, ContentId, ResultId,
-    ResultManifest, blob_codec, identity::encoding,
+    ActionFingerprint, ActionKey, ActionMode, BlobEncoding, BlobReader, BlobRef, ContentId,
+    ResultId, ResultManifest, blob_codec, identity::encoding,
 };
 
 const ACTIONS: TableDefinition<'static, &[u8; 32], &[u8]> = TableDefinition::new("actions_v1");
@@ -31,6 +34,8 @@ const TREE_PACKAGES: MultimapTableDefinition<'static, &[u8; 32], &[u8; 32]> =
     MultimapTableDefinition::new("tree_packages_v1");
 const TREES: TableDefinition<'static, &[u8; 32], &[u8]> = TableDefinition::new("trees_v1");
 const BLOBS: TableDefinition<'static, &[u8; 32], u64> = TableDefinition::new("blobs_v1");
+const BLOB_LAYOUTS: TableDefinition<'static, &[u8; 32], u8> =
+    TableDefinition::new("blob_layouts_v1");
 const RESULT_ACTIONS: MultimapTableDefinition<'static, &[u8; 32], &[u8; 32]> =
     MultimapTableDefinition::new("result_actions_v1");
 const ACCOUNTING: TableDefinition<'static, u8, u64> = TableDefinition::new("accounting_v1");
@@ -55,6 +60,7 @@ pub struct StagedBlob {
     path: TempPath,
     metadata: fs::Metadata,
     reference: BlobRef,
+    encoding: BlobEncoding,
     owner: Arc<Inner>,
 }
 
@@ -199,13 +205,23 @@ impl Inner {
         self.root.join("blobs").join(&hex[..2]).join(&hex[2..])
     }
 
+    fn blob_encoding(&self, id: ContentId) -> Result<BlobEncoding> {
+        let read = self.db.begin_read()?;
+        let layouts = read.open_table(BLOB_LAYOUTS)?;
+        let value = layouts
+            .get(&id.0)?
+            .with_context(|| format!("missing indexed physical encoding for {id:?}"))?
+            .value();
+        BlobEncoding::try_from(value)
+    }
+
     fn check_blob(&self, id: ContentId, size: u64) -> Result<()> {
         let path = self.blob_path(id);
         let metadata = fs::symlink_metadata(&path)
             .with_context(|| format!("missing native store content {id:?}"))?;
         ensure!(metadata.is_file(), "invalid native store content {id:?}");
         ensure!(
-            BlobReader::open(File::open(&path)?)?.len() == size,
+            BlobReader::open(File::open(&path)?, self.blob_encoding(id)?)?.len() == size,
             "invalid native store content {id:?}"
         );
         Ok(())
@@ -257,6 +273,14 @@ impl Inner {
         }
         let read = self.db.begin_read()?;
         let blobs = read.open_table(BLOBS)?;
+        let layouts = read.open_table(BLOB_LAYOUTS)?;
+        let mut stale_layouts = Vec::new();
+        for entry in layouts.iter()? {
+            let (id, _) = entry?;
+            if blobs.get(id.value())?.is_none() {
+                stale_layouts.push(*id.value());
+            }
+        }
         for shard in fs::read_dir(self.root.join("blobs"))? {
             let shard = shard?;
             ensure!(shard.file_type()?.is_dir(), "invalid blob shard");
@@ -275,15 +299,25 @@ impl Inner {
                 );
                 if blobs.get(&id.0)?.is_none() {
                     self.remove_blob(id)?;
+                } else {
+                    ensure!(
+                        layouts.get(&id.0)?.is_some(),
+                        "indexed CAS entry missing physical encoding"
+                    );
                 }
             }
         }
         // Pending deletions are all unreferenced, and no readers or uploads
         // can survive a process restart. The scan above removed their files.
+        drop(layouts);
         drop(blobs);
         drop(read);
         let write = self.db.begin_write()?;
         {
+            let mut layouts = write.open_table(BLOB_LAYOUTS)?;
+            for id in stale_layouts {
+                layouts.remove(&id)?;
+            }
             let mut pending = write.open_table(PENDING_DELETIONS)?;
             pending.retain(|_, _| false)?;
             let mut accounting = write.open_table(ACCOUNTING)?;
@@ -294,17 +328,118 @@ impl Inner {
     }
 }
 
+struct ReservingReader<'a, 's, R> {
+    source: R,
+    budget: &'a mut space::StageBudget<'s>,
+    seen: u64,
+    bounded: bool,
+}
+impl<R: Read> Read for ReservingReader<'_, '_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self.source.read(buffer)?;
+        let next = self
+            .seen
+            .checked_add(count as u64)
+            .ok_or_else(|| io::Error::other("native stage size overflow"))?;
+        if !self.bounded {
+            self.budget.grow_to(next).map_err(io::Error::other)?;
+        }
+        self.seen = next;
+        Ok(count)
+    }
+}
+
 /// Single-owner, durable action index and content-addressed file storage.
 ///
 /// Blocking storage operations belong on an I/O executor rather than the
 /// scheduler's asynchronous control loop. Provision the directory on a
 /// dedicated compressed filesystem/dataset; this type does not create pools,
 /// change filesystem properties or start other cache services.
+#[cfg(target_os = "linux")]
+const MAX_CACHED_TREE_MOUNTS: usize = 16;
+
+/// A bounded set of persistent immutable views, independent of each action's
+/// private writable scratch. Reusing a view preserves kernel page-cache pages.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct MountCache {
+    entries: BTreeMap<crate::TreeId, Arc<trees::ReadOnlyView>>,
+    order: VecDeque<crate::TreeId>,
+}
+
+#[cfg(target_os = "linux")]
+impl MountCache {
+    fn mount(
+        &mut self,
+        lease: trees::TreeLease,
+        persistent: &Path,
+        scratch: &Path,
+    ) -> Result<trees::MountedTree> {
+        let key = lease.id();
+        if let Some(view) = self.entries.get(&key) {
+            let mounted = trees::MountedTree::from_view(Arc::clone(view), scratch)?;
+            self.order.retain(|other| other != &key);
+            self.order.push_back(key);
+            return Ok(mounted);
+        }
+        let view = Arc::new(trees::ReadOnlyView::mount(lease, persistent)?);
+        let mounted = trees::MountedTree::from_view(Arc::clone(&view), scratch)?;
+        self.entries.insert(key, view);
+        self.order.push_back(key);
+        while self.entries.len() > MAX_CACHED_TREE_MOUNTS {
+            if let Some(least_recent) = self.order.pop_front() {
+                self.entries.remove(&least_recent);
+            }
+        }
+        Ok(mounted)
+    }
+
+    /// Drop inactive cached views before evicting durable CAS content.
+    /// A view held by an executing build retains its lease and is not evicted.
+    fn drop_idle(&mut self, only: Option<crate::TreeId>) {
+        let unused: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(id, view)| {
+                only.is_none_or(|target| **id == target) && Arc::strong_count(view) == 1
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for key in &unused {
+            self.entries.remove(key);
+        }
+        self.order.retain(|key| !unused.contains(key));
+    }
+}
+
 pub struct NativeStore {
     inner: Arc<Inner>,
+    #[cfg(target_os = "linux")]
+    mounts: Mutex<MountCache>,
 }
 
 impl NativeStore {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn mount_tree(
+        &self,
+        lease: trees::TreeLease,
+        parent: &Path,
+    ) -> Result<trees::MountedTree> {
+        self.mounts
+            .lock()
+            .map_err(|_| anyhow!("native CAS mount cache lock poisoned"))?
+            .mount(lease, &self.inner.root.join("mounts"), parent)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn drop_idle_views(&self, only: Option<crate::TreeId>) -> Result<()> {
+        self.mounts
+            .lock()
+            .map_err(|_| anyhow!("native CAS mount cache lock poisoned"))?
+            .drop_idle(only);
+        Ok(())
+    }
+
     /// Open or initialize an exclusive store and recover unreferenced files.
     ///
     /// # Errors
@@ -334,7 +469,7 @@ impl NativeStore {
             Err(error) => return Err(error.into()),
         }
         let db = Database::create(index)?;
-        for name in ["staging", "blobs"] {
+        for name in ["staging", "blobs", "mounts"] {
             let path = root.join(name);
             fs::create_dir_all(&path)?;
             let metadata = fs::symlink_metadata(&path)?;
@@ -345,7 +480,7 @@ impl NativeStore {
                 "native store directory is not owner-controlled: {}",
                 path.display()
             );
-            if name == "staging" {
+            if name == "staging" || name == "mounts" {
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
             }
         }
@@ -358,6 +493,7 @@ impl NativeStore {
         write.open_multimap_table(TREE_PACKAGES)?;
         write.open_multimap_table(BLOB_PACKAGES)?;
         write.open_table(BLOBS)?;
+        write.open_table(BLOB_LAYOUTS)?;
         write.open_multimap_table(RESULT_ACTIONS)?;
         write.open_multimap_table(BLOB_ROOTS)?;
         write.open_table(PENDING_DELETIONS)?;
@@ -381,7 +517,11 @@ impl NativeStore {
             space: Mutex::default(),
         });
         inner.recover_orphans()?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            #[cfg(target_os = "linux")]
+            mounts: Mutex::new(MountCache::default()),
+        })
     }
 
     /// Encode generated content exactly once with indexed Zstandard blocks.
@@ -444,6 +584,7 @@ impl NativeStore {
                 id: ContentId(*hash.finalize().as_bytes()),
                 size,
             },
+            encoding: BlobEncoding::Raw,
             owner: Arc::clone(&self.inner),
         })
     }
@@ -458,26 +599,6 @@ impl NativeStore {
         let mut budget = space::StageBudget::new(self);
         if let Some(bound) = bound {
             budget.grow_to(bound)?;
-        }
-        struct ReservingReader<'a, 's, R> {
-            source: R,
-            budget: &'a mut space::StageBudget<'s>,
-            seen: u64,
-            bounded: bool,
-        }
-        impl<R: Read> Read for ReservingReader<'_, '_, R> {
-            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-                if !self.bounded {
-                    let next = self
-                        .seen
-                        .checked_add(buffer.len() as u64)
-                        .ok_or_else(|| io::Error::other("native stage size overflow"))?;
-                    self.budget.grow_to(next).map_err(io::Error::other)?;
-                }
-                let count = self.source.read(buffer)?;
-                self.seen += count as u64;
-                Ok(count)
-            }
         }
         let mut staged = NamedTempFile::new_in(self.inner.root.join("staging"))?;
         let reference = blob_codec::encode(
@@ -499,6 +620,7 @@ impl NativeStore {
             path: staged.into_temp_path(),
             metadata,
             reference,
+            encoding: BlobEncoding::ZstdChunks,
             owner: Arc::clone(&self.inner),
         })
     }
@@ -526,6 +648,7 @@ impl NativeStore {
             path: staged.into_temp_path(),
             metadata,
             reference: expected,
+            encoding: BlobEncoding::ZstdChunks,
             owner: Arc::clone(&self.inner),
         })
     }
@@ -744,6 +867,7 @@ impl NativeStore {
         existing_result: bool,
     ) -> Result<()> {
         let mut blob_table = write.open_table(BLOBS)?;
+        let mut layouts = write.open_table(BLOB_LAYOUTS)?;
         let mut blob_roots = write.open_multimap_table(BLOB_ROOTS)?;
         let mut pending = write.open_table(PENDING_DELETIONS)?;
         let mut accounting = write.open_table(ACCOUNTING)?;
@@ -782,7 +906,12 @@ impl NativeStore {
                     let blob = staged
                         .remove(&id)
                         .context("validated staged content disappeared")?;
+                    let encoding = blob.encoding;
                     self.inner.install_blob(blob, &mut directories)?;
+                    ensure!(
+                        layouts.insert(&id.0, encoding as u8)?.is_none(),
+                        "physical encoding already indexed for new CAS content"
+                    );
                 }
                 blob_table.insert(&id.0, size)?;
                 added = added.checked_add(size).context("store size overflow")?;
@@ -1063,9 +1192,14 @@ impl NativeStore {
             let write = self.inner.db.begin_write()?;
             {
                 let mut pending = write.open_table(PENDING_DELETIONS)?;
+                let mut layouts = write.open_table(BLOB_LAYOUTS)?;
                 let mut accounting = write.open_table(ACCOUNTING)?;
                 for id in &completed {
                     ensure!(pending.remove(&id.0)?.is_some(), "missing pending deletion");
+                    ensure!(
+                        layouts.remove(&id.0)?.is_some(),
+                        "missing physical encoding for removed blob"
+                    );
                 }
                 let queued = accounting
                     .get(PENDING_BYTES)?
@@ -1176,7 +1310,7 @@ impl ResultLease {
     /// Returns an error for an undeclared blob or filesystem failure.
     pub fn open_blob(&self, id: ContentId) -> Result<impl Read + Seek + '_> {
         Ok(LeasedReader {
-            file: BlobReader::open(self.open_file(id)?)?,
+            file: BlobReader::open(self.open_file(id)?, self.inner.blob_encoding(id)?)?,
             _lease: self,
         })
     }

@@ -456,7 +456,7 @@ impl NativeCacheClient {
                         blobs.get(&missing.id) == Some(&missing.size),
                         "scheduler requested undeclared output"
                     );
-                    self.upload(ticket, missing, captured.open_blob(missing.id)?)?;
+                    self.upload_encoded_file(ticket, missing, captured.open_file(missing.id)?)?;
                 }
                 ensure!(
                     self.commit(ticket)? == *manifest,

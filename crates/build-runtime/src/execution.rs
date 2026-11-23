@@ -217,6 +217,32 @@ fn writable_locations(
     Ok(result)
 }
 
+fn capture_locations(
+    spec: &ExecutionSpec,
+    views: &BTreeMap<BuildPath, MountedTree>,
+    writable: &BTreeSet<BuildPath>,
+) -> Result<BTreeMap<String, OutputLocation>> {
+    let mut outputs = BTreeMap::new();
+    for (name, output) in &spec.outputs {
+        // Capture from the *writable bind's* backing directory, not the
+        // underlying immutable FUSE tree hidden by that bind.
+        let parent = writable
+            .iter()
+            .filter(|path| output.path.within(path.as_bytes()))
+            .max_by_key(|path| path.as_bytes().len())
+            .context("output is not in a declared writable mount")?;
+        let (point, view) = backing(views, parent)?;
+        outputs.insert(
+            name.clone(),
+            OutputLocation {
+                directory: File::open(view.writable_path(relative(parent, point)?)?)?,
+                relative: relative(&output.path, parent)?.to_owned(),
+            },
+        );
+    }
+    Ok(outputs)
+}
+
 impl PreparedBuild {
     fn prepare(spec: &ExecutionSpec, store: &NativeStore, scratch: &Path) -> Result<Self> {
         let root_point = BuildPath::new(b"/".to_vec())?;
@@ -249,7 +275,7 @@ impl PreparedBuild {
         // parents. The mounted lease pins its backing blobs through execution.
         let mut views: BTreeMap<BuildPath, MountedTree> = leases
             .into_iter()
-            .map(|(path, lease)| Ok((path, lease.mount_readonly(scratch)?)))
+            .map(|(path, lease)| Ok((path, store.mount_tree(lease, scratch)?)))
             .collect::<Result<_>>()?;
         for path in &writable {
             let (point, _) = backing(&views, path)?;
@@ -307,24 +333,7 @@ impl PreparedBuild {
                 MountAccess::Writable,
             )?;
         }
-        let mut outputs = BTreeMap::new();
-        for (name, output) in &spec.outputs {
-            // Capture from the *writable bind's* backing directory, not the
-            // underlying immutable FUSE tree hidden by that bind.
-            let parent = writable
-                .iter()
-                .filter(|path| output.path.within(path.as_bytes()))
-                .max_by_key(|path| path.as_bytes().len())
-                .context("output is not in a declared writable mount")?;
-            let (point, view) = backing(&views, parent)?;
-            outputs.insert(
-                name.clone(),
-                OutputLocation {
-                    directory: File::open(view.writable_path(relative(parent, point)?)?)?,
-                    relative: relative(&output.path, parent)?.to_owned(),
-                },
-            );
-        }
+        let outputs = capture_locations(spec, &views, &writable)?;
         Ok(Self {
             plan,
             outputs,

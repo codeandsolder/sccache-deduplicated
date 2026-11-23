@@ -533,18 +533,6 @@ impl NativeCacheClient {
         self.control("begin", &ManifestRequest { ticket, manifest })
     }
 
-    /// Upload one missing blob directly from an open file descriptor.
-    ///
-    /// # Errors
-    /// Returns an error for an invalid length or rejected transfer.
-    pub fn upload_file(&self, ticket: Ticket, blob: BlobRef, file: File) -> Result<()> {
-        ensure!(
-            file.metadata()?.len() == blob.size,
-            "native upload file length mismatch"
-        );
-        self.upload(ticket, blob, file)
-    }
-
     /// Compress a new blob once and upload the encoded representation.
     /// The scheduler verifies the original digest while retaining the exact
     /// compressed bytes; no transfer-side recompression is necessary.

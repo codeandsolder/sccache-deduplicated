@@ -27,6 +27,52 @@ fn result(blob: BlobRef) -> ResultManifest {
 }
 
 #[test]
+fn literal_magic_prefix_in_raw_cas_blob_survives_restart() -> Result<()> {
+    use crate::{TreeEntry, TreeManifest, TreeMetadata, TreePath, TreeTimestamp};
+    let directory = tempfile::tempdir()?;
+    let store = NativeStore::open(directory.path())?;
+    let content = b"SC-CAS-ZSTD-0002arbitrary-original-bytes";
+    let staged = store.stage_inner(content.as_slice(), Some(content.len() as u64))?;
+    let reference = staged.reference();
+    let metadata = TreeMetadata {
+        mode: 0o755,
+        modified: TreeTimestamp {
+            seconds: 10,
+            nanoseconds: 0,
+        },
+    };
+    let tree = TreeManifest {
+        root: metadata,
+        entries: BTreeMap::from([(
+            TreePath::new(b"source".to_vec())?,
+            TreeEntry::File {
+                blob: reference,
+                metadata,
+            },
+        )]),
+    };
+    let id = store.publish_tree(&tree, vec![staged])?;
+    let lease = store
+        .lookup_tree(id)?
+        .context("missing raw archive-like content")?;
+    let mut decoded = Vec::new();
+    lease.open_blob(reference.id)?.read_to_end(&mut decoded)?;
+    assert_eq!(decoded, content);
+    assert_eq!(std::fs::read(lease.open_file(reference.id)?)?, content);
+    drop(lease);
+    drop(store);
+
+    let reopened = NativeStore::open(directory.path())?;
+    let lease = reopened
+        .lookup_tree(id)?
+        .context("raw physical kind lost across restart")?;
+    decoded.clear();
+    lease.open_blob(reference.id)?.read_to_end(&mut decoded)?;
+    assert_eq!(decoded, content);
+    Ok(())
+}
+
+#[test]
 fn aliases_and_shared_artifacts_reclaim_only_last_reference() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let store = NativeStore::open(dir.path())?;
@@ -529,7 +575,8 @@ fn staging_many_blobs_does_not_hold_file_descriptors() -> Result<()> {
     assert_eq!(fs::read_dir(&staging)?.count(), staged.len());
     for (index, blob) in staged.iter().enumerate() {
         let mut bytes = Vec::new();
-        crate::BlobReader::open(blob.open_file()?)?.read_to_end(&mut bytes)?;
+        crate::BlobReader::open(blob.open_file()?, crate::BlobEncoding::ZstdChunks)?
+            .read_to_end(&mut bytes)?;
         assert_eq!(bytes, u32::try_from(index)?.to_le_bytes());
     }
     drop(staged);

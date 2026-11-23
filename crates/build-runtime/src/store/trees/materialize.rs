@@ -185,9 +185,10 @@ impl TreeLease {
         stats: &mut MaterializationStats,
     ) -> Result<()> {
         let source = File::open(self.inner.blob_path(blob.id))?;
-        let mut decoded = crate::BlobReader::open(source.try_clone()?)?;
+        let mut decoded =
+            crate::BlobReader::open(source.try_clone()?, self.inner.blob_encoding(blob.id)?)?;
         let mut destination = OpenOptions::new().write(true).create_new(true).open(path)?;
-        let cloned = if decoded.is_compressed() {
+        let cloned = if decoded.is_encoded() {
             Err(Errno::OPNOTSUPP)
         } else {
             rustix::fs::ioctl_ficlone(&destination, &source)

@@ -88,6 +88,11 @@ impl NativeStore {
         let mut free = available()?;
         let mut evicted_roots = 0;
         if free < minimum {
+            // Idle FUSE mounts pin their backing objects to preserve decoded
+            // page-cache reuse. Under storage pressure release those pins
+            // before choosing eviction candidates.
+            #[cfg(target_os = "linux")]
+            self.drop_idle_views(None)?;
             for root in self
                 .eviction_candidates()?
                 .into_iter()

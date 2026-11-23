@@ -237,6 +237,8 @@ impl NativeStore {
     /// # Errors
     /// Returns an error for inconsistent metadata or storage failure.
     pub fn evict_tree(&self, id: TreeId) -> Result<Eviction> {
+        #[cfg(target_os = "linux")]
+        self.drop_idle_views(Some(id))?;
         let _mutation = self.inner.lock_mutations()?;
         let mut pins = self.inner.lock_pins()?;
         if pins.trees.contains_key(&id) {
@@ -326,7 +328,7 @@ impl TreeLease {
     /// # Errors
     /// Returns an error for missing content or an invalid physical payload.
     pub fn open_decoded(&self, id: ContentId) -> Result<crate::BlobReader> {
-        crate::BlobReader::open(self.open_file(id)?)
+        crate::BlobReader::open(self.open_file(id)?, self.inner.blob_encoding(id)?)
     }
 
     /// Open an independent reader for content declared by this tree.
@@ -335,7 +337,7 @@ impl TreeLease {
     /// Returns an error for undeclared content or filesystem failure.
     pub fn open_blob(&self, id: ContentId) -> Result<impl Read + Seek + '_> {
         Ok(LeasedReader {
-            file: crate::BlobReader::open(self.open_file(id)?)?,
+            file: crate::BlobReader::open(self.open_file(id)?, self.inner.blob_encoding(id)?)?,
             _lease: self,
         })
     }
@@ -361,6 +363,8 @@ mod capture;
 mod mount;
 #[cfg(target_os = "linux")]
 pub use mount::MountedTree;
+#[cfg(target_os = "linux")]
+pub use mount::ReadOnlyView;
 #[cfg(target_os = "linux")]
 mod materialize;
 #[cfg(target_os = "linux")]

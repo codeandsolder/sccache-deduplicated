@@ -15,6 +15,27 @@ const CHUNK: usize = 256 * 1024;
 const HEADER: u64 = 32;
 const RAW_CHUNK: u32 = 1 << 31;
 
+/// A CAS entry's physical format, recorded in the index independently of its content hash.
+/// Original upstream package archives are raw even if they begin with the encoded-file magic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BlobEncoding {
+    Raw = 0,
+    ZstdChunks = 1,
+}
+
+impl TryFrom<u8> for BlobEncoding {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Raw),
+            1 => Ok(Self::ZstdChunks),
+            _ => anyhow::bail!("unknown CAS physical encoding: {value}"),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Part {
     offset: u64,
@@ -29,6 +50,7 @@ pub struct BlobReader {
     file: File,
     parts: Vec<Part>,
     plain_len: u64,
+    encoded: bool,
     position: u64,
     current: Option<(usize, Vec<u8>)>,
 }
@@ -49,30 +71,35 @@ fn read_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> io::Result<()
 }
 
 impl BlobReader {
-    /// Parse and validate the physical index; plain source archives remain raw.
+    /// Open a CAS object using its explicit physical encoding from the durable index.
     ///
     /// # Errors
     /// Returns an error if the on-disk file or its chunk directory is malformed.
-    pub fn open(file: File) -> Result<Self> {
+    pub fn open(file: File, encoding: BlobEncoding) -> Result<Self> {
         let stored_len = file.metadata()?.len();
-        let mut marker = [0u8; 16];
-        if stored_len < MAGIC.len() as u64
-            || read_at(&file, &mut marker, 0).is_err()
-            || marker != MAGIC
-        {
+        if encoding == BlobEncoding::Raw {
             return Ok(Self {
                 file,
                 parts: Vec::new(),
                 plain_len: stored_len,
+                encoded: false,
                 position: 0,
                 current: None,
             });
         }
+        ensure!(stored_len >= HEADER, "truncated encoded CAS header");
+        let mut marker = [0u8; 16];
+        read_at(&file, &mut marker, 0)?;
+        ensure!(marker == MAGIC, "invalid encoded CAS marker");
         let mut header = [0u8; 16];
         read_at(&file, &mut header, 16)?;
         let plain_len = u64::from_le_bytes(header[..8].try_into()?);
         let chunk_size = u32::from_le_bytes(header[8..12].try_into()?);
         let count = u32::from_le_bytes(header[12..].try_into()?);
+        ensure!(
+            stored_len >= HEADER && u64::from(count) <= (stored_len - HEADER) / 9,
+            "CAS chunk index exceeds physical payload bounds"
+        );
         ensure!(chunk_size as usize == CHUNK, "CAS chunk size mismatch");
         ensure!(
             u64::from(count) == plain_len.div_ceil(CHUNK as u64),
@@ -89,7 +116,11 @@ impl BlobReader {
             let plain = usize::try_from(u32::from_le_bytes(widths[4..].try_into()?))?;
             let compressed = word & RAW_CHUNK == 0;
             ensure!(
-                stored > 0 && plain > 0 && plain <= CHUNK && (compressed || stored == plain),
+                stored > 0
+                    && stored <= zstd::zstd_safe::compress_bound(CHUNK)
+                    && plain > 0
+                    && plain <= CHUNK
+                    && (compressed || stored == plain),
                 "invalid CAS chunk lengths"
             );
             offset = offset.checked_add(8).context("CAS chunk offset overflow")?;
@@ -114,6 +145,7 @@ impl BlobReader {
             file,
             parts,
             plain_len,
+            encoded: true,
             position: 0,
             current: None,
         })
@@ -125,8 +157,13 @@ impl BlobReader {
     }
 
     #[must_use]
-    pub fn is_compressed(&self) -> bool {
-        !self.parts.is_empty() || self.file.metadata().is_ok_and(|m| m.len() == HEADER)
+    pub const fn is_empty(&self) -> bool {
+        self.plain_len == 0
+    }
+
+    #[must_use]
+    pub const fn is_encoded(&self) -> bool {
+        self.encoded
     }
 
     fn chunk(&mut self, idx: usize) -> io::Result<&[u8]> {
@@ -203,6 +240,9 @@ impl Seek for BlobReader {
 
 /// Write one immutable compressed representation while hashing its logical
 /// content. This is one compression pass with bounded buffering.
+///
+/// # Errors
+/// Returns an error for input/output failure, excessive content, or an encoding error.
 pub fn encode(mut reader: impl Read, file: &mut File, bound: Option<u64>) -> Result<BlobRef> {
     file.write_all(&MAGIC)?;
     file.write_all(&[0_u8; 16])?;
@@ -255,6 +295,9 @@ pub fn encode(mut reader: impl Read, file: &mut File, bound: Option<u64>) -> Res
 /// Read a transported physical payload into a staged file while verifying all
 /// decoded bytes against the advertised content digest. Encoded bytes are
 /// retained verbatim for subsequent transfers.
+///
+/// # Errors
+/// Returns an error for malformed frames, hash/length mismatches, or I/O failure.
 pub fn transfer(
     mut reader: impl Read,
     mut physical: impl Write,
@@ -289,7 +332,11 @@ pub fn transfer(
         let stored = usize::try_from(word & !RAW_CHUNK)?;
         let plain = usize::try_from(u32::from_le_bytes(widths[4..].try_into()?))?;
         ensure!(
-            stored > 0 && plain > 0 && plain <= CHUNK && (word & RAW_CHUNK == 0 || stored == plain),
+            stored > 0
+                && stored <= zstd::zstd_safe::compress_bound(CHUNK)
+                && plain > 0
+                && plain <= CHUNK
+                && (word & RAW_CHUNK == 0 || stored == plain),
             "native CAS chunk exceeds bounds"
         );
         decoded = decoded
@@ -337,18 +384,58 @@ mod tests {
         let reference = encode(input.as_slice(), &mut f, None)?;
         assert_eq!(reference.id, ContentId::of(&input));
         drop(f);
-        let mut decoded = BlobReader::open(File::open(&p)?)?;
+        let mut decoded = BlobReader::open(File::open(&p)?, BlobEncoding::ZstdChunks)?;
         assert_eq!(decoded.len(), input.len() as u64);
         decoded.seek(SeekFrom::Start(250_000))?;
-        let mut subset = [0_u8; 50_000];
+        let mut subset = vec![0_u8; 50_000];
         decoded.read_exact(&mut subset)?;
         assert_eq!(&subset, &input[250_000..300_000]);
         decoded.seek(SeekFrom::Start(0))?;
         let mut output = Vec::new();
         decoded.read_to_end(&mut output)?;
         assert_eq!(output, input);
-        let mut saved = File::create(tmp.path().join("received"))?;
-        transfer(File::open(p)?, &mut saved, io::sink(), reference)?;
+        let received = tmp.path().join("received");
+        let mut saved = File::create(&received)?;
+        transfer(File::open(&p)?, &mut saved, io::sink(), reference)?;
+        drop(saved);
+        assert_eq!(std::fs::read(p)?, std::fs::read(received)?);
+        Ok(())
+    }
+
+    #[test]
+    fn plain_physical_file_has_no_encoded_envelope_even_when_header_sized() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("raw");
+        std::fs::write(&path, vec![0xa5; usize::try_from(HEADER)?])?;
+        let decoded = BlobReader::open(File::open(&path)?, BlobEncoding::Raw)?;
+        assert!(!decoded.is_encoded());
+        assert_eq!(decoded.len(), HEADER);
+        Ok(())
+    }
+
+    #[test]
+    fn incompressible_chunks_remain_raw_and_seekable() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let file_path = temporary.path().join("entropy");
+        let mut bytes = vec![0_u8; 300_000];
+        blake3::Hasher::new().finalize_xof().fill(&mut bytes);
+        let mut target = File::create(&file_path)?;
+        let reference = encode(bytes.as_slice(), &mut target, None)?;
+        drop(target);
+        let physical = std::fs::read(&file_path)?;
+        let physical_header = u32::from_le_bytes(physical[32..36].try_into()?);
+        assert_ne!(
+            physical_header & RAW_CHUNK,
+            0,
+            "incompressible input should not waste CPU on subsequent decoding"
+        );
+        assert!(physical.len() < bytes.len() + 64);
+        let mut decoded = BlobReader::open(File::open(&file_path)?, BlobEncoding::ZstdChunks)?;
+        let mut output = Vec::new();
+        decoded.read_to_end(&mut output)?;
+        assert_eq!(output, bytes);
+        let mut copied = File::create(temporary.path().join("wire"))?;
+        transfer(File::open(file_path)?, &mut copied, io::sink(), reference)?;
         Ok(())
     }
 

@@ -45,7 +45,10 @@ fn decoded_download(
     publisher: Publisher,
     id: ContentId,
 ) -> Result<crate::BlobReader> {
-    crate::BlobReader::open(service.download(ticket, publisher, id)?)
+    crate::BlobReader::open(
+        service.download(ticket, publisher, id)?,
+        crate::BlobEncoding::ZstdChunks,
+    )
 }
 
 fn empty_root() -> TreeManifest {

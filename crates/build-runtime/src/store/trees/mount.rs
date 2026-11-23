@@ -10,13 +10,15 @@ use std::{
         fs::{MetadataExt, PermissionsExt, symlink},
     },
     path::{Path, PathBuf},
+    sync::Arc,
+    thread::{self, JoinHandle},
     time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result, ensure};
 use fuser::{
-    BackgroundSession, FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request,
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, Request, Session, SessionUnmounter,
 };
 use rustix::fs::{AtFlags, CWD, Timestamps, utimensat};
 use rustix::time::Timespec;
@@ -42,7 +44,7 @@ struct Node {
 }
 
 struct VirtualFs {
-    _lease: TreeLease,
+    lease: TreeLease,
     nodes: Vec<Node>,
     handles: BTreeMap<u64, BlobReader>,
     next_handle: u64,
@@ -66,10 +68,8 @@ impl VirtualFs {
             }
             let bytes = path.as_bytes();
             let cut = bytes.iter().rposition(|&b| b == b'/');
-            let (parent_path, name) = match cut {
-                Some(n) => (&bytes[..n], &bytes[n + 1..]),
-                None => (&b""[..], bytes),
-            };
+            let (parent_path, name) =
+                cut.map_or_else(|| (&b""[..], bytes), |n| (&bytes[..n], &bytes[n + 1..]));
             let parent = *paths
                 .get(parent_path)
                 .context("missing FUSE parent directory")?;
@@ -86,13 +86,15 @@ impl VirtualFs {
                 TreeEntry::Hardlink(_) => unreachable!("hardlinks handled in second pass"),
             };
             let ino = u64::try_from(nodes.len())? + 1;
+            let is_dir = matches!(&kind, Kind::Directory(_));
             nodes.push(Node {
                 kind,
                 metadata,
                 parent,
-                nlink: 1,
+                nlink: if is_dir { 2 } else { 1 },
             });
-            let Kind::Directory(children) = &mut nodes[usize::try_from(parent - 1)?].kind else {
+            let parent_node = &mut nodes[usize::try_from(parent - 1)?];
+            let Kind::Directory(children) = &mut parent_node.kind else {
                 anyhow::bail!("FUSE parent is not a directory");
             };
             ensure!(
@@ -101,6 +103,12 @@ impl VirtualFs {
                     .is_none(),
                 "duplicate FUSE child"
             );
+            if is_dir {
+                parent_node.nlink = parent_node
+                    .nlink
+                    .checked_add(1)
+                    .context("FUSE directory link count overflow")?;
+            }
             paths.insert(bytes.to_vec(), ino);
         }
         for (path, entry) in &lease.manifest().entries {
@@ -109,10 +117,8 @@ impl VirtualFs {
             };
             let bytes = path.as_bytes();
             let cut = bytes.iter().rposition(|&b| b == b'/');
-            let (parent_path, name) = match cut {
-                Some(n) => (&bytes[..n], &bytes[n + 1..]),
-                None => (&b""[..], bytes),
-            };
+            let (parent_path, name) =
+                cut.map_or_else(|| (&b""[..], bytes), |n| (&bytes[..n], &bytes[n + 1..]));
             let parent = *paths
                 .get(parent_path)
                 .context("missing FUSE hardlink parent")?;
@@ -122,7 +128,11 @@ impl VirtualFs {
             let Kind::File(_) = nodes[usize::try_from(ino - 1)?].kind else {
                 anyhow::bail!("hardlink targets must be regular files");
             };
-            nodes[usize::try_from(ino - 1)?].nlink += 1;
+            let target = &mut nodes[usize::try_from(ino - 1)?];
+            target.nlink = target
+                .nlink
+                .checked_add(1)
+                .context("FUSE file link count overflow")?;
             let Kind::Directory(children) = &mut nodes[usize::try_from(parent - 1)?].kind else {
                 anyhow::bail!("FUSE hardlink parent is not a directory");
             };
@@ -134,7 +144,7 @@ impl VirtualFs {
             );
         }
         Ok(Self {
-            _lease: lease,
+            lease,
             nodes,
             handles: BTreeMap::new(),
             next_handle: 1,
@@ -232,11 +242,17 @@ impl Filesystem for VirtualFs {
             reply.error(libc::ENOTDIR);
             return;
         };
-        let mut entries = vec![
-            (ino, FileType::Directory, OsString::from(".")),
-            (node.parent, FileType::Directory, OsString::from("..")),
-        ];
-        for (name, &child) in children {
+        // Avoid cloning every filename on each directory page.
+        let offset = usize::try_from(offset).unwrap_or(0);
+        if offset == 0 && reply.add(ino, 1, FileType::Directory, OsStr::new(".")) {
+            reply.ok();
+            return;
+        }
+        if offset <= 1 && reply.add(node.parent, 2, FileType::Directory, OsStr::new("..")) {
+            reply.ok();
+            return;
+        }
+        for (idx, (name, &child)) in children.iter().enumerate().skip(offset.saturating_sub(2)) {
             let kind = match self.node(child).map(|node| &node.kind) {
                 Some(Kind::Directory(_)) => FileType::Directory,
                 Some(Kind::File(_)) => FileType::RegularFile,
@@ -246,12 +262,11 @@ impl Filesystem for VirtualFs {
                     return;
                 }
             };
-            entries.push((child, kind, name.clone()));
-        }
-        for (index, (child, kind, name)) in
-            entries.into_iter().enumerate().skip(offset.max(0) as usize)
-        {
-            if reply.add(child, (index + 1) as i64, kind, name) {
+            let Some(cookie) = idx.checked_add(3).and_then(|i| i64::try_from(i).ok()) else {
+                reply.error(libc::EOVERFLOW);
+                return;
+            };
+            if reply.add(child, cookie, kind, name) {
                 break;
             }
         }
@@ -267,11 +282,13 @@ impl Filesystem for VirtualFs {
             reply.error(libc::EISDIR);
             return;
         };
-        let path = self._lease.inner.blob_path(blob.id);
-        match File::open(path)
-            .map_err(anyhow::Error::from)
-            .and_then(BlobReader::open)
-        {
+        let path = self.lease.inner.blob_path(blob.id);
+        let opened = self
+            .lease
+            .inner
+            .blob_encoding(blob.id)
+            .and_then(|encoding| BlobReader::open(File::open(path)?, encoding));
+        match opened {
             Ok(reader) => {
                 let handle = self.next_handle;
                 self.next_handle = self.next_handle.wrapping_add(1);
@@ -329,19 +346,87 @@ impl Filesystem for VirtualFs {
     }
 }
 
-/// A mounted immutable tree plus the minimal private writable directories
-/// needed for a build's output mounts. Immutable inputs stay compressed.
-pub struct MountedTree {
-    _session: BackgroundSession,
-    directory: TempDir,
+/// Owns a long-lived readonly FUSE mount and its backing content pins.
+/// Destruction synchronously unmounts and joins the worker before releasing pins.
+pub struct ReadOnlyView {
+    unmount: SessionUnmounter,
+    thread: Option<JoinHandle<io::Result<()>>>,
+    _directory: TempDir,
     mountpoint: PathBuf,
+}
+
+impl ReadOnlyView {
+    pub(crate) fn mount(lease: TreeLease, parent: &Path) -> Result<Self> {
+        let filesystem = VirtualFs::new(lease)?;
+        let directory = tempfile::Builder::new()
+            .prefix("build-fuse-")
+            .tempdir_in(parent)?;
+        let mountpoint = directory.path().join("root");
+        fs::create_dir(&mountpoint)?;
+        let mut session = Session::new(
+            filesystem,
+            &mountpoint,
+            &[
+                MountOption::RO,
+                MountOption::DefaultPermissions,
+                MountOption::FSName("sccache-native-cas".into()),
+            ],
+        )?;
+        let unmount = session.unmount_callable();
+        let thread = thread::spawn(move || session.run());
+        Ok(Self {
+            unmount,
+            thread: Some(thread),
+            _directory: directory,
+            mountpoint,
+        })
+    }
+
+    fn root(&self) -> &Path {
+        &self.mountpoint
+    }
+}
+
+impl Drop for ReadOnlyView {
+    fn drop(&mut self) {
+        if let Err(error) = self.unmount.unmount() {
+            log::warn!("cannot unmount compressed CAS tree: {error}");
+        }
+        if let Some(thread) = self.thread.take() {
+            match thread.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => log::warn!("compressed CAS FUSE worker failed: {error}"),
+                Err(_) => log::error!("compressed CAS FUSE worker panicked"),
+            }
+        }
+    }
+}
+
+/// A read-only CAS tree with per-action writable scratch.
+///
+/// The kernel can reuse decoded pages through the shared FUSE inode whenever
+/// another build mounts the same immutable tree.
+pub struct MountedTree {
+    view: Arc<ReadOnlyView>,
+    directory: TempDir,
     writable: BTreeMap<PathBuf, PathBuf>,
 }
 
 impl MountedTree {
+    pub(crate) fn from_view(view: Arc<ReadOnlyView>, parent: &Path) -> Result<Self> {
+        let directory = tempfile::Builder::new()
+            .prefix("build-mutable-")
+            .tempdir_in(parent)?;
+        Ok(Self {
+            view,
+            directory,
+            writable: BTreeMap::new(),
+        })
+    }
+
     #[must_use]
     pub fn root(&self) -> &Path {
-        &self.mountpoint
+        self.view.root()
     }
 
     /// Copy the contents of one directory into private writable scratch.
@@ -350,7 +435,7 @@ impl MountedTree {
     /// # Errors
     /// Returns an error for invalid backing directories, file types or I/O failures.
     pub fn mark_writable(&mut self, relative: &Path) -> Result<()> {
-        let source = self.mountpoint.join(relative);
+        let source = self.view.root().join(relative);
         ensure!(source.is_dir(), "writable mount source is not a directory");
         let scratch = self
             .directory
@@ -432,34 +517,14 @@ impl TreeLease {
     /// # Errors
     /// Returns an error when the mount, manifest or filesystem is unavailable.
     pub fn mount_readonly(self, parent: &Path) -> Result<MountedTree> {
-        let filesystem = VirtualFs::new(self)?;
-        let directory = tempfile::Builder::new()
-            .prefix("build-fuse-")
-            .tempdir_in(parent)?;
-        let mountpoint = directory.path().join("root");
-        fs::create_dir(&mountpoint)?;
-        let session = fuser::spawn_mount2(
-            filesystem,
-            &mountpoint,
-            &[
-                MountOption::RO,
-                MountOption::DefaultPermissions,
-                MountOption::FSName("sccache-native-cas".into()),
-            ],
-        )?;
-        Ok(MountedTree {
-            _session: session,
-            directory,
-            mountpoint,
-            writable: BTreeMap::new(),
-        })
+        MountedTree::from_view(Arc::new(ReadOnlyView::mount(self, parent)?), parent)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::NativeStore;
+    use crate::{Eviction, NativeStore};
 
     #[test]
     fn mounted_tree_exposes_decoded_data_hardlinks_symlinks_and_writable_scratch() -> Result<()> {
@@ -503,6 +568,41 @@ mod tests {
         assert_eq!(fs::read(root.join("out/original"))?, b"untouched");
         drop(mounted);
         assert!(!root.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn cached_readonly_mount_keeps_inode_and_releases_pins_on_eviction() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("input");
+        fs::create_dir_all(&input)?;
+        fs::write(input.join("artifact"), b"generated compiler output")?;
+        let store = NativeStore::open(&temp.path().join("store"))?;
+        let first_lease = store.capture_tree(&input)?;
+        let id = first_lease.id();
+
+        let scratch_one = temp.path().join("build-one");
+        let scratch_two = temp.path().join("build-two");
+        fs::create_dir(&scratch_one)?;
+        fs::create_dir(&scratch_two)?;
+        let first = store.mount_tree(first_lease, &scratch_one)?;
+        let root = first.root().to_owned();
+        let ino = fs::metadata(root.join("artifact"))?.ino();
+        assert_eq!(
+            fs::read(root.join("artifact"))?,
+            b"generated compiler output"
+        );
+        let second_lease = store.lookup_tree(id)?.context("tree not indexed")?;
+        let second = store.mount_tree(second_lease, &scratch_two)?;
+        assert_eq!(root, second.root());
+        assert_eq!(fs::metadata(second.root().join("artifact"))?.ino(), ino);
+        assert_eq!(store.evict_tree(id)?, Eviction::Pinned);
+
+        drop(first);
+        drop(second);
+        assert!(root.exists(), "cache should retain the warm read-only view");
+        assert!(matches!(store.evict_tree(id)?, Eviction::Removed { .. }));
+        assert!(!root.exists(), "eviction must unmount the inactive view");
         Ok(())
     }
 }
