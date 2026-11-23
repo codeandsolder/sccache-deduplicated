@@ -330,7 +330,7 @@ impl OutputStyle {
     }
 }
 
-/// Common CCompilerImpl result for all three CUDA device compiler stages.
+/// Common `CCompilerImpl` result for all three CUDA device compiler stages.
 pub(super) type CudaStageCompileCommands<T> = (
     Box<dyn CompileCommand<T>>,
     Option<dist::CompileCommand>,
