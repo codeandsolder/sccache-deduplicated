@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, io::Cursor};
 
 use super::*;
 use crate::{
-    ActionFingerprint, Artifact, BlobRef, ContentId, ResultManifest, TreeManifest, TreeMetadata,
-    TreeTimestamp,
+    ActionFingerprint, Artifact, BlobRef, ContentId, ResultManifest, TreeEntry, TreeManifest,
+    TreeMetadata, TreePath, TreeTimestamp,
 };
 
 fn policy() -> SpacePolicy {
@@ -400,5 +400,39 @@ fn committed_action_releases_staging_reservations_into_resident_accounting() -> 
     assert_eq!(report.resident_bytes, 5);
     assert!(report.minimum_satisfied);
     assert!(store.lookup(key)?.is_some());
+    Ok(())
+}
+
+#[test]
+fn committed_tree_releases_staging_reservations_into_resident_accounting() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut limit = policy();
+    limit.max_resident_bytes = 6;
+    limit.target_resident_bytes = 5;
+    let store = NativeStore::open_managed(temp.path(), limit)?;
+    let staged = store.stage(&b"12345"[..])?;
+    let metadata = TreeMetadata {
+        mode: 0o755,
+        modified: TreeTimestamp {
+            seconds: 0,
+            nanoseconds: 0,
+        },
+    };
+    let tree = TreeManifest {
+        root: metadata,
+        entries: BTreeMap::from([(
+            TreePath::new(b"file".to_vec())?,
+            TreeEntry::File {
+                blob: staged.reference(),
+                metadata,
+            },
+        )]),
+    };
+    let tree_id = store.publish_tree(&tree, vec![staged])?;
+    let report = store.maintain_space()?.context("missing policy")?;
+    assert_eq!(report.reserved_bytes, 0);
+    assert_eq!(report.resident_bytes, 5);
+    assert!(report.minimum_satisfied);
+    assert!(store.lookup_tree(tree_id)?.is_some());
     Ok(())
 }
