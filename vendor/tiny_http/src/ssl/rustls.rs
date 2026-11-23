@@ -106,12 +106,12 @@ impl RustlsContext {
         &self,
         mut stream: Connection,
     ) -> Result<RustlsStream, Box<dyn Error + Send + Sync + 'static>> {
-        stream.set_handshake_timeout(Some(super::HANDSHAKE_TIMEOUT))?;
+        stream.set_io_timeout(Some(super::HANDSHAKE_TIMEOUT))?;
         let mut connection = rustls::ServerConnection::new(self.0.clone())?;
         while connection.is_handshaking() {
             connection.complete_io(&mut stream)?;
         }
-        stream.set_handshake_timeout(None)?;
+        stream.set_io_timeout(Some(crate::SOCKET_IO_TIMEOUT))?;
         Ok(RustlsStream(Arc::new(Mutex::new(
             rustls::StreamOwned::new(connection, stream),
         ))))

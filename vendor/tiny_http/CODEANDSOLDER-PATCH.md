@@ -18,3 +18,25 @@ The TLS integration test keeps one handshake unfinished and verifies that a
 second HTTPS client is served. The cause of the specific stalled live thread
 remains unverified until stack capture, but this closes the concrete transport
 path that can produce the observed symptom.
+
+## 2026-11-23: bound post-handshake idle connections and request headers
+
+TLS handshake isolation alone leaves connection task threads exposed to incomplete
+HTTP headers and abandoned request-body uploads. After negotiation the former
+socket timeouts were removed, so those connections could occupy a worker
+indefinitely; the connection task pool could grow without a bound. Set a
+60-second *idle I/O* timeout throughout the connection lifecycle (normal
+streaming uploads may continue as long as data arrives), a 60-second absolute
+HTTP-header phase deadline, and a 64 KiB cumulative request-header budget.
+Admission permits cap concurrent connection tasks at a CPU-scaled 128–512,
+independently of the tighter 32–256 TLS-handshake cap. Oversized requests get
+HTTP 431; idle request headers get HTTP 408 where feasible.
+
+The separate HTTP header regression test covers a single oversized header,
+excessive aggregate header size, and a large valid header section.
+
+Plaintext HTTP request pipelining now uses the same response notification and
+per-connection backpressure as TLS: it cannot push unbounded requests into the
+shared messages queue or Rouille executor. Notification sends tolerate a peer
+connection that has already vanished rather than panicking during response
+completion or cleanup.
