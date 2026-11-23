@@ -21,6 +21,8 @@ pub use self::server::{
     ClientAuthCheck, ClientVisibleMsg, HEARTBEAT_TIMEOUT, Scheduler, ServerAuthCheck,
 };
 
+mod transport;
+
 mod common {
     use reqwest::header;
     use serde::{Deserialize, Serialize};
@@ -28,8 +30,6 @@ mod common {
     use {crate::util::BASE64_URL_SAFE_ENGINE, base64::Engine, std::collections::HashMap};
 
     use crate::dist;
-    #[cfg(feature = "dist-client")]
-    use crate::errors::HttpClientError;
     use crate::errors::{Context, Result};
 
     // Note that content-length is necessary due to https://github.com/tiny-http/tiny-http/issues/147
@@ -66,30 +66,6 @@ mod common {
             .header(header::CONTENT_LENGTH, bytes.len())
             .body(bytes)
         }
-    }
-
-    #[cfg(feature = "dist-client")]
-    pub async fn bincode_req_fut<T: serde::de::DeserializeOwned + 'static>(
-        req: reqwest::RequestBuilder,
-    ) -> Result<T> {
-        // Work around tiny_http issue #151 by disabling HTTP pipeline with
-        // `Connection: close`.
-        let res = req.header(header::CONNECTION, "close").send().await?;
-
-        let status = res.status();
-        let bytes = res.bytes().await?;
-        if !status.is_success() {
-            let errmsg = format!(
-                "Error {}: {}",
-                status.as_u16(),
-                String::from_utf8_lossy(&bytes)
-            );
-            if status.is_client_error() {
-                anyhow::bail!(HttpClientError(errmsg));
-            }
-            anyhow::bail!(errmsg);
-        }
-        Ok(bincode::deserialize(&bytes)?)
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -320,7 +296,7 @@ pub mod urls {
 
 #[cfg(feature = "dist-server")]
 mod server {
-    use crate::util::{new_reqwest_blocking_builder, new_reqwest_blocking_client, num_cpus};
+    use crate::util::num_cpus;
     use byteorder::{BigEndian, ReadBytesExt};
     use rouille::accept;
     use serde::{Deserialize, Serialize};
@@ -338,6 +314,7 @@ mod server {
         AllocJobHttpResponse, HeartbeatServerHttpRequest, ReqwestRequestBuilderExt,
         RunJobHttpRequest, ServerCertificateHttpResponse, WorkerNameHttpResponse,
     };
+    use super::transport::{self, send_blocking};
     use super::urls;
     use crate::dist::{
         self, AllocJobResult, AssignJobResult, HeartbeatServerResult, InputsReader, JobAuthorizer,
@@ -608,28 +585,6 @@ mod server {
         }
     }
 
-    pub fn bincode_req<T: serde::de::DeserializeOwned + 'static>(
-        req: reqwest::blocking::RequestBuilder,
-    ) -> Result<T> {
-        // Work around tiny_http issue #151 by disabling HTTP pipeline with
-        // `Connection: close`.
-        let mut res = req.header(reqwest::header::CONNECTION, "close").send()?;
-        let status = res.status();
-        let mut body = vec![];
-        res.copy_to(&mut body)
-            .context("error reading response body")?;
-        if !status.is_success() {
-            Err(anyhow!(
-                "Error {} (Headers={:?}): {}",
-                status.as_u16(),
-                res.headers(),
-                String::from_utf8_lossy(&body)
-            ))
-        } else {
-            bincode::deserialize(&body).map_err(Into::into)
-        }
-    }
-
     fn create_https_cert_and_privkey(addr: SocketAddr) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
         let rsa_key = openssl::rsa::Rsa::<openssl::pkey::Private>::generate(2048)
             .context("failed to generate rsa privkey")?;
@@ -740,6 +695,8 @@ mod server {
     pub enum RouilleBincodeError {
         BodyAlreadyExtracted,
         WrongContentType,
+        BodyTooLarge,
+        BodyReadError(std::io::Error),
         ParseError(bincode::Error),
     }
     impl From<bincode::Error> for RouilleBincodeError {
@@ -751,6 +708,7 @@ mod server {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             match *self {
                 RouilleBincodeError::ParseError(ref e) => Some(e),
+                RouilleBincodeError::BodyReadError(ref e) => Some(e),
                 _ => None,
             }
         }
@@ -770,6 +728,9 @@ mod server {
                     RouilleBincodeError::WrongContentType => {
                         "the request didn't have a binary content type"
                     }
+                    RouilleBincodeError::BodyTooLarge => "control-plane request body exceeds limit",
+                    RouilleBincodeError::BodyReadError(_) =>
+                        "error reading control-plane request body",
                     RouilleBincodeError::ParseError(_) => "error while parsing the bincode body",
                 }
             )
@@ -787,11 +748,16 @@ mod server {
             return Err(RouilleBincodeError::WrongContentType);
         }
 
-        if let Some(mut b) = request.data() {
-            bincode::deserialize_from::<_, O>(&mut b).map_err(From::from)
-        } else {
-            Err(RouilleBincodeError::BodyAlreadyExtracted)
-        }
+        let mut body = request
+            .data()
+            .ok_or(RouilleBincodeError::BodyAlreadyExtracted)?;
+        let bytes = transport::read_bounded(&mut body, transport::CONTROL_REQUEST_LIMIT).map_err(
+            |error| match error {
+                transport::BoundedReadError::TooLarge => RouilleBincodeError::BodyTooLarge,
+                transport::BoundedReadError::Io(error) => RouilleBincodeError::BodyReadError(error),
+            },
+        )?;
+        transport::decode_bincode(&bytes).map_err(From::from)
     }
 
     // Based on try_or_400 in rouille, but with logging
@@ -844,6 +810,24 @@ mod server {
             try_or_err_and_log!($reqid, 400, $result)
         };
     }
+    macro_rules! try_bincode_input {
+        ($reqid:expr, $request:expr) => {{
+            match bincode_input($request) {
+                Ok(value) => value,
+                Err(error) => {
+                    let status = if matches!(error, RouilleBincodeError::BodyTooLarge) {
+                        413
+                    } else {
+                        400
+                    };
+                    warn!("Res {} error: {}", $reqid, error);
+                    return rouille::Response::json(&ErrJson::from_err(&error))
+                        .with_status_code(status);
+                }
+            }
+        }};
+    }
+
     macro_rules! try_or_500_log {
         ($reqid:expr, $result:expr) => {
             try_or_err_and_log!($reqid, 500, $result)
@@ -1032,7 +1016,7 @@ mod server {
                 check_server_auth,
             } = self;
             let requester = SchedulerRequester {
-                client: Mutex::new(new_reqwest_blocking_client()?),
+                client: Mutex::new(transport::blocking_client(Vec::new())?),
             };
 
             macro_rules! check_server_auth_or_err {
@@ -1075,28 +1059,14 @@ mod server {
                     "Adding new certificate for {} to scheduler",
                     server_id.addr()
                 );
-                let mut client_builder = new_reqwest_blocking_builder()?;
-                // Add all the certificates we know about
-                let mut roots = vec![
-                    reqwest::Certificate::from_pem(&cert_pem)
-                        .context("failed to interpret pem as certificate")?,
-                ];
-                for (id, (_, pem)) in certs.iter() {
-                    if *id != server_id {
-                        roots.push(
-                            reqwest::Certificate::from_pem(pem)
-                                .context("stored server certificate is no longer valid")?,
-                        );
-                    }
-                }
-                client_builder = client_builder.tls_certs_merge(roots);
-                // Finish the client
-                let new_client = client_builder
-                    // Disable connection pool to avoid broken connection
-                    // between runtime
-                    .pool_max_idle_per_host(0)
-                    .build()
-                    .context("failed to create a HTTP client")?;
+                let roots = transport::certificate_roots(
+                    &cert_pem,
+                    certs
+                        .iter()
+                        .filter(|(id, _)| **id != server_id)
+                        .map(|(_, (_, pem))| pem.as_slice()),
+                )?;
+                let new_client = transport::blocking_client(roots)?;
                 // Use the updated certificates
                 *client = new_client;
                 certs.insert(server_id, (cert_digest, cert_pem));
@@ -1125,7 +1095,7 @@ mod server {
                                 return make_401_with_body("bearer_auth_failed", client_msg)
                             },
                         }
-                        let toolchain = try_or_400_log!(req_id, bincode_input(request));
+                        let toolchain = try_bincode_input!(req_id, request);
                         trace!("Req {}: alloc_job: {:?}", req_id, toolchain);
 
                         let alloc_job_res: AllocJobResult = try_or_500_log!(req_id, handler.handle_alloc_job(&requester, toolchain));
@@ -1177,7 +1147,7 @@ mod server {
                         let worker_name = request
                             .header("X-Sccache-Worker-Name")
                             .map(ToOwned::to_owned);
-                        let heartbeat_server = try_or_400_log!(req_id, bincode_input(request));
+                        let heartbeat_server = try_bincode_input!(req_id, request);
                         trace!(target: "sccache_heartbeat", "Req {}: heartbeat_server: {:?}", req_id, heartbeat_server);
 
                         let HeartbeatServerHttpRequest { cpu_capacity, active_job_ids, jwt_key, server_nonce, cert_digest, cert_pem } = heartbeat_server;
@@ -1220,7 +1190,7 @@ mod server {
                     },
                     (POST) (/api/v1/scheduler/job_state/{job_id: JobId}) => {
                         let server_id = check_server_auth_or_err!(request);
-                        let job_state = try_or_400_log!(req_id, bincode_input(request));
+                        let job_state = try_bincode_input!(req_id, request);
                         trace!("Req {}: job state: {:?}", req_id, job_state);
 
                         let res: UpdateJobStateResult = try_or_500_log!(req_id, handler.handle_update_job_state(
@@ -1275,7 +1245,7 @@ mod server {
                     .map_err(|_| anyhow!("scheduler HTTP client mutex poisoned"))?;
                 client.post(url)
             };
-            bincode_req(
+            send_blocking(
                 req.timeout(ASSIGN_JOB_TIMEOUT)
                     .bearer_auth(auth)
                     .bincode(&tc)?,
@@ -1393,12 +1363,12 @@ mod server {
             let job_authorizer = JWTJobAuthorizer::boxed(&jwt_key)?;
             let heartbeat_url = urls::scheduler_heartbeat_server(&scheduler_url)?;
             let requester = ServerRequester {
-                client: new_reqwest_blocking_client()?,
+                client: transport::blocking_client(Vec::new())?,
                 scheduler_url,
                 scheduler_auth: scheduler_auth.clone(),
             };
 
-            let heartbeat_client = new_reqwest_blocking_client()?;
+            let heartbeat_client = transport::blocking_client(Vec::new())?;
             // TODO: detect if this panics
             thread::spawn(move || {
                 let client = heartbeat_client;
@@ -1446,7 +1416,7 @@ mod server {
                     }
                     let heartbeat_result = heartbeat_request
                         .bincode(&heartbeat_req)
-                        .and_then(bincode_req);
+                        .and_then(send_blocking);
                     match heartbeat_result {
                         Ok(HeartbeatServerResult {
                             is_new,
@@ -1488,7 +1458,7 @@ mod server {
                 let response = (|| router!(request,
                     (POST) (/api/v1/distserver/assign_job/{job_id: JobId}) => {
                         job_auth_or_401!(request, &job_authorizer, job_id);
-                        let toolchain = try_or_400_log!(req_id, bincode_input(request));
+                        let toolchain = try_bincode_input!(req_id, request);
                         trace!("Req {}: assign_job({}): {:?}", req_id, job_id, toolchain);
 
                         let res: AssignJobResult = try_or_500_log!(req_id, handler.handle_assign_job(job_id, toolchain));
@@ -1564,7 +1534,7 @@ mod server {
         ) -> Result<UpdateJobStateResult> {
             let url = urls::scheduler_job_state(&self.scheduler_url, job_id)?;
             let publish = || {
-                bincode_req(
+                send_blocking(
                     self.client
                         .post(url.clone())
                         // Never retain an execution slot forever on a stalled ACK.
@@ -1598,6 +1568,34 @@ mod server {
                 headers,
                 Vec::new(),
             )
+        }
+
+        #[test]
+        fn inbound_control_bincode_is_bounded() {
+            let headers = vec![(
+                "Content-Type".to_owned(),
+                "application/octet-stream".to_owned(),
+            )];
+            let good = rouille::Request::fake_http_from(
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+                "POST",
+                "/api/test",
+                headers.clone(),
+                bincode::serialize(&123_u64).expect("serialize control value"),
+            );
+            assert_eq!(bincode_input::<u64>(&good).expect("decode valid body"), 123);
+
+            let oversized = rouille::Request::fake_http_from(
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345)),
+                "POST",
+                "/api/test",
+                headers,
+                vec![0; transport::CONTROL_REQUEST_LIMIT + 1],
+            );
+            assert!(matches!(
+                bincode_input::<u64>(&oversized),
+                Err(RouilleBincodeError::BodyTooLarge)
+            ));
         }
 
         #[test]
@@ -1663,14 +1661,12 @@ mod client {
 
     use super::common::{
         AllocJobHttpResponse, ReqwestRequestBuilderExt, RunJobHttpRequest,
-        ServerCertificateHttpResponse, WorkerNameHttpResponse, bincode_req_fut,
+        ServerCertificateHttpResponse, WorkerNameHttpResponse,
     };
+    use super::transport::{self, RequestClass, send_async};
     use super::urls;
     use crate::errors::{Context, Result, anyhow};
 
-    const REQUEST_TIMEOUT_SECS: u64 = 1200;
-    const CONNECT_TIMEOUT_SECS: u64 = 20;
-    const WORKER_NAME_LOOKUP_TIMEOUT: Duration = Duration::from_secs(1);
     const WORKER_NAME_CACHE_TTL: Duration = Duration::from_secs(300);
     const WORKER_NAME_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
 
@@ -1705,16 +1701,7 @@ mod client {
             auth_token: String,
             rewrite_includes_only: bool,
         ) -> Result<Self> {
-            let timeout = Duration::new(REQUEST_TIMEOUT_SECS, 0);
-            let connect_timeout = Duration::new(CONNECT_TIMEOUT_SECS, 0);
-            let client = crate::util::new_reqwest_client_builder()?
-                .timeout(timeout)
-                .connect_timeout(connect_timeout)
-                // Disable connection pool to avoid broken connection
-                // between runtime
-                .pool_max_idle_per_host(0)
-                .build()
-                .context("failed to create an async HTTP client")?;
+            let client = transport::async_client(Vec::new())?;
             let client_toolchains =
                 cache::ClientToolchains::new(cache_dir, cache_size, toolchain_configs)
                     .context("failed to initialise client toolchains")?;
@@ -1736,30 +1723,14 @@ mod client {
             cert_digest: Vec<u8>,
             cert_pem: Vec<u8>,
         ) -> Result<()> {
-            let mut client_async_builder = crate::util::new_reqwest_client_builder()?;
-            // Add all the certificates we know about
-            let mut roots = vec![
-                reqwest::Certificate::from_pem(&cert_pem)
-                    .context("failed to interpret pem as certificate")?,
-            ];
-            for (digest, pem) in certs.iter() {
-                if *digest != cert_digest {
-                    roots.push(
-                        reqwest::Certificate::from_pem(pem)
-                            .context("stored server certificate is no longer valid")?,
-                    );
-                }
-            }
-            client_async_builder = client_async_builder.tls_certs_merge(roots);
-            // Finish the client
-            let timeout = Duration::new(REQUEST_TIMEOUT_SECS, 0);
-            let new_client_async = client_async_builder
-                .timeout(timeout)
-                .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
-                // Disable keep-alive
-                .pool_max_idle_per_host(0)
-                .build()
-                .context("failed to create an async HTTP client")?;
+            let roots = transport::certificate_roots(
+                &cert_pem,
+                certs
+                    .iter()
+                    .filter(|(digest, _)| **digest != cert_digest)
+                    .map(|(_, pem)| pem.as_slice()),
+            )?;
+            let new_client_async = transport::async_client(roots)?;
             // Use the updated certificates
             *client = new_client_async;
             certs.insert(cert_digest, cert_pem);
@@ -1784,7 +1755,7 @@ mod client {
             let http_client = self.http.clone();
             let server_certs = self.server_certs.clone();
 
-            match bincode_req_fut(req).await? {
+            match send_async(req, RequestClass::Control).await? {
                 AllocJobHttpResponse::Success {
                     job_alloc,
                     need_toolchain,
@@ -1813,7 +1784,7 @@ mod client {
                             .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
                         client.get(url)
                     };
-                    let res: ServerCertificateHttpResponse = bincode_req_fut(req)
+                    let res: ServerCertificateHttpResponse = send_async(req, RequestClass::Control)
                         .await
                         .context("GET to scheduler server_certificate failed")?;
 
@@ -1880,14 +1851,11 @@ mod client {
                     debug!("HTTP client mutex poisoned during worker-name lookup");
                     return fallback;
                 };
-                client
-                    .get(url)
-                    .bearer_auth(self.auth_token.clone())
-                    .timeout(WORKER_NAME_LOOKUP_TIMEOUT)
+                client.get(url).bearer_auth(self.auth_token.clone())
             };
 
             let checked_at = Instant::now();
-            match bincode_req_fut::<WorkerNameHttpResponse>(req).await {
+            match send_async::<WorkerNameHttpResponse>(req, RequestClass::WorkerName).await {
                 Ok(response) => {
                     let worker_name = response.worker_name;
                     if let Ok(mut names) = self.server_names.lock() {
@@ -1918,7 +1886,7 @@ mod client {
                     .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
                 client.get(url)
             };
-            bincode_req_fut(req).await
+            send_async(req, RequestClass::Control).await
         }
 
         async fn do_submit_toolchain(
@@ -1940,7 +1908,7 @@ mod client {
                     let toolchain_file_stream = tokio_util::io::ReaderStream::new(toolchain_file);
                     let body = Body::wrap_stream(toolchain_file_stream);
                     let req = req.bearer_auth(job_alloc.auth).body(body);
-                    bincode_req_fut(req).await
+                    send_async(req, RequestClass::ToolchainUpload).await
                 }
                 Ok(None) => Err(anyhow!("couldn't find toolchain locally")),
                 Err(e) => Err(e),
@@ -1998,7 +1966,7 @@ mod client {
                 client.post(url)
             };
             req = req.bearer_auth(job_alloc.auth.clone()).bytes(body);
-            bincode_req_fut(req).await
+            send_async(req, RequestClass::BuildResult).await
         }
 
         async fn put_toolchain(
