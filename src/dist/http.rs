@@ -349,6 +349,9 @@ mod server {
     const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
     const HEARTBEAT_ERROR_INTERVAL: Duration = Duration::from_secs(10);
     pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
+    // Allocating a job is a control-plane operation, not a toolchain upload.
+    // A hung worker must never permanently occupy a scheduler HTTP thread.
+    const ASSIGN_JOB_TIMEOUT: Duration = Duration::from_secs(20);
 
     struct LoadAwareCapacity {
         previous_cpu_times: Option<(u64, u64)>,
@@ -1272,8 +1275,12 @@ mod server {
                     .map_err(|_| anyhow!("scheduler HTTP client mutex poisoned"))?;
                 client.post(url)
             };
-            bincode_req(req.bearer_auth(auth).bincode(&tc)?)
-                .context("POST to scheduler assign_job failed")
+            bincode_req(
+                req.timeout(ASSIGN_JOB_TIMEOUT)
+                    .bearer_auth(auth)
+                    .bincode(&tc)?,
+            )
+            .context("POST to worker assign_job failed")
         }
     }
 

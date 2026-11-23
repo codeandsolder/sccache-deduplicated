@@ -1196,7 +1196,11 @@ pub(crate) fn new_reqwest_client_builder() -> reqwest::Result<reqwest::ClientBui
 
 #[cfg(any(feature = "dist-server", feature = "dist-client"))]
 pub(crate) fn new_reqwest_blocking_builder() -> reqwest::Result<reqwest::blocking::ClientBuilder> {
-    let builder = reqwest::blocking::Client::builder();
+    // Include certificate-rebuilt scheduler clients: all blocking control-plane
+    // requests need finite deadlines even after trust-root rotation.
+    let builder = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(90));
     #[cfg(all(not(target_os = "android"), any(unix, windows)))]
     let builder = builder.tls_certs_merge(mozilla_root_certificates()?);
     Ok(builder)
