@@ -600,16 +600,24 @@ impl LruDiskCache {
     ///
     /// Returns an error if an existing cached file cannot be removed.
     pub fn remove<K: AsRef<OsStr>>(&mut self, key: K) -> Result<()> {
-        match self.lru.remove(key.as_ref()) {
-            Some(_) => {
-                let path = self.rel_to_abs_path(key.as_ref());
-                fs::remove_file(&path).map_err(|e| {
-                    error!("Error removing file from cache: `{}`: {e}", path.display());
-                    Into::into(e)
-                })
-            }
-            None => Ok(()),
+        let key = key.as_ref();
+        if !self.lru.contains_key(key) {
+            return Ok(());
         }
+        let path = self.rel_to_abs_path(key);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                error!(
+                    "Error removing file from cache: `{}`: {error}",
+                    path.display()
+                );
+                return Err(Error::Io(error));
+            }
+        }
+        self.lru.remove(key);
+        Ok(())
     }
 }
 
@@ -1051,6 +1059,29 @@ mod tests {
         // The temporary file should not be there anymore.
         assert!(get_all_files(cache_dir).all(|(file, _)| file != path));
 
+        Ok(())
+    }
+
+    #[test]
+    fn failed_removal_preserves_lru_accounting() -> Result<()> {
+        let fixture = TestFixture::new()?;
+        let root = fixture.tmp().join("cache");
+        let mut cache = LruDiskCache::new(&root, 32)?;
+        cache.insert_bytes("entry", b"payload")?;
+        let path = root.join("entry");
+
+        fs::remove_file(&path)?;
+        fs::create_dir(&path)?;
+        assert!(matches!(cache.remove("entry"), Err(Error::Io(_))));
+        assert!(cache.contains_key("entry"));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.size(), 7);
+
+        fs::remove_dir(&path)?;
+        cache.remove("entry")?;
+        assert!(!cache.contains_key("entry"));
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.size(), 0);
         Ok(())
     }
 
