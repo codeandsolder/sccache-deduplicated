@@ -1140,7 +1140,6 @@ fn make_lru_key_path(key: &ArchiveId) -> PathBuf {
 #[cfg(test)]
 mod cache_validation_tests {
     use super::*;
-    use std::io::Write;
 
     #[cfg(all(target_os = "linux", feature = "dist-server"))]
     #[test]
