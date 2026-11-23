@@ -21,7 +21,7 @@ const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_mins(20);
 /// compressed build result which may legitimately exceed ordinary limits.
 #[cfg(feature = "dist-client")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RequestClass {
+pub enum RequestClass {
     /// Scheduler and worker control messages, which must return promptly.
     Control,
     /// Optional display metadata: failure must not affect compilation.
@@ -148,7 +148,7 @@ pub(super) fn blocking_client(
 }
 
 #[cfg(feature = "dist-client")]
-pub(crate) async fn send_async<T: serde::de::DeserializeOwned>(
+pub async fn send_async<T: serde::de::DeserializeOwned>(
     req: reqwest::RequestBuilder,
     class: RequestClass,
 ) -> Result<T> {

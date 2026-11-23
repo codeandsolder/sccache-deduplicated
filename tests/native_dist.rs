@@ -178,6 +178,9 @@ impl Fleet {
             package_upstreams,
             sccache::build_runtime::PackageTransferCost {
                 download_bytes_per_second: 1 << 20,
+                decode_xz_bytes_per_second: 1 << 30,
+                decode_zstd_bytes_per_second: 1 << 30,
+                per_entry_nanoseconds: 0,
                 startup_nanoseconds: 0,
                 ..Default::default()
             },

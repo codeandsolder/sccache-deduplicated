@@ -459,12 +459,13 @@ decoder_timeout_secs = 600
 
 The optional worker `[native_worker.package_transfer]` table controls
 the initial transfer-cost estimate. The default models a 128 MiB/s raw
-download path, full-package Zstandard expansion at 64 MiB/s, XZ at
+download path, a 2 ms raw-blob request overhead and four parallel raw
+downloads per worker, full-package Zstandard expansion at 64 MiB/s, XZ at
 24 MiB/s, Gzip at 128 MiB/s and uncompressed tar at 512 MiB/s,
 plus 20 microseconds per archive entry and 75 ms of fixed work.
 These are **starting estimates, not measured universal rates**. The worker
-smooths real raw download+staging throughput and successful full-package
-reconstruction throughput across jobs to adjust its future choices. Samples
+smooths raw download+staging throughput, small-file request overhead,
+and successful full-package reconstruction throughput across jobs to adjust its future choices. Samples
 below 1 MiB are ignored, and a package's predicted transfer time is
 subtracted from its measured reconstruction time before updating the
 codec's decode rate. Override initial values for the network and hardware:
@@ -472,6 +473,8 @@ codec's decode rate. Override initial values for the network and hardware:
 ```toml
 [native_worker.package_transfer]
 download_bytes_per_second = 20971520
+raw_request_nanoseconds = 2000000
+raw_parallelism = 4
 decode_tar_bytes_per_second = 536870912
 decode_gzip_bytes_per_second = 134217728
 decode_xz_bytes_per_second = 25165824

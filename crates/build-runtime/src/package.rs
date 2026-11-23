@@ -125,6 +125,10 @@ impl ArchiveLength {
 #[serde(deny_unknown_fields)]
 pub struct PackageTransferCost {
     pub download_bytes_per_second: u64,
+    /// Approximate setup/staging latency of one original HTTP blob request.
+    pub raw_request_nanoseconds: u64,
+    /// Maximum simultaneous raw blob fetches across worker jobs.
+    pub raw_parallelism: u32,
     pub decode_tar_bytes_per_second: u64,
     pub decode_gzip_bytes_per_second: u64,
     pub decode_xz_bytes_per_second: u64,
@@ -138,6 +142,8 @@ impl Default for PackageTransferCost {
         const MIB: u64 = 1 << 20;
         Self {
             download_bytes_per_second: 128 * MIB,
+            raw_request_nanoseconds: 2_000_000,
+            raw_parallelism: 4,
             decode_tar_bytes_per_second: 512 * MIB,
             decode_gzip_bytes_per_second: 128 * MIB,
             decode_xz_bytes_per_second: 24 * MIB,
@@ -165,7 +171,9 @@ impl PackageTransferCost {
                 .iter()
                 .all(|&rate| (1..=1_000_000_000_000).contains(&rate))
                 && self.per_entry_nanoseconds <= 1_000_000_000
-                && self.startup_nanoseconds <= 60_000_000_000,
+                && self.startup_nanoseconds <= 60_000_000_000
+                && self.raw_request_nanoseconds <= 60_000_000_000
+                && (1..=32).contains(&self.raw_parallelism),
             "invalid original-package transfer cost estimate"
         );
         Ok(())
@@ -177,24 +185,30 @@ impl PackageTransferCost {
     pub fn predicted_savings_nanoseconds(
         self,
         raw_bytes: u128,
+        raw_files: usize,
         archive: PackageArchive,
     ) -> Option<u128> {
         const SECOND: u128 = 1_000_000_000;
-        let transfer_saved = raw_bytes.checked_sub(u128::from(archive.source.size))?;
+        if raw_files == 0 || self.validate().is_err() {
+            return None;
+        }
+        let rate = u128::from(self.download_bytes_per_second);
+        let request = u128::from(self.raw_request_nanoseconds);
+        let batches = (raw_files as u128).div_ceil(u128::from(self.raw_parallelism));
+        let raw_cost = raw_bytes * SECOND / rate + batches * request;
         let decode_rate = match archive.source.identity.compression {
             PackageCompression::Tar => self.decode_tar_bytes_per_second,
             PackageCompression::Gzip => self.decode_gzip_bytes_per_second,
             PackageCompression::Xz => self.decode_xz_bytes_per_second,
             PackageCompression::Zstd => self.decode_zstd_bytes_per_second,
         };
-        if self.validate().is_err() {
-            return None;
-        }
-        let network_saving = transfer_saved * SECOND / u128::from(self.download_bytes_per_second);
-        let decode = u128::from(archive.expanded_bytes) * SECOND / u128::from(decode_rate);
-        let metadata = u128::from(archive.entry_count) * u128::from(self.per_entry_nanoseconds);
-        network_saving
-            .checked_sub(decode + metadata + u128::from(self.startup_nanoseconds))
+        let archive_cost = u128::from(archive.source.size) * SECOND / rate
+            + request
+            + u128::from(archive.expanded_bytes) * SECOND / u128::from(decode_rate)
+            + u128::from(archive.entry_count) * u128::from(self.per_entry_nanoseconds)
+            + u128::from(self.startup_nanoseconds);
+        raw_cost
+            .checked_sub(archive_cost)
             .filter(|&saving| saving > 0)
     }
 }
@@ -240,7 +254,7 @@ mod transport_cost_tests {
         let fast_link = PackageTransferCost::default();
         assert!(
             fast_link
-                .predicted_savings_nanoseconds(168_285_404, archive)
+                .predicted_savings_nanoseconds(168_285_404, 285, archive)
                 .is_none()
         );
         let slow_link = PackageTransferCost {
@@ -249,12 +263,12 @@ mod transport_cost_tests {
         };
         assert!(
             slow_link
-                .predicted_savings_nanoseconds(168_285_404, archive)
+                .predicted_savings_nanoseconds(168_285_404, 285, archive)
                 .is_some()
         );
         assert!(
             slow_link
-                .predicted_savings_nanoseconds(40_000_000, archive)
+                .predicted_savings_nanoseconds(40_000_000, 12, archive)
                 .is_none()
         );
         let changed_decoder = PackageTransferCost {
@@ -263,7 +277,7 @@ mod transport_cost_tests {
         };
         assert!(
             changed_decoder
-                .predicted_savings_nanoseconds(168_285_404, archive)
+                .predicted_savings_nanoseconds(168_285_404, 285, archive)
                 .is_none()
         );
         let invalid = PackageTransferCost {
@@ -273,7 +287,31 @@ mod transport_cost_tests {
         assert!(invalid.validate().is_err());
         assert!(
             invalid
-                .predicted_savings_nanoseconds(168_285_404, archive)
+                .predicted_savings_nanoseconds(168_285_404, 285, archive)
+                .is_none()
+        );
+        let latency = PackageTransferCost {
+            download_bytes_per_second: 1 << 30,
+            raw_request_nanoseconds: 2_000_000,
+            raw_parallelism: 1,
+            startup_nanoseconds: 0,
+            decode_zstd_bytes_per_second: 1 << 30,
+            per_entry_nanoseconds: 0,
+            ..fast_link
+        };
+        // Overfetching an original can be faster than many serial HTTP calls.
+        assert!(
+            latency
+                .predicted_savings_nanoseconds(60_000_000, 150, archive)
+                .is_some()
+        );
+        let concurrent = PackageTransferCost {
+            raw_parallelism: 16,
+            ..latency
+        };
+        assert!(
+            concurrent
+                .predicted_savings_nanoseconds(60_000_000, 150, archive)
                 .is_none()
         );
     }

@@ -470,22 +470,24 @@ impl NativeCacheClient {
             let _ = package_import;
             let updated = store.reserve_tree_upload(&read.manifest)?;
             drop(reserved);
-            let mut staged = Vec::new();
             debug!(
-                "native tree {id:?}: downloading {} raw bytes after package reconstruction",
+                "native tree {id:?}: downloading {} raw bytes in at most {} concurrent requests after package reconstruction",
                 updated
                     .missing()
                     .iter()
                     .map(|blob| u128::from(blob.size))
-                    .sum::<u128>()
+                    .sum::<u128>(),
+                transport.parallelism()
             );
-            for blob in updated.missing() {
+            let staged = map_packages(updated.missing(), transport.parallelism(), |blob| {
                 check()?;
+                let _slot = transport.raw_slot(check)?;
                 let start = Instant::now();
                 let response = self.download_response(read.ticket, blob.id)?;
-                staged.push(store.stage_expected(*blob, response)?);
+                let staged = store.stage_expected(*blob, response)?;
                 transport.observe_raw(blob.size, start.elapsed());
-            }
+                Ok(staged)
+            })?;
             let tree = store.publish_tree_pinned(&read.manifest, staged)?;
             #[cfg(target_os = "linux")]
             drop(packages);

@@ -4,7 +4,7 @@
 
 use std::{
     num::NonZeroUsize,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Arc, Condvar, Mutex, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -24,17 +24,76 @@ use crate::build_runtime::{
 #[derive(Clone)]
 pub struct PackageTransportTracker {
     rates: Arc<Mutex<PackageTransferCost>>,
+    slots: Arc<RawDownloadSlots>,
+}
+
+struct RawDownloadSlots {
+    limit: NonZeroUsize,
+    active: Mutex<usize>,
+    wake: Condvar,
+}
+
+pub(super) struct RawDownloadPermit<'a>(&'a RawDownloadSlots);
+
+impl Drop for RawDownloadPermit<'_> {
+    fn drop(&mut self) {
+        let mut active = self.0.active.lock().unwrap_or_else(PoisonError::into_inner);
+        *active -= 1;
+        drop(active);
+        self.0.wake.notify_one();
+    }
 }
 
 impl PackageTransportTracker {
-    /// Construct a rate tracker from administrator-provided initial costs.
+    /// Construct a rate tracker and the shared raw download budget.
     /// # Errors
-    /// Returns an error when the initial costs are invalid.
+    /// Returns an error when the initial costs or concurrency are invalid.
     pub fn new(initial: PackageTransferCost) -> Result<Self> {
         initial.validate()?;
+        let limit = NonZeroUsize::new(usize::try_from(initial.raw_parallelism)?)
+            .context("zero raw download parallelism")?;
         Ok(Self {
             rates: Arc::new(Mutex::new(initial)),
+            slots: Arc::new(RawDownloadSlots {
+                limit,
+                active: Mutex::new(0),
+                wake: Condvar::new(),
+            }),
         })
+    }
+
+    /// Maximum concurrent raw content fetches across this worker process.
+    #[must_use = "raw transfer concurrency is bounded worker-wide"]
+    pub fn parallelism(&self) -> NonZeroUsize {
+        self.slots.limit
+    }
+
+    /// Acquire one raw HTTP-and-staging slot, checking cancellation while
+    /// waiting. A slot is released on every return path, including failures.
+    /// # Errors
+    /// Returns an error if cancellation or lease renewal failed.
+    pub(super) fn raw_slot(&self, check: &LeaseCheck<'_>) -> Result<RawDownloadPermit<'_>> {
+        loop {
+            check()?;
+            let (mut active, _) = self
+                .slots
+                .wake
+                .wait_timeout_while(
+                    self.slots
+                        .active
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner),
+                    Duration::from_millis(50),
+                    |in_use| *in_use >= self.slots.limit.get(),
+                )
+                .unwrap_or_else(PoisonError::into_inner);
+            if *active < self.slots.limit.get() {
+                *active += 1;
+                drop(active);
+                return Ok(RawDownloadPermit(&self.slots));
+            }
+            drop(active);
+        }
     }
 
     /// A point-in-time estimate to send with a package selection request.
@@ -56,7 +115,24 @@ impl PackageTransportTracker {
     /// Observe actual download and staging time for a verified raw blob.
     pub fn observe_raw(&self, bytes: u64, duration: Duration) {
         let mut rates = self.rates.lock().unwrap_or_else(PoisonError::into_inner);
-        Self::smooth(&mut rates.download_bytes_per_second, bytes, duration);
+        let nanos = duration.as_nanos();
+        if (4096..(1 << 20)).contains(&bytes) && (200_000..=2_000_000_000).contains(&nanos) {
+            // Small files are dominated by setup and staging. Discount the
+            // predicted wire time and update an independent request overhead.
+            let wire =
+                u128::from(bytes) * 1_000_000_000 / u128::from(rates.download_bytes_per_second);
+            let overhead = nanos.saturating_sub(wire).min(5_000_000_000);
+            rates.raw_request_nanoseconds =
+                u64::try_from((3 * u128::from(rates.raw_request_nanoseconds) + overhead) / 4)
+                    .unwrap_or(5_000_000_000);
+        } else if bytes >= 1 << 20 {
+            let effective = nanos.saturating_sub(u128::from(rates.raw_request_nanoseconds));
+            Self::smooth(
+                &mut rates.download_bytes_per_second,
+                bytes,
+                Duration::from_nanos(u64::try_from(effective).unwrap_or(u64::MAX)),
+            );
+        }
     }
 
     /// Observe original delivery plus verified full-package reconstruction.
@@ -66,8 +142,10 @@ impl PackageTransportTracker {
         let mut rates = self.rates.lock().unwrap_or_else(PoisonError::into_inner);
         let transfer_ns = u128::from(archive.source.size) * 1_000_000_000
             / u128::from(rates.download_bytes_per_second);
+        let entry_cost = u128::from(rates.per_entry_nanoseconds) * u128::from(archive.entry_count);
         let overhead_ns = u128::from(rates.startup_nanoseconds)
-            + u128::from(rates.per_entry_nanoseconds) * u128::from(archive.entry_count);
+            + u128::from(rates.raw_request_nanoseconds)
+            + entry_cost;
         let decode_ns = duration
             .as_nanos()
             .saturating_sub(transfer_ns.saturating_add(overhead_ns));
@@ -107,6 +185,58 @@ mod transport_tests {
     use crate::build_runtime::{
         BlobRef, ContentId, PackageCompression, PackageIdentity, PackageSource, TreeId,
     };
+
+    #[test]
+    fn slots_bound_parallel_downloads_and_restore_admission_on_drop() -> Result<()> {
+        use std::sync::{
+            Barrier,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let tracker = PackageTransportTracker::new(PackageTransferCost {
+            raw_parallelism: 2,
+            ..PackageTransferCost::default()
+        })?;
+        let barrier = Barrier::new(8);
+        let running = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        std::thread::scope(|scope| -> Result<()> {
+            let threads = (0..8)
+                .map(|_| {
+                    let tracker = tracker.clone();
+                    let barrier = &barrier;
+                    let running = &running;
+                    let peak = &peak;
+                    scope.spawn(move || -> Result<()> {
+                        barrier.wait();
+                        let _permit = tracker.raw_slot(&|| Ok(()))?;
+                        let count = running.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(count, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(30));
+                        running.fetch_sub(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                })
+                .collect::<Vec<_>>();
+            for thread in threads {
+                thread
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("raw limiter worker panicked"))??;
+            }
+            Ok(())
+        })?;
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!(running.load(Ordering::SeqCst), 0);
+        assert!(
+            tracker
+                .raw_slot(&|| anyhow::bail!("expired session"))
+                .is_err()
+        );
+        let initial = tracker.estimate().raw_request_nanoseconds;
+        tracker.observe_raw(8192, Duration::from_millis(35));
+        assert!(tracker.estimate().raw_request_nanoseconds > initial);
+        assert_eq!(tracker.estimate().raw_parallelism, 2);
+        Ok(())
+    }
 
     #[test]
     fn observed_rates_change_future_costs_without_overreacting_to_tiny_files() -> Result<()> {

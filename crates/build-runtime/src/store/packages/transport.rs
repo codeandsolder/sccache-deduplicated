@@ -75,13 +75,14 @@ impl NativeStore {
             let best = candidates
                 .iter()
                 .filter_map(|(key, candidate)| {
-                    let raw: u128 = candidate
+                    let (raw, files) = candidate
                         .covers
                         .iter()
                         .filter_map(|id| remaining.get(id))
-                        .map(|size| u128::from(*size))
-                        .sum();
-                    cost.predicted_savings_nanoseconds(raw, candidate.archive)
+                        .fold((0_u128, 0_usize), |(bytes, count), size| {
+                            (bytes + u128::from(*size), count + 1)
+                        });
+                    cost.predicted_savings_nanoseconds(raw, files, candidate.archive)
                         .map(|saving| (saving, *key))
                 })
                 .max();
