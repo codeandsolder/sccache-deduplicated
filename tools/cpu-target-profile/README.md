@@ -18,6 +18,15 @@ Or describe a known target CPU without access to the actual machine:
 cargo run --manifest-path tools/cpu-target-profile/Cargo.toml -- model --target x86_64-unknown-linux-gnu --cpu x86_64_v4 --output cpu.json
 ~~~
 
+Version 2 of the exported profile records capture provenance: a named model,
+Archspec's host detector on systems without independent processor-topology
+inspection, or a Linux per-processor capability intersection with logical
+processor count and an explicit heterogeneous flag. The Linux
+`hypervisor_flag_seen` field records only whether the kernel exposed a
+hypervisor hint; `false` does not prove the destination is non-virtualized.
+The provenance fields are descriptive and are never extra compiler cache keys.
+Version 1 profiles are intentionally rejected rather than silently interpreted.
+
 The exported versioned JSON distinguishes a detected CPU from a named model.
 For Linux x86/x86-64 and AArch64 detection, the feature set is the
 **intersection of kernel-exposed, OS-usable flags across all visible cores**,

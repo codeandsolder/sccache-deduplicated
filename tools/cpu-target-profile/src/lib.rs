@@ -16,7 +16,7 @@ use target_lexicon::Triple;
 #[cfg(target_os = "linux")]
 mod linux_capabilities;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 /// Normalize target triple architecture spelling into Archspec family names.
 fn triple_cpu_family(triple: &str) -> &str {
@@ -41,10 +41,19 @@ fn matches_cpu_family(triple: &str, cpu_family: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProfileOrigin {
-    Detected,
     NamedModel,
+    /// Host model and feature set were obtained from Archspec's platform
+    /// detector; processor topology was not independently established.
+    ArchspecHost,
+    /// Linux capability intersection over all listed processors. A present
+    /// hypervisor flag is a hint only, not a definitive virtualization test.
+    LinuxCpuInfo {
+        logical_processors: usize,
+        heterogeneous: bool,
+        hypervisor_flag_seen: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -67,7 +76,7 @@ impl DestinationProfile {
         let detected =
             archspec::cpu::host().map_err(|_| anyhow::anyhow!("cannot detect destination CPU"))?;
         let profile =
-            Self::from_microarchitecture(target_triple, &detected, ProfileOrigin::Detected)?;
+            Self::from_microarchitecture(target_triple, &detected, ProfileOrigin::ArchspecHost)?;
         #[cfg(target_os = "linux")]
         {
             let contents = std::fs::read_to_string("/proc/cpuinfo")
@@ -562,6 +571,20 @@ mod tests {
     }
 
     #[test]
+    fn profile_schema_records_provenance_and_rejects_old_versions() -> Result<()> {
+        let profile = mock_profile("x86_64_v3")?;
+        let json = serde_json::to_string(&profile)?;
+        assert!(json.contains(r#""schema_version":2"#));
+        assert!(json.contains(r#""kind":"named_model""#));
+        let decoded: DestinationProfile = serde_json::from_str(&json)?;
+        assert_eq!(decoded, profile);
+        let mut incompatible = decoded;
+        incompatible.schema_version = 1;
+        assert!(incompatible.resolve(None).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn c_target_machine_accepts_vendor_aliases_but_not_abi_or_architecture_changes() -> Result<()> {
         assert!(compiler_target_matches(
             "x86_64-unknown-linux-gnu",
@@ -685,7 +708,7 @@ mod tests {
         let expected = cargo_toml(&original, None, Path::new("rustc"))?;
         let mut modified = original.clone();
         modified.features.push("kernel_bookkeeping_bit".to_owned());
-        modified.origin = ProfileOrigin::Detected;
+        modified.origin = ProfileOrigin::ArchspecHost;
         assert_ne!(original, modified);
         assert_eq!(expected, cargo_toml(&modified, None, Path::new("rustc"))?);
         Ok(())

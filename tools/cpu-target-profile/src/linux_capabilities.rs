@@ -5,7 +5,7 @@
 //! use ISA features missing from another CPU. Kernel flags represent OS-usable
 //! instructions, including XSAVE/XCR0 requirements for vector extensions.
 
-use super::DestinationProfile;
+use super::{DestinationProfile, ProfileOrigin};
 use anyhow::{Context, Result, ensure};
 use archspec::cpu::Microarchitecture;
 use archspec::schema::MicroarchitecturesSchema;
@@ -129,10 +129,28 @@ pub fn enforce_common_cpu_features(
                     "cannot infer a common {family} ISA from heterogeneous or unidentified Linux CPUs; specify an explicit compatible model"
                 );
             }
+            profile.origin = ProfileOrigin::LinuxCpuInfo {
+                logical_processors: records.len(),
+                heterogeneous: false,
+                hypervisor_flag_seen: false,
+            };
             return Ok(profile);
         }
     };
-    let mut features = common_features(&records, feature_key)?;
+    let raw_features = common_features(&records, feature_key)?;
+    let differing_core_features = records.iter().any(|record| {
+        record.get(feature_key).is_some_and(|features| {
+            features
+                .split_ascii_whitespace()
+                .any(|feature| !raw_features.contains(feature))
+        })
+    });
+    let hypervisor_flag_seen = records.iter().any(|record| {
+        record
+            .get(feature_key)
+            .is_some_and(|features| features.split_ascii_whitespace().any(|f| f == "hypervisor"))
+    });
+    let mut features = raw_features;
     ensure!(
         !features.is_empty(),
         "no ISA features shared by all listed processors"
@@ -176,6 +194,11 @@ pub fn enforce_common_cpu_features(
     selected.vendor().clone_into(&mut profile.vendor);
     profile.features = features.into_iter().collect();
     profile.features.sort();
+    profile.origin = ProfileOrigin::LinuxCpuInfo {
+        logical_processors: records.len(),
+        heterogeneous: !homogeneous || differing_core_features,
+        hypervisor_flag_seen,
+    };
     Ok(profile)
 }
 
@@ -221,6 +244,42 @@ mod tests {
         );
         assert!(actual.resolve(Some("x86_64_v4")).is_err());
         assert!(actual.resolve(Some("x86_64_v2")).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_cpu_profile_records_downgrade_provenance() -> Result<()> {
+        let v4 = flags("x86_64_v4")?;
+        let v3 = flags("x86_64_v3")?;
+        let source = cpuinfo(&[("fast", &v4), ("slow", &v3)]);
+        let profile = DestinationProfile::named("x86_64-unknown-linux-gnu", "x86_64_v4")?;
+        let detected = enforce_common_cpu_features(profile, &source)?;
+        assert_eq!(detected.microarchitecture, "x86_64_v3");
+        assert_eq!(
+            detected.origin,
+            ProfileOrigin::LinuxCpuInfo {
+                logical_processors: 2,
+                heterogeneous: true,
+                hypervisor_flag_seen: false,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hypervisor_flag_is_recorded_without_claiming_non_virtualization() -> Result<()> {
+        let features = format!("{} hypervisor", flags("x86_64_v3")?);
+        let source = cpuinfo(&[("virtual", &features)]);
+        let profile = DestinationProfile::named("x86_64-unknown-linux-gnu", "x86_64_v3")?;
+        let detected = enforce_common_cpu_features(profile, &source)?;
+        assert_eq!(
+            detected.origin,
+            ProfileOrigin::LinuxCpuInfo {
+                logical_processors: 1,
+                heterogeneous: false,
+                hypervisor_flag_seen: true,
+            }
+        );
         Ok(())
     }
 

@@ -3295,6 +3295,24 @@ mod test {
         assert_neq!(h_abc, h_a);
     }
 
+    #[test]
+    fn test_destination_cpu_flags_partition_c_cache() {
+        let key = |args: &[&str]| {
+            let arguments: Vec<_> = args.iter().map(OsString::from).collect();
+            HashKeyParams::new(
+                "gcc-toolchain-digest",
+                Language::C,
+                &arguments,
+                b"same preprocessed C source",
+            )
+            .compute()
+        };
+        let v2 = key(&["-O3", "-march=x86-64-v2"]);
+        let v4 = key(&["-O3", "-march=x86-64-v4"]);
+        assert_ne!(v2, v4, "effective GCC -march must partition C cache");
+        assert_eq!(v2, key(&["-O3", "-march=x86-64-v2"]));
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_hash_key_non_unicode_argument_boundaries() {
