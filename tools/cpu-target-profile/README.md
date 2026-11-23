@@ -19,9 +19,17 @@ cargo run --manifest-path tools/cpu-target-profile/Cargo.toml -- model --target 
 ~~~
 
 The exported versioned JSON distinguishes a detected CPU from a named model.
-The feature set is Archspec's model capability data, not an independent survey
-of all cores on a heterogeneous machine. For heterogeneous destinations,
-choose a CPU model compatible with every core that will run the output.
+For Linux x86/x86-64 and AArch64 detection, the feature set is the
+**intersection of kernel-exposed, OS-usable flags across all visible cores**,
+with aliases derived from Archspec's own database. Mixed CPU models downgrade
+the explicitly exported CPU *selection* to an ISA-proven common baseline:
+for x86 it is the best compatible generic x86-64 level, and for AArch64 the
+ARMv8-A baseline (because Archspec's ARMv9 version markers alone do not prove
+instruction support). Missing core reports cause capture to fail. For PowerPC
+and RISC-V, nonuniform or unidentifiable per-core processor identities fail
+rather than trusting CPU0. Other operating systems currently rely on Archspec
+host detection; use an explicit named CPU profile for heterogeneous machines
+whose common ISA cannot be established by that API.
 
 ## Render only the settings consumed by each compiler
 

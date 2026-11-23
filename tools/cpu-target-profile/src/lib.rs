@@ -13,6 +13,9 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::process::Command;
 
+#[cfg(target_os = "linux")]
+mod linux_capabilities;
+
 const SCHEMA_VERSION: u32 = 1;
 
 /// Normalize target triple architecture spelling into Archspec family names.
@@ -63,7 +66,18 @@ impl DestinationProfile {
     pub fn capture(target_triple: &str) -> Result<Self> {
         let detected =
             archspec::cpu::host().map_err(|_| anyhow::anyhow!("cannot detect destination CPU"))?;
-        Self::from_microarchitecture(target_triple, &detected, ProfileOrigin::Detected)
+        let profile =
+            Self::from_microarchitecture(target_triple, &detected, ProfileOrigin::Detected)?;
+        #[cfg(target_os = "linux")]
+        {
+            let contents = std::fs::read_to_string("/proc/cpuinfo")
+                .context("cannot read Linux processor capabilities from /proc/cpuinfo")?;
+            linux_capabilities::enforce_common_cpu_features(profile, &contents)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(profile)
+        }
     }
 
     /// Define a destination CPU model independently of the build host.
@@ -283,13 +297,9 @@ fn tool_output(compiler: &Path, args: &[&str]) -> Result<String> {
         .args(args)
         .output()
         .with_context(|| format!("unable to run {}", compiler.display()))?;
-    ensure!(
-        output.status.success(),
-        "{} {:?} failed: {}",
-        compiler.display(),
-        args,
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let path = compiler.display();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    ensure!(output.status.success(), "{path} {args:?} failed: {stderr}");
     String::from_utf8(output.stdout).context("compiler emitted non-UTF8 output")
 }
 
@@ -384,6 +394,9 @@ pub fn rustc_flags(
     }
     if let Some(rest) = cpu.name().strip_prefix("x86_64_v") {
         alternatives.push(format!("x86-64-v{rest}"));
+    }
+    if cpu.name() == "aarch64" {
+        alternatives.push("generic".to_owned());
     }
     let selected = alternatives.into_iter().find(|name| supported.contains(name.as_str()))
         .with_context(|| format!("rustc {} does not recognize Archspec CPU {} for target {}; use a compiler that supports the destination CPU", compiler.display(), cpu.name(), profile.target_triple))?;
@@ -511,6 +524,18 @@ mod tests {
         let profile = mock_profile("x86_64_v2")?;
         assert!(profile.resolve(Some("x86_64_v4")).is_err());
         assert!(profile.resolve(Some("neoverse_n2")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn unrelated_profile_metadata_does_not_affect_effective_rustc_flags() -> Result<()> {
+        let original = mock_profile("x86_64_v3")?;
+        let expected = cargo_toml(&original, None, Path::new("rustc"))?;
+        let mut modified = original.clone();
+        modified.features.push("kernel_bookkeeping_bit".to_owned());
+        modified.origin = ProfileOrigin::Detected;
+        assert_ne!(original, modified);
+        assert_eq!(expected, cargo_toml(&modified, None, Path::new("rustc"))?);
         Ok(())
     }
 
