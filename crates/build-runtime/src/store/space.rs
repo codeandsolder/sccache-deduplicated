@@ -191,10 +191,7 @@ impl NativeStore {
             .context("native resident reservation overflow")?;
         let mut evicted_roots = 0;
         if free < minimum || resident > policy.max_resident_bytes {
-            for root in self
-                .eviction_candidates(policy.max_evictions_per_pass)?
-                .into_iter()
-            {
+            for root in self.eviction_candidates(policy.max_evictions_per_pass)? {
                 let result = match root {
                     Root::Action(key) => self.evict(key)?,
                     Root::Tree(id) => self.evict_tree(id)?,
