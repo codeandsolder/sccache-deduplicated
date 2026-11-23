@@ -33,7 +33,7 @@ use async_trait::async_trait;
 use fs::File;
 use fs_err as fs;
 use log::Level::Trace;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
@@ -1215,9 +1215,16 @@ where
     Ok((command, dist_command, Cacheable::Yes))
 }
 
+enum ResponseFileEntry {
+    Argument(OsString),
+    EndFile(PathBuf),
+}
+
 pub struct ExpandIncludeFile<'a> {
     cwd: &'a Path,
-    stack: Vec<OsString>,
+    stack: Vec<ResponseFileEntry>,
+    // Only active ancestors form cycles; repeated non-recursive @file use is legal.
+    active_files: HashSet<PathBuf>,
 }
 
 impl<'a> ExpandIncludeFile<'a> {
@@ -1226,9 +1233,10 @@ impl<'a> ExpandIncludeFile<'a> {
             stack: args
                 .iter()
                 .rev()
-                .map(std::borrow::ToOwned::to_owned)
+                .map(|arg| ResponseFileEntry::Argument(arg.clone()))
                 .collect(),
             cwd,
+            active_files: HashSet::new(),
         }
     }
 }
@@ -1238,7 +1246,13 @@ impl Iterator for ExpandIncludeFile<'_> {
 
     fn next(&mut self) -> Option<OsString> {
         loop {
-            let arg = self.stack.pop()?;
+            let arg = match self.stack.pop()? {
+                ResponseFileEntry::Argument(arg) => arg,
+                ResponseFileEntry::EndFile(path) => {
+                    self.active_files.remove(&path);
+                    continue;
+                }
+            };
             let file = match arg.split_prefix("@") {
                 Some(arg) => self.cwd.join(arg),
                 None => return Some(arg),
@@ -1275,6 +1289,22 @@ impl Iterator for ExpandIncludeFile<'_> {
             // back to invoking the compiler directly.
             //
             // [1]: https://gcc.gnu.org/onlinedocs/gcc/Overall-Options.html#Overall-Options
+            // GNU response files expand recursively. Resolve aliases and
+            // reject an active ancestor, rather than recursing without ever
+            // producing an argument. Returning the literal @file is safe:
+            // GCC/Clang argument parsing classifies it as uncacheable and
+            // runs the original compiler invocation.
+            let canonical = match file.canonicalize() {
+                Ok(canonical) => canonical,
+                Err(e) => {
+                    debug!("failed to resolve @-file `{}`: {e}", file.display());
+                    return Some(arg);
+                }
+            };
+            if self.active_files.contains(&canonical) {
+                debug!("cyclic @-file reference at {}", file.display());
+                return Some(arg);
+            }
             let mut contents = String::new();
             let res = File::open(&file).and_then(|mut f| f.read_to_string(&mut contents));
             if let Err(e) = res {
@@ -1282,7 +1312,10 @@ impl Iterator for ExpandIncludeFile<'_> {
                 return Some(arg);
             }
             let new_args = split_gnu_response_file_args(&contents);
-            self.stack.extend(new_args.into_iter().rev());
+            self.active_files.insert(canonical.clone());
+            self.stack.push(ResponseFileEntry::EndFile(canonical));
+            self.stack
+                .extend(new_args.into_iter().rev().map(ResponseFileEntry::Argument));
         }
     }
 }
@@ -2600,6 +2633,74 @@ mod test {
             CompilerArguments::CannotCache("@", None),
             parse_arguments_(stringvec!["-c", "foo.c", "-o", "@foo"], false)
         );
+    }
+
+    #[test]
+    fn recursive_response_file_cycles_fall_back_without_hanging() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(temp.path().join("self.rsp"), b"@self.rsp")?;
+        let args = ovec!["-c", "@self.rsp", "source.c"];
+        assert_eq!(
+            ExpandIncludeFile::new(temp.path(), &args).collect::<Vec<_>>(),
+            args
+        );
+        assert_eq!(
+            parse_arguments(&args, temp.path(), &ARGS[..], false, CCompilerKind::Gcc),
+            CompilerArguments::CannotCache("@", None)
+        );
+
+        fs::write(temp.path().join("first.rsp"), b"@second.rsp")?;
+        fs::write(temp.path().join("second.rsp"), b"@first.rsp")?;
+        assert_eq!(
+            ExpandIncludeFile::new(
+                temp.path(),
+                &[OsString::from("@first.rsp"), OsString::from("tail")]
+            )
+            .collect::<Vec<_>>(),
+            ovec!["@first.rsp", "tail"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_response_file_reuse_remains_supported() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(temp.path().join("leaf.rsp"), b"-DVALUE=1")?;
+        fs::write(temp.path().join("outer.rsp"), b"@leaf.rsp -c source.c")?;
+        assert_eq!(
+            ExpandIncludeFile::new(
+                temp.path(),
+                &[OsString::from("@outer.rsp"), OsString::from("@leaf.rsp")]
+            )
+            .collect::<Vec<_>>(),
+            ovec!["-DVALUE=1", "-c", "source.c", "-DVALUE=1"]
+        );
+        fs::write(temp.path().join("empty.rsp"), b"")?;
+        assert_eq!(
+            ExpandIncludeFile::new(
+                temp.path(),
+                &[OsString::from("@empty.rsp"), OsString::from("tail")]
+            )
+            .collect::<Vec<_>>(),
+            ovec!["tail"]
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_response_file_symlink_alias_is_detected() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        fs::write(temp.path().join("actual.rsp"), b"@alias.rsp")?;
+        symlink("actual.rsp", temp.path().join("alias.rsp"))?;
+        assert_eq!(
+            ExpandIncludeFile::new(temp.path(), &[OsString::from("@actual.rsp")])
+                .collect::<Vec<_>>(),
+            ovec!["@alias.rsp"]
+        );
+        Ok(())
     }
 
     #[test]
