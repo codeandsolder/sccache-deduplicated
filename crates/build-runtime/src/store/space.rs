@@ -4,6 +4,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, ensure};
+use bincode::Options;
 use redb::{ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
 
