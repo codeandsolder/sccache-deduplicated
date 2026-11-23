@@ -20,11 +20,85 @@ mod client {
     use anyhow::{Context, Error, Result, anyhow, bail};
     use fs_err as fs;
     use std::collections::{HashMap, HashSet};
-    use std::io::Write;
+    use std::io::{self, Write};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+    use std::time::SystemTime;
 
     use super::{TcCache, path_key};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct ArchiveStamp {
+        length: u64,
+        modified: SystemTime,
+        #[cfg(unix)]
+        dev: u64,
+        #[cfg(unix)]
+        inode: u64,
+        #[cfg(unix)]
+        changed_sec: i64,
+        #[cfg(unix)]
+        changed_nsec: i64,
+        #[cfg(windows)]
+        volume: u32,
+        #[cfg(windows)]
+        index: u64,
+    }
+
+    impl ArchiveStamp {
+        fn of(file: &fs::File) -> Result<Self> {
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                bail!("custom toolchain archive is not a regular file");
+            }
+            #[cfg(unix)]
+            use std::os::unix::fs::MetadataExt;
+
+            #[cfg(windows)]
+            let (volume, index) = {
+                use std::mem::MaybeUninit;
+                use std::os::windows::io::AsRawHandle;
+                use windows_sys::Win32::Storage::FileSystem::{
+                    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+                };
+                let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+                // SAFETY: the live File owns this handle. The Win32 API fills
+                // the entire output structure on success without retaining it.
+                if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) }
+                    == 0
+                {
+                    return Err(io::Error::last_os_error().into());
+                }
+                // SAFETY: the API initialized the record on successful return.
+                let info = unsafe { info.assume_init() };
+                (
+                    info.dwVolumeSerialNumber,
+                    (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+                )
+            };
+
+            Ok(Self {
+                length: metadata.len(),
+                modified: metadata.modified()?,
+                #[cfg(unix)]
+                dev: metadata.dev(),
+                #[cfg(unix)]
+                inode: metadata.ino(),
+                #[cfg(unix)]
+                changed_sec: metadata.ctime(),
+                #[cfg(unix)]
+                changed_nsec: metadata.ctime_nsec(),
+                #[cfg(windows)]
+                volume,
+                #[cfg(windows)]
+                index,
+            })
+        }
+
+        fn at_path(path: &Path) -> Result<Self> {
+            Self::of(&fs::File::open(path)?)
+        }
+    }
 
     #[derive(Clone, Debug)]
     struct CustomToolchain {
@@ -32,50 +106,61 @@ mod client {
         compiler_executable: String,
         cargo_executable: Option<String>,
         identity: Option<Toolchain>,
+        stamp: Option<ArchiveStamp>,
         hash_lock: Arc<Mutex<()>>,
     }
 
     impl CustomToolchain {
-        fn to_override(&self) -> CustomToolchainOverride {
+        fn to_override(&self, snapshot_path: &Path) -> CustomToolchainOverride {
             CustomToolchainOverride {
                 compiler_executable: self.compiler_executable.clone(),
-                archive: self.archive.clone(),
+                archive: snapshot_path.to_owned(),
                 cargo_executable: self.cargo_executable.clone(),
             }
         }
     }
 
-    // Both indexes must be updated under one lock: returning a resolved toolchain
-    // without registering its archive makes get_toolchain() miss that toolchain.
+    // Snapshots remain pinned for the client daemon lifetime: an older job
+    // may still upload its original archive after this compiler path changes.
     struct CustomToolchainRegistry {
         configured: HashMap<PathBuf, CustomToolchain>,
-        archives: HashMap<Toolchain, PathBuf>,
+        archives: HashMap<Toolchain, tempfile::NamedTempFile>,
     }
 
     impl CustomToolchainRegistry {
+        fn current(
+            &self,
+            compiler_path: &Path,
+            stamp: ArchiveStamp,
+        ) -> Option<(Toolchain, CustomToolchainOverride)> {
+            let custom = self.configured.get(compiler_path)?;
+            if custom.stamp != Some(stamp) {
+                return None;
+            }
+            let identity = custom.identity.as_ref()?;
+            let path = self.archives.get(identity)?.path();
+            Some((identity.clone(), custom.to_override(path)))
+        }
+
         fn register(
             &mut self,
             compiler_path: &Path,
             candidate: Toolchain,
+            stamp: ArchiveStamp,
+            snapshot: tempfile::NamedTempFile,
         ) -> Result<(Toolchain, CustomToolchainOverride)> {
+            let path = self
+                .archives
+                .entry(candidate.clone())
+                .or_insert(snapshot)
+                .path();
             let custom = self
                 .configured
                 .get_mut(compiler_path)
                 .ok_or_else(|| anyhow!("configured toolchain disappeared during registration"))?;
-            // Another caller may have completed hashing and registered the path.
-            let tc = custom.identity.get_or_insert(candidate).clone();
-            let override_ = custom.to_override();
-            let previous = self.archives.insert(tc.clone(), override_.archive.clone());
-            if let Some(previous) = previous
-                && previous != override_.archive
-            {
-                warn!(
-                    "Detected interchangeable toolchain archives at {} and {}",
-                    previous.display(),
-                    override_.archive.display()
-                );
-            }
-            Ok((tc, override_))
+            custom.identity = Some(candidate.clone());
+            custom.stamp = Some(stamp);
+            Ok((candidate, custom.to_override(path)))
         }
     }
 
@@ -125,6 +210,7 @@ mod client {
         cache: Mutex<TcCache>,
         toolchain_creation: Mutex<()>,
         custom_toolchains: Mutex<CustomToolchainRegistry>,
+        custom_snapshots_dir: PathBuf,
         // Toolchains configured to not be distributed
         disabled_toolchains: HashSet<PathBuf>,
         // Local machine mapping from 'weak' hashes to strong toolchain hashes
@@ -162,6 +248,14 @@ mod client {
                 toolchain_creation_dir.display()
             ))?;
 
+            let custom_snapshots_dir = cache_dir.join("custom_snapshots");
+            if custom_snapshots_dir.exists() {
+                fs::remove_dir_all(&custom_snapshots_dir)
+                    .context("failed to clean stale custom toolchain snapshots")?;
+            }
+            fs::create_dir(&custom_snapshots_dir)
+                .context("failed to create custom toolchain snapshot directory")?;
+
             let weak_map = load_weak_map(&cache_dir)?;
 
             let tc_cache_dir = cache_dir.join("tc");
@@ -189,6 +283,7 @@ mod client {
                             compiler_executable: archive_compiler_executable.clone(),
                             cargo_executable: archive_cargo_executable.clone(),
                             identity: None,
+                            stamp: None,
                             hash_lock: Arc::new(Mutex::new(())),
                         };
                         if custom_toolchain_paths
@@ -231,6 +326,7 @@ mod client {
                     configured: custom_toolchain_paths,
                     archives: HashMap::new(),
                 }),
+                custom_snapshots_dir,
                 disabled_toolchains,
                 // TODO: shouldn't clear on restart, but also should have some
                 // form of pruning
@@ -248,7 +344,7 @@ mod client {
                 .map_err(|_| anyhow::anyhow!("custom toolchain registry mutex poisoned"))?
                 .archives
                 .get(tc)
-                .cloned();
+                .map(|snapshot| snapshot.path().to_owned());
             let file = if let Some(custom_tc_archive) = custom_tc_archive {
                 fs::File::open(&custom_tc_archive).with_context(|| {
                     format!(
@@ -405,42 +501,58 @@ mod client {
                 let Some(custom) = registry.configured.get(compiler_path) else {
                     return Ok(None);
                 };
-                if let Some(tc) = &custom.identity {
-                    return Ok(Some((tc.clone(), custom.to_override())));
-                }
-                let values = (custom.archive.clone(), Arc::clone(&custom.hash_lock));
-                drop(registry);
-                values
+                (custom.archive.clone(), Arc::clone(&custom.hash_lock))
             };
-            // Only one caller hashes an uninitialized archive. Other toolchains
-            // and archive lookups remain independent of this slow I/O.
-            let hash_guard = hash_lock
-                .lock()
-                .map_err(|_| anyhow!("custom toolchain hash mutex poisoned"))?;
+            // Fast path checks only inode/version metadata, never rehashes
+            // an unchanged large archive. The bytes sent to workers always
+            // come from the pinned immutable snapshot, not this path.
+            let stamp = ArchiveStamp::at_path(&archive)?;
             {
                 let registry = self
                     .custom_toolchains
                     .lock()
                     .map_err(|_| anyhow!("custom toolchain registry mutex poisoned"))?;
-                let Some(custom) = registry.configured.get(compiler_path) else {
-                    return Err(anyhow!("configured toolchain disappeared during hashing"));
-                };
-                if let Some(tc) = &custom.identity {
-                    return Ok(Some((tc.clone(), custom.to_override())));
+                if let Some(found) = registry.current(compiler_path, stamp) {
+                    return Ok(Some(found));
                 }
-                drop(registry);
+            }
+
+            let _hash_guard = hash_lock
+                .lock()
+                .map_err(|_| anyhow!("custom toolchain hash mutex poisoned"))?;
+            let stamp = ArchiveStamp::at_path(&archive)?;
+            {
+                let registry = self
+                    .custom_toolchains
+                    .lock()
+                    .map_err(|_| anyhow!("custom toolchain registry mutex poisoned"))?;
+                if let Some(found) = registry.current(compiler_path, stamp) {
+                    return Ok(Some(found));
+                }
+            }
+            let mut source = fs::File::open(&archive)
+                .with_context(|| format!("opening custom toolchain {}", archive.display()))?;
+            let before = ArchiveStamp::of(&source)?;
+            let mut snapshot = tempfile::Builder::new()
+                .prefix(".sccache-custom-")
+                .tempfile_in(&self.custom_snapshots_dir)?;
+            io::copy(&mut source, snapshot.as_file_mut())?;
+            if before != ArchiveStamp::of(&source)? || before != ArchiveStamp::at_path(&archive)? {
+                bail!(
+                    "custom toolchain archive changed while being snapshotted: {}",
+                    archive.display()
+                );
             }
             let candidate = Toolchain {
-                archive_id: path_key(&archive)?,
+                archive_id: path_key(snapshot.path())?,
             };
             let mut registry = self
                 .custom_toolchains
                 .lock()
                 .map_err(|_| anyhow!("custom toolchain registry mutex poisoned"))?;
-            let result = registry.register(compiler_path, candidate).map(Some);
-            drop(registry);
-            drop(hash_guard);
-            result
+            registry
+                .register(compiler_path, candidate, before, snapshot)
+                .map(Some)
         }
 
         fn weak_to_strong(&self, weak_key: &str) -> Result<Option<ArchiveId>> {
@@ -772,6 +884,78 @@ mod client {
         }
 
         #[test]
+        fn custom_archive_replacement_retains_old_job_bytes() -> Result<()> {
+            use std::io::Read;
+            let directory = tempfile::tempdir()?;
+            let archive = directory.path().join("custom.tar");
+            std::fs::write(&archive, b"version one")?;
+            let client = std::sync::Arc::new(ClientToolchains::new(
+                &directory.path().join("cache"),
+                1024 * 1024,
+                &[config::DistToolchainConfig::PathOverride {
+                    compiler_executable: "/my/compiler".into(),
+                    archive: archive.clone(),
+                    archive_compiler_executable: "/my/compiler".into(),
+                    archive_cargo_executable: None,
+                }],
+            )?);
+            let compiler = std::path::Path::new("/my/compiler");
+            let (old, first_override) = client
+                .get_custom_toolchain(compiler)?
+                .ok_or_else(|| anyhow!("custom toolchain not configured"))?;
+            assert_ne!(first_override.archive, archive);
+            assert_eq!(std::fs::read(&first_override.archive)?, b"version one");
+            let mut original = client
+                .get_toolchain(&old)?
+                .ok_or_else(|| anyhow!("published archive missing"))?;
+            let mut pinned = Vec::new();
+            original.read_to_end(&mut pinned)?;
+            assert_eq!(pinned, b"version one");
+
+            let newer_path = directory.path().join("new.tar");
+            std::fs::write(&newer_path, b"version two")?;
+            std::fs::rename(&newer_path, &archive)?;
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let client = std::sync::Arc::clone(&client);
+                    std::thread::spawn(move || client.get_custom_toolchain(compiler))
+                })
+                .collect();
+            let mut replacement = None;
+            for thread in threads {
+                let (new, new_override) = thread
+                    .join()
+                    .map_err(|_| anyhow!("custom snapshot thread panicked"))??
+                    .ok_or_else(|| anyhow!("custom toolchain not configured"))?;
+                assert_ne!(new, old);
+                assert_eq!(std::fs::read(&new_override.archive)?, b"version two");
+                if let Some(previous) = &replacement {
+                    assert_eq!(previous, &new);
+                }
+                replacement = Some(new);
+            }
+            let new = replacement.ok_or_else(|| anyhow!("no replacement recorded"))?;
+            assert_eq!(std::fs::read(&first_override.archive)?, b"version one");
+            let mut old_bytes = Vec::new();
+            client
+                .get_toolchain(&old)?
+                .ok_or_else(|| anyhow!("old job archive lost"))?
+                .read_to_end(&mut old_bytes)?;
+            assert_eq!(old_bytes, b"version one");
+            let mut new_bytes = Vec::new();
+            client
+                .get_toolchain(&new)?
+                .ok_or_else(|| anyhow!("new job archive lost"))?
+                .read_to_end(&mut new_bytes)?;
+            assert_eq!(new_bytes, b"version two");
+            std::fs::remove_file(&archive)?;
+            assert!(client.get_custom_toolchain(compiler).is_err());
+            assert!(client.get_toolchain(&old)?.is_some());
+            assert!(client.get_toolchain(&new)?.is_some());
+            Ok(())
+        }
+
+        #[test]
         fn custom_toolchain_failed_hash_can_be_retried() -> Result<()> {
             let directory = tempfile::tempdir()?;
             let archive = directory.path().join("custom.tar");
@@ -859,11 +1043,14 @@ mod client {
                 "weak_key",
                 PanicToolchainPackager::boxed(),
             )?;
+            let selected = newpath.ok_or_else(|| anyhow!("missing custom toolchain path"))?;
+            assert_ne!(selected.archive, ct1);
+            assert_eq!(std::fs::read(&selected.archive)?, std::fs::read(ct1)?);
             assert_eq!(
-                newpath.ok_or_else(|| anyhow!("missing custom toolchain path"))?,
+                selected,
                 CustomToolchainOverride {
                     compiler_executable: "/my/compiler/in_archive".to_owned(),
-                    archive: ct1,
+                    archive: selected.archive.clone(),
                     cargo_executable: Some("/my/cargo/in_archive".to_owned()),
                 }
             );
@@ -908,11 +1095,18 @@ mod client {
                 "weak_key",
                 PanicToolchainPackager::boxed(),
             )?;
+            let first_path = newpath
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing custom toolchain path"))?
+                .archive
+                .clone();
+            assert_ne!(first_path, ct1);
+            assert_eq!(std::fs::read(&first_path)?, std::fs::read(&ct1)?);
             assert_eq!(
                 newpath.ok_or_else(|| anyhow!("missing custom toolchain path"))?,
                 CustomToolchainOverride {
                     compiler_executable: "/my/compiler/in_archive".to_owned(),
-                    archive: ct1.clone(),
+                    archive: first_path.clone(),
                     cargo_executable: None,
                 }
             );
@@ -925,7 +1119,7 @@ mod client {
                 newpath.ok_or_else(|| anyhow!("missing custom toolchain path"))?,
                 CustomToolchainOverride {
                     compiler_executable: "/my/compiler2/in_archive".to_owned(),
-                    archive: ct1.clone(),
+                    archive: first_path.clone(),
                     cargo_executable: None,
                 }
             );
@@ -938,7 +1132,7 @@ mod client {
                 newpath.ok_or_else(|| anyhow!("missing custom toolchain path"))?,
                 CustomToolchainOverride {
                     compiler_executable: "/my/compiler/in_archive".to_owned(),
-                    archive: ct1,
+                    archive: first_path.clone(),
                     cargo_executable: None,
                 }
             );
