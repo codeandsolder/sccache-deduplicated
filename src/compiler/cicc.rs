@@ -136,8 +136,13 @@ where
         Language::Cubin => arguments.iter().position(is_ptxas_input),
         _ => None,
     }
-    .unwrap_or(arguments.len() - input_arg_offset_from_end);
-    let Some(input) = args.splice(input_loc..=input_loc, []).next() else {
+    // The expected trailing position is a fallback, not a precondition:
+    // explicit PTX/CICC inputs may occur even in shorter argument lists.
+    // `unwrap_or` would evaluate a potentially underflowing subtraction
+    // even when an input suffix had already been located.
+    .or_else(|| arguments.len().checked_sub(input_arg_offset_from_end));
+    let Some(input) = input_loc.and_then(|index| (index < args.len()).then(|| args.remove(index)))
+    else {
         return CompilerArguments::CannotCache("missing compiler input", None);
     };
 
@@ -151,9 +156,7 @@ where
     let mut unhashed_args = vec![];
 
     for arg in ArgsIter::new(args.iter().cloned(), arg_info) {
-        let Ok(arg) = arg else {
-            continue;
-        };
+        let arg = try_or_cannot_cache!(arg, "argument parse");
         let args = match arg.get_data() {
             Some(PassThrough(_)) => {
                 take_next = false;
@@ -231,6 +234,10 @@ where
         } else {
             extra_dist_files.push(module_id_path);
         }
+    }
+
+    if !outputs.contains_key("obj") {
+        return CompilerArguments::CannotCache("missing compiler output", None);
     }
 
     CompilerArguments::Ok(ParsedArguments {
@@ -521,6 +528,88 @@ mod test {
                 }),
                 parsed.outputs.get("obj")
             );
+        }
+    }
+
+    #[test]
+    fn truncated_cuda_arguments_never_select_invalid_input() {
+        for (arguments, language, arg_info, offset) in [
+            (os_strings(&[]), Language::Ptx, &ARGS[..], 3),
+            (os_strings(&["-arch"]), Language::Cubin, &ptxas::ARGS[..], 3),
+            (
+                os_strings(&["--output-file=kernel.cubin", "not-a-source"]),
+                Language::Cubin,
+                &ptxas::ARGS[..],
+                3,
+            ),
+            (os_strings(&[]), Language::CudaFE, &ARGS[..], 1),
+        ] {
+            let parsed = parse_arguments(&arguments, Path::new("."), language, arg_info, offset);
+            assert!(
+                matches!(parsed, CompilerArguments::CannotCache(_, _)),
+                "truncated argument list unexpectedly cacheable: {arguments:?} -> {parsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn suffix_selected_before_fallback_even_for_short_invocations() {
+        // The input suffix is authoritative; a fixed-position fallback must
+        // not be evaluated eagerly when the source is already known.
+        let arguments = os_strings(&["kernel.ptx", "-o=kernel.cubin"]);
+        let parsed = parse_arguments(
+            &arguments,
+            Path::new("."),
+            Language::Cubin,
+            &ptxas::ARGS[..],
+            3,
+        );
+        let CompilerArguments::Ok(parsed) = parsed else {
+            panic!("short valid PTX invocation was rejected: {parsed:?}");
+        };
+        assert_eq!(parsed.input, PathBuf::from("kernel.ptx"));
+        assert_eq!(
+            parsed
+                .outputs
+                .get("obj")
+                .map(|output| output.path.as_path()),
+            Some(Path::new("./kernel.cubin"))
+        );
+    }
+
+    #[test]
+    fn malformed_cuda_flags_and_missing_outputs_are_not_cacheable() {
+        let trailing_missing_value =
+            os_strings(&["kernel.ptx", "--output-file=kernel.cubin", "-arch"]);
+        assert!(matches!(
+            parse_arguments(
+                &trailing_missing_value,
+                Path::new("."),
+                Language::Cubin,
+                &ptxas::ARGS[..],
+                3
+            ),
+            CompilerArguments::CannotCache("argument parse", Some(_))
+        ));
+
+        for (arguments, language, arg_info, offset) in [
+            (
+                os_strings(&["kernel.ptx"]),
+                Language::Cubin,
+                &ptxas::ARGS[..],
+                3,
+            ),
+            (
+                os_strings(&["kernel.cpp1.ii", "--gen_module_id_file"]),
+                Language::Ptx,
+                &ARGS[..],
+                3,
+            ),
+        ] {
+            assert!(matches!(
+                parse_arguments(&arguments, Path::new("."), language, arg_info, offset),
+                CompilerArguments::CannotCache("missing compiler output", None)
+            ));
         }
     }
 }
