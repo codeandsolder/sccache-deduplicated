@@ -9,7 +9,7 @@ These are the source-of-truth copies of the machine-wide Cargo/sccache wrappers,
 - `cargo-wrapper` exports `EPHEMERAL_CARGO_WRAPPER`/`CARGO` so nested Cargo invocations return through the site launcher instead of exposing the underlying Cargo binary.
 - `rustup-wrapper` is a narrow policy guard: `rustup run <toolchain> cargo ...` is translated to the equivalent site `cargo +<toolchain> ...` path, while non-Cargo rustup commands pass through untouched. `CODEANDSOLDER_RUSTUP_STOCK_CARGO=1` explicitly restores stock Cargo for compatibility testing.
 - For compilation subcommands it resolves the effective target root with Cargo precedence (`--target-dir`, existing `CARGO_TARGET_DIR`, then `cargo metadata`) and exports only `SCCACHE_CANONICAL_TARGET_ROOT` for child compiler processes. Wrapper-derived roots are marked and recomputed by nested Cargo invocations so a child build cannot inherit a stale parent target root.
-- `sccache-client` is also the public `/usr/local/bin/sccache` router (install as a symlink). The root-owned plain key/value `/etc/sccache/wrapper.conf` selects managed TCP or Unix endpoints by EUID; explicit caller endpoints always take precedence. Automatically selected endpoints wait for service readiness for compilations, never administrative commands. Both entrypoints disable implicit daemon starts in the actual client. Compiler-wrapper mode only opts into experimental canonical Rust when target-layout context is available (`SCCACHE_CANONICAL_TARGET_ROOT`, `CARGO_TARGET_DIR`, or `OUT_DIR`). Direct rustc without Cargo target context remains ordinary sccache.
+- `sccache-client` is also the public `/usr/local/bin/sccache` router (install as a symlink). The root-owned plain key/value `/etc/sccache/wrapper.conf` selects one managed TCP or Unix endpoint for all users and configures the daemon UID. Clients running as a different UID compile in namespace mode, so their compiler and output materialization stay under their own identity while storage and distributed scheduling remain shared. Explicit caller endpoints always take precedence. Automatically selected endpoints wait for service readiness for compilations, never administrative commands. Both entrypoints disable implicit daemon starts in the actual client. Compiler-wrapper mode only opts into experimental canonical Rust when target-layout context is available (`SCCACHE_CANONICAL_TARGET_ROOT`, `CARGO_TARGET_DIR`, or `OUT_DIR`). Direct rustc without Cargo target context remains ordinary sccache.
 - Native Cargo dependencies use the actual build-script `OUT_DIR` and shared Cargo root discovery, not a guessed temporary-directory naming pattern. With canonical Cargo context and a supported Linux GCC/Clang compiler, sccache applies real compiler `-ffile-prefix-map` options to both preprocessing and local/distributed compilation. The per-package output root has stable identity independent of the temporary build directory or Cargo fingerprint. Generated map options do not leak their physical paths into the object-cache key: genuine preprocessor filename directives and compiler-visible paths are hashed with the corresponding canonical identity; source literals remain data.
 - The native path policy always fully preprocesses the source before cache lookup, generating dependency files with the actual local paths on both hits and misses. It does not use the filename-sensitive direct preprocessor cache or directives-only worker reprocessing. Explicit compiler path mappings/compilation-directory overrides remain authoritative, and profiling/coverage and PCH generation retain their ordinary compiler semantics. Ordinary non-Cargo cache keys are unchanged.
 - Canonical Rust inside sccache is fail-open: if the discovered cwd, output, source, extern, staticlib, or target-JSON path cannot be represented safely by the canonical map, that compilation uses ordinary sccache instead of failing the build.
@@ -36,7 +36,32 @@ The live paths are:
 /usr/local/libexec/sccache-release-update
 ```
 
-Install atomically as root after validating these repository copies. Install the tracked `wrapper.conf` as the host-specific configuration (change endpoint/service settings explicitly on TCP-only hosts). Do not install the new wrapper until the matching binary supports no-autostart. Keep the prior live files as timestamped backups; binary rollouts are handled by the tracked `sccache-release-update`.
+Install atomically as root after validating these repository copies. The shared-endpoint router and config replace the old `user_endpoint`/`root_endpoint` and `user_service`/`root_service` settings; apply them together. Install the tracked `wrapper.conf` as the host-specific configuration (change endpoint/service/server_uid explicitly on other hosts). Do not install the new wrapper until the matching binary supports no-autostart. Keep the prior live files as timestamped backups; binary rollouts are handled by the tracked `sccache-release-update`.
+
+## Shared multi-user daemon rollout
+
+The normal cache-storage and distributed-scheduling daemon runs as the
+configured `server_uid` (Acer: jan, UID 1000). The managed wrapper routes
+all identities to its single socket. For clients with a different UID it
+activates namespace/client-side mode; the caller itself opens source files,
+runs any local compiler, and writes output files. The daemon retains cache
+and worker-scheduling state. Root can connect to Acer's existing jan-owned
+socket; other unprivileged users need an explicitly authorized Unix-socket
+group/ACL, including permission to traverse its parent directory. Do not
+make the socket world-writable.
+
+The current production binary predates the namespace distributed broker.
+Only activate the shared router after installing a matching native
+`sccache`/dist bundle with compatible namespace IPC and the coordinated
+fleet protocol migration. Respect the existing fleet deployment hold.
+Replace the router and `wrapper.conf` together; their configuration keys
+are intentionally not backwards-compatible. Test root and jan C/Rust
+compilation, output ownership, shared hit counters, and distributed jobs
+through the same socket before disabling the redundant
+`sccache-local-root.service` (TCP 4227). Retain
+`sccache-native-root.service` and `sccache-strict-local.service` until
+their distinct execution policies are handled by the shared broker.
+The release updater already handles an inactive root-local service.
 
 ## Service provisioning
 

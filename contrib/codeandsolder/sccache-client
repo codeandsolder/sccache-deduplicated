@@ -27,10 +27,9 @@ sccache_wrapper_main() {
     local mode="$1" uid="$2" configuration="$3" binary="$4" rustup="$5"
     shift 5
     local parent_exe endpoint service key value
-    local user_endpoint='unix:/run/sccache-jan/sccache.sock'
-    local root_endpoint='tcp:4227'
-    local user_service='sccache-local.service'
-    local root_service='sccache-local-root.service'
+    local managed_endpoint='unix:/run/sccache-jan/sccache.sock'
+    local managed_service='sccache-local.service'
+    local server_uid=1000
     local readiness_seconds=300
     local drain='/dev/shm/sccache-maintenance-drain'
     local drain_mtime now
@@ -49,10 +48,9 @@ sccache_wrapper_main() {
         while IFS='=' read -r key value || [[ -n "$key" ]]; do
             case "$key" in
                 ''|'#'*) continue ;;
-                user_endpoint) user_endpoint="$value" ;;
-                root_endpoint) root_endpoint="$value" ;;
-                user_service) user_service="$value" ;;
-                root_service) root_service="$value" ;;
+                endpoint) managed_endpoint="$value" ;;
+                service) managed_service="$value" ;;
+                server_uid) server_uid="$value" ;;
                 readiness_seconds) readiness_seconds="$value" ;;
                 *) printf 'sccache: unknown wrapper setting %s\n' "$key" >&2; return 78 ;;
             esac
@@ -63,6 +61,10 @@ sccache_wrapper_main() {
         return 78
     fi
     readiness_seconds=$((10#$readiness_seconds))
+    if [[ ! "$server_uid" =~ ^(0|[1-9][0-9]{0,9})$ ]] || (( server_uid > 4294967295 )); then
+        printf 'sccache: invalid server_uid\n' >&2
+        return 78
+    fi
 
     if [[ "$mode" == compiler || (${1:-} != -* && $# -gt 0) ]]; then
         while [[ -e "$drain" ]]; do
@@ -78,13 +80,8 @@ sccache_wrapper_main() {
     # Preserve explicit endpoints, including abstract Unix sockets and test
     # daemons. Only an automatically selected managed endpoint is waited on.
     if [[ -z "${SCCACHE_SERVER_PORT:-}" && -z "${SCCACHE_SERVER_UDS:-}" ]]; then
-        if (( uid == 0 )); then
-            endpoint="$root_endpoint"
-            service="$root_service"
-        else
-            endpoint="$user_endpoint"
-            service="$user_service"
-        fi
+        endpoint="$managed_endpoint"
+        service="$managed_service"
         case "$endpoint" in
             unix:/*)
                 unset SCCACHE_SERVER_PORT
@@ -104,6 +101,12 @@ sccache_wrapper_main() {
         # Do not wait for an explicitly requested administrative command.
         if [[ "$mode" == compiler || (${1:-} != -* && $# -gt 0) ]]; then
             sccache_wait_endpoint "$endpoint" "$service" "$readiness_seconds" || return "$?"
+        fi
+        # The daemon owns cache storage and distributed scheduling, while the
+        # compiler and output materialization must run as the invoking user.
+        # Namespace mode brokers remote jobs through the managed daemon.
+        if (( uid != server_uid )); then
+            export SCCACHE_CLIENT_SIDE=1
         fi
     fi
 
