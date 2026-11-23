@@ -146,8 +146,18 @@ impl Digest {
     /// the actual hash computation on a background thread in `pool`.
     pub async fn reader(path: PathBuf, pool: &tokio::runtime::Handle) -> Result<String> {
         pool.spawn_blocking(move || {
-            let mut digest = Self::new();
-            if path.is_dir() {
+            let is_directory = path.is_dir();
+            // A different BLAKE3 domain keeps a file whose literal bytes
+            // equal a directory serialization from sharing its digest.
+            // Ordinary file digests retain their existing identity.
+            let mut digest = if is_directory {
+                Self {
+                    inner: blake3_Hasher::new_derive_key("sccache tracked directory digest v2"),
+                }
+            } else {
+                Self::new()
+            };
+            if is_directory {
                 // A tracked directory's identity includes its full entry tree,
                 // including empty directories and the targets of symlinks.
                 let mut entries = Vec::new();
@@ -2498,6 +2508,15 @@ mod tests {
         let pool = tokio::runtime::Handle::current();
         assert_ne!(
             Digest::reader(empty_file, &pool).await.unwrap(),
+            Digest::reader(empty_dir, &pool).await.unwrap(),
+        );
+
+        // The serialized form of an empty directory must not have the
+        // same digest as a regular file containing exactly those bytes.
+        let forged = temp.path().join("forged-directory");
+        std::fs::write(&forged, b"\0SCCACHE\0directory-tree-v2\0").unwrap();
+        assert_ne!(
+            Digest::reader(forged, &pool).await.unwrap(),
             Digest::reader(empty_dir, &pool).await.unwrap(),
         );
 
