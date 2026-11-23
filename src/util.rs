@@ -84,6 +84,14 @@ fn read_chunks<R: Read + ?Sized>(reader: &mut R, f: impl FnMut(&[u8])) -> Result
     Ok(())
 }
 
+/// One entry in the serialized identity of a tracked directory.
+struct DirectoryHashEntry {
+    path: PathBuf,
+    is_directory: bool,
+    is_file: bool,
+    symlink_target: Option<PathBuf>,
+}
+
 #[derive(Clone)]
 pub struct Digest {
     inner: blake3_Hasher,
@@ -140,16 +148,35 @@ impl Digest {
         pool.spawn_blocking(move || {
             let mut digest = Self::new();
             if path.is_dir() {
-                // For directories (e.g., from
-                // proc_macro::tracked_path::path()), recursively hash all file
-                // names and contents in sorted order.
+                // A tracked directory's identity includes its full entry tree,
+                // including empty directories and the targets of symlinks.
                 let mut entries = Vec::new();
-                Self::collect_dir_entries(&path, &mut entries)?;
-                entries.sort();
+                Self::collect_dir_entries(&path, &mut entries, &mut Vec::new())?;
+                entries.sort_by(|left, right| left.path.cmp(&right.path));
+                digest.delimiter(b"directory-tree-v2");
                 for entry in &entries {
-                    let rel = entry.strip_prefix(&path).unwrap_or(entry);
-                    digest.delimiter(rel.to_string_lossy().as_bytes());
-                    digest.update_from_file(entry)?;
+                    let relative = entry.path.strip_prefix(&path)?;
+                    // Lossy Unicode conversion can alias two distinct Unix
+                    // filenames and silently reuse an incorrect cache result.
+                    digest.delimiter(relative.as_os_str().as_encoded_bytes());
+                    digest.update(&[if entry.is_directory {
+                        b'D'
+                    } else if entry.is_file {
+                        b'F'
+                    } else {
+                        b'S'
+                    }]);
+                    if let Some(target) = &entry.symlink_target {
+                        digest.delimiter(b"symlink-target");
+                        digest.delimiter(target.as_os_str().as_encoded_bytes());
+                    }
+                    if entry.is_file {
+                        // A fixed-size content digest frames each file. Otherwise
+                        // crafted file bytes could impersonate an entry delimiter.
+                        let mut content = Self::new();
+                        content.update_from_file(&entry.path)?;
+                        digest.update(content.inner.finalize().as_bytes());
+                    }
                 }
             } else {
                 digest.update_from_file(&path)?;
@@ -168,22 +195,69 @@ impl Digest {
         Ok(())
     }
 
-    /// Recursively collect all file paths within a directory.
-    fn collect_dir_entries(dir: &Path, entries: &mut Vec<PathBuf>) -> Result<()> {
+    /// Walk tracked directory entries without following recursive symlink loops.
+    fn collect_dir_entries(
+        dir: &Path,
+        entries: &mut Vec<DirectoryHashEntry>,
+        ancestors: &mut Vec<PathBuf>,
+    ) -> Result<()> {
+        let canonical = std::fs::canonicalize(dir).with_context(|| {
+            format!(
+                "Failed to resolve tracked directory: {}",
+                debug_display(dir)
+            )
+        })?;
+        if ancestors.contains(&canonical) {
+            anyhow::bail!(
+                "Recursive directory symlink while hashing: {}",
+                debug_display(dir)
+            );
+        }
+        ancestors.push(canonical);
         for entry in std::fs::read_dir(dir).with_context(|| {
             format!(
                 "Failed to read directory for hashing: {}",
-                debug_display(&dir)
+                debug_display(dir)
             )
         })? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() {
-                Self::collect_dir_entries(&path, entries)?;
+            let file_type = entry.file_type()?;
+            let symlink_target = if file_type.is_symlink() {
+                Some(std::fs::read_link(&path)?)
             } else {
-                entries.push(path);
+                None
+            };
+            // Follow symlink targets, too: a tracked directory can contain
+            // references to files/directories outside its own lexical root.
+            let target_type = if symlink_target.is_some() {
+                match std::fs::metadata(&path) {
+                    Ok(metadata) => Some(metadata.file_type()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                Some(file_type)
+            };
+            let is_directory = target_type.as_ref().is_some_and(std::fs::FileType::is_dir);
+            let is_file = target_type.as_ref().is_some_and(std::fs::FileType::is_file);
+            if !(is_directory || is_file || symlink_target.is_some()) {
+                anyhow::bail!(
+                    "Unsupported special file in tracked directory: {}",
+                    debug_display(&path)
+                );
+            }
+            entries.push(DirectoryHashEntry {
+                path: path.clone(),
+                is_directory,
+                is_file,
+                symlink_target,
+            });
+            if is_directory {
+                Self::collect_dir_entries(&path, entries, ancestors)?;
             }
         }
+        ancestors.pop();
         Ok(())
     }
 
@@ -2412,6 +2486,94 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(h1, h2);
+    }
+
+    #[tokio::test]
+    async fn test_digest_reader_directory_tracks_empty_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let empty_file = temp.path().join("empty-file");
+        let empty_dir = temp.path().join("empty-dir");
+        std::fs::write(&empty_file, []).unwrap();
+        std::fs::create_dir(&empty_dir).unwrap();
+        let pool = tokio::runtime::Handle::current();
+        assert_ne!(
+            Digest::reader(empty_file, &pool).await.unwrap(),
+            Digest::reader(empty_dir, &pool).await.unwrap(),
+        );
+
+        let tree = temp.path().join("tracked");
+        std::fs::create_dir(&tree).unwrap();
+        let before = Digest::reader(tree.clone(), &pool).await.unwrap();
+        std::fs::create_dir(tree.join("new-empty-directory")).unwrap();
+        let after = Digest::reader(tree, &pool).await.unwrap();
+        assert_ne!(before, after);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_digest_reader_directory_distinguishes_invalid_utf8_names() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        std::fs::write(
+            left.path()
+                .join(std::ffi::OsString::from_vec(vec![b'n', 0xff])),
+            b"same contents",
+        )
+        .unwrap();
+        std::fs::write(
+            right
+                .path()
+                .join(std::ffi::OsString::from_vec(vec![b'n', 0xfe])),
+            b"same contents",
+        )
+        .unwrap();
+        let pool = tokio::runtime::Handle::current();
+        assert_ne!(
+            Digest::reader(left.path().to_path_buf(), &pool)
+                .await
+                .unwrap(),
+            Digest::reader(right.path().to_path_buf(), &pool)
+                .await
+                .unwrap(),
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_digest_reader_directory_detects_symlink_target_and_contents() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        std::fs::write(dir.join("first"), b"same").unwrap();
+        std::fs::write(dir.join("second"), b"same").unwrap();
+        symlink("first", dir.join("alias")).unwrap();
+        let pool = tokio::runtime::Handle::current();
+        let first = Digest::reader(dir.to_path_buf(), &pool).await.unwrap();
+        std::fs::remove_file(dir.join("alias")).unwrap();
+        symlink("second", dir.join("alias")).unwrap();
+        let second = Digest::reader(dir.to_path_buf(), &pool).await.unwrap();
+        assert_ne!(first, second);
+
+        std::fs::write(dir.join("second"), b"changed").unwrap();
+        let third = Digest::reader(dir.to_path_buf(), &pool).await.unwrap();
+        assert_ne!(second, third);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_digest_reader_rejects_recursive_symlink_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        symlink(".", temp.path().join("loop")).unwrap();
+        let pool = tokio::runtime::Handle::current();
+        let error = Digest::reader(temp.path().to_path_buf(), &pool)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("Recursive directory symlink"));
     }
 
     #[test]
