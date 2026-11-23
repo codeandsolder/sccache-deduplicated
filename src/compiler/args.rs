@@ -199,9 +199,7 @@ impl<T: ArgumentValue> Iterator for Iter<'_, T> {
                 (0, &ArgDisposition::CanBeSeparated(d) | &ArgDisposition::Concatenated(d)) => {
                     let mut s = OsString::from(s);
                     let v = v.clone().into_arg_os_string();
-                    if let Some(d) = d
-                        && !v.is_empty()
-                    {
+                    if let Some(d) = d {
                         s.push(char::from(d).to_string());
                     }
                     s.push(v);
@@ -250,9 +248,7 @@ impl<T: ArgumentValue, F: FnMut(&Path) -> Option<String>> Iterator for IterStrin
                         .into_arg_string(&mut self.path_transformer)
                         .map(|v| {
                             let mut arg = s.to_owned();
-                            if let Some(d) = d
-                                && !v.is_empty()
-                            {
+                            if let Some(d) = d {
                                 arg.push(char::from(d));
                             }
                             arg.push_str(&v);
@@ -442,10 +438,12 @@ impl<T: ArgumentValue> ArgInfo<T> {
                         "argument does not start with its flag",
                     ));
                 };
-                if let Some(d) = d
-                    && let Some(stripped) = value.split_prefix(&char::from(d).to_string())
-                {
-                    value = stripped;
+                if let Some(d) = d {
+                    value = value.split_prefix(&char::from(d).to_string()).ok_or(
+                        ArgParseError::Other(
+                            "concatenated argument is missing the required delimiter",
+                        ),
+                    )?;
                 }
                 Argument::WithValue(s, create(value)?, ArgDisposition::Concatenated(d))
             }
@@ -1088,6 +1086,45 @@ mod tests {
 
         let arg = arg!(WithValue("-foo", Foo("bar"), Separated));
         assert_eq!(arg.iter_os_strings().collect_vec(), ovec!["-foo", "bar"]);
+    }
+
+    #[test]
+    fn explicit_delimiter_is_preserved_for_empty_values() -> ArgParseResult<()> {
+        let concatenated = take_arg!("-foo", OsString, Concatenated(b'='), Foo);
+        let argument = concatenated.clone().process("-foo=", || None)?;
+        assert_eq!(argument.iter_os_strings().collect_vec(), ovec!["-foo="]);
+        assert!(matches!(
+            concatenated.process("-foo", || None),
+            Err(ArgParseError::Other(_))
+        ));
+
+        let optional_separation = take_arg!("-foo", OsString, CanBeSeparated(b'='), Foo);
+        let argument = optional_separation.process("-foo=", || None)?;
+        assert_eq!(argument.iter_os_strings().collect_vec(), ovec!["-foo="]);
+
+        #[cfg(feature = "dist-client")]
+        {
+            assert_eq!(
+                argument.iter_strings(|_| None).collect::<Vec<_>>(),
+                vec![Ok("-foo=".to_owned())]
+            );
+            let empty_path = Argument::WithValue(
+                "-I",
+                PathBuf::new(),
+                ArgDisposition::Concatenated(Some(b'=')),
+            );
+            assert_eq!(
+                empty_path
+                    .iter_strings(|_| Some(String::new()))
+                    .collect::<Vec<_>>(),
+                vec![Ok("-I=".to_owned())]
+            );
+        }
+
+        let no_delimiter =
+            take_arg!("-foo", OsString, Concatenated, Foo).process("-foo", || None)?;
+        assert_eq!(no_delimiter.iter_os_strings().collect_vec(), ovec!["-foo"]);
+        Ok(())
     }
 
     #[cfg(feature = "dist-client")]
