@@ -375,13 +375,16 @@ fn bounded_eviction_selection_keeps_only_lowest_utility_roots() -> Result<()> {
     for _ in 0..8 {
         drop(store.lookup(warm)?.context("missing warm root")?);
     }
-    assert_eq!(store.eviction_candidates(1)?, vec![Root::Action(cold)]);
     assert_eq!(
-        store.eviction_candidates(2)?,
+        store.eviction_candidates(1, false)?,
+        vec![Root::Action(cold)]
+    );
+    assert_eq!(
+        store.eviction_candidates(2, false)?,
         vec![Root::Action(cold), Root::Action(warm)]
     );
     assert_eq!(
-        store.eviction_candidates(3)?,
+        store.eviction_candidates(3, false)?,
         vec![Root::Action(cold), Root::Action(warm), Root::Action(hot)]
     );
     Ok(())
@@ -508,5 +511,126 @@ fn worker_cache_heartbeat_hints_remain_bounded_as_store_grows() -> Result<()> {
         Eviction::Removed { .. }
     ));
     assert_eq!(store.recent_trees(1)?, vec![published[62]]);
+    Ok(())
+}
+
+#[test]
+fn eviction_prefers_exclusive_blobs_over_shared_result_aliases() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = NativeStore::open(temp.path())?;
+    let first = publish(&store, "aliased-payload")?;
+    let fingerprint = ActionFingerprint {
+        schema: "test".into(),
+        components: BTreeMap::from([("source".into(), ContentId::of(b"different-input"))]),
+    };
+    let shared_blob = BlobRef {
+        id: ContentId::of(b"aliased-payload"),
+        size: u64::try_from(b"aliased-payload".len())?,
+    };
+    let manifest = ResultManifest {
+        outputs: BTreeMap::from([(
+            "obj".into(),
+            Artifact {
+                blob: shared_blob,
+                mode: None,
+            },
+        )]),
+        stdout: None,
+        stderr: None,
+    };
+    let alias = store
+        .publish(&fingerprint, &manifest, vec![], crate::ActionMode::Reuse)?
+        .action;
+    let exclusive = publish(&store, "exclusive")?;
+    // This action has more accesses but frees content; neither alias frees
+    // its own shared result until the final action reference disappears.
+    for _ in 0..32 {
+        drop(
+            store
+                .lookup(exclusive)?
+                .context("missing exclusive result")?,
+        );
+    }
+    assert_eq!(
+        store.eviction_candidates(1, false)?,
+        vec![Root::Action(exclusive)]
+    );
+    assert!(matches!(
+        store.evict(first)?,
+        Eviction::Removed {
+            unreferenced_logical_bytes: 0
+        }
+    ));
+    assert_eq!(
+        store.eviction_candidates(1, false)?,
+        vec![Root::Action(alias)]
+    );
+    assert!(matches!(
+        store.evict(alias)?,
+        Eviction::Removed {
+            unreferenced_logical_bytes
+        } if unreferenced_logical_bytes == shared_blob.size
+    ));
+    Ok(())
+}
+
+#[test]
+fn eviction_prefers_exclusive_tree_content_over_shared_tree_blobs() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = NativeStore::open(temp.path())?;
+    let metadata = TreeMetadata {
+        mode: 0o755,
+        modified: TreeTimestamp {
+            seconds: 0,
+            nanoseconds: 0,
+        },
+    };
+    let staged = store.stage(&b"shared-tree-content"[..])?;
+    let shared = staged.reference();
+    let mut manifest = TreeManifest {
+        root: metadata,
+        entries: BTreeMap::from([(
+            TreePath::new(b"file".to_vec())?,
+            TreeEntry::File {
+                blob: shared,
+                metadata,
+            },
+        )]),
+    };
+    let first = store.publish_tree(&manifest, vec![staged])?;
+    manifest.root.mode = 0o700;
+    let second = store.publish_tree(&manifest, vec![])?;
+    let staged = store.stage(&b"exclusive-content"[..])?;
+    let unique = staged.reference();
+    manifest.root.mode = 0o750;
+    manifest.entries.insert(
+        TreePath::new(b"file".to_vec())?,
+        TreeEntry::File {
+            blob: unique,
+            metadata,
+        },
+    );
+    let exclusive = store.publish_tree(&manifest, vec![staged])?;
+    for _ in 0..32 {
+        drop(
+            store
+                .lookup_tree(exclusive)?
+                .context("missing exclusive tree")?,
+        );
+    }
+    assert_eq!(
+        store.eviction_candidates(1, false)?,
+        vec![Root::Tree(exclusive)]
+    );
+    assert!(matches!(
+        store.evict_tree(first)?,
+        Eviction::Removed {
+            unreferenced_logical_bytes: 0
+        }
+    ));
+    assert_eq!(
+        store.eviction_candidates(1, false)?,
+        vec![Root::Tree(second)]
+    );
     Ok(())
 }

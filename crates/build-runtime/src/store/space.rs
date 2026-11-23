@@ -2,20 +2,22 @@
 //! ZFS controls physical compression and allocation. Logical byte limits are
 //! deliberately conservative and do not replace filesystem free-space checks.
 use std::{
-    collections::BinaryHeap,
+    collections::{BTreeMap, BTreeSet, BinaryHeap},
+    os::unix::fs::MetadataExt,
     sync::{Arc, atomic::Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
 use bincode::Options;
-use redb::{ReadableDatabase, ReadableTable};
+use redb::{ReadableDatabase, ReadableMultimapTable, ReadableTable};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ACTIONS, ActionRecord, Eviction, Inner, NativeStore, RESULTS, TREES, encoding, persist_usage,
+    ACTIONS, ActionRecord, BLOB_ROOTS, Eviction, Inner, NativeStore, PACKAGES, RESULT_ACTIONS,
+    RESULTS, TREE_PACKAGES, TREES, encoding, packages::PackageRecord, persist_usage,
 };
-use crate::{ActionKey, ResultManifest, SpacePolicy, TreeId, TreeManifest};
+use crate::{ActionKey, BlobRef, ContentId, ResultManifest, SpacePolicy, TreeId, TreeManifest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Root {
@@ -204,7 +206,7 @@ impl NativeStore {
             .context("native resident reservation overflow")?;
         let mut evicted_roots = 0;
         if free < minimum || resident > policy.max_resident_bytes {
-            for root in self.eviction_candidates(policy.max_evictions_per_pass)? {
+            for root in self.eviction_candidates(policy.max_evictions_per_pass, free < minimum)? {
                 let result = match root {
                     Root::Action(key) => self.evict(key)?,
                     Root::Tree(id) => self.evict_tree(id)?,
@@ -232,66 +234,145 @@ impl NativeStore {
         })
     }
 
-    fn eviction_candidates(&self, limit: usize) -> Result<Vec<Root>> {
-        // Rank only under pressure. Do not scan manifests or write usage data
-        // on the critical lookup path.
+    fn eviction_candidates(&self, limit: usize, physical_pressure: bool) -> Result<Vec<Root>> {
+        // This is intentionally a pressure-only path: query committed reverse
+        // references and actual file allocation, never the lookup hot path.
         let read = self.inner.db.begin_read()?;
         let actions = read.open_table(ACTIONS)?;
         let results = read.open_table(RESULTS)?;
+        let result_actions = read.open_multimap_table(RESULT_ACTIONS)?;
         let trees = read.open_table(TREES)?;
+        let tree_packages = read.open_multimap_table(TREE_PACKAGES)?;
+        let packages = read.open_table(PACKAGES)?;
+        let blob_roots = read.open_multimap_table(BLOB_ROOTS)?;
         let pins = self.inner.lock_pins()?;
         let observed = now_ms();
-        // Only the worst limited roots are needed. A bounded heap avoids
-        // sorting/materializing the entire action and tree index under disk
-        // pressure, while still scanning every eligible root for fairness.
+        // Lowest cost-per-reclaimed-byte first; zero-release aliases come
+        // last, but can still be evicted to uncover the final shared owner.
+        // Keep at most K candidates even for very large stores.
         let mut candidates = BinaryHeap::new();
-        // Both action and tree manifests share the same content-aware
-        // scoring and bounded admission into the eviction candidate heap.
-        let mut consider = |root: Root, blobs: &std::collections::BTreeMap<_, u64>| -> Result<()> {
-            let bytes = blobs.values().try_fold(0_u64, |sum, &size| {
+        let mut consider = |root: Root,
+                            blobs: &BTreeMap<ContentId, u64>,
+                            disappearing: &BTreeSet<[u8; 32]>|
+         -> Result<()> {
+            let total_bytes = blobs.values().try_fold(0_u64, |sum, &size| {
                 sum.checked_add(size)
                     .context("eviction root bytes overflow")
             })?;
+            let mut unique_logical = 0_u64;
+            let mut estimated_blocks = 0_u64;
+            for (&id, &size) in blobs {
+                // A live descriptor may keep even an unreferenced blob in the
+                // pending-GC queue, so its bytes cannot relieve this pass.
+                if pins.blobs.contains_key(&id) || disappearing.is_empty() {
+                    continue;
+                }
+                let mut has_reference = false;
+                let mut exclusive = true;
+                for reference in blob_roots.get(&id.0)? {
+                    has_reference = true;
+                    if !disappearing.contains(reference?.value()) {
+                        exclusive = false;
+                        break;
+                    }
+                }
+                ensure!(
+                    has_reference,
+                    "indexed eviction blob has no reverse reference"
+                );
+                if !exclusive {
+                    continue;
+                }
+                unique_logical = unique_logical
+                    .checked_add(size)
+                    .context("reclaimable logical bytes overflow")?;
+                if physical_pressure {
+                    let allocated = std::fs::metadata(self.inner.blob_path(id))?
+                        .blocks()
+                        .checked_mul(512)
+                        .context("estimated allocated bytes overflow")?;
+                    estimated_blocks = estimated_blocks
+                        .checked_add(allocated)
+                        .context("estimated reclaimable bytes overflow")?;
+                }
+            }
+            let potential = if physical_pressure {
+                estimated_blocks
+            } else {
+                unique_logical
+            };
             let usage = pins.usage.get(&root);
-            let candidate = (
-                reuse_utility(usage, bytes, observed),
+            // A zero-potential root is only useful as a prerequisite for
+            // breaking a shared chain of owners. Prefer any direct recovery.
+            let rank = (
+                u8::from(potential == 0),
+                u128::from(reuse_utility(usage, total_bytes, observed)).saturating_mul(1 << 20)
+                    / u128::from(potential.max(1)),
+                std::cmp::Reverse(potential),
                 usage.map_or(0, |record| record.last_used_ms),
                 root,
             );
             if candidates.len() < limit {
-                candidates.push(candidate);
-            } else if candidates.peek().is_some_and(|worst| candidate < *worst) {
+                candidates.push(rank);
+            } else if candidates.peek().is_some_and(|worst| rank < *worst) {
                 candidates.pop();
-                candidates.push(candidate);
+                candidates.push(rank);
             }
             Ok(())
         };
         for entry in actions.iter()? {
             let (key, value) = entry?;
             let key = ActionKey(*key.value());
-            if !pins.actions.contains_key(&key) {
-                let record: ActionRecord = encoding().deserialize(value.value())?;
-                let manifest = results
-                    .get(&record.result.0)?
-                    .context("missing native eviction result")?;
-                let manifest: ResultManifest = encoding().deserialize(manifest.value())?;
-                consider(Root::Action(key), &manifest.blobs()?)?;
+            if pins.actions.contains_key(&key) {
+                continue;
             }
+            let record: ActionRecord = encoding().deserialize(value.value())?;
+            let manifest = results
+                .get(&record.result.0)?
+                .context("missing native eviction result")?;
+            let manifest: ResultManifest = encoding().deserialize(manifest.value())?;
+            let mut aliases = result_actions.get(&record.result.0)?;
+            ensure!(
+                aliases.next().transpose()?.is_some(),
+                "missing native result alias"
+            );
+            let disappearing = if aliases.next().transpose()?.is_none() {
+                BTreeSet::from([record.result.0])
+            } else {
+                BTreeSet::new()
+            };
+            consider(Root::Action(key), &manifest.blobs()?, &disappearing)?;
         }
         for entry in trees.iter()? {
             let (id, value) = entry?;
             let id = TreeId(*id.value());
-            if !pins.trees.contains_key(&id) {
-                let manifest: TreeManifest = encoding().deserialize(value.value())?;
-                consider(Root::Tree(id), &manifest.blobs()?)?;
+            if pins.trees.contains_key(&id) {
+                continue;
             }
+            let manifest: TreeManifest = encoding().deserialize(value.value())?;
+            let mut blobs = manifest.blobs()?;
+            let mut disappearing = BTreeSet::from([id.0]);
+            for package in tree_packages.get(&id.0)? {
+                let package = *package?.value();
+                let record = packages
+                    .get(&package)?
+                    .context("missing native eviction package")?;
+                let record: PackageRecord = encoding().deserialize(record.value())?;
+                ensure!(record.tree == id, "inconsistent native package tree");
+                disappearing.insert(package);
+                if let Some(BlobRef { id, size }) = record.archive {
+                    if let Some(previous) = blobs.insert(id, size) {
+                        ensure!(previous == size, "inconsistent archive content size");
+                    }
+                }
+            }
+            consider(Root::Tree(id), &blobs, &disappearing)?;
         }
         drop(pins);
-        // Heap sorting produces the least useful roots first.
         Ok(candidates
             .into_sorted_vec()
             .into_iter()
-            .map(|(_, _, root)| root)
+            .map(|(_, _, _, _, root)| root)
             .collect())
     }
 }
