@@ -2106,7 +2106,7 @@ mod test {
         assert_eq!(extract_nvcc_threads(&mut reversed)?, 3);
         assert!(reversed.is_empty());
 
-        let mut unrelated = ovec![
+        let mut unrelated: Vec<OsString> = [
             "-target=sm_80",
             "--keep",
             "-t2",
@@ -2114,7 +2114,10 @@ mod test {
             "compute_90",
             "--threads=5",
             "-t=0",
-        ];
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
         assert_eq!(extract_nvcc_threads(&mut unrelated)?, 0);
         assert_eq!(
             unrelated,
