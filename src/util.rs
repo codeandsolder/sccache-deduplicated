@@ -2506,9 +2506,10 @@ mod tests {
         std::fs::write(&empty_file, []).unwrap();
         std::fs::create_dir(&empty_dir).unwrap();
         let pool = tokio::runtime::Handle::current();
+        let empty_dir_digest = Digest::reader(empty_dir, &pool).await.unwrap();
         assert_ne!(
             Digest::reader(empty_file, &pool).await.unwrap(),
-            Digest::reader(empty_dir, &pool).await.unwrap(),
+            empty_dir_digest,
         );
 
         // The serialized form of an empty directory must not have the
@@ -2517,7 +2518,7 @@ mod tests {
         std::fs::write(&forged, b"\0SCCACHE\0directory-tree-v2\0").unwrap();
         assert_ne!(
             Digest::reader(forged, &pool).await.unwrap(),
-            Digest::reader(empty_dir, &pool).await.unwrap(),
+            empty_dir_digest,
         );
 
         let tree = temp.path().join("tracked");
