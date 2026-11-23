@@ -484,8 +484,29 @@ impl LruDiskCache {
         };
         #[cfg(windows)]
         let has_external_links = {
-            use std::os::windows::fs::MetadataExt;
-            metadata.number_of_links().is_none_or(|count| count > 1)
+            use std::mem::MaybeUninit;
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+            };
+
+            let check = || -> io::Result<bool> {
+                let file = File::open(source)?;
+                let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+                // SAFETY: the open File owns a valid live handle; Windows fills
+                // the complete output record on success and retains no pointer.
+                let status =
+                    unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) };
+                if status == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: the API successfully initialized every field.
+                Ok(unsafe { info.assume_init() }.nNumberOfLinks > 1)
+            };
+            check().unwrap_or_else(|error| {
+                warn!("Cannot inspect cache source hard links: {error}; copying instead");
+                true
+            })
         };
         #[cfg(not(any(unix, windows)))]
         let has_external_links = true;
