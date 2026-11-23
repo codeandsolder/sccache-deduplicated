@@ -283,4 +283,6 @@ semicolon_if_nothing_returned = "warn"
 unnecessary_semicolon = "warn"
 
 [patch.crates-io]
+zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast", rev = "510f0a7b2f022395196a7346ac10d3d38df20bdc" }
+
 tiny_http = { path = "vendor/tiny_http" }
