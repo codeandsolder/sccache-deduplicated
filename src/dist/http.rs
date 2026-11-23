@@ -151,7 +151,8 @@ mod common {
                     "cert_digest",
                     &BASE64_URL_SAFE_ENGINE.encode(&self.cert_digest),
                 )
-                .finish()
+                // JWT signing key and PEM are deliberately not logged.
+                .finish_non_exhaustive()
         }
     }
     #[cfg(all(test, feature = "dist-server"))]

@@ -123,6 +123,38 @@ fn with_native_service(
     outcome
 }
 
+fn verify_compressed_download(
+    url: &reqwest::Url,
+    ticket: crate::build_runtime::wire::Ticket,
+    blob: BlobRef,
+    bytes: &[u8],
+) -> Result<()> {
+    // Negotiation preserves the authenticated verified-bytes contract.
+    let compressed = reqwest::blocking::Client::new()
+        .post(url.join("/api/v2/native/client/download")?)
+        .bearer_auth("client-token")
+        .header("Content-Type", "application/octet-stream")
+        .header("X-Sccache-Accept-Blob-Codec", "zstd")
+        .body(codec().serialize(&DownloadRequest {
+            ticket,
+            id: blob.id,
+        })?)
+        .send()?
+        .error_for_status()?;
+    assert_eq!(
+        compressed
+            .headers()
+            .get("X-Sccache-Blob-Codec")
+            .context("server skipped native zstd transfer")?
+            .as_bytes(),
+        b"zstd"
+    );
+    let mut decoded = Vec::new();
+    zstd::stream::read::Decoder::new(compressed)?.read_to_end(&mut decoded)?;
+    assert_eq!(decoded, bytes);
+    Ok(())
+}
+
 #[test]
 fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
     with_native_service(|url, sessions| {
@@ -213,30 +245,7 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
         let mut downloaded = Vec::new();
         client.download(ticket, blob, &mut downloaded)?;
         assert_eq!(downloaded, bytes);
-        // Explicitly prove the negotiated codec path was selected for this
-        // large compressible file and the bytes still verify after decoding.
-        let compressed = reqwest::blocking::Client::new()
-            .post(url.join("/api/v2/native/client/download")?)
-            .bearer_auth("client-token")
-            .header("Content-Type", "application/octet-stream")
-            .header("X-Sccache-Accept-Blob-Codec", "zstd")
-            .body(codec().serialize(&DownloadRequest {
-                ticket,
-                id: blob.id,
-            })?)
-            .send()?
-            .error_for_status()?;
-        assert_eq!(
-            compressed
-                .headers()
-                .get("X-Sccache-Blob-Codec")
-                .context("server skipped native zstd transfer")?
-                .as_bytes(),
-            b"zstd"
-        );
-        let mut decoded = Vec::new();
-        zstd::stream::read::Decoder::new(compressed)?.read_to_end(&mut decoded)?;
-        assert_eq!(decoded, bytes);
+        verify_compressed_download(url, ticket, blob, &bytes)?;
         assert!(
             client
                 .download(
