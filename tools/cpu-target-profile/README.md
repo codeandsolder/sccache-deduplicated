@@ -40,6 +40,21 @@ rather than trusting CPU0. Other operating systems currently rely on Archspec
 host detection; use an explicit named CPU profile for heterogeneous machines
 whose common ISA cannot be established by that API.
 
+## Native requests versus explicit destination profiles
+
+A plain compiler `native` request means the machine **initiating the
+compilation**, not whichever worker receives the job. The profile exported
+here is a deliberate, explicit destination selection and can target
+different hardware; `capture` is run on the intended destination, and
+`model` names a CPU directly. Do not interpret the distributed worker's
+CPU as the default destination. For portable fleet binaries choose an
+explicit baseline rather than changing the meaning of `native`.
+
+The current sccache implementation resolves Rust native CPU requests before
+remote dispatch; unresolved GCC/Clang native requests execute locally and
+include the initiating compiler's CPU expansion in their cache key. See
+[distributed native behavior](../../docs/Distributed.md#native-cpu-is-the-requesting-host-not-the-worker).
+
 ## Render only the settings consumed by each compiler
 
 Execute the tool on any build host, using the actual compiler binary:

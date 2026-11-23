@@ -3416,6 +3416,39 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_clang_native_codegen_is_not_distributed() {
+        let f = TestFixture::new();
+        for flag in ["-march=native", "-mtune=native"] {
+            let parsed_args = match parse_arguments_clang(
+                stringvec![flag, "-c", "foo.c", "-o", "foo.o"],
+                false,
+            ) {
+                CompilerArguments::Ok(args) => args,
+                other => panic!("Got unexpected parse result: {other:?}"),
+            };
+            let mut path_transformer = dist::PathTransformer::new();
+            let (_, dist_command, _) = generate_compile_commands(
+                &mut path_transformer,
+                &f.bins[0],
+                &parsed_args,
+                f.tempdir.path(),
+                &[],
+                GccCompileConfig {
+                    kind: CCompilerKind::Clang,
+                    rewrite_includes_only: false,
+                    language_to_arg: clang::language_to_clang_arg,
+                },
+            )
+            .unwrap();
+            assert!(
+                dist_command.is_none(),
+                "{flag} must resolve to the requesting CPU before running remotely"
+            );
+        }
+    }
+
+    #[test]
     fn test_compile_double_dash_input() {
         let args = stringvec!["-c", "-o", "foo.o", "--", "foo.c"];
         let parsed_args = match parse_arguments_clang(args, false) {
