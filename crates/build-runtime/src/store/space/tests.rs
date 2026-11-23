@@ -181,12 +181,11 @@ fn usage_survives_restart_and_is_removed_with_evicted_roots() -> Result<()> {
     drop(store);
     let restored = NativeStore::open(temp.path())?;
     assert!(
-        restored
+        !restored
             .inner
             .lock_pins()?
             .usage
             .contains_key(&Root::Action(cold))
-            == false
     );
     Ok(())
 }

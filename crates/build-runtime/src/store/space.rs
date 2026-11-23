@@ -368,6 +368,7 @@ impl<'a> StageBudget<'a> {
                 .reserved
                 .checked_sub(surplus)
                 .context("native staging reservation underflow")?;
+            drop(state);
             self.reserved = actual_bytes;
         }
         let reserved = std::mem::take(&mut self.reserved);
