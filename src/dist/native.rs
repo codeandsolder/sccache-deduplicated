@@ -626,17 +626,21 @@ impl NativeCacheClient {
         )
     }
 
-    fn download_response(
-        &self,
-        ticket: Ticket,
-        id: ContentId,
-    ) -> Result<reqwest::blocking::Response> {
+    fn download_response(&self, ticket: Ticket, id: ContentId) -> Result<Box<dyn Read + Send>> {
         let request = codec().serialize(&DownloadRequest { ticket, id })?;
-        Ok(self
+        let response = self
             .request("download")?
+            .header("X-Sccache-Accept-Blob-Codec", "zstd")
             .body(request)
             .send()?
-            .error_for_status()?)
+            .error_for_status()?;
+        match response.headers().get("X-Sccache-Blob-Codec") {
+            None => Ok(Box::new(response)),
+            Some(value) if value.as_bytes() == b"zstd" => {
+                Ok(Box::new(zstd::stream::read::Decoder::new(response)?))
+            }
+            Some(other) => anyhow::bail!("unsupported native blob codec: {other:?}"),
+        }
     }
 }
 

@@ -1,11 +1,18 @@
 //! Dedicated native cache listener. Reuse scheduler authentication and job
 //! ownership without running filesystem I/O on the scheduling request pool.
 
-use std::{collections::BTreeMap, io::Read, sync::Arc, thread, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    sync::Arc,
+    thread,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use bincode::Options;
-use rouille::{Request, Response};
+use rouille::{Request, Response, ResponseBody};
 use serde::{Serialize, de::DeserializeOwned};
 
 use super::{ClientAuthCheck, ServerAuthenticator, authenticate_client, authenticate_server};
@@ -145,6 +152,40 @@ pub(super) fn spawn(
 }
 
 const PREFIX: &str = "/api/v2/native/";
+
+/// Compress only when a representative prefix wins comfortably. We keep the
+/// immutable digest-named files raw for mmap/materialization; this codec is
+/// solely a negotiated transfer representation.
+fn blob_response(mut file: File, accept_zstd: bool) -> Result<Response> {
+    const SAMPLE_SIZE: u64 = 128 * 1024;
+    const MIN_COMPRESS_BYTES: u64 = 32 * 1024;
+    if !accept_zstd || file.metadata()?.len() < MIN_COMPRESS_BYTES {
+        return Ok(Response::from_file("application/octet-stream", file));
+    }
+
+    let sampled = usize::try_from(file.metadata()?.len().min(SAMPLE_SIZE))?;
+    let mut prefix = vec![0; sampled];
+    file.read_exact(&mut prefix)?;
+    let packed = zstd::bulk::compress(&prefix, 1)?;
+    file.seek(SeekFrom::Start(0))?;
+
+    // A meaningful margin amortizes encoding CPU under heavy load and avoids
+    // paying to recompress already packed/upstream-compressed binaries.
+    if packed.len().saturating_add(64) * 100 > sampled * 85 {
+        return Ok(Response::from_file("application/octet-stream", file));
+    }
+
+    let encoded = zstd::stream::read::Encoder::new(file, 1)?;
+    Ok(Response {
+        status_code: 200,
+        headers: vec![
+            ("Content-Type".into(), "application/octet-stream".into()),
+            ("X-Sccache-Blob-Codec".into(), "zstd".into()),
+        ],
+        data: ResponseBody::from_reader(encoded),
+        upgrade: None,
+    })
+}
 
 fn respond(
     request: &Request,
@@ -324,7 +365,10 @@ fn dispatch(
         "download" => {
             let DownloadRequest { ticket, id } = metadata(request, limit)?;
             let file = sessions.download(ticket, publisher, id)?;
-            Ok(Response::from_file("application/octet-stream", file))
+            blob_response(
+                file,
+                request.header("X-Sccache-Accept-Blob-Codec") == Some("zstd"),
+            )
         }
         "tree_offer" if publisher == Publisher::Client => {
             encode(&sessions.offer_tree(metadata(request, limit)?)?, limit)

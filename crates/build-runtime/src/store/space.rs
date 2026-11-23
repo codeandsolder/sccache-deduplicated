@@ -140,6 +140,7 @@ impl NativeStore {
                 }
             }
         }
+        drop(pins);
         Ok(latest
             .into_sorted_vec()
             .into_iter()

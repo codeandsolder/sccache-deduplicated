@@ -213,6 +213,30 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
         let mut downloaded = Vec::new();
         client.download(ticket, blob, &mut downloaded)?;
         assert_eq!(downloaded, bytes);
+        // Explicitly prove the negotiated codec path was selected for this
+        // large compressible file and the bytes still verify after decoding.
+        let compressed = reqwest::blocking::Client::new()
+            .post(url.join("/api/v2/native/client/download")?)
+            .bearer_auth("client-token")
+            .header("Content-Type", "application/octet-stream")
+            .header("X-Sccache-Accept-Blob-Codec", "zstd")
+            .body(codec().serialize(&DownloadRequest {
+                ticket,
+                id: blob.id,
+            })?)
+            .send()?
+            .error_for_status()?;
+        assert_eq!(
+            compressed
+                .headers()
+                .get("X-Sccache-Blob-Codec")
+                .context("server skipped native zstd transfer")?
+                .as_bytes(),
+            b"zstd"
+        );
+        let mut decoded = Vec::new();
+        zstd::stream::read::Decoder::new(compressed)?.read_to_end(&mut decoded)?;
+        assert_eq!(decoded, bytes);
         assert!(
             client
                 .download(
@@ -381,4 +405,57 @@ fn native_action_transfers_inputs_executes_and_publishes_without_worker_result_s
         client.close(hit)?;
         Ok(())
     })
+}
+
+#[test]
+fn adaptive_blob_response_compresses_only_when_transfer_saves_bytes() -> Result<()> {
+    use std::io::{Read as _, Seek as _, Write as _};
+
+    let mut compressible = tempfile::tempfile()?;
+    let original = vec![b'Z'; 256 * 1024];
+    compressible.write_all(&original)?;
+    compressible.rewind()?;
+    let response = blob_response(compressible.try_clone()?, false)?;
+    assert!(
+        response
+            .headers
+            .iter()
+            .all(|(name, _)| name != "X-Sccache-Blob-Codec")
+    );
+
+    let response = blob_response(compressible, true)?;
+    assert!(
+        response
+            .headers
+            .iter()
+            .any(|(name, value)| name == "X-Sccache-Blob-Codec" && value == "zstd")
+    );
+    let (stream, size) = response.data.into_reader_and_size();
+    assert!(size.is_none());
+    let mut decoded = Vec::new();
+    zstd::stream::read::Decoder::new(stream)?.read_to_end(&mut decoded)?;
+    assert_eq!(decoded, original);
+
+    // Pseudorandom, incompressible 256 KiB. The test's fixed block-hash
+    // sequence is deterministic across hosts and doesn't need RNG state.
+    let mut noise = Vec::new();
+    for i in 0..8192_u64 {
+        noise.extend_from_slice(blake3::hash(&i.to_le_bytes()).as_bytes());
+    }
+    let mut incompressible = tempfile::tempfile()?;
+    incompressible.write_all(&noise)?;
+    incompressible.rewind()?;
+    let response = blob_response(incompressible, true)?;
+    assert!(
+        response
+            .headers
+            .iter()
+            .all(|(name, _)| name != "X-Sccache-Blob-Codec")
+    );
+    let (mut stream, size) = response.data.into_reader_and_size();
+    assert_eq!(size, Some(noise.len()));
+    let mut received = Vec::new();
+    stream.read_to_end(&mut received)?;
+    assert_eq!(received, noise);
+    Ok(())
 }
