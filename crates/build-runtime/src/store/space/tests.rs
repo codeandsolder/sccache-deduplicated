@@ -342,12 +342,14 @@ fn staged_release_never_waits_for_space_admission_lock() -> Result<()> {
         .space
         .lock()
         .map_err(|_| anyhow!("poisoned admission lock"))?;
-    // Publication can hold a separate mutation lock. A staged-file drop
-    // cannot need the space mutex or we would admit an ABBA deadlock.
+    // Streaming already deferred its unused round-up. Publication can
+    // hold the mutation lock; a staged-file drop must not take the
+    // admission lock as that would admit an ABBA deadlock.
+    let already_released = store.inner.space_released.load(Ordering::Acquire);
     drop(staged);
     assert_eq!(
         store.inner.space_released.load(Ordering::Acquire),
-        u64::try_from(b"reservation".len())?
+        already_released + u64::try_from(b"reservation".len())?
     );
     drop(held);
     assert_eq!(
