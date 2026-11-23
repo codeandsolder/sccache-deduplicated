@@ -54,7 +54,7 @@ pub fn is_ptxas_input(arg: impl AsRef<OsStr>) -> bool {
 // Only their compiler kind, input syntax and output style differ. Keep the
 // complete lifecycle in one place rather than duplicating trait impls.
 macro_rules! impl_cuda_stage_compiler {
-    ($stage:ident, $kind:expr, $language:expr, $args:expr, $offset:expr, $style:expr) => {
+    ($stage:ident, $kind:expr, $language:expr, $args:expr, $offset:expr, $style:expr $(,)?) => {
         #[async_trait::async_trait]
         impl crate::compiler::c::CCompilerImpl for $stage {
             fn kind(&self) -> crate::compiler::c::CCompilerKind {
