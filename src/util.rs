@@ -21,7 +21,6 @@ use object::read::archive::ArchiveFile;
 use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::hash::Hasher;
@@ -299,171 +298,82 @@ const MAX_HAYSTACK_LEN: usize = b"__TIMESTAMP__".len();
 #[cfg(test)]
 pub const MAX_TIME_MACRO_HAYSTACK_LEN: usize = MAX_HAYSTACK_LEN;
 
-/// Used during the chunked hashing process to check for C preprocessor time
-/// macros (namely `__TIMESTAMP__`, `__DATE__`, `__DATETIME__`) while reusing
-/// the same buffer as the hashing function, for efficiency.
+/// Finds C preprocessor time macros across arbitrary streaming chunk sizes.
 ///
-/// See `[Self::find_time_macros]` for details.
+/// Only the trailing bytes that could start a macro are retained. In particular,
+/// a reader returning one byte per call cannot cause the scanner to retain its
+/// entire input or repeatedly rescan an ever-growing buffer.
 #[derive(Debug, Default)]
 pub struct TimeMacroFinder {
-    found_date: Cell<bool>,
-    found_time: Cell<bool>,
-    found_timestamp: Cell<bool>,
-    overlap_buffer: [u8; MAX_HAYSTACK_LEN * 2],
-    /// Counter of chunks of full size we've been through. Partial reads do
-    /// not count and are handled separately.
-    full_chunks_counter: usize,
-    /// Contents of the previous read if it was smaller than `MAX_HAYSTACK_LEN`,
-    /// plus `MAX_HAYSTACK_LEN` bytes of the previous chunk, to account for
-    /// the possibility of partial reads splitting a time macro
-    /// across two calls.
-    previous_small_read: Vec<u8>,
+    found_date: bool,
+    found_time: bool,
+    found_timestamp: bool,
+    suffix: [u8; MAX_HAYSTACK_LEN - 1],
+    suffix_len: usize,
 }
 
 impl TimeMacroFinder {
-    /// Called for each chunk of a file during the hashing process
-    /// in preprocessor cache mode.
+    /// Scan a chunk and its boundary with the previous chunk.
     ///
-    /// When buffer reading a file, we get something like this:
-    ///
-    /// `[xxxx....aaaa][bbbb....cccc][dddd....eeee][ffff...]`
-    ///
-    /// The brackets represent each buffer chunk. We use the fact that the largest
-    /// pattern we're looking for is `__TIMESTAMP__` to avoid copying the entire
-    /// file to memory and re-searching the entire buffer for each pattern.
-    /// We can check inside each chunk for each pattern, and we use an overlap
-    /// buffer to keep the last `b"__TIMESTAMP__".len()` bytes around from the
-    /// last chunk, to also catch any pattern overlapping two chunks.
-    ///
-    /// In the above case, the overflow buffer would look like:
-    ///
-    /// ```text
-    ///    Chunk 1
-    ///    - aaaa0000
-    ///    Chunk 2
-    ///    - aaaabbbb
-    ///    - cccc0000
-    ///    Chunk 3
-    ///    - ccccdddd
-    ///    - eeee0000
-    ///    Chunk 4
-    ///    - eeeeffff
-    ///    [...]
-    /// ```
-    ///
-    /// We have to be careful to zero out the buffer right after each overlap check,
-    /// otherwise we risk the (unlikely) case of a pattern being spread between the
-    /// start of a chunk and its end.
-    /// Finally, we need to account for partial reads: it's possible that a read
-    /// smaller than the haystack hide a time macro because it spreads it across
-    /// two calls. This makes the example more complicated and isn't necessary
-    /// to get the point of the algorithm across.
-    /// See unit tests for some concrete examples.
+    /// A pattern of length at most `MAX_HAYSTACK_LEN` can overlap a boundary
+    /// only within the last `MAX_HAYSTACK_LEN - 1` previous bytes and the
+    /// first `MAX_HAYSTACK_LEN - 1` new bytes.
     pub fn find_time_macros(&mut self, visit: &[u8]) {
-        if self.full_chunks_counter == 0 {
-            if visit.len() <= MAX_HAYSTACK_LEN {
-                // The read is smaller than the largest haystack.
-                // We might get called again, if this was an incomplete read.
-                if self.previous_small_read.is_empty() {
-                    visit.clone_into(&mut self.previous_small_read);
-                } else {
-                    // In a rare pathological case where all reads are small,
-                    // this will grow up to the length of the file.
-                    // It is *very* unlikely and of minor performance
-                    // importance compared to just getting many small reads.
-                    self.previous_small_read.extend(visit);
-                }
-                self.find_macros(&self.previous_small_read);
-                return;
-            }
-            // Copy the right side of the visit to the left of the buffer
-            let right_half = visit.len() - MAX_HAYSTACK_LEN;
-            self.overlap_buffer[..MAX_HAYSTACK_LEN].copy_from_slice(&visit[right_half..]);
-        } else {
-            if visit.len() < MAX_HAYSTACK_LEN {
-                // The read is smaller than the largest haystack.
-                // We might get called again, if this was an incomplete read.
-                if self.previous_small_read.is_empty() {
-                    // Since this isn't the first non-small read (counter != 0)
-                    // we need to start from MAX_HAYSTACK_LEN bytes of the previous
-                    // read, otherwise we might miss a complete read followed
-                    // by a small read.
-                    let mut buf = self.overlap_buffer[..MAX_HAYSTACK_LEN].to_owned();
-                    buf.extend(visit);
-                    self.previous_small_read = buf;
-                } else {
-                    self.previous_small_read.extend(visit);
-                }
-
-                // zero the right side of the buffer
-                self.overlap_buffer[MAX_HAYSTACK_LEN..].copy_from_slice(&[0; MAX_HAYSTACK_LEN]);
-                // Copy the visit to the right of the buffer, starting from the middle
-                self.overlap_buffer[MAX_HAYSTACK_LEN..MAX_HAYSTACK_LEN + visit.len()]
-                    .copy_from_slice(visit);
-
-                // Check both the concatenation with the previous small read
-                self.find_macros(&self.previous_small_read);
-                // ...and the overlap buffer
-                self.find_macros(&self.overlap_buffer);
-                return;
-            }
-
-            // Copy the left side of the visit to the right of the buffer
-            let left_half = MAX_HAYSTACK_LEN;
-            self.overlap_buffer[left_half..].copy_from_slice(&visit[..left_half]);
-            self.find_macros(&self.overlap_buffer);
-            // zero the buffer
-            self.overlap_buffer = Default::default();
-            // Copy the right side of the visit to the left of the buffer
-            let right_half = visit.len() - MAX_HAYSTACK_LEN;
-            self.overlap_buffer[..MAX_HAYSTACK_LEN].copy_from_slice(&visit[right_half..]);
-            self.find_macros(&self.overlap_buffer);
+        const OVERLAP: usize = MAX_HAYSTACK_LEN - 1;
+        if visit.is_empty() || self.found_date && self.found_time && self.found_timestamp {
+            return;
         }
-        // Also check the concatenation with the previous small read
-        if !self.previous_small_read.is_empty() {
-            let mut concatenated = self.previous_small_read.clone();
-            concatenated.extend(visit);
-            self.find_macros(&concatenated);
-        }
+        let prefix_len = visit.len().min(OVERLAP);
+        let mut boundary = [0; OVERLAP * 2];
+        boundary[..self.suffix_len].copy_from_slice(&self.suffix[..self.suffix_len]);
+        boundary[self.suffix_len..self.suffix_len + prefix_len]
+            .copy_from_slice(&visit[..prefix_len]);
 
+        self.find_macros(&boundary[..self.suffix_len + prefix_len]);
         self.find_macros(visit);
-        self.full_chunks_counter += 1;
-        self.previous_small_read.clear();
-    }
 
-    fn find_macros(&self, buffer: &[u8]) {
-        // TODO
-        // This could be made more efficient, either by using a regex for all
-        // three patterns, or by doing some SIMD trickery like `ccache` does.
-        //
-        // `ccache` reads the file twice, so we might actually already be
-        // winning in most cases... though they have an inode cache.
-        // In any case, let's only improve this if it ends up being slow.
-        if memchr::memmem::find(buffer, b"__TIMESTAMP__").is_some() {
-            self.found_timestamp.set(true);
-        }
-        if memchr::memmem::find(buffer, b"__TIME__").is_some() {
-            self.found_time.set(true);
-        }
-        if memchr::memmem::find(buffer, b"__DATE__").is_some() {
-            self.found_date.set(true);
+        if visit.len() >= OVERLAP {
+            self.suffix.copy_from_slice(&visit[visit.len() - OVERLAP..]);
+            self.suffix_len = OVERLAP;
+        } else {
+            let keep = self.suffix_len.min(OVERLAP - visit.len());
+            self.suffix
+                .copy_within(self.suffix_len - keep..self.suffix_len, 0);
+            self.suffix[keep..keep + visit.len()].copy_from_slice(visit);
+            self.suffix_len = keep + visit.len();
         }
     }
 
+    fn find_macros(&mut self, buffer: &[u8]) {
+        if !self.found_timestamp && memchr::memmem::find(buffer, b"__TIMESTAMP__").is_some() {
+            self.found_timestamp = true;
+        }
+        if !self.found_time && memchr::memmem::find(buffer, b"__TIME__").is_some() {
+            self.found_time = true;
+        }
+        if !self.found_date && memchr::memmem::find(buffer, b"__DATE__").is_some() {
+            self.found_date = true;
+        }
+    }
+
+    #[must_use = "the caller must observe whether a time-dependent macro was detected"]
     pub const fn found_time_macros(&self) -> bool {
         self.found_date() || self.found_time() || self.found_timestamp()
     }
 
+    #[must_use = "the caller must observe whether __TIME__ was detected"]
     pub const fn found_time(&self) -> bool {
-        self.found_time.get()
+        self.found_time
     }
 
+    #[must_use = "the caller must observe whether __DATE__ was detected"]
     pub const fn found_date(&self) -> bool {
-        self.found_date.get()
+        self.found_date
     }
 
+    #[must_use = "the caller must observe whether __TIMESTAMP__ was detected"]
     pub const fn found_timestamp(&self) -> bool {
-        self.found_timestamp.get()
+        self.found_timestamp
     }
 
     #[must_use = "the returned digest state must be updated with the input bytes"]
@@ -1998,6 +1908,51 @@ mod tests {
         assert!(!finder.found_timestamp());
         finder.find_time_macros(b"TIMESTAMP__ This is larger than the haystack");
         assert!(finder.found_timestamp());
+    }
+
+    #[test]
+    fn test_time_macro_one_byte_stream_is_bounded_and_exact() {
+        let mut bytes = vec![b'x'; 65_536];
+        bytes[128..136].copy_from_slice(b"__TIME__");
+        bytes[16_384..16_397].copy_from_slice(b"__TIMESTAMP__");
+        bytes[32_768..32_776].copy_from_slice(b"__DATE__");
+
+        let mut finder = TimeMacroFinder::new();
+        for byte in bytes {
+            finder.find_time_macros(&[byte]);
+            assert!(finder.suffix_len <= super::MAX_HAYSTACK_LEN - 1);
+        }
+        assert!(finder.found_time());
+        assert!(finder.found_timestamp());
+        assert!(finder.found_date());
+    }
+
+    #[test]
+    fn test_time_macro_streaming_matches_unpartitioned_for_all_chunk_sizes() {
+        let content = b"__TIMESTAMX__ / __TIME__ separated / __DATE__ then __TIMESTAMP__";
+        let mut expected = TimeMacroFinder::new();
+        expected.find_time_macros(content);
+
+        for chunk_size in 1..=content.len() + 1 {
+            let mut actual = TimeMacroFinder::new();
+            for chunk in content.chunks(chunk_size) {
+                actual.find_time_macros(chunk);
+                actual.find_time_macros(b"");
+            }
+            assert_eq!(
+                (
+                    actual.found_time(),
+                    actual.found_date(),
+                    actual.found_timestamp()
+                ),
+                (
+                    expected.found_time(),
+                    expected.found_date(),
+                    expected.found_timestamp()
+                ),
+                "different result for chunk size {chunk_size}"
+            );
+        }
     }
 
     #[test]
