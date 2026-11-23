@@ -121,6 +121,12 @@ impl<T: ArgumentValue> Argument<T> {
             Self::WithValue(
                 s,
                 v,
+                original @ (ArgDisposition::CanBeConcatenated(_)
+                | ArgDisposition::CanBeSeparated(_)),
+            ) if v.is_empty_arg_value() => Self::WithValue(s, v, original),
+            Self::WithValue(
+                s,
+                v,
                 ArgDisposition::CanBeConcatenated(d) | ArgDisposition::CanBeSeparated(d),
             ) => Self::WithValue(
                 s,
@@ -297,6 +303,10 @@ macro_rules! ArgData {
 
     { __impl $( $tok:tt )+ } => {
         impl IntoArg for ArgData {
+            fn is_empty_arg_value(&self) -> bool {
+                ArgData!{ __matchify self is_empty_arg_value () () $($tok)+ }
+            }
+
             fn into_arg_os_string(self) -> OsString {
                 ArgData!{ __matchify self into_arg_os_string () () $($tok)+ }
             }
@@ -333,6 +343,17 @@ pub trait FromArg: Sized {
 }
 
 pub trait IntoArg: Sized {
+    /// Whether this value would become an empty compiler argument.
+    ///
+    /// Implementations should inspect the borrowed value without cloning
+    /// when possible; this is used when normalizing compiler argument layout.
+    fn is_empty_arg_value(&self) -> bool
+    where
+        Self: Clone,
+    {
+        self.clone().into_arg_os_string().is_empty()
+    }
+
     fn into_arg_os_string(self) -> OsString;
     fn into_arg_string(self, transformer: PathTransformerFn<'_>) -> ArgToStringResult;
 }
@@ -354,6 +375,10 @@ impl FromArg for String {
 }
 
 impl IntoArg for OsString {
+    fn is_empty_arg_value(&self) -> bool {
+        self.as_os_str().is_empty()
+    }
+
     fn into_arg_os_string(self) -> OsString {
         self
     }
@@ -362,6 +387,10 @@ impl IntoArg for OsString {
     }
 }
 impl IntoArg for PathBuf {
+    fn is_empty_arg_value(&self) -> bool {
+        self.as_os_str().is_empty()
+    }
+
     fn into_arg_os_string(self) -> OsString {
         self.into()
     }
@@ -370,6 +399,10 @@ impl IntoArg for PathBuf {
     }
 }
 impl IntoArg for String {
+    fn is_empty_arg_value(&self) -> bool {
+        self.is_empty()
+    }
+
     fn into_arg_os_string(self) -> OsString {
         self.into()
     }
@@ -378,6 +411,10 @@ impl IntoArg for String {
     }
 }
 impl IntoArg for () {
+    fn is_empty_arg_value(&self) -> bool {
+        true
+    }
+
     fn into_arg_os_string(self) -> OsString {
         OsString::new()
     }
@@ -1095,6 +1132,48 @@ mod tests {
 
         let arg = arg!(WithValue("-foo", Foo("bar"), Separated));
         assert_eq!(arg.iter_os_strings().collect_vec(), ovec!["-foo", "bar"]);
+    }
+
+    #[test]
+    fn normalization_preserves_which_empty_values_are_separated() {
+        let empty_separated = Argument::WithValue(
+            "-I",
+            OsString::new(),
+            ArgDisposition::CanBeConcatenated(None),
+        );
+        assert_eq!(
+            empty_separated
+                .normalize(NormalizedDisposition::Concatenated)
+                .iter_os_strings()
+                .collect_vec(),
+            ovec!["-I", ""]
+        );
+
+        let empty_concatenated = Argument::WithValue(
+            "--flag",
+            OsString::new(),
+            ArgDisposition::CanBeSeparated(Some(b'=')),
+        );
+        assert_eq!(
+            empty_concatenated
+                .normalize(NormalizedDisposition::Separated)
+                .iter_os_strings()
+                .collect_vec(),
+            ovec!["--flag="]
+        );
+
+        let nonempty = Argument::WithValue(
+            "-I",
+            OsString::from("include"),
+            ArgDisposition::CanBeConcatenated(None),
+        );
+        assert_eq!(
+            nonempty
+                .normalize(NormalizedDisposition::Concatenated)
+                .iter_os_strings()
+                .collect_vec(),
+            ovec!["-Iinclude"]
+        );
     }
 
     #[test]
