@@ -516,6 +516,17 @@ pub fn meson_options(flags: &[String]) -> String {
     format!("[built-in options]\nc_args = [{flags}]\ncpp_args = [{flags}]\n")
 }
 
+/// Serialize C compiler arguments for a cc-rs build script to read at runtime.
+///
+/// The native flag data is not Rust source, so changing GCC flags does not
+/// change the host-executed build script's Rust compilation identity.
+///
+/// # Errors
+/// Fails if serializing the compiler arguments as JSON fails.
+pub fn cc_rs_flags_json(flags: &[String]) -> Result<String> {
+    Ok(serde_json::to_string_pretty(flags)?)
+}
+
 pub fn show_flags(flags: &[String]) -> String {
     let mut result = String::new();
     for (index, flag) in flags.iter().enumerate() {
@@ -549,6 +560,21 @@ mod tests {
 
     fn mock_profile(name: &str) -> Result<DestinationProfile> {
         DestinationProfile::named("x86_64-unknown-linux-gnu", name)
+    }
+
+    #[test]
+    fn cc_rs_generated_flags_are_data_not_rust_source() -> Result<()> {
+        let flags = vec![
+            "-march=x86-64-v4".to_owned(),
+            "-DNAME=two words".to_owned(),
+            r#"-DQUOTED=hello\"world"#.to_owned(),
+        ];
+        let output = cc_rs_flags_json(&flags)?;
+        assert_eq!(serde_json::from_str::<Vec<String>>(&output)?, flags);
+        assert!(!output.contains("build.flag"));
+        assert!(!output.contains("rustflags"));
+        assert!(!output.contains("cargo:rustc"));
+        Ok(())
     }
 
     #[test]

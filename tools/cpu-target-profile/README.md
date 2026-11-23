@@ -50,6 +50,7 @@ cargo run --manifest-path tools/cpu-target-profile/Cargo.toml -- emit --profile 
 cargo run --manifest-path tools/cpu-target-profile/Cargo.toml -- emit --profile cpu.json --format clang --compiler /usr/bin/clang --output clang.flags
 cargo run --manifest-path tools/cpu-target-profile/Cargo.toml -- emit --profile cpu.json --format cmake --c-compiler gcc --compiler /usr/bin/gcc --output cmake-target.cmake
 cargo run --manifest-path tools/cpu-target-profile/Cargo.toml -- emit --profile cpu.json --format meson --c-compiler clang --compiler /usr/bin/clang --output meson-target.ini
+cargo run --manifest-path tools/cpu-target-profile/Cargo.toml -- emit --profile cpu.json --format cc-rs --c-compiler gcc --compiler /usr/bin/gcc --output target_cpu_cc.json
 ~~~
 
 Apply Cargo's configuration with an explicit target to avoid targeting build
@@ -69,10 +70,39 @@ compiling client-side code, linking or producing artifacts. This rejects native 
 architectures, instead of silently generating unusable configurations.
 The cross-toolchain and any required sysroot are selected independently.
 
-C flags are used only by native C/C++ invocations. For Cargo packages that
-compile C through build scripts, separately configure the actual C compiler
-using its generated flags; this tool deliberately does not inject GCC flags
-into the Cargo/rustc config. CMake and Meson outputs only configure C/C++ codegen;
+C flags are used only by native C/C++ invocations. For an editable Cargo
+package using [cc-rs](https://docs.rs/cc/latest/cc/), generate the `cc-rs`
+flags data file *alongside* the Rust-only Cargo config. Use a stable `build.rs`
+to read the JSON at build-script **runtime**, then pass only those arguments to
+the native compiler:
+
+~~~rust
+fn main() {
+    println!("cargo:rerun-if-changed=target_cpu_cc.json");
+    let flags: Vec<String> = serde_json::from_slice(
+        &std::fs::read("target_cpu_cc.json").expect("native CPU flags")
+    ).expect("valid native CPU flags");
+    let mut native = cc::Build::new();
+    native.file("src/native.c");
+    for flag in &flags {
+        native.flag(flag);
+    }
+    native.compile("native");
+}
+~~~
+
+This requires `cc` and `serde_json` as **build dependencies**. Cargo reruns
+the build script when the native flags data changes, but does not need to
+recompile the build script itself: GCC flags do not enter that host Rust
+compilation's source/hash identity. Only the specific `cc::Build` receiving
+the arguments changes; unrelated Rust crates remain unaffected. Use the actual
+C compiler/launcher matching the one probed by the exporter, and invoke Cargo
+with an explicit `--target`. This requires no `CFLAGS` environment variables
+and does not modify global Cargo rustflags. Uneditable third-party native build
+scripts must be configured through their existing supported native compiler
+interfaces.
+
+CMake and Meson outputs only configure C/C++ codegen;
 configure the linker, sysroot and ABI separately for cross-toolchain builds.
 
 To deliberately target a compatible baseline of a captured destination, use

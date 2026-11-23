@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use cpu_target_profile::{
-    DestinationProfile, cargo_toml, cmake_toolchain, meson_options, selected_c_flags, show_flags,
+    DestinationProfile, cargo_toml, cc_rs_flags_json, cmake_toolchain, meson_options,
+    selected_c_flags, show_flags,
 };
 use std::path::{Path, PathBuf};
 
@@ -57,6 +58,7 @@ enum OutputFormat {
     Clang,
     Cmake,
     Meson,
+    CcRs,
 }
 #[derive(Clone, Copy, ValueEnum)]
 enum CCompiler {
@@ -109,7 +111,7 @@ fn main() -> Result<()> {
                     "clang",
                     compiler.as_deref().unwrap_or_else(|| Path::new("clang")),
                 )?),
-                OutputFormat::Cmake | OutputFormat::Meson => {
+                OutputFormat::Cmake | OutputFormat::Meson | OutputFormat::CcRs => {
                     let flags = selected_c_flags(
                         &profile,
                         cpu,
@@ -120,8 +122,10 @@ fn main() -> Result<()> {
                     )?;
                     if matches!(format, OutputFormat::Cmake) {
                         cmake_toolchain(&flags)
-                    } else {
+                    } else if matches!(format, OutputFormat::Meson) {
                         meson_options(&flags)
+                    } else {
+                        cc_rs_flags_json(&flags)?
                     }
                 }
             };
