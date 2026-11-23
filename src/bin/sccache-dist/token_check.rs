@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use sccache::dist::http::{ClientAuthCheck, ClientVisibleMsg};
-use sccache::util::{BASE64_URL_SAFE_ENGINE, new_reqwest_blocking_client};
+use sccache::http_client::{self, new_reqwest_blocking_client};
+use sccache::util::BASE64_URL_SAFE_ENGINE;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::result::Result as StdResult;
@@ -152,6 +153,7 @@ impl ProxyTokenCheck {
             .client
             .get(self.url.clone())
             .bearer_auth(token)
+            .timeout(http_client::AUTH_REQUEST_TIMEOUT)
             .send()
             .context("Failed to make request to proxying url")?;
         if !res.status().is_success() {
@@ -196,11 +198,17 @@ impl ClientAuthCheck for ValidJWTCheck {
 
 impl ValidJWTCheck {
     pub fn new(audience: String, issuer: String, jwks_url: &str) -> Result<Self> {
-        let res = reqwest::blocking::get(jwks_url).context("Failed to make request to JWKs url")?;
+        let client = new_reqwest_blocking_client()?;
+        let res = client
+            .get(jwks_url)
+            .timeout(http_client::AUTH_REQUEST_TIMEOUT)
+            .send()
+            .context("Failed to make request to JWKs url")?;
         if !res.status().is_success() {
             bail!("Could not retrieve JWKs, HTTP error: {}", res.status())
         }
-        let jwks: Jwks = res.json().context("Failed to parse JWKs json")?;
+        let jwks: Jwks = http_client::read_bounded_json(res, http_client::JWKS_LIMIT)
+            .context("Failed to parse JWKs json")?;
         let kid_to_pkcs1 = jwks
             .keys
             .into_iter()

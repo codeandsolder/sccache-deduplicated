@@ -127,7 +127,7 @@ pub(super) fn certificate_roots<'a>(
 
 #[cfg(feature = "dist-client")]
 pub(super) fn async_client(roots: Vec<reqwest::Certificate>) -> Result<reqwest::Client> {
-    crate::util::new_reqwest_client_builder()?
+    crate::http_client::new_reqwest_client_builder()?
         .tls_certs_merge(roots)
         .timeout(HTTP_REQUEST_TIMEOUT)
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
@@ -140,7 +140,7 @@ pub(super) fn async_client(roots: Vec<reqwest::Certificate>) -> Result<reqwest::
 pub(super) fn blocking_client(
     roots: Vec<reqwest::Certificate>,
 ) -> Result<reqwest::blocking::Client> {
-    crate::util::new_reqwest_blocking_builder()?
+    crate::http_client::new_reqwest_blocking_builder()?
         .tls_certs_merge(roots)
         .pool_max_idle_per_host(0)
         .build()
