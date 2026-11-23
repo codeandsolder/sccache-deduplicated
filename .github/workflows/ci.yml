@@ -91,6 +91,36 @@ jobs:
         if: always()
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
 
+
+  cpu_target_profile:
+    name: Destination CPU profile exporter
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install stable Rust
+        uses: ./.github/actions/rust-toolchain
+        id: rust
+        with:
+          toolchain: stable
+          components: rustfmt clippy
+
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
+        with:
+          rust-toolchain: ${{ steps.rust.outputs.name }}
+
+      - name: Verify formatting, lints and tests
+        run: |
+          cargo fmt --manifest-path tools/cpu-target-profile/Cargo.toml --all -- --check
+          cargo clippy --manifest-path tools/cpu-target-profile/Cargo.toml --locked --all-targets -- -D warnings
+          cargo test --manifest-path tools/cpu-target-profile/Cargo.toml --locked
+
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
+
   host_tools:
     runs-on: ubuntu-latest
     steps:
