@@ -187,6 +187,42 @@ Neither path leaves a second compressed copy in the store, and the underlying
 ZFS dataset retains transparent compression. These request paths are bounded
 by existing session and concurrency limits.
 
+### Native canary trace and budget replay
+
+Only when the `native_cas_replay` log target is at **trace** level,
+a worker emits compact JSON events for every resolved execution input tree:
+`tree_access` with its immutable tree ID, verified unique blob IDs/lengths,
+and a local-tree-hit flag; `tree_transfer` with the raw logical missing
+content bytes after any original-package reconstruction. The latter describes
+**decoded content** downloaded, not Zstd HTTP bytes. These events omit paths,
+environment, source text and credentials. When trace logging is disabled,
+workers do not enumerate blobs or serialize JSON for this instrumentation.
+
+On an **isolated, coordinated native canary**, opt into the existing
+`sccache-dist server --syslog trace` logging mode for a **short** window.
+This mode enables other trace targets too, so avoid doing so on the busy
+production workers. Extract the two native events from the canary journal
+into a working directory, then compare candidate logical budgets:
+
+```sh
+journalctl -u sccache-dist-worker --since '2026-11-23 20:00:00' -o cat |
+  rg '"kind":"(tree_access|tree_transfer)"' > /home/jan/build/sccache-native-cache-retention-20261123/native-trace.jsonl
+
+cargo +nightly-2026-11-22 run --locked -p sccache-build   --example cache_budget_replay -- 1073741824 2147483648 4294967296 8589934592   < /home/jan/build/sccache-native-cache-retention-20261123/native-trace.jsonl
+```
+
+The replay is an **offline deduplicated LRU baseline**, not a claim to
+implement the production frequency/recency and exclusive-reclaim ranking
+exactly. For each budget it reports tree-hit rate, logical missing-content
+bytes, evictions and peak unique resident bytes. It counts a shared content ID
+once across all retained trees, handles trees too large to admit, and uses a
+75%-of-maximum hysteresis target. The same run separately prints the
+**actual** canary tree-hit count and raw logical download bytes for comparison.
+Empty/non-native log lines are ignored; malformed matching event records are
+rejected. Run representative cold and warm sequences with their real ordering;
+counterfactual results do not include ZFS block compression, original-package
+decode CPU, cache admission stalls, concurrent pinning or external snapshots.
+
 The worker advertises the BLAKE3 digest of the exact platform contract.
 Clients use the same digest in `ExecutionSpec.platform`. The renewal
 interval must be shorter than the scheduler idle timeout.
