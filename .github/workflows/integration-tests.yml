@@ -29,12 +29,13 @@ jobs:
 
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
+        id: rust
         with:
           toolchain: "nightly-2026-11-22"
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
         with:
-          rust-toolchain: "nightly-2026-11-22"
+          rust-toolchain: ${{ steps.rust.outputs.name }}
 
       - name: Build
         run: |
@@ -113,12 +114,13 @@ jobs:
 
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
+        id: rust
         with:
           toolchain: "nightly-2026-11-22"
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
         with:
-          rust-toolchain: "nightly-2026-11-22"
+          rust-toolchain: ${{ steps.rust.outputs.name }}
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -178,13 +180,14 @@ jobs:
 
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
+        id: rust
         with:
           toolchain: "nightly-2026-11-22"
           target: $TARGET
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
         with:
-          rust-toolchain: "nightly-2026-11-22"
+          rust-toolchain: ${{ steps.rust.outputs.name }}
 
       - name: Build
         run: cargo build --bin sccache --target $env:TARGET --features=vendored-openssl
@@ -201,7 +204,7 @@ jobs:
         working-directory: ./tests/integration/msvc
         run: |
           cl "@args.rsp"
-          test -e ./foo.o || { echo "No compiler output found"; exit -1; }
+          test -e ./foo.o || { echo "No compiler output found"; exit 1; }
 
       - name: Start Server
         shell: bash
@@ -215,8 +218,8 @@ jobs:
           $SCCACHE_EXE "$(where cl.exe)" -c "@args.rsp"
           $SCCACHE_EXE --show-stats
           $SCCACHE_EXE --show-stats | grep -e "Cache misses\s*[1-9]"
-          test -e ./foo.o || { echo "No compiler output found"; exit -1; }
-          test -e ./foo.o.json || { echo "No dependency list found"; exit -1; }
+          test -e ./foo.o || { echo "No compiler output found"; exit 1; }
+          test -e ./foo.o.json || { echo "No dependency list found"; exit 1; }
 
       - name: Compile - Cache Hit
         shell: bash
@@ -226,8 +229,8 @@ jobs:
           $SCCACHE_EXE "$(where cl.exe)" -c "@args.rsp"
           $SCCACHE_EXE --show-stats
           $SCCACHE_EXE --show-stats | grep -e "Cache hits\s*[1-9]"
-          test -e ./foo.o || { echo "No compiler output found"; exit -1; }
-          test -e ./foo.o.json || { echo "No dependency list found"; exit -1; }
+          test -e ./foo.o || { echo "No compiler output found"; exit 1; }
+          test -e ./foo.o.json || { echo "No dependency list found"; exit 1; }
 
       - name: Compile - Preprocessing Compiler Bug
         shell: bash
@@ -294,11 +297,6 @@ jobs:
       #     script: |
       #       core.exportVariable('ROCM_PATH', process.env.ROCM_PATH || '');
 
-      - name: Setup mandatory compiler sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
-        with:
-          rust-toolchain: "nightly-2026-11-22"
-
       - name: Install dependencies
         shell: bash
         run: |
@@ -310,8 +308,14 @@ jobs:
 
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
+        id: rust
         with:
           toolchain: "nightly-2026-11-22"
+
+      - name: Setup mandatory compiler sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
+        with:
+          rust-toolchain: ${{ steps.rust.outputs.name }}
 
       - name: Build & setup librandomize_readdir
         run: |
@@ -383,12 +387,13 @@ jobs:
 
       - name: Install rust
         uses: ./.github/actions/rust-toolchain
+        id: rust
         with:
           toolchain: "nightly-2026-11-22"
       - name: Setup mandatory compiler sccache
         uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
         with:
-          rust-toolchain: "nightly-2026-11-22"
+          rust-toolchain: ${{ steps.rust.outputs.name }}
 
       - name: Build sccache
         run: |
