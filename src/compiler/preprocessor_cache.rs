@@ -42,7 +42,7 @@ use super::c::{INPUT_FILE_NAME_DOMAIN, hash_arguments, hashed_input_file_name};
 
 /// The current format is 1 header byte for the version + bincode encoding
 /// of the [`PreprocessorCacheEntry`] struct.
-const FORMAT_VERSION: u8 = 2;
+const FORMAT_VERSION: u8 = 3;
 const MAX_PREPROCESSOR_CACHE_ENTRIES: usize = 100;
 const MAX_PREPROCESSOR_CACHE_FILE_INFO_ENTRIES: usize = 10000;
 
@@ -511,6 +511,37 @@ mod test {
     use crate::util::{HASH_BUFFER_SIZE, MAX_TIME_MACRO_HAYSTACK_LEN};
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_preprocessor_cache_non_unicode_argument_boundaries() -> anyhow::Result<()> {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source.c");
+        std::fs::write(&source, b"int probe(void) { return 1; }")?;
+        let merged = [OsString::from_vec(b"-DVALUE=a\xff-DOTHER=b".to_vec())];
+        let split = [OsString::from("-DVALUE=a"), OsString::from("-DOTHER=b")];
+        let key = |arguments: &[OsString]| {
+            preprocessor_cache_entry_hash_key(PreprocessorCacheKey {
+                compiler_digest: "same-compiler",
+                language: Language::C,
+                arguments,
+                extra_hashes: &[],
+                assembler_digest: None,
+                env_vars: &[],
+                input_file: &source,
+                plusplus: false,
+                config: PreprocessorCacheModeConfig::activated(),
+                basedirs: &[],
+            })
+        };
+        assert_ne!(
+            key(&merged)?.expect("valid input"),
+            key(&split)?.expect("valid input")
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_find_time_macros_empty_file() {

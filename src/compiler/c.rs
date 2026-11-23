@@ -2521,7 +2521,7 @@ pub(super) fn hashed_input_file_name(language: Language, input: &Path) -> Option
 }
 
 /// The cache is versioned by the inputs to `HashKeyParams::compute`.
-pub const CACHE_VERSION: &[u8] = b"14";
+pub const CACHE_VERSION: &[u8] = b"15";
 
 /// Environment variables that are factored into the cache key.
 static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
@@ -2543,17 +2543,18 @@ static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
     .collect()
 });
 
-/// Feed the compiler arguments into `m`, with the base directories stripped.
+/// Feed normalized compiler arguments into the digest with unambiguous boundaries.
 ///
-/// The arguments are hashed verbatim, so any that spell out an absolute path -
-/// `-ffile-prefix-map=/home/user/project=.` above all - would tie the cache
-/// entry to one checkout of the tree. See [`strip_basedirs_from_arg`].
+/// C compiler argv may contain non-UTF-8 bytes, including 0xff on Unix.
+/// A one-byte separator therefore aliases a single argument containing that
+/// byte with two distinct arguments. Frame both count and byte lengths.
 pub fn hash_arguments(m: &mut Digest, arguments: &[OsString], basedirs: &[Vec<u8>]) {
+    m.delimiter(b"c-argv-v1");
+    m.update(&(arguments.len() as u128).to_le_bytes());
     for arg in arguments {
-        // Same shape as OsString's own Hash impl: the bytes, then a separator
-        // that cannot occur in them.
-        m.update(&strip_basedirs_from_arg(arg.as_encoded_bytes(), basedirs));
-        m.update(&[0xff]);
+        let normalized = strip_basedirs_from_arg(arg.as_encoded_bytes(), basedirs);
+        m.update(&(normalized.len() as u128).to_le_bytes());
+        m.update(&normalized);
     }
 }
 
@@ -3251,6 +3252,30 @@ mod test {
         assert_neq!(h_abc, h_xyz);
         assert_neq!(h_abc, h_ab);
         assert_neq!(h_abc, h_a);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_hash_key_non_unicode_argument_boundaries() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let merged = [OsString::from_vec(b"-DVALUE=a\xff-DOTHER=b".to_vec())];
+        let split = [OsString::from("-DVALUE=a"), OsString::from("-DOTHER=b")];
+        let old_hash = |args: &[OsString]| {
+            let mut digest = Digest::new();
+            for arg in args {
+                digest.update(arg.as_encoded_bytes());
+                digest.update(&[0xff]);
+            }
+            digest.finish()
+        };
+        assert_eq!(old_hash(&merged), old_hash(&split));
+
+        let key = |args: &[OsString]| {
+            HashKeyParams::new("compiler", Language::C, args, b"same preprocessed content")
+                .compute()
+        };
+        assert_ne!(key(&merged), key(&split));
     }
 
     #[test]
