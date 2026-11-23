@@ -21,6 +21,7 @@ use crate::compiler::c::{
     ArtifactDescriptor, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
     ParsedArguments,
 };
+use crate::compiler::response_files::ResponseFileExpansion;
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
     SingleCompileCommand,
@@ -404,18 +405,14 @@ pub fn generate_compile_commands(
 
 pub struct ExpandAtArgs<'a> {
     cwd: &'a Path,
-    stack: Vec<OsString>,
+    expansion: ResponseFileExpansion,
 }
 
 impl<'a> ExpandAtArgs<'a> {
     pub fn new(cwd: &'a Path, args: &[OsString]) -> Self {
-        ExpandAtArgs {
-            stack: args
-                .iter()
-                .rev()
-                .map(std::borrow::ToOwned::to_owned)
-                .collect(),
+        Self {
             cwd,
+            expansion: ResponseFileExpansion::new(args),
         }
     }
 }
@@ -425,7 +422,7 @@ impl Iterator for ExpandAtArgs<'_> {
 
     fn next(&mut self) -> Option<OsString> {
         loop {
-            let arg = self.stack.pop()?;
+            let arg = self.expansion.next_argument()?;
 
             // Just return non @ arguments
             if !arg.starts_with("-@") {
@@ -458,20 +455,26 @@ impl Iterator for ExpandAtArgs<'_> {
             // and not just env::var. This is technically possible, but
             // considered as a unneeded edge case for now.
 
-            let mut contents = String::new();
             let file = self.cwd.join(&value);
-            let res = File::open(file).and_then(|mut f| f.read_to_string(&mut contents));
-            if res.is_err() {
-                // Failed to read the file, so return the argument as it is.
-                // This will result in a CannotCache.
+            if !self.expansion.expand(&file, || {
+                let mut contents = String::new();
+                let res = File::open(&file).and_then(|mut f| f.read_to_string(&mut contents));
+                if let Err(error) = res {
+                    debug!(
+                        "failed to read Diab response file {}: {error}",
+                        file.display()
+                    );
+                    return None;
+                }
+                if contents.contains('"') || contents.contains('\'') {
+                    return None;
+                }
+                Some(contents.split_whitespace().map(OsString::from).collect())
+            }) {
+                // If the file cannot be expanded, let the compiler parse it
+                // itself and mark the request as uncacheable.
                 return Some(arg);
             }
-            if contents.contains('"') || contents.contains('\'') {
-                return Some(arg);
-            }
-            let new_args = contents.split_whitespace().collect::<Vec<_>>();
-            self.stack
-                .extend(new_args.iter().rev().map(std::convert::Into::into));
         }
     }
 }
@@ -726,6 +729,76 @@ mod test {
         assert_eq!(parse_arguments_(vec!["-@E+foo".into()]), cannot_cache);
         assert_eq!(parse_arguments_(vec!["-@O=foo".into()]), cannot_cache);
         assert_eq!(parse_arguments_(vec!["-@O+foo".into()]), cannot_cache);
+    }
+
+    #[test]
+    fn recursive_response_files_fall_back_without_hanging() -> crate::errors::Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(temp.path().join("self.rsp"), b"-@self.rsp")?;
+        let args = [OsString::from("-@self.rsp")];
+        assert_eq!(
+            super::ExpandAtArgs::new(temp.path(), &args).collect::<Vec<_>>(),
+            args
+        );
+        assert_eq!(
+            parse_arguments(&args, temp.path(), &ARGS[..]),
+            CompilerArguments::CannotCache("-@", None)
+        );
+
+        fs::write(temp.path().join("first.rsp"), b"-@second.rsp")?;
+        fs::write(temp.path().join("second.rsp"), b"-@first.rsp")?;
+        assert_eq!(
+            super::ExpandAtArgs::new(temp.path(), &[OsString::from("-@first.rsp")])
+                .collect::<Vec<_>>(),
+            [OsString::from("-@first.rsp")]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_and_repeated_response_files_remain_supported() -> crate::errors::Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::write(temp.path().join("leaf.rsp"), b"-DVALUE=1")?;
+        fs::write(temp.path().join("outer.rsp"), b"-@leaf.rsp -c source.c")?;
+        assert_eq!(
+            super::ExpandAtArgs::new(
+                temp.path(),
+                &[OsString::from("-@outer.rsp"), OsString::from("-@leaf.rsp"),],
+            )
+            .collect::<Vec<_>>(),
+            [
+                OsString::from("-DVALUE=1"),
+                OsString::from("-c"),
+                OsString::from("source.c"),
+                OsString::from("-DVALUE=1"),
+            ]
+        );
+        fs::write(temp.path().join("empty.rsp"), b"")?;
+        assert_eq!(
+            super::ExpandAtArgs::new(
+                temp.path(),
+                &[OsString::from("-@empty.rsp"), OsString::from("tail")],
+            )
+            .collect::<Vec<_>>(),
+            [OsString::from("tail")]
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn response_file_symlink_cycles_are_detected() -> crate::errors::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        fs::write(temp.path().join("actual.rsp"), b"-@alias.rsp")?;
+        symlink("actual.rsp", temp.path().join("alias.rsp"))?;
+        assert_eq!(
+            super::ExpandAtArgs::new(temp.path(), &[OsString::from("-@actual.rsp")])
+                .collect::<Vec<_>>(),
+            [OsString::from("-@alias.rsp")]
+        );
+        Ok(())
     }
 
     #[test]
