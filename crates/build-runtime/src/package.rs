@@ -179,6 +179,7 @@ impl PackageTransferCost {
         raw_bytes: u128,
         archive: PackageArchive,
     ) -> Option<u128> {
+        const SECOND: u128 = 1_000_000_000;
         let transfer_saved = raw_bytes.checked_sub(u128::from(archive.source.size))?;
         let decode_rate = match archive.source.identity.compression {
             PackageCompression::Tar => self.decode_tar_bytes_per_second,
@@ -189,7 +190,6 @@ impl PackageTransferCost {
         if self.validate().is_err() {
             return None;
         }
-        const SECOND: u128 = 1_000_000_000;
         let network_saving = transfer_saved * SECOND / u128::from(self.download_bytes_per_second);
         let decode = u128::from(archive.expanded_bytes) * SECOND / u128::from(decode_rate);
         let metadata = u128::from(archive.entry_count) * u128::from(self.per_entry_nanoseconds);
