@@ -44,7 +44,7 @@ fn blob_identity_is_exact_content_and_independent_of_read_chunking() -> Result<(
 
     let dir = tempfile::tempdir()?;
     let store = NativeStore::open(dir.path())?;
-    let data: Vec<u8> = (0..131_071).map(|index| (index % 251) as u8).collect();
+    let data: Vec<u8> = (0_u8..=250).cycle().take(131_071).collect();
     let expected = BlobRef {
         id: ContentId(*blake3::hash(&data).as_bytes()),
         size: data.len().try_into()?,
