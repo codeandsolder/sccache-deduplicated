@@ -2652,7 +2652,11 @@ mod test {
         fs::write(temp.path().join("first.rsp"), b"@second.rsp")?;
         fs::write(temp.path().join("second.rsp"), b"@first.rsp")?;
         assert_eq!(
-            ExpandIncludeFile::new(temp.path(), &ovec!["@first.rsp", "tail"]).collect::<Vec<_>>(),
+            ExpandIncludeFile::new(
+                temp.path(),
+                &[OsString::from("@first.rsp"), OsString::from("tail")]
+            )
+            .collect::<Vec<_>>(),
             ovec!["@first.rsp", "tail"]
         );
         Ok(())
@@ -2664,13 +2668,20 @@ mod test {
         fs::write(temp.path().join("leaf.rsp"), b"-DVALUE=1")?;
         fs::write(temp.path().join("outer.rsp"), b"@leaf.rsp -c source.c")?;
         assert_eq!(
-            ExpandIncludeFile::new(temp.path(), &ovec!["@outer.rsp", "@leaf.rsp"])
-                .collect::<Vec<_>>(),
+            ExpandIncludeFile::new(
+                temp.path(),
+                &[OsString::from("@outer.rsp"), OsString::from("@leaf.rsp")]
+            )
+            .collect::<Vec<_>>(),
             ovec!["-DVALUE=1", "-c", "source.c", "-DVALUE=1"]
         );
         fs::write(temp.path().join("empty.rsp"), b"")?;
         assert_eq!(
-            ExpandIncludeFile::new(temp.path(), &ovec!["@empty.rsp", "tail"]).collect::<Vec<_>>(),
+            ExpandIncludeFile::new(
+                temp.path(),
+                &[OsString::from("@empty.rsp"), OsString::from("tail")]
+            )
+            .collect::<Vec<_>>(),
             ovec!["tail"]
         );
         Ok(())
@@ -2685,7 +2696,8 @@ mod test {
         fs::write(temp.path().join("actual.rsp"), b"@alias.rsp")?;
         symlink("actual.rsp", temp.path().join("alias.rsp"))?;
         assert_eq!(
-            ExpandIncludeFile::new(temp.path(), &ovec!["@actual.rsp"]).collect::<Vec<_>>(),
+            ExpandIncludeFile::new(temp.path(), &[OsString::from("@actual.rsp")])
+                .collect::<Vec<_>>(),
             ovec!["@alias.rsp"]
         );
         Ok(())
