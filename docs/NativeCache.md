@@ -153,6 +153,22 @@ hold admission reservations through publication; their releases are applied
 atomically without taking the admission lock, preventing lock-order cycles
 with concurrent eviction and index publication.
 
+Under cache pressure, eviction ranks roots by the expected reuse cost per
+byte that deleting them could actually reclaim. It follows the transactional
+reverse-reference index: multiple action aliases for one result are not
+counted as independent copies, content shared between trees or results is
+not double-counted, and original package archives are included with their
+own tree's eviction. Active content pins cannot free their underlying inode
+immediately and are excluded from reclaim estimates. Under logical budget
+pressure the score uses exclusive logical bytes; under filesystem free-space
+pressure it uses the existing file's allocated blocks (`st_blocks`) so
+transparent ZFS compression influences ranking. Snapshots or block clones
+can still retain blocks; only post-GC `statvfs` confirms real free space.
+A root that frees no content by itself can be evicted later if needed to
+remove the last remaining shared reference. Candidate selection runs only
+under pressure, holds at most the configured eviction batch in memory,
+and takes no pin mutex over filesystem metadata I/O.
+
 Native workers include up to 32 recently used immutable tree IDs in each
 scheduler heartbeat. The scheduler considers their overlap with the native
 action's input-tree closure when weighing eligible workers; this modest
@@ -180,9 +196,10 @@ The application currently bounds sessions, transfer sizes and concurrent
 uploads. Store admission uses allocatable filesystem bytes (statvfs), not
 logical blob lengths, so compressed and block-cloned ZFS content is not
 mistaken for physical allocation. Below the configured low watermark it
-reclaims pending garbage and evicts unpinned least-recently-used action
-and tree roots in bounded passes, rechecking actual free space rather than
-assuming deleted logical lengths were reclaimed. Active writers reserve a
+reclaims pending garbage and evicts unpinned action/tree roots using
+persistent reuse statistics and uniquely reclaimable-content estimates in
+bounded passes, rechecking actual free space rather than assuming deleted
+logical lengths were reclaimed. Active writers reserve a
 conservative uncompressed upper bound until staged bytes are synced.
 Recency is in-memory and unknown roots after restart rank oldest.
 The external dataset quota remains the hard limit; snapshots, open files,
