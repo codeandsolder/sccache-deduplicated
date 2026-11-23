@@ -190,7 +190,7 @@ by existing session and concurrency limits.
 ### Native canary trace and budget replay
 
 Only when the `native_cas_replay` log target is at **trace** level,
-a worker emits compact JSON events for every resolved execution input tree:
+a worker emits structured JSON events for every resolved execution input tree:
 `tree_access` with its immutable tree ID, verified unique blob IDs/lengths,
 and a local-tree-hit flag; `tree_transfer` with the raw logical missing
 content bytes after any original-package reconstruction. The latter describes
@@ -205,7 +205,7 @@ production workers. Extract the two native events from the canary journal
 into a working directory, then compare candidate logical budgets:
 
 ```sh
-journalctl -u sccache-dist-worker --since '2026-11-23 20:00:00' -o cat |
+journalctl -u sccache-dist-worker --since '30 minutes ago' -o cat |
   rg '"kind":"(tree_access|tree_transfer)"' > /home/jan/build/sccache-native-cache-retention-20261123/native-trace.jsonl
 
 cargo +nightly-2026-11-22 run --locked -p sccache-build   --example cache_budget_replay -- 1073741824 2147483648 4294967296 8589934592   < /home/jan/build/sccache-native-cache-retention-20261123/native-trace.jsonl
