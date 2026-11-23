@@ -955,10 +955,11 @@ fn rust_shadow_args(args: &[(OsString, Option<OsString>)]) -> Vec<String> {
 // Otherwise one -C link-arg containing "-Clink-arg=" can alias two -C options.
 fn hash_rust_argument_pairs<'a>(
     digest: &mut Digest,
-    args: impl ExactSizeIterator<Item = &'a (OsString, Option<OsString>)>,
+    arg_count: usize,
+    args: impl Iterator<Item = &'a (OsString, Option<OsString>)>,
 ) {
     digest.delimiter(b"rust-argv-v1");
-    digest.update(&(args.len() as u128).to_le_bytes());
+    digest.update(&(arg_count as u128).to_le_bytes());
     for (name, value) in args {
         let name_bytes = name.as_encoded_bytes();
         digest.update(&(name_bytes.len() as u128).to_le_bytes());
@@ -3215,7 +3216,11 @@ where
             // out, sort them, and append them to the rest of the arguments.
             .partition(|&(arg, _)| arg == "--cfg");
         sortables.sort();
-        hash_rust_argument_pairs(&mut m, rest.iter().chain(sortables.iter()).copied());
+        hash_rust_argument_pairs(
+            &mut m,
+            rest.len() + sortables.len(),
+            rest.iter().chain(sortables.iter()).copied(),
+        );
         let hashed_argument_pairs = shadow_log_path.is_some().then(|| {
             rest.iter()
                 .chain(sortables.iter())
@@ -6705,7 +6710,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             (OsString::from("--cfg"), Some(OsString::from("abc"))),
             (OsString::from("--cfg"), Some(OsString::from("xyz"))),
         ];
-        hash_rust_argument_pairs(&mut m, args.iter());
+        hash_rust_argument_pairs(&mut m, args.len(), args.iter());
         // bar.rs (source file, from dep-info)
         m.update(empty_digest.as_bytes());
         // foo.rs (source file, from dep-info)
@@ -6753,7 +6758,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
 
         let framed_hash = |args: &[(OsString, Option<OsString>)]| {
             let mut digest = Digest::new();
-            hash_rust_argument_pairs(&mut digest, args.iter());
+            hash_rust_argument_pairs(&mut digest, args.len(), args.iter());
             digest.finish()
         };
         assert_ne!(framed_hash(&single), framed_hash(&split));
