@@ -1831,7 +1831,7 @@ mod test {
             let Some(mount) = line.split_whitespace().nth(4) else {
                 continue;
             };
-            let mount = mount.replace(r" ", " ").replace(r"	", "	");
+            let mount = mount.replace(r"\040", " ").replace(r"\011", "\t");
             let root = Path::new(&mount);
             if fs::metadata(root).is_ok_and(|metadata| metadata.dev() != source_dev)
                 && let Ok(dir) = tempfile::tempdir_in(root)
