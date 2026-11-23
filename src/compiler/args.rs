@@ -438,14 +438,23 @@ impl<T: ArgumentValue> ArgInfo<T> {
                         "argument does not start with its flag",
                     ));
                 };
-                if let Some(d) = d {
-                    value = value.split_prefix(&char::from(d).to_string()).ok_or(
-                        ArgParseError::Other(
-                            "concatenated argument is missing the required delimiter",
-                        ),
-                    )?;
-                }
-                Argument::WithValue(s, create(value)?, ArgDisposition::Concatenated(d))
+                // Keep a bare flag distinct from a flag with an explicit
+                // empty value: "-foo" and "-foo=" can have different meaning.
+                // Some compilers also permit bare spellings of flags declared
+                // with a concatenation delimiter.
+                let delimiter = match d {
+                    Some(_) if value.is_empty() => None,
+                    Some(d) => {
+                        value = value.split_prefix(&char::from(d).to_string()).ok_or(
+                            ArgParseError::Other(
+                                "concatenated argument is missing the configured delimiter",
+                            ),
+                        )?;
+                        Some(d)
+                    }
+                    None => None,
+                };
+                Argument::WithValue(s, create(value)?, ArgDisposition::Concatenated(delimiter))
             }
             Self::TakeArg(
                 s,
@@ -1093,8 +1102,10 @@ mod tests {
         let concatenated = take_arg!("-foo", OsString, Concatenated(b'='), Foo);
         let argument = concatenated.clone().process("-foo=", || None)?;
         assert_eq!(argument.iter_os_strings().collect_vec(), ovec!["-foo="]);
+        let bare = concatenated.clone().process("-foo", || None)?;
+        assert_eq!(bare.iter_os_strings().collect_vec(), ovec!["-foo"]);
         assert!(matches!(
-            concatenated.process("-foo", || None),
+            concatenated.process("-foobar", || None),
             Err(ArgParseError::Other(_))
         ));
 
@@ -1107,6 +1118,10 @@ mod tests {
             assert_eq!(
                 argument.iter_strings(|_| None).collect::<Vec<_>>(),
                 vec![Ok("-foo=".to_owned())]
+            );
+            assert_eq!(
+                bare.iter_strings(|_| None).collect::<Vec<_>>(),
+                vec![Ok("-foo".to_owned())]
             );
             let empty_path = Argument::WithValue(
                 "-I",
