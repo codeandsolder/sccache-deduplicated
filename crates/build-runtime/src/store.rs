@@ -5,7 +5,6 @@ use std::{
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
-    time::Instant,
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -31,6 +30,7 @@ const TREE_PACKAGES: MultimapTableDefinition<'static, &[u8; 32], &[u8; 32]> =
     MultimapTableDefinition::new("tree_packages_v1");
 const TREES: TableDefinition<'static, &[u8; 32], &[u8]> = TableDefinition::new("trees_v1");
 const BLOBS: TableDefinition<'static, &[u8; 32], u64> = TableDefinition::new("blobs_v1");
+const USAGE: TableDefinition<'static, &[u8; 33], &[u8]> = TableDefinition::new("usage_v1");
 const RESULT_ACTIONS: MultimapTableDefinition<'static, &[u8; 32], &[u8; 32]> =
     MultimapTableDefinition::new("result_actions_v1");
 const ACCOUNTING: TableDefinition<'static, u8, u64> = TableDefinition::new("accounting_v1");
@@ -135,7 +135,8 @@ struct Pins {
     actions: BTreeMap<ActionKey, usize>,
     trees: BTreeMap<crate::TreeId, usize>,
     blobs: BTreeMap<ContentId, usize>,
-    last_used: BTreeMap<space::Root, Instant>,
+    usage: BTreeMap<space::Root, space::UsageRecord>,
+    dirty_usage: BTreeSet<space::Root>,
 }
 
 impl Pins {
@@ -357,6 +358,7 @@ impl NativeStore {
         write.open_multimap_table(TREE_PACKAGES)?;
         write.open_multimap_table(BLOB_PACKAGES)?;
         write.open_table(BLOBS)?;
+        write.open_table(USAGE)?;
         write.open_multimap_table(RESULT_ACTIONS)?;
         write.open_multimap_table(BLOB_ROOTS)?;
         write.open_table(PENDING_DELETIONS)?;
@@ -370,11 +372,21 @@ impl NativeStore {
             }
         }
         write.commit()?;
+        let mut pins = Pins::default();
+        {
+            let read = db.begin_read()?;
+            for entry in read.open_table(USAGE)?.iter()? {
+                let (key, value) = entry?;
+                let root = space::Root::from_key(*key.value())?;
+                let record: space::UsageRecord = encoding().deserialize(value.value())?;
+                pins.usage.insert(root, record);
+            }
+        }
         let inner = Arc::new(Inner {
             root,
             db,
             mutations: Mutex::new(()),
-            pins: Mutex::new(Pins::default()),
+            pins: Mutex::new(pins),
             package_imports: Mutex::new(BTreeSet::new()),
             space_policy,
             space: Mutex::default(),
@@ -845,11 +857,16 @@ impl NativeStore {
                 record.result,
             )?;
         }
+        // Remove the matching usage record in the same transaction.
+        write
+            .open_table(USAGE)?
+            .remove(&space::Root::Action(action).key())?;
         // Durable deletion intent precedes physical deletion. The collector
         // can batch work and retry failures without scanning the live store.
         write.commit()?;
         // Lookup and eviction must serialize until removal is committed.
-        pins.last_used.remove(&space::Root::Action(action));
+        pins.usage.remove(&space::Root::Action(action));
+        pins.dirty_usage.remove(&space::Root::Action(action));
         drop(pins);
         Ok(Eviction::Removed {
             unreferenced_logical_bytes,

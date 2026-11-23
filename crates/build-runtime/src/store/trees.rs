@@ -12,7 +12,7 @@ use redb::{ReadableDatabase, ReadableTable};
 use super::packages::PackageRecord;
 use super::{
     BLOB_PACKAGES, Eviction, Inner, LeasedReader, NativeStore, PACKAGES, StagedBlob, TREE_PACKAGES,
-    TREES, UploadReservation, encoding, release_pin, space::Root,
+    TREES, USAGE, UploadReservation, encoding, release_pin, space::Root,
 };
 use crate::{BlobRef, ContentId, PackageSource, TreeId, TreeManifest, TreeRecipe};
 
@@ -283,8 +283,10 @@ impl NativeStore {
                 .checked_add(Self::detach_blobs(&write, &id.0, contents)?)
                 .context("tree eviction size overflow")?
         };
+        write.open_table(USAGE)?.remove(&Root::Tree(id).key())?;
         write.commit()?;
-        pins.last_used.remove(&Root::Tree(id));
+        pins.usage.remove(&Root::Tree(id));
+        pins.dirty_usage.remove(&Root::Tree(id));
         drop(pins);
         Ok(Eviction::Removed {
             unreferenced_logical_bytes: bytes,

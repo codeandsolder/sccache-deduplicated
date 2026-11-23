@@ -101,6 +101,8 @@ max_metadata_bytes = 67108864
 [native_cache.space]
 min_available_bytes = 536870912
 target_available_bytes = 2147483648
+max_resident_bytes = 274877906944
+target_resident_bytes = 257698037760
 max_evictions_per_pass = 32
 gc_batch = 1024
 ```
@@ -132,9 +134,20 @@ max_metadata_bytes = 67108864
 [native_worker.space]
 min_available_bytes = 536870912
 target_available_bytes = 2147483648
+max_resident_bytes = 4294967296
+target_resident_bytes = 3221225472
 max_evictions_per_pass = 32
 gc_batch = 1024
 ```
+
+The native store uses one transactional index, lease/GC implementation, and
+usage-aware eviction policy on scheduler, worker and local executor. The
+resident budget counts uncompressed live blobs and queued garbage conservatively;
+ZFS separately compresses them and the filesystem free-space watermarks still
+apply. For actual physical cache isolation, place each store on a quota-managed
+dataset. Worker replicas are persistent and reuse the same verified blobs and
+package trees, fetching missing inputs only. Access frequency and recency are
+buffered and checkpointed during maintenance without write I/O on hits.
 
 The worker advertises the BLAKE3 digest of the exact platform contract.
 Clients use the same digest in `ExecutionSpec.platform`. The renewal

@@ -191,6 +191,8 @@ mod tests {
                 space: SpacePolicy {
                     min_available_bytes: 1,
                     target_available_bytes: 1,
+                    max_resident_bytes: u64::MAX,
+                    target_resident_bytes: u64::MAX,
                     max_evictions_per_pass: 1,
                     gc_batch: 1,
                 },

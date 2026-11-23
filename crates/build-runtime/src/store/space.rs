@@ -1,12 +1,15 @@
-//! Quota-aware admission. The filesystem, not summed logical blob lengths,
-//! reports allocatable bytes on compressed or block-cloned storage.
-use std::time::Instant;
+//! Shared resident-cache accounting, admission, and restart-safe reuse policy.
+//! ZFS controls physical compression and allocation. Logical byte limits are
+//! deliberately conservative and do not replace filesystem free-space checks.
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, ensure};
+use bincode::Options;
 use redb::{ReadableDatabase, ReadableTable};
+use serde::{Deserialize, Serialize};
 
-use super::{ACTIONS, Eviction, NativeStore, TREES};
-use crate::{ActionKey, SpacePolicy, TreeId};
+use super::{ACTIONS, ActionRecord, Eviction, NativeStore, RESULTS, TREES, USAGE, encoding};
+use crate::{ActionKey, ResultManifest, SpacePolicy, TreeId, TreeManifest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Root {
@@ -14,22 +17,67 @@ pub(super) enum Root {
     Tree(TreeId),
 }
 
+impl Root {
+    pub(super) fn key(self) -> [u8; 33] {
+        let mut out = [0; 33];
+        match self {
+            Self::Action(id) => {
+                out[0] = 0;
+                out[1..].copy_from_slice(&id.0);
+            }
+            Self::Tree(id) => {
+                out[0] = 1;
+                out[1..].copy_from_slice(&id.0);
+            }
+        }
+        out
+    }
+
+    pub(super) fn from_key(key: [u8; 33]) -> Result<Self> {
+        let mut digest = [0; 32];
+        digest.copy_from_slice(&key[1..]);
+        match key[0] {
+            0 => Ok(Self::Action(ActionKey(digest))),
+            1 => Ok(Self::Tree(TreeId(digest))),
+            _ => Err(anyhow!("invalid native usage root type")),
+        }
+    }
+}
+
+/// Usage is buffered in memory and checkpointed in a single transaction.
+/// Last access uses wall time only for eviction heuristics, never identity.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct UsageRecord {
+    hits: u64,
+    last_used_ms: u64,
+}
+
+fn now_ms() -> u64 {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(elapsed).unwrap_or(u64::MAX)
+}
+
 #[derive(Default)]
 pub(super) struct SpaceState {
     reserved: u64,
 }
 
-/// Result of a bounded physical-space maintenance pass.
+/// Result of a bounded physical-space and resident-content maintenance pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpaceReport {
     pub available_bytes: u64,
     pub reserved_bytes: u64,
+    pub resident_bytes: u64,
     pub evicted_roots: usize,
+    /// Both physical free space and resident-budget admission are satisfied.
     pub minimum_satisfied: bool,
 }
 
 impl NativeStore {
-    /// Open a store with filesystem-aware admission and retention.
+    /// Open a store with a managed resident budget and filesystem admission.
     ///
     /// # Errors
     /// Returns an error for invalid policy or storage initialization failure.
@@ -45,10 +93,42 @@ impl NativeStore {
             .context("available filesystem size overflow")
     }
 
-    /// Reclaim queued garbage, then evict least-recently-used unpinned roots
-    /// when free space is below the low watermark. Recheck real available
-    /// space after reclaiming; shared blocks, open inodes and snapshots may
-    /// prevent physical reclamation.
+    fn resident_bytes(&self) -> Result<u64> {
+        let stats = self.stats()?;
+        stats
+            .logical_bytes
+            .checked_add(stats.pending_gc_bytes)
+            .context("native resident byte overflow")
+    }
+
+    /// Persist only dirty usage records in one bounded write transaction,
+    /// avoiding synchronous database writes on cache hits.
+    ///
+    /// # Errors
+    /// Returns an error if the usage index is unavailable.
+    pub fn checkpoint_usage(&self) -> Result<()> {
+        let _mutation = self.inner.lock_mutations()?;
+        let mut pins = self.inner.lock_pins()?;
+        if pins.dirty_usage.is_empty() {
+            return Ok(());
+        }
+        let write = self.inner.db.begin_write()?;
+        {
+            let mut usage = write.open_table(USAGE)?;
+            for root in &pins.dirty_usage {
+                if let Some(record) = pins.usage.get(root) {
+                    let bytes = encoding().serialize(record)?;
+                    usage.insert(&root.key(), bytes.as_slice())?;
+                }
+            }
+        }
+        write.commit()?;
+        pins.dirty_usage.clear();
+        Ok(())
+    }
+
+    /// Reclaim queued garbage before considering eviction. Keep leases intact
+    /// and recheck filesystem allocation after each bounded GC pass.
     ///
     /// # Errors
     /// Returns an error for filesystem, index or synchronization failure.
@@ -56,6 +136,7 @@ impl NativeStore {
         let Some(policy) = self.inner.space_policy else {
             return Ok(None);
         };
+        self.checkpoint_usage()?;
         let state = self
             .inner
             .space
@@ -86,8 +167,12 @@ impl NativeStore {
             .context("native target space overflow")?;
         self.collect_garbage(policy.gc_batch)?;
         let mut free = available()?;
+        let mut resident = self
+            .resident_bytes()?
+            .checked_add(need)
+            .context("native resident reservation overflow")?;
         let mut evicted_roots = 0;
-        if free < minimum {
+        if free < minimum || resident > policy.max_resident_bytes {
             for root in self
                 .eviction_candidates()?
                 .into_iter()
@@ -101,7 +186,11 @@ impl NativeStore {
                     evicted_roots += 1;
                     self.collect_garbage(policy.gc_batch)?;
                     free = available()?;
-                    if free >= target {
+                    resident = self
+                        .resident_bytes()?
+                        .checked_add(need)
+                        .context("native resident reservation overflow")?;
+                    if free >= target && resident <= policy.target_resident_bytes {
                         break;
                     }
                 }
@@ -110,39 +199,92 @@ impl NativeStore {
         Ok(SpaceReport {
             available_bytes: free,
             reserved_bytes: reserved,
+            resident_bytes: resident,
             evicted_roots,
-            minimum_satisfied: free >= minimum,
+            minimum_satisfied: free >= minimum && resident <= policy.max_resident_bytes,
         })
     }
 
     fn eviction_candidates(&self) -> Result<Vec<Root>> {
-        // Snapshot only the rank and pin state. Actual eviction rechecks pins
-        // transactionally; ordinary lookups never take the space lock.
+        // Rank only under pressure. Do not scan manifests or write usage data
+        // on the critical lookup path.
         let read = self.inner.db.begin_read()?;
         let actions = read.open_table(ACTIONS)?;
+        let results = read.open_table(RESULTS)?;
         let trees = read.open_table(TREES)?;
         let pins = self.inner.lock_pins()?;
+        let observed = now_ms();
         let mut candidates = Vec::new();
         for entry in actions.iter()? {
-            let (key, _) = entry?;
+            let (key, value) = entry?;
             let key = ActionKey(*key.value());
             if !pins.actions.contains_key(&key) {
+                let record: ActionRecord = encoding().deserialize(value.value())?;
+                let manifest = results
+                    .get(&record.result.0)?
+                    .context("missing native eviction result")?;
+                let manifest: ResultManifest = encoding().deserialize(manifest.value())?;
+                let bytes = manifest.blobs()?.values().try_fold(0_u64, |acc, &n| {
+                    acc.checked_add(n).context("eviction action bytes overflow")
+                })?;
                 let root = Root::Action(key);
-                candidates.push((pins.last_used.get(&root).copied(), root));
+                let usage = pins.usage.get(&root);
+                candidates.push((
+                    reuse_utility(usage, bytes, observed),
+                    usage.map_or(0, |u| u.last_used_ms),
+                    root,
+                ));
             }
         }
         for entry in trees.iter()? {
-            let (id, _) = entry?;
+            let (id, value) = entry?;
             let id = TreeId(*id.value());
             if !pins.trees.contains_key(&id) {
+                let manifest: TreeManifest = encoding().deserialize(value.value())?;
+                let bytes = manifest.blobs()?.values().try_fold(0_u64, |acc, &n| {
+                    acc.checked_add(n).context("eviction tree bytes overflow")
+                })?;
                 let root = Root::Tree(id);
-                candidates.push((pins.last_used.get(&root).copied(), root));
+                let usage = pins.usage.get(&root);
+                candidates.push((
+                    reuse_utility(usage, bytes, observed),
+                    usage.map_or(0, |u| u.last_used_ms),
+                    root,
+                ));
             }
         }
         drop(pins);
-        // Unknown recency after restart sorts first. No synchronous DB write on a hit.
+        // Low expected future reuse per retained byte is evicted first.
         candidates.sort_unstable();
-        Ok(candidates.into_iter().map(|(_, root)| root).collect())
+        Ok(candidates.into_iter().map(|(_, _, root)| root).collect())
+    }
+}
+
+/// Higher scores mean more expected reuse benefit. Logarithmic hit and
+/// transport-size weights prevent an old, very popular artifact from becoming
+/// immortal; idle age eventually dominates. Zero-byte roots cannot release
+/// blob space and are evicted only after all useful candidates.
+fn reuse_utility(usage: Option<&UsageRecord>, bytes: u64, now: u64) -> u64 {
+    if bytes == 0 {
+        return u64::MAX;
+    }
+    let usage = usage.copied().unwrap_or_default();
+    let frequency = u64::from(usage.hits.max(1).ilog2()) + 1;
+    let size_mib = bytes.div_ceil(1 << 20);
+    let transfer_cost = u64::from(size_mib.ilog2()) + 1;
+    let idle_hours = now.saturating_sub(usage.last_used_ms) / 3_600_000;
+    frequency
+        .saturating_mul(transfer_cost)
+        .saturating_mul(1 << 16)
+        / idle_hours.saturating_add(1)
+}
+
+impl super::Pins {
+    pub(super) fn touch(&mut self, root: Root) {
+        let record = self.usage.entry(root).or_default();
+        record.hits = record.hits.saturating_add(1);
+        record.last_used_ms = now_ms();
+        self.dirty_usage.insert(root);
     }
 }
 
@@ -181,13 +323,18 @@ impl<'a> StageBudget<'a> {
             .min_available_bytes
             .checked_add(need)
             .context("native minimum space overflow")?;
-        if self.store.available_bytes()? < minimum {
+        let resident = self
+            .store
+            .resident_bytes()?
+            .checked_add(need)
+            .context("native resident reservation overflow")?;
+        if self.store.available_bytes()? < minimum || resident > policy.max_resident_bytes {
             let report = self.store.reclaim(policy, state.reserved, extra, || {
                 self.store.available_bytes()
             })?;
             ensure!(
                 report.minimum_satisfied,
-                "native store has insufficient allocatable space after bounded reclamation"
+                "native store has insufficient allocatable space or resident budget after bounded reclamation"
             );
         }
         state.reserved = need;
@@ -205,12 +352,6 @@ impl Drop for StageBudget<'_> {
                 Err(error) => log::error!("native space reservation release failed: {error}"),
             }
         }
-    }
-}
-
-impl super::Pins {
-    pub(super) fn touch(&mut self, root: Root) {
-        self.last_used.insert(root, Instant::now());
     }
 }
 

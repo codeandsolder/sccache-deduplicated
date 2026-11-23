@@ -10,6 +10,8 @@ fn policy() -> SpacePolicy {
     SpacePolicy {
         min_available_bytes: 100,
         target_available_bytes: 200,
+        max_resident_bytes: u64::MAX,
+        target_resident_bytes: u64::MAX,
         max_evictions_per_pass: 4,
         gc_batch: 16,
     }
@@ -121,5 +123,112 @@ fn managed_staging_reservations_are_released_and_oversize_rejected() -> Result<(
         &b"abc"[..],
     )?;
     assert_eq!(blob.reference().size, 3);
+    Ok(())
+}
+
+#[test]
+fn reuse_favors_a_hot_root_over_a_newer_cold_root() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = NativeStore::open(temp.path())?;
+    let hot = publish(&store, "hot")?;
+    for _ in 0..32 {
+        drop(store.lookup(hot)?.context("missing hot action")?);
+    }
+    let cold = publish(&store, "cold")?;
+    let mut limit = policy();
+    limit.max_evictions_per_pass = 1;
+    let report = store.reclaim(limit, 0, 0, || {
+        Ok(if store.stats()?.actions == 2 { 0 } else { 300 })
+    })?;
+    assert_eq!(report.evicted_roots, 1);
+    assert!(store.lookup(hot)?.is_some());
+    assert!(store.lookup(cold)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn usage_survives_restart_and_is_removed_with_evicted_roots() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (hot, cold) = {
+        let store = NativeStore::open(temp.path())?;
+        let hot = publish(&store, "hot")?;
+        for _ in 0..32 {
+            drop(store.lookup(hot)?.context("missing hot action")?);
+        }
+        let cold = publish(&store, "cold")?;
+        store.checkpoint_usage()?;
+        (hot, cold)
+    };
+    let store = NativeStore::open(temp.path())?;
+    let usage = store.inner.lock_pins()?;
+    assert!(
+        usage
+            .usage
+            .get(&Root::Action(hot))
+            .context("usage lost")?
+            .hits
+            > 32
+    );
+    drop(usage);
+    let mut limit = policy();
+    limit.max_evictions_per_pass = 1;
+    let report = store.reclaim(limit, 0, 0, || {
+        Ok(if store.stats()?.actions == 2 { 0 } else { 300 })
+    })?;
+    assert_eq!(report.evicted_roots, 1);
+    assert!(store.lookup(hot)?.is_some());
+    assert!(store.lookup(cold)?.is_none());
+    drop(store);
+    let restored = NativeStore::open(temp.path())?;
+    assert!(
+        restored
+            .inner
+            .lock_pins()?
+            .usage
+            .get(&Root::Action(cold))
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn resident_limit_evicts_even_when_filesystem_has_plenty_of_space() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = NativeStore::open(temp.path())?;
+    let first = publish(&store, "aaa")?;
+    let second = publish(&store, "bbb")?;
+    let newest = publish(&store, "ccccc")?;
+    for _ in 0..16 {
+        drop(store.lookup(newest)?.context("missing hot new root")?);
+    }
+    let mut limit = policy();
+    limit.max_resident_bytes = 8;
+    limit.target_resident_bytes = 6;
+    let report = store.reclaim(limit, 0, 0, || Ok(100_000))?;
+    assert!(report.minimum_satisfied);
+    assert_eq!(report.evicted_roots, 2);
+    assert!(report.resident_bytes <= 6);
+    assert!(store.lookup(first)?.is_none());
+    assert!(store.lookup(second)?.is_none());
+    assert!(store.lookup(newest)?.is_some());
+    Ok(())
+}
+
+#[test]
+fn active_content_is_never_evicted_to_meet_a_worker_budget() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = NativeStore::open(temp.path())?;
+    let keep = publish(&store, "keep")?;
+    let pin = store.lookup(keep)?.context("missing pinned action")?;
+    let mut limit = policy();
+    limit.max_resident_bytes = 1;
+    limit.target_resident_bytes = 1;
+    let report = store.reclaim(limit, 0, 0, || Ok(100_000))?;
+    assert_eq!(report.evicted_roots, 0);
+    assert!(!report.minimum_satisfied);
+    drop(pin);
+    let report = store.reclaim(limit, 0, 0, || Ok(100_000))?;
+    assert!(report.minimum_satisfied);
+    assert_eq!(report.resident_bytes, 0);
     Ok(())
 }
