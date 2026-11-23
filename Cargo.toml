@@ -73,7 +73,7 @@ jwt = { package = "jsonwebtoken", version = "12", optional = true, features = [
 libc = "0.2.153"
 linked-hash-map = "0.5"
 log = "0.4"
-lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "b15ed618158cbee1d194df26329cc6f41e6e8d21", optional = true }
+lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "d960b4c7b41592b134a6deee3bd9dae57516eb38", optional = true }
 memchr = "2"
 mime = "0.3"
 object = "0.41"
