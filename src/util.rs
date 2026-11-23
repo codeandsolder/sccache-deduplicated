@@ -319,11 +319,10 @@ impl TimeMacroFinder {
     /// only within the last `MAX_HAYSTACK_LEN - 1` previous bytes and the
     /// first `MAX_HAYSTACK_LEN - 1` new bytes.
     pub fn find_time_macros(&mut self, visit: &[u8]) {
+        const OVERLAP: usize = MAX_HAYSTACK_LEN - 1;
         if visit.is_empty() || self.found_date && self.found_time && self.found_timestamp {
             return;
         }
-
-        const OVERLAP: usize = MAX_HAYSTACK_LEN - 1;
         let prefix_len = visit.len().min(OVERLAP);
         let mut boundary = [0; OVERLAP * 2];
         boundary[..self.suffix_len].copy_from_slice(&self.suffix[..self.suffix_len]);
@@ -357,18 +356,22 @@ impl TimeMacroFinder {
         }
     }
 
+    #[must_use = "the caller must observe whether a time-dependent macro was detected"]
     pub const fn found_time_macros(&self) -> bool {
         self.found_date() || self.found_time() || self.found_timestamp()
     }
 
+    #[must_use = "the caller must observe whether __TIME__ was detected"]
     pub const fn found_time(&self) -> bool {
         self.found_time
     }
 
+    #[must_use = "the caller must observe whether __DATE__ was detected"]
     pub const fn found_date(&self) -> bool {
         self.found_date
     }
 
+    #[must_use = "the caller must observe whether __TIMESTAMP__ was detected"]
     pub const fn found_timestamp(&self) -> bool {
         self.found_timestamp
     }
