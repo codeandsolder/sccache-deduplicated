@@ -38,7 +38,7 @@ use log::Level::Trace;
 use regex::Regex;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::io::BufRead;
+use std::io::{self, BufRead};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -518,6 +518,205 @@ pub struct NvccCompileCommand {
     pub output_file_name: OsString,
 }
 
+/// Publish NVCC's scratch entries into the user's --keep directory. A failed
+/// entry must not stop independent intermediates from being preserved.
+fn preserve_nvcc_intermediates(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination).with_context(|| {
+        format!(
+            "create NVCC intermediate destination {}",
+            destination.display()
+        )
+    })?;
+    let mut failures = Vec::new();
+    for entry in fs::read_dir(source)? {
+        match entry {
+            Ok(entry) => {
+                let from = entry.path();
+                let to = destination.join(entry.file_name());
+                if let Err(error) = move_nvcc_intermediate(&from, &to) {
+                    failures.push(format!("{}: {error:#}", from.display()));
+                }
+            }
+            Err(error) => failures.push(format!("read NVCC scratch entry: {error}")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{} NVCC intermediate(s) could not be preserved: {}",
+            failures.len(),
+            failures.join("; ")
+        ))
+    }
+}
+
+fn move_nvcc_intermediate(source: &Path, destination: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    match fs::rename(source, destination) {
+        Ok(()) => return Ok(()),
+        Err(error) => {
+            // A cross-filesystem move needs a copy. Existing destinations
+            // also require an explicit replacement or directory merge.
+            if error.kind() != io::ErrorKind::CrossesDevices
+                && fs::symlink_metadata(destination).is_err()
+            {
+                return Err(error)
+                    .with_context(|| format!("rename NVCC intermediate {}", source.display()));
+            }
+        }
+    }
+
+    let ty = metadata.file_type();
+    if ty.is_file() {
+        copy_nvcc_regular(source, destination, &metadata)?;
+    } else if ty.is_symlink() {
+        copy_nvcc_symlink(source, destination)?;
+    } else if ty.is_dir() {
+        merge_nvcc_directory(source, destination, &metadata)?;
+    } else {
+        return Err(anyhow!(
+            "unsupported NVCC scratch entry type: {}",
+            source.display()
+        ));
+    }
+    Ok(())
+}
+
+fn nvcc_file_times(metadata: &std::fs::Metadata) -> io::Result<std::fs::FileTimes> {
+    Ok(std::fs::FileTimes::new()
+        .set_accessed(metadata.accessed()?)
+        .set_modified(metadata.modified()?))
+}
+
+fn copy_nvcc_regular(
+    source: &Path,
+    destination: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<()> {
+    let parent = destination
+        .parent()
+        .context("NVCC destination has no parent")?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(".sccache-nvcc-keep-")
+        .tempfile_in(parent)?;
+    io::copy(&mut fs::File::open(source)?, staged.as_file_mut())?;
+    staged.as_file().set_times(nvcc_file_times(metadata)?)?;
+    staged.as_file().set_permissions(metadata.permissions())?;
+    staged.persist(destination).map_err(|error| error.error)?;
+    if let Err(error) = fs::remove_file(source) {
+        log::warn!(
+            "Could not clean copied NVCC scratch file {}: {error}",
+            source.display()
+        );
+    }
+    Ok(())
+}
+
+fn copy_nvcc_symlink(source: &Path, destination: &Path) -> Result<()> {
+    let parent = destination
+        .parent()
+        .context("NVCC destination has no parent")?;
+    let staged = tempfile::Builder::new()
+        .prefix(".sccache-nvcc-keep-")
+        .tempfile_in(parent)?
+        .into_temp_path();
+    fs::remove_file(&staged)?;
+    let target = fs::read_link(source)?;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &staged)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, symlink_dir, symlink_file};
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+        let metadata = fs::symlink_metadata(source)?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            symlink_dir(&target, &staged)?;
+        } else {
+            symlink_file(&target, &staged)?;
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    return Err(anyhow!("cannot preserve NVCC symlinks on this platform"));
+    staged.persist(destination).map_err(|error| error.error)?;
+    if let Err(error) = fs::remove_file(source) {
+        log::warn!(
+            "Could not clean copied NVCC scratch symlink {}: {error}",
+            source.display()
+        );
+    }
+    Ok(())
+}
+
+fn nvcc_directory_times(destination: &Path, metadata: &std::fs::Metadata) -> Result<()> {
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(destination)?
+    };
+    #[cfg(not(windows))]
+    let file = fs::File::open(destination)?;
+    file.set_times(nvcc_file_times(metadata)?)?;
+    fs::set_permissions(destination, metadata.permissions())?;
+    Ok(())
+}
+
+fn merge_nvcc_directory(
+    source: &Path,
+    destination: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<()> {
+    let newly_created = match fs::symlink_metadata(destination) {
+        Ok(existing) if existing.is_dir() => false,
+        Ok(_) => {
+            return Err(anyhow!(
+                "NVCC destination is not a directory: {}",
+                destination.display()
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(destination)?;
+            true
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut failures = Vec::new();
+    for entry in fs::read_dir(source)? {
+        match entry {
+            Ok(entry) => {
+                let from = entry.path();
+                if let Err(error) =
+                    move_nvcc_intermediate(&from, &destination.join(entry.file_name()))
+                {
+                    failures.push(format!("{}: {error:#}", from.display()));
+                }
+            }
+            Err(error) => failures.push(format!("read NVCC nested scratch entry: {error}")),
+        }
+    }
+    if !failures.is_empty() {
+        return Err(anyhow!(
+            "{} NVCC nested intermediate(s) failed: {}",
+            failures.len(),
+            failures.join("; ")
+        ));
+    }
+    if newly_created {
+        nvcc_directory_times(destination, metadata)?;
+    }
+    if let Err(error) = fs::remove_dir(source) {
+        log::warn!(
+            "Could not clean copied NVCC scratch directory {}: {error}",
+            source.display()
+        );
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl CompileCommandImpl for NvccCompileCommand {
     fn get_executable(&self) -> PathBuf {
@@ -569,29 +768,6 @@ impl CompileCommandImpl for NvccCompileCommand {
             })
             .await?;
 
-        let maybe_keep_temps = || {
-            // If the caller passed `-keep` or `-keep-dir`, copy the
-            // temp files to the requested location. We do this because we
-            // override `-keep` and `-keep-dir` in our `nvcc --dryrun` call.
-            if let Some(dst) = keep_dir.as_ref() {
-                // The TempDir owner deletes every remaining file on last drop.
-                if let Err(err) = fs::create_dir_all(dst)
-                    .and_then(|()| fs::read_dir(temp_dir.path()))
-                    .and_then(|mut files| {
-                        files.try_fold((), |(), entry| {
-                            let entry = entry?;
-                            fs::rename(entry.path(), dst.join(entry.file_name()))
-                        })
-                    })
-                {
-                    log::warn!(
-                        "Could not preserve NVCC intermediate files in {}: {err}",
-                        dst.display()
-                    );
-                }
-            }
-        };
-
         let mut output = process::Output {
             status: process::ExitStatus::default(),
             stdout: vec![],
@@ -605,7 +781,7 @@ impl CompileCommandImpl for NvccCompileCommand {
 
         let num_parallel = effective_nvcc_threads(*num_parallel, device_compile_range.len());
 
-        for command_group_chunks in [
+        'stages: for command_group_chunks in [
             nvcc_subcommand_groups[cuda_front_end_range].chunks(1),
             // compile multiple device architectures in parallel when `nvcc -t=N` is specified
             nvcc_subcommand_groups[device_compile_range].chunks(num_parallel),
@@ -622,17 +798,35 @@ impl CompileCommandImpl for NvccCompileCommand {
                 }
 
                 if !output.status.success() {
-                    output.stdout.shrink_to_fit();
-                    output.stderr.shrink_to_fit();
-                    maybe_keep_temps();
-                    return Err(ProcessError(output).into());
+                    break 'stages;
                 }
             }
         }
 
         output.stdout.shrink_to_fit();
         output.stderr.shrink_to_fit();
-        maybe_keep_temps();
+        let preserved = if let Some(destination) = keep_dir {
+            // Copying potentially large device intermediates must not block
+            // Tokio worker threads while other builds are in progress.
+            let scratch = Arc::clone(temp_dir);
+            let destination = destination.clone();
+            tokio::task::spawn_blocking(move || {
+                preserve_nvcc_intermediates(scratch.path(), &destination)
+            })
+            .await?
+        } else {
+            Ok(())
+        };
+        if !output.status.success() {
+            let failure = anyhow::Error::new(ProcessError(output));
+            return Err(match preserved {
+                Ok(()) => failure,
+                Err(error) => failure.context(format!(
+                    "NVCC compilation failed and preserving intermediates also failed: {error:#}"
+                )),
+            });
+        }
+        preserved?;
         Ok(output)
     }
 }
@@ -1540,6 +1734,134 @@ mod test {
     use crate::test::utils::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn nvcc_keep_merges_existing_destinations_and_preserves_metadata() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let scratch = fixture.path().join("scratch");
+        let destination = fixture.path().join("kept");
+        fs::create_dir_all(scratch.join("nested/deep"))?;
+        fs::create_dir_all(destination.join("nested"))?;
+        fs::write(scratch.join("nested/deep/device.ptx"), b"device-stage")?;
+        fs::write(scratch.join("nested/replace.ptx"), b"new-intermediate")?;
+        fs::write(destination.join("nested/replace.ptx"), b"old-intermediate")?;
+        fs::write(destination.join("unrelated.txt"), b"existing")?;
+        let stage = scratch.join("nested/replace.ptx");
+        let modified =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_500_000_000);
+        std::fs::File::open(&stage)?.set_times(std::fs::FileTimes::new().set_modified(modified))?;
+        #[cfg(unix)]
+        fs::set_permissions(&stage, fs::Permissions::from_mode(0o640))?;
+
+        preserve_nvcc_intermediates(&scratch, &destination)?;
+        let copied = destination.join("nested/replace.ptx");
+        assert_eq!(fs::read(&copied)?, b"new-intermediate");
+        assert_eq!(
+            fs::read(destination.join("nested/deep/device.ptx"))?,
+            b"device-stage"
+        );
+        assert_eq!(fs::read(destination.join("unrelated.txt"))?, b"existing");
+        assert_eq!(fs::metadata(&copied)?.modified()?, modified);
+        #[cfg(unix)]
+        assert_eq!(fs::metadata(&copied)?.permissions().mode() & 0o777, 0o640);
+        assert!(fs::read_dir(&scratch)?.next().is_none());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nvcc_keep_preserves_non_utf8_filenames_and_symlinks() -> Result<()> {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir()?;
+        let scratch = fixture.path().join("scratch");
+        let destination = fixture.path().join("kept");
+        fs::create_dir_all(&scratch)?;
+        let odd = OsString::from_vec(vec![b'f', b'i', b'l', b'e', 0xff]);
+        fs::write(scratch.join(&odd), b"nonutf8")?;
+        symlink("missing target", scratch.join("dangling"))?;
+        preserve_nvcc_intermediates(&scratch, &destination)?;
+        assert_eq!(fs::read(destination.join(&odd))?, b"nonutf8");
+        assert_eq!(
+            fs::read_link(destination.join("dangling"))?,
+            PathBuf::from("missing target")
+        );
+        assert!(!scratch.join("dangling").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn nvcc_keep_reports_partial_failures_but_preserves_independent_entries() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let scratch = fixture.path().join("scratch");
+        let destination = fixture.path().join("kept");
+        fs::create_dir_all(scratch.join("nested/blocked"))?;
+        fs::create_dir_all(destination.join("nested"))?;
+        fs::write(scratch.join("nested/blocked/device.ptx"), b"not-preserved")?;
+        fs::write(destination.join("nested/blocked"), b"conflicting-file")?;
+        fs::write(scratch.join("nested/ok.ptx"), b"preserved")?;
+        fs::write(scratch.join("independent.ptx"), b"other-stage")?;
+
+        let err = preserve_nvcc_intermediates(&scratch, &destination)
+            .expect_err("colliding directory and file must be reported");
+        let diagnostic = format!("{err:#}");
+        assert!(diagnostic.contains("blocked"), "{diagnostic}");
+        assert_eq!(
+            fs::read(destination.join("nested/blocked"))?,
+            b"conflicting-file"
+        );
+        assert_eq!(fs::read(destination.join("nested/ok.ptx"))?, b"preserved");
+        assert_eq!(
+            fs::read(destination.join("independent.ptx"))?,
+            b"other-stage"
+        );
+        assert!(scratch.join("nested/blocked/device.ptx").exists());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nvcc_keep_copies_across_distinct_filesystems() -> Result<()> {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let scratch = tempfile::tempdir()?;
+        let source_dev = fs::metadata(scratch.path())?.dev();
+        let mut other = None;
+        for line in fs::read_to_string("/proc/self/mountinfo")?.lines() {
+            let Some(mount) = line.split_whitespace().nth(4) else {
+                continue;
+            };
+            let mount = mount.replace(r" ", " ").replace(r"	", "	");
+            let root = Path::new(&mount);
+            if fs::metadata(root).is_ok_and(|metadata| metadata.dev() != source_dev)
+                && let Ok(dir) = tempfile::tempdir_in(root)
+            {
+                other = Some(dir);
+                break;
+            }
+        }
+        let Some(other) = other else {
+            eprintln!("No second writable filesystem mounted; skipping EXDEV fixture");
+            return Ok(());
+        };
+        let destination = other.path().join("kept");
+        fs::create_dir_all(scratch.path().join("nested"))?;
+        fs::write(scratch.path().join("kernel.ptx"), b"kernel")?;
+        fs::write(scratch.path().join("nested/source.cudafe1.c"), b"generated")?;
+        symlink("kernel.ptx", scratch.path().join("link.ptx"))?;
+        preserve_nvcc_intermediates(scratch.path(), &destination)?;
+        assert_eq!(fs::read(destination.join("kernel.ptx"))?, b"kernel");
+        assert_eq!(
+            fs::read(destination.join("nested/source.cudafe1.c"))?,
+            b"generated"
+        );
+        assert_eq!(
+            fs::read_link(destination.join("link.ptx"))?,
+            PathBuf::from("kernel.ptx")
+        );
+        assert!(fs::read_dir(scratch.path())?.next().is_none());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn nvcc_scratch_dir_is_removed_after_last_clone_and_cancellation() -> Result<()> {
