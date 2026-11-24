@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::job_telemetry;
 use anyhow::{Context, Result, bail};
+use sccache::dist::JobId;
 use std::process::{ChildStdin, Command, Output, Stdio};
 
 pub(super) trait CommandExt {
@@ -66,6 +68,7 @@ impl CommandExt for Command {
 
 /// Append a compiler invocation after a container's clean-environment command.
 pub(super) fn run_with_environment(
+    job_id: JobId,
     command: &mut Command,
     environment: Vec<(String, String)>,
     executable: String,
@@ -80,8 +83,7 @@ pub(super) fn run_with_environment(
         command.arg(key);
     }
     command.arg(executable).args(arguments);
-    command
-        .output()
+    job_telemetry::run_external_container(job_id, command)
         .context("Failed to start executing compile")
 }
 

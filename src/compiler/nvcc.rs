@@ -29,7 +29,7 @@ use crate::compiler::{
     cicc, gcc,
 };
 use crate::mock_command::{CommandCreatorSync, ExitStatusValue, RunCommand, exit_status};
-use crate::util::{OsStrExt, resolve_compiler_avoiding_wrapper, run_input_output};
+use crate::util::{resolve_compiler_avoiding_wrapper, run_input_output};
 use crate::{counted_array, dist, protocol, server};
 use async_trait::async_trait;
 use fs_err as fs;
@@ -38,11 +38,12 @@ use log::Level::Trace;
 use regex::Regex;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::io::BufRead;
+use std::io::{self, BufRead};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
 use which::which_in;
 
 #[cfg(test)]
@@ -292,6 +293,55 @@ impl CCompilerImpl for Nvcc {
     }
 }
 
+/// Strip only NVCC thread-control options from the dry-run arguments and
+/// retain their original order when applying the last-option-wins rule.
+fn extract_nvcc_threads(args: &mut Vec<OsString>) -> Result<usize> {
+    let mut remaining = Vec::with_capacity(args.len());
+    let mut options = std::mem::take(args).into_iter();
+    let mut threads = 1;
+    while let Some(arg) = options.next() {
+        let value = match arg.to_str() {
+            Some("-t" | "--threads") => options
+                .next()
+                .context("NVCC -t/--threads requires a numeric value")?,
+            Some(flag) => {
+                let count = flag
+                    .strip_prefix("-t=")
+                    .or_else(|| flag.strip_prefix("--threads="))
+                    .or_else(|| {
+                        flag.strip_prefix("-t").filter(|suffix| {
+                            suffix.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                        })
+                    });
+                let Some(count) = count else {
+                    remaining.push(arg);
+                    continue;
+                };
+                OsString::from(count)
+            }
+            None => {
+                remaining.push(arg);
+                continue;
+            }
+        };
+        threads = value
+            .to_str()
+            .context("NVCC thread count is not valid UTF-8")?
+            .parse::<usize>()
+            .context("NVCC -t/--threads requires a non-negative integer")?;
+    }
+    *args = remaining;
+    Ok(threads)
+}
+fn effective_nvcc_threads(requested: usize, device_groups: usize) -> usize {
+    let available = if requested == 0 {
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+    } else {
+        requested
+    };
+    // chunks(0) would panic when a compilation has no device-stage groups.
+    device_groups.min(available).max(1)
+}
 #[expect(
     clippy::too_many_lines,
     reason = "NVCC expands one logical compile into an ordered multi-stage command graph; keeping stage construction contiguous makes dependencies visible"
@@ -345,53 +395,13 @@ pub fn generate_compile_commands(
         keep.then_some(()).and(keep_dir)
     };
 
-    let num_parallel = {
-        let mut num_parallel = 1;
-        // Remove all occurrences of `-t=` or `--threads` because it's incompatible with --dryrun
-        // Prefer the last occurrence of `-t=` or `--threads` to match nvcc behavior
-        loop {
-            if let Some(idx) = unhashed_args.iter().position(|x| x.starts_with("-t")) {
-                let arg = unhashed_args.get(idx);
-                if let Some(arg) = arg.and_then(|arg| arg.to_str()) {
-                    let range = if arg.contains('=') {
-                        3..arg.len()
-                    } else {
-                        2..arg.len()
-                    };
-                    if let Ok(arg) = arg[range].parse::<usize>() {
-                        num_parallel = arg;
-                    }
-                }
-                unhashed_args.splice(idx..=idx, []);
-                continue;
-            }
-            if let Some(idx) = unhashed_args.iter().position(|x| x == "--threads") {
-                let arg = unhashed_args
-                    .get(idx + 1)
-                    .context("NVCC --threads requires a numeric value")?
-                    .to_str()
-                    .context("NVCC --threads value is not valid UTF-8")?;
-                if let Ok(arg) = arg.parse::<usize>() {
-                    num_parallel = arg;
-                }
-                unhashed_args.splice(idx..(idx + 2), []);
-                continue;
-            }
-            break;
-        }
-        num_parallel
-    };
+    let num_parallel = extract_nvcc_threads(&mut unhashed_args)?;
 
     let env_vars = env_vars
         .iter()
         .filter(|(k, _)| k != "NVCC_PREPEND_FLAGS" && k != "NVCC_APPEND_FLAGS")
         .cloned()
         .collect::<Vec<_>>();
-
-    let temp_dir = tempfile::Builder::new()
-        .prefix("sccache_nvcc")
-        .tempdir()?
-        .keep();
 
     let mut arguments = vec![];
 
@@ -460,6 +470,10 @@ pub fn generate_compile_commands(
     };
     arguments.push(input.into());
 
+    // Keep the scratch directory owned until the final command clone is dropped.
+    // All validation errors above must leave no persisted scratch files.
+    let temp_dir = Arc::new(tempfile::Builder::new().prefix("sccache_nvcc").tempdir()?);
+
     let command = NvccCompileCommand {
         temp_dir,
         keep_dir,
@@ -492,7 +506,7 @@ pub fn generate_compile_commands(
 
 #[derive(Clone, Debug)]
 pub struct NvccCompileCommand {
-    pub temp_dir: PathBuf,
+    pub temp_dir: Arc<tempfile::TempDir>,
     pub keep_dir: Option<PathBuf>,
     pub num_parallel: usize,
     pub executable: PathBuf,
@@ -502,6 +516,205 @@ pub struct NvccCompileCommand {
     pub cwd: PathBuf,
     pub host_compiler: NvccHostCompiler,
     pub output_file_name: OsString,
+}
+
+/// Publish NVCC's scratch entries into the user's --keep directory. A failed
+/// entry must not stop independent intermediates from being preserved.
+fn preserve_nvcc_intermediates(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination).with_context(|| {
+        format!(
+            "create NVCC intermediate destination {}",
+            destination.display()
+        )
+    })?;
+    let mut failures = Vec::new();
+    for entry in fs::read_dir(source)? {
+        match entry {
+            Ok(entry) => {
+                let from = entry.path();
+                let to = destination.join(entry.file_name());
+                if let Err(error) = move_nvcc_intermediate(&from, &to) {
+                    failures.push(format!("{}: {error:#}", from.display()));
+                }
+            }
+            Err(error) => failures.push(format!("read NVCC scratch entry: {error}")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{} NVCC intermediate(s) could not be preserved: {}",
+            failures.len(),
+            failures.join("; ")
+        ))
+    }
+}
+
+fn move_nvcc_intermediate(source: &Path, destination: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    match fs::rename(source, destination) {
+        Ok(()) => return Ok(()),
+        Err(error) => {
+            // A cross-filesystem move needs a copy. Existing destinations
+            // also require an explicit replacement or directory merge.
+            if error.kind() != io::ErrorKind::CrossesDevices
+                && fs::symlink_metadata(destination).is_err()
+            {
+                return Err(error)
+                    .with_context(|| format!("rename NVCC intermediate {}", source.display()));
+            }
+        }
+    }
+
+    let ty = metadata.file_type();
+    if ty.is_file() {
+        copy_nvcc_regular(source, destination, &metadata)?;
+    } else if ty.is_symlink() {
+        copy_nvcc_symlink(source, destination)?;
+    } else if ty.is_dir() {
+        merge_nvcc_directory(source, destination, &metadata)?;
+    } else {
+        return Err(anyhow!(
+            "unsupported NVCC scratch entry type: {}",
+            source.display()
+        ));
+    }
+    Ok(())
+}
+
+fn nvcc_file_times(metadata: &std::fs::Metadata) -> io::Result<std::fs::FileTimes> {
+    Ok(std::fs::FileTimes::new()
+        .set_accessed(metadata.accessed()?)
+        .set_modified(metadata.modified()?))
+}
+
+fn copy_nvcc_regular(
+    source: &Path,
+    destination: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<()> {
+    let parent = destination
+        .parent()
+        .context("NVCC destination has no parent")?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(".sccache-nvcc-keep-")
+        .tempfile_in(parent)?;
+    io::copy(&mut fs::File::open(source)?, staged.as_file_mut())?;
+    staged.as_file().set_times(nvcc_file_times(metadata)?)?;
+    staged.as_file().set_permissions(metadata.permissions())?;
+    staged.persist(destination).map_err(|error| error.error)?;
+    if let Err(error) = fs::remove_file(source) {
+        log::warn!(
+            "Could not clean copied NVCC scratch file {}: {error}",
+            source.display()
+        );
+    }
+    Ok(())
+}
+
+fn copy_nvcc_symlink(source: &Path, destination: &Path) -> Result<()> {
+    let parent = destination
+        .parent()
+        .context("NVCC destination has no parent")?;
+    let staged = tempfile::Builder::new()
+        .prefix(".sccache-nvcc-keep-")
+        .tempfile_in(parent)?
+        .into_temp_path();
+    fs::remove_file(&staged)?;
+    let target = fs::read_link(source)?;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &staged)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, symlink_dir, symlink_file};
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+        let metadata = fs::symlink_metadata(source)?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            symlink_dir(&target, &staged)?;
+        } else {
+            symlink_file(&target, &staged)?;
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    return Err(anyhow!("cannot preserve NVCC symlinks on this platform"));
+    staged.persist(destination).map_err(|error| error.error)?;
+    if let Err(error) = fs::remove_file(source) {
+        log::warn!(
+            "Could not clean copied NVCC scratch symlink {}: {error}",
+            source.display()
+        );
+    }
+    Ok(())
+}
+
+fn nvcc_directory_times(destination: &Path, metadata: &std::fs::Metadata) -> Result<()> {
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(destination)?
+    };
+    #[cfg(not(windows))]
+    let file = fs::File::open(destination)?;
+    file.set_times(nvcc_file_times(metadata)?)?;
+    fs::set_permissions(destination, metadata.permissions())?;
+    Ok(())
+}
+
+fn merge_nvcc_directory(
+    source: &Path,
+    destination: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<()> {
+    let newly_created = match fs::symlink_metadata(destination) {
+        Ok(existing) if existing.is_dir() => false,
+        Ok(_) => {
+            return Err(anyhow!(
+                "NVCC destination is not a directory: {}",
+                destination.display()
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(destination)?;
+            true
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut failures = Vec::new();
+    for entry in fs::read_dir(source)? {
+        match entry {
+            Ok(entry) => {
+                let from = entry.path();
+                if let Err(error) =
+                    move_nvcc_intermediate(&from, &destination.join(entry.file_name()))
+                {
+                    failures.push(format!("{}: {error:#}", from.display()));
+                }
+            }
+            Err(error) => failures.push(format!("read NVCC nested scratch entry: {error}")),
+        }
+    }
+    if !failures.is_empty() {
+        return Err(anyhow!(
+            "{} NVCC nested intermediate(s) failed: {}",
+            failures.len(),
+            failures.join("; ")
+        ));
+    }
+    if newly_created {
+        nvcc_directory_times(destination, metadata)?;
+    }
+    if let Err(error) = fs::remove_dir(source) {
+        log::warn!(
+            "Could not clean copied NVCC scratch directory {}: {error}",
+            source.display()
+        );
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -547,41 +760,13 @@ impl CompileCommandImpl for NvccCompileCommand {
                 arguments,
                 compilation_flag,
                 cwd,
-                tmp: temp_dir.as_path(),
+                tmp: temp_dir.path(),
                 keep_dir: keep_dir.as_deref(),
                 env_vars,
                 host_compiler,
                 output_file_name,
             })
             .await?;
-
-        let maybe_keep_temps_then_clean = || {
-            // If the caller passed `-keep` or `-keep-dir`, copy the
-            // temp files to the requested location. We do this because we
-            // override `-keep` and `-keep-dir` in our `nvcc --dryrun` call.
-            let maybe_keep_temps = keep_dir.as_ref().and_then(|dst| {
-                fs::create_dir_all(dst)
-                    .and_then(|()| fs::read_dir(temp_dir))
-                    .and_then(|files| {
-                        files
-                            .filter_map(std::result::Result::ok)
-                            .filter_map(|path| {
-                                path.file_name()
-                                    .to_str()
-                                    .map(|file| (path.path(), file.to_owned()))
-                            })
-                            .try_fold((), |(), (path, file)| fs::rename(path, dst.join(file)))
-                    })
-                    .ok()
-            });
-
-            maybe_keep_temps
-                .map_or_else(
-                    || fs::remove_dir_all(temp_dir).ok(),
-                    |()| fs::remove_dir_all(temp_dir).ok(),
-                )
-                .unwrap_or(());
-        };
 
         let mut output = process::Output {
             status: process::ExitStatus::default(),
@@ -594,9 +779,9 @@ impl CompileCommandImpl for NvccCompileCommand {
         let final_assembly_range = if n > 1 { n - 1..n } else { 0..0 };
         let device_compile_range = if n > 2 { 1..n - 1 } else { 0..0 };
 
-        let num_parallel = device_compile_range.len().min(*num_parallel).max(1);
+        let num_parallel = effective_nvcc_threads(*num_parallel, device_compile_range.len());
 
-        for command_group_chunks in [
+        'stages: for command_group_chunks in [
             nvcc_subcommand_groups[cuda_front_end_range].chunks(1),
             // compile multiple device architectures in parallel when `nvcc -t=N` is specified
             nvcc_subcommand_groups[device_compile_range].chunks(num_parallel),
@@ -613,17 +798,35 @@ impl CompileCommandImpl for NvccCompileCommand {
                 }
 
                 if !output.status.success() {
-                    output.stdout.shrink_to_fit();
-                    output.stderr.shrink_to_fit();
-                    maybe_keep_temps_then_clean();
-                    return Err(ProcessError(output).into());
+                    break 'stages;
                 }
             }
         }
 
         output.stdout.shrink_to_fit();
         output.stderr.shrink_to_fit();
-        maybe_keep_temps_then_clean();
+        let preserved = if let Some(destination) = keep_dir {
+            // Copying potentially large device intermediates must not block
+            // Tokio worker threads while other builds are in progress.
+            let scratch = Arc::clone(temp_dir);
+            let destination = destination.clone();
+            tokio::task::spawn_blocking(move || {
+                preserve_nvcc_intermediates(scratch.path(), &destination)
+            })
+            .await?
+        } else {
+            Ok(())
+        };
+        if !output.status.success() {
+            let failure = anyhow::Error::new(ProcessError(output));
+            return Err(match preserved {
+                Ok(()) => failure,
+                Err(error) => failure.context(format!(
+                    "NVCC compilation failed and preserving intermediates also failed: {error:#}"
+                )),
+            });
+        }
+        preserved?;
         Ok(output)
     }
 }
@@ -1532,6 +1735,177 @@ mod test {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[test]
+    fn nvcc_keep_merges_existing_destinations_and_preserves_metadata() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let scratch = fixture.path().join("scratch");
+        let destination = fixture.path().join("kept");
+        fs::create_dir_all(scratch.join("nested/deep"))?;
+        fs::create_dir_all(destination.join("nested"))?;
+        fs::write(scratch.join("nested/deep/device.ptx"), b"device-stage")?;
+        fs::write(scratch.join("nested/replace.ptx"), b"new-intermediate")?;
+        fs::write(destination.join("nested/replace.ptx"), b"old-intermediate")?;
+        fs::write(destination.join("unrelated.txt"), b"existing")?;
+        let stage = scratch.join("nested/replace.ptx");
+        let modified =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_500_000_000);
+        std::fs::File::open(&stage)?.set_times(std::fs::FileTimes::new().set_modified(modified))?;
+        #[cfg(unix)]
+        fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o640))?;
+
+        preserve_nvcc_intermediates(&scratch, &destination)?;
+        let copied = destination.join("nested/replace.ptx");
+        assert_eq!(fs::read(&copied)?, b"new-intermediate");
+        assert_eq!(
+            fs::read(destination.join("nested/deep/device.ptx"))?,
+            b"device-stage"
+        );
+        assert_eq!(fs::read(destination.join("unrelated.txt"))?, b"existing");
+        assert_eq!(fs::metadata(&copied)?.modified()?, modified);
+        #[cfg(unix)]
+        assert_eq!(fs::metadata(&copied)?.permissions().mode() & 0o777, 0o640);
+        assert!(fs::read_dir(&scratch)?.next().is_none());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nvcc_keep_preserves_non_utf8_filenames_and_symlinks() -> Result<()> {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir()?;
+        let scratch = fixture.path().join("scratch");
+        let destination = fixture.path().join("kept");
+        fs::create_dir_all(&scratch)?;
+        let odd = OsString::from_vec(vec![b'f', b'i', b'l', b'e', 0xff]);
+        fs::write(scratch.join(&odd), b"nonutf8")?;
+        symlink("missing target", scratch.join("dangling"))?;
+        preserve_nvcc_intermediates(&scratch, &destination)?;
+        assert_eq!(fs::read(destination.join(&odd))?, b"nonutf8");
+        assert_eq!(
+            fs::read_link(destination.join("dangling"))?,
+            PathBuf::from("missing target")
+        );
+        assert!(!scratch.join("dangling").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn nvcc_keep_reports_partial_failures_but_preserves_independent_entries() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let scratch = fixture.path().join("scratch");
+        let destination = fixture.path().join("kept");
+        fs::create_dir_all(scratch.join("nested/blocked"))?;
+        fs::create_dir_all(destination.join("nested"))?;
+        fs::write(scratch.join("nested/blocked/device.ptx"), b"not-preserved")?;
+        fs::write(destination.join("nested/blocked"), b"conflicting-file")?;
+        fs::write(scratch.join("nested/ok.ptx"), b"preserved")?;
+        fs::write(scratch.join("independent.ptx"), b"other-stage")?;
+
+        let err = preserve_nvcc_intermediates(&scratch, &destination)
+            .expect_err("colliding directory and file must be reported");
+        let diagnostic = format!("{err:#}");
+        assert!(diagnostic.contains("blocked"), "{diagnostic}");
+        assert_eq!(
+            fs::read(destination.join("nested/blocked"))?,
+            b"conflicting-file"
+        );
+        assert_eq!(fs::read(destination.join("nested/ok.ptx"))?, b"preserved");
+        assert_eq!(
+            fs::read(destination.join("independent.ptx"))?,
+            b"other-stage"
+        );
+        assert!(scratch.join("nested/blocked/device.ptx").exists());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nvcc_keep_copies_across_distinct_filesystems() -> Result<()> {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let scratch = tempfile::tempdir()?;
+        let source_dev = fs::metadata(scratch.path())?.dev();
+        let mut other = None;
+        for line in fs::read_to_string("/proc/self/mountinfo")?.lines() {
+            let Some(mount) = line.split_whitespace().nth(4) else {
+                continue;
+            };
+            let mount = mount.replace(r"\040", " ").replace(r"\011", "\t");
+            let root = Path::new(&mount);
+            if fs::metadata(root).is_ok_and(|metadata| metadata.dev() != source_dev)
+                && let Ok(dir) = tempfile::tempdir_in(root)
+            {
+                other = Some(dir);
+                break;
+            }
+        }
+        let Some(other) = other else {
+            eprintln!("No second writable filesystem mounted; skipping EXDEV fixture");
+            return Ok(());
+        };
+        let destination = other.path().join("kept");
+        fs::create_dir_all(scratch.path().join("nested"))?;
+        fs::write(scratch.path().join("kernel.ptx"), b"kernel")?;
+        fs::write(scratch.path().join("nested/source.cudafe1.c"), b"generated")?;
+        symlink("kernel.ptx", scratch.path().join("link.ptx"))?;
+        preserve_nvcc_intermediates(scratch.path(), &destination)?;
+        assert_eq!(fs::read(destination.join("kernel.ptx"))?, b"kernel");
+        assert_eq!(
+            fs::read(destination.join("nested/source.cudafe1.c"))?,
+            b"generated"
+        );
+        assert_eq!(
+            fs::read_link(destination.join("link.ptx"))?,
+            PathBuf::from("kernel.ptx")
+        );
+        assert!(fs::read_dir(scratch.path())?.next().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nvcc_scratch_dir_is_removed_after_last_clone_and_cancellation() -> Result<()> {
+        let parent = tempfile::tempdir()?;
+        let scratch = Arc::new(
+            tempfile::Builder::new()
+                .prefix("sccache_nvcc_test")
+                .tempdir_in(parent.path())?,
+        );
+        let path = scratch.path().to_owned();
+        fs::write(path.join("intermediate.ptx"), b"device stage")?;
+        let command = NvccCompileCommand {
+            temp_dir: scratch,
+            keep_dir: None,
+            num_parallel: 1,
+            executable: PathBuf::from("nvcc"),
+            arguments: vec![],
+            compilation_flag: OsString::from("-c"),
+            env_vars: vec![],
+            cwd: parent.path().to_owned(),
+            host_compiler: NvccHostCompiler::Gcc,
+            output_file_name: OsString::from("kernel.o"),
+        };
+        let pending_command = command.clone();
+        drop(command);
+        assert!(path.join("intermediate.ptx").exists());
+
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let owned = pending_command;
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+            drop(owned);
+        });
+        ready.await?;
+        assert!(
+            path.exists(),
+            "scratch directory dropped while clone was running"
+        );
+        task.abort();
+        assert!(task.await.is_err(), "pending command was not cancelled");
+        assert!(!path.exists(), "scratch directory survived cancellation");
+        Ok(())
+    }
     fn parse_arguments_gcc(arguments: Vec<String>) -> CompilerArguments<ParsedArguments> {
         let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
         Nvcc {
@@ -2072,6 +2446,73 @@ mod test {
         );
     }
 
+    #[test]
+    fn test_nvcc_threads_are_parsed_in_cli_order() -> Result<()> {
+        let mut parsed = parses!(
+            "--threads=2",
+            "-t4",
+            "--threads",
+            "3",
+            "-t=7",
+            "-c",
+            "foo.cu",
+            "-o",
+            "foo.o"
+        );
+        assert_eq!(extract_nvcc_threads(&mut parsed.unhashed_args)?, 7);
+        assert!(parsed.unhashed_args.is_empty());
+
+        let mut reversed = ovec!["-t=7", "--threads", "3"];
+        assert_eq!(extract_nvcc_threads(&mut reversed)?, 3);
+        assert!(reversed.is_empty());
+
+        let mut unrelated: Vec<OsString> = [
+            "-target=sm_80",
+            "--keep",
+            "-t2",
+            "-target",
+            "compute_90",
+            "--threads=5",
+            "-t=0",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(extract_nvcc_threads(&mut unrelated)?, 0);
+        assert_eq!(
+            unrelated,
+            ovec!["-target=sm_80", "--keep", "-target", "compute_90"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_nvcc_threads_reject_malformed_values() {
+        for bad in [
+            ovec!["-t"],
+            ovec!["--threads"],
+            ovec!["-t=bad"],
+            ovec!["--threads", "NaN"],
+            ovec!["--threads="],
+            ovec!["-t184467440737095516160"],
+        ] {
+            let mut args = bad.clone();
+            assert!(
+                extract_nvcc_threads(&mut args).is_err(),
+                "NVCC accepted malformed thread count: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nvcc_zero_threads_uses_available_cpus_and_clamps_device_groups() {
+        let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        assert_eq!(effective_nvcc_threads(0, usize::MAX), cpus);
+        assert_eq!(effective_nvcc_threads(0, 1), 1);
+        assert_eq!(effective_nvcc_threads(2, 10), 2);
+        assert_eq!(effective_nvcc_threads(100, 3), 3);
+        assert_eq!(effective_nvcc_threads(0, 0), 1);
+    }
     #[test]
     fn test_generate_compile_commands_rejects_missing_unhashed_option_values() -> Result<()> {
         let tempdir = tempfile::tempdir()?;

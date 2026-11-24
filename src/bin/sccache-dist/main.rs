@@ -31,6 +31,7 @@ mod build;
 
 mod cmdline;
 mod command_helpers;
+mod job_telemetry;
 #[cfg(target_os = "linux")]
 mod native;
 #[cfg(target_os = "linux")]
@@ -681,18 +682,22 @@ fn run(command: Command) -> Result<i32> {
 }
 
 fn init_logging() {
-    if env::var(sccache::LOGGING_ENV).is_ok() {
-        let mut builder = env_logger::Builder::from_env(sccache::LOGGING_ENV);
-
-        // Enable millisecond precision timestamps if SCCACHE_LOG_MILLIS is set
-        if env::var("SCCACHE_LOG_MILLIS").is_ok() {
-            builder.format_timestamp_millis();
-        }
-
-        match builder.try_init() {
-            Ok(_) => (),
-            Err(e) => panic!("Failed to initialize logging: {:?}", e),
-        }
+    // Job/PID mappings are only useful after a fatal worker failure if they
+    // are in the journal by default; do not require an opt-in debug setting.
+    let mut builder = env_logger::Builder::new();
+    // Keep third-party dependencies quiet; the binary's job/scheduler
+    // lifecycle is the information needed for postmortem reconstruction.
+    builder.filter_level(log::LevelFilter::Warn);
+    builder.filter_module(module_path!(), log::LevelFilter::Info);
+    if let Ok(filters) = env::var(sccache::LOGGING_ENV) {
+        builder.parse_filters(&filters);
+    }
+    if env::var("SCCACHE_LOG_MILLIS").is_ok() {
+        builder.format_timestamp_millis();
+    }
+    if let Err(error) = builder.try_init() {
+        eprintln!("sccache-dist: failed to initialize logging: {error}");
+        std::process::exit(2);
     }
 }
 
@@ -894,8 +899,9 @@ impl Scheduler {
             };
             for job_id in server_details.jobs_assigned {
                 warn!(
-                    "Non-terminated job {} was cleaned up in server pruning",
-                    job_id
+                    "dist_job_lost job_id={job_id} worker={} reason=heartbeat_timeout previous_state={:?}",
+                    server_id.addr(),
+                    jobs.get(&job_id).map(|detail| detail.state)
                 );
                 // A job may be missing here if it failed to allocate
                 // initially, so just warn if it's not present.
@@ -1208,6 +1214,11 @@ impl SchedulerIncoming for Scheduler {
                         stale_jobs
                     );
                     for job_id in stale_jobs {
+                        warn!(
+                            "dist_job_lost job_id={job_id} worker={} reason=stale_assignment previous_state={:?}",
+                            server_id.addr(),
+                            jobs.get(&job_id).map(|detail| detail.state)
+                        );
                         if !details.jobs_assigned.remove(&job_id) {
                             warn!(
                                 "Stale job for server {} not assigned: {}",
@@ -1229,6 +1240,11 @@ impl SchedulerIncoming for Scheduler {
             }
             Some(ref mut details) if details.server_nonce != server_nonce => {
                 for job_id in details.jobs_assigned.iter() {
+                    warn!(
+                        "dist_job_lost job_id={job_id} worker={} reason=worker_restarted previous_state={:?}",
+                        server_id.addr(),
+                        jobs.get(job_id).map(|detail| detail.state)
+                    );
                     if jobs.remove(job_id).is_none() {
                         warn!(
                             "Unknown job found when replacing server {}: {}",
@@ -1488,15 +1504,22 @@ impl ArchiveWorker {
         })
     }
 
+    fn has_cached_toolchain(&self, tc: &Toolchain) -> Result<bool> {
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?;
+        match cache.get_file(tc) {
+            Ok(_) => Ok(true),
+            Err(sccache::lru_disk_cache::Error::FileNotInCache) => Ok(false),
+            Err(error) => Err(error).context("checking worker toolchain cache"),
+        }
+    }
+
     /// Try local archive sources before asking the client to upload. The
     /// cache mutex is not held while cloning or verifying archive contents.
     fn has_or_reuse_toolchain(&self, tc: &Toolchain) -> Result<bool> {
-        if self
-            .cache
-            .lock()
-            .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?
-            .contains_toolchain(tc)
-        {
+        if self.has_cached_toolchain(tc)? {
             return Ok(true);
         }
         #[cfg(target_os = "linux")]
@@ -1526,11 +1549,7 @@ impl ArchiveWorker {
                 ),
             }
         }
-        Ok(self
-            .cache
-            .lock()
-            .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?
-            .contains_toolchain(tc))
+        self.has_cached_toolchain(tc)
     }
 }
 
@@ -1814,17 +1833,37 @@ impl ServerIncoming for Server {
             bail!("archive job assignment type changed");
         };
 
+        let (crate_name, command_fingerprint) = job_telemetry::identity(&command);
+        info!(
+            "dist_job_start job_id={job_id} compiler={:?} crate_name={:?} command_fingerprint={command_fingerprint:016x} argument_count={}",
+            command.executable,
+            crate_name,
+            command.arguments.len()
+        );
+        let started = Instant::now();
         let archive = self.archive.as_ref().context("archive worker disabled")?;
         let res = archive
             .builder
-            .run_build(toolchain, command, outputs, inputs_rdr, &archive.cache)
+            .run_build(job_id, toolchain, command, outputs, inputs_rdr, &archive.cache)
             .map(|res| {
+                info!(
+                    "dist_job_result job_id={job_id} result=complete exit_code={} output_count={} elapsed_ms={}",
+                    res.output.code,
+                    res.outputs.len(),
+                    started.elapsed().as_millis()
+                );
                 RunJobResult::Complete(JobComplete {
                     output: res.output,
                     outputs: res.outputs,
                 })
             })
-            .map_err(|e| e.context("run build failed"));
+            .map_err(|error| {
+                warn!(
+                    "dist_job_result job_id={job_id} result=error elapsed_ms={} error={error:#}",
+                    started.elapsed().as_millis()
+                );
+                error.context("run build failed")
+            });
         requester
             .do_update_job_state(job_id, JobState::Complete)
             .context("Updating job state failed")?;
@@ -3003,6 +3042,7 @@ mod server_upload_tests {
     impl BuilderIncoming for NoopBuilder {
         fn run_build(
             &self,
+            _job_id: JobId,
             _toolchain: Toolchain,
             _command: CompileCommand,
             _outputs: OutputRequest,
@@ -3246,6 +3286,34 @@ mod server_upload_tests {
         );
         assert!(matches!(upload_result?, SubmitToolchainResult::Success));
         assert_eq!(states, vec![JobState::Ready]);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_cached_archive_requires_fresh_upload_on_assignment() -> Result<()> {
+        let (dir, server) = test_server()?;
+        let contents = b"verified archive removed after publication";
+        let toolchain = tc(contents)?;
+        let root = dir.path().join("tc");
+        let staged = StagedToolchainArchive::receive(
+            &root,
+            toolchain.clone(),
+            contents.as_slice(),
+            1024 * 1024,
+        )?;
+        server.cache.lock().unwrap().insert_staged(staged)?;
+
+        let first = server.handle_assign_job(JobId(45), toolchain.clone())?;
+        assert!(!first.need_toolchain);
+        assert!(matches!(first.state, JobState::Ready));
+
+        let key = toolchain.archive_id.as_str();
+        std::fs::remove_file(root.join(&key[..1]).join(&key[1..2]).join(key))?;
+
+        let next = server.handle_assign_job(JobId(46), toolchain.clone())?;
+        assert!(next.need_toolchain);
+        assert!(matches!(next.state, JobState::Pending));
+        assert!(!server.cache.lock().unwrap().contains_toolchain(&toolchain));
         Ok(())
     }
 

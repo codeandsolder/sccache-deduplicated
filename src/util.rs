@@ -21,7 +21,6 @@ use object::read::archive::ArchiveFile;
 use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::hash::Hasher;
@@ -84,6 +83,14 @@ fn read_chunks<R: Read + ?Sized>(reader: &mut R, f: impl FnMut(&[u8])) -> Result
     Ok(())
 }
 
+/// One entry in the serialized identity of a tracked directory.
+struct DirectoryHashEntry {
+    path: PathBuf,
+    is_directory: bool,
+    is_file: bool,
+    symlink_target: Option<PathBuf>,
+}
+
 #[derive(Clone)]
 pub struct Digest {
     inner: blake3_Hasher,
@@ -138,18 +145,47 @@ impl Digest {
     /// the actual hash computation on a background thread in `pool`.
     pub async fn reader(path: PathBuf, pool: &tokio::runtime::Handle) -> Result<String> {
         pool.spawn_blocking(move || {
-            let mut digest = Self::new();
-            if path.is_dir() {
-                // For directories (e.g., from
-                // proc_macro::tracked_path::path()), recursively hash all file
-                // names and contents in sorted order.
+            let is_directory = path.is_dir();
+            // A different BLAKE3 domain keeps a file whose literal bytes
+            // equal a directory serialization from sharing its digest.
+            // Ordinary file digests retain their existing identity.
+            let mut digest = if is_directory {
+                Self {
+                    inner: blake3_Hasher::new_derive_key("sccache tracked directory digest v2"),
+                }
+            } else {
+                Self::new()
+            };
+            if is_directory {
+                // A tracked directory's identity includes its full entry tree,
+                // including empty directories and the targets of symlinks.
                 let mut entries = Vec::new();
-                Self::collect_dir_entries(&path, &mut entries)?;
-                entries.sort();
+                Self::collect_dir_entries(&path, &mut entries, &mut Vec::new())?;
+                entries.sort_by(|left, right| left.path.cmp(&right.path));
+                digest.delimiter(b"directory-tree-v2");
                 for entry in &entries {
-                    let rel = entry.strip_prefix(&path).unwrap_or(entry);
-                    digest.delimiter(rel.to_string_lossy().as_bytes());
-                    digest.update_from_file(entry)?;
+                    let relative = entry.path.strip_prefix(&path)?;
+                    // Lossy Unicode conversion can alias two distinct Unix
+                    // filenames and silently reuse an incorrect cache result.
+                    digest.delimiter(relative.as_os_str().as_encoded_bytes());
+                    digest.update(&[if entry.is_directory {
+                        b'D'
+                    } else if entry.is_file {
+                        b'F'
+                    } else {
+                        b'S'
+                    }]);
+                    if let Some(target) = &entry.symlink_target {
+                        digest.delimiter(b"symlink-target");
+                        digest.delimiter(target.as_os_str().as_encoded_bytes());
+                    }
+                    if entry.is_file {
+                        // A fixed-size content digest frames each file. Otherwise
+                        // crafted file bytes could impersonate an entry delimiter.
+                        let mut content = Self::new();
+                        content.update_from_file(&entry.path)?;
+                        digest.update(content.inner.finalize().as_bytes());
+                    }
                 }
             } else {
                 digest.update_from_file(&path)?;
@@ -168,22 +204,69 @@ impl Digest {
         Ok(())
     }
 
-    /// Recursively collect all file paths within a directory.
-    fn collect_dir_entries(dir: &Path, entries: &mut Vec<PathBuf>) -> Result<()> {
+    /// Walk tracked directory entries without following recursive symlink loops.
+    fn collect_dir_entries(
+        dir: &Path,
+        entries: &mut Vec<DirectoryHashEntry>,
+        ancestors: &mut Vec<PathBuf>,
+    ) -> Result<()> {
+        let canonical = std::fs::canonicalize(dir).with_context(|| {
+            format!(
+                "Failed to resolve tracked directory: {}",
+                debug_display(dir)
+            )
+        })?;
+        if ancestors.contains(&canonical) {
+            anyhow::bail!(
+                "Recursive directory symlink while hashing: {}",
+                debug_display(dir)
+            );
+        }
+        ancestors.push(canonical);
         for entry in std::fs::read_dir(dir).with_context(|| {
             format!(
                 "Failed to read directory for hashing: {}",
-                debug_display(&dir)
+                debug_display(dir)
             )
         })? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() {
-                Self::collect_dir_entries(&path, entries)?;
+            let file_type = entry.file_type()?;
+            let symlink_target = if file_type.is_symlink() {
+                Some(std::fs::read_link(&path)?)
             } else {
-                entries.push(path);
+                None
+            };
+            // Follow symlink targets, too: a tracked directory can contain
+            // references to files/directories outside its own lexical root.
+            let target_type = if symlink_target.is_some() {
+                match std::fs::metadata(&path) {
+                    Ok(metadata) => Some(metadata.file_type()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                Some(file_type)
+            };
+            let is_directory = target_type.as_ref().is_some_and(std::fs::FileType::is_dir);
+            let is_file = target_type.as_ref().is_some_and(std::fs::FileType::is_file);
+            if target_type.is_some() && !(is_directory || is_file) {
+                anyhow::bail!(
+                    "Unsupported special file in tracked directory: {}",
+                    debug_display(&path)
+                );
+            }
+            entries.push(DirectoryHashEntry {
+                path: path.clone(),
+                is_directory,
+                is_file,
+                symlink_target,
+            });
+            if is_directory {
+                Self::collect_dir_entries(&path, entries, ancestors)?;
             }
         }
+        ancestors.pop();
         Ok(())
     }
 
@@ -215,171 +298,82 @@ const MAX_HAYSTACK_LEN: usize = b"__TIMESTAMP__".len();
 #[cfg(test)]
 pub const MAX_TIME_MACRO_HAYSTACK_LEN: usize = MAX_HAYSTACK_LEN;
 
-/// Used during the chunked hashing process to check for C preprocessor time
-/// macros (namely `__TIMESTAMP__`, `__DATE__`, `__DATETIME__`) while reusing
-/// the same buffer as the hashing function, for efficiency.
+/// Finds C preprocessor time macros across arbitrary streaming chunk sizes.
 ///
-/// See `[Self::find_time_macros]` for details.
+/// Only the trailing bytes that could start a macro are retained. In particular,
+/// a reader returning one byte per call cannot cause the scanner to retain its
+/// entire input or repeatedly rescan an ever-growing buffer.
 #[derive(Debug, Default)]
 pub struct TimeMacroFinder {
-    found_date: Cell<bool>,
-    found_time: Cell<bool>,
-    found_timestamp: Cell<bool>,
-    overlap_buffer: [u8; MAX_HAYSTACK_LEN * 2],
-    /// Counter of chunks of full size we've been through. Partial reads do
-    /// not count and are handled separately.
-    full_chunks_counter: usize,
-    /// Contents of the previous read if it was smaller than `MAX_HAYSTACK_LEN`,
-    /// plus `MAX_HAYSTACK_LEN` bytes of the previous chunk, to account for
-    /// the possibility of partial reads splitting a time macro
-    /// across two calls.
-    previous_small_read: Vec<u8>,
+    found_date: bool,
+    found_time: bool,
+    found_timestamp: bool,
+    suffix: [u8; MAX_HAYSTACK_LEN - 1],
+    suffix_len: usize,
 }
 
 impl TimeMacroFinder {
-    /// Called for each chunk of a file during the hashing process
-    /// in preprocessor cache mode.
+    /// Scan a chunk and its boundary with the previous chunk.
     ///
-    /// When buffer reading a file, we get something like this:
-    ///
-    /// `[xxxx....aaaa][bbbb....cccc][dddd....eeee][ffff...]`
-    ///
-    /// The brackets represent each buffer chunk. We use the fact that the largest
-    /// pattern we're looking for is `__TIMESTAMP__` to avoid copying the entire
-    /// file to memory and re-searching the entire buffer for each pattern.
-    /// We can check inside each chunk for each pattern, and we use an overlap
-    /// buffer to keep the last `b"__TIMESTAMP__".len()` bytes around from the
-    /// last chunk, to also catch any pattern overlapping two chunks.
-    ///
-    /// In the above case, the overflow buffer would look like:
-    ///
-    /// ```text
-    ///    Chunk 1
-    ///    - aaaa0000
-    ///    Chunk 2
-    ///    - aaaabbbb
-    ///    - cccc0000
-    ///    Chunk 3
-    ///    - ccccdddd
-    ///    - eeee0000
-    ///    Chunk 4
-    ///    - eeeeffff
-    ///    [...]
-    /// ```
-    ///
-    /// We have to be careful to zero out the buffer right after each overlap check,
-    /// otherwise we risk the (unlikely) case of a pattern being spread between the
-    /// start of a chunk and its end.
-    /// Finally, we need to account for partial reads: it's possible that a read
-    /// smaller than the haystack hide a time macro because it spreads it across
-    /// two calls. This makes the example more complicated and isn't necessary
-    /// to get the point of the algorithm across.
-    /// See unit tests for some concrete examples.
+    /// A pattern of length at most `MAX_HAYSTACK_LEN` can overlap a boundary
+    /// only within the last `MAX_HAYSTACK_LEN - 1` previous bytes and the
+    /// first `MAX_HAYSTACK_LEN - 1` new bytes.
     pub fn find_time_macros(&mut self, visit: &[u8]) {
-        if self.full_chunks_counter == 0 {
-            if visit.len() <= MAX_HAYSTACK_LEN {
-                // The read is smaller than the largest haystack.
-                // We might get called again, if this was an incomplete read.
-                if self.previous_small_read.is_empty() {
-                    visit.clone_into(&mut self.previous_small_read);
-                } else {
-                    // In a rare pathological case where all reads are small,
-                    // this will grow up to the length of the file.
-                    // It is *very* unlikely and of minor performance
-                    // importance compared to just getting many small reads.
-                    self.previous_small_read.extend(visit);
-                }
-                self.find_macros(&self.previous_small_read);
-                return;
-            }
-            // Copy the right side of the visit to the left of the buffer
-            let right_half = visit.len() - MAX_HAYSTACK_LEN;
-            self.overlap_buffer[..MAX_HAYSTACK_LEN].copy_from_slice(&visit[right_half..]);
-        } else {
-            if visit.len() < MAX_HAYSTACK_LEN {
-                // The read is smaller than the largest haystack.
-                // We might get called again, if this was an incomplete read.
-                if self.previous_small_read.is_empty() {
-                    // Since this isn't the first non-small read (counter != 0)
-                    // we need to start from MAX_HAYSTACK_LEN bytes of the previous
-                    // read, otherwise we might miss a complete read followed
-                    // by a small read.
-                    let mut buf = self.overlap_buffer[..MAX_HAYSTACK_LEN].to_owned();
-                    buf.extend(visit);
-                    self.previous_small_read = buf;
-                } else {
-                    self.previous_small_read.extend(visit);
-                }
-
-                // zero the right side of the buffer
-                self.overlap_buffer[MAX_HAYSTACK_LEN..].copy_from_slice(&[0; MAX_HAYSTACK_LEN]);
-                // Copy the visit to the right of the buffer, starting from the middle
-                self.overlap_buffer[MAX_HAYSTACK_LEN..MAX_HAYSTACK_LEN + visit.len()]
-                    .copy_from_slice(visit);
-
-                // Check both the concatenation with the previous small read
-                self.find_macros(&self.previous_small_read);
-                // ...and the overlap buffer
-                self.find_macros(&self.overlap_buffer);
-                return;
-            }
-
-            // Copy the left side of the visit to the right of the buffer
-            let left_half = MAX_HAYSTACK_LEN;
-            self.overlap_buffer[left_half..].copy_from_slice(&visit[..left_half]);
-            self.find_macros(&self.overlap_buffer);
-            // zero the buffer
-            self.overlap_buffer = Default::default();
-            // Copy the right side of the visit to the left of the buffer
-            let right_half = visit.len() - MAX_HAYSTACK_LEN;
-            self.overlap_buffer[..MAX_HAYSTACK_LEN].copy_from_slice(&visit[right_half..]);
-            self.find_macros(&self.overlap_buffer);
+        const OVERLAP: usize = MAX_HAYSTACK_LEN - 1;
+        if visit.is_empty() || self.found_date && self.found_time && self.found_timestamp {
+            return;
         }
-        // Also check the concatenation with the previous small read
-        if !self.previous_small_read.is_empty() {
-            let mut concatenated = self.previous_small_read.clone();
-            concatenated.extend(visit);
-            self.find_macros(&concatenated);
-        }
+        let prefix_len = visit.len().min(OVERLAP);
+        let mut boundary = [0; OVERLAP * 2];
+        boundary[..self.suffix_len].copy_from_slice(&self.suffix[..self.suffix_len]);
+        boundary[self.suffix_len..self.suffix_len + prefix_len]
+            .copy_from_slice(&visit[..prefix_len]);
 
+        self.find_macros(&boundary[..self.suffix_len + prefix_len]);
         self.find_macros(visit);
-        self.full_chunks_counter += 1;
-        self.previous_small_read.clear();
-    }
 
-    fn find_macros(&self, buffer: &[u8]) {
-        // TODO
-        // This could be made more efficient, either by using a regex for all
-        // three patterns, or by doing some SIMD trickery like `ccache` does.
-        //
-        // `ccache` reads the file twice, so we might actually already be
-        // winning in most cases... though they have an inode cache.
-        // In any case, let's only improve this if it ends up being slow.
-        if memchr::memmem::find(buffer, b"__TIMESTAMP__").is_some() {
-            self.found_timestamp.set(true);
-        }
-        if memchr::memmem::find(buffer, b"__TIME__").is_some() {
-            self.found_time.set(true);
-        }
-        if memchr::memmem::find(buffer, b"__DATE__").is_some() {
-            self.found_date.set(true);
+        if visit.len() >= OVERLAP {
+            self.suffix.copy_from_slice(&visit[visit.len() - OVERLAP..]);
+            self.suffix_len = OVERLAP;
+        } else {
+            let keep = self.suffix_len.min(OVERLAP - visit.len());
+            self.suffix
+                .copy_within(self.suffix_len - keep..self.suffix_len, 0);
+            self.suffix[keep..keep + visit.len()].copy_from_slice(visit);
+            self.suffix_len = keep + visit.len();
         }
     }
 
+    fn find_macros(&mut self, buffer: &[u8]) {
+        if !self.found_timestamp && memchr::memmem::find(buffer, b"__TIMESTAMP__").is_some() {
+            self.found_timestamp = true;
+        }
+        if !self.found_time && memchr::memmem::find(buffer, b"__TIME__").is_some() {
+            self.found_time = true;
+        }
+        if !self.found_date && memchr::memmem::find(buffer, b"__DATE__").is_some() {
+            self.found_date = true;
+        }
+    }
+
+    #[must_use = "the caller must observe whether a time-dependent macro was detected"]
     pub const fn found_time_macros(&self) -> bool {
         self.found_date() || self.found_time() || self.found_timestamp()
     }
 
+    #[must_use = "the caller must observe whether __TIME__ was detected"]
     pub const fn found_time(&self) -> bool {
-        self.found_time.get()
+        self.found_time
     }
 
+    #[must_use = "the caller must observe whether __DATE__ was detected"]
     pub const fn found_date(&self) -> bool {
-        self.found_date.get()
+        self.found_date
     }
 
+    #[must_use = "the caller must observe whether __TIMESTAMP__ was detected"]
     pub const fn found_timestamp(&self) -> bool {
-        self.found_timestamp.get()
+        self.found_timestamp
     }
 
     #[must_use = "the returned digest state must be updated with the input bytes"]
@@ -1176,48 +1170,6 @@ pub fn daemonize(_preserve_fds: &[std::os::windows::io::RawHandle]) -> Result<()
     Ok(())
 }
 
-#[cfg(all(feature = "reqwest", not(target_os = "android"), any(unix, windows)))]
-fn mozilla_root_certificates() -> reqwest::Result<Vec<reqwest::Certificate>> {
-    webpki_root_certs::TLS_SERVER_ROOT_CERTS
-        .iter()
-        .map(|cert| reqwest::Certificate::from_der(cert.as_ref()))
-        .collect()
-}
-
-/// Use the platform verifier augmented with Mozilla roots on platforms where
-/// reqwest supports merging roots. Android uses its own platform verifier.
-#[cfg(feature = "reqwest")]
-pub(crate) fn new_reqwest_client_builder() -> reqwest::Result<reqwest::ClientBuilder> {
-    let builder = reqwest::Client::builder();
-    #[cfg(all(not(target_os = "android"), any(unix, windows)))]
-    let builder = builder.tls_certs_merge(mozilla_root_certificates()?);
-    Ok(builder)
-}
-
-#[cfg(any(feature = "dist-server", feature = "dist-client"))]
-pub(crate) fn new_reqwest_blocking_builder() -> reqwest::Result<reqwest::blocking::ClientBuilder> {
-    // Include certificate-rebuilt scheduler clients: all blocking control-plane
-    // requests need finite deadlines even after trust-root rotation.
-    let builder = reqwest::blocking::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(90));
-    #[cfg(all(not(target_os = "android"), any(unix, windows)))]
-    let builder = builder.tls_certs_merge(mozilla_root_certificates()?);
-    Ok(builder)
-}
-
-/// Build the blocking HTTP client used by distributed components.
-/// Pooling is disabled because connections may outlive their original runtime.
-/// # Errors
-/// Returns an error if reqwest cannot initialize the configured client.
-#[cfg(any(feature = "dist-server", feature = "dist-client"))]
-pub fn new_reqwest_blocking_client() -> Result<reqwest::blocking::Client> {
-    new_reqwest_blocking_builder()?
-        .pool_max_idle_per_host(0)
-        .build()
-        .context("failed to build blocking HTTP client")
-}
-
 fn unhex(b: u8) -> std::io::Result<u8> {
     match b {
         b'0'..=b'9' => Ok(b - b'0'),
@@ -1689,36 +1641,6 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::path::Path;
 
-    #[cfg(feature = "reqwest")]
-    #[test]
-    fn http_builders_load_trust_roots() -> crate::errors::Result<()> {
-        super::new_reqwest_client_builder()?.build()?;
-        #[cfg(any(feature = "dist-server", feature = "dist-client"))]
-        super::new_reqwest_blocking_client()?;
-        Ok(())
-    }
-
-    #[cfg(all(feature = "reqwest", target_os = "linux"))]
-    #[test]
-    fn http_builders_survive_missing_system_ca_store() -> crate::errors::Result<()> {
-        // Isolate the platform verifier's environment from concurrently running
-        // tests, including any other HTTP clients they construct.
-        let dir = tempfile::tempdir()?;
-        let output = std::process::Command::new(std::env::current_exe()?)
-            .args(["--exact", "util::tests::http_builders_load_trust_roots"])
-            .env("SSL_CERT_FILE", dir.path().join("missing-ca-file"))
-            .env("SSL_CERT_DIR", dir.path().join("missing-ca-dir"))
-            .output()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success(),
-            "{stdout}\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(stdout.contains("1 passed"), "{stdout}");
-        Ok(())
-    }
-
     #[test]
     fn test_reader_sync_across_buffer_sizes() {
         use super::HASH_BUFFER_SIZE;
@@ -1986,6 +1908,51 @@ mod tests {
         assert!(!finder.found_timestamp());
         finder.find_time_macros(b"TIMESTAMP__ This is larger than the haystack");
         assert!(finder.found_timestamp());
+    }
+
+    #[test]
+    fn test_time_macro_one_byte_stream_is_bounded_and_exact() {
+        let mut bytes = vec![b'x'; 65_536];
+        bytes[128..136].copy_from_slice(b"__TIME__");
+        bytes[16_384..16_397].copy_from_slice(b"__TIMESTAMP__");
+        bytes[32_768..32_776].copy_from_slice(b"__DATE__");
+
+        let mut finder = TimeMacroFinder::new();
+        for byte in bytes {
+            finder.find_time_macros(&[byte]);
+            assert!(finder.suffix_len <= super::MAX_HAYSTACK_LEN - 1);
+        }
+        assert!(finder.found_time());
+        assert!(finder.found_timestamp());
+        assert!(finder.found_date());
+    }
+
+    #[test]
+    fn test_time_macro_streaming_matches_unpartitioned_for_all_chunk_sizes() {
+        let content = b"__TIMESTAMX__ / __TIME__ separated / __DATE__ then __TIMESTAMP__";
+        let mut expected = TimeMacroFinder::new();
+        expected.find_time_macros(content);
+
+        for chunk_size in 1..=content.len() + 1 {
+            let mut actual = TimeMacroFinder::new();
+            for chunk in content.chunks(chunk_size) {
+                actual.find_time_macros(chunk);
+                actual.find_time_macros(b"");
+            }
+            assert_eq!(
+                (
+                    actual.found_time(),
+                    actual.found_date(),
+                    actual.found_timestamp()
+                ),
+                (
+                    expected.found_time(),
+                    expected.found_date(),
+                    expected.found_timestamp()
+                ),
+                "different result for chunk size {chunk_size}"
+            );
+        }
     }
 
     #[test]
@@ -2484,6 +2451,123 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(h1, h2);
+    }
+
+    #[tokio::test]
+    async fn test_digest_reader_directory_tracks_empty_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let empty_file = temp.path().join("empty-file");
+        let empty_dir = temp.path().join("empty-dir");
+        std::fs::write(&empty_file, []).unwrap();
+        std::fs::create_dir(&empty_dir).unwrap();
+        let pool = tokio::runtime::Handle::current();
+        let empty_dir_digest = Digest::reader(empty_dir, &pool).await.unwrap();
+        assert_ne!(
+            Digest::reader(empty_file, &pool).await.unwrap(),
+            empty_dir_digest,
+        );
+
+        // The serialized form of an empty directory must not have the
+        // same digest as a regular file containing exactly those bytes.
+        let forged = temp.path().join("forged-directory");
+        std::fs::write(&forged, b"\0SCCACHE\0directory-tree-v2\0").unwrap();
+        assert_ne!(
+            Digest::reader(forged, &pool).await.unwrap(),
+            empty_dir_digest,
+        );
+
+        let tree = temp.path().join("tracked");
+        std::fs::create_dir(&tree).unwrap();
+        let before = Digest::reader(tree.clone(), &pool).await.unwrap();
+        std::fs::create_dir(tree.join("new-empty-directory")).unwrap();
+        let after = Digest::reader(tree, &pool).await.unwrap();
+        assert_ne!(before, after);
+    }
+
+    #[tokio::test]
+    async fn test_digest_reader_directory_frames_file_contents() {
+        // The old hash concatenated raw file bytes after path delimiters:
+        // a file could impersonate a subsequent path and cause a cache collision.
+        let single = tempfile::tempdir().unwrap();
+        let split = tempfile::tempdir().unwrap();
+        std::fs::write(single.path().join("a"), b"x\0SCCACHE\0b\0y").unwrap();
+        std::fs::write(split.path().join("a"), b"x").unwrap();
+        std::fs::write(split.path().join("b"), b"y").unwrap();
+        let pool = tokio::runtime::Handle::current();
+        assert_ne!(
+            Digest::reader(single.path().to_path_buf(), &pool)
+                .await
+                .unwrap(),
+            Digest::reader(split.path().to_path_buf(), &pool)
+                .await
+                .unwrap(),
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_digest_reader_directory_distinguishes_invalid_utf8_names() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        for (dir, name) in [(left.path(), 0xff), (right.path(), 0xfe)] {
+            let path = dir.join(std::ffi::OsString::from_vec(vec![b'n', name]));
+            if let Err(error) = std::fs::write(path, b"same contents") {
+                // ZFS datasets configured with utf8only=on reject non-UTF8
+                // pathnames. The full regression runs on filesystems that
+                // support raw Unix filename bytes (including CI).
+                if error.raw_os_error() == Some(libc::EILSEQ) {
+                    return;
+                }
+                panic!("Failed to write invalid-UTF8 test fixture: {error}");
+            }
+        }
+        let pool = tokio::runtime::Handle::current();
+        assert_ne!(
+            Digest::reader(left.path().to_path_buf(), &pool)
+                .await
+                .unwrap(),
+            Digest::reader(right.path().to_path_buf(), &pool)
+                .await
+                .unwrap(),
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_digest_reader_directory_detects_symlink_target_and_contents() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        std::fs::write(dir.join("first"), b"same").unwrap();
+        std::fs::write(dir.join("second"), b"same").unwrap();
+        symlink("first", dir.join("alias")).unwrap();
+        let pool = tokio::runtime::Handle::current();
+        let first = Digest::reader(dir.to_path_buf(), &pool).await.unwrap();
+        std::fs::remove_file(dir.join("alias")).unwrap();
+        symlink("second", dir.join("alias")).unwrap();
+        let second = Digest::reader(dir.to_path_buf(), &pool).await.unwrap();
+        assert_ne!(first, second);
+
+        std::fs::write(dir.join("second"), b"changed").unwrap();
+        let third = Digest::reader(dir.to_path_buf(), &pool).await.unwrap();
+        assert_ne!(second, third);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_digest_reader_rejects_recursive_symlink_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        symlink(".", temp.path().join("loop")).unwrap();
+        let pool = tokio::runtime::Handle::current();
+        let error = Digest::reader(temp.path().to_path_buf(), &pool)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("Recursive directory symlink"));
     }
 
     #[test]

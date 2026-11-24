@@ -22,6 +22,26 @@ These are the source-of-truth copies of the machine-wide Cargo/sccache wrappers,
 - Scheduler socket activation is stopped before the scheduler and restored afterward, including on rollback. The updater does not query distributed queue occupancy before restarting. A different or unknown installed protocol requires a coordinated migration even when the queue is empty. `sccache-release-update --plan-only` verifies the candidate and displays the restart decision without changing services.
 - Canonical bundles also carry a `rollout_epoch`. The updater requires it to match `SCCACHE_AUTOUPDATE_EXPECTED_ROLLOUT_EPOCH` (default `2`) before touching live binaries. Increment the release epoch for any change that needs coordinated host-side migration; old hosts then refuse the release until the migration is performed and their expected epoch is advanced.
 
+## Fleet release promotion
+
+Ordinary commits to `main` and pull requests are tested but **never published
+as fleet releases**. After the `ci` and `Strict Rust` push checks pass for
+current `main`, explicitly run:
+
+```sh
+gh workflow run publish-ci-client.yml \
+  --repo codeandsolder/sccache-deduplicated \
+  --ref main -f ref=main
+```
+
+The workflow rechecks both gates against the exact current `main` revision,
+then builds and verifies the Linux client and worker bundle. A successful
+promotion creates an immutable `sccache-ci-<full source SHA>` GitHub Release.
+The existing `sccache-release-update` service (invoked by `random-utils-update`)
+installs only releases with that prefix, subject to protocol, rollout epoch,
+ABI, health, and host-native bundle checks. `v*` source tags have a separate
+upstream release workflow and do not promote the fleet bundle by themselves.
+
 ## Acer installation
 
 The live paths are:

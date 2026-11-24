@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::command_helpers::{CommandExt, run_with_environment};
+use crate::job_telemetry;
 use anyhow::{Context, Error, Result, anyhow, bail};
 use fs_err as fs;
 use libmount::Overlay;
@@ -22,8 +23,8 @@ use nix::sys::stat::{Mode, mkdirat};
 use sccache::compression::ZstdFrame;
 use sccache::compression::deflate::unpack_gzip;
 use sccache::dist::{
-    BuildResult, BuilderIncoming, CompileCommand, InputsReader, OutputRequest, ProcessOutput,
-    TcCache, Toolchain,
+    BuildResult, BuilderIncoming, CompileCommand, InputsReader, JobId, OutputRequest,
+    ProcessOutput, TcCache, Toolchain,
 };
 use sccache::lru_disk_cache::Error as LruError;
 use std::collections::{HashMap, HashSet, hash_map};
@@ -401,6 +402,7 @@ impl OverlayBuilder {
     }
 
     fn perform_build(
+        job_id: JobId,
         bubblewrap: &Path,
         compile_command: CompileCommand,
         inputs_rdr: InputsReader,
@@ -533,8 +535,7 @@ impl OverlayBuilder {
                     cmd.arg("--");
                     cmd.arg(executable);
                     cmd.args(arguments);
-                    let compile_output = cmd
-                        .output()
+                    let compile_output = job_telemetry::run(job_id, &mut cmd)
                         .context("Failed to retrieve output from compile")?;
                     trace!("compile_output: {:?}", compile_output);
 
@@ -600,6 +601,7 @@ impl OverlayBuilder {
 impl BuilderIncoming for OverlayBuilder {
     fn run_build(
         &self,
+        job_id: JobId,
         tc: Toolchain,
         command: CompileCommand,
         outputs: OutputRequest,
@@ -611,7 +613,14 @@ impl BuilderIncoming for OverlayBuilder {
             .prepare_overlay_dirs(&tc, tccache)
             .context("failed to prepare overlay dirs")?;
         debug!("Performing build in {:?}", overlay);
-        let res = Self::perform_build(&self.bubblewrap, command, inputs_rdr, outputs, &overlay);
+        let res = Self::perform_build(
+            job_id,
+            &self.bubblewrap,
+            command,
+            inputs_rdr,
+            outputs,
+            &overlay,
+        );
         debug!("Finishing with overlay");
         self.finish_overlay(&tc, overlay, tccache);
         debug!("Returning result");
@@ -939,6 +948,7 @@ impl DockerBuilder {
     }
 
     fn perform_build(
+        job_id: JobId,
         compile_command: CompileCommand,
         inputs_rdr: InputsReader,
         outputs: OutputRequest,
@@ -993,7 +1003,8 @@ impl DockerBuilder {
         cmd.args(["exec", "--workdir"])
             .arg(cwd)
             .args([cid, "/busybox", "env", "-i", "--"]);
-        let compile_output = run_with_environment(&mut cmd, env_vars, executable, arguments)?;
+        let compile_output =
+            run_with_environment(job_id, &mut cmd, env_vars, executable, arguments)?;
         trace!("compile_output: {:?}", compile_output);
 
         let mut outputs = vec![];
@@ -1028,6 +1039,7 @@ impl BuilderIncoming for DockerBuilder {
     // From Server
     fn run_build(
         &self,
+        job_id: JobId,
         tc: Toolchain,
         command: CompileCommand,
         outputs: OutputRequest,
@@ -1039,7 +1051,7 @@ impl BuilderIncoming for DockerBuilder {
             .get_container(&tc, tccache)
             .context("Failed to get a container for build")?;
         debug!("Performing build with container {}", cid);
-        let result = Self::perform_build(command, inputs_rdr, outputs, &cid)
+        let result = Self::perform_build(job_id, command, inputs_rdr, outputs, &cid)
             .context("Failed to perform build");
         debug!("Finishing with container {}", cid);
         self.finish_container(&tc, cid);
@@ -1157,7 +1169,6 @@ mod overlay_lifecycle_tests {
 
     #[test]
     fn extracted_byte_budget_evicts_oldest_idle_cache_entries() -> Result<()> {
-        use std::io::Write as _;
         use std::time::Duration;
 
         let tempdir = tempfile::tempdir()?;
@@ -1167,7 +1178,8 @@ mod overlay_lifecycle_tests {
             toolchain_dir_map: Mutex::new(HashMap::new()),
             extracted_toolchain_cache_size: 20,
         };
-        let mut tc_cache = TcCache::new(&tempdir.path().join("archives"), 1024)?;
+        let cache_root = tempdir.path().join("archives");
+        let mut tc_cache = TcCache::new(&cache_root, 1024)?;
         let mut map = builder.toolchain_dir_map.lock().unwrap();
         let now = Instant::now();
         let mut ids = Vec::new();
@@ -1178,7 +1190,13 @@ mod overlay_lifecycle_tests {
                     sccache::util::Digest::reader_sync(bytes.as_slice())?,
                 )?,
             };
-            tc_cache.insert_with(&tc, |mut file| file.write_all(&bytes))?;
+            let staged = sccache::dist::StagedToolchainArchive::receive(
+                &cache_root,
+                tc.clone(),
+                bytes.as_slice(),
+                1024,
+            )?;
+            tc_cache.insert_staged(staged)?;
             let path = tempdir.path().join(tc.archive_id.as_str());
             fs::create_dir(&path)?;
             map.insert(
@@ -1213,8 +1231,6 @@ mod overlay_lifecycle_tests {
 
     #[test]
     fn active_extracted_toolchain_is_pruned_only_after_last_build_finishes() -> Result<()> {
-        use std::io::Write as _;
-
         let tempdir = tempfile::tempdir()?;
         let toolchains_dir = tempdir.path().join("toolchains");
         fs::create_dir(&toolchains_dir)?;
@@ -1247,8 +1263,15 @@ mod overlay_lifecycle_tests {
                 _active_lease: Arc::clone(&lease),
             })
             .collect();
-        let mut tc_cache = TcCache::new(&tempdir.path().join("tc-cache"), 1024 * 1024)?;
-        tc_cache.insert_with(&cached_tc, |mut file| file.write_all(archive))?;
+        let cache_root = tempdir.path().join("tc-cache");
+        let mut tc_cache = TcCache::new(&cache_root, 1024 * 1024)?;
+        let staged = sccache::dist::StagedToolchainArchive::receive(
+            &cache_root,
+            cached_tc.clone(),
+            archive.as_slice(),
+            1024 * 1024,
+        )?;
+        tc_cache.insert_staged(staged)?;
         let cache = Mutex::new(tc_cache);
         let mut dir_map = builder.toolchain_dir_map.lock().unwrap();
         dir_map.insert(
