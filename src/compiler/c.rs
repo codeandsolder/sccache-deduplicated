@@ -825,6 +825,21 @@ where
             storage.basedirs()
         };
 
+        let debug_compilation_dir = matches!(
+            self.compiler.kind(),
+            CCompilerKind::Gcc | CCompilerKind::Clang
+        )
+        .then(|| effective_debug_compilation_dir(&cwd, &common_and_arch_args))
+        .flatten()
+        .map(|directory| {
+            // Cargo's canonical source path identity is realized by injected
+            // compiler prefix maps. Those maps rewrite DW_AT_comp_dir too;
+            // hash the *emitted* directory, not the physical OUT_DIR/CWD.
+            canonical_native.as_ref().map_or_else(
+                || directory.clone(),
+                |paths| paths.map_bytes(&directory).into_owned(),
+            )
+        });
         let key = HashKeyParams::new(
             &self.executable_digest,
             parsed_args.language,
@@ -840,6 +855,7 @@ where
             self.parsed_args.language,
             &self.parsed_args.input,
         ))
+        .with_debug_compilation_dir(debug_compilation_dir.as_deref())
         .compute();
 
         // Cache the preprocessing step
@@ -2512,6 +2528,88 @@ pub(super) const INPUT_FILE_NAME_DOMAIN: &[u8] = b"c-input-file-name-v1";
 /// The inputs of nvcc's device-code steps are its own temporaries, named after
 /// the source, and identical device code from different sources is meant to be
 /// shared.
+/// The exact directory emitted as debug compilation metadata, after the
+/// compiler's last matching prefix-map rule. Worktrees may safely share C/C++
+/// objects without debug information or when their debug directories map to
+/// the same path, but not when emitted `DW_AT_comp_dir` would differ.
+///
+/// The original (not previously transformed) path is tested against each
+/// mapping, with the last match winning; both GCC and Clang use this order.
+/// These switches select a debugging information level on GCC/Clang.
+/// Modifiers such as `-gcolumn-info`, `-gz`, and `-gstrict-dwarf` do not
+/// enable it by themselves; treating every `-g*` option as an enabler would
+/// unnecessarily partition cache entries for ordinary optimized builds.
+fn enables_debug_information(arg: &[u8]) -> bool {
+    matches!(
+        arg,
+        b"-g" | b"-ggdb" | b"-gline-tables-only" | b"-gmlt" | b"-gmodules" | b"-gcodeview"
+    ) || matches!(
+        arg,
+        b"-g1" | b"-g2" | b"-g3" | b"-ggdb1" | b"-ggdb2" | b"-ggdb3"
+    ) || arg.starts_with(b"-gdwarf-")
+}
+
+fn effective_debug_compilation_dir(cwd: &Path, args: &[OsString]) -> Option<Vec<u8>> {
+    let mut debug_enabled = false;
+    let mut clang_debug_forced = false;
+    let mut clang_frontend_next = false;
+    let mut explicit_directory = None;
+    let mut maps = Vec::new();
+    let mut args = args.iter().map(|arg| arg.as_encoded_bytes());
+    while let Some(arg) = args.next() {
+        // `-Xclang -debug-info-kind=limited` enables DWARF without `-g`.
+        // It is forwarded directly to Clang's frontend, independently of the
+        // driver's -g option order. Do not confuse it with a regular option.
+        if arg == b"-Xclang" {
+            clang_frontend_next = true;
+            continue;
+        }
+        if std::mem::take(&mut clang_frontend_next) {
+            if let Some(kind) = arg.strip_prefix(b"-debug-info-kind=") {
+                clang_debug_forced = kind != b"none";
+            }
+            if let Some(path) = arg.strip_prefix(b"-fdebug-compilation-dir=") {
+                explicit_directory = Some(path.to_vec());
+            }
+            // Frontend options can also contain normal debug prefix mappings.
+            // Apply them through the same last-match rule below.
+        }
+        if matches!(arg, b"-g0" | b"-ggdb0") {
+            debug_enabled = false;
+        } else if enables_debug_information(arg) {
+            debug_enabled = true;
+        }
+        if let Some(path) = arg.strip_prefix(b"-fdebug-compilation-dir=") {
+            explicit_directory = Some(path.to_vec());
+        } else if arg == b"-fdebug-compilation-dir" {
+            explicit_directory = args.next().map(<[u8]>::to_vec);
+        }
+        for option in [b"-fdebug-prefix-map=".as_slice(), b"-ffile-prefix-map="] {
+            if let Some(mapping) = arg.strip_prefix(option)
+                && let Some(separator) = mapping.iter().position(|&byte| byte == b'=')
+            {
+                maps.push((
+                    mapping[..separator].to_vec(),
+                    mapping[separator + 1..].to_vec(),
+                ));
+            }
+        }
+    }
+    if !(debug_enabled || clang_debug_forced) {
+        return None;
+    }
+    let original =
+        explicit_directory.unwrap_or_else(|| cwd.as_os_str().as_encoded_bytes().to_vec());
+    let mut effective = original.clone();
+    for (from, to) in maps {
+        if original.starts_with(&from) {
+            effective = to;
+            effective.extend_from_slice(&original[from.len()..]);
+        }
+    }
+    Some(effective)
+}
+
 pub(super) fn hashed_input_file_name(language: Language, input: &Path) -> Option<&OsStr> {
     match language {
         Language::CudaFE | Language::Ptx | Language::Cubin => None,
@@ -2639,6 +2737,7 @@ pub struct HashKeyParams<'a> {
     basedirs: &'a [Vec<u8>],
     assembler_digest: Option<&'a str>,
     input_file_name: Option<&'a OsStr>,
+    debug_compilation_dir: Option<&'a [u8]>,
 }
 
 impl<'a> HashKeyParams<'a> {
@@ -2668,6 +2767,7 @@ impl<'a> HashKeyParams<'a> {
             basedirs: &[],
             assembler_digest: None,
             input_file_name: None,
+            debug_compilation_dir: None,
         }
     }
 
@@ -2707,6 +2807,13 @@ impl<'a> HashKeyParams<'a> {
         self
     }
 
+    /// Adds the effective debug compilation directory when debug metadata
+    /// includes one. Omitting it preserves nondebug cache identity.
+    pub const fn with_debug_compilation_dir(mut self, directory: Option<&'a [u8]>) -> Self {
+        self.debug_compilation_dir = directory;
+        self
+    }
+
     /// Computes the hash key based on the configured parameters.
     ///
     /// If `basedirs` are provided, paths in the preprocessor output will be normalized by
@@ -2737,6 +2844,14 @@ impl<'a> HashKeyParams<'a> {
         }
 
         hash_cached_env_vars(&mut m, self.env_vars, &CACHED_ENV_VARS);
+
+        // Version only the debug-dependent keys: objects without debug data
+        // retain their existing cache identity, while old unsafe debug hits
+        // cannot alias the additional domain and directory payload.
+        if let Some(dir) = self.debug_compilation_dir {
+            m.delimiter(b"c-effective-debug-compdir-v1");
+            hash_length_prefixed(&mut m, dir);
+        }
 
         // Strip basedirs from preprocessor output if configured
         let preprocessor_output_to_hash = strip_basedirs(self.preprocessor_output, self.basedirs);
@@ -3164,6 +3279,176 @@ mod test {
                 "unresolved driver line must not be cacheable: {driver_line}"
             );
         }
+    }
+
+    #[test]
+    fn debug_compilation_directory_respects_effective_debug_options_and_prefix_maps() {
+        let cwd = Path::new("/build/a");
+        let effective = |args: Vec<OsString>| effective_debug_compilation_dir(cwd, &args);
+        assert_eq!(effective(ovec![]), None);
+        assert_eq!(effective(ovec!["-g", "-g0"]), None);
+        assert_eq!(effective(ovec!["-ggdb0"]), None);
+        assert_eq!(effective(ovec!["-gsplit-dwarf"]), None);
+        for option in [
+            "-gstrict-dwarf",
+            "-gcolumn-info",
+            "-gz",
+            "-gpubnames",
+            "-grecord-gcc-switches",
+            "-gcc-toolchain=/path",
+        ] {
+            assert_eq!(
+                effective(ovec![option]),
+                None,
+                "{option} alone must not emit DWARF"
+            );
+        }
+        assert_eq!(effective(ovec!["-gdwarf-5"]), Some(b"/build/a".to_vec()));
+        assert_eq!(effective(ovec!["-gmodules"]), Some(b"/build/a".to_vec()));
+        assert_eq!(
+            effective(ovec!["-Xclang", "-debug-info-kind=limited"]),
+            Some(b"/build/a".to_vec())
+        );
+        assert_eq!(
+            effective(ovec!["-Xclang", "-debug-info-kind=line-tables-only"]),
+            Some(b"/build/a".to_vec())
+        );
+        assert_eq!(effective(ovec!["-Xclang", "-debug-info-kind=none"]), None);
+        assert_eq!(
+            effective(ovec![
+                "-Xclang",
+                "-debug-info-kind=limited",
+                "-Xclang",
+                "-debug-info-kind=none"
+            ]),
+            None
+        );
+        assert_eq!(
+            effective(ovec![
+                "-Xclang",
+                "-debug-info-kind=limited",
+                "-Xclang",
+                "-fdebug-compilation-dir=/fixed"
+            ]),
+            Some(b"/fixed".to_vec())
+        );
+        assert_eq!(
+            effective(ovec![
+                "-g",
+                "-Xclang",
+                "-fdebug-prefix-map=/build/a=/mapped"
+            ]),
+            Some(b"/mapped".to_vec())
+        );
+        assert_eq!(
+            effective(ovec!["-Xclang", "-debug-info-kind=limited", "-g0"]),
+            Some(b"/build/a".to_vec())
+        );
+        assert_eq!(effective(ovec!["-g0", "-g"]), Some(b"/build/a".to_vec()));
+        assert_eq!(
+            effective(ovec!["-gline-tables-only"]),
+            Some(b"/build/a".to_vec())
+        );
+        assert_eq!(
+            effective(ovec!["-g", "-fdebug-compilation-dir=/stable"]),
+            Some(b"/stable".to_vec())
+        );
+        assert_eq!(
+            effective(ovec!["-g", "-fdebug-compilation-dir", "."]),
+            Some(b".".to_vec())
+        );
+        assert_eq!(
+            effective(ovec!["-g", "-fdebug-prefix-map=/build/a=/stable"]),
+            Some(b"/stable".to_vec())
+        );
+        assert_eq!(
+            effective(ovec!["-g", "-ffile-prefix-map=/build/a=/stable"]),
+            Some(b"/stable".to_vec())
+        );
+        assert_eq!(
+            effective(ovec!["-g", "-fdebug-prefix-map=/build=/virtual"]),
+            Some(b"/virtual/a".to_vec())
+        );
+        assert_eq!(
+            effective(ovec![
+                "-g",
+                "-fdebug-prefix-map=/build=/one",
+                "-fdebug-prefix-map=/build/a=/two"
+            ]),
+            Some(b"/two".to_vec())
+        );
+        assert_eq!(
+            effective(ovec![
+                "-g",
+                "-fdebug-prefix-map=/build/a=/two",
+                "-fdebug-prefix-map=/build=/one"
+            ]),
+            Some(b"/one/a".to_vec())
+        );
+    }
+
+    #[test]
+    fn gcc_and_clang_parsers_retain_debug_path_options_for_cache_identity() {
+        let arguments = ovec![
+            "-g",
+            "-fdebug-prefix-map=/build/a=/virtual",
+            "-c",
+            "probe.c",
+            "-o",
+            "probe.o"
+        ];
+        for (kind, parsed_result) in [
+            (
+                CCompilerKind::Gcc,
+                crate::compiler::gcc::parse_arguments(
+                    &arguments,
+                    Path::new("/build/a"),
+                    &crate::compiler::gcc::ARGS[..],
+                    false,
+                    CCompilerKind::Gcc,
+                ),
+            ),
+            (
+                CCompilerKind::Clang,
+                crate::compiler::gcc::parse_arguments(
+                    &arguments,
+                    Path::new("/build/a"),
+                    (
+                        &crate::compiler::gcc::ARGS[..],
+                        &crate::compiler::clang::ARGS[..],
+                    ),
+                    false,
+                    CCompilerKind::Clang,
+                ),
+            ),
+        ] {
+            let parsed = match parsed_result {
+                CompilerArguments::Ok(args) => args,
+                other => panic!("{kind:?} failed to recognize a debug-path mapping: {other:?}"),
+            };
+            let mut flags = parsed.common_args;
+            flags.extend(parsed.arch_args);
+            assert_eq!(
+                effective_debug_compilation_dir(Path::new("/build/a"), &flags),
+                Some(b"/virtual".to_vec()),
+            );
+        }
+    }
+
+    #[test]
+    fn debug_compilation_directory_changes_only_debug_dependent_cache_keys() {
+        let args = ovec!["-g"];
+        let key = |directory: Option<&[u8]>| {
+            HashKeyParams::new("cc", Language::C, &args, b"same-preprocessed-source")
+                .with_debug_compilation_dir(directory)
+                .compute()
+        };
+        assert_ne!(key(Some(b"/build/a")), key(Some(b"/build/b")));
+        assert_eq!(key(Some(b"/virtual")), key(Some(b"/virtual")));
+        assert_eq!(
+            key(None),
+            HashKeyParams::new("cc", Language::C, &args, b"same-preprocessed-source").compute(),
+        );
     }
 
     #[test]
