@@ -238,6 +238,76 @@ fn capture_locations(
     Ok(outputs)
 }
 
+/// Mount every declared backing input, permitting target-file overlays only
+/// where no writable directory or more-specific immutable mount can hide it.
+fn mount_input_views(
+    spec: &ExecutionSpec,
+    store: &NativeStore,
+    scratch: &Path,
+    leases: BTreeMap<BuildPath, TreeLease>,
+    writable: &BTreeSet<BuildPath>,
+) -> Result<BTreeMap<BuildPath, MountedTree>> {
+    let protected_system = [
+        BuildPath::new(b"/proc".to_vec())?,
+        BuildPath::new(b"/dev".to_vec())?,
+    ];
+    let views: BTreeMap<BuildPath, MountedTree> = leases
+        .into_iter()
+        .map(|(point, lease)| {
+            // A private output mount or nested explicit input mount
+            // shadows its backing root. Do not insert file overlays
+            // within those regions or split an inode group there.
+            let protected = writable
+                .iter()
+                .filter(|path| path.within(point.as_bytes()))
+                .chain(
+                    spec.mounts
+                        .keys()
+                        .filter(|path| **path != point && path.within(point.as_bytes())),
+                )
+                .chain(
+                    protected_system
+                        .iter()
+                        .filter(|path| path.within(point.as_bytes())),
+                )
+                .map(|path| relative(path, &point).map(Path::to_owned))
+                .collect::<Result<Vec<_>>>()?;
+            Ok((
+                point,
+                store.mount_tree_protected(lease, scratch, &protected)?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    Ok(views)
+}
+
+/// Bind target-specific immutable regular files after the larger input
+/// mounts. The immutable base and exact target content stay pinned by views.
+fn bind_file_overlays(
+    plan: &mut SandboxPlan,
+    views: &BTreeMap<BuildPath, MountedTree>,
+) -> Result<()> {
+    for (point, view) in views {
+        if let Some(stats) = view.overlay_stats() {
+            log::debug!(
+                "native CAS action mount {} reused base with {} block clones and {} bytes copied",
+                host_path(point.as_bytes()).display(),
+                stats.cloned_files,
+                stats.copied_bytes,
+            );
+        }
+        for (path, physical) in view.overlay_bindings() {
+            let destination = host_path(point.as_bytes()).join(OsStr::from_bytes(path.as_bytes()));
+            plan.bind(
+                physical,
+                SandboxPath::new(&destination)?,
+                MountAccess::ReadOnly,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 impl PreparedBuild {
     fn prepare(spec: &ExecutionSpec, store: &NativeStore, scratch: &Path) -> Result<Self> {
         let root_point = BuildPath::new(b"/".to_vec())?;
@@ -267,10 +337,7 @@ impl PreparedBuild {
         let writable = writable_locations(spec, &leases)?;
         // Reuse immutable native-ZFS CoW tree views (or compressed FUSE
         // mounts on non-ZFS). Only output parents need private scratch.
-        let mut views: BTreeMap<BuildPath, MountedTree> = leases
-            .into_iter()
-            .map(|(path, lease)| Ok((path, store.mount_tree(lease, scratch)?)))
-            .collect::<Result<_>>()?;
+        let mut views = mount_input_views(spec, store, scratch, leases, &writable)?;
         for path in &writable {
             let (point, _) = backing(&views, path)?;
             let point = point.clone();
@@ -327,6 +394,7 @@ impl PreparedBuild {
                 MountAccess::Writable,
             )?;
         }
+        bind_file_overlays(&mut plan, &views)?;
         let outputs = capture_locations(spec, &views, &writable)?;
         Ok(Self {
             plan,

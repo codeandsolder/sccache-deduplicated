@@ -102,14 +102,18 @@ fn heterogeneous_zfs_and_non_zfs_stores_exchange_all_physical_encodings() -> Res
     use crate::{TreeEntry, TreeManifest, TreeMetadata, TreePath, TreeTimestamp};
     use std::path::Path;
 
-    if !is_native_zfs(Path::new("/home"))?
+    // The default tempfile root may be tmpfs even when the checkout is on
+    // ZFS. Build the ZFS half on a verified, writable ZFS path rather than
+    // testing /home and then accidentally creating the store in /tmp.
+    let zfs_parent = std::env::current_dir()?;
+    if !is_native_zfs(&zfs_parent)?
         || !Path::new("/dev/shm").is_dir()
         || is_native_zfs(Path::new("/dev/shm"))?
     {
         return Ok(());
     }
 
-    let zfs_dir = tempfile::tempdir()?;
+    let zfs_dir = tempfile::tempdir_in(&zfs_parent)?;
     let memory_dir = tempfile::tempdir_in("/dev/shm")?;
     let zfs = NativeStore::open(zfs_dir.path())?;
     let non_zfs = NativeStore::open(memory_dir.path())?;

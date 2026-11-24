@@ -514,12 +514,51 @@ impl MountCache {
         persistent: &Path,
         scratch: &Path,
         native_zfs: bool,
+        protected: &[PathBuf],
     ) -> Result<trees::MountedTree> {
         let key = lease.id();
         if let Some(view) = self.entries.get(&key) {
             let mounted = trees::MountedTree::from_view(Arc::clone(view), scratch)?;
             self.order.retain(|other| other != &key);
             self.order.push_back(key);
+            return Ok(mounted);
+        }
+        // A new action identity need not imply a new physical view. Reuse
+        // unchanged directories, symlinks and hardlink groups from a cached
+        // root; only differing regular files are cloned/decoded into private
+        // files and read-only bound into the sandbox. Never reuse changed
+        // files beneath writable or already-mounted paths.
+        let best = self
+            .entries
+            .iter()
+            .filter_map(|(&id, view)| {
+                let changed = trees::compatible_regular_file_overlays(
+                    view.manifest(),
+                    lease.manifest(),
+                    protected,
+                )?;
+                // Per-file bind mounts and private clones have a cost too:
+                // only use the fast path when more entries are preserved
+                // than replaced. This is a performance choice, not a
+                // correctness constraint.
+                (changed.len() < lease.manifest().entries.len() - changed.len())
+                    .then_some((id, changed))
+            })
+            .min_by_key(|(id, changed)| (changed.len(), *id));
+        if let Some((base_id, changed)) = best {
+            let view = Arc::clone(&self.entries[&base_id]);
+            let mut mounted = trees::MountedTree::from_view(view, scratch)?;
+            let overlay = lease.materialize_overlays(&changed, scratch)?;
+            let stats = overlay.stats;
+            mounted.attach_overlays(overlay);
+            log::debug!(
+                "native CAS reused immutable tree {base_id:?} with {} file overlays, {} block clones, {} copied bytes",
+                changed.len(),
+                stats.cloned_files,
+                stats.copied_bytes,
+            );
+            self.order.retain(|other| other != &base_id);
+            self.order.push_back(base_id);
             return Ok(mounted);
         }
         let view = Arc::new(if native_zfs {
@@ -565,16 +604,23 @@ pub struct NativeStore {
 
 impl NativeStore {
     #[cfg(target_os = "linux")]
-    pub(crate) fn mount_tree(
+    pub(crate) fn mount_tree_protected(
         &self,
         lease: trees::TreeLease,
         parent: &Path,
+        protected: &[PathBuf],
     ) -> Result<trees::MountedTree> {
         let native_zfs = self.can_clone_into(parent)?;
         self.mounts
             .lock()
             .map_err(|_| anyhow!("native CAS mount cache lock poisoned"))?
-            .mount(lease, &self.inner.root.join("mounts"), parent, native_zfs)
+            .mount(
+                lease,
+                &self.inner.root.join("mounts"),
+                parent,
+                native_zfs,
+                protected,
+            )
     }
 
     #[cfg(target_os = "linux")]
