@@ -62,6 +62,25 @@ fn assume(credentials: &Credentials, mount: &OwnedFd, root: &OwnedFd) -> Result<
             credentials.groups.as_ptr(),
         ))?;
         checked(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))?;
+        if credentials.uid != 0 {
+            // Do not inherit a service configuration that preserves root
+            // capabilities across the UID transition.
+            checked(libc::prctl(libc::PR_SET_KEEPCAPS, 0, 0, 0, 0))?;
+            let securebits = libc::prctl(libc::PR_GET_SECUREBITS, 0, 0, 0, 0);
+            checked(securebits)?;
+            const NO_SETUID_FIXUP: libc::c_int = 1 << 2;
+            ensure!(
+                securebits & NO_SETUID_FIXUP == 0,
+                "unsafe inherited securebits"
+            );
+            checked(libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_CLEAR_ALL,
+                0,
+                0,
+                0,
+            ))?;
+        }
         checked(libc::setresgid(
             credentials.gid,
             credentials.gid,
@@ -85,11 +104,14 @@ fn assume(credentials: &Credentials, mount: &OwnedFd, root: &OwnedFd) -> Result<
 
 async fn compile(job: Job, broker: UnixStream) -> Result<CompileFinished> {
     let Job {
-        compile,
+        mut compile,
         aliases,
         toolchains,
         catalogs,
     } = job;
+    // Use the attested real executable for both cacheable work and the
+    // daemon-owned fallback; a strict launcher must not resubmit the job.
+    compile.exe = aliases.resolve(compile.exe.into())?.into_os_string();
     let storage = IpcStorage::connect(ServerConnection::new(Box::new(broker))?).await?;
     let conn = storage.conn();
     let config = DistConfig {
