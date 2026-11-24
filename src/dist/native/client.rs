@@ -73,6 +73,7 @@ impl InputBlob {
                 .map_err(|_| anyhow::anyhow!("native input reader poisoned"))?;
             io::copy(&mut *reader, &mut io::sink())?;
             ensure!(reader.limit() == 0, "truncated native IPC input frame");
+            drop(reader);
         }
         Ok(())
     }
@@ -327,6 +328,29 @@ impl NativeCacheClient {
         }
     }
 
+    fn schedule_with_retry(
+        &self,
+        ticket: Ticket,
+        spec: &ExecutionSpec,
+        start: Instant,
+        timeout: Duration,
+    ) -> Result<ScheduleReply> {
+        let mut delay = Duration::from_millis(10);
+        loop {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            ensure!(!remaining.is_zero(), "native allocation deadline exceeded");
+            match self.schedule(ticket, spec.clone()) {
+                Ok(reply) => return Ok(reply),
+                Err(error) if retryable_transport_error(&error) => {
+                    debug!("retrying native allocation: {error:#}");
+                    thread::sleep(delay.min(remaining));
+                    delay = (delay * 2).min(Duration::from_millis(200));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     fn run_admitted<'a>(
         &self,
         pin: Pin<'a>,
@@ -339,20 +363,7 @@ impl NativeCacheClient {
         if let Some(local) = local.filter(|executor| executor.prefers_local()) {
             return self.run_local(pin, spec, inputs, policy, start, local);
         }
-        let mut delay = Duration::from_millis(10);
-        let reply = loop {
-            let remaining = policy.timeout.saturating_sub(start.elapsed());
-            ensure!(!remaining.is_zero(), "native allocation deadline exceeded");
-            match self.schedule(pin.ticket, spec.clone()) {
-                Ok(reply) => break reply,
-                Err(error) if retryable_transport_error(&error) => {
-                    debug!("retrying native allocation: {error:#}");
-                    thread::sleep(delay.min(remaining));
-                    delay = (delay * 2).min(Duration::from_millis(200));
-                }
-                Err(error) => return Err(error),
-            }
-        };
+        let reply = self.schedule_with_retry(pin.ticket, spec, start, policy.timeout)?;
         let allocation = match reply {
             ScheduleReply::Assigned(allocation) => allocation,
             ScheduleReply::Unavailable { message } => {

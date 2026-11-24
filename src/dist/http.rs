@@ -273,6 +273,10 @@ pub mod urls {
     }
 
     /// Build the authenticated native peer blob endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the worker URL cannot be parsed.
     pub fn server_native_blob(server_id: ServerId) -> Result<reqwest::Url> {
         Ok(reqwest::Url::parse(&format!(
             "https://{}/api/v3/distserver/native_blob",

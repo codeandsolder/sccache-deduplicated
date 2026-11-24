@@ -73,6 +73,7 @@ impl WorkerTrustCache {
         if workers.len() < 256 {
             workers.insert(server, Arc::clone(&slot));
         }
+        drop(workers);
         Ok(slot)
     }
 
