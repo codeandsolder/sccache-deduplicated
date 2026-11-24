@@ -680,7 +680,9 @@ where
             .collect::<Vec<_>>();
 
         activity::phase(Phase::CacheLookup);
-        let lookup = match cache_status.await {
+        let cache_status = cache_status.await;
+        storage.validate_session()?;
+        let lookup = match cache_status {
             (Ok(Ok(Cache::Hit(mut entry))), duration) => {
                 debug!(
                     "[{out_pretty}]: Cache hit in {}",
@@ -1235,7 +1237,7 @@ where
 
     do_dist_compile
         .or_else(move |e| async move {
-            if let Some(HttpClientError(_)) = e.downcast_ref::<HttpClientError>() {
+            if e.is::<crate::client::IpcTransportFailure>() || e.is::<HttpClientError>() {
                 Err(e)
             } else if matches!(e.downcast_ref::<lru_disk_cache::Error>(), Some(lru_disk_cache::Error::FileTooLarge))
             {

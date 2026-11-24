@@ -1135,6 +1135,9 @@ where
                     result.map_err(|error| format!("{error:#}")),
                 )))
             }
+            Request::ObserveCompile(_) | Request::ObservePhase(_) => {
+                bail!("observation RPC requires a dedicated connection")
+            }
             Request::CancelCompile(id) => Ok(Message::WithoutBody(
                 Response::CompileCancellationRequested(self.activities.cancel(&id)),
             )),
@@ -1278,25 +1281,36 @@ where
         // Conversely, a disconnected reader drops the abort-on-drop writer
         // and all of its pending compiler futures.
         let mut handler = util::spawn(async move {
+            let mut next = match reqs_rx.recv().await {
+                Some(Message::WithoutBody(Request::ObserveCompile(identity))) => {
+                    return me.serve_observer(identity, &mut reqs_rx, &mut sink).await;
+                }
+                first => first,
+            };
             let mut transfers = TransferSession::new(
                 chunk_bytes,
                 #[cfg(feature = "dist-client")]
                 Arc::clone(&me.namespace_reservations),
             );
-            while let Some(req) = reqs_rx.recv().await {
+            while let Some(req) = next {
                 if let Message::WithoutBody(Request::Compile(compile)) = &req {
                     let registration = me.activities.begin(compile);
                     me.serve_compile(&registration.activity, req, &mut transfers, &mut sink)
                         .await?;
                 } else {
-                    let Message::WithoutBody(message) = me.dispatch(req, &mut transfers).await?
+                    let budget = transfers.request_budget(&req, me.compile_limits);
+                    let Message::WithoutBody(message) =
+                        Self::monitor_control(&mut sink, me.dispatch(req, &mut transfers), budget)
+                            .await?
                     else {
                         bail!("unexpected compiler body outside a compile request");
                     };
-                    sink.send(Frame::Message { message }).await?;
+                    send_ipc_frame(&mut sink, Frame::Message { message }).await?;
                 }
+                next = reqs_rx.recv().await;
             }
 
+            drop(transfers);
             Ok::<_, Error>(())
         });
 
@@ -1314,6 +1328,56 @@ where
             result = &mut handler => result.context("response handler task failed")?,
             result = reader => result,
         }
+    }
+
+    async fn serve_observer<S>(
+        &self,
+        identity: crate::protocol::CompileIdentity,
+        requests: &mut tokio::sync::mpsc::Receiver<SccacheRequest>,
+        sink: &mut S,
+    ) -> Result<()>
+    where
+        S: Sink<Frame<Response, Response>, Error = Error> + Unpin,
+    {
+        drop(self.tx.clone().start_send(ServerMessage::Request));
+        let registration = self
+            .activities
+            .register(&identity, activity::CompileOwner::Namespace);
+        let activity = &registration.activity;
+        send_ipc_frame(
+            sink,
+            Frame::Message {
+                message: Response::CompileObserved(activity.snapshot().id),
+            },
+        )
+        .await?;
+        while let Some(request) =
+            time::timeout(activity::IPC_INACTIVITY_TIMEOUT, requests.recv()).await?
+        {
+            drop(self.tx.clone().start_send(ServerMessage::Request));
+            let Message::WithoutBody(Request::ObservePhase(sample)) = request else {
+                bail!("unexpected request on compile observation connection");
+            };
+            activity.observe(sample)?;
+            if let Some(reason) = activity.snapshot().deadline_error(self.compile_limits) {
+                send_ipc_frame(
+                    sink,
+                    Frame::Message {
+                        message: Response::RequestAborted(reason.clone()),
+                    },
+                )
+                .await?;
+                bail!("{reason}");
+            }
+            send_ipc_frame(
+                sink,
+                Frame::Message {
+                    message: Response::ObservationAccepted,
+                },
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     async fn serve_compile<S>(
@@ -1337,16 +1401,16 @@ where
             {
                 Message::WithoutBody(message) => {
                     activity.phase(Phase::SendReply);
-                    sink.send(Frame::Message { message }).await?;
+                    send_ipc_frame(sink, Frame::Message { message }).await?;
                 }
                 Message::WithBody(message, body) => {
-                    sink.send(Frame::Message { message }).await?;
+                    send_ipc_frame(sink, Frame::Message { message }).await?;
                     let body = activity::scope(activity, async {
                         util::spawn(activity::inherit(body)).await?
                     });
                     let message = self.monitor_compile(activity, sink, body).await?;
                     activity.phase(Phase::SendReply);
-                    sink.send(Frame::Body { chunk: message }).await?;
+                    send_ipc_frame(sink, Frame::Body { chunk: message }).await?;
                 }
             }
             Ok::<_, Error>(())
@@ -1355,14 +1419,48 @@ where
         if let Err(error) = result {
             // The monitored future has been dropped. Some blocking I/O
             // may still finish, so the outcome is explicitly ambiguous.
-            let _ = sink
-                .send(Frame::Message {
-                    message: Response::CompileAborted(format!("{error:#}")),
-                })
+            if !error.is::<IpcSendFailure>() {
+                let _ = send_ipc_frame(
+                    sink,
+                    Frame::Message {
+                        message: Response::CompileAborted(format!("{error:#}")),
+                    },
+                )
                 .await;
+            }
             return Err(error);
         }
         Ok(())
+    }
+
+    async fn monitor_control<F, R, S>(sink: &mut S, work: F, budget: Duration) -> Result<R>
+    where
+        F: Future<Output = Result<R>> + Send,
+        S: Sink<Frame<Response, Response>, Error = Error> + Unpin,
+    {
+        let mut ticker = time::interval_at(
+            time::Instant::now() + activity::HEARTBEAT_INTERVAL,
+            activity::HEARTBEAT_INTERVAL,
+        );
+        ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        let deadline = time::sleep(budget);
+        tokio::pin!(work, deadline);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut work => return result,
+                () = &mut deadline => {
+                    let reason = "IPC operation exceeded its deadline; session abandoned";
+                    send_ipc_frame(sink, Frame::Message {
+                        message: Response::RequestAborted(reason.into()),
+                    }).await?;
+                    bail!("{reason}");
+                }
+                _ = ticker.tick() => {
+                    send_ipc_frame(sink, Frame::Message { message: Response::Heartbeat }).await?;
+                }
+            }
+        }
     }
 
     async fn monitor_compile<F, R, S>(
@@ -1385,16 +1483,15 @@ where
             tokio::select! {
                 biased;
                 () = activity.cancellation.cancelled() => {
-                    let snapshot = activity.snapshot();
-                    bail!("compile request {} cancellation requested during {:?}; outcome unknown", snapshot.id, snapshot.phase);
+                    bail!("{}", activity.snapshot().deadline_error(self.compile_limits).unwrap_or_else(|| "compile cancelled".into()));
                 }
                 result = &mut work => return result,
                 _ = ticker.tick() => {
                     let snapshot = activity.snapshot();
-                    if Duration::from_millis(snapshot.phase_age_ms) >= self.compile_limits.budget(snapshot.phase) {
-                        bail!("compile request {} exceeded its {:?} phase deadline after {} ms; outcome unknown", snapshot.id, snapshot.phase, snapshot.phase_age_ms);
+                    if let Some(reason) = snapshot.deadline_error(self.compile_limits) {
+                        bail!("{reason}");
                     }
-                    sink.send(Frame::Message { message: Response::CompileProgress(snapshot) }).await?;
+                    send_ipc_frame(sink, Frame::Message { message: Response::CompileProgress(snapshot) }).await?;
                 }
             }
         }
@@ -1458,11 +1555,15 @@ where
         &self,
         compile: Compile,
     ) -> Result<(CompileResponse, Option<CompileFinished>)> {
-        match self.handle_compile(compile).await? {
+        self.storage.validate_session()?;
+        let response = self.handle_compile(compile).await?;
+        self.storage.validate_session()?;
+        match response {
             Message::WithBody(Response::Compile(resp), body) => {
                 let Response::CompileFinished(finished) = body.await? else {
                     bail!("unexpected body response from compile_direct")
                 };
+                self.storage.validate_session()?;
                 Ok((resp, Some(finished)))
             }
             Message::WithoutBody(Response::Compile(resp)) => Ok((resp, None)),
@@ -2589,6 +2690,27 @@ enum Frame<R, R1> {
     Message { message: R },
 }
 
+#[derive(Debug)]
+struct IpcSendFailure;
+
+impl std::fmt::Display for IpcSendFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IPC response delivery failed")
+    }
+}
+
+impl std::error::Error for IpcSendFailure {}
+
+async fn send_ipc_frame<S>(sink: &mut S, frame: Frame<Response, Response>) -> Result<()>
+where
+    S: Sink<Frame<Response, Response>, Error = Error> + Unpin,
+{
+    time::timeout(activity::IPC_INACTIVITY_TIMEOUT, sink.send(frame))
+        .await
+        .context(IpcSendFailure)?
+        .context(IpcSendFailure)
+}
+
 struct Body<R> {
     receiver: mpsc::Receiver<Result<R>>,
 }
@@ -2896,6 +3018,140 @@ mod tests {
             env_vars: vec![],
         };
         (service, request)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn namespace_observer_mirrors_phase_and_cancels_only_selected_caller() -> Result<()> {
+        let (service, request) = watchdog_fixture(31);
+        let other = service.activities.begin(&request);
+        let identity = crate::protocol::CompileIdentity::from(&request);
+        let (socket, peer) = tokio::io::duplex(4096);
+        let handler = util::spawn(service.clone().bind(peer));
+        let mut client = tokio_util::codec::Framed::new(socket, LengthDelimitedCodec::new());
+        client
+            .send(Bytes::from(bincode::serialize(&Request::ObserveCompile(
+                identity.clone(),
+            ))?))
+            .await?;
+        let frame = client
+            .next()
+            .await
+            .context("observer registration missing")??;
+        let Response::CompileObserved(id) = bincode::deserialize::<Response>(&frame)? else {
+            bail!("unexpected observer registration");
+        };
+        let local =
+            activity::Activity::new(id.clone(), &identity, activity::CompileOwner::Namespace);
+        local.phase(Phase::RunDistributed);
+        time::advance(Duration::from_secs(15)).await;
+        client
+            .send(Bytes::from(bincode::serialize(&Request::ObservePhase(
+                local.snapshot(),
+            ))?))
+            .await?;
+        let frame = client.next().await.context("observer update missing")??;
+        assert!(matches!(
+            bincode::deserialize::<Response>(&frame)?,
+            Response::ObservationAccepted
+        ));
+        let snapshot = service
+            .activities
+            .snapshots()
+            .into_iter()
+            .find(|sample| sample.id == id)
+            .context("namespace request missing")?;
+        assert_eq!(snapshot.owner, activity::CompileOwner::Namespace);
+        assert_eq!(snapshot.phase, Phase::RunDistributed);
+        assert_eq!(snapshot.phase_age_ms, 15000);
+        assert!(service.activities.cancel(&id));
+        client
+            .send(Bytes::from(bincode::serialize(&Request::ObservePhase(
+                local.snapshot(),
+            ))?))
+            .await?;
+        let frame = client
+            .next()
+            .await
+            .context("observer cancel response missing")??;
+        let Response::RequestAborted(reason) = bincode::deserialize::<Response>(&frame)? else {
+            bail!("observer cancellation did not abort");
+        };
+        assert!(reason.contains("cancellation requested"));
+        assert!(handler.await?.is_err());
+        assert!(!other.activity.snapshot().cancellation_requested);
+        assert_eq!(service.activities.snapshots().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn namespace_observer_aborts_actual_caller_future() -> Result<()> {
+        let (service, request) = watchdog_fixture(31);
+        let identity = crate::protocol::CompileIdentity::from(&request);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = crate::net::SocketAddr::Net(listener.local_addr()?);
+        let peer = service.clone();
+        let server = util::spawn(async move {
+            let (socket, _) = listener.accept().await?;
+            peer.bind(socket).await
+        });
+        let observer = tokio::task::spawn_blocking(move || {
+            crate::client::CompileObserver::connect(&addr, &identity)
+        })
+        .await??;
+        let (held, dropped) = tokio::sync::oneshot::channel::<()>();
+        let work = async move {
+            activity::phase(Phase::RunDistributed);
+            let _held = held;
+            future::pending::<Result<()>>().await
+        };
+        let cancel = async {
+            time::sleep(Duration::from_secs(16)).await;
+            let active = service.activities.snapshots();
+            assert_eq!(active.len(), 1);
+            assert_eq!(active[0].phase, Phase::RunDistributed);
+            assert_eq!(active[0].owner, activity::CompileOwner::Namespace);
+            assert!(service.activities.cancel(&active[0].id));
+        };
+        let (result, ()) = tokio::join!(observer.run(work), cancel);
+        let error = result.expect_err("caller-side work must abort");
+        assert!(format!("{error:#}").contains("cancellation requested"));
+        assert!(dropped.await.is_err());
+        assert!(server.await?.is_err());
+        assert!(service.activities.snapshots().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn control_rpc_heartbeats_do_not_extend_deadline() -> Result<()> {
+        let (tx, mut rx) = mpsc::unbounded();
+        let mut sink = tx.sink_err_into::<Error>();
+        let monitor = SccacheService::<ProcessCommandCreator>::monitor_control(
+            &mut sink,
+            future::pending::<Result<()>>(),
+            Duration::from_secs(31),
+        );
+        tokio::pin!(monitor);
+        let result = async {
+            for _ in 0..2 {
+                assert!(matches!(
+                    rx.next().await,
+                    Some(Frame::Message {
+                        message: Response::Heartbeat
+                    })
+                ));
+            }
+            assert!(matches!(
+                rx.next().await,
+                Some(Frame::Message {
+                    message: Response::RequestAborted(_)
+                })
+            ));
+            Ok::<_, Error>(())
+        };
+        let (error, received) = tokio::join!(monitor, result);
+        received?;
+        assert!(error.is_err());
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]
