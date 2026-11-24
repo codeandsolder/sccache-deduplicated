@@ -21,7 +21,7 @@ fn publish(store: &NativeStore, name: &str) -> Result<ActionKey> {
     let stage = store.stage(Cursor::new(name.as_bytes()))?;
     let blob: BlobRef = stage.reference();
     let manifest = ResultManifest {
-        outputs: BTreeMap::from([("obj".into(), Artifact { blob, mode: None })]),
+        outputs: BTreeMap::from([("obj".into(), Artifact::File { blob, mode: None })]),
         stdout: None,
         stderr: None,
     };
@@ -456,7 +456,7 @@ fn eviction_prefers_exclusive_blobs_over_shared_result_aliases() -> Result<()> {
     let manifest = ResultManifest {
         outputs: BTreeMap::from([(
             "obj".into(),
-            Artifact {
+            Artifact::File {
                 blob: shared_blob,
                 mode: None,
             },
@@ -695,7 +695,7 @@ fn output_headroom_survives_other_staging_and_converts_without_double_charge() -
             .is_err()
     );
     let manifest = ResultManifest {
-        outputs: BTreeMap::from([("obj".into(), Artifact { blob, mode: None })]),
+        outputs: BTreeMap::from([("obj".into(), Artifact::File { blob, mode: None })]),
         stdout: None,
         stderr: None,
     };

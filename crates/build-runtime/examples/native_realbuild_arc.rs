@@ -203,6 +203,7 @@ mod linux {
                 OutputSpec {
                     path: BuildPath::new(b"/out/result.o".to_vec())?,
                     required: true,
+                    kind: sccache_build::OutputKind::File,
                 },
             )]),
         })

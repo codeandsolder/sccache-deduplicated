@@ -2909,7 +2909,7 @@ mod scheduler_tests {
             size: 512 << 20,
         };
         let manifest = ResultManifest {
-            outputs: BTreeMap::from([("obj".into(), Artifact { blob, mode: None })]),
+            outputs: BTreeMap::from([("obj".into(), Artifact::File { blob, mode: None })]),
             stdout: None,
             stderr: None,
         };

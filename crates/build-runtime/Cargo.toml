@@ -35,8 +35,8 @@ serde_json = ">=1.0, <1.0.155"
 
 [features]
 default = ["store"]
-mapping = ["dep:rustix", "dep:log"]
-store = ["mapping", "dep:rand", "dep:redb", "dep:tempfile", "dep:flate2", "dep:lzma-rust2", "dep:sha2", "dep:tar", "dep:zstd", "dep:fuser", "dep:libc"]
+mapping = ["dep:rustix", "dep:tempfile", "dep:log"]
+store = ["mapping", "dep:rand", "dep:redb", "dep:flate2", "dep:lzma-rust2", "dep:sha2", "dep:tar", "dep:zstd", "dep:fuser", "dep:libc"]
 
 [lints]
 workspace = true

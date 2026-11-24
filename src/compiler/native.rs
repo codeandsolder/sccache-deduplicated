@@ -16,8 +16,8 @@ use anyhow::{Context, Result, ensure};
 
 use crate::{
     build_runtime::{
-        ActionMode, BuildPath, CommandSpec, ContentId, ExecutionRoot, ExecutionSpec, OutputSpec,
-        PreparedTree, SourceDigestCache, TreeRecipe,
+        ActionMode, BuildPath, CommandSpec, ContentId, ExecutionRoot, ExecutionSpec, OutputKind,
+        OutputSpec, PreparedTree, SourceDigestCache, TreeRecipe,
     },
     cache::FileObjectSource,
     client::{SharedConnection, connection_task},
@@ -253,6 +253,65 @@ impl NativeCompilerClient {
     }
 }
 
+struct NativeOutput {
+    name: String,
+    source: PathBuf,
+    destination: PathBuf,
+    required: bool,
+    kind: OutputKind,
+}
+
+impl NativeOutput {
+    fn file(cwd: &Path, output: FileObjectSource) -> Self {
+        let path = cwd.join(output.path);
+        Self {
+            name: output.key,
+            source: path.clone(),
+            destination: path,
+            required: !output.optional,
+            kind: OutputKind::File,
+        }
+    }
+    const fn generated(name: String, source: PathBuf, destination: PathBuf) -> Self {
+        Self {
+            name,
+            source,
+            destination,
+            required: true,
+            kind: OutputKind::GeneratedTree,
+        }
+    }
+
+    fn remote_path(&self, layout: &mut pkg::CompilerInputs) -> Result<BuildPath> {
+        let path = if self.kind.is_tree() {
+            PathBuf::from(layout.directory(&self.source)?)
+        } else {
+            ensure!(
+                self.source != Path::new("/dev/null"),
+                "native outputs must be regular files"
+            );
+            match std::fs::symlink_metadata(&self.source) {
+                Ok(metadata) => ensure!(
+                    metadata.is_file(),
+                    "native output would replace a nonregular file"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("inspect native output destination"),
+            }
+            let parent = self
+                .source
+                .parent()
+                .context("native output parent missing")?;
+            let name = self
+                .source
+                .file_name()
+                .context("native output name missing")?;
+            Path::new(&layout.directory(parent)?).join(name)
+        };
+        BuildPath::new(path.as_os_str().as_bytes().to_vec())
+    }
+}
+
 struct CompilerPlan {
     spec: ExecutionSpec,
     inputs: Vec<PreparedTree>,
@@ -263,7 +322,7 @@ impl CompilerPlan {
     fn prepare(
         command: dist::CompileCommand,
         cwd: &Path,
-        outputs: Vec<FileObjectSource>,
+        outputs: Vec<NativeOutput>,
         transformer: dist::PathTransformer,
         packagers: DistPackagers,
         platform: ContentId,
@@ -274,39 +333,21 @@ impl CompilerPlan {
         let mut paths = BTreeMap::new();
         let mut destinations = BTreeMap::new();
         for output in outputs {
-            let local = cwd.join(output.path);
-            ensure!(
-                local != Path::new("/dev/null"),
-                "native outputs must be regular files"
-            );
-            match std::fs::symlink_metadata(&local) {
-                Ok(metadata) => ensure!(
-                    metadata.is_file(),
-                    "native output would replace a nonregular file"
-                ),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error).context("inspect native output destination"),
-            }
-            let parent = local.parent().context("native output parent missing")?;
-            let name = local.file_name().context("native output name missing")?;
-            // The input layout preserves symlink and parent traversal. The
-            // output descriptor addresses the actual resolved backing entry.
-            let remote_parent = layout.directory(parent)?;
-            let remote = Path::new(&remote_parent).join(name);
-            let path = BuildPath::new(remote.as_os_str().as_bytes().to_vec())?;
+            let path = output.remote_path(&mut layout)?;
             ensure!(
                 paths
                     .insert(
-                        output.key.clone(),
+                        output.name.clone(),
                         OutputSpec {
                             path,
-                            required: !output.optional
+                            required: output.required,
+                            kind: output.kind,
                         }
                     )
                     .is_none(),
                 "duplicate native output key"
             );
-            destinations.insert(output.key, local);
+            destinations.insert(output.name, output.destination);
         }
         let (inputs, toolchain) = packagers;
         let before = toolchain_digests.catalog_hits();
@@ -364,6 +405,213 @@ impl CompilerPlan {
     }
 }
 
+/// Split a Rust action without changing its logical cwd, argument ordering,
+/// target, or environment. The private delivery directories are independent
+/// of all of those key fields.
+struct NativeLink {
+    workspace: super::rust_link::NativeLinkWorkspace,
+    layout: super::rust_link::NativeLinkLayout,
+    executable: PathBuf,
+    logical_cwd: PathBuf,
+    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    expected: Vec<FileObjectSource>,
+    physical_cwd: PathBuf,
+}
+
+impl NativeLink {
+    fn prepare(
+        layout: super::rust_link::NativeLinkLayout,
+        remote: &mut dist::CompileCommand,
+        transformer: &dist::PathTransformer,
+        scratch: &Path,
+        local_environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+        expected: Vec<FileObjectSource>,
+        physical_cwd: PathBuf,
+    ) -> Result<Self> {
+        use super::rust_link::{NativeLinkWorkspace, RustLinkStages};
+
+        let args = remote
+            .arguments
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect();
+        let logical_cwd = PathBuf::from(&remote.cwd);
+        let stages = RustLinkStages::from_expanded(args, &logical_cwd, |cwd, path| {
+            let logical = cwd.join(path);
+            let physical = transformer
+                .to_local(logical.to_str().context("non-UTF8 logical output root")?)?
+                .canonicalize()?;
+            let mut mapping = dist::PathTransformer::new();
+            for (local, remote) in transformer.path_mappings() {
+                mapping.add_root_mapping(local, &remote);
+            }
+            Ok(PathBuf::from(
+                mapping
+                    .as_dist_abs(&physical)
+                    .context("output path has no native mapping")?,
+            ))
+        })?;
+        let workspace = NativeLinkWorkspace::new(stages, scratch, |root| {
+            transformer.to_local(root.to_str().context("non-UTF8 output root")?)
+        })?;
+        remote.arguments = workspace
+            .codegen_arguments()
+            .into_iter()
+            .map(|arg| {
+                arg.into_string()
+                    .map_err(|_| anyhow::anyhow!("non-UTF8 native argument"))
+            })
+            .collect::<Result<_>>()?;
+        // Literal leading @ arguments have already been expanded by the
+        // frontend. The worker command cannot regenerate response files.
+        ensure!(
+            !remote.arguments.iter().any(|arg| arg.starts_with('@')),
+            "native worker would expand a literal response-file operand"
+        );
+        Ok(Self {
+            workspace,
+            layout,
+            executable: PathBuf::from(&remote.executable),
+            logical_cwd,
+            environment: local_environment,
+            expected,
+            physical_cwd,
+        })
+    }
+
+    fn outputs(&self) -> Vec<NativeOutput> {
+        self.workspace
+            .outputs()
+            .enumerate()
+            .map(|(index, (_, physical, destination))| {
+                NativeOutput::generated(
+                    format!("codegen-{index}"),
+                    physical.to_owned(),
+                    destination.to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    async fn finish<T: CommandCreatorSync>(
+        &self,
+        creator: &T,
+        mut generated: process::Output,
+    ) -> Result<process::Output> {
+        use crate::errors::ProcessError;
+        use crate::mock_command::RunCommand;
+        let mut args = self.layout.mounts.clone();
+        args.extend(self.workspace.overlay_arguments()?);
+        args.extend([
+            "--chdir".into(),
+            self.logical_cwd.clone().into_os_string(),
+            "--".into(),
+            self.executable.clone().into_os_string(),
+        ]);
+        args.extend(self.workspace.link_arguments()?);
+
+        let mut command = creator.clone().new_command_sync("/usr/bin/bwrap");
+        command
+            .args(&args)
+            .env_clear()
+            .envs(self.environment.clone())
+            .current_dir("/");
+        command.share_jobserver();
+        let linked = match crate::util::run_input_output(command, None).await {
+            Ok(output) => output,
+            Err(error) => match error.downcast::<ProcessError>() {
+                Ok(ProcessError(output)) => output,
+                Err(error) => return Err(error),
+            },
+        };
+        if linked.status.success() {
+            self.workspace.publish(
+                &self.expected,
+                &self.physical_cwd,
+                self.layout.dep_info.as_deref(),
+            )?;
+        }
+        if !linked.status.success() {
+            debug!(
+                "native local link failed with {}: {}",
+                linked.status,
+                String::from_utf8_lossy(&linked.stderr)
+            );
+        }
+        generated.status = linked.status;
+        generated.stdout.extend(linked.stdout);
+        generated.stderr.extend(linked.stderr);
+        Ok(generated)
+    }
+}
+
+fn prepare_dispatch(
+    compilation: Box<dyn Compilation<impl CommandCreatorSync>>,
+    remote: &mut dist::CompileCommand,
+    transformer: dist::PathTransformer,
+    cwd: &Path,
+    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    scratch: &mut Option<tempfile::TempDir>,
+    split: &mut Option<NativeLink>,
+) -> Result<(Vec<NativeOutput>, dist::PathTransformer, DistPackagers)> {
+    super::core::validate_dist_environment_dependencies(
+        remote,
+        &compilation.dist_environment_dependencies(),
+    )?;
+    let expected = compilation
+        .outputs()
+        .filter(|output| output.key != "d")
+        .collect::<Vec<_>>();
+    let outputs = if let Some(layout) = compilation.native_link_layout() {
+        let directory = tempfile::Builder::new()
+            .prefix("sccache-native-link-")
+            .tempdir()?;
+        let link = NativeLink::prepare(
+            layout.clone(),
+            remote,
+            &transformer,
+            directory.path(),
+            environment,
+            expected,
+            cwd.to_owned(),
+        )?;
+        let outputs = link.outputs();
+        *scratch = Some(directory);
+        *split = Some(link);
+        outputs
+    } else {
+        expected
+            .into_iter()
+            .map(|output| NativeOutput::file(cwd, output))
+            .collect()
+    };
+    let mut layout = dist::PathTransformer::new();
+    for (local, remote) in transformer.path_mappings() {
+        layout.add_root_mapping(local, &remote);
+    }
+    let packagers = compilation.into_dist_packagers(transformer)?;
+    Ok((outputs, layout, packagers))
+}
+
+fn classify_source(
+    source: NativeBuildSource,
+    mode: ActionMode,
+    elapsed: Duration,
+) -> CompileResult {
+    let miss = if mode == ActionMode::Refresh {
+        MissType::ForcedRecache
+    } else {
+        MissType::Normal
+    };
+    match source {
+        NativeBuildSource::Hit => CompileResult::CacheHit(elapsed),
+        NativeBuildSource::Local => CompileResult::NativeMiss(miss, DistType::NoDist, elapsed),
+        NativeBuildSource::Worker(addr) => {
+            CompileResult::NativeMiss(miss, DistType::Ok(addr.to_string()), elapsed)
+        }
+    }
+}
+
 pub(super) async fn compile<T: CommandCreatorSync>(
     client: Arc<NativeCompilerClient>,
     service: &SccacheService<T>,
@@ -388,23 +636,21 @@ pub(super) async fn compile<T: CommandCreatorSync>(
         ActionMode::Reuse
     };
     let mut fallback = DistType::NoDist;
-    if let Some(remote) = remote.filter(|_| eligible) {
+    if let Some(mut remote) = remote.filter(|_| eligible) {
+        // Hold the temporary parent until link completion and artifact
+        // publication. It is private scratch, not a cache tier.
+        let mut scratch = None;
+        let mut split = None;
         let result = (|| {
-            super::core::validate_dist_environment_dependencies(
-                &remote,
-                &compilation.dist_environment_dependencies(),
+            let (outputs, layout, packagers) = prepare_dispatch(
+                compilation,
+                &mut remote,
+                transformer,
+                &cwd,
+                local.get_env_vars(),
+                &mut scratch,
+                &mut split,
             )?;
-            let outputs = compilation
-                .outputs()
-                .filter(|output| output.key != "d")
-                .collect();
-            // Preserve root mappings, but do not carry the large reverse
-            // path table into the independent directory-only plan.
-            let mut layout = dist::PathTransformer::new();
-            for (local, remote) in transformer.path_mappings() {
-                layout.add_root_mapping(local, &remote);
-            }
-            let packagers = compilation.into_dist_packagers(transformer)?;
             let preparation_client = Arc::clone(&client);
             Ok::<_, anyhow::Error>(pool.spawn_blocking(move || {
                 CompilerPlan::prepare(
@@ -425,24 +671,25 @@ pub(super) async fn compile<T: CommandCreatorSync>(
             },
             Err(error) => Err(error),
         };
+        let result = match (result, split.as_ref()) {
+            (Ok(mut result), Some(link)) if result.output.status.success() => {
+                match link.finish(&creator, result.output).await {
+                    Ok(output) => {
+                        result.output = output;
+                        Ok(result)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            (result, _) => result,
+        };
+        // Explicit drop order: the workspace's TempDirs reference scratch.
+        drop(split);
+        drop(scratch);
         match result {
             Ok(result) if result.output.status.success() => {
                 let elapsed = start.elapsed();
-                let classification = match result.source {
-                    NativeBuildSource::Hit => CompileResult::CacheHit(elapsed),
-                    source => CompileResult::NativeMiss(
-                        if mode == ActionMode::Refresh {
-                            MissType::ForcedRecache
-                        } else {
-                            MissType::Normal
-                        },
-                        match source {
-                            NativeBuildSource::Local | NativeBuildSource::Hit => DistType::NoDist,
-                            NativeBuildSource::Worker(addr) => DistType::Ok(addr.to_string()),
-                        },
-                        elapsed,
-                    ),
-                };
+                let classification = classify_source(result.source, mode, elapsed);
                 return Ok((classification, result.output));
             }
             Ok(result) => {
@@ -506,6 +753,7 @@ mod tests {
         args: &[&str],
         name: &str,
         source: &str,
+        split_link: bool,
     ) -> Result<()> {
         let temp = tempfile::tempdir()?;
         let cwd = temp.path().canonicalize()?;
@@ -530,8 +778,12 @@ mod tests {
             pool,
             crate::compiler::CompilerDiscovery::default(),
         ))?;
-        let CompilerArguments::Ok(mut hasher) = compiler.parse_arguments(&args, &cwd, &environment)
-        else {
+        let CompilerArguments::Ok(mut hasher) = compiler.parse_arguments(
+            &args,
+            &cwd,
+            &environment,
+            super::super::CompilerCachePolicy::Native,
+        ) else {
             anyhow::bail!("real compiler arguments are not cacheable");
         };
         let hashed = rt.block_on(hasher.generate_hash_key(GenerateHashKeyContext {
@@ -550,15 +802,40 @@ mod tests {
         let (_, remote, cacheable) =
             compilation.generate_compile_commands(&mut transformer, CompileTransport::Native)?;
         assert_eq!(cacheable, Cacheable::Yes);
-        let remote = remote.context("no distributed command for real compiler")?;
+        let mut remote = remote.context("no distributed command for real compiler")?;
         super::super::core::validate_dist_environment_dependencies(
             &remote,
             &compilation.dist_environment_dependencies(),
         )?;
-        let outputs = compilation
+        let expected = compilation
             .outputs()
             .filter(|output| output.key != "d")
-            .collect();
+            .collect::<Vec<_>>();
+        let mut replay = None;
+        let outputs = if split_link {
+            let layout = compilation
+                .native_link_layout()
+                .context("linked Rust invocation did not select split linking")?
+                .clone();
+            let link = NativeLink::prepare(
+                layout,
+                &mut remote,
+                &transformer,
+                &cwd,
+                environment.clone(),
+                expected.clone(),
+                cwd.clone(),
+            )?;
+            let outputs = link.outputs();
+            replay = Some(link);
+            outputs
+        } else {
+            assert!(compilation.native_link_layout().is_none());
+            expected
+                .into_iter()
+                .map(|output| NativeOutput::file(&cwd, output))
+                .collect()
+        };
         let mut layout = dist::PathTransformer::new();
         for (local, remote) in transformer.path_mappings() {
             layout.add_root_mapping(local, &remote);
@@ -605,6 +882,54 @@ mod tests {
             .successful_result()
             .context("compiler produced no result")?;
         plan.spec.action_request()?.validate_result(manifest)?;
+        let mut replayed = BTreeMap::new();
+        if let Some(link) = &replay {
+            use crate::build_runtime::{Artifact, materialize_tree};
+            for (index, (_, _, destination)) in link.workspace.outputs().enumerate() {
+                let Artifact::GeneratedTree(manifest) =
+                    &manifest.outputs[&format!("codegen-{index}")]
+                else {
+                    anyhow::bail!("expected generated codegen tree");
+                };
+                let staged = materialize_tree(
+                    manifest,
+                    destination.parent().context("stage parent")?,
+                    |blob, path| {
+                        std::io::copy(
+                            &mut result.open_blob(blob.id)?,
+                            &mut std::fs::File::create(path)?,
+                        )?;
+                        Ok(())
+                    },
+                )?;
+                staged.publish(destination)?;
+            }
+            let output = rt.block_on(link.finish(
+                &creator,
+                process::Output {
+                    status: result.status(),
+                    stdout: vec![],
+                    stderr: vec![],
+                },
+            ))?;
+            ensure!(
+                output.status.success(),
+                "native link failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for output in &link.expected {
+                let physical = cwd.join(&output.path);
+                if output.optional && !physical.exists() {
+                    continue;
+                }
+                replayed.insert(physical.clone(), std::fs::read(physical)?);
+            }
+            ensure!(
+                !replayed.is_empty(),
+                "local link did not produce an artifact"
+            );
+            assert!(!cwd.join("build/input-stage.rlink").exists());
+        }
         let reference = process::Command::new(executable)
             .args(&args)
             .current_dir(&cwd)
@@ -616,14 +941,23 @@ mod tests {
             "local compiler failed: {}",
             String::from_utf8_lossy(&reference.stderr)
         );
-        for (name, output) in &manifest.outputs {
-            let mut bytes = Vec::new();
-            result.open_blob(output.blob.id)?.read_to_end(&mut bytes)?;
-            assert_eq!(
-                ContentId::of(&bytes),
-                ContentId::of(&std::fs::read(&plan.destinations[name])?),
-                "output {name} differs from local compile"
-            );
+        if split_link {
+            for (path, bytes) in replayed {
+                assert_eq!(ContentId::of(&bytes), ContentId::of(&std::fs::read(path)?));
+            }
+        } else {
+            for (name, output) in &manifest.outputs {
+                let mut bytes = Vec::new();
+                let crate::build_runtime::Artifact::File { blob, .. } = output else {
+                    anyhow::bail!("expected file output");
+                };
+                result.open_blob(blob.id)?.read_to_end(&mut bytes)?;
+                assert_eq!(
+                    ContentId::of(&bytes),
+                    ContentId::of(&std::fs::read(&plan.destinations[name])?),
+                    "output {name} differs from local compile"
+                );
+            }
         }
         assert!(!config.fallback_cache.dir.exists());
         assert!(!config.dist.cache_dir.exists());
@@ -646,12 +980,14 @@ mod tests {
             ],
             "input.c",
             "int square(int x) { return x*x; }\n",
+            false,
         )
     }
 
-    #[test]
-    #[ignore = "requires a Rust toolchain, ldd and Linux Bubblewrap"]
-    fn native_rust_compiler_plan() -> Result<()> {
+    #[test_case::test_case(false; "completed_rlib")]
+    #[test_case::test_case(true; "split_link_bin")]
+    #[ignore = "requires a nightly Rust toolchain, ldd and Linux Bubblewrap"]
+    fn native_rust_compiler_plan(split_link: bool) -> Result<()> {
         let sysroot = process::Command::new("rustc")
             .args(["--print", "sysroot"])
             .output()?;
@@ -663,14 +999,20 @@ mod tests {
                 "--crate-name",
                 "input",
                 "--crate-type",
-                "rlib",
+                if split_link { "bin" } else { "rlib" },
                 "--emit=link,dep-info",
                 "--out-dir",
                 "build",
+                "-Cextra-filename=-stage",
                 "input.rs",
             ],
             "input.rs",
-            "pub fn square(x: i32) -> i32 { x*x }\n",
+            if split_link {
+                "fn main() { println!(\"{}\", 7 * 7); }\n"
+            } else {
+                "pub fn square(x: i32) -> i32 { x*x }\n"
+            },
+            split_link,
         )
     }
 }

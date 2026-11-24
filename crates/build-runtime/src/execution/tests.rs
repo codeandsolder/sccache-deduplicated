@@ -170,6 +170,7 @@ fn shell_output_fixture(
             OutputSpec {
                 path: BuildPath::new(b"/out/nested/object".to_vec())?,
                 required: true,
+                kind: crate::OutputKind::File,
             },
         )]),
     };
@@ -194,7 +195,7 @@ fn read_shell_output(
         .context("shell action failed")?;
     let mut bytes = Vec::new();
     execution
-        .open_blob(manifest.outputs["object"].blob.id)?
+        .open_blob(manifest.outputs["object"].test_file_blob().id)?
         .read_to_end(&mut bytes)?;
     Ok(bytes)
 }
@@ -335,7 +336,8 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
             },
         )]),
     };
-    let src = store.publish_tree(&tree, vec![input])?;
+    let original_manifest = tree;
+    let src = store.publish_tree(&original_manifest, vec![input])?;
     let platform = ContentId::of(b"test platform");
     let mut spec = ExecutionSpec {
         platform, root: ExecutionRoot { id: root, recipe: TreeRecipe::union(metadata(0o755), [root]) },
@@ -347,8 +349,8 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
             environment: BTreeMap::new(),
         },
         outputs: BTreeMap::from([
-            ("obj".into(), OutputSpec { path: BuildPath::new(b"/out/nested/object".to_vec())?, required: true }),
-            ("optional".into(), OutputSpec { path: BuildPath::new(b"/out/optional".to_vec())?, required: false }),
+            ("obj".into(), OutputSpec { path: BuildPath::new(b"/out/nested/object".to_vec())?, required: true, kind: crate::OutputKind::File }),
+            ("optional".into(), OutputSpec { path: BuildPath::new(b"/out/optional".to_vec())?, required: false, kind: crate::OutputKind::File }),
         ]),
     };
     let policy = ExecutionPolicy {
@@ -363,8 +365,8 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
     spec.action_request()?.validate_result(manifest)?;
     let object = manifest.outputs.get("obj").context("object missing")?;
     let mut bytes = Vec::new();
-    let mut a = result.open_blob(object.blob.id)?;
-    let mut b = result.open_blob(object.blob.id)?;
+    let mut a = result.open_blob(object.test_file_blob().id)?;
+    let mut b = result.open_blob(object.test_file_blob().id)?;
     let mut first = [0];
     a.read_exact(&mut first)?;
     b.read_to_end(&mut bytes)?;
@@ -389,7 +391,13 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
         result.diagnostics().1.context("stderr missing")?.id,
         ContentId::of(b"failed")
     );
-    verify_writable_mounts_and_invalid_outputs(&mut spec, &store, &policy, src)?;
+    verify_writable_mounts_and_invalid_outputs(
+        &mut spec,
+        &store,
+        &policy,
+        src,
+        &original_manifest,
+    )?;
     Ok(())
 }
 
@@ -398,6 +406,7 @@ fn verify_writable_mounts_and_invalid_outputs(
     store: &NativeStore,
     policy: &ExecutionPolicy,
     src: crate::TreeId,
+    original_manifest: &TreeManifest,
 ) -> Result<()> {
     // Two mounts of the same tree must be independent even when one is
     // writable. Preserve the compiler's relative output path and input
@@ -409,6 +418,7 @@ fn verify_writable_mounts_and_invalid_outputs(
             OutputSpec {
                 path: BuildPath::new(b"/src/object".to_vec())?,
                 required: true,
+                kind: crate::OutputKind::File,
             },
         ),
         (
@@ -416,6 +426,7 @@ fn verify_writable_mounts_and_invalid_outputs(
             OutputSpec {
                 path: BuildPath::new(b"/tmp/result".to_vec())?,
                 required: true,
+                kind: crate::OutputKind::File,
             },
         ),
     ]);
@@ -426,7 +437,7 @@ fn verify_writable_mounts_and_invalid_outputs(
         .context("in-place output execution failed")?;
     let mut content = Vec::new();
     result
-        .open_blob(manifest.outputs["scratch"].blob.id)?
+        .open_blob(manifest.outputs["scratch"].test_file_blob().id)?
         .read_to_end(&mut content)?;
     assert_eq!(content, b"hello native");
     assert!(
@@ -437,6 +448,81 @@ fn verify_writable_mounts_and_invalid_outputs(
             .entries
             .contains_key(&TreePath::new(b"object".to_vec())?)
     );
+
+    let file_outputs = spec.outputs.clone();
+    spec.outputs = BTreeMap::from([(
+        "codegen".into(),
+        OutputSpec {
+            path: BuildPath::new(b"/src".to_vec())?,
+            required: true,
+            kind: crate::OutputKind::Tree,
+        },
+    )]);
+    spec.command.arguments[1] = b"printf generated > /src/first.o; printf second > /src/second.o; printf changed > /src/input".to_vec();
+    let result = execute(&spec, &store, &policy, || Ok(()))?;
+    let manifest = result
+        .successful_result()
+        .context("tree output execution failed")?;
+    spec.action_request()?.validate_result(manifest)?;
+    let Artifact::Tree(tree) = &manifest.outputs["codegen"] else {
+        anyhow::bail!("expected complete directory output");
+    };
+    assert_eq!(tree.entries.len(), 3);
+    let mut seen = BTreeMap::new();
+    for (path, entry) in &tree.entries {
+        let TreeEntry::File { blob, .. } = entry else {
+            anyhow::bail!("expected file");
+        };
+        let mut bytes = Vec::new();
+        result.open_blob(blob.id)?.read_to_end(&mut bytes)?;
+        seen.insert(path.as_bytes(), bytes);
+    }
+    assert_eq!(seen[b"first.o".as_slice()], b"generated");
+    assert_eq!(seen[b"second.o".as_slice()], b"second");
+    assert_eq!(seen[b"input".as_slice()], b"changed");
+    assert_eq!(
+        store
+            .lookup_tree(src)?
+            .context("original input")?
+            .manifest(),
+        original_manifest
+    );
+    // Generated-only mode never returns existing input files, even if the
+    // original logical output directory also contains compiler dependencies.
+    spec.outputs.get_mut("codegen").context("output")?.kind = crate::OutputKind::GeneratedTree;
+    spec.command.arguments[1] =
+        b"printf generated > /src/first.o; printf second > /src/second.o".to_vec();
+    let result = execute(&spec, &store, &policy, || Ok(()))?;
+    let manifest = result
+        .successful_result()
+        .context("generated output execution failed")?;
+    let Artifact::GeneratedTree(tree) = &manifest.outputs["codegen"] else {
+        anyhow::bail!("expected generated directory output");
+    };
+    assert_eq!(tree.entries.len(), 2);
+    assert!(
+        !tree
+            .entries
+            .contains_key(&TreePath::new(b"input".to_vec())?)
+    );
+    assert!(
+        !manifest
+            .blobs()?
+            .contains_key(&ContentId::of(b"hello native\n"))
+    );
+    assert_eq!(manifest.logical_bytes()?, 15);
+    for path in [b"first.o".as_slice(), b"second.o"] {
+        let Some(TreeEntry::File { blob, .. }) = tree.entries.get(&TreePath::new(path.to_vec())?)
+        else {
+            anyhow::bail!("generated file missing");
+        };
+        assert!(result.open_blob(blob.id).is_ok());
+    }
+    spec.command.arguments[1] = b"printf replaced > /src/input".to_vec();
+    assert!(execute(&spec, &store, &policy, || Ok(())).is_err());
+
+    spec.outputs = file_outputs;
+    spec.command.arguments[1] = b"printf new > object".to_vec();
 
     // A preexisting input cannot silently serve as a compiler output.
     spec.outputs.get_mut("object").context("output")?.path =
@@ -482,6 +568,7 @@ fn rejects_symlink_and_fifo_outputs_without_following_or_blocking() -> Result<()
             OutputSpec {
                 path: BuildPath::new(b"/out/object".to_vec())?,
                 required: true,
+                kind: crate::OutputKind::File,
             },
         )]),
     };
@@ -490,6 +577,7 @@ fn rejects_symlink_and_fifo_outputs_without_following_or_blocking() -> Result<()
         OutputLocation {
             directory: File::open(dir.path())?,
             relative: "object".into(),
+            baseline: None,
         },
     )]);
     assert!(capture.outputs(&locations, &spec).is_err());

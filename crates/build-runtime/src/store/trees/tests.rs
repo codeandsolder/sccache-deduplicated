@@ -239,7 +239,7 @@ fn package_trees_and_actions_share_one_blob_index_across_restart() -> Result<()>
     let result = ResultManifest {
         outputs: BTreeMap::from([(
             "output".into(),
-            Artifact {
+            Artifact::File {
                 blob,
                 mode: Some(0o600),
             },
@@ -519,5 +519,56 @@ fn pending_gc_content_is_still_available_until_last_pin_releases() -> Result<()>
     drop(reservation);
     store.collect_garbage(16)?;
     assert!(store.open_available_blob(blob)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn result_tree_and_input_tree_share_and_retain_leaf_blobs() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let staged = store.stage(&b"codegen unit"[..])?;
+    let blob = staged.reference();
+    let tree = sample_tree(blob)?;
+    let id = store.publish_tree(&tree, vec![staged])?;
+    let result = ResultManifest {
+        outputs: BTreeMap::from([
+            ("codegen".into(), Artifact::Tree(tree)),
+            (
+                "object".into(),
+                Artifact::File {
+                    blob,
+                    mode: Some(0o644),
+                },
+            ),
+        ]),
+        stdout: None,
+        stderr: None,
+    };
+    let fingerprint = ActionFingerprint {
+        schema: "generated-tree-test".into(),
+        components: BTreeMap::from([("compiler".into(), ContentId::of(b"rustc"))]),
+    };
+    let published = store.publish(&fingerprint, &result, vec![], crate::ActionMode::Reuse)?;
+    assert_eq!(store.stats()?.blobs, 1);
+    let lease = store
+        .lookup(published.action)?
+        .context("result tree missing")?;
+    assert_eq!(
+        store.evict_tree(id)?,
+        Eviction::Removed {
+            unreferenced_logical_bytes: 0
+        }
+    );
+    assert_eq!(store.evict(published.action)?, Eviction::Pinned);
+    assert_eq!(lease.manifest(), &result);
+    assert_eq!(lease.open_blob(blob.id)?.len(), blob.size);
+    drop(lease);
+    assert_eq!(
+        store.evict(published.action)?,
+        Eviction::Removed {
+            unreferenced_logical_bytes: blob.size
+        }
+    );
+    assert_eq!(store.collect_garbage(100)?.blobs, 1);
     Ok(())
 }

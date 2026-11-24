@@ -534,6 +534,19 @@ impl CanonicalRustPaths {
         arguments: &[OsString],
         cwd: &Path,
     ) -> Vec<OsString> {
+        let mut out = self.bwrap_mount_arguments();
+        out.extend([
+            OsString::from("--chdir"),
+            self.canonical_cwd(cwd).into_os_string(),
+            OsString::from("--"),
+            self.canonical_executable(executable).into_os_string(),
+        ]);
+        out.extend(arguments.iter().map(|arg| self.normalize_os_value(arg)));
+        out
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn bwrap_mount_arguments(&self) -> Vec<OsString> {
         let mut out = Vec::<OsString>::new();
 
         macro_rules! push {
@@ -619,11 +632,6 @@ impl CanonicalRustPaths {
             out.push(alias.as_os_str().to_owned());
         }
 
-        push!("--chdir");
-        out.push(self.canonical_cwd(cwd).into_os_string());
-        push!("--");
-        out.push(self.canonical_executable(executable).into_os_string());
-        out.extend(arguments.iter().map(|arg| self.normalize_os_value(arg)));
         out
     }
 

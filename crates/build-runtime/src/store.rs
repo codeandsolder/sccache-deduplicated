@@ -1822,9 +1822,9 @@ pub use packages::{
     VerifiedPackage, decode_package_process,
 };
 mod trees;
-pub use trees::TreeLease;
 #[cfg(target_os = "linux")]
-pub use trees::{MaterializationStats, MaterializedTree, MountedTree};
+pub use trees::MountedTree;
+pub use trees::TreeLease;
 
 #[cfg(test)]
 mod tests;

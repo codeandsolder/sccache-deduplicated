@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use sccache::{
     build_runtime::{
-        ActionMode, BuildPath, CommandSpec, ComponentAudit, ContentId, ExecutionRoot,
+        ActionMode, Artifact, BuildPath, CommandSpec, ComponentAudit, ContentId, ExecutionRoot,
         ExecutionSpec, InstallationManifest, MappedMetadata, MappedTree, NativeStore, OutputSpec,
         SpacePolicy, TreeLayer, TreePath, TreeRecipe,
         wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply},
@@ -1308,6 +1308,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
             OutputSpec {
                 path: BuildPath::new(b"/src/object.o".to_vec())?,
                 required: true,
+                kind: sccache_build::OutputKind::File,
             },
         )]),
     };
@@ -1350,7 +1351,10 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
         anyhow::bail!("result not published");
     };
     let mut bytes = Vec::new();
-    client.download(ticket, manifest.outputs["object"].blob, &mut bytes)?;
+    let Artifact::File { blob, .. } = &manifest.outputs["object"] else {
+        anyhow::bail!("expected file output");
+    };
+    client.download(ticket, *blob, &mut bytes)?;
     assert_eq!(bytes, fs::read(&reference)?);
     client.close(ticket)?;
     let warm_pin = client.push_tree(
@@ -1453,6 +1457,49 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
         assert!(result.output.status.success());
         assert_eq!(fs::read(&delivered)?, fs::read(&reference)?);
     }
+
+    // The same worker can declare a complete directory result, including
+    // live input files at the original logical output root. The scheduler
+    // retains leaf content; both miss and hit materialize a private tree.
+    let mut directory = spec.clone();
+    directory.outputs = BTreeMap::from([(
+        "codegen".into(),
+        OutputSpec {
+            path: BuildPath::new(b"/src".to_vec())?,
+            required: true,
+            kind: sccache_build::OutputKind::Tree,
+        },
+    )]);
+    let generated = root.join("generated-codegen");
+    let tree_destinations = BTreeMap::from([("codegen".into(), generated.clone())]);
+    let result = client.run_action(&directory, &inputs, &tree_destinations, &policy, None)?;
+    assert_eq!(result.source, NativeBuildSource::Worker(worker_address));
+    assert!(result.output.status.success());
+    assert_eq!(fs::read(generated.join("object.o"))?, fs::read(&reference)?);
+    let source_bytes = fs::read(generated.join("input.s"))?;
+    assert!(
+        client
+            .run_action(&directory, &inputs, &tree_destinations, &policy, None)
+            .is_err()
+    );
+    fs::remove_dir_all(&generated)?;
+    let result = client.run_action(&directory, &inputs, &tree_destinations, &policy, None)?;
+    assert_eq!(result.source, NativeBuildSource::Hit);
+    assert_eq!(fs::read(generated.join("object.o"))?, fs::read(&reference)?);
+    assert_eq!(fs::read(generated.join("input.s"))?, source_bytes);
+
+    directory.outputs.get_mut("codegen").context("output")?.kind =
+        sccache_build::OutputKind::GeneratedTree;
+    fs::remove_dir_all(&generated)?;
+    let result = client.run_action(&directory, &inputs, &tree_destinations, &policy, None)?;
+    assert_eq!(result.source, NativeBuildSource::Worker(worker_address));
+    assert_eq!(fs::read(generated.join("object.o"))?, fs::read(&reference)?);
+    assert!(!generated.join("input.s").exists());
+    fs::remove_dir_all(&generated)?;
+    let result = client.run_action(&directory, &inputs, &tree_destinations, &policy, None)?;
+    assert_eq!(result.source, NativeBuildSource::Hit);
+    assert_eq!(fs::read(generated.join("object.o"))?, fs::read(&reference)?);
+    assert_eq!(fs::read_dir(&generated)?.count(), 1);
 
     // The exact sandbox on the client host can publish and refresh the same
     // action as the remote worker; its successful result needs no download.
@@ -1568,9 +1615,9 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
             "worker retained redundant archive"
         );
     }
-    assert_eq!(worker_stats.actions, 2);
-    assert_eq!(scheduler_stats.actions, 3);
-    assert_eq!(scheduler_stats.results, 1);
+    assert_eq!(worker_stats.actions, 4);
+    assert_eq!(scheduler_stats.actions, 5);
+    assert_eq!(scheduler_stats.results, 3);
     assert!(worker_stats.trees >= 4);
     assert_eq!(scheduler_stats.trees, 4);
     Ok(())
@@ -1699,6 +1746,7 @@ fn run_worker_only_inputs(peer_source: bool) -> Result<()> {
             OutputSpec {
                 path: BuildPath::new(b"/src/object.o".to_vec())?,
                 required: true,
+                kind: sccache_build::OutputKind::File,
             },
         )]),
     };
@@ -1948,6 +1996,43 @@ for i in 1 2 ${4:+3 4}; do
     test -s build/probe-c.d
     test -s build/probe.d
 done
+
+# The two calls have exactly the same Rust codegen inputs and arguments.
+# Change the native archive, response-file contents, and literal linker
+# argument. None is a codegen input; the same generated tree must be reused.
+for value in 17 42; do
+    printf 'unsigned native_value(void) { return %s; }\n' "$value" > native.c
+    "$2" -c native.c -o native.o
+    /usr/bin/ar rcs libnative.a native.o
+    printf '%s\n' "-Wl,--defsym,native_marker=$value" > native.rsp
+    rm -f build/linked-stage build/linked-stage.d build/linked-stage.dwp build/liblinked-stage.rmeta
+    "$1" "$3" --crate-name linked --crate-type bin --edition=2024 --emit=link,metadata,dep-info --out-dir build -Cextra-filename=-stage -Cdebuginfo=2 -Csplit-debuginfo=packed -Lnative=. -lstatic=native -Clink-arg=@native.rsp "-Clink-arg=-Wl,--defsym,live_marker=$value" linked.rs
+    test "$(build/linked-stage)" = "$value"
+    test "$(readelf -Ws build/linked-stage | awk '$7 == "ABS" && $8 == "live_marker" { print $2 }')" = "$(printf '%016x' "$value")"
+    test -f build/liblinked-stage.rmeta
+    test -s build/linked-stage.d
+    test -s build/linked-stage.dwp
+    test ! -e build/linked-stage.rlink
+done
+# A test harness is an ordinary executable despite its explicit lib
+# crate type. Its actual output must also be independently cacheable.
+for i in 1 2; do
+    rm -f build/testcase-stage build/testcase-stage.d
+    "$1" "$3" --crate-name testcase --crate-type lib --test --edition=2024 --emit=link,dep-info --out-dir build -Cextra-filename=-stage testcase.rs
+    build/testcase-stage --quiet
+    test ! -e build/testcase-stage.rlink
+done
+# -Zno-link currently changes the crate metadata hash. The native
+# backend must not silently replace a proc macro with an incompatible
+# metadata identity, even though its linker invocation can be replayed.
+"$3" --crate-name identity --crate-type proc-macro --edition=2024 --emit=link,dep-info --out-dir build -Cextra-filename=-stage identity.rs
+"$3" --crate-name intermediate --crate-type rlib --edition=2024 --extern identity=build/libidentity-stage.so intermediate.rs --out-dir build
+rm -f build/libidentity-stage.so
+"$1" "$3" --crate-name identity --crate-type proc-macro --edition=2024 --emit=link,dep-info --out-dir build -Cextra-filename=-stage identity.rs
+"$3" --edition=2024 --extern intermediate=build/libintermediate.rlib -Ldependency=build consumer.rs -o build/consumer
+build/consumer
+test ! -e build/identity-stage.rlink
+
 "#
 }
 
@@ -2052,6 +2137,24 @@ fn write_compiler_sources(root: &Path) -> Result<()> {
     fs::write(
         root.join("probe.rs"),
         b"pub fn namespace_probe() -> u32 { 42 }\n",
+    )?;
+    fs::write(
+        root.join("linked.rs"),
+        br#"unsafe extern "C" { fn native_value() -> u32; }
+fn main() { println!("{}", unsafe { native_value() }); }"#,
+    )?;
+    fs::write(root.join("identity.rs"), b"extern crate proc_macro; #[proc_macro] pub fn identity(x:proc_macro::TokenStream)->proc_macro::TokenStream{x}")?;
+    fs::write(
+        root.join("consumer.rs"),
+        b"fn main(){assert_eq!(intermediate::answer(),49);}",
+    )?;
+    fs::write(
+        root.join("intermediate.rs"),
+        b"pub fn answer()->i32 {identity::identity!(7 * 7)}",
+    )?;
+    fs::write(
+        root.join("testcase.rs"),
+        b"#[test] fn answer(){assert_eq!(7 * 7,49);}",
     )?;
     Ok(())
 }
@@ -2159,10 +2262,10 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
         "direct native compiler path failed"
     );
     let stats = service.stats()?;
-    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 4);
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 6);
     assert_eq!(stats.forced_recaches, 2);
-    assert_eq!(stats.cache_hits.all(), 4);
-    assert_eq!(stats.cache_misses.all(), 4);
+    assert_eq!(stats.cache_hits.all(), 6);
+    assert_eq!(stats.cache_misses.all(), 6);
     assert_eq!(stats.dist_errors, 0);
 
     let visible = root.join("visible");
@@ -2186,9 +2289,9 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
         "native namespace compiler path failed"
     );
     let stats = service.stats()?;
-    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 8);
-    assert_eq!(stats.cache_hits.all(), 8);
-    assert_eq!(stats.cache_misses.all(), 8);
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 12);
+    assert_eq!(stats.cache_hits.all(), 12);
+    assert_eq!(stats.cache_misses.all(), 12);
     assert_eq!(stats.forced_recaches, 4);
     assert_eq!(stats.dist_errors, 0);
     assert!(private.join("build/probe.o").is_file());
@@ -2222,23 +2325,23 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
         fs::read(private.join("rust-reference.rlib"))?
     );
     let stats = service.stats()?;
-    assert_eq!(stats.cache_hits.all(), 12);
-    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 8);
+    assert_eq!(stats.cache_hits.all(), 20);
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 12);
     run_environment_audit(&service, &direct, &rustc, &direct_config)?;
     let stats = service.stats()?;
-    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 11);
+    assert_eq!(stats.dist_compiles.values().sum::<usize>(), 15);
     assert_eq!(stats.dist_errors, 0);
     let index = fleet.scheduler_directory.join("index.redb");
     service.stop()?;
     let (scheduler, worker) = fleet.finish()?;
-    assert_eq!(scheduler.actions, 7);
+    assert_eq!(scheduler.actions, 11);
     let unused = audit_index(&index, "environment/CARGO_NATIVE_AUDIT_UNUSED")?;
     assert_eq!(unused.equivalent_pairs, 1);
     assert_eq!(unused.conflicting_pairs, 0);
     let observed = audit_index(&index, "environment/NATIVE_AUDIT_OBSERVED")?;
     assert_eq!(observed.equivalent_pairs, 0);
     assert_eq!(observed.conflicting_pairs, 1);
-    assert_eq!(unused.examined_actions, 7);
+    assert_eq!(unused.examined_actions, 11);
     eprintln!("actual Rust environment audit: {unused:?}; {observed:?}");
     assert_eq!(worker.actions, 7);
     Ok(())
@@ -2281,8 +2384,8 @@ fn native_local_execution_in_networkless_namespace_shares_remote_actions() -> Re
     );
     let stats = service.stats()?;
     assert_eq!(stats.dist_compiles.values().sum::<usize>(), 0);
-    assert_eq!(stats.cache_misses.all(), 4);
-    assert_eq!(stats.cache_hits.all(), 4);
+    assert_eq!(stats.cache_misses.all(), 6);
+    assert_eq!(stats.cache_hits.all(), 6);
     assert_eq!(stats.forced_recaches, 2);
     assert_eq!(stats.dist_errors, 0);
     service.stop()?;
@@ -2303,14 +2406,14 @@ fn native_local_execution_in_networkless_namespace_shares_remote_actions() -> Re
     let stats = service.stats()?;
     assert_eq!(stats.dist_compiles.values().sum::<usize>(), 2);
     assert_eq!(stats.cache_misses.all(), 2);
-    assert_eq!(stats.cache_hits.all(), 6);
+    assert_eq!(stats.cache_hits.all(), 10);
     assert_eq!(stats.forced_recaches, 2);
     assert_eq!(stats.dist_errors, 0);
     assert!(!visible.join("build").exists());
     assert!(!root.join("unexpected-archive-cache").exists());
     service.stop()?;
     let (scheduler, worker) = fleet.finish()?;
-    assert_eq!(scheduler.actions, 2);
-    assert_eq!(worker.actions, 2);
+    assert_eq!(scheduler.actions, 4);
+    assert_eq!(worker.actions, 4);
     Ok(())
 }

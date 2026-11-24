@@ -220,7 +220,7 @@ mod tests {
 
     fn result(blob: BlobRef) -> ResultManifest {
         ResultManifest {
-            outputs: BTreeMap::from([("output".into(), Artifact { blob, mode: None })]),
+            outputs: BTreeMap::from([("output".into(), Artifact::File { blob, mode: None })]),
             stdout: None,
             stderr: None,
         }

@@ -285,7 +285,7 @@ mod tests {
             size: 4,
         };
         let manifest = ResultManifest {
-            outputs: BTreeMap::from([("obj".into(), Artifact { blob, mode: None })]),
+            outputs: BTreeMap::from([("obj".into(), Artifact::File { blob, mode: None })]),
             stdout: None,
             stderr: None,
         };
@@ -337,7 +337,7 @@ mod tests {
             size: u64::try_from(bytes.len())?,
         };
         let manifest = ResultManifest {
-            outputs: BTreeMap::from([("obj".into(), Artifact { blob, mode: None })]),
+            outputs: BTreeMap::from([("obj".into(), Artifact::File { blob, mode: None })]),
             stdout: None,
             stderr: None,
         };

@@ -1515,7 +1515,12 @@ where
                     .await
                 {
                     Err(err) => error_to_output(err),
-                    Ok(compiler) => match compiler.parse_arguments(&args, cwd, env_vars) {
+                    Ok(compiler) => match compiler.parse_arguments(
+                        &args,
+                        cwd,
+                        env_vars,
+                        super::CompilerCachePolicy::FinishedArtifact,
+                    ) {
                         CompilerArguments::NotCompilation => Err(anyhow!("Not compilation")),
                         CompilerArguments::CannotCache(why, extra_info) => Err(extra_info
                             .map_or_else(

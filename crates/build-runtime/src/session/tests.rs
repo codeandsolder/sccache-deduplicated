@@ -85,8 +85,8 @@ fn request() -> Result<ActionRequest> {
             recipe: TreeRecipe::union(root.root, [id]),
         },
         input_trees: BTreeSet::from([id]),
-        required_outputs: BTreeSet::from(["obj".into()]),
-        optional_outputs: BTreeSet::new(),
+        required_outputs: BTreeMap::from([("obj".into(), crate::OutputKind::File)]),
+        optional_outputs: BTreeMap::new(),
     })
 }
 
@@ -94,7 +94,7 @@ fn manifest(bytes: &[u8]) -> ResultManifest {
     ResultManifest {
         outputs: BTreeMap::from([(
             "obj".into(),
-            Artifact {
+            Artifact::File {
                 blob: BlobRef {
                     id: ContentId::of(bytes),
                     size: bytes.len() as u64,
@@ -138,7 +138,7 @@ fn worker_publication_and_client_download_are_bound_to_ticket() -> Result<()> {
         NativeAdmission::InFlight
     );
     let output = manifest(b"object");
-    let blob = output.outputs["obj"].blob;
+    let blob = output.outputs["obj"].test_file_blob();
     assert!(service.begin(ticket, other_worker, output.clone()).is_err());
     assert!(
         service
@@ -300,7 +300,9 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     );
     assert!(service.renew(ticket, Publisher::Client).is_err());
     let mut changed = request()?;
-    changed.required_outputs.insert("other".into());
+    changed
+        .required_outputs
+        .insert("other".into(), crate::OutputKind::File);
     assert!(
         service
             .schedule(ticket, &changed, |_, _| bail!("wrong declaration"))
@@ -658,6 +660,89 @@ fn expiry_releases_action_even_when_a_transfer_retains_the_session() -> Result<(
 }
 
 #[test]
+fn tree_result_contract_rejects_wrong_kinds_and_duplicate_logical_overflow() -> Result<()> {
+    use crate::{OutputKind, TreeEntry, TreeManifest, TreeMetadata, TreePath, TreeTimestamp};
+    let dir = tempfile::tempdir()?;
+    let service = service(dir.path())?;
+    let mut request = request()?;
+    request
+        .required_outputs
+        .insert("obj".into(), OutputKind::Tree);
+    let NativeAdmission::Compile { ticket } =
+        service.admit(request.clone(), Publisher::Client, ActionMode::Reuse)?
+    else {
+        bail!("expected tree miss");
+    };
+    assert!(
+        service
+            .begin(ticket, Publisher::Client, manifest(b"wrong kind"))
+            .is_err()
+    );
+    let metadata = TreeMetadata {
+        mode: 0o755,
+        modified: TreeTimestamp {
+            seconds: 0,
+            nanoseconds: 0,
+        },
+    };
+    let data = vec![42_u8; 600];
+    let blob = BlobRef {
+        id: ContentId::of(&data),
+        size: data.len() as u64,
+    };
+    let tree = TreeManifest {
+        root: metadata,
+        entries: BTreeMap::from([
+            (
+                TreePath::new(b"one".to_vec())?,
+                TreeEntry::File { blob, metadata },
+            ),
+            (
+                TreePath::new(b"two".to_vec())?,
+                TreeEntry::File { blob, metadata },
+            ),
+        ]),
+    };
+    let mut result = ResultManifest {
+        outputs: BTreeMap::from([("obj".into(), Artifact::Tree(tree))]),
+        stdout: None,
+        stderr: None,
+    };
+    assert_eq!(result.blobs()?.len(), 1);
+    assert_eq!(result.logical_bytes()?, 1200);
+    assert!(
+        service
+            .begin(ticket, Publisher::Client, result.clone())
+            .is_err()
+    );
+    let Artifact::Tree(tree) = result.outputs.get_mut("obj").context("missing tree")? else {
+        bail!("expected tree");
+    };
+    tree.entries.remove(&TreePath::new(b"two".to_vec())?);
+    assert_eq!(
+        service
+            .begin(ticket, Publisher::Client, result.clone())?
+            .missing,
+        vec![blob]
+    );
+    service.upload(ticket, Publisher::Client, blob, data.as_slice())?;
+    assert_eq!(service.commit(ticket, Publisher::Client)?, result);
+    service.close(ticket, Publisher::Client)?;
+    let NativeAdmission::Hit { ticket, manifest } =
+        service.admit(request, Publisher::Client, ActionMode::Reuse)?
+    else {
+        bail!("expected tree hit");
+    };
+    assert_eq!(manifest, result);
+    let mut restored = Vec::new();
+    service
+        .download(ticket, Publisher::Client, blob.id)?
+        .read_to_end(&mut restored)?;
+    assert_eq!(restored, data);
+    Ok(())
+}
+
+#[test]
 fn original_package_slots_deduplicate_identities_and_bound_parallel_imports() -> Result<()> {
     use crate::PackageCompression;
     let dir = tempfile::tempdir()?;
@@ -693,7 +778,7 @@ fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result
         bail!("expected initial compilation");
     };
     let old = manifest(b"old");
-    let old_blob = old.outputs["obj"].blob;
+    let old_blob = old.outputs["obj"].test_file_blob();
     service.begin(first, client, old.clone())?;
     upload_encoded(&service, first, client, old_blob, b"old")?;
     service.commit(first, client)?;
@@ -742,7 +827,7 @@ fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result
         bail!("expected another refresh");
     };
     let new = manifest(b"new");
-    let new_blob = new.outputs["obj"].blob;
+    let new_blob = new.outputs["obj"].test_file_blob();
     service.begin(next, client, new.clone())?;
     assert!(service.commit(next, client).is_err());
     assert_eq!(service.status(reader)?, NativeStatus::Ready(old));
@@ -1194,7 +1279,8 @@ fn evicted_result_is_restored_once_from_only_missing_peer_blobs() -> Result<()> 
         let store = service.store();
         let staged = store.stage_expected(local, &b"local stderr"[..])?;
         store.publish_tree(&NativeStore::blob_retention_manifest(local)?, vec![staged])?;
-        let staged = store.stage_expected(output.outputs["obj"].blob, &b"peer object"[..])?;
+        let staged =
+            store.stage_expected(output.outputs["obj"].test_file_blob(), &b"peer object"[..])?;
         store.publish(&fingerprint, &output, vec![staged], ActionMode::Reuse)?;
         store.evict(key)?;
         store.collect_garbage(32)?;
@@ -1217,7 +1303,7 @@ fn evicted_result_is_restored_once_from_only_missing_peer_blobs() -> Result<()> 
     assert!(
         service.recover_next_result(Duration::ZERO, |blob, store, _| {
             calls.set(calls.get() + 1);
-            assert_eq!(blob, output.outputs["obj"].blob);
+            assert_eq!(blob, output.outputs["obj"].test_file_blob());
             Ok(Some(store.stage_expected(blob, &b"peer object"[..])?))
         })?
     );
@@ -1234,7 +1320,7 @@ fn evicted_result_is_restored_once_from_only_missing_peer_blobs() -> Result<()> 
         &service,
         ticket,
         Publisher::Client,
-        output.outputs["obj"].blob.id,
+        output.outputs["obj"].test_file_blob().id,
     )?
     .read_to_end(&mut data)?;
     assert_eq!(data, b"peer object");
@@ -1258,7 +1344,7 @@ fn failed_result_recovery_preserves_partial_content_and_allows_compilation() -> 
     };
     output.stderr = Some(missing);
     let store = service.store();
-    let object = output.outputs["obj"].blob;
+    let object = output.outputs["obj"].test_file_blob();
     store.publish(
         &fingerprint,
         &output,

@@ -63,7 +63,7 @@ mod linux {
         let output = ResultManifest {
             outputs: BTreeMap::from([(
                 "output".into(),
-                Artifact {
+                Artifact::File {
                     blob,
                     mode: Some(0o644),
                 },

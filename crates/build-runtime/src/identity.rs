@@ -76,12 +76,60 @@ pub struct BlobRef {
     pub size: u64,
 }
 
-/// One materialized compiler output. File metadata belongs to the manifest so
-/// different modes can share the same underlying content.
+/// The kind of filesystem object promised by an output declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Artifact {
-    pub blob: BlobRef,
-    pub mode: Option<u32>,
+pub enum OutputKind {
+    /// One regular file at the declared path.
+    File,
+    /// A complete directory snapshot, including any remaining input entries.
+    Tree,
+    /// New entries only. Existing inputs must remain intact.
+    GeneratedTree,
+}
+
+impl OutputKind {
+    #[must_use = "directory outputs must be captured using directory descriptors"]
+    pub const fn is_tree(self) -> bool {
+        matches!(self, Self::Tree | Self::GeneratedTree)
+    }
+}
+
+/// One materialized compiler output, with metadata separate from content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Artifact {
+    File { blob: BlobRef, mode: Option<u32> },
+    Tree(crate::TreeManifest),
+    GeneratedTree(crate::TreeManifest),
+}
+
+impl Artifact {
+    #[must_use = "the output kind is part of the execution contract"]
+    pub const fn kind(&self) -> OutputKind {
+        match self {
+            Self::File { .. } => OutputKind::File,
+            Self::Tree(_) => OutputKind::Tree,
+            Self::GeneratedTree(_) => OutputKind::GeneratedTree,
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        match self {
+            Self::File { mode, .. } => ensure!(
+                mode.is_none_or(|mode| mode & !0o777 == 0),
+                "unsupported output mode"
+            ),
+            Self::Tree(tree) | Self::GeneratedTree(tree) => tree.validate()?,
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_file_blob(&self) -> BlobRef {
+        match self {
+            Self::File { blob, .. } => *blob,
+            Self::Tree(_) | Self::GeneratedTree(_) => panic!("expected a regular file"),
+        }
+    }
 }
 
 /// Result of a successful cacheable compilation.
@@ -102,7 +150,37 @@ impl ResultManifest {
     /// # Errors
     /// Returns an error if the manifest cannot be encoded.
     pub fn id(&self) -> Result<ResultId> {
-        Ok(ResultId(typed_digest(b"sccache-result-v1\0", self)?))
+        Ok(ResultId(typed_digest(b"sccache-result-v2\0", self)?))
+    }
+
+    /// Charge every independently materialized file, including duplicate
+    /// content, rather than just the unique CAS bytes.
+    /// # Errors
+    /// Returns an error if the logical size overflows.
+    pub fn logical_bytes(&self) -> Result<u64> {
+        let mut total = 0_u64;
+        let mut count = |blob: BlobRef| -> Result<()> {
+            total = total
+                .checked_add(blob.size)
+                .context("native result logical size overflow")?;
+            Ok(())
+        };
+        for artifact in self.outputs.values() {
+            match artifact {
+                Artifact::File { blob, .. } => count(*blob)?,
+                Artifact::Tree(tree) | Artifact::GeneratedTree(tree) => {
+                    for entry in tree.entries.values() {
+                        if let crate::TreeEntry::File { blob, .. } = entry {
+                            count(*blob)?;
+                        }
+                    }
+                }
+            }
+        }
+        for blob in self.stdout.into_iter().chain(self.stderr) {
+            count(blob)?;
+        }
+        Ok(total)
     }
 
     /// Iterate over each unique content reference, checking that repeated
@@ -112,20 +190,25 @@ impl ResultManifest {
     /// Returns an error if the same digest has conflicting declared lengths.
     pub fn blobs(&self) -> Result<BTreeMap<ContentId, u64>> {
         let mut blobs = BTreeMap::new();
-        for blob in self
-            .outputs
-            .values()
-            .map(|artifact| artifact.blob)
-            .chain(self.stdout)
-            .chain(self.stderr)
-        {
-            if let Some(previous) = blobs.insert(blob.id, blob.size) {
-                ensure!(
-                    previous == blob.size,
-                    "inconsistent lengths for content {:?}",
-                    blob.id
-                );
+        let mut insert = |id, size| -> Result<()> {
+            if let Some(previous) = blobs.insert(id, size) {
+                ensure!(previous == size, "inconsistent lengths for content {id:?}");
             }
+            Ok(())
+        };
+        for artifact in self.outputs.values() {
+            artifact.validate()?;
+            match artifact {
+                Artifact::File { blob, .. } => insert(blob.id, blob.size)?,
+                Artifact::Tree(tree) | Artifact::GeneratedTree(tree) => {
+                    for (id, size) in tree.blobs()? {
+                        insert(id, size)?;
+                    }
+                }
+            }
+        }
+        for blob in self.stdout.into_iter().chain(self.stderr) {
+            insert(blob.id, blob.size)?;
         }
         Ok(blobs)
     }
@@ -184,7 +267,7 @@ mod tests {
         let mut result = ResultManifest {
             outputs: BTreeMap::from([(
                 "obj".into(),
-                Artifact {
+                Artifact::File {
                     blob,
                     mode: Some(0o644),
                 },
@@ -197,8 +280,8 @@ mod tests {
         assert_ne!(first, result.id()?);
         assert_eq!(result.blobs()?.len(), 1);
         result.stderr = None;
-        if let Some(artifact) = result.outputs.get_mut("obj") {
-            artifact.mode = Some(0o755);
+        if let Some(Artifact::File { mode, .. }) = result.outputs.get_mut("obj") {
+            *mode = Some(0o755);
         }
         assert_ne!(first, result.id()?);
         result.stdout = Some(BlobRef { size: 5, ..blob });

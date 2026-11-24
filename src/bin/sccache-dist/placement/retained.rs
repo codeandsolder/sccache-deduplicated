@@ -124,7 +124,7 @@ mod tests {
 
     fn manifest(blob: BlobRef) -> ResultManifest {
         ResultManifest {
-            outputs: BTreeMap::from([("result".into(), Artifact { blob, mode: None })]),
+            outputs: BTreeMap::from([("result".into(), Artifact::File { blob, mode: None })]),
             stdout: None,
             stderr: None,
         }
@@ -198,7 +198,7 @@ mod tests {
         for n in 0..=MAX_BLOBS {
             large.outputs.insert(
                 n.to_string(),
-                Artifact {
+                Artifact::File {
                     blob: BlobRef {
                         id: ContentId::of(&n.to_le_bytes()),
                         size: 1,

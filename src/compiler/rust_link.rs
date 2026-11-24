@@ -362,14 +362,19 @@ impl LinkInvocation {
 
 /// A compiler-owned split-link invocation.
 ///
-/// Both stages retain the complete
-/// compiler option list, changing only the source operand and stage selector.
-/// The caller executes them in namespaces with identical logical paths.
+/// The link stage retains the complete compiler option list. The codegen
+/// stage omits typed native-linker-only arguments; all other argument bytes
+/// and ordering remain exact. Both use identical logical paths.
 pub struct RustLinkStages {
-    arguments: Vec<OsString>,
-    input: usize,
+    arguments: ParsedLinkArguments,
     codegen_directory: PathBuf,
     output_roots: Vec<PathBuf>,
+}
+
+pub(super) struct ParsedLinkArguments {
+    pub original: Vec<OsString>,
+    pub codegen: Vec<OsString>,
+    pub input: usize,
 }
 
 impl RustLinkStages {
@@ -378,32 +383,60 @@ impl RustLinkStages {
     /// # Errors
     /// The input is ambiguous, not a linked compilation, or already a stage.
     pub fn new(arguments: &[OsString], cwd: &Path) -> Result<Self> {
-        super::rust::native_link_stage_input(arguments, cwd)
+        Self::from_expanded(
+            super::rust_response::expand(arguments, cwd)?,
+            cwd,
+            resolve_output_directory,
+        )
+    }
+
+    /// Construct stages from already expanded compiler arguments in a
+    /// caller-defined logical filesystem layout. The resolver must resolve
+    /// the exact output directory through the actual physical path mapping,
+    /// then return its canonical logical spelling.
+    /// # Errors
+    /// Returns an error for an ambiguous source or output layout.
+    pub fn from_expanded(
+        arguments: Vec<OsString>,
+        cwd: &Path,
+        resolve_directory: impl FnMut(&Path, &Path) -> Result<PathBuf>,
+    ) -> Result<Self> {
+        super::rust::native_link_stage_input(arguments, cwd, resolve_directory)
     }
 
     pub(super) fn from_parsed(
-        arguments: Vec<OsString>,
-        input: usize,
+        arguments: ParsedLinkArguments,
         cwd: &Path,
         out_dir: Option<&Path>,
         output_file: Option<&Path>,
         explicit_outputs: &[PathBuf],
+        mut resolve_directory: impl FnMut(&Path, &Path) -> Result<PathBuf>,
     ) -> Result<Self> {
         ensure!(cwd.is_absolute(), "compiler cwd must be absolute");
         let directory = output_file.map_or_else(
             || out_dir.unwrap_or(cwd),
             |path| path.parent().unwrap_or_else(|| Path::new("")),
         );
-        let codegen_directory = resolve_output_directory(cwd, directory)?;
+        let codegen_directory = resolve_directory(cwd, directory)?;
         let mut roots = vec![codegen_directory.clone()];
         for path in explicit_outputs {
-            roots.push(resolve_output_directory(
+            roots.push(resolve_directory(
                 cwd,
                 path.parent().unwrap_or_else(|| Path::new("")),
             )?);
         }
         // Parent roots already contain any nested output directory. Keep
         // overlays disjoint, including when two paths resolve through aliases.
+        for root in &roots {
+            ensure!(
+                root.is_absolute()
+                    && root != Path::new("/")
+                    && root
+                        .components()
+                        .all(|part| matches!(part, Component::RootDir | Component::Normal(_))),
+                "invalid logical output directory"
+            );
+        }
         roots.sort_unstable();
         let mut output_roots: Vec<PathBuf> = Vec::new();
         for root in roots {
@@ -413,7 +446,6 @@ impl RustLinkStages {
         }
         Ok(Self {
             arguments,
-            input,
             codegen_directory,
             output_roots,
         })
@@ -437,25 +469,24 @@ impl RustLinkStages {
     /// preparation when launching, so literal leading @ operands survive.
     #[must_use = "these arguments execute the codegen stage"]
     pub fn codegen_arguments(&self) -> Vec<OsString> {
-        self.stage_arguments("no-link", None)
+        let mut arguments = Vec::with_capacity(self.arguments.codegen.len() + 2);
+        arguments.extend([OsString::from("-Z"), OsString::from("no-link")]);
+        arguments.extend(self.arguments.codegen.iter().cloned());
+        arguments
     }
 
     /// Expanded link arguments, with the .rlink artifact at its original
     /// logical path and all current linker options retained.
     #[must_use = "these arguments execute the compiler's native link stage"]
     pub fn link_arguments(&self, artifact: &Path) -> Vec<OsString> {
-        self.stage_arguments("link-only", Some(artifact))
-    }
-
-    fn stage_arguments(&self, stage: &str, artifact: Option<&Path>) -> Vec<OsString> {
-        let mut arguments = Vec::with_capacity(self.arguments.len() + 2);
+        let mut arguments = Vec::with_capacity(self.arguments.original.len() + 2);
         // Prefix the stage option: a trailing -- must not turn it into a
         // source operand.
-        arguments.extend([OsString::from("-Z"), OsString::from(stage)]);
-        arguments.extend(self.arguments.iter().cloned());
-        if let Some(path) = artifact {
-            path.as_os_str().clone_into(&mut arguments[self.input + 2]);
-        }
+        arguments.extend([OsString::from("-Z"), OsString::from("link-only")]);
+        arguments.extend(self.arguments.original.iter().cloned());
+        artifact
+            .as_os_str()
+            .clone_into(&mut arguments[self.arguments.input + 2]);
         arguments
     }
 
@@ -551,6 +582,17 @@ impl PrivateOutputTree {
         Ok(Self { root, upper, work })
     }
 
+    /// Reserve the upper directory as the destination of an incoming native
+    /// CAS tree. Delivery publishes the verified tree atomically at this
+    /// absent path. The overlay then uses exactly those files in place,
+    /// without an intermediate archive, copy, or second cache.
+    /// # Errors
+    /// Returns an error if the stage has already been populated.
+    pub fn prepare_delivery(&self) -> Result<&Path> {
+        fs::remove_dir(&self.upper)?;
+        Ok(&self.upper)
+    }
+
     /// Build the Bubblewrap overlay operation preserving the original path.
     /// The returned arguments must precede the sandbox command separator.
     ///
@@ -599,6 +641,281 @@ impl PrivateOutputTree {
     pub fn restore(&self, archive: &Path, limits: CaptureLimits) -> Result<()> {
         restore_root(archive, &self.upper, &mut Budget::new(limits))
     }
+}
+
+/// Local namespace of an ordinary Rust native link.
+///
+/// Linking must use these mounts rather than the worker's
+/// sparse input filesystem.
+#[cfg(feature = "dist-client")]
+#[derive(Debug, Clone)]
+pub struct NativeLinkLayout {
+    pub(crate) mounts: Vec<OsString>,
+    pub(crate) dep_info: Option<PathBuf>,
+}
+
+#[cfg(feature = "dist-client")]
+impl NativeLinkLayout {
+    pub(crate) fn new(
+        canonical: Option<&super::canonical_paths::CanonicalRustPaths>,
+        dep_info: Option<PathBuf>,
+    ) -> Self {
+        let mounts = canonical.map_or_else(
+            || {
+                [
+                    "--die-with-parent",
+                    "--bind",
+                    "/",
+                    "/",
+                    "--dev-bind",
+                    "/dev",
+                    "/dev",
+                ]
+                .map(OsString::from)
+                .to_vec()
+            },
+            super::canonical_paths::CanonicalRustPaths::bwrap_mount_arguments,
+        );
+        Self { mounts, dep_info }
+    }
+}
+
+/// Prepared native Rust codegen delivery and local replay roots.
+///
+/// Each returned directory is mounted over the current caller's lower directory,
+/// so native dependencies remain live at the same logical paths. There is no
+/// archive or copied staging tree between CAS delivery and linking.
+pub struct NativeLinkWorkspace {
+    stages: RustLinkStages,
+    roots: BTreeMap<PathBuf, NativeLinkRoot>,
+}
+
+struct NativeLinkRoot {
+    physical: PathBuf,
+    tree: PrivateOutputTree,
+}
+
+impl NativeLinkWorkspace {
+    /// Reserve private, absent delivery paths for every logical output root.
+    /// # Errors
+    /// Returns an error for an unavailable or overlapping physical layout,
+    /// or a staging directory that could not be created.
+    pub fn new(
+        stages: RustLinkStages,
+        scratch: &Path,
+        mut physical_path: impl FnMut(&Path) -> Result<PathBuf>,
+    ) -> Result<Self> {
+        let mut roots: BTreeMap<PathBuf, NativeLinkRoot> = BTreeMap::new();
+        for logical in stages.output_roots() {
+            let physical = fs::canonicalize(physical_path(logical)?)?;
+            ensure!(physical.is_dir(), "native link lower is not a directory");
+            ensure!(
+                roots
+                    .values()
+                    .all(|root| !root.physical.starts_with(&physical)
+                        && !physical.starts_with(&root.physical)),
+                "physical output roots overlap"
+            );
+            let tree = PrivateOutputTree::new(scratch)?;
+            tree.overlay_arguments(&physical, logical)?;
+            tree.prepare_delivery()?;
+            roots.insert(logical.clone(), NativeLinkRoot { physical, tree });
+        }
+        Ok(Self { stages, roots })
+    }
+
+    /// Exact codegen arguments in the declared logical layout.
+    #[must_use = "the worker must execute this stage instead of final linking"]
+    pub fn codegen_arguments(&self) -> Vec<OsString> {
+        self.stages.codegen_arguments()
+    }
+
+    /// Logical path, caller physical lower directory, and absent private
+    /// destination for every generated tree.
+    #[must_use = "the outputs describe the directory delivery contract"]
+    pub fn outputs(&self) -> impl Iterator<Item = (&Path, &Path, &Path)> {
+        self.roots.iter().map(|(logical, root)| {
+            (
+                logical.as_path(),
+                root.physical.as_path(),
+                root.tree.generated_root(),
+            )
+        })
+    }
+
+    /// All output overlays to append after base namespace bindings.
+    /// # Errors
+    /// Returns an error if a lower directory is no longer available.
+    pub fn overlay_arguments(&self) -> Result<Vec<OsString>> {
+        let mut arguments = Vec::new();
+        for (logical, root) in &self.roots {
+            ensure!(
+                root.tree.generated_root().is_dir(),
+                "native codegen output has not been delivered"
+            );
+            arguments.extend(root.tree.overlay_arguments(&root.physical, logical)?);
+        }
+        Ok(arguments)
+    }
+
+    /// Locate the generated artifact in the private delivery tree and prepare
+    /// the original logical command for local linking.
+    /// # Errors
+    /// Returns an error if codegen did not deliver exactly one link artifact.
+    pub fn link_arguments(&self) -> Result<Vec<OsString>> {
+        Ok(self.stages.link_arguments(&self.link_artifact()?))
+    }
+
+    fn link_artifact(&self) -> Result<PathBuf> {
+        let directory = self.stages.codegen_directory();
+        let (logical, root) = self
+            .roots
+            .iter()
+            .find(|(logical, _)| directory.starts_with(logical))
+            .context("missing native codegen root")?;
+        let generated = root
+            .tree
+            .generated_root()
+            .join(directory.strip_prefix(logical)?);
+        RustLinkStages::link_artifact(&generated, directory)
+    }
+
+    /// Install the surviving outputs of the successful link stage.
+    ///
+    /// The compiler has cleaned its own temporary files. Skip
+    /// only the exact internal .rlink and the independently generated local
+    /// dependency file, not classes of names or filename suffixes.
+    /// # Errors
+    /// Invalid output topology, missing required outputs, or publication I/O
+    /// failure. No paths outside the declared output roots are published.
+    #[cfg(feature = "dist-client")]
+    pub(crate) fn publish(
+        &self,
+        expected: &[crate::cache::FileObjectSource],
+        cwd: &Path,
+        dep_info: Option<&Path>,
+    ) -> Result<()> {
+        use std::collections::BTreeSet;
+
+        let artifact = self.link_artifact()?;
+        let mut entries = Vec::new();
+        let mut seen = BTreeSet::new();
+        for (logical, root) in &self.roots {
+            for entry in WalkDir::new(root.tree.generated_root())
+                .min_depth(1)
+                .follow_links(false)
+            {
+                let entry = entry?;
+                let relative = entry.path().strip_prefix(root.tree.generated_root())?;
+                let destination = root.physical.join(relative);
+                if logical.join(relative) == artifact || dep_info == Some(destination.as_path()) {
+                    continue;
+                }
+                let kind = entry.file_type();
+                ensure!(
+                    kind.is_dir() || kind.is_file() || kind.is_symlink(),
+                    "unsupported generated filesystem object: {}",
+                    entry.path().display()
+                );
+                // Validate every existing lower ancestor without following
+                // links: the final rename must remain in the output root.
+                let mut parent = destination.parent().context("missing output parent")?;
+                while parent.starts_with(&root.physical) {
+                    match fs::symlink_metadata(parent) {
+                        Ok(metadata) => ensure!(
+                            metadata.is_dir(),
+                            "unsafe output parent {}",
+                            parent.display()
+                        ),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    if parent == root.physical {
+                        break;
+                    }
+                    parent = parent.parent().context("missing output ancestor")?;
+                }
+                if let Ok(metadata) = fs::symlink_metadata(&destination) {
+                    ensure!(
+                        metadata.is_dir() == kind.is_dir(),
+                        "output kind conflicts with existing path {}",
+                        destination.display()
+                    );
+                }
+                if !kind.is_dir() {
+                    seen.insert(destination.clone());
+                }
+                entries.push((entry.into_path(), destination, kind));
+            }
+        }
+        for output in expected {
+            let path = cwd.join(&output.path);
+            let parent = resolve_output_directory(
+                cwd,
+                path.parent().context("missing declared output parent")?,
+            )?;
+            let destination =
+                parent.join(path.file_name().context("missing declared output name")?);
+            ensure!(
+                output.optional || seen.contains(&destination),
+                "native link did not produce {}",
+                destination.display()
+            );
+        }
+        // WalkDir is parent-first. A directory from an overlay can represent
+        // existing lower topology; never replace the lower directory wholesale.
+        for (_, destination, kind) in &entries {
+            if kind.is_dir() && !destination.exists() {
+                fs::create_dir(destination)?;
+            }
+        }
+        for (source, destination, kind) in &entries {
+            if !kind.is_dir() {
+                publish_leaf(source, destination)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "dist-client")]
+fn publish_leaf(source: &Path, destination: &Path) -> Result<()> {
+    // fs_err adds useful path context but wraps the underlying OS error.
+    // Inspect the original errno before adding that context.
+    match std::fs::rename(source, destination) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "publish generated output {} to {}",
+                    source.display(),
+                    destination.display()
+                )
+            });
+        }
+    }
+    // Cross-filesystem delivery still publishes each verified leaf by
+    // atomic rename. Copy only when the source cannot be renamed.
+    let parent = destination.parent().context("missing publication parent")?;
+    let stage = tempfile::Builder::new()
+        .prefix(".rust-link-publish-")
+        .tempdir_in(parent)?;
+    let temporary = stage.path().join("output");
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.is_symlink() {
+        std::os::unix::fs::symlink(fs::read_link(source)?, &temporary)?;
+    } else {
+        fs::copy(source, &temporary)?;
+        // Preserve compiler output timestamps across the bind-mount boundary.
+        fs::File::open(&temporary)?.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(metadata.modified()?)
+                .set_accessed(metadata.accessed()?),
+        )?;
+    }
+    fs::rename(temporary, destination)?;
+    Ok(())
 }
 
 /// The normal sccache executable also acts as an explicitly installed relay.

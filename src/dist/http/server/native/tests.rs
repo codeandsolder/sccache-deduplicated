@@ -54,6 +54,7 @@ fn action(root: &TreeManifest) -> Result<ExecutionSpec> {
             OutputSpec {
                 path: BuildPath::new(b"/out/obj".to_vec())?,
                 required: true,
+                kind: sccache_build::OutputKind::File,
             },
         )]),
     })
@@ -264,7 +265,7 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
         let output = ResultManifest {
             outputs: BTreeMap::from([(
                 "obj".into(),
-                Artifact {
+                Artifact::File {
                     blob,
                     mode: Some(0o644),
                 },
@@ -399,7 +400,7 @@ fn raw_physical_transport_preserves_original_magic_prefixed_bytes() -> Result<()
         let manifest = ResultManifest {
             outputs: BTreeMap::from([(
                 "obj".into(),
-                Artifact {
+                Artifact::File {
                     blob,
                     mode: Some(0o644),
                 },
@@ -563,7 +564,10 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
             NativeStatus::Ready(manifest.clone())
         );
         let mut bytes = Vec::new();
-        client.download(ticket, manifest.outputs["obj"].blob, &mut bytes)?;
+        let Artifact::File { blob, .. } = &manifest.outputs["obj"] else {
+            anyhow::bail!("expected file output");
+        };
+        client.download(ticket, *blob, &mut bytes)?;
         assert_eq!(bytes, b"hello native");
         bytes.clear();
         client.download(

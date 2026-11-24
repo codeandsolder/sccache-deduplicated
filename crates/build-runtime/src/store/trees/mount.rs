@@ -24,8 +24,9 @@ use rustix::fs::{AtFlags, CWD, Timestamps, ioctl_ficlone, utimensat};
 use rustix::time::Timespec;
 use tempfile::TempDir;
 
-use super::{MaterializedTree, TreeLease, materialize::OverlayFiles};
+use super::{TreeLease, materialize::OverlayFiles};
 use crate::{BlobReader, BlobRef, TreeEntry, TreeManifest, TreeMetadata, TreePath, TreeTimestamp};
+use crate::{MaterializationStats, MaterializedTree};
 
 const TTL: Duration = Duration::from_secs(3600);
 const KEEP_CACHE: u32 = 1 << 1;
@@ -501,6 +502,12 @@ impl MountedTree {
             .map_or_else(|| self.view.root(), MaterializedTree::root)
     }
 
+    pub(crate) fn manifest(&self) -> &TreeManifest {
+        self.overlays
+            .as_ref()
+            .map_or_else(|| self.view.manifest(), OverlayFiles::manifest)
+    }
+
     pub(crate) fn attach_overlays(&mut self, overlays: OverlayFiles) {
         self.overlays = Some(overlays);
     }
@@ -514,7 +521,7 @@ impl MountedTree {
         })
     }
 
-    pub(crate) fn overlay_stats(&self) -> Option<super::MaterializationStats> {
+    pub(crate) fn overlay_stats(&self) -> Option<MaterializationStats> {
         self.overlays.as_ref().map(|overlay| overlay.stats)
     }
 
@@ -590,7 +597,7 @@ impl Drop for MountedTree {
         // Make the private scratch tree traversable before TempDir recursively
         // removes it. Original manifest directories may be mode 000 or 0555.
         for path in &self.scratch_directories {
-            super::materialize::restore_mutable_directories(path);
+            crate::tree_fs::restore_mutable_directories(path);
         }
     }
 }

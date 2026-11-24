@@ -589,7 +589,5 @@ mod overlay;
 pub(super) use overlay::plan_overlays;
 #[cfg(target_os = "linux")]
 mod materialize;
-#[cfg(target_os = "linux")]
-pub use materialize::{MaterializationStats, MaterializedTree};
 #[cfg(test)]
 mod tests;
