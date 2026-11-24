@@ -503,7 +503,7 @@ fn indexed_tree_repairs_only_physically_missing_content() -> Result<()> {
     let repaired = store.stage_expected(bad_ref, &b"lost file"[..])?;
     let tree = store.publish_tree_pinned(&manifest, vec![repaired])?;
     let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut tree.open_file(good_ref.id)?, &mut bytes)?;
+    std::io::Read::read_to_end(&mut tree.open_blob(good_ref.id)?, &mut bytes)?;
     assert_eq!(bytes, b"good file");
     assert_eq!(store.stats()?, before);
     assert!(store.lookup_tree(id)?.is_some());
