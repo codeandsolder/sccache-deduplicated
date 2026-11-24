@@ -22,7 +22,9 @@ pub enum Peer {
     Other,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum Direction {
     Send,
     Receive,
@@ -32,7 +34,7 @@ const MAX_PEERS: usize = 512;
 const MAX_GROUPS: usize = 64;
 const MIN_RATE: u64 = 64 * 1024;
 const MAX_RATE: u64 = 1_000_000_000_000;
-const MAX_AGE: Duration = Duration::from_secs(30 * 60);
+const MAX_AGE: Duration = Duration::from_mins(30);
 
 #[derive(Default)]
 struct Activity {
@@ -75,6 +77,7 @@ impl Counters {
 /// even when the transport aborts before the body has been consumed.
 pub struct MeteredReader<R> {
     reader: R,
+    _activity: WorkActivity,
     counters: Arc<Counters>,
     logical_size: u64,
     exact_wire_size: Option<u64>,
@@ -146,6 +149,7 @@ struct PeerRecord {
     peak_at: Instant,
     wire_per_mille: u64,
     last_active: Instant,
+    latest_rate: u64,
 }
 
 impl PeerRecord {
@@ -157,6 +161,7 @@ impl PeerRecord {
             peak_at: now,
             wire_per_mille: 1000,
             last_active: now,
+            latest_rate: 0,
         }
     }
 }
@@ -181,6 +186,8 @@ pub struct PeerCapacity {
     /// Largest recent sustained observation; an observed lower bound, not a
     /// proven physical link ceiling.
     pub observed_bytes_per_second: u64,
+    pub calibrated_bytes_per_second: u64,
+    pub latest_bytes_per_second: u64,
     pub wire_per_mille: u64,
     pub active_remaining_bytes: u64,
     pub body_bytes: u64,
@@ -227,7 +234,13 @@ impl DirectionSnapshot {
         self.peers
             .get(&peer)
             .map_or(fallback, |entry| {
-                entry.observed_bytes_per_second.max(fallback)
+                if entry.calibrated_bytes_per_second == 0 {
+                    entry.observed_bytes_per_second.max(fallback)
+                } else {
+                    entry
+                        .observed_bytes_per_second
+                        .max(entry.calibrated_bytes_per_second)
+                }
             })
             .max(1)
     }
@@ -282,6 +295,7 @@ impl DirectionMeter {
             let rate = u64::try_from(u128::from(bytes) * 1_000_000_000 / elapsed.as_nanos())
                 .unwrap_or(MAX_RATE)
                 .min(MAX_RATE);
+            record.latest_rate = rate;
             if rate > 0 {
                 current_rates.insert(peer, rate);
             }
@@ -328,15 +342,15 @@ impl DirectionMeter {
         if !slowed || total.saturating_mul(100) > independent.saturating_mul(80) {
             return;
         }
-        if self.evidence.len() >= MAX_GROUPS && !self.evidence.contains_key(&members) {
-            if let Some(oldest) = self
+        if self.evidence.len() >= MAX_GROUPS
+            && !self.evidence.contains_key(&members)
+            && let Some(oldest) = self
                 .evidence
                 .iter()
                 .min_by_key(|(_, entry)| entry.seen)
                 .map(|(key, _)| key.clone())
-            {
-                self.evidence.remove(&oldest);
-            }
+        {
+            self.evidence.remove(&oldest);
         }
         let evidence = self.evidence.entry(members).or_insert(Evidence {
             count: 0,
@@ -371,6 +385,8 @@ impl DirectionMeter {
                         peer,
                         PeerCapacity {
                             observed_bytes_per_second: record.peak,
+                            calibrated_bytes_per_second: 0,
+                            latest_bytes_per_second: record.latest_rate,
                             wire_per_mille: record.wire_per_mille,
                             active_remaining_bytes: record
                                 .counters
@@ -401,7 +417,7 @@ struct State {
 }
 
 impl State {
-    fn direction(&mut self, direction: Direction) -> &mut DirectionMeter {
+    const fn direction(&mut self, direction: Direction) -> &mut DirectionMeter {
         match direction {
             Direction::Send => &mut self.send,
             Direction::Receive => &mut self.receive,
@@ -412,12 +428,14 @@ impl State {
 /// One scheduler-wide meter across all authenticated native body transfers.
 /// Byte accounting is per-peer and atomic; no global lock during I/O.
 pub struct NetworkMeter {
+    gate: Arc<IdleGate>,
     state: Mutex<State>,
 }
 
 impl Default for NetworkMeter {
     fn default() -> Self {
         Self {
+            gate: Arc::new(IdleGate::default()),
             state: Mutex::new(State {
                 last_sample: Instant::now(),
                 send: DirectionMeter::default(),
@@ -428,6 +446,12 @@ impl Default for NetworkMeter {
 }
 
 impl NetworkMeter {
+    /// Shared idle gate for real request admission and low-priority probes.
+    #[must_use = "the same gate coordinates probes and real transfers"]
+    pub const fn idle_gate(&self) -> &Arc<IdleGate> {
+        &self.gate
+    }
+
     /// Observe encoded bytes and the logical size of a streaming body.
     /// For compressed bodies the total wire size is not known until EOF.
     pub fn meter<R>(
@@ -452,12 +476,13 @@ impl NetworkMeter {
                 .activity
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            activity.active += 1;
             counters.remaining.fetch_add(remaining, Ordering::Relaxed);
+            activity.active += 1;
         }
         drop(state);
         MeteredReader {
             reader,
+            _activity: self.gate.begin(),
             counters,
             logical_size,
             exact_wire_size,
@@ -472,7 +497,7 @@ impl NetworkMeter {
         let now = Instant::now();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let elapsed = now.duration_since(state.last_sample);
-        if elapsed < Duration::from_millis(500) {
+        if elapsed < Duration::from_millis(200) {
             return;
         }
         state.send.sample(now, elapsed);
@@ -490,10 +515,13 @@ impl NetworkMeter {
     }
 }
 
+mod calibration;
+mod idle;
+pub use idle::{IdleGate, IdlePermit, ProbePayload, ProbeStream, WorkActivity};
 mod checkpoint;
 pub use checkpoint::NetworkCheckpoint;
 mod simulation;
-pub use simulation::TransferDemand;
+pub use simulation::{TransferDemand, transfer_seconds};
 
 #[cfg(test)]
 mod tests;
@@ -576,7 +604,7 @@ impl ResultTransferEstimate {
 
     #[must_use = "the duration is used in the completion estimate"]
     pub fn seconds(self) -> f64 {
-        self.expected_bytes as f64 / self.bytes_per_second.max(1) as f64
+        transfer_seconds(u128::from(self.expected_bytes), self.bytes_per_second)
             + Duration::from_nanos(
                 self.expected_requests
                     .saturating_mul(self.request_nanoseconds),

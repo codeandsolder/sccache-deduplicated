@@ -108,10 +108,6 @@ impl DirectionCheckpoint {
                 || group.minimum == 0
                 || group.maximum < group.minimum
                 || group.maximum > MAX_RATE.saturating_mul(MAX_PEERS as u64)
-                || !group
-                    .members
-                    .iter()
-                    .all(|peer| direction.peers.contains_key(peer))
             {
                 continue;
             }
@@ -143,7 +139,12 @@ impl NetworkMeter {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let send = DirectionCheckpoint::capture(&state.send, now);
         let receive = DirectionCheckpoint::capture(&state.receive, now);
-        if send.peers.is_empty() && receive.peers.is_empty() {
+        drop(state);
+        if send.peers.is_empty()
+            && receive.peers.is_empty()
+            && send.groups.is_empty()
+            && receive.groups.is_empty()
+        {
             return None;
         }
         Some(NetworkCheckpoint {

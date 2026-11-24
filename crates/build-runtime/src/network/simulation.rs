@@ -1,5 +1,25 @@
 use super::{DirectionSnapshot, MAX_RATE, Peer};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
+
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
+
+/// Convert advisory transfer demand to time, saturating only beyond the
+/// representable nanosecond horizon (hundreds of years).
+#[must_use = "the duration is used in placement prediction"]
+pub fn transfer_seconds(bytes: u128, bytes_per_second: u64) -> f64 {
+    seconds(
+        bytes
+            .saturating_mul(NANOS_PER_SECOND)
+            .div_ceil(u128::from(bytes_per_second.max(1))),
+    )
+}
+
+fn seconds(nanos: u128) -> f64 {
+    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX)).as_secs_f64()
+}
 
 /// One peer's outstanding transport bytes and estimated individual service rate.
 #[derive(Debug, Clone, Copy)]
@@ -15,17 +35,15 @@ impl TransferDemand {
 }
 
 struct Simulation {
-    finished: BTreeMap<Peer, f64>,
-    remaining: BTreeMap<Peer, f64>,
+    finished: BTreeMap<Peer, u128>,
+    // Byte-nanoseconds: retain fractional bytes through each rate transition.
+    remaining: BTreeMap<Peer, u128>,
 }
 
 impl DirectionSnapshot {
-    /// Progressive max-min filling across individual and overlapping group
-    /// constraints. A peer freezes when either its own rate or a shared
-    /// resource has no capacity for another equal increment.
     fn rates(
         &self,
-        active: &BTreeMap<Peer, f64>,
+        active: &BTreeMap<Peer, u128>,
         demands: &BTreeMap<Peer, TransferDemand>,
     ) -> BTreeMap<Peer, u64> {
         let mut rates: BTreeMap<_, u64> = active.keys().map(|&peer| (peer, 0)).collect();
@@ -38,14 +56,17 @@ impl DirectionSnapshot {
                 .unwrap_or(0);
             for group in &self.shared {
                 let count = group.members.intersection(&growing).count() as u64;
-                if count != 0 {
-                    let allocated = group
-                        .members
-                        .iter()
-                        .filter_map(|peer| rates.get(peer))
-                        .sum::<u64>();
-                    increment =
-                        increment.min(group.bytes_per_second.saturating_sub(allocated) / count);
+                let allocated = group
+                    .members
+                    .iter()
+                    .filter_map(|peer| rates.get(peer))
+                    .sum::<u64>();
+                if let Some(share) = group
+                    .bytes_per_second
+                    .saturating_sub(allocated)
+                    .checked_div(count)
+                {
+                    increment = increment.min(share);
                 }
             }
             for peer in &growing {
@@ -77,17 +98,17 @@ impl DirectionSnapshot {
         rates
     }
 
-    fn simulate(&self, demands: &BTreeMap<Peer, TransferDemand>, until: f64) -> Simulation {
+    fn simulate(&self, demands: &BTreeMap<Peer, TransferDemand>, until: u128) -> Simulation {
         let mut remaining: BTreeMap<_, _> = demands
             .iter()
             .filter(|(_, demand)| demand.bytes > 0)
-            .map(|(&peer, demand)| (peer, demand.bytes as f64))
+            .map(|(&peer, demand)| (peer, demand.bytes.saturating_mul(NANOS_PER_SECOND)))
             .collect();
         let mut finished = BTreeMap::new();
         if self.shared.is_empty() {
             remaining.retain(|peer, bytes| {
-                let rate = demands[peer].rate() as f64;
-                let duration = *bytes / rate;
+                let rate = u128::from(demands[peer].rate());
+                let duration = bytes.div_ceil(rate);
                 if duration <= until {
                     finished.insert(*peer, duration);
                     false
@@ -101,24 +122,23 @@ impl DirectionSnapshot {
                 remaining,
             };
         }
-
-        let mut elapsed = 0.0;
+        let mut elapsed = 0_u128;
         while !remaining.is_empty() && elapsed < until {
             let rates = self.rates(&remaining, demands);
             let next_finish = remaining
                 .iter()
-                .map(|(peer, bytes)| bytes / rates[peer].max(1) as f64)
-                .fold(f64::INFINITY, f64::min);
+                .map(|(peer, bytes)| bytes.div_ceil(u128::from(rates[peer].max(1))))
+                .min()
+                .unwrap_or(0);
             let step = next_finish.min(until - elapsed);
             elapsed += step;
             remaining.retain(|peer, bytes| {
-                let rate = rates[peer].max(1) as f64;
-                if *bytes / rate <= step {
+                *bytes = bytes.saturating_sub(step.saturating_mul(u128::from(rates[peer].max(1))));
+                if *bytes == 0 {
                     finished.insert(*peer, elapsed);
                     false
                 } else {
-                    *bytes -= step * rate;
-                    *bytes > 0.0
+                    true
                 }
             });
         }
@@ -132,25 +152,30 @@ impl DirectionSnapshot {
     /// each time a peer finishes.
     #[must_use = "completion times are advisory placement predictions"]
     pub fn finish_times(&self, demands: &BTreeMap<Peer, TransferDemand>) -> BTreeMap<Peer, f64> {
-        self.simulate(demands, f64::INFINITY).finished
+        self.simulate(demands, u128::MAX)
+            .finished
+            .into_iter()
+            .map(|(peer, nanos)| (peer, seconds(nanos)))
+            .collect()
     }
 
-    /// Advance the existing traffic to a future arrival time, e.g. the
-    /// moment a newly scheduled compiler finishes and starts publishing.
+    /// Advance the existing traffic to a future arrival time.
     #[must_use = "the remaining demand predicts future contention"]
     pub fn remaining_after(
         &self,
         demands: &BTreeMap<Peer, TransferDemand>,
-        seconds: f64,
+        delay_seconds: f64,
     ) -> BTreeMap<Peer, TransferDemand> {
-        self.simulate(demands, seconds.max(0.0))
+        let until = Duration::try_from_secs_f64(delay_seconds.max(0.0))
+            .map_or(u128::MAX, |duration| duration.as_nanos());
+        self.simulate(demands, until)
             .remaining
             .into_iter()
             .map(|(peer, bytes)| {
                 (
                     peer,
                     TransferDemand {
-                        bytes: bytes.ceil() as u128,
+                        bytes: bytes.div_ceil(NANOS_PER_SECOND),
                         bytes_per_second: demands[&peer].bytes_per_second,
                     },
                 )

@@ -653,15 +653,15 @@ fn run(command: Command) -> Result<i32> {
                 }
             };
 
+            let server = Server::new(archive);
             #[cfg(target_os = "linux")]
             let native_worker = native_worker
-                .map(|config| NativeWorker::new(config, scheduler_auth.clone()))
+                .map(|config| NativeWorker::new(config, scheduler_auth.clone(), &server.activity))
                 .transpose()?;
             #[cfg(not(target_os = "linux"))]
             if native_worker.is_some() {
                 bail!("native worker requires Linux");
             }
-            let server = Server::new(archive);
             #[cfg(target_os = "linux")]
             let server = Server {
                 native_worker,
@@ -1522,6 +1522,7 @@ struct LocalAssignment {
     _input_pins: Vec<sccache::build_runtime::TreeLease>,
     // Local time of receipt, not the scheduler's assignment timestamp.
     accepted_at: Instant,
+    _activity: sccache::build_runtime::WorkActivity,
 }
 
 struct ArchiveWorker {
@@ -1610,6 +1611,7 @@ impl ArchiveWorker {
 
 pub struct Server {
     archive: Option<ArchiveWorker>,
+    activity: std::sync::Arc<sccache::build_runtime::IdleGate>,
     execution_queue: dist::execution_queue::ExecutionQueue,
     job_toolchains: Mutex<HashMap<JobId, LocalAssignment>>,
     #[cfg(target_os = "linux")]
@@ -1620,6 +1622,7 @@ impl Server {
     fn new(archive: Option<ArchiveWorker>) -> Self {
         Self {
             archive,
+            activity: std::sync::Arc::new(sccache::build_runtime::IdleGate::default()),
             execution_queue: dist::execution_queue::ExecutionQueue::new(
                 std::num::NonZeroUsize::new(sccache::util::num_cpus())
                     .unwrap_or(std::num::NonZeroUsize::MIN),
@@ -1757,6 +1760,7 @@ impl ServerIncoming for Server {
         job_id: JobId,
         assignment: NativeAssignment,
     ) -> Result<AssignJobResult> {
+        let activity = self.activity.begin();
         assignment.spec.validate()?;
         let input_pins = self.pin_resident_inputs(&assignment.spec)?;
         let mut assignments = self
@@ -1770,6 +1774,7 @@ impl ServerIncoming for Server {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(LocalAssignment {
                     assignment: JobAssignment::Native(Box::new(assignment)),
+                    _activity: activity,
                     _input_pins: input_pins,
                     accepted_at: Instant::now(),
                 });
@@ -1812,6 +1817,7 @@ impl ServerIncoming for Server {
     }
 
     fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> Result<AssignJobResult> {
+        let activity = self.activity.begin();
         let need_toolchain = !self
             .archive
             .as_ref()
@@ -1828,6 +1834,7 @@ impl ServerIncoming for Server {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(LocalAssignment {
                     assignment: JobAssignment::Archive(tc),
+                    _activity: activity,
                     _input_pins: Vec::new(),
                     accepted_at: Instant::now(),
                 });
@@ -2076,7 +2083,7 @@ mod scheduler_tests {
         let network = NetworkSnapshot::default();
         let plan = NativeTransferPlan::new(&network, &HashMap::new());
         let peer = Peer::Worker("127.0.0.1:10501".parse().unwrap());
-        let eta = |capacity, assigned, placement| {
+        let eta = |capacity, assigned: &HashMap<_, _>, placement: &dist::NativePlacement| {
             native_eta_seconds(capacity, assigned, placement, &inputs, peer, &plan)
         };
         assert!(eta(4.0, &empty, &fast) < eta(4.0, &empty, &slow));

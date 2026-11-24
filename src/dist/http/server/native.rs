@@ -31,8 +31,13 @@ use crate::{
 };
 
 mod network;
+mod probe;
 
-pub(super) type Allocator = dyn Fn(crate::dist::NativeAssignment, crate::dist::NativeInputBlobs) -> Result<ScheduleReply>
+pub(super) type Allocator = dyn Fn(
+        crate::dist::NativeAssignment,
+        crate::dist::NativeInputBlobs,
+        &crate::build_runtime::NetworkSnapshot,
+    ) -> Result<ScheduleReply>
     + Send
     + Sync;
 
@@ -111,6 +116,7 @@ pub(super) fn spawn(
     allocate: impl Fn(
         crate::dist::NativeAssignment,
         crate::dist::NativeInputBlobs,
+        &crate::build_runtime::NetworkSnapshot,
     ) -> Result<ScheduleReply>
     + Send
     + Sync
@@ -132,6 +138,22 @@ pub(super) fn spawn(
         config.directory.join("network-timing.json"),
         config.public_addr,
     )?;
+    let calibration = config
+        .network_probe_bytes
+        .map(|bytes| {
+            probe::ProbeCoordinator::start(
+                &network,
+                config.directory.join("network-calibration.json"),
+                config.public_addr,
+                bytes,
+                config
+                    .http_threads
+                    .saturating_sub(config.max_total_uploads)
+                    .saturating_sub(2)
+                    .min(4),
+            )
+        })
+        .transpose()?;
     let server = rouille::Server::new(config.public_addr, move |request| {
         respond(
             request,
@@ -139,6 +161,7 @@ pub(super) fn spawn(
                 sessions: &sessions,
                 packages: packages.as_ref(),
                 network: &network,
+                calibration: calibration.as_deref(),
             },
             &allocate,
             &*client_auth,
@@ -219,6 +242,7 @@ struct NativeServices<'a> {
     sessions: &'a NativeSessions,
     packages: Option<&'a PackageService>,
     network: &'a NetworkMeter,
+    calibration: Option<&'a probe::ProbeCoordinator>,
 }
 
 fn respond(
@@ -239,6 +263,9 @@ fn respond(
     let Some((role, operation)) = path.split_once('/') else {
         return Response::empty_404();
     };
+    if request.header("Content-Type") != Some("application/octet-stream") {
+        return Response::empty_400();
+    }
     let publisher = match role {
         "client" => {
             if let Err(response) = authenticate_client(request, client_auth) {
@@ -251,6 +278,24 @@ fn respond(
                 Ok(server) => server,
                 Err(response) => return response,
             };
+            if matches!(
+                operation,
+                "probe_offer" | "probe_download" | "probe_upload" | "probe_receipt"
+            ) {
+                let response = match services.calibration {
+                    Some(calibration) => {
+                        calibration.dispatch(request, server.addr(), operation, limit)
+                    }
+                    None if operation == "probe_offer" => {
+                        encode(&crate::dist::native::probe::ProbeOffer::Disabled, limit)
+                    }
+                    None => Ok(Response::empty_404()),
+                };
+                return response.unwrap_or_else(|error| {
+                    trace!("Native calibration request deferred: {error:#}");
+                    Response::text("calibration deferred").with_status_code(409)
+                });
+            }
             let Some(job) = request
                 .header("X-Sccache-Native-Job")
                 .and_then(|job| job.parse::<u64>().ok())
@@ -264,9 +309,7 @@ fn respond(
         }
         _ => return Response::empty_404(),
     };
-    if request.header("Content-Type") != Some("application/octet-stream") {
-        return Response::empty_400();
-    }
+    let _real_work = services.network.idle_gate().begin();
     match dispatch(request, services, allocate, publisher, operation, limit) {
         Ok(response) => response,
         Err(error) if error.is::<NativeServiceBusy>() => {
@@ -293,6 +336,7 @@ fn dispatch(
         sessions,
         packages,
         network,
+        calibration,
     } = services;
     let peer = match publisher {
         Publisher::Client => Peer::Client(request.remote_addr().ip()),
@@ -397,7 +441,13 @@ fn dispatch(
             let request = spec.action_request()?;
             encode(
                 &sessions.schedule(ticket, &request, |inputs| {
-                    allocate(crate::dist::NativeAssignment { ticket, spec }, inputs)
+                    let snapshot = calibration
+                        .map_or_else(|| network.snapshot(), probe::ProbeCoordinator::snapshot);
+                    allocate(
+                        crate::dist::NativeAssignment { ticket, spec },
+                        inputs,
+                        &snapshot,
+                    )
                 })?,
                 limit,
             )

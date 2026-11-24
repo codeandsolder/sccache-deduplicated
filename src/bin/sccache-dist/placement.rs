@@ -4,6 +4,7 @@ use super::ServerDetails;
 use sccache::{
     build_runtime::{
         DirectionSnapshot, NetworkSnapshot, Peer, ResultTransferEstimate, TransferDemand,
+        transfer_seconds,
     },
     dist::{self, JobId, ServerId},
 };
@@ -85,10 +86,7 @@ fn marginal_completion(
     demand: TransferDemand,
 ) -> (f64, f64) {
     if network.shared.is_empty() {
-        return (
-            demand.bytes as f64 / demand.bytes_per_second.max(1) as f64,
-            0.0,
-        );
+        return (transfer_seconds(demand.bytes, demand.bytes_per_second), 0.0);
     }
     let mut updated = demands.clone();
     updated.insert(peer, demand);
@@ -209,21 +207,26 @@ pub(super) fn native_eta_seconds(
     let cost = placement.transfer;
     let (network, externality) = plan.input_completion(peer, bytes, cost.download_bytes_per_second);
     let logical_rate = plan.send.logical_rate(peer, cost.download_bytes_per_second);
-    let staging_seconds = bytes as f64 / logical_rate as f64;
+    let staging_seconds = transfer_seconds(bytes, logical_rate);
     let batches = (requests as u128).div_ceil(u128::from(cost.raw_parallelism));
     let overhead = Duration::from_nanos(
         u64::try_from(batches * u128::from(cost.raw_request_nanoseconds)).unwrap_or(u64::MAX),
     )
     .as_secs_f64();
-    let transfer_seconds = network.max(staging_seconds) + overhead;
+    let input_seconds = network.max(staging_seconds) + overhead;
     let execution = Duration::from_nanos(placement.execution_nanoseconds).as_secs_f64();
     let capacity = capacity.max(1.0);
-    let queue = (assigned.len() as f64 + 1.0 - capacity).max(0.0) / capacity * execution;
-    let ready_at = queue.max(transfer_seconds) + execution;
+    let queue = (f64::from(u32::try_from(assigned.len()).unwrap_or(u32::MAX)) + 1.0 - capacity)
+        .max(0.0)
+        / capacity
+        * execution;
+    let ready_at = queue.max(input_seconds) + execution;
     let (output_network, output_externality) =
         plan.result_completion(peer, ready_at, placement.result);
-    let output_processing =
-        placement.result.expected_bytes as f64 / placement.result.bytes_per_second as f64;
+    let output_processing = transfer_seconds(
+        u128::from(placement.result.expected_bytes),
+        placement.result.bytes_per_second,
+    );
     let output_overhead = Duration::from_nanos(
         placement
             .result
@@ -253,6 +256,8 @@ mod tests {
                 a,
                 PeerCapacity {
                     observed_bytes_per_second: 100_000_000,
+                    calibrated_bytes_per_second: 0,
+                    latest_bytes_per_second: 0,
                     wire_per_mille: 1000,
                     active_remaining_bytes: 100_000_000,
                     body_bytes: 0,
