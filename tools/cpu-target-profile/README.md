@@ -50,9 +50,11 @@ different hardware; `capture` is run on the intended destination, and
 CPU as the default destination. For portable fleet binaries choose an
 explicit baseline rather than changing the meaning of `native`.
 
-The current sccache implementation resolves Rust native CPU requests before
-remote dispatch; unresolved GCC/Clang native requests execute locally and
-include the initiating compiler's CPU expansion in their cache key. See
+The current sccache implementation resolves Rust native CPU requests on the
+initiating host before remote dispatch. GCC/Clang native requests are also
+expanded before remote dispatch: the requesting compiler's complete final
+frontend target state supplies explicit ISA/tuning arguments and participates
+in the cache identity. No worker uses its own CPU to reinterpret `native`. See
 [distributed native behavior](../../docs/Distributed.md#native-cpu-is-the-requesting-host-not-the-worker).
 
 ## Choose a target directly, or use a saved profile
@@ -76,6 +78,40 @@ Without --profile, --target is required; omitting --cpu selects native. With
 --cpu selects a compatible down-target. For targeting CPUs with OS- or
 hypervisor-masked ISA, the serialized profile records the safe, currently
 usable feature intersection, rather than trusting a physical model name.
+
+## Exact ISA masks for captured Linux x86-64 CPUs
+
+Named models describe the CPU **requested**, so `--cpu x86_64_v4` is never
+silently reduced to an ISA supported by the build machine. A saved profile
+captured from Linux instead describes the destination's **actual usable ISA**,
+which may be smaller than the default features a compiler enables for that
+CPU model (including hypervisor masks and differences across processors).
+
+For captured Linux x86-64 profiles, all three backends constrain the chosen
+CPU model using the saved feature intersection:
+
+- **Rust** reads the actual rustc's enabled `target_feature` settings for its
+  selected CPU and emits explicit `-C target-feature=-feature` for instructions
+  missing from the destination snapshot.
+- **GCC** probes the selected CPU's enabled ISA switches using `-Q --help=target`
+  and emits matching `-mno-*` disables; previously unknown CPU-dependent
+  switches cause an error instead of risking unsupported instructions.
+- **Clang** emits a tiny LLVM IR-only function to inspect its selected CPU's
+  *actual* enabled LLVM target features and forwards explicit negative features
+  only for those missing from the saved snapshot. No machine code is created
+  or executed in this inspection.
+
+For example, on a Zen 2 CPU whose Linux feature list lacks `xsaves`, a captured
+profile emits `-march=znver2 -mtune=znver2 -mno-xsaves` for GCC, preserves
+`target-cpu=znver2` with `-C target-feature=-xsaves` for Rust, and explicitly
+passes `-xsaves` through Clang's `-Xclang -target-feature` interface. Captured
+WSL2 Ryzen flags can additionally mask `mwaitx`, `rdpru` and `wbnoinvd` for
+Clang. Other architecture families still use the Archspec required-feature
+validation and their native compiler mapping.
+
+These ISA flags are part of each compiler's normal command line, so the
+existing compiler-specific cache key distinguishes masked and unmasked builds
+without hashing descriptive capture metadata.
 
 ## Render only the settings consumed by each compiler
 
@@ -103,7 +139,8 @@ GCC must report a compatible architecture/OS/environment via `-dumpmachine`
 `--target=DESTINATION_TRIPLE` argument. Both backends are checked with a
 syntax-only compiler invocation (`-fsyntax-only -x c -`) using the
 generated optimization flags. This validates CPU flag support without
-compiling client-side code, linking or producing artifacts. This rejects native GCC for foreign
+building a machine-code object, linking or producing artifacts (the additional
+Clang feature discovery emits temporary LLVM IR to stdout only). This rejects native GCC for foreign
 architectures, instead of silently generating unusable configurations.
 The cross-toolchain and any required sysroot are selected independently.
 

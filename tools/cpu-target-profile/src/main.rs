@@ -113,10 +113,17 @@ fn main() -> Result<()> {
                 let selected_cpu = cpu.as_deref().filter(|name| *name != "native");
                 (selection.resolve()?, selected_cpu)
             } else {
-                let target = target.as_deref().context("emit needs --profile or --target")?;
+                let target = target
+                    .as_deref()
+                    .context("emit needs --profile or --target")?;
                 let selection = match cpu.as_deref() {
-                    None | Some("native") => CpuTargetSelection::Native { target_triple: target },
-                    Some(cpu) => CpuTargetSelection::Model { target_triple: target, cpu },
+                    None | Some("native") => CpuTargetSelection::Native {
+                        target_triple: target,
+                    },
+                    Some(cpu) => CpuTargetSelection::Model {
+                        target_triple: target,
+                        cpu,
+                    },
                 };
                 (selection.resolve()?, None)
             };

@@ -15,6 +15,7 @@ use target_lexicon::Triple;
 
 #[cfg(target_os = "linux")]
 mod linux_capabilities;
+mod x86_features;
 
 const SCHEMA_VERSION: u32 = 2;
 
@@ -74,7 +75,10 @@ pub enum CpuTargetSelection<'a> {
     /// The machine that initiates the compile request (never its worker).
     Native { target_triple: &'a str },
     /// An explicit target model, regardless of the compiler execution host.
-    Model { target_triple: &'a str, cpu: &'a str },
+    Model {
+        target_triple: &'a str,
+        cpu: &'a str,
+    },
     /// An exact saved capability snapshot, potentially from an offline host.
     Profile(&'a DestinationProfile),
 }
@@ -428,6 +432,14 @@ pub fn selected_c_flags(
         // arguments, hashed by the existing C compiler-specific cache key.
         flags.insert(0, format!("--target={}", profile.target_triple));
     }
+    if x86_features::is_captured_x86(profile) {
+        let missing = if family == "gcc" {
+            x86_features::gcc_mask_flags(profile, compiler, &flags)?
+        } else {
+            x86_features::clang_mask_flags(profile, compiler, &flags)?
+        };
+        flags.extend(missing);
+    }
     validate_c_target_flags(compiler, &flags)?;
     Ok(flags)
 }
@@ -491,7 +503,38 @@ pub fn rustc_flags(
     }
     let selected = alternatives.into_iter().find(|name| supported.contains(name.as_str()))
         .with_context(|| format!("rustc {} does not recognize Archspec CPU {} for target {}; use a compiler that supports the destination CPU", compiler.display(), cpu.name(), profile.target_triple))?;
-    Ok(vec!["-C".to_owned(), format!("target-cpu={selected}")])
+    let mut flags = vec!["-C".to_owned(), format!("target-cpu={selected}")];
+    if x86_features::is_captured_x86(profile) {
+        // Query this actual rustc's CPU expansion; it is the authority on
+        // instruction features implied by its target-cpu option. Explicitly
+        // disable ones absent from the saved destination's Linux ISA snapshot.
+        let cpu_arg = format!("target-cpu={selected}");
+        let cfg = tool_output(
+            compiler,
+            &[
+                "--print",
+                "cfg",
+                "--target",
+                &profile.target_triple,
+                "-C",
+                &cpu_arg,
+            ],
+        )?;
+        let missing: std::collections::BTreeSet<_> = cfg
+            .lines()
+            .filter_map(|line| line.strip_prefix("target_feature=\"")?.strip_suffix('"'))
+            .filter(|feature| !x86_features::llvm_available(profile, feature))
+            .map(|feature| format!("-{feature}"))
+            .collect();
+        if !missing.is_empty() {
+            flags.push("-C".to_owned());
+            flags.push(format!(
+                "target-feature={}",
+                missing.into_iter().collect::<Vec<_>>().join(",")
+            ));
+        }
+    }
+    Ok(flags)
 }
 
 #[derive(Serialize)]
@@ -590,23 +633,106 @@ mod tests {
         let named = CpuTargetSelection::Model {
             target_triple: "x86_64-unknown-linux-gnu",
             cpu: "x86_64_v3",
-        }.resolve()?;
+        }
+        .resolve()?;
         let saved = CpuTargetSelection::Profile(&named).resolve()?;
         assert_eq!(saved, named);
         let cargo = rustc_flags(&saved, None, std::path::Path::new("rustc"))?;
-        assert_eq!(cargo, rustc_flags(&named, None, std::path::Path::new("rustc"))?);
-        assert!(CpuTargetSelection::Model {
-            target_triple: "aarch64-unknown-linux-gnu",
-            cpu: "zen2",
-        }.resolve().is_err());
+        assert_eq!(
+            cargo,
+            rustc_flags(&named, None, std::path::Path::new("rustc"))?
+        );
+        assert!(
+            CpuTargetSelection::Model {
+                target_triple: "aarch64-unknown-linux-gnu",
+                cpu: "zen2",
+            }
+            .resolve()
+            .is_err()
+        );
         Ok(())
     }
-
 
     use super::*;
 
     fn mock_profile(name: &str) -> Result<DestinationProfile> {
         DestinationProfile::named("x86_64-unknown-linux-gnu", name)
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn captured_linux_cpu_masks_compiler_features_absent_from_snapshot() -> Result<()> {
+        let mut captured = DestinationProfile::named("x86_64-unknown-linux-gnu", "zen2")?;
+        captured.origin = ProfileOrigin::LinuxCpuInfo {
+            logical_processors: 4,
+            heterogeneous: false,
+            hypervisor_flag_seen: true,
+        };
+        // Archspec knows ISA requirements but not every optional instruction
+        // activated by the compiler's -march=znver2 target.
+        assert!(!captured.features.contains(&"xsaves".to_owned()));
+        let rust = rustc_flags(&captured, None, Path::new("rustc"))?;
+        assert!(rust.iter().any(|arg| arg.contains("-xsaves")), "{rust:?}");
+        let gcc = selected_c_flags(&captured, None, "gcc", Path::new("gcc"))?;
+        assert!(gcc.contains(&"-mno-xsaves".to_owned()), "{gcc:?}");
+        let clang = selected_c_flags(&captured, None, "clang", Path::new("clang"))?;
+        assert!(
+            clang
+                .windows(4)
+                .any(|args| args == ["-Xclang", "-target-feature", "-Xclang", "-xsaves"])
+        );
+        assert_eq!(
+            rustc_flags(
+                &DestinationProfile::named("x86_64-unknown-linux-gnu", "zen2")?,
+                None,
+                Path::new("rustc")
+            )?
+            .len(),
+            2
+        );
+        Ok(())
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn saved_cpu_feature_masks_change_compiler_flags_but_not_named_model() -> Result<()> {
+        let mut masked = DestinationProfile::named("x86_64-unknown-linux-gnu", "zen2")?;
+        masked.origin = ProfileOrigin::LinuxCpuInfo {
+            logical_processors: 2,
+            heterogeneous: false,
+            hypervisor_flag_seen: true,
+        };
+        let mut enabled = masked.clone();
+        enabled.features.push("xsaves".to_owned());
+        let named = DestinationProfile::named("x86_64-unknown-linux-gnu", "zen2")?;
+        let rust_masked = rustc_flags(&masked, None, Path::new("rustc"))?;
+        let rust_enabled = rustc_flags(&enabled, None, Path::new("rustc"))?;
+        assert_ne!(rust_masked, rust_enabled);
+        assert!(!rust_enabled.iter().any(|arg| arg.contains("-xsaves")));
+        assert_eq!(rustc_flags(&named, None, Path::new("rustc"))?.len(), 2);
+        let gcc_masked = selected_c_flags(&masked, None, "gcc", Path::new("gcc"))?;
+        let gcc_enabled = selected_c_flags(&enabled, None, "gcc", Path::new("gcc"))?;
+        assert_ne!(gcc_masked, gcc_enabled);
+        assert!(!gcc_enabled.contains(&"-mno-xsaves".to_owned()));
+        let clang_masked = selected_c_flags(&masked, None, "clang", Path::new("clang"))?;
+        let clang_enabled = selected_c_flags(&enabled, None, "clang", Path::new("clang"))?;
+        assert_ne!(clang_masked, clang_enabled);
+        assert!(
+            !clang_enabled
+                .windows(4)
+                .any(|args| { args == ["-Xclang", "-target-feature", "-Xclang", "-xsaves"] })
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compiler_probe_does_not_repeat_its_arguments() -> Result<()> {
+        assert_eq!(
+            tool_output(Path::new("printf"), &["%s", "marker"])?,
+            "marker"
+        );
+        Ok(())
     }
 
     #[test]
