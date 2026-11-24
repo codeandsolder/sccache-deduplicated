@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# Run only on a disposable Linux CI runner, through sudo. The managed fleet
+# must not be touched. The optional JSON file supplies native distribution.
+set -euo pipefail
+
+binary=${1:?sccache test binary required}
+dist=${2:-}
+uid=${SUDO_UID:?run this regression with sudo from a non-root account}
+gid=${SUDO_GID:?run this regression with sudo from a non-root account}
+[[ $EUID == 0 && $uid != 0 ]]
+root=$(mktemp -d /run/sccache-shared-test.XXXXXX)
+server_pid=
+cleanup() {
+    local status=$?
+    if [[ -n $server_pid ]]; then
+        kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+    fi
+    if (( status != 0 )); then
+        cat "$root/server.log" >&2 || true
+    fi
+    rm -rf -- "$root"
+}
+trap cleanup EXIT
+chmod 755 "$root"
+install -o root -g root -m 755 "$binary" "$root/sccache"
+install -d -m 700 "$root/root-private" "$root/cache"
+install -d -o "$uid" -g "$gid" -m 700 "$root/user-private"
+touch "$root/client.toml"
+chmod 644 "$root/client.toml"
+# Configuration and scheduler credentials are visible only to root.
+if [[ -z $dist ]]; then
+    printf '{}\n' > "$root/distribution.json"
+else
+    cp "$dist" "$root/distribution.json"
+fi
+jq -n --arg dir "$root/cache" --argjson uid "$uid" --argjson gid "$gid" \
+    --slurpfile dist "$root/distribution.json" \
+    '{cache: {disk: {dir: $dir, size: 104857600}}, shared_daemon: {socket_gid: $gid, allowed_uids: [$uid]}, dist: ($dist[0] + {cache_dir: ($dir + "/toolchains")})}' \
+    > "$root/server.json"
+chmod 600 "$root/server.json" "$root/distribution.json"
+env -i PATH=/usr/bin:/bin HOME="$root/root-private" SCCACHE_CONF="$root/server.json" \
+    SCCACHE_SERVER_UDS="$root/service.sock" SCCACHE_START_SERVER=1 SCCACHE_NO_DAEMON=1 \
+    SCCACHE_IDLE_TIMEOUT=0 SCCACHE_LOG=info "$root/sccache" >"$root/server.log" 2>&1 &
+server_pid=$!
+
+client() {
+    env -i PATH=/usr/bin:/bin HOME="$root/user-private" SCCACHE_CONF="$root/client.toml" \
+        SCCACHE_SERVER_UDS="$root/service.sock" SCCACHE_NO_AUTO_START_SERVER=1 \
+        "$root/sccache" "$@"
+}
+user_client() {
+    setpriv --reuid "$uid" --regid "$gid" --groups "$gid" -- \
+        env -i PATH=/usr/bin:/bin HOME="$root/user-private" SCCACHE_CONF="$root/client.toml" \
+        SCCACHE_SERVER_UDS="$root/service.sock" SCCACHE_NO_AUTO_START_SERVER=1 \
+        "$root/sccache" "$@"
+}
+stats() {
+    client --show-stats --stats-format=json
+}
+for ((i=0; i<200; i++)); do
+    [[ -S $root/service.sock ]] && stats >/dev/null 2>&1 && break
+    kill -0 "$server_pid"
+    sleep .1
+done
+[[ $(stat -c '%u:%g:%a' "$root/service.sock") == "0:$gid:660" ]]
+stats >/dev/null
+
+# Same exact source, same pathname and command: share a cache entry across
+# UIDs, but each materialization belongs to the requesting UID.
+cd "$root/user-private"
+printf 'int shared_value(void) { return 42; }\n' > probe.c
+chown "$uid:$gid" probe.c
+chmod 600 probe.c
+user_client /usr/bin/gcc -c probe.c -o probe.o
+[[ $(stat -c '%u:%g' probe.o) == "$uid:$gid" ]]
+reference=$(sha256sum probe.o | cut -d' ' -f1)
+rm probe.o
+before=$(stats | jq '.stats.cache_hits.counts | [.[]] | add // 0')
+client /usr/bin/gcc -c probe.c -o probe.o
+[[ $(stat -c '%u' probe.o) == 0 ]]
+[[ $(sha256sum probe.o | cut -d' ' -f1) == "$reference" ]]
+after=$(stats | jq '.stats.cache_hits.counts | [.[]] | add // 0')
+(( after == before + 1 ))
+rm probe.o
+user_client /usr/bin/gcc -c probe.c -o probe.o
+[[ $(stat -c '%u:%g' probe.o) == "$uid:$gid" ]]
+[[ $(sha256sum probe.o | cut -d' ' -f1) == "$reference" ]]
+
+# A root-private source is available to root, not to the ordinary caller.
+cd "$root/root-private"
+printf 'int root_private_value(void) { return 7; }\n' > private.c
+chmod 600 private.c
+client /usr/bin/gcc -c private.c -o private.o
+[[ $(stat -c '%u' private.o) == 0 ]]
+cd "$root/user-private"
+if user_client /usr/bin/gcc -c "$root/root-private/private.c" -o forbidden.o; then
+    echo "unprivileged compile read root-private source" >&2
+    exit 1
+fi
+[[ ! -e forbidden.o ]]
+
+# The server-owned fallback must consume the real caller stdin; this cannot
+# be implemented by launching the compiler in the public CLI.
+printf 'int streamed_value(void) { return 13; }\n' | user_client /usr/bin/gcc -x c - -c -o streamed.o
+[[ $(stat -c '%u:%g' streamed.o) == "$uid:$gid" ]]
+nm streamed.o | rg -q 'streamed_value$'
+
+# A wrapper observes the actual compiler process ancestry. The server helper
+# is the compiler's ancestor, rather than the public client's process tree.
+cat > compiler-wrapper <<'WRAPPER'
+#!/bin/sh
+printf '%s %s %s\n' "$(id -u)" "$PPID" "$(awk '/^PPid:/ { print $2 }' "/proc/$PPID/status")" >> ancestry
+exec /usr/bin/gcc "$@"
+WRAPPER
+chmod 755 compiler-wrapper
+chown "$uid:$gid" compiler-wrapper
+user_client "$root/user-private/compiler-wrapper" -c probe.c -o wrapper.o
+[[ -s ancestry ]]
+awk -v uid="$uid" -v parent="$server_pid" '
+    $1 != uid || $3 != parent { bad=1 }
+    END { exit bad || NR == 0 }
+' ancestry
+[[ $(stat -c '%u' wrapper.o) == "$uid" ]]
+
+# Socket group membership alone is insufficient. An ordinary authorized UID
+# also cannot use administrative or raw namespace/client-side compile RPCs.
+other=65534
+[[ $uid != "$other" ]] || other=65533
+if setpriv --reuid "$other" --regid "$gid" --groups "$gid" -- \
+    env -i PATH=/usr/bin:/bin HOME=/tmp SCCACHE_CONF="$root/client.toml" \
+    SCCACHE_SERVER_UDS="$root/service.sock" SCCACHE_NO_AUTO_START_SERVER=1 \
+    "$root/sccache" --show-stats; then
+    echo "unauthorized UID accessed shared daemon" >&2
+    exit 1
+fi
+if user_client --zero-stats; then
+    echo "ordinary UID reset shared statistics" >&2
+    exit 1
+fi
+if setpriv --reuid "$uid" --regid "$gid" --groups "$gid" -- \
+    env -i PATH=/usr/bin:/bin HOME="$root/user-private" SCCACHE_CONF="$root/client.toml" \
+    SCCACHE_SERVER_UDS="$root/service.sock" SCCACHE_NO_AUTO_START_SERVER=1 SCCACHE_CLIENT_SIDE=1 \
+    "$root/sccache" /usr/bin/gcc -c probe.c -o caller.o; then
+    echo "shared endpoint allowed caller-owned compilation" >&2
+    exit 1
+fi
+[[ ! -e caller.o ]]
+
+# Exercise an alternate mount view of the same pathname, without moving the
+# root daemon into the caller's filesystem namespace.
+install -d -o "$uid" -g "$gid" -m 700 "$root/alternate" "$root/user-private/view"
+printf 'int namespace_visible(void) { return 8; }\n' > "$root/alternate/visible.c"
+chown "$uid:$gid" "$root/alternate/visible.c"
+# shellcheck disable=SC2016 # Positional parameters belong to the inner shell.
+unshare --mount --propagation private -- bash -eu -c '
+    mount --bind "$1/alternate" "$1/user-private/view"
+    cd "$1/user-private/view"
+    exec setpriv --reuid "$2" --regid "$3" --groups "$3" -- \
+        env -i PATH=/usr/bin:/bin HOME="$1/user-private" SCCACHE_CONF="$1/client.toml" \
+        SCCACHE_SERVER_UDS="$1/service.sock" SCCACHE_NO_AUTO_START_SERVER=1 \
+        "$1/sccache" /usr/bin/gcc -c visible.c -o visible.o
+' _ "$root" "$uid" "$gid"
+[[ ! -e "$root/user-private/view/visible.o" ]]
+[[ $(stat -c '%u:%g' "$root/alternate/visible.o") == "$uid:$gid" ]]
+nm "$root/alternate/visible.o" | rg -q 'namespace_visible$'
+
+if [[ -n $dist ]]; then
+    stats | jq -e '[.stats.dist_compiles[]] | add > 0' >/dev/null
+fi
+client --stop-server
+wait "$server_pid"
+server_pid=
+echo "shared daemon credential, cache, fallback and mount namespace regression passed"

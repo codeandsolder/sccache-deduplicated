@@ -63,6 +63,7 @@ fn config_with_dist_auth(
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
+        shared_daemon: None,
         compiler_aliases: Default::default(),
         compile_limits: Default::default(),
     }

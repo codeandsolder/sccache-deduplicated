@@ -361,6 +361,62 @@ impl Fleet {
     }
 }
 
+/// This explicit root test is run only in the disposable hosted CI lane.
+#[test]
+#[ignore = "requires sudo and Linux host namespace capabilities on a disposable CI runner"]
+fn shared_daemon_credential_isolation() -> Result<()> {
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("contrib/codeandsolder/test-shared-daemon");
+    let binary = env!("CARGO_BIN_EXE_sccache");
+    let local = Command::new("sudo")
+        .args(["-n", "bash"])
+        .arg(&script)
+        .arg(binary)
+        .status()?;
+    ensure!(
+        local.success(),
+        "shared local daemon regression failed: {local}"
+    );
+
+    let temporary = tempfile::tempdir()?;
+    let fleet = Fleet::start(temporary.path(), BTreeMap::new())?;
+    let config = sccache::config::DistConfig {
+        scheduler_url: Some(HTTPUrl::from_url(fleet.scheduler_url.clone())),
+        auth: DistAuth::Token {
+            token: CLIENT_TOKEN.into(),
+        },
+        native: Some(NativeClientConfig {
+            endpoint: HTTPUrl::from_url(fleet.cache_url.clone()),
+            platform_contract: PLATFORM.into(),
+            request_timeout_secs: 60,
+            build_timeout_secs: 180,
+            renewal_interval_secs: 1,
+            max_metadata_bytes: 64 * 1024 * 1024,
+            max_result_bytes: 64 * 1024 * 1024,
+            local_execution: None,
+        }),
+        ..Default::default()
+    };
+    let path = temporary.path().join("shared-distribution.json");
+    fs::write(&path, serde_json::to_vec(&config)?)?;
+    let distributed = Command::new("sudo")
+        .args(["-n", "bash"])
+        .arg(script)
+        .arg(binary)
+        .arg(path)
+        .status()?;
+    ensure!(
+        distributed.success(),
+        "shared native daemon regression failed: {distributed}"
+    );
+    let (scheduler, worker) = fleet.finish()?;
+    ensure!(
+        scheduler.actions > 0 && worker.actions > 0,
+        "no remote native action persisted"
+    );
+    Ok(())
+}
+
 fn rust_installer_fixture(component: &str, file: &str, contents: &[u8]) -> Result<Vec<u8>> {
     let mut archive = tar::Builder::new(Vec::new());
     let components = format!("{component}\n");
