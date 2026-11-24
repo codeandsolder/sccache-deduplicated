@@ -579,13 +579,13 @@ impl NativeStore {
 
     /// The storage format selected for this store's backing filesystem.
     /// ZFS retains ordinary files; other filesystems retain indexed Zstd frames.
-    #[must_use]
+    #[must_use = "blob storage and transfer must use the backing filesystem's physical encoding"]
     pub const fn physical_encoding(&self) -> BlobEncoding {
         self.physical_encoding
     }
 
     /// True when the backing store is on ZFS and can share native ARC buffers.
-    #[must_use]
+    #[must_use = "native block cloning is only valid on a compatible ZFS dataset"]
     pub const fn uses_native_zfs(&self) -> bool {
         matches!(self.physical_encoding, BlobEncoding::Raw)
     }
