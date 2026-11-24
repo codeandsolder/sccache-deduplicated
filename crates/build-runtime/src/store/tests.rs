@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, io::Read, sync::Barrier, thread};
+use std::{
+    collections::BTreeMap,
+    io::{self, Read},
+    sync::Barrier,
+    thread,
+};
 
 use anyhow::{Context, Result};
 
@@ -224,6 +229,43 @@ fn literal_magic_prefix_in_raw_cas_blob_survives_restart() -> Result<()> {
     decoded.clear();
     lease.open_blob(reference.id)?.read_to_end(&mut decoded)?;
     assert_eq!(decoded, content);
+    Ok(())
+}
+
+#[test]
+fn blob_identity_is_exact_content_and_independent_of_read_chunking() -> Result<()> {
+    struct Chunked<'a> {
+        data: &'a [u8],
+        maximum: usize,
+    }
+
+    impl Read for Chunked<'_> {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            let count = output.len().min(self.maximum).min(self.data.len());
+            output[..count].copy_from_slice(&self.data[..count]);
+            self.data = &self.data[count..];
+            Ok(count)
+        }
+    }
+
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let data: Vec<u8> = (0_u8..=250).cycle().take(131_071).collect();
+    let expected = BlobRef {
+        id: ContentId(*blake3::hash(&data).as_bytes()),
+        size: data.len().try_into()?,
+    };
+
+    for maximum in [1, 31, 4096, 65_536, data.len()] {
+        let staged = store.stage(Chunked {
+            data: &data,
+            maximum,
+        })?;
+        assert_eq!(staged.reference(), expected);
+    }
+
+    let empty = store.stage(io::empty())?;
+    assert_eq!(empty.reference().id, ContentId::of(b""));
     Ok(())
 }
 
