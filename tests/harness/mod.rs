@@ -9,13 +9,11 @@ use std::env;
 use std::fs::remove_dir_all;
 use std::io::Write;
 #[cfg(feature = "dist-server")]
-use std::net::{self, IpAddr, SocketAddr};
+use std::net::{self, SocketAddr};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "dist-server")]
 use std::process::{Child, Output};
 use std::process::{Command, Stdio};
-#[cfg(feature = "dist-server")]
-use std::str::FromStr;
 use std::str::{self};
 #[cfg(feature = "dist-server")]
 use std::thread;
@@ -51,12 +49,49 @@ pub const CUSTOM_SERVER_TOKEN_ENV: &str = "SCCACHE_TEST_CUSTOM_SERVER_TOKEN";
 const CONFIGS_CONTAINER_PATH: &str = "/sccache-bits";
 #[cfg(feature = "dist-server")]
 const BUILD_DIR_CONTAINER_PATH: &str = "/sccache-bits/build-dir";
-#[cfg(feature = "dist-server")]
-const SCHEDULER_PORT: u16 = 10500;
-#[cfg(feature = "dist-server")]
-const SERVER_PORT: u16 = 12345; // arbitrary
+// Per-fixture endpoints avoid touching the managed build cache or other
+// distributed test processes on the host.
+#[cfg(all(unix, feature = "dist-server"))]
+thread_local! {
+    static DIST_DAEMON_SOCKET: std::cell::RefCell<Option<PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
 
-const TC_CACHE_SIZE: u64 = 1024 * 1024 * 1024; // 1 gig
+#[cfg(all(unix, feature = "dist-server"))]
+struct DistDaemonSocket;
+
+#[cfg(all(unix, feature = "dist-server"))]
+impl DistDaemonSocket {
+    fn new(path: PathBuf) -> Self {
+        DIST_DAEMON_SOCKET.with(|socket| {
+            assert!(socket.borrow().is_none(), "nested distributed test fixture");
+            socket.replace(Some(path));
+        });
+        Self
+    }
+}
+
+#[cfg(all(unix, feature = "dist-server"))]
+impl Drop for DistDaemonSocket {
+    fn drop(&mut self) {
+        let _ = stop_local_daemon();
+        DIST_DAEMON_SOCKET.with(|socket| {
+            socket.replace(None);
+        });
+    }
+}
+
+#[cfg(feature = "dist-server")]
+fn loopback_listener() -> net::TcpListener {
+    net::TcpListener::bind("127.0.0.1:0").unwrap()
+}
+
+// A current Rust sysroot plus cross-target runtimes can exceed 1 GiB.
+// Keep normal test worker archives and extractions resident across requests.
+const TC_CACHE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+#[cfg(feature = "dist-server")]
+const EXTRACTED_TC_CACHE_SIZE: u64 = 8 * 1024 * 1024 * 1024;
 
 pub fn start_local_daemon(cfg_path: &Path, cached_cfg_path: &Path) {
     // Don't run this with run() because on Windows `wait_with_output`
@@ -160,6 +195,12 @@ pub fn prune_command(mut cmd: Command) -> Command {
             cmd.env_remove(var);
         }
     }
+    #[cfg(all(unix, feature = "dist-server"))]
+    DIST_DAEMON_SOCKET.with(|socket| {
+        if let Some(path) = socket.borrow().as_ref() {
+            cmd.env("SCCACHE_SERVER_UDS", path);
+        }
+    });
     cmd
 }
 
@@ -227,11 +268,11 @@ pub fn sccache_client_cfg(
 }
 
 #[cfg(feature = "dist-server")]
-fn sccache_scheduler_cfg() -> sccache::config::scheduler::Config {
+fn sccache_scheduler_cfg(address: SocketAddr) -> sccache::config::scheduler::Config {
     sccache::config::scheduler::Config {
         maintenance_drain_file: None,
         job_slack: Default::default(),
-        public_addr: SocketAddr::from(([0, 0, 0, 0], SCHEDULER_PORT)),
+        public_addr: address,
         client_auth: sccache::config::scheduler::ClientAuth::Insecure,
         server_auth: sccache::config::scheduler::ServerAuth::Token {
             token: DIST_SERVER_TOKEN.to_owned(),
@@ -243,7 +284,7 @@ fn sccache_scheduler_cfg() -> sccache::config::scheduler::Config {
 fn sccache_server_cfg(
     tmpdir: &Path,
     scheduler_url: HTTPUrl,
-    server_ip: IpAddr,
+    server_addr: SocketAddr,
 ) -> sccache::config::server::Config {
     let relpath = "server-cache";
     fs::create_dir(tmpdir.join(relpath)).unwrap();
@@ -252,11 +293,11 @@ fn sccache_server_cfg(
         builder: sccache::config::server::BuilderType::Overlay {
             build_dir: BUILD_DIR_CONTAINER_PATH.into(),
             bwrap_path: DIST_IMAGE_BWRAP_PATH.into(),
-            extracted_toolchain_cache_size: TC_CACHE_SIZE,
+            extracted_toolchain_cache_size: EXTRACTED_TC_CACHE_SIZE,
         },
         cache_dir: Path::new(CONFIGS_CONTAINER_PATH).join(relpath),
-        public_addr: SocketAddr::new(server_ip, SERVER_PORT),
-        bind_address: Some(SocketAddr::from(([0, 0, 0, 0], SERVER_PORT))),
+        public_addr: server_addr,
+        bind_address: Some(server_addr),
         scheduler_url,
         scheduler_auth: sccache::config::server::SchedulerAuth::Token {
             token: DIST_SERVER_TOKEN.to_owned(),
@@ -284,6 +325,10 @@ pub struct DistSystem {
     sccache_dist: PathBuf,
     tmpdir: PathBuf,
 
+    scheduler_addr: SocketAddr,
+    scheduler_listener: Option<net::TcpListener>,
+    #[cfg(unix)]
+    daemon_socket: Option<DistDaemonSocket>,
     scheduler_name: Option<String>,
     server_names: Vec<String>,
     server_processes: Vec<Child>,
@@ -292,41 +337,52 @@ pub struct DistSystem {
 #[cfg(feature = "dist-server")]
 impl DistSystem {
     pub fn new(sccache_dist: &Path, tmpdir: &Path) -> Self {
-        // Make sure the docker image is available, building it if necessary.
-        // Retry up to 3 times to handle transient apt-get failures in CI.
-        let mut last_output = None;
-        for attempt in 1..=3 {
-            let mut child = Command::new("docker")
-                .args(["build", "-q", "-t", DIST_IMAGE, "-"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            child
-                .stdin
-                .as_mut()
-                .unwrap()
-                .write_all(DIST_DOCKERFILE.as_bytes())
-                .unwrap();
-            let output = child.wait_with_output().unwrap();
-            if output.status.success() {
+        static IMAGE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        IMAGE.get_or_init(|| {
+            // Make sure the docker image is available, building it if necessary.
+            // Retry up to 3 times to handle transient apt-get failures in CI.
+            let mut last_output = None;
+            for attempt in 1..=3 {
+                let mut child = Command::new("docker")
+                    .args(["build", "-q", "-t", DIST_IMAGE, "-"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(DIST_DOCKERFILE.as_bytes())
+                    .unwrap();
+                let output = child.wait_with_output().unwrap();
+                if output.status.success() {
+                    last_output = Some(output);
+                    break;
+                }
+                eprintln!(
+                    "docker build attempt {}/3 failed (exit {}), retrying...",
+                    attempt, output.status
+                );
                 last_output = Some(output);
-                break;
+                std::thread::sleep(Duration::from_secs(5 * attempt as u64));
             }
-            eprintln!(
-                "docker build attempt {}/3 failed (exit {}), retrying...",
-                attempt, output.status
-            );
-            last_output = Some(output);
-            std::thread::sleep(Duration::from_secs(5 * attempt as u64));
-        }
-        check_output(&last_output.unwrap());
+            check_output(&last_output.unwrap());
+        });
 
         let tmpdir = tmpdir.join("distsystem");
         fs::create_dir(&tmpdir).unwrap();
 
+        let scheduler_listener = loopback_listener();
+        let scheduler_addr = scheduler_listener.local_addr().unwrap();
+        #[cfg(unix)]
+        let daemon_socket = Some(DistDaemonSocket::new(tmpdir.join("client.sock")));
         Self {
+            scheduler_addr,
+            scheduler_listener: Some(scheduler_listener),
+            #[cfg(unix)]
+            daemon_socket,
             sccache_dist: sccache_dist.to_owned(),
             tmpdir,
 
@@ -341,7 +397,7 @@ impl DistSystem {
         let scheduler_cfg_path = self.tmpdir.join(scheduler_cfg_relpath);
         let scheduler_cfg_container_path =
             Path::new(CONFIGS_CONTAINER_PATH).join(scheduler_cfg_relpath);
-        let scheduler_cfg = sccache_scheduler_cfg();
+        let scheduler_cfg = sccache_scheduler_cfg(self.scheduler_addr);
         fs::File::create(scheduler_cfg_path)
             .unwrap()
             .write_all(&serde_json::to_vec(&scheduler_cfg).unwrap())
@@ -349,6 +405,8 @@ impl DistSystem {
 
         // Create the scheduler
         let scheduler_name = make_container_name("scheduler");
+        // Reserve until immediately before the service binds.
+        drop(self.scheduler_listener.take());
         let output = Command::new("docker")
             .args([
                 "run",
@@ -465,17 +523,18 @@ impl DistSystem {
 
         check_output(&output);
 
-        let server_ip = IpAddr::from_str("127.0.0.1").unwrap();
-        let server_cfg = sccache_server_cfg(&self.tmpdir, self.scheduler_url(), server_ip);
+        let listener = loopback_listener();
+        let server_addr = listener.local_addr().unwrap();
+        let server_cfg = sccache_server_cfg(&self.tmpdir, self.scheduler_url(), server_addr);
         fs::File::create(&server_cfg_path)
             .unwrap()
             .write_all(&serde_json::to_vec(&server_cfg).unwrap())
             .unwrap();
+        drop(listener);
         fs::File::create(format!("{}.ready", server_cfg_path.to_str().unwrap())).unwrap();
 
-        let url = HTTPUrl::from_url(
-            reqwest::Url::parse(&format!("https://{}:{}", server_ip, SERVER_PORT)).unwrap(),
-        );
+        let url =
+            HTTPUrl::from_url(reqwest::Url::parse(&format!("https://{server_addr}")).unwrap());
         let handle = ServerHandle::Container {
             cid: server_name,
             url,
@@ -485,13 +544,11 @@ impl DistSystem {
     }
 
     pub fn add_custom_server_process(&mut self, test_name: &str) -> ServerHandle {
-        let server_addr = {
-            let ip = IpAddr::from_str("127.0.0.1").unwrap();
-            let listener = net::TcpListener::bind(SocketAddr::from((ip, 0))).unwrap();
-            listener.local_addr().unwrap()
-        };
+        let listener = loopback_listener();
+        let server_addr = listener.local_addr().unwrap();
         let token = create_server_token(ServerId::new(server_addr), DIST_SERVER_TOKEN);
         let scheduler_url = self.scheduler_url().to_url().to_string();
+        drop(listener);
         let child = Command::new(env::current_exe().unwrap())
             .args(["--exact", test_name, "--nocapture"])
             .env(CUSTOM_SERVER_ADDR_ENV, server_addr.to_string())
@@ -581,7 +638,7 @@ impl DistSystem {
     }
 
     pub fn scheduler_url(&self) -> HTTPUrl {
-        let url = format!("http://127.0.0.1:{}", SCHEDULER_PORT);
+        let url = format!("http://{}", self.scheduler_addr);
         HTTPUrl::from_url(reqwest::Url::parse(&url).unwrap())
     }
 
@@ -600,6 +657,8 @@ impl DistSystem {
 #[cfg(feature = "dist-server")]
 impl Drop for DistSystem {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        drop(self.daemon_socket.take());
         let mut did_err = false;
 
         // Panicking halfway through drop would either abort (if it's a double panic) or leave us with

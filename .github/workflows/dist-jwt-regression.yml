@@ -5,6 +5,7 @@ on:
     paths:
       - Cargo.toml
       - Cargo.lock
+      - rust-toolchain.toml
       - src/dist/**
       - src/compiler/rust.rs
       - src/compiler/rust_dlltool.rs
@@ -20,6 +21,7 @@ on:
     paths:
       - Cargo.toml
       - Cargo.lock
+      - rust-toolchain.toml
       - src/dist/**
       - src/compiler/rust.rs
       - src/compiler/rust_dlltool.rs
@@ -39,39 +41,28 @@ permissions:
   contents: read
 
 jobs:
-  jwt-signing:
-    runs-on: ubuntu-26.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Install selected Rust nightly
-        id: rust
-        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
-        with:
-          toolchain: "nightly-2026-11-23"
-          components: clippy
-          targets: x86_64-pc-windows-gnu
-      - name: Isolate build cache from regression test services
-        run: echo "SCCACHE_SERVER_UDS=$RUNNER_TEMP/dist-regression-build.sock" >> "$GITHUB_ENV"
-      - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
-        with:
-          rust-toolchain: ${{ steps.rust.outputs.name }}
-      - name: Enable mount namespace regression
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bubblewrap binutils-mingw-w64-x86-64
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          bwrap --ro-bind / / -- /usr/bin/true
-      - name: Verify distributed JWT signing and Rust metadata and environment round trips
-        run: |
-          test_runner="$RUNNER_TEMP/dist-test-runner"
-          printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'unset SCCACHE_SERVER_UDS SCCACHE_SERVER_PORT' 'exec "$@"' > "$test_runner"
-          chmod +x "$test_runner"
-          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$test_runner"
-          cargo +${{ steps.rust.outputs.name }} test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-tests --lib test_job_token_verification
-          cargo +${{ steps.rust.outputs.name }} test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-tests --test dist test_dist_namespace_broker -- --exact
-          cargo +${{ steps.rust.outputs.name }} test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-tests --test dist test_dist_rust_ -- --test-threads 1
-          cargo +${{ steps.rust.outputs.name }} test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-tests --test dist test_dist_c_ -- --test-threads 1
-      - name: Finalize mandatory sccache
-        if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
+  distributed:
+    name: Distributed runtime regression
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
+    with:
+      runner: ubuntu-26.04
+      rust-toolchain: "nightly-2026-11-22"
+      rust-components: clippy
+      rust-targets: x86_64-pc-windows-gnu
+      isolate-public-sccache-server: true
+      rustflags: ""
+      timeout-minutes: 30
+      command: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends bubblewrap binutils-mingw-w64-x86-64
+        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        bwrap --ro-bind / / -- /usr/bin/true
+        test_runner="$RUNNER_TEMP/dist-test-runner"
+        printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'unset SCCACHE_SERVER_UDS SCCACHE_SERVER_PORT' 'exec "$@"' > "$test_runner"
+        chmod +x "$test_runner"
+        export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$test_runner"
+        # Keep compilation and test cache daemons independent. Cold namespace
+        # and C cases retain their own workers; the compatible Rust scenarios
+        # use one worker with fresh result caches for each case.
+        cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-tests --lib test_job_token_verification
+        cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-tests --test dist -- --test-threads 1 test_dist_namespace_broker test_dist_rust_ test_dist_c_
