@@ -443,7 +443,7 @@ impl NativeCacheClient {
                     return Ok(result);
                 }
                 Err(error) if retryable_transport_error(&error) => {
-                    debug!("retrying native worker status: {error:#}")
+                    debug!("retrying native worker status: {error:#}");
                 }
                 Err(error) => return Err(error),
             }

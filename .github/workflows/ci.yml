@@ -340,7 +340,7 @@ jobs:
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
 
   ci-bundle-release-profile:
-    name: CI bundle release profile (Rust nightly-2026-11-22)
+    name: CI bundle release profile (publisher toolchain)
     # Reuse shared sccache setup, and check the exact pinned publisher features
     # on every PR and main push (not only tag builds).
     permissions:
@@ -348,12 +348,14 @@ jobs:
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
     with:
       isolate-public-sccache-server: true
-      rust-toolchain: "nightly-2026-11-22"
+      rust-toolchain: "nightly-2026-11-20"
       rustflags: "-C target-cpu=x86-64-v2"
-      command: >-
-        cargo check --release --locked --no-default-features
-        --features s3,gha,dist-client,dist-server,direct-metrics,vendored-openssl
-        --bin sccache --bin sccache-dist
+      command: |
+        source contrib/codeandsolder/release-protocol.env
+        test "$(rustc -V)" = "$(rustc +"$rust_toolchain" -V)"
+        cargo check --release --locked --no-default-features \
+          --features s3,gha,dist-client,dist-server,direct-metrics,vendored-openssl \
+          --bin sccache --bin sccache-dist
 
   build:
     name: build ${{ matrix.binary || 'sccache' }} ${{ matrix.target }}

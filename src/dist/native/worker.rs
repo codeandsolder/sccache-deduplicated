@@ -232,6 +232,7 @@ pub struct WorkerDelivery<'a> {
 }
 
 #[cfg(feature = "dist-client")]
+#[derive(Clone, Copy)]
 pub(super) struct ExecutionControl<'a> {
     pub renewal_interval: Duration,
     pub queue: Option<&'a crate::dist::execution_queue::ExecutionQueue>,
