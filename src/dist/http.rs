@@ -1248,7 +1248,7 @@ mod server {
                         Ok(None)
                     },
                     move |server, job, event| {
-                        result_handler.observe_native_result(server, job, event)
+                        result_handler.observe_native_lifecycle(server, job, event)
                     },
                     Arc::clone(&check_client_auth),
                     Arc::clone(&check_server_auth),

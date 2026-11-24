@@ -835,6 +835,32 @@ struct ServerDetails {
 }
 
 impl ServerDetails {
+    fn apply_milestones(&mut self, now: Instant) {
+        if let Some(placement) = &mut self.capabilities.native_placement {
+            for (&id, assigned) in &self.jobs_assigned {
+                if let Some(milestone) = assigned.as_ref().and_then(|job| job.milestone) {
+                    milestone.apply(&mut placement.queue, id, now);
+                }
+            }
+        }
+    }
+
+    fn native_milestone(
+        &mut self,
+        id: JobId,
+        phase: sccache::build_runtime::wire::NativeJobPhase,
+        now: Instant,
+    ) {
+        if let Some(assigned) = self.jobs_assigned.get_mut(&id).and_then(Option::as_mut) {
+            placement::Milestone::advance(&mut assigned.milestone, phase, now);
+            if let Some(milestone) = assigned.milestone
+                && let Some(placement) = &mut self.capabilities.native_placement
+            {
+                milestone.apply(&mut placement.queue, id, now);
+            }
+        }
+    }
+
     fn compiler_demand(&self) -> usize {
         self.capabilities.native_placement.as_ref().map_or_else(
             || self.jobs_assigned.len(),
@@ -1161,6 +1187,7 @@ impl Scheduler {
                         cost: predictions
                             .get(&server_id.addr())
                             .map(|estimate| estimate.cost),
+                        milestone: None,
                     });
                     assert!(
                         server_details
@@ -1306,11 +1333,11 @@ impl SchedulerIncoming for Scheduler {
         )
     }
 
-    fn observe_native_result(
+    fn observe_native_lifecycle(
         &self,
         server_id: ServerId,
         job: JobId,
-        event: dist::NativeResultEvent<'_>,
+        event: dist::NativeLifecycleEvent<'_>,
     ) {
         let now = Instant::now();
         // Same lock order as assignment and heartbeat processing. The
@@ -1331,8 +1358,13 @@ impl SchedulerIncoming for Scheduler {
         {
             return;
         }
+        use sccache::build_runtime::wire::NativeJobPhase;
         match event {
-            dist::NativeResultEvent::Negotiated => {
+            dist::NativeLifecycleEvent::InputsStaged => {
+                server.native_milestone(job, NativeJobPhase::Ready, now);
+            }
+            dist::NativeLifecycleEvent::Negotiated => {
+                server.native_milestone(job, NativeJobPhase::Publishing, now);
                 if detail.publication_began_at.is_none() {
                     detail.publication_began_at = Some(now);
                     if let Some(assigned) = server.jobs_assigned.get(&job).and_then(Option::as_ref)
@@ -1341,7 +1373,7 @@ impl SchedulerIncoming for Scheduler {
                     }
                 }
             }
-            dist::NativeResultEvent::Committed {
+            dist::NativeLifecycleEvent::Committed {
                 manifest,
                 retained_after_begin,
                 observation,
@@ -1356,6 +1388,7 @@ impl SchedulerIncoming for Scheduler {
                 }
                 if !detail.observed_result && detail.publication_began_at.is_some() {
                     detail.observed_result = true;
+                    server.native_milestone(job, NativeJobPhase::Terminal, now);
                     if let Some(assigned) = server.jobs_assigned.get(&job).and_then(Option::as_ref)
                     {
                         server.recent_residency.record_inputs(&assigned.inputs, now);
@@ -1422,18 +1455,29 @@ impl SchedulerIncoming for Scheduler {
             .filter_map(|(id, details)| {
                 let placement = details.capabilities.native_placement.as_ref()?;
                 let now = Instant::now();
-                let locality = if details.recent_residency.retained(blob.id, blob.size, now) {
-                    3_u8
-                } else if details.recent_residency.contains(blob.id, blob.size, now) {
-                    2_u8
-                } else {
-                    u8::from(
-                        placement
-                            .residency
+                let pinned = details.jobs_assigned.iter().any(|(id, assigned)| {
+                    placement
+                        .queue
+                        .jobs
+                        .get(id)
+                        .is_some_and(|progress| progress.phase.inputs_ready())
+                        && assigned
                             .as_ref()
-                            .is_some_and(|residency| residency.may_contain(blob.id)),
-                    )
-                };
+                            .is_some_and(|job| job.inputs.get(&blob.id) == Some(&blob.size))
+                });
+                let locality =
+                    if pinned || details.recent_residency.retained(blob.id, blob.size, now) {
+                        3_u8
+                    } else if details.recent_residency.contains(blob.id, blob.size, now) {
+                        2_u8
+                    } else {
+                        u8::from(
+                            placement
+                                .residency
+                                .as_ref()
+                                .is_some_and(|residency| residency.may_contain(blob.id)),
+                        )
+                    };
                 (Some(id.addr()) != requester
                     && details.last_seen.elapsed() < Duration::from_secs(20)
                     && details.last_error.is_none()
@@ -1512,6 +1556,7 @@ impl SchedulerIncoming for Scheduler {
                 details.last_seen = now;
                 details.cpu_capacity = cpu_capacity;
                 details.capabilities = capabilities;
+                details.apply_milestones(now);
                 details.recent_residency.reap(now);
 
                 // Executing jobs and transfers with recent byte progress have
@@ -1739,6 +1784,21 @@ impl SchedulerIncoming for Scheduler {
                         .completed_acks
                         .lock()
                         .map_err(|_| anyhow::anyhow!("completion acknowledgment mutex poisoned"))?;
+                    // The worker has drained the assignment. Remember its verified
+                    // inputs even if compilation itself failed.
+                    if let Some(assigned) =
+                        details.jobs_assigned.get(&job_id).and_then(Option::as_ref)
+                        && assigned.milestone.is_some()
+                    {
+                        details
+                            .recent_residency
+                            .record_inputs(&assigned.inputs, now);
+                    }
+                    details.native_milestone(
+                        job_id,
+                        sccache::build_runtime::wire::NativeJobPhase::Terminal,
+                        now,
+                    );
                     details.jobs_assigned.remove(&job_id);
                     entry.remove_entry();
                     acks.record(job_id, server_id, now);
@@ -2419,6 +2479,7 @@ mod scheduler_tests {
                     inputs: inputs.clone(),
                     class: None,
                     cost: None,
+                    milestone: None,
                 }),
             ),
             (
@@ -2427,6 +2488,7 @@ mod scheduler_tests {
                     inputs: inputs.clone(),
                     class: None,
                     cost: None,
+                    milestone: None,
                 }),
             ),
         ]);
@@ -2518,6 +2580,88 @@ mod scheduler_tests {
     }
 
     #[test]
+    fn native_staged_closure_survives_stale_heartbeat_and_failed_compilation() -> Result<()> {
+        use sccache::build_runtime::{BlobRef, ContentId, wire::NativeJobPhase};
+        let scheduler = Scheduler::new();
+        let worker: ServerId = "127.0.0.1:10501".parse()?;
+        let peer: ServerId = "127.0.0.2:10501".parse()?;
+        let platform = ContentId::of(b"native-staging-test");
+        let nonce = ServerNonce::new();
+        let capabilities = dist::WorkerCapabilities {
+            archive: false,
+            native_platform: Some(platform),
+            native_placement: Some(dist::NativePlacement::default()),
+        };
+        let heartbeat = |active: &[JobId]| {
+            scheduler.handle_heartbeat_server(
+                worker,
+                nonce.clone(),
+                4.0,
+                active,
+                Box::new(TestJobAuthorizer),
+                capabilities.clone(),
+            )
+        };
+        heartbeat(&[])?;
+        let blob = BlobRef {
+            id: ContentId::of(b"input"),
+            size: 512 << 20,
+        };
+        let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_native_job(
+            &AcceptAssign,
+            native_test_assignment(platform, BTreeMap::from([(blob.id, blob.size)]))?,
+            &NetworkSnapshot::default(),
+        )?
+        else {
+            bail!("worker unavailable");
+        };
+        let id = job_alloc.job_id;
+        assert!(
+            scheduler
+                .native_blob_sources(blob, Some(peer.addr()))?
+                .is_empty()
+        );
+        scheduler.observe_native_lifecycle(peer, id, dist::NativeLifecycleEvent::InputsStaged);
+        assert!(
+            scheduler
+                .native_blob_sources(blob, Some(peer.addr()))?
+                .is_empty()
+        );
+        scheduler.observe_native_lifecycle(worker, id, dist::NativeLifecycleEvent::InputsStaged);
+        heartbeat(&[id])?;
+        assert_eq!(
+            scheduler
+                .native_blob_sources(blob, Some(peer.addr()))?
+                .len(),
+            1
+        );
+        {
+            let servers = scheduler.servers.lock().unwrap();
+            let queue = &servers[&worker]
+                .capabilities
+                .native_placement
+                .as_ref()
+                .context("missing placement")?
+                .queue;
+            assert_eq!(queue.jobs[&id].phase, NativeJobPhase::Ready);
+            assert_eq!(queue.jobs[&id].remaining_input_bytes, 0);
+            assert_eq!(servers[&worker].compiler_demand(), 1);
+        }
+        scheduler.handle_update_job_state(id, worker, JobState::Complete)?;
+        assert_eq!(
+            scheduler
+                .native_blob_sources(blob, Some(peer.addr()))?
+                .len(),
+            1
+        );
+        assert_eq!(
+            scheduler.servers.lock().unwrap()[&worker].compiler_demand(),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
     fn native_producer_receipt_places_consumer_before_next_heartbeat() -> Result<()> {
         use sccache::build_runtime::{Artifact, BlobRef, ContentId, ResultManifest};
         let scheduler = Scheduler::new();
@@ -2562,26 +2706,26 @@ mod scheduler_tests {
             stdout: None,
             stderr: None,
         };
-        let committed = || dist::NativeResultEvent::Committed {
+        let committed = || dist::NativeLifecycleEvent::Committed {
             manifest: &manifest,
             retained_after_begin: Duration::from_secs(300),
             observation: None,
         };
         register(other, 1_000_000_000)?;
-        scheduler.observe_native_result(producer, job, committed());
+        scheduler.observe_native_lifecycle(producer, job, committed());
         assert!(
             scheduler
                 .native_blob_sources(blob, Some(other.addr()))?
                 .is_empty()
         );
-        scheduler.observe_native_result(producer, job, dist::NativeResultEvent::Negotiated);
-        scheduler.observe_native_result(other, job, committed());
+        scheduler.observe_native_lifecycle(producer, job, dist::NativeLifecycleEvent::Negotiated);
+        scheduler.observe_native_lifecycle(other, job, committed());
         assert!(
             scheduler
                 .native_blob_sources(blob, Some(other.addr()))?
                 .is_empty()
         );
-        scheduler.observe_native_result(producer, job, committed());
+        scheduler.observe_native_lifecycle(producer, job, committed());
         let sources = scheduler.native_blob_sources(blob, Some(other.addr()))?;
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].server, producer);
@@ -2598,8 +2742,8 @@ mod scheduler_tests {
         assert_eq!(job_alloc.server_id, producer);
         // Worker incarnation changes invalidate the hints and prior job IDs.
         register(producer, 2_000_000_000)?;
-        scheduler.observe_native_result(producer, job, dist::NativeResultEvent::Negotiated);
-        scheduler.observe_native_result(producer, job, committed());
+        scheduler.observe_native_lifecycle(producer, job, dist::NativeLifecycleEvent::Negotiated);
+        scheduler.observe_native_lifecycle(producer, job, committed());
         assert!(
             scheduler
                 .native_blob_sources(blob, Some(other.addr()))?

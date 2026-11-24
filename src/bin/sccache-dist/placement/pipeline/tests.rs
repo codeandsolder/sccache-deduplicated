@@ -68,6 +68,7 @@ fn phase_assignments(
                     inputs: inputs.clone(),
                     class: None,
                     cost: None,
+                    milestone: None,
                 }),
             )
         })
@@ -113,6 +114,7 @@ fn native_pipeline_waits_for_staging_slots_and_reuses_future_content() {
             inputs: inputs.clone(),
             class: None,
             cost: None,
+            milestone: None,
         }),
     )]);
     placement.queue.jobs.insert(
@@ -221,6 +223,7 @@ fn native_pipeline_uses_each_reservations_learned_service_time() {
             inputs: inputs.clone(),
             class: None,
             cost: Some(large),
+            milestone: None,
         }),
     )]);
     placement.queue.jobs.insert(

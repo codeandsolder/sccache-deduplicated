@@ -1129,10 +1129,11 @@ impl Default for NativePlacement {
     }
 }
 
-/// Authenticated native result lifecycle observations, emitted only after
+/// Authenticated native action lifecycle observations, emitted only after
 /// the corresponding session operation has succeeded.
 #[cfg(feature = "dist-server")]
-pub enum NativeResultEvent<'a> {
+pub enum NativeLifecycleEvent<'a> {
+    InputsStaged,
     Negotiated,
     Committed {
         manifest: &'a crate::build_runtime::ResultManifest,
@@ -1184,7 +1185,12 @@ pub trait SchedulerIncoming: Send + Sync {
         requester: Option<std::net::SocketAddr>,
     ) -> ExtResult<Vec<NativeBlobSource>, Error>;
     /// Record advisory producer residency for the current worker epoch.
-    fn observe_native_result(&self, server_id: ServerId, job: JobId, event: NativeResultEvent<'_>);
+    fn observe_native_lifecycle(
+        &self,
+        server_id: ServerId,
+        job: JobId,
+        event: NativeLifecycleEvent<'_>,
+    );
     // From Server
     fn handle_heartbeat_server(
         &self,

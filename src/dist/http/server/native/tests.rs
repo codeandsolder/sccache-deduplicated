@@ -83,7 +83,14 @@ fn make_client(url: &reqwest::Url, token: &str) -> Result<NativeCacheClient> {
     )
 }
 
-type Observations = Mutex<Vec<(ServerId, JobId, Option<(ResultManifest, Duration)>)>>;
+#[derive(Debug, PartialEq, Eq)]
+enum Observation {
+    Staged,
+    Negotiated,
+    Committed(ResultManifest, Duration),
+}
+
+type Observations = Mutex<Vec<(ServerId, JobId, Observation)>>;
 
 fn with_native_service(
     operation: impl FnOnce(&reqwest::Url, &NativeSessions, &NetworkMeter, &Observations) -> Result<()>,
@@ -109,12 +116,15 @@ fn with_native_service(
                     network: &network,
                     observe_result: &|server, job, event| {
                         let result = match event {
-                            crate::dist::NativeResultEvent::Negotiated => None,
-                            crate::dist::NativeResultEvent::Committed {
+                            crate::dist::NativeLifecycleEvent::InputsStaged => Observation::Staged,
+                            crate::dist::NativeLifecycleEvent::Negotiated => {
+                                Observation::Negotiated
+                            }
+                            crate::dist::NativeLifecycleEvent::Committed {
                                 manifest,
                                 retained_after_begin,
                                 ..
-                            } => Some((manifest.clone(), retained_after_begin)),
+                            } => Observation::Committed(manifest.clone(), retained_after_begin),
                         };
                         observations.lock().unwrap().push((server, job, result));
                     },
@@ -274,7 +284,7 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
         let owner: ServerId = "127.0.0.1:10501".parse()?;
         assert_eq!(
             *observations.lock().unwrap(),
-            vec![(owner, JobId(42), None)]
+            vec![(owner, JobId(42), Observation::Negotiated)]
         );
         assert!(
             wrong_job
@@ -292,8 +302,12 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
         assert_eq!(
             *observations.lock().unwrap(),
             vec![
-                (owner, JobId(42), None),
-                (owner, JobId(42), Some((output.clone(), retention)))
+                (owner, JobId(42), Observation::Negotiated),
+                (
+                    owner,
+                    JobId(42),
+                    Observation::Committed(output.clone(), retention)
+                )
             ]
         );
         assert_eq!(client.status(ticket)?, NativeStatus::Ready(output.clone()));
@@ -580,7 +594,7 @@ fn lazy_admission_prefetch_and_origin_backfill_over_http() -> Result<()> {
         TreeEntry, TreePath,
         wire::{InputDemand, InputPoll},
     };
-    with_native_service(|url, sessions, _network, _observations| {
+    with_native_service(|url, sessions, _network, observations| {
         let client = make_client(url, "client-token")?;
         let worker = make_client(url, "worker-token")?.for_worker(JobId(42));
         let metadata = TreeMetadata {
@@ -671,8 +685,23 @@ fn lazy_admission_prefetch_and_origin_backfill_over_http() -> Result<()> {
         assert!(sessions.store().open_available_blob(unused)?.is_none());
         worker.close(read.ticket)?;
         assert!(client.inputs_staged(ticket).is_err());
+        assert!(
+            make_client(url, "worker-token")?
+                .for_worker(JobId(43))
+                .inputs_staged(ticket)
+                .is_err()
+        );
+        assert!(observations.lock().unwrap().is_empty());
         worker.inputs_staged(ticket)?;
         worker.inputs_staged(ticket)?;
+        let owner: ServerId = "127.0.0.1:10501".parse()?;
+        assert_eq!(
+            *observations.lock().unwrap(),
+            vec![
+                (owner, JobId(42), Observation::Staged),
+                (owner, JobId(42), Observation::Staged),
+            ]
+        );
         assert_eq!(client.poll_input(ticket)?, InputPoll::Complete);
         worker.fail(ticket)?;
         client.close(ticket)?;

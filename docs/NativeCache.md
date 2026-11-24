@@ -926,7 +926,11 @@ dependencies from a build graph.
 
 Verified acquisition and publication events also refresh a separate bounded
 recent-input index (65,536 unique digests per worker, 20-second expiry).
-The input closure was pinned and verified for that action, but its leases
+The existing authenticated inputs_staged notification marks the active
+reservation ready immediately, before the next heartbeat. Monotonic phase
+lower bounds prevent delayed heartbeats from undoing verified staging or
+publication transitions. Active verified closures are exact placement and
+peer-source evidence. The input closure was pinned and verified for that action, but its leases
 can be released after publication. These short-lived positive hints bridge
 the 15-second Bloom refresh interval; they do not claim grace retention.
 The real assignment pinning and exact content validation still apply.

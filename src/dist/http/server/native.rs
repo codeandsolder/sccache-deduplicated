@@ -40,7 +40,7 @@ pub(super) type Allocator = dyn Fn(
     + Send
     + Sync;
 
-pub(super) type ResultObserver<'a> = dyn Fn(crate::dist::ServerId, crate::dist::JobId, crate::dist::NativeResultEvent<'_>)
+pub(super) type ResultObserver<'a> = dyn Fn(crate::dist::ServerId, crate::dist::JobId, crate::dist::NativeLifecycleEvent<'_>)
     + Send
     + Sync
     + 'a;
@@ -136,7 +136,7 @@ pub(super) fn spawn(
     observe_result: impl Fn(
         crate::dist::ServerId,
         crate::dist::JobId,
-        crate::dist::NativeResultEvent<'_>,
+        crate::dist::NativeLifecycleEvent<'_>,
     ) + Send
     + Sync
     + 'static,
@@ -580,6 +580,13 @@ fn dispatch(
         }
         "inputs_staged" => {
             sessions.inputs_staged(metadata(request, limit)?, publisher)?;
+            if let Publisher::Worker { address, job } = publisher {
+                observe_result(
+                    crate::dist::ServerId::new(address),
+                    crate::dist::JobId(job),
+                    crate::dist::NativeLifecycleEvent::InputsStaged,
+                );
+            }
             encode(&(), limit)
         }
         "input_unavailable" if publisher == Publisher::Client => {
@@ -681,7 +688,7 @@ fn dispatch(
                 observe_result(
                     crate::dist::ServerId::new(address),
                     crate::dist::JobId(job),
-                    crate::dist::NativeResultEvent::Negotiated,
+                    crate::dist::NativeLifecycleEvent::Negotiated,
                 );
             }
             encode(&reply, limit)
@@ -711,7 +718,7 @@ fn dispatch(
                 observe_result(
                     crate::dist::ServerId::new(address),
                     crate::dist::JobId(job),
-                    crate::dist::NativeResultEvent::Committed {
+                    crate::dist::NativeLifecycleEvent::Committed {
                         manifest: &manifest,
                         retained_after_begin: Duration::from_millis(retained_after_begin_millis),
                         observation,

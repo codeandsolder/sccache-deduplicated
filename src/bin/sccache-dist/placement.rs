@@ -6,6 +6,8 @@ mod exploration;
 pub(super) use cost::{
     ActionClass, ActionCost, AssignedNative, CostBook, WorkerScope, start_checkpoint,
 };
+mod milestone;
+pub(super) use milestone::Milestone;
 mod pipeline;
 mod retained;
 pub(super) use exploration::{Exploration, choose_worker};

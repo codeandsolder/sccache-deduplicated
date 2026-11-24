@@ -111,6 +111,7 @@ pub(crate) struct AssignedNative {
     pub inputs: NativeInputBlobs,
     pub class: Option<ActionClass>,
     pub cost: Option<ActionCost>,
+    pub milestone: Option<super::Milestone>,
 }
 
 #[derive(Clone, Copy)]
