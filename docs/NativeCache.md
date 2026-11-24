@@ -75,9 +75,16 @@ Scheduling a miss selects a worker whose advertised platform contract
 matches and accounts for capacity in the same pool as ordinary jobs.
 Repeating scheduling for the same pending ticket replays the allocation.
 
-On the worker, each tree location is independently block-cloned (or copied)
-into a private view. Bubblewrap binds views read-only except for declared
-output parent directories and private `/tmp`. The command and its output
+On ZFS workers, each immutable tree is materialized **once per cached
+TreeId** as ordinary files backed by native CoW block clones and reused
+through read-only Bubblewrap binds. ZFS owns compression and the compressed
+ARC, without application-level FUSE decoding. Each action block-clones only
+the directory subtrees that it can modify; cross-boundary hardlink groups
+instead use a complete private CoW tree so POSIX inode identity and write
+visibility remain correct. On non-ZFS workers, independently Zstd-compressed
+CAS objects are exposed through a cached read-only FUSE view with separate
+writable output scratch. Bubblewrap binds both types of immutable views
+read-only except for declared output parents and private `/tmp`. The command and its output
 paths need not be rewritten into a special `/out` directory. Every output
 parent and mount destination must be a real declared directory; an output
 cannot replace an input entry, mount root, or namespace device/proc path.
@@ -166,7 +173,18 @@ The worker advertises the BLAKE3 digest of the exact platform contract.
 Clients use the same digest in `ExecutionSpec.platform`. The renewal
 interval must be shorter than the scheduler idle timeout.
 
-Place store and scratch on appropriate quota-controlled dedicated filesystems.
+On ZFS workers, the native CAS directory and execution scratch **must be
+on the same ZFS dataset** for block cloning. The worker verifies this at
+startup: a different dataset, including another ZFS dataset in the same pool,
+does not support `FICLONE` and is rejected instead of silently copying
+input content. Use dataset quotas plus store/scratch capacity policies to
+control these shared resources. Non-ZFS workers retain the independent
+Zstd-chunk CAS with a FUSE input view.
+
+Generated CAS content is stored as ordinary plaintext files on ZFS, whose
+native compression and compressed ARC manage data residency. Compressed
+Zstd chunks are still used on the wire, with verified decoding at a ZFS
+receiver. Original upstream package archives remain byte-for-byte.
 The application currently bounds sessions, transfer sizes and concurrent
 uploads. Store admission uses allocatable filesystem bytes (statvfs), not
 logical blob lengths, so compressed and block-cloned ZFS content is not
@@ -178,9 +196,10 @@ conservative uncompressed upper bound until staged bytes are synced.
 Recency is in-memory and unknown roots after restart rank oldest.
 The external dataset quota remains the hard limit; snapshots, open files,
 clone extents, delayed accounting and other writers can prevent reclaim.
-A separate quota-controlled scratch filesystem is still required; per-job
-scratch limits and fleet-level capacity policy remain outstanding. The native store is not
-an additional production sccache cache tier.
+A separate scratch *filesystem* is not appropriate for native ZFS cloning:
+scratch must share the CAS dataset. Per-job scratch limits and fleet-level
+capacity policy remain outstanding. The native store is not an additional
+production sccache cache tier.
 
 ### Ordinary compiler client
 

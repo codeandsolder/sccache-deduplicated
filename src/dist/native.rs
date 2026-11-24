@@ -2,7 +2,7 @@
 
 use std::{
     fs::File,
-    io::{self, Cursor, Read, Write},
+    io::{self, Cursor, Read, Seek, Write},
     time::{Duration, Instant},
 };
 
@@ -11,8 +11,9 @@ use bincode::Options;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::build_runtime::{
-    ActionMode, BlobRef, ContentId, ExecutionSpec, InstallationManifest, PackageIdentity,
-    PackageReceipt, PackageSource, PackageTransferCost, ResultManifest, TreeId, TreeManifest,
+    ActionMode, BlobEncoding, BlobRef, ContentId, ExecutionSpec, InstallationManifest,
+    PackageIdentity, PackageReceipt, PackageSource, PackageTransferCost, ResultManifest, TreeId,
+    TreeManifest,
     wire::{
         BeginResult, NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply, Ticket,
         TreeOffer, TreeRead, UploadHeader, WorkerAllocation,
@@ -396,11 +397,45 @@ impl NativeCacheClient {
         mut open: impl FnMut(ContentId) -> Result<R>,
         renewal_interval: Duration,
     ) -> Result<Ticket> {
+        self.push_tree_with(manifest, renewal_interval, |ticket, blob| {
+            self.upload(ticket, blob, open(blob.id)?)
+        })
+    }
+
+    /// Publish a tree from its local physical CAS representation.
+    /// Already encoded data travels unchanged, while native ZFS raw content
+    /// is compressed temporarily for transfer without changing its disk format.
+    ///
+    /// # Errors
+    /// Returns an error if a reserved blob is absent or fails remote validation.
+    pub fn push_tree_stored(
+        &self,
+        manifest: &TreeManifest,
+        mut open: impl FnMut(ContentId) -> Result<(File, BlobEncoding)>,
+        renewal_interval: Duration,
+    ) -> Result<Ticket> {
+        self.push_tree_with(manifest, renewal_interval, |ticket, blob| {
+            let (file, encoding) = open(blob.id)?;
+            match encoding {
+                // Preserve network compression even though ZFS stores the
+                // plain bytes and lets ARC compress them natively.
+                BlobEncoding::Raw => self.upload(ticket, blob, file),
+                BlobEncoding::ZstdChunks => self.upload_stored_file(ticket, blob, encoding, file),
+            }
+        })
+    }
+
+    fn push_tree_with(
+        &self,
+        manifest: &TreeManifest,
+        renewal_interval: Duration,
+        mut upload: impl FnMut(Ticket, BlobRef) -> Result<()>,
+    ) -> Result<Ticket> {
         let id = manifest.id()?;
         let blobs = manifest.blobs()?;
         let offer = self.offer_tree(manifest)?;
         debug!(
-            "native tree {id:?}: upload {}/{} blobs, {}/{} content bytes",
+            "native tree {id:?}: upload {}/{} blobs, {}/{} logical bytes",
             offer.missing.len(),
             blobs.len(),
             offer
@@ -419,7 +454,7 @@ impl NativeCacheClient {
                     blobs.get(&blob.id) == Some(&blob.size) && seen.insert(blob.id),
                     "scheduler requested undeclared or duplicate input content"
                 );
-                self.upload(offer.ticket, blob, open(blob.id)?)?;
+                upload(offer.ticket, blob)?;
             }
             ensure!(
                 self.commit_tree(offer.ticket)? == id,
@@ -483,8 +518,8 @@ impl NativeCacheClient {
                 check()?;
                 let _slot = transport.raw_slot(check)?;
                 let start = Instant::now();
-                let response = self.download_response(read.ticket, blob.id)?;
-                let staged = store.stage_expected(*blob, response)?;
+                let (response, encoding) = self.download_response(read.ticket, blob.id)?;
+                let staged = store.stage_expected_physical(*blob, encoding, response)?;
                 transport.observe_raw(blob.size, start.elapsed());
                 Ok(staged)
             })?;
@@ -506,20 +541,9 @@ impl NativeCacheClient {
         self.control("begin", &ManifestRequest { ticket, manifest })
     }
 
-    /// Upload one missing blob directly from an open file descriptor.
-    ///
-    /// # Errors
-    /// Returns an error for an invalid length or rejected transfer.
-    pub fn upload_file(&self, ticket: Ticket, blob: BlobRef, file: File) -> Result<()> {
-        ensure!(
-            file.metadata()?.len() == blob.size,
-            "native upload file length mismatch"
-        );
-        self.upload(ticket, blob, file)
-    }
-
-    /// Send raw content without buffering it in memory. The scheduler verifies
-    /// the full digest and declared length before admitting it.
+    /// Compress a new blob once and upload the encoded representation.
+    /// The scheduler verifies the original digest while retaining the exact
+    /// compressed bytes; no transfer-side recompression is necessary.
     ///
     /// # Errors
     /// Returns an error on transport or verification failure.
@@ -529,7 +553,43 @@ impl NativeCacheClient {
         blob: BlobRef,
         reader: impl Read + Send + 'static,
     ) -> Result<()> {
-        self.send_stream("upload", &UploadHeader { ticket, blob }, blob.size, reader)?;
+        let mut encoded = tempfile::tempfile()?;
+        let reference =
+            crate::build_runtime::encode_native_blob(reader, &mut encoded, Some(blob.size))?;
+        ensure!(
+            reference == blob,
+            "native upload content digest or length mismatch"
+        );
+        encoded.rewind()?;
+        self.upload_stored_file(ticket, blob, BlobEncoding::ZstdChunks, encoded)
+    }
+
+    /// Transfer an immutable physical CAS payload as supplied, including its
+    /// explicit raw or Zstd encoding. The receiver verifies decoded identity.
+    ///
+    /// # Errors
+    /// Returns an error for a missing physical file or rejected transfer.
+    pub fn upload_stored_file(
+        &self,
+        ticket: Ticket,
+        blob: BlobRef,
+        encoding: BlobEncoding,
+        file: File,
+    ) -> Result<()> {
+        let size = file.metadata()?.len();
+        if encoding == BlobEncoding::Raw {
+            ensure!(size == blob.size, "native raw upload size mismatch");
+        }
+        self.send_stream(
+            "upload",
+            &UploadHeader {
+                ticket,
+                blob,
+                encoding: encoding as u8,
+            },
+            size,
+            file,
+        )?;
         Ok(())
     }
 
@@ -619,10 +679,13 @@ impl NativeCacheClient {
         blob: BlobRef,
         mut destination: impl Write,
     ) -> Result<()> {
-        copy_verified(
-            self.download_response(ticket, blob.id)?,
-            blob,
+        let (response, encoding) = self.download_response(ticket, blob.id)?;
+        crate::build_runtime::transfer_native_blob(
+            response,
+            io::sink(),
             &mut destination,
+            blob,
+            encoding,
         )
     }
 
@@ -630,13 +693,20 @@ impl NativeCacheClient {
         &self,
         ticket: Ticket,
         id: ContentId,
-    ) -> Result<reqwest::blocking::Response> {
+    ) -> Result<(reqwest::blocking::Response, BlobEncoding)> {
         let request = codec().serialize(&DownloadRequest { ticket, id })?;
-        Ok(self
+        let response = self
             .request("download")?
             .body(request)
             .send()?
-            .error_for_status()?)
+            .error_for_status()?;
+        let descriptor = response
+            .headers()
+            .get("x-sccache-cas-encoding")
+            .context("native download missing physical encoding")?
+            .to_str()?;
+        let encoding = BlobEncoding::from_http_value(descriptor)?;
+        Ok((response, encoding))
     }
 }
 

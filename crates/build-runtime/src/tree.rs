@@ -54,7 +54,7 @@ impl TreePath {
         &self.0
     }
 
-    fn parent(&self) -> Option<Self> {
+    pub(crate) fn parent(&self) -> Option<Self> {
         self.0
             .iter()
             .rposition(|&byte| byte == b'/')

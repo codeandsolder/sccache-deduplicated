@@ -11,8 +11,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::{ClientAuthCheck, ServerAuthenticator, authenticate_client, authenticate_server};
 use crate::{
     build_runtime::{
-        ActionMode, ArchiveLength, ExecutionSpec, NativeServiceBusy, NativeSessions, NativeStore,
-        PackageIdentity, PackageImportLimits, PackageSource, VerifiedPackage,
+        ActionMode, ArchiveLength, BlobEncoding, ExecutionSpec, NativeServiceBusy, NativeSessions,
+        NativeStore, PackageIdentity, PackageImportLimits, PackageSource, VerifiedPackage,
         wire::{Publisher, ScheduleReply, UploadHeader},
     },
     config::scheduler::NativeCacheConfig,
@@ -323,8 +323,9 @@ fn dispatch(
         }
         "download" => {
             let DownloadRequest { ticket, id } = metadata(request, limit)?;
-            let file = sessions.download(ticket, publisher, id)?;
-            Ok(Response::from_file("application/octet-stream", file))
+            let (file, encoding) = sessions.download(ticket, publisher, id)?;
+            Ok(Response::from_file("application/octet-stream", file)
+                .with_additional_header("X-Sccache-CAS-Encoding", encoding.http_value()))
         }
         "tree_offer" if publisher == Publisher::Client => {
             encode(&sessions.offer_tree(metadata(request, limit)?)?, limit)
@@ -360,8 +361,14 @@ fn dispatch(
         "upload" => {
             let mut body = request.data().context("missing native upload body")?;
             // Fixed-width header, never deserialize or buffer the actual blob.
-            let header: UploadHeader = codec().with_limit(72).deserialize_from(&mut body)?;
-            sessions.upload(header.ticket, publisher, header.blob, body)?;
+            let header: UploadHeader = codec().with_limit(73).deserialize_from(&mut body)?;
+            sessions.upload(
+                header.ticket,
+                publisher,
+                header.blob,
+                BlobEncoding::try_from(header.encoding)?,
+                body,
+            )?;
             encode(&(), limit)
         }
         "commit" => encode(

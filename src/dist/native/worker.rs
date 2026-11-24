@@ -345,7 +345,14 @@ impl NativeCacheClient {
                 ArchiveLength::Exact(offer.source.size),
                 limits,
                 &executable,
-                || self.download_response(ticket, offer.blob.id),
+                || {
+                    let (response, encoding) = self.download_response(ticket, offer.blob.id)?;
+                    ensure!(
+                        encoding == crate::build_runtime::BlobEncoding::Raw,
+                        "original package transport must use exact raw archive bytes"
+                    );
+                    Ok(response)
+                },
             ) {
                 Ok(package) => package,
                 Err(error) if error.is::<NativeServiceBusy>() => {
@@ -456,7 +463,19 @@ impl NativeCacheClient {
                         blobs.get(&missing.id) == Some(&missing.size),
                         "scheduler requested undeclared output"
                     );
-                    self.upload(ticket, missing, captured.open_blob(missing.id)?)?;
+                    match captured.physical_encoding() {
+                        crate::build_runtime::BlobEncoding::Raw => {
+                            self.upload(ticket, missing, captured.open_file(missing.id)?)?;
+                        }
+                        crate::build_runtime::BlobEncoding::ZstdChunks => {
+                            self.upload_stored_file(
+                                ticket,
+                                missing,
+                                captured.physical_encoding(),
+                                captured.open_file(missing.id)?,
+                            )?;
+                        }
+                    }
                 }
                 ensure!(
                     self.commit(ticket)? == *manifest,

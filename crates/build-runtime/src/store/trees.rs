@@ -237,6 +237,8 @@ impl NativeStore {
     /// # Errors
     /// Returns an error for inconsistent metadata or storage failure.
     pub fn evict_tree(&self, id: TreeId) -> Result<Eviction> {
+        #[cfg(target_os = "linux")]
+        self.drop_idle_views(Some(id))?;
         let _mutation = self.inner.lock_mutations()?;
         let mut pins = self.inner.lock_pins()?;
         if pins.trees.contains_key(&id) {
@@ -320,13 +322,31 @@ impl TreeLease {
         self.inner.open_declared(&self.blobs, id)
     }
 
+    /// The immutable physical CAS encoding of a declared tree blob.
+    ///
+    /// # Errors
+    /// Returns an error for undeclared content or missing index metadata.
+    pub fn physical_encoding(&self, id: ContentId) -> Result<crate::BlobEncoding> {
+        ensure!(self.blobs.contains_key(&id), "undeclared tree content");
+        self.inner.blob_encoding(id)
+    }
+
+    /// Open decoded content as an owned reader. The file descriptor remains
+    /// valid independently of the tree lease, including during a network upload.
+    ///
+    /// # Errors
+    /// Returns an error for missing content or an invalid physical payload.
+    pub fn open_decoded(&self, id: ContentId) -> Result<crate::BlobReader> {
+        crate::BlobReader::open(self.open_file(id)?, self.inner.blob_encoding(id)?)
+    }
+
     /// Open an independent reader for content declared by this tree.
     ///
     /// # Errors
     /// Returns an error for undeclared content or filesystem failure.
     pub fn open_blob(&self, id: ContentId) -> Result<impl Read + Seek + '_> {
         Ok(LeasedReader {
-            file: self.open_file(id)?,
+            file: crate::BlobReader::open(self.open_file(id)?, self.inner.blob_encoding(id)?)?,
             _lease: self,
         })
     }
@@ -348,6 +368,16 @@ impl Drop for TreePin {
 
 #[cfg(target_os = "linux")]
 mod capture;
+#[cfg(target_os = "linux")]
+mod mount;
+#[cfg(target_os = "linux")]
+pub use mount::MountedTree;
+#[cfg(target_os = "linux")]
+pub use mount::ReadOnlyView;
+#[cfg(target_os = "linux")]
+mod overlay;
+#[cfg(target_os = "linux")]
+pub(super) use overlay::plan_overlays;
 #[cfg(target_os = "linux")]
 mod materialize;
 #[cfg(target_os = "linux")]
