@@ -27,7 +27,7 @@ struct State {
     refs: BTreeMap<ContentId, (u64, usize)>,
     bytes: u64,
     pending: u64,
-    publishers: usize,
+    waiting_publishers: usize,
 }
 
 impl State {
@@ -96,7 +96,7 @@ impl ArtifactGrace {
         );
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.reap(Instant::now());
-        if state.publishers != 0
+        if state.waiting_publishers != 0
             || limit
                 > self
                     .max_bytes
@@ -151,21 +151,22 @@ impl GraceReservation {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         state.pending -= std::mem::take(&mut self.limit);
-        state.publishers += 1;
         drop(state);
         Publication {
             pool: self.pool.clone(),
+            waiting: false,
         }
     }
 }
 
 struct Publication {
     pool: ArtifactGrace,
+    waiting: bool,
 }
 
 impl Publication {
     fn commit(
-        self,
+        mut self,
         lease: ResultLease,
         wait: (Duration, &dyn Fn() -> Result<()>),
     ) -> Result<Instant> {
@@ -218,6 +219,10 @@ impl Publication {
                 drop(state);
                 return Ok(expires);
             }
+            if !self.waiting {
+                state.waiting_publishers += 1;
+                self.waiting = true;
+            }
             drop(state);
             ensure!(
                 started.elapsed() < timeout,
@@ -232,11 +237,13 @@ impl Publication {
 
 impl Drop for Publication {
     fn drop(&mut self) {
-        self.pool
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .publishers -= 1;
+        if self.waiting {
+            self.pool
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .waiting_publishers -= 1;
+        }
     }
 }
 
@@ -347,7 +354,7 @@ mod tests {
 
         // A surprisingly large result supersedes the remaining forecasts.
         let first = first.promote();
-        assert!(pool.reserve(0)?.is_none());
+        assert!(pool.reserve(3)?.is_some());
         first.commit(result(&store, b"123456")?, (Duration::ZERO, &|| Ok(())))?;
         {
             let state = pool.state.lock().unwrap();
@@ -366,7 +373,7 @@ mod tests {
             let state = pool.state.lock().unwrap();
             assert_eq!(state.bytes, 8);
             assert_eq!(state.pending, 0);
-            assert_eq!(state.publishers, 0);
+            assert_eq!(state.waiting_publishers, 0);
             assert_eq!(state.results.len(), 3);
         }
         assert!(pool.reserve(1)?.is_none());
@@ -390,6 +397,9 @@ mod tests {
             (Duration::from_secs(2), &|| {
                 let count = check_count.get();
                 check_count.set(count + 1);
+                if count != 0 {
+                    assert!(pool.reserve(0)?.is_none());
+                }
                 ensure!(count == 0, "cancelled publication");
                 Ok(())
             }),
@@ -399,7 +409,7 @@ mod tests {
         let mut state = pool.state.lock().unwrap();
         assert_eq!(state.bytes, 6);
         assert_eq!(state.pending, 0);
-        assert_eq!(state.publishers, 0);
+        assert_eq!(state.waiting_publishers, 0);
         assert_eq!(state.results.len(), 1);
         state.reap(Instant::now() + Duration::from_secs(301));
         assert_eq!(state.bytes, 0);

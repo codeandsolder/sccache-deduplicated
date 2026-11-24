@@ -165,6 +165,57 @@ impl PeerRecord {
             last_active: now,
         }
     }
+    fn sample(&mut self, now: Instant, elapsed: Duration) -> PeerWindow {
+        let current = self.counters.sample();
+        let bytes = current.bytes.wrapping_sub(self.previous.bytes);
+        let wire = current
+            .completed_wire
+            .wrapping_sub(self.previous.completed_wire);
+        let logical = current
+            .completed_logical
+            .wrapping_sub(self.previous.completed_logical);
+        if logical >= 1 << 20 {
+            let ratio = (u128::from(wire) * 1000 / u128::from(logical)).clamp(1, 1100);
+            let ratio = u64::try_from(ratio).unwrap_or(1000);
+            self.wire_per_mille = (3 * self.wire_per_mille + ratio).div_ceil(4);
+        }
+        if now.duration_since(self.peak_at) > MAX_AGE {
+            self.peak = 0;
+        }
+        if now.duration_since(self.isolated_at) > MAX_AGE {
+            self.isolated = 0;
+        }
+        if bytes != 0 || current.active != 0 {
+            self.last_active = now;
+        }
+        let rate = u64::try_from(u128::from(bytes) * 1_000_000_000 / elapsed.as_nanos())
+            .unwrap_or(MAX_RATE)
+            .min(MAX_RATE);
+        let continuous = current.active > 0
+            && self.previous.active > 0
+            && current.idle_epoch == self.previous.idle_epoch;
+        let sustained = continuous && rate >= MIN_RATE;
+        if sustained && rate >= self.peak {
+            self.peak = rate;
+            self.peak_at = now;
+        }
+        let partial =
+            !sustained && (bytes != 0 || current.active != 0 || self.previous.active != 0);
+        self.previous = current;
+        PeerWindow {
+            rate,
+            isolated: self.isolated,
+            sustained,
+            partial,
+        }
+    }
+}
+
+struct PeerWindow {
+    rate: u64,
+    isolated: u64,
+    sustained: bool,
+    partial: bool,
 }
 
 struct Evidence {
@@ -269,47 +320,14 @@ impl DirectionMeter {
         let mut partial = elapsed > Duration::from_secs(3);
         let mut current_rates = BTreeMap::new();
         for (&peer, record) in &mut self.peers {
-            let current = record.counters.sample();
-            let bytes = current.bytes.wrapping_sub(record.previous.bytes);
-            let wire = current
-                .completed_wire
-                .wrapping_sub(record.previous.completed_wire);
-            let logical = current
-                .completed_logical
-                .wrapping_sub(record.previous.completed_logical);
-            if logical >= 1 << 20 {
-                let ratio = (u128::from(wire) * 1000 / u128::from(logical)).clamp(1, 1100);
-                let ratio = u64::try_from(ratio).unwrap_or(1000);
-                record.wire_per_mille = (3 * record.wire_per_mille + ratio).div_ceil(4);
+            let window = record.sample(now, elapsed);
+            if window.rate > 0 {
+                current_rates.insert(peer, window.rate);
             }
-            if now.duration_since(record.peak_at) > MAX_AGE {
-                record.peak = 0;
+            if window.sustained {
+                sustained.insert(peer, (window.rate, window.isolated));
             }
-            if now.duration_since(record.isolated_at) > MAX_AGE {
-                record.isolated = 0;
-            }
-            if bytes != 0 || current.active != 0 {
-                record.last_active = now;
-            }
-            let rate = u64::try_from(u128::from(bytes) * 1_000_000_000 / elapsed.as_nanos())
-                .unwrap_or(MAX_RATE)
-                .min(MAX_RATE);
-            if rate > 0 {
-                current_rates.insert(peer, rate);
-            }
-            let continuous = current.active > 0
-                && record.previous.active > 0
-                && current.idle_epoch == record.previous.idle_epoch;
-            if continuous && rate >= MIN_RATE {
-                sustained.insert(peer, (rate, record.isolated));
-                if rate >= record.peak {
-                    record.peak = rate;
-                    record.peak_at = now;
-                }
-            } else if bytes != 0 || current.active != 0 || record.previous.active != 0 {
-                partial = true;
-            }
-            record.previous = current;
+            partial |= window.partial;
         }
 
         self.peers.retain(|_, record| {
@@ -332,11 +350,10 @@ impl DirectionMeter {
             && sustained.len() == 1
             && let Some((peer, &(rate, _))) = sustained.first_key_value()
             && let Some(record) = self.peers.get_mut(peer)
+            && rate >= record.isolated
         {
-            if rate >= record.isolated {
-                record.isolated = rate;
-                record.isolated_at = now;
-            }
+            record.isolated = rate;
+            record.isolated_at = now;
         }
         // Only infer contention from aligned, continuously backlogged body
         // windows with evidence that every participant can go faster.

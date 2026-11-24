@@ -791,6 +791,25 @@ impl CompletedJobAcks {
         self.recent.push_back((job_id, server_id, now));
     }
 
+    fn reconcile_native_queue(
+        &mut self,
+        owner: ServerId,
+        queue: &mut dist::NativeQueueSnapshot,
+        now: Instant,
+    ) {
+        use sccache::build_runtime::wire::NativeJobPhase;
+        self.prune(now);
+        // A known completed reservation may still have a replayable terminal
+        // response on the worker. Preserve occupancy but never charge CPU
+        // work from a snapshot captured before its completion.
+        for &(id, server, completed) in &self.recent {
+            if server == owner && queue.jobs.contains_key(&id) {
+                placement::Milestone::reached(NativeJobPhase::Terminal, completed)
+                    .apply(queue, id, now);
+            }
+        }
+    }
+
     fn contains(&mut self, job_id: JobId, server_id: ServerId, now: Instant) -> bool {
         self.prune(now);
         self.recent
@@ -1574,6 +1593,12 @@ impl SchedulerIncoming for Scheduler {
                 details.cpu_capacity = cpu_capacity;
                 details.capabilities = capabilities;
                 details.apply_milestones(now);
+                if let Some(placement) = &mut details.capabilities.native_placement {
+                    self.completed_acks
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("completion acknowledgment mutex poisoned"))?
+                        .reconcile_native_queue(server_id, &mut placement.queue, now);
+                }
                 details.recent_residency.reap(now);
 
                 // Executing jobs and transfers with recent byte progress have
@@ -2676,6 +2701,49 @@ mod scheduler_tests {
             scheduler.servers.lock().unwrap()[&worker].compiler_demand(),
             0
         );
+        // A heartbeat captured before completion can arrive after the
+        // scheduler has removed the assignment. Its obsolete CPU charge
+        // must not resurrect a completed job.
+        let mut stale = capabilities.clone();
+        let queue = &mut stale
+            .native_placement
+            .as_mut()
+            .context("missing placement")?
+            .queue;
+        queue.compiler_active = 1;
+        queue.jobs.insert(
+            id,
+            dist::NativeJobProgress {
+                phase: NativeJobPhase::Executing,
+                phase_nanoseconds: 0,
+                remaining_input_bytes: 0,
+                remaining_input_blobs: 0,
+            },
+        );
+        scheduler.handle_heartbeat_server(
+            worker,
+            nonce,
+            4.0,
+            &[id],
+            Box::new(TestJobAuthorizer),
+            stale,
+        )?;
+        let servers = scheduler.servers.lock().unwrap();
+        let details = &servers[&worker];
+        let queue = &details
+            .capabilities
+            .native_placement
+            .as_ref()
+            .context("missing placement")?
+            .queue;
+        assert_eq!(queue.jobs[&id].phase, NativeJobPhase::Terminal);
+        assert_eq!(queue.compiler_active, 0);
+        assert_eq!(details.compiler_demand(), 0);
+        assert_eq!(
+            queue.available_reservations(std::iter::empty()),
+            queue.capacity as usize - 1
+        );
+        drop(servers);
         Ok(())
     }
 

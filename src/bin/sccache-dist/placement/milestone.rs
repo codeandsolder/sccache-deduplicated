@@ -27,12 +27,16 @@ const fn rank(phase: NativeJobPhase) -> u8 {
 }
 
 impl Milestone {
+    pub(crate) const fn reached(phase: NativeJobPhase, now: Instant) -> Self {
+        Self {
+            phase,
+            reached: now,
+        }
+    }
+
     pub(crate) fn advance(slot: &mut Option<Self>, phase: NativeJobPhase, now: Instant) {
         if slot.is_none_or(|previous| rank(phase) > rank(previous.phase)) {
-            *slot = Some(Self {
-                phase,
-                reached: now,
-            });
+            *slot = Some(Self::reached(phase, now));
         }
     }
 
