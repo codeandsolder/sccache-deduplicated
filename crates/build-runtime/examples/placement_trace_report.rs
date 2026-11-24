@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 struct Forecast {
     seconds: f64,
     completion_seconds: f64,
+    inputs_ready_at: Option<f64>,
+    ready_at: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -42,6 +44,8 @@ struct Completion {
     class: ContentId,
     predicted_seconds: Option<f64>,
     actual_seconds: f64,
+    actual_inputs_ready_seconds: Option<f64>,
+    actual_result_negotiation_seconds: Option<f64>,
     execution_nanoseconds: f64,
     upload_bytes: f64,
     upload_requests: f64,
@@ -156,6 +160,8 @@ impl Errors {
 #[derive(Default)]
 struct Metrics {
     completion_seconds: Errors,
+    inputs_ready_seconds: Errors,
+    result_negotiation_seconds: Errors,
     learned_execution_seconds: Errors,
     prior_execution_seconds: Errors,
     learned_upload_bytes: Errors,
@@ -168,6 +174,8 @@ struct Metrics {
 #[derive(Serialize)]
 struct MetricSummary {
     completion_seconds: ErrorSummary,
+    inputs_ready_seconds: ErrorSummary,
+    result_negotiation_seconds: ErrorSummary,
     learned_execution_seconds: ErrorSummary,
     prior_execution_seconds: ErrorSummary,
     learned_upload_bytes: ErrorSummary,
@@ -199,6 +207,18 @@ impl Metrics {
         );
         self.completion_seconds
             .add(selected.completion_seconds, completion.actual_seconds)?;
+        if let Some((predicted, actual)) = selected
+            .inputs_ready_at
+            .zip(completion.actual_inputs_ready_seconds)
+        {
+            self.inputs_ready_seconds.add(predicted, actual)?;
+        }
+        if let Some((predicted, actual)) = selected
+            .ready_at
+            .zip(completion.actual_result_negotiation_seconds)
+        {
+            self.result_negotiation_seconds.add(predicted, actual)?;
+        }
         self.learned_execution_seconds.add(
             predicted.execution_nanoseconds / 1e9,
             completion.execution_nanoseconds / 1e9,
@@ -232,6 +252,8 @@ impl Metrics {
     fn summarize(self) -> MetricSummary {
         MetricSummary {
             completion_seconds: self.completion_seconds.summarize(),
+            inputs_ready_seconds: self.inputs_ready_seconds.summarize(),
+            result_negotiation_seconds: self.result_negotiation_seconds.summarize(),
             learned_execution_seconds: self.learned_execution_seconds.summarize(),
             prior_execution_seconds: self.prior_execution_seconds.summarize(),
             learned_upload_bytes: self.learned_upload_bytes.summarize(),
@@ -302,13 +324,13 @@ mod tests {
         let other = "127.0.0.1:2";
         let assigned = serde_json::json!({
             "kind": "assigned", "job": 1, "worker": worker, "class": class,
-            "candidates": {(worker): {"seconds": 2.01, "completion_seconds": 1.5}, (other): {"seconds": 2.0, "completion_seconds": 1.8}},
+            "candidates": {(worker): {"seconds": 2.01, "completion_seconds": 1.5, "inputs_ready_at": 0.25, "ready_at": 1.25}, (other): {"seconds": 2.0, "completion_seconds": 1.8}},
             "healthy": [worker, other],
             "host_prior": {"execution_nanoseconds": 1_000_000_000, "output_bytes": 100, "output_requests": 1},
         });
         let completed = serde_json::json!({
             "kind": "completed", "job": 1, "worker": worker, "class": class,
-            "predicted_seconds": 1.5, "actual_seconds": 2.0, "execution_nanoseconds": 1_500_000_000,
+            "predicted_seconds": 1.5, "actual_seconds": 2.0, "actual_inputs_ready_seconds": 0.5, "actual_result_negotiation_seconds": 1.75, "execution_nanoseconds": 1_500_000_000,
             "upload_bytes": 0, "upload_requests": 0,
             "predicted_cost": {"execution_nanoseconds": 1_400_000_000, "output_bytes": 0, "output_requests": 0},
         });
@@ -318,6 +340,14 @@ mod tests {
             format!("other log\n[TRACE] {assigned}\n{unmatched}\n{completed}\n{completed}\n");
         let report = evaluate(&Trace::read(lines.as_bytes())?)?;
         assert_eq!(report.matched, 1);
+        assert_eq!(
+            report.total.inputs_ready_seconds.mean_absolute_error,
+            Some(0.25)
+        );
+        assert_eq!(
+            report.total.result_negotiation_seconds.mean_absolute_error,
+            Some(0.5)
+        );
         assert_eq!(report.assignments_without_completion, 1);
         assert_eq!(
             report.total.completion_seconds.mean_absolute_error,

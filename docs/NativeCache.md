@@ -1001,8 +1001,15 @@ with:
 cargo run --locked -p sccache-build --example placement_trace_report < placement-trace.jsonl
 ```
 
+Assignment traces include the predicted input-ready and publication-slot
+arrival times. Completion traces carry actual first authenticated input-staged
+and result-negotiation arrival times relative to assignment. These scheduler
+clock observations include control overhead, queueing and local CAS work;
+result negotiation occurs after the worker has staged its result locally.
+The phase error is a forecast residual, not a pure decoder or network rate.
+
 The JSON report includes unmatched counts, per-worker and overall timing
-errors (signed bias, MAE, median and p90 absolute error, weighted absolute
+errors for completion, input readiness and result negotiation (signed bias, MAE, median and p90 absolute error, weighted absolute
 percentage error), learned versus host-prior execution/upload prediction
 errors and the predicted score gap to the best eligible candidate. Unmatched
 assignments are not counted as compiler failures or as zero-duration jobs.

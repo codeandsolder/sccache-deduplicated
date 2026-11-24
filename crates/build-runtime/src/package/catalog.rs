@@ -6,7 +6,7 @@ use crate::ContentId;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Candidate {
+pub struct Candidate {
     pub(crate) archive: PackageArchive,
     pub(crate) covers: BTreeSet<ContentId>,
 }

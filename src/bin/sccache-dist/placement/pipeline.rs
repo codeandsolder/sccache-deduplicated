@@ -330,6 +330,7 @@ impl Pipeline {
 /// Predict when the new action can start publishing, not merely when a
 /// nominal count of outstanding jobs would clear a compiler semaphore.
 pub(super) struct PipelineForecast {
+    pub inputs_ready_at: f64,
     pub ready_at: f64,
     pub traffic: InputTraffic,
 }
@@ -438,6 +439,7 @@ pub(super) fn publication_forecast(
     let ready = timeline.stage(Some(requested), None, catalog);
     let (execution, output) = pipeline.service(Some(cost), placement);
     PipelineForecast {
+        inputs_ready_at: ready.as_secs_f64(),
         ready_at: pipeline.finish(ready, execution, output).as_secs_f64(),
         traffic: timeline.traffic,
     }

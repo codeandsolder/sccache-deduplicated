@@ -160,7 +160,7 @@ impl Default for PackageTransferCost {
 
 mod catalog;
 #[cfg(all(unix, feature = "store"))]
-pub(crate) use catalog::Candidate;
+pub use catalog::Candidate;
 pub use catalog::{PackageCatalog, PackageDeliveryLimits};
 
 impl PackageTransferCost {

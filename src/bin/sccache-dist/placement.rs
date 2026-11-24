@@ -223,7 +223,8 @@ pub(super) struct PlacementEstimate {
     missing_input_union_bytes: u128,
     input_wire_bytes: u128,
     pub(super) archive_bytes: u128,
-    ready_at: f64,
+    pub(super) inputs_ready_at: f64,
+    pub(super) ready_at: f64,
     pub(super) cost: ActionCost,
 }
 
@@ -273,11 +274,12 @@ pub(super) fn native_estimate(
     if unconstrained > 0.0 {
         rates.contention = (network / unconstrained).max(1.0);
     }
-    let ready_at = if rates.contention > 1.0 {
-        pipeline::publication_forecast(forecast, requested, plan.packages, rates).ready_at
+    let adjusted = if rates.contention > 1.0 {
+        pipeline::publication_forecast(forecast, requested, plan.packages, rates)
     } else {
-        initial.ready_at
+        initial
     };
+    let ready_at = adjusted.ready_at;
     // Already resident candidates do not increase the existing backlog.
     let externality = if bytes == 0 { 0.0 } else { externality };
     let result = action.result(placement.result);
@@ -293,10 +295,11 @@ pub(super) fn native_estimate(
     let completion_seconds = ready_at + output_network.max(output_processing) + output_overhead;
     PlacementEstimate {
         ready_at,
+        inputs_ready_at: adjusted.inputs_ready_at,
         completion_seconds,
         missing_input_union_bytes: bytes,
-        input_wire_bytes: initial.traffic.wire_bytes,
-        archive_bytes: initial.traffic.archive_bytes,
+        input_wire_bytes: adjusted.traffic.wire_bytes,
+        archive_bytes: adjusted.traffic.archive_bytes,
         cost: action,
         seconds: completion_seconds + externality + output_externality,
     }

@@ -737,9 +737,10 @@ struct JobDetail {
     state_since: Instant,
     // First heartbeat that did not report this Started job as executing.
     missing_since: Option<Instant>,
+    inputs_staged_at: Option<Instant>,
     publication_began_at: Option<Instant>,
     assigned_at: Instant,
-    predicted_seconds: Option<f64>,
+    prediction: Option<placement::PlacementEstimate>,
     observed_result: bool,
 }
 
@@ -1074,7 +1075,7 @@ impl Scheduler {
             .map(|assignment| placement::ActionClass::from_spec(&assignment.spec))
             .transpose()?;
         let assigned_at = Instant::now();
-        let (job_id, server_id, auth, predicted_seconds, estimated_result_bytes) = {
+        let (job_id, server_id, auth, prediction, estimated_result_bytes) = {
             // LOCKS
             let mut servers = self
                 .servers
@@ -1194,9 +1195,7 @@ impl Scheduler {
                         .job_authorizer
                         .generate_token(job_id)
                         .context("Could not create an auth token for this job")?;
-                    let predicted_seconds = predictions
-                        .get(&server_id.addr())
-                        .map(|estimate| estimate.completion_seconds);
+                    let prediction = predictions.get(&server_id.addr()).copied();
                     if let Some(class) = class {
                         trace!(target: "native_placement_replay", "{}", serde_json::json!({
                             "kind": "assigned", "job": job_id.0, "worker": server_id.addr(), "class": class,
@@ -1232,13 +1231,7 @@ impl Scheduler {
                         "Job {} created and will be assigned to server {:?}",
                         job_id, server_id
                     );
-                    Some((
-                        job_id,
-                        server_id,
-                        auth,
-                        predicted_seconds,
-                        estimated_result_bytes,
-                    ))
+                    Some((job_id, server_id, auth, prediction, estimated_result_bytes))
                 } else {
                     None
                 }
@@ -1315,9 +1308,10 @@ impl Scheduler {
                         state,
                         state_since: Instant::now(),
                         missing_since: None,
+                        inputs_staged_at: None,
                         publication_began_at: None,
                         assigned_at,
-                        predicted_seconds,
+                        prediction,
                         observed_result: false,
                     }
                 )
@@ -1399,6 +1393,7 @@ impl SchedulerIncoming for Scheduler {
         use sccache::build_runtime::wire::NativeJobPhase;
         match event {
             dist::NativeLifecycleEvent::InputsStaged => {
+                detail.inputs_staged_at.get_or_insert(now);
                 server.native_milestone(job, NativeJobPhase::Ready, now);
             }
             dist::NativeLifecycleEvent::Negotiated => {
@@ -1464,7 +1459,10 @@ impl SchedulerIncoming for Scheduler {
                         }
                         trace!(target: "native_placement_replay", "{}", serde_json::json!({
                             "kind": "completed", "job": job.0, "worker": server_id.addr(),
-                            "class": class, "predicted_seconds": detail.predicted_seconds,
+                            "class": class, "predicted_seconds": detail.prediction.map(|prediction| prediction.completion_seconds),
+                            "actual_inputs_ready_seconds": detail.inputs_staged_at.map(|staged| staged.saturating_duration_since(detail.assigned_at).as_secs_f64()),
+                            "actual_result_negotiation_seconds": detail.publication_began_at.map(|began| began.saturating_duration_since(detail.assigned_at).as_secs_f64()),
+                            "actual_start_seconds": (detail.state == JobState::Started).then(|| detail.state_since.saturating_duration_since(detail.assigned_at).as_secs_f64()),
                             "actual_seconds": now.saturating_duration_since(detail.assigned_at).as_secs_f64(),
                             "result_bytes": manifest.blobs().ok().map(|blobs| blobs.values().copied().fold(0_u64, u64::saturating_add)),
                             "execution_nanoseconds": observed.execution_nanoseconds,
