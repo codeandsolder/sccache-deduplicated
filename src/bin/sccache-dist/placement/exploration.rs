@@ -180,7 +180,7 @@ impl<'a> Opportunity<'a> {
             return Some(question);
         }
         let forecast = self.forecast?;
-        if forecast.placement.result.observations == 0 {
+        if forecast.placement.timing.result.observations == 0 {
             return None;
         }
         let estimate = native_estimate(forecast, requested, peer, plan);

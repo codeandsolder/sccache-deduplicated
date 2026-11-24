@@ -86,6 +86,7 @@ fn native_cost_history_shrinks_expires_and_bounds_samples() -> anyhow::Result<()
     let mut costs = ActionCosts::default();
     let observation = ActionObservation {
         execution_nanoseconds: 9_000_000_000,
+        worker_timing: None,
         warm_staging_nanoseconds: None,
         publication_setup_nanoseconds: None,
         upload_bytes: 0,

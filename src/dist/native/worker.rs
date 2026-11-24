@@ -8,7 +8,7 @@ use std::{
     num::NonZeroUsize,
     sync::{
         Arc, Condvar, Mutex, PoisonError,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -20,9 +20,9 @@ use super::{
 };
 use crate::build_runtime::{
     ArchiveLength, BlobRef, CapturedExecution, ExecutionPolicy, ExecutionSpec, NativeServiceBusy,
-    NativeStore, PackageArchive, PackageImportLimits, PackageTransferCost, ResultTransferEstimate,
-    StageBudget, TreeId, TreeLease, VerifiedPackage, execute,
-    wire::{ActionObservation, ActionRequest, Ticket},
+    NativeStore, PackageArchive, PackageImportLimits, PackageTransferCost, StageBudget, TreeId,
+    TreeLease, VerifiedPackage, execute,
+    wire::{ActionObservation, ActionRequest, Ticket, WorkerTiming},
 };
 
 /// Per-worker observed transfer and decoding rates.
@@ -31,9 +31,7 @@ use crate::build_runtime::{
 /// holding locks during I/O. A poisoned estimate is advisory and recoverable.
 #[derive(Clone)]
 pub struct PackageTransportTracker {
-    rates: Arc<Mutex<PackageTransferCost>>,
-    execution_nanoseconds: Arc<AtomicU64>,
-    result: Arc<Mutex<ResultTransferEstimate>>,
+    timing: Arc<Mutex<WorkerTiming>>,
     slots: Arc<RawDownloadSlots>,
 }
 
@@ -58,15 +56,13 @@ impl PackageTransportTracker {
     /// Construct a rate tracker and the shared raw download budget.
     /// # Errors
     /// Returns an error when the initial costs or concurrency are invalid.
-    pub fn new(initial: PackageTransferCost, result: ResultTransferEstimate) -> Result<Self> {
-        initial.validate()?;
-        ensure!(result.valid(), "invalid result transfer estimate");
-        let limit = NonZeroUsize::new(usize::try_from(initial.raw_parallelism)?)
+    pub fn new(mut initial: WorkerTiming) -> Result<Self> {
+        ensure!(initial.valid(), "invalid worker timing estimate");
+        initial.revision = 0;
+        let limit = NonZeroUsize::new(usize::try_from(initial.transfer.raw_parallelism)?)
             .context("zero raw download parallelism")?;
         Ok(Self {
-            rates: Arc::new(Mutex::new(initial)),
-            execution_nanoseconds: Arc::new(AtomicU64::new(0)),
-            result: Arc::new(Mutex::new(result)),
+            timing: Arc::new(Mutex::new(initial)),
             slots: Arc::new(RawDownloadSlots {
                 limit,
                 active: Mutex::new(0),
@@ -112,31 +108,19 @@ impl PackageTransportTracker {
     /// A point-in-time estimate to send with a package selection request.
     #[must_use = "the estimate changes as the worker observes real work"]
     pub fn estimate(&self) -> PackageTransferCost {
-        *self.rates.lock().unwrap_or_else(PoisonError::into_inner)
+        self.snapshot().transfer
     }
 
-    /// Return the latest successful result publication estimate.
-    #[must_use = "the estimate predicts result upload cost"]
-    pub fn result_estimate(&self) -> ResultTransferEstimate {
-        *self.result.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Snapshot both the estimates and their incarnation-local revision.
+    #[must_use = "scheduler must not replace newer timing observations with stale heartbeats"]
+    pub fn snapshot(&self) -> WorkerTiming {
+        *self.timing.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn observe_result(&self, bytes: u64, requests: u64, duration: Duration) {
-        self.result
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .observe(bytes, requests, duration);
-    }
-
-    /// Estimated time spent occupying an execution slot, excluding staging and queue waits.
-    #[must_use = "the estimate is used for worker placement"]
-    pub fn execution_nanoseconds(&self) -> u64 {
-        let observed = self.execution_nanoseconds.load(Ordering::Relaxed);
-        if observed == 0 {
-            1_000_000_000
-        } else {
-            observed
-        }
+        let mut timing = self.timing.lock().unwrap_or_else(PoisonError::into_inner);
+        timing.result.observe(bytes, requests, duration);
+        timing.revision = timing.revision.saturating_add(1);
     }
 
     /// Update the service-time estimate from a completed sandbox execution.
@@ -144,23 +128,14 @@ impl PackageTransportTracker {
         let observed = u64::try_from(duration.as_nanos())
             .unwrap_or(u64::MAX)
             .clamp(1_000_000, 3_600_000_000_000);
-        let mut previous = self.execution_nanoseconds.load(Ordering::Relaxed);
-        loop {
-            let updated = if previous == 0 {
-                observed
-            } else {
-                (3 * previous + observed).div_ceil(4)
-            };
-            match self.execution_nanoseconds.compare_exchange_weak(
-                previous,
-                updated,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => previous = actual,
-            }
-        }
+        let mut timing = self.timing.lock().unwrap_or_else(PoisonError::into_inner);
+        let previous = timing.execution_nanoseconds;
+        timing.execution_nanoseconds = if previous == 0 {
+            observed
+        } else {
+            (3 * previous + observed).div_ceil(4)
+        };
+        timing.revision = timing.revision.saturating_add(1);
     }
 
     fn smooth(rate: &mut u64, bytes: u64, duration: Duration) {
@@ -175,7 +150,9 @@ impl PackageTransportTracker {
 
     /// Observe actual download and staging time for a verified raw blob.
     pub fn observe_raw(&self, bytes: u64, duration: Duration) {
-        let mut rates = self.rates.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut timing = self.timing.lock().unwrap_or_else(PoisonError::into_inner);
+        let before = timing.transfer;
+        let rates = &mut timing.transfer;
         let nanos = duration.as_nanos();
         if (4096..(1 << 20)).contains(&bytes) && (200_000..=2_000_000_000).contains(&nanos) {
             // Small files are dominated by setup and staging. Discount the
@@ -194,13 +171,18 @@ impl PackageTransportTracker {
                 Duration::from_nanos(u64::try_from(effective).unwrap_or(u64::MAX)),
             );
         }
+        if timing.transfer != before {
+            timing.revision = timing.revision.saturating_add(1);
+        }
     }
 
     /// Observe original delivery plus verified full-package reconstruction.
     /// Measure archive-byte transfer separately from logical raw-blob goodput;
     /// subtract the actual download duration before attributing time to decoding.
     pub fn observe_archive(&self, archive: PackageArchive, duration: Duration, download: Duration) {
-        let mut rates = self.rates.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut timing = self.timing.lock().unwrap_or_else(PoisonError::into_inner);
+        let before = timing.transfer;
+        let rates = &mut timing.transfer;
         let effective_download =
             download.saturating_sub(Duration::from_nanos(rates.raw_request_nanoseconds));
         Self::smooth(
@@ -232,6 +214,9 @@ impl PackageTransportTracker {
                 archive.expanded_bytes,
                 Duration::from_nanos(u64::try_from(decode_ns).unwrap_or(u64::MAX)),
             );
+        }
+        if timing.transfer != before {
+            timing.revision = timing.revision.saturating_add(1);
         }
     }
 }
@@ -267,13 +252,13 @@ mod transport_tests {
             Barrier,
             atomic::{AtomicUsize, Ordering},
         };
-        let tracker = PackageTransportTracker::new(
-            PackageTransferCost {
+        let tracker = PackageTransportTracker::new(WorkerTiming {
+            transfer: PackageTransferCost {
                 raw_parallelism: 2,
-                ..PackageTransferCost::default()
+                ..Default::default()
             },
-            ResultTransferEstimate::default(),
-        )?;
+            ..Default::default()
+        })?;
         let barrier = Barrier::new(8);
         let running = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
@@ -317,11 +302,37 @@ mod transport_tests {
     }
 
     #[test]
+    fn observed_worker_timing_revisions_cover_every_published_service_update() -> Result<()> {
+        let tracker = PackageTransportTracker::new(WorkerTiming::default())?;
+        let initial = tracker.snapshot();
+        assert_eq!(initial.execution_estimate(), 1_000_000_000);
+        tracker.observe_execution(Duration::from_millis(50));
+        let compiled = tracker.snapshot();
+        assert_eq!(compiled.execution_estimate(), 50_000_000);
+        assert!(compiled.revision > initial.revision);
+        tracker.observe_result(0, 0, Duration::ZERO);
+        let published = tracker.snapshot();
+        assert_eq!(published.result.expected_bytes, 0);
+        assert!(published.revision > compiled.revision);
+        tracker.observe_raw(32 << 20, Duration::from_secs(2));
+        let transferred = tracker.snapshot();
+        assert_ne!(transferred.transfer, published.transfer);
+        assert!(transferred.revision > published.revision);
+        let mut scheduler = transferred;
+        scheduler.adopt(published);
+        assert_eq!(scheduler, transferred);
+        scheduler.adopt(WorkerTiming {
+            revision: transferred.revision + 1,
+            execution_nanoseconds: u64::MAX,
+            ..transferred
+        });
+        assert_eq!(scheduler, transferred);
+        Ok(())
+    }
+
+    #[test]
     fn observed_rates_change_future_costs_without_overreacting_to_tiny_files() -> Result<()> {
-        let tracker = PackageTransportTracker::new(
-            PackageTransferCost::default(),
-            ResultTransferEstimate::default(),
-        )?;
+        let tracker = PackageTransportTracker::new(WorkerTiming::default())?;
         let initial = tracker.estimate();
         tracker.observe_raw(100, Duration::from_secs(20));
         assert_eq!(tracker.estimate(), initial);
@@ -737,11 +748,16 @@ impl NativeCacheClient {
                 self.upload(ticket, missing, captured.open_blob(missing.id)?)?;
             }
             let upload_duration = started.elapsed();
+            let worker_timing = transport.map(|transport| {
+                transport.observe_result(bytes, requests, upload_duration);
+                transport.snapshot()
+            });
             ensure!(
                 self.commit(
                     ticket,
                     retained_after_begin,
                     Some(ActionObservation {
+                        worker_timing,
                         warm_staging_nanoseconds: prepared
                             .warm_staging
                             .and_then(service_nanoseconds),
@@ -758,9 +774,6 @@ impl NativeCacheClient {
                 )? == *manifest,
                 "native publication manifest mismatch"
             );
-            if let Some(transport) = transport {
-                transport.observe_result(bytes, requests, upload_duration);
-            }
         } else {
             self.fail(ticket)?;
         }

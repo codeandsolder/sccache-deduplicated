@@ -43,13 +43,16 @@ fn placement() -> NativePlacement {
             publication_slots: 2,
             jobs: Default::default(),
         },
-        execution_nanoseconds: 1_000_000_000,
+        timing: sccache::build_runtime::wire::WorkerTiming {
+            execution_nanoseconds: 1_000_000_000,
+            ..Default::default()
+        },
         ..Default::default()
     };
-    placement.transfer.raw_request_nanoseconds = 0;
-    placement.result.expected_bytes = 100;
-    placement.result.bytes_per_second = 100;
-    placement.result.expected_requests = 0;
+    placement.timing.transfer.raw_request_nanoseconds = 0;
+    placement.timing.result.expected_bytes = 100;
+    placement.timing.result.bytes_per_second = 100;
+    placement.timing.result.expected_requests = 0;
     placement
 }
 

@@ -862,7 +862,7 @@ input transfers. These estimates are checkpointed atomically to
 per minute. Restart uses a validated checkpoint no older than 24 hours, scoped
 to the cache endpoint and platform; a new route starts from configuration.
 
-Heartbeat protocol v2 includes the dispatcher reservation limit, staging,
+Heartbeat protocol v4 includes the dispatcher reservation limit, staging,
 compiler and publication widths, occupied shared compiler slots, and a
 bounded job-ID map of phase, phase age and remaining unverified input bytes
 and blob count. Initial remaining counts come from the assignment's exact
@@ -894,7 +894,7 @@ remain separate improvements.
 
 ### Immediate producer-output residency
 
-The native cache protocol v4 records recently published worker outputs without
+The native cache protocol v5 records recently published worker outputs without
 waiting for the periodic residency heartbeat. After successful local CAS
 publication, the worker knows its actual grace-lease deadline. The existing
 authenticated result negotiation establishes a scheduler-local monotonic time
@@ -1020,6 +1020,17 @@ in the shared-link forecast, without consuming a compiler slot. These
 observations are never transferred to different workers as machine-speed
 priors. Native service protocol v5 carries the two optional samples.
 
+Successful worker commits carry a coherent, revisioned timing snapshot
+from the same tracker used by live transfer and package negotiation.
+The scheduler adopts it immediately after verification; a delayed
+heartbeat or out-of-order completion cannot overwrite a newer revision.
+The worker's process nonce scopes the revision, and restored timing
+checkpoints initialize the new incarnation at revision zero. All
+successful observed compilers update the host prior immediately,
+rather than leaving new command families shrunk toward the stale
+initial one-second estimate until the next heartbeat. No separate
+telemetry request or synthetic payload is required.
+
 The JSON report includes unmatched counts, per-worker and overall timing
 errors for completion, input readiness and result negotiation (signed bias, MAE, median and p90 absolute error, weighted absolute
 percentage error), learned versus host-prior execution/upload prediction
@@ -1036,7 +1047,7 @@ transfer any originals. Excessively large or unavailable catalogs fall back
 to the raw-blob forecast. Each queued assignment retains its catalog for
 future staging forecasts.
 
-Heartbeat protocol v3 advertises the worker's reconstruction limits.
+Heartbeat protocol v4 advertises the worker's reconstruction limits.
 Placement and real package negotiation share the same positive-savings
 greedy archive selector. For each new input closure the forecast removes
 resident and previously scheduled digests, chooses covering archives per

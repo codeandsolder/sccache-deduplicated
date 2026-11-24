@@ -1090,6 +1090,7 @@ fn verify_learned_placement_trace(log: &Path, expected_archive_bytes: u64) -> Re
     let mut estimate = None;
     let mut peak_result = 0_u64;
     let mut staging_observed = None;
+    let mut previous_timing = cold["worker_timing"].clone();
     for value in repeated {
         let observed = value["execution_nanoseconds"]
             .as_u64()
@@ -1110,6 +1111,26 @@ fn verify_learned_placement_trace(log: &Path, expected_archive_bytes: u64) -> Re
             .context("warm staging sample missing")?;
         assert!(stage > 0);
         let forecast_phase = &assignment["candidates"][worker]["cost"]["phase"];
+        // The exact current worker-wide prior comes from the preceding
+        // authenticated commit, not the periodic heartbeat.
+        assert_eq!(
+            assignment["host_prior"]["execution_nanoseconds"],
+            previous_timing["execution_nanoseconds"]
+        );
+        assert_eq!(
+            assignment["host_prior"]["output_bytes"],
+            previous_timing["result"]["expected_bytes"]
+        );
+        let revision = value["worker_timing"]["revision"]
+            .as_u64()
+            .context("missing timing revision")?;
+        assert!(
+            revision
+                > previous_timing["revision"]
+                    .as_u64()
+                    .context("missing previous timing revision")?
+        );
+        previous_timing = value["worker_timing"].clone();
         if let Some(previous) = staging_observed {
             assert_eq!(forecast_phase["staging_nanoseconds"], previous);
             let updated = if stage >= previous {

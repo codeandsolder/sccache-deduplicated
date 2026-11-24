@@ -99,9 +99,9 @@ impl ActionCost {
                 staging_nanoseconds: 0,
                 publication_nanoseconds: 0,
             },
-            execution_nanoseconds: placement.execution_nanoseconds,
-            output_bytes: placement.result.expected_bytes,
-            output_requests: placement.result.expected_requests,
+            execution_nanoseconds: placement.timing.execution_estimate(),
+            output_bytes: placement.timing.result.expected_bytes,
+            output_requests: placement.timing.result.expected_requests,
         }
     }
 

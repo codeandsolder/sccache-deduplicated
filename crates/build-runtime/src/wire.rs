@@ -209,10 +209,47 @@ pub enum ScheduleReply {
     Unavailable { message: String },
 }
 
+/// Coherent snapshot of a worker's measured transfer and compiler service.
+/// Revision is monotonic within the authenticated worker incarnation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerTiming {
+    pub revision: u64,
+    pub transfer: crate::PackageTransferCost,
+    /// Zero denotes an unobserved execution prior.
+    pub execution_nanoseconds: u64,
+    pub result: crate::ResultTransferEstimate,
+}
+
+impl WorkerTiming {
+    #[must_use = "worker timing is advisory and must be validated"]
+    pub fn valid(self) -> bool {
+        self.transfer.validate().is_ok()
+            && self.execution_nanoseconds <= 3_600_000_000_000
+            && self.result.valid()
+    }
+
+    #[must_use = "unknown compiler service uses the configured initial prior"]
+    pub const fn execution_estimate(self) -> u64 {
+        if self.execution_nanoseconds == 0 {
+            1_000_000_000
+        } else {
+            self.execution_nanoseconds
+        }
+    }
+
+    /// Ignore stale snapshots from the same worker incarnation.
+    pub fn adopt(&mut self, other: Self) {
+        if other.revision > self.revision && other.valid() {
+            *self = other;
+        }
+    }
+}
+
 /// Real service times and actual negotiated output traffic for a successful
 /// worker action. Advisory only; never changes the action identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionObservation {
+    pub worker_timing: Option<WorkerTiming>,
     /// Warm staging service, excluding worker queue and grace-capacity waits.
     pub warm_staging_nanoseconds: Option<u64>,
     /// Warm local retention and result negotiation, excluding new local writes and grace waits.
@@ -227,6 +264,7 @@ impl ActionObservation {
     #[must_use = "untrusted timing samples must be validated"]
     pub fn valid(self) -> bool {
         (1..=3_600_000_000_000).contains(&self.execution_nanoseconds)
+            && self.worker_timing.is_none_or(WorkerTiming::valid)
             && self
                 .warm_staging_nanoseconds
                 .is_none_or(|ns| ns <= 60_000_000_000)

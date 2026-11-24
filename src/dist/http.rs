@@ -234,7 +234,7 @@ pub mod urls {
     ///
     /// Returns an error if `scheduler_url` cannot be used as a base URL.
     pub fn scheduler_heartbeat_server(scheduler_url: &reqwest::Url) -> Result<reqwest::Url> {
-        Ok(scheduler_url.join("/api/v3/scheduler/heartbeat_server")?)
+        Ok(scheduler_url.join("/api/v4/scheduler/heartbeat_server")?)
     }
 
     /// Build the scheduler job-state endpoint for `job_id`.
@@ -1350,7 +1350,7 @@ mod server {
                         );
                         prepare_response(request, &WorkerNameHttpResponse { worker_name })
                     },
-                    (POST) (/api/v3/scheduler/heartbeat_server) => {
+                    (POST) (/api/v4/scheduler/heartbeat_server) => {
                         let server_id = check_server_auth_or_err!(request);
                         let worker_name = request
                             .header("X-Sccache-Worker-Name")

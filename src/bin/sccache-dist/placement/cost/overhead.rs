@@ -79,6 +79,7 @@ mod tests {
         let mut history = OverheadHistory::default();
         let first = ActionObservation {
             warm_staging_nanoseconds: Some(10_000_000),
+            worker_timing: None,
             publication_setup_nanoseconds: Some(20_000_000),
             execution_nanoseconds: 50_000_000,
             upload_bytes: 0,

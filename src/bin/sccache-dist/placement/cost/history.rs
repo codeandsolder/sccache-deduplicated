@@ -211,6 +211,7 @@ mod tests {
     fn observation(ns: u64) -> ActionObservation {
         ActionObservation {
             execution_nanoseconds: ns,
+            worker_timing: None,
             warm_staging_nanoseconds: None,
             publication_setup_nanoseconds: None,
             upload_bytes: 100,
@@ -315,6 +316,7 @@ mod tests {
         let other_class = ActionClass(ContentId::of(b"link"));
         let measured = ActionObservation {
             warm_staging_nanoseconds: Some(10_000_000),
+            worker_timing: None,
             publication_setup_nanoseconds: Some(6_000_000),
             ..observation(100_000_000)
         };

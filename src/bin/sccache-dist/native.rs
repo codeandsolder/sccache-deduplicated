@@ -11,7 +11,7 @@ use anyhow::{Result, ensure};
 use sccache::{
     build_runtime::{
         BlobResidency, CapturedExecution, ContentId, ExecutionPolicy, NativeStore,
-        PackageImportLimits, PackageTransferCost,
+        PackageImportLimits, PackageTransferCost, wire::WorkerTiming,
     },
     config::server::NativeWorkerConfig,
     dist::{
@@ -87,10 +87,7 @@ impl NativeWorker {
             scope,
             config.package_transfer,
         );
-        let package_transfer = PackageTransportTracker::new(timing.transfer, timing.result)?;
-        if timing.execution_nanoseconds != 0 {
-            package_transfer.observe_execution(Duration::from_nanos(timing.execution_nanoseconds));
-        }
+        let package_transfer = PackageTransportTracker::new(timing)?;
         let client = NativeCacheClient::new(
             config.cache_url.to_url(),
             auth,
@@ -147,11 +144,7 @@ impl NativeWorker {
 
     pub(super) fn placement(&self, queue: sccache::dist::NativeQueueSnapshot) -> NativePlacement {
         self.artifact_grace.reap();
-        let timing = WorkerTiming {
-            transfer: self.package_transfer.estimate(),
-            execution_nanoseconds: self.package_transfer.execution_nanoseconds(),
-            result: self.package_transfer.result_estimate(),
-        };
+        let timing = self.package_transfer.snapshot();
         let mut cache = self
             .placement
             .lock()
@@ -217,13 +210,6 @@ impl NativeWorker {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-struct WorkerTiming {
-    transfer: PackageTransferCost,
-    execution_nanoseconds: u64,
-    result: sccache::build_runtime::ResultTransferEstimate,
-}
-
 #[derive(Serialize, Deserialize)]
 struct SavedTiming {
     scope: ContentId,
@@ -254,8 +240,7 @@ impl PlacementCache {
     ) -> (Self, WorkerTiming) {
         let mut timing = WorkerTiming {
             transfer: configured,
-            execution_nanoseconds: 0,
-            result: sccache::build_runtime::ResultTransferEstimate::default(),
+            ..Default::default()
         };
         match std::fs::File::open(&path) {
             Ok(file) => match serde_json::from_reader::<_, SavedTiming>(file) {
@@ -264,11 +249,10 @@ impl PlacementCache {
                         && unix_seconds()
                             .checked_sub(saved.observed_at)
                             .is_some_and(|age| age <= 24 * 60 * 60)
-                        && saved.timing.transfer.validate().is_ok()
-                        && saved.timing.execution_nanoseconds <= 3_600_000_000_000
-                        && saved.timing.result.valid() =>
+                        && saved.timing.valid() =>
                 {
                     timing = saved.timing;
+                    timing.revision = 0;
                     // Concurrency is configuration, not a learned rate.
                     timing.transfer.raw_parallelism = configured.raw_parallelism;
                 }
@@ -323,9 +307,7 @@ impl PlacementCache {
                 .inventory
                 .as_ref()
                 .and_then(|(_, summary)| summary.clone()),
-            transfer: timing.transfer,
-            execution_nanoseconds: timing.execution_nanoseconds,
-            result: timing.result,
+            timing,
             queue,
         }
     }

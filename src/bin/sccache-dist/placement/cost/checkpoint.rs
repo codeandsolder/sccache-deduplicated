@@ -314,6 +314,7 @@ mod tests {
                 class,
                 ActionObservation {
                     execution_nanoseconds: 123_000_000,
+                    worker_timing: None,
                     warm_staging_nanoseconds: Some(10_000_000),
                     publication_setup_nanoseconds: Some(5_000_000),
                     upload_bytes: 100,

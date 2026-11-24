@@ -255,14 +255,15 @@ impl Pipeline {
             .find(|&width| f64::from(width) >= effective)
             .unwrap_or(1);
         let execution = duration(
-            Duration::from_nanos(placement.execution_nanoseconds).as_secs_f64() * f64::from(width)
+            Duration::from_nanos(placement.timing.execution_estimate()).as_secs_f64()
+                * f64::from(width)
                 / effective,
         );
         Self {
             compiler: Slots::new(width, jobs),
             publication: Slots::new(placement.queue.publication_slots, jobs),
             execution,
-            output: output_service(placement.result),
+            output: output_service(placement.timing.result),
             scaling: f64::from(width) / effective,
             ready: Vec::new(),
             publish: Vec::new(),
@@ -279,7 +280,7 @@ impl Pipeline {
                 duration(
                     Duration::from_nanos(cost.execution_nanoseconds).as_secs_f64() * self.scaling,
                 ),
-                output_service(cost.result(placement.result))
+                output_service(cost.result(placement.timing.result))
                     .saturating_add(cost.phase.publication()),
             )
         })
@@ -430,7 +431,7 @@ pub(super) fn publication_forecast(
         slots: Slots::new(placement.queue.staging_slots, jobs),
         wire_free: Duration::ZERO,
         rates,
-        cost: placement.transfer,
+        cost: placement.timing.transfer,
         limits: placement.package_limits,
         traffic: InputTraffic::default(),
         residency: WorkerResidency::new(assigned, placement, recent),

@@ -134,7 +134,7 @@ impl<'a> NativeTransferPlan<'a> {
                     let Some(forecast) = WorkerForecast::new(details, None) else {
                         continue;
                     };
-                    let rates = DeliveryRates::new(&network.send, peer, placement.transfer);
+                    let rates = DeliveryRates::new(&network.send, peer, placement.timing.transfer);
                     let traffic = pipeline::publication_forecast(
                         forecast,
                         &dist::NativeInputBlobs::new(),
@@ -268,7 +268,7 @@ pub(super) fn native_estimate(
         ..
     } = forecast;
     let (bytes, _) = native_missing_inputs(assigned, placement, recent, Some(requested));
-    let mut rates = DeliveryRates::new(plan.send, peer, placement.transfer);
+    let mut rates = DeliveryRates::new(plan.send, peer, placement.timing.transfer);
     let initial = pipeline::publication_forecast(forecast, requested, plan.packages, rates);
     let (network, externality) = plan.input_completion(peer, initial.traffic);
     let unconstrained = initial.traffic.wire_time.as_secs_f64();
@@ -284,7 +284,7 @@ pub(super) fn native_estimate(
     let negotiation_at = ready_at + action.phase.publication().as_secs_f64();
     // Already resident candidates do not increase the existing backlog.
     let externality = if bytes == 0 { 0.0 } else { externality };
-    let result = action.result(placement.result);
+    let result = action.result(placement.timing.result);
     let (output_network, output_externality) = plan.result_completion(peer, negotiation_at, result);
     let output_processing =
         transfer_seconds(u128::from(result.expected_bytes), result.bytes_per_second);

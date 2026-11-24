@@ -1440,6 +1440,11 @@ impl SchedulerIncoming for Scheduler {
                             }),
                         )
                     {
+                        if let Some(timing) = observed.worker_timing
+                            && let Some(placement) = server.capabilities.native_placement.as_mut()
+                        {
+                            placement.timing.adopt(timing);
+                        }
                         if let Some(platform) = server.capabilities.native_platform {
                             self.cost_book
                                 .lock()
@@ -1466,6 +1471,7 @@ impl SchedulerIncoming for Scheduler {
                             "actual_seconds": now.saturating_duration_since(detail.assigned_at).as_secs_f64(),
                             "result_bytes": manifest.blobs().ok().map(|blobs| blobs.values().copied().fold(0_u64, u64::saturating_add)),
                             "execution_nanoseconds": observed.execution_nanoseconds,
+                            "worker_timing": observed.worker_timing,
                             "warm_staging_nanoseconds": observed.warm_staging_nanoseconds,
                             "publication_setup_nanoseconds": observed.publication_setup_nanoseconds,
                             "upload_bytes": observed.upload_bytes, "upload_requests": observed.upload_requests,
@@ -1550,7 +1556,7 @@ impl SchedulerIncoming for Scheduler {
         cpu_capacity: f64,
         active_job_ids: &[JobId],
         job_authorizer: Box<dyn JobAuthorizer>,
-        capabilities: dist::WorkerCapabilities,
+        mut capabilities: dist::WorkerCapabilities,
     ) -> Result<HeartbeatServerResult> {
         // LOCKS
         let mut jobs = self
@@ -1576,9 +1582,8 @@ impl SchedulerIncoming for Scheduler {
             "native worker telemetry must match advertised engine"
         );
         if let Some(placement) = &capabilities.native_placement {
-            placement.transfer.validate()?;
             anyhow::ensure!(
-                placement.result.valid()
+                placement.timing.valid()
                     && placement.queue.valid()
                     && placement
                         .package_limits
@@ -1586,12 +1591,10 @@ impl SchedulerIncoming for Scheduler {
                 "invalid native result or queue telemetry"
             );
             anyhow::ensure!(
-                placement.execution_nanoseconds > 0
-                    && placement.execution_nanoseconds <= 3_600_000_000_000
-                    && placement
-                        .residency
-                        .as_ref()
-                        .is_none_or(sccache::build_runtime::BlobResidency::valid),
+                placement
+                    .residency
+                    .as_ref()
+                    .is_none_or(sccache::build_runtime::BlobResidency::valid),
                 "invalid native placement telemetry"
             );
         }
@@ -1600,6 +1603,14 @@ impl SchedulerIncoming for Scheduler {
                 let now = Instant::now();
                 details.last_seen = now;
                 details.cpu_capacity = cpu_capacity;
+                if details.capabilities.native_platform == capabilities.native_platform
+                    && let (Some(previous), Some(incoming)) = (
+                        details.capabilities.native_placement.as_ref(),
+                        capabilities.native_placement.as_mut(),
+                    )
+                {
+                    incoming.timing.adopt(previous.timing);
+                }
                 details.capabilities = capabilities;
                 details.apply_milestones(now);
                 if let Some(placement) = &mut details.capabilities.native_placement {
@@ -2494,10 +2505,10 @@ mod scheduler_tests {
         let a = ContentId::of(b"a");
         let b = ContentId::of(b"b");
         let mut fast = dist::NativePlacement::default();
-        fast.transfer.download_bytes_per_second = 100_000_000;
-        fast.transfer.raw_request_nanoseconds = 0;
+        fast.timing.transfer.download_bytes_per_second = 100_000_000;
+        fast.timing.transfer.raw_request_nanoseconds = 0;
         let mut slow = fast.clone();
-        slow.transfer.download_bytes_per_second = 1_000_000;
+        slow.timing.transfer.download_bytes_per_second = 1_000_000;
         let inputs = BTreeMap::from([(a, 100_000_000), (b, 1_000_000)]);
         let empty = HashMap::new();
         let network = NetworkSnapshot::default();
@@ -2760,6 +2771,100 @@ mod scheduler_tests {
     }
 
     #[test]
+    fn native_completed_timing_supersedes_heartbeat_until_worker_restart() -> Result<()> {
+        use sccache::build_runtime::{
+            ContentId, ResultManifest,
+            wire::{ActionObservation, WorkerTiming},
+        };
+        let scheduler = Scheduler::new();
+        let worker: ServerId = "127.0.0.1:10501".parse()?;
+        let platform = ContentId::of(b"timing-platform");
+        let nonce = ServerNonce::new();
+        let capabilities = dist::WorkerCapabilities {
+            archive: false,
+            native_platform: Some(platform),
+            native_placement: Some(dist::NativePlacement::default()),
+        };
+        let heartbeat = |nonce, caps, active: &[JobId]| {
+            scheduler.handle_heartbeat_server(
+                worker,
+                nonce,
+                4.0,
+                active,
+                Box::new(TestJobAuthorizer),
+                caps,
+            )
+        };
+        heartbeat(nonce.clone(), capabilities.clone(), &[])?;
+        let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_native_job(
+            &AcceptAssign,
+            native_test_assignment(platform, BTreeMap::new())?,
+            &NetworkSnapshot::default(),
+            Default::default(),
+        )?
+        else {
+            bail!("worker unavailable");
+        };
+        let id = job_alloc.job_id;
+        let timing = WorkerTiming {
+            revision: 7,
+            execution_nanoseconds: 50_000_000,
+            ..Default::default()
+        };
+        let manifest = ResultManifest {
+            outputs: BTreeMap::new(),
+            stdout: None,
+            stderr: None,
+        };
+        let observation = ActionObservation {
+            worker_timing: Some(timing),
+            warm_staging_nanoseconds: None,
+            publication_setup_nanoseconds: None,
+            execution_nanoseconds: 50_000_000,
+            upload_bytes: 0,
+            upload_requests: 0,
+            upload_nanoseconds: 0,
+        };
+        scheduler.observe_native_lifecycle(worker, id, dist::NativeLifecycleEvent::Negotiated);
+        scheduler.observe_native_lifecycle(
+            worker,
+            id,
+            dist::NativeLifecycleEvent::Committed {
+                manifest: &manifest,
+                retained_after_begin: Duration::ZERO,
+                observation: Some(observation),
+            },
+        );
+        let current = || {
+            scheduler.servers.lock().unwrap()[&worker]
+                .capabilities
+                .native_placement
+                .as_ref()
+                .unwrap()
+                .timing
+        };
+        assert_eq!(current(), timing);
+        heartbeat(nonce.clone(), capabilities.clone(), &[id])?;
+        assert_eq!(current(), timing);
+        let mut newer = capabilities.clone();
+        let fresh = WorkerTiming {
+            revision: 8,
+            execution_nanoseconds: 60_000_000,
+            ..timing
+        };
+        newer
+            .native_placement
+            .as_mut()
+            .context("missing worker placement")?
+            .timing = fresh;
+        heartbeat(nonce, newer, &[id])?;
+        assert_eq!(current(), fresh);
+        heartbeat(ServerNonce::new(), capabilities, &[])?;
+        assert_eq!(current(), WorkerTiming::default());
+        Ok(())
+    }
+
+    #[test]
     fn native_producer_receipt_places_consumer_before_next_heartbeat() -> Result<()> {
         use sccache::build_runtime::{Artifact, BlobRef, ContentId, ResultManifest};
         let scheduler = Scheduler::new();
@@ -2777,7 +2882,10 @@ mod scheduler_tests {
                     archive: false,
                     native_platform: Some(platform),
                     native_placement: Some(dist::NativePlacement {
-                        execution_nanoseconds,
+                        timing: sccache::build_runtime::wire::WorkerTiming {
+                            execution_nanoseconds,
+                            ..Default::default()
+                        },
                         ..Default::default()
                     }),
                 },

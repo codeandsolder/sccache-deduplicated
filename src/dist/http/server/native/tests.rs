@@ -452,8 +452,7 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
             max_result_bytes: 1024,
         };
         let transport = crate::dist::native::PackageTransportTracker::new(
-            crate::build_runtime::PackageTransferCost::default(),
-            crate::build_runtime::ResultTransferEstimate::default(),
+            crate::build_runtime::wire::WorkerTiming::default(),
         )?;
         let execution_queue =
             crate::dist::execution_queue::ExecutionQueue::new(std::num::NonZeroUsize::MIN);
