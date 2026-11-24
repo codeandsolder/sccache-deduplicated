@@ -2,7 +2,10 @@
 //! exact input identities already reserved by the scheduler.
 
 use sccache::{
-    build_runtime::{ContentId, PackageTransferCost, transfer_seconds, wire::NativeJobPhase},
+    build_runtime::{
+        ContentId, PackageCatalog, PackageDeliveryLimits, PackageTransferCost, transfer_seconds,
+        wire::NativeJobPhase,
+    },
     dist::{JobId, NativeInputBlobs, NativeJobProgress, NativePlacement},
 };
 use std::{
@@ -11,7 +14,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{ActionCost, AssignedNative, RecentResidency};
+use super::{
+    ActionCost, AssignedNative, RecentResidency,
+    delivery::{Delivery, DeliveryRates, InputTraffic},
+};
 
 pub(super) type Assignments = HashMap<JobId, Option<AssignedNative>>;
 
@@ -96,9 +102,10 @@ struct StagingTimeline<'a> {
     // Unique logical bytes consume one aggregate worker delivery resource.
     // Request setup can overlap with the next independent byte transfer.
     wire_free: Duration,
-    logical_rate: u64,
-    contention: f64,
+    rates: DeliveryRates,
     cost: PackageTransferCost,
+    limits: Option<PackageDeliveryLimits>,
+    traffic: InputTraffic,
     residency: WorkerResidency<'a>,
     future: HashMap<ContentId, Duration>,
 }
@@ -108,12 +115,13 @@ impl StagingTimeline<'_> {
         &mut self,
         inputs: Option<&NativeInputBlobs>,
         progress: Option<&NativeJobProgress>,
+        catalog: Option<&PackageCatalog>,
     ) -> Duration {
         let start = self.slots.available();
         let mut dependency = start;
         let mut bytes = 0_u128;
         let mut requests = 0_u64;
-        let mut new = Vec::new();
+        let mut new = NativeInputBlobs::new();
         for (&id, &size) in inputs.into_iter().flat_map(|inputs| inputs.iter()) {
             if self.residency.contains(id, size) {
                 continue;
@@ -121,11 +129,13 @@ impl StagingTimeline<'_> {
             if let Some(&ready) = self.future.get(&id) {
                 dependency = dependency.max(ready);
             } else {
-                new.push(id);
+                new.insert(id, size);
                 bytes += u128::from(size);
                 requests = requests.saturating_add(1);
             }
         }
+        let exact_bytes = bytes;
+        let exact_requests = requests;
         if let Some(progress) = progress {
             // The last verified remainder can still include blobs supplied by
             // another reservation since it was measured. Never add a second
@@ -139,21 +149,28 @@ impl StagingTimeline<'_> {
                 requests = progress.remaining_input_blobs;
             }
         }
-        let wire_done = if bytes == 0 {
+        let delivery = if bytes == exact_bytes
+            && requests == exact_requests
+            && self.limits.is_some()
+            && catalog.is_some_and(|catalog| !catalog.is_empty())
+        {
+            Delivery::plan(new.clone(), catalog, self.limits, self.cost, self.rates)
+        } else {
+            // Progress counts cannot identify which digests remain. Do not
+            // invent a smaller package cover for this partial closure.
+            Delivery::raw(bytes, requests, self.cost, self.rates)
+        };
+        self.traffic.extend(delivery.traffic);
+        let wire_done = if delivery.traffic.wire_bytes == 0 {
             start
         } else {
             self.wire_free = self.wire_free.max(start).saturating_add(duration(
-                transfer_seconds(bytes, self.logical_rate) * self.contention,
+                delivery.traffic.wire_time.as_secs_f64() * self.rates.contention,
             ));
             self.wire_free
         };
-        let overhead = Duration::from_nanos(
-            requests
-                .div_ceil(u64::from(self.cost.raw_parallelism))
-                .saturating_mul(self.cost.raw_request_nanoseconds),
-        );
-        let ready = dependency.max(wire_done.saturating_add(overhead));
-        for id in new {
+        let ready = dependency.max(wire_done.saturating_add(delivery.processing));
+        for id in new.into_keys() {
             self.future.insert(id, ready);
         }
         self.slots.reserve(ready, Duration::ZERO)
@@ -312,12 +329,17 @@ impl Pipeline {
 
 /// Predict when the new action can start publishing, not merely when a
 /// nominal count of outstanding jobs would clear a compiler semaphore.
-pub(super) fn publication_start(
+pub(super) struct PipelineForecast {
+    pub ready_at: f64,
+    pub traffic: InputTraffic,
+}
+
+pub(super) fn publication_forecast(
     forecast: super::WorkerForecast<'_>,
     requested: &NativeInputBlobs,
-    logical_rate: u64,
-    contention: f64,
-) -> f64 {
+    catalog: Option<&PackageCatalog>,
+    rates: DeliveryRates,
+) -> PipelineForecast {
     let super::WorkerForecast {
         capacity,
         assigned,
@@ -395,22 +417,30 @@ pub(super) fn publication_start(
     let mut timeline = StagingTimeline {
         slots: Slots::new(placement.queue.staging_slots, jobs),
         wire_free: Duration::ZERO,
-        logical_rate,
-        contention,
+        rates,
         cost: placement.transfer,
+        limits: placement.package_limits,
+        traffic: InputTraffic::default(),
         residency: WorkerResidency::new(assigned, placement, recent),
         future: HashMap::new(),
     };
     for job in staging {
-        let ready = timeline.stage(job.inputs.map(|job| &job.inputs), job.progress);
+        let ready = timeline.stage(
+            job.inputs.map(|job| &job.inputs),
+            job.progress,
+            job.inputs.map(|job| job.packages.as_ref()),
+        );
         let (execution, output) = pipeline.service(job.inputs.and_then(|job| job.cost), placement);
         pipeline
             .ready
             .push((ready, false, job.id, true, execution, output));
     }
-    let ready = timeline.stage(Some(requested), None);
+    let ready = timeline.stage(Some(requested), None, catalog);
     let (execution, output) = pipeline.service(Some(cost), placement);
-    pipeline.finish(ready, execution, output).as_secs_f64()
+    PipelineForecast {
+        ready_at: pipeline.finish(ready, execution, output).as_secs_f64(),
+        traffic: timeline.traffic,
+    }
 }
 
 #[cfg(test)]

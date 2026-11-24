@@ -1007,6 +1007,37 @@ percentage error), learned versus host-prior execution/upload prediction
 errors and the predicted score gap to the best eligible candidate. Unmatched
 assignments are not counted as compiler failures or as zero-duration jobs.
 
+### Package-aware input staging forecasts
+
+The scheduler queries the verified original-package reverse content index
+once per admitted action. The bounded advisory catalog retains at most
+256 candidates and 262,144 coverage references, plus the covered digest
+memberships in the actual admitted input-tree order. It does not reserve or
+transfer any originals. Excessively large or unavailable catalogs fall back
+to the raw-blob forecast. Each queued assignment retains its catalog for
+future staging forecasts.
+
+Heartbeat protocol v3 advertises the worker's reconstruction limits.
+Placement and real package negotiation share the same positive-savings
+greedy archive selector. For each new input closure the forecast removes
+resident and previously scheduled digests, chooses covering archives per
+input tree, and counts uncovered raw payload only once. It never subtracts
+raw transfers needed by an earlier tree merely because a later archive
+contains the same content. Each selected archive contributes its full
+compressed wire size and complete decoder/entry/startup service, even
+when only a subset of its files is needed. Worker decoder parallelism
+bounds the expansion service approximation. Partial progress without
+exact remaining identities uses the raw remainder instead.
+
+The shared-link model uses encoded raw bytes plus actual compressed archive
+bytes, not uncompressed expansion bytes. Trace records distinguish
+missing_input_union_bytes, input_wire_bytes and archive_bytes. All wire
+transfers remain real workload demands; optional placement exploration
+is skipped for archive-bearing forecasts until exact package-aware
+extra-traffic proofs are available. Actual reconstruction still validates
+limits, content and availability and may fall back to raw delivery.
+Catalogs and forecasts are advisory; no change to content identity.
+
 ### Directional shared-network estimation
 
 The native cache listener meters encoded HTTP payload bytes before delivery

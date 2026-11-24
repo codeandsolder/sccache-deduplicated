@@ -36,6 +36,7 @@ mod network;
 pub(super) type Allocator = dyn Fn(
         crate::dist::NativeAssignment,
         &crate::build_runtime::NetworkSnapshot,
+        std::sync::Arc<crate::build_runtime::PackageCatalog>,
     ) -> Result<ScheduleReply>
     + Send
     + Sync;
@@ -120,6 +121,7 @@ pub(super) fn spawn(
     allocate: impl Fn(
         crate::dist::NativeAssignment,
         &crate::build_runtime::NetworkSnapshot,
+        std::sync::Arc<crate::build_runtime::PackageCatalog>,
     ) -> Result<ScheduleReply>
     + Send
     + Sync
@@ -611,7 +613,20 @@ fn dispatch(
             let ExecutionRequest { ticket, spec } = metadata(request, limit)?;
             let request = spec.action_request()?;
             encode(
-                &sessions.schedule(ticket, &request, |inputs| {
+                &sessions.schedule(ticket, &request, |inputs, trees| {
+                    let blobs = inputs
+                        .iter()
+                        .map(|(&id, &size)| BlobRef { id, size })
+                        .collect::<Vec<_>>();
+                    let mut packages =
+                        sessions
+                            .store()
+                            .package_catalog(&blobs)
+                            .unwrap_or_else(|error| {
+                                warn!("Native package placement catalog unavailable: {error:#}");
+                                crate::build_runtime::PackageCatalog::default()
+                            });
+                    packages.restrict_to_trees(trees);
                     let snapshot = network.snapshot();
                     allocate(
                         crate::dist::NativeAssignment {
@@ -621,6 +636,7 @@ fn dispatch(
                             estimated_result_bytes: None,
                         },
                         &snapshot,
+                        std::sync::Arc::new(packages),
                     )
                 })?,
                 limit,

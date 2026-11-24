@@ -156,7 +156,17 @@ impl NativeWorker {
             .placement
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        cache.refresh(&self.store, timing, queue)
+        let mut placement = cache.refresh(&self.store, timing, queue);
+        drop(cache);
+        placement.package_limits =
+            self.package_import
+                .map(|limits| sccache::build_runtime::PackageDeliveryLimits {
+                    max_archive_bytes: limits.max_archive_bytes,
+                    max_expanded_bytes: limits.max_expanded_bytes,
+                    max_entries: u64::try_from(limits.max_entries).unwrap_or(u64::MAX),
+                    parallelism: u32::try_from(limits.max_concurrent_imports.min(32)).unwrap_or(32),
+                });
+        placement
     }
 
     pub(super) fn transfer_parallelism(&self) -> usize {
@@ -308,6 +318,7 @@ impl PlacementCache {
             }
         }
         NativePlacement {
+            package_limits: None,
             residency: self
                 .inventory
                 .as_ref()

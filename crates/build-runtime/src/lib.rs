@@ -17,8 +17,8 @@ pub use network::{
 mod package;
 pub use installation::{InstallationManifest, InstallationRecipe, InstalledComponent};
 pub use package::{
-    ArchiveLength, PackageArchive, PackageCompression, PackageIdentity, PackageReceipt,
-    PackageSource, PackageTransferCost,
+    ArchiveLength, PackageArchive, PackageCatalog, PackageCompression, PackageDeliveryLimits,
+    PackageIdentity, PackageReceipt, PackageSource, PackageTransferCost,
 };
 mod recipe;
 mod residency;

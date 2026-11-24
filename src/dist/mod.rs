@@ -1111,6 +1111,7 @@ impl Default for NativeQueueSnapshot {
 #[cfg(feature = "dist-server")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativePlacement {
+    pub package_limits: Option<crate::build_runtime::PackageDeliveryLimits>,
     pub residency: Option<crate::build_runtime::BlobResidency>,
     pub transfer: crate::build_runtime::PackageTransferCost,
     pub execution_nanoseconds: u64,
@@ -1122,6 +1123,7 @@ pub struct NativePlacement {
 impl Default for NativePlacement {
     fn default() -> Self {
         Self {
+            package_limits: None,
             residency: None,
             transfer: crate::build_runtime::PackageTransferCost::default(),
             execution_nanoseconds: 1_000_000_000,
@@ -1179,6 +1181,7 @@ pub trait SchedulerIncoming: Send + Sync {
         requester: &dyn SchedulerOutgoing,
         assignment: NativeAssignment,
         network: &crate::build_runtime::NetworkSnapshot,
+        packages: std::sync::Arc<crate::build_runtime::PackageCatalog>,
     ) -> ExtResult<AllocJobResult, Error>;
     /// Select likely sources for a missing exact blob without allocating a job.
     fn native_blob_sources(

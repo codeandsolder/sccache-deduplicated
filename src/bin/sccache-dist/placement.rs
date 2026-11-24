@@ -2,6 +2,8 @@
 //! directional shared-link observations.
 use super::ServerDetails;
 mod cost;
+mod delivery;
+use delivery::{DeliveryRates, InputTraffic};
 mod exploration;
 pub(super) use cost::{
     ActionClass, ActionCost, AssignedNative, CostBook, WorkerScope, start_checkpoint,
@@ -14,8 +16,8 @@ pub(super) use exploration::{Exploration, choose_worker};
 pub(super) use retained::RecentResidency;
 use sccache::{
     build_runtime::{
-        DirectionSnapshot, NetworkSnapshot, Peer, ResultTransferEstimate, TransferDemand,
-        transfer_seconds,
+        DirectionSnapshot, NetworkSnapshot, PackageCatalog, Peer, ResultTransferEstimate,
+        TransferDemand, transfer_seconds,
     },
     dist::{self, ServerId},
 };
@@ -66,6 +68,7 @@ fn native_missing_inputs(
 }
 
 pub(super) struct NativeTransferPlan<'a> {
+    packages: Option<&'a PackageCatalog>,
     send: &'a DirectionSnapshot,
     receive: &'a DirectionSnapshot,
     send_demands: BTreeMap<Peer, TransferDemand>,
@@ -119,6 +122,7 @@ impl<'a> NativeTransferPlan<'a> {
     pub(super) fn new(
         network: &'a NetworkSnapshot,
         servers: &HashMap<ServerId, ServerDetails>,
+        packages: Option<&'a PackageCatalog>,
     ) -> Self {
         let mut send_demands = active_demands(&network.send);
         // Other workers' predicted input closures are only needed if they can
@@ -127,19 +131,19 @@ impl<'a> NativeTransferPlan<'a> {
             for (&id, details) in servers {
                 if let Some(placement) = &details.capabilities.native_placement {
                     let peer = Peer::Worker(id.addr());
-                    let (bytes, _) = native_missing_inputs(
-                        &details.jobs_assigned,
-                        placement,
-                        &details.recent_residency,
+                    let Some(forecast) = WorkerForecast::new(details, None) else {
+                        continue;
+                    };
+                    let rates = DeliveryRates::new(&network.send, peer, placement.transfer);
+                    let traffic = pipeline::publication_forecast(
+                        forecast,
+                        &dist::NativeInputBlobs::new(),
                         None,
-                    );
-                    let demand = Self::input_demand(
-                        &network.send,
-                        peer,
-                        bytes,
-                        placement.transfer.download_bytes_per_second,
-                    );
-                    if demand.bytes > 0 {
+                        rates,
+                    )
+                    .traffic;
+                    if traffic.wire_bytes > 0 {
+                        let demand = Self::input_demand(&network.send, peer, traffic);
                         send_demands.insert(peer, demand);
                     }
                 }
@@ -147,6 +151,7 @@ impl<'a> NativeTransferPlan<'a> {
         }
         let send_baseline = network.send.finish_times(&send_demands);
         Self {
+            packages,
             send: &network.send,
             receive: &network.receive,
             send_demands,
@@ -158,16 +163,14 @@ impl<'a> NativeTransferPlan<'a> {
     fn input_demand(
         network: &DirectionSnapshot,
         peer: Peer,
-        logical: u128,
-        logical_rate: u64,
+        traffic: InputTraffic,
     ) -> TransferDemand {
-        let bytes = network.wire_bytes(peer, logical);
+        let bytes = traffic.wire_bytes;
         let active = network
             .peers
             .get(&peer)
             .map_or(0, |capacity| capacity.active_remaining_bytes);
-        let fallback =
-            u64::try_from(network.wire_bytes(peer, u128::from(logical_rate))).unwrap_or(u64::MAX);
+        let fallback = traffic.effective_rate();
         TransferDemand {
             // Active worker input bytes already belong to the reserved input union.
             bytes: bytes.max(u128::from(active)),
@@ -175,11 +178,11 @@ impl<'a> NativeTransferPlan<'a> {
         }
     }
 
-    fn input_completion(&self, peer: Peer, logical: u128, logical_rate: u64) -> (f64, f64) {
-        if logical == 0 {
+    fn input_completion(&self, peer: Peer, traffic: InputTraffic) -> (f64, f64) {
+        if traffic.wire_bytes == 0 {
             return (0.0, 0.0);
         }
-        let demand = Self::input_demand(self.send, peer, logical, logical_rate);
+        let demand = Self::input_demand(self.send, peer, traffic);
         marginal_completion(
             self.send,
             &self.send_demands,
@@ -218,6 +221,8 @@ pub(super) struct PlacementEstimate {
     pub(super) seconds: f64,
     pub(super) completion_seconds: f64,
     missing_input_union_bytes: u128,
+    input_wire_bytes: u128,
+    pub(super) archive_bytes: u128,
     ready_at: f64,
     pub(super) cost: ActionCost,
 }
@@ -261,28 +266,20 @@ pub(super) fn native_estimate(
         ..
     } = forecast;
     let (bytes, _) = native_missing_inputs(assigned, placement, recent, Some(requested));
-    let cost = placement.transfer;
-    let (network, externality) = plan.input_completion(peer, bytes, cost.download_bytes_per_second);
-    let logical_rate = plan.send.logical_rate(peer, cost.download_bytes_per_second);
-    // A warm candidate adds no network traffic but existing staging still
-    // consumes the worker's aggregate link. Use the baseline contention for it.
-    let (backlog, network_time) = if bytes == 0 {
-        let (backlog, _) = native_missing_inputs(assigned, placement, recent, None);
-        (
-            backlog,
-            plan.input_completion(peer, backlog, cost.download_bytes_per_second)
-                .0,
-        )
+    let mut rates = DeliveryRates::new(plan.send, peer, placement.transfer);
+    let initial = pipeline::publication_forecast(forecast, requested, plan.packages, rates);
+    let (network, externality) = plan.input_completion(peer, initial.traffic);
+    let unconstrained = initial.traffic.wire_time.as_secs_f64();
+    if unconstrained > 0.0 {
+        rates.contention = (network / unconstrained).max(1.0);
+    }
+    let ready_at = if rates.contention > 1.0 {
+        pipeline::publication_forecast(forecast, requested, plan.packages, rates).ready_at
     } else {
-        (bytes, network)
+        initial.ready_at
     };
-    let unconstrained = transfer_seconds(backlog, logical_rate);
-    let contention = if unconstrained > 0.0 {
-        (network_time / unconstrained).max(1.0)
-    } else {
-        1.0
-    };
-    let ready_at = pipeline::publication_start(forecast, requested, logical_rate, contention);
+    // Already resident candidates do not increase the existing backlog.
+    let externality = if bytes == 0 { 0.0 } else { externality };
     let result = action.result(placement.result);
     let (output_network, output_externality) = plan.result_completion(peer, ready_at, result);
     let output_processing =
@@ -298,6 +295,8 @@ pub(super) fn native_estimate(
         ready_at,
         completion_seconds,
         missing_input_union_bytes: bytes,
+        input_wire_bytes: initial.traffic.wire_bytes,
+        archive_bytes: initial.traffic.archive_bytes,
         cost: action,
         seconds: completion_seconds + externality + output_externality,
     }
@@ -341,20 +340,44 @@ mod tests {
             send: constrained(a, b),
             receive: DirectionSnapshot::default(),
         };
-        let plan = NativeTransferPlan::new(&network, &HashMap::new());
+        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None);
         assert_eq!(
-            plan.input_completion(a, 100_000_000, 100_000_000),
+            plan.input_completion(
+                a,
+                InputTraffic {
+                    wire_bytes: 100_000_000,
+                    archive_bytes: 0,
+                    wire_time: Duration::from_secs(1)
+                }
+            ),
             (1.0, 0.0)
         );
         assert_eq!(
-            plan.input_completion(b, 100_000_000, 100_000_000),
+            plan.input_completion(
+                b,
+                InputTraffic {
+                    wire_bytes: 100_000_000,
+                    archive_bytes: 0,
+                    wire_time: Duration::from_secs(1)
+                }
+            ),
             (2.0, 1.0)
         );
         assert_eq!(
-            plan.input_completion(c, 100_000_000, 100_000_000),
+            plan.input_completion(
+                c,
+                InputTraffic {
+                    wire_bytes: 100_000_000,
+                    archive_bytes: 0,
+                    wire_time: Duration::from_secs(1)
+                }
+            ),
             (1.0, 0.0)
         );
-        assert_eq!(plan.input_completion(b, 0, 100_000_000), (0.0, 0.0));
+        assert_eq!(
+            plan.input_completion(b, InputTraffic::default()),
+            (0.0, 0.0)
+        );
     }
 
     #[test]
@@ -365,7 +388,7 @@ mod tests {
             send: DirectionSnapshot::default(),
             receive: constrained(a, b),
         };
-        let plan = NativeTransferPlan::new(&network, &HashMap::new());
+        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None);
         let result = ResultTransferEstimate {
             expected_bytes: 100_000_000,
             bytes_per_second: 100_000_000,

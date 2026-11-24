@@ -129,7 +129,7 @@ fn with_native_service(
                         observations.lock().unwrap().push((server, job, result));
                     },
                 },
-                &move |_, _| {
+                &move |_, _, _| {
                     Ok(ScheduleReply::Assigned(WorkerAllocation {
                         address: worker.addr(),
                         job: 42,

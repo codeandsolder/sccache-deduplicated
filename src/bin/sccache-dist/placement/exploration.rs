@@ -223,6 +223,12 @@ pub(crate) fn choose_worker(
         left.total_cmp(right).then_with(|| a.addr().cmp(&b.addr()))
     })?;
     let limit = best_eta + (best_eta * 0.01).min(0.020);
+    if predictions
+        .values()
+        .any(|prediction| prediction.archive_bytes > 0)
+    {
+        return Some(best);
+    }
     if !candidates
         .iter()
         .any(|(id, eta)| *id != best && *eta <= limit)

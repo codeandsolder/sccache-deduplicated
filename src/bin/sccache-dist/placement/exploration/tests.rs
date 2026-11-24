@@ -68,7 +68,7 @@ fn native_exploration_prefers_a_real_near_equivalent_unanswered_overlap_once() -
     }
     let servers = scheduler.servers.lock().unwrap();
     let network = network();
-    let plan = NativeTransferPlan::new(&network, &servers);
+    let plan = NativeTransferPlan::new(&network, &servers, None);
     let mut history = Exploration::default();
     let now = Instant::now();
     let options = [(id(1), 3.0), (id(2), 3.01)];
@@ -131,7 +131,7 @@ fn native_exploration_never_increases_required_payload_or_exceeds_eta_budget() -
     let options = [(id(1), 3.0), (id(2), 3.01)];
     {
         let servers = scheduler.servers.lock().unwrap();
-        let plan = NativeTransferPlan::new(&network, &servers);
+        let plan = NativeTransferPlan::new(&network, &servers, None);
         assert_eq!(
             choose_worker(
                 &options,
@@ -147,7 +147,7 @@ fn native_exploration_never_increases_required_payload_or_exceeds_eta_budget() -
     }
     register(&scheduler, id(1), dist::NativePlacement::default())?;
     let servers = scheduler.servers.lock().unwrap();
-    let plan = NativeTransferPlan::new(&network, &servers);
+    let plan = NativeTransferPlan::new(&network, &servers, None);
     assert_eq!(
         choose_worker(
             &[(id(1), 3.0), (id(2), 3.03)],
@@ -179,7 +179,7 @@ fn native_exploration_skips_answered_or_unmeasurable_overlap() -> anyhow::Result
         rates: BTreeMap::from([(peer(1), 100_000_000), (peer(2), 100_000_000)]),
     });
     {
-        let plan = NativeTransferPlan::new(&network, &servers);
+        let plan = NativeTransferPlan::new(&network, &servers, None);
         assert_eq!(
             choose_worker(
                 &options,
@@ -199,7 +199,7 @@ fn native_exploration_skips_answered_or_unmeasurable_overlap() -> anyhow::Result
         bytes_per_second: 100_000_000,
     });
     {
-        let plan = NativeTransferPlan::new(&network, &servers);
+        let plan = NativeTransferPlan::new(&network, &servers, None);
         assert_eq!(
             choose_worker(
                 &options,
@@ -220,7 +220,7 @@ fn native_exploration_skips_answered_or_unmeasurable_overlap() -> anyhow::Result
         .get_mut(&peer(1))
         .unwrap()
         .active_remaining_bytes = 0;
-    let plan = NativeTransferPlan::new(&network, &servers);
+    let plan = NativeTransferPlan::new(&network, &servers, None);
     assert_eq!(
         choose_worker(
             &options,

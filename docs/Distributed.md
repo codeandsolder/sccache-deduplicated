@@ -82,7 +82,7 @@ The HTTP implementation of sccache has the following API, where all HTTP body co
       - Called by a client to retrieve the (dynamically created) HTTPS
         certificate for a server, for use in communication with that server.
       - Returns a digest and PEM for the temporary server HTTPS certificate.
-   - `POST /api/v2/scheduler/heartbeat_server`
+   - `POST /api/v3/scheduler/heartbeat_server`
       - Called (repeatedly) by servers to register as available for jobs.
       - Every five seconds, advertises fractional effective CPU capacity from
         host idle CPU time plus the worker's currently executing jobs (capped

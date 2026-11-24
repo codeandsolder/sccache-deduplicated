@@ -1045,7 +1045,7 @@ fn provision_compressed_fixture(
     Ok(receipt)
 }
 
-fn verify_learned_placement_trace(log: &Path) -> Result<()> {
+fn verify_learned_placement_trace(log: &Path, expected_archive_bytes: u64) -> Result<()> {
     let contents = fs::read_to_string(log)?;
     let mut assignments = BTreeMap::new();
     let mut completed = Vec::new();
@@ -1067,6 +1067,19 @@ fn verify_learned_placement_trace(log: &Path) -> Result<()> {
         }
     }
     assert_eq!(completed.len(), 6);
+    let cold = completed.first().context("missing cold completion")?;
+    let id = cold["job"].as_u64().context("missing cold job")?;
+    let worker = cold["worker"].as_str().context("missing worker address")?;
+    let forecast = &assignments.get(&id).context("missing cold allocation")?["candidates"][worker];
+    assert_eq!(forecast["archive_bytes"], expected_archive_bytes);
+    assert!(
+        forecast["input_wire_bytes"]
+            .as_u64()
+            .context("missing wire forecast")?
+            < forecast["missing_input_union_bytes"]
+                .as_u64()
+                .context("missing logical forecast")?
+    );
     let class = completed.last().context("no successful worker actions")?["class"].clone();
     let repeated = completed
         .iter()
@@ -1088,6 +1101,8 @@ fn verify_learned_placement_trace(log: &Path) -> Result<()> {
             assignment["candidates"][worker]["missing_input_union_bytes"], 0,
             "warm closure must be recognized before the next heartbeat"
         );
+        assert_eq!(assignment["candidates"][worker]["input_wire_bytes"], 0);
+        assert_eq!(assignment["candidates"][worker]["archive_bytes"], 0);
         assert!(
             value["actual_seconds"]
                 .as_f64()
@@ -1463,7 +1478,10 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let worker_directory = fleet.worker_directory.clone();
     let scheduler_log = fleet.scheduler.log.clone();
     let (scheduler_stats, worker_stats) = fleet.finish()?;
-    verify_learned_placement_trace(&scheduler_log)?;
+    verify_learned_placement_trace(
+        &scheduler_log,
+        packages.iter().map(|package| package.source.size).sum(),
+    )?;
     let store = NativeStore::open(&worker_directory)?;
     let policy = sccache::build_runtime::PackagePolicy::normalized_archive(
         100000,

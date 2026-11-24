@@ -261,11 +261,11 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     };
     let expected = ScheduleReply::Assigned(allocation);
     assert_eq!(
-        service.schedule(ticket, &request()?, |_| Ok(expected.clone()))?,
+        service.schedule(ticket, &request()?, |_, _| Ok(expected.clone()))?,
         expected
     );
     assert_eq!(
-        service.schedule(ticket, &request()?, |_| bail!("duplicate allocation"))?,
+        service.schedule(ticket, &request()?, |_, _| bail!("duplicate allocation"))?,
         expected
     );
     assert!(service.renew(ticket, Publisher::Client).is_err());
@@ -273,7 +273,7 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     changed.required_outputs.insert("other".into());
     assert!(
         service
-            .schedule(ticket, &changed, |_| bail!("wrong declaration"))
+            .schedule(ticket, &changed, |_, _| bail!("wrong declaration"))
             .is_err()
     );
     service.renew(
@@ -294,7 +294,7 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     let result = manifest(b"object");
     let missing = service.begin(ticket, publisher, result.clone())?.missing;
     assert_eq!(
-        service.schedule(ticket, &request()?, |_| bail!("duplicate assignment"))?,
+        service.schedule(ticket, &request()?, |_, _| bail!("duplicate assignment"))?,
         expected
     );
     assert_eq!(missing.len(), 1);
@@ -302,14 +302,14 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     assert_eq!(service.commit(ticket, publisher)?, result);
     // A worker can finish while the original schedule response is lost.
     assert_eq!(
-        service.schedule(ticket, &request()?, |_| bail!(
+        service.schedule(ticket, &request()?, |_, _| bail!(
             "duplicate assignment after commit"
         ))?,
         expected
     );
     assert!(
         service
-            .schedule(ticket, &changed, |_| bail!(
+            .schedule(ticket, &changed, |_, _| bail!(
                 "wrong declaration after commit"
             ))
             .is_err()
@@ -330,12 +330,12 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
         bail!("expected second compilation");
     };
     assert_eq!(
-        service.schedule(ticket, &failed, |_| Ok(expected.clone()))?,
+        service.schedule(ticket, &failed, |_, _| Ok(expected.clone()))?,
         expected
     );
     service.fail(ticket, publisher)?;
     assert_eq!(
-        service.schedule(ticket, &failed, |_| bail!(
+        service.schedule(ticket, &failed, |_, _| bail!(
             "duplicate assignment after failure"
         ))?,
         expected
@@ -393,7 +393,7 @@ fn delegation_blocks_early_worker_verification_until_assignment_returns() -> Res
                 done.send(service.verify_execution(ticket, publisher, action))?;
                 Ok(())
             });
-            let reply = service.schedule(ticket, action, |_| {
+            let reply = service.schedule(ticket, action, |_, _| {
                 start.send(())?;
                 attempt_rx.recv_timeout(Duration::from_secs(5))?;
                 // The action mutex is still held while assignment returns.

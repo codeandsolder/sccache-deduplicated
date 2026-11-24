@@ -7,42 +7,37 @@ use redb::ReadableDatabase;
 
 use super::{PackageArchiveLease, PackageRecord};
 use crate::store::{BLOB_PACKAGES, PACKAGES, encoding};
-use crate::{BlobRef, ContentId, NativeStore, PackageArchive, PackageTransferCost};
-
-struct Candidate {
-    archive: PackageArchive,
-    covers: BTreeSet<ContentId>,
-}
+use crate::{
+    BlobRef, ContentId, NativeStore, PackageCatalog, PackageTransferCost, package::Candidate,
+};
 
 impl NativeStore {
-    /// Select retained original archives that reduce the remaining raw
-    /// transfer. Coverage is counted only once, even across overlapping
-    /// packages; each selected original remains pinned until delivery ends.
-    ///
+    /// Snapshot bounded original coverage for placement without pinning archives.
     /// # Errors
-    /// Returns an error for inconsistent index metadata or unavailable content.
-    pub fn plan_package_downloads(
+    /// Returns an error for inconsistent package index metadata.
+    pub fn package_catalog(&self, missing: &[BlobRef]) -> Result<PackageCatalog> {
+        self.discover_packages(missing, u64::MAX, true)
+    }
+
+    fn discover_packages(
         &self,
         missing: &[BlobRef],
-        maximum: usize,
         max_archive_bytes: u64,
-        cost: PackageTransferCost,
-    ) -> Result<Vec<PackageArchiveLease>> {
-        cost.validate()?;
-        let mut remaining: BTreeMap<_, _> =
-            missing.iter().map(|blob| (blob.id, blob.size)).collect();
-        ensure!(
-            remaining.len() == missing.len(),
-            "duplicate requested package content"
-        );
+        bounded: bool,
+    ) -> Result<PackageCatalog> {
         let mut candidates = BTreeMap::<ContentId, Candidate>::new();
         {
             let read = self.inner.db.begin_read()?;
             let reverse = read.open_multimap_table(BLOB_PACKAGES)?;
             let packages = read.open_table(PACKAGES)?;
             let mut oversized = BTreeSet::new();
+            let mut visits = 0_usize;
             for blob in missing {
                 for key in reverse.get(&blob.id.0)? {
+                    visits = visits.saturating_add(1);
+                    if bounded && (visits > 262_144 || candidates.len() >= 256) {
+                        return Ok(PackageCatalog::default());
+                    }
                     let key = ContentId(*key?.value());
                     if let Some(candidate) = candidates.get_mut(&key) {
                         candidate.covers.insert(blob.id);
@@ -70,24 +65,40 @@ impl NativeStore {
                 }
             }
         }
+        Ok(PackageCatalog {
+            candidates,
+            ..Default::default()
+        })
+    }
+
+    /// Select retained original archives that reduce the remaining raw
+    /// transfer. Coverage is counted only once, even across overlapping
+    /// packages; each selected original remains pinned until delivery ends.
+    ///
+    /// # Errors
+    /// Returns an error for inconsistent index metadata or unavailable content.
+    pub fn plan_package_downloads(
+        &self,
+        missing: &[BlobRef],
+        maximum: usize,
+        max_archive_bytes: u64,
+        cost: PackageTransferCost,
+    ) -> Result<Vec<PackageArchiveLease>> {
+        cost.validate()?;
+        let mut remaining: BTreeMap<_, _> =
+            missing.iter().map(|blob| (blob.id, blob.size)).collect();
+        ensure!(
+            remaining.len() == missing.len(),
+            "duplicate requested package content"
+        );
+        let mut catalog = self.discover_packages(missing, max_archive_bytes, false)?;
         let mut selected = Vec::new();
         while selected.len() < maximum {
-            let best = candidates
-                .iter()
-                .filter_map(|(key, candidate)| {
-                    let (raw, files) = candidate
-                        .covers
-                        .iter()
-                        .filter_map(|id| remaining.get(id))
-                        .fold((0_u128, 0_usize), |(bytes, count), size| {
-                            (bytes + u128::from(*size), count + 1)
-                        });
-                    cost.predicted_savings_nanoseconds(raw, files, candidate.archive)
-                        .map(|saving| (saving, *key))
-                })
-                .max();
-            let Some((_, key)) = best else { break };
-            let candidate = candidates
+            let Some(key) = catalog.best(&remaining, &BTreeSet::new(), cost, |_| true) else {
+                break;
+            };
+            let candidate = catalog
+                .candidates
                 .remove(&key)
                 .context("selected package disappeared")?;
             // Candidate enumeration uses a read snapshot, not the store's

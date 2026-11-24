@@ -802,7 +802,10 @@ impl NativeSessions {
         &self,
         ticket: Ticket,
         request: &ActionRequest,
-        allocate: impl FnOnce(BTreeMap<ContentId, u64>) -> Result<ScheduleReply>,
+        allocate: impl FnOnce(
+            BTreeMap<ContentId, u64>,
+            Vec<&BTreeMap<ContentId, u64>>,
+        ) -> Result<ScheduleReply>,
     ) -> Result<ScheduleReply> {
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
@@ -846,7 +849,19 @@ impl NativeSessions {
                 );
             }
         }
-        let reply = allocate(blobs)?;
+        let trees = action
+            .request
+            .input_trees
+            .iter()
+            .map(|id| {
+                action
+                    .inputs
+                    .get(id)
+                    .map(|tree| &tree.blobs)
+                    .context("missing admitted input manifest")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let reply = allocate(blobs, trees)?;
         if let ScheduleReply::Assigned(allocation) = &reply {
             state.allocation = Some(DelegatedAllocation {
                 declaration,

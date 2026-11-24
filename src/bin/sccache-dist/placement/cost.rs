@@ -108,6 +108,7 @@ impl ActionCost {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AssignedNative {
+    pub packages: std::sync::Arc<sccache::build_runtime::PackageCatalog>,
     pub inputs: NativeInputBlobs,
     pub class: Option<ActionClass>,
     pub cost: Option<ActionCost>,

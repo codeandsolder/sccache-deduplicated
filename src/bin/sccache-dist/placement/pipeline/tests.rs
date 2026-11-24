@@ -10,6 +10,29 @@ fn progress(phase: NativeJobPhase, elapsed: Duration, remaining: u64) -> NativeJ
     }
 }
 
+fn publication_start(
+    forecast: super::super::WorkerForecast<'_>,
+    inputs: &NativeInputBlobs,
+    raw: u64,
+    contention: f64,
+) -> f64 {
+    publication_forecast(
+        forecast,
+        inputs,
+        None,
+        DeliveryRates {
+            raw,
+            archive: forecast
+                .placement
+                .transfer
+                .archive_download_bytes_per_second,
+            wire_per_mille: 1000,
+            contention,
+        },
+    )
+    .ready_at
+}
+
 fn placement() -> NativePlacement {
     let mut placement = NativePlacement {
         queue: NativeQueueSnapshot {
@@ -65,6 +88,7 @@ fn phase_assignments(
             (
                 id,
                 Some(AssignedNative {
+                    packages: Default::default(),
                     inputs: inputs.clone(),
                     class: None,
                     cost: None,
@@ -111,6 +135,7 @@ fn native_pipeline_waits_for_staging_slots_and_reuses_future_content() {
     let assigned = Assignments::from([(
         JobId(1),
         Some(AssignedNative {
+            packages: Default::default(),
             inputs: inputs.clone(),
             class: None,
             cost: None,
@@ -220,6 +245,7 @@ fn native_pipeline_uses_each_reservations_learned_service_time() {
     let assigned = Assignments::from([(
         JobId(1),
         Some(AssignedNative {
+            packages: Default::default(),
             inputs: inputs.clone(),
             class: None,
             cost: Some(large),

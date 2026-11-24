@@ -1057,6 +1057,7 @@ impl Scheduler {
         requester: &dyn SchedulerOutgoing,
         mut assignment: JobAssignment,
         network: &NetworkSnapshot,
+        packages: std::sync::Arc<sccache::build_runtime::PackageCatalog>,
     ) -> Result<AllocJobResult> {
         if self.is_draining() {
             return Ok(AllocJobResult::Fail {
@@ -1086,7 +1087,7 @@ impl Scheduler {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let transfer_plan = native_inputs
                 .as_ref()
-                .map(|_| NativeTransferPlan::new(network, &servers));
+                .map(|_| NativeTransferPlan::new(network, &servers, Some(&packages)));
             let res = {
                 let mut healthy = Vec::new();
                 let mut retry = Vec::new();
@@ -1206,6 +1207,7 @@ impl Scheduler {
                         }));
                     }
                     let assigned = native_inputs.map(|inputs| placement::AssignedNative {
+                        packages: std::sync::Arc::clone(&packages),
                         inputs: inputs.clone(),
                         class,
                         cost: predictions
@@ -1349,6 +1351,7 @@ impl SchedulerIncoming for Scheduler {
             requester,
             JobAssignment::Archive(tc),
             &NetworkSnapshot::default(),
+            Default::default(),
         )
     }
 
@@ -1357,12 +1360,14 @@ impl SchedulerIncoming for Scheduler {
         requester: &dyn SchedulerOutgoing,
         assignment: NativeAssignment,
         network: &NetworkSnapshot,
+        packages: std::sync::Arc<sccache::build_runtime::PackageCatalog>,
     ) -> Result<AllocJobResult> {
         assignment.spec.validate()?;
         self.allocate_job(
             requester,
             JobAssignment::Native(Box::new(assignment)),
             network,
+            packages,
         )
     }
 
@@ -1573,7 +1578,11 @@ impl SchedulerIncoming for Scheduler {
         if let Some(placement) = &capabilities.native_placement {
             placement.transfer.validate()?;
             anyhow::ensure!(
-                placement.result.valid() && placement.queue.valid(),
+                placement.result.valid()
+                    && placement.queue.valid()
+                    && placement
+                        .package_limits
+                        .is_none_or(sccache::build_runtime::PackageDeliveryLimits::valid),
                 "invalid native result or queue telemetry"
             );
             anyhow::ensure!(
@@ -2492,7 +2501,7 @@ mod scheduler_tests {
         let inputs = BTreeMap::from([(a, 100_000_000), (b, 1_000_000)]);
         let empty = HashMap::new();
         let network = NetworkSnapshot::default();
-        let plan = NativeTransferPlan::new(&network, &HashMap::new());
+        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None);
         let peer = Peer::Worker("127.0.0.1:10501".parse().unwrap());
         let eta = |capacity, assigned: &HashMap<_, _>, placement: &dist::NativePlacement| {
             native_estimate(
@@ -2518,6 +2527,7 @@ mod scheduler_tests {
             (
                 JobId(1),
                 Some(placement::AssignedNative {
+                    packages: Default::default(),
                     inputs: inputs.clone(),
                     class: None,
                     cost: None,
@@ -2527,6 +2537,7 @@ mod scheduler_tests {
             (
                 JobId(2),
                 Some(placement::AssignedNative {
+                    packages: Default::default(),
                     inputs: inputs.clone(),
                     class: None,
                     cost: None,
@@ -2654,6 +2665,7 @@ mod scheduler_tests {
             &AcceptAssign,
             native_test_assignment(platform, BTreeMap::from([(blob.id, blob.size)]))?,
             &NetworkSnapshot::default(),
+            Default::default(),
         )?
         else {
             bail!("worker unavailable");
@@ -2777,6 +2789,7 @@ mod scheduler_tests {
             &AcceptAssign,
             native_test_assignment(platform, BTreeMap::new())?,
             &network,
+            Default::default(),
         )?
         else {
             bail!("producer not allocated")
@@ -2820,6 +2833,7 @@ mod scheduler_tests {
             &AcceptAssign,
             native_test_assignment(platform, BTreeMap::from([(blob.id, blob.size)]))?,
             &network,
+            Default::default(),
         )?
         else {
             bail!("consumer not allocated")
@@ -2839,6 +2853,7 @@ mod scheduler_tests {
             &AcceptAssign,
             native_test_assignment(platform, BTreeMap::from([(blob.id, blob.size)]))?,
             &network,
+            Default::default(),
         )?
         else {
             bail!("consumer not allocated after restart")
@@ -2889,6 +2904,7 @@ mod scheduler_tests {
             &AcceptAssign,
             assignment.clone(),
             &NetworkSnapshot::default(),
+            Default::default(),
         )?
         else {
             bail!("compatible worker unavailable");
@@ -2904,7 +2920,8 @@ mod scheduler_tests {
             scheduler.handle_alloc_native_job(
                 &AcceptAssign,
                 assignment,
-                &NetworkSnapshot::default()
+                &NetworkSnapshot::default(),
+                Default::default(),
             )?,
             AllocJobResult::Fail { .. }
         ));

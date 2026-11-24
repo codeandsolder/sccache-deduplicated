@@ -158,6 +158,11 @@ impl Default for PackageTransferCost {
     }
 }
 
+mod catalog;
+#[cfg(all(unix, feature = "store"))]
+pub(crate) use catalog::Candidate;
+pub use catalog::{PackageCatalog, PackageDeliveryLimits};
+
 impl PackageTransferCost {
     /// Reject invalid or nonsensical estimates before scheduler admission.
     /// # Errors
@@ -201,21 +206,28 @@ impl PackageTransferCost {
         let request = u128::from(self.raw_request_nanoseconds);
         let batches = (raw_files as u128).div_ceil(u128::from(self.raw_parallelism));
         let raw_cost = raw_bytes * SECOND / rate + batches * request;
+        let archive_cost = u128::from(archive.source.size) * SECOND
+            / u128::from(self.archive_download_bytes_per_second)
+            + self.archive_processing_nanoseconds(archive);
+        raw_cost
+            .checked_sub(archive_cost)
+            .filter(|&saving| saving > 0)
+    }
+
+    /// Full decoder and per-entry service, excluding original wire bytes.
+    #[must_use = "forecast must charge complete archive expansion"]
+    pub fn archive_processing_nanoseconds(self, archive: PackageArchive) -> u128 {
+        const SECOND: u128 = 1_000_000_000;
         let decode_rate = match archive.source.identity.compression {
             PackageCompression::Tar => self.decode_tar_bytes_per_second,
             PackageCompression::Gzip => self.decode_gzip_bytes_per_second,
             PackageCompression::Xz => self.decode_xz_bytes_per_second,
             PackageCompression::Zstd => self.decode_zstd_bytes_per_second,
         };
-        let archive_cost = u128::from(archive.source.size) * SECOND
-            / u128::from(self.archive_download_bytes_per_second)
-            + request
-            + u128::from(archive.expanded_bytes) * SECOND / u128::from(decode_rate)
+        u128::from(self.raw_request_nanoseconds)
+            + u128::from(archive.expanded_bytes) * SECOND / u128::from(decode_rate.max(1))
             + u128::from(archive.entry_count) * u128::from(self.per_entry_nanoseconds)
-            + u128::from(self.startup_nanoseconds);
-        raw_cost
-            .checked_sub(archive_cost)
-            .filter(|&saving| saving > 0)
+            + u128::from(self.startup_nanoseconds)
     }
 }
 
