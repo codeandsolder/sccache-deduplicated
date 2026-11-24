@@ -4,7 +4,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
@@ -260,40 +260,6 @@ pub(super) fn spawn(
 }
 
 const PREFIX: &str = "/api/v5/native/";
-
-/// Compress only when a representative prefix wins comfortably. We keep the
-/// immutable digest-named files raw for mmap/materialization; this codec is
-/// solely a negotiated transfer representation.
-pub(super) fn blob_response(mut file: File, accept_zstd: bool) -> Result<Response> {
-    const SAMPLE_SIZE: u64 = 128 * 1024;
-    const MIN_COMPRESS_BYTES: u64 = 32 * 1024;
-    if !accept_zstd || file.metadata()?.len() < MIN_COMPRESS_BYTES {
-        return Ok(Response::from_file("application/octet-stream", file));
-    }
-
-    let sampled = usize::try_from(file.metadata()?.len().min(SAMPLE_SIZE))?;
-    let mut prefix = vec![0; sampled];
-    file.read_exact(&mut prefix)?;
-    let packed = zstd::bulk::compress(&prefix, 1)?;
-    file.seek(SeekFrom::Start(0))?;
-
-    // A meaningful margin amortizes encoding CPU under heavy load and avoids
-    // paying to recompress already packed/upstream-compressed binaries.
-    if packed.len().saturating_add(64) * 100 > sampled * 85 {
-        return Ok(Response::from_file("application/octet-stream", file));
-    }
-
-    let encoded = zstd::stream::read::Encoder::new(file, 1)?;
-    Ok(Response {
-        status_code: 200,
-        headers: vec![
-            ("Content-Type".into(), "application/octet-stream".into()),
-            ("X-Sccache-Blob-Codec".into(), "zstd".into()),
-        ],
-        data: ResponseBody::from_reader(encoded),
-        upgrade: None,
-    })
-}
 
 pub(super) fn physical_blob_response(mut file: File, encoding: BlobEncoding) -> Result<Response> {
     let (file, encoding) = if encoding == BlobEncoding::Raw {

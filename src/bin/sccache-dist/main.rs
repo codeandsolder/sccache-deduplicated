@@ -4272,11 +4272,6 @@ mod server_upload_tests {
     #[test]
     fn missing_cached_archive_requires_fresh_upload_on_assignment() -> Result<()> {
         let (dir, server) = test_server()?;
-        let cache = &server
-            .archive
-            .as_ref()
-            .context("archive worker missing")?
-            .cache;
         let contents = b"verified archive removed after publication";
         let toolchain = tc(contents)?;
         let root = dir.path().join("tc");

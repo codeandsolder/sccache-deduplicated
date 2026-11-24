@@ -166,7 +166,6 @@ fn verify_compressed_download(
         .post(url.join("/api/v5/native/client/download")?)
         .bearer_auth("client-token")
         .header("Content-Type", "application/octet-stream")
-        .header("X-Sccache-Accept-Blob-Codec", "zstd")
         .body(codec().serialize(&DownloadRequest {
             ticket,
             id: blob.id,
@@ -176,13 +175,19 @@ fn verify_compressed_download(
     assert_eq!(
         compressed
             .headers()
-            .get("X-Sccache-Blob-Codec")
+            .get("X-Sccache-CAS-Encoding")
             .context("server skipped native zstd transfer")?
             .as_bytes(),
-        b"zstd"
+        b"zstd-chunks"
     );
     let mut decoded = Vec::new();
-    zstd::stream::read::Decoder::new(compressed)?.read_to_end(&mut decoded)?;
+    crate::build_runtime::transfer_native_blob(
+        compressed,
+        std::io::sink(),
+        &mut decoded,
+        blob,
+        BlobEncoding::ZstdChunks,
+    )?;
     assert_eq!(decoded, bytes);
     Ok(())
 }
@@ -318,7 +323,7 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
         let measured = network.snapshot();
         let worker = Peer::Worker("127.0.0.1:10501".parse()?);
         let client_peer = Peer::Client("127.0.0.1".parse()?);
-        assert!(measured.receive.peers[&worker].body_bytes >= blob.size);
+        assert!(measured.receive.peers[&worker].body_bytes > 0);
         assert_eq!(measured.receive.peers[&worker].active_remaining_bytes, 0);
         assert!(measured.send.peers[&client_peer].body_bytes > 0);
         assert!(measured.send.peers[&client_peer].body_bytes < blob.size);
@@ -358,7 +363,7 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
 fn raw_physical_transport_preserves_original_magic_prefixed_bytes() -> Result<()> {
     use std::io::{Seek, Write};
 
-    with_native_service(|url, _sessions| {
+    with_native_service(|url, _sessions, _, _| {
         let client = make_client(url, "client-token")?;
         let worker = make_client(url, "worker-token")?.for_worker(JobId(42));
         let root = TreeManifest {
@@ -374,8 +379,11 @@ fn raw_physical_transport_preserves_original_magic_prefixed_bytes() -> Result<()
         let offered = client.offer_tree(&root)?;
         client.commit_tree(offered.ticket)?;
         let spec = action(&root)?;
-        let NativeAdmission::Compile { ticket } =
-            client.admit(&spec, crate::build_runtime::ActionMode::Reuse)?
+        let NativeAdmission::Compile { ticket } = client.admit(
+            &spec,
+            crate::build_runtime::ActionMode::Reuse,
+            &BTreeMap::new(),
+        )?
         else {
             anyhow::bail!("expected native compile");
         };
@@ -404,7 +412,7 @@ fn raw_physical_transport_preserves_original_magic_prefixed_bytes() -> Result<()
         raw.write_all(original)?;
         raw.rewind()?;
         worker.upload_stored_file(ticket, blob, crate::build_runtime::BlobEncoding::Raw, raw)?;
-        assert_eq!(worker.commit(ticket)?, manifest);
+        assert_eq!(worker.commit(ticket, Duration::ZERO, None)?, manifest);
         let mut received = Vec::new();
         client.download(ticket, blob, &mut received)?;
         assert_eq!(received, original);
@@ -597,55 +605,53 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
 }
 
 #[test]
-fn adaptive_blob_response_compresses_only_when_transfer_saves_bytes() -> Result<()> {
-    use std::io::{Read as _, Seek as _, Write as _};
-
-    let mut compressible = tempfile::tempfile()?;
-    let original = vec![b'Z'; 256 * 1024];
-    compressible.write_all(&original)?;
-    compressible.rewind()?;
-    let response = blob_response(compressible.try_clone()?, false)?;
-    assert!(
-        response
-            .headers
-            .iter()
-            .all(|(name, _)| name != "X-Sccache-Blob-Codec")
-    );
-
-    let response = blob_response(compressible, true)?;
-    assert!(
-        response
-            .headers
-            .iter()
-            .any(|(name, value)| name == "X-Sccache-Blob-Codec" && value == "zstd")
-    );
-    let (stream, size) = response.data.into_reader_and_size();
-    assert!(size.is_none());
-    let mut decoded = Vec::new();
-    zstd::stream::read::Decoder::new(stream)?.read_to_end(&mut decoded)?;
-    assert_eq!(decoded, original);
-
-    // Pseudorandom, incompressible 256 KiB. The test's fixed block-hash
-    // sequence is deterministic across hosts and doesn't need RNG state.
-    let mut noise = Vec::new();
-    for i in 0..8192_u64 {
-        noise.extend_from_slice(blake3::hash(&i.to_le_bytes()).as_bytes());
+fn physical_blob_response_preserves_content_and_reuses_encoded_files() -> Result<()> {
+    use std::io::{Seek as _, Write as _};
+    let compressible = vec![b'Z'; 256 * 1024];
+    let noise: Vec<u8> = (0..8192_u64)
+        .flat_map(|i| *blake3::hash(&i.to_le_bytes()).as_bytes())
+        .collect();
+    for original in [compressible, noise] {
+        let blob = BlobRef {
+            id: ContentId::of(&original),
+            size: u64::try_from(original.len())?,
+        };
+        let mut raw = tempfile::tempfile()?;
+        raw.write_all(&original)?;
+        raw.rewind()?;
+        let response = physical_blob_response(raw, BlobEncoding::Raw)?;
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(name, value)| name == "X-Sccache-CAS-Encoding" && value == "zstd-chunks")
+        );
+        let (stream, size) = response.data.into_reader_and_size();
+        let mut encoded = tempfile::tempfile()?;
+        let mut decoded = Vec::new();
+        crate::build_runtime::transfer_native_blob(
+            stream,
+            &mut encoded,
+            &mut decoded,
+            blob,
+            BlobEncoding::ZstdChunks,
+        )?;
+        assert_eq!(decoded, original);
+        encoded.rewind()?;
+        let (stream, reused_size) = physical_blob_response(encoded, BlobEncoding::ZstdChunks)?
+            .data
+            .into_reader_and_size();
+        assert_eq!(size, reused_size);
+        let mut decoded = Vec::new();
+        crate::build_runtime::transfer_native_blob(
+            stream,
+            std::io::sink(),
+            &mut decoded,
+            blob,
+            BlobEncoding::ZstdChunks,
+        )?;
+        assert_eq!(decoded, original);
     }
-    let mut incompressible = tempfile::tempfile()?;
-    incompressible.write_all(&noise)?;
-    incompressible.rewind()?;
-    let response = blob_response(incompressible, true)?;
-    assert!(
-        response
-            .headers
-            .iter()
-            .all(|(name, _)| name != "X-Sccache-Blob-Codec")
-    );
-    let (mut stream, size) = response.data.into_reader_and_size();
-    assert_eq!(size, Some(noise.len()));
-    let mut received = Vec::new();
-    stream.read_to_end(&mut received)?;
-    assert_eq!(received, noise);
     Ok(())
 }
 
