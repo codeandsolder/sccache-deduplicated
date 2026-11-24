@@ -191,3 +191,106 @@ fn materialization_preserves_modes_links_and_timestamps_without_mutating_cas() -
     assert!(!parent.exists());
     Ok(())
 }
+
+#[test]
+fn concurrent_tree_acquisition_shares_one_transfer_and_keeps_consumer_pins() -> Result<()> {
+    use std::sync::{
+        Barrier,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let data = b"shared compiler input";
+    let blob = BlobRef {
+        id: ContentId::of(data),
+        size: u64::try_from(data.len())?,
+    };
+    let tree = sample_tree(blob)?;
+    let id = tree.id()?;
+    let barrier = Barrier::new(8);
+    let transfers = AtomicUsize::new(0);
+    let leases = std::thread::scope(|scope| -> Result<Vec<_>> {
+        let jobs = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    store.acquire_tree(
+                        id,
+                        || Ok(()),
+                        || {
+                            transfers.fetch_add(1, Ordering::Relaxed);
+                            store.publish_tree_pinned(
+                                &tree,
+                                vec![store.stage_expected(blob, &data[..])?],
+                            )
+                        },
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        jobs.into_iter().map(|job| job.join().unwrap()).collect()
+    })?;
+    assert_eq!(transfers.load(Ordering::Relaxed), 1);
+    assert_eq!(leases.iter().filter(|(_, reused)| !reused).count(), 1);
+    assert_eq!(store.evict_tree(id)?, Eviction::Pinned);
+    drop(leases);
+    assert!(matches!(store.evict_tree(id)?, Eviction::Removed { .. }));
+    Ok(())
+}
+
+#[test]
+fn failed_tree_acquisition_can_be_retried_without_losing_the_waiting_consumer() -> Result<()> {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let data = b"retry";
+    let blob = BlobRef {
+        id: ContentId::of(data),
+        size: 5,
+    };
+    let tree = sample_tree(blob)?;
+    let id = tree.id()?;
+    let (started, running) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let lease = std::thread::scope(|scope| -> Result<_> {
+        let store_ref = &store;
+        let leader = scope.spawn(move || {
+            store_ref.acquire_tree(
+                id,
+                || Ok(()),
+                || {
+                    started.send(())?;
+                    released.recv_timeout(Duration::from_secs(5))?;
+                    anyhow::bail!("producer cancelled")
+                },
+            )
+        });
+        running.recv_timeout(Duration::from_secs(5))?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let tree_ref = &tree;
+        let follower = scope.spawn(move || {
+            store_ref.acquire_tree(
+                id,
+                || {
+                    anyhow::ensure!(Instant::now() < deadline, "consumer deadline exceeded");
+                    Ok(())
+                },
+                || {
+                    store_ref.publish_tree_pinned(
+                        tree_ref,
+                        vec![store_ref.stage_expected(blob, &data[..])?],
+                    )
+                },
+            )
+        });
+        release.send(())?;
+        assert!(leader.join().unwrap().is_err());
+        follower.join().unwrap()
+    })?;
+    assert!(!lease.1);
+    assert_eq!(store.evict_tree(id)?, Eviction::Pinned);
+    drop(lease);
+    assert!(matches!(store.evict_tree(id)?, Eviction::Removed { .. }));
+    Ok(())
+}

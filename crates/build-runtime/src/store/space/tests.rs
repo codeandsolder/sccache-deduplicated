@@ -728,3 +728,112 @@ fn eviction_counts_retained_package_archive_even_when_tree_files_are_shared() ->
     assert!(store.lookup_tree(sibling)?.is_some());
     Ok(())
 }
+
+#[test]
+fn output_headroom_survives_other_staging_and_converts_without_double_charge() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut limit = policy();
+    limit.max_resident_bytes = 10;
+    limit.target_resident_bytes = 10;
+    let store = NativeStore::open_managed(temp.path(), limit)?;
+    let mut output = store.reserve_staging(7)?;
+    let input = store.stage_expected(
+        BlobRef {
+            id: ContentId::of(b"abc"),
+            size: 3,
+        },
+        &b"abc"[..],
+    )?;
+    assert!(store.reserve_staging(1).is_err());
+    let blob = BlobRef {
+        id: ContentId::of(b"result!"),
+        size: 7,
+    };
+    let staged = output.stage_expected(blob, &b"result!"[..])?;
+    assert_eq!(
+        store
+            .maintain_space()?
+            .context("missing policy")?
+            .reserved_bytes,
+        10
+    );
+    assert!(
+        output
+            .stage_expected(
+                BlobRef {
+                    id: ContentId::of(b"x"),
+                    size: 1
+                },
+                &b"x"[..]
+            )
+            .is_err()
+    );
+    let manifest = ResultManifest {
+        outputs: BTreeMap::from([("obj".into(), Artifact { blob, mode: None })]),
+        stdout: None,
+        stderr: None,
+    };
+    let fingerprint = ActionFingerprint {
+        schema: "reserved-output".into(),
+        components: BTreeMap::new(),
+    };
+    let lease = store.publish_pinned(
+        &fingerprint,
+        &manifest,
+        vec![staged],
+        crate::ActionMode::Reuse,
+    )?;
+    drop(output);
+    let report = store.maintain_space()?.context("missing policy")?;
+    assert_eq!(report.reserved_bytes, 3);
+    assert_eq!(report.resident_bytes, 10);
+    assert!(store.reserve_staging(1).is_err());
+    drop(input);
+    assert_eq!(
+        store
+            .maintain_space()?
+            .context("missing policy")?
+            .reserved_bytes,
+        0
+    );
+    assert_eq!(store.stats()?.logical_bytes, 7);
+    drop(lease);
+    Ok(())
+}
+
+#[test]
+fn rejected_reserved_upload_releases_its_charge() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut limit = policy();
+    limit.max_resident_bytes = 10;
+    limit.target_resident_bytes = 10;
+    let store = NativeStore::open_managed(temp.path(), limit)?;
+    let mut budget = store.reserve_staging(10)?;
+    assert!(
+        budget
+            .stage_expected(
+                BlobRef {
+                    id: ContentId::of(b"abc"),
+                    size: 3
+                },
+                &b"bad"[..]
+            )
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .maintain_space()?
+            .context("missing policy")?
+            .reserved_bytes,
+        7
+    );
+    drop(budget);
+    assert_eq!(
+        store
+            .maintain_space()?
+            .context("missing policy")?
+            .reserved_bytes,
+        0
+    );
+    Ok(())
+}

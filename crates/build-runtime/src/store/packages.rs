@@ -362,7 +362,11 @@ impl NativeStore {
             reader: input.take(limit),
             hash: Sha256::new(),
         };
-        let archive = self.stage_inner(&mut hashed, Some(limit))?;
+        let archive = self.stage_inner(
+            &mut hashed,
+            Some(limit),
+            super::space::StageBudget::new(self),
+        )?;
         ensure!(
             length.accepts(archive.reference().size),
             "incorrect original package length or archive size limit exceeded"
@@ -468,7 +472,11 @@ impl ImportedTree {
                     self.bytes <= self.policy.max_expanded_bytes,
                     "expanded package size limit exceeded"
                 );
-                let staged = store.stage_inner(data.take(size), Some(size))?;
+                let staged = store.stage_inner(
+                    data.take(size),
+                    Some(size),
+                    super::space::StageBudget::new(store),
+                )?;
                 let blob = staged.reference();
                 ensure!(blob.size == size, "archive member size mismatch");
                 self.staged.entry(blob.id).or_insert(staged);

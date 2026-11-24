@@ -438,24 +438,30 @@ impl NativeCacheClient {
     /// # Errors
     /// Returns an error for an invalid manifest or failed transfer.
     #[cfg(all(target_os = "linux", feature = "native-store"))]
-    pub fn fetch_tree(
+    fn fetch_tree(
         &self,
         action: Ticket,
         id: TreeId,
         store: &crate::build_runtime::NativeStore,
-        renewal_interval: Duration,
-        package_import: Option<crate::build_runtime::PackageImportLimits>,
-        transport: &worker::PackageTransportTracker,
+        delivery: worker::WorkerDelivery<'_>,
+        action_check: &LeaseCheck<'_>,
     ) -> Result<crate::build_runtime::TreeLease> {
+        action_check()?;
+        let transport = delivery.transport;
         let read = self.open_tree(action, id)?;
-        let result = self.with_renewal(read.ticket, renewal_interval, |check| {
+        let result = self.with_renewal(read.ticket, delivery.renewal_interval, |tree_check| {
+            let check = &|| {
+                action_check()?;
+                tree_check()
+            };
+            check()?;
             ensure!(
                 read.manifest.id()? == id,
                 "native tree download identity mismatch"
             );
             let reserved = store.reserve_tree_upload(&read.manifest)?;
             #[cfg(target_os = "linux")]
-            let packages = match package_import {
+            let packages = match delivery.package_import {
                 Some(limits) if !reserved.missing().is_empty() => self.reconstruct_packages(
                     read.ticket,
                     reserved.missing(),
@@ -466,8 +472,6 @@ impl NativeCacheClient {
                 )?,
                 _ => Vec::new(),
             };
-            #[cfg(not(target_os = "linux"))]
-            let _ = package_import;
             let updated = store.reserve_tree_upload(&read.manifest)?;
             drop(reserved);
             debug!(

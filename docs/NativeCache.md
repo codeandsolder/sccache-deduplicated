@@ -729,15 +729,23 @@ Heartbeats use actual occupied execution slots for CPU restoration, separately
 from active HTTP requests that maintain job liveness. The scheduler includes
 the input closures of outstanding assignments in advisory tree-locality
 scoring (counting each matching tree once), before those transfers complete.
+Concurrent acquisitions of an identical missing tree share one transfer and
+its verified lease. If the producer fails or is cancelled, a waiting consumer
+may retry using its own authorized action; other consumers remain independent.
 
 Newly generated native outputs are also retained in the same worker CAS
 with a default 300-second grace lease. The optional native worker settings
 `artifact_grace_secs` and `artifact_grace_bytes` control the lease lifetime
-and a separate logical byte budget. The default budget is the larger of one
-result limit and 25% of the worker resident budget, capped by that resident
+and a separate logical byte budget. The default budget is the larger of twice
+the maximum result size and 25% of the worker resident budget, capped by that resident
 budget. Shared output content is charged only once. Expiry releases the
 lease, not the content itself; ordinary eviction can then reclaim it.
-If the worker grace quota or physical storage cannot admit another result,
-the worker logs that local retention was skipped and still publishes the
-verified result to the scheduler. It never evicts another unexpired grace
-lease to make room. Input leases remain independent of grace expiration.
+Before staging a build, the worker reserves its configured maximum result size
+in both the grace and CAS staging budgets. A full grace tier delays admission
+without consuming compiler slots, up to the execution timeout. Insufficient
+CAS headroom rejects the build before staging. Output publication converts
+reserved bytes directly into verified staged content and then actual unique
+resident bytes; no second capacity charge or silent retention bypass occurs.
+Failed or cancelled jobs release reservations. Grace expiry never releases
+independent consumer leases. The maximum-result bound is deliberately
+conservative until output sizes can be predicted with a reliable upper bound.

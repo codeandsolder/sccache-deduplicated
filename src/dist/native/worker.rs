@@ -413,16 +413,7 @@ impl NativeCacheClient {
                 queue: Some(delivery.execution_queue),
                 grace: Some(delivery.artifact_grace),
             },
-            |id, _| {
-                self.fetch_tree(
-                    ticket,
-                    id,
-                    store,
-                    delivery.renewal_interval,
-                    delivery.package_import,
-                    delivery.transport,
-                )
-            },
+            |id, check| self.fetch_tree(ticket, id, store, delivery, check),
         )
     }
 
@@ -437,6 +428,9 @@ impl NativeCacheClient {
     ) -> Result<CapturedExecution> {
         let result = self.with_renewal(ticket, control.renewal_interval, |check| {
             self.verify_execution(ticket, spec.clone())?;
+            if let Some(grace) = control.grace {
+                grace.reap();
+            }
             if let Some(report) = store.maintain_space()? {
                 ensure!(
                     report.minimum_satisfied,
@@ -448,15 +442,29 @@ impl NativeCacheClient {
                 spec.platform == policy.platform,
                 "native executor platform mismatch"
             );
+            // Reserve output headroom before staged inputs can consume it. Wait for
+            // grace capacity without occupying a compiler slot.
+            let mut output = if let Some(grace) = control.grace {
+                let started = Instant::now();
+                let reservation = loop {
+                    check()?;
+                    if let Some(reservation) = grace.reserve(policy.max_result_bytes)? {
+                        break reservation;
+                    }
+                    ensure!(
+                        started.elapsed() < policy.timeout,
+                        "native artifact grace admission timed out"
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                };
+                Some((reservation, store.reserve_staging(policy.max_result_bytes)?))
+            } else {
+                None
+            };
             let mut inputs = Vec::new();
             for id in &request.input_trees {
                 check()?;
-                let cached = store.lookup_tree(*id)?;
-                let hit = cached.is_some();
-                let tree = match cached {
-                    Some(tree) => tree,
-                    None => fetch(*id, check)?,
-                };
+                let (tree, hit) = store.acquire_tree(*id, check, || fetch(*id, check))?;
                 if log::log_enabled!(target: "native_cas_replay", log::Level::Trace) {
                     let blobs = tree
                         .manifest()
@@ -479,7 +487,8 @@ impl NativeCacheClient {
             }
             // Keep input leases through the ready queue wait. Only execution consumes compiler capacity.
             let captured = {
-                let _permit = control.queue
+                let _permit = control
+                    .queue
                     .map(|queue| queue.acquire(check))
                     .transpose()?;
                 execute(spec, store, policy, check)?
@@ -488,12 +497,14 @@ impl NativeCacheClient {
             if let Some(manifest) = captured.successful_result() {
                 request.validate_result(manifest)?;
                 let blobs = manifest.blobs()?;
-                if let Some(grace) = control.grace {
-                    match grace.retain(store, &request.action_fingerprint()?, manifest, &captured) {
-                        Ok(true) => {},
-                        Ok(false) => warn!("Native worker artifact grace budget exhausted; publishing only to scheduler"),
-                        Err(error) => warn!("Native worker artifact retention failed; publishing only to scheduler: {error:#}"),
-                    }
+                if let Some((grace, mut budget)) = output.take() {
+                    grace.retain(
+                        store,
+                        &mut budget,
+                        &request.action_fingerprint()?,
+                        manifest,
+                        &captured,
+                    )?;
                 }
                 for missing in self.begin(ticket, manifest.clone())?.missing {
                     check()?;

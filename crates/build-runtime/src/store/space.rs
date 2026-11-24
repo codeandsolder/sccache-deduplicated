@@ -120,6 +120,16 @@ impl NativeStore {
         Ok(())
     }
 
+    /// Reserve space before starting work whose output will enter this CAS.
+    /// The budget transfers directly into staged blobs without a second charge.
+    /// # Errors
+    /// Returns an error if the managed store cannot admit the reservation.
+    pub fn reserve_staging(&self, bytes: u64) -> Result<StageBudget<'_>> {
+        let mut budget = StageBudget::new(self);
+        budget.grow_to(bytes)?;
+        Ok(budget)
+    }
+
     /// Recent immutable tree IDs for advisory worker placement. Heartbeats
     /// only clone a bounded MRU index; they never scan the full usage map or
     /// hold the pin lock across filesystem or index I/O.
@@ -473,7 +483,7 @@ impl super::Pins {
 /// Uncompressed upper bound on concurrent in-flight writers. Retain the
 /// reservation until fsync; completed staging files are already represented
 /// by filesystem space counters.
-pub(super) struct StageBudget<'a> {
+pub struct StageBudget<'a> {
     store: &'a NativeStore,
     reserved: u64,
 }
@@ -483,8 +493,40 @@ impl<'a> StageBudget<'a> {
         Self { store, reserved: 0 }
     }
 
+    /// Stage a verified blob using space already reserved by this budget.
+    /// # Errors
+    /// Returns an error for insufficient reserved bytes, invalid content or I/O failure.
+    pub fn stage_expected(
+        &mut self,
+        expected: BlobRef,
+        reader: impl std::io::Read,
+    ) -> Result<super::StagedBlob> {
+        let limit = expected
+            .size
+            .checked_add(1)
+            .context("blob length overflow")?;
+        ensure!(
+            expected.size <= self.reserved,
+            "blob exceeds reserved staging headroom"
+        );
+        self.reserved -= expected.size;
+        let child = Self {
+            store: self.store,
+            reserved: expected.size,
+        };
+        let staged = self
+            .store
+            .stage_inner(reader.take(limit), Some(expected.size), child)?;
+        ensure!(
+            staged.reference() == expected,
+            "uploaded content does not match its declared digest and length"
+        );
+        Ok(staged)
+    }
+
     pub(super) fn grow_to(&mut self, size: u64) -> Result<()> {
         let Some(policy) = self.store.inner.space_policy else {
+            self.reserved = self.reserved.max(size);
             return Ok(());
         };
         if self.reserved >= size {
@@ -528,11 +570,15 @@ impl<'a> StageBudget<'a> {
     /// Hold exact staged bytes until the file is committed or discarded.
     /// Streaming round-up is released to avoid inflating small blob charges.
     pub(super) fn finish(mut self, actual_bytes: u64) -> Result<StagingReservation> {
-        if self.store.inner.space_policy.is_some() {
-            ensure!(
-                actual_bytes <= self.reserved,
-                "native staging content exceeds its reservation"
-            );
+        ensure!(
+            actual_bytes <= self.reserved,
+            "native staging content exceeds its reservation"
+        );
+        if self.store.inner.space_policy.is_none() {
+            return Ok(StagingReservation {
+                inner: Arc::clone(&self.store.inner),
+                reserved: 0,
+            });
         }
         if actual_bytes < self.reserved {
             let surplus = self.reserved - actual_bytes;
@@ -567,7 +613,7 @@ impl Drop for StagingReservation {
 
 impl Drop for StageBudget<'_> {
     fn drop(&mut self) {
-        if self.reserved > 0 {
+        if self.reserved > 0 && self.store.inner.space_policy.is_some() {
             self.store
                 .inner
                 .space_released

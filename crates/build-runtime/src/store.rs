@@ -203,6 +203,7 @@ struct Inner {
     mutations: Mutex<()>,
     pins: Mutex<Pins>,
     package_imports: Mutex<BTreeSet<crate::PackageIdentity>>,
+    tree_flights: trees::TreeFlights,
     space_policy: Option<SpacePolicy>,
     space: Mutex<space::SpaceState>,
     // Releases never acquire the space admission lock, avoiding lock-order
@@ -445,6 +446,7 @@ impl NativeStore {
             mutations: Mutex::new(()),
             pins: Mutex::new(pins),
             package_imports: Mutex::new(BTreeSet::new()),
+            tree_flights: trees::TreeFlights::default(),
             space_policy,
             space: Mutex::default(),
             space_released: AtomicU64::new(0),
@@ -459,12 +461,16 @@ impl NativeStore {
     /// # Errors
     /// Returns an error if the stream or filesystem fails.
     pub fn stage(&self, reader: impl Read) -> Result<StagedBlob> {
-        self.stage_inner(reader, None)
+        self.stage_inner(reader, None, space::StageBudget::new(self))
     }
 
     // Size is an upper bound, not a substitute for digest/length validation.
-    fn stage_inner(&self, mut reader: impl Read, bound: Option<u64>) -> Result<StagedBlob> {
-        let mut budget = space::StageBudget::new(self);
+    fn stage_inner(
+        &self,
+        mut reader: impl Read,
+        bound: Option<u64>,
+        mut budget: space::StageBudget<'_>,
+    ) -> Result<StagedBlob> {
         if let Some(bound) = bound {
             budget.grow_to(bound)?;
         }
@@ -533,18 +539,8 @@ impl NativeStore {
     /// # Errors
     /// Returns an error for an invalid stream, digest/length mismatch or I/O failure.
     pub fn stage_expected(&self, expected: BlobRef, reader: impl Read) -> Result<StagedBlob> {
-        let limit = expected
-            .size
-            .checked_add(1)
-            .context("blob length overflow")?;
-        // Read one extra byte to detect overflow, but reserve only the
-        // declared content size against the worker's resident limit.
-        let staged = self.stage_inner(reader.take(limit), Some(expected.size))?;
-        ensure!(
-            staged.reference() == expected,
-            "uploaded content does not match its declared digest and length"
-        );
-        Ok(staged)
+        self.reserve_staging(expected.size)?
+            .stage_expected(expected, reader)
     }
 
     /// Reserve already present content during missing-blob negotiation.
@@ -1231,7 +1227,7 @@ impl<L> Seek for LeasedReader<'_, L> {
 
 mod space;
 use crate::SpacePolicy;
-pub use space::SpaceReport;
+pub use space::{SpaceReport, StageBudget};
 mod audit;
 pub use audit::{ComponentAudit, NativeIndexAudit, SchemaInventory};
 mod packages;

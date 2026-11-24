@@ -2,7 +2,8 @@ use std::{
     collections::BTreeMap,
     fs::File,
     io::{Read, Seek},
-    sync::Arc,
+    sync::{Arc, Condvar, Mutex, PoisonError, Weak},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -16,7 +17,102 @@ use super::{
 };
 use crate::{BlobRef, ContentId, PackageSource, TreeId, TreeManifest, TreeRecipe};
 
+#[derive(Default)]
+pub(super) struct TreeFlights(Mutex<BTreeMap<TreeId, Weak<TreeFlight>>>);
+
+#[derive(Default)]
+struct TreeFlight {
+    state: Mutex<FlightState>,
+    wake: Condvar,
+}
+
+#[derive(Default)]
+enum FlightState {
+    #[default]
+    Idle,
+    Fetching,
+    Ready(Arc<TreeLease>),
+}
+
+struct FlightOwner<'a>(&'a TreeFlight);
+
+impl Drop for FlightOwner<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if matches!(*state, FlightState::Fetching) {
+            *state = FlightState::Idle;
+        }
+        drop(state);
+        self.0.wake.notify_all();
+    }
+}
+
 impl NativeStore {
+    /// Resolve a tree with one in-flight acquisition per immutable identity.
+    /// Waiting consumers share the published lease; failed producers release
+    /// ownership so another authorized consumer can retry.
+    /// # Errors
+    /// Returns an error for cancellation, invalid acquisition or storage failure.
+    pub fn acquire_tree(
+        &self,
+        id: TreeId,
+        check: impl Fn() -> Result<()>,
+        fetch: impl FnOnce() -> Result<TreeLease>,
+    ) -> Result<(Arc<TreeLease>, bool)> {
+        check()?;
+        if let Some(tree) = self.lookup_tree(id)? {
+            return Ok((Arc::new(tree), true));
+        }
+        let flight = {
+            let mut flights = self
+                .inner
+                .tree_flights
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            flights.retain(|_, flight| flight.strong_count() > 0);
+            if let Some(flight) = flights.get(&id).and_then(Weak::upgrade) {
+                flight
+            } else {
+                let flight = Arc::new(TreeFlight::default());
+                flights.insert(id, Arc::downgrade(&flight));
+                flight
+            }
+        };
+        loop {
+            check()?;
+            let mut state = flight.state.lock().unwrap_or_else(PoisonError::into_inner);
+            match &*state {
+                FlightState::Ready(lease) => return Ok((Arc::clone(lease), true)),
+                FlightState::Idle => {
+                    *state = FlightState::Fetching;
+                    drop(state);
+                    let _owner = FlightOwner(&flight);
+                    let (lease, reused) = match self.lookup_tree(id)? {
+                        Some(lease) => (lease, true),
+                        None => (fetch()?, false),
+                    };
+                    ensure!(
+                        lease.id() == id && Arc::ptr_eq(&lease.inner, &self.inner),
+                        "tree acquisition returned unrelated content"
+                    );
+                    let lease = Arc::new(lease);
+                    *flight.state.lock().unwrap_or_else(PoisonError::into_inner) =
+                        FlightState::Ready(Arc::clone(&lease));
+                    return Ok((lease, reused));
+                }
+                FlightState::Fetching => {
+                    drop(
+                        flight
+                            .wake
+                            .wait_timeout(state, Duration::from_millis(100))
+                            .unwrap_or_else(PoisonError::into_inner),
+                    );
+                }
+            }
+        }
+    }
+
     /// Reserve any already available files before negotiating a tree upload.
     ///
     /// # Errors

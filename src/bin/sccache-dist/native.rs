@@ -43,12 +43,12 @@ impl NativeWorker {
         let package_transfer = PackageTransportTracker::new(config.package_transfer)?;
         let grace_bytes = config.artifact_grace_bytes.unwrap_or_else(|| {
             (config.space.max_resident_bytes / 4)
-                .max(config.max_result_bytes)
+                .max(config.max_result_bytes.saturating_mul(2))
                 .min(config.space.max_resident_bytes)
         });
         ensure!(
-            grace_bytes <= config.space.max_resident_bytes,
-            "artifact grace budget exceeds total native resident budget"
+            (config.max_result_bytes..=config.space.max_resident_bytes).contains(&grace_bytes),
+            "artifact grace budget must fit one maximum result and the resident budget"
         );
         let artifact_grace = sccache::dist::native::ArtifactGrace::new(
             Duration::from_secs(config.artifact_grace_secs),
