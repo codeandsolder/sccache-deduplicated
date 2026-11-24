@@ -3,7 +3,9 @@
 use super::ServerDetails;
 mod exploration;
 mod pipeline;
+mod retained;
 pub(super) use exploration::{Exploration, choose_worker};
+pub(super) use retained::RecentOutputs;
 use sccache::{
     build_runtime::{
         DirectionSnapshot, NetworkSnapshot, Peer, ResultTransferEstimate, TransferDemand,
@@ -21,16 +23,16 @@ use std::{
 fn native_missing_inputs(
     assigned: &pipeline::Assignments,
     placement: &dist::NativePlacement,
+    recent: &RecentOutputs,
     requested: Option<&dist::NativeInputBlobs>,
 ) -> (u128, usize) {
-    let confirmed = pipeline::confirmed_inputs(assigned, placement);
-    let resident = |id| pipeline::resident(placement, &confirmed, id);
+    let residency = pipeline::WorkerResidency::new(assigned, placement, recent);
     let mut missing = dist::NativeInputBlobs::new();
     if let Some(inputs) = requested {
         missing.extend(
             inputs
                 .iter()
-                .filter(|(id, _)| !resident(**id))
+                .filter(|(id, size)| !residency.contains(**id, **size))
                 .map(|(&id, &size)| (id, size)),
         );
         if missing.is_empty() {
@@ -47,7 +49,7 @@ fn native_missing_inputs(
         .filter_map(|(_, inputs)| inputs.as_ref())
         .flat_map(|inputs| inputs.iter())
     {
-        if !resident(id) {
+        if !residency.contains(id, size) {
             missing.entry(id).or_insert(size);
         }
     }
@@ -119,7 +121,12 @@ impl<'a> NativeTransferPlan<'a> {
             for (&id, details) in servers {
                 if let Some(placement) = &details.capabilities.native_placement {
                     let peer = Peer::Worker(id.addr());
-                    let (bytes, _) = native_missing_inputs(&details.jobs_assigned, placement, None);
+                    let (bytes, _) = native_missing_inputs(
+                        &details.jobs_assigned,
+                        placement,
+                        &details.recent_outputs,
+                        None,
+                    );
                     let demand = Self::input_demand(
                         &network.send,
                         peer,
@@ -212,18 +219,19 @@ pub(super) fn native_estimate(
     capacity: f64,
     assigned: &pipeline::Assignments,
     placement: &dist::NativePlacement,
+    recent: &RecentOutputs,
     requested: &dist::NativeInputBlobs,
     peer: Peer,
     plan: &NativeTransferPlan<'_>,
 ) -> PlacementEstimate {
-    let (bytes, _) = native_missing_inputs(assigned, placement, Some(requested));
+    let (bytes, _) = native_missing_inputs(assigned, placement, recent, Some(requested));
     let cost = placement.transfer;
     let (network, externality) = plan.input_completion(peer, bytes, cost.download_bytes_per_second);
     let logical_rate = plan.send.logical_rate(peer, cost.download_bytes_per_second);
     // A warm candidate adds no network traffic but existing staging still
     // consumes the worker's aggregate link. Use the baseline contention for it.
     let (backlog, network_time) = if bytes == 0 {
-        let (backlog, _) = native_missing_inputs(assigned, placement, None);
+        let (backlog, _) = native_missing_inputs(assigned, placement, recent, None);
         (
             backlog,
             plan.input_completion(peer, backlog, cost.download_bytes_per_second)
@@ -242,6 +250,7 @@ pub(super) fn native_estimate(
         capacity,
         assigned,
         placement,
+        recent,
         requested,
         logical_rate,
         contention,

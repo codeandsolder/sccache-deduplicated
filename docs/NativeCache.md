@@ -883,6 +883,37 @@ exact blob deltas. Placement uses raw delivery costs and mean worker service
 times; package-specific placement and per-action output/compute estimates
 remain separate improvements.
 
+### Immediate producer-output residency
+
+The native cache protocol v3 records recently published worker outputs without
+waiting for the periodic residency heartbeat. After successful local CAS
+publication, the worker knows its actual grace-lease deadline. The existing
+authenticated result negotiation establishes a scheduler-local monotonic time
+anchor before the response is sent. The worker measures the remaining local
+grace time when that response arrives, and includes that duration in the
+existing result commit request. Consequently the scheduler's predicted expiry
+is conservative even without synchronized host clocks, and a long upload
+does not extend the original grace lease. No additional transfer or RPC is
+introduced.
+
+Only a successfully committed, verified result for a currently assigned native
+job contributes exact digest/length hints. Each worker incarnation has an
+independent bounded index (8192 distinct blobs, at most 30 minutes of retained
+hint lifetime). Shared output IDs retain the longest unexpired deadline;
+repeated commits do not slide their expiry. Worker replacement discards all
+previous hints. Expiration or metadata pressure merely removes a prediction,
+not the worker's data. The real worker grace and consumer input leases govern
+eviction.
+
+Placement, pending input forecasting, transfer exploration and peer backfill
+use the same exact recent-output evidence in addition to the Bloom inventory.
+Exact retained outputs are preferred to probabilistic inventory matches when
+choosing peer sources. Every transfer still uses the ordinary content
+verification and assignment pinning mechanisms. As soon as a consumer's
+manifest names a just-produced blob, the scheduler can exploit the producer's
+retained copy; unknown future hashes still require explicit producer/output
+dependencies from a build graph.
+
 ### Directional shared-network estimation
 
 The native cache listener meters encoded HTTP payload bytes before delivery

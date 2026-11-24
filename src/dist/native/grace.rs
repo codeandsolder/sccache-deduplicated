@@ -120,9 +120,9 @@ impl GraceReservation {
         fingerprint: &ActionFingerprint,
         manifest: &ResultManifest,
         captured: &CapturedExecution,
-    ) -> Result<()> {
+    ) -> Result<Option<Instant>> {
         if manifest.outputs.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let existing = store.reserve_upload(manifest)?;
         let mut staged = Vec::new();
@@ -130,10 +130,10 @@ impl GraceReservation {
             staged.push(budget.stage_expected(blob, captured.open_blob(blob.id)?)?);
         }
         let lease = store.publish_pinned(fingerprint, manifest, staged, ActionMode::Refresh)?;
-        self.commit(lease)
+        self.commit(lease).map(Some)
     }
 
-    fn commit(mut self, lease: ResultLease) -> Result<()> {
+    fn commit(mut self, lease: ResultLease) -> Result<Instant> {
         let contents = lease.manifest().blobs()?;
         let mut state = self
             .pool
@@ -173,7 +173,7 @@ impl GraceReservation {
             _lease: lease,
         });
         drop(state);
-        Ok(())
+        Ok(expires)
     }
 }
 

@@ -90,14 +90,19 @@ fn question(
 
 fn additional_inputs(details: &ServerDetails, requested: &NativeInputBlobs) -> NativeInputBlobs {
     let placement = details.capabilities.native_placement.as_ref();
-    let confirmed = placement.map_or_else(Default::default, |placement| {
-        super::pipeline::confirmed_inputs(&details.jobs_assigned, placement)
+    let residency = placement.map(|placement| {
+        super::pipeline::WorkerResidency::new(
+            &details.jobs_assigned,
+            placement,
+            &details.recent_outputs,
+        )
     });
     let mut missing: NativeInputBlobs = requested
         .iter()
-        .filter(|(id, _)| {
-            !placement
-                .is_some_and(|placement| super::pipeline::resident(placement, &confirmed, **id))
+        .filter(|(id, size)| {
+            !residency
+                .as_ref()
+                .is_some_and(|residency| residency.contains(**id, **size))
         })
         .map(|(&id, &bytes)| (id, bytes))
         .collect();
@@ -181,6 +186,7 @@ impl<'a> Opportunity<'a> {
             self.details.cpu_capacity,
             &self.details.jobs_assigned,
             placement,
+            &self.details.recent_outputs,
             requested,
             peer,
             plan,

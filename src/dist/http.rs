@@ -1182,6 +1182,7 @@ mod server {
                 let requester = Arc::clone(&requester);
                 let certs = Arc::clone(&server_certificates);
                 let peer_handler = Arc::clone(&handler);
+                let result_handler = Arc::clone(&handler);
                 let peer_certs = Arc::clone(&server_certificates);
                 let peer_http = native::PeerHttp::default();
                 let network = Arc::new(crate::build_runtime::NetworkMeter::default());
@@ -1245,6 +1246,9 @@ mod server {
                             }
                         }
                         Ok(None)
+                    },
+                    move |server, job, event| {
+                        result_handler.observe_native_result(server, job, event)
                     },
                     Arc::clone(&check_client_auth),
                     Arc::clone(&check_server_auth),

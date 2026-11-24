@@ -8,8 +8,10 @@ use sccache::{
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, HashSet},
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+use super::RecentOutputs;
 
 pub(super) type Assignments = HashMap<JobId, Option<NativeInputBlobs>>;
 
@@ -29,16 +31,36 @@ pub(super) fn confirmed_inputs(
         .collect()
 }
 
-pub(super) fn resident(
-    placement: &NativePlacement,
-    confirmed: &HashSet<ContentId>,
-    id: ContentId,
-) -> bool {
-    confirmed.contains(&id)
-        || placement
-            .residency
-            .as_ref()
-            .is_some_and(|filter| filter.may_contain(id))
+pub(super) struct WorkerResidency<'a> {
+    placement: &'a NativePlacement,
+    confirmed: HashSet<ContentId>,
+    recent: &'a RecentOutputs,
+    now: Instant,
+}
+
+impl<'a> WorkerResidency<'a> {
+    pub(super) fn new(
+        assigned: &Assignments,
+        placement: &'a NativePlacement,
+        recent: &'a RecentOutputs,
+    ) -> Self {
+        Self {
+            placement,
+            confirmed: confirmed_inputs(assigned, placement),
+            recent,
+            now: Instant::now(),
+        }
+    }
+
+    pub(super) fn contains(&self, id: ContentId, size: u64) -> bool {
+        self.confirmed.contains(&id)
+            || self.recent.contains(id, size, self.now)
+            || self
+                .placement
+                .residency
+                .as_ref()
+                .is_some_and(|filter| filter.may_contain(id))
+    }
 }
 
 fn duration(seconds: f64) -> Duration {
@@ -77,8 +99,7 @@ struct StagingTimeline<'a> {
     logical_rate: u64,
     contention: f64,
     cost: PackageTransferCost,
-    placement: &'a NativePlacement,
-    confirmed: HashSet<ContentId>,
+    residency: WorkerResidency<'a>,
     future: HashMap<ContentId, Duration>,
 }
 
@@ -94,7 +115,7 @@ impl StagingTimeline<'_> {
         let mut requests = 0_u64;
         let mut new = Vec::new();
         for (&id, &size) in inputs.into_iter().flat_map(|inputs| inputs.iter()) {
-            if resident(self.placement, &self.confirmed, id) {
+            if self.residency.contains(id, size) {
                 continue;
             }
             if let Some(&ready) = self.future.get(&id) {
@@ -269,6 +290,7 @@ pub(super) fn publication_start(
     capacity: f64,
     assigned: &Assignments,
     placement: &NativePlacement,
+    recent: &RecentOutputs,
     requested: &NativeInputBlobs,
     logical_rate: u64,
     contention: f64,
@@ -339,8 +361,7 @@ pub(super) fn publication_start(
         logical_rate,
         contention,
         cost: placement.transfer,
-        placement,
-        confirmed: confirmed_inputs(assigned, placement),
+        residency: WorkerResidency::new(assigned, placement, recent),
         future: HashMap::new(),
     };
     for job in staging {

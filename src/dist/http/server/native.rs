@@ -26,8 +26,8 @@ use crate::{
     },
     config::scheduler::NativeCacheConfig,
     dist::native::{
-        DownloadRequest, ExecutionRequest, InputPrefetchRequest, ManifestRequest, OpenTreeRequest,
-        PackageAcquisition, PackageLocator, PackagePlanRequest, codec,
+        CommitRequest, DownloadRequest, ExecutionRequest, InputPrefetchRequest, ManifestRequest,
+        OpenTreeRequest, PackageAcquisition, PackageLocator, PackagePlanRequest, codec,
     },
 };
 
@@ -39,6 +39,11 @@ pub(super) type Allocator = dyn Fn(
     ) -> Result<ScheduleReply>
     + Send
     + Sync;
+
+pub(super) type ResultObserver<'a> = dyn Fn(crate::dist::ServerId, crate::dist::JobId, crate::dist::NativeResultEvent<'_>)
+    + Send
+    + Sync
+    + 'a;
 
 struct PackageService {
     limits: PackageImportLimits,
@@ -128,6 +133,13 @@ pub(super) fn spawn(
     + Send
     + Sync
     + 'static,
+    observe_result: impl Fn(
+        crate::dist::ServerId,
+        crate::dist::JobId,
+        crate::dist::NativeResultEvent<'_>,
+    ) + Send
+    + Sync
+    + 'static,
     client_auth: Arc<dyn ClientAuthCheck>,
     server_auth: Arc<ServerAuthenticator>,
     network: Arc<NetworkMeter>,
@@ -205,6 +217,7 @@ pub(super) fn spawn(
                 sessions: &sessions,
                 packages: packages.as_ref(),
                 network: &network,
+                observe_result: &observe_result,
             },
             &allocate,
             &*client_auth,
@@ -244,7 +257,7 @@ pub(super) fn spawn(
     Ok(())
 }
 
-const PREFIX: &str = "/api/v2/native/";
+const PREFIX: &str = "/api/v3/native/";
 
 /// Compress only when a representative prefix wins comfortably. We keep the
 /// immutable digest-named files raw for mmap/materialization; this codec is
@@ -372,6 +385,7 @@ struct NativeServices<'a> {
     sessions: &'a NativeSessions,
     packages: Option<&'a PackageService>,
     network: &'a NetworkMeter,
+    observe_result: &'a ResultObserver<'a>,
 }
 
 fn respond(
@@ -452,6 +466,7 @@ fn dispatch(
         sessions,
         packages,
         network,
+        observe_result,
     } = services;
     let peer = match publisher {
         Publisher::Client => Peer::Client(request.remote_addr().ip()),
@@ -661,7 +676,15 @@ fn dispatch(
         }
         "begin" => {
             let ManifestRequest { ticket, manifest } = metadata(request, limit)?;
-            encode(&sessions.begin(ticket, publisher, manifest)?, limit)
+            let reply = sessions.begin(ticket, publisher, manifest)?;
+            if let Publisher::Worker { address, job } = publisher {
+                observe_result(
+                    crate::dist::ServerId::new(address),
+                    crate::dist::JobId(job),
+                    crate::dist::NativeResultEvent::Negotiated,
+                );
+            }
+            encode(&reply, limit)
         }
         "upload" => {
             let mut body = request.data().context("missing native upload body")?;
@@ -677,10 +700,24 @@ fn dispatch(
             sessions.upload(header.ticket, publisher, header.blob, reader)?;
             encode(&(), limit)
         }
-        "commit" => encode(
-            &sessions.commit(metadata(request, limit)?, publisher)?,
-            limit,
-        ),
+        "commit" => {
+            let CommitRequest {
+                ticket,
+                retained_after_begin_millis,
+            } = metadata(request, limit)?;
+            let manifest = sessions.commit(ticket, publisher)?;
+            if let Publisher::Worker { address, job } = publisher {
+                observe_result(
+                    crate::dist::ServerId::new(address),
+                    crate::dist::JobId(job),
+                    crate::dist::NativeResultEvent::Committed {
+                        manifest: &manifest,
+                        retained_after_begin: Duration::from_millis(retained_after_begin_millis),
+                    },
+                );
+            }
+            encode(&manifest, limit)
+        }
         "renew" => {
             sessions.renew(metadata(request, limit)?, publisher)?;
             encode(&(), limit)

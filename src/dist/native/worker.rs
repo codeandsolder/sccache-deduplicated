@@ -674,16 +674,23 @@ impl NativeCacheClient {
         if let Some(manifest) = captured.successful_result() {
             prepared.request.validate_result(manifest)?;
             let blobs = manifest.blobs()?;
-            if let Some((grace, mut budget)) = prepared.output.take() {
+            let retained_until = if let Some((grace, mut budget)) = prepared.output.take() {
                 grace.retain(
                     store,
                     &mut budget,
                     &prepared.request.action_fingerprint()?,
                     manifest,
                     &captured,
-                )?;
-            }
+                )?
+            } else {
+                None
+            };
             let missing = self.begin(ticket, manifest.clone())?.missing;
+            // The scheduler recorded its anchor before sending the begin
+            // response. Its clock need not be synchronized with ours.
+            let retained_after_begin = retained_until.map_or(Duration::ZERO, |deadline| {
+                deadline.saturating_duration_since(Instant::now())
+            });
             let bytes = missing
                 .iter()
                 .map(|blob| blob.size)
@@ -700,7 +707,7 @@ impl NativeCacheClient {
             }
             let upload_duration = started.elapsed();
             ensure!(
-                self.commit(ticket)? == *manifest,
+                self.commit(ticket, retained_after_begin)? == *manifest,
                 "native publication manifest mismatch"
             );
             if let Some(transport) = transport {

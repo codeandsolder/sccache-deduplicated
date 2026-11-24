@@ -36,7 +36,15 @@ fn start(
     requested: &NativeInputBlobs,
     cpus: f64,
 ) -> f64 {
-    publication_start(cpus, assigned, placement, requested, 100, 1.0)
+    publication_start(
+        cpus,
+        assigned,
+        placement,
+        &RecentOutputs::default(),
+        requested,
+        100,
+        1.0,
+    )
 }
 
 #[test]

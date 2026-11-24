@@ -1129,6 +1129,17 @@ impl Default for NativePlacement {
     }
 }
 
+/// Authenticated native result lifecycle observations, emitted only after
+/// the corresponding session operation has succeeded.
+#[cfg(feature = "dist-server")]
+pub enum NativeResultEvent<'a> {
+    Negotiated,
+    Committed {
+        manifest: &'a crate::build_runtime::ResultManifest,
+        retained_after_begin: std::time::Duration,
+    },
+}
+
 /// Worker build engines advertised atomically with its scheduler heartbeat.
 #[cfg(feature = "dist-server")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1171,6 +1182,8 @@ pub trait SchedulerIncoming: Send + Sync {
         blob: crate::build_runtime::BlobRef,
         requester: Option<std::net::SocketAddr>,
     ) -> ExtResult<Vec<NativeBlobSource>, Error>;
+    /// Record advisory producer residency for the current worker epoch.
+    fn observe_native_result(&self, server_id: ServerId, job: JobId, event: NativeResultEvent<'_>);
     // From Server
     fn handle_heartbeat_server(
         &self,

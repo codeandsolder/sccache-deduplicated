@@ -83,8 +83,10 @@ fn make_client(url: &reqwest::Url, token: &str) -> Result<NativeCacheClient> {
     )
 }
 
+type Observations = Mutex<Vec<(ServerId, JobId, Option<(ResultManifest, Duration)>)>>;
+
 fn with_native_service(
-    operation: impl FnOnce(&reqwest::Url, &NativeSessions, &NetworkMeter) -> Result<()>,
+    operation: impl FnOnce(&reqwest::Url, &NativeSessions, &NetworkMeter, &Observations) -> Result<()>,
 ) -> Result<()> {
     let directory = tempfile::tempdir()?;
     let sessions = Arc::new(NativeSessions::new(
@@ -93,9 +95,11 @@ fn with_native_service(
     )?);
     let worker: ServerId = "127.0.0.1:10501".parse()?;
     let network = Arc::new(NetworkMeter::default());
+    let observations = Arc::new(Observations::default());
     let server = rouille::Server::new("127.0.0.1:0", {
         let sessions = Arc::clone(&sessions);
         let network = Arc::clone(&network);
+        let observations = Arc::clone(&observations);
         move |request| {
             respond(
                 request,
@@ -103,6 +107,16 @@ fn with_native_service(
                     sessions: &sessions,
                     packages: None,
                     network: &network,
+                    observe_result: &|server, job, event| {
+                        let result = match event {
+                            crate::dist::NativeResultEvent::Negotiated => None,
+                            crate::dist::NativeResultEvent::Committed {
+                                manifest,
+                                retained_after_begin,
+                            } => Some((manifest.clone(), retained_after_begin)),
+                        };
+                        observations.lock().unwrap().push((server, job, result));
+                    },
                 },
                 &move |_, _| {
                     Ok(ScheduleReply::Assigned(WorkerAllocation {
@@ -122,7 +136,7 @@ fn with_native_service(
     .pool_size(4);
     let url = reqwest::Url::parse(&format!("http://{}/", server.server_addr()))?;
     let (handle, stop) = server.stoppable();
-    let outcome = operation(&url, &sessions, &network);
+    let outcome = operation(&url, &sessions, &network, &observations);
     stop.send(()).map_err(|error| anyhow!("{error}"))?;
     handle
         .join()
@@ -138,7 +152,7 @@ fn verify_compressed_download(
 ) -> Result<()> {
     // Negotiation preserves the authenticated verified-bytes contract.
     let compressed = reqwest::blocking::Client::new()
-        .post(url.join("/api/v2/native/client/download")?)
+        .post(url.join("/api/v3/native/client/download")?)
         .bearer_auth("client-token")
         .header("Content-Type", "application/octet-stream")
         .header("X-Sccache-Accept-Blob-Codec", "zstd")
@@ -164,7 +178,7 @@ fn verify_compressed_download(
 
 #[test]
 fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
-    with_native_service(|url, sessions, network| {
+    with_native_service(|url, sessions, network, observations| {
         let client = make_client(url, "client-token")?;
         let worker_client = make_client(url, "worker-token")?.for_worker(JobId(42));
         let wrong_job = worker_client.clone().for_worker(JobId(43));
@@ -246,7 +260,17 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
             worker_client.begin(ticket, output.clone())?.missing,
             vec![blob]
         );
-        assert!(worker_client.commit(ticket).is_err());
+        assert!(
+            worker_client
+                .commit(ticket, Duration::from_secs(300))
+                .is_err()
+        );
+        assert!(wrong_job.commit(ticket, Duration::from_secs(300)).is_err());
+        let owner: ServerId = "127.0.0.1:10501".parse()?;
+        assert_eq!(
+            *observations.lock().unwrap(),
+            vec![(owner, JobId(42), None)]
+        );
         assert!(
             wrong_job
                 .upload(ticket, blob, Cursor::new(bytes.clone()))
@@ -258,7 +282,15 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
                 .is_err()
         );
         worker_client.upload(ticket, blob, Cursor::new(bytes.clone()))?;
-        assert_eq!(worker_client.commit(ticket)?, output);
+        let retention = Duration::from_millis(299_123);
+        assert_eq!(worker_client.commit(ticket, retention)?, output);
+        assert_eq!(
+            *observations.lock().unwrap(),
+            vec![
+                (owner, JobId(42), None),
+                (owner, JobId(42), Some((output.clone(), retention)))
+            ]
+        );
         assert_eq!(client.status(ticket)?, NativeStatus::Ready(output.clone()));
         let mut downloaded = Vec::new();
         client.download(ticket, blob, &mut downloaded)?;
@@ -307,14 +339,14 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
 fn metadata_is_bounded_and_rejects_trailing_bytes() -> Result<()> {
     let request = Request::fake_http(
         "POST",
-        "/api/v2/native/client/status",
+        "/api/v3/native/client/status",
         Vec::new(),
         vec![0; 33],
     );
     assert!(metadata::<crate::build_runtime::wire::Ticket>(&request, 32).is_err());
     let request = Request::fake_http(
         "POST",
-        "/api/v2/native/client/status",
+        "/api/v3/native/client/status",
         Vec::new(),
         vec![0; 33],
     );
@@ -337,7 +369,7 @@ fn metadata_is_bounded_and_rejects_trailing_bytes() -> Result<()> {
 fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result<()> {
     use crate::build_runtime::ExecutionPolicy;
     use std::{fs, process::Command};
-    with_native_service(|url, sessions, _network| {
+    with_native_service(|url, sessions, _network, _observations| {
         let directory = tempfile::tempdir()?;
         let sender = NativeStore::open(&directory.path().join("sender"))?;
         let worker_store = NativeStore::open(&directory.path().join("worker"))?;
@@ -542,7 +574,7 @@ fn lazy_admission_prefetch_and_origin_backfill_over_http() -> Result<()> {
         TreeEntry, TreePath,
         wire::{InputDemand, InputPoll},
     };
-    with_native_service(|url, sessions, _network| {
+    with_native_service(|url, sessions, _network, _observations| {
         let client = make_client(url, "client-token")?;
         let worker = make_client(url, "worker-token")?.for_worker(JobId(42));
         let metadata = TreeMetadata {
@@ -599,7 +631,7 @@ fn lazy_admission_prefetch_and_origin_backfill_over_http() -> Result<()> {
             missing: vec![missing],
         };
         request
-            .post(url.join("/api/v2/native/worker/input_prefetch")?)
+            .post(url.join("/api/v3/native/worker/input_prefetch")?)
             .bearer_auth("worker-token")
             .header("Content-Type", "application/octet-stream")
             .header("X-Sccache-Native-Job", "42")
@@ -607,7 +639,7 @@ fn lazy_admission_prefetch_and_origin_backfill_over_http() -> Result<()> {
             .send()?
             .error_for_status()?;
         let pending = request
-            .post(url.join("/api/v2/native/worker/download")?)
+            .post(url.join("/api/v3/native/worker/download")?)
             .bearer_auth("worker-token")
             .header("Content-Type", "application/octet-stream")
             .header("X-Sccache-Native-Job", "42")

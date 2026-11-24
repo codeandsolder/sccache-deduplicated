@@ -729,6 +729,7 @@ struct JobDetail {
     state_since: Instant,
     // First heartbeat that did not report this Started job as executing.
     missing_since: Option<Instant>,
+    publication_began_at: Option<Instant>,
 }
 
 impl JobDetail {
@@ -817,6 +818,7 @@ struct ServerDetails {
     server_nonce: ServerNonce,
     worker_name: Option<String>,
     capabilities: dist::WorkerCapabilities,
+    recent_outputs: placement::RecentOutputs,
     job_authorizer: Box<dyn JobAuthorizer>,
 }
 
@@ -1056,6 +1058,7 @@ impl Scheduler {
                             details.cpu_capacity,
                             &details.jobs_assigned,
                             placement,
+                            &details.recent_outputs,
                             inputs,
                             Peer::Worker(server_id.addr()),
                             plan,
@@ -1192,6 +1195,7 @@ impl Scheduler {
                         state,
                         state_since: Instant::now(),
                         missing_since: None,
+                        publication_began_at: None,
                     }
                 )
                 .is_none()
@@ -1241,6 +1245,53 @@ impl SchedulerIncoming for Scheduler {
         )
     }
 
+    fn observe_native_result(
+        &self,
+        server_id: ServerId,
+        job: JobId,
+        event: dist::NativeResultEvent<'_>,
+    ) {
+        let now = Instant::now();
+        // Same lock order as assignment and heartbeat processing. The
+        // scheduler-epoch job ID ties the receipt to the current worker
+        // incarnation even if the address is reused after a restart.
+        let (Ok(mut jobs), Ok(mut servers)) = (self.jobs.lock(), self.servers.lock()) else {
+            warn!("Native output locality update skipped: scheduler state poisoned");
+            return;
+        };
+        let Some(detail) = jobs.get_mut(&job) else {
+            return;
+        };
+        let Some(server) = servers.get_mut(&server_id) else {
+            return;
+        };
+        if detail.server_id != server_id
+            || !server.jobs_assigned.get(&job).is_some_and(Option::is_some)
+        {
+            return;
+        }
+        match event {
+            dist::NativeResultEvent::Negotiated => {
+                detail.publication_began_at.get_or_insert(now);
+            }
+            dist::NativeResultEvent::Committed {
+                manifest,
+                retained_after_begin,
+            } => {
+                if let Some(anchor) = detail.publication_began_at
+                    && let Err(error) =
+                        server
+                            .recent_outputs
+                            .record(manifest, anchor, retained_after_begin, now)
+                {
+                    warn!("Native output locality update failed: {error:#}");
+                }
+            }
+        }
+        drop(servers);
+        drop(jobs);
+    }
+
     fn native_blob_sources(
         &self,
         blob: sccache::build_runtime::BlobRef,
@@ -1257,15 +1308,25 @@ impl SchedulerIncoming for Scheduler {
             .iter()
             .filter_map(|(id, details)| {
                 let placement = details.capabilities.native_placement.as_ref()?;
-                let predicted = placement
-                    .residency
-                    .as_ref()
-                    .is_some_and(|residency| residency.may_contain(blob.id));
+                let locality =
+                    if details
+                        .recent_outputs
+                        .contains(blob.id, blob.size, Instant::now())
+                    {
+                        2_u8
+                    } else {
+                        u8::from(
+                            placement
+                                .residency
+                                .as_ref()
+                                .is_some_and(|residency| residency.may_contain(blob.id)),
+                        )
+                    };
                 (Some(id.addr()) != requester
                     && details.last_seen.elapsed() < Duration::from_secs(20)
                     && details.last_error.is_none()
-                    && (requester.is_none() || predicted))
-                    .then_some((id, details, predicted))
+                    && (requester.is_none() || locality > 0))
+                    .then_some((id, details, locality))
             })
             .collect::<Vec<_>>();
         candidates.sort_unstable_by(|(a, left, left_predicted), (b, right, right_predicted)| {
@@ -1339,6 +1400,7 @@ impl SchedulerIncoming for Scheduler {
                 details.last_seen = now;
                 details.cpu_capacity = cpu_capacity;
                 details.capabilities = capabilities;
+                details.recent_outputs.reap(now);
 
                 // Executing jobs and transfers with recent byte progress have
                 // live request owners. A Started job missing from one heartbeat
@@ -1434,6 +1496,7 @@ impl SchedulerIncoming for Scheduler {
                 server_nonce,
                 worker_name: None,
                 capabilities,
+                recent_outputs: placement::RecentOutputs::default(),
                 job_authorizer,
             },
         );
@@ -2212,7 +2275,16 @@ mod scheduler_tests {
         let plan = NativeTransferPlan::new(&network, &HashMap::new());
         let peer = Peer::Worker("127.0.0.1:10501".parse().unwrap());
         let eta = |capacity, assigned: &HashMap<_, _>, placement: &dist::NativePlacement| {
-            native_estimate(capacity, assigned, placement, &inputs, peer, &plan).seconds
+            native_estimate(
+                capacity,
+                assigned,
+                placement,
+                &placement::RecentOutputs::default(),
+                &inputs,
+                peer,
+                &plan,
+            )
+            .seconds
         };
         assert!(eta(4.0, &empty, &fast) < eta(4.0, &empty, &slow));
         let mut filter = BlobResidency::for_count(2).unwrap();
@@ -2272,12 +2344,146 @@ mod scheduler_tests {
         Ok(())
     }
 
+    fn native_test_assignment(
+        platform: sccache::build_runtime::ContentId,
+        input_blobs: dist::NativeInputBlobs,
+    ) -> Result<NativeAssignment> {
+        use sccache::build_runtime::{
+            BuildPath, CommandSpec, ExecutionRoot, ExecutionSpec, TreeId, TreeMetadata, TreeRecipe,
+            TreeTimestamp, wire::Ticket,
+        };
+        Ok(NativeAssignment {
+            ticket: Ticket([42; 32]),
+            input_blobs,
+            spec: ExecutionSpec {
+                platform,
+                root: ExecutionRoot {
+                    id: TreeId([0; 32]),
+                    recipe: TreeRecipe::union(
+                        TreeMetadata {
+                            mode: 0o755,
+                            modified: TreeTimestamp {
+                                seconds: 1,
+                                nanoseconds: 0,
+                            },
+                        },
+                        [TreeId([0; 32])],
+                    ),
+                },
+                mounts: BTreeMap::new(),
+                command: CommandSpec {
+                    executable: BuildPath::new(b"/bin/tool".to_vec())?,
+                    arguments: Vec::new(),
+                    cwd: BuildPath::new(b"/".to_vec())?,
+                    environment: BTreeMap::new(),
+                },
+                outputs: BTreeMap::new(),
+            },
+        })
+    }
+
+    #[test]
+    fn native_producer_receipt_places_consumer_before_next_heartbeat() -> Result<()> {
+        use sccache::build_runtime::{Artifact, BlobRef, ContentId, ResultManifest};
+        let scheduler = Scheduler::new();
+        let producer: ServerId = "127.0.0.1:10501".parse()?;
+        let other: ServerId = "127.0.0.2:10501".parse()?;
+        let platform = ContentId::of(b"test");
+        let register = |id, execution_nanoseconds| {
+            scheduler.handle_heartbeat_server(
+                id,
+                ServerNonce::new(),
+                4.0,
+                &[],
+                Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities {
+                    archive: false,
+                    native_platform: Some(platform),
+                    native_placement: Some(dist::NativePlacement {
+                        execution_nanoseconds,
+                        ..Default::default()
+                    }),
+                },
+            )
+        };
+        register(producer, 2_000_000_000)?;
+        let network = NetworkSnapshot::default();
+        let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_native_job(
+            &AcceptAssign,
+            native_test_assignment(platform, BTreeMap::new())?,
+            &network,
+        )?
+        else {
+            bail!("producer not allocated")
+        };
+        assert_eq!(job_alloc.server_id, producer);
+        let job = job_alloc.job_id;
+        let blob = BlobRef {
+            id: ContentId::of(b"result"),
+            size: 512 << 20,
+        };
+        let manifest = ResultManifest {
+            outputs: BTreeMap::from([("obj".into(), Artifact { blob, mode: None })]),
+            stdout: None,
+            stderr: None,
+        };
+        let committed = || dist::NativeResultEvent::Committed {
+            manifest: &manifest,
+            retained_after_begin: Duration::from_secs(300),
+        };
+        register(other, 1_000_000_000)?;
+        scheduler.observe_native_result(producer, job, committed());
+        assert!(
+            scheduler
+                .native_blob_sources(blob, Some(other.addr()))?
+                .is_empty()
+        );
+        scheduler.observe_native_result(producer, job, dist::NativeResultEvent::Negotiated);
+        scheduler.observe_native_result(other, job, committed());
+        assert!(
+            scheduler
+                .native_blob_sources(blob, Some(other.addr()))?
+                .is_empty()
+        );
+        scheduler.observe_native_result(producer, job, committed());
+        let sources = scheduler.native_blob_sources(blob, Some(other.addr()))?;
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].server, producer);
+        scheduler.handle_update_job_state(job, producer, JobState::Complete)?;
+        let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_native_job(
+            &AcceptAssign,
+            native_test_assignment(platform, BTreeMap::from([(blob.id, blob.size)]))?,
+            &network,
+        )?
+        else {
+            bail!("consumer not allocated")
+        };
+        // Producer is slower but avoids fetching a 512 MiB dependency.
+        assert_eq!(job_alloc.server_id, producer);
+        // Worker incarnation changes invalidate the hints and prior job IDs.
+        register(producer, 2_000_000_000)?;
+        scheduler.observe_native_result(producer, job, dist::NativeResultEvent::Negotiated);
+        scheduler.observe_native_result(producer, job, committed());
+        assert!(
+            scheduler
+                .native_blob_sources(blob, Some(other.addr()))?
+                .is_empty()
+        );
+        let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_native_job(
+            &AcceptAssign,
+            native_test_assignment(platform, BTreeMap::from([(blob.id, blob.size)]))?,
+            &network,
+        )?
+        else {
+            bail!("consumer not allocated after restart")
+        };
+        assert_eq!(job_alloc.server_id, other);
+        Ok(())
+    }
+
     #[test]
     fn native_jobs_select_compatible_workers_using_shared_capacity() -> Result<()> {
-        use sccache::build_runtime::{
-            BuildPath, CommandSpec, ContentId, ExecutionRoot, ExecutionSpec, TreeId, TreeMetadata,
-            TreeRecipe, TreeTimestamp, wire::Ticket,
-        };
+        use sccache::build_runtime::ContentId;
         let scheduler = Scheduler::new_with_job_slack(JobSlackConfig {
             static_jobs: 0,
             percent: 0.0,
@@ -2311,34 +2517,8 @@ mod scheduler_tests {
                 native_placement: Some(dist::NativePlacement::default()),
             },
         )?;
-        let assignment = NativeAssignment {
-            ticket: Ticket([42; 32]),
-            input_blobs: BTreeMap::from([(ContentId([1; 32]), 10)]),
-            spec: ExecutionSpec {
-                platform,
-                root: ExecutionRoot {
-                    id: TreeId([0; 32]),
-                    recipe: TreeRecipe::union(
-                        TreeMetadata {
-                            mode: 0o755,
-                            modified: TreeTimestamp {
-                                seconds: 1,
-                                nanoseconds: 0,
-                            },
-                        },
-                        [TreeId([0; 32])],
-                    ),
-                },
-                mounts: BTreeMap::new(),
-                command: CommandSpec {
-                    executable: BuildPath::new(b"/bin/tool".to_vec())?,
-                    arguments: Vec::new(),
-                    cwd: BuildPath::new(b"/".to_vec())?,
-                    environment: BTreeMap::new(),
-                },
-                outputs: BTreeMap::new(),
-            },
-        };
+        let assignment =
+            native_test_assignment(platform, BTreeMap::from([(ContentId([1; 32]), 10)]))?;
         let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_native_job(
             &AcceptAssign,
             assignment.clone(),
