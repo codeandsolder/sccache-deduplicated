@@ -560,7 +560,11 @@ impl NativeStore {
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) fn can_clone_into(&self, scratch: &Path) -> Result<bool> {
+    /// Check whether a build can use native block cloning on this store.
+    ///
+    /// # Errors
+    /// Returns an error when native ZFS and scratch are on different datasets.
+    pub fn can_clone_into(&self, scratch: &Path) -> Result<bool> {
         if !self.uses_native_zfs() {
             return Ok(false);
         }
