@@ -1242,16 +1242,16 @@ pub trait ServerIncoming: Send + Sync {
     /// Returns an error for incompatible platforms or duplicate assignments.
     fn handle_assign_native_job(
         &self,
+        requester: std::sync::Arc<dyn ServerOutgoing>,
         job_id: JobId,
         assignment: NativeAssignment,
     ) -> ExtResult<AssignJobResult, Error>;
-    /// Claim or observe an assigned native action without blocking for compilation.
+    /// Observe an already dispatched native action without blocking for compilation.
     ///
     /// # Errors
     /// Returns an error if execution, scheduler reporting or publication fails.
     fn handle_run_native_job(
         &self,
-        requester: std::sync::Arc<dyn ServerOutgoing>,
         job_id: JobId,
         request: crate::build_runtime::wire::NativeRunRequest,
     ) -> ExtResult<crate::build_runtime::wire::NativeRunResult, Error>;

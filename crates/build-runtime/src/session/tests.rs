@@ -287,18 +287,132 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     let expiry = NativeSessions::lock(&session)?.expires;
     assert_eq!(service.status(ticket)?, NativeStatus::Compiling);
     assert_eq!(NativeSessions::lock(&session)?.expires, expiry);
-    service.begin(
-        ticket,
-        Publisher::Worker {
-            address: worker,
-            job: 42,
-        },
-        manifest(b"object"),
-    )?;
+    let publisher = Publisher::Worker {
+        address: worker,
+        job: 42,
+    };
+    let result = manifest(b"object");
+    let missing = service.begin(ticket, publisher, result.clone())?.missing;
     assert_eq!(
         service.schedule(ticket, &request()?, |_| bail!("duplicate assignment"))?,
         expected
     );
+    assert_eq!(missing.len(), 1);
+    service.upload(ticket, publisher, missing[0], &b"object"[..])?;
+    assert_eq!(service.commit(ticket, publisher)?, result);
+    // A worker can finish while the original schedule response is lost.
+    assert_eq!(
+        service.schedule(ticket, &request()?, |_| bail!(
+            "duplicate assignment after commit"
+        ))?,
+        expected
+    );
+    assert!(
+        service
+            .schedule(ticket, &changed, |_| bail!(
+                "wrong declaration after commit"
+            ))
+            .is_err()
+    );
+
+    let mut failed = request()?;
+    failed
+        .fingerprint
+        .components
+        .insert("failed".into(), ContentId::of(b"failed"));
+    let NativeAdmission::Compile { ticket } = service.admit(
+        failed.clone(),
+        Publisher::Client,
+        ActionMode::Reuse,
+        BTreeMap::new(),
+    )?
+    else {
+        bail!("expected second compilation");
+    };
+    assert_eq!(
+        service.schedule(ticket, &failed, |_| Ok(expected.clone()))?,
+        expected
+    );
+    service.fail(ticket, publisher)?;
+    assert_eq!(
+        service.schedule(ticket, &failed, |_| bail!(
+            "duplicate assignment after failure"
+        ))?,
+        expected
+    );
+    assert_eq!(service.status(ticket)?, NativeStatus::Failed);
+    Ok(())
+}
+
+#[test]
+fn delegation_blocks_early_worker_verification_until_assignment_returns() -> Result<()> {
+    use std::{sync::mpsc, thread};
+    let dir = tempfile::tempdir()?;
+    let service = service(dir.path())?;
+    for accepted in [false, true] {
+        let mut action = request()?;
+        action.fingerprint.components.insert(
+            "allocation-attempt".into(),
+            ContentId::of(&[u8::from(accepted)]),
+        );
+        let NativeAdmission::Compile { ticket } = service.admit(
+            action.clone(),
+            Publisher::Client,
+            ActionMode::Reuse,
+            BTreeMap::new(),
+        )?
+        else {
+            bail!("expected compilation");
+        };
+        let worker = WorkerAllocation {
+            address: "127.0.0.1:10501".parse()?,
+            job: u64::from(accepted),
+            auth: "proof".into(),
+            certificate: vec![1],
+        };
+        let publisher = Publisher::Worker {
+            address: worker.address,
+            job: worker.job,
+        };
+        let expected = if accepted {
+            ScheduleReply::Assigned(worker)
+        } else {
+            ScheduleReply::Unavailable {
+                message: "assignment rejected".into(),
+            }
+        };
+        thread::scope(|scope| -> Result<()> {
+            let (start, start_rx) = mpsc::channel();
+            let (attempt, attempt_rx) = mpsc::channel();
+            let (done, done_rx) = mpsc::channel();
+            let service = &service;
+            let action = &action;
+            let verifier = scope.spawn(move || -> Result<()> {
+                start_rx.recv_timeout(Duration::from_secs(5))?;
+                attempt.send(())?;
+                done.send(service.verify_execution(ticket, publisher, action))?;
+                Ok(())
+            });
+            let reply = service.schedule(ticket, action, |_| {
+                start.send(())?;
+                attempt_rx.recv_timeout(Duration::from_secs(5))?;
+                // The action mutex is still held while assignment returns.
+                assert!(matches!(
+                    done_rx.recv_timeout(Duration::from_millis(50)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ));
+                Ok(expected.clone())
+            })?;
+            assert_eq!(reply, expected);
+            let verified = done_rx.recv_timeout(Duration::from_secs(5))?;
+            assert_eq!(verified.is_ok(), accepted);
+            verifier
+                .join()
+                .map_err(|_| anyhow!("verification thread panicked"))??;
+            Ok(())
+        })?;
+        service.close(ticket, Publisher::Client)?;
+    }
     Ok(())
 }
 

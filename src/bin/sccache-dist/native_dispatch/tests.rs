@@ -25,7 +25,7 @@ fn worker(root: &std::path::Path, url: reqwest::Url) -> Result<NativeWorker> {
             bubblewrap: "/usr/bin/bwrap".into(),
             platform_contract: "dispatch-test".into(),
             renewal_interval_secs: 1,
-            request_timeout_secs: 1,
+            request_timeout_secs: 5,
             execution_timeout_secs: 5,
             max_result_bytes: 1024,
             max_metadata_bytes: 1 << 20,
@@ -70,20 +70,13 @@ fn assignment(marker: u8) -> Result<NativeAssignment> {
     })
 }
 
-struct PausingRequester {
+struct RecordingRequester {
     states: mpsc::Sender<(JobId, JobState)>,
-    release: Mutex<mpsc::Receiver<()>>,
 }
 
-impl ServerOutgoing for PausingRequester {
+impl ServerOutgoing for RecordingRequester {
     fn do_update_job_state(&self, id: JobId, state: JobState) -> Result<UpdateJobStateResult> {
         self.states.send((id, state))?;
-        if state == JobState::Started {
-            self.release
-                .lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(5))?;
-        }
         Ok(UpdateJobStateResult::Success)
     }
 }
@@ -97,14 +90,10 @@ fn active_jobs(dispatcher: &NativeDispatcher) -> Vec<JobId> {
         .collect()
 }
 
-fn terminal(
-    dispatcher: &NativeDispatcher,
-    requester: &Arc<dyn ServerOutgoing>,
-    id: JobId,
-) -> Result<NativeRunResult> {
+fn terminal(dispatcher: &NativeDispatcher, id: JobId) -> Result<NativeRunResult> {
     let started = Instant::now();
     loop {
-        let result = dispatcher.poll(id, Arc::clone(requester), NativeRunRequest::Poll)?;
+        let result = dispatcher.poll(id, NativeRunRequest::Poll)?;
         if !matches!(result, NativeRunResult::Pending(_)) {
             return Ok(result);
         }
@@ -117,12 +106,36 @@ fn terminal(
 }
 
 #[test]
-fn native_dispatcher_claim_is_nonblocking_and_replayable_with_bounded_reservations() -> Result<()> {
+fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Result<()> {
     let directory = tempfile::tempdir()?;
-    // No successful transfer: exercise actual dispatcher failure/cleanup
-    // without needing a compiler or a complete native scheduler.
-    let server = rouille::Server::new("127.0.0.1:0", |_| {
-        rouille::Response::text("test lease unavailable").with_status_code(409)
+    let (verification_tx, verification_rx) = mpsc::channel();
+    let (delegation_tx, delegation_rx) = mpsc::channel::<u16>();
+    let delegation_rx = Mutex::new(delegation_rx);
+    // Model a scheduler which holds its admission lock until the worker
+    // returns the assignment response. Verification is deliberately blocked.
+    let server = rouille::Server::new("127.0.0.1:0", move |request| match request.url().as_str() {
+        "/api/v3/native/worker/verify" => {
+            let Some(id) = request
+                .header("X-Sccache-Native-Job")
+                .and_then(|job| job.parse::<u64>().ok())
+            else {
+                return rouille::Response::empty_400();
+            };
+            if verification_tx.send(JobId(id)).is_err() {
+                return rouille::Response::empty_404();
+            }
+            let status = delegation_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or(503);
+            rouille::Response::from_data("application/octet-stream", Vec::new())
+                .with_status_code(status)
+        }
+        "/api/v3/native/worker/renew" | "/api/v3/native/worker/fail" => {
+            rouille::Response::from_data("application/octet-stream", Vec::new())
+        }
+        _ => rouille::Response::text("test input unavailable").with_status_code(409),
     })
     .map_err(|error| anyhow::anyhow!("{error}"))?;
     let url = reqwest::Url::parse(&format!("http://{}/", server.server_addr()))?;
@@ -131,110 +144,118 @@ fn native_dispatcher_claim_is_nonblocking_and_replayable_with_bounded_reservatio
         let queue = Arc::new(ExecutionQueue::new(NonZeroUsize::MIN));
         let dispatcher = NativeDispatcher::new(worker(directory.path(), url)?, Arc::clone(&queue))?;
         let (state_tx, states) = mpsc::channel();
-        let (release, release_rx) = mpsc::channel();
-        let requester: Arc<dyn ServerOutgoing> = Arc::new(PausingRequester {
-            states: state_tx,
-            release: Mutex::new(release_rx),
-        });
+        let requester: Arc<dyn ServerOutgoing> = Arc::new(RecordingRequester { states: state_tx });
         let first = JobId(1);
         let second = JobId(2);
         let third = JobId(3);
-        dispatcher.assign(first, assignment(1)?)?;
-        dispatcher.assign(second, assignment(2)?)?;
-        assert!(dispatcher.assign(third, assignment(3)?).is_err());
-        assert!(active_jobs(&dispatcher).is_empty());
-
-        assert_eq!(
-            dispatcher.poll(first, Arc::clone(&requester), NativeRunRequest::Poll)?,
-            NativeRunResult::Pending(NativeJobPhase::Queued)
+        dispatcher.assign(first, assignment(1)?, Arc::clone(&requester))?;
+        // No client status request has been issued.
+        assert_eq!(verification_rx.recv_timeout(Duration::from_secs(5))?, first);
+        assert!(states.try_recv().is_err());
+        assert_eq!(queue.active(), 0);
+        dispatcher.assign(second, assignment(2)?, Arc::clone(&requester))?;
+        assert!(
+            dispatcher
+                .assign(third, assignment(3)?, Arc::clone(&requester))
+                .is_err()
         );
-        assert_eq!(
-            states.recv_timeout(Duration::from_secs(5))?,
-            (first, JobState::Started)
-        );
-        assert_eq!(
-            dispatcher.poll(first, Arc::clone(&requester), NativeRunRequest::Poll)?,
-            NativeRunResult::Pending(NativeJobPhase::Staging)
-        );
-        assert_eq!(
-            dispatcher.poll(second, Arc::clone(&requester), NativeRunRequest::Poll)?,
-            NativeRunResult::Pending(NativeJobPhase::Queued)
-        );
-        assert_eq!(
-            dispatcher.poll(second, Arc::clone(&requester), NativeRunRequest::Poll)?,
-            NativeRunResult::Pending(NativeJobPhase::Queued)
-        );
+        for id in [first, second] {
+            assert_eq!(
+                dispatcher.poll(id, NativeRunRequest::Poll)?,
+                NativeRunResult::Pending(NativeJobPhase::Queued)
+            );
+            assert_eq!(
+                dispatcher.poll(id, NativeRunRequest::Poll)?,
+                NativeRunResult::Pending(NativeJobPhase::Queued)
+            );
+        }
         assert_eq!(
             active_jobs(&dispatcher).into_iter().collect::<HashSet<_>>(),
             HashSet::from([first, second])
         );
-        assert_eq!(queue.active(), 0);
         assert!(
             dispatcher
-                .poll(first, Arc::clone(&requester), NativeRunRequest::Acknowledge)
+                .poll(first, NativeRunRequest::Acknowledge)
                 .is_err()
         );
+        assert!(verification_rx.try_recv().is_err());
         assert!(states.try_recv().is_err());
 
-        // Queued cancellation cannot lose ownership of its reservation or
-        // permit another job to exceed the bound before cleanup.
+        // A cancellation of a queued job holds its reservation until its
+        // stage drains, and never performs verification or starts a compiler.
+        assert_eq!(
+            dispatcher.reconcile(&HashSet::from([first]), Instant::now()),
+            1
+        );
         assert_eq!(
             dispatcher.reconcile(&HashSet::from([first]), Instant::now()),
             0
         );
-        assert!(dispatcher.assign(third, assignment(3)?).is_err());
-        release.send(())?;
+        assert!(
+            dispatcher
+                .assign(third, assignment(3)?, Arc::clone(&requester))
+                .is_err()
+        );
+        delegation_tx.send(200)?;
+        assert_eq!(
+            states.recv_timeout(Duration::from_secs(5))?,
+            (first, JobState::Started)
+        );
         assert_eq!(
             states.recv_timeout(Duration::from_secs(5))?,
             (first, JobState::Complete)
         );
         assert_eq!(
             states.recv_timeout(Duration::from_secs(5))?,
-            (second, JobState::Started)
-        );
-        release.send(())?;
-        assert_eq!(
-            states.recv_timeout(Duration::from_secs(5))?,
             (second, JobState::Complete)
         );
+        assert!(verification_rx.try_recv().is_err());
 
         for id in [first, second] {
+            assert_eq!(terminal(&dispatcher, id)?, NativeRunResult::Unavailable);
             assert_eq!(
-                terminal(&dispatcher, &requester, id)?,
-                NativeRunResult::Unavailable
-            );
-            assert_eq!(
-                dispatcher.poll(id, Arc::clone(&requester), NativeRunRequest::Poll)?,
+                dispatcher.poll(id, NativeRunRequest::Poll)?,
                 NativeRunResult::Unavailable
             );
         }
         assert!(active_jobs(&dispatcher).is_empty());
-        assert!(dispatcher.assign(third, assignment(3)?).is_err());
-        assert_eq!(
-            dispatcher.poll(first, Arc::clone(&requester), NativeRunRequest::Acknowledge)?,
-            NativeRunResult::Acknowledged
+        assert!(
+            dispatcher
+                .assign(third, assignment(3)?, Arc::clone(&requester))
+                .is_err()
         );
+        for _ in 0..2 {
+            assert_eq!(
+                dispatcher.poll(first, NativeRunRequest::Acknowledge)?,
+                NativeRunResult::Acknowledged
+            );
+        }
         assert_eq!(
-            dispatcher.poll(first, Arc::clone(&requester), NativeRunRequest::Acknowledge)?,
-            NativeRunResult::Acknowledged
-        );
-        assert_eq!(
-            dispatcher.poll(first, Arc::clone(&requester), NativeRunRequest::Poll)?,
+            dispatcher.poll(first, NativeRunRequest::Poll)?,
             NativeRunResult::JobNotFound
         );
+
+        // An older heartbeat cannot cancel a new assignment. A scheduler
+        // that declines delegation must never observe Started.
         let cutoff = Instant::now();
-        dispatcher.assign(third, assignment(3)?)?;
+        dispatcher.assign(third, assignment(3)?, Arc::clone(&requester))?;
+        assert_eq!(verification_rx.recv_timeout(Duration::from_secs(5))?, third);
         assert_eq!(dispatcher.reconcile(&HashSet::new(), cutoff), 0);
-        assert_eq!(dispatcher.reconcile(&HashSet::new(), Instant::now()), 1);
+        assert!(states.try_recv().is_err());
+        delegation_tx.send(409)?;
         assert_eq!(
-            dispatcher.poll(third, Arc::clone(&requester), NativeRunRequest::Poll)?,
-            NativeRunResult::JobNotFound
+            states.recv_timeout(Duration::from_secs(5))?,
+            (third, JobState::Complete)
         );
+        assert_eq!(terminal(&dispatcher, third)?, NativeRunResult::Unavailable);
+        assert!(states.try_recv().is_err());
+        assert_eq!(queue.active(), 0);
         assert_eq!(
-            dispatcher.poll(second, Arc::clone(&requester), NativeRunRequest::Poll)?,
+            dispatcher.poll(second, NativeRunRequest::Poll)?,
             NativeRunResult::Unavailable
         );
-        dispatcher.poll(second, requester, NativeRunRequest::Acknowledge)?;
+        dispatcher.poll(second, NativeRunRequest::Acknowledge)?;
+        dispatcher.poll(third, NativeRunRequest::Acknowledge)?;
         Ok(())
     })();
     stop.send(()).map_err(|error| anyhow::anyhow!("{error}"))?;

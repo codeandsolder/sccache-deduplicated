@@ -265,7 +265,7 @@ pub mod urls {
     /// Returns an error if the generated server URL is invalid.
     pub fn server_assign_native_job(server_id: ServerId, job_id: JobId) -> Result<reqwest::Url> {
         Ok(reqwest::Url::parse(&format!(
-            "https://{}/api/v3/distserver/assign_native_job/{job_id}",
+            "https://{}/api/v4/distserver/assign_native_job/{job_id}",
             server_id.addr()
         ))?)
     }
@@ -284,7 +284,7 @@ pub mod urls {
     /// Returns an error if the generated server URL is invalid.
     pub fn server_run_native_job(server_id: ServerId, job_id: JobId) -> Result<reqwest::Url> {
         Ok(reqwest::Url::parse(&format!(
-            "https://{}/api/v4/distserver/run_native_job/{job_id}",
+            "https://{}/api/v5/distserver/run_native_job/{job_id}",
             server_id.addr()
         ))?)
     }
@@ -1677,7 +1677,7 @@ mod server {
                                 heartbeat_started_at,
                             ) {
                                 Ok(removed) if removed > 0 => {
-                                    info!("Discarded {removed} stale unclaimed worker assignments");
+                                    info!("Reconciled {removed} stale worker assignments");
                                 }
                                 Err(error) => {
                                     warn!("Unable to reconcile worker assignments: {error:#}");
@@ -1713,11 +1713,11 @@ mod server {
                         let res: AssignJobResult = try_or_500_log!(req_id, handler.handle_assign_job(job_id, toolchain));
                         prepare_response(request, &res)
                     },
-                    (POST) (/api/v3/distserver/assign_native_job/{job_id: JobId}) => {
+                    (POST) (/api/v4/distserver/assign_native_job/{job_id: JobId}) => {
                         job_auth_or_401!(request, &job_authorizer, job_id);
                         let limit = try_or_400_log!(req_id, handler.native_metadata_limit().context("native worker disabled"));
                         let assignment: NativeAssignment = try_or_400_log!(req_id, native::metadata(request, limit));
-                        let res = try_or_500_log!(req_id, handler.handle_assign_native_job(job_id, assignment));
+                        let res = try_or_500_log!(req_id, handler.handle_assign_native_job(requester.clone(), job_id, assignment));
                         prepare_response(request, &res)
                     },
                     (POST) (/api/v3/distserver/native_blob) => {
@@ -1735,10 +1735,10 @@ mod server {
                             None => rouille::Response::empty_404(),
                         }
                     },
-                    (POST) (/api/v4/distserver/run_native_job/{job_id: JobId}) => {
+                    (POST) (/api/v5/distserver/run_native_job/{job_id: JobId}) => {
                         job_auth_or_401!(request, &job_authorizer, job_id);
                         let operation: crate::build_runtime::wire::NativeRunRequest = try_or_400_log!(req_id, native::metadata(request, 16));
-                        let res = try_or_500_log!(req_id, handler.handle_run_native_job(requester.clone(), job_id, operation));
+                        let res = try_or_500_log!(req_id, handler.handle_run_native_job(job_id, operation));
                         let data = try_or_500_log!(req_id, crate::dist::native::codec().serialize(&res));
                         rouille::Response::from_data("application/octet-stream", data)
                     },

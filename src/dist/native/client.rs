@@ -322,7 +322,21 @@ impl NativeCacheClient {
         if let Some(local) = local.filter(|executor| executor.prefers_local()) {
             return self.run_local(pin, spec, inputs, policy, start, local);
         }
-        let allocation = match self.schedule(pin.ticket, spec.clone())? {
+        let mut delay = Duration::from_millis(10);
+        let reply = loop {
+            let remaining = policy.timeout.saturating_sub(start.elapsed());
+            ensure!(!remaining.is_zero(), "native allocation deadline exceeded");
+            match self.schedule(pin.ticket, spec.clone()) {
+                Ok(reply) => break reply,
+                Err(error) if retryable_transport_error(&error) => {
+                    debug!("retrying native allocation: {error:#}");
+                    thread::sleep(delay.min(remaining));
+                    delay = (delay * 2).min(Duration::from_millis(200));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let allocation = match reply {
             ScheduleReply::Assigned(allocation) => allocation,
             ScheduleReply::Unavailable { message } => {
                 if let Some(local) = local {
@@ -394,26 +408,33 @@ impl NativeCacheClient {
                 supply?;
             }
             result
-        })?;
-        match result {
-            NativeRunResult::Stored => {
-                let NativeStatus::Ready(manifest) = self.status(pin.ticket)? else {
-                    bail!("native worker did not publish its result");
-                };
-                Ok(Outcome::Ready {
-                    delivery: Delivery::Scheduler(pin),
-                    source,
-                    manifest,
-                })
+        });
+        let error = match result {
+            Ok(NativeRunResult::Stored) => None,
+            Ok(failure @ NativeRunResult::Failed { .. }) => {
+                return Ok(Outcome::Failed { source, failure });
             }
-            failure @ NativeRunResult::Failed { .. } => Ok(Outcome::Failed { source, failure }),
-            NativeRunResult::JobNotFound => bail!("native worker lost its assigned job"),
-            NativeRunResult::Unavailable => {
-                bail!("native worker could not execute its assigned job")
+            Ok(NativeRunResult::JobNotFound) => {
+                Some(anyhow::anyhow!("native worker lost its assigned job"))
             }
-            NativeRunResult::Pending(_) | NativeRunResult::Acknowledged => {
-                bail!("unexpected nonterminal worker result")
+            Ok(NativeRunResult::Unavailable) => Some(anyhow::anyhow!(
+                "native worker could not execute its assigned job"
+            )),
+            Ok(NativeRunResult::Pending(_) | NativeRunResult::Acknowledged) => {
+                Some(anyhow::anyhow!("unexpected nonterminal worker result"))
             }
+            Err(error) => Some(error),
+        };
+        // Successful publication is authoritative even if the worker's
+        // terminal response was lost, expired, or the worker restarted.
+        match (self.status(pin.ticket), error) {
+            (Ok(NativeStatus::Ready(manifest)), _) => Ok(Outcome::Ready {
+                delivery: Delivery::Scheduler(pin),
+                source,
+                manifest,
+            }),
+            (_, Some(error)) | (Err(error), None) => Err(error),
+            (Ok(_), None) => bail!("native worker did not publish its result"),
         }
     }
     fn supply_demand(

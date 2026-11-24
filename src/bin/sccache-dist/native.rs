@@ -205,10 +205,6 @@ impl NativeWorker {
     pub(super) fn publish(&self, completed: CompletedWorker) -> Result<CapturedExecution> {
         completed.publish(&self.store, &self.policy, &self.package_transfer)
     }
-
-    pub(super) fn fail(&self, job: JobId, ticket: sccache::build_runtime::wire::Ticket) {
-        let _ = self.client.clone().for_worker(job).fail(ticket);
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

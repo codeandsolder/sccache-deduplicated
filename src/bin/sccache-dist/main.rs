@@ -1937,6 +1937,7 @@ impl ServerIncoming for Server {
 
     fn handle_assign_native_job(
         &self,
+        requester: std::sync::Arc<dyn ServerOutgoing>,
         job_id: JobId,
         assignment: NativeAssignment,
     ) -> Result<AssignJobResult> {
@@ -1945,7 +1946,7 @@ impl ServerIncoming for Server {
             self.native_worker
                 .as_ref()
                 .context("native worker unavailable")?
-                .assign(job_id, assignment)?;
+                .assign(job_id, assignment, requester)?;
             Ok(AssignJobResult {
                 state: JobState::Ready,
                 need_toolchain: false,
@@ -1953,14 +1954,13 @@ impl ServerIncoming for Server {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (job_id, assignment);
+            let _ = (requester, job_id, assignment);
             bail!("native worker requires Linux")
         }
     }
 
     fn handle_run_native_job(
         &self,
-        requester: std::sync::Arc<dyn ServerOutgoing>,
         job_id: JobId,
         request: sccache::build_runtime::wire::NativeRunRequest,
     ) -> Result<sccache::build_runtime::wire::NativeRunResult> {
@@ -1969,11 +1969,11 @@ impl ServerIncoming for Server {
             self.native_worker
                 .as_ref()
                 .context("native worker unavailable")?
-                .poll(job_id, requester, request)
+                .poll(job_id, request)
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (requester, job_id, request);
+            let _ = (job_id, request);
             bail!("native worker requires Linux")
         }
     }

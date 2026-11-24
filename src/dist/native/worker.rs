@@ -509,9 +509,13 @@ impl NativeCacheClient {
         let lease = WorkerLease::start(
             self.clone(),
             ticket,
+            spec,
+            policy.timeout,
             delivery.renewal_interval,
             preparation.cancelled,
         )?;
+        lease.check()?;
+        (preparation.on_authorized)()?;
         lease.check()?;
         let prepared = self.prepare_execution(
             ExecutionContext {
@@ -549,6 +553,7 @@ impl NativeCacheClient {
             policy,
         };
         let result = self.with_renewal(ticket, control.renewal_interval, |check| {
+            self.verify_execution(ticket, spec.clone())?;
             let prepared = self.prepare_execution(
                 context,
                 control.grace,
@@ -579,7 +584,6 @@ impl NativeCacheClient {
             store,
             policy,
         } = context;
-        self.verify_execution(ticket, spec.clone())?;
         if let Some(grace) = grace {
             grace.reap();
         }
@@ -766,6 +770,8 @@ impl WorkerLease {
     fn start(
         client: NativeCacheClient,
         ticket: Ticket,
+        spec: &ExecutionSpec,
+        timeout: Duration,
         interval: Duration,
         cancelled: Arc<AtomicBool>,
     ) -> Result<Self> {
@@ -775,8 +781,32 @@ impl WorkerLease {
             renewals: None,
             cancelled,
         };
+        // Verification is the delegation barrier: the scheduler cannot
+        // authorize this worker until its assignment RPC has returned and
+        // the session has installed the delegated publisher.
         let result = (|| {
-            lease.client.renew(ticket)?;
+            let started = Instant::now();
+            let mut delay = Duration::from_millis(10);
+            loop {
+                ensure!(
+                    !lease.cancelled.load(Ordering::Acquire),
+                    "native worker assignment cancelled"
+                );
+                let remaining = timeout.saturating_sub(started.elapsed());
+                ensure!(
+                    !remaining.is_zero(),
+                    "native assignment authorization timed out"
+                );
+                match lease.client.verify_execution(ticket, spec.clone()) {
+                    Ok(()) => break,
+                    Err(error) if retryable_transport_error(&error) => {
+                        debug!("retrying native assignment authorization: {error:#}");
+                        std::thread::sleep(delay.min(remaining));
+                        delay = (delay * 2).min(Duration::from_millis(200));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             let renewals = super::renewal::Renewals::start(lease.client.clone(), interval)?;
             renewals.add(ticket)?;
             Ok(renewals)
@@ -826,6 +856,7 @@ impl Drop for WorkerLease {
 pub struct WorkerPreparation<'a> {
     pub cancelled: Arc<AtomicBool>,
     pub on_tree: &'a mut dyn FnMut(&TreeLease),
+    pub on_authorized: &'a dyn Fn() -> Result<()>,
 }
 
 /// A ready action owns its verified input closure and output reservation.

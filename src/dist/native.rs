@@ -374,7 +374,7 @@ impl NativeCacheClient {
         self.control("schedule", &ExecutionRequest { ticket, spec })
     }
 
-    /// Claim a scheduler-assigned worker job over its authenticated HTTPS
+    /// Observe a scheduler-dispatched worker job over its authenticated HTTPS
     /// endpoint. Successful outputs are read separately from the scheduler.
     ///
     /// # Errors

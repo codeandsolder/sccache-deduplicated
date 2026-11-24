@@ -143,7 +143,7 @@ other nondeterministic process behavior are not automatically normalized.
 
 The native scheduler, worker and compiler client are opt-in. Use an authenticated private transport for
 the dedicated HTTP cache listener (e.g. the managed private network);
-the listener does not terminate TLS itself. Worker job claiming uses the
+the listener does not terminate TLS itself. Worker assignment and status observation use the
 existing HTTPS job service with the scheduler-provided certificate and job
 capability. The cache listener uses the scheduler's existing client and
 worker authentication. Do not expose it as a public cache endpoint.
@@ -442,7 +442,7 @@ reference accounting, publication, session leases and isolated execution.
 The native HTTP tests exercise actual wire transfers and a Bubblewrap
 execution with a captured shell root and a separate mounted source tree.
 The scheduler unit test checks platform matching and shared capacity.
-A subprocess integration test uses real assembler dependency discovery, direct CAS transfer, the scheduler, HTTPS job claiming and a native-only Bubblewrap worker; it compares object bytes against local assembly and verifies cache reuse and failed-action handling.
+A subprocess integration test uses real assembler dependency discovery, direct CAS transfer, the scheduler, HTTPS job status and a native-only Bubblewrap worker; it compares object bytes against local assembly and verifies cache reuse and failed-action handling.
 Real GCC and Rust compiler-plan tests compare native sandbox outputs
 byte-for-byte against direct compiler invocations, including local dep-info
 generation. A subprocess integration additionally runs real GCC and Rust through an
@@ -803,20 +803,29 @@ compiler width) bounds reservations across assignments, staging, ready jobs,
 execution, publication and unacknowledged terminal responses.
 
 Already cached input trees and partial resident blobs are pinned when the
-assignment is accepted. Once the client claims its delegated ticket, staging
-starts independently of HTTP request lifetime. The prepared job owns its
-verified input leases, output headroom, grace reservation and lease renewal
-through the ready queue and execution; publication retains ownership until
-completion or cancellation. Successful and failed compiler outcomes leave
-the compiler pool before publication or remote cleanup.
+assignment is accepted. Assignment protocol v4 enqueues the job immediately
+and acknowledges it without waiting for staging, authorization or execution.
+The staging pool verifies its immutable execution declaration against the
+scheduler's delegated session before reporting Started or acquiring missing
+inputs. This verification waits for the scheduler to finish allocation and
+delegate the publisher; a rejected or cancelled allocation cannot start
+compilation. The prepared job owns its verified input leases, output headroom,
+grace reservation and lease renewal through the ready queue and execution;
+publication retains ownership until completion or cancellation. Successful
+and failed compiler outcomes leave the compiler pool before publication or
+remote cleanup.
 
-Native run protocol v4 returns short, idempotent status replies (queued,
-staging, ready, executing, awaiting publication or publishing). A terminal result is replayable
-until the client acknowledges it or the five-minute retention expires.
-Repeated claims cannot launch duplicate executions. Heartbeats report
-active dispatched jobs separately from actual occupied compiler slots.
-Reconciliation cancels abandoned active jobs without prematurely releasing
-their reservation, and drops stale unclaimed assignments. The scheduler includes
+Native run protocol v5 returns short, idempotent, observational status replies
+(queued, staging, ready, executing, awaiting publication or publishing).
+Polling never initiates a job. A terminal result is replayable until the
+client acknowledges it or the five-minute retention expires. The native
+session retains the original allocation and exact declaration digest even
+after successful or failed execution, so a lost schedule response can be
+retried without assigning another job. The scheduler's verified result
+remains authoritative if the worker's terminal reply is unavailable.
+Heartbeats report active dispatched jobs separately from actual occupied
+compiler slots. Reconciliation signals cancellation of abandoned active
+jobs without prematurely releasing their reservation. The scheduler includes
 the input blobs of outstanding assignments in the transfer backlog before
 those transfers complete (counting shared content once).
 Concurrent acquisitions of an identical missing tree share one transfer and

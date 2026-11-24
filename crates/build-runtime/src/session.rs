@@ -209,7 +209,6 @@ struct PendingAction {
     unavailable: BTreeSet<(TreeId, ContentId)>,
     origin: Arc<()>,
     upload: Option<(ResultManifest, Transfer)>,
-    allocation: Option<WorkerAllocation>,
 }
 
 enum Pending {
@@ -394,7 +393,13 @@ enum Kind {
     Tree,
 }
 
+struct DelegatedAllocation {
+    declaration: [u8; 32],
+    worker: WorkerAllocation,
+}
+
 struct Session {
+    allocation: Option<DelegatedAllocation>,
     expires: Instant,
     publisher: Publisher,
     kind: Kind,
@@ -555,6 +560,7 @@ impl NativeSessions {
         sessions.insert(
             ticket,
             Arc::new(Mutex::new(Session {
+                allocation: None,
                 expires: self.deadline(),
                 publisher,
                 kind,
@@ -777,7 +783,6 @@ impl NativeSessions {
                     unavailable: BTreeSet::new(),
                     origin: Arc::new(()),
                     upload: None,
-                    allocation: None,
                 }));
                 let ticket =
                     self.register(Kind::Action, publisher, Phase::Pending(Box::new(pending)))?;
@@ -801,7 +806,20 @@ impl NativeSessions {
     ) -> Result<ScheduleReply> {
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
-        self.touch(&mut state)?;
+        if !matches!(state.phase, Phase::Publishing) {
+            self.touch(&mut state)?;
+        }
+        let declaration =
+            crate::identity::typed_digest(b"sccache-native-allocation-declaration-v1\0", request)?;
+        // Assignment starts independently of the response reaching the
+        // origin. Replay survives execution, publication and failure.
+        if let Some(allocation) = &state.allocation {
+            ensure!(
+                allocation.declaration == declaration,
+                "allocation declaration differs from admission"
+            );
+            return Ok(ScheduleReply::Assigned(allocation.worker.clone()));
+        }
         let publisher = state.publisher;
         let Phase::Pending(pending) = &mut state.phase else {
             bail!("native ticket is no longer pending");
@@ -813,9 +831,6 @@ impl NativeSessions {
             &action.request == request,
             "allocation declaration differs from admission"
         );
-        if let Some(allocation) = &action.allocation {
-            return Ok(ScheduleReply::Assigned(allocation.clone()));
-        }
         ensure!(
             publisher == Publisher::Client && action.upload.is_none(),
             "native action already has a publisher"
@@ -833,7 +848,10 @@ impl NativeSessions {
         }
         let reply = allocate(blobs)?;
         if let ScheduleReply::Assigned(allocation) = &reply {
-            action.allocation = Some(allocation.clone());
+            state.allocation = Some(DelegatedAllocation {
+                declaration,
+                worker: allocation.clone(),
+            });
             state.publisher = Publisher::Worker {
                 address: allocation.address,
                 job: allocation.job,

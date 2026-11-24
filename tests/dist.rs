@@ -527,6 +527,7 @@ impl ServerIncoming for FailingServer {
     }
     fn handle_assign_native_job(
         &self,
+        _requester: std::sync::Arc<dyn ServerOutgoing>,
         _job_id: JobId,
         _assignment: sccache::dist::NativeAssignment,
     ) -> Result<AssignJobResult> {
@@ -534,7 +535,6 @@ impl ServerIncoming for FailingServer {
     }
     fn handle_run_native_job(
         &self,
-        _requester: std::sync::Arc<dyn ServerOutgoing>,
         _job_id: JobId,
         _request: sccache::build_runtime::wire::NativeRunRequest,
     ) -> Result<sccache::build_runtime::wire::NativeRunResult> {

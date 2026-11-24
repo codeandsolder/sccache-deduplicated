@@ -63,7 +63,6 @@ impl Terminal {
 }
 
 enum State {
-    Assigned(Box<Assignment>),
     Active(NativeJobPhase),
     Terminal {
         result: Arc<Terminal>,
@@ -100,7 +99,6 @@ impl RemainingInputs {
 impl Reservation {
     fn progress(&self, now: Instant) -> NativeJobProgress {
         let phase = match self.state {
-            State::Assigned(_) => NativeJobPhase::Assigned,
             State::Active(phase) => phase,
             State::Terminal { .. } => NativeJobPhase::Terminal,
         };
@@ -213,23 +211,6 @@ impl Shared {
 
     fn stage(&self, staging: Staging, ready: &SyncSender<Ready>) {
         let Staging { job, assignment } = staging;
-        self.phase(job.id, NativeJobPhase::Staging);
-        let result = (|| {
-            match job
-                .requester
-                .do_update_job_state(job.id, JobState::Started)?
-            {
-                UpdateJobStateResult::Success => (),
-                UpdateJobStateResult::Fail { msg } => {
-                    anyhow::bail!("scheduler rejected native job start: {msg}")
-                }
-            }
-            ensure!(
-                !job.cancelled.load(Ordering::Acquire),
-                "native job cancelled before staging"
-            );
-            Ok(())
-        })();
         let missing = assignment._pins._blobs.missing();
         let mut remaining = RemainingInputs::from_missing(missing);
         let mut missing: BTreeMap<_, _> = missing.iter().map(|blob| (blob.id, blob.size)).collect();
@@ -242,21 +223,27 @@ impl Shared {
             }
             self.remaining(job.id, remaining);
         };
-        let result = match result {
-            Ok(()) => self.worker.prepare(
-                job.id,
-                &assignment.spec,
-                &self.queue,
-                WorkerPreparation {
-                    cancelled: Arc::clone(&job.cancelled),
-                    on_tree: &mut on_tree,
+        let result = self.worker.prepare(
+            job.id,
+            &assignment.spec,
+            &self.queue,
+            WorkerPreparation {
+                cancelled: Arc::clone(&job.cancelled),
+                on_tree: &mut on_tree,
+                on_authorized: &|| match job
+                    .requester
+                    .do_update_job_state(job.id, JobState::Started)?
+                {
+                    UpdateJobStateResult::Success => {
+                        self.phase(job.id, NativeJobPhase::Staging);
+                        Ok(())
+                    }
+                    UpdateJobStateResult::Fail { msg } => {
+                        anyhow::bail!("scheduler rejected native job start: {msg}")
+                    }
                 },
-            ),
-            Err(error) => {
-                self.worker.fail(job.id, assignment.spec.ticket);
-                Err(error)
-            }
-        };
+            },
+        );
         match result {
             Ok(prepared) => {
                 // PreparedWorker owns every complete input tree. Drop the
@@ -398,7 +385,12 @@ impl NativeDispatcher {
         &self.shared.worker
     }
 
-    pub(super) fn assign(&self, id: JobId, spec: NativeAssignment) -> Result<()> {
+    pub(super) fn assign(
+        &self,
+        id: JobId,
+        spec: NativeAssignment,
+        requester: Arc<dyn ServerOutgoing>,
+    ) -> Result<()> {
         spec.spec.validate()?;
         let pins = self.shared.worker.pin_resident_inputs(&spec)?;
         let remaining = RemainingInputs::from_missing(pins._blobs.missing());
@@ -412,17 +404,34 @@ impl NativeDispatcher {
             reservations.len() < self.shared.capacity,
             "native dispatcher reservation limit reached"
         );
-        match reservations.entry(id) {
-            Entry::Occupied(_) => anyhow::bail!("duplicate native assignment for job {id}"),
-            Entry::Vacant(entry) => {
-                entry.insert(Reservation {
-                    accepted_at: Instant::now(),
-                    phase_since: Instant::now(),
-                    remaining,
-                    cancelled: Arc::new(AtomicBool::new(false)),
-                    state: State::Assigned(Box::new(Assignment { spec, _pins: pins })),
-                });
-            }
+        let sender = self.staging.as_ref().context("native dispatcher stopped")?;
+        let Entry::Vacant(entry) = reservations.entry(id) else {
+            anyhow::bail!("duplicate native assignment for job {id}");
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let now = Instant::now();
+        entry.insert(Reservation {
+            accepted_at: now,
+            phase_since: now,
+            remaining,
+            cancelled: Arc::clone(&cancelled),
+            state: State::Active(NativeJobPhase::Queued),
+        });
+        let task = Staging {
+            job: Job {
+                id,
+                requester,
+                cancelled,
+            },
+            assignment: Box::new(Assignment { spec, _pins: pins }),
+        };
+        // No authorization RPC on this request thread: schedule still holds
+        // its session lock while awaiting our assignment acknowledgement.
+        if let Err(error) = sender.try_send(task) {
+            reservations.remove(&id);
+            drop(reservations);
+            drop(error);
+            anyhow::bail!("native staging dispatcher unavailable");
         }
         drop(reservations);
         Ok(())
@@ -459,40 +468,29 @@ impl NativeDispatcher {
     }
 
     pub(super) fn reconcile(&self, known: &HashSet<JobId>, cutoff: Instant) -> usize {
-        let mut reservations = self
+        let reservations = self
             .shared
             .reservations
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let before = reservations.len();
-        reservations.retain(|id, entry| {
-            if entry.accepted_at >= cutoff || known.contains(id) {
-                return true;
-            }
-            match &entry.state {
-                State::Assigned(_) => false,
-                State::Active(_) => {
-                    entry.cancelled.store(true, Ordering::Release);
-                    true
-                }
-                // A completion acknowledgement removes the scheduler entry
-                // before the client has fetched its terminal result.
-                State::Terminal { .. } => true,
-            }
-        });
-        let removed = before - reservations.len();
+        // Retain active reservations until their owning stage drains. A
+        // terminal result is independent of the scheduler job's lifetime.
+        let removed = reservations
+            .iter()
+            .filter(|(id, entry)| {
+                entry.accepted_at < cutoff
+                    && !known.contains(id)
+                    && matches!(entry.state, State::Active(_))
+                    && !entry.cancelled.swap(true, Ordering::AcqRel)
+            })
+            .count();
         drop(reservations);
         removed
     }
 
-    /// The first poll claims the assignment; retries only observe its state.
+    /// Polls only observe state; assignment already initiated execution.
     /// Terminal data survives lost responses until explicit acknowledgement.
-    pub(super) fn poll(
-        &self,
-        id: JobId,
-        requester: Arc<dyn ServerOutgoing>,
-        request: NativeRunRequest,
-    ) -> Result<NativeRunResult> {
+    pub(super) fn poll(&self, id: JobId, request: NativeRunRequest) -> Result<NativeRunResult> {
         let mut reservations = self
             .shared
             .reservations
@@ -509,7 +507,7 @@ impl NativeDispatcher {
             }
             anyhow::bail!("cannot acknowledge an active native job");
         }
-        let Some(entry) = reservations.get_mut(&id) else {
+        let Some(entry) = reservations.get(&id) else {
             return Ok(NativeRunResult::JobNotFound);
         };
         match &entry.state {
@@ -519,39 +517,6 @@ impl NativeDispatcher {
                 result.response()
             }
             State::Active(phase) => Ok(NativeRunResult::Pending(*phase)),
-            State::Assigned(_) => {
-                let State::Assigned(assignment) =
-                    std::mem::replace(&mut entry.state, State::Active(NativeJobPhase::Queued))
-                else {
-                    anyhow::bail!("native assignment changed while locked");
-                };
-                entry.phase_since = Instant::now();
-                let job = Job {
-                    id,
-                    requester,
-                    cancelled: Arc::clone(&entry.cancelled),
-                };
-                let task = Staging { job, assignment };
-                // At most capacity reservations exist across all stages. A
-                // full channel cannot occur for a newly claimed reservation.
-                if let Err(error) = self
-                    .staging
-                    .as_ref()
-                    .context("native dispatcher stopped")?
-                    .try_send(task)
-                {
-                    let task = match error {
-                        mpsc::TrySendError::Full(task) | mpsc::TrySendError::Disconnected(task) => {
-                            task
-                        }
-                    };
-                    let Staging { assignment, .. } = task;
-                    entry.state = State::Assigned(assignment);
-                    return Err(anyhow::anyhow!("native staging dispatcher unavailable"));
-                }
-                drop(reservations);
-                Ok(NativeRunResult::Pending(NativeJobPhase::Queued))
-            }
         }
     }
 }
