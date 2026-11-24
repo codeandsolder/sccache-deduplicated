@@ -375,7 +375,9 @@ pub use mount::MountedTree;
 #[cfg(target_os = "linux")]
 pub use mount::ReadOnlyView;
 #[cfg(target_os = "linux")]
-pub(super) use mount::compatible_regular_file_overlays;
+mod overlay;
+#[cfg(target_os = "linux")]
+pub(super) use overlay::plan_overlays;
 #[cfg(target_os = "linux")]
 mod materialize;
 #[cfg(target_os = "linux")]

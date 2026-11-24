@@ -1,7 +1,7 @@
 //! Read-only virtual trees backed directly by independently compressed CAS objects.
 //! A Bubblewrap worker receives a normal filesystem without persistent expanded copies.
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     ffi::{OsStr, OsString},
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom},
@@ -29,48 +29,6 @@ use crate::{BlobReader, BlobRef, TreeEntry, TreeManifest, TreeMetadata, TreePath
 
 const TTL: Duration = Duration::from_secs(3600);
 const KEEP_CACHE: u32 = 1 << 1;
-
-/// Identify namespace-preserving regular-file replacements relative to a
-/// cached immutable tree. Any directory, symlink, root, or link-topology
-/// change instead requires a complete view.
-pub fn compatible_regular_file_overlays(
-    base: &TreeManifest,
-    target: &TreeManifest,
-    protected: &[PathBuf],
-) -> Option<Vec<TreePath>> {
-    if base.root != target.root || base.entries.len() != target.entries.len() {
-        return None;
-    }
-    let mut changed = Vec::new();
-    for ((base_path, old), (target_path, new)) in base.entries.iter().zip(&target.entries) {
-        if base_path != target_path {
-            return None;
-        }
-        if old == new {
-            continue;
-        }
-        match (old, new) {
-            (TreeEntry::File { .. }, TreeEntry::File { .. }) => {
-                let path = Path::new(OsStr::from_bytes(target_path.as_bytes()));
-                if protected.iter().any(|region| path.starts_with(region)) {
-                    return None;
-                }
-                changed.push(target_path.clone());
-            }
-            _ => return None,
-        }
-    }
-    if changed.is_empty() {
-        return None;
-    }
-    let changed_targets: BTreeSet<_> = changed.iter().collect();
-    if target.entries.values().any(
-        |entry| matches!(entry, TreeEntry::Hardlink(source) if changed_targets.contains(source)),
-    ) {
-        return None;
-    }
-    Some(changed)
-}
 
 enum Kind {
     Directory(BTreeMap<OsString, u64>),
@@ -711,6 +669,7 @@ impl TreeLease {
 
 #[cfg(test)]
 mod tests {
+    use super::super::overlay::compatible_regular_file_overlays;
     use super::*;
     use crate::{Eviction, NativeStore};
 
@@ -1025,6 +984,206 @@ mod tests {
             Ok(())
         })?;
         drop(base_view);
+        Ok(())
+    }
+
+    /// Verify both the indexed-Zstd/FUSE implementation and, when available,
+    /// native ZFS block-cloned subtree construction.
+    #[test]
+    fn changing_directory_members_reuses_unaffected_tree_and_preserves_inodes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        verify_directory_view(temp.path())?;
+        let current = std::env::current_dir()?;
+        if crate::store::is_native_zfs(&current)? {
+            let zfs = tempfile::tempdir_in(current)?;
+            verify_directory_view(zfs.path())?;
+        }
+        Ok(())
+    }
+
+    fn verify_directory_view(parent: &Path) -> Result<()> {
+        let input = parent.join("input");
+        let work = input.join("src/work");
+        fs::create_dir_all(&work)?;
+        fs::create_dir_all(input.join("out"))?;
+        fs::create_dir_all(input.join("stable"))?;
+        fs::write(work.join("source"), b"first")?;
+        fs::hard_link(work.join("source"), work.join("alias"))?;
+        fs::write(work.join("removed"), b"old")?;
+        symlink("source", work.join("sym"))?;
+        for index in 0..96 {
+            fs::write(
+                input.join("stable").join(format!("header-{index:03}")),
+                b"header",
+            )?;
+        }
+        let store = NativeStore::open(&parent.join("store"))?;
+        let original = store.capture_tree(&input)?;
+        let old_id = original.id();
+        let base = store.mount_tree_protected(original, parent, &[])?;
+        let base_root = base.root().to_owned();
+
+        fs::write(work.join("source"), b"second")?;
+        fs::remove_file(work.join("removed"))?;
+        fs::write(work.join("added"), b"new")?;
+        fs::remove_file(work.join("sym"))?;
+        symlink("added", work.join("sym"))?;
+        let newer = store.capture_tree(&input)?;
+        let newer_id = newer.id();
+        assert_ne!(old_id, newer_id);
+        let mut view = store.mount_tree_protected(newer, parent, &[PathBuf::from("out")])?;
+        assert_eq!(view.root(), base_root);
+        let bindings = view.overlay_bindings().collect::<Vec<_>>();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].0, &TreePath::new(b"src/work".to_vec())?);
+        let replacement = bindings[0].1;
+        assert!(replacement.is_dir());
+        assert_eq!(fs::read(replacement.join("source"))?, b"second");
+        assert_eq!(fs::read(replacement.join("alias"))?, b"second");
+        assert_eq!(fs::read_link(replacement.join("sym"))?, Path::new("added"));
+        assert_eq!(fs::read(replacement.join("added"))?, b"new");
+        assert!(!replacement.join("removed").exists());
+        assert_eq!(
+            fs::metadata(replacement.join("source"))?.ino(),
+            fs::metadata(replacement.join("alias"))?.ino()
+        );
+        assert_eq!(fs::metadata(replacement.join("source"))?.nlink(), 2);
+        assert_eq!(fs::read(base_root.join("src/work/source"))?, b"first");
+        assert!(base_root.join("src/work/removed").exists());
+        assert!(!base_root.join("src/work/added").exists());
+        assert_eq!(store.evict_tree(old_id)?, Eviction::Pinned);
+        assert_eq!(store.evict_tree(newer_id)?, Eviction::Pinned);
+        let stats = view
+            .overlay_stats()
+            .context("missing materialization counters")?;
+        println!(
+            "DIRECTORY_OVERLAY backend={} cloned_files={} copied_files={} copied_bytes={} unchanged_headers=96",
+            if store.uses_native_zfs() {
+                "zfs"
+            } else {
+                "fuse"
+            },
+            stats.cloned_files,
+            stats.copied_files,
+            stats.copied_bytes,
+        );
+        if store.uses_native_zfs() {
+            assert_eq!(stats.cloned_files, 2);
+            assert_eq!(stats.copied_files, 0);
+        } else {
+            assert_eq!(stats.copied_files, 2);
+        }
+        view.mark_writable(Path::new("out"))?;
+        fs::write(
+            view.writable_path(Path::new("out"))?.join("private"),
+            b"private",
+        )?;
+        assert!(!base_root.join("out/private").exists());
+        drop(view);
+        drop(base);
+        assert!(matches!(
+            store.evict_tree(old_id)?,
+            Eviction::Removed { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_directory_topology_variants_keep_private_inode_groups() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("input");
+        let work = input.join("src/work");
+        fs::create_dir_all(&work)?;
+        fs::create_dir_all(input.join("headers"))?;
+        fs::write(work.join("source"), b"unchanged")?;
+        fs::hard_link(work.join("source"), work.join("alias"))?;
+        fs::write(work.join("removed"), b"obsolete")?;
+        symlink("source", work.join("selected"))?;
+        for index in 0..64 {
+            fs::write(input.join("headers").join(format!("{index:03}")), b"header")?;
+        }
+        let store = NativeStore::open(&temp.path().join("store"))?;
+        let base = store.capture_tree(&input)?;
+        let cached = store.mount_tree_protected(base, temp.path(), &[])?;
+        let cached_root = cached.root().to_owned();
+        let mut variants = Vec::new();
+        let source = store.capture_tree(&input)?;
+        let source_name = TreePath::new(b"src/work/source".to_vec())?;
+        let referent = match source.manifest().entries.get(&source_name) {
+            Some(TreeEntry::File { .. }) => &source_name,
+            Some(TreeEntry::Hardlink(target)) => target,
+            _ => anyhow::bail!("captured source must be a regular file or hardlink"),
+        };
+        let metadata = match source.manifest().entries.get(referent) {
+            Some(TreeEntry::File { metadata, .. }) => *metadata,
+            _ => anyhow::bail!("captured hardlink referent missing"),
+        };
+        for index in 0..8 {
+            let mut manifest = source.manifest().clone();
+            let content = format!("generated variant {index}").into_bytes();
+            let blob = store.stage(content.as_slice())?;
+            let name = format!("variant-{index}");
+            manifest
+                .entries
+                .remove(&TreePath::new(b"src/work/removed".to_vec())?);
+            manifest.entries.insert(
+                TreePath::new(format!("src/work/{name}").into_bytes())?,
+                TreeEntry::File {
+                    blob: blob.reference(),
+                    metadata,
+                },
+            );
+            manifest.entries.insert(
+                TreePath::new(b"src/work/selected".to_vec())?,
+                TreeEntry::Symlink {
+                    target: name.as_bytes().to_vec(),
+                    modified: TreeTimestamp {
+                        seconds: 123,
+                        nanoseconds: 0,
+                    },
+                },
+            );
+            let id = store.publish_tree(&manifest, vec![blob])?;
+            variants.push((id, name, content));
+        }
+        let scratch = temp.path();
+        std::thread::scope(|scope| -> Result<()> {
+            let handles = variants
+                .iter()
+                .map(|(id, name, content)| {
+                    let store = &store;
+                    let cached_root = &cached_root;
+                    scope.spawn(move || -> Result<()> {
+                        let target = store.lookup_tree(*id)?.context("missing variant")?;
+                        let view = store.mount_tree_protected(target, scratch, &[])?;
+                        assert_eq!(view.root(), cached_root);
+                        let bindings = view.overlay_bindings().collect::<Vec<_>>();
+                        assert_eq!(bindings.len(), 1);
+                        let dir = bindings[0].1;
+                        assert_eq!(fs::read(dir.join(name))?, *content);
+                        assert_eq!(fs::read_link(dir.join("selected"))?, Path::new(name));
+                        assert!(!dir.join("removed").exists());
+                        assert_eq!(
+                            fs::metadata(dir.join("source"))?.ino(),
+                            fs::metadata(dir.join("alias"))?.ino()
+                        );
+                        assert_eq!(fs::metadata(dir.join("source"))?.nlink(), 2);
+                        assert!(matches!(store.evict_tree(*id)?, Eviction::Pinned));
+                        Ok(())
+                    })
+                })
+                .collect::<Vec<_>>();
+            for task in handles {
+                task.join().expect("directory overlay thread panicked")?;
+            }
+            Ok(())
+        })?;
+        assert_eq!(
+            fs::read_link(cached_root.join("src/work/selected"))?,
+            Path::new("source")
+        );
+        drop(source);
+        drop(cached);
         Ok(())
     }
 

@@ -18,7 +18,7 @@ use rustix::{
 };
 use tempfile::TempDir;
 
-use super::TreeLease;
+use super::{TreeLease, overlay::OverlayPlan};
 use crate::{BlobRef, TreeEntry, TreeMetadata, TreePath, TreeTimestamp};
 
 /// Materialization work, reporting explicit block clones separately from copies.
@@ -36,6 +36,19 @@ pub struct OverlayFiles {
     _directory: TempDir,
     pub(super) replacements: BTreeMap<TreePath, PathBuf>,
     pub(crate) stats: MaterializationStats,
+}
+
+impl Drop for OverlayFiles {
+    fn drop(&mut self) {
+        // Per-action directory overlays are immutable inside the sandbox,
+        // but may have mode 000 or other restrictive metadata. Restore only
+        // directory modes, without following symlinks, before TempDir cleanup.
+        for path in self.replacements.values() {
+            if path.is_dir() {
+                restore_mutable_directories(path);
+            }
+        }
+    }
 }
 
 /// A private materialized input tree.
@@ -126,34 +139,115 @@ pub(super) fn restore_mutable_directories(root: &Path) {
 }
 
 impl TreeLease {
+    /// Materialize only planned private file and complete directory overlays
+    /// from the target lease, preserving original mode, mtime and hardlinks.
     pub(crate) fn materialize_overlays(
         self,
-        changed: &[TreePath],
+        plan: &OverlayPlan,
         parent: &Path,
     ) -> Result<OverlayFiles> {
         let directory = tempfile::Builder::new()
             .prefix("build-file-overlays-")
             .tempdir_in(parent)?;
-        let mut replacements = BTreeMap::new();
-        let mut stats = MaterializationStats::default();
-        for (index, path) in changed.iter().enumerate() {
-            let Some(TreeEntry::File { blob, metadata }) = self.manifest.entries.get(path) else {
+        // Own the partially materialized subtrees from the outset. Any
+        // mid-operation failure runs the same safe cleanup as success, even
+        // if an already-created child directory has restrictive permissions.
+        let mut overlays = OverlayFiles {
+            _lease: self,
+            _directory: directory,
+            replacements: BTreeMap::new(),
+            stats: MaterializationStats::default(),
+        };
+        for (index, path) in plan.files.iter().enumerate() {
+            let Some(TreeEntry::File { blob, metadata }) =
+                overlays._lease.manifest.entries.get(path)
+            else {
                 anyhow::bail!("overlay source must be a regular file");
             };
-            let physical = directory.path().join(index.to_string());
-            self.materialize_file(*blob, &physical, &mut stats)?;
+            let physical = overlays._directory.path().join(format!("file-{index}"));
+            overlays
+                ._lease
+                .materialize_file(*blob, &physical, &mut overlays.stats)?;
             apply_metadata(&physical, *metadata)?;
             ensure!(
-                replacements.insert(path.clone(), physical).is_none(),
+                overlays
+                    .replacements
+                    .insert(path.clone(), physical)
+                    .is_none(),
                 "duplicate overlay path"
             );
         }
-        Ok(OverlayFiles {
-            _lease: self,
-            _directory: directory,
-            replacements,
-            stats,
-        })
+        for (index, anchor) in plan.directories.iter().enumerate() {
+            let physical = overlays._directory.path().join(format!("dir-{index}"));
+            ensure!(
+                overlays
+                    .replacements
+                    .insert(anchor.clone(), physical.clone())
+                    .is_none(),
+                "duplicate overlay directory"
+            );
+            overlays
+                ._lease
+                .materialize_overlay_subtree(anchor, &physical, &mut overlays.stats)?;
+        }
+        Ok(overlays)
+    }
+
+    /// Build a complete subtree with a private root, using only the files
+    /// declared beneath an existing directory in the target manifest.
+    fn materialize_overlay_subtree(
+        &self,
+        anchor: &TreePath,
+        destination: &Path,
+        stats: &mut MaterializationStats,
+    ) -> Result<()> {
+        let Some(TreeEntry::Directory(root_metadata)) = self.manifest.entries.get(anchor) else {
+            anyhow::bail!("overlay anchor must be a directory");
+        };
+        fs::create_dir(destination)?;
+        let prefix = [anchor.as_bytes(), b"/"].concat();
+        let mut links = Vec::new();
+        let mut dirs = Vec::new();
+        for (path, entry) in &self.manifest.entries {
+            let Some(remainder) = path.as_bytes().strip_prefix(prefix.as_slice()) else {
+                continue;
+            };
+            let physical = destination.join(OsStr::from_bytes(remainder));
+            match entry {
+                TreeEntry::Directory(_) => {
+                    fs::create_dir(&physical)?;
+                    dirs.push((physical, entry));
+                }
+                TreeEntry::File { blob, metadata } => {
+                    self.materialize_file(*blob, &physical, stats)?;
+                    apply_metadata(&physical, *metadata)?;
+                }
+                TreeEntry::Symlink { target, modified } => {
+                    symlink(OsStr::from_bytes(target), &physical)?;
+                    set_timestamp(&physical, *modified)?;
+                }
+                TreeEntry::Hardlink(target) => {
+                    let referent = target
+                        .as_bytes()
+                        .strip_prefix(prefix.as_slice())
+                        .context("overlay hardlink target crosses subtree boundary")?;
+                    links.push((destination.join(OsStr::from_bytes(referent)), physical));
+                }
+            }
+        }
+        // Hardlink target may sort after its aliases; create all regular files
+        // first, preserving one inode and st_nlink across the entire group.
+        for (target, alias) in links {
+            fs::hard_link(target, alias)?;
+        }
+        // Parent metadata is applied last so creation does not disturb mtime.
+        for (path, entry) in dirs.into_iter().rev() {
+            if let TreeEntry::Directory(metadata) = entry {
+                apply_metadata(&path, *metadata)?;
+            }
+        }
+        apply_metadata(destination, *root_metadata)?;
+        Ok(())
     }
 
     /// Materialize a validated tree in a fresh private directory on the
@@ -287,6 +381,35 @@ fn set_timestamp(path: &Path, timestamp: TreeTimestamp) -> Result<()> {
 #[cfg(test)]
 mod cleanup_tests {
     use super::*;
+    use crate::{NativeStore, TreeEntry, TreePath};
+
+    #[test]
+    fn failed_directory_overlay_cleans_partially_constructed_scratch() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("input");
+        fs::create_dir_all(input.join("src/work/inner"))?;
+        fs::write(input.join("src/work/inner/good"), b"good")?;
+        fs::write(input.join("src/work/zz-broken"), b"missing blob")?;
+        let store = NativeStore::open(&temp.path().join("store"))?;
+        let lease = store.capture_tree(&input)?;
+        let missing_path = TreePath::new(b"src/work/zz-broken".to_vec())?;
+        let Some(TreeEntry::File { blob, .. }) = lease.manifest().entries.get(&missing_path) else {
+            anyhow::bail!("test blob not captured");
+        };
+        // Model a storage read failure after the region root, nested
+        // directories and preceding regular files have been created.
+        fs::remove_file(lease.inner.blob_path(blob.id))?;
+        let scratch = temp.path().join("scratch");
+        fs::create_dir(&scratch)?;
+        let plan = OverlayPlan {
+            files: Vec::new(),
+            directories: vec![TreePath::new(b"src/work".to_vec())?],
+            materialized_entries: 4,
+        };
+        assert!(lease.materialize_overlays(&plan, &scratch).is_err());
+        assert_eq!(fs::read_dir(&scratch)?.count(), 0);
+        Ok(())
+    }
 
     #[test]
     fn mutable_cleanup_does_not_follow_replacement_symlinks() -> Result<()> {
