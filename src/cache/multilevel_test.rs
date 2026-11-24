@@ -1150,6 +1150,56 @@ fn test_preprocessor_cache_methods() -> Result<()> {
 }
 
 #[test]
+fn preprocessor_cache_read_errors_fall_through_without_masking_total_misses() -> Result<()> {
+    let runtime = RuntimeBuilder::new_current_thread().enable_all().build()?;
+    let cache_root = TempBuilder::new()
+        .prefix("sccache_preprocessor_fallback_")
+        .tempdir()?;
+    let fallback = Arc::new(DiskCache::new(
+        &cache_root.path().join("cache"),
+        1024 * 1024,
+        runtime.handle(),
+        PreprocessorCacheModeConfig::activated(),
+        CacheMode::ReadWrite,
+        vec![],
+    ));
+
+    runtime.block_on(async {
+        let key = "preprocessor-cache-fallback-entry";
+        fallback
+            .put_preprocessor_cache_entry(key, PreprocessorCacheEntry::default())
+            .await?;
+        let storage = MultiLevelStorage::new(vec![
+            Arc::new(FailingStorage) as Arc<dyn Storage>,
+            fallback.clone() as Arc<dyn Storage>,
+        ]);
+
+        // A failed fast tier must not prevent retrieval from the slower tier.
+        assert!(storage.get_preprocessor_cache_entry(key).await?.is_some());
+        assert_eq!(storage.stats().0[0].read_errors, 1);
+
+        // When no healthy tier contains the entry, retain the earlier error
+        // instead of interpreting a backend outage as a genuine cache miss.
+        let Err(error) = storage.get_preprocessor_cache_entry("absent").await else {
+            panic!("cache backend error was incorrectly reported as a miss");
+        };
+        assert!(format!("{error:#}").contains("Intentional failure for testing"));
+        assert!(format!("{error:#}").contains("preprocessor cache level 0"));
+        assert_eq!(storage.stats().0[0].read_errors, 2);
+
+        // All healthy cache tiers missing the entry is a normal miss.
+        let healthy = MultiLevelStorage::new(vec![fallback as Arc<dyn Storage>]);
+        assert!(
+            healthy
+                .get_preprocessor_cache_entry("absent")
+                .await?
+                .is_none()
+        );
+        Ok::<(), anyhow::Error>(())
+    })
+}
+
+#[test]
 fn test_readonly_level_in_check() -> Result<()> {
     // Test that check() properly detects read-only levels
     let runtime = RuntimeBuilder::new_multi_thread()
