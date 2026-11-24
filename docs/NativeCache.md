@@ -5,6 +5,32 @@ protocol. It does not reinterpret the archive compiler protocol's keys and
 is not yet the default compiler frontend. Neither enabling the scheduler
 listener nor enabling a worker changes ordinary archive assignments.
 
+## Content identity and lookup contract
+
+The native store uses a **BLAKE3-256 content identity** over the exact bytes of
+each logical blob. This identity is independent of read chunk boundaries,
+file paths, permissions, output names, execution actions and storage encoding.
+Compression or decompression never changes the identity of the decoded bytes;
+an original compressed package is a separate blob whose contents are its
+compressed source bytes. Tree manifests carry content identities and file
+metadata separately.
+
+The scheduler indexes **semantic action keys to result identities**, and
+result manifests then identify their output blobs. Identical bytes are stored
+once even when independently produced by different actions or used in
+multiple trees. Leases and reverse references prevent eviction while any
+result or tree still needs the blob. Ingest computes the digest while staging
+each new byte stream; receivers independently verify advertised digests and
+lengths before publication, including across worker/client trust boundaries.
+
+BLAKE3-256 is the existing identity format, not a configurable algorithm.
+The considered XXH3-128 and GxHash-128 alternatives hash warm memory faster,
+but bulk hash throughput is not the observed import bottleneck, and their use
+would change the content-verification contract. GxHash's incremental API
+also produces different identities for different write chunk boundaries.
+Do not shrink or replace the stored hash without an explicit format
+revision and measured end-to-end benefit.
+
 ## Action and storage contract
 
 A client describes quiescent files directly, or a store imports verified
