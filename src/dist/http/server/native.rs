@@ -257,7 +257,7 @@ pub(super) fn spawn(
     Ok(())
 }
 
-const PREFIX: &str = "/api/v3/native/";
+const PREFIX: &str = "/api/v4/native/";
 
 /// Compress only when a representative prefix wins comfortably. We keep the
 /// immutable digest-named files raw for mmap/materialization; this codec is
@@ -704,6 +704,7 @@ fn dispatch(
             let CommitRequest {
                 ticket,
                 retained_after_begin_millis,
+                observation,
             } = metadata(request, limit)?;
             let manifest = sessions.commit(ticket, publisher)?;
             if let Publisher::Worker { address, job } = publisher {
@@ -713,6 +714,7 @@ fn dispatch(
                     crate::dist::NativeResultEvent::Committed {
                         manifest: &manifest,
                         retained_after_begin: Duration::from_millis(retained_after_begin_millis),
+                        observation,
                     },
                 );
             }

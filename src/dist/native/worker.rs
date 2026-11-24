@@ -22,7 +22,7 @@ use crate::build_runtime::{
     ArchiveLength, BlobRef, CapturedExecution, ExecutionPolicy, ExecutionSpec, NativeServiceBusy,
     NativeStore, PackageArchive, PackageImportLimits, PackageTransferCost, ResultTransferEstimate,
     StageBudget, TreeId, TreeLease, VerifiedPackage, execute,
-    wire::{ActionRequest, Ticket},
+    wire::{ActionObservation, ActionRequest, Ticket},
 };
 
 /// Per-worker observed transfer and decoding rates.
@@ -669,11 +669,12 @@ impl NativeCacheClient {
         &self,
         context: ExecutionContext<'_>,
         mut prepared: PreparedExecution,
-        captured: CapturedExecution,
+        measured: MeasuredExecution,
         transport: Option<&PackageTransportTracker>,
         check: &LeaseCheck<'_>,
     ) -> Result<CapturedExecution> {
         let ExecutionContext { ticket, store, .. } = context;
+        let MeasuredExecution { captured, duration } = measured;
         check()?;
         if let Some(manifest) = captured.successful_result() {
             prepared.request.validate_result(manifest)?;
@@ -711,7 +712,19 @@ impl NativeCacheClient {
             }
             let upload_duration = started.elapsed();
             ensure!(
-                self.commit(ticket, retained_after_begin)? == *manifest,
+                self.commit(
+                    ticket,
+                    retained_after_begin,
+                    Some(ActionObservation {
+                        execution_nanoseconds: u64::try_from(duration.as_nanos())
+                            .unwrap_or(u64::MAX)
+                            .max(1),
+                        upload_bytes: bytes,
+                        upload_requests: requests,
+                        upload_nanoseconds: u64::try_from(upload_duration.as_nanos())
+                            .unwrap_or(u64::MAX),
+                    })
+                )? == *manifest,
                 "native publication manifest mismatch"
             );
             if let Some(transport) = transport {
@@ -738,23 +751,29 @@ struct PreparedExecution {
     output: Option<(super::grace::GraceReservation, StageBudget)>,
 }
 
+struct MeasuredExecution {
+    captured: CapturedExecution,
+    duration: Duration,
+}
+
 fn compile(
     context: ExecutionContext<'_>,
     queue: Option<&crate::dist::execution_queue::ExecutionQueue>,
     transport: Option<&PackageTransportTracker>,
     check: &LeaseCheck<'_>,
     on_start: impl FnOnce(),
-) -> Result<CapturedExecution> {
+) -> Result<MeasuredExecution> {
     let _permit = queue.map(|queue| queue.acquire(check)).transpose()?;
     on_start();
     let started = Instant::now();
     let captured = execute(context.spec, context.store, context.policy, check)?;
+    let duration = started.elapsed();
     if captured.successful_result().is_some()
         && let Some(transport) = transport
     {
-        transport.observe_execution(started.elapsed());
+        transport.observe_execution(duration);
     }
-    Ok(captured)
+    Ok(MeasuredExecution { captured, duration })
 }
 
 // The lease owns cancellation and renewal across queue handoffs. Errors
@@ -899,7 +918,7 @@ impl PreparedWorker {
 /// A compiler has exited; publication does not occupy a compiler slot.
 pub struct CompletedWorker {
     worker: PreparedWorker,
-    captured: Result<CapturedExecution>,
+    captured: Result<MeasuredExecution>,
 }
 
 impl CompletedWorker {

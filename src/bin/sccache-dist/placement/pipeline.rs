@@ -11,9 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::RecentOutputs;
+use super::{ActionCost, AssignedNative, RecentOutputs};
 
-pub(super) type Assignments = HashMap<JobId, Option<NativeInputBlobs>>;
+pub(super) type Assignments = HashMap<JobId, Option<AssignedNative>>;
 
 /// A completed input closure is exact evidence, independently of the
 /// periodic Bloom inventory. The prediction never authorizes content.
@@ -27,7 +27,7 @@ pub(super) fn confirmed_inputs(
         .iter()
         .filter(|(_, job)| job.phase != NativeJobPhase::Terminal && job.remaining_input_blobs == 0)
         .filter_map(|(id, _)| assigned.get(id).and_then(Option::as_ref))
-        .flat_map(|inputs| inputs.keys().copied())
+        .flat_map(|job| job.inputs.keys().copied())
         .collect()
 }
 
@@ -163,7 +163,7 @@ impl StagingTimeline<'_> {
 #[derive(Clone, Copy)]
 struct Pending<'a> {
     id: JobId,
-    inputs: Option<&'a NativeInputBlobs>,
+    inputs: Option<&'a AssignedNative>,
     progress: Option<&'a NativeJobProgress>,
 }
 
@@ -197,8 +197,7 @@ fn remaining(service: Duration, progress: Option<&NativeJobProgress>) -> Duratio
         .max(service / 4)
 }
 
-fn output_service(placement: &NativePlacement) -> Duration {
-    let result = placement.result;
+fn output_service(result: sccache::build_runtime::ResultTransferEstimate) -> Duration {
     duration(transfer_seconds(
         u128::from(result.expected_bytes),
         result.bytes_per_second,
@@ -215,8 +214,9 @@ struct Pipeline {
     publication: Slots,
     execution: Duration,
     output: Duration,
-    ready: Vec<(Duration, bool, JobId, bool)>,
-    publish: Vec<(Duration, bool, JobId)>,
+    scaling: f64,
+    ready: Vec<(Duration, bool, JobId, bool, Duration, Duration)>,
+    publish: Vec<(Duration, bool, JobId, Duration)>,
 }
 
 impl Pipeline {
@@ -235,28 +235,48 @@ impl Pipeline {
             compiler: Slots::new(width, jobs),
             publication: Slots::new(placement.queue.publication_slots, jobs),
             execution,
-            output: output_service(placement),
+            output: output_service(placement.result),
+            scaling: f64::from(width) / effective,
             ready: Vec::new(),
             publish: Vec::new(),
         }
     }
 
-    fn observe(&mut self, job: Pending<'_>) {
+    fn service(
+        &self,
+        cost: Option<ActionCost>,
+        placement: &NativePlacement,
+    ) -> (Duration, Duration) {
+        cost.map_or((self.execution, self.output), |cost| {
+            (
+                duration(
+                    Duration::from_nanos(cost.execution_nanoseconds).as_secs_f64() * self.scaling,
+                ),
+                output_service(cost.result(placement.result)),
+            )
+        })
+    }
+
+    fn observe(&mut self, job: Pending<'_>, placement: &NativePlacement) {
+        let (execution, output) = self.service(job.inputs.and_then(|job| job.cost), placement);
         match job.phase() {
             NativeJobPhase::Publishing => {
                 self.publication
-                    .reserve(Duration::ZERO, remaining(self.output, job.progress));
+                    .reserve(Duration::ZERO, remaining(output, job.progress));
             }
             NativeJobPhase::AwaitingPublication => {
-                self.publish.push((Duration::ZERO, false, job.id))
+                self.publish.push((Duration::ZERO, false, job.id, output))
             }
             NativeJobPhase::Executing => {
                 let done = self
                     .compiler
-                    .reserve(Duration::ZERO, remaining(self.execution, job.progress));
-                self.publish.push((done, false, job.id));
+                    .reserve(Duration::ZERO, remaining(execution, job.progress));
+                self.publish.push((done, false, job.id, output));
             }
-            NativeJobPhase::Ready => self.ready.push((Duration::ZERO, false, job.id, true)),
+            NativeJobPhase::Ready => {
+                self.ready
+                    .push((Duration::ZERO, false, job.id, true, execution, output))
+            }
             NativeJobPhase::Assigned
             | NativeJobPhase::Queued
             | NativeJobPhase::Staging
@@ -264,37 +284,47 @@ impl Pipeline {
         }
     }
 
-    fn finish(mut self, candidate_ready: Duration) -> Duration {
-        self.ready.push((candidate_ready, true, JobId(0), true));
+    fn finish(
+        mut self,
+        candidate_ready: Duration,
+        execution: Duration,
+        output: Duration,
+    ) -> Duration {
+        self.ready
+            .push((candidate_ready, true, JobId(0), true, execution, output));
         self.ready.sort_unstable();
-        for (ready, candidate, id, publishes) in self.ready {
-            let done = self.compiler.reserve(ready, self.execution);
+        for (ready, candidate, id, publishes, execution, output) in self.ready {
+            let done = self.compiler.reserve(ready, execution);
             if publishes {
-                self.publish.push((done, candidate, id));
+                self.publish.push((done, candidate, id, output));
             }
         }
         self.publish.sort_unstable();
-        for (ready, candidate, _) in self.publish {
+        for (ready, candidate, _, output) in self.publish {
             if candidate {
                 return self.publication.available().max(ready);
             }
-            self.publication.reserve(ready, self.output);
+            self.publication.reserve(ready, output);
         }
-        candidate_ready.saturating_add(self.execution)
+        candidate_ready.saturating_add(execution)
     }
 }
 
 /// Predict when the new action can start publishing, not merely when a
 /// nominal count of outstanding jobs would clear a compiler semaphore.
 pub(super) fn publication_start(
-    capacity: f64,
-    assigned: &Assignments,
-    placement: &NativePlacement,
-    recent: &RecentOutputs,
+    forecast: super::WorkerForecast<'_>,
     requested: &NativeInputBlobs,
     logical_rate: u64,
     contention: f64,
 ) -> f64 {
+    let super::WorkerForecast {
+        capacity,
+        assigned,
+        placement,
+        recent,
+        cost,
+    } = forecast;
     let jobs = assigned
         .len()
         .saturating_add(placement.queue.jobs.len())
@@ -340,13 +370,20 @@ pub(super) fn publication_start(
                             .reserve(Duration::ZERO, pipeline.execution);
                         other_running -= 1;
                     } else {
-                        pipeline.ready.push((Duration::ZERO, false, job.id, false));
+                        pipeline.ready.push((
+                            Duration::ZERO,
+                            false,
+                            job.id,
+                            false,
+                            pipeline.execution,
+                            Duration::ZERO,
+                        ));
                     }
                 } else {
                     staging.push(job);
                 }
             }
-            _ => pipeline.observe(job),
+            _ => pipeline.observe(job, placement),
         }
     }
     for _ in 0..other_running {
@@ -365,11 +402,15 @@ pub(super) fn publication_start(
         future: HashMap::new(),
     };
     for job in staging {
-        let ready = timeline.stage(job.inputs, job.progress);
-        pipeline.ready.push((ready, false, job.id, true));
+        let ready = timeline.stage(job.inputs.map(|job| &job.inputs), job.progress);
+        let (execution, output) = pipeline.service(job.inputs.and_then(|job| job.cost), placement);
+        pipeline
+            .ready
+            .push((ready, false, job.id, true, execution, output));
     }
     let ready = timeline.stage(Some(requested), None);
-    pipeline.finish(ready).as_secs_f64()
+    let (execution, output) = pipeline.service(Some(cost), placement);
+    pipeline.finish(ready, execution, output).as_secs_f64()
 }
 
 #[cfg(test)]

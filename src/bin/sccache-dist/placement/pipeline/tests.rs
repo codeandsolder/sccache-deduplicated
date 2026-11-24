@@ -37,10 +37,13 @@ fn start(
     cpus: f64,
 ) -> f64 {
     publication_start(
-        cpus,
-        assigned,
-        placement,
-        &RecentOutputs::default(),
+        super::super::WorkerForecast {
+            capacity: cpus,
+            assigned,
+            placement,
+            recent: &RecentOutputs::default(),
+            cost: ActionCost::baseline(placement),
+        },
         requested,
         100,
         1.0,
@@ -52,8 +55,22 @@ fn native_pipeline_does_not_charge_publication_or_terminal_as_cpu_work() {
     let mut placement = placement();
     let inputs = NativeInputBlobs::new();
     let assigned = Assignments::from([
-        (JobId(1), Some(inputs.clone())),
-        (JobId(2), Some(inputs.clone())),
+        (
+            JobId(1),
+            Some(AssignedNative {
+                inputs: inputs.clone(),
+                class: None,
+                cost: None,
+            }),
+        ),
+        (
+            JobId(2),
+            Some(AssignedNative {
+                inputs: inputs.clone(),
+                class: None,
+                cost: None,
+            }),
+        ),
     ]);
     placement.queue.jobs.insert(
         JobId(1),
@@ -84,7 +101,14 @@ fn native_pipeline_waits_for_staging_slots_and_reuses_future_content() {
     let shared = ContentId::of(b"shared");
     let independent = ContentId::of(b"independent");
     let inputs = NativeInputBlobs::from([(shared, 1_000)]);
-    let assigned = Assignments::from([(JobId(1), Some(inputs.clone()))]);
+    let assigned = Assignments::from([(
+        JobId(1),
+        Some(AssignedNative {
+            inputs: inputs.clone(),
+            class: None,
+            cost: None,
+        }),
+    )]);
     placement.queue.jobs.insert(
         JobId(1),
         progress(NativeJobPhase::Staging, Duration::ZERO, 200),
@@ -119,8 +143,22 @@ fn native_pipeline_predicts_publication_backpressure_separately() {
     placement.queue.publication_slots = 1;
     let inputs = NativeInputBlobs::new();
     let assigned = Assignments::from([
-        (JobId(1), Some(inputs.clone())),
-        (JobId(2), Some(inputs.clone())),
+        (
+            JobId(1),
+            Some(AssignedNative {
+                inputs: inputs.clone(),
+                class: None,
+                cost: None,
+            }),
+        ),
+        (
+            JobId(2),
+            Some(AssignedNative {
+                inputs: inputs.clone(),
+                class: None,
+                cost: None,
+            }),
+        ),
     ]);
     placement.queue.jobs.insert(
         JobId(1),
@@ -173,4 +211,56 @@ fn native_pipeline_legacy_execution_shares_compiler_not_publication_slots() {
     assert_eq!(start(&placement, &assigned, &inputs, 3.0), 1.0);
     placement.queue.compiler_active = 2;
     assert_eq!(start(&placement, &assigned, &inputs, 2.0), 2.0);
+}
+
+#[test]
+fn native_pipeline_uses_each_reservations_learned_service_time() {
+    let mut placement = placement();
+    let inputs = NativeInputBlobs::new();
+    let large = ActionCost {
+        execution_nanoseconds: 8_000_000_000,
+        output_bytes: 400,
+        output_requests: 0,
+    };
+    let small = ActionCost {
+        execution_nanoseconds: 200_000_000,
+        output_bytes: 0,
+        output_requests: 0,
+    };
+    let assigned = Assignments::from([(
+        JobId(1),
+        Some(AssignedNative {
+            inputs: inputs.clone(),
+            class: None,
+            cost: Some(large),
+        }),
+    )]);
+    placement.queue.jobs.insert(
+        JobId(1),
+        progress(NativeJobPhase::Executing, Duration::from_secs(3), 0),
+    );
+    placement.queue.compiler_active = 1;
+    let recent = RecentOutputs::default();
+    let forecast = super::super::WorkerForecast {
+        capacity: 1.0,
+        assigned: &assigned,
+        placement: &placement,
+        recent: &recent,
+        cost: small,
+    };
+    assert_eq!(publication_start(forecast, &inputs, 100, 1.0), 5.2);
+    placement.queue.jobs.insert(
+        JobId(1),
+        progress(NativeJobPhase::Publishing, Duration::from_secs(1), 0),
+    );
+    placement.queue.compiler_active = 0;
+    placement.queue.publication_slots = 1;
+    let forecast = super::super::WorkerForecast {
+        placement: &placement,
+        capacity: 4.0,
+        assigned: &assigned,
+        recent: &recent,
+        cost: small,
+    };
+    assert_eq!(publication_start(forecast, &inputs, 100, 1.0), 3.0);
 }

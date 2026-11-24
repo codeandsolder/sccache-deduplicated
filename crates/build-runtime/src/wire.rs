@@ -209,6 +209,27 @@ pub enum ScheduleReply {
     Unavailable { message: String },
 }
 
+/// Real service times and actual negotiated output traffic for a successful
+/// worker action. Advisory only; never changes the action identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionObservation {
+    pub execution_nanoseconds: u64,
+    pub upload_bytes: u64,
+    pub upload_requests: u64,
+    pub upload_nanoseconds: u64,
+}
+
+impl ActionObservation {
+    #[must_use = "untrusted timing samples must be validated"]
+    pub fn valid(self) -> bool {
+        (1..=3_600_000_000_000).contains(&self.execution_nanoseconds)
+            && self.upload_bytes <= 1 << 40
+            && self.upload_requests <= 1_000_000
+            && self.upload_nanoseconds <= 3_600_000_000_000
+            && (self.upload_requests != 0 || self.upload_bytes == 0)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativeJobPhase {
     Assigned,

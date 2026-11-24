@@ -894,7 +894,7 @@ remain separate improvements.
 
 ### Immediate producer-output residency
 
-The native cache protocol v3 records recently published worker outputs without
+The native cache protocol v4 records recently published worker outputs without
 waiting for the periodic residency heartbeat. After successful local CAS
 publication, the worker knows its actual grace-lease deadline. The existing
 authenticated result negotiation establishes a scheduler-local monotonic time
@@ -922,6 +922,43 @@ verification and assignment pinning mechanisms. As soon as a consumer's
 manifest names a just-produced blob, the scheduler can exploit the producer's
 retained copy; unknown future hashes still require explicit producer/output
 dependencies from a build graph.
+
+### Measured command-family costs and placement traces
+
+Successful verified result commits carry the worker's measured compiler-slot
+service time and the actual bytes, requests and elapsed time of its negotiated
+output uploads. This does not require any extra RPC or synthetic transfer.
+Only the first valid observation for the assigned job trains the scheduler.
+The worker's overall timing estimate remains the cold-start prior.
+
+Each worker incarnation maintains up to 4096 command-family records, expiring
+after 24 hours without observations. Families are hashed from platform,
+canonical executable, working directory and argument shape; Rust metadata and
+extra-filename hashes and dependency artifact paths are normalized while
+dependency names, features, target, crate name, emit mode and optimization
+flags remain distinct. This is an advisory cost key, never a cache identity.
+Samples are smoothed with a quarter-weight moving average; one through four
+observations progressively replace the host-wide prior. This first version
+does not persist family records across scheduler restart or worker replacement.
+
+Candidate estimates use the learned service duration and negotiated output
+traffic. Each admitted native reservation carries its own predicted cost
+through the staging, compiler and publication forecasts, rather than applying
+a candidate's cost to unrelated queued work. Unseen commands use the host
+prior. Output size here means negotiated missing payload, not total result
+size or an eviction reservation; measured logical result size is logged
+separately for future reservation sizing.
+
+The opt-in `native_placement_replay` trace target logs JSON assignment records
+with job ID, hashed command family, selected worker, all eligible workers'
+predicted completion and contention-penalized scores, and healthy candidates.
+Verified completion records contain the original prediction, scheduler
+assignment-to-commit elapsed time, predicted cost, actual execution time,
+total result bytes and negotiated upload measurements. Join by job ID within
+the scheduler epoch. This supports evaluating prediction error and selection
+behavior on genuine compilation workloads. Counterfactual worker timings
+are forecasts, not measured speedups; a full causal trace replay requires
+additional queue and residency state.
 
 ### Directional shared-network estimation
 

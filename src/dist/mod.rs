@@ -1137,6 +1137,7 @@ pub enum NativeResultEvent<'a> {
     Committed {
         manifest: &'a crate::build_runtime::ResultManifest,
         retained_after_begin: std::time::Duration,
+        observation: Option<crate::build_runtime::wire::ActionObservation>,
     },
 }
 

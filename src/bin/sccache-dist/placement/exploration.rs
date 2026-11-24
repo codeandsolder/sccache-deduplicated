@@ -117,7 +117,7 @@ fn additional_inputs(details: &ServerDetails, requested: &NativeInputBlobs) -> N
             })
         })
         .filter_map(|(_, inputs)| inputs.as_ref())
-        .flat_map(|inputs| inputs.keys())
+        .flat_map(|job| job.inputs.keys())
     {
         missing.remove(id);
     }
@@ -136,9 +136,9 @@ fn no_extra_inputs(candidate: &NativeInputBlobs, baseline: &NativeInputBlobs) ->
 
 struct Opportunity<'a> {
     server: ServerId,
-    details: &'a ServerDetails,
     inputs: NativeInputBlobs,
     encoded: u128,
+    forecast: Option<super::WorkerForecast<'a>>,
 }
 
 impl<'a> Opportunity<'a> {
@@ -146,7 +146,9 @@ impl<'a> Opportunity<'a> {
         server: ServerId,
         details: &'a ServerDetails,
         requested: &NativeInputBlobs,
+        class: Option<super::ActionClass>,
         plan: &NativeTransferPlan<'_>,
+        now: Instant,
     ) -> Self {
         let inputs = additional_inputs(details, requested);
         let encoded = plan
@@ -154,9 +156,9 @@ impl<'a> Opportunity<'a> {
             .wire_bytes(Peer::Worker(server.addr()), logical_size(&inputs));
         Self {
             server,
-            details,
             inputs,
             encoded,
+            forecast: super::WorkerForecast::new(details, class, now),
         }
     }
 
@@ -178,40 +180,30 @@ impl<'a> Opportunity<'a> {
         {
             return Some(question);
         }
-        let placement = self.details.capabilities.native_placement.as_ref()?;
-        if placement.result.observations == 0 {
+        let forecast = self.forecast?;
+        if forecast.placement.result.observations == 0 {
             return None;
         }
-        let estimate = native_estimate(
-            self.details.cpu_capacity,
-            &self.details.jobs_assigned,
-            placement,
-            &self.details.recent_outputs,
-            requested,
-            peer,
-            plan,
-        );
+        let estimate = native_estimate(forecast, requested, peer, plan);
         question(
             plan.receive,
             Direction::Receive,
             peer,
-            u128::from(placement.result.expected_bytes),
+            u128::from(forecast.cost.output_bytes),
             estimate.ready_at,
         )
         .filter(|question| history.available(question, now))
     }
 
     fn no_extra_traffic(&self, baseline: &Self) -> bool {
-        let result_bytes = |details: &ServerDetails| {
-            details
-                .capabilities
-                .native_placement
-                .as_ref()
-                .map(|placement| placement.result.expected_bytes)
+        let result_bytes = |opportunity: &Self| {
+            opportunity
+                .forecast
+                .map(|forecast| forecast.cost.output_bytes)
         };
         self.encoded <= baseline.encoded
             && no_extra_inputs(&self.inputs, &baseline.inputs)
-            && result_bytes(self.details) <= result_bytes(baseline.details)
+            && result_bytes(self) <= result_bytes(baseline)
     }
 }
 
@@ -223,6 +215,7 @@ pub(crate) fn choose_worker(
     candidates: &[(ServerId, f64)],
     servers: &HashMap<ServerId, ServerDetails>,
     requested: &NativeInputBlobs,
+    class: Option<super::ActionClass>,
     plan: &NativeTransferPlan<'_>,
     history: &mut Exploration,
     now: Instant,
@@ -247,7 +240,7 @@ pub(crate) fn choose_worker(
     {
         return Some(best);
     }
-    let baseline = Opportunity::new(best, servers.get(&best)?, requested, plan);
+    let baseline = Opportunity::new(best, servers.get(&best)?, requested, class, plan, now);
     if baseline.question(requested, plan, history, now).is_some() {
         return Some(best);
     }
@@ -257,7 +250,7 @@ pub(crate) fn choose_worker(
         .iter()
         .filter(|(id, eta)| *id != best && *eta <= limit)
         .filter_map(|&(id, eta)| {
-            let candidate = Opportunity::new(id, servers.get(&id)?, requested, plan);
+            let candidate = Opportunity::new(id, servers.get(&id)?, requested, class, plan, now);
             if !candidate.no_extra_traffic(&baseline) {
                 return None;
             }

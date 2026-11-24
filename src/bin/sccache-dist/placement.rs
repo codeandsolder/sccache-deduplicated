@@ -1,7 +1,9 @@
 //! Native placement prediction over verified content, worker timing and
 //! directional shared-link observations.
 use super::ServerDetails;
+mod cost;
 mod exploration;
+pub(super) use cost::{ActionClass, ActionCost, ActionCosts, AssignedNative};
 mod pipeline;
 mod retained;
 pub(super) use exploration::{Exploration, choose_worker};
@@ -47,7 +49,7 @@ fn native_missing_inputs(
             })
         })
         .filter_map(|(_, inputs)| inputs.as_ref())
-        .flat_map(|inputs| inputs.iter())
+        .flat_map(|job| job.inputs.iter())
     {
         if !residency.contains(id, size) {
             missing.entry(id).or_insert(size);
@@ -207,23 +209,55 @@ impl<'a> NativeTransferPlan<'a> {
     }
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub(super) struct PlacementEstimate {
     pub(super) seconds: f64,
+    pub(super) completion_seconds: f64,
     ready_at: f64,
 }
 
 /// Overlap compiler queue waiting
 /// and input delivery. Include the measured
 /// effective application service time and the marginal delay to other peers.
+#[derive(Clone, Copy)]
+pub(super) struct WorkerForecast<'a> {
+    pub capacity: f64,
+    pub assigned: &'a pipeline::Assignments,
+    pub placement: &'a dist::NativePlacement,
+    pub recent: &'a RecentOutputs,
+    pub cost: ActionCost,
+}
+
+impl<'a> WorkerForecast<'a> {
+    pub(super) fn new(
+        details: &'a ServerDetails,
+        class: Option<ActionClass>,
+        now: std::time::Instant,
+    ) -> Option<Self> {
+        let placement = details.capabilities.native_placement.as_ref()?;
+        Some(Self {
+            capacity: details.cpu_capacity,
+            assigned: &details.jobs_assigned,
+            placement,
+            recent: &details.recent_outputs,
+            cost: details.action_costs.predict(class, placement, now),
+        })
+    }
+}
+
 pub(super) fn native_estimate(
-    capacity: f64,
-    assigned: &pipeline::Assignments,
-    placement: &dist::NativePlacement,
-    recent: &RecentOutputs,
+    forecast: WorkerForecast<'_>,
     requested: &dist::NativeInputBlobs,
     peer: Peer,
     plan: &NativeTransferPlan<'_>,
 ) -> PlacementEstimate {
+    let WorkerForecast {
+        assigned,
+        placement,
+        recent,
+        cost: action,
+        ..
+    } = forecast;
     let (bytes, _) = native_missing_inputs(assigned, placement, recent, Some(requested));
     let cost = placement.transfer;
     let (network, externality) = plan.input_completion(peer, bytes, cost.download_bytes_per_second);
@@ -246,35 +280,22 @@ pub(super) fn native_estimate(
     } else {
         1.0
     };
-    let ready_at = pipeline::publication_start(
-        capacity,
-        assigned,
-        placement,
-        recent,
-        requested,
-        logical_rate,
-        contention,
-    );
-    let (output_network, output_externality) =
-        plan.result_completion(peer, ready_at, placement.result);
-    let output_processing = transfer_seconds(
-        u128::from(placement.result.expected_bytes),
-        placement.result.bytes_per_second,
-    );
+    let ready_at = pipeline::publication_start(forecast, requested, logical_rate, contention);
+    let result = action.result(placement.result);
+    let (output_network, output_externality) = plan.result_completion(peer, ready_at, result);
+    let output_processing =
+        transfer_seconds(u128::from(result.expected_bytes), result.bytes_per_second);
     let output_overhead = Duration::from_nanos(
-        placement
-            .result
+        result
             .expected_requests
-            .saturating_mul(placement.result.request_nanoseconds),
+            .saturating_mul(result.request_nanoseconds),
     )
     .as_secs_f64();
+    let completion_seconds = ready_at + output_network.max(output_processing) + output_overhead;
     PlacementEstimate {
         ready_at,
-        seconds: ready_at
-            + output_network.max(output_processing)
-            + output_overhead
-            + externality
-            + output_externality,
+        completion_seconds,
+        seconds: completion_seconds + externality + output_externality,
     }
 }
 

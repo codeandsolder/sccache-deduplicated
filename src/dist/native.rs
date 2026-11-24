@@ -46,6 +46,7 @@ pub(super) struct CommitRequest {
     pub ticket: Ticket,
     // Duration from receipt of the begin response until local grace expiry.
     pub retained_after_begin_millis: u64,
+    pub observation: Option<crate::build_runtime::wire::ActionObservation>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -148,7 +149,7 @@ impl NativeCacheClient {
         };
         let url = self
             .base
-            .join(&format!("/api/v3/native/{role}/{operation}"))?;
+            .join(&format!("/api/v4/native/{role}/{operation}"))?;
         let mut request = self
             .http
             .post(url)
@@ -734,13 +735,19 @@ impl NativeCacheClient {
     ///
     /// # Errors
     /// Returns an error if uploads are unfinished or publication failed.
-    pub fn commit(&self, ticket: Ticket, retained_after_begin: Duration) -> Result<ResultManifest> {
+    pub fn commit(
+        &self,
+        ticket: Ticket,
+        retained_after_begin: Duration,
+        observation: Option<crate::build_runtime::wire::ActionObservation>,
+    ) -> Result<ResultManifest> {
         self.control(
             "commit",
             &CommitRequest {
                 ticket,
                 retained_after_begin_millis: u64::try_from(retained_after_begin.as_millis())
                     .unwrap_or(u64::MAX),
+                observation,
             },
         )
     }

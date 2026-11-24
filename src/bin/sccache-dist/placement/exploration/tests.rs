@@ -73,12 +73,28 @@ fn native_exploration_prefers_a_real_near_equivalent_unanswered_overlap_once() -
     let now = Instant::now();
     let options = [(id(1), 3.0), (id(2), 3.01)];
     assert_eq!(
-        choose_worker(&options, &servers, &demand(), &plan, &mut history, now),
+        choose_worker(
+            &options,
+            &servers,
+            &demand(),
+            None,
+            &plan,
+            &mut history,
+            now
+        ),
         Some(id(2))
     );
     assert_eq!(history.attempts.len(), 1);
     assert_eq!(
-        choose_worker(&options, &servers, &demand(), &plan, &mut history, now),
+        choose_worker(
+            &options,
+            &servers,
+            &demand(),
+            None,
+            &plan,
+            &mut history,
+            now
+        ),
         Some(id(1))
     );
     assert_eq!(
@@ -86,6 +102,7 @@ fn native_exploration_prefers_a_real_near_equivalent_unanswered_overlap_once() -
             &options,
             &servers,
             &demand(),
+            None,
             &plan,
             &mut history,
             now + COOLDOWN
@@ -116,7 +133,15 @@ fn native_exploration_never_increases_required_payload_or_exceeds_eta_budget() -
         let servers = scheduler.servers.lock().unwrap();
         let plan = NativeTransferPlan::new(&network, &servers);
         assert_eq!(
-            choose_worker(&options, &servers, &requested, &plan, &mut history, now),
+            choose_worker(
+                &options,
+                &servers,
+                &requested,
+                None,
+                &plan,
+                &mut history,
+                now
+            ),
             Some(id(1))
         );
     }
@@ -128,6 +153,7 @@ fn native_exploration_never_increases_required_payload_or_exceeds_eta_budget() -
             &[(id(1), 3.0), (id(2), 3.03)],
             &servers,
             &requested,
+            None,
             &plan,
             &mut history,
             now
@@ -155,7 +181,15 @@ fn native_exploration_skips_answered_or_unmeasurable_overlap() -> anyhow::Result
     {
         let plan = NativeTransferPlan::new(&network, &servers);
         assert_eq!(
-            choose_worker(&options, &servers, &demand(), &plan, &mut history, now),
+            choose_worker(
+                &options,
+                &servers,
+                &demand(),
+                None,
+                &plan,
+                &mut history,
+                now
+            ),
             Some(id(1))
         );
     }
@@ -167,7 +201,15 @@ fn native_exploration_skips_answered_or_unmeasurable_overlap() -> anyhow::Result
     {
         let plan = NativeTransferPlan::new(&network, &servers);
         assert_eq!(
-            choose_worker(&options, &servers, &demand(), &plan, &mut history, now),
+            choose_worker(
+                &options,
+                &servers,
+                &demand(),
+                None,
+                &plan,
+                &mut history,
+                now
+            ),
             Some(id(1))
         );
     }
@@ -180,7 +222,15 @@ fn native_exploration_skips_answered_or_unmeasurable_overlap() -> anyhow::Result
         .active_remaining_bytes = 0;
     let plan = NativeTransferPlan::new(&network, &servers);
     assert_eq!(
-        choose_worker(&options, &servers, &demand(), &plan, &mut history, now),
+        choose_worker(
+            &options,
+            &servers,
+            &demand(),
+            None,
+            &plan,
+            &mut history,
+            now
+        ),
         Some(id(1))
     );
     assert!(history.attempts.is_empty());

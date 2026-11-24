@@ -730,6 +730,9 @@ struct JobDetail {
     // First heartbeat that did not report this Started job as executing.
     missing_since: Option<Instant>,
     publication_began_at: Option<Instant>,
+    assigned_at: Instant,
+    predicted_seconds: Option<f64>,
+    observed_result: bool,
 }
 
 impl JobDetail {
@@ -808,7 +811,8 @@ pub struct Scheduler {
 
 struct ServerDetails {
     // Native input closures are reserved with the assignment, even before transfer.
-    jobs_assigned: HashMap<JobId, Option<dist::NativeInputBlobs>>,
+    jobs_assigned: HashMap<JobId, Option<placement::AssignedNative>>,
+    action_costs: placement::ActionCosts,
     // Reservations for assignment RPCs still in flight. Once assigned,
     // the state and unclaimed timeout are owned exclusively by JobDetail.
     jobs_assigning: HashMap<JobId, Instant>,
@@ -1011,7 +1015,11 @@ impl Scheduler {
         };
         let native_platform = native.map(|assignment| assignment.spec.platform);
         let native_inputs = native.map(|assignment| &assignment.input_blobs);
-        let (job_id, server_id, auth) = {
+        let class = native
+            .map(|assignment| placement::ActionClass::from_spec(&assignment.spec))
+            .transpose()?;
+        let assigned_at = Instant::now();
+        let (job_id, server_id, auth, predicted_seconds) = {
             // LOCKS
             let mut servers = self
                 .servers
@@ -1024,6 +1032,7 @@ impl Scheduler {
             let res = {
                 let mut healthy = Vec::new();
                 let mut retry = Vec::new();
+                let mut predictions = BTreeMap::new();
                 let now = Instant::now();
                 for (&server_id, details) in servers.iter_mut() {
                     let compatible = match native_platform {
@@ -1054,16 +1063,14 @@ impl Scheduler {
                         ) {
                             continue;
                         }
-                        native_estimate(
-                            details.cpu_capacity,
-                            &details.jobs_assigned,
-                            placement,
-                            &details.recent_outputs,
-                            inputs,
-                            Peer::Worker(server_id.addr()),
-                            plan,
-                        )
-                        .seconds
+                        let Some(forecast) = placement::WorkerForecast::new(details, class, now)
+                        else {
+                            continue;
+                        };
+                        let estimate =
+                            native_estimate(forecast, inputs, Peer::Worker(server_id.addr()), plan);
+                        predictions.insert(server_id.addr(), estimate);
+                        estimate.seconds
                     } else {
                         weight
                     };
@@ -1086,7 +1093,7 @@ impl Scheduler {
                             .exploration
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        choose_worker(candidates, &servers, inputs, plan, &mut history, now)
+                        choose_worker(candidates, &servers, inputs, class, plan, &mut history, now)
                     } else {
                         weighted_server(candidates, rand::random::<f64>())
                     }
@@ -1104,10 +1111,26 @@ impl Scheduler {
                         .job_authorizer
                         .generate_token(job_id)
                         .context("Could not create an auth token for this job")?;
+                    let predicted_seconds = predictions
+                        .get(&server_id.addr())
+                        .map(|estimate| estimate.completion_seconds);
+                    if let Some(class) = class {
+                        trace!(target: "native_placement_replay", "{}", serde_json::json!({
+                            "kind": "assigned", "job": job_id.0, "worker": server_id.addr(), "class": class,
+                            "candidates": predictions,
+                            "healthy": healthy.iter().map(|(id, _)| id.addr()).collect::<Vec<_>>(),
+                        }));
+                    }
+                    let assigned = native_inputs.map(|inputs| placement::AssignedNative {
+                        inputs: inputs.clone(),
+                        class,
+                        cost: placement::WorkerForecast::new(server_details, class, now)
+                            .map(|forecast| forecast.cost),
+                    });
                     assert!(
                         server_details
                             .jobs_assigned
-                            .insert(job_id, native_inputs.cloned())
+                            .insert(job_id, assigned)
                             .is_none()
                     );
                     assert!(
@@ -1121,7 +1144,7 @@ impl Scheduler {
                         "Job {} created and will be assigned to server {:?}",
                         job_id, server_id
                     );
-                    Some((job_id, server_id, auth))
+                    Some((job_id, server_id, auth, predicted_seconds))
                 } else {
                     None
                 }
@@ -1196,6 +1219,9 @@ impl Scheduler {
                         state_since: Instant::now(),
                         missing_since: None,
                         publication_began_at: None,
+                        assigned_at,
+                        predicted_seconds,
+                        observed_result: false,
                     }
                 )
                 .is_none()
@@ -1277,6 +1303,7 @@ impl SchedulerIncoming for Scheduler {
             dist::NativeResultEvent::Committed {
                 manifest,
                 retained_after_begin,
+                observation,
             } => {
                 if let Some(anchor) = detail.publication_began_at
                     && let Err(error) =
@@ -1285,6 +1312,34 @@ impl SchedulerIncoming for Scheduler {
                             .record(manifest, anchor, retained_after_begin, now)
                 {
                     warn!("Native output locality update failed: {error:#}");
+                }
+                if !detail.observed_result && detail.publication_began_at.is_some() {
+                    detail.observed_result = true;
+                    if let Some(assigned) = server.jobs_assigned.get(&job).and_then(Option::as_ref)
+                        && let (Some(class), Some(observed)) = (
+                            assigned.class,
+                            observation.filter(|sample| {
+                                sample.valid()
+                                    && manifest.blobs().is_ok_and(|blobs| {
+                                        sample.upload_bytes
+                                            <= blobs.values().copied().fold(0, u64::saturating_add)
+                                            && sample.upload_requests
+                                                <= u64::try_from(blobs.len()).unwrap_or(u64::MAX)
+                                    })
+                            }),
+                        )
+                    {
+                        server.action_costs.observe(class, observed, now);
+                        trace!(target: "native_placement_replay", "{}", serde_json::json!({
+                            "kind": "completed", "job": job.0, "worker": server_id.addr(),
+                            "class": class, "predicted_seconds": detail.predicted_seconds,
+                            "actual_seconds": now.saturating_duration_since(detail.assigned_at).as_secs_f64(),
+                            "result_bytes": manifest.blobs().ok().map(|blobs| blobs.values().copied().fold(0_u64, u64::saturating_add)),
+                            "execution_nanoseconds": observed.execution_nanoseconds,
+                            "upload_bytes": observed.upload_bytes, "upload_requests": observed.upload_requests,
+                            "upload_nanoseconds": observed.upload_nanoseconds, "predicted_cost": assigned.cost,
+                        }));
+                    }
                 }
             }
         }
@@ -1497,6 +1552,7 @@ impl SchedulerIncoming for Scheduler {
                 worker_name: None,
                 capabilities,
                 recent_outputs: placement::RecentOutputs::default(),
+                action_costs: placement::ActionCosts::default(),
                 job_authorizer,
             },
         );
@@ -1616,7 +1672,13 @@ impl SchedulerIncoming for Scheduler {
                 (JobState::Pending, JobState::Ready) | (JobState::Ready, JobState::Started) => {
                     entry.get_mut().transition_to(job_state, now);
                 }
-                (JobState::Pending | JobState::Ready | JobState::Started, JobState::Complete) => {
+                (from, JobState::Complete)
+                    if from == JobState::Started
+                        || details
+                            .jobs_assigned
+                            .get(&job_id)
+                            .is_some_and(Option::is_some) =>
+                {
                     let mut acks = self
                         .completed_acks
                         .lock()
@@ -2276,10 +2338,13 @@ mod scheduler_tests {
         let peer = Peer::Worker("127.0.0.1:10501".parse().unwrap());
         let eta = |capacity, assigned: &HashMap<_, _>, placement: &dist::NativePlacement| {
             native_estimate(
-                capacity,
-                assigned,
-                placement,
-                &placement::RecentOutputs::default(),
+                placement::WorkerForecast {
+                    capacity,
+                    assigned,
+                    placement,
+                    recent: &placement::RecentOutputs::default(),
+                    cost: placement::ActionCost::baseline(placement),
+                },
                 &inputs,
                 peer,
                 &plan,
@@ -2292,8 +2357,22 @@ mod scheduler_tests {
         slow.residency = Some(filter);
         assert!(eta(4.0, &empty, &slow) < eta(4.0, &empty, &fast));
         let queued = HashMap::from([
-            (JobId(1), Some(inputs.clone())),
-            (JobId(2), Some(inputs.clone())),
+            (
+                JobId(1),
+                Some(placement::AssignedNative {
+                    inputs: inputs.clone(),
+                    class: None,
+                    cost: None,
+                }),
+            ),
+            (
+                JobId(2),
+                Some(placement::AssignedNative {
+                    inputs: inputs.clone(),
+                    class: None,
+                    cost: None,
+                }),
+            ),
         ]);
         assert_eq!(eta(4.0, &queued, &fast), eta(4.0, &empty, &fast));
         assert!(eta(1.0, &queued, &fast) > eta(4.0, &empty, &fast));
@@ -2430,6 +2509,7 @@ mod scheduler_tests {
         let committed = || dist::NativeResultEvent::Committed {
             manifest: &manifest,
             retained_after_begin: Duration::from_secs(300),
+            observation: None,
         };
         register(other, 1_000_000_000)?;
         scheduler.observe_native_result(producer, job, committed());
@@ -2529,8 +2609,10 @@ mod scheduler_tests {
         };
         assert_eq!(job_alloc.server_id, a);
         assert_eq!(
-            scheduler.servers.lock().unwrap()[&a].jobs_assigned[&job_alloc.job_id],
-            Some(BTreeMap::from([(ContentId([1; 32]), 10)]))
+            scheduler.servers.lock().unwrap()[&a].jobs_assigned[&job_alloc.job_id]
+                .as_ref()
+                .map(|job| &job.inputs),
+            Some(&BTreeMap::from([(ContentId([1; 32]), 10)]))
         );
         assert!(matches!(
             scheduler.handle_alloc_native_job(

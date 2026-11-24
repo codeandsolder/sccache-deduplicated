@@ -114,7 +114,7 @@ fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Res
     // Model a scheduler which holds its admission lock until the worker
     // returns the assignment response. Verification is deliberately blocked.
     let server = rouille::Server::new("127.0.0.1:0", move |request| match request.url().as_str() {
-        "/api/v3/native/worker/verify" => {
+        "/api/v4/native/worker/verify" => {
             let Some(id) = request
                 .header("X-Sccache-Native-Job")
                 .and_then(|job| job.parse::<u64>().ok())
@@ -132,7 +132,7 @@ fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Res
             rouille::Response::from_data("application/octet-stream", Vec::new())
                 .with_status_code(status)
         }
-        "/api/v3/native/worker/renew" | "/api/v3/native/worker/fail" => {
+        "/api/v4/native/worker/renew" | "/api/v4/native/worker/fail" => {
             rouille::Response::from_data("application/octet-stream", Vec::new())
         }
         _ => rouille::Response::text("test input unavailable").with_status_code(409),
