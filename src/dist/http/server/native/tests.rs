@@ -355,6 +355,66 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
 }
 
 #[test]
+fn raw_physical_transport_preserves_original_magic_prefixed_bytes() -> Result<()> {
+    use std::io::{Seek, Write};
+
+    with_native_service(|url, _sessions| {
+        let client = make_client(url, "client-token")?;
+        let worker = make_client(url, "worker-token")?.for_worker(JobId(42));
+        let root = TreeManifest {
+            root: TreeMetadata {
+                mode: 0o755,
+                modified: TreeTimestamp {
+                    seconds: 1,
+                    nanoseconds: 0,
+                },
+            },
+            entries: BTreeMap::new(),
+        };
+        let offered = client.offer_tree(&root)?;
+        client.commit_tree(offered.ticket)?;
+        let spec = action(&root)?;
+        let NativeAdmission::Compile { ticket } =
+            client.admit(&spec, crate::build_runtime::ActionMode::Reuse)?
+        else {
+            anyhow::bail!("expected native compile");
+        };
+        assert!(matches!(
+            client.schedule(ticket, spec)?,
+            ScheduleReply::Assigned(_)
+        ));
+        let original = b"SC-CAS-ZSTD-0002an-original-uncompressed-package-blob";
+        let blob = BlobRef {
+            id: ContentId::of(original),
+            size: u64::try_from(original.len())?,
+        };
+        let manifest = ResultManifest {
+            outputs: BTreeMap::from([(
+                "obj".into(),
+                Artifact {
+                    blob,
+                    mode: Some(0o644),
+                },
+            )]),
+            stdout: None,
+            stderr: None,
+        };
+        assert_eq!(worker.begin(ticket, manifest.clone())?.missing, vec![blob]);
+        let mut raw = tempfile::tempfile()?;
+        raw.write_all(original)?;
+        raw.rewind()?;
+        worker.upload_stored_file(ticket, blob, crate::build_runtime::BlobEncoding::Raw, raw)?;
+        assert_eq!(worker.commit(ticket)?, manifest);
+        let mut received = Vec::new();
+        client.download(ticket, blob, &mut received)?;
+        assert_eq!(received, original);
+        client.close(ticket)?;
+        client.close(offered.ticket)?;
+        Ok(())
+    })
+}
+
+#[test]
 fn metadata_is_bounded_and_rejects_trailing_bytes() -> Result<()> {
     let request = Request::fake_http(
         "POST",
@@ -376,9 +436,10 @@ fn metadata_is_bounded_and_rejects_trailing_bytes() -> Result<()> {
             id: ContentId::of(b"abc"),
             size: 3,
         },
+        encoding: crate::build_runtime::BlobEncoding::ZstdChunks as u8,
     };
     let encoded = codec().serialize(&header)?;
-    assert_eq!(encoded.len(), 72);
+    assert_eq!(encoded.len(), 73);
     Ok(())
 }
 
@@ -418,12 +479,12 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
         let worker = make_client(url, "worker-token")?.for_worker(JobId(42));
         let root_pin = client.push_tree(
             root.manifest(),
-            |id| root.open_file(id),
+            |id| root.open_decoded(id),
             Duration::from_secs(1),
         )?;
         let source_pin = client.push_tree(
             source.manifest(),
-            |id| source.open_file(id),
+            |id| source.open_decoded(id),
             Duration::from_secs(1),
         )?;
         let mut spec = action(root.manifest())?;

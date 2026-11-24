@@ -88,6 +88,7 @@ impl NativeWorker {
             config.package_transfer,
         );
         let package_transfer = PackageTransportTracker::new(timing)?;
+        let _ = store.can_clone_into(&config.scratch)?;
         let client = NativeCacheClient::new(
             config.cache_url.to_url(),
             auth,
@@ -138,8 +139,8 @@ impl NativeWorker {
     pub(super) fn open_blob(
         &self,
         blob: sccache::build_runtime::BlobRef,
-    ) -> Result<Option<std::fs::File>> {
-        self.store.open_available_blob(blob)
+    ) -> Result<Option<(std::fs::File, sccache::build_runtime::BlobEncoding)>> {
+        self.store.open_available_physical(blob)
     }
 
     pub(super) fn placement(&self, queue: sccache::dist::NativeQueueSnapshot) -> NativePlacement {

@@ -136,7 +136,7 @@ pub(super) fn capture_regular(store: &NativeStore, file: &File, stat: &Stat) -> 
         "capture source is not a regular file"
     );
     let size = u64::try_from(stat.st_size)?;
-    let blob = store.stage_inner(
+    let blob = store.stage_local_inner(
         file,
         Some(size),
         crate::store::space::StageBudget::new(store),

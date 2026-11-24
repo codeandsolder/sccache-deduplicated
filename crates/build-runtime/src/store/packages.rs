@@ -3,7 +3,8 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{self, Read},
+    fs::File,
+    io::{self, Read, Seek},
     sync::Mutex,
 };
 
@@ -160,9 +161,20 @@ impl PackageArchiveLease {
         self.tree
             .inner
             .check_blob(self.archive.blob.id, self.archive.blob.size)?;
-        Ok(std::fs::File::open(
-            self.tree.inner.blob_path(self.archive.blob.id),
-        )?)
+        let file = File::open(self.tree.inner.blob_path(self.archive.blob.id))?;
+        let mut decoded = crate::BlobReader::open(
+            file.try_clone()?,
+            self.tree.inner.blob_encoding(self.archive.blob.id)?,
+        )?;
+        if !decoded.is_encoded() {
+            return Ok(file);
+        }
+        // CAS identity is the original byte hash, independent of physical encoding.
+        // A generated blob may have been stored under the same digest earlier.
+        let mut original = tempfile::tempfile()?;
+        io::copy(&mut decoded, &mut original)?;
+        original.rewind()?;
+        Ok(original)
     }
 }
 
@@ -472,7 +484,7 @@ impl ImportedTree {
                     self.bytes <= self.policy.max_expanded_bytes,
                     "expanded package size limit exceeded"
                 );
-                let staged = store.stage_inner(
+                let staged = store.stage_local_inner(
                     data.take(size),
                     Some(size),
                     super::space::StageBudget::new(store),

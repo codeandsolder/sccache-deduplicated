@@ -466,7 +466,15 @@ impl NativeCacheClient {
                 || {
                     let start = Instant::now();
                     Ok(TimedDownload {
-                        reader: self.download_response(ticket, offer.blob.id)?,
+                        reader: {
+                            let (response, encoding) =
+                                self.download_response(ticket, offer.blob.id)?;
+                            ensure!(
+                                encoding == crate::build_runtime::BlobEncoding::Raw,
+                                "package must be original bytes"
+                            );
+                            response
+                        },
                         start,
                         elapsed: &downloaded,
                     })
@@ -745,7 +753,12 @@ impl NativeCacheClient {
                     blobs.get(&missing.id) == Some(&missing.size),
                     "scheduler requested undeclared output"
                 );
-                self.upload(ticket, missing, captured.open_blob(missing.id)?)?;
+                self.upload_stored_file(
+                    ticket,
+                    missing,
+                    captured.physical_encoding(),
+                    captured.open_file(missing.id)?,
+                )?;
             }
             let upload_duration = started.elapsed();
             let worker_timing = transport.map(|transport| {

@@ -184,6 +184,71 @@ mod tests {
     }
 
     #[test]
+    fn original_archive_digest_reused_from_encoded_output_keeps_source_bytes() -> Result<()> {
+        use crate::{TreeEntry, TreeManifest, TreeMetadata, TreePath};
+        let directory = tempfile::tempdir()?;
+        let store = NativeStore::open(directory.path())?;
+        let (tar, expanded) = fixture()?;
+        let original = gzip(&tar, flate2::Compression::fast())?;
+        let policy = PackagePolicy {
+            retain_original: true,
+            ..PackagePolicy::normalized_archive(100, 1 << 20, 1 << 20, 1 << 20)?
+        };
+        // Force the preexisting encoded representation to test an original
+        // package whose content ID was already occupied by that CAS layout.
+        let staged = store.stage_compressed_inner(
+            original.as_slice(),
+            None,
+            super::super::space::StageBudget::new(&store),
+        )?;
+        let reference = staged.reference();
+        let tree = TreeManifest {
+            root: policy.directory,
+            entries: std::collections::BTreeMap::from([
+                (
+                    TreePath::new(b"generated".to_vec())?,
+                    TreeEntry::Directory(policy.directory),
+                ),
+                (
+                    TreePath::new(b"generated/input.crate".to_vec())?,
+                    TreeEntry::File {
+                        blob: reference,
+                        metadata: TreeMetadata {
+                            mode: 0o644,
+                            modified: policy.modified,
+                        },
+                    },
+                ),
+            ]),
+        };
+        let id = store.publish_tree(&tree, vec![staged])?;
+        let lease = store.lookup_tree(id)?.context("missing staged tree")?;
+        assert!(
+            crate::BlobReader::open(
+                lease.open_file(reference.id)?,
+                crate::BlobEncoding::ZstdChunks
+            )?
+            .is_encoded()
+        );
+        let source = source(&original, PackageCompression::Gzip)?;
+        let package = store.import_package(
+            source.identity,
+            ArchiveLength::Exact(source.size),
+            policy,
+            original.as_slice(),
+            PackageDecoder::InProcess,
+        )?;
+        assert_eq!(package.source(), source);
+        let offers = store.plan_package_downloads(&[expanded], 8, u64::MAX, slow_link())?;
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].archive().blob, reference);
+        let mut restored = Vec::new();
+        offers[0].open_file()?.read_to_end(&mut restored)?;
+        assert_eq!(restored, original);
+        Ok(())
+    }
+
+    #[test]
     fn original_transport_prefers_smallest_cover_and_is_reference_accounted() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let store = NativeStore::open(directory.path())?;

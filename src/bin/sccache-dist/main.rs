@@ -2159,7 +2159,7 @@ impl ServerIncoming for Server {
     fn handle_native_blob(
         &self,
         blob: sccache::build_runtime::BlobRef,
-    ) -> Result<Option<std::fs::File>> {
+    ) -> Result<Option<(std::fs::File, sccache::build_runtime::BlobEncoding)>> {
         #[cfg(target_os = "linux")]
         {
             self.native_worker
@@ -4272,6 +4272,11 @@ mod server_upload_tests {
     #[test]
     fn missing_cached_archive_requires_fresh_upload_on_assignment() -> Result<()> {
         let (dir, server) = test_server()?;
+        let cache = &server
+            .archive
+            .as_ref()
+            .context("archive worker missing")?
+            .cache;
         let contents = b"verified archive removed after publication";
         let toolchain = tc(contents)?;
         let root = dir.path().join("tc");

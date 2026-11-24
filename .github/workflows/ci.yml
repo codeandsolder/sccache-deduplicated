@@ -303,9 +303,8 @@ jobs:
         cargo test --locked --target x86_64-unknown-linux-gnu --lib --bins --tests
         cargo test --locked --target x86_64-unknown-linux-gnu -p sccache-build -- --include-ignored
         cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-client,dist-server --test native_dist -- --include-ignored
-        # Default features do not include dist-server, so the preceding command
-        # never executes the scheduler/worker binary tests. Run them explicitly
-        # to retain process-to-job/OOM telemetry regressions on each PR.
+        # The default feature set omits dist-server: explicitly run all
+        # scheduler/worker binary tests, including job resource telemetry.
         cargo test --locked --target x86_64-unknown-linux-gnu \
           --no-default-features --features=dist-server --bin sccache-dist
       rust-toolchain: "nightly-2026-11-22"

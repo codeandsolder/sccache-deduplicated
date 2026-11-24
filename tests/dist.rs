@@ -25,25 +25,56 @@ use sccache::errors::*;
 
 pub mod harness;
 
-/// Each Rust distribution test needs an isolated compilation cache, but it
-/// should not repack the identical sysroot for every independent test case.
-/// Serialize reuse: each test stops the previous local daemon before opening
-/// this shared archive index, while workers and compilation caches stay isolated.
-fn shared_rust_toolchain_cache() -> (std::sync::MutexGuard<'static, ()>, &'static Path) {
-    static CACHE: std::sync::LazyLock<(std::sync::Mutex<()>, tempfile::TempDir)> =
-        std::sync::LazyLock::new(|| {
-            (
-                std::sync::Mutex::new(()),
-                tempfile::tempdir().expect("create Rust distribution test toolchain cache"),
-            )
-        });
-    (
-        CACHE
-            .0
-            .lock()
-            .expect("Rust distribution test cache mutex poisoned"),
-        CACHE.1.path(),
-    )
+/// One worker per compatible group, with independent client-result caches.
+/// Keeping the worker alive also retains verified extracted toolchains. The
+/// namespace and toolchain lifecycle tests below still create cold workers.
+#[cfg(unix)]
+struct RustDistFixture {
+    system: harness::DistSystem,
+    root: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+struct RustDistCase {
+    root: tempfile::TempDir,
+    config: std::path::PathBuf,
+    cached_config: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl RustDistFixture {
+    fn new(environment: &[(&str, &str)]) -> Result<Self> {
+        let root = tempfile::tempdir()?;
+        let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root.path());
+        system.add_scheduler();
+        let _worker = system.add_server(environment);
+        Ok(Self { system, root })
+    }
+
+    fn case(&self) -> Result<RustDistCase> {
+        let root = tempfile::tempdir()?;
+        let path = root.path();
+        let mut cfg = harness::sccache_client_cfg(path, false);
+        cfg.dist.scheduler_url = Some(self.system.scheduler_url());
+        cfg.dist.cache_dir = self.root.path().join("client-toolchains");
+        let config = path.join("sccache-cfg.json");
+        let cached_config = path.join("sccache-cached-cfg");
+        write_json_cfg(path, "sccache-cfg.json", &cfg);
+        let _ = stop_local_daemon();
+        start_local_daemon(&config, &cached_config);
+        Ok(RustDistCase {
+            root,
+            config,
+            cached_config,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RustDistCase {
+    fn drop(&mut self) {
+        let _ = stop_local_daemon();
+    }
 }
 
 fn basic_compile(tmpdir: &Path, sccache_cfg_path: &Path, sccache_cached_cfg_path: &Path) {
@@ -518,7 +549,7 @@ impl ServerIncoming for FailingServer {
     fn handle_native_blob(
         &self,
         _blob: sccache::build_runtime::BlobRef,
-    ) -> Result<Option<std::fs::File>> {
+    ) -> Result<Option<(std::fs::File, sccache::build_runtime::BlobEncoding)>> {
         Ok(None)
     }
 
@@ -679,20 +710,12 @@ fn test_dist_cargo_build() {
 #[test]
 #[cfg(unix)]
 #[cfg_attr(not(feature = "dist-tests"), ignore)]
-fn test_dist_rust_observed_environment() {
-    let (_rust_toolchain_cache_guard, rust_toolchain_cache_dir) = shared_rust_toolchain_cache();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let root = tmpdir.path();
-    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
-    system.add_scheduler();
-    let _server_handle = system.add_server(&[("SCCACHE_OBSERVED_MISSING", "worker-only")]);
-    let mut cfg = dist_test_sccache_client_cfg(root, system.scheduler_url());
-    cfg.dist.cache_dir = rust_toolchain_cache_dir.to_owned();
-    let cfg_path = root.join("sccache-cfg.json");
-    write_json_cfg(root, "sccache-cfg.json", &cfg);
-    let cached_cfg = root.join("sccache-cached-cfg");
-    let _ = stop_local_daemon();
-    start_local_daemon(&cfg_path, &cached_cfg);
+fn test_dist_rust_observed_environment() -> Result<()> {
+    let fixture = RustDistFixture::new(&[("SCCACHE_OBSERVED_MISSING", "worker-only")])?;
+    let case = fixture.case()?;
+    let root = case.root.path();
+    let cfg_path = &case.config;
+    let cached_cfg = &case.cached_config;
 
     let project = init_cargo(root, "observed_env");
     write_source(
@@ -740,32 +763,20 @@ fn main() {
         assert_eq!(1, info.stats.dist_compiles.values().sum::<usize>());
         assert_eq!(0, info.stats.dist_errors);
     });
+    Ok(())
 }
 
 /// The policy directory is tracked by Clippy itself and can also be observed
 /// by user source. The worker must resolve the original spelling, not a
 /// rewritten environment value, with the exact policy contents.
-#[test]
 #[cfg(unix)]
-#[cfg_attr(not(feature = "dist-tests"), ignore)]
-fn test_dist_rust_clippy_observed_paths() -> Result<()> {
-    let (_rust_toolchain_cache_guard, rust_toolchain_cache_dir) = shared_rust_toolchain_cache();
+fn rust_clippy_observed_paths(fixture: &RustDistFixture) -> Result<()> {
     use std::fs;
     use std::os::unix::fs::symlink;
-
-    let temp = tempfile::tempdir()?;
-    let root = temp.path().canonicalize()?;
-    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), &root);
-    system.add_scheduler();
-    let _worker = system.add_server(&[]);
-    let mut cfg = harness::sccache_client_cfg(&root, false);
-    cfg.dist.cache_dir = rust_toolchain_cache_dir.to_owned();
-    cfg.dist.scheduler_url = Some(system.scheduler_url());
-    let cfg_path = root.join("sccache-cfg.json");
-    write_json_cfg(&root, "sccache-cfg.json", &cfg);
-    let cached_cfg = root.join("sccache-cached-cfg");
-    let _ = stop_local_daemon();
-    start_local_daemon(&cfg_path, &cached_cfg);
+    let case = fixture.case()?;
+    let root = case.root.path().canonicalize()?;
+    let cfg_path = &case.config;
+    let cached_cfg = &case.cached_config;
 
     let project = root.join("source");
     let target = root.join("target");
@@ -863,8 +874,8 @@ pub fn marker() -> u32 {{ let policy_denied_name = 11; policy_denied_name + 1 }}
                 .env("CLIPPY_CONF_DIR", spelling)
                 .env_remove("CLIPPY_ARGS")
                 .env("TMPDIR", &tmpdir)
-                .env("SCCACHE_CONF", &cfg_path)
-                .env("SCCACHE_CACHED_CONF", &cached_cfg)
+                .env("SCCACHE_CONF", cfg_path)
+                .env("SCCACHE_CACHED_CONF", cached_cfg)
                 .env("SCCACHE_EXPERIMENTAL_CANONICAL_RUST", "1")
                 .env("SCCACHE_CANONICAL_BUILD_ROOT", &project)
                 .env("SCCACHE_CANONICAL_TARGET_ROOT", &target);
@@ -923,25 +934,13 @@ pub fn marker() -> u32 {{ let policy_denied_name = 11; policy_denied_name + 1 }}
 }
 
 // MinGW's raw-dylib import library is generated during rlib compilation.
-#[test]
 #[cfg(target_os = "linux")]
-#[cfg_attr(not(feature = "dist-tests"), ignore)]
-fn test_dist_rust_windows_gnu_dlltool() -> Result<()> {
-    let (_rust_toolchain_cache_guard, rust_toolchain_cache_dir) = shared_rust_toolchain_cache();
+fn rust_windows_gnu_dlltool(fixture: &RustDistFixture) -> Result<()> {
     use std::io::Write;
-    let tmpdir = tempfile::tempdir()?;
-    let root = tmpdir.path();
-    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
-    system.add_scheduler();
-    let _worker = system.add_server(&[]);
-    let mut cfg = harness::sccache_client_cfg(root, false);
-    cfg.dist.cache_dir = rust_toolchain_cache_dir.to_owned();
-    cfg.dist.scheduler_url = Some(system.scheduler_url());
-    let cfg_path = root.join("sccache-cfg.json");
-    write_json_cfg(root, "sccache-cfg.json", &cfg);
-    let cached_cfg = root.join("sccache-cached-cfg");
-    let _ = stop_local_daemon();
-    start_local_daemon(&cfg_path, &cached_cfg);
+    let case = fixture.case()?;
+    let root = case.root.path();
+    let cfg_path = &case.config;
+    let cached_cfg = &case.cached_config;
 
     let tools = root.join("auxiliary tools");
     std::fs::create_dir(&tools)?;
@@ -983,8 +982,8 @@ pub fn ticks() -> u32 { unsafe { GetTickCount() } }
         }
         command
             .arg("raw.rs")
-            .env("SCCACHE_CONF", &cfg_path)
-            .env("SCCACHE_CACHED_CONF", &cached_cfg)
+            .env("SCCACHE_CONF", cfg_path)
+            .env("SCCACHE_CACHED_CONF", cached_cfg)
             .assert()
             .success();
     };
@@ -1014,24 +1013,12 @@ pub fn ticks() -> u32 { unsafe { GetTickCount() } }
 
 // Check the real worker and cache restoration, including zero-length rmeta
 // marker files required by Cargo for executable and test targets.
-#[test]
 #[cfg(unix)]
-#[cfg_attr(not(feature = "dist-tests"), ignore)]
-fn test_dist_rust_metadata_outputs() -> Result<()> {
-    let (_rust_toolchain_cache_guard, rust_toolchain_cache_dir) = shared_rust_toolchain_cache();
-    let tmpdir = tempfile::tempdir()?;
-    let root = tmpdir.path();
-    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
-    system.add_scheduler();
-    let _worker = system.add_server(&[]);
-    let mut cfg = harness::sccache_client_cfg(root, false);
-    cfg.dist.cache_dir = rust_toolchain_cache_dir.to_owned();
-    cfg.dist.scheduler_url = Some(system.scheduler_url());
-    let cfg_path = root.join("sccache-cfg.json");
-    write_json_cfg(root, "sccache-cfg.json", &cfg);
-    let cached_cfg = root.join("sccache-cached-cfg");
-    let _ = stop_local_daemon();
-    start_local_daemon(&cfg_path, &cached_cfg);
+fn rust_metadata_outputs(fixture: &RustDistFixture) -> Result<()> {
+    let case = fixture.case()?;
+    let root = case.root.path();
+    let cfg_path = &case.config;
+    let cached_cfg = &case.cached_config;
 
     let source = root.join("source");
     std::fs::create_dir(&source)?;
@@ -1089,8 +1076,8 @@ use proc_macro::TokenStream;
                 .arg("--out-dir")
                 .arg(&output)
                 .arg(src)
-                .env("SCCACHE_CONF", &cfg_path)
-                .env("SCCACHE_CACHED_CONF", &cached_cfg)
+                .env("SCCACHE_CONF", cfg_path)
+                .env("SCCACHE_CACHED_CONF", cached_cfg)
                 .env("SCCACHE_EXPERIMENTAL_CANONICAL_RUST", "1")
                 .env("SCCACHE_CANONICAL_BUILD_ROOT", &source)
                 .env("SCCACHE_CANONICAL_TARGET_ROOT", &output)
@@ -1264,43 +1251,12 @@ fn test_dist_toolchain() {
 
 // rustc must resolve a transitive metadata dependency through -L dependency
 // even when the client command explicitly names only the immediate extern.
-#[test]
 #[cfg(unix)]
-#[cfg_attr(not(feature = "dist-tests"), ignore)]
-fn test_dist_rust_dependency_chain() -> Result<()> {
-    dist_rust_dependency_chain(None)
-}
-
-#[test]
-#[cfg(unix)]
-#[cfg_attr(not(feature = "dist-tests"), ignore)]
-fn test_dist_rust_dependency_chain_relative_nested() -> Result<()> {
-    dist_rust_dependency_chain(Some("out"))
-}
-
-#[test]
-#[cfg(unix)]
-#[cfg_attr(not(feature = "dist-tests"), ignore)]
-fn test_dist_rust_dependency_chain_relative_sibling() -> Result<()> {
-    dist_rust_dependency_chain(Some("../target"))
-}
-
-#[cfg(unix)]
-fn dist_rust_dependency_chain(relative: Option<&str>) -> Result<()> {
-    let (_rust_toolchain_cache_guard, rust_toolchain_cache_dir) = shared_rust_toolchain_cache();
-    let temp = tempfile::tempdir()?;
-    let root = temp.path();
-    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
-    system.add_scheduler();
-    let _worker = system.add_server(&[]);
-    let mut cfg = harness::sccache_client_cfg(root, false);
-    cfg.dist.cache_dir = rust_toolchain_cache_dir.to_owned();
-    cfg.dist.scheduler_url = Some(system.scheduler_url());
-    let cfg_path = root.join("sccache-cfg.json");
-    write_json_cfg(root, "sccache-cfg.json", &cfg);
-    let cached_cfg = root.join("sccache-cached-cfg");
-    let _ = stop_local_daemon();
-    start_local_daemon(&cfg_path, &cached_cfg);
+fn dist_rust_dependency_chain(fixture: &RustDistFixture, relative: Option<&str>) -> Result<()> {
+    let case = fixture.case()?;
+    let root = case.root.path();
+    let cfg_path = &case.config;
+    let cached_cfg = &case.cached_config;
 
     let source = root.join("source");
     let target = if relative == Some("out") {
@@ -1366,8 +1322,8 @@ fn dist_rust_dependency_chain(relative: Option<&str>) -> Result<()> {
                 .arg(format!("dependency={}", operand.display()))
                 .arg(format!("{name}.rs"))
                 .env("CARGO_PKG_NAME", name)
-                .env("SCCACHE_CONF", &cfg_path)
-                .env("SCCACHE_CACHED_CONF", &cached_cfg)
+                .env("SCCACHE_CONF", cfg_path)
+                .env("SCCACHE_CACHED_CONF", cached_cfg)
                 .env("SCCACHE_EXPERIMENTAL_CANONICAL_RUST", "1")
                 .env("SCCACHE_CANONICAL_BUILD_ROOT", &source)
                 .env("SCCACHE_CANONICAL_TARGET_ROOT", &target);
@@ -1403,24 +1359,12 @@ fn dist_rust_dependency_chain(relative: Option<&str>) -> Result<()> {
 /// Cargo's real split build root contains target metadata and sibling host
 /// proc macro artifacts. Compile a consumer of a re-exported proc macro
 /// through a transitive metadata dependency in two independent build roots.
-#[test]
 #[cfg(target_os = "linux")]
-#[cfg_attr(not(feature = "dist-tests"), ignore)]
-fn test_dist_rust_cargo_split_root_proc_macro() -> Result<()> {
-    let (_rust_toolchain_cache_guard, rust_toolchain_cache_dir) = shared_rust_toolchain_cache();
-    let temp = tempfile::tempdir()?;
-    let root = temp.path();
-    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
-    system.add_scheduler();
-    let _worker = system.add_server(&[]);
-    let mut cfg = harness::sccache_client_cfg(root, false);
-    cfg.dist.cache_dir = rust_toolchain_cache_dir.to_owned();
-    cfg.dist.scheduler_url = Some(system.scheduler_url());
-    let cfg_path = root.join("sccache-cfg.json");
-    write_json_cfg(root, "sccache-cfg.json", &cfg);
-    let cached_cfg = root.join("sccache-cached-cfg");
-    let _ = stop_local_daemon();
-    start_local_daemon(&cfg_path, &cached_cfg);
+fn rust_cargo_split_root_proc_macro(fixture: &RustDistFixture) -> Result<()> {
+    let case = fixture.case()?;
+    let root = case.root.path();
+    let cfg_path = &case.config;
+    let cached_cfg = &case.cached_config;
 
     let project = root.join("consumer");
     for (name, manifest, source) in [
@@ -1469,8 +1413,8 @@ fn test_dist_rust_cargo_split_root_proc_macro() -> Result<()> {
             .arg("--target-dir")
             .arg(&target)
             .env("RUSTC_WRAPPER", env!("CARGO_BIN_EXE_sccache"))
-            .env("SCCACHE_CONF", &cfg_path)
-            .env("SCCACHE_CACHED_CONF", &cached_cfg)
+            .env("SCCACHE_CONF", cfg_path)
+            .env("SCCACHE_CACHED_CONF", cached_cfg)
             .env("SCCACHE_EXPERIMENTAL_CANONICAL_RUST", "1")
             .env("SCCACHE_CANONICAL_TARGET_ROOT", &target)
             .env("CARGO_BUILD_EPHEMERAL_INTERMEDIATES", "false")
@@ -1485,5 +1429,38 @@ fn test_dist_rust_cargo_split_root_proc_macro() -> Result<()> {
         assert!(info.stats.cache_hits.all() >= 3);
         assert_eq!(info.stats.dist_errors, 0);
     });
+    Ok(())
+}
+
+// Each case is named in the log so CI timings remain attributable even
+// though the expensive worker/toolchain setup is shared.
+#[test]
+#[cfg(unix)]
+#[cfg_attr(not(feature = "dist-tests"), ignore)]
+fn test_dist_rust_warm_regressions() -> Result<()> {
+    let fixture = RustDistFixture::new(&[])?;
+    fn timed(name: &str, case: impl FnOnce() -> Result<()>) -> Result<()> {
+        let start = std::time::Instant::now();
+        let result = case().with_context(|| format!("distributed regression: {name}"));
+        eprintln!("{name}: {:.2?}", start.elapsed());
+        result
+    }
+    #[cfg(target_os = "linux")]
+    timed("cargo split-root proc macro", || {
+        rust_cargo_split_root_proc_macro(&fixture)
+    })?;
+    timed("Clippy observed paths", || {
+        rust_clippy_observed_paths(&fixture)
+    })?;
+    for (name, relative) in [
+        ("dependency chain absolute", None),
+        ("dependency chain relative nested", Some("out")),
+        ("dependency chain relative sibling", Some("../target")),
+    ] {
+        timed(name, || dist_rust_dependency_chain(&fixture, relative))?;
+    }
+    timed("metadata outputs", || rust_metadata_outputs(&fixture))?;
+    #[cfg(target_os = "linux")]
+    timed("Windows GNU dlltool", || rust_windows_gnu_dlltool(&fixture))?;
     Ok(())
 }

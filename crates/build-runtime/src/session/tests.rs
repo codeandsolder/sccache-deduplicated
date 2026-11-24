@@ -3,7 +3,10 @@ use crate::{
     ActionFingerprint, Artifact, ContentId, Eviction, ExecutionRoot, TreeMetadata, TreeRecipe,
     TreeTimestamp,
 };
-use std::{collections::BTreeMap, io::Read};
+use std::{
+    collections::BTreeMap,
+    io::{Read, Seek, SeekFrom},
+};
 
 fn service(dir: &std::path::Path) -> Result<NativeSessions> {
     let store = NativeStore::open(dir)?;
@@ -23,6 +26,37 @@ fn service(dir: &std::path::Path) -> Result<NativeSessions> {
             peer_discovery_timeout: Duration::ZERO,
         },
     )
+}
+
+fn upload_encoded(
+    service: &NativeSessions,
+    ticket: Ticket,
+    publisher: Publisher,
+    declared: BlobRef,
+    contents: &[u8],
+) -> Result<()> {
+    let mut encoded = tempfile::tempfile()?;
+    crate::encode_native_blob(contents, &mut encoded, None)?;
+    encoded.seek(SeekFrom::Start(0))?;
+    service.upload(
+        ticket,
+        publisher,
+        declared,
+        crate::BlobEncoding::ZstdChunks,
+        encoded,
+    )
+}
+
+fn decoded_download(
+    service: &NativeSessions,
+    ticket: Ticket,
+    publisher: Publisher,
+    id: ContentId,
+) -> Result<crate::BlobReader> {
+    {
+        let (file, encoding) = service.download(ticket, publisher, id)?;
+        crate::BlobReader::open(file, encoding)
+    }
 }
 
 fn empty_root() -> TreeManifest {
@@ -116,17 +150,13 @@ fn worker_publication_and_client_download_are_bound_to_ticket() -> Result<()> {
         vec![blob]
     );
     assert!(service.commit(ticket, worker).is_err());
-    assert!(
-        service
-            .upload(ticket, worker, blob, &b"wrong!"[..])
-            .is_err()
-    );
-    service.upload(ticket, worker, blob, &b"object"[..])?;
+    assert!(upload_encoded(&service, ticket, worker, blob, b"wrong!").is_err());
+    upload_encoded(&service, ticket, worker, blob, b"object")?;
     assert_eq!(service.begin(ticket, worker, output.clone())?.missing, []);
     assert_eq!(service.commit(ticket, worker)?, output);
     assert_eq!(service.commit(ticket, worker)?, output);
     assert_eq!(service.status(ticket)?, NativeStatus::Ready(output.clone()));
-    let mut file = service.download(ticket, Publisher::Client, blob.id)?;
+    let mut file = decoded_download(&service, ticket, Publisher::Client, blob.id)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     assert_eq!(bytes, b"object");
@@ -298,7 +328,13 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
         expected
     );
     assert_eq!(missing.len(), 1);
-    service.upload(ticket, publisher, missing[0], &b"object"[..])?;
+    service.upload(
+        ticket,
+        publisher,
+        missing[0],
+        crate::BlobEncoding::Raw,
+        &b"object"[..],
+    )?;
     assert_eq!(service.commit(ticket, publisher)?, result);
     // A worker can finish while the original schedule response is lost.
     assert_eq!(
@@ -497,7 +533,13 @@ fn input_manifest_survives_scheduler_eviction_and_worker_fetch_is_scoped() -> Re
     let offer = service.offer_tree(manifest.clone())?;
     assert_eq!(offer.missing, vec![blob]);
     assert!(service.commit_tree(offer.ticket).is_err());
-    service.upload(offer.ticket, Publisher::Client, blob, &b"tree data"[..])?;
+    upload_encoded(
+        &service,
+        offer.ticket,
+        Publisher::Client,
+        blob,
+        b"tree data",
+    )?;
     let id = service.commit_tree(offer.ticket)?;
     assert_eq!(id, manifest.id()?);
     let again = service.offer_tree(manifest)?;
@@ -563,9 +605,7 @@ fn input_manifest_survives_scheduler_eviction_and_worker_fetch_is_scoped() -> Re
     );
     service.backfill_input(ticket, blob, &b"tree data"[..])?;
     let mut contents = Vec::new();
-    service
-        .download(read.ticket, worker, blob.id)?
-        .read_to_end(&mut contents)?;
+    decoded_download(&service, read.ticket, worker, blob.id)?.read_to_end(&mut contents)?;
     assert_eq!(contents, b"tree data");
     service.close(read.ticket, worker)?;
     service.fail(ticket, worker)?;
@@ -655,7 +695,7 @@ fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result
     let old = manifest(b"old");
     let old_blob = old.outputs["obj"].blob;
     service.begin(first, client, old.clone())?;
-    service.upload(first, client, old_blob, &b"old"[..])?;
+    upload_encoded(&service, first, client, old_blob, b"old")?;
     service.commit(first, client)?;
 
     let NativeAdmission::Compile { ticket: failed } = service.admit(
@@ -706,7 +746,7 @@ fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result
     service.begin(next, client, new.clone())?;
     assert!(service.commit(next, client).is_err());
     assert_eq!(service.status(reader)?, NativeStatus::Ready(old));
-    service.upload(next, client, new_blob, &b"new"[..])?;
+    upload_encoded(&service, next, client, new_blob, b"new")?;
     assert_eq!(service.commit(next, client)?, new);
     let NativeAdmission::Hit {
         ticket: latest,
@@ -725,9 +765,7 @@ fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result
     assert_eq!(service.store().stats()?.results, 1);
     assert_eq!(service.store().collect_garbage(8)?.blobs, 0);
     let mut bytes = Vec::new();
-    service
-        .download(reader, client, old_blob.id)?
-        .read_to_end(&mut bytes)?;
+    decoded_download(&service, reader, client, old_blob.id)?.read_to_end(&mut bytes)?;
     assert_eq!(bytes, b"old");
     service.close(first, client)?;
     service.close(reader, client)?;
@@ -872,9 +910,7 @@ fn lazy_manifest_admission_and_cross_action_backfill_are_single_flight() -> Resu
     assert_eq!(service.poll_input(b)?, InputPoll::Waiting);
     for (ticket, worker) in [(ta, worker1), (tb, worker2)] {
         let mut actual = Vec::new();
-        service
-            .download(ticket, worker, blob.id)?
-            .read_to_end(&mut actual)?;
+        decoded_download(&service, ticket, worker, blob.id)?.read_to_end(&mut actual)?;
         assert_eq!(actual, bytes);
         service.close(ticket, worker)?;
     }
@@ -974,9 +1010,7 @@ fn exercise_source_release(staged: bool) -> Result<()> {
     service.backfill_input(b, blob, &bytes[..])?;
     assert_eq!(service.active_uploads.load(Ordering::Acquire), 0);
     let mut actual = Vec::new();
-    service
-        .download(tb, worker, blob.id)?
-        .read_to_end(&mut actual)?;
+    decoded_download(&service, tb, worker, blob.id)?.read_to_end(&mut actual)?;
     assert_eq!(actual, bytes);
     Ok(())
 }
@@ -1060,9 +1094,7 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
         |blob, store, _| Ok(Some(store.stage_expected(blob, &b"peer bytes"[..])?)),
     )?;
     let mut bytes = Vec::new();
-    service
-        .download(delivery, worker, first.id)?
-        .read_to_end(&mut bytes)?;
+    decoded_download(&service, delivery, worker, first.id)?.read_to_end(&mut bytes)?;
     assert_eq!(bytes, b"peer bytes");
     assert_eq!(service.poll_input(ticket)?, InputPoll::Waiting);
 
@@ -1092,9 +1124,7 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
     );
     service.backfill_input(ticket, second, &b"origin bytes"[..])?;
     bytes.clear();
-    service
-        .download(delivery, worker, second.id)?
-        .read_to_end(&mut bytes)?;
+    decoded_download(&service, delivery, worker, second.id)?.read_to_end(&mut bytes)?;
     assert_eq!(bytes, b"origin bytes");
 
     service.request_inputs(delivery, worker, vec![third])?;
@@ -1139,9 +1169,7 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
         |blob, store, _| Ok(Some(store.stage_expected(blob, &b"late peer"[..])?)),
     )?;
     bytes.clear();
-    service
-        .download(delivery, worker, third.id)?
-        .read_to_end(&mut bytes)?;
+    decoded_download(&service, delivery, worker, third.id)?.read_to_end(&mut bytes)?;
     assert_eq!(bytes, b"late peer");
     assert_eq!(service.active_uploads.load(Ordering::Acquire), 0);
     service.close(delivery, worker)?;
@@ -1202,9 +1230,13 @@ fn evicted_result_is_restored_once_from_only_missing_peer_blobs() -> Result<()> 
     };
     assert_eq!(manifest, output);
     let mut data = Vec::new();
-    service
-        .download(ticket, Publisher::Client, output.outputs["obj"].blob.id)?
-        .read_to_end(&mut data)?;
+    decoded_download(
+        &service,
+        ticket,
+        Publisher::Client,
+        output.outputs["obj"].blob.id,
+    )?
+    .read_to_end(&mut data)?;
     assert_eq!(data, b"peer object");
     service.close(ticket, Publisher::Client)?;
     assert_eq!(service.active_uploads.load(Ordering::Acquire), 0);

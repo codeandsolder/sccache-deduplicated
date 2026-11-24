@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs::File,
-    io::Read,
+    io::{Read, Seek},
     net::SocketAddr,
     path::Path,
     sync::{
@@ -17,10 +17,10 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use bincode::Options;
 
 use crate::{
-    ActionMode, Admission, ArchiveLength, BlobRef, BuildCoordinator, CompilePermit, ContentId,
-    NativeStore, PackageArchive, PackageArchiveLease, PackageIdentity, PackageImportLimits,
-    PackageTransferCost, ResultLease, ResultManifest, StagedBlob, TreeId, TreeLease, TreeManifest,
-    UploadReservation, VerifiedPackage,
+    ActionMode, Admission, ArchiveLength, BlobEncoding, BlobRef, BuildCoordinator, CompilePermit,
+    ContentId, NativeStore, PackageArchive, PackageArchiveLease, PackageIdentity,
+    PackageImportLimits, PackageTransferCost, ResultLease, ResultManifest, StagedBlob, TreeId,
+    TreeLease, TreeManifest, UploadReservation, VerifiedPackage,
     wire::{
         ActionRequest, BeginResult, InputDemand, InputPoll, NativeAdmission, NativeStatus,
         Publisher, ScheduleReply, Ticket, TreeOffer, TreeRead, WorkerAllocation,
@@ -1122,6 +1122,7 @@ impl NativeSessions {
         ticket: Ticket,
         publisher: Publisher,
         blob: BlobRef,
+        encoding: BlobEncoding,
         reader: impl Read,
     ) -> Result<()> {
         let _slot = self.upload_slot(UploadSource::Direct)?;
@@ -1138,7 +1139,7 @@ impl NativeSessions {
                 .start(blob, self.limits.max_concurrent_uploads)?;
             drop(state);
         }
-        let result = self.store().stage_expected(blob, reader);
+        let result = self.store().stage_expected_physical(blob, encoding, reader);
         let mut state = Self::lock(&session)?;
         // Clear the active marker even if this upload exceeded its lease.
         if let Phase::Pending(pending) = &mut state.phase
@@ -1243,25 +1244,35 @@ impl NativeSessions {
         })
     }
 
-    /// Open only declared content with an owned file descriptor.
+    /// Open declared content for transport. Generated raw ZFS files are
+    /// temporarily encoded for efficient wire transfer; original package
+    /// archives are returned byte-for-byte.
     ///
     /// # Errors
     /// Returns an error for unknown tickets, unavailable or undeclared content.
-    pub fn download(&self, ticket: Ticket, reader: Publisher, id: ContentId) -> Result<File> {
+    pub fn download(
+        &self,
+        ticket: Ticket,
+        reader: Publisher,
+        id: ContentId,
+    ) -> Result<(File, BlobEncoding)> {
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
         self.authorize_reader(&mut state, reader)?;
         let Phase::Ready(lease) = &mut state.phase else {
             bail!("native content not available");
         };
-        match lease {
-            Ready::Result(lease) => lease.open_file(id),
+        let original = matches!(lease, Ready::Tree(tree) if tree.packages.contains_key(&id));
+        let (file, encoding) = match lease {
+            Ready::Result(lease) => Ok((lease.open_file(id)?, lease.physical_encoding(id)?)),
             Ready::Tree(delivery) => {
                 if let Some(package) = delivery.packages.get(&id) {
-                    return package.open_file();
+                    return Ok((package.open_file()?, BlobEncoding::Raw));
                 }
                 match &delivery.source {
-                    TreeSource::Stored(tree) => tree.open_file(id),
+                    TreeSource::Stored(tree) => {
+                        Ok((tree.open_file(id)?, tree.physical_encoding(id)?))
+                    }
                     TreeSource::Action {
                         ticket,
                         id: tree,
@@ -1271,13 +1282,13 @@ impl NativeSessions {
                         let tree = *tree;
                         let action = *ticket;
                         let blob = BlobRef { id, size };
-                        if let Some(file) = self.store().open_available_blob(blob)? {
+                        if let Some(file) = self.store().open_available_physical(blob)? {
                             let requested = delivery.requested.remove(&id);
                             drop(state);
                             if requested {
                                 self.finish_backfills(action, reader, [id])?;
                             }
-                            return Ok(file);
+                            return encode_delivery(file, false);
                         }
                         delivery.requested.insert(id);
                         drop(state);
@@ -1286,7 +1297,9 @@ impl NativeSessions {
                     }
                 }
             }
-        }
+        }?;
+        drop(state);
+        encode_delivery((file, encoding), original)
     }
 
     /// Prefetch only the blobs the worker actually lacks. Protect those
@@ -1828,3 +1841,16 @@ mod recovery;
 
 #[cfg(test)]
 mod tests;
+
+fn encode_delivery(
+    (mut file, encoding): (File, BlobEncoding),
+    original: bool,
+) -> Result<(File, BlobEncoding)> {
+    if original || encoding == BlobEncoding::ZstdChunks {
+        return Ok((file, encoding));
+    }
+    let mut wire = tempfile::tempfile()?;
+    crate::encode_native_blob(&mut file, &mut wire, None)?;
+    wire.rewind()?;
+    Ok((wire, BlobEncoding::ZstdChunks))
+}

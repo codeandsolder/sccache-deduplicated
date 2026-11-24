@@ -55,6 +55,189 @@ fn sample_tree(blob: BlobRef) -> Result<TreeManifest> {
     })
 }
 
+/// Copy representative real C/C++ headers into a deterministic CAS input.
+fn compiler_header_corpus(input: &std::path::Path) -> Result<(Vec<String>, u64)> {
+    use std::{fs, path::PathBuf};
+
+    let mut todo = vec![PathBuf::from("/usr/include")];
+    let mut bytes = 0_u64;
+    let mut names = Vec::new();
+    while let Some(dir) = todo.pop() {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        let mut entries = entries
+            .filter_map(std::result::Result::ok)
+            .collect::<Vec<_>>();
+        entries.sort_by_key(fs::DirEntry::path);
+        for entry in entries {
+            let kind = entry.file_type()?;
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
+                todo.push(entry.path());
+                continue;
+            }
+            if !kind.is_file() {
+                continue;
+            }
+            let size = entry.metadata()?.len();
+            if !(64..=2_000_000).contains(&size)
+                || bytes + size > 64 * 1024 * 1024
+                || names.len() >= 640
+            {
+                continue;
+            }
+            let name = format!("input-{:05}.h", names.len());
+            fs::copy(entry.path(), input.join(&name))?;
+            names.push(name);
+            bytes += size;
+        }
+        if names.len() >= 640 {
+            break;
+        }
+    }
+    anyhow::ensure!(names.len() > 100, "insufficient real compiler inputs");
+    Ok((names, bytes))
+}
+
+/// Repeatable warm-cache benchmark of real compiler header trees.
+/// Only runs explicitly when ignored tests are enabled.
+#[test]
+#[ignore = "benchmark native ZFS clones against reuse of compressed FUSE trees"]
+fn benchmark_native_zfs_clones_against_fuse_views() -> Result<()> {
+    use std::{fs, io, time::Instant};
+
+    let zfs_dir = tempfile::tempdir()?;
+    let memory_dir = tempfile::tempdir_in("/dev/shm")?;
+    let zfs = NativeStore::open(&zfs_dir.path().join("store"))?;
+    let non_zfs = NativeStore::open(&memory_dir.path().join("store"))?;
+    if !zfs.uses_native_zfs() {
+        return Ok(());
+    }
+    let input = zfs_dir.path().join("real-compiler-inputs");
+    fs::create_dir(&input)?;
+    let (names, bytes) = compiler_header_corpus(&input)?;
+    eprintln!("BENCH corpus files={} logical_bytes={}", names.len(), bytes);
+    let start = Instant::now();
+    let zfs_lease = zfs.capture_tree(&input)?;
+    let zfs_capture = start.elapsed().as_micros();
+    let start = Instant::now();
+    let fuse_lease = non_zfs.capture_tree(&input)?;
+    let fuse_capture = start.elapsed().as_micros();
+    eprintln!("BENCH capture backend=zfs micros={zfs_capture}");
+    eprintln!("BENCH capture backend=fuse micros={fuse_capture}");
+
+    for iteration in 0..6 {
+        let begin = Instant::now();
+        let view = zfs_lease.materialize(zfs_dir.path())?;
+        let setup = begin.elapsed().as_micros();
+        let start = Instant::now();
+        let mut total = 0_u64;
+        for name in &names {
+            let mut file = fs::File::open(view.root().join(name))?;
+            total += io::copy(&mut file, &mut io::sink())?;
+        }
+        let reading = start.elapsed().as_micros();
+        anyhow::ensure!(total == bytes, "ZFS materialized content mismatch");
+        let stats = view.stats();
+        eprintln!(
+            "BENCH run={} backend=zfs setup_us={} read_us={} clones={} copies={} copied_bytes={}",
+            iteration, setup, reading, stats.cloned_files, stats.copied_files, stats.copied_bytes,
+        );
+    }
+    for iteration in 0..6 {
+        let lease = zfs
+            .lookup_tree(zfs_lease.id())?
+            .context("ZFS tree missing")?;
+        let start = Instant::now();
+        let view = zfs.mount_tree_protected(lease, zfs_dir.path(), &[])?;
+        let setup = start.elapsed().as_micros();
+        let start = Instant::now();
+        let mut total = 0_u64;
+        for name in &names {
+            let mut file = fs::File::open(view.root().join(name))?;
+            total += io::copy(&mut file, &mut io::sink())?;
+        }
+        let reading = start.elapsed().as_micros();
+        anyhow::ensure!(total == bytes, "cached ZFS content mismatch");
+        eprintln!("BENCH run={iteration} backend=zfs_cached setup_us={setup} read_us={reading}");
+    }
+    for iteration in 0..6 {
+        let lease = non_zfs
+            .lookup_tree(fuse_lease.id())?
+            .context("FUSE tree missing")?;
+        let start = Instant::now();
+        let view = non_zfs.mount_tree_protected(lease, memory_dir.path(), &[])?;
+        let setup = start.elapsed().as_micros();
+        let start = Instant::now();
+        let mut total = 0_u64;
+        for name in &names {
+            let mut file = fs::File::open(view.root().join(name))?;
+            total += io::copy(&mut file, &mut io::sink())?;
+        }
+        let reading = start.elapsed().as_micros();
+        anyhow::ensure!(total == bytes, "FUSE virtual content mismatch");
+        eprintln!("BENCH run={iteration} backend=fuse setup_us={setup} read_us={reading}");
+    }
+    Ok(())
+}
+
+#[test]
+fn zfs_plain_content_materializes_without_fuse() -> Result<()> {
+    use std::{io::Read, os::unix::fs::MetadataExt};
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let original = b"compiler-output-with-repeating-structure".repeat(18_000);
+    let staged = store.stage(original.as_slice())?;
+    let blob = staged.reference();
+    let tree = TreeManifest {
+        root: metadata(0o755),
+        entries: BTreeMap::from([
+            (
+                TreePath::new(b"bin".to_vec())?,
+                TreeEntry::Directory(metadata(0o755)),
+            ),
+            (
+                TreePath::new(b"bin/compiler".to_vec())?,
+                TreeEntry::File {
+                    blob,
+                    metadata: metadata(0o755),
+                },
+            ),
+            (
+                TreePath::new(b"bin/alias".to_vec())?,
+                TreeEntry::Hardlink(TreePath::new(b"bin/compiler".to_vec())?),
+            ),
+        ]),
+    };
+    let id = store.publish_tree(&tree, vec![staged])?;
+    let lease = store
+        .lookup_tree(id)?
+        .context("missing native ZFS test tree")?;
+    let view = lease.materialize(dir.path())?;
+    assert_eq!(std::fs::read(view.root().join("bin/compiler"))?, original);
+    assert_eq!(
+        std::fs::metadata(view.root().join("bin/compiler"))?.ino(),
+        std::fs::metadata(view.root().join("bin/alias"))?.ino()
+    );
+    assert_eq!(view.stats().cloned_files + view.stats().copied_files, 1);
+    eprintln!(
+        "CAS backing ZFS={} cloned_files={} copied_files={} copied_bytes={}",
+        store.uses_native_zfs(),
+        view.stats().cloned_files,
+        view.stats().copied_files,
+        view.stats().copied_bytes
+    );
+    if store.uses_native_zfs() {
+        let mut physical = Vec::new();
+        lease.open_file(blob.id)?.read_to_end(&mut physical)?;
+        assert_eq!(physical, original);
+    }
+    Ok(())
+}
+
 #[test]
 fn package_trees_and_actions_share_one_blob_index_across_restart() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -136,7 +319,7 @@ fn recipe_lease_pins_original_packages_without_creating_an_indexed_root() -> Res
     assert!(store.lookup_tree(lease.id())?.is_none());
     assert_eq!(store.stats()?.trees, 1);
     assert_eq!(store.evict_tree(package)?, Eviction::Pinned);
-    assert_eq!(lease.open_file(blob.id)?.metadata()?.len(), blob.size);
+    assert_eq!(lease.open_decoded(blob.id)?.len(), blob.size);
     drop(lease);
     assert!(matches!(
         store.evict_tree(package)?,

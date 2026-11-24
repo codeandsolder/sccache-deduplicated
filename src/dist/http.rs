@@ -1238,7 +1238,9 @@ mod server {
                                 &peer_network,
                                 deadline,
                             ) {
-                                Ok(Some(reader)) => match store.stage_expected(blob, reader) {
+                                Ok(Some((reader, encoding))) => match store
+                                    .stage_expected_physical(blob, encoding, reader)
+                                {
                                     Ok(staged) => return Ok(Some(staged)),
                                     Err(error) => debug!("native peer content rejected: {error:#}"),
                                 },
@@ -1731,8 +1733,7 @@ mod server {
                         }
                         let file = try_or_500_log!(req_id, handler.handle_native_blob(blob));
                         match file {
-                            Some(file) => try_or_500_log!(req_id, native::blob_response(file,
-                                request.header("X-Sccache-Accept-Blob-Codec") == Some("zstd"))),
+                            Some((file, encoding)) => try_or_500_log!(req_id, native::physical_blob_response(file, encoding)),
                             None => rouille::Response::empty_404(),
                         }
                     },

@@ -18,7 +18,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::{ClientAuthCheck, ServerAuthenticator, authenticate_client, authenticate_server};
 use crate::{
     build_runtime::{
-        ActionMode, ArchiveLength, BlobRef, ContentId, Direction, ExecutionSpec,
+        ActionMode, ArchiveLength, BlobEncoding, BlobRef, ContentId, Direction, ExecutionSpec,
         NativeContentPending, NativeInputRejected, NativeServiceBusy, NativeSessions, NativeStore,
         NetworkMeter, PackageIdentity, PackageImportLimits, PackageSource, Peer, StagedBlob,
         TreeId, TreeManifest, VerifiedPackage,
@@ -295,6 +295,19 @@ pub(super) fn blob_response(mut file: File, accept_zstd: bool) -> Result<Respons
     })
 }
 
+pub(super) fn physical_blob_response(mut file: File, encoding: BlobEncoding) -> Result<Response> {
+    let (file, encoding) = if encoding == BlobEncoding::Raw {
+        let mut encoded = tempfile::tempfile()?;
+        crate::build_runtime::encode_native_blob(&mut file, &mut encoded, None)?;
+        encoded.rewind()?;
+        (encoded, BlobEncoding::ZstdChunks)
+    } else {
+        (file, encoding)
+    };
+    Ok(Response::from_file("application/octet-stream", file)
+        .with_additional_header("X-Sccache-CAS-Encoding", encoding.http_value()))
+}
+
 /// Reuse TLS connections without broadening each peer's pinned trust root.
 #[derive(Default)]
 pub(super) struct PeerHttp {
@@ -343,7 +356,7 @@ impl PeerHttp {
         certificate: &[u8],
         network: &NetworkMeter,
         deadline: Instant,
-    ) -> Result<Option<Box<dyn Read + Send>>> {
+    ) -> Result<Option<(impl Read + Send + use<>, BlobEncoding)>> {
         // Bounded source probe: allow roughly 4 MiB/s plus setup time,
         // with an absolute ceiling; a slow peer falls back to the origin.
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -356,14 +369,19 @@ impl PeerHttp {
             .timeout(timeout)
             .bearer_auth(source.token)
             .header("Content-Type", "application/octet-stream")
-            .header("X-Sccache-Accept-Blob-Codec", "zstd")
             .body(codec().serialize(&blob)?)
             .send()?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
         let response = response.error_for_status()?;
-        let encoding = response.headers().get("X-Sccache-Blob-Codec").cloned();
+        let encoding = BlobEncoding::from_http_value(
+            response
+                .headers()
+                .get("x-sccache-cas-encoding")
+                .context("missing peer encoding")?
+                .to_str()?,
+        )?;
         let size = response.content_length();
         let response = network.meter(
             Direction::Receive,
@@ -372,13 +390,7 @@ impl PeerHttp {
             blob.size,
             size,
         );
-        match encoding.as_ref() {
-            None => Ok(Some(Box::new(response))),
-            Some(codec) if codec.as_bytes() == b"zstd" => {
-                Ok(Some(Box::new(zstd::stream::read::Decoder::new(response)?)))
-            }
-            Some(other) => anyhow::bail!("unsupported peer blob codec: {other:?}"),
-        }
+        Ok(Some((response, encoding)))
     }
 }
 
@@ -598,14 +610,12 @@ fn dispatch(
         }
         "backfill_input" if publisher == Publisher::Client => {
             let mut body = request.data().context("missing native backfill body")?;
-            let header: UploadHeader = codec().with_limit(72).deserialize_from(&mut body)?;
-            let reader = network.meter(
-                Direction::Receive,
-                peer,
-                body,
-                header.blob.size,
-                Some(header.blob.size),
+            let header: UploadHeader = codec().with_limit(73).deserialize_from(&mut body)?;
+            ensure!(
+                header.encoding == BlobEncoding::Raw as u8,
+                "backfill input requires logical bytes"
             );
+            let reader = network.meter(Direction::Receive, peer, body, header.blob.size, None);
             sessions.backfill_input(header.ticket, header.blob, reader)?;
             encode(&(), limit)
         }
@@ -651,12 +661,11 @@ fn dispatch(
         }
         "download" => {
             let DownloadRequest { ticket, id } = metadata(request, limit)?;
-            let file = sessions.download(ticket, publisher, id)?;
-            let logical = file.metadata()?.len();
-            let mut response = blob_response(
-                file,
-                request.header("X-Sccache-Accept-Blob-Codec") == Some("zstd"),
-            )?;
+            let (file, encoding) = sessions.download(ticket, publisher, id)?;
+            let logical =
+                crate::build_runtime::BlobReader::open(file.try_clone()?, encoding)?.len();
+            let mut response = Response::from_file("application/octet-stream", file)
+                .with_additional_header("X-Sccache-CAS-Encoding", encoding.http_value());
             let (reader, size) = response.data.into_reader_and_size();
             let reader = network.meter(
                 Direction::Send,
@@ -713,15 +722,15 @@ fn dispatch(
         "upload" => {
             let mut body = request.data().context("missing native upload body")?;
             // Fixed-width header, never deserialize or buffer the actual blob.
-            let header: UploadHeader = codec().with_limit(72).deserialize_from(&mut body)?;
-            let reader = network.meter(
-                Direction::Receive,
-                peer,
-                body,
-                header.blob.size,
-                Some(header.blob.size),
-            );
-            sessions.upload(header.ticket, publisher, header.blob, reader)?;
+            let header: UploadHeader = codec().with_limit(73).deserialize_from(&mut body)?;
+            let reader = network.meter(Direction::Receive, peer, body, header.blob.size, None);
+            sessions.upload(
+                header.ticket,
+                publisher,
+                header.blob,
+                BlobEncoding::try_from(header.encoding)?,
+                reader,
+            )?;
             encode(&(), limit)
         }
         "commit" => {

@@ -220,6 +220,8 @@ impl NativeStore {
             .context("native resident reservation overflow")?;
         let mut evicted_roots = 0;
         if free < minimum || resident > policy.max_resident_bytes {
+            #[cfg(target_os = "linux")]
+            self.drop_idle_views(None)?;
             for root in self.eviction_candidates(policy.max_evictions_per_pass, free < minimum)? {
                 let result = match root {
                     Root::Action(key) => self.evict(key)?,
@@ -465,9 +467,7 @@ pub struct StageBudget {
 impl StageBudget {
     pub(super) fn new(store: &NativeStore) -> Self {
         Self {
-            store: NativeStore {
-                inner: Arc::clone(&store.inner),
-            },
+            store: store.clone(),
             reserved: 0,
         }
     }
@@ -490,14 +490,12 @@ impl StageBudget {
         );
         self.reserved -= expected.size;
         let child = Self {
-            store: NativeStore {
-                inner: Arc::clone(&self.store.inner),
-            },
+            store: self.store.clone(),
             reserved: expected.size,
         };
-        let staged = self
-            .store
-            .stage_inner(reader.take(limit), Some(expected.size), child)?;
+        let staged =
+            self.store
+                .stage_local_inner(reader.take(limit), Some(expected.size), child)?;
         let actual = staged.reference();
         ensure!(
             actual.size == expected.size,
