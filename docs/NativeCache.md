@@ -793,13 +793,30 @@ files. The catalog alone does not place a package in the scheduler.
 
 ### Worker execution and protected artifact residency
 
-The worker uses a bounded FIFO ready queue shared by native and legacy
-execution, with compiler slots derived from available logical CPUs. Native
-inputs are staged and leased before acquiring a compiler slot; publication
-does not consume a compiler slot. Already cached input trees and partial resident blobs are pinned when
-the assignment is accepted, and released on completion or reconciliation.
-Heartbeats use actual occupied execution slots for CPU restoration, separately
-from active HTTP requests that maintain job liveness. The scheduler includes
+The native dispatcher owns independent bounded staging, compiler and
+publication pools. Compiler capacity is shared with legacy execution, derived
+from available logical CPUs; a full ready queue waits with cancellation
+rather than failing a build. The staging and publication pools each have
+the smaller of the configured transfer parallelism and compiler width.
+The optional native worker setting `max_inflight_jobs` (default four times
+compiler width) bounds reservations across assignments, staging, ready jobs,
+execution, publication and unacknowledged terminal responses.
+
+Already cached input trees and partial resident blobs are pinned when the
+assignment is accepted. Once the client claims its delegated ticket, staging
+starts independently of HTTP request lifetime. The prepared job owns its
+verified input leases, output headroom, grace reservation and lease renewal
+through the ready queue and execution; publication retains ownership until
+completion or cancellation. Successful and failed compiler outcomes leave
+the compiler pool before publication or remote cleanup.
+
+Native run protocol v4 returns short, idempotent status replies (queued,
+staging, ready, executing or publishing). A terminal result is replayable
+until the client acknowledges it or the five-minute retention expires.
+Repeated claims cannot launch duplicate executions. Heartbeats report
+active dispatched jobs separately from actual occupied compiler slots.
+Reconciliation cancels abandoned active jobs without prematurely releasing
+their reservation, and drops stale unclaimed assignments. The scheduler includes
 the input blobs of outstanding assignments in the transfer backlog before
 those transfers complete (counting shared content once).
 Concurrent acquisitions of an identical missing tree share one transfer and

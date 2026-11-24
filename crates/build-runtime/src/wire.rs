@@ -225,7 +225,8 @@ pub enum NativeRunRequest {
 }
 
 /// Successful output bytes are retrieved from the scheduler. Failed
-/// compilations deliver their diagnostics once, without creating a cache hit.
+/// compilations retain replayable diagnostics until acknowledgement or expiry,
+/// without creating a cache hit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativeRunResult {
     Pending(NativeJobPhase),
