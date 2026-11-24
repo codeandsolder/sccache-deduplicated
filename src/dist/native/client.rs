@@ -16,10 +16,10 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use tempfile::NamedTempFile;
 
-use super::{LocalExecutor, NativeCacheClient, copy_verified, renewal::Renewals};
+use super::{LocalExecutor, NativeCacheClient, copy_verified};
 use crate::build_runtime::{
     ActionMode, BlobRef, CapturedExecution, ExecutionSpec, PreparedTree, ResultManifest, TreeId,
-    TreeLease, TreeManifest,
+    TreeManifest,
     wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply, Ticket},
 };
 
@@ -196,24 +196,19 @@ impl NativeCacheClient {
         validate_policy(policy)?;
         let request = spec.action_request()?;
         let start = Instant::now();
-        let mut pins: BTreeMap<TreeId, Pin<'_>> = BTreeMap::new();
-        let mut local_pins: BTreeMap<TreeId, TreeLease> = BTreeMap::new();
-        let renewals = Renewals::start(self.clone(), policy.renewal_interval)?;
+        let mut declared = BTreeMap::new();
 
         loop {
-            renewals.check()?;
             ensure!(
                 start.elapsed() < policy.timeout,
                 "native admission timed out"
             );
-            match self.admit(spec, policy.mode)? {
+            match self.admit(spec, policy.mode, &declared)? {
                 NativeAdmission::Hit { ticket, manifest } => {
                     let pin = Pin {
                         client: self,
                         ticket,
                     };
-                    renewals.finish()?;
-                    drop(pins);
                     return Ok(Outcome::Ready {
                         delivery: Delivery::Scheduler(pin),
                         source: NativeBuildSource::Hit,
@@ -221,11 +216,7 @@ impl NativeCacheClient {
                     });
                 }
                 NativeAdmission::InFlight => {
-                    // No speculative duplicate compilation. Input pins are
-                    // not needed while another admitted action owns its closure.
-                    renewals.clear()?;
-                    pins.clear();
-                    local_pins.clear();
+                    // No speculative duplicate compilation.
                     thread::sleep(
                         Duration::from_millis(50)
                             .min(policy.timeout.saturating_sub(start.elapsed())),
@@ -242,25 +233,11 @@ impl NativeCacheClient {
                             request.input_trees.contains(&id),
                             "scheduler requested undeclared input tree"
                         );
-                        if let Some(pin) = pins.remove(&id) {
-                            renewals.remove(pin.ticket)?;
-                            drop(pin);
-                        }
-                        let ticket = self.supply_input(
-                            id,
-                            inputs,
-                            local,
-                            &mut local_pins,
-                            &renewals,
-                            policy.renewal_interval,
-                        )?;
-                        renewals.add(ticket)?;
-                        pins.insert(
-                            id,
-                            Pin {
-                                client: self,
-                                ticket,
-                            },
+                        let manifest = inputs.manifest(id)?;
+                        ensure!(manifest.id()? == id, "input provider supplied wrong tree");
+                        ensure!(
+                            declared.insert(id, manifest).is_none(),
+                            "scheduler did not accept declared input"
                         );
                     }
                 }
@@ -269,43 +246,9 @@ impl NativeCacheClient {
                         client: self,
                         ticket,
                     };
-                    renewals.finish()?;
-                    drop(pins);
                     return self.run_admitted(pin, spec, inputs, policy, start, local);
                 }
             }
-        }
-    }
-
-    fn supply_input(
-        &self,
-        id: TreeId,
-        inputs: &mut impl InputProvider,
-        local: Option<&LocalExecutor>,
-        local_pins: &mut BTreeMap<TreeId, TreeLease>,
-        renewals: &Renewals,
-        interval: Duration,
-    ) -> Result<Ticket> {
-        if let Some(local) = local.filter(|executor| executor.prefers_local()) {
-            let tree = match local_pins.entry(id) {
-                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(local.prepare_input(id, inputs, &|| renewals.check())?)
-                }
-            };
-            self.push_tree(tree.manifest(), |content| tree.open_file(content), interval)
-        } else {
-            let manifest = inputs.manifest(id)?;
-            ensure!(manifest.id()? == id, "input provider supplied wrong tree");
-            let blobs = manifest.blobs()?;
-            self.push_tree(
-                &manifest,
-                |content| {
-                    let size = *blobs.get(&content).context("undeclared content")?;
-                    inputs.open_blob(id, BlobRef { id: content, size })
-                },
-                interval,
-            )
         }
     }
 
@@ -331,8 +274,64 @@ impl NativeCacheClient {
             }
         };
         let source = NativeBuildSource::Worker(allocation.address);
+        let request = spec.action_request()?;
         let remaining = policy.timeout.saturating_sub(start.elapsed());
-        match Self::run_worker(&allocation, remaining, policy.max_result_bytes)? {
+        // Keep the origin connection live while the worker acquires inputs.
+        // Only the worker RPC needs a separate thread; the original provider
+        // (including the namespace stream) remains owned by this thread.
+        let result = thread::scope(|scope| {
+            let worker =
+                scope.spawn(|| Self::run_worker(&allocation, remaining, policy.max_result_bytes));
+            let supply = (|| -> Result<()> {
+                let mut idle = Duration::from_millis(10);
+                while !worker.is_finished() {
+                    ensure!(
+                        start.elapsed() < policy.timeout,
+                        "native worker deadline exceeded"
+                    );
+                    let demands = self.input_demands(pin.ticket)?;
+                    if demands.is_empty() {
+                        thread::sleep(idle);
+                        idle = (idle * 2).min(Duration::from_millis(200));
+                        continue;
+                    }
+                    idle = Duration::from_millis(10);
+                    for demand in demands {
+                        ensure!(
+                            request.input_trees.contains(&demand.tree),
+                            "scheduler requested undeclared tree"
+                        );
+                        self.backfill_input(
+                            pin.ticket,
+                            demand.blob,
+                            inputs.open_blob(demand.tree, demand.blob)?,
+                        )?;
+                    }
+                    // A nonempty batch is followed immediately by another poll.
+                }
+                Ok(())
+            })();
+            // A worker may become ready through a concurrent provider while
+            // its previous origin request is still in transit. Preserve an
+            // already terminal result instead of cancelling it.
+            let terminal = supply.is_err()
+                && (worker.is_finished()
+                    || matches!(
+                        self.status(pin.ticket),
+                        Ok(NativeStatus::Ready(_) | NativeStatus::Failed)
+                    ));
+            if supply.is_err() && !terminal {
+                let _ = self.close(pin.ticket);
+            }
+            let result = worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("native worker request panicked"))?;
+            if !terminal {
+                supply?;
+            }
+            result
+        })?;
+        match result {
             NativeRunResult::Stored => {
                 let NativeStatus::Ready(manifest) = self.status(pin.ticket)? else {
                     bail!("native worker did not publish its result");

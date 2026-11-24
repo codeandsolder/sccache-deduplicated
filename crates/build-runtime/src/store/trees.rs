@@ -48,6 +48,60 @@ impl Drop for FlightOwner<'_> {
 }
 
 impl NativeStore {
+    /// Open indexed content without requiring a complete tree. The open descriptor
+    /// remains valid across eviction. The caller must authorize the blob separately.
+    ///
+    /// # Errors
+    /// Returns an error for inconsistent indexed lengths or storage failures.
+    pub fn open_available_blob(&self, blob: BlobRef) -> Result<Option<File>> {
+        let read = self.inner.db.begin_read()?;
+        let live = read.open_table(super::BLOBS)?;
+        let Some(size) = live.get(&blob.id.0)? else {
+            return Ok(None);
+        };
+        ensure!(
+            size.value() == blob.size,
+            "inconsistent indexed blob length"
+        );
+        if !self.inner.blob_present(blob.id, blob.size)? {
+            return Ok(None);
+        }
+        match File::open(self.inner.blob_path(blob.id)) {
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// A canonical single-blob retention root. Uses the ordinary CAS and eviction
+    /// policy so incomplete tree acquisitions can share verified bytes without
+    /// making a second copy or leaving unaccounted files.
+    ///
+    /// # Errors
+    /// Returns an error for invalid tree metadata.
+    pub fn blob_retention_manifest(blob: BlobRef) -> Result<TreeManifest> {
+        let modified = crate::TreeTimestamp {
+            seconds: 0,
+            nanoseconds: 0,
+        };
+        Ok(TreeManifest {
+            root: crate::TreeMetadata {
+                mode: 0o755,
+                modified,
+            },
+            entries: BTreeMap::from([(
+                crate::TreePath::new(b"blob".to_vec())?,
+                crate::TreeEntry::File {
+                    blob,
+                    metadata: crate::TreeMetadata {
+                        mode: 0o444,
+                        modified,
+                    },
+                },
+            )]),
+        })
+    }
+
     /// Resolve a tree with one in-flight acquisition per immutable identity.
     /// Waiting consumers share the published lease; failed producers release
     /// ownership so another authorized consumer can retry.
@@ -317,6 +371,21 @@ impl NativeStore {
         })
     }
 
+    /// Read immutable tree metadata independently of local blob residency.
+    ///
+    /// # Errors
+    /// Returns an error for invalid metadata or storage failure.
+    pub(crate) fn lookup_tree_manifest(&self, id: TreeId) -> Result<Option<TreeManifest>> {
+        let read = self.inner.db.begin_read()?;
+        let trees = read.open_table(TREES)?;
+        let Some(record) = trees.get(&id.0)? else {
+            return Ok(None);
+        };
+        let manifest: TreeManifest = encoding().deserialize(record.value())?;
+        ensure!(manifest.id()? == id, "invalid indexed tree");
+        Ok(Some(manifest))
+    }
+
     /// Pin a tree while its files are consumed.
     ///
     /// # Errors
@@ -332,7 +401,9 @@ impl NativeStore {
         ensure!(manifest.id()? == id, "invalid indexed tree");
         let blobs = manifest.blobs()?;
         for (&content, &size) in &blobs {
-            self.inner.check_blob(content, size)?;
+            if !self.inner.blob_present(content, size)? {
+                return Ok(None);
+            }
         }
         pins.touch(Root::Tree(id));
         let count = pins.trees.entry(id).or_default();

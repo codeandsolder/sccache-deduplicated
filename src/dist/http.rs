@@ -1098,11 +1098,9 @@ mod server {
                 let certs = Arc::clone(&server_certificates);
                 native::spawn(
                     &config,
-                    move |assignment, inputs| match handler.handle_alloc_native_job(
-                        &*requester,
-                        assignment,
-                        inputs,
-                    )? {
+                    move |assignment| match handler
+                        .handle_alloc_native_job(&*requester, assignment)?
+                    {
                         AllocJobResult::Success {
                             job_alloc,
                             need_toolchain,

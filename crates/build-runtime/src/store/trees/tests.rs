@@ -294,3 +294,35 @@ fn failed_tree_acquisition_can_be_retried_without_losing_the_waiting_consumer() 
     assert!(matches!(store.evict_tree(id)?, Eviction::Removed { .. }));
     Ok(())
 }
+
+#[test]
+fn indexed_tree_repairs_only_physically_missing_content() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let store = NativeStore::open(directory.path())?;
+    let good = store.stage(&b"good file"[..])?;
+    let bad = store.stage(&b"lost file"[..])?;
+    let good_ref = good.reference();
+    let bad_ref = bad.reference();
+    let mut manifest = sample_tree(good_ref)?;
+    manifest.entries.insert(
+        TreePath::new(b"lost".to_vec())?,
+        TreeEntry::File {
+            blob: bad_ref,
+            metadata: metadata(0o444),
+        },
+    );
+    let id = store.publish_tree(&manifest, vec![good, bad])?;
+    let before = store.stats()?;
+    std::fs::remove_file(store.inner.blob_path(bad_ref.id))?;
+    assert!(store.lookup_tree(id)?.is_none());
+    let reserve = store.reserve_tree_upload(&manifest)?;
+    assert_eq!(reserve.missing(), &[bad_ref]);
+    let repaired = store.stage_expected(bad_ref, &b"lost file"[..])?;
+    let tree = store.publish_tree_pinned(&manifest, vec![repaired])?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut tree.open_file(good_ref.id)?, &mut bytes)?;
+    assert_eq!(bytes, b"good file");
+    assert_eq!(store.stats()?, before);
+    assert!(store.lookup_tree(id)?.is_some());
+    Ok(())
+}

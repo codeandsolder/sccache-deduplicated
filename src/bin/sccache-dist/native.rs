@@ -114,19 +114,23 @@ impl NativeWorker {
 
     pub(super) fn pin_resident_inputs(
         &self,
-        spec: &sccache::build_runtime::ExecutionSpec,
-    ) -> Result<Vec<sccache::build_runtime::TreeLease>> {
+        assignment: &NativeAssignment,
+    ) -> Result<super::NativeInputPins> {
         ensure!(
-            self.policy.platform == spec.platform,
+            self.policy.platform == assignment.spec.platform,
             "native worker platform unavailable"
         );
-        let mut pins = Vec::new();
-        for tree in spec.action_request()?.input_trees {
+        let blobs = self.store.reserve_blobs(assignment.input_blobs.clone())?;
+        let mut trees = Vec::new();
+        for tree in assignment.spec.action_request()?.input_trees {
             if let Some(pin) = self.store.lookup_tree(tree)? {
-                pins.push(pin);
+                trees.push(pin);
             }
         }
-        Ok(pins)
+        Ok(super::NativeInputPins {
+            _trees: trees,
+            _blobs: blobs,
+        })
     }
 
     pub(super) fn placement(&self) -> NativePlacement {

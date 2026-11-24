@@ -19,6 +19,7 @@ fn service(dir: &std::path::Path) -> Result<NativeSessions> {
             max_tree_blobs: 100,
             max_concurrent_uploads: 2,
             max_total_uploads: 4,
+            max_manifest_cache_bytes: 1024 * 1024,
         },
     )
 }
@@ -83,13 +84,22 @@ fn worker_publication_and_client_download_are_bound_to_ticket() -> Result<()> {
         address: "127.0.0.1:10502".parse()?,
         job: 42,
     };
-    let NativeAdmission::Compile { ticket } =
-        service.admit(request()?, worker, ActionMode::Reuse)?
+    let NativeAdmission::Compile { ticket } = service.admit(
+        request()?,
+        worker,
+        ActionMode::Reuse,
+        std::collections::BTreeMap::new(),
+    )?
     else {
         bail!("expected compilation");
     };
     assert_eq!(
-        service.admit(request()?, Publisher::Client, ActionMode::Reuse)?,
+        service.admit(
+            request()?,
+            Publisher::Client,
+            ActionMode::Reuse,
+            std::collections::BTreeMap::new()
+        )?,
         NativeAdmission::InFlight
     );
     let output = manifest(b"object");
@@ -124,7 +134,12 @@ fn worker_publication_and_client_download_are_bound_to_ticket() -> Result<()> {
     let NativeAdmission::Hit {
         ticket: second,
         manifest,
-    } = service.admit(request()?, Publisher::Client, ActionMode::Reuse)?
+    } = service.admit(
+        request()?,
+        Publisher::Client,
+        ActionMode::Reuse,
+        std::collections::BTreeMap::new(),
+    )?
     else {
         bail!("expected hit");
     };
@@ -147,8 +162,12 @@ fn worker_publication_and_client_download_are_bound_to_ticket() -> Result<()> {
 fn abandoned_and_failed_sessions_release_exclusive_compilation() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
-    let NativeAdmission::Compile { ticket } =
-        service.admit(request()?, Publisher::Client, ActionMode::Reuse)?
+    let NativeAdmission::Compile { ticket } = service.admit(
+        request()?,
+        Publisher::Client,
+        ActionMode::Reuse,
+        std::collections::BTreeMap::new(),
+    )?
     else {
         bail!("expected compilation");
     };
@@ -158,15 +177,24 @@ fn abandoned_and_failed_sessions_release_exclusive_compilation() -> Result<()> {
     }
     assert_eq!(service.reap()?, 1);
     assert!(service.status(ticket).is_err());
-    let NativeAdmission::Compile { ticket } =
-        service.admit(request()?, Publisher::Client, ActionMode::Reuse)?
+    let NativeAdmission::Compile { ticket } = service.admit(
+        request()?,
+        Publisher::Client,
+        ActionMode::Reuse,
+        std::collections::BTreeMap::new(),
+    )?
     else {
         bail!("expected compilation after expiration");
     };
     service.fail(ticket, Publisher::Client)?;
     assert_eq!(service.status(ticket)?, NativeStatus::Failed);
     assert!(matches!(
-        service.admit(request()?, Publisher::Client, ActionMode::Reuse)?,
+        service.admit(
+            request()?,
+            Publisher::Client,
+            ActionMode::Reuse,
+            std::collections::BTreeMap::new()
+        )?,
         NativeAdmission::Compile { .. }
     ));
     Ok(())
@@ -176,8 +204,12 @@ fn abandoned_and_failed_sessions_release_exclusive_compilation() -> Result<()> {
 fn result_contract_and_limits_control_publication() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
-    let NativeAdmission::Compile { ticket } =
-        service.admit(request()?, Publisher::Client, ActionMode::Reuse)?
+    let NativeAdmission::Compile { ticket } = service.admit(
+        request()?,
+        Publisher::Client,
+        ActionMode::Reuse,
+        std::collections::BTreeMap::new(),
+    )?
     else {
         bail!("expected compilation");
     };
@@ -195,7 +227,12 @@ fn result_contract_and_limits_control_publication() -> Result<()> {
     );
     service.close(ticket, Publisher::Client)?;
     assert!(matches!(
-        service.admit(request()?, Publisher::Client, ActionMode::Reuse)?,
+        service.admit(
+            request()?,
+            Publisher::Client,
+            ActionMode::Reuse,
+            std::collections::BTreeMap::new()
+        )?,
         NativeAdmission::Compile { .. }
     ));
     Ok(())
@@ -205,8 +242,12 @@ fn result_contract_and_limits_control_publication() -> Result<()> {
 fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
-    let NativeAdmission::Compile { ticket } =
-        service.admit(request()?, Publisher::Client, ActionMode::Reuse)?
+    let NativeAdmission::Compile { ticket } = service.admit(
+        request()?,
+        Publisher::Client,
+        ActionMode::Reuse,
+        std::collections::BTreeMap::new(),
+    )?
     else {
         bail!("expected compilation");
     };
@@ -316,7 +357,7 @@ fn verify_package_plan_authorization(
 }
 
 #[test]
-fn shared_input_tree_is_pinned_and_worker_can_fetch_only_declared_inputs() -> Result<()> {
+fn input_manifest_survives_scheduler_eviction_and_worker_fetch_is_scoped() -> Result<()> {
     use crate::{TreeEntry, TreePath};
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
@@ -358,14 +399,23 @@ fn shared_input_tree_is_pinned_and_worker_can_fetch_only_declared_inputs() -> Re
         address: "127.0.0.1:10501".parse()?,
         job: 42,
     };
-    let NativeAdmission::Compile { ticket } =
-        service.admit(request.clone(), worker, ActionMode::Reuse)?
+    let NativeAdmission::Compile { ticket } = service.admit(
+        request.clone(),
+        worker,
+        ActionMode::Reuse,
+        std::collections::BTreeMap::new(),
+    )?
     else {
         bail!("expected native action");
     };
     service.close(offer.ticket, Publisher::Client)?;
     service.close(again.ticket, Publisher::Client)?;
-    assert_eq!(service.store().evict_tree(id)?, Eviction::Pinned);
+    assert_eq!(
+        service.store().evict_tree(id)?,
+        Eviction::Removed {
+            unreferenced_logical_bytes: 9,
+        }
+    );
     assert!(service.open_tree(id, worker, Ticket([0; 32])).is_err());
     let unrelated = service.store().publish_tree(
         &TreeManifest {
@@ -383,6 +433,17 @@ fn shared_input_tree_is_pinned_and_worker_can_fetch_only_declared_inputs() -> Re
             .download(read.ticket, Publisher::Client, blob.id)
             .is_err()
     );
+    assert!(
+        service
+            .download(read.ticket, worker, blob.id)
+            .unwrap_err()
+            .is::<NativeContentPending>()
+    );
+    assert_eq!(
+        service.input_demands(ticket)?,
+        vec![InputDemand { tree: id, blob }]
+    );
+    service.backfill_input(ticket, blob, &b"tree data"[..])?;
     let mut contents = Vec::new();
     service
         .download(read.ticket, worker, blob.id)?
@@ -390,18 +451,22 @@ fn shared_input_tree_is_pinned_and_worker_can_fetch_only_declared_inputs() -> Re
     assert_eq!(contents, b"tree data");
     service.close(read.ticket, worker)?;
     service.fail(ticket, worker)?;
+    let retention = NativeStore::blob_retention_manifest(blob)?.id()?;
     assert_eq!(
-        service.store().evict_tree(id)?,
+        service.store().evict_tree(retention)?,
         Eviction::Removed {
-            unreferenced_logical_bytes: 9
+            unreferenced_logical_bytes: 9,
         }
     );
-    assert_eq!(
-        service.admit(request, Publisher::Client, ActionMode::Reuse)?,
-        NativeAdmission::MissingInputs {
-            trees: BTreeSet::from([id])
-        }
-    );
+    assert!(matches!(
+        service.admit(
+            request,
+            Publisher::Client,
+            ActionMode::Reuse,
+            BTreeMap::new()
+        )?,
+        NativeAdmission::Compile { .. }
+    ));
     Ok(())
 }
 
@@ -409,8 +474,12 @@ fn shared_input_tree_is_pinned_and_worker_can_fetch_only_declared_inputs() -> Re
 fn expiry_releases_action_even_when_a_transfer_retains_the_session() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
-    let NativeAdmission::Compile { ticket } =
-        service.admit(request()?, Publisher::Client, ActionMode::Reuse)?
+    let NativeAdmission::Compile { ticket } = service.admit(
+        request()?,
+        Publisher::Client,
+        ActionMode::Reuse,
+        std::collections::BTreeMap::new(),
+    )?
     else {
         bail!("expected compilation");
     };
@@ -419,7 +488,12 @@ fn expiry_releases_action_even_when_a_transfer_retains_the_session() -> Result<(
     assert_eq!(service.reap()?, 1);
     assert!(matches!(NativeSessions::lock(&held)?.phase, Phase::Failed));
     assert!(matches!(
-        service.admit(request()?, Publisher::Client, ActionMode::Reuse)?,
+        service.admit(
+            request()?,
+            Publisher::Client,
+            ActionMode::Reuse,
+            std::collections::BTreeMap::new()
+        )?,
         NativeAdmission::Compile { .. }
     ));
     Ok(())
@@ -451,8 +525,12 @@ fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
     let client = Publisher::Client;
-    let NativeAdmission::Compile { ticket: first } =
-        service.admit(request()?, client, ActionMode::Reuse)?
+    let NativeAdmission::Compile { ticket: first } = service.admit(
+        request()?,
+        client,
+        ActionMode::Reuse,
+        std::collections::BTreeMap::new(),
+    )?
     else {
         bail!("expected initial compilation");
     };
@@ -462,19 +540,33 @@ fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result
     service.upload(first, client, old_blob, &b"old"[..])?;
     service.commit(first, client)?;
 
-    let NativeAdmission::Compile { ticket: failed } =
-        service.admit(request()?, client, ActionMode::Refresh)?
+    let NativeAdmission::Compile { ticket: failed } = service.admit(
+        request()?,
+        client,
+        ActionMode::Refresh,
+        std::collections::BTreeMap::new(),
+    )?
     else {
         bail!("expected refresh");
     };
     assert_eq!(
-        service.admit(request()?, client, ActionMode::Refresh)?,
+        service.admit(
+            request()?,
+            client,
+            ActionMode::Refresh,
+            std::collections::BTreeMap::new()
+        )?,
         NativeAdmission::InFlight
     );
     let NativeAdmission::Hit {
         ticket: reader,
         manifest: current,
-    } = service.admit(request()?, client, ActionMode::Reuse)?
+    } = service.admit(
+        request()?,
+        client,
+        ActionMode::Reuse,
+        std::collections::BTreeMap::new(),
+    )?
     else {
         bail!("expected old hit during refresh");
     };
@@ -482,8 +574,12 @@ fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result
     service.fail(failed, client)?;
     service.close(failed, client)?;
 
-    let NativeAdmission::Compile { ticket: next } =
-        service.admit(request()?, client, ActionMode::Refresh)?
+    let NativeAdmission::Compile { ticket: next } = service.admit(
+        request()?,
+        client,
+        ActionMode::Refresh,
+        std::collections::BTreeMap::new(),
+    )?
     else {
         bail!("expected another refresh");
     };
@@ -497,7 +593,12 @@ fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result
     let NativeAdmission::Hit {
         ticket: latest,
         manifest: current,
-    } = service.admit(request()?, client, ActionMode::Reuse)?
+    } = service.admit(
+        request()?,
+        client,
+        ActionMode::Reuse,
+        std::collections::BTreeMap::new(),
+    )?
     else {
         bail!("expected refreshed hit");
     };
@@ -515,5 +616,210 @@ fn refresh_keeps_previous_result_until_success_and_preserves_readers() -> Result
     assert_eq!(service.store().collect_garbage(8)?.blobs, 1);
     service.close(next, client)?;
     service.close(latest, client)?;
+    Ok(())
+}
+
+#[test]
+fn lazy_manifest_admission_and_cross_action_backfill_are_single_flight() -> Result<()> {
+    use crate::{TreeEntry, TreePath};
+    let directory = tempfile::tempdir()?;
+    let service = service(directory.path())?;
+    let root = empty_root().root;
+    let bytes = b"shared content";
+    let blob = BlobRef {
+        id: ContentId::of(bytes),
+        size: bytes.len() as u64,
+    };
+    let other = BlobRef {
+        id: ContentId::of(b"unused"),
+        size: 6,
+    };
+    let tree = TreeManifest {
+        root,
+        entries: BTreeMap::from([
+            (
+                TreePath::new(b"used".to_vec())?,
+                TreeEntry::File {
+                    blob,
+                    metadata: root,
+                },
+            ),
+            (
+                TreePath::new(b"worker-already-has".to_vec())?,
+                TreeEntry::File {
+                    blob: other,
+                    metadata: root,
+                },
+            ),
+        ]),
+    };
+    let id = tree.id()?;
+    let mut first = request()?;
+    first.root = ExecutionRoot {
+        id,
+        recipe: TreeRecipe::union(root, [id]),
+    };
+    first.input_trees = BTreeSet::from([id]);
+    let mut second = first.clone();
+    second
+        .fingerprint
+        .components
+        .insert("second".into(), ContentId::of(b"second"));
+    let worker1 = Publisher::Worker {
+        address: "127.0.0.1:10501".parse()?,
+        job: 1,
+    };
+    let worker2 = Publisher::Worker {
+        address: "127.0.0.1:10502".parse()?,
+        job: 2,
+    };
+    assert_eq!(
+        service.admit(first.clone(), worker1, ActionMode::Reuse, BTreeMap::new())?,
+        NativeAdmission::MissingInputs {
+            trees: BTreeSet::from([id])
+        }
+    );
+    let NativeAdmission::Compile { ticket: a } = service.admit(
+        first,
+        worker1,
+        ActionMode::Reuse,
+        BTreeMap::from([(id, tree)]),
+    )?
+    else {
+        bail!("metadata-only admission failed");
+    };
+    let NativeAdmission::Compile { ticket: b } =
+        service.admit(second, worker2, ActionMode::Reuse, BTreeMap::new())?
+    else {
+        bail!("cached manifest admission failed");
+    };
+    assert_eq!(service.store().stats()?.blobs, 0);
+    let ta = service.open_tree(id, worker1, a)?.ticket;
+    let tb = service.open_tree(id, worker2, b)?.ticket;
+    assert!(service.request_inputs(ta, worker2, vec![blob]).is_err());
+    assert!(
+        service
+            .request_inputs(
+                ta,
+                worker1,
+                vec![BlobRef {
+                    id: blob.id,
+                    size: blob.size + 1
+                }]
+            )
+            .is_err()
+    );
+    service.request_inputs(ta, worker1, vec![blob])?;
+    service.request_inputs(tb, worker2, vec![blob])?;
+    assert_eq!(
+        service.input_demands(a)?,
+        vec![InputDemand { tree: id, blob }]
+    );
+    assert_eq!(
+        service.input_demands(a)?,
+        vec![InputDemand { tree: id, blob }]
+    );
+    assert!(service.input_demands(b)?.is_empty());
+    assert!(service.backfill_input(b, blob, &bytes[..]).is_err());
+    assert!(service.backfill_input(a, other, &b"unused"[..]).is_err());
+    assert!(
+        service
+            .download(ta, worker1, blob.id)
+            .unwrap_err()
+            .is::<NativeContentPending>()
+    );
+    // A rejected source stream releases its reservation so a different origin can supply it.
+    assert!(
+        service
+            .backfill_input(a, blob, &b"wrong content!"[..])
+            .is_err()
+    );
+    assert_eq!(
+        service.input_demands(b)?,
+        vec![InputDemand { tree: id, blob }]
+    );
+    service.backfill_input(b, blob, &bytes[..])?;
+    assert!(service.input_demands(a)?.is_empty());
+    assert!(service.input_demands(b)?.is_empty());
+    for (ticket, worker) in [(ta, worker1), (tb, worker2)] {
+        let mut actual = Vec::new();
+        service
+            .download(ticket, worker, blob.id)?
+            .read_to_end(&mut actual)?;
+        assert_eq!(actual, bytes);
+        service.close(ticket, worker)?;
+    }
+    assert_eq!(service.store().stats()?.blobs, 1);
+    assert!(service.store().open_available_blob(other)?.is_none());
+    assert_eq!(service.active_uploads.load(Ordering::Acquire), 0);
+    service.fail(a, worker1)?;
+    service.fail(b, worker2)?;
+    Ok(())
+}
+
+#[test]
+fn cancelled_source_releases_claim_to_another_live_origin() -> Result<()> {
+    use crate::{TreeEntry, TreePath};
+    let directory = tempfile::tempdir()?;
+    let service = service(directory.path())?;
+    let bytes = b"content";
+    let blob = BlobRef {
+        id: ContentId::of(bytes),
+        size: bytes.len() as u64,
+    };
+    let root = empty_root().root;
+    let tree = TreeManifest {
+        root,
+        entries: BTreeMap::from([(
+            TreePath::new(b"file".to_vec())?,
+            TreeEntry::File {
+                blob,
+                metadata: root,
+            },
+        )]),
+    };
+    let id = tree.id()?;
+    let mut spec = request()?;
+    spec.root = ExecutionRoot {
+        id,
+        recipe: TreeRecipe::union(root, [id]),
+    };
+    spec.input_trees = BTreeSet::from([id]);
+    let worker = Publisher::Worker {
+        address: "127.0.0.1:10501".parse()?,
+        job: 1,
+    };
+    let NativeAdmission::Compile { ticket: a } = service.admit(
+        spec.clone(),
+        worker,
+        ActionMode::Reuse,
+        BTreeMap::from([(id, tree)]),
+    )?
+    else {
+        bail!("first admission failed")
+    };
+    spec.fingerprint
+        .components
+        .insert("other".into(), ContentId::of(b"other"));
+    let NativeAdmission::Compile { ticket: b } =
+        service.admit(spec, worker, ActionMode::Reuse, BTreeMap::new())?
+    else {
+        bail!("second admission failed")
+    };
+    let ta = service.open_tree(id, worker, a)?.ticket;
+    let tb = service.open_tree(id, worker, b)?.ticket;
+    service.request_inputs(ta, worker, vec![blob])?;
+    service.request_inputs(tb, worker, vec![blob])?;
+    assert_eq!(service.input_demands(a)?.len(), 1);
+    assert!(service.input_demands(b)?.is_empty());
+    service.close(a, Publisher::Client)?;
+    assert_eq!(service.input_demands(b)?.len(), 1);
+    service.backfill_input(b, blob, &bytes[..])?;
+    assert_eq!(service.active_uploads.load(Ordering::Acquire), 0);
+    let mut actual = Vec::new();
+    service
+        .download(tb, worker, blob.id)?
+        .read_to_end(&mut actual)?;
+    assert_eq!(actual, bytes);
     Ok(())
 }

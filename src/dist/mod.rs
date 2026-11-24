@@ -976,6 +976,7 @@ type ExtResult<T, E> = ::std::result::Result<T, E>;
 pub struct NativeAssignment {
     pub ticket: crate::build_runtime::wire::Ticket,
     pub spec: crate::build_runtime::ExecutionSpec,
+    pub input_blobs: NativeInputBlobs,
 }
 
 /// One scheduler assignment routed through the common capacity accounting.
@@ -1068,7 +1069,6 @@ pub trait SchedulerIncoming: Send + Sync {
         &self,
         requester: &dyn SchedulerOutgoing,
         assignment: NativeAssignment,
-        inputs: NativeInputBlobs,
     ) -> ExtResult<AllocJobResult, Error>;
     // From Server
     fn handle_heartbeat_server(

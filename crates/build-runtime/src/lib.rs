@@ -35,7 +35,7 @@ mod coordinator;
 #[cfg(all(unix, feature = "store"))]
 mod session;
 #[cfg(all(unix, feature = "store"))]
-pub use session::{NativeServiceBusy, NativeSessions, SessionLimits};
+pub use session::{NativeContentPending, NativeServiceBusy, NativeSessions, SessionLimits};
 #[cfg(all(unix, feature = "store"))]
 mod store;
 #[cfg(all(unix, feature = "store"))]

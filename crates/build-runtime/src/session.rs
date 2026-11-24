@@ -6,13 +6,14 @@ use std::{
     io::Read,
     path::Path,
     sync::{
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, Weak,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use bincode::Options;
 
 use crate::{
     ActionMode, Admission, ArchiveLength, BlobRef, BuildCoordinator, CompilePermit, ContentId,
@@ -20,8 +21,8 @@ use crate::{
     PackageTransferCost, ResultLease, ResultManifest, StagedBlob, TreeId, TreeLease, TreeManifest,
     UploadReservation, VerifiedPackage,
     wire::{
-        ActionRequest, BeginResult, NativeAdmission, NativeStatus, Publisher, ScheduleReply,
-        Ticket, TreeOffer, TreeRead, WorkerAllocation,
+        ActionRequest, BeginResult, InputDemand, NativeAdmission, NativeStatus, Publisher,
+        ScheduleReply, Ticket, TreeOffer, TreeRead, WorkerAllocation,
     },
 };
 
@@ -36,6 +37,7 @@ pub struct SessionLimits {
     pub max_tree_blobs: usize,
     pub max_concurrent_uploads: usize,
     pub max_total_uploads: usize,
+    pub max_manifest_cache_bytes: usize,
 }
 
 impl SessionLimits {
@@ -55,7 +57,8 @@ impl SessionLimits {
                 && self.max_tree_blobs > 0
                 && self.max_tree_bytes > 0
                 && self.max_concurrent_uploads > 0
-                && self.max_total_uploads > 0,
+                && self.max_total_uploads > 0
+                && self.max_manifest_cache_bytes > 0,
             "native limits must be nonzero"
         );
         Ok(())
@@ -141,10 +144,64 @@ impl Transfer {
     }
 }
 
+struct InputManifest {
+    manifest: TreeManifest,
+    blobs: BTreeMap<ContentId, u64>,
+}
+
+struct CachedManifest {
+    input: Arc<InputManifest>,
+    bytes: usize,
+    used: Instant,
+}
+
+#[derive(Default)]
+struct ManifestCatalog {
+    entries: HashMap<TreeId, CachedManifest>,
+    bytes: usize,
+}
+
+impl ManifestCatalog {
+    fn get(&mut self, id: TreeId) -> Option<Arc<InputManifest>> {
+        self.entries.get_mut(&id).map(|entry| {
+            entry.used = Instant::now();
+            Arc::clone(&entry.input)
+        })
+    }
+
+    fn remember(&mut self, id: TreeId, input: Arc<InputManifest>, bytes: usize, limit: usize) {
+        if bytes > limit {
+            return;
+        }
+        if let Some(previous) = self.entries.remove(&id) {
+            self.bytes -= previous.bytes;
+        }
+        while self.bytes > limit - bytes {
+            let Some((&oldest, _)) = self.entries.iter().min_by_key(|(_, entry)| entry.used) else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.bytes -= removed.bytes;
+            }
+        }
+        self.entries.insert(
+            id,
+            CachedManifest {
+                input,
+                bytes,
+                used: Instant::now(),
+            },
+        );
+        self.bytes += bytes;
+    }
+}
+
 struct PendingAction {
     request: ActionRequest,
     permit: CompilePermit,
-    inputs: Vec<TreeLease>,
+    inputs: BTreeMap<TreeId, Arc<InputManifest>>,
+    demands: BTreeMap<ContentId, (TreeId, Arc<Backfill>)>,
+    origin: Arc<()>,
     upload: Option<(ResultManifest, Transfer)>,
     allocation: Option<WorkerAllocation>,
 }
@@ -180,15 +237,9 @@ impl Pending {
     fn publish(self, store: &NativeStore) -> Result<Ready> {
         match self {
             Self::Action(action) => {
-                let PendingAction {
-                    permit,
-                    inputs,
-                    upload,
-                    ..
-                } = *action;
+                let PendingAction { permit, upload, .. } = *action;
                 let (manifest, transfer) = upload.context("missing result negotiation")?;
                 let result = transfer.publish(|staged| permit.publish_pinned(&manifest, staged));
-                drop(inputs);
                 Ok(Ready::Result(result?))
             }
             Self::Tree { manifest, transfer } => Ok(Ready::Tree(TreeDelivery::new(
@@ -198,24 +249,85 @@ impl Pending {
     }
 }
 
+enum TreeSource {
+    Stored(TreeLease),
+    Action {
+        ticket: Ticket,
+        id: TreeId,
+        input: Arc<InputManifest>,
+    },
+}
+
 struct TreeDelivery {
-    tree: TreeLease,
+    source: TreeSource,
     packages: BTreeMap<ContentId, PackageArchiveLease>,
+    requested: BTreeSet<ContentId>,
+    reservation: Option<UploadReservation>,
 }
 
 impl TreeDelivery {
     const fn new(tree: TreeLease) -> Self {
         Self {
-            tree,
+            source: TreeSource::Stored(tree),
             packages: BTreeMap::new(),
+            requested: BTreeSet::new(),
+            reservation: None,
         }
     }
 
-    fn open_file(&self, id: ContentId) -> Result<File> {
-        if let Some(package) = self.packages.get(&id) {
-            return package.open_file();
+    fn manifest(&self) -> &TreeManifest {
+        match &self.source {
+            TreeSource::Stored(tree) => tree.manifest(),
+            TreeSource::Action { input, .. } => &input.manifest,
         }
-        self.tree.open_file(id)
+    }
+}
+
+/// A missing file may be shared by several independently admitted actions.
+/// Only the claimed origin uploads; the verified retention lease is shared.
+struct Backfill {
+    blob: BlobRef,
+    state: Mutex<BackfillState>,
+}
+
+#[derive(Default)]
+struct BackfillState {
+    claim: Option<BackfillClaim>,
+    uploading: bool,
+    ready: Option<TreeLease>,
+}
+
+struct BackfillClaim {
+    ticket: Ticket,
+    expires: Instant,
+    origin: Weak<()>,
+    slot: UploadSlot,
+}
+
+impl BackfillClaim {
+    fn live(&self, now: Instant) -> bool {
+        self.expires > now && self.origin.strong_count() > 0
+    }
+}
+
+impl Backfill {
+    fn lock(&self) -> Result<MutexGuard<'_, BackfillState>> {
+        self.state
+            .lock()
+            .map_err(|_| anyhow!("native backfill lock poisoned"))
+    }
+}
+
+struct BackfillUpload {
+    flight: Arc<Backfill>,
+    _slot: UploadSlot,
+}
+
+impl Drop for BackfillUpload {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.flight.lock() {
+            state.uploading = false;
+        }
     }
 }
 
@@ -225,17 +337,13 @@ enum Ready {
 }
 
 impl Ready {
-    fn open_file(&self, id: ContentId) -> Result<File> {
+    fn committed(&self) -> Result<Committed> {
         match self {
-            Self::Result(lease) => lease.open_file(id),
-            Self::Tree(lease) => lease.open_file(id),
-        }
-    }
-
-    fn committed(&self) -> Committed {
-        match self {
-            Self::Result(lease) => Committed::Result(lease.manifest().clone()),
-            Self::Tree(lease) => Committed::Tree(lease.tree.id()),
+            Self::Result(lease) => Ok(Committed::Result(lease.manifest().clone())),
+            Self::Tree(lease) => match &lease.source {
+                TreeSource::Stored(tree) => Ok(Committed::Tree(tree.id())),
+                TreeSource::Action { .. } => bail!("delivery tickets cannot be committed"),
+            },
         }
     }
 }
@@ -275,7 +383,9 @@ pub struct NativeSessions {
     coordinator: BuildCoordinator,
     limits: SessionLimits,
     sessions: Mutex<HashMap<Ticket, SharedSession>>,
-    active_uploads: AtomicUsize,
+    active_uploads: Arc<AtomicUsize>,
+    backfills: Mutex<HashMap<ContentId, Weak<Backfill>>>,
+    manifests: Mutex<ManifestCatalog>,
 }
 
 /// A bounded service slot is occupied. Clients can retry without changing
@@ -291,6 +401,18 @@ impl std::fmt::Display for NativeServiceBusy {
 
 impl std::error::Error for NativeServiceBusy {}
 
+/// An authorized input is being requested from its submitting client.
+#[derive(Debug)]
+pub struct NativeContentPending;
+
+impl std::fmt::Display for NativeContentPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native input content pending")
+    }
+}
+
+impl std::error::Error for NativeContentPending {}
+
 impl NativeSessions {
     /// Initialize a scheduler-owned native service.
     ///
@@ -302,7 +424,9 @@ impl NativeSessions {
             coordinator: BuildCoordinator::new(store),
             limits,
             sessions: Mutex::new(HashMap::new()),
-            active_uploads: AtomicUsize::new(0),
+            active_uploads: Arc::new(AtomicUsize::new(0)),
+            backfills: Mutex::new(HashMap::new()),
+            manifests: Mutex::new(ManifestCatalog::default()),
         })
     }
 
@@ -451,10 +575,59 @@ impl NativeSessions {
         };
         // Release permits even if an expired upload still owns a session Arc.
         drop(expired);
+        // Weak flight entries do not retain storage or upload capacity.
+        self.backfills
+            .lock()
+            .map_err(|_| anyhow!("native backfill map poisoned"))?
+            .retain(|_, flight| flight.strong_count() > 0);
         Ok(count)
     }
 
-    /// Admit a complete action, pinning its input closure on a miss.
+    fn input_manifest(
+        &self,
+        id: TreeId,
+        declared: Option<TreeManifest>,
+    ) -> Result<Option<Arc<InputManifest>>> {
+        if let Some(input) = self
+            .manifests
+            .lock()
+            .map_err(|_| anyhow!("native manifest catalog poisoned"))?
+            .get(id)
+        {
+            ensure!(
+                declared
+                    .as_ref()
+                    .is_none_or(|manifest| manifest == &input.manifest),
+                "input manifest differs from validated declaration"
+            );
+            return Ok(Some(input));
+        }
+        let manifest = if let Some(manifest) = declared {
+            ensure!(manifest.id()? == id, "input manifest identity mismatch");
+            manifest
+        } else if let Some(manifest) = self.store().lookup_tree_manifest(id)? {
+            manifest
+        } else {
+            return Ok(None);
+        };
+        let blobs = manifest.blobs()?;
+        self.limits.check_blobs(Kind::Tree, &blobs)?;
+        let bytes = usize::try_from(bincode::DefaultOptions::new().serialized_size(&manifest)?)?;
+        let input = Arc::new(InputManifest { manifest, blobs });
+        self.manifests
+            .lock()
+            .map_err(|_| anyhow!("native manifest catalog poisoned"))?
+            .remember(
+                id,
+                Arc::clone(&input),
+                bytes,
+                self.limits.max_manifest_cache_bytes,
+            );
+        Ok(Some(input))
+    }
+
+    /// Admit an action from verified manifest identities, without requiring
+    /// its entire content closure in the scheduler CAS.
     ///
     /// # Errors
     /// Returns an error for invalid inputs, missing trees, capacity exhaustion
@@ -464,6 +637,7 @@ impl NativeSessions {
         request: ActionRequest,
         publisher: Publisher,
         mode: ActionMode,
+        mut declared: BTreeMap<TreeId, TreeManifest>,
     ) -> Result<NativeAdmission> {
         self.reap()?;
         let fingerprint = request.action_fingerprint()?;
@@ -477,24 +651,25 @@ impl NativeSessions {
                 Ok(NativeAdmission::Hit { ticket, manifest })
             }
             Admission::Compile(permit) => {
-                let mut inputs = Vec::new();
+                ensure!(
+                    declared.keys().all(|id| request.input_trees.contains(id)),
+                    "undeclared input manifest"
+                );
+                let mut inputs = BTreeMap::new();
                 let mut missing = BTreeSet::new();
                 for &id in &request.input_trees {
-                    match self.store().lookup_tree(id)? {
-                        Some(lease) => inputs.push(lease),
-                        None => {
-                            missing.insert(id);
-                        }
+                    if let Some(input) = self.input_manifest(id, declared.remove(&id))? {
+                        inputs.insert(id, input);
+                    } else {
+                        missing.insert(id);
                     }
                 }
                 if !missing.is_empty() {
-                    // Drop the compile permit rather than reserve capacity
-                    // while the client supplies its input closure.
                     return Ok(NativeAdmission::MissingInputs { trees: missing });
                 }
                 let packages = inputs
                     .iter()
-                    .map(|lease| (lease.id(), lease.manifest()))
+                    .map(|(&id, input)| (id, &input.manifest))
                     .collect();
                 let composed = request.root.recipe.compose(&packages)?;
                 request.root.verify(composed.id()?)?;
@@ -503,6 +678,8 @@ impl NativeSessions {
                     request,
                     permit,
                     inputs,
+                    demands: BTreeMap::new(),
+                    origin: Arc::new(()),
                     upload: None,
                     allocation: None,
                 }));
@@ -548,8 +725,8 @@ impl NativeSessions {
             "native action already has a publisher"
         );
         let mut blobs = BTreeMap::new();
-        for tree in &action.inputs {
-            for (&id, &size) in tree.blobs() {
+        for tree in action.inputs.values() {
+            for (&id, &size) in &tree.blobs {
                 ensure!(
                     blobs
                         .insert(id, size)
@@ -612,7 +789,7 @@ impl NativeSessions {
         }
     }
 
-    fn upload_slot(&self) -> Result<UploadSlot<'_>> {
+    fn upload_slot(&self) -> Result<UploadSlot> {
         let mut active = self.active_uploads.load(Ordering::Acquire);
         loop {
             if active >= self.limits.max_total_uploads {
@@ -624,7 +801,7 @@ impl NativeSessions {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Ok(UploadSlot(&self.active_uploads)),
+                Ok(_) => return Ok(UploadSlot(Arc::clone(&self.active_uploads))),
                 Err(observed) => active = observed,
             }
         }
@@ -733,17 +910,27 @@ impl NativeSessions {
             action.request.input_trees.contains(&id),
             "tree is not an input of this action"
         );
-        // The action pins this tree until the delivery lease is acquired.
-        let lease = self
-            .store()
-            .lookup_tree(id)?
-            .context("native input tree unavailable")?;
+        let input = Arc::clone(
+            action
+                .inputs
+                .get(&id)
+                .context("missing admitted input manifest")?,
+        );
+        let manifest = input.manifest.clone();
         drop(state);
-        let manifest = lease.manifest().clone();
         let ticket = self.register(
             Kind::Tree,
             reader,
-            Phase::Ready(Ready::Tree(TreeDelivery::new(lease))),
+            Phase::Ready(Ready::Tree(TreeDelivery {
+                source: TreeSource::Action {
+                    ticket: action_ticket,
+                    id,
+                    input,
+                },
+                packages: BTreeMap::new(),
+                requested: BTreeSet::new(),
+                reservation: None,
+            })),
         )?;
         Ok(TreeRead { ticket, manifest })
     }
@@ -771,7 +958,7 @@ impl NativeSessions {
         let Phase::Ready(Ready::Tree(delivery)) = &mut state.phase else {
             bail!("package delivery requires a tree ticket");
         };
-        let blobs = delivery.tree.manifest().blobs()?;
+        let blobs = delivery.manifest().blobs()?;
         ensure!(
             missing.len() <= blobs.len()
                 && missing
@@ -851,7 +1038,7 @@ impl NativeSessions {
                 "native ticket has wrong publication kind"
             );
             match &state.phase {
-                Phase::Ready(lease) => return Ok(lease.committed()),
+                Phase::Ready(lease) => return lease.committed(),
                 Phase::Pending(pending) => pending.check_complete()?,
                 _ => bail!("native session cannot commit"),
             }
@@ -869,7 +1056,7 @@ impl NativeSessions {
             Ok(lease) => {
                 let reply = lease.committed();
                 state.phase = Phase::Ready(lease);
-                Ok(reply)
+                reply
             }
             Err(error) => {
                 state.phase = Phase::Failed;
@@ -931,12 +1118,276 @@ impl NativeSessions {
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
         self.authorize_reader(&mut state, reader)?;
-        let Phase::Ready(lease) = &state.phase else {
+        let Phase::Ready(lease) = &mut state.phase else {
             bail!("native content not available");
         };
-        let file = lease.open_file(id);
+        match lease {
+            Ready::Result(lease) => lease.open_file(id),
+            Ready::Tree(delivery) => {
+                if let Some(package) = delivery.packages.get(&id) {
+                    return package.open_file();
+                }
+                match &delivery.source {
+                    TreeSource::Stored(tree) => tree.open_file(id),
+                    TreeSource::Action {
+                        ticket,
+                        id: tree,
+                        input,
+                    } => {
+                        let size = *input.blobs.get(&id).context("undeclared input blob")?;
+                        let tree = *tree;
+                        let action = *ticket;
+                        let blob = BlobRef { id, size };
+                        if let Some(file) = self.store().open_available_blob(blob)? {
+                            let requested = delivery.requested.remove(&id);
+                            drop(state);
+                            if requested {
+                                self.finish_backfills(action, reader, [id])?;
+                            }
+                            return Ok(file);
+                        }
+                        delivery.requested.insert(id);
+                        drop(state);
+                        self.request_backfills(action, reader, tree, &[blob])?;
+                        Err(NativeContentPending.into())
+                    }
+                }
+            }
+        }
+    }
+
+    /// Prefetch only the blobs the worker actually lacks. Protect those
+    /// already present on the scheduler and request the rest from the origin.
+    ///
+    /// # Errors
+    /// Returns an error for unauthorized or undeclared inputs or storage failure.
+    pub fn request_inputs(
+        &self,
+        ticket: Ticket,
+        reader: Publisher,
+        missing: Vec<BlobRef>,
+    ) -> Result<()> {
+        let session = self.get(ticket)?;
+        let mut state = Self::lock(&session)?;
+        self.authorize_reader(&mut state, reader)?;
+        let Phase::Ready(Ready::Tree(delivery)) = &mut state.phase else {
+            bail!("input prefetch requires a tree delivery");
+        };
+        let TreeSource::Action {
+            ticket: action,
+            id: tree,
+            input,
+        } = &delivery.source
+        else {
+            bail!("input prefetch requires an assigned action");
+        };
+        let mut blobs = BTreeMap::new();
+        for blob in missing {
+            ensure!(
+                input.blobs.get(&blob.id) == Some(&blob.size)
+                    && blobs.insert(blob.id, blob.size).is_none(),
+                "undeclared or duplicate input prefetch"
+            );
+        }
+        let action = *action;
+        let tree = *tree;
+        let reservation = self.store().reserve_blobs(blobs)?;
+        let absent = reservation.missing().to_vec();
+        delivery.requested.extend(absent.iter().map(|blob| blob.id));
+        delivery.reservation = Some(reservation);
         drop(state);
-        file
+        self.request_backfills(action, reader, tree, &absent)
+    }
+
+    fn request_backfills(
+        &self,
+        ticket: Ticket,
+        reader: Publisher,
+        tree: TreeId,
+        blobs: &[BlobRef],
+    ) -> Result<()> {
+        let session = self.get(ticket)?;
+        let mut state = Self::lock(&session)?;
+        self.authorize(&mut state, reader)?;
+        let Phase::Pending(pending) = &mut state.phase else {
+            bail!("native action no longer pending");
+        };
+        let Pending::Action(action) = &mut **pending else {
+            bail!("native action required");
+        };
+        let input = action.inputs.get(&tree).context("undeclared input tree")?;
+        let mut flights = self
+            .backfills
+            .lock()
+            .map_err(|_| anyhow!("native backfill map poisoned"))?;
+        for &blob in blobs {
+            ensure!(
+                input.blobs.get(&blob.id) == Some(&blob.size),
+                "undeclared input blob"
+            );
+            let flight = if let Some(flight) = flights.get(&blob.id).and_then(Weak::upgrade) {
+                ensure!(flight.blob == blob, "conflicting requested blob length");
+                flight
+            } else {
+                let flight = Arc::new(Backfill {
+                    blob,
+                    state: Mutex::new(BackfillState::default()),
+                });
+                flights.insert(blob.id, Arc::downgrade(&flight));
+                flight
+            };
+            {
+                let mut pending = flight.lock()?;
+                if pending.ready.is_some() && self.store().open_available_blob(blob)?.is_none() {
+                    pending.ready = None;
+                }
+            }
+            action.demands.entry(blob.id).or_insert((tree, flight));
+        }
+        Ok(())
+    }
+
+    fn finish_backfills(
+        &self,
+        ticket: Ticket,
+        reader: Publisher,
+        ids: impl IntoIterator<Item = ContentId>,
+    ) -> Result<()> {
+        let session = self.get(ticket)?;
+        let mut state = Self::lock(&session)?;
+        self.authorize(&mut state, reader)?;
+        let Phase::Pending(pending) = &mut state.phase else {
+            bail!("native action no longer pending");
+        };
+        let Pending::Action(action) = &mut **pending else {
+            bail!("native action required");
+        };
+        // An origin may already have received a claim while another
+        // publication makes this blob available. Let the claimed stream
+        // finish rather than rejecting valid bytes mid-transfer.
+        for id in ids {
+            if let Some((_, flight)) = action.demands.get(&id) {
+                let pending = flight.lock()?;
+                let finished = pending.claim.is_none() && !pending.uploading;
+                drop(pending);
+                if finished {
+                    action.demands.remove(&id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Poll missing inputs requested by the assigned worker. Claims are shared
+    /// by content identity across actions and expire if their source disappears.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid or expired action ticket.
+    pub fn input_demands(&self, ticket: Ticket) -> Result<Vec<InputDemand>> {
+        let session = self.get(ticket)?;
+        let mut state = Self::lock(&session)?;
+        self.authorize_reader(&mut state, Publisher::Client)?;
+        let Phase::Pending(pending) = &state.phase else {
+            return Ok(Vec::new());
+        };
+        let Pending::Action(action) = &**pending else {
+            bail!("native action required");
+        };
+        let now = Instant::now();
+        // A lost poll reply is replayable. At most one reserved upload per
+        // origin keeps sequential namespace streams from hoarding slots.
+        let mut candidate = None;
+        for (tree, flight) in action.demands.values() {
+            let mut pending = flight.lock()?;
+            if pending.claim.as_ref().is_some_and(|claim| !claim.live(now)) {
+                pending.claim = None;
+            }
+            if pending.uploading || pending.ready.is_some() {
+                continue;
+            }
+            if let Some(claim) = &mut pending.claim {
+                if claim.ticket == ticket {
+                    claim.expires = self.deadline();
+                    return Ok(vec![InputDemand {
+                        tree: *tree,
+                        blob: flight.blob,
+                    }]);
+                }
+            } else if candidate.is_none() {
+                candidate = Some((*tree, flight));
+            }
+        }
+        if let Some((tree, flight)) = candidate {
+            let mut pending = flight.lock()?;
+            if !pending.uploading && pending.ready.is_none() && pending.claim.is_none() {
+                match self.upload_slot() {
+                    Ok(slot) => {
+                        pending.claim = Some(BackfillClaim {
+                            ticket,
+                            expires: self.deadline(),
+                            origin: Arc::downgrade(&action.origin),
+                            slot,
+                        });
+                        return Ok(vec![InputDemand {
+                            tree,
+                            blob: flight.blob,
+                        }]);
+                    }
+                    Err(error) if error.is::<NativeServiceBusy>() => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Backfill exactly one demanded input from its claimed origin.
+    ///
+    /// # Errors
+    /// Returns an error for an unauthorized, unrequested or invalid stream.
+    pub fn backfill_input(&self, ticket: Ticket, blob: BlobRef, reader: impl Read) -> Result<()> {
+        let session = self.get(ticket)?;
+        let guard = {
+            let mut state = Self::lock(&session)?;
+            self.authorize_reader(&mut state, Publisher::Client)?;
+            let Phase::Pending(pending) = &state.phase else {
+                bail!("native action no longer pending");
+            };
+            let Pending::Action(action) = &**pending else {
+                bail!("native action required");
+            };
+            let (_, flight) = action
+                .demands
+                .get(&blob.id)
+                .context("unrequested input upload")?;
+            ensure!(flight.blob == blob, "input upload length mismatch");
+            let mut pending = flight.lock()?;
+            ensure!(
+                !pending.uploading
+                    && pending.ready.is_none()
+                    && pending
+                        .claim
+                        .as_ref()
+                        .is_some_and(|claim| claim.ticket == ticket),
+                "input upload not claimed"
+            );
+            let claim = pending
+                .claim
+                .take()
+                .context("input upload claim disappeared")?;
+            pending.uploading = true;
+            BackfillUpload {
+                flight: Arc::clone(flight),
+                _slot: claim.slot,
+            }
+        };
+        let manifest = NativeStore::blob_retention_manifest(blob)?;
+        let _reserved = self.store().reserve_tree_upload(&manifest)?;
+        // Still verify the stream if concurrent publication supplied the same content.
+        let staged = vec![self.store().stage_expected(blob, reader)?];
+        let lease = self.store().publish_tree_pinned(&manifest, staged)?;
+        guard.flight.lock()?.ready = Some(lease);
+        Ok(())
     }
 
     /// Release a delivery ticket, or cancel an unfinished action.
@@ -957,6 +1408,14 @@ impl NativeSessions {
         };
         let removed = self.sessions()?.remove(&ticket);
         drop(removed);
+        if let Phase::Ready(Ready::Tree(delivery)) = &previous
+            && let TreeSource::Action { ticket: action, .. } = &delivery.source
+            && !delivery.requested.is_empty()
+        {
+            // A different local tree acquisition may have supplied some
+            // prefetched bytes. Stop requesting unclaimed leftovers.
+            let _ = self.finish_backfills(*action, reader, delivery.requested.iter().copied());
+        }
         drop(previous);
         Ok(())
     }
@@ -980,9 +1439,9 @@ impl NativeSessions {
     }
 }
 
-struct UploadSlot<'a>(&'a AtomicUsize);
+struct UploadSlot(Arc<AtomicUsize>);
 
-impl Drop for UploadSlot<'_> {
+impl Drop for UploadSlot {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }

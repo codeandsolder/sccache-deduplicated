@@ -2167,6 +2167,7 @@ pub mod scheduler {
                 max_tree_blobs: self.max_tree_blobs,
                 max_concurrent_uploads: self.max_concurrent_uploads,
                 max_total_uploads: self.max_total_uploads,
+                max_manifest_cache_bytes: self.max_metadata_bytes,
             };
             limits.validate()?;
             self.space.validate()?;

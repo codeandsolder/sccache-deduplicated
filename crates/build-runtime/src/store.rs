@@ -229,13 +229,18 @@ impl Inner {
         self.root.join("blobs").join(&hex[..2]).join(&hex[2..])
     }
 
+    fn blob_present(&self, id: ContentId, size: u64) -> Result<bool> {
+        match fs::symlink_metadata(self.blob_path(id)) {
+            Ok(metadata) => Ok(metadata.is_file() && metadata.len() == size),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn check_blob(&self, id: ContentId, size: u64) -> Result<()> {
-        let path = self.blob_path(id);
-        let metadata = fs::symlink_metadata(&path)
-            .with_context(|| format!("missing native store content {id:?}"))?;
         ensure!(
-            metadata.is_file() && metadata.len() == size,
-            "invalid native store content {id:?}"
+            self.blob_present(id, size)?,
+            "missing or invalid native store content {id:?}"
         );
         Ok(())
     }
@@ -550,7 +555,12 @@ impl NativeStore {
         self.reserve_blobs(manifest.blobs()?)
     }
 
-    fn reserve_blobs(&self, blobs: BTreeMap<ContentId, u64>) -> Result<UploadReservation> {
+    /// Pin the existing portion of an exact input closure, regardless of which
+    /// local tree or result currently references the content.
+    ///
+    /// # Errors
+    /// Returns an error for inconsistent lengths or storage failure.
+    pub fn reserve_blobs(&self, blobs: BTreeMap<ContentId, u64>) -> Result<UploadReservation> {
         let _mutation = self.inner.lock_mutations()?;
         let read = self.inner.db.begin_read()?;
         let live = read.open_table(BLOBS)?;
@@ -562,10 +572,7 @@ impl NativeStore {
             let pending_size = pending.get(&id.0)?.map(|entry| entry.value());
             if let Some(indexed_size) = live_size.or(pending_size) {
                 ensure!(indexed_size == size, "inconsistent indexed content length");
-                if live_size.is_some() {
-                    self.inner.check_blob(id, size)?;
-                    reserved.push(id);
-                } else if self.inner.check_blob(id, size).is_ok() {
+                if self.inner.blob_present(id, size)? {
                     reserved.push(id);
                 } else {
                     missing.push(BlobRef { id, size });
@@ -752,10 +759,15 @@ impl NativeStore {
         let mut pending = write.open_table(PENDING_DELETIONS)?;
         let mut accounting = write.open_table(ACCOUNTING)?;
         let mut resurrected = Vec::new();
+        let mut repair = BTreeSet::new();
         for (&id, &size) in blobs {
             if let Some(existing_size) = blob_table.get(&id.0)?.map(|entry| entry.value()) {
                 ensure!(existing_size == size, "content length mismatch for {id:?}");
-                self.inner.check_blob(id, size)?;
+                if !self.inner.blob_present(id, size)? {
+                    let blob = staged.get(&id).context("missing staged repair content")?;
+                    ensure!(blob.reference.size == size, "staged repair length mismatch");
+                    repair.insert(id);
+                }
             } else {
                 ensure!(!existing_result, "indexed result is missing content {id:?}");
                 if let Some(old_size) = pending.get(&id.0)?.map(|entry| entry.value()) {
@@ -781,7 +793,10 @@ impl NativeStore {
         let mut pending_removed = 0_u64;
         let mut directories = BTreeSet::new();
         for (&id, &size) in blobs {
-            if blob_table.get(&id.0)?.is_none() {
+            if repair.contains(&id) {
+                let blob = staged.remove(&id).context("validated repair disappeared")?;
+                reservations.push(self.inner.install_blob(blob, &mut directories)?);
+            } else if blob_table.get(&id.0)?.is_none() {
                 if resurrected.binary_search(&id).is_err() {
                     let blob = staged
                         .remove(&id)

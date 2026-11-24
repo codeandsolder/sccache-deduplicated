@@ -69,6 +69,7 @@ fn limits() -> SessionLimits {
         max_tree_blobs: 100,
         max_concurrent_uploads: 2,
         max_total_uploads: 4,
+        max_manifest_cache_bytes: 1024 * 1024,
     }
 }
 
@@ -96,7 +97,7 @@ fn with_native_service(
             respond(
                 request,
                 &sessions,
-                &move |_, _| {
+                &move |_| {
                     Ok(ScheduleReply::Assigned(WorkerAllocation {
                         address: worker.addr(),
                         job: 42,
@@ -179,17 +180,28 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
 
         assert!(
             unauthorized
-                .admit(&spec, crate::build_runtime::ActionMode::Reuse)
+                .admit(
+                    &spec,
+                    crate::build_runtime::ActionMode::Reuse,
+                    &std::collections::BTreeMap::new()
+                )
                 .is_err()
         );
 
-        let NativeAdmission::Compile { ticket } =
-            client.admit(&spec, crate::build_runtime::ActionMode::Reuse)?
+        let NativeAdmission::Compile { ticket } = client.admit(
+            &spec,
+            crate::build_runtime::ActionMode::Reuse,
+            &std::collections::BTreeMap::new(),
+        )?
         else {
             anyhow::bail!("expected compilation");
         };
         assert_eq!(
-            client.admit(&spec, crate::build_runtime::ActionMode::Reuse)?,
+            client.admit(
+                &spec,
+                crate::build_runtime::ActionMode::Reuse,
+                &std::collections::BTreeMap::new()
+            )?,
             NativeAdmission::InFlight
         );
         let mut wrong_spec = spec.clone();
@@ -262,7 +274,11 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
         let NativeAdmission::Hit {
             ticket: hit,
             manifest,
-        } = client.admit(&spec, crate::build_runtime::ActionMode::Reuse)?
+        } = client.admit(
+            &spec,
+            crate::build_runtime::ActionMode::Reuse,
+            &std::collections::BTreeMap::new(),
+        )?
         else {
             anyhow::bail!("expected stored hit");
         };
@@ -350,8 +366,11 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
         spec.mounts
             .insert(BuildPath::new(b"/src".to_vec())?, source.id());
         spec.command.arguments = vec![b"-c".to_vec(), b"IFS= read -r data < /src/input; printf '%s' \"$data\" > /out/obj; printf diagnostic >&2".to_vec()];
-        let NativeAdmission::Compile { ticket } =
-            client.admit(&spec, crate::build_runtime::ActionMode::Reuse)?
+        let NativeAdmission::Compile { ticket } = client.admit(
+            &spec,
+            crate::build_runtime::ActionMode::Reuse,
+            &std::collections::BTreeMap::new(),
+        )?
         else {
             anyhow::bail!("expected native compilation");
         };
@@ -422,7 +441,11 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
         let NativeAdmission::Hit {
             ticket: hit,
             manifest: cached,
-        } = client.admit(&spec, crate::build_runtime::ActionMode::Reuse)?
+        } = client.admit(
+            &spec,
+            crate::build_runtime::ActionMode::Reuse,
+            &std::collections::BTreeMap::new(),
+        )?
         else {
             anyhow::bail!("expected cache hit");
         };
@@ -484,4 +507,103 @@ fn adaptive_blob_response_compresses_only_when_transfer_saves_bytes() -> Result<
     stream.read_to_end(&mut received)?;
     assert_eq!(received, noise);
     Ok(())
+}
+
+#[test]
+fn lazy_admission_prefetch_and_origin_backfill_over_http() -> Result<()> {
+    use crate::build_runtime::{TreeEntry, TreePath, wire::InputDemand};
+    with_native_service(|url, sessions| {
+        let client = make_client(url, "client-token")?;
+        let worker = make_client(url, "worker-token")?.for_worker(JobId(42));
+        let metadata = TreeMetadata {
+            mode: 0o755,
+            modified: TreeTimestamp {
+                seconds: 1,
+                nanoseconds: 0,
+            },
+        };
+        let bytes = b"missing from scheduler";
+        let missing = BlobRef {
+            id: ContentId::of(bytes),
+            size: u64::try_from(bytes.len())?,
+        };
+        let unused = BlobRef {
+            id: ContentId::of(b"already on worker"),
+            size: 17,
+        };
+        let root = TreeManifest {
+            root: metadata,
+            entries: BTreeMap::from([
+                (
+                    TreePath::new(b"missing".to_vec())?,
+                    TreeEntry::File {
+                        blob: missing,
+                        metadata,
+                    },
+                ),
+                (
+                    TreePath::new(b"unused".to_vec())?,
+                    TreeEntry::File {
+                        blob: unused,
+                        metadata,
+                    },
+                ),
+            ]),
+        };
+        let id = root.id()?;
+        let spec = action(&root)?;
+        let NativeAdmission::Compile { ticket } =
+            client.admit(&spec, ActionMode::Reuse, &BTreeMap::from([(id, root)]))?
+        else {
+            anyhow::bail!("metadata-only admission failed");
+        };
+        assert_eq!(sessions.store().stats()?.blobs, 0);
+        assert!(matches!(
+            client.schedule(ticket, spec)?,
+            ScheduleReply::Assigned(_)
+        ));
+        let read = worker.open_tree(ticket, id)?;
+        let request = reqwest::blocking::Client::new();
+        let prefetch = InputPrefetchRequest {
+            ticket: read.ticket,
+            missing: vec![missing],
+        };
+        request
+            .post(url.join("/api/v2/native/worker/input_prefetch")?)
+            .bearer_auth("worker-token")
+            .header("Content-Type", "application/octet-stream")
+            .header("X-Sccache-Native-Job", "42")
+            .body(codec().serialize(&prefetch)?)
+            .send()?
+            .error_for_status()?;
+        let pending = request
+            .post(url.join("/api/v2/native/worker/download")?)
+            .bearer_auth("worker-token")
+            .header("Content-Type", "application/octet-stream")
+            .header("X-Sccache-Native-Job", "42")
+            .body(codec().serialize(&DownloadRequest {
+                ticket: read.ticket,
+                id: missing.id,
+            })?)
+            .send()?;
+        assert_eq!(pending.status(), reqwest::StatusCode::ACCEPTED);
+        assert_eq!(
+            client.input_demands(ticket)?,
+            vec![InputDemand {
+                tree: id,
+                blob: missing
+            }]
+        );
+        client.backfill_input(ticket, missing, Cursor::new(bytes))?;
+        let mut actual = Vec::new();
+        worker.download(read.ticket, missing, &mut actual)?;
+        assert_eq!(actual, bytes);
+        assert!(client.input_demands(ticket)?.is_empty());
+        assert_eq!(sessions.store().stats()?.blobs, 1);
+        assert!(sessions.store().open_available_blob(unused)?.is_none());
+        worker.close(read.ticket)?;
+        worker.fail(ticket)?;
+        client.close(ticket)?;
+        Ok(())
+    })
 }

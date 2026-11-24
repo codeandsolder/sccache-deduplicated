@@ -1,6 +1,7 @@
 //! Client and worker adapters for the scheduler's native cache protocol.
 
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::{self, Cursor, Read, Write},
     time::{Duration, Instant},
@@ -14,8 +15,8 @@ use crate::build_runtime::{
     ActionMode, BlobRef, ContentId, ExecutionSpec, InstallationManifest, PackageIdentity,
     PackageReceipt, PackageSource, PackageTransferCost, ResultManifest, TreeId, TreeManifest,
     wire::{
-        BeginResult, NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply, Ticket,
-        TreeOffer, TreeRead, UploadHeader, WorkerAllocation,
+        BeginResult, InputDemand, NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply,
+        Ticket, TreeOffer, TreeRead, UploadHeader, WorkerAllocation,
     },
 };
 use crate::dist::JobId;
@@ -50,6 +51,12 @@ pub(super) struct DownloadRequest {
 pub(super) struct OpenTreeRequest {
     pub action: Ticket,
     pub tree: TreeId,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct InputPrefetchRequest {
+    pub ticket: Ticket,
+    pub missing: Vec<BlobRef>,
 }
 
 #[cfg(all(target_os = "linux", feature = "native-store"))]
@@ -308,8 +315,32 @@ impl NativeCacheClient {
     ///
     /// # Errors
     /// Returns an error on invalid metadata, authentication or transport failure.
-    pub fn admit(&self, spec: &ExecutionSpec, mode: ActionMode) -> Result<NativeAdmission> {
-        self.control("admit", &(spec, mode))
+    pub fn admit(
+        &self,
+        spec: &ExecutionSpec,
+        mode: ActionMode,
+        declared: &BTreeMap<TreeId, TreeManifest>,
+    ) -> Result<NativeAdmission> {
+        self.control("admit", &(spec, mode, declared))
+    }
+
+    pub(super) fn input_demands(&self, ticket: Ticket) -> Result<Vec<InputDemand>> {
+        self.control("input_demands", &ticket)
+    }
+
+    pub(super) fn backfill_input(
+        &self,
+        ticket: Ticket,
+        blob: BlobRef,
+        reader: impl Read + Send + 'static,
+    ) -> Result<()> {
+        self.send_stream(
+            "backfill_input",
+            &UploadHeader { ticket, blob },
+            blob.size,
+            reader,
+        )?;
+        Ok(())
     }
 
     /// Verify that a publisher is executing exactly the admitted specification.
@@ -484,16 +515,21 @@ impl NativeCacheClient {
                 transport.parallelism()
             );
             let raw_missing = updated.missing().to_vec();
-            let staged = map_packages(updated.missing(), transport.parallelism(), |blob| {
-                check()?;
-                let _slot = transport.raw_slot(check)?;
-                let start = Instant::now();
-                let response = self.download_response(read.ticket, blob.id)?;
-                let staged = store.stage_expected(*blob, response)?;
-                transport.observe_raw(blob.size, start.elapsed());
-                Ok(staged)
-            })?;
-            let tree = store.publish_tree_pinned(&read.manifest, staged)?;
+            let mut acquired = Vec::new();
+            // Register a bounded lookahead before download slots start waiting.
+            // The origin can stream subsequent misses while these are consumed.
+            let lookahead = transport.parallelism().get().saturating_mul(8).min(256);
+            for chunk in updated.missing().chunks(lookahead) {
+                self.control::<_, ()>("input_prefetch", &InputPrefetchRequest {
+                    ticket: read.ticket,
+                    missing: chunk.to_vec(),
+                })?;
+                acquired.extend(map_packages(chunk, transport.parallelism(), |blob| {
+                    self.fetch_input_blob(read.ticket, *blob, store, transport, check)
+                })?);
+            }
+            let tree = store.publish_tree_pinned(&read.manifest, Vec::new())?;
+            drop(acquired);
             if log::log_enabled!(target: "native_cas_replay", log::Level::Trace) {
                 log::trace!(
                     target: "native_cas_replay",
@@ -516,6 +552,47 @@ impl NativeCacheClient {
         // Best effort: the remote pin also expires automatically.
         let _ = self.close(read.ticket);
         result
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-store"))]
+    fn fetch_input_blob(
+        &self,
+        ticket: Ticket,
+        blob: BlobRef,
+        store: &crate::build_runtime::NativeStore,
+        transport: &worker::PackageTransportTracker,
+        check: &LeaseCheck<'_>,
+    ) -> Result<std::sync::Arc<crate::build_runtime::TreeLease>> {
+        check()?;
+        let manifest = crate::build_runtime::NativeStore::blob_retention_manifest(blob)?;
+        let (lease, _) = store.acquire_tree(manifest.id()?, check, || {
+            let reservation = store.reserve_tree_upload(&manifest)?;
+            let staged = if reservation.missing().is_empty() {
+                Vec::new()
+            } else {
+                let start = Instant::now();
+                let mut delay = Duration::from_millis(10);
+                loop {
+                    check()?;
+                    let slot = transport.raw_slot(check)?;
+                    let transfer = Instant::now();
+                    if let Some(response) = self.try_download_response(ticket, blob.id)? {
+                        let staged = store.stage_expected(blob, response)?;
+                        transport.observe_raw(blob.size, transfer.elapsed());
+                        break vec![staged];
+                    }
+                    drop(slot);
+                    ensure!(
+                        start.elapsed() < self.timeout,
+                        "native input backfill timed out"
+                    );
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(Duration::from_millis(200));
+                }
+            };
+            store.publish_tree_pinned(&manifest, staged)
+        })?;
+        Ok(lease)
     }
 
     /// Negotiate missing content for a successful result.
@@ -647,17 +724,29 @@ impl NativeCacheClient {
     }
 
     fn download_response(&self, ticket: Ticket, id: ContentId) -> Result<Box<dyn Read + Send>> {
+        self.try_download_response(ticket, id)?
+            .context("native content not yet available")
+    }
+
+    fn try_download_response(
+        &self,
+        ticket: Ticket,
+        id: ContentId,
+    ) -> Result<Option<Box<dyn Read + Send>>> {
         let request = codec().serialize(&DownloadRequest { ticket, id })?;
         let response = self
             .request("download")?
             .header("X-Sccache-Accept-Blob-Codec", "zstd")
             .body(request)
-            .send()?
-            .error_for_status()?;
+            .send()?;
+        if response.status() == reqwest::StatusCode::ACCEPTED {
+            return Ok(None);
+        }
+        let response = response.error_for_status()?;
         match response.headers().get("X-Sccache-Blob-Codec") {
-            None => Ok(Box::new(response)),
+            None => Ok(Some(Box::new(response))),
             Some(value) if value.as_bytes() == b"zstd" => {
-                Ok(Box::new(zstd::stream::read::Decoder::new(response)?))
+                Ok(Some(Box::new(zstd::stream::read::Decoder::new(response)?)))
             }
             Some(other) => anyhow::bail!("unsupported native blob codec: {other:?}"),
         }

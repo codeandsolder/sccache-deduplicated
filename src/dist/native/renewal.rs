@@ -84,22 +84,13 @@ impl Renewals {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn remove(&self, ticket: Ticket) -> Result<()> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow!("native renewal state poisoned"))?;
         state.tickets.remove(&ticket);
-        drop(state);
-        Ok(())
-    }
-
-    pub(super) fn clear(&self) -> Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("native renewal state poisoned"))?;
-        state.tickets.clear();
         drop(state);
         Ok(())
     }

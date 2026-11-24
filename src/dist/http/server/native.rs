@@ -18,20 +18,20 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::{ClientAuthCheck, ServerAuthenticator, authenticate_client, authenticate_server};
 use crate::{
     build_runtime::{
-        ActionMode, ArchiveLength, ExecutionSpec, NativeServiceBusy, NativeSessions, NativeStore,
-        PackageIdentity, PackageImportLimits, PackageSource, VerifiedPackage,
+        ActionMode, ArchiveLength, ExecutionSpec, NativeContentPending, NativeServiceBusy,
+        NativeSessions, NativeStore, PackageIdentity, PackageImportLimits, PackageSource, TreeId,
+        TreeManifest, VerifiedPackage,
         wire::{Publisher, ScheduleReply, UploadHeader},
     },
     config::scheduler::NativeCacheConfig,
     dist::native::{
-        DownloadRequest, ExecutionRequest, ManifestRequest, OpenTreeRequest, PackageAcquisition,
-        PackageLocator, PackagePlanRequest, codec,
+        DownloadRequest, ExecutionRequest, InputPrefetchRequest, ManifestRequest, OpenTreeRequest,
+        PackageAcquisition, PackageLocator, PackagePlanRequest, codec,
     },
 };
 
-pub(super) type Allocator = dyn Fn(crate::dist::NativeAssignment, crate::dist::NativeInputBlobs) -> Result<ScheduleReply>
-    + Send
-    + Sync;
+pub(super) type Allocator =
+    dyn Fn(crate::dist::NativeAssignment) -> Result<ScheduleReply> + Send + Sync;
 
 struct PackageService {
     limits: PackageImportLimits,
@@ -97,13 +97,7 @@ impl PackageService {
 
 pub(super) fn spawn(
     config: &NativeCacheConfig,
-    allocate: impl Fn(
-        crate::dist::NativeAssignment,
-        crate::dist::NativeInputBlobs,
-    ) -> Result<ScheduleReply>
-    + Send
-    + Sync
-    + 'static,
+    allocate: impl Fn(crate::dist::NativeAssignment) -> Result<ScheduleReply> + Send + Sync + 'static,
     client_auth: Arc<dyn ClientAuthCheck>,
     server_auth: Arc<ServerAuthenticator>,
 ) -> Result<()> {
@@ -245,6 +239,9 @@ fn respond(
         request, sessions, allocate, publisher, operation, limit, packages,
     ) {
         Ok(response) => response,
+        Err(error) if error.is::<NativeContentPending>() => {
+            Response::text("native input pending").with_status_code(202)
+        }
         Err(error) if error.is::<NativeServiceBusy>() => {
             Response::text("native service busy").with_status_code(503)
         }
@@ -346,18 +343,40 @@ fn dispatch(
             }
         }
         "admit" if publisher == Publisher::Client => {
-            let (input, mode): (ExecutionSpec, ActionMode) = metadata(request, limit)?;
+            let (input, mode, declared): (
+                ExecutionSpec,
+                ActionMode,
+                BTreeMap<TreeId, TreeManifest>,
+            ) = metadata(request, limit)?;
             encode(
-                &sessions.admit(input.action_request()?, publisher, mode)?,
+                &sessions.admit(input.action_request()?, publisher, mode, declared)?,
                 limit,
             )
+        }
+        "input_prefetch" if matches!(publisher, Publisher::Worker { .. }) => {
+            let InputPrefetchRequest { ticket, missing } = metadata(request, limit)?;
+            sessions.request_inputs(ticket, publisher, missing)?;
+            encode(&(), limit)
+        }
+        "input_demands" if publisher == Publisher::Client => {
+            encode(&sessions.input_demands(metadata(request, limit)?)?, limit)
+        }
+        "backfill_input" if publisher == Publisher::Client => {
+            let mut body = request.data().context("missing native backfill body")?;
+            let header: UploadHeader = codec().with_limit(72).deserialize_from(&mut body)?;
+            sessions.backfill_input(header.ticket, header.blob, body)?;
+            encode(&(), limit)
         }
         "schedule" if publisher == Publisher::Client => {
             let ExecutionRequest { ticket, spec } = metadata(request, limit)?;
             let request = spec.action_request()?;
             encode(
                 &sessions.schedule(ticket, &request, |inputs| {
-                    allocate(crate::dist::NativeAssignment { ticket, spec }, inputs)
+                    allocate(crate::dist::NativeAssignment {
+                        ticket,
+                        spec,
+                        input_blobs: inputs,
+                    })
                 })?,
                 limit,
             )

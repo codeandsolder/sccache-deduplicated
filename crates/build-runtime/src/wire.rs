@@ -141,6 +141,13 @@ pub enum NativeStatus {
     Failed,
 }
 
+/// One requested input blob, routed to its original declared tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputDemand {
+    pub tree: TreeId,
+    pub blob: BlobRef,
+}
+
 /// Negotiated result manifest and missing content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BeginResult {

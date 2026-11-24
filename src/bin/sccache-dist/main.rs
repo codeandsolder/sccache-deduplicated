@@ -987,17 +987,18 @@ impl Scheduler {
         &self,
         requester: &dyn SchedulerOutgoing,
         assignment: JobAssignment,
-        native_inputs: Option<dist::NativeInputBlobs>,
     ) -> Result<AllocJobResult> {
         if self.is_draining() {
             return Ok(AllocJobResult::Fail {
                 msg: "scheduler is draining for maintenance".to_owned(),
             });
         }
-        let native_platform = match &assignment {
+        let native = match &assignment {
             JobAssignment::Archive(_) => None,
-            JobAssignment::Native(native) => Some(native.spec.platform),
+            JobAssignment::Native(native) => Some(native.as_ref()),
         };
+        let native_platform = native.map(|assignment| assignment.spec.platform);
+        let native_inputs = native.map(|assignment| &assignment.input_blobs);
         let (job_id, server_id, auth) = {
             // LOCKS
             let mut servers = self
@@ -1024,7 +1025,7 @@ impl Scheduler {
                     ) else {
                         continue;
                     };
-                    let weight = if let Some(inputs) = native_inputs.as_ref() {
+                    let weight = if let Some(inputs) = native_inputs {
                         let Some(placement) = details.capabilities.native_placement.as_ref() else {
                             continue;
                         };
@@ -1076,7 +1077,7 @@ impl Scheduler {
                     assert!(
                         server_details
                             .jobs_assigned
-                            .insert(job_id, native_inputs.unwrap_or_default())
+                            .insert(job_id, native_inputs.cloned().unwrap_or_default())
                             .is_none()
                     );
                     assert!(
@@ -1192,21 +1193,16 @@ impl SchedulerIncoming for Scheduler {
         requester: &dyn SchedulerOutgoing,
         tc: Toolchain,
     ) -> Result<AllocJobResult> {
-        self.allocate_job(requester, JobAssignment::Archive(tc), None)
+        self.allocate_job(requester, JobAssignment::Archive(tc))
     }
 
     fn handle_alloc_native_job(
         &self,
         requester: &dyn SchedulerOutgoing,
         assignment: NativeAssignment,
-        inputs: dist::NativeInputBlobs,
     ) -> Result<AllocJobResult> {
         assignment.spec.validate()?;
-        self.allocate_job(
-            requester,
-            JobAssignment::Native(Box::new(assignment)),
-            Some(inputs),
-        )
+        self.allocate_job(requester, JobAssignment::Native(Box::new(assignment)))
     }
 
     fn handle_heartbeat_server(
@@ -1538,10 +1534,15 @@ impl SchedulerIncoming for Scheduler {
 
 struct LocalAssignment {
     assignment: JobAssignment,
-    // Retain already-resident input trees from assignment until execution finishes or reconciliation cancels it.
-    _input_pins: Vec<sccache::build_runtime::TreeLease>,
+    // Protect both complete trees and partial resident inputs before staging.
+    _input_pins: Option<NativeInputPins>,
     // Local time of receipt, not the scheduler's assignment timestamp.
     accepted_at: Instant,
+}
+
+struct NativeInputPins {
+    _trees: Vec<sccache::build_runtime::TreeLease>,
+    _blobs: sccache::build_runtime::UploadReservation,
 }
 
 struct ArchiveWorker {
@@ -1652,20 +1653,17 @@ impl Server {
 }
 
 impl Server {
-    fn pin_resident_inputs(
-        &self,
-        spec: &sccache::build_runtime::ExecutionSpec,
-    ) -> Result<Vec<sccache::build_runtime::TreeLease>> {
+    fn pin_resident_inputs(&self, assignment: &NativeAssignment) -> Result<NativeInputPins> {
         #[cfg(target_os = "linux")]
         {
             self.native_worker
                 .as_ref()
                 .context("native worker unavailable")?
-                .pin_resident_inputs(spec)
+                .pin_resident_inputs(assignment)
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = spec;
+            let _ = assignment;
             bail!("native worker requires Linux")
         }
     }
@@ -1778,7 +1776,7 @@ impl ServerIncoming for Server {
         assignment: NativeAssignment,
     ) -> Result<AssignJobResult> {
         assignment.spec.validate()?;
-        let input_pins = self.pin_resident_inputs(&assignment.spec)?;
+        let input_pins = self.pin_resident_inputs(&assignment)?;
         let mut assignments = self
             .job_toolchains
             .lock()
@@ -1790,7 +1788,7 @@ impl ServerIncoming for Server {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(LocalAssignment {
                     assignment: JobAssignment::Native(Box::new(assignment)),
-                    _input_pins: input_pins,
+                    _input_pins: Some(input_pins),
                     accepted_at: Instant::now(),
                 });
             }
@@ -1848,7 +1846,7 @@ impl ServerIncoming for Server {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(LocalAssignment {
                     assignment: JobAssignment::Archive(tc),
-                    _input_pins: Vec::new(),
+                    _input_pins: None,
                     accepted_at: Instant::now(),
                 });
             }
@@ -2156,6 +2154,7 @@ mod scheduler_tests {
         )?;
         let assignment = NativeAssignment {
             ticket: Ticket([42; 32]),
+            input_blobs: BTreeMap::from([(ContentId([1; 32]), 10)]),
             spec: ExecutionSpec {
                 platform,
                 root: ExecutionRoot {
@@ -2181,11 +2180,8 @@ mod scheduler_tests {
                 outputs: BTreeMap::new(),
             },
         };
-        let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_native_job(
-            &AcceptAssign,
-            assignment.clone(),
-            BTreeMap::from([(ContentId([1; 32]), 10)]),
-        )?
+        let AllocJobResult::Success { job_alloc, .. } =
+            scheduler.handle_alloc_native_job(&AcceptAssign, assignment.clone())?
         else {
             bail!("compatible worker unavailable");
         };
@@ -2195,7 +2191,7 @@ mod scheduler_tests {
             BTreeMap::from([(ContentId([1; 32]), 10)])
         );
         assert!(matches!(
-            scheduler.handle_alloc_native_job(&AcceptAssign, assignment, BTreeMap::new())?,
+            scheduler.handle_alloc_native_job(&AcceptAssign, assignment)?,
             AllocJobResult::Fail { .. }
         ));
         let AllocJobResult::Success { job_alloc, .. } =
