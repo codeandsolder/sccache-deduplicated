@@ -8,7 +8,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use tokio::net::UnixStream;
 
-pub(crate) struct Peer {
+pub struct Peer {
     pub(super) credentials: Credentials,
     pub(super) mount: File,
     pub(super) root: File,
@@ -30,7 +30,7 @@ fn socket_option(
             libc::SOL_SOCKET,
             option,
             output.as_mut_ptr().cast(),
-            &mut len,
+            &raw mut len,
         )
     };
     if result < 0 {
@@ -60,12 +60,10 @@ fn peer_groups(socket: BorrowedFd<'_>) -> Result<Vec<u32>> {
     );
     bytes.truncate(len);
     Ok(bytes
-        .chunks_exact(size_of::<libc::gid_t>())
-        .map(|chunk| {
-            let mut value = [0; size_of::<libc::gid_t>()];
-            value.copy_from_slice(chunk);
-            libc::gid_t::from_ne_bytes(value)
-        })
+        .as_chunks::<{ size_of::<libc::gid_t>() }>()
+        .0
+        .iter()
+        .map(|bytes| libc::gid_t::from_ne_bytes(*bytes))
         .collect())
 }
 
@@ -82,7 +80,7 @@ pub(super) fn alive(pidfd: BorrowedFd<'_>) -> io::Result<bool> {
         revents: 0,
     };
     // SAFETY: poll references one initialized pollfd for this syscall.
-    match unsafe { libc::poll(&mut poll, 1, 0) } {
+    match unsafe { libc::poll(&raw mut poll, 1, 0) } {
         0 => Ok(true),
         -1 => Err(io::Error::last_os_error()),
         _ => Ok(false),

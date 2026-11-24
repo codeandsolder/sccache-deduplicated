@@ -2,7 +2,7 @@
 //! which enters the peer's filesystem and irreversibly assumes its credentials.
 mod executor;
 mod peer;
-pub(crate) use peer::Peer;
+pub use peer::Peer;
 
 use super::{Message, Phase, SccacheResponse, SccacheService, activity};
 use crate::config::{CompilerAliases, Config, SharedDaemonConfig};
@@ -62,9 +62,30 @@ fn root_owned(metadata: &fs::Metadata) -> bool {
     metadata.uid() == 0 && metadata.mode() & 0o022 == 0
 }
 
+pub(super) fn for_listener(
+    config: &Config,
+    client: &Client,
+    addr: &crate::net::SocketAddr,
+) -> io::Result<Option<Arc<SharedExecutor>>> {
+    if let Some(policy) = config.shared_daemon.clone() {
+        if !addr.is_unix_path() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "shared daemon requires a pathname Unix socket",
+            ));
+        }
+        Ok(Some(Arc::new(
+            SharedExecutor::new(config, policy, client.clone()).map_err(io::Error::other)?,
+        )))
+    } else {
+        Ok(None)
+    }
+}
+
 pub(super) fn prepare_listener(path: &Path) -> Result<()> {
     // SAFETY: geteuid has no preconditions.
     ensure!(
+        // SAFETY: these credential queries have no pointer arguments.
         unsafe { libc::geteuid() == 0 && libc::getuid() == 0 },
         "shared daemon must run as root"
     );
@@ -102,7 +123,7 @@ pub(super) fn prepare_listener(path: &Path) -> Result<()> {
             match UnixStream::connect(path) {
                 Ok(_) => return Err(io::Error::from(io::ErrorKind::AddrInUse).into()),
                 Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
-                    fs::remove_file(path)?
+                    fs::remove_file(path)?;
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -288,7 +309,7 @@ impl SharedExecutor {
     }
 }
 
-pub(crate) fn run_if_requested() -> Option<Result<()>> {
+pub fn run_if_requested() -> Option<Result<()>> {
     let mut args = std::env::args_os().skip(1);
     if args.next().is_some_and(|arg| arg == HELPER_ARG) {
         Some(executor::run())

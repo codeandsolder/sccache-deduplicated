@@ -63,12 +63,12 @@ fn assume(credentials: &Credentials, mount: &OwnedFd, root: &OwnedFd) -> Result<
         ))?;
         checked(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))?;
         if credentials.uid != 0 {
+            const NO_SETUID_FIXUP: libc::c_int = 1 << 2;
             // Do not inherit a service configuration that preserves root
             // capabilities across the UID transition.
             checked(libc::prctl(libc::PR_SET_KEEPCAPS, 0, 0, 0, 0))?;
             let securebits = libc::prctl(libc::PR_GET_SECUREBITS, 0, 0, 0, 0);
             checked(securebits)?;
-            const NO_SETUID_FIXUP: libc::c_int = 1 << 2;
             ensure!(
                 securebits & NO_SETUID_FIXUP == 0,
                 "unsafe inherited securebits"
@@ -178,6 +178,7 @@ pub(super) fn run() -> Result<()> {
     // SAFETY: geteuid has no preconditions; direct invocation by ordinary users
     // cannot turn this entry point into a privileged process.
     ensure!(
+        // SAFETY: these credential queries have no pointer arguments.
         unsafe { libc::geteuid() == 0 && libc::getuid() == 0 },
         "shared executor must be launched by root daemon"
     );

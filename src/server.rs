@@ -617,19 +617,7 @@ fn bind_server(
     let compiler_aliases = config.compiler_aliases.clone();
     let compile_limits = config.compile_limits;
     #[cfg(target_os = "linux")]
-    let shared = config
-        .shared_daemon
-        .clone()
-        .map(|policy| shared::SharedExecutor::new(config, policy, client.clone()).map(Arc::new))
-        .transpose()
-        .map_err(io::Error::other)?;
-    #[cfg(target_os = "linux")]
-    if shared.is_some() && !addr.is_unix_path() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "shared daemon requires a pathname Unix socket",
-        ));
-    }
+    let shared = shared::for_listener(config, client, addr)?;
 
     match addr {
         crate::net::SocketAddr::Net(addr) => {
@@ -1396,12 +1384,12 @@ where
         role: &ConnectionRole,
     ) -> Result<SccacheResponse> {
         #[cfg(target_os = "linux")]
-        if let ConnectionRole::SharedPublic { executor, peer } = role {
-            if let Message::WithoutBody(Request::Compile(compile)) = req {
-                drop(self.tx.clone().start_send(ServerMessage::Request));
-                self.stats.lock().await.compile_requests += 1;
-                return Ok(Arc::clone(executor).response(self.clone(), Arc::clone(peer), compile));
-            }
+        if let ConnectionRole::SharedPublic { executor, peer } = role
+            && let Message::WithoutBody(Request::Compile(compile)) = req
+        {
+            drop(self.tx.clone().start_send(ServerMessage::Request));
+            self.stats.lock().await.compile_requests += 1;
+            return Ok(Arc::clone(executor).response(self.clone(), Arc::clone(peer), compile));
         }
         let _ = role;
         self.dispatch(req, transfers).await
