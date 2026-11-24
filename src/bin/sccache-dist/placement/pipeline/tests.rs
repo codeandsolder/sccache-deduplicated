@@ -233,11 +233,13 @@ fn native_pipeline_uses_each_reservations_learned_service_time() {
     let mut placement = placement();
     let inputs = NativeInputBlobs::new();
     let large = ActionCost {
+        phase: Default::default(),
         execution_nanoseconds: 8_000_000_000,
         output_bytes: 400,
         output_requests: 0,
     };
     let small = ActionCost {
+        phase: Default::default(),
         execution_nanoseconds: 200_000_000,
         output_bytes: 0,
         output_requests: 0,
@@ -280,4 +282,55 @@ fn native_pipeline_uses_each_reservations_learned_service_time() {
         cost: small,
     };
     assert_eq!(publication_start(forecast, &inputs, 100, 1.0), 3.0);
+}
+
+#[test]
+fn native_pipeline_charges_warm_preparation_and_publication_without_uploads() {
+    let mut placement = placement();
+    placement.queue.staging_slots = 1;
+    placement.queue.publication_slots = 1;
+    let inputs = NativeInputBlobs::new();
+    let action = ActionCost {
+        phase: super::super::cost::PhaseCost {
+            staging_nanoseconds: 10_000_000,
+            publication_nanoseconds: 20_000_000,
+        },
+        execution_nanoseconds: 30_000_000,
+        output_bytes: 0,
+        output_requests: 0,
+    };
+    let assigned = Assignments::from([(
+        JobId(1),
+        Some(AssignedNative {
+            packages: Default::default(),
+            inputs: inputs.clone(),
+            class: None,
+            cost: Some(action),
+            milestone: None,
+        }),
+    )]);
+    let recent = RecentResidency::default();
+    let forecast = super::super::WorkerForecast {
+        capacity: 1.0,
+        assigned: &assigned,
+        placement: &placement,
+        recent: &recent,
+        cost: action,
+    };
+    let pipeline = publication_forecast(
+        forecast,
+        &inputs,
+        None,
+        DeliveryRates {
+            raw: 100,
+            archive: 100,
+            wire_per_mille: 1000,
+            contention: 1.0,
+        },
+    );
+    // One staging slot: 10ms per job. One compiler: first runs
+    // from 10–40ms, second 40–70ms; first publication 40–60ms.
+    assert_eq!(pipeline.inputs_ready_at, 0.020);
+    assert_eq!(pipeline.ready_at, 0.070);
+    assert_eq!(pipeline.traffic.wire_bytes, 0);
 }

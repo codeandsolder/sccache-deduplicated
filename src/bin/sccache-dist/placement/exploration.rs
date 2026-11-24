@@ -189,7 +189,7 @@ impl<'a> Opportunity<'a> {
             Direction::Receive,
             peer,
             u128::from(forecast.cost.output_bytes),
-            estimate.ready_at,
+            estimate.negotiation_at,
         )
         .filter(|question| history.available(question, now))
     }

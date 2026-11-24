@@ -4,6 +4,7 @@
 use super::{
     ActionClass, ActionCost, ActionCosts, CostBook, MAX_AGE, MAX_CLASSES, Sample, WorkerScope,
     history::MAX_WORKERS,
+    overhead::{OverheadHistory, TimedMean},
 };
 use anyhow::{Result, ensure};
 use bincode::Options;
@@ -19,7 +20,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const LIMIT: u64 = 16 << 20;
 const INTERVAL: Duration = Duration::from_secs(60);
 
@@ -33,8 +34,38 @@ struct SavedSample {
 }
 
 #[derive(Serialize, Deserialize)]
+struct SavedMean {
+    value: u64,
+    age_millis: u64,
+}
+
+impl SavedMean {
+    fn capture(sample: Option<TimedMean>, now: Instant) -> Option<Self> {
+        let sample = sample?;
+        let age = now.saturating_duration_since(sample.seen);
+        (age < MAX_AGE).then(|| Self {
+            value: sample.value,
+            age_millis: u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
+        })
+    }
+
+    fn restore(self, now: Instant, elapsed: u64) -> Option<TimedMean> {
+        let age = Duration::from_millis(elapsed.saturating_add(self.age_millis));
+        if age >= MAX_AGE || self.value > 60_000_000_000 {
+            return None;
+        }
+        Some(TimedMean {
+            value: self.value,
+            seen: now.checked_sub(age)?,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 struct SavedWorker {
     scope: WorkerScope,
+    staging: Option<SavedMean>,
+    publication: Option<SavedMean>,
     samples: Vec<SavedSample>,
 }
 
@@ -79,7 +110,12 @@ impl Snapshot {
                         })
                     })
                     .collect();
-                (!samples.is_empty()).then_some(SavedWorker { scope, samples })
+                (!samples.is_empty()).then_some(SavedWorker {
+                    scope,
+                    samples,
+                    staging: SavedMean::capture(costs.overhead.staging, now),
+                    publication: SavedMean::capture(costs.overhead.publication, now),
+                })
             })
             .collect();
         Self {
@@ -143,7 +179,20 @@ impl Snapshot {
             if !entries.is_empty() {
                 ensure!(
                     book.workers
-                        .insert(worker.scope, ActionCosts { entries })
+                        .insert(
+                            worker.scope,
+                            ActionCosts {
+                                entries,
+                                overhead: OverheadHistory {
+                                    staging: worker
+                                        .staging
+                                        .and_then(|sample| sample.restore(now, elapsed)),
+                                    publication: worker
+                                        .publication
+                                        .and_then(|sample| sample.restore(now, elapsed))
+                                }
+                            }
+                        )
                         .is_none(),
                     "duplicate worker history"
                 );
@@ -265,6 +314,8 @@ mod tests {
                 class,
                 ActionObservation {
                     execution_nanoseconds: 123_000_000,
+                    warm_staging_nanoseconds: Some(10_000_000),
+                    publication_setup_nanoseconds: Some(5_000_000),
                     upload_bytes: 100,
                     upload_requests: 1,
                     upload_nanoseconds: 1000,
@@ -286,6 +337,15 @@ mod tests {
                 .predict(scope, class, &placement, now + Duration::from_secs(60))
                 .execution_nanoseconds,
             123_000_000
+        );
+        assert_eq!(
+            restored
+                .predict(scope, class, &placement, now + Duration::from_secs(60))
+                .phase,
+            super::super::PhaseCost {
+                staging_nanoseconds: 10_000_000,
+                publication_nanoseconds: 5_000_000
+            }
         );
         let expired_wall = wall + u64::try_from(MAX_AGE.as_millis())?;
         assert!(

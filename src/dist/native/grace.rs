@@ -114,6 +114,11 @@ impl ArtifactGrace {
     }
 }
 
+pub(super) struct RetainedOutput {
+    pub deadline: Instant,
+    pub warm: bool,
+}
+
 pub(super) struct GraceReservation {
     pool: ArtifactGrace,
     limit: u64,
@@ -128,18 +133,23 @@ impl GraceReservation {
         manifest: &ResultManifest,
         captured: &CapturedExecution,
         wait: (Duration, &dyn Fn() -> Result<()>),
-    ) -> Result<Option<Instant>> {
+    ) -> Result<Option<RetainedOutput>> {
         if manifest.outputs.is_empty() {
             return Ok(None);
         }
         let publication = self.promote();
         let existing = store.reserve_upload(manifest)?;
+        let warm = existing.missing().is_empty();
         let mut staged = Vec::new();
         for &blob in existing.missing() {
             staged.push(budget.stage_expected(blob, captured.open_blob(blob.id)?)?);
         }
         let lease = store.publish_pinned(fingerprint, manifest, staged, ActionMode::Refresh)?;
-        publication.commit(lease, wait).map(Some)
+        let (deadline, waited) = publication.commit(lease, wait)?;
+        Ok(Some(RetainedOutput {
+            deadline,
+            warm: warm && !waited,
+        }))
     }
 
     /// Exact publishers supersede forecasts. No publisher can deadlock
@@ -169,7 +179,7 @@ impl Publication {
         mut self,
         lease: ResultLease,
         wait: (Duration, &dyn Fn() -> Result<()>),
-    ) -> Result<Instant> {
+    ) -> Result<(Instant, bool)> {
         let contents = lease.manifest().blobs()?;
         let total = contents.values().try_fold(0_u64, |sum, &size| {
             sum.checked_add(size).context("grace result size overflow")
@@ -217,7 +227,7 @@ impl Publication {
                     _lease: lease,
                 });
                 drop(state);
-                return Ok(expires);
+                return Ok((expires, self.waiting));
             }
             if !self.waiting {
                 state.waiting_publishers += 1;

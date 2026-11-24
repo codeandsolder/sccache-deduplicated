@@ -1068,6 +1068,7 @@ fn verify_learned_placement_trace(log: &Path, expected_archive_bytes: u64) -> Re
     }
     assert_eq!(completed.len(), 6);
     let cold = completed.first().context("missing cold completion")?;
+    assert!(cold["warm_staging_nanoseconds"].is_null());
     let id = cold["job"].as_u64().context("missing cold job")?;
     let worker = cold["worker"].as_str().context("missing worker address")?;
     let forecast = &assignments.get(&id).context("missing cold allocation")?["candidates"][worker];
@@ -1088,6 +1089,7 @@ fn verify_learned_placement_trace(log: &Path, expected_archive_bytes: u64) -> Re
     assert_eq!(repeated.len(), 5);
     let mut estimate = None;
     let mut peak_result = 0_u64;
+    let mut staging_observed = None;
     for value in repeated {
         let observed = value["execution_nanoseconds"]
             .as_u64()
@@ -1103,6 +1105,34 @@ fn verify_learned_placement_trace(log: &Path, expected_archive_bytes: u64) -> Re
         );
         assert_eq!(assignment["candidates"][worker]["input_wire_bytes"], 0);
         assert_eq!(assignment["candidates"][worker]["archive_bytes"], 0);
+        let stage = value["warm_staging_nanoseconds"]
+            .as_u64()
+            .context("warm staging sample missing")?;
+        assert!(stage > 0);
+        let forecast_phase = &assignment["candidates"][worker]["cost"]["phase"];
+        if let Some(previous) = staging_observed {
+            assert_eq!(forecast_phase["staging_nanoseconds"], previous);
+            let updated = if stage >= previous {
+                previous + (stage - previous).div_ceil(4)
+            } else {
+                previous - (previous - stage).div_ceil(4)
+            };
+            staging_observed = Some(updated);
+        } else {
+            staging_observed = Some(stage);
+        }
+        assert!(
+            value["publication_setup_nanoseconds"]
+                .as_u64()
+                .is_some_and(|ns| ns > 0)
+        );
+        if estimate.is_some() {
+            assert!(
+                forecast_phase["publication_nanoseconds"]
+                    .as_u64()
+                    .is_some_and(|ns| ns > 0)
+            );
+        }
         assert!(
             value["actual_seconds"]
                 .as_f64()

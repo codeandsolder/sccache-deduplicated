@@ -149,7 +149,7 @@ impl NativeCacheClient {
         };
         let url = self
             .base
-            .join(&format!("/api/v4/native/{role}/{operation}"))?;
+            .join(&format!("/api/v5/native/{role}/{operation}"))?;
         let mut request = self
             .http
             .post(url)

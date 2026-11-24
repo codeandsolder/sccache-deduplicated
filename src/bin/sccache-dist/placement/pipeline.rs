@@ -116,6 +116,7 @@ impl StagingTimeline<'_> {
         inputs: Option<&NativeInputBlobs>,
         progress: Option<&NativeJobProgress>,
         catalog: Option<&PackageCatalog>,
+        overhead: Duration,
     ) -> Duration {
         let start = self.slots.available();
         let mut dependency = start;
@@ -169,7 +170,16 @@ impl StagingTimeline<'_> {
             ));
             self.wire_free
         };
-        let ready = dependency.max(wire_done.saturating_add(delivery.processing));
+        let setup = if bytes == 0
+            && progress.is_some_and(|progress| progress.phase == NativeJobPhase::Staging)
+        {
+            remaining(overhead, progress)
+        } else {
+            overhead
+        };
+        let ready = dependency
+            .max(wire_done.saturating_add(delivery.processing))
+            .saturating_add(setup);
         for id in new.into_keys() {
             self.future.insert(id, ready);
         }
@@ -269,7 +279,8 @@ impl Pipeline {
                 duration(
                     Duration::from_nanos(cost.execution_nanoseconds).as_secs_f64() * self.scaling,
                 ),
-                output_service(cost.result(placement.result)),
+                output_service(cost.result(placement.result))
+                    .saturating_add(cost.phase.publication()),
             )
         })
     }
@@ -430,13 +441,18 @@ pub(super) fn publication_forecast(
             job.inputs.map(|job| &job.inputs),
             job.progress,
             job.inputs.map(|job| job.packages.as_ref()),
+            job.inputs
+                .and_then(|job| job.cost)
+                .unwrap_or(cost)
+                .phase
+                .staging(),
         );
         let (execution, output) = pipeline.service(job.inputs.and_then(|job| job.cost), placement);
         pipeline
             .ready
             .push((ready, false, job.id, true, execution, output));
     }
-    let ready = timeline.stage(Some(requested), None, catalog);
+    let ready = timeline.stage(Some(requested), None, catalog, cost.phase.staging());
     let (execution, output) = pipeline.service(Some(cost), placement);
     PipelineForecast {
         inputs_ready_at: ready.as_secs_f64(),

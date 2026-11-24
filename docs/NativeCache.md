@@ -1008,6 +1008,18 @@ clock observations include control overhead, queueing and local CAS work;
 result negotiation occurs after the worker has staged its result locally.
 The phase error is a forecast residual, not a pure decoder or network rate.
 
+Successful worker observations also report warm staging service (including
+authorization, input pinning and staged notification, but only if every tree
+was immediately resident and no grace admission wait occurred) and local
+publication setup (result verification, retention and negotiation, excluding
+known grace-capacity waits and newly written local result blobs). The scheduler maintains independently expiring
+worker-local quarter-weight EWMAs, persisted in action-cost checkpoint v3.
+Every action pays the warm preparation baseline even if it adds no network
+bytes. Publication setup consumes a publication slot and delays upload arrival
+in the shared-link forecast, without consuming a compiler slot. These
+observations are never transferred to different workers as machine-speed
+priors. Native service protocol v5 carries the two optional samples.
+
 The JSON report includes unmatched counts, per-worker and overall timing
 errors for completion, input readiness and result negotiation (signed bias, MAE, median and p90 absolute error, weighted absolute
 percentage error), learned versus host-prior execution/upload prediction

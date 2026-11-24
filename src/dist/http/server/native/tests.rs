@@ -163,7 +163,7 @@ fn verify_compressed_download(
 ) -> Result<()> {
     // Negotiation preserves the authenticated verified-bytes contract.
     let compressed = reqwest::blocking::Client::new()
-        .post(url.join("/api/v4/native/client/download")?)
+        .post(url.join("/api/v5/native/client/download")?)
         .bearer_auth("client-token")
         .header("Content-Type", "application/octet-stream")
         .header("X-Sccache-Accept-Blob-Codec", "zstd")
@@ -358,14 +358,14 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
 fn metadata_is_bounded_and_rejects_trailing_bytes() -> Result<()> {
     let request = Request::fake_http(
         "POST",
-        "/api/v4/native/client/status",
+        "/api/v5/native/client/status",
         Vec::new(),
         vec![0; 33],
     );
     assert!(metadata::<crate::build_runtime::wire::Ticket>(&request, 32).is_err());
     let request = Request::fake_http(
         "POST",
-        "/api/v4/native/client/status",
+        "/api/v5/native/client/status",
         Vec::new(),
         vec![0; 33],
     );
@@ -652,7 +652,7 @@ fn lazy_admission_prefetch_and_origin_backfill_over_http() -> Result<()> {
             missing: vec![missing],
         };
         request
-            .post(url.join("/api/v4/native/worker/input_prefetch")?)
+            .post(url.join("/api/v5/native/worker/input_prefetch")?)
             .bearer_auth("worker-token")
             .header("Content-Type", "application/octet-stream")
             .header("X-Sccache-Native-Job", "42")
@@ -660,7 +660,7 @@ fn lazy_admission_prefetch_and_origin_backfill_over_http() -> Result<()> {
             .send()?
             .error_for_status()?;
         let pending = request
-            .post(url.join("/api/v4/native/worker/download")?)
+            .post(url.join("/api/v5/native/worker/download")?)
             .bearer_auth("worker-token")
             .header("Content-Type", "application/octet-stream")
             .header("X-Sccache-Native-Job", "42")

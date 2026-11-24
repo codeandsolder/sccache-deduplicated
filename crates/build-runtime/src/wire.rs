@@ -213,6 +213,10 @@ pub enum ScheduleReply {
 /// worker action. Advisory only; never changes the action identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionObservation {
+    /// Warm staging service, excluding worker queue and grace-capacity waits.
+    pub warm_staging_nanoseconds: Option<u64>,
+    /// Warm local retention and result negotiation, excluding new local writes and grace waits.
+    pub publication_setup_nanoseconds: Option<u64>,
     pub execution_nanoseconds: u64,
     pub upload_bytes: u64,
     pub upload_requests: u64,
@@ -223,6 +227,12 @@ impl ActionObservation {
     #[must_use = "untrusted timing samples must be validated"]
     pub fn valid(self) -> bool {
         (1..=3_600_000_000_000).contains(&self.execution_nanoseconds)
+            && self
+                .warm_staging_nanoseconds
+                .is_none_or(|ns| ns <= 60_000_000_000)
+            && self
+                .publication_setup_nanoseconds
+                .is_none_or(|ns| ns <= 60_000_000_000)
             && self.upload_bytes <= 1 << 40
             && self.upload_requests <= 1_000_000
             && self.upload_nanoseconds <= 3_600_000_000_000

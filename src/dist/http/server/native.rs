@@ -259,7 +259,7 @@ pub(super) fn spawn(
     Ok(())
 }
 
-const PREFIX: &str = "/api/v4/native/";
+const PREFIX: &str = "/api/v5/native/";
 
 /// Compress only when a representative prefix wins comfortably. We keep the
 /// immutable digest-named files raw for mmap/materialization; this codec is

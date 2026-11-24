@@ -86,6 +86,8 @@ fn native_cost_history_shrinks_expires_and_bounds_samples() -> anyhow::Result<()
     let mut costs = ActionCosts::default();
     let observation = ActionObservation {
         execution_nanoseconds: 9_000_000_000,
+        warm_staging_nanoseconds: None,
+        publication_setup_nanoseconds: None,
         upload_bytes: 0,
         upload_requests: 0,
         upload_nanoseconds: 0,
@@ -104,6 +106,7 @@ fn native_cost_history_shrinks_expires_and_bounds_samples() -> anyhow::Result<()
     assert_eq!(
         costs.predict(Some(class), &placement, now),
         ActionCost {
+            phase: Default::default(),
             execution_nanoseconds: observation.execution_nanoseconds,
             output_bytes: 0,
             output_requests: 0,

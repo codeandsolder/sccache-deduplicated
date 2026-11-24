@@ -13,7 +13,10 @@ use std::{
 mod checkpoint;
 pub(crate) use checkpoint::start as start_checkpoint;
 mod history;
+mod overhead;
 pub(crate) use history::{CostBook, WorkerScope};
+use overhead::OverheadHistory;
+pub use overhead::PhaseCost;
 const MAX_CLASSES: usize = 4096;
 const MAX_AGE: Duration = Duration::from_hours(24);
 
@@ -77,6 +80,7 @@ fn volatile_codegen(arg: &[u8]) -> bool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ActionCost {
+    pub phase: PhaseCost,
     pub execution_nanoseconds: u64,
     pub output_bytes: u64,
     pub output_requests: u64,
@@ -87,9 +91,14 @@ impl ActionCost {
         (1..=3_600_000_000_000).contains(&self.execution_nanoseconds)
             && self.output_bytes <= 1 << 40
             && self.output_requests <= 1_000_000
+            && self.phase.valid()
     }
     pub(crate) const fn baseline(placement: &NativePlacement) -> Self {
         Self {
+            phase: PhaseCost {
+                staging_nanoseconds: 0,
+                publication_nanoseconds: 0,
+            },
             execution_nanoseconds: placement.execution_nanoseconds,
             output_bytes: placement.result.expected_bytes,
             output_requests: placement.result.expected_requests,
@@ -125,7 +134,16 @@ struct Sample {
 
 #[derive(Default)]
 pub(crate) struct ActionCosts {
+    overhead: OverheadHistory,
     entries: BTreeMap<ActionClass, Sample>,
+}
+
+fn smooth(old: u64, new: u64) -> u64 {
+    if new >= old {
+        old + (new - old).div_ceil(4)
+    } else {
+        old - (old - new).div_ceil(4)
+    }
 }
 
 impl ActionCosts {
@@ -161,6 +179,7 @@ impl ActionCosts {
         let weight = sample.observations.min(4);
         let blend = |prior, learned| history::blend(prior, learned, weight);
         ActionCost {
+            phase: baseline.phase,
             execution_nanoseconds: blend(
                 baseline.execution_nanoseconds,
                 sample.cost.execution_nanoseconds,
@@ -180,7 +199,9 @@ impl ActionCosts {
         if !observed.valid() || result_bytes > 1 << 40 || observed.upload_bytes > result_bytes {
             return;
         }
+        self.overhead.observe(observed, now);
         let cost = ActionCost {
+            phase: PhaseCost::default(),
             execution_nanoseconds: observed.execution_nanoseconds,
             output_bytes: observed.upload_bytes,
             output_requests: observed.upload_requests,
@@ -195,14 +216,8 @@ impl ActionCosts {
                 };
                 return;
             }
-            let smooth = |old: u64, new: u64| {
-                if new >= old {
-                    old + (new - old).div_ceil(4)
-                } else {
-                    old - (old - new).div_ceil(4)
-                }
-            };
             sample.cost = ActionCost {
+                phase: PhaseCost::default(),
                 execution_nanoseconds: smooth(
                     sample.cost.execution_nanoseconds,
                     cost.execution_nanoseconds,

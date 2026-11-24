@@ -88,10 +88,16 @@ impl CostBook {
     ) -> ActionCost {
         let baseline = ActionCost::baseline(placement);
         let target = self.workers.get(&scope);
+        let phase = target.map_or(super::PhaseCost::default(), |history| {
+            history.overhead.estimate(now)
+        });
         if let Some(sample) = target.and_then(|history| history.fresh(class, now))
             && sample.observations >= 4
         {
-            return sample.cost;
+            return ActionCost {
+                phase,
+                ..sample.cost
+            };
         }
         let mut calibrated = Vec::new();
         let mut uncalibrated = Vec::new();
@@ -126,6 +132,7 @@ impl CostBook {
             |ns| blend(baseline.execution_nanoseconds, ns, 3),
         );
         let prior = ActionCost {
+            phase,
             execution_nanoseconds: execution,
             output_bytes: median(bytes).map_or(baseline.output_bytes, |value| {
                 blend(baseline.output_bytes, value, 2)
@@ -204,6 +211,8 @@ mod tests {
     fn observation(ns: u64) -> ActionObservation {
         ActionObservation {
             execution_nanoseconds: ns,
+            warm_staging_nanoseconds: None,
+            publication_setup_nanoseconds: None,
             upload_bytes: 100,
             upload_requests: 1,
             upload_nanoseconds: 10_000,
@@ -293,6 +302,34 @@ mod tests {
         assert_eq!(
             book.result_reservation(first.platform, class, now + MAX_AGE),
             None
+        );
+    }
+
+    #[test]
+    fn native_cost_book_attaches_only_worker_local_phase_observations() {
+        let mut book = CostBook::default();
+        let now = Instant::now();
+        let local = scope(1);
+        let peer = scope(2);
+        let class = ActionClass(ContentId::of(b"compile"));
+        let other_class = ActionClass(ContentId::of(b"link"));
+        let measured = ActionObservation {
+            warm_staging_nanoseconds: Some(10_000_000),
+            publication_setup_nanoseconds: Some(6_000_000),
+            ..observation(100_000_000)
+        };
+        book.observe(local, class, measured, 100, now);
+        let placement = NativePlacement::default();
+        let phase = book.predict(local, other_class, &placement, now).phase;
+        assert_eq!(phase.staging_nanoseconds, 10_000_000);
+        assert_eq!(phase.publication_nanoseconds, 6_000_000);
+        assert_eq!(
+            book.predict(peer, class, &placement, now).phase,
+            Default::default()
+        );
+        assert_eq!(
+            book.predict(local, class, &placement, now + MAX_AGE).phase,
+            Default::default()
         );
     }
 }

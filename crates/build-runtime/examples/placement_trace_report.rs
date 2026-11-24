@@ -17,7 +17,7 @@ struct Forecast {
     seconds: f64,
     completion_seconds: f64,
     inputs_ready_at: Option<f64>,
-    ready_at: Option<f64>,
+    negotiation_at: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -324,7 +324,7 @@ mod tests {
         let other = "127.0.0.1:2";
         let assigned = serde_json::json!({
             "kind": "assigned", "job": 1, "worker": worker, "class": class,
-            "candidates": {(worker): {"seconds": 2.01, "completion_seconds": 1.5, "inputs_ready_at": 0.25, "ready_at": 1.25}, (other): {"seconds": 2.0, "completion_seconds": 1.8}},
+            "candidates": {(worker): {"seconds": 2.01, "completion_seconds": 1.5, "inputs_ready_at": 0.25, "negotiation_at": 1.25}, (other): {"seconds": 2.0, "completion_seconds": 1.8}},
             "healthy": [worker, other],
             "host_prior": {"execution_nanoseconds": 1_000_000_000, "output_bytes": 100, "output_requests": 1},
         });

@@ -225,6 +225,7 @@ pub(super) struct PlacementEstimate {
     pub(super) archive_bytes: u128,
     pub(super) inputs_ready_at: f64,
     pub(super) ready_at: f64,
+    pub(super) negotiation_at: f64,
     pub(super) cost: ActionCost,
 }
 
@@ -280,10 +281,11 @@ pub(super) fn native_estimate(
         initial
     };
     let ready_at = adjusted.ready_at;
+    let negotiation_at = ready_at + action.phase.publication().as_secs_f64();
     // Already resident candidates do not increase the existing backlog.
     let externality = if bytes == 0 { 0.0 } else { externality };
     let result = action.result(placement.result);
-    let (output_network, output_externality) = plan.result_completion(peer, ready_at, result);
+    let (output_network, output_externality) = plan.result_completion(peer, negotiation_at, result);
     let output_processing =
         transfer_seconds(u128::from(result.expected_bytes), result.bytes_per_second);
     let output_overhead = Duration::from_nanos(
@@ -292,9 +294,11 @@ pub(super) fn native_estimate(
             .saturating_mul(result.request_nanoseconds),
     )
     .as_secs_f64();
-    let completion_seconds = ready_at + output_network.max(output_processing) + output_overhead;
+    let completion_seconds =
+        negotiation_at + output_network.max(output_processing) + output_overhead;
     PlacementEstimate {
         ready_at,
+        negotiation_at,
         inputs_ready_at: adjusted.inputs_ready_at,
         completion_seconds,
         missing_input_union_bytes: bytes,

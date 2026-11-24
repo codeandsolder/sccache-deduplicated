@@ -506,6 +506,7 @@ impl NativeCacheClient {
         delivery: WorkerDelivery<'_>,
         preparation: WorkerPreparation<'_>,
     ) -> Result<PreparedWorker> {
+        let started = Instant::now();
         let lease = WorkerLease::start(
             self.clone(),
             ticket,
@@ -517,7 +518,7 @@ impl NativeCacheClient {
         lease.check()?;
         (preparation.on_authorized)()?;
         lease.check()?;
-        let prepared = self.prepare_execution(
+        let mut prepared = self.prepare_execution(
             ExecutionContext {
                 ticket,
                 spec,
@@ -535,6 +536,9 @@ impl NativeCacheClient {
             &|| lease.check(),
             preparation.on_tree,
         )?;
+        if prepared.warm_staging.is_some() {
+            prepared.warm_staging = Some(started.elapsed());
+        }
         Ok(PreparedWorker {
             lease,
             prepared,
@@ -584,6 +588,8 @@ impl NativeCacheClient {
         check: &LeaseCheck<'_>,
         on_tree: &mut dyn FnMut(&TreeLease),
     ) -> Result<PreparedExecution> {
+        let started = Instant::now();
+        let mut warm = true;
         let ExecutionContext {
             ticket,
             spec,
@@ -617,6 +623,7 @@ impl NativeCacheClient {
                     started.elapsed() < policy.timeout,
                     "native artifact grace admission timed out"
                 );
+                warm = false;
                 std::thread::sleep(Duration::from_millis(100));
             };
             Some((reservation, store.reserve_staging(policy.max_result_bytes)?))
@@ -626,7 +633,12 @@ impl NativeCacheClient {
         let mut inputs = Vec::new();
         for id in &request.input_trees {
             check()?;
-            let (tree, hit) = store.acquire_tree(*id, check, || fetch(*id, check, on_tree))?;
+            let (tree, hit) = if let Some(tree) = store.lookup_tree(*id)? {
+                (Arc::new(tree), true)
+            } else {
+                warm = false;
+                store.acquire_tree(*id, check, || fetch(*id, check, on_tree))?
+            };
             if log::log_enabled!(target: "native_cas_replay", log::Level::Trace) {
                 let blobs = tree
                     .manifest()
@@ -659,6 +671,7 @@ impl NativeCacheClient {
                     if retryable_transport_error(&error)
                         && announced.elapsed() < policy.timeout =>
                 {
+                    warm = false;
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 Err(error) => return Err(error),
@@ -668,6 +681,7 @@ impl NativeCacheClient {
             request,
             _inputs: inputs,
             output,
+            warm_staging: warm.then(|| started.elapsed()),
         })
     }
 
@@ -683,9 +697,10 @@ impl NativeCacheClient {
         let MeasuredExecution { captured, duration } = measured;
         check()?;
         if let Some(manifest) = captured.successful_result() {
+            let publication_started = Instant::now();
             prepared.request.validate_result(manifest)?;
             let blobs = manifest.blobs()?;
-            let retained_until = if let Some((grace, mut budget)) = prepared.output.take() {
+            let retained = if let Some((grace, mut budget)) = prepared.output.take() {
                 grace.retain(
                     store,
                     &mut budget,
@@ -698,10 +713,14 @@ impl NativeCacheClient {
                 None
             };
             let missing = self.begin(ticket, manifest.clone())?.missing;
+            let publication_setup = retained
+                .as_ref()
+                .is_none_or(|output| output.warm)
+                .then(|| publication_started.elapsed());
             // The scheduler recorded its anchor before sending the begin
             // response. Its clock need not be synchronized with ours.
-            let retained_after_begin = retained_until.map_or(Duration::ZERO, |deadline| {
-                deadline.saturating_duration_since(Instant::now())
+            let retained_after_begin = retained.map_or(Duration::ZERO, |output| {
+                output.deadline.saturating_duration_since(Instant::now())
             });
             let bytes = missing
                 .iter()
@@ -723,6 +742,11 @@ impl NativeCacheClient {
                     ticket,
                     retained_after_begin,
                     Some(ActionObservation {
+                        warm_staging_nanoseconds: prepared
+                            .warm_staging
+                            .and_then(service_nanoseconds),
+                        publication_setup_nanoseconds: publication_setup
+                            .and_then(service_nanoseconds),
                         execution_nanoseconds: u64::try_from(duration.as_nanos())
                             .unwrap_or(u64::MAX)
                             .max(1),
@@ -753,9 +777,16 @@ struct ExecutionContext<'a> {
 }
 
 struct PreparedExecution {
+    warm_staging: Option<Duration>,
     request: ActionRequest,
     _inputs: Vec<Arc<TreeLease>>,
     output: Option<(super::grace::GraceReservation, StageBudget)>,
+}
+
+fn service_nanoseconds(duration: Duration) -> Option<u64> {
+    u64::try_from(duration.as_nanos())
+        .ok()
+        .filter(|&ns| ns <= 60_000_000_000)
 }
 
 struct MeasuredExecution {
