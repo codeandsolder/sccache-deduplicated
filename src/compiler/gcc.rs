@@ -1091,7 +1091,7 @@ pub fn generate_compile_commands<F>(
     parsed_args: &ParsedArguments,
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
-    config: GccCompileConfig<F>,
+    config: GccCompileConfig<'_, F>,
 ) -> Result<(
     SingleCompileCommand,
     Option<dist::CompileCommand>,
@@ -1205,10 +1205,10 @@ where
                 arguments.push("-fpreprocessed".into());
             }
             let common_args = dist_common_args(parsed_args, worker_reprocesses);
-            let common_args = native_resolution.map_or_else(
-                || common_args.clone(),
-                |resolution| resolution.rewrite_arguments(common_args),
-            );
+            let common_args = match native_resolution {
+                Some(resolution) => resolution.rewrite_arguments(common_args),
+                None => common_args,
+            };
             arguments.extend(dist::osstrings_to_strings(&common_args)?);
             arguments.extend(dist_assembler_include_args(
                 path_transformer,
