@@ -173,6 +173,7 @@ impl CCompilerImpl for Nvhpc {
             cwd,
             env_vars,
             rewrite_includes_only,
+            ..
         } = context;
         gcc::generate_compile_commands(
             path_transformer,
@@ -184,6 +185,7 @@ impl CCompilerImpl for Nvhpc {
                 kind: self.kind(),
                 rewrite_includes_only,
                 language_to_arg: gcc::language_to_gcc_arg,
+                native_resolution: None,
             },
         )
         .map(|(command, dist_command, cacheable)| {

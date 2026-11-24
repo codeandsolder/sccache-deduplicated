@@ -6971,6 +6971,66 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
     }
 
     #[test]
+    fn test_destination_cpu_changes_rust_cache_key_not_gcc_only_flags() {
+        let f = TestFixture::new();
+        let args_v2 = [
+            "--emit",
+            "metadata",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "-C",
+            "target-cpu=x86-64-v2",
+        ];
+        let args_v4 = [
+            "--emit",
+            "metadata",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "-C",
+            "target-cpu=x86-64-v4",
+        ];
+        let no_env = &[];
+        let gcc_v2 = [(
+            OsString::from("CFLAGS_x86_64_unknown_linux_gnu"),
+            OsString::from("-march=x86-64-v2"),
+        )];
+        let gcc_v4 = [(
+            OsString::from("CFLAGS_x86_64_unknown_linux_gnu"),
+            OsString::from("-march=x86-64-v4"),
+        )];
+        let key = |args: &[&'static str], env: &[(OsString, OsString)]| {
+            hash_key(&f, args, env, |_| Ok(()), false)
+        };
+        let rust_v2 = key(&args_v2, no_env);
+        let rust_v4 = key(&args_v4, no_env);
+        assert_ne!(
+            rust_v2, rust_v4,
+            "effective target-cpu must partition Rust cache"
+        );
+        assert_eq!(rust_v2, key(&args_v2, no_env));
+        assert_eq!(
+            rust_v2,
+            key(&args_v2, &gcc_v2),
+            "unobserved GCC-only flags cannot change Rust compilation identity"
+        );
+        assert_eq!(
+            rust_v2,
+            key(&args_v2, &gcc_v4),
+            "unobserved GCC-only flags cannot change Rust compilation identity"
+        );
+    }
+
+    #[test]
     fn test_external_clippy_config_file_contents_change_cache_key() -> Result<()> {
         let f = TestFixture::new();
         let policy = f.tempdir.path().join("policy");

@@ -171,6 +171,7 @@ impl CCompilerImpl for Clang {
             cwd,
             env_vars,
             rewrite_includes_only,
+            native_resolution,
         } = context;
         gcc::generate_compile_commands(
             path_transformer,
@@ -182,6 +183,7 @@ impl CCompilerImpl for Clang {
                 kind: self.kind(),
                 rewrite_includes_only,
                 language_to_arg: language_to_clang_arg,
+                native_resolution,
             },
         )
         .map(|(command, dist_command, cacheable)| {
@@ -1752,6 +1754,7 @@ mod test {
                 kind: CCompilerKind::Clang,
                 rewrite_includes_only: false,
                 language_to_arg: language_to_clang_arg,
+                native_resolution: None,
             },
         )
         .unwrap();

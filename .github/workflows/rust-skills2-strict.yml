@@ -18,3 +18,10 @@ jobs:
     with:
       python-ci-paths: tools
       allow-test-panics: true
+
+  strict-cpu-target-profile:
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@f01e6b6b93a444e11600b90b5ca5ff42ec4206ee # main
+    with:
+      working-directory: tools/cpu-target-profile
+      rust-toolchain: nightly-2026-11-20
+      python-ci-paths: tools

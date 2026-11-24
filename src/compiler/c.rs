@@ -44,6 +44,7 @@ use std::process;
 use std::sync::LazyLock;
 
 use crate::errors::{Context, ProcessError, Result, bail};
+use anyhow::ensure;
 
 use super::CacheControl;
 use super::canonical_native::NativeCargoPaths;
@@ -144,13 +145,169 @@ fn native_codegen_args(parsed_args: &ParsedArguments) -> Vec<OsString> {
         .collect()
 }
 
-async fn native_codegen_fingerprint<T>(
+/// Compiler-specific lowering of the final target state on the machine
+/// that received the compile request, independent of its chosen worker.
+#[derive(Debug, Clone)]
+pub struct NativeCodegenResolution {
+    fingerprint: String,
+    #[cfg(feature = "dist-client")]
+    /// Exact compiler-observed target state, not merely a CPU model name.
+    /// Apply after the original non-native options so user overrides survive
+    /// Clang's driver-to-cc1 argument reordering.
+    explicit_args: Vec<OsString>,
+}
+
+impl NativeCodegenResolution {
+    #[cfg(feature = "dist-client")]
+    pub fn rewrite_arguments(&self, args: Vec<OsString>) -> Vec<OsString> {
+        let mut resolved = args
+            .into_iter()
+            .filter(|arg| !is_native_codegen_arg(arg))
+            .collect::<Vec<_>>();
+        resolved.extend_from_slice(&self.explicit_args);
+        resolved
+    }
+}
+
+fn is_native_driver_frontend(arg: &str) -> bool {
+    let executable = arg.rsplit(['/', '\\']).next().unwrap_or(arg);
+    matches!(
+        executable.strip_suffix(".exe").unwrap_or(executable),
+        "-cc1" | "cc1" | "cc1plus" | "cc1obj" | "cc1objplus"
+    )
+}
+
+fn native_driver_args(driver_line: &str) -> Result<Vec<String>> {
+    let args = shlex::split(driver_line).context("unparseable compiler native expansion")?;
+    if !args.iter().any(|arg| is_native_driver_frontend(arg)) {
+        bail!("native probe did not identify GCC/Clang compiler frontend");
+    }
+    if args
+        .iter()
+        .any(|arg| arg == "native" || arg.ends_with("=native"))
+    {
+        bail!("compiler left native CPU selection unresolved");
+    }
+    Ok(args)
+}
+
+/// Lower the *whole effective target state*, including the caller's explicit
+/// feature and tuning overrides. Per-switch expansion is not sufficient:
+/// Clang forwards -Xclang feature settings after its ordinary -m switches,
+/// even when those were placed earlier in the original command.
+fn native_driver_replacement(
+    driver_line: &str,
+    kind: CCompilerKind,
+    native_args: &[OsString],
+) -> Result<Vec<OsString>> {
+    let args = native_driver_args(driver_line)?;
+    let mut flags = Vec::<OsString>::new();
+    match kind {
+        CCompilerKind::Gcc => {
+            for (index, arg) in args.iter().enumerate() {
+                if arg.starts_with("-m") {
+                    flags.push(OsString::from(arg));
+                } else if arg == "--param" {
+                    let value = args
+                        .get(index + 1)
+                        .context("GCC native expansion had a dangling --param")?;
+                    flags.push(OsString::from("--param"));
+                    flags.push(OsString::from(value));
+                }
+            }
+            if native_args.iter().any(|arg| arg == "-march=native")
+                && !flags
+                    .iter()
+                    .any(|arg| arg.to_string_lossy().starts_with("-march="))
+            {
+                bail!("GCC native expansion did not resolve -march");
+            }
+            if native_args
+                .iter()
+                .any(|arg| arg == "-mtune=native" || arg == "-mcpu=native")
+                && !flags
+                    .iter()
+                    .any(|arg| arg.to_string_lossy().starts_with("-mtune="))
+            {
+                bail!("GCC native expansion did not resolve tuning");
+            }
+        }
+        CCompilerKind::Clang => {
+            let cpu = args
+                .windows(2)
+                .find_map(|pair| (pair[0] == "-target-cpu").then_some(pair[1].as_str()))
+                .context("Clang native expansion did not resolve the requested CPU")?;
+            ensure!(
+                !cpu.is_empty() && cpu != "native",
+                "Clang native CPU model unresolved"
+            );
+            let cpu_option = if native_args.iter().any(|arg| arg == "-mcpu=native") {
+                "-mcpu"
+            } else {
+                "-march"
+            };
+            flags.push(OsString::from(format!("{cpu_option}={cpu}")));
+            if let Some(tune) = args
+                .windows(2)
+                .find_map(|pair| (pair[0] == "-tune-cpu").then_some(pair[1].as_str()))
+            {
+                ensure!(
+                    !tune.is_empty() && tune != "native",
+                    "Clang tune CPU unresolved"
+                );
+                flags.push(OsString::from(format!("-mtune={tune}")));
+            }
+            // cc1 target-feature overrides include VM-masked features and all
+            // explicit -mno-* settings. Feed the final state to cc1 last.
+            for pair in args.windows(2) {
+                if pair[0] == "-target-feature" {
+                    ensure!(
+                        pair[1].starts_with('+') || pair[1].starts_with('-'),
+                        "malformed Clang native feature {}",
+                        pair[1]
+                    );
+                    flags.extend([
+                        OsString::from("-Xclang"),
+                        OsString::from("-target-feature"),
+                        OsString::from("-Xclang"),
+                        OsString::from(&pair[1]),
+                    ]);
+                }
+            }
+        }
+        _ => bail!("unsupported compiler family for native CPU resolution: {kind:?}"),
+    }
+    Ok(flags)
+}
+
+/// The compiler driver must resolve the ISA in the *requested language*.
+/// Probing C for C++ can change frontend options (or reject C++-only flags)
+/// and then fingerprint a state different from the actual compilation.
+/// For assembly/other modes with no C frontend, use a C frontend solely to
+/// determine CPU codegen flags, not the syntax of the source.
+const fn native_probe_language(language: Language) -> &'static str {
+    match language {
+        Language::Cxx | Language::CxxHeader | Language::CxxPreprocessed | Language::CxxModule => {
+            "c++"
+        }
+        Language::ObjectiveCxx
+        | Language::ObjectiveCxxHeader
+        | Language::ObjectiveCxxPreprocessed => "objective-c++",
+        Language::ObjectiveC | Language::ObjectiveCHeader | Language::ObjectiveCPreprocessed => {
+            "objective-c"
+        }
+        _ => "c",
+    }
+}
+
+async fn native_codegen_resolution<T>(
     creator: &T,
     executable: &Path,
     parsed_args: &ParsedArguments,
-    _cwd: &Path,
+    cwd: &Path,
     env_vars: &[(OsString, OsString)],
-) -> Result<Option<String>>
+    kind: CCompilerKind,
+) -> Result<Option<NativeCodegenResolution>>
 where
     T: CommandCreatorSync,
 {
@@ -159,48 +316,44 @@ where
         return Ok(None);
     }
 
-    // `-m{arch,cpu,tune}=native` is resolved by the compiler driver from the
-    // machine on which the driver runs. The literal command line is therefore
-    // not a sufficient cache identity when a cache is shared between hosts.
-    // Ask the *local* compiler what it would hand to cc1 and include that line
-    // in the cache identity. This mirrors ccache's fix for the same bug while
-    // leaving the actual local compile command untouched.
+    // Probe once using the entire ordered target-relevant driver argument
+    // sequence, including any named CPU and feature masks interleaved with
+    // native. The observed cc1 target state is the authoritative expansion.
     let mut cmd = creator.clone().new_command_sync(executable);
     cmd.arg("-###")
         .arg("-E")
         .arg("-x")
-        .arg("c")
+        .arg(native_probe_language(parsed_args.language))
         .arg("-")
-        .args(&native_args)
+        .args(&parsed_args.common_args)
+        .args(&parsed_args.arch_args)
         .env_clear()
         .envs(env_vars.to_vec())
-        // The probe has no project inputs. A stable working directory keeps
-        // unrelated debug-compilation-dir flags from fragmenting the native
-        // host fingerprint across worktrees.
-        .current_dir(std::env::temp_dir());
+        .current_dir(cwd);
     let output = run_input_output(cmd, Some(Vec::new())).await?;
-
     let stderr = String::from_utf8_lossy(&output.stderr);
     let driver_line = stderr
         .lines()
-        .find(|line| line.contains("-cc1") || line.contains("/cc1 ") || line.contains("/cc1plus "))
-        .context("compiler did not expose a native codegen expansion")?;
-    let still_native = driver_line.split_whitespace().any(|token| {
-        let token = token.trim_matches('"');
-        token == "native" || token.ends_with("=native")
-    });
-    if still_native {
-        bail!("compiler left native codegen unresolved in its driver expansion");
-    }
-
+        .find(|line| {
+            shlex::split(line)
+                .is_some_and(|args| args.iter().any(|arg| is_native_driver_frontend(arg)))
+        })
+        .context("compiler did not expose a native CPU frontend expansion")?;
+    let flags = native_driver_replacement(driver_line, kind, &native_args)?;
+    // Preserve the requesting compiler's full observed frontend state in the
+    // native-only cache supplement. The working directory can affect emitted
+    // debug metadata without changing preprocessed bytes (notably Clang -g),
+    // so hashing only the CPU switches could alias materially different objects.
     let mut digest = Digest::new();
-    digest.update(b"sccache-native-codegen-v1\0");
-    for arg in &native_args {
-        digest.update(arg.as_encoded_bytes());
-        digest.update(&[0xff]);
-    }
+    digest.update(b"sccache-native-target-resolution-v4\0");
     digest.update(driver_line.as_bytes());
-    Ok(Some(digest.finish()))
+    #[cfg(not(feature = "dist-client"))]
+    let _ = flags;
+    Ok(Some(NativeCodegenResolution {
+        fingerprint: digest.finish(),
+        #[cfg(feature = "dist-client")]
+        explicit_args: flags,
+    }))
 }
 
 impl ParsedArguments {
@@ -217,6 +370,7 @@ struct CCompilation<I: CCompilerImpl> {
     parsed_args: ParsedArguments,
     is_locally_preprocessed: bool,
     allow_dist: bool,
+    native_resolution: Option<NativeCodegenResolution>,
     #[cfg(feature = "dist-client")]
     preprocessed_input: Vec<u8>,
     executable: PathBuf,
@@ -268,6 +422,7 @@ pub struct CCompileContext<'a> {
     pub cwd: &'a Path,
     pub env_vars: &'a [(OsString, OsString)],
     pub rewrite_includes_only: bool,
+    pub native_resolution: Option<&'a NativeCodegenResolution>,
 }
 
 /// An interface to a specific C compiler.
@@ -489,27 +644,25 @@ where
         }
 
         let mut extra_hashes = hash_all(&parsed_args.extra_hash_files, &pool.clone()).await?;
-        let mut cache_control = match native_codegen_fingerprint(
+        let native_resolution = native_codegen_resolution(
             creator,
             &self.executable,
             &self.parsed_args,
             &cwd,
             &env_vars,
+            self.compiler.kind(),
         )
-        .await
-        {
-            Ok(Some(native_fingerprint)) => {
-                extra_hashes.push(native_fingerprint);
-                cache_control
-            }
-            Ok(None) => cache_control,
-            Err(error) => {
-                warn!(
-                    "Failed to resolve native C/C++ codegen identity; bypassing cache for this compile: {error:#}"
-                );
-                CacheControl::ForceNoCache
-            }
-        };
+        .await;
+        let mut cache_control = cache_control;
+        if let Ok(Some(resolution)) = &native_resolution {
+            extra_hashes.push(resolution.fingerprint.clone());
+        } else if let Err(error) = &native_resolution {
+            warn!(
+                "Failed to resolve native C/C++ codegen identity; bypassing cache for this compile: {error:#}"
+            );
+            cache_control = CacheControl::ForceNoCache;
+        }
+        let native_resolution = native_resolution.ok().flatten();
         // The assembler that turns the compiler's output into the object file is
         // as much a part of the result as the compiler itself.
         let assembler_digest = if parsed_args.uses_external_assembler {
@@ -648,6 +801,7 @@ where
                                 parsed_args: parsed_args.clone(),
                                 is_locally_preprocessed: false,
                                 allow_dist: true,
+                                native_resolution: native_resolution.clone(),
                                 #[cfg(feature = "dist-client")]
                                 preprocessed_input: PREPROCESSING_SKIPPED_COMPILE_POISON.to_vec(),
                                 executable: self.executable.clone(),
@@ -892,6 +1046,7 @@ where
                 parsed_args,
                 is_locally_preprocessed: true,
                 allow_dist,
+                native_resolution,
                 #[cfg(feature = "dist-client")]
                 preprocessed_input: preprocessor_output,
                 executable: self.executable.clone(),
@@ -1949,6 +2104,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
                 cwd: &self.cwd,
                 env_vars: &self.env_vars,
                 rewrite_includes_only,
+                native_resolution: self.native_resolution.as_ref(),
             })?;
         if !self.allow_dist {
             dist_command = None;
@@ -3229,7 +3385,197 @@ mod test {
     }
 
     #[test]
-    fn test_native_codegen_fingerprint_tracks_driver_expansion() {
+    fn test_native_driver_replacement_preserves_complete_cpu_state() -> Result<()> {
+        let native = ovec!["-march=native", "-mtune=native"];
+        let gcc = native_driver_replacement(
+            "/usr/lib/gcc/cc1 -march=znver2 -mavx2 -mno-avx512f -mno-xsaves -mtune=znver2 --param l1-cache-size=32",
+            CCompilerKind::Gcc,
+            &native,
+        )?;
+        assert_eq!(
+            gcc,
+            ovec![
+                "-march=znver2",
+                "-mavx2",
+                "-mno-avx512f",
+                "-mno-xsaves",
+                "-mtune=znver2",
+                "--param",
+                "l1-cache-size=32",
+            ]
+        );
+        let gcc_tune = native_driver_replacement(
+            "/usr/lib/gcc/cc1 -mtune=znver2 -march=x86-64",
+            CCompilerKind::Gcc,
+            &[OsString::from("-mtune=native")],
+        )?;
+        assert_eq!(gcc_tune, ovec!["-mtune=znver2", "-march=x86-64"]);
+        let clang = native_driver_replacement(
+            "\"/usr/bin/clang\" \"-cc1\" \"-target-cpu\" \"znver2\" \"-tune-cpu\" \"znver2\" \"-target-feature\" \"+avx2\" \"-target-feature\" \"-xsaves\"",
+            CCompilerKind::Clang,
+            &native,
+        )?;
+        assert_eq!(
+            clang,
+            ovec![
+                "-march=znver2",
+                "-mtune=znver2",
+                "-Xclang",
+                "-target-feature",
+                "-Xclang",
+                "+avx2",
+                "-Xclang",
+                "-target-feature",
+                "-Xclang",
+                "-xsaves",
+            ]
+        );
+        assert!(
+            native_driver_replacement(
+                "/usr/lib/gcc/cc1 -march=native",
+                CCompilerKind::Gcc,
+                &native,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_native_codegen_is_lowered_for_worker_not_local_compiler() -> Result<()> {
+        let mut parsed_args = native_parsed_arguments();
+        parsed_args.common_args = ovec!["-march=native", "-mno-avx2", "-mtune=native"];
+        parsed_args.outputs.insert(
+            "obj",
+            ArtifactDescriptor {
+                path: "foo.o".into(),
+                optional: false,
+            },
+        );
+        let resolution = NativeCodegenResolution {
+            fingerprint: "test-native".to_owned(),
+            explicit_args: ovec!["-march=znver2", "-mno-avx2", "-mno-xsaves", "-mtune=znver2"],
+        };
+        let mut transformer = dist::PathTransformer::new();
+        let (local, remote, _) = crate::compiler::gcc::generate_compile_commands(
+            &mut transformer,
+            Path::new("/usr/bin/gcc"),
+            &parsed_args,
+            Path::new("/work"),
+            &[],
+            crate::compiler::gcc::GccCompileConfig {
+                kind: CCompilerKind::Gcc,
+                rewrite_includes_only: false,
+                language_to_arg: crate::compiler::gcc::language_to_gcc_arg,
+                native_resolution: Some(&resolution),
+            },
+        )?;
+        assert!(local.arguments.contains(&OsString::from("-march=native")));
+        let remote_args = remote
+            .context("expected explicit distributed native target")?
+            .arguments;
+        let arch = remote_args
+            .iter()
+            .position(|arg| arg == "-march=znver2")
+            .context("resolved CPU missing")?;
+        assert_eq!(
+            &remote_args[arch..arch + 4],
+            ["-march=znver2", "-mno-avx2", "-mno-xsaves", "-mtune=znver2"]
+        );
+        assert!(!remote_args.iter().any(|arg| arg.ends_with("=native")));
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_clang_native_codegen_is_lowered_for_worker() -> Result<()> {
+        let mut parsed_args = native_parsed_arguments();
+        parsed_args.outputs.insert(
+            "obj",
+            ArtifactDescriptor {
+                path: "foo.o".into(),
+                optional: false,
+            },
+        );
+        let resolution = NativeCodegenResolution {
+            fingerprint: "clang-native".to_owned(),
+            explicit_args: ovec![
+                "-march=znver2",
+                "-Xclang",
+                "-target-feature",
+                "-Xclang",
+                "-xsaves"
+            ],
+        };
+        let mut transformer = dist::PathTransformer::new();
+        let (local, remote, _) = crate::compiler::gcc::generate_compile_commands(
+            &mut transformer,
+            Path::new("/usr/bin/clang"),
+            &parsed_args,
+            Path::new("/work"),
+            &[],
+            crate::compiler::gcc::GccCompileConfig {
+                kind: CCompilerKind::Clang,
+                rewrite_includes_only: false,
+                language_to_arg: crate::compiler::clang::language_to_clang_arg,
+                native_resolution: Some(&resolution),
+            },
+        )?;
+        assert!(local.arguments.contains(&OsString::from("-march=native")));
+        let arguments = remote
+            .context("expected distributed native Clang job")?
+            .arguments;
+        assert!(arguments.iter().any(|arg| arg == "-march=znver2"));
+        assert!(
+            arguments
+                .windows(4)
+                .any(|args| { args == ["-Xclang", "-target-feature", "-Xclang", "-xsaves"] })
+        );
+        assert!(!arguments.iter().any(|arg| arg.ends_with("=native")));
+        Ok(())
+    }
+
+    #[test]
+    fn test_native_codegen_probe_respects_cxx_language_and_options() -> Result<()> {
+        let mut parsed = native_parsed_arguments();
+        parsed.language = Language::Cxx;
+        parsed.common_args.push(OsString::from("-std=c++20"));
+        let creator = new_creator();
+        next_command_calls(&creator, |args| {
+            assert!(args.windows(2).any(|pair| pair == ["-x", "c++"]));
+            assert!(args.iter().any(|arg| arg == "-std=c++20"));
+            assert!(args.iter().any(|arg| arg == "-march=native"));
+            Ok(MockChild::new(
+                exit_status(0),
+                "",
+                "/usr/lib/gcc/cc1plus -march=znver2 -mtune=znver2 -std=c++20",
+            ))
+        });
+        let result = single_threaded_runtime().block_on(native_codegen_resolution(
+            &creator,
+            Path::new("/usr/bin/g++"),
+            &parsed,
+            Path::new("/project"),
+            &[],
+            CCompilerKind::Gcc,
+        ))?;
+        assert!(result.is_some());
+        assert_eq!(native_probe_language(Language::CxxModule), "c++");
+        assert_eq!(
+            native_probe_language(Language::ObjectiveCxx),
+            "objective-c++"
+        );
+        assert_eq!(native_probe_language(Language::ObjectiveC), "objective-c");
+        assert_eq!(native_probe_language(Language::AssemblerToPreprocess), "c");
+        assert!(native_driver_args(" cc1obj -march=znver2 -mtune=znver2").is_ok());
+        assert!(native_driver_args(" cc1objplus -march=znver2 -mtune=znver2").is_ok());
+        assert!(is_native_driver_frontend(r"C:\gcc\libexec\cc1plus.exe"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_native_codegen_fingerprint_tracks_effective_cpu_state() {
         fn fingerprint(driver_line: &str) -> String {
             let creator = new_creator();
             next_command(
@@ -3237,15 +3583,17 @@ mod test {
                 Ok(MockChild::new(exit_status(0), "", driver_line)),
             );
             single_threaded_runtime()
-                .block_on(native_codegen_fingerprint(
+                .block_on(native_codegen_resolution(
                     &creator,
                     Path::new("/usr/bin/cc"),
                     &native_parsed_arguments(),
                     Path::new("/project"),
                     &[],
+                    CCompilerKind::Gcc,
                 ))
                 .unwrap()
                 .unwrap()
+                .fingerprint
         }
 
         let znver2 = fingerprint(r"/usr/lib/gcc/cc1 -march=znver2 -mtune=znver2");
@@ -3254,6 +3602,19 @@ mod test {
 
         assert_eq!(znver2, znver2_again);
         assert_ne!(znver2, skylake);
+        // Debug compilation directories can affect emitted DW_AT_comp_dir even
+        // when preprocessing output and CPU ISA are otherwise identical.
+        assert_ne!(
+            znver2,
+            fingerprint(
+                "/usr/lib/gcc/cc1 -march=znver2 -mtune=znver2 -fdebug-compilation-dir=/other/worktree"
+            )
+        );
+        // Conversely, an effective ISA change must never alias the cache.
+        assert_ne!(
+            znver2,
+            fingerprint("/usr/lib/gcc/cc1 -march=znver2 -mtune=znver2 -mno-avx2")
+        );
     }
 
     #[test]
@@ -3267,12 +3628,13 @@ mod test {
                 &creator,
                 Ok(MockChild::new(exit_status(0), "", driver_line)),
             );
-            let result = single_threaded_runtime().block_on(native_codegen_fingerprint(
+            let result = single_threaded_runtime().block_on(native_codegen_resolution(
                 &creator,
                 Path::new("/usr/bin/cc"),
                 &native_parsed_arguments(),
                 Path::new("/project"),
                 &[],
+                CCompilerKind::Gcc,
             ));
             assert!(
                 result.is_err(),
@@ -3578,6 +3940,24 @@ mod test {
         assert_neq!(h_abc, h_xyz);
         assert_neq!(h_abc, h_ab);
         assert_neq!(h_abc, h_a);
+    }
+
+    #[test]
+    fn test_destination_cpu_flags_partition_c_cache() {
+        let key = |args: &[&str]| {
+            let arguments: Vec<_> = args.iter().map(OsString::from).collect();
+            HashKeyParams::new(
+                "gcc-toolchain-digest",
+                Language::C,
+                &arguments,
+                b"same preprocessed C source",
+            )
+            .compute()
+        };
+        let v2 = key(&["-O3", "-march=x86-64-v2"]);
+        let v4 = key(&["-O3", "-march=x86-64-v4"]);
+        assert_ne!(v2, v4, "effective GCC -march must partition C cache");
+        assert_eq!(v2, key(&["-O3", "-march=x86-64-v2"]));
     }
 
     #[cfg(unix)]
