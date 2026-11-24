@@ -159,7 +159,7 @@ impl NativeCompilerClient {
                 let result = async {
                     let scheduler = scheduler.as_ref().context("scheduler URL unavailable")?;
                     let url = dist::http::urls::scheduler_status(&scheduler.to_url())?;
-                    let client = crate::util::new_reqwest_client_builder()?
+                    let client = crate::http_client::new_reqwest_client_builder()?
                         .timeout(Duration::from_secs(config.request_timeout_secs))
                         .build()?;
                     dist::http::transport::send_async(

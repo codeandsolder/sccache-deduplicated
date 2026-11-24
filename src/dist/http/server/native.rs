@@ -37,7 +37,7 @@ impl PackageService {
         };
         let mut upstreams = BTreeMap::new();
         for (name, upstream) in &config.package_upstreams {
-            let client = crate::util::new_reqwest_blocking_builder()?
+            let client = crate::http_client::new_reqwest_blocking_builder()?
                 .timeout(Duration::from_secs(upstream.timeout_secs))
                 .connect_timeout(Duration::from_secs(10))
                 .redirect(reqwest::redirect::Policy::none())
