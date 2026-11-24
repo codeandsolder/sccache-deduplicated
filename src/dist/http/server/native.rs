@@ -32,7 +32,6 @@ use crate::{
 };
 
 mod network;
-mod probe;
 
 pub(super) type Allocator = dyn Fn(
         crate::dist::NativeAssignment,
@@ -141,24 +140,20 @@ pub(super) fn spawn(
     for index in 0..peer_threads {
         let sessions = Arc::downgrade(&sessions);
         let fetch_peer = Arc::clone(&fetch_peer);
-        let network = Arc::clone(&network);
         thread::Builder::new()
             .name(format!("native-peer-backfill-{index}"))
             .spawn(move || {
                 while let Some(sessions) = sessions.upgrade() {
                     match sessions.claim_peer_input(Duration::from_millis(100)) {
-                        Ok(Some(claim)) => {
-                            let _activity = network.idle_gate().begin();
-                            match fetch_peer(claim.blob(), claim.requester()) {
-                                Ok(Some(reader)) => {
-                                    if let Err(error) = sessions.publish_peer_input(claim, reader) {
-                                        debug!("native peer backfill failed: {error:#}");
-                                    }
+                        Ok(Some(claim)) => match fetch_peer(claim.blob(), claim.requester()) {
+                            Ok(Some(reader)) => {
+                                if let Err(error) = sessions.publish_peer_input(claim, reader) {
+                                    debug!("native peer backfill failed: {error:#}");
                                 }
-                                Ok(None) => {}
-                                Err(error) => debug!("native peer backfill unavailable: {error:#}"),
                             }
-                        }
+                            Ok(None) => {}
+                            Err(error) => debug!("native peer backfill unavailable: {error:#}"),
+                        },
                         Ok(None) => {}
                         Err(error) => {
                             warn!("native peer claim failed: {error:#}");
@@ -175,22 +170,6 @@ pub(super) fn spawn(
         config.directory.join("network-timing.json"),
         config.public_addr,
     )?;
-    let calibration = config
-        .network_probe_bytes
-        .map(|bytes| {
-            probe::ProbeCoordinator::start(
-                &network,
-                config.directory.join("network-calibration.json"),
-                config.public_addr,
-                bytes,
-                config
-                    .http_threads
-                    .saturating_sub(config.max_total_uploads)
-                    .saturating_sub(2)
-                    .min(4),
-            )
-        })
-        .transpose()?;
     let server = rouille::Server::new(config.public_addr, move |request| {
         respond(
             request,
@@ -198,7 +177,6 @@ pub(super) fn spawn(
                 sessions: &sessions,
                 packages: packages.as_ref(),
                 network: &network,
-                calibration: calibration.as_deref(),
             },
             &allocate,
             &*client_auth,
@@ -272,35 +250,6 @@ pub(super) fn blob_response(mut file: File, accept_zstd: bool) -> Result<Respons
         data: ResponseBody::from_reader(encoded),
         upgrade: None,
     })
-}
-
-struct ActivePeerReader<R> {
-    inner: R,
-    _activity: crate::build_runtime::WorkActivity,
-}
-
-impl<R: Read> Read for ActivePeerReader<R> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        self.inner.read(buffer)
-    }
-}
-
-pub(super) fn peer_blob_response(
-    file: File,
-    activity: crate::build_runtime::WorkActivity,
-    accept_compressed: bool,
-) -> Result<Response> {
-    let mut response = blob_response(file, accept_compressed)?;
-    let (inner, size) = response.data.into_reader_and_size();
-    let reader = ActivePeerReader {
-        inner,
-        _activity: activity,
-    };
-    response.data = match size {
-        Some(size) => ResponseBody::from_reader_and_size(reader, size),
-        None => ResponseBody::from_reader(reader),
-    };
-    Ok(response)
 }
 
 /// Reuse TLS connections without broadening each peer's pinned trust root.
@@ -391,7 +340,6 @@ struct NativeServices<'a> {
     sessions: &'a NativeSessions,
     packages: Option<&'a PackageService>,
     network: &'a NetworkMeter,
-    calibration: Option<&'a probe::ProbeCoordinator>,
 }
 
 fn respond(
@@ -427,24 +375,6 @@ fn respond(
                 Ok(server) => server,
                 Err(response) => return response,
             };
-            if matches!(
-                operation,
-                "probe_offer" | "probe_download" | "probe_upload" | "probe_receipt"
-            ) {
-                let response = match services.calibration {
-                    Some(calibration) => {
-                        calibration.dispatch(request, server.addr(), operation, limit)
-                    }
-                    None if operation == "probe_offer" => {
-                        encode(&crate::dist::native::probe::ProbeOffer::Disabled, limit)
-                    }
-                    None => Ok(Response::empty_404()),
-                };
-                return response.unwrap_or_else(|error| {
-                    trace!("Native calibration request deferred: {error:#}");
-                    Response::text("calibration deferred").with_status_code(409)
-                });
-            }
             let Some(job) = request
                 .header("X-Sccache-Native-Job")
                 .and_then(|job| job.parse::<u64>().ok())
@@ -458,7 +388,6 @@ fn respond(
         }
         _ => return Response::empty_404(),
     };
-    let _real_work = services.network.idle_gate().begin();
     match dispatch(request, services, allocate, publisher, operation, limit) {
         Ok(response) => response,
         Err(error) if error.is::<NativeContentPending>() => {
@@ -488,7 +417,6 @@ fn dispatch(
         sessions,
         packages,
         network,
-        calibration,
     } = services;
     let peer = match publisher {
         Publisher::Client => Peer::Client(request.remote_addr().ip()),
@@ -623,8 +551,7 @@ fn dispatch(
             let request = spec.action_request()?;
             encode(
                 &sessions.schedule(ticket, &request, |inputs| {
-                    let snapshot = calibration
-                        .map_or_else(|| network.snapshot(), probe::ProbeCoordinator::snapshot);
+                    let snapshot = network.snapshot();
                     allocate(
                         crate::dist::NativeAssignment {
                             ticket,

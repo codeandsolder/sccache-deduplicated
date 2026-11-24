@@ -1708,7 +1708,7 @@ mod server {
                         }
                         let file = try_or_500_log!(req_id, handler.handle_native_blob(blob));
                         match file {
-                            Some((file, activity)) => try_or_500_log!(req_id, native::peer_blob_response(file, activity,
+                            Some(file) => try_or_500_log!(req_id, native::blob_response(file,
                                 request.header("X-Sccache-Accept-Blob-Codec") == Some("zstd"))),
                             None => rouille::Response::empty_404(),
                         }

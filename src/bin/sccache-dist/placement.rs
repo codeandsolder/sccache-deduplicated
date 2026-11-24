@@ -1,6 +1,8 @@
 //! Native placement prediction over verified content, worker timing and
 //! directional shared-link observations.
 use super::ServerDetails;
+mod exploration;
+pub(super) use exploration::{Exploration, choose_worker};
 use sccache::{
     build_runtime::{
         DirectionSnapshot, NetworkSnapshot, Peer, ResultTransferEstimate, TransferDemand,
@@ -192,17 +194,22 @@ impl<'a> NativeTransferPlan<'a> {
     }
 }
 
+pub(super) struct PlacementEstimate {
+    pub(super) seconds: f64,
+    ready_at: f64,
+}
+
 /// Overlap compiler queue waiting
 /// and input delivery. Include the measured
 /// effective application service time and the marginal delay to other peers.
-pub(super) fn native_eta_seconds(
+pub(super) fn native_estimate(
     capacity: f64,
     assigned: &HashMap<JobId, dist::NativeInputBlobs>,
     placement: &dist::NativePlacement,
     requested: &dist::NativeInputBlobs,
     peer: Peer,
     plan: &NativeTransferPlan<'_>,
-) -> f64 {
+) -> PlacementEstimate {
     let (bytes, requests) = native_missing_inputs(assigned, placement, Some(requested));
     let cost = placement.transfer;
     let (network, externality) = plan.input_completion(peer, bytes, cost.download_bytes_per_second);
@@ -234,11 +241,14 @@ pub(super) fn native_eta_seconds(
             .saturating_mul(placement.result.request_nanoseconds),
     )
     .as_secs_f64();
-    ready_at
-        + output_network.max(output_processing)
-        + output_overhead
-        + externality
-        + output_externality
+    PlacementEstimate {
+        ready_at,
+        seconds: ready_at
+            + output_network.max(output_processing)
+            + output_overhead
+            + externality
+            + output_externality,
+    }
 }
 
 #[cfg(test)]
@@ -256,13 +266,13 @@ mod tests {
                 a,
                 PeerCapacity {
                     observed_bytes_per_second: 100_000_000,
-                    calibrated_bytes_per_second: 0,
-                    latest_bytes_per_second: 0,
+                    isolated_bytes_per_second: 100_000_000,
                     wire_per_mille: 1000,
                     active_remaining_bytes: 100_000_000,
                     body_bytes: 0,
                 },
             )]),
+            independent: Vec::new(),
             shared: vec![SharedCapacity {
                 members: [a, b].into_iter().collect(),
                 bytes_per_second: 100_000_000,

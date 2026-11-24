@@ -1139,7 +1139,7 @@ pub trait ServerIncoming: Send + Sync {
     fn handle_native_blob(
         &self,
         blob: crate::build_runtime::BlobRef,
-    ) -> ExtResult<Option<(std::fs::File, crate::build_runtime::WorkActivity)>, Error>;
+    ) -> ExtResult<Option<std::fs::File>, Error>;
     /// Accept an immutable native action assignment.
     ///
     /// # Errors

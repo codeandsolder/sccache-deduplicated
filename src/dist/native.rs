@@ -22,8 +22,6 @@ use crate::build_runtime::{
 use crate::dist::JobId;
 
 mod package;
-#[cfg(feature = "dist-server")]
-pub(crate) mod probe;
 pub use package::{
     PackageAcquisition, PackageLocator, map_packages, validate_upstream_base,
     validate_upstream_name,
@@ -74,8 +72,6 @@ pub(super) struct PackagePlanRequest {
 enum Role {
     Client,
     Worker(JobId),
-    #[cfg(feature = "dist-server")]
-    Calibration,
 }
 
 /// Bounded streaming HTTP client for native result publication and retrieval.
@@ -142,8 +138,6 @@ impl NativeCacheClient {
         let (role, job) = match self.role {
             Role::Client => ("client", None),
             Role::Worker(job) => ("worker", Some(job)),
-            #[cfg(feature = "dist-server")]
-            Role::Calibration => ("worker", None),
         };
         let url = self
             .base
@@ -524,12 +518,13 @@ impl NativeCacheClient {
                     .sum::<u128>(),
                 transport.parallelism()
             );
-            let raw_missing = updated.missing().to_vec();
+            let mut raw_missing = updated.missing().to_vec();
+            raw_missing.sort_unstable_by_key(|blob| std::cmp::Reverse(blob.size));
             let mut acquired = Vec::new();
             // Register a bounded lookahead before download slots start waiting.
             // The origin can stream subsequent misses while these are consumed.
             let lookahead = transport.parallelism().get().saturating_mul(8).min(256);
-            for chunk in updated.missing().chunks(lookahead) {
+            for chunk in raw_missing.chunks(lookahead) {
                 self.control::<_, ()>("input_prefetch", &InputPrefetchRequest {
                     ticket: read.ticket,
                     missing: chunk.to_vec(),

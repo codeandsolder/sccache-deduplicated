@@ -190,7 +190,6 @@ fn native_worker_config(
             execution_timeout_secs: 120,
             max_result_bytes: 64 * 1024 * 1024,
             max_metadata_bytes: 64 * 1024 * 1024,
-            network_probe: false,
             artifact_grace_secs: 300,
             artifact_grace_bytes: None,
             package_import: Some(package_limits(false)),
@@ -270,7 +269,6 @@ impl Fleet {
                     max_total_uploads: 4,
                     http_threads: 8,
                     max_metadata_bytes: 64 * 1024 * 1024,
-                    network_probe_bytes: None,
                     package_import: Some(package_limits(true)),
                     package_upstreams,
                 }),
@@ -1605,6 +1603,10 @@ impl LocalService {
         fleet: &Fleet,
         local_execution: Option<NativeLocalConfig>,
     ) -> Result<Self> {
+        let _ = env_logger::builder()
+            .is_test(true)
+            .filter_level(log::LevelFilter::Debug)
+            .try_init();
         let socket = root.join("client.sock");
         let caller_config = root.join("caller.toml");
         let cached_config = root.join("caller-cached.toml");
@@ -1678,6 +1680,7 @@ impl LocalService {
             String::from_utf8_lossy(&output.stderr)
         );
         let info: sccache::server::ServerInfo = serde_json::from_slice(&output.stdout)?;
+        eprintln!("Native integration stats: {:?}", info.stats);
         Ok(info.stats)
     }
 
