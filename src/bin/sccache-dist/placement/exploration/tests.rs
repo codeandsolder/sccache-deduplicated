@@ -77,7 +77,7 @@ fn native_exploration_prefers_a_real_near_equivalent_unanswered_overlap_once() -
             &options,
             &servers,
             &demand(),
-            None,
+            &BTreeMap::new(),
             &plan,
             &mut history,
             now
@@ -90,7 +90,7 @@ fn native_exploration_prefers_a_real_near_equivalent_unanswered_overlap_once() -
             &options,
             &servers,
             &demand(),
-            None,
+            &BTreeMap::new(),
             &plan,
             &mut history,
             now
@@ -102,7 +102,7 @@ fn native_exploration_prefers_a_real_near_equivalent_unanswered_overlap_once() -
             &options,
             &servers,
             &demand(),
-            None,
+            &BTreeMap::new(),
             &plan,
             &mut history,
             now + COOLDOWN
@@ -137,7 +137,7 @@ fn native_exploration_never_increases_required_payload_or_exceeds_eta_budget() -
                 &options,
                 &servers,
                 &requested,
-                None,
+                &BTreeMap::new(),
                 &plan,
                 &mut history,
                 now
@@ -153,7 +153,7 @@ fn native_exploration_never_increases_required_payload_or_exceeds_eta_budget() -
             &[(id(1), 3.0), (id(2), 3.03)],
             &servers,
             &requested,
-            None,
+            &BTreeMap::new(),
             &plan,
             &mut history,
             now
@@ -185,7 +185,7 @@ fn native_exploration_skips_answered_or_unmeasurable_overlap() -> anyhow::Result
                 &options,
                 &servers,
                 &demand(),
-                None,
+                &BTreeMap::new(),
                 &plan,
                 &mut history,
                 now
@@ -205,7 +205,7 @@ fn native_exploration_skips_answered_or_unmeasurable_overlap() -> anyhow::Result
                 &options,
                 &servers,
                 &demand(),
-                None,
+                &BTreeMap::new(),
                 &plan,
                 &mut history,
                 now
@@ -226,7 +226,7 @@ fn native_exploration_skips_answered_or_unmeasurable_overlap() -> anyhow::Result
             &options,
             &servers,
             &demand(),
-            None,
+            &BTreeMap::new(),
             &plan,
             &mut history,
             now

@@ -3,7 +3,9 @@
 use super::ServerDetails;
 mod cost;
 mod exploration;
-pub(super) use cost::{ActionClass, ActionCost, ActionCosts, AssignedNative};
+pub(super) use cost::{
+    ActionClass, ActionCost, AssignedNative, CostBook, WorkerScope, start_checkpoint,
+};
 mod pipeline;
 mod retained;
 pub(super) use exploration::{Exploration, choose_worker};
@@ -215,6 +217,7 @@ pub(super) struct PlacementEstimate {
     pub(super) completion_seconds: f64,
     missing_input_union_bytes: u128,
     ready_at: f64,
+    pub(super) cost: ActionCost,
 }
 
 /// Overlap compiler queue waiting
@@ -230,18 +233,14 @@ pub(super) struct WorkerForecast<'a> {
 }
 
 impl<'a> WorkerForecast<'a> {
-    pub(super) fn new(
-        details: &'a ServerDetails,
-        class: Option<ActionClass>,
-        now: std::time::Instant,
-    ) -> Option<Self> {
+    pub(super) fn new(details: &'a ServerDetails, cost: Option<ActionCost>) -> Option<Self> {
         let placement = details.capabilities.native_placement.as_ref()?;
         Some(Self {
             capacity: details.cpu_capacity,
             assigned: &details.jobs_assigned,
             placement,
             recent: &details.recent_residency,
-            cost: details.action_costs.predict(class, placement, now),
+            cost: cost.unwrap_or_else(|| ActionCost::baseline(placement)),
         })
     }
 }
@@ -297,6 +296,7 @@ pub(super) fn native_estimate(
         ready_at,
         completion_seconds,
         missing_input_union_bytes: bytes,
+        cost: action,
         seconds: completion_seconds + externality + output_externality,
     }
 }

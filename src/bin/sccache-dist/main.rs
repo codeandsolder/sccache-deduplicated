@@ -558,6 +558,14 @@ fn run(command: Command) -> Result<i32> {
             );
             let scheduler =
                 Scheduler::new_with_job_slack_and_drain(job_slack, maintenance_drain_file);
+            if let Some(config) = &native_cache {
+                config.session_limits()?;
+                placement::start_checkpoint(
+                    &scheduler.cost_book,
+                    config.directory.join("action-costs.bin"),
+                    config.public_addr,
+                )?;
+            }
             let http_scheduler = dist::http::Scheduler::new(
                 public_addr,
                 scheduler,
@@ -807,12 +815,12 @@ pub struct Scheduler {
     servers: Mutex<HashMap<ServerId, ServerDetails>>,
     completed_acks: Mutex<CompletedJobAcks>,
     exploration: Mutex<Exploration>,
+    cost_book: std::sync::Arc<Mutex<placement::CostBook>>,
 }
 
 struct ServerDetails {
     // Native input closures are reserved with the assignment, even before transfer.
     jobs_assigned: HashMap<JobId, Option<placement::AssignedNative>>,
-    action_costs: placement::ActionCosts,
     // Reservations for assignment RPCs still in flight. Once assigned,
     // the state and unclaimed timeout are owned exclusively by JobDetail.
     jobs_assigning: HashMap<JobId, Instant>,
@@ -901,6 +909,7 @@ impl Scheduler {
             servers: Mutex::new(HashMap::new()),
             completed_acks: Mutex::new(CompletedJobAcks::default()),
             exploration: Mutex::new(Exploration::default()),
+            cost_book: std::sync::Arc::new(Mutex::new(placement::CostBook::default())),
         }
     }
 
@@ -1026,6 +1035,10 @@ impl Scheduler {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
 
+            let cost_book = self
+                .cost_book
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let transfer_plan = native_inputs
                 .as_ref()
                 .map(|_| NativeTransferPlan::new(network, &servers));
@@ -1063,7 +1076,18 @@ impl Scheduler {
                         ) {
                             continue;
                         }
-                        let Some(forecast) = placement::WorkerForecast::new(details, class, now)
+                        let learned = class.zip(native_platform).map(|(class, platform)| {
+                            cost_book.predict(
+                                placement::WorkerScope {
+                                    address: server_id.addr(),
+                                    platform,
+                                },
+                                class,
+                                placement,
+                                now,
+                            )
+                        });
+                        let Some(forecast) = placement::WorkerForecast::new(details, learned)
                         else {
                             continue;
                         };
@@ -1085,6 +1109,7 @@ impl Scheduler {
                         healthy.push((server_id, weight));
                     }
                 }
+                drop(cost_book);
                 let selected = [&healthy, &retry].into_iter().find_map(|candidates| {
                     if let (Some(inputs), Some(plan)) =
                         (native_inputs.as_ref(), transfer_plan.as_ref())
@@ -1093,7 +1118,15 @@ impl Scheduler {
                             .exploration
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        choose_worker(candidates, &servers, inputs, class, plan, &mut history, now)
+                        choose_worker(
+                            candidates,
+                            &servers,
+                            inputs,
+                            &predictions,
+                            plan,
+                            &mut history,
+                            now,
+                        )
                     } else {
                         weighted_server(candidates, rand::random::<f64>())
                     }
@@ -1125,8 +1158,9 @@ impl Scheduler {
                     let assigned = native_inputs.map(|inputs| placement::AssignedNative {
                         inputs: inputs.clone(),
                         class,
-                        cost: placement::WorkerForecast::new(server_details, class, now)
-                            .map(|forecast| forecast.cost),
+                        cost: predictions
+                            .get(&server_id.addr())
+                            .map(|estimate| estimate.cost),
                     });
                     assert!(
                         server_details
@@ -1340,7 +1374,20 @@ impl SchedulerIncoming for Scheduler {
                             }),
                         )
                     {
-                        server.action_costs.observe(class, observed, now);
+                        if let Some(platform) = server.capabilities.native_platform {
+                            self.cost_book
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .observe(
+                                    placement::WorkerScope {
+                                        address: server_id.addr(),
+                                        platform,
+                                    },
+                                    class,
+                                    observed,
+                                    now,
+                                );
+                        }
                         trace!(target: "native_placement_replay", "{}", serde_json::json!({
                             "kind": "completed", "job": job.0, "worker": server_id.addr(),
                             "class": class, "predicted_seconds": detail.predicted_seconds,
@@ -1562,7 +1609,6 @@ impl SchedulerIncoming for Scheduler {
                 worker_name: None,
                 capabilities,
                 recent_residency: placement::RecentResidency::default(),
-                action_costs: placement::ActionCosts::default(),
                 job_authorizer,
             },
         );

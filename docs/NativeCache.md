@@ -923,6 +923,16 @@ manifest names a just-produced blob, the scheduler can exploit the producer's
 retained copy; unknown future hashes still require explicit producer/output
 dependencies from a build graph.
 
+
+Verified acquisition and publication events also refresh a separate bounded
+recent-input index (65,536 unique digests per worker, 20-second expiry).
+The input closure was pinned and verified for that action, but its leases
+can be released after publication. These short-lived positive hints bridge
+the 15-second Bloom refresh interval; they do not claim grace retention.
+The real assignment pinning and exact content validation still apply.
+Peer recovery prefers grace-retained outputs, then recently acquired inputs,
+then Bloom matches. Worker replacement discards all residency evidence.
+
 ### Measured command-family costs and placement traces
 
 Successful verified result commits carry the worker's measured compiler-slot
@@ -931,15 +941,27 @@ output uploads. This does not require any extra RPC or synthetic transfer.
 Only the first valid observation for the assigned job trains the scheduler.
 The worker's overall timing estimate remains the cold-start prior.
 
-Each worker incarnation maintains up to 4096 command-family records, expiring
+Each worker address and platform maintains up to 4096 command-family records, expiring
 after 24 hours without observations. Families are hashed from platform,
 canonical executable, working directory and argument shape; Rust metadata and
 extra-filename hashes and dependency artifact paths are normalized while
 dependency names, features, target, crate name, emit mode and optimization
 flags remain distinct. This is an advisory cost key, never a cache identity.
 Samples are smoothed with a quarter-weight moving average; one through four
-observations progressively replace the host-wide prior. This first version
-does not persist family records across scheduler restart or worker replacement.
+observations progressively replace the host-wide prior. The scheduler keeps at most 32 such histories and checkpoints them atomically
+every 60 seconds when observations change, in action-costs.bin under its native
+cache directory (16 MiB maximum). The checkpoint is scoped to the cache listener,
+worker address and platform; expired samples and mismatched or invalid checkpoints
+are discarded. Residency and reservations are not persisted in this history.
+
+Unseen or sparsely observed command families can use measurements from other
+workers with the same platform. Peer execution times are adjusted by the median
+service-time ratio of at least two other common command families, each observed
+at least twice on both workers. A calibrated peer prior receives three quarters
+of the weight; uncalibrated peers receive only one quarter. Peer output traffic
+provides a half-weight prior because negotiated uploads also depend on scheduler
+CAS state. Local observations progressively replace these priors. The host-wide
+mean is not treated as a hardware speed ratio.
 
 Candidate estimates use the learned service duration and negotiated output
 traffic. Each admitted native reservation carries its own predicted cost

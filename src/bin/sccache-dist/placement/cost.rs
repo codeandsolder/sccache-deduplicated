@@ -6,14 +6,20 @@ use sccache::{
     dist::{NativeInputBlobs, NativePlacement},
 };
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     time::{Duration, Instant},
 };
 
+mod checkpoint;
+pub(crate) use checkpoint::start as start_checkpoint;
+mod history;
+pub(crate) use history::{CostBook, WorkerScope};
 const MAX_CLASSES: usize = 4096;
 const MAX_AGE: Duration = Duration::from_hours(24);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub(crate) struct ActionClass(ContentId);
 
 impl ActionClass {
@@ -69,7 +75,7 @@ fn volatile_codegen(arg: &[u8]) -> bool {
     arg.starts_with(b"metadata=") || arg.starts_with(b"extra-filename=")
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ActionCost {
     pub execution_nanoseconds: u64,
     pub output_bytes: u64,
@@ -77,6 +83,11 @@ pub(crate) struct ActionCost {
 }
 
 impl ActionCost {
+    fn valid(self) -> bool {
+        (1..=3_600_000_000_000).contains(&self.execution_nanoseconds)
+            && self.output_bytes <= 1 << 40
+            && self.output_requests <= 1_000_000
+    }
     pub(crate) const fn baseline(placement: &NativePlacement) -> Self {
         Self {
             execution_nanoseconds: placement.execution_nanoseconds,
@@ -102,6 +113,7 @@ pub(crate) struct AssignedNative {
     pub cost: Option<ActionCost>,
 }
 
+#[derive(Clone, Copy)]
 struct Sample {
     cost: ActionCost,
     seen: Instant,
@@ -110,34 +122,41 @@ struct Sample {
 
 #[derive(Default)]
 pub(crate) struct ActionCosts {
-    entries: HashMap<ActionClass, Sample>,
+    entries: BTreeMap<ActionClass, Sample>,
 }
 
 impl ActionCosts {
+    #[cfg(test)]
     pub(crate) fn predict(
         &self,
         class: Option<ActionClass>,
         placement: &NativePlacement,
         now: Instant,
     ) -> ActionCost {
-        let baseline = ActionCost::baseline(placement);
-        let Some(sample) = class
-            .and_then(|class| self.entries.get(&class))
+        class.map_or(ActionCost::baseline(placement), |class| {
+            self.predict_from_prior(class, ActionCost::baseline(placement), now)
+        })
+    }
+
+    fn fresh(&self, class: ActionClass, now: Instant) -> Option<&Sample> {
+        self.entries
+            .get(&class)
             .filter(|sample| now.saturating_duration_since(sample.seen) < MAX_AGE)
-        else {
+    }
+
+    fn predict_from_prior(
+        &self,
+        class: ActionClass,
+        baseline: ActionCost,
+        now: Instant,
+    ) -> ActionCost {
+        let Some(sample) = self.fresh(class, now) else {
             return baseline;
         };
         // Shrink a single observation towards the host prior. After several
         // genuine observations, the class-specific estimate dominates.
         let weight = sample.observations.min(4);
-        let blend = |prior: u64, learned: u64| {
-            u64::try_from(
-                (u128::from(prior) * u128::from(4 - weight)
-                    + u128::from(learned) * u128::from(weight))
-                    / 4,
-            )
-            .unwrap_or(u64::MAX)
-        };
+        let blend = |prior, learned| history::blend(prior, learned, weight);
         ActionCost {
             execution_nanoseconds: blend(
                 baseline.execution_nanoseconds,

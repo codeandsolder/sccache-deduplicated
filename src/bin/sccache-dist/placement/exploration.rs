@@ -146,9 +146,8 @@ impl<'a> Opportunity<'a> {
         server: ServerId,
         details: &'a ServerDetails,
         requested: &NativeInputBlobs,
-        class: Option<super::ActionClass>,
+        prediction: Option<&super::PlacementEstimate>,
         plan: &NativeTransferPlan<'_>,
-        now: Instant,
     ) -> Self {
         let inputs = additional_inputs(details, requested);
         let encoded = plan
@@ -158,7 +157,7 @@ impl<'a> Opportunity<'a> {
             server,
             inputs,
             encoded,
-            forecast: super::WorkerForecast::new(details, class, now),
+            forecast: super::WorkerForecast::new(details, prediction.map(|estimate| estimate.cost)),
         }
     }
 
@@ -215,7 +214,7 @@ pub(crate) fn choose_worker(
     candidates: &[(ServerId, f64)],
     servers: &HashMap<ServerId, ServerDetails>,
     requested: &NativeInputBlobs,
-    class: Option<super::ActionClass>,
+    predictions: &BTreeMap<std::net::SocketAddr, super::PlacementEstimate>,
     plan: &NativeTransferPlan<'_>,
     history: &mut Exploration,
     now: Instant,
@@ -240,7 +239,13 @@ pub(crate) fn choose_worker(
     {
         return Some(best);
     }
-    let baseline = Opportunity::new(best, servers.get(&best)?, requested, class, plan, now);
+    let baseline = Opportunity::new(
+        best,
+        servers.get(&best)?,
+        requested,
+        predictions.get(&best.addr()),
+        plan,
+    );
     if baseline.question(requested, plan, history, now).is_some() {
         return Some(best);
     }
@@ -250,7 +255,13 @@ pub(crate) fn choose_worker(
         .iter()
         .filter(|(id, eta)| *id != best && *eta <= limit)
         .filter_map(|&(id, eta)| {
-            let candidate = Opportunity::new(id, servers.get(&id)?, requested, class, plan, now);
+            let candidate = Opportunity::new(
+                id,
+                servers.get(&id)?,
+                requested,
+                predictions.get(&id.addr()),
+                plan,
+            );
             if !candidate.no_extra_traffic(&baseline) {
                 return None;
             }
