@@ -4,9 +4,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs::File,
     io::Read,
+    net::SocketAddr,
     path::Path,
     sync::{
-        Arc, Mutex, MutexGuard, Weak,
+        Arc, Condvar, Mutex, MutexGuard, Weak,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -38,6 +39,7 @@ pub struct SessionLimits {
     pub max_concurrent_uploads: usize,
     pub max_total_uploads: usize,
     pub max_manifest_cache_bytes: usize,
+    pub peer_discovery_timeout: Duration,
 }
 
 impl SessionLimits {
@@ -47,7 +49,9 @@ impl SessionLimits {
     /// Returns an error for zero or unusable limits.
     pub fn validate(self) -> Result<()> {
         ensure!(
-            !self.idle_timeout.is_zero() && Instant::now().checked_add(self.idle_timeout).is_some(),
+            !self.idle_timeout.is_zero()
+                && Instant::now().checked_add(self.idle_timeout).is_some()
+                && self.peer_discovery_timeout <= self.idle_timeout,
             "invalid session timeout"
         );
         ensure!(
@@ -287,11 +291,14 @@ impl TreeDelivery {
 /// Only the claimed origin uploads; the verified retention lease is shared.
 struct Backfill {
     blob: BlobRef,
+    requester: SocketAddr,
     state: Mutex<BackfillState>,
 }
 
 #[derive(Default)]
 struct BackfillState {
+    // Give a bounded peer discovery window before requesting the origin.
+    peer_until: Option<Instant>,
     claim: Option<BackfillClaim>,
     uploading: bool,
     ready: Option<TreeLease>,
@@ -328,6 +335,22 @@ impl Drop for BackfillUpload {
         if let Ok(mut state) = self.flight.lock() {
             state.uploading = false;
         }
+    }
+}
+
+/// Exclusive opportunity to recover one missing input from a peer cache.
+/// Dropping the claim allows the originating client to supply the same blob.
+pub struct PeerInputClaim(BackfillUpload);
+
+impl PeerInputClaim {
+    #[must_use]
+    pub fn blob(&self) -> BlobRef {
+        self.0.flight.blob
+    }
+
+    #[must_use]
+    pub fn requester(&self) -> SocketAddr {
+        self.0.flight.requester
     }
 }
 
@@ -385,6 +408,7 @@ pub struct NativeSessions {
     sessions: Mutex<HashMap<Ticket, SharedSession>>,
     active_uploads: Arc<AtomicUsize>,
     backfills: Mutex<HashMap<ContentId, Weak<Backfill>>>,
+    peer_wake: Condvar,
     manifests: Mutex<ManifestCatalog>,
 }
 
@@ -426,6 +450,7 @@ impl NativeSessions {
             sessions: Mutex::new(HashMap::new()),
             active_uploads: Arc::new(AtomicUsize::new(0)),
             backfills: Mutex::new(HashMap::new()),
+            peer_wake: Condvar::new(),
             manifests: Mutex::new(ManifestCatalog::default()),
         })
     }
@@ -1241,6 +1266,12 @@ impl NativeSessions {
             bail!("native action required");
         };
         let input = action.inputs.get(&tree).context("undeclared input tree")?;
+        let Publisher::Worker {
+            address: requester, ..
+        } = reader
+        else {
+            bail!("backfill requires a worker");
+        };
         let mut flights = self
             .backfills
             .lock()
@@ -1256,7 +1287,12 @@ impl NativeSessions {
             } else {
                 let flight = Arc::new(Backfill {
                     blob,
-                    state: Mutex::new(BackfillState::default()),
+                    requester,
+                    state: Mutex::new(BackfillState {
+                        peer_until: (!self.limits.peer_discovery_timeout.is_zero())
+                            .then(|| Instant::now() + self.limits.peer_discovery_timeout),
+                        ..BackfillState::default()
+                    }),
                 });
                 flights.insert(blob.id, Arc::downgrade(&flight));
                 flight
@@ -1269,7 +1305,71 @@ impl NativeSessions {
             }
             action.demands.entry(blob.id).or_insert((tree, flight));
         }
+        drop(flights);
+        self.peer_wake.notify_all();
         Ok(())
+    }
+
+    /// Claim one missing blob for a peer-source lookup. A short discovery window
+    /// prevents a busy peer service from delaying the original submitter.
+    ///
+    /// # Errors
+    /// Returns an error for poisoned state or a resource accounting failure.
+    pub fn claim_peer_input(&self, wait: Duration) -> Result<Option<PeerInputClaim>> {
+        let start = Instant::now();
+        let mut flights = self
+            .backfills
+            .lock()
+            .map_err(|_| anyhow!("native backfill map poisoned"))?;
+        loop {
+            let now = Instant::now();
+            for flight in flights.values().filter_map(Weak::upgrade) {
+                let Ok(mut pending) = flight.state.try_lock() else {
+                    continue;
+                };
+                let Some(until) = pending.peer_until else {
+                    continue;
+                };
+                if until <= now {
+                    pending.peer_until = None;
+                    continue;
+                }
+                if pending.uploading || pending.ready.is_some() || pending.claim.is_some() {
+                    continue;
+                }
+                match self.upload_slot() {
+                    Ok(slot) => {
+                        pending.peer_until = None;
+                        pending.uploading = true;
+                        drop(pending);
+                        return Ok(Some(PeerInputClaim(BackfillUpload {
+                            flight,
+                            _slot: slot,
+                        })));
+                    }
+                    Err(error) if error.is::<NativeServiceBusy>() => break,
+                    Err(error) => return Err(error),
+                }
+            }
+            let remaining = wait.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let (guard, _) = self
+                .peer_wake
+                .wait_timeout(flights, remaining)
+                .map_err(|_| anyhow!("native backfill map poisoned"))?;
+            flights = guard;
+        }
+    }
+
+    /// Verify and publish bytes acquired from an authenticated peer.
+    ///
+    /// # Errors
+    /// Returns an error for invalid content or storage failure.
+    pub fn publish_peer_input(&self, claim: PeerInputClaim, reader: impl Read) -> Result<()> {
+        let blob = claim.blob();
+        self.publish_backfill(claim.0, blob, reader)
     }
 
     fn finish_backfills(
@@ -1327,9 +1427,13 @@ impl NativeSessions {
             if pending.claim.as_ref().is_some_and(|claim| !claim.live(now)) {
                 pending.claim = None;
             }
-            if pending.uploading || pending.ready.is_some() {
+            if pending.uploading
+                || pending.ready.is_some()
+                || pending.peer_until.is_some_and(|until| until > now)
+            {
                 continue;
             }
+            pending.peer_until = None;
             if let Some(claim) = &mut pending.claim {
                 if claim.ticket == ticket {
                     claim.expires = self.deadline();
@@ -1344,7 +1448,11 @@ impl NativeSessions {
         }
         if let Some((tree, flight)) = candidate {
             let mut pending = flight.lock()?;
-            if !pending.uploading && pending.ready.is_none() && pending.claim.is_none() {
+            if !pending.uploading
+                && pending.ready.is_none()
+                && pending.claim.is_none()
+                && pending.peer_until.is_none_or(|until| until <= now)
+            {
                 match self.upload_slot() {
                     Ok(slot) => {
                         pending.claim = Some(BackfillClaim {
@@ -1406,6 +1514,15 @@ impl NativeSessions {
                 _slot: claim.slot,
             }
         };
+        self.publish_backfill(guard, blob, reader)
+    }
+
+    fn publish_backfill(
+        &self,
+        guard: BackfillUpload,
+        blob: BlobRef,
+        reader: impl Read,
+    ) -> Result<()> {
         let manifest = NativeStore::blob_retention_manifest(blob)?;
         let _reserved = self.store().reserve_tree_upload(&manifest)?;
         // Still verify the stream if concurrent publication supplied the same content.

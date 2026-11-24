@@ -2168,6 +2168,8 @@ pub mod scheduler {
                 max_concurrent_uploads: self.max_concurrent_uploads,
                 max_total_uploads: self.max_total_uploads,
                 max_manifest_cache_bytes: self.max_metadata_bytes,
+                peer_discovery_timeout: std::time::Duration::from_millis(25)
+                    .min(std::time::Duration::from_secs(self.idle_timeout_secs)),
             };
             limits.validate()?;
             self.space.validate()?;

@@ -270,6 +270,14 @@ pub mod urls {
         ))?)
     }
 
+    /// Build the authenticated native peer blob endpoint.
+    pub fn server_native_blob(server_id: ServerId) -> Result<reqwest::Url> {
+        Ok(reqwest::Url::parse(&format!(
+            "https://{}/api/v3/distserver/native_blob",
+            server_id.addr()
+        ))?)
+    }
+
     /// Build the native job execution endpoint.
     ///
     /// # Errors
@@ -343,7 +351,7 @@ mod server {
     use super::transport::{self, send_blocking};
     use super::urls;
     use crate::build_runtime::{
-        ContentId,
+        BlobRef, ContentId,
         wire::{ScheduleReply, WorkerAllocation},
     };
     use crate::dist::{
@@ -980,7 +988,22 @@ mod server {
         pub job_id: dist::JobId,
     }
 
-    // Generation and verification of job auth
+    // Separate claim schema: a job token cannot authorize a peer blob
+    // lookup, and a blob token authorizes only the exact digest and length.
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct BlobJwt {
+        exp: u64,
+        blob: BlobRef,
+    }
+
+    static BLOB_JWT_VALIDATION: LazyLock<jwt::Validation> = LazyLock::new(|| {
+        let mut validation = jwt::Validation::new(jwt::Algorithm::HS256);
+        validation.leeway = 0;
+        validation
+    });
+
+    // Generation and verification of worker capabilities
     struct JWTJobAuthorizer {
         encoding_key: jwt::EncodingKey,
         decoding_key: jwt::DecodingKey,
@@ -1019,6 +1042,68 @@ mod server {
                     }
                 })
         }
+
+        fn generate_blob_token(&self, blob: BlobRef) -> Result<String> {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            let exp = now
+                .checked_add(60)
+                .context("peer capability deadline overflow")?;
+            Ok(jwt::encode(
+                &JWT_HEADER,
+                &BlobJwt { exp, blob },
+                &self.encoding_key,
+            )?)
+        }
+
+        fn verify_blob_token(&self, blob: BlobRef, token: &str) -> Result<()> {
+            let claims =
+                jwt::decode::<BlobJwt>(token, &self.decoding_key, &BLOB_JWT_VALIDATION)?.claims;
+            anyhow::ensure!(claims.blob == blob, "mismatched peer blob capability");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn peer_blob_token_is_exact_and_distinct_from_job_token() -> Result<()> {
+        let authorizer = JWTJobAuthorizer::boxed(&[3; JWT_KEY_LENGTH])?;
+        let blob = BlobRef {
+            id: ContentId::of(b"data"),
+            size: 4,
+        };
+        let token = authorizer.generate_blob_token(blob)?;
+        authorizer.verify_blob_token(blob, &token)?;
+        assert!(
+            authorizer
+                .verify_blob_token(BlobRef { size: 5, ..blob }, &token)
+                .is_err()
+        );
+        assert!(
+            authorizer
+                .verify_blob_token(
+                    BlobRef {
+                        id: ContentId::of(b"else"),
+                        ..blob
+                    },
+                    &token
+                )
+                .is_err()
+        );
+        let job = JobId(17);
+        assert!(authorizer.verify_token(job, &token).is_err());
+        assert!(
+            authorizer
+                .verify_blob_token(blob, &authorizer.generate_token(job)?)
+                .is_err()
+        );
+        let expired = jwt::encode(
+            &JWT_HEADER,
+            &BlobJwt { exp: 1, blob },
+            &authorizer.encoding_key,
+        )?;
+        assert!(authorizer.verify_blob_token(blob, &expired).is_err());
+        Ok(())
     }
 
     #[test]
@@ -1096,6 +1181,9 @@ mod server {
                 let handler = Arc::clone(&handler);
                 let requester = Arc::clone(&requester);
                 let certs = Arc::clone(&server_certificates);
+                let peer_handler = Arc::clone(&handler);
+                let peer_certs = Arc::clone(&server_certificates);
+                let peer_http = native::PeerHttp::default();
                 native::spawn(
                     &config,
                     move |assignment| match handler
@@ -1123,6 +1211,24 @@ mod server {
                         AllocJobResult::Fail { msg } => {
                             Ok(ScheduleReply::Unavailable { message: msg })
                         }
+                    },
+                    move |blob, requester| {
+                        for source in peer_handler.native_blob_sources(blob, requester)? {
+                            let certificate = peer_certs
+                                .lock()
+                                .map_err(|_| anyhow!("server certificate mutex poisoned"))?
+                                .get(&source.server)
+                                .map(|entry| entry.1.clone());
+                            let Some(certificate) = certificate else {
+                                continue;
+                            };
+                            match peer_http.fetch(source, blob, &certificate) {
+                                Ok(Some(reader)) => return Ok(Some(reader)),
+                                Ok(None) => {}
+                                Err(error) => debug!("native peer lookup failed: {error:#}"),
+                            }
+                        }
+                        Ok(None)
                     },
                     Arc::clone(&check_client_auth),
                     Arc::clone(&check_server_auth),
@@ -1586,6 +1692,21 @@ mod server {
                         let assignment: NativeAssignment = try_or_400_log!(req_id, native::metadata(request, limit));
                         let res = try_or_500_log!(req_id, handler.handle_assign_native_job(job_id, assignment));
                         prepare_response(request, &res)
+                    },
+                    (POST) (/api/v3/distserver/native_blob) => {
+                        let blob: BlobRef = try_or_400_log!(req_id, native::metadata(request, 40));
+                        let Some(token) = bearer_http_auth(request) else {
+                            return rouille::Response::text("invalid peer capability").with_status_code(401);
+                        };
+                        if job_authorizer.verify_blob_token(blob, token).is_err() {
+                            return rouille::Response::text("invalid peer capability").with_status_code(401);
+                        }
+                        let file = try_or_500_log!(req_id, handler.handle_native_blob(blob));
+                        match file {
+                            Some(file) => try_or_500_log!(req_id, native::blob_response(file,
+                                request.header("X-Sccache-Accept-Blob-Codec") == Some("zstd"))),
+                            None => rouille::Response::empty_404(),
+                        }
                     },
                     (POST) (/api/v3/distserver/run_native_job/{job_id: JobId}) => {
                         job_auth_or_401!(request, &job_authorizer, job_id);

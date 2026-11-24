@@ -20,6 +20,7 @@ fn service(dir: &std::path::Path) -> Result<NativeSessions> {
             max_concurrent_uploads: 2,
             max_total_uploads: 4,
             max_manifest_cache_bytes: 1024 * 1024,
+            peer_discovery_timeout: Duration::ZERO,
         },
     )
 }
@@ -828,5 +829,107 @@ fn cancelled_source_releases_claim_to_another_live_origin() -> Result<()> {
         .download(tb, worker, blob.id)?
         .read_to_end(&mut actual)?;
     assert_eq!(actual, bytes);
+    Ok(())
+}
+
+#[test]
+fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
+    use crate::{TreeEntry, TreePath};
+    let directory = tempfile::tempdir()?;
+    let mut service = service(directory.path())?;
+    service.limits.peer_discovery_timeout = Duration::from_secs(1);
+    let root = empty_root().root;
+    let first = BlobRef {
+        id: ContentId::of(b"peer bytes"),
+        size: 10,
+    };
+    let second = BlobRef {
+        id: ContentId::of(b"origin bytes"),
+        size: 12,
+    };
+    let tree = TreeManifest {
+        root,
+        entries: BTreeMap::from([
+            (
+                TreePath::new(b"first".to_vec())?,
+                TreeEntry::File {
+                    blob: first,
+                    metadata: root,
+                },
+            ),
+            (
+                TreePath::new(b"second".to_vec())?,
+                TreeEntry::File {
+                    blob: second,
+                    metadata: root,
+                },
+            ),
+        ]),
+    };
+    let id = tree.id()?;
+    let mut spec = request()?;
+    spec.root = ExecutionRoot {
+        id,
+        recipe: TreeRecipe::union(root, [id]),
+    };
+    spec.input_trees = BTreeSet::from([id]);
+    let address = "127.0.0.1:10501".parse()?;
+    let worker = Publisher::Worker { address, job: 1 };
+    let NativeAdmission::Compile { ticket } = service.admit(
+        spec,
+        worker,
+        ActionMode::Reuse,
+        BTreeMap::from([(id, tree)]),
+    )?
+    else {
+        bail!("metadata-only admission failed");
+    };
+    let delivery = service.open_tree(id, worker, ticket)?.ticket;
+    service.request_inputs(delivery, worker, vec![first])?;
+    assert!(service.input_demands(ticket)?.is_empty());
+    let claim = service
+        .claim_peer_input(Duration::ZERO)?
+        .context("peer claim missing")?;
+    assert_eq!(claim.blob(), first);
+    assert_eq!(claim.requester(), address);
+    assert!(service.input_demands(ticket)?.is_empty());
+    assert!(service.claim_peer_input(Duration::ZERO)?.is_none());
+    service.publish_peer_input(claim, &b"peer bytes"[..])?;
+    let mut bytes = Vec::new();
+    service
+        .download(delivery, worker, first.id)?
+        .read_to_end(&mut bytes)?;
+    assert_eq!(bytes, b"peer bytes");
+    assert!(service.input_demands(ticket)?.is_empty());
+
+    service.request_inputs(delivery, worker, vec![second])?;
+    let claim = service
+        .claim_peer_input(Duration::ZERO)?
+        .context("peer claim missing")?;
+    assert_eq!(claim.blob(), second);
+    // A wrong peer payload must not become visible; the failed claim
+    // releases the same single flight to the origin.
+    assert!(
+        service
+            .publish_peer_input(claim, &b"wrong bytes!"[..])
+            .is_err()
+    );
+    assert!(service.store().open_available_blob(second)?.is_none());
+    assert_eq!(
+        service.input_demands(ticket)?,
+        vec![InputDemand {
+            tree: id,
+            blob: second
+        }]
+    );
+    service.backfill_input(ticket, second, &b"origin bytes"[..])?;
+    bytes.clear();
+    service
+        .download(delivery, worker, second.id)?
+        .read_to_end(&mut bytes)?;
+    assert_eq!(bytes, b"origin bytes");
+    assert_eq!(service.active_uploads.load(Ordering::Acquire), 0);
+    service.close(delivery, worker)?;
+    service.fail(ticket, worker)?;
     Ok(())
 }

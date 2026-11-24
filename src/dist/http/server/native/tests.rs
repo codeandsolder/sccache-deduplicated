@@ -70,6 +70,7 @@ fn limits() -> SessionLimits {
         max_concurrent_uploads: 2,
         max_total_uploads: 4,
         max_manifest_cache_bytes: 1024 * 1024,
+        peer_discovery_timeout: Duration::ZERO,
     }
 }
 

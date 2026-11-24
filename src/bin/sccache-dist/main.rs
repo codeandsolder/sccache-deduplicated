@@ -1205,6 +1205,47 @@ impl SchedulerIncoming for Scheduler {
         self.allocate_job(requester, JobAssignment::Native(Box::new(assignment)))
     }
 
+    fn native_blob_sources(
+        &self,
+        blob: sccache::build_runtime::BlobRef,
+        requester: std::net::SocketAddr,
+    ) -> Result<Vec<dist::NativeBlobSource>> {
+        let servers = self
+            .servers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
+        let mut candidates = servers
+            .iter()
+            .filter(|(id, details)| {
+                id.addr() != requester
+                    && details.last_seen.elapsed() < Duration::from_secs(20)
+                    && details.last_error.is_none()
+                    && details
+                        .capabilities
+                        .native_placement
+                        .as_ref()
+                        .and_then(|placement| placement.residency.as_ref())
+                        .is_some_and(|residency| residency.may_contain(blob.id))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by(|(a, left), (b, right)| {
+            right
+                .last_seen
+                .cmp(&left.last_seen)
+                .then_with(|| a.addr().cmp(&b.addr()))
+        });
+        candidates
+            .into_iter()
+            .take(2)
+            .map(|(&server, details)| {
+                Ok(dist::NativeBlobSource {
+                    server,
+                    token: details.job_authorizer.generate_blob_token(blob)?,
+                })
+            })
+            .collect()
+    }
+
     fn handle_heartbeat_server(
         &self,
         server_id: ServerId,
@@ -1770,6 +1811,24 @@ impl ServerIncoming for Server {
         }
     }
 
+    fn handle_native_blob(
+        &self,
+        blob: sccache::build_runtime::BlobRef,
+    ) -> Result<Option<std::fs::File>> {
+        #[cfg(target_os = "linux")]
+        {
+            self.native_worker
+                .as_ref()
+                .context("native worker unavailable")?
+                .open_blob(blob)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = blob;
+            Ok(None)
+        }
+    }
+
     fn handle_assign_native_job(
         &self,
         job_id: JobId,
@@ -2039,6 +2098,18 @@ mod scheduler_tests {
         fn verify_token(&self, _job_id: JobId, _token: &str) -> Result<()> {
             Ok(())
         }
+
+        fn generate_blob_token(&self, _blob: sccache::build_runtime::BlobRef) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn verify_blob_token(
+            &self,
+            _blob: sccache::build_runtime::BlobRef,
+            _token: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
     }
 
     fn register_test_server(scheduler: &Scheduler, server_id: ServerId, nonce: ServerNonce) {
@@ -2111,6 +2182,48 @@ mod scheduler_tests {
             native_eta_seconds(1.0, &queued, &fast, &inputs)
                 > native_eta_seconds(4.0, &empty, &fast, &inputs)
         );
+    }
+
+    #[test]
+    fn peer_blob_sources_exclude_requester_and_do_not_reserve_jobs() -> Result<()> {
+        use sccache::build_runtime::{BlobRef, BlobResidency, ContentId};
+        let scheduler = Scheduler::new();
+        let requester: ServerId = "127.0.0.1:10501".parse()?;
+        let peer: ServerId = "127.0.0.2:10501".parse()?;
+        let empty: ServerId = "127.0.0.3:10501".parse()?;
+        let blob = BlobRef {
+            id: ContentId::of(b"shared"),
+            size: 6,
+        };
+        for (server, resident) in [(requester, true), (peer, true), (empty, false)] {
+            let mut filter = BlobResidency::for_count(1).context("residency allocation")?;
+            if resident {
+                filter.insert(blob.id);
+            }
+            let placement = dist::NativePlacement {
+                residency: Some(filter),
+                ..Default::default()
+            };
+            scheduler.handle_heartbeat_server(
+                server,
+                ServerNonce::new(),
+                1.0,
+                &[],
+                Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities {
+                    archive: false,
+                    native_platform: Some(ContentId::of(server.addr().to_string().as_bytes())),
+                    native_placement: Some(placement),
+                },
+            )?;
+        }
+        let sources = scheduler.native_blob_sources(blob, requester.addr())?;
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].server, peer);
+        for server in [requester, peer, empty] {
+            assert_no_assigned_jobs(&scheduler, &server);
+        }
+        Ok(())
     }
 
     #[test]
@@ -2719,6 +2832,18 @@ mod scheduler_tests {
         }
 
         fn verify_token(&self, _job_id: JobId, _token: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn generate_blob_token(&self, _blob: sccache::build_runtime::BlobRef) -> Result<String> {
+            bail!("synthetic authorization failure")
+        }
+
+        fn verify_blob_token(
+            &self,
+            _blob: sccache::build_runtime::BlobRef,
+            _token: &str,
+        ) -> Result<()> {
             Ok(())
         }
     }

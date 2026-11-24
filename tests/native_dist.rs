@@ -159,6 +159,45 @@ fn fetch_status(
         .json()?)
 }
 
+fn native_worker_config(
+    root: &Path,
+    worker_address: SocketAddr,
+    scheduler_url: reqwest::Url,
+    cache_url: reqwest::Url,
+    platform: &str,
+    transfer: sccache::build_runtime::PackageTransferCost,
+) -> server::Config {
+    server::Config {
+        builder: server::BuilderType::Native,
+        cache_dir: None,
+        public_addr: worker_address,
+        bind_address: None,
+        scheduler_url: HTTPUrl::from_url(scheduler_url),
+        scheduler_auth: server::SchedulerAuth::Token {
+            token: WORKER_TOKEN.into(),
+        },
+        toolchain_cache_size: 0,
+        toolchain_archive_sources: Vec::new(),
+        native_worker: Some(server::NativeWorkerConfig {
+            cache_url: HTTPUrl::from_url(cache_url),
+            directory: root.join("worker-store"),
+            space: space(),
+            scratch: root.join("scratch"),
+            bubblewrap: "/usr/bin/bwrap".into(),
+            platform_contract: platform.into(),
+            renewal_interval_secs: 1,
+            request_timeout_secs: 60,
+            execution_timeout_secs: 120,
+            max_result_bytes: 64 * 1024 * 1024,
+            max_metadata_bytes: 64 * 1024 * 1024,
+            artifact_grace_secs: 300,
+            artifact_grace_bytes: None,
+            package_import: Some(package_limits(false)),
+            package_transfer: transfer,
+        }),
+    }
+}
+
 struct Fleet {
     worker: Process,
     scheduler: Process,
@@ -246,35 +285,14 @@ impl Fleet {
         let mut worker_process = Process::start(
             root,
             "server",
-            &server::Config {
-                builder: server::BuilderType::Native,
-                cache_dir: None,
-                public_addr: worker_address,
-                bind_address: None,
-                scheduler_url: HTTPUrl::from_url(scheduler_url.clone()),
-                scheduler_auth: server::SchedulerAuth::Token {
-                    token: WORKER_TOKEN.into(),
-                },
-                toolchain_cache_size: 0,
-                toolchain_archive_sources: Vec::new(),
-                native_worker: Some(server::NativeWorkerConfig {
-                    cache_url: HTTPUrl::from_url(cache_url.clone()),
-                    directory: worker_directory.clone(),
-                    space: space(),
-                    scratch: root.join("scratch"),
-                    bubblewrap: "/usr/bin/bwrap".into(),
-                    platform_contract: PLATFORM.into(),
-                    renewal_interval_secs: 1,
-                    request_timeout_secs: 60,
-                    execution_timeout_secs: 120,
-                    max_result_bytes: 64 * 1024 * 1024,
-                    max_metadata_bytes: 64 * 1024 * 1024,
-                    artifact_grace_secs: 300,
-                    artifact_grace_bytes: None,
-                    package_import: Some(package_limits(false)),
-                    package_transfer: transfer,
-                }),
-            },
+            &native_worker_config(
+                root,
+                worker_address,
+                scheduler_url.clone(),
+                cache_url.clone(),
+                PLATFORM,
+                transfer,
+            ),
         )?;
         wait_for(|| {
             scheduler_process.check()?;
@@ -293,6 +311,27 @@ impl Fleet {
             scheduler_url,
             http,
         })
+    }
+
+    fn start_peer(&self, root: &Path) -> Result<Process> {
+        let address = TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+        let mut peer = Process::start(
+            root,
+            "server",
+            &native_worker_config(
+                root,
+                address,
+                self.scheduler_url.clone(),
+                self.cache_url.clone(),
+                "native-integration-peer-only-platform",
+                sccache::build_runtime::PackageTransferCost::default(),
+            ),
+        )?;
+        wait_for(|| {
+            peer.check()?;
+            Ok(self.status().ok().filter(|status| status.num_servers == 2))
+        })?;
+        Ok(peer)
     }
 
     fn status(&self) -> Result<SchedulerStatusResult> {
@@ -1365,6 +1404,16 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
 #[test]
 #[ignore = "requires Linux Bubblewrap, GNU assembler and isolated scheduler/worker processes"]
 fn native_worker_only_inputs_survive_scheduler_eviction_and_restart() -> Result<()> {
+    run_worker_only_inputs(false)
+}
+
+#[test]
+#[ignore = "requires Linux Bubblewrap, GNU assembler and isolated scheduler/worker processes"]
+fn native_peer_only_input_is_recovered_without_origin_upload() -> Result<()> {
+    run_worker_only_inputs(true)
+}
+
+fn run_worker_only_inputs(peer_source: bool) -> Result<()> {
     use sccache::build_runtime::BlobRef;
 
     let temp = tempfile::tempdir()?;
@@ -1395,7 +1444,7 @@ fn native_worker_only_inputs_survive_scheduler_eviction_and_restart() -> Result<
     let mut mapping = MappedTree::new(root_tree.manifest().root);
     mapping.add_file(
         TreePath::new(b"input.s".to_vec())?,
-        input,
+        input.clone(),
         MappedMetadata::Preserve,
     )?;
     mapping.add_file(
@@ -1424,6 +1473,19 @@ fn native_worker_only_inputs_survive_scheduler_eviction_and_restart() -> Result<
             vec![store.stage_expected(present, &include[..])?],
         )?;
         assert!(store.lookup_tree(source_tree.id())?.is_none());
+    }
+    let peer_root = root.join("peer");
+    if peer_source {
+        fs::create_dir(&peer_root)?;
+        let store = NativeStore::open(&peer_root.join("worker-store"))?;
+        let retention = NativeStore::blob_retention_manifest(missing)?;
+        store.publish_tree(
+            &retention,
+            vec![store.stage_expected(missing, &assembly[..])?],
+        )?;
+        // The only accessible copy is on the non-compiling peer. Any attempt
+        // to request this input from the original provider must fail.
+        fs::remove_file(&input)?;
     }
     let mut spec = ExecutionSpec {
         platform: ContentId::of(PLATFORM.as_bytes()),
@@ -1481,6 +1543,11 @@ fn native_worker_only_inputs_survive_scheduler_eviction_and_restart() -> Result<
             fs::remove_file(&delivered)?;
         }
         let fleet = Fleet::start(root, BTreeMap::new())?;
+        let peer = if pass == 0 && peer_source {
+            Some(fleet.start_peer(&peer_root)?)
+        } else {
+            None
+        };
         let client = NativeCacheClient::new(
             fleet.cache_url.clone(),
             CLIENT_TOKEN.into(),
@@ -1494,6 +1561,7 @@ fn native_worker_only_inputs_survive_scheduler_eviction_and_restart() -> Result<
         );
         assert!(result.output.status.success());
         assert_eq!(fs::read(&delivered)?, fs::read(&reference)?);
+        drop(peer);
         fleet.finish()?;
         let scheduler = NativeStore::open(&root.join("scheduler-store"))?;
         for (&id, &size) in &worker_only {

@@ -133,6 +133,13 @@ impl NativeWorker {
         })
     }
 
+    pub(super) fn open_blob(
+        &self,
+        blob: sccache::build_runtime::BlobRef,
+    ) -> Result<Option<std::fs::File>> {
+        self.store.open_available_blob(blob)
+    }
+
     pub(super) fn placement(&self) -> NativePlacement {
         self.artifact_grace.reap();
         let timing = WorkerTiming {

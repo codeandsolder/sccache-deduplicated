@@ -494,6 +494,13 @@ impl ServerIncoming for FailingServer {
         None
     }
 
+    fn handle_native_blob(
+        &self,
+        _blob: sccache::build_runtime::BlobRef,
+    ) -> Result<Option<std::fs::File>> {
+        Ok(None)
+    }
+
     fn capabilities(&self) -> sccache::dist::WorkerCapabilities {
         sccache::dist::WorkerCapabilities::ARCHIVE
     }

@@ -1009,6 +1009,15 @@ pub trait ServerOutgoing {
 pub trait JobAuthorizer: Send {
     fn generate_token(&self, job_id: JobId) -> Result<String>;
     fn verify_token(&self, job_id: JobId, token: &str) -> Result<()>;
+    fn generate_blob_token(&self, blob: crate::build_runtime::BlobRef) -> Result<String>;
+    fn verify_blob_token(&self, blob: crate::build_runtime::BlobRef, token: &str) -> Result<()>;
+}
+
+/// A narrowly scoped peer-source capability; never log its token.
+#[cfg(feature = "dist-server")]
+pub struct NativeBlobSource {
+    pub server: ServerId,
+    pub token: String,
 }
 
 /// Scheduler-owned union of the verified input blobs in an admitted action.
@@ -1070,6 +1079,12 @@ pub trait SchedulerIncoming: Send + Sync {
         requester: &dyn SchedulerOutgoing,
         assignment: NativeAssignment,
     ) -> ExtResult<AllocJobResult, Error>;
+    /// Select likely sources for a missing exact blob without allocating a job.
+    fn native_blob_sources(
+        &self,
+        blob: crate::build_runtime::BlobRef,
+        requester: std::net::SocketAddr,
+    ) -> ExtResult<Vec<NativeBlobSource>, Error>;
     // From Server
     fn handle_heartbeat_server(
         &self,
@@ -1117,6 +1132,11 @@ pub trait ServerIncoming: Send + Sync {
     fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> ExtResult<AssignJobResult, Error>;
     fn capabilities(&self) -> WorkerCapabilities;
     fn native_metadata_limit(&self) -> Option<usize>;
+    /// Open an exact local CAS blob for an authenticated scheduler request.
+    fn handle_native_blob(
+        &self,
+        blob: crate::build_runtime::BlobRef,
+    ) -> ExtResult<Option<std::fs::File>, Error>;
     /// Accept an immutable native action assignment.
     ///
     /// # Errors

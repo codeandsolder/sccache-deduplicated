@@ -2,10 +2,10 @@
 //! ownership without running filesystem I/O on the scheduling request pool.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs::File,
     io::{Read, Seek, SeekFrom},
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread,
     time::Duration,
 };
@@ -18,9 +18,9 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::{ClientAuthCheck, ServerAuthenticator, authenticate_client, authenticate_server};
 use crate::{
     build_runtime::{
-        ActionMode, ArchiveLength, ExecutionSpec, NativeContentPending, NativeServiceBusy,
-        NativeSessions, NativeStore, PackageIdentity, PackageImportLimits, PackageSource, TreeId,
-        TreeManifest, VerifiedPackage,
+        ActionMode, ArchiveLength, BlobRef, ContentId, ExecutionSpec, NativeContentPending,
+        NativeServiceBusy, NativeSessions, NativeStore, PackageIdentity, PackageImportLimits,
+        PackageSource, TreeId, TreeManifest, VerifiedPackage,
         wire::{Publisher, ScheduleReply, UploadHeader},
     },
     config::scheduler::NativeCacheConfig,
@@ -98,6 +98,10 @@ impl PackageService {
 pub(super) fn spawn(
     config: &NativeCacheConfig,
     allocate: impl Fn(crate::dist::NativeAssignment) -> Result<ScheduleReply> + Send + Sync + 'static,
+    fetch_peer: impl Fn(BlobRef, std::net::SocketAddr) -> Result<Option<Box<dyn Read + Send>>>
+    + Send
+    + Sync
+    + 'static,
     client_auth: Arc<dyn ClientAuthCheck>,
     server_auth: Arc<ServerAuthenticator>,
 ) -> Result<()> {
@@ -107,6 +111,36 @@ pub(super) fn spawn(
         limits,
     )?);
     let maintenance = Arc::downgrade(&sessions);
+    let fetch_peer = Arc::new(fetch_peer);
+    // Keep source acquisition bounded separately from compiler execution
+    // and leave capacity for originating-client uploads.
+    let peer_threads = config.max_total_uploads.saturating_sub(1).min(4).max(1);
+    for index in 0..peer_threads {
+        let sessions = Arc::downgrade(&sessions);
+        let fetch_peer = Arc::clone(&fetch_peer);
+        thread::Builder::new()
+            .name(format!("native-peer-backfill-{index}"))
+            .spawn(move || {
+                while let Some(sessions) = sessions.upgrade() {
+                    match sessions.claim_peer_input(Duration::from_millis(100)) {
+                        Ok(Some(claim)) => match fetch_peer(claim.blob(), claim.requester()) {
+                            Ok(Some(reader)) => {
+                                if let Err(error) = sessions.publish_peer_input(claim, reader) {
+                                    debug!("native peer backfill failed: {error:#}");
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => debug!("native peer backfill unavailable: {error:#}"),
+                        },
+                        Ok(None) => {}
+                        Err(error) => {
+                            warn!("native peer claim failed: {error:#}");
+                            thread::sleep(Duration::from_millis(100));
+                        }
+                    }
+                }
+            })?;
+    }
     let metadata_limit = config.max_metadata_bytes;
     let packages = PackageService::new(config)?;
     let server = rouille::Server::new(config.public_addr, move |request| {
@@ -157,7 +191,7 @@ const PREFIX: &str = "/api/v2/native/";
 /// Compress only when a representative prefix wins comfortably. We keep the
 /// immutable digest-named files raw for mmap/materialization; this codec is
 /// solely a negotiated transfer representation.
-fn blob_response(mut file: File, accept_zstd: bool) -> Result<Response> {
+pub(super) fn blob_response(mut file: File, accept_zstd: bool) -> Result<Response> {
     const SAMPLE_SIZE: u64 = 128 * 1024;
     const MIN_COMPRESS_BYTES: u64 = 32 * 1024;
     if !accept_zstd || file.metadata()?.len() < MIN_COMPRESS_BYTES {
@@ -186,6 +220,79 @@ fn blob_response(mut file: File, accept_zstd: bool) -> Result<Response> {
         data: ResponseBody::from_reader(encoded),
         upgrade: None,
     })
+}
+
+/// Reuse TLS connections without broadening each peer's pinned trust root.
+#[derive(Default)]
+pub(super) struct PeerHttp {
+    clients: Mutex<HashMap<crate::dist::ServerId, (ContentId, reqwest::blocking::Client)>>,
+}
+
+impl PeerHttp {
+    fn client(
+        &self,
+        server: crate::dist::ServerId,
+        certificate: &[u8],
+    ) -> Result<reqwest::blocking::Client> {
+        let digest = ContentId::of(certificate);
+        let mut clients = self
+            .clients
+            .lock()
+            .map_err(|_| anyhow!("native peer HTTP cache poisoned"))?;
+        if let Some((saved, client)) = clients.get(&server)
+            && *saved == digest
+        {
+            return Ok(client.clone());
+        }
+        let certificate = reqwest::Certificate::from_pem(certificate)?;
+        let client = reqwest::blocking::Client::builder()
+            .tls_certs_only([certificate])
+            .connect_timeout(Duration::from_secs(1))
+            .redirect(reqwest::redirect::Policy::none())
+            .pool_max_idle_per_host(2)
+            .no_proxy()
+            .build()?;
+        // Bound stale worker connections across fleet churn. Current requests
+        // retain their own cloned clients and are unaffected.
+        if clients.len() >= 64 {
+            clients.clear();
+        }
+        clients.insert(server, (digest, client.clone()));
+        Ok(client)
+    }
+
+    /// Retrieve a blob from a specific worker using its exact-content
+    /// capability. A stale inventory hint is an ordinary miss.
+    pub(super) fn fetch(
+        &self,
+        source: crate::dist::NativeBlobSource,
+        blob: BlobRef,
+        certificate: &[u8],
+    ) -> Result<Option<Box<dyn Read + Send>>> {
+        // Bounded source probe: allow roughly 4 MiB/s plus setup time,
+        // with an absolute ceiling; a slow peer falls back to the origin.
+        let timeout = Duration::from_secs((2 + blob.size.div_ceil(4 * 1024 * 1024)).min(30));
+        let response = self
+            .client(source.server, certificate)?
+            .post(super::super::urls::server_native_blob(source.server)?)
+            .timeout(timeout)
+            .bearer_auth(source.token)
+            .header("Content-Type", "application/octet-stream")
+            .header("X-Sccache-Accept-Blob-Codec", "zstd")
+            .body(codec().serialize(&blob)?)
+            .send()?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let response = response.error_for_status()?;
+        match response.headers().get("X-Sccache-Blob-Codec") {
+            None => Ok(Some(Box::new(response))),
+            Some(codec) if codec.as_bytes() == b"zstd" => {
+                Ok(Some(Box::new(zstd::stream::read::Decoder::new(response)?)))
+            }
+            Some(other) => anyhow::bail!("unsupported peer blob codec: {other:?}"),
+        }
+    }
 }
 
 fn respond(
