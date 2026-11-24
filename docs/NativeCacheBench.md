@@ -21,7 +21,8 @@ CAS roots and never changes ARC limits, ZFS settings, or production services.
 
 The benchmark captures the **real installed Clang ELF executable and 15+
 dynamic loader/library dependencies**, then compiles a generated C
-translation unit including 384 separate headers with
+translation unit including 384 separate headers and a generated header
+under src/aux/ with
 `clang -cc1 -O2 -emit-obj`. Every native output object is verified
 byte-for-byte against direct host Clang.
 
@@ -30,7 +31,7 @@ source variants differing only by a trailing comment. The changed source
 preserves the output bytes but changes the input-tree identity, exposing
 cache-reuse behavior on real action misses.
 
-Three source layouts are compared in rotated order:
+Three source-only layouts are compared in rotated order:
 
 1. One newly composed root containing compiler, libraries, all headers and
    the changed source file. This matches the current compiler frontend's
@@ -41,6 +42,13 @@ Three source layouts are compared in rotated order:
    mounted separately. The explicit `-I /src` include path preserves
    header resolution and the generated object remains byte-identical.
 
+A fourth, structural-churn case uses the normal unpartitioned action root,
+but changes src/aux/selected.h from a regular file to a symlink to a newly
+added candidate-N.h. Every candidate contains identical header bytes and
+Clang actually resolves the include. This tests real file additions, symlink
+replacement and different whole-tree identities, not just repeated-root
+reuse. Compare unique-root-structural against unique-root on the same backend.
+
 Output includes wall time, CAS import time, source identity, and per-run
 global ARC hit/miss and memory counters. The benchmark deliberately does
 not include scheduler/network transfer latency.
@@ -48,9 +56,17 @@ not include scheduler/network transfer latency.
 ## Interpretation
 
 Warm identical-root timing does not predict normal cache misses because
-an unchanged action should already be a cache hit. A source-only change can
-invalidate the current immutable-view cache, which is keyed by complete
-`TreeId`. Global ARC counters do not attribute demand to the
+an unchanged action should already be a cache hit.
+The native worker now reuses unchanged cached views across distinct root
+identities by binding changed regular files privately, or by binding a
+complete small changed directory for additions, removals and changed symlinks.
+Large or unsafe cross-boundary changes still fall back to full views. The
+ordinary distinct-root benchmark is therefore a valid measurement of this
+reuse path rather than necessarily re-materializing the whole tree. The
+action identity always binds every source manifest, regardless of the chosen
+physical view.
+
+Global ARC counters do not attribute demand to the
 individual job, and non-ZFS tmpfs/FUSE measurements do not generalize to
 disk-backed ext4/XFS. First execution is subject to dynamic loader cold
 pages, ZFS TXG work, and competing host activity.
@@ -61,5 +77,6 @@ datasets/test hosts; never globally flush ARC on an active worker.
 See merged [PR #416](https://github.com/codeandsolder/sccache-deduplicated/pull/416)
 for the storage policy, [issue #432](https://github.com/codeandsolder/sccache-deduplicated/issues/432)
 for general immutable subtree reuse, and the
-[Notion experiment log](https://app.notion.com/p/422f74be9020815ca210d49c64a216ed)
+[original compiler experiment](https://app.notion.com/p/422f74be9020815ca210d49c64a216ed)
+and [directory-overlay verification log](https://app.notion.com/p/422f74be902081c992c2dadb81bf5330)
 for current measurements and methods.

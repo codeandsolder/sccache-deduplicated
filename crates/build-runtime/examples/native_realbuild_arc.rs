@@ -74,6 +74,15 @@ mod linux {
                 ),
             )?;
         }
+        // A stable generated include is also used in the structural-delta
+        // benchmark below. Replacing it with a symlink to byte-identical
+        // generated headers must leave the compiled object unchanged.
+        fs::create_dir_all(root.join("src/aux"))?;
+        fs::write(
+            root.join("src/aux/selected.h"),
+            b"/* generated stable header */\n",
+        )?;
+        source.push_str("#include \"aux/selected.h\"\n");
         source.push_str("unsigned compiled_kernel(unsigned seed) { unsigned v = seed;\n");
         for index in 0..HEADER_COUNT {
             writeln!(source, "v = mix_{index}(v);")?;
@@ -252,6 +261,7 @@ mod linux {
         }
 
         run_variants(&store, &tree, root, &spec, &policy, reference)?;
+        run_structural_variants(&store, &tree, &spec, &policy, reference)?;
         Ok(())
     }
 
@@ -404,6 +414,63 @@ mod linux {
                 let (label, command) = runs[(offset + index) % runs.len()];
                 run_once(label, index, command, store, policy, reference)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Exercise the normal whole-root action planner with changes to the
+    /// contents *and topology* of a small generated-header directory. Clang
+    /// actually reads the symlinked header, and every resulting object must
+    /// be byte-identical to direct host Clang.
+    fn run_structural_variants(
+        store: &NativeStore,
+        tree: &sccache_build::TreeLease,
+        spec: &ExecutionSpec,
+        policy: &ExecutionPolicy,
+        reference: &[u8],
+    ) -> Result<()> {
+        let selected = TreePath::new(b"src/aux/selected.h".to_vec())?;
+        let TreeEntry::File { metadata, .. } = tree
+            .manifest()
+            .entries
+            .get(&selected)
+            .context("generated header missing")?
+        else {
+            anyhow::bail!("expected a regular generated benchmark header");
+        };
+        let original = tree
+            .manifest()
+            .entries
+            .get(&selected)
+            .context("original header unavailable")?
+            .clone();
+        // Refresh this base view so structural variants do not inherit
+        // eviction state from the earlier source-only benchmark.
+        run_once("structural-baseline", 0, spec, store, policy, reference)?;
+        for iteration in 0..REPETITIONS {
+            let mut variant = tree.manifest().clone();
+            let filename = format!("candidate-{iteration}.h");
+            let extra_path = TreePath::new([b"src/aux/".as_slice(), filename.as_bytes()].concat())?;
+            variant.entries.insert(extra_path, original.clone());
+            variant.entries.insert(
+                selected.clone(),
+                TreeEntry::Symlink {
+                    target: filename.into_bytes(),
+                    modified: metadata.modified,
+                },
+            );
+            let id = store.publish_tree(&variant, vec![])?;
+            let recipe = TreeRecipe::union(spec.root.recipe.directories, [id]);
+            let composed = store.lease_recipe(&recipe)?.id();
+            let command = compile_spec(composed, recipe, policy.platform)?;
+            run_once(
+                "unique-root-structural",
+                iteration,
+                &command,
+                store,
+                policy,
+                reference,
+            )?;
         }
         Ok(())
     }

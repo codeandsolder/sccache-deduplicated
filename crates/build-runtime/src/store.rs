@@ -532,28 +532,24 @@ impl MountCache {
             .entries
             .iter()
             .filter_map(|(&id, view)| {
-                let changed = trees::compatible_regular_file_overlays(
-                    view.manifest(),
-                    lease.manifest(),
-                    protected,
-                )?;
-                // Per-file bind mounts and private clones have a cost too:
-                // only use the fast path when more entries are preserved
-                // than replaced. This is a performance choice, not a
-                // correctness constraint.
-                (changed.len() < lease.manifest().entries.len() - changed.len())
-                    .then_some((id, changed))
+                let plan = trees::plan_overlays(view.manifest(), lease.manifest(), protected)?;
+                // Only reuse when the changed subtree is a minority of the
+                // target: avoid spawning extra bind mounts for nearly
+                // complete replacements.
+                (plan.materialized_entries < lease.manifest().entries.len().div_ceil(2))
+                    .then_some((id, plan))
             })
-            .min_by_key(|(id, changed)| (changed.len(), *id));
-        if let Some((base_id, changed)) = best {
+            .min_by_key(|(id, plan)| (plan.materialized_entries, *id));
+        if let Some((base_id, plan)) = best {
             let view = Arc::clone(&self.entries[&base_id]);
             let mut mounted = trees::MountedTree::from_view(view, scratch)?;
-            let overlay = lease.materialize_overlays(&changed, scratch)?;
+            let overlay = lease.materialize_overlays(&plan, scratch)?;
             let stats = overlay.stats;
             mounted.attach_overlays(overlay);
             log::debug!(
-                "native CAS reused immutable tree {base_id:?} with {} file overlays, {} block clones, {} copied bytes",
-                changed.len(),
+                "native CAS reused immutable tree {base_id:?} with {} changed files, {} changed subtrees, {} block clones, {} copied bytes",
+                plan.files.len(),
+                plan.directories.len(),
                 stats.cloned_files,
                 stats.copied_bytes,
             );
