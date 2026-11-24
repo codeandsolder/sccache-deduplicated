@@ -17,17 +17,15 @@ use crate::compiler::args::{ArgDisposition, ArgInfo, FromArg, IntoArg};
 #[cfg(test)]
 use crate::compiler::c::ArtifactDescriptor;
 use crate::compiler::c::{
-    CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext, ParsedArguments,
+    CCompileCommands, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
+    ParsedArguments,
 };
 use crate::compiler::gcc::ArgData::{
     DepArgumentPath, DoCompilation, ExtraHashFile, Language as LanguageArg, NeedDepTarget,
     PassThrough, PreprocessorArgument, PreprocessorArgumentFlag, PreprocessorArgumentPath, TooHard,
     Unhashed, UnhashedFlag,
 };
-use crate::compiler::{
-    CCompileCommand, Cacheable, CompileCommand, CompileCommandImpl, CompilerArguments, Language,
-    cicc, gcc,
-};
+use crate::compiler::{Cacheable, CompileCommandImpl, CompilerArguments, Language, cicc, gcc};
 use crate::mock_command::{CommandCreatorSync, ExitStatusValue, RunCommand, exit_status};
 use crate::util::{resolve_compiler_avoiding_wrapper, run_input_output};
 use crate::{counted_array, dist, protocol, server};
@@ -82,6 +80,8 @@ pub struct Nvcc {
 
 #[async_trait]
 impl CCompilerImpl for Nvcc {
+    type LocalCommand = NvccCompileCommand;
+
     fn kind(&self) -> CCompilerKind {
         CCompilerKind::Nvcc
     }
@@ -267,29 +267,11 @@ impl CCompilerImpl for Nvcc {
         run_input_output(preprocessor_command(), None).await
     }
 
-    fn generate_compile_commands<T>(
+    fn generate_compile_commands(
         &self,
         context: CCompileContext<'_>,
-    ) -> Result<(
-        Box<dyn CompileCommand<T>>,
-        Option<dist::CompileCommand>,
-        Cacheable,
-    )>
-    where
-        T: CommandCreatorSync,
-    {
-        let CCompileContext {
-            executable,
-            parsed_args,
-            cwd,
-            env_vars,
-            ..
-        } = context;
-        generate_compile_commands(parsed_args, executable, cwd, env_vars, &self.host_compiler).map(
-            |(command, dist_command, cacheable)| {
-                (CCompileCommand::boxed(command), dist_command, cacheable)
-            },
-        )
+    ) -> CCompileCommands<Self::LocalCommand> {
+        generate_compile_commands(&context, &self.host_compiler)
     }
 }
 
@@ -347,12 +329,16 @@ fn effective_nvcc_threads(requested: usize, device_groups: usize) -> usize {
     reason = "NVCC expands one logical compile into an ordered multi-stage command graph; keeping stage construction contiguous makes dependencies visible"
 )]
 pub fn generate_compile_commands(
-    parsed_args: &ParsedArguments,
-    executable: &Path,
-    cwd: &Path,
-    env_vars: &[(OsString, OsString)],
+    context: &CCompileContext<'_>,
     host_compiler: &NvccHostCompiler,
-) -> Result<(NvccCompileCommand, Option<dist::CompileCommand>, Cacheable)> {
+) -> CCompileCommands<NvccCompileCommand> {
+    let CCompileContext {
+        parsed_args,
+        executable,
+        cwd,
+        env_vars,
+        ..
+    } = *context;
     let mut unhashed_args = parsed_args.unhashed_args.clone();
 
     let keep_dir = {
@@ -2532,10 +2518,15 @@ mod test {
 
             assert!(
                 generate_compile_commands(
-                    &parsed,
-                    Path::new("nvcc"),
-                    tempdir.path(),
-                    &[],
+                    &CCompileContext {
+                        path_transformer: &mut dist::PathTransformer::new(),
+                        executable: Path::new("nvcc"),
+                        parsed_args: &parsed,
+                        cwd: tempdir.path(),
+                        env_vars: &[],
+                        rewrite_includes_only: false,
+                        native_resolution: None,
+                    },
                     &NvccHostCompiler::Gcc,
                 )
                 .is_err(),

@@ -59,11 +59,13 @@ mod pkg {
     pub trait InputsPackager {}
 }
 
-#[cfg(target_os = "windows")]
 mod path_transform {
     use std::collections::HashMap;
-    use std::path::{Component, Components, Path, PathBuf, Prefix, PrefixComponent};
+    #[cfg(windows)]
+    use std::path::{Component, Components, Prefix, PrefixComponent};
+    use std::path::{Path, PathBuf};
 
+    #[cfg(windows)]
     fn take_prefix<'a>(components: &'a mut Components<'_>) -> Option<PrefixComponent<'a>> {
         let prefix = components.next()?;
         let pc = match prefix {
@@ -77,6 +79,7 @@ mod path_transform {
         Some(pc)
     }
 
+    #[cfg(windows)]
     fn transform_prefix_component(pc: PrefixComponent<'_>) -> Option<String> {
         match pc.kind() {
             // Transforming these to the same place means these may flip-flop
@@ -107,8 +110,9 @@ mod path_transform {
     }
 
     impl PathTransformer {
+        #[must_use = "the returned path transformer records paths for the distributed compilation"]
         pub fn new() -> Self {
-            PathTransformer {
+            Self {
                 dist_to_local_path: HashMap::new(),
                 root_mappings: Vec::new(),
             }
@@ -117,34 +121,49 @@ mod path_transform {
         pub fn add_root_mapping(&mut self, local_root: PathBuf, dist_root: &str) {
             debug_assert!(local_root.is_absolute());
             debug_assert!(dist_root.starts_with('/'));
-            self.root_mappings
-                .push((local_root, dist_root.trim_end_matches('/').to_owned()));
+            let root = dist_root.trim_end_matches('/');
+            let root = if root.is_empty() { "/" } else { root };
+            self.root_mappings.push((local_root, root.to_owned()));
             self.root_mappings
                 .sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
         }
+
         pub fn as_dist_abs(&mut self, p: &Path) -> Option<String> {
             if !p.is_absolute() {
                 return None;
             }
             self.as_dist(p)
         }
-        pub fn as_dist(&mut self, p: &Path) -> Option<String> {
-            if p.is_absolute() {
-                for (local_root, dist_root) in &self.root_mappings {
-                    if let Ok(suffix) = p.strip_prefix(local_root) {
-                        let suffix = suffix.to_str()?.replace('\\', "/");
-                        let dist_path = if suffix.is_empty() {
-                            dist_root.clone()
-                        } else {
-                            format!("{}/{}", dist_root, suffix)
-                        };
-                        self.dist_to_local_path
-                            .insert(dist_path.clone(), p.to_owned());
-                        return Some(dist_path);
-                    }
-                }
-            }
 
+        pub fn as_dist(&mut self, p: &Path) -> Option<String> {
+            let mapping = self
+                .root_mappings
+                .iter()
+                .find_map(|(local, dist)| p.strip_prefix(local).ok().map(|suffix| (dist, suffix)));
+            let dist_path = if let Some((root, suffix)) = mapping {
+                let suffix = suffix.to_str()?;
+                #[cfg(windows)]
+                let suffix = suffix.replace('\\', "/");
+                if suffix.is_empty() {
+                    root.clone()
+                } else {
+                    format!("{}/{suffix}", root.trim_end_matches('/'))
+                }
+            } else {
+                Self::encode_unmapped(p)?
+            };
+            self.dist_to_local_path
+                .insert(dist_path.clone(), p.to_owned());
+            Some(dist_path)
+        }
+
+        #[cfg(unix)]
+        fn encode_unmapped(p: &Path) -> Option<String> {
+            Some(p.to_str()?.to_owned())
+        }
+
+        #[cfg(windows)]
+        fn encode_unmapped(p: &Path) -> Option<String> {
             let mut components = p.components();
 
             // Extract the prefix (e.g. "C:/") if present
@@ -184,10 +203,9 @@ mod path_transform {
             } else {
                 dist_suffix
             };
-            self.dist_to_local_path
-                .insert(dist_path.clone(), p.to_owned());
             Some(dist_path)
         }
+        #[cfg(windows)]
         pub fn disk_mappings(&self) -> impl Iterator<Item = (PathBuf, String)> {
             let mut normal_mappings = HashMap::new();
             let mut verbatim_mappings = HashMap::new();
@@ -220,25 +238,53 @@ mod path_transform {
         }
 
         pub fn path_mappings(&self) -> impl Iterator<Item = (PathBuf, String)> + '_ {
-            self.root_mappings
-                .iter()
-                .cloned()
-                .chain(self.disk_mappings())
+            let mappings = self.root_mappings.iter().cloned();
+            #[cfg(windows)]
+            let mappings = mappings.chain(self.disk_mappings());
+            mappings
         }
 
-        /// Transform a distributed path back to its local Windows path.
+        /// Transform a distributed path back to its local path.
         ///
         /// # Errors
         ///
-        /// Returns an error when the distributed path has no recorded local mapping.
+        /// Returns an error for an embedded NUL, or on Windows when no local mapping exists.
         pub fn to_local(&self, p: &str) -> crate::errors::Result<PathBuf> {
-            self.dist_to_local_path
-                .get(p)
-                .cloned()
-                .ok_or_else(|| crate::errors::anyhow!("unknown distributed path: {p}"))
+            if p.as_bytes().contains(&0) {
+                return Err(crate::errors::anyhow!(
+                    "distributed path contains an embedded NUL"
+                ));
+            }
+            if let Some(local) = self.dist_to_local_path.get(p) {
+                return Ok(local.clone());
+            }
+            #[cfg(windows)]
+            return Err(crate::errors::anyhow!("unknown distributed path: {p}"));
+            #[cfg(unix)]
+            Ok(self.decode_unmapped(p))
+        }
+
+        #[cfg(unix)]
+        fn decode_unmapped(&self, p: &str) -> PathBuf {
+            let path = Path::new(p);
+            if let Some((local, suffix, _)) = self
+                .root_mappings
+                .iter()
+                .filter_map(|(local, dist)| {
+                    let root = Path::new(dist);
+                    path.strip_prefix(root)
+                        .ok()
+                        .map(|suffix| (local, suffix, root.components().count()))
+                })
+                .min_by_key(|(_, _, depth)| std::cmp::Reverse(*depth))
+            {
+                return local.join(suffix);
+            }
+            path.to_owned()
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_root_mapping() {
         let mut pt = PathTransformer::new();
@@ -262,6 +308,7 @@ mod path_transform {
         assert!(mappings.contains(&(PathBuf::from("C:/physical/project"), "/build".to_owned())));
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_basic() {
         let mut pt = PathTransformer::new();
@@ -294,6 +341,7 @@ mod path_transform {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_relative_paths() {
         let mut pt = PathTransformer::new();
@@ -302,6 +350,7 @@ mod path_transform {
         assert_eq!(pt.to_local("a/b").unwrap(), Path::new("a/b"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_verbatim_disks() {
         let mut pt = PathTransformer::new();
@@ -329,6 +378,7 @@ mod path_transform {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_slash_directions() {
         let mut pt = PathTransformer::new();
@@ -337,105 +387,7 @@ mod path_transform {
         assert_eq!(pt.to_local("/prefix/disk-C/a").unwrap(), Path::new("C:/a"));
         assert_eq!(pt.disk_mappings().count(), 1);
     }
-}
-
-#[cfg(unix)]
-mod path_transform {
-    use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
-
-    #[derive(Debug)]
-    pub struct PathTransformer {
-        dist_to_local_path: HashMap<String, PathBuf>,
-        root_mappings: Vec<(PathBuf, String)>,
-    }
-
-    impl Default for PathTransformer {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    impl PathTransformer {
-        #[must_use = "the returned path transformer records paths for the distributed compilation"]
-        pub fn new() -> Self {
-            Self {
-                dist_to_local_path: HashMap::new(),
-                root_mappings: Vec::new(),
-            }
-        }
-
-        pub fn add_root_mapping(&mut self, local_root: PathBuf, dist_root: &str) {
-            debug_assert!(local_root.is_absolute());
-            debug_assert!(dist_root.starts_with('/'));
-            self.root_mappings
-                .push((local_root, dist_root.trim_end_matches('/').to_owned()));
-            self.root_mappings
-                .sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
-        }
-
-        pub fn as_dist_abs(&mut self, p: &Path) -> Option<String> {
-            if !p.is_absolute() {
-                return None;
-            }
-            self.as_dist(p)
-        }
-
-        pub fn as_dist(&mut self, p: &Path) -> Option<String> {
-            if p.is_absolute() {
-                for (local_root, dist_root) in &self.root_mappings {
-                    if let Ok(suffix) = p.strip_prefix(local_root) {
-                        let suffix = suffix.to_str()?;
-                        let dist_path = if suffix.is_empty() {
-                            dist_root.clone()
-                        } else {
-                            format!("{dist_root}/{suffix}")
-                        };
-                        self.dist_to_local_path
-                            .insert(dist_path.clone(), p.to_owned());
-                        return Some(dist_path);
-                    }
-                }
-            }
-            let dist_path = p.as_os_str().to_str()?.to_owned();
-            self.dist_to_local_path
-                .insert(dist_path.clone(), p.to_owned());
-            Some(dist_path)
-        }
-
-        pub fn disk_mappings(&self) -> impl Iterator<Item = (PathBuf, String)> + '_ {
-            // Unix paths have no drive-prefix mappings. Keep the method shape
-            // aligned with Windows while returning an allocation-free empty iterator.
-            self.root_mappings.iter().take(0).cloned()
-        }
-
-        pub fn path_mappings(&self) -> impl Iterator<Item = (PathBuf, String)> + '_ {
-            self.root_mappings.iter().cloned()
-        }
-
-        /// Transform a distributed path back to its local Unix path.
-        ///
-        /// # Errors
-        ///
-        /// Returns an error when the path contains an embedded NUL byte.
-        pub fn to_local(&self, p: &str) -> crate::errors::Result<PathBuf> {
-            if p.as_bytes().contains(&0) {
-                return Err(crate::errors::anyhow!(
-                    "distributed path contains an embedded NUL"
-                ));
-            }
-            if let Some(local) = self.dist_to_local_path.get(p) {
-                return Ok(local.clone());
-            }
-            for (local_root, dist_root) in &self.root_mappings {
-                if let Ok(suffix) = Path::new(p).strip_prefix(dist_root) {
-                    return Ok(local_root.join(suffix));
-                }
-            }
-            Ok(PathBuf::from(p))
-        }
-    }
-
+    #[cfg(unix)]
     #[test]
     fn test_root_mapping() -> crate::errors::Result<()> {
         let mut pt = PathTransformer::new();
@@ -448,6 +400,53 @@ mod path_transform {
         assert_eq!(
             pt.to_local("/build/src/lib.rs")?,
             PathBuf::from("/physical/project/src/lib.rs")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_mapping_precedence_and_root() -> crate::errors::Result<()> {
+        let mut transformer = PathTransformer::new();
+        #[cfg(windows)]
+        let local = Path::new("C:/physical/project");
+        #[cfg(unix)]
+        let local = Path::new("/physical/project");
+
+        transformer.add_root_mapping(local.join("nested"), "/special/");
+        transformer.add_root_mapping(local.to_owned(), "/mapped");
+        assert_eq!(
+            transformer
+                .as_dist_abs(&local.join("nested/file"))
+                .as_deref(),
+            Some("/special/file")
+        );
+        assert_eq!(
+            transformer.to_local("/special/file")?,
+            local.join("nested/file")
+        );
+        assert_eq!(transformer.as_dist_abs(Path::new("relative")), None);
+        transformer.add_root_mapping(local.join("root"), "/");
+        assert_eq!(
+            transformer.as_dist_abs(&local.join("root")).as_deref(),
+            Some("/")
+        );
+        assert_eq!(
+            transformer.as_dist_abs(&local.join("root/file")).as_deref(),
+            Some("/file")
+        );
+        assert!(transformer.to_local("bad\0path").is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reverse_mapping_uses_distributed_precedence() -> crate::errors::Result<()> {
+        let mut transformer = PathTransformer::new();
+        transformer.add_root_mapping(PathBuf::from("/physical/deep/project"), "/mapped");
+        transformer.add_root_mapping(PathBuf::from("/other"), "/mapped/nested");
+        assert_eq!(
+            transformer.to_local("/mapped/nested/file")?,
+            PathBuf::from("/other/file")
         );
         Ok(())
     }

@@ -17,16 +17,18 @@ use crate::compiler::args::{
     NormalizedDisposition, PathTransformerFn,
 };
 use crate::compiler::c::{
-    ArtifactDescriptor, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
-    ParsedArguments,
+    ArtifactDescriptor, CCompileCommands, CCompileContext, CCompilerImpl, CCompilerKind,
+    CPreprocessContext, ParsedArguments,
 };
 use crate::compiler::{
-    CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
-    SingleCompileCommand, clang, gcc, write_temp_file,
+    Cacheable, ColorMode, CompilerArguments, Language, SingleCompileCommand, clang, gcc,
+    write_temp_file,
 };
+use crate::counted_array;
+#[cfg(any(feature = "dist-client", test))]
+use crate::dist;
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::{OsStrExt, encode_path, run_input_output};
-use crate::{counted_array, dist};
 use async_trait::async_trait;
 use fs::File;
 use fs_err as fs;
@@ -52,6 +54,8 @@ pub struct Msvc {
 
 #[async_trait]
 impl CCompilerImpl for Msvc {
+    type LocalCommand = SingleCompileCommand;
+
     fn kind(&self) -> CCompilerKind {
         CCompilerKind::Msvc
     }
@@ -100,30 +104,11 @@ impl CCompilerImpl for Msvc {
         .await
     }
 
-    fn generate_compile_commands<T>(
+    fn generate_compile_commands(
         &self,
         context: CCompileContext<'_>,
-    ) -> Result<(
-        Box<dyn CompileCommand<T>>,
-        Option<dist::CompileCommand>,
-        Cacheable,
-    )>
-    where
-        T: CommandCreatorSync,
-    {
-        let CCompileContext {
-            path_transformer,
-            executable,
-            parsed_args,
-            cwd,
-            env_vars,
-            ..
-        } = context;
-        generate_compile_commands(path_transformer, executable, parsed_args, cwd, env_vars).map(
-            |(command, dist_command, cacheable)| {
-                (CCompileCommand::boxed(command), dist_command, cacheable)
-            },
-        )
+    ) -> CCompileCommands<Self::LocalCommand> {
+        generate_compile_commands(context)
     }
 }
 
@@ -1160,19 +1145,10 @@ where
 }
 
 fn generate_compile_commands(
-    path_transformer: &mut dist::PathTransformer,
-    executable: &Path,
-    parsed_args: &ParsedArguments,
-    cwd: &Path,
-    env_vars: &[(OsString, OsString)],
-) -> Result<(
-    SingleCompileCommand,
-    Option<dist::CompileCommand>,
-    Cacheable,
-)> {
-    #[cfg(not(feature = "dist-client"))]
-    let _ = path_transformer;
-
+    context: CCompileContext<'_>,
+) -> CCompileCommands<SingleCompileCommand> {
+    let parsed_args = context.parsed_args;
+    let cwd = context.cwd;
     trace!("compile");
     let out_file = match parsed_args.outputs.get("obj") {
         Some(obj) => &obj.path,
@@ -1205,13 +1181,14 @@ fn generate_compile_commands(
         arguments.push("--".into());
     }
     arguments.push(parsed_args.input.clone().into());
-    let command = SingleCompileCommand {
-        executable: executable.to_owned(),
-        arguments,
-        env_vars: env_vars.to_owned(),
-        cwd: cwd.to_owned(),
-        share_jobserver: false,
-    };
+    let command = context.local_command(arguments);
+    #[cfg(feature = "dist-client")]
+    let CCompileContext {
+        path_transformer,
+        executable,
+        env_vars,
+        ..
+    } = context;
 
     #[cfg(not(feature = "dist-client"))]
     let dist_command = None;
@@ -1502,8 +1479,6 @@ mod test {
     use super::*;
     use crate::compiler::*;
     use crate::mock_command::*;
-    use crate::server;
-    use crate::test::mock_storage::MockStorage;
     use crate::test::utils::*;
 
     fn parse_arguments(arguments: Vec<OsString>) -> CompilerArguments<ParsedArguments> {
@@ -2749,63 +2724,47 @@ mod test {
         assert_eq!(cmd.args, expected_args);
     }
 
-    #[test]
-    fn test_compile_simple() {
-        let creator = new_creator();
+    #[test_case::test_case(false; "ordinary")]
+    #[test_case::test_case(true; "existing pdb")]
+    fn test_compile_simple(existing_pdb: bool) -> Result<()> {
         let f = TestFixture::new();
-        let parsed_args = ParsedArguments {
-            input: "foo.c".into(),
-            double_dash_input: false,
-            language: Language::C,
-            compilation_flag: "-c".into(),
-            depfile: None,
-            outputs: vec![(
-                "obj",
+        let mut parsed_args = ParsedArguments::test_compile("foo.c", "foo.obj", Language::C);
+        if existing_pdb {
+            parsed_args.compilation_flag = "/c".into();
+            parsed_args.outputs.insert(
+                "pdb",
                 ArtifactDescriptor {
-                    path: "foo.obj".into(),
+                    path: f.touch("foo.pdb")?,
                     optional: false,
                 },
-            )]
-            .into_iter()
-            .collect(),
-            dependency_args: vec![],
-            preprocessor_args: vec![],
-            common_args: vec![],
-            arch_args: vec![],
-            unhashed_args: vec![],
-            extra_dist_files: vec![],
-            extra_hash_files: vec![],
-            uses_external_assembler: false,
-            msvc_show_includes: false,
-            profile_generate: false,
-            color_mode: ColorMode::Auto,
-            suppress_rewrite_includes_only: false,
-            too_hard_for_preprocessor_cache_mode: None,
-        };
-        let runtime = single_threaded_runtime();
-        let storage = MockStorage::new(None, false);
-        let storage: std::sync::Arc<MockStorage> = std::sync::Arc::new(storage);
-        let service = server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
+            );
+        }
         let compiler = &f.bins[0];
-        // Compiler invocation.
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
         let mut path_transformer = dist::PathTransformer::new();
-        let (command, dist_command, cacheable) = generate_compile_commands(
-            &mut path_transformer,
-            compiler,
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-        )
+        let (command, dist_command, cacheable) = generate_compile_commands(CCompileContext {
+            path_transformer: &mut path_transformer,
+            executable: compiler,
+            parsed_args: &parsed_args,
+            cwd: f.tempdir.path(),
+            env_vars: &[],
+            rewrite_includes_only: false,
+            native_resolution: None,
+        })
         .unwrap();
         #[cfg(feature = "dist-client")]
         assert!(dist_command.is_some());
         #[cfg(not(feature = "dist-client"))]
         assert!(dist_command.is_none());
-        let _ = command.execute(&service, &creator).wait();
-        assert_eq!(Cacheable::Yes, cacheable);
-        // Ensure that we ran all processes.
-        assert_eq!(0, creator.lock().unwrap().children.len());
+        assert_compile_command_executes(&command)?;
+        assert_eq!(
+            if existing_pdb {
+                Cacheable::No
+            } else {
+                Cacheable::Yes
+            },
+            cacheable
+        );
+        Ok(())
     }
 
     #[test]
@@ -2818,85 +2777,18 @@ mod test {
         let f = TestFixture::new();
         let compiler = &f.bins[0];
         let mut path_transformer = dist::PathTransformer::new();
-        let (command, _, _) = generate_compile_commands(
-            &mut path_transformer,
-            compiler,
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-        )
+        let (command, _, _) = generate_compile_commands(CCompileContext {
+            path_transformer: &mut path_transformer,
+            executable: compiler,
+            parsed_args: &parsed_args,
+            cwd: f.tempdir.path(),
+            env_vars: &[],
+            rewrite_includes_only: false,
+            native_resolution: None,
+        })
         .unwrap();
         let expected_args = ovec!["-c", "-Fofoo.obj", "--", "foo.c"];
         assert_eq!(command.arguments, expected_args);
-    }
-
-    #[test]
-    fn test_compile_not_cacheable_pdb() {
-        let creator = new_creator();
-        let f = TestFixture::new();
-        let pdb = f.touch("foo.pdb").unwrap();
-        let parsed_args = ParsedArguments {
-            input: "foo.c".into(),
-            double_dash_input: false,
-            language: Language::C,
-            compilation_flag: "/c".into(),
-            depfile: None,
-            outputs: vec![
-                (
-                    "obj",
-                    ArtifactDescriptor {
-                        path: "foo.obj".into(),
-                        optional: false,
-                    },
-                ),
-                (
-                    "pdb",
-                    ArtifactDescriptor {
-                        path: pdb,
-                        optional: false,
-                    },
-                ),
-            ]
-            .into_iter()
-            .collect(),
-            dependency_args: vec![],
-            preprocessor_args: vec![],
-            common_args: vec![],
-            arch_args: vec![],
-            unhashed_args: vec![],
-            extra_dist_files: vec![],
-            extra_hash_files: vec![],
-            uses_external_assembler: false,
-            msvc_show_includes: false,
-            profile_generate: false,
-            color_mode: ColorMode::Auto,
-            suppress_rewrite_includes_only: false,
-            too_hard_for_preprocessor_cache_mode: None,
-        };
-        let runtime = single_threaded_runtime();
-        let storage = MockStorage::new(None, false);
-        let storage: std::sync::Arc<MockStorage> = std::sync::Arc::new(storage);
-        let service = server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
-        let compiler = &f.bins[0];
-        // Compiler invocation.
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
-        let mut path_transformer = dist::PathTransformer::new();
-        let (command, dist_command, cacheable) = generate_compile_commands(
-            &mut path_transformer,
-            compiler,
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-        )
-        .unwrap();
-        #[cfg(feature = "dist-client")]
-        assert!(dist_command.is_some());
-        #[cfg(not(feature = "dist-client"))]
-        assert!(dist_command.is_none());
-        let _ = command.execute(&service, &creator).wait();
-        assert_eq!(Cacheable::No, cacheable);
-        // Ensure that we ran all processes.
-        assert_eq!(0, creator.lock().unwrap().children.len());
     }
 
     #[test]
