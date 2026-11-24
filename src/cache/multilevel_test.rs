@@ -1109,6 +1109,57 @@ fn test_empty_levels_new() {
     assert!(location.contains('0'));
 }
 
+#[tokio::test]
+async fn multilevel_size_metrics_distinguish_known_zero_from_unavailable() -> Result<()> {
+    let dir = TempBuilder::new()
+        .prefix("sccache_multilevel_zero_size_")
+        .tempdir()?;
+    let zero_capacity = Arc::new(DiskCache::new(
+        &dir.path().join("zero"),
+        0,
+        &tokio::runtime::Handle::current(),
+        PreprocessorCacheModeConfig::default(),
+        CacheMode::ReadWrite,
+        vec![],
+    ));
+    let zero_usage = Arc::new(DiskCache::new(
+        &dir.path().join("empty"),
+        1024,
+        &tokio::runtime::Handle::current(),
+        PreprocessorCacheModeConfig::default(),
+        CacheMode::ReadWrite,
+        vec![],
+    ));
+    zero_usage.put_raw("empty", Bytes::new()).await?;
+    assert_eq!(zero_usage.current_size().await?, Some(0));
+
+    // None means the metric is unavailable; Some(0) is a known zero and
+    // must not be discarded just because the accumulator starts at zero.
+    let unknown = Arc::new(InMemoryStorage::new()) as Arc<dyn Storage>;
+    let sizes = MultiLevelStorage::new(vec![unknown.clone(), zero_capacity as Arc<dyn Storage>]);
+    assert_eq!(sizes.max_size().await?, Some(0));
+
+    let usage = MultiLevelStorage::new(vec![unknown.clone(), zero_usage as Arc<dyn Storage>]);
+    assert_eq!(usage.current_size().await?, Some(0));
+    assert_eq!(usage.max_size().await?, Some(1024));
+
+    let large = Arc::new(DiskCache::new(
+        &dir.path().join("large"),
+        u64::MAX,
+        &tokio::runtime::Handle::current(),
+        PreprocessorCacheModeConfig::default(),
+        CacheMode::ReadWrite,
+        vec![],
+    ));
+    let saturated = MultiLevelStorage::new(vec![large.clone(), large]);
+    assert_eq!(saturated.max_size().await?, Some(u64::MAX));
+
+    let unknown_only = MultiLevelStorage::new(vec![unknown]);
+    assert_eq!(unknown_only.current_size().await?, None);
+    assert_eq!(unknown_only.max_size().await?, None);
+    Ok(())
+}
+
 #[test]
 fn test_preprocessor_cache_methods() -> Result<()> {
     // Test get_preprocessor_cache_entry and put_preprocessor_cache_entry
@@ -1147,6 +1198,56 @@ fn test_preprocessor_cache_methods() -> Result<()> {
         Ok::<(), anyhow::Error>(())
     })?;
     Ok(())
+}
+
+#[test]
+fn preprocessor_cache_read_errors_fall_through_without_masking_total_misses() -> Result<()> {
+    let runtime = RuntimeBuilder::new_current_thread().enable_all().build()?;
+    let cache_root = TempBuilder::new()
+        .prefix("sccache_preprocessor_fallback_")
+        .tempdir()?;
+    let fallback = Arc::new(DiskCache::new(
+        &cache_root.path().join("cache"),
+        1024 * 1024,
+        runtime.handle(),
+        PreprocessorCacheModeConfig::activated(),
+        CacheMode::ReadWrite,
+        vec![],
+    ));
+
+    runtime.block_on(async {
+        let key = "preprocessor-cache-fallback-entry";
+        fallback
+            .put_preprocessor_cache_entry(key, PreprocessorCacheEntry::default())
+            .await?;
+        let storage = MultiLevelStorage::new(vec![
+            Arc::new(FailingStorage) as Arc<dyn Storage>,
+            fallback.clone() as Arc<dyn Storage>,
+        ]);
+
+        // A failed fast tier must not prevent retrieval from the slower tier.
+        assert!(storage.get_preprocessor_cache_entry(key).await?.is_some());
+        assert_eq!(storage.stats().0[0].read_errors, 1);
+
+        // When no healthy tier contains the entry, retain the earlier error
+        // instead of interpreting a backend outage as a genuine cache miss.
+        let Err(error) = storage.get_preprocessor_cache_entry("absent").await else {
+            panic!("cache backend error was incorrectly reported as a miss");
+        };
+        assert!(format!("{error:#}").contains("Intentional failure for testing"));
+        assert!(format!("{error:#}").contains("preprocessor cache level 0"));
+        assert_eq!(storage.stats().0[0].read_errors, 2);
+
+        // All healthy cache tiers missing the entry is a normal miss.
+        let healthy = MultiLevelStorage::new(vec![fallback as Arc<dyn Storage>]);
+        assert!(
+            healthy
+                .get_preprocessor_cache_entry("absent")
+                .await?
+                .is_none()
+        );
+        Ok::<(), anyhow::Error>(())
+    })
 }
 
 #[test]
@@ -1658,6 +1759,54 @@ fn test_put_mode_all_fails_on_any_error() -> Result<()> {
         );
         Ok::<(), anyhow::Error>(())
     })?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn all_required_writes_finish_before_reporting_another_tiers_failure() -> Result<()> {
+    let slow = Arc::new(SlowWriteStorage::new(Duration::from_millis(40)));
+    let storage = MultiLevelStorage::with_write_error_policy(
+        vec![
+            Arc::new(InMemoryStorage::new()) as Arc<dyn Storage>,
+            Arc::new(FailingStorage) as Arc<dyn Storage>,
+            slow.clone() as Arc<dyn Storage>,
+        ],
+        WriteErrorPolicy::All,
+    );
+    let error = storage
+        .put_raw("failed_and_slow", Bytes::from_static(b"payload"))
+        .await
+        .expect_err("a required tier failed");
+    assert!(error.to_string().contains("cache level 1"));
+    assert_eq!(
+        slow.writes.load(Ordering::SeqCst),
+        1,
+        "a successful slow tier must finish before the failure is returned"
+    );
+    assert_eq!(slow.in_flight.load(Ordering::SeqCst), 0);
+    assert_eq!(storage.stats().0[1].write_failures, 1);
+    assert_eq!(storage.stats().0[2].writes, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn required_write_reports_closed_slow_level_semaphore() -> Result<()> {
+    let slow = Arc::new(SlowWriteStorage::new(Duration::ZERO));
+    let storage = MultiLevelStorage::with_write_error_policy(
+        vec![
+            Arc::new(InMemoryStorage::new()) as Arc<dyn Storage>,
+            slow.clone() as Arc<dyn Storage>,
+        ],
+        WriteErrorPolicy::All,
+    );
+    storage.slow_level_semaphore.close();
+    let error = storage
+        .put_raw("closed_semaphore", Bytes::from_static(b"payload"))
+        .await
+        .expect_err("required semaphore acquisition failed");
+    assert!(error.to_string().contains("semaphore closed"));
+    assert_eq!(slow.writes.load(Ordering::SeqCst), 0);
+    assert_eq!(storage.stats().0[1].write_failures, 1);
     Ok(())
 }
 

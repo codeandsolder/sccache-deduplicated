@@ -47,11 +47,13 @@ impl fmt::Display for SocketAddr {
 impl SocketAddr {
     /// Get a Net address that with IP part set to "127.0.0.1".
     #[inline]
+    #[must_use = "returns the constructed address"]
     pub fn with_port(port: u16) -> Self {
         Self::Net(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
     }
 
     #[inline]
+    #[must_use = "returns the network address, if present"]
     pub const fn as_net(&self) -> Option<&std::net::SocketAddr> {
         match self {
             Self::Net(addr) => Some(addr),
@@ -63,6 +65,9 @@ impl SocketAddr {
     /// Parse a string as a unix domain socket.
     ///
     /// The string should follow the format of `self.to_string()`.
+    ///
+    /// # Errors
+    /// Returns an error for invalid escaped abstract socket names.
     #[cfg(unix)]
     pub fn parse_uds(s: &str) -> std::io::Result<Self> {
         // Parse abstract socket address first as it can contain any chars.
@@ -79,11 +84,13 @@ impl SocketAddr {
     }
 
     #[cfg(unix)]
+    #[must_use = "indicates whether the address is a Unix socket path"]
     pub const fn is_unix_path(&self) -> bool {
         matches!(self, Self::Unix(_))
     }
 
     #[cfg(not(unix))]
+    #[must_use = "indicates whether the address is a Unix socket path"]
     pub fn is_unix_path(&self) -> bool {
         false
     }
@@ -120,19 +127,28 @@ impl Acceptor for tokio::net::TcpListener {
 pub trait Connection: std::io::Read + std::io::Write + Send {
     fn try_clone(&self) -> std::io::Result<Box<dyn Connection>>;
     fn set_io_timeout(&self, timeout: std::time::Duration) -> std::io::Result<()>;
+    fn shutdown(&self) -> std::io::Result<()>;
 }
 
-impl Connection for std::net::TcpStream {
-    #[inline]
-    fn try_clone(&self) -> std::io::Result<Box<dyn Connection>> {
-        let stream = Self::try_clone(self)?;
-        Ok(Box::new(stream))
-    }
-    fn set_io_timeout(&self, timeout: std::time::Duration) -> std::io::Result<()> {
-        self.set_read_timeout(Some(timeout))?;
-        self.set_write_timeout(Some(timeout))
-    }
+macro_rules! impl_connection {
+    ($stream:ty) => {
+        impl Connection for $stream {
+            #[inline]
+            fn try_clone(&self) -> std::io::Result<Box<dyn Connection>> {
+                let stream = Self::try_clone(self)?;
+                Ok(Box::new(stream))
+            }
+            fn set_io_timeout(&self, timeout: std::time::Duration) -> std::io::Result<()> {
+                self.set_read_timeout(Some(timeout))?;
+                self.set_write_timeout(Some(timeout))
+            }
+            fn shutdown(&self) -> std::io::Result<()> {
+                Self::shutdown(self, std::net::Shutdown::Both)
+            }
+        }
+    };
 }
+impl_connection!(std::net::TcpStream);
 
 /// Report a failure to disable Nagle's algorithm on `stream`, which is not worth
 /// failing the connection over. Without it, the last segment of a message
@@ -195,15 +211,5 @@ mod unix_imp {
         }
     }
 
-    impl Connection for std::os::unix::net::UnixStream {
-        #[inline]
-        fn try_clone(&self) -> std::io::Result<Box<dyn Connection>> {
-            let stream = Self::try_clone(self)?;
-            Ok(Box::new(stream))
-        }
-        fn set_io_timeout(&self, timeout: std::time::Duration) -> std::io::Result<()> {
-            self.set_read_timeout(Some(timeout))?;
-            self.set_write_timeout(Some(timeout))
-        }
-    }
+    impl_connection!(std::os::unix::net::UnixStream);
 }

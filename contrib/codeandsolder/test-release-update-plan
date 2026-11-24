@@ -116,11 +116,11 @@ for literal in 'source contrib/codeandsolder/release-protocol.env' 'vendored-ope
     rg -Fq -- "$literal" "$publisher"
 done
 # Development pushes still run CI, but only an explicit operator action may
-# publish a new fleet release. A manual run must recheck both CI gates.
+# publish a new fleet release. A manual run must recheck all four CI gates.
 rg -q '^  workflow_dispatch:' "$publisher"
 if rg -q '^  workflow_run:' "$publisher"; then
     echo 'Fleet publisher must not run automatically after CI' >&2
     exit 1
 fi
-rg -Fq 'for workflow in ci.yml rust-skills2-strict.yml; do' "$publisher"
+rg -Fq 'for workflow in ci.yml rust-skills2-strict.yml clone-regression.yml dist-jwt-regression.yml; do' "$publisher"
 echo 'Release updater and publisher contract checks passed'

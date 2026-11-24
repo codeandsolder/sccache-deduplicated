@@ -26,6 +26,45 @@ records openssl_linkage=vendored-static. The older published protocol-v2
 canary e266a04e demonstrated why both checks matter: it passed GLIBC
 verification but required OpenSSL 4 on an OpenSSL 3 worker host.
 
+## Native CPU is the requesting host, not the worker
+
+For a compilation with `native` CPU or tuning settings, the requesting
+machine's **compiler-visible CPU profile** defines the output, even if the
+distributed scheduler chooses a different worker. Do not substitute the
+worker's CPU, and do not silently replace `native` with the oldest CPU in the
+fleet. Build artifacts intended for multiple machines should use an explicit,
+separately selected portable target, such as `x86-64-v2`.
+
+Rust `-C target-cpu=native` is resolved by the initiating rustc into an
+explicit baseline CPU and feature selection before dispatch, preserving masked
+CPU features in virtual machines; `-Z tune-cpu=native` uses the initiating
+host's tuning model. Native CPU identity also enters the Rust cache key.
+Where native resolution is unproven, the compilation remains local.
+
+For GCC and Clang, the initiating compiler's `-###` frontend expansion is
+used to resolve the **complete final CPU target state**, including named CPU
+options, ISA feature masks and tuning options interleaved with `native`.
+The compiler-specific target flags are shipped explicitly in the distributed
+compile command, without an unresolved `native`. The original local command
+retains the user-provided options. The native-specific cache supplement hashes
+the initiating compiler's **complete observed frontend invocation**, including
+its compilation directory: debug information can depend on that path even
+when the preprocessed source is identical. The driver probe uses the actual
+source language (including C++/Objective-C++) and requesting working directory
+to preserve frontend options and relative driver paths.
+Clang's cc1 target-feature settings are forwarded after the normal options to
+preserve precedence of explicit `-mno-*` flags; GCC receives its observed
+`-m*` options and cache-size parameters. If the
+compiler cannot resolve or expose its native frontend settings, sccache does
+not distribute an unproven native request or store it in the cache.
+The worker's own detection must never decide codegen for the initiator's
+`native` request. Sandboxed `/proc/cpuinfo` spoofing is not used: CPUID
+and other hardware probes would disagree.
+
+For deliberate builds targeting another machine, use the explicit destination
+CPU profile exporter in `tools/cpu-target-profile`; this is distinct from
+the implicit `native` CPU at the compilation request's origin.
+
 ## Distributed compression backend
 
 Input transport uses the direct fallible zlib-rs-fast streaming API.
@@ -82,17 +121,18 @@ The HTTP implementation of sccache has the following API, where all HTTP body co
       - Called by a client to retrieve the (dynamically created) HTTPS
         certificate for a server, for use in communication with that server.
       - Returns a digest and PEM for the temporary server HTTPS certificate.
-   - `POST /api/v1/scheduler/heartbeat_server`
+   - `POST /api/v4/scheduler/heartbeat_server`
       - Called (repeatedly) by servers to register as available for jobs.
       - Every five seconds, advertises fractional effective CPU capacity from
         host idle CPU time plus the worker's currently executing jobs (capped
-        at the available CPU count). The scheduler subtracts all outstanding
-        assignments, including in-flight reservations, and randomly selects
-        a healthy worker with weight max(0, effective CPUs - assigned jobs) + 0.5.
-        Even a fully busy worker remains eligible unless its admission limit
-        is reached; there is no separate queue-slot draw. The previous busy
-        cutoff and re-enable delay are removed.
-      - Includes active `run_job` IDs. A `Started` job absent for a full
+        at the available CPU count). Admission counts assignments still
+        requiring compiler capacity, including newly reserved jobs not yet
+        visible in the heartbeat; native publication and terminal replies
+        use separate bounded dispatcher capacity. Legacy selection weights
+        healthy workers by remaining compiler capacity. Native selection
+        predicts staging, execution and publication completion from the
+        queue snapshot and measured transfer costs (see NativeCache.md).
+      - Includes active legacy `run_job` IDs and native dispatcher phases. A `Started` job absent for a full
         heartbeat timeout is released, while long compilations remain
         assigned as long as the worker reports them running.
       - The response includes the scheduler's assigned-job IDs, including

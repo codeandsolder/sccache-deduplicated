@@ -28,6 +28,7 @@ mod test;
 #[macro_use]
 pub mod errors;
 
+pub use sccache_build as build_runtime;
 pub mod cache;
 mod client;
 mod cmdline;
@@ -60,6 +61,9 @@ pub static BUILD_CAPABILITIES: &[&str] = &[
     #[cfg(feature = "direct-metrics")]
     telemetry::CAPABILITY,
 ];
+// For benches/preprocessor_cache_bench.rs.
+#[doc(hidden)]
+pub use compiler::PreprocessorCacheEntry;
 
 use std::env;
 

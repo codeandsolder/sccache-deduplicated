@@ -109,6 +109,10 @@ pub(super) struct TransferSession {
     reservations: std::sync::Arc<ToolchainReservations>,
     #[cfg(feature = "dist-client")]
     reservation: Option<Reservation>,
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    native: Option<std::sync::Arc<crate::compiler::NativeCompilerClient>>,
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    native_exchange: Option<crate::dist::native::broker::NativeExchange>,
 }
 
 impl TransferSession {
@@ -129,7 +133,35 @@ impl TransferSession {
             reservations,
             #[cfg(feature = "dist-client")]
             reservation: None,
+            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+            native: None,
+            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+            native_exchange: None,
         }
+    }
+
+    pub(super) const fn request_budget(
+        &self,
+        request: &super::SccacheRequest,
+        limits: super::activity::CompileLimits,
+    ) -> std::time::Duration {
+        #[cfg(feature = "dist-client")]
+        if matches!(
+            (&self.state, request),
+            (
+                Transfer::Upload {
+                    kind: UploadKind::Run { .. },
+                    ..
+                },
+                super::Message::WithoutBody(crate::protocol::Request::Transfer(
+                    TransferRequest::FinishWrite
+                ))
+            )
+        ) {
+            return limits.budget(super::activity::Phase::RunDistributed);
+        }
+        let _ = request;
+        limits.budget(super::activity::Phase::IdentifyToolchain)
     }
 
     pub(super) const fn chunk_bytes(&self) -> usize {
@@ -143,6 +175,14 @@ impl TransferSession {
         #[cfg(feature = "dist-client")]
         {
             // Only the daemon initializes scheduler credentials and connections.
+            #[cfg(target_os = "linux")]
+            {
+                self.native.clone_from(&client.native);
+                if self.native.is_some() {
+                    self.dist = None;
+                    return None;
+                }
+            }
             self.dist = match client.get_client().await {
                 Ok(client) => client,
                 Err(error) => {
@@ -161,6 +201,73 @@ impl TransferSession {
         }
     }
 
+    pub(super) fn native_policy(&self) -> Option<crate::protocol::NativeNamespacePolicy> {
+        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+        {
+            self.native
+                .as_ref()
+                .map(|client| client.namespace_policy().clone())
+        }
+        #[cfg(not(all(feature = "dist-client", target_os = "linux")))]
+        {
+            None
+        }
+    }
+
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    async fn handle_native(&mut self, request: TransferRequest) -> Result<TransferReply> {
+        use crate::dist::native::broker::NativeExchange;
+        use std::time::Duration;
+
+        match request {
+            TransferRequest::NativeStart => {
+                ensure!(
+                    matches!(self.state, Transfer::Idle) && self.native_exchange.is_none(),
+                    "native action already active"
+                );
+                let client = self
+                    .native
+                    .clone()
+                    .context("native namespace handshake required")?;
+                let timeout = Duration::from_secs(client.namespace_policy().build_timeout_secs);
+                self.native_exchange = Some(NativeExchange::start(
+                    self.chunk_bytes,
+                    timeout,
+                    move |stream| client.serve_namespace(stream),
+                )?);
+                Ok(TransferReply::Ack)
+            }
+            TransferRequest::NativeWrite(bytes) => {
+                self.native_exchange
+                    .as_mut()
+                    .context("no native action active")?
+                    .write(bytes)
+                    .await?;
+                Ok(TransferReply::Ack)
+            }
+            TransferRequest::NativeRead => Ok(TransferReply::Chunk(
+                self.native_exchange
+                    .as_mut()
+                    .context("no native action active")?
+                    .read()
+                    .await?,
+            )),
+            TransferRequest::NativeEnd => {
+                self.native_exchange
+                    .take()
+                    .context("no native action active")?
+                    .finish()
+                    .await?;
+                Ok(TransferReply::Ack)
+            }
+            TransferRequest::Abort => {
+                self.abort();
+                Ok(TransferReply::Ack)
+            }
+            _ => bail!("legacy transfers unavailable in native namespace mode"),
+        }
+    }
+
     pub(super) async fn handle(
         &mut self,
         request: TransferRequest,
@@ -175,6 +282,10 @@ impl TransferSession {
 
     fn abort(&mut self) {
         self.state = Transfer::Idle;
+        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+        {
+            self.native_exchange = None;
+        }
         #[cfg(feature = "dist-client")]
         {
             self.reservation = None;
@@ -298,6 +409,10 @@ impl TransferSession {
             self.chunk_bytes > 0,
             "IPC frame limit is too small for namespace transfers"
         );
+        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+        if self.native.is_some() {
+            return self.handle_native(request).await;
+        }
         match request {
             TransferRequest::Read { kind, key } => {
                 validate_storage_key(&key)?;
@@ -517,6 +632,11 @@ struct FileInputs(std::fs::File);
 
 #[cfg(feature = "dist-client")]
 impl crate::dist::pkg::InputsPackager for FileInputs {
+    #[cfg(target_os = "linux")]
+    fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
+        bail!("namespace archive transport cannot supply a native input mapping")
+    }
+
     fn write_inputs(mut self: Box<Self>, output: &mut dyn std::io::Write) -> Result<()> {
         std::io::copy(&mut self.0, output)?;
         Ok(())
@@ -647,11 +767,8 @@ mod tests {
             let expected = data.clone();
             let key_copy = key.clone();
             let other_copy = other.clone();
-            let client = tokio::task::spawn_blocking(move || -> Result<IpcStorage> {
-                let socket = std::net::TcpStream::connect(addr)?;
-                IpcStorage::connect(ServerConnection::new(Box::new(socket))?)
-            })
-            .await??;
+            let socket = std::net::TcpStream::connect(addr)?;
+            let client = IpcStorage::connect(ServerConnection::new(Box::new(socket))?).await?;
             assert!(client.get_raw(&key).await?.is_none());
             client.put_raw(&key, data.into()).await?;
             assert_eq!(

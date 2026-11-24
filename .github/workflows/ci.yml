@@ -91,6 +91,7 @@ jobs:
         if: always()
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
 
+
   host_tools:
     runs-on: ubuntu-latest
     steps:
@@ -288,11 +289,18 @@ jobs:
         # bwrap, just like the managed Linux hosts.
         command -v bwrap
         [[ "$(bwrap --help)" == *--overlay-src* ]]
-        # Ubuntu 24.04's AppArmor profile blocks unprivileged user namespaces
-        # by default. The ephemeral CI VM permits this setting via sudo;
-        # canonical Rust's bwrap sandbox requires a user namespace to run.
+        # This disposable test VM must permit nested mount namespaces: the
+        # networkless caller creates its own overlay for Rust's local link.
+        # Ubuntu 26.04's bwrap-userns-restrict profile denies nested namespace
+        # creation independently of the global unprivileged-userns sysctl.
+        # Do not change this policy on managed production hosts.
         sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-        bwrap --ro-bind / / --proc /proc --dev-bind /dev /dev -- /usr/bin/true
+        profile=/etc/apparmor.d/bwrap-userns-restrict
+        if [ -f "$profile" ]; then
+          sudo apparmor_parser -R "$profile"
+        fi
+        bwrap --unshare-net --ro-bind / / --proc /proc --dev-bind /dev /dev -- \
+          bwrap --ro-bind / / --dev-bind /dev /dev -- /usr/bin/true
         # Compile with the canonical CI sccache daemon on its isolated Unix socket.
         # Run test executables without that socket variable: the sccache system
         # tests must manage their own independent test daemon.
@@ -301,11 +309,15 @@ jobs:
         chmod +x "$test_runner"
         export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$test_runner"
         cargo test --locked --target x86_64-unknown-linux-gnu --lib --bins --tests
-        # Default features do not include dist-server, so the preceding command
-        # never executes the scheduler/worker binary tests. Run them explicitly
-        # to retain process-to-job/OOM telemetry regressions on each PR.
+        cargo test --locked --target x86_64-unknown-linux-gnu -p sccache-build -- --include-ignored --skip benchmark_native_zfs_clones_against_reuse --skip benchmark_native_zfs_clones_against_fuse_views
+        cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-client,dist-server --test native_dist -- --include-ignored
+        # The default feature set omits dist-server: explicitly run all
+        # scheduler/worker binary tests, including job resource telemetry.
         cargo test --locked --target x86_64-unknown-linux-gnu \
           --no-default-features --features=dist-server --bin sccache-dist
+        # Reuse the already-initialized mandatory sccache for the standalone
+        # destination-profile tests. Strict compiler lints run in rust-skills2.
+        cargo test --locked --manifest-path tools/cpu-target-profile/Cargo.toml
       rust-toolchain: "nightly-2026-11-22"
       rustflags: "-C target-cpu=x86-64-v2"
 
@@ -335,7 +347,7 @@ jobs:
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@d168449633a47de6c0166f0c0cff903e96983820 # main
 
   ci-bundle-release-profile:
-    name: CI bundle release profile (Rust nightly-2026-11-22)
+    name: CI bundle release profile (publisher toolchain)
     # Reuse shared sccache setup, and check the exact pinned publisher features
     # on every PR and main push (not only tag builds).
     permissions:
@@ -343,12 +355,14 @@ jobs:
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
     with:
       isolate-public-sccache-server: true
-      rust-toolchain: "nightly-2026-11-22"
+      rust-toolchain: "nightly-2026-11-20"
       rustflags: "-C target-cpu=x86-64-v2"
-      command: >-
-        cargo check --release --locked --no-default-features
-        --features s3,gha,dist-client,dist-server,direct-metrics,vendored-openssl
-        --bin sccache --bin sccache-dist
+      command: |
+        source contrib/codeandsolder/release-protocol.env
+        test "$(rustc -V)" = "$(rustc +"$rust_toolchain" -V)"
+        cargo check --release --locked --no-default-features \
+          --features s3,gha,dist-client,dist-server,direct-metrics,vendored-openssl \
+          --bin sccache --bin sccache-dist
 
   build:
     name: build ${{ matrix.binary || 'sccache' }} ${{ matrix.target }}

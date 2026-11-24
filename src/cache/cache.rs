@@ -108,6 +108,15 @@ use crate::errors::{Result, anyhow};
 /// An interface to cache storage.
 #[async_trait]
 pub trait Storage: Send + Sync {
+    /// Verify that a connection-owned compilation session remains usable.
+    /// A failed session must not turn into a speculative local compilation.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying session is no longer usable.
+    fn validate_session(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Get a cache entry by `key`.
     ///
     /// If an error occurs, this method should return a `Cache::Error`.
@@ -769,6 +778,49 @@ pub fn build_single_cache(
     Ok(Arc::new(storage))
 }
 
+// Native actions bypass the archive Storage API altogether. Keep only
+// the compiler-discovery settings used by the existing compiler frontends;
+// do not initialize a disk or remote archive backend.
+#[cfg(all(feature = "dist-client", target_os = "linux"))]
+struct NativeDiscoveryStorage {
+    location: String,
+    basedirs: Vec<Vec<u8>>,
+}
+
+#[cfg(all(feature = "dist-client", target_os = "linux"))]
+#[async_trait]
+impl Storage for NativeDiscoveryStorage {
+    async fn get(&self, _: &str) -> Result<Cache> {
+        Err(anyhow!("archive lookup attempted in native compiler mode"))
+    }
+
+    async fn put(&self, _: &str, _: CacheWrite) -> Result<Duration> {
+        Err(anyhow!(
+            "archive publication attempted in native compiler mode"
+        ))
+    }
+
+    fn location(&self) -> String {
+        self.location.clone()
+    }
+
+    fn cache_type_name(&self) -> &'static str {
+        "native"
+    }
+
+    async fn current_size(&self) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    async fn max_size(&self) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    fn basedirs(&self) -> &[Vec<u8>] {
+        &self.basedirs
+    }
+}
+
 /// Get a suitable `Storage` implementation from configuration.
 /// Supports both single-cache (backward compatible) and multi-level cache configurations.
 ///
@@ -779,6 +831,14 @@ pub fn storage_from_config(
     config: &Config,
     pool: &tokio::runtime::Handle,
 ) -> Result<Arc<dyn Storage>> {
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    if let Some(native) = &config.dist.native {
+        return Ok(Arc::new(NativeDiscoveryStorage {
+            location: native.endpoint.to_url().to_string(),
+            basedirs: config.basedirs.clone(),
+        }));
+    }
+
     // Check for multi-level cache configuration
     if let Some(multilevel) = MultiLevelStorage::from_config(config, pool)? {
         return Ok(Arc::new(multilevel));

@@ -21,7 +21,7 @@ const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_mins(20);
 /// compressed build result which may legitimately exceed ordinary limits.
 #[cfg(feature = "dist-client")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum RequestClass {
+pub enum RequestClass {
     /// Scheduler and worker control messages, which must return promptly.
     Control,
     /// Optional display metadata: failure must not affect compilation.
@@ -106,29 +106,64 @@ fn check_advertised_length(length: Option<u64>, limit: usize) -> Result<()> {
     Ok(())
 }
 
-/// Parse a newly advertised worker certificate together with still-trusted
-/// certificates. Both scheduler and client use the same TLS root parsing.
-pub(super) fn certificate_roots<'a>(
-    current: &'a [u8],
-    previous: impl IntoIterator<Item = &'a [u8]>,
-) -> Result<Vec<reqwest::Certificate>> {
-    let mut roots = Vec::new();
-    for pem in std::iter::once(current).chain(previous) {
-        let bundle = reqwest::Certificate::from_pem_bundle(pem)
-            .context("invalid distributed worker certificate")?;
-        anyhow::ensure!(
-            !bundle.is_empty(),
-            "distributed worker certificate PEM contains no certificates"
-        );
-        roots.extend(bundle);
-    }
-    Ok(roots)
+/// Decode exactly one certificate and authenticate its SHA-256 DER identity.
+/// The endpoint's IP SAN is independently checked by the TLS handshake.
+fn certificate_der(pem: &[u8]) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    let text = std::str::from_utf8(pem)?.trim();
+    let encoded = text
+        .strip_prefix("-----BEGIN CERTIFICATE-----")
+        .and_then(|text| text.strip_suffix("-----END CERTIFICATE-----"))
+        .context("invalid worker certificate PEM")?;
+    let encoded: Vec<_> = encoded
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    Ok(base64::engine::general_purpose::STANDARD.decode(encoded)?)
+}
+
+pub(super) fn verified_worker_certificate(
+    digest: &[u8],
+    pem: &[u8],
+) -> Result<reqwest::Certificate> {
+    use sha2::{Digest as _, Sha256};
+    let der = certificate_der(pem)?;
+    let actual: [u8; 32] = Sha256::digest(&der).into();
+    anyhow::ensure!(digest == actual, "worker certificate digest mismatch");
+    Ok(reqwest::Certificate::from_der(&der)?)
 }
 
 #[cfg(feature = "dist-client")]
-pub(super) fn async_client(roots: Vec<reqwest::Certificate>) -> Result<reqwest::Client> {
+pub(super) fn pinned_async_client(certificate: reqwest::Certificate) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .tls_certs_only([certificate])
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .pool_max_idle_per_host(0)
+        .build()
+        .context("create pinned worker HTTP client")
+}
+
+#[cfg(feature = "dist-server")]
+pub(super) fn pinned_blocking_client(
+    certificate: reqwest::Certificate,
+) -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .tls_certs_only([certificate])
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(0)
+        .build()
+        .context("create pinned scheduler-to-worker HTTP client")
+}
+
+#[cfg(feature = "dist-client")]
+pub(super) fn async_client() -> Result<reqwest::Client> {
     crate::http_client::new_reqwest_client_builder()?
-        .tls_certs_merge(roots)
         .timeout(HTTP_REQUEST_TIMEOUT)
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .pool_max_idle_per_host(0)
@@ -137,18 +172,15 @@ pub(super) fn async_client(roots: Vec<reqwest::Certificate>) -> Result<reqwest::
 }
 
 #[cfg(feature = "dist-server")]
-pub(super) fn blocking_client(
-    roots: Vec<reqwest::Certificate>,
-) -> Result<reqwest::blocking::Client> {
+pub(super) fn blocking_client() -> Result<reqwest::blocking::Client> {
     crate::http_client::new_reqwest_blocking_builder()?
-        .tls_certs_merge(roots)
         .pool_max_idle_per_host(0)
         .build()
         .context("failed to create distributed blocking HTTP client")
 }
 
 #[cfg(feature = "dist-client")]
-pub(super) async fn send_async<T: serde::de::DeserializeOwned>(
+pub async fn send_async<T: serde::de::DeserializeOwned>(
     req: reqwest::RequestBuilder,
     class: RequestClass,
 ) -> Result<T> {
@@ -377,16 +409,18 @@ mod tests {
     }
 
     #[test]
-    fn trusted_worker_roots_reject_malformed_pem() {
-        assert!(certificate_roots(b"not a certificate", std::iter::empty()).is_err());
-    }
-
-    #[test]
-    fn trusted_worker_roots_accept_valid_certificate_pem() {
+    fn worker_certificate_requires_exact_digest_and_single_pem() -> Result<()> {
+        use sha2::{Digest as _, Sha256};
         let pem = include_bytes!("../../../vendor/tiny_http/examples/ssl-cert.pem");
-        let roots = certificate_roots(pem, std::iter::once(pem.as_slice()))
-            .expect("valid PEM certificate and retained previous root");
-        assert_eq!(roots.len(), 2);
+        let digest = Sha256::digest(certificate_der(pem)?);
+        verified_worker_certificate(&digest, pem)?;
+        assert!(verified_worker_certificate(&[0; 32], pem).is_err());
+        assert!(verified_worker_certificate(&digest, b"not a certificate").is_err());
+        assert!(
+            verified_worker_certificate(&digest, &[pem.as_slice(), pem.as_slice()].concat())
+                .is_err()
+        );
+        Ok(())
     }
 
     #[test]

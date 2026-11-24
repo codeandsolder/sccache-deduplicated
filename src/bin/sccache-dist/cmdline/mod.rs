@@ -24,6 +24,61 @@ pub enum Command {
     Auth(AuthSubcommand),
     Scheduler(config::scheduler::Config),
     Server(config::server::Config),
+    NativeAudit {
+        index: std::path::PathBuf,
+        schema: Option<String>,
+        without: Vec<String>,
+    },
+    NativeDecodePackage {
+        compression: sccache::build_runtime::PackageCompression,
+        max_tar_bytes: u64,
+        memory_bytes: u64,
+    },
+    NativeProvisionPackage {
+        client_config: std::path::PathBuf,
+        archive: Option<std::path::PathBuf>,
+        identity: sccache::build_runtime::PackageIdentity,
+        expected_size: Option<u64>,
+        locator: Option<sccache::dist::native::PackageLocator>,
+    },
+    NativeProvisionRust {
+        client_config: std::path::PathBuf,
+        archive: Option<std::path::PathBuf>,
+        source: sccache::build_runtime::PackageSource,
+        manifest_output: Option<std::path::PathBuf>,
+    },
+    NativeImportRust {
+        store: std::path::PathBuf,
+        archive: Option<std::path::PathBuf>,
+        source: sccache::build_runtime::PackageSource,
+        max_entries: usize,
+        max_expanded_bytes: u64,
+        max_tar_bytes: u64,
+        manifest_output: Option<std::path::PathBuf>,
+    },
+    #[cfg(target_os = "linux")]
+    NativeSyncSystem {
+        client_config: std::path::PathBuf,
+        paths: Vec<std::path::PathBuf>,
+        cache_dir: std::path::PathBuf,
+        jobs: std::num::NonZeroUsize,
+    },
+    #[cfg(target_os = "linux")]
+    NativeSyncRust {
+        root: std::path::PathBuf,
+        client_config: std::path::PathBuf,
+        output: std::path::PathBuf,
+        recipe_output: std::path::PathBuf,
+        full: bool,
+        jobs: std::num::NonZeroUsize,
+    },
+    #[cfg(target_os = "linux")]
+    NativeAttestInstallation {
+        root: std::path::PathBuf,
+        manifests: Vec<std::path::PathBuf>,
+        recipe: Option<std::path::PathBuf>,
+        output: std::path::PathBuf,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]

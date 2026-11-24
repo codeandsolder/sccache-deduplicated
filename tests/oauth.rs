@@ -57,6 +57,8 @@ fn config_with_dist_auth(
             toolchains: vec![],
             toolchain_cache_size: 0,
             rewrite_includes_only: true,
+            native: None,
+            native_installation_catalogs: Vec::new(),
         },
         server_startup_timeout_ms: None,
         basedirs: vec![],

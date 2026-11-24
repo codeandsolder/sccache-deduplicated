@@ -107,7 +107,39 @@ fn get_clap_command() -> ClapCommand {
             .value_parser(clap::value_parser!(PathBuf))
     };
 
-    ClapCommand::new(env!("CARGO_PKG_NAME"))
+    let command = ClapCommand::new(env!("CARGO_PKG_NAME"));
+    #[cfg(target_os = "linux")]
+    let command = command.subcommand(
+        ClapCommand::new("native-sync-system")
+            .about("Discover original packages owning selected installed system files using pacman metadata")
+            .arg(flag_infer_long("client-config").value_parser(clap::value_parser!(PathBuf)).required(true))
+            .arg(flag_infer_long("path").value_parser(clap::value_parser!(PathBuf))
+                .action(clap::ArgAction::Append).required(true)
+                .help("Installed file whose owning package should be provisioned; repeat for the discovered toolchain closure"))
+            .arg(flag_infer_long("cache-dir").value_parser(clap::value_parser!(PathBuf))
+                .default_value("/var/cache/pacman/pkg"))
+            .arg(flag_infer_long("jobs").value_parser(clap::value_parser!(std::num::NonZeroUsize))
+                .default_value("2")),
+    );
+    let command = command.subcommand(
+        ClapCommand::new("native-sync-rust")
+            .about("Acquire original packages for an installed Rustup sysroot and emit its recipe and verified catalog")
+            .arg(flag_infer_long("root").value_parser(clap::value_parser!(PathBuf)).required(true))
+            .arg(flag_infer_long("client-config").value_parser(clap::value_parser!(PathBuf)).required(true))
+            .arg(flag_infer_long("output").value_parser(clap::value_parser!(PathBuf)).required(true))
+            .arg(flag_infer_long("recipe-output").value_parser(clap::value_parser!(PathBuf)).required(true))
+            .arg(flag_infer_long("full").action(clap::ArgAction::SetTrue).help("Include installed non-build components such as documentation"))
+            .arg(flag_infer_long("jobs").value_parser(clap::value_parser!(std::num::NonZeroUsize)).default_value("2").help("Maximum parallel package acquisitions")),
+    ).subcommand(
+        ClapCommand::new("native-attest-installation")
+            .about("Verify installed files against original package manifests for reuse by compiler clients")
+            .arg(flag_infer_long("root").value_parser(clap::value_parser!(PathBuf)).required(true))
+            .arg(flag_infer_long("manifest").value_parser(clap::value_parser!(PathBuf)).action(clap::ArgAction::Append))
+            .arg(flag_infer_long("recipe").value_parser(clap::value_parser!(PathBuf)))
+            .group(ArgGroup::new("installation_input").args(["manifest", "recipe"]).required(true))
+            .arg(flag_infer_long("output").value_parser(clap::value_parser!(PathBuf)).required(true)),
+    );
+    command
         .version(env!("CARGO_PKG_VERSION"))
         .subcommand_required(true)
         .subcommand(
@@ -145,6 +177,39 @@ fn get_clap_command() -> ClapCommand {
                             .value_parser(TokenLength::from_bits),
                     ),
                 ),
+        )
+        .subcommand(
+            ClapCommand::new("native-decode-package").hide(true)
+                .arg(flag_infer_long("compression").value_parser(["xz", "gzip", "tar", "zstd"]).required(true))
+                .arg(flag_infer_long("max-tar-bytes").value_parser(clap::value_parser!(u64)).required(true))
+                .arg(flag_infer_long("memory-bytes").value_parser(clap::value_parser!(u64)).required(true))
+        )
+        .subcommand(
+            installer_args(ClapCommand::new("native-import-rust"))
+                .about("Verify an original Rust installer archive in an exclusive offline store")
+                .arg(flag_infer_long("store").value_parser(clap::value_parser!(PathBuf)).required(true))
+                .arg(flag_infer_long("max-entries").value_parser(clap::value_parser!(usize)).default_value("100000"))
+                .arg(flag_infer_long("max-expanded-bytes").value_parser(clap::value_parser!(u64)).default_value("8589934592"))
+                .arg(flag_infer_long("max-tar-bytes").value_parser(clap::value_parser!(u64)).default_value("9663676416"))
+        )
+        .subcommand(
+            package_args(ClapCommand::new("native-provision-package"))
+                .about("Provision or resolve an original tar archive for native content transport")
+                .arg(flag_infer_long("upstream").requires("path").conflicts_with("archive"))
+                .arg(flag_infer_long("path").requires("upstream"))
+                .arg(flag_infer_long("client-config").value_parser(clap::value_parser!(PathBuf)).required(true))
+        )
+        .subcommand(
+            installer_args(ClapCommand::new("native-provision-rust"))
+                .about("Provision or resolve an original Rust installer through a live scheduler")
+                .arg(flag_infer_long("client-config").value_parser(clap::value_parser!(PathBuf)).required(true))
+        )
+        .subcommand(
+            ClapCommand::new("native-audit")
+                .about("Inspect a closed native index or consistent offline snapshot without changing it")
+                .arg(flag_infer_long("index").value_parser(clap::value_parser!(PathBuf)).required(true))
+                .arg(flag_infer_long("schema").requires("without"))
+                .arg(flag_infer_long("without").action(clap::ArgAction::Append).requires("schema")),
         )
         .subcommand(
             ClapCommand::new("scheduler")
@@ -226,6 +291,147 @@ pub fn try_parse_from(
             }
             _ => unreachable!("Subcommand is enforced by clap"),
         }),
+        Some(("native-decode-package", matches)) => Command::NativeDecodePackage {
+            compression: package_compression(matches)?,
+            max_tar_bytes: *matches
+                .get_one::<u64>("max-tar-bytes")
+                .context("missing decoded tar limit")?,
+            memory_bytes: *matches
+                .get_one::<u64>("memory-bytes")
+                .context("missing memory limit")?,
+        },
+        Some(("native-provision-package", matches)) => {
+            let identity = package_identity(matches)?;
+            let locator = matches
+                .get_one::<String>("upstream")
+                .map(|upstream| {
+                    let locator = sccache::dist::native::PackageLocator {
+                        identity,
+                        expected_size: matches.get_one::<u64>("size").copied(),
+                        upstream: upstream.clone(),
+                        path: matches
+                            .get_one::<String>("path")
+                            .context("missing upstream path")?
+                            .clone(),
+                    };
+                    locator.validate()?;
+                    Ok::<_, anyhow::Error>(locator)
+                })
+                .transpose()?;
+            Command::NativeProvisionPackage {
+                client_config: matches
+                    .get_one::<PathBuf>("client-config")
+                    .context("missing client configuration")?
+                    .clone(),
+                archive: matches.get_one::<PathBuf>("archive").cloned(),
+                identity,
+                expected_size: matches.get_one::<u64>("size").copied(),
+                locator,
+            }
+        }
+        Some(("native-provision-rust", matches)) => Command::NativeProvisionRust {
+            client_config: matches
+                .get_one::<PathBuf>("client-config")
+                .context("missing client configuration")?
+                .clone(),
+            archive: matches.get_one::<PathBuf>("archive").cloned(),
+            source: package_source(matches)?,
+            manifest_output: matches.get_one::<PathBuf>("manifest-output").cloned(),
+        },
+        Some(("native-import-rust", matches)) => {
+            let source = package_source(matches)?;
+            Command::NativeImportRust {
+                store: matches
+                    .get_one::<PathBuf>("store")
+                    .context("missing store path")?
+                    .clone(),
+                archive: matches.get_one::<PathBuf>("archive").cloned(),
+                source,
+                max_entries: *matches
+                    .get_one::<usize>("max-entries")
+                    .context("missing entry limit")?,
+                max_expanded_bytes: *matches
+                    .get_one::<u64>("max-expanded-bytes")
+                    .context("missing expansion limit")?,
+                max_tar_bytes: *matches
+                    .get_one::<u64>("max-tar-bytes")
+                    .context("missing decoded tar limit")?,
+                manifest_output: matches.get_one::<PathBuf>("manifest-output").cloned(),
+            }
+        }
+        #[cfg(target_os = "linux")]
+        Some(("native-sync-system", matches)) => Command::NativeSyncSystem {
+            client_config: matches
+                .get_one::<PathBuf>("client-config")
+                .context("missing client configuration")?
+                .clone(),
+            paths: matches
+                .get_many::<PathBuf>("path")
+                .context("missing selected paths")?
+                .cloned()
+                .collect(),
+            cache_dir: matches
+                .get_one::<PathBuf>("cache-dir")
+                .context("missing pacman package cache directory")?
+                .clone(),
+            jobs: *matches
+                .get_one::<std::num::NonZeroUsize>("jobs")
+                .context("missing acquisition concurrency")?,
+        },
+        #[cfg(target_os = "linux")]
+        Some(("native-sync-rust", matches)) => Command::NativeSyncRust {
+            root: matches
+                .get_one::<PathBuf>("root")
+                .context("missing installation root")?
+                .clone(),
+            client_config: matches
+                .get_one::<PathBuf>("client-config")
+                .context("missing client configuration")?
+                .clone(),
+            output: matches
+                .get_one::<PathBuf>("output")
+                .context("missing catalog output")?
+                .clone(),
+            recipe_output: matches
+                .get_one::<PathBuf>("recipe-output")
+                .context("missing recipe output")?
+                .clone(),
+            full: matches.get_flag("full"),
+            jobs: *matches
+                .get_one::<std::num::NonZeroUsize>("jobs")
+                .context("missing acquisition concurrency")?,
+        },
+        #[cfg(target_os = "linux")]
+        Some(("native-attest-installation", matches)) => Command::NativeAttestInstallation {
+            root: matches
+                .get_one::<PathBuf>("root")
+                .context("missing installation root")?
+                .clone(),
+            manifests: matches
+                .get_many::<PathBuf>("manifest")
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect(),
+            recipe: matches.get_one::<PathBuf>("recipe").cloned(),
+            output: matches
+                .get_one::<PathBuf>("output")
+                .context("missing catalog output")?
+                .clone(),
+        },
+        Some(("native-audit", matches)) => Command::NativeAudit {
+            index: matches
+                .get_one::<PathBuf>("index")
+                .context("missing native index path")?
+                .clone(),
+            schema: matches.get_one::<String>("schema").cloned(),
+            without: matches
+                .get_many::<String>("without")
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect(),
+        },
         Some(("scheduler", matches)) => {
             if matches.contains_id("syslog") {
                 let log_level = matches
@@ -368,4 +574,53 @@ mod tests {
             );
         }
     }
+}
+
+fn package_compression(
+    matches: &clap::ArgMatches,
+) -> anyhow::Result<sccache::build_runtime::PackageCompression> {
+    matches
+        .get_one::<String>("compression")
+        .context("missing package compression")?
+        .parse()
+}
+
+fn package_args(command: ClapCommand) -> ClapCommand {
+    command
+        .arg(flag_infer_long("archive").value_parser(clap::value_parser!(PathBuf)))
+        .arg(flag_infer_long("sha256").required(true))
+        .arg(flag_infer_long("size").value_parser(clap::value_parser!(u64)))
+        .arg(
+            flag_infer_long("compression")
+                .value_parser(["xz", "gzip", "tar", "zstd"])
+                .required(true),
+        )
+}
+
+fn installer_args(command: ClapCommand) -> ClapCommand {
+    package_args(command)
+        .mut_arg("size", |arg| arg.required(true))
+        .arg(flag_infer_long("manifest-output").value_parser(clap::value_parser!(PathBuf)))
+}
+
+fn package_identity(
+    matches: &clap::ArgMatches,
+) -> anyhow::Result<sccache::build_runtime::PackageIdentity> {
+    sccache::build_runtime::PackageIdentity::from_sha256_hex(
+        matches
+            .get_one::<String>("sha256")
+            .context("missing SHA-256")?,
+        package_compression(matches)?,
+    )
+}
+
+fn package_source(
+    matches: &clap::ArgMatches,
+) -> anyhow::Result<sccache::build_runtime::PackageSource> {
+    Ok(sccache::build_runtime::PackageSource {
+        identity: package_identity(matches)?,
+        size: *matches
+            .get_one::<u64>("size")
+            .context("missing package size")?,
+    })
 }

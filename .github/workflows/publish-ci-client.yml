@@ -43,7 +43,7 @@ jobs:
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           ready=true
-          for workflow in ci.yml rust-skills2-strict.yml; do
+          for workflow in ci.yml rust-skills2-strict.yml clone-regression.yml dist-jwt-regression.yml; do
             conclusion="$(
               gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?head_sha=$sha&event=push&per_page=20" |
                 jq -r --arg sha "$sha" '[.workflow_runs[] | select(.head_sha == $sha)] | sort_by(.run_number) | last | .conclusion // ""'
@@ -54,6 +54,10 @@ jobs:
             fi
           done
           echo "ready=$ready" >> "$GITHUB_OUTPUT"
+          if [[ "$ready" != true ]]; then
+            echo "::error::The exact current main revision has not passed every fleet release gate."
+            exit 1
+          fi
 
   build-publish:
     needs: required-gates

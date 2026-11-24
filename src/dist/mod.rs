@@ -39,7 +39,11 @@ mod cache;
 #[cfg(feature = "dist-client")]
 pub mod client_auth;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
+pub mod execution_queue;
+#[cfg(any(feature = "dist-client", feature = "dist-server"))]
 pub mod http;
+#[cfg(any(feature = "dist-client", feature = "dist-server"))]
+pub mod native;
 #[cfg(test)]
 mod test;
 
@@ -59,11 +63,13 @@ mod pkg {
     pub trait InputsPackager {}
 }
 
-#[cfg(target_os = "windows")]
 mod path_transform {
     use std::collections::HashMap;
-    use std::path::{Component, Components, Path, PathBuf, Prefix, PrefixComponent};
+    #[cfg(windows)]
+    use std::path::{Component, Components, Prefix, PrefixComponent};
+    use std::path::{Path, PathBuf};
 
+    #[cfg(windows)]
     fn take_prefix<'a>(components: &'a mut Components<'_>) -> Option<PrefixComponent<'a>> {
         let prefix = components.next()?;
         let pc = match prefix {
@@ -77,6 +83,7 @@ mod path_transform {
         Some(pc)
     }
 
+    #[cfg(windows)]
     fn transform_prefix_component(pc: PrefixComponent<'_>) -> Option<String> {
         match pc.kind() {
             // Transforming these to the same place means these may flip-flop
@@ -107,8 +114,9 @@ mod path_transform {
     }
 
     impl PathTransformer {
+        #[must_use = "the returned path transformer records paths for the distributed compilation"]
         pub fn new() -> Self {
-            PathTransformer {
+            Self {
                 dist_to_local_path: HashMap::new(),
                 root_mappings: Vec::new(),
             }
@@ -117,34 +125,49 @@ mod path_transform {
         pub fn add_root_mapping(&mut self, local_root: PathBuf, dist_root: &str) {
             debug_assert!(local_root.is_absolute());
             debug_assert!(dist_root.starts_with('/'));
-            self.root_mappings
-                .push((local_root, dist_root.trim_end_matches('/').to_owned()));
+            let root = dist_root.trim_end_matches('/');
+            let root = if root.is_empty() { "/" } else { root };
+            self.root_mappings.push((local_root, root.to_owned()));
             self.root_mappings
                 .sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
         }
+
         pub fn as_dist_abs(&mut self, p: &Path) -> Option<String> {
             if !p.is_absolute() {
                 return None;
             }
             self.as_dist(p)
         }
-        pub fn as_dist(&mut self, p: &Path) -> Option<String> {
-            if p.is_absolute() {
-                for (local_root, dist_root) in &self.root_mappings {
-                    if let Ok(suffix) = p.strip_prefix(local_root) {
-                        let suffix = suffix.to_str()?.replace('\\', "/");
-                        let dist_path = if suffix.is_empty() {
-                            dist_root.clone()
-                        } else {
-                            format!("{}/{}", dist_root, suffix)
-                        };
-                        self.dist_to_local_path
-                            .insert(dist_path.clone(), p.to_owned());
-                        return Some(dist_path);
-                    }
-                }
-            }
 
+        pub fn as_dist(&mut self, p: &Path) -> Option<String> {
+            let mapping = self
+                .root_mappings
+                .iter()
+                .find_map(|(local, dist)| p.strip_prefix(local).ok().map(|suffix| (dist, suffix)));
+            let dist_path = if let Some((root, suffix)) = mapping {
+                let suffix = suffix.to_str()?;
+                #[cfg(windows)]
+                let suffix = suffix.replace('\\', "/");
+                if suffix.is_empty() {
+                    root.clone()
+                } else {
+                    format!("{}/{suffix}", root.trim_end_matches('/'))
+                }
+            } else {
+                Self::encode_unmapped(p)?
+            };
+            self.dist_to_local_path
+                .insert(dist_path.clone(), p.to_owned());
+            Some(dist_path)
+        }
+
+        #[cfg(unix)]
+        fn encode_unmapped(p: &Path) -> Option<String> {
+            Some(p.to_str()?.to_owned())
+        }
+
+        #[cfg(windows)]
+        fn encode_unmapped(p: &Path) -> Option<String> {
             let mut components = p.components();
 
             // Extract the prefix (e.g. "C:/") if present
@@ -184,10 +207,9 @@ mod path_transform {
             } else {
                 dist_suffix
             };
-            self.dist_to_local_path
-                .insert(dist_path.clone(), p.to_owned());
             Some(dist_path)
         }
+        #[cfg(windows)]
         pub fn disk_mappings(&self) -> impl Iterator<Item = (PathBuf, String)> {
             let mut normal_mappings = HashMap::new();
             let mut verbatim_mappings = HashMap::new();
@@ -220,25 +242,53 @@ mod path_transform {
         }
 
         pub fn path_mappings(&self) -> impl Iterator<Item = (PathBuf, String)> + '_ {
-            self.root_mappings
-                .iter()
-                .cloned()
-                .chain(self.disk_mappings())
+            let mappings = self.root_mappings.iter().cloned();
+            #[cfg(windows)]
+            let mappings = mappings.chain(self.disk_mappings());
+            mappings
         }
 
-        /// Transform a distributed path back to its local Windows path.
+        /// Transform a distributed path back to its local path.
         ///
         /// # Errors
         ///
-        /// Returns an error when the distributed path has no recorded local mapping.
+        /// Returns an error for an embedded NUL, or on Windows when no local mapping exists.
         pub fn to_local(&self, p: &str) -> crate::errors::Result<PathBuf> {
-            self.dist_to_local_path
-                .get(p)
-                .cloned()
-                .ok_or_else(|| crate::errors::anyhow!("unknown distributed path: {p}"))
+            if p.as_bytes().contains(&0) {
+                return Err(crate::errors::anyhow!(
+                    "distributed path contains an embedded NUL"
+                ));
+            }
+            if let Some(local) = self.dist_to_local_path.get(p) {
+                return Ok(local.clone());
+            }
+            #[cfg(windows)]
+            return Err(crate::errors::anyhow!("unknown distributed path: {p}"));
+            #[cfg(unix)]
+            Ok(self.decode_unmapped(p))
+        }
+
+        #[cfg(unix)]
+        fn decode_unmapped(&self, p: &str) -> PathBuf {
+            let path = Path::new(p);
+            if let Some((local, suffix, _)) = self
+                .root_mappings
+                .iter()
+                .filter_map(|(local, dist)| {
+                    let root = Path::new(dist);
+                    path.strip_prefix(root)
+                        .ok()
+                        .map(|suffix| (local, suffix, root.components().count()))
+                })
+                .min_by_key(|(_, _, depth)| std::cmp::Reverse(*depth))
+            {
+                return local.join(suffix);
+            }
+            path.to_owned()
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_root_mapping() {
         let mut pt = PathTransformer::new();
@@ -262,6 +312,7 @@ mod path_transform {
         assert!(mappings.contains(&(PathBuf::from("C:/physical/project"), "/build".to_owned())));
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_basic() {
         let mut pt = PathTransformer::new();
@@ -294,6 +345,7 @@ mod path_transform {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_relative_paths() {
         let mut pt = PathTransformer::new();
@@ -302,6 +354,7 @@ mod path_transform {
         assert_eq!(pt.to_local("a/b").unwrap(), Path::new("a/b"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_verbatim_disks() {
         let mut pt = PathTransformer::new();
@@ -329,6 +382,7 @@ mod path_transform {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn test_slash_directions() {
         let mut pt = PathTransformer::new();
@@ -337,105 +391,7 @@ mod path_transform {
         assert_eq!(pt.to_local("/prefix/disk-C/a").unwrap(), Path::new("C:/a"));
         assert_eq!(pt.disk_mappings().count(), 1);
     }
-}
-
-#[cfg(unix)]
-mod path_transform {
-    use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
-
-    #[derive(Debug)]
-    pub struct PathTransformer {
-        dist_to_local_path: HashMap<String, PathBuf>,
-        root_mappings: Vec<(PathBuf, String)>,
-    }
-
-    impl Default for PathTransformer {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    impl PathTransformer {
-        #[must_use = "the returned path transformer records paths for the distributed compilation"]
-        pub fn new() -> Self {
-            Self {
-                dist_to_local_path: HashMap::new(),
-                root_mappings: Vec::new(),
-            }
-        }
-
-        pub fn add_root_mapping(&mut self, local_root: PathBuf, dist_root: &str) {
-            debug_assert!(local_root.is_absolute());
-            debug_assert!(dist_root.starts_with('/'));
-            self.root_mappings
-                .push((local_root, dist_root.trim_end_matches('/').to_owned()));
-            self.root_mappings
-                .sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
-        }
-
-        pub fn as_dist_abs(&mut self, p: &Path) -> Option<String> {
-            if !p.is_absolute() {
-                return None;
-            }
-            self.as_dist(p)
-        }
-
-        pub fn as_dist(&mut self, p: &Path) -> Option<String> {
-            if p.is_absolute() {
-                for (local_root, dist_root) in &self.root_mappings {
-                    if let Ok(suffix) = p.strip_prefix(local_root) {
-                        let suffix = suffix.to_str()?;
-                        let dist_path = if suffix.is_empty() {
-                            dist_root.clone()
-                        } else {
-                            format!("{dist_root}/{suffix}")
-                        };
-                        self.dist_to_local_path
-                            .insert(dist_path.clone(), p.to_owned());
-                        return Some(dist_path);
-                    }
-                }
-            }
-            let dist_path = p.as_os_str().to_str()?.to_owned();
-            self.dist_to_local_path
-                .insert(dist_path.clone(), p.to_owned());
-            Some(dist_path)
-        }
-
-        pub fn disk_mappings(&self) -> impl Iterator<Item = (PathBuf, String)> + '_ {
-            // Unix paths have no drive-prefix mappings. Keep the method shape
-            // aligned with Windows while returning an allocation-free empty iterator.
-            self.root_mappings.iter().take(0).cloned()
-        }
-
-        pub fn path_mappings(&self) -> impl Iterator<Item = (PathBuf, String)> + '_ {
-            self.root_mappings.iter().cloned()
-        }
-
-        /// Transform a distributed path back to its local Unix path.
-        ///
-        /// # Errors
-        ///
-        /// Returns an error when the path contains an embedded NUL byte.
-        pub fn to_local(&self, p: &str) -> crate::errors::Result<PathBuf> {
-            if p.as_bytes().contains(&0) {
-                return Err(crate::errors::anyhow!(
-                    "distributed path contains an embedded NUL"
-                ));
-            }
-            if let Some(local) = self.dist_to_local_path.get(p) {
-                return Ok(local.clone());
-            }
-            for (local_root, dist_root) in &self.root_mappings {
-                if let Ok(suffix) = Path::new(p).strip_prefix(dist_root) {
-                    return Ok(local_root.join(suffix));
-                }
-            }
-            Ok(PathBuf::from(p))
-        }
-    }
-
+    #[cfg(unix)]
     #[test]
     fn test_root_mapping() -> crate::errors::Result<()> {
         let mut pt = PathTransformer::new();
@@ -448,6 +404,53 @@ mod path_transform {
         assert_eq!(
             pt.to_local("/build/src/lib.rs")?,
             PathBuf::from("/physical/project/src/lib.rs")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_mapping_precedence_and_root() -> crate::errors::Result<()> {
+        let mut transformer = PathTransformer::new();
+        #[cfg(windows)]
+        let local = Path::new("C:/physical/project");
+        #[cfg(unix)]
+        let local = Path::new("/physical/project");
+
+        transformer.add_root_mapping(local.join("nested"), "/special/");
+        transformer.add_root_mapping(local.to_owned(), "/mapped");
+        assert_eq!(
+            transformer
+                .as_dist_abs(&local.join("nested/file"))
+                .as_deref(),
+            Some("/special/file")
+        );
+        assert_eq!(
+            transformer.to_local("/special/file")?,
+            local.join("nested/file")
+        );
+        assert_eq!(transformer.as_dist_abs(Path::new("relative")), None);
+        transformer.add_root_mapping(local.join("root"), "/");
+        assert_eq!(
+            transformer.as_dist_abs(&local.join("root")).as_deref(),
+            Some("/")
+        );
+        assert_eq!(
+            transformer.as_dist_abs(&local.join("root/file")).as_deref(),
+            Some("/file")
+        );
+        assert!(transformer.to_local("bad\0path").is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reverse_mapping_uses_distributed_precedence() -> crate::errors::Result<()> {
+        let mut transformer = PathTransformer::new();
+        transformer.add_root_mapping(PathBuf::from("/physical/deep/project"), "/mapped");
+        transformer.add_root_mapping(PathBuf::from("/other"), "/mapped/nested");
+        assert_eq!(
+            transformer.to_local("/mapped/nested/file")?,
+            PathBuf::from("/other/file")
         );
         Ok(())
     }
@@ -966,6 +969,24 @@ impl<'a> InputsReader<'a> {
 #[cfg(feature = "dist-server")]
 type ExtResult<T, E> = ::std::result::Result<T, E>;
 
+/// Native assignment contains the exact declaration admitted by the cache.
+#[cfg(feature = "dist-server")]
+#[derive(Clone, Serialize, Deserialize)]
+pub struct NativeAssignment {
+    pub ticket: crate::build_runtime::wire::Ticket,
+    pub spec: crate::build_runtime::ExecutionSpec,
+    pub input_blobs: NativeInputBlobs,
+    /// Scheduler's advisory logical result-size forecast, never a hard limit.
+    pub estimated_result_bytes: Option<u64>,
+}
+
+/// One scheduler assignment routed through the common capacity accounting.
+#[cfg(feature = "dist-server")]
+pub enum JobAssignment {
+    Archive(Toolchain),
+    Native(Box<NativeAssignment>),
+}
+
 #[cfg(feature = "dist-server")]
 pub trait SchedulerOutgoing {
     // To Server
@@ -973,13 +994,13 @@ pub trait SchedulerOutgoing {
         &self,
         server_id: ServerId,
         job_id: JobId,
-        tc: Toolchain,
+        assignment: JobAssignment,
         auth: String,
     ) -> Result<AssignJobResult>;
 }
 
 #[cfg(feature = "dist-server")]
-pub trait ServerOutgoing {
+pub trait ServerOutgoing: Send + Sync {
     // To Scheduler
     fn do_update_job_state(&self, job_id: JobId, state: JobState) -> Result<UpdateJobStateResult>;
 }
@@ -989,6 +1010,141 @@ pub trait ServerOutgoing {
 pub trait JobAuthorizer: Send {
     fn generate_token(&self, job_id: JobId) -> Result<String>;
     fn verify_token(&self, job_id: JobId, token: &str) -> Result<()>;
+    fn generate_blob_token(&self, blob: crate::build_runtime::BlobRef) -> Result<String>;
+    fn verify_blob_token(&self, blob: crate::build_runtime::BlobRef, token: &str) -> Result<()>;
+}
+
+/// A narrowly scoped peer-source capability; never log its token.
+#[cfg(feature = "dist-server")]
+pub struct NativeBlobSource {
+    pub server: ServerId,
+    pub token: String,
+}
+
+/// Scheduler-owned union of the verified input blobs in an admitted action.
+#[cfg(feature = "dist-server")]
+pub type NativeInputBlobs = std::collections::BTreeMap<crate::build_runtime::ContentId, u64>;
+
+/// Verified progress for one worker reservation; durations are relative to
+/// the heartbeat snapshot, not synchronized wall clocks.
+#[cfg(feature = "dist-server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeJobProgress {
+    pub phase: crate::build_runtime::wire::NativeJobPhase,
+    pub phase_nanoseconds: u64,
+    pub remaining_input_bytes: u64,
+    pub remaining_input_blobs: u64,
+}
+
+/// Bounded snapshot of the worker-owned pipeline, including terminal
+/// responses still occupying reservation capacity.
+#[cfg(feature = "dist-server")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeQueueSnapshot {
+    pub capacity: u32,
+    pub compiler_slots: u32,
+    pub compiler_active: u32,
+    pub staging_slots: u32,
+    pub publication_slots: u32,
+    pub jobs: std::collections::BTreeMap<JobId, NativeJobProgress>,
+}
+
+#[cfg(feature = "dist-server")]
+impl NativeQueueSnapshot {
+    pub const MAX_CAPACITY: u32 = 65_536;
+
+    #[must_use = "invalid telemetry must not drive scheduling"]
+    pub fn valid(&self) -> bool {
+        (1..=Self::MAX_CAPACITY).contains(&self.capacity)
+            && (1..=Self::MAX_CAPACITY).contains(&self.compiler_slots)
+            && self.compiler_active <= self.compiler_slots
+            && (1..=self.compiler_slots).contains(&self.staging_slots)
+            && (1..=self.compiler_slots).contains(&self.publication_slots)
+            && self.jobs.len() <= self.capacity as usize
+            && self.jobs.values().all(|job| {
+                !job.phase.inputs_ready()
+                    || (job.remaining_input_bytes == 0 && job.remaining_input_blobs == 0)
+            })
+    }
+
+    #[must_use = "the dispatcher must have room for an additional reservation"]
+    pub fn has_capacity(&self, assigned: impl Iterator<Item = JobId>) -> bool {
+        self.available_reservations(assigned) != 0
+    }
+
+    #[must_use = "unobserved reservations and terminal replies also consume local capacity"]
+    pub fn available_reservations(&self, assigned: impl Iterator<Item = JobId>) -> usize {
+        let unobserved = assigned.filter(|id| !self.jobs.contains_key(id)).count();
+        (self.capacity as usize).saturating_sub(self.jobs.len().saturating_add(unobserved))
+    }
+
+    #[must_use = "compiler admission excludes publication-only reservations"]
+    pub fn compiler_demand(&self, assigned: impl Iterator<Item = JobId>) -> usize {
+        let local = self
+            .jobs
+            .values()
+            .filter(|job| job.phase.needs_compiler())
+            .count();
+        // Unknown scheduler reservations include legacy jobs and native
+        // assignments made since the snapshot. Orphaned local reservations
+        // still compete until their cancellation has drained.
+        local.saturating_add(assigned.filter(|id| !self.jobs.contains_key(id)).count())
+    }
+}
+
+#[cfg(feature = "dist-server")]
+impl Default for NativeQueueSnapshot {
+    fn default() -> Self {
+        Self {
+            capacity: Self::MAX_CAPACITY,
+            compiler_slots: Self::MAX_CAPACITY,
+            compiler_active: 0,
+            staging_slots: 4,
+            publication_slots: 4,
+            jobs: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+/// Advisory worker telemetry, never part of action identity or verification.
+#[cfg(feature = "dist-server")]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativePlacement {
+    pub package_limits: Option<crate::build_runtime::PackageDeliveryLimits>,
+    pub residency: Option<crate::build_runtime::BlobResidency>,
+    pub timing: crate::build_runtime::wire::WorkerTiming,
+    pub queue: NativeQueueSnapshot,
+}
+
+/// Authenticated native action lifecycle observations, emitted only after
+/// the corresponding session operation has succeeded.
+#[cfg(feature = "dist-server")]
+pub enum NativeLifecycleEvent<'a> {
+    InputsStaged,
+    Negotiated,
+    Committed {
+        manifest: &'a crate::build_runtime::ResultManifest,
+        retained_after_begin: std::time::Duration,
+        observation: Option<crate::build_runtime::wire::ActionObservation>,
+    },
+}
+
+/// Worker build engines advertised atomically with its scheduler heartbeat.
+#[cfg(feature = "dist-server")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerCapabilities {
+    pub archive: bool,
+    pub native_platform: Option<crate::build_runtime::ContentId>,
+    pub native_placement: Option<NativePlacement>,
+}
+
+#[cfg(feature = "dist-server")]
+impl WorkerCapabilities {
+    pub const ARCHIVE: Self = Self {
+        archive: true,
+        native_platform: None,
+        native_placement: None,
+    };
 }
 
 #[cfg(feature = "dist-server")]
@@ -999,6 +1155,30 @@ pub trait SchedulerIncoming: Send + Sync {
         requester: &dyn SchedulerOutgoing,
         tc: Toolchain,
     ) -> ExtResult<AllocJobResult, Error>;
+    /// Allocate a native action from the shared worker capacity pool.
+    ///
+    /// # Errors
+    /// Returns an error if allocation or assignment fails.
+    fn handle_alloc_native_job(
+        &self,
+        requester: &dyn SchedulerOutgoing,
+        assignment: NativeAssignment,
+        network: &crate::build_runtime::NetworkSnapshot,
+        packages: std::sync::Arc<crate::build_runtime::PackageCatalog>,
+    ) -> ExtResult<AllocJobResult, Error>;
+    /// Select likely sources for a missing exact blob without allocating a job.
+    fn native_blob_sources(
+        &self,
+        blob: crate::build_runtime::BlobRef,
+        requester: Option<std::net::SocketAddr>,
+    ) -> ExtResult<Vec<NativeBlobSource>, Error>;
+    /// Record advisory producer residency for the current worker epoch.
+    fn observe_native_lifecycle(
+        &self,
+        server_id: ServerId,
+        job: JobId,
+        event: NativeLifecycleEvent<'_>,
+    );
     // From Server
     fn handle_heartbeat_server(
         &self,
@@ -1007,6 +1187,7 @@ pub trait SchedulerIncoming: Send + Sync {
         cpu_capacity: f64,
         active_job_ids: &[JobId],
         job_authorizer: Box<dyn JobAuthorizer>,
+        capabilities: WorkerCapabilities,
     ) -> ExtResult<HeartbeatServerResult, Error>;
     // From Server, best-effort observability metadata.
     fn handle_update_worker_name(
@@ -1039,8 +1220,36 @@ pub trait SchedulerIncoming: Send + Sync {
 
 #[cfg(feature = "dist-server")]
 pub trait ServerIncoming: Send + Sync {
+    /// Compiler slots in use, excluding jobs waiting for input or a slot.
+    fn executing_jobs(&self) -> usize;
     // From Scheduler
     fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> ExtResult<AssignJobResult, Error>;
+    fn capabilities(&self) -> WorkerCapabilities;
+    fn native_metadata_limit(&self) -> Option<usize>;
+    /// Open an exact local CAS blob for an authenticated scheduler request.
+    fn handle_native_blob(
+        &self,
+        blob: crate::build_runtime::BlobRef,
+    ) -> ExtResult<Option<(std::fs::File, crate::build_runtime::BlobEncoding)>, Error>;
+    /// Accept an immutable native action assignment.
+    ///
+    /// # Errors
+    /// Returns an error for incompatible platforms or duplicate assignments.
+    fn handle_assign_native_job(
+        &self,
+        requester: std::sync::Arc<dyn ServerOutgoing>,
+        job_id: JobId,
+        assignment: NativeAssignment,
+    ) -> ExtResult<AssignJobResult, Error>;
+    /// Observe an already dispatched native action without blocking for compilation.
+    ///
+    /// # Errors
+    /// Returns an error if execution, scheduler reporting or publication fails.
+    fn handle_run_native_job(
+        &self,
+        job_id: JobId,
+        request: crate::build_runtime::wire::NativeRunRequest,
+    ) -> ExtResult<crate::build_runtime::wire::NativeRunResult, Error>;
     // Reconcile scheduler-side reservations against local unclaimed jobs.
     // The cutoff predates the heartbeat request; later assignments must survive.
     fn handle_reconcile_assignments(

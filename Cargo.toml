@@ -50,7 +50,6 @@ bincode = "1"
 blake3 = "1"
 byteorder = "1.5"
 bytes = "1"
-chrono = "0.4"
 clap = { version = "4.5.13", features = ["derive", "env", "wrap_help"] }
 directories = "6.0"
 encoding_rs = "0.8"
@@ -73,7 +72,7 @@ jwt = { package = "jsonwebtoken", version = "12", optional = true, features = [
 libc = "0.2.153"
 linked-hash-map = "0.5"
 log = "0.4"
-lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "b65ea856949839f8fc4500363837d76c651e9fd1", optional = true }
+lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "68a4a057a9b32e4a45fe7530a2fbd0fdf2566f43", optional = true }
 memchr = "2"
 mime = "0.3"
 object = "0.41"
@@ -83,6 +82,7 @@ opendal-layer-logging = { version = "0.59.0", optional = true }
 openssl = { version = "0.10.75", optional = true }
 rand = "0.10.0"
 regex = "1.10.3"
+percent-encoding = "2.3"
 reqwest = { version = "0.13", features = [
   "json",
   "blocking",
@@ -90,7 +90,9 @@ reqwest = { version = "0.13", features = [
   "rustls",
 ], optional = true }
 semver = "1.0"
+sccache-build = { path = "crates/build-runtime", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
+serde_bytes = "0.11.19"
 serde_json = ">=1.0, <1.0.155" # zmij (used in 1.0.147+) requires Rust 1.84+
 sha2 = { version = "0.11.0", optional = true }
 shlex = "2.0.1"
@@ -206,6 +208,7 @@ gha = [
 ]
 memcached = ["opendal/services-memcached", "opendal-layer-logging"]
 native-zlib = []
+native-store = ["sccache-build/store"]
 oss = [
   "opendal/services-oss",
   "opendal-layer-logging",
@@ -234,6 +237,7 @@ vendored-openssl = ["openssl?/vendored", "reqwest?/native-tls-vendored"]
 unstable = []
 # Enables distributed support in the sccache client
 dist-client = [
+  "native-store",
   "zlib-rs-fast",
   "zlib-rs-fast/parallel",
   "hyper",
@@ -245,6 +249,9 @@ dist-client = [
 ]
 # Enables the sccache-dist binary
 dist-server = [
+  "native-store",
+  "sha2",
+  "url/serde",
   "jwt",
   "zlib-rs-fast",
   "libmount",
@@ -261,11 +268,16 @@ dist-tests = ["dist-client", "dist-server"]
 
 [workspace]
 exclude = ["tests/test-crate", "vendor/tiny_http"]
-members = ["tests/integration/randomize_readdir"]
+members = ["crates/build-runtime", "tests/integration/randomize_readdir"]
 
 [[bench]]
 harness = false
 name = "sccache_bench"
+test = false
+
+[[bench]]
+harness = false
+name = "preprocessor_cache_bench"
 test = false
 
 [lints]

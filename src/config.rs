@@ -853,6 +853,89 @@ impl Default for DistAuth {
     }
 }
 
+/// Select the executor for an admitted native cache miss.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeExecutionPreference {
+    Local,
+    RemoteFirst,
+}
+
+/// Owner-local input store and sandbox settings. The caller never chooses
+/// these paths through the namespace protocol.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeLocalConfig {
+    pub preference: NativeExecutionPreference,
+    pub max_jobs: usize,
+    pub directory: PathBuf,
+    pub scratch: PathBuf,
+    pub bubblewrap: PathBuf,
+    pub space: crate::build_runtime::SpacePolicy,
+}
+
+impl NativeLocalConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.directory.is_absolute()
+                && self.scratch.is_absolute()
+                && self.bubblewrap.is_absolute(),
+            "native local execution paths must be absolute"
+        );
+        anyhow::ensure!(
+            self.max_jobs > 0,
+            "native local execution requires at least one slot"
+        );
+        self.space.validate()?;
+        Ok(())
+    }
+}
+
+/// Explicit scheduler-owned cache and execution policy for a native client.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeClientConfig {
+    #[cfg(any(feature = "dist-client", feature = "dist-server"))]
+    pub endpoint: HTTPUrl,
+    #[cfg(not(any(feature = "dist-client", feature = "dist-server")))]
+    pub endpoint: String,
+    pub platform_contract: String,
+    pub request_timeout_secs: u64,
+    pub build_timeout_secs: u64,
+    pub renewal_interval_secs: u64,
+    pub max_metadata_bytes: u64,
+    pub max_result_bytes: u64,
+    pub local_execution: Option<NativeLocalConfig>,
+}
+
+impl NativeClientConfig {
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            cfg!(all(
+                feature = "dist-client",
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )),
+            "native compiler mode requires a Linux distributed client"
+        );
+        anyhow::ensure!(
+            !self.platform_contract.is_empty()
+                && self.request_timeout_secs > 0
+                && self.build_timeout_secs > 0
+                && self.renewal_interval_secs > 0
+                && self.max_metadata_bytes > 0
+                && self.max_metadata_bytes < u64::MAX
+                && self.max_result_bytes > 0
+                && self.max_result_bytes < u64::MAX,
+            "invalid native compiler client limits or platform contract"
+        );
+        if let Some(local) = &self.local_execution {
+            local.validate()?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 #[serde(deny_unknown_fields)]
@@ -867,6 +950,8 @@ pub struct DistConfig {
     #[serde(deserialize_with = "deserialize_size_from_str")]
     pub toolchain_cache_size: u64,
     pub rewrite_includes_only: bool,
+    pub native: Option<NativeClientConfig>,
+    pub native_installation_catalogs: Vec<PathBuf>,
 }
 
 impl Default for DistConfig {
@@ -878,6 +963,8 @@ impl Default for DistConfig {
             toolchains: Vec::default(),
             toolchain_cache_size: default_toolchain_cache_size(),
             rewrite_includes_only: false,
+            native: None,
+            native_installation_catalogs: Vec::new(),
         }
     }
 }
@@ -1782,6 +1869,13 @@ impl Config {
 
         // Logging must never change the filesystem namespace used to compile.
         let client_side_mode = env_client_side_mode.unwrap_or(file_client_side_mode);
+        if let Some(native) = &dist.native {
+            native.validate()?;
+            anyhow::ensure!(
+                dist.scheduler_url.is_some(),
+                "native compiler mode requires the scheduler status URL"
+            );
+        }
 
         let (caches, fallback_cache) = conf_caches.clone().into_fallback();
         Ok(Self {
@@ -2020,6 +2114,82 @@ pub mod scheduler {
         }
     }
 
+    /// Owner-configured repository prefix for original package archives.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct PackageUpstream {
+        pub origin: reqwest::Url,
+        pub timeout_secs: u64,
+    }
+
+    /// Dedicated native cache listener and its explicit resource limits.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct NativeCacheConfig {
+        pub public_addr: SocketAddr,
+        pub directory: PathBuf,
+        pub space: crate::build_runtime::SpacePolicy,
+        pub idle_timeout_secs: u64,
+        pub max_sessions: usize,
+        pub max_result_bytes: u64,
+        pub max_result_blobs: usize,
+        pub max_tree_bytes: u64,
+        pub max_tree_blobs: usize,
+        pub max_concurrent_uploads: usize,
+        pub max_total_uploads: usize,
+        pub http_threads: usize,
+        pub max_metadata_bytes: usize,
+        pub package_import: Option<crate::build_runtime::PackageImportLimits>,
+        #[serde(default)]
+        pub package_upstreams: std::collections::BTreeMap<String, PackageUpstream>,
+    }
+
+    impl NativeCacheConfig {
+        /// Validate configuration before binding the listener.
+        ///
+        /// # Errors
+        /// Returns an error for a relative path or unusable resource bounds.
+        pub fn session_limits(&self) -> Result<crate::build_runtime::SessionLimits> {
+            if !self.directory.is_absolute() {
+                bail!("native cache directory must be absolute");
+            }
+            if self.http_threads <= self.max_total_uploads || self.max_metadata_bytes == 0 {
+                bail!(
+                    "native cache requires spare HTTP threads for control traffic and a nonzero metadata limit"
+                );
+            }
+            let limits = crate::build_runtime::SessionLimits {
+                idle_timeout: std::time::Duration::from_secs(self.idle_timeout_secs),
+                max_sessions: self.max_sessions,
+                max_result_bytes: self.max_result_bytes,
+                max_result_blobs: self.max_result_blobs,
+                max_tree_bytes: self.max_tree_bytes,
+                max_tree_blobs: self.max_tree_blobs,
+                max_concurrent_uploads: self.max_concurrent_uploads,
+                max_total_uploads: self.max_total_uploads,
+                max_manifest_cache_bytes: self.max_metadata_bytes,
+                peer_discovery_timeout: std::time::Duration::from_millis(25)
+                    .min(std::time::Duration::from_secs(self.idle_timeout_secs)),
+            };
+            limits.validate()?;
+            self.space.validate()?;
+            if let Some(package_import) = self.package_import {
+                package_import.validate()?;
+                if package_import.max_concurrent_imports > self.max_total_uploads {
+                    bail!("native package concurrency exceeds total upload capacity");
+                }
+            }
+            for (name, upstream) in &self.package_upstreams {
+                crate::dist::native::validate_upstream_name(name)?;
+                crate::dist::native::validate_upstream_base(&upstream.origin)?;
+                if self.package_import.is_none() || upstream.timeout_secs == 0 {
+                    bail!("original package upstream needs import limits and a nonzero timeout");
+                }
+            }
+            Ok(limits)
+        }
+    }
+
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct Config {
@@ -2029,6 +2199,7 @@ pub mod scheduler {
         #[serde(default)]
         pub maintenance_drain_file: Option<PathBuf>,
         pub job_slack: JobSlackConfig,
+        pub native_cache: Option<NativeCacheConfig>,
     }
 
     pub fn from_path(conf_path: &Path) -> Result<Option<Config>> {
@@ -2036,6 +2207,12 @@ pub mod scheduler {
             .context("Failed to load scheduler config file")?;
         if let Some(config) = &config {
             config.job_slack.validate()?;
+            if let Some(native) = &config.native_cache {
+                native.session_limits()?;
+                if native.public_addr == config.public_addr {
+                    bail!("native cache listener must have a separate address");
+                }
+            }
         }
         Ok(config)
     }
@@ -2120,6 +2297,8 @@ pub mod server {
     #[serde(tag = "type")]
     #[serde(deny_unknown_fields)]
     pub enum BuilderType {
+        #[serde(rename = "native")]
+        Native,
         #[serde(rename = "docker")]
         Docker,
         #[serde(rename = "overlay")]
@@ -2154,11 +2333,39 @@ pub mod server {
         Token { token: String },
     }
 
+    const fn default_artifact_grace_secs() -> u64 {
+        300
+    }
+
+    /// Explicit native worker execution and store configuration.
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct NativeWorkerConfig {
+        pub cache_url: HTTPUrl,
+        pub directory: PathBuf,
+        pub space: crate::build_runtime::SpacePolicy,
+        pub scratch: PathBuf,
+        pub bubblewrap: PathBuf,
+        pub platform_contract: String,
+        pub renewal_interval_secs: u64,
+        pub request_timeout_secs: u64,
+        pub execution_timeout_secs: u64,
+        pub max_result_bytes: u64,
+        pub max_metadata_bytes: u64,
+        #[serde(default = "default_artifact_grace_secs")]
+        pub artifact_grace_secs: u64,
+        pub artifact_grace_bytes: Option<u64>,
+        pub max_inflight_jobs: Option<std::num::NonZeroUsize>,
+        pub package_import: Option<crate::build_runtime::PackageImportLimits>,
+        #[serde(default)]
+        pub package_transfer: crate::build_runtime::PackageTransferCost,
+    }
+
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
     #[serde(deny_unknown_fields)]
     pub struct Config {
         pub builder: BuilderType,
-        pub cache_dir: PathBuf,
+        pub cache_dir: Option<PathBuf>,
         pub public_addr: SocketAddr,
         pub bind_address: Option<SocketAddr>,
         pub scheduler_url: HTTPUrl,
@@ -2168,6 +2375,7 @@ pub mod server {
         /// Other local archive-cache roots eligible for hash-verified reflink reuse.
         #[serde(default)]
         pub toolchain_archive_sources: Vec<PathBuf>,
+        pub native_worker: Option<NativeWorkerConfig>,
     }
 
     pub fn from_path(conf_path: &Path) -> Result<Option<Config>> {
@@ -3543,6 +3751,8 @@ key_prefix = "cosprefix"
                 toolchains: vec![],
                 toolchain_cache_size: 5_368_709_120,
                 rewrite_includes_only: false,
+                native: None,
+                native_installation_catalogs: Vec::new(),
             },
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],
@@ -3595,7 +3805,7 @@ fn server_toml_parse() {
                 bwrap_path: PathBuf::from("/usr/bin/bwrap"),
                 extracted_toolchain_cache_size: 8 * 1024 * 1024 * 1024,
             },
-            cache_dir: PathBuf::from("/tmp/toolchains"),
+            cache_dir: Some(PathBuf::from("/tmp/toolchains")),
             public_addr: "192.168.1.1:10501"
                 .parse()
                 .expect("Public address must be valid socket address"),
@@ -3613,6 +3823,7 @@ fn server_toml_parse() {
             },
             toolchain_cache_size: 10737418240,
             toolchain_archive_sources: vec![],
+            native_worker: None,
         }
     )
 }
@@ -3984,4 +4195,43 @@ fn test_get_cache_levels_missing_config() {
             .to_string()
             .contains("S3 cache not configured")
     );
+}
+
+#[test]
+#[cfg(all(
+    feature = "dist-client",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn native_compiler_config_is_validated() -> Result<()> {
+    let input = r#"
+[dist]
+scheduler_url = "http://127.0.0.1:10500"
+
+[dist.native]
+endpoint = "http://127.0.0.1:10502"
+platform_contract = "test-platform"
+request_timeout_secs = 120
+build_timeout_secs = 600
+renewal_interval_secs = 15
+max_metadata_bytes = 67108864
+max_result_bytes = 1073741824
+"#;
+    let make = |text: &str| -> Result<Config> {
+        Config::from_env_and_file_configs(EnvConfig::default(), toml::from_str(text)?)
+    };
+    assert_eq!(
+        make(input)?
+            .dist
+            .native
+            .context("native configuration missing")?
+            .platform_contract,
+        "test-platform"
+    );
+    assert!(
+        make(&input.replace("renewal_interval_secs = 15", "renewal_interval_secs = 0")).is_err()
+    );
+    assert!(make(&input.replace("scheduler_url = \"http://127.0.0.1:10500\"", "")).is_err());
+    assert!(make(&format!("client_side_mode = true\n{input}"))?.client_side_mode);
+    Ok(())
 }

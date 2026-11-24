@@ -258,6 +258,8 @@ pub fn sccache_client_cfg(
             toolchains: vec![],
             toolchain_cache_size: TC_CACHE_SIZE,
             rewrite_includes_only: false, // TODO
+            native: None,
+            native_installation_catalogs: Vec::new(),
         },
         server_startup_timeout_ms: None,
         basedirs: vec![],
@@ -271,6 +273,7 @@ pub fn sccache_client_cfg(
 fn sccache_scheduler_cfg(address: SocketAddr) -> sccache::config::scheduler::Config {
     sccache::config::scheduler::Config {
         maintenance_drain_file: None,
+        native_cache: None,
         job_slack: Default::default(),
         public_addr: address,
         client_auth: sccache::config::scheduler::ClientAuth::Insecure,
@@ -295,7 +298,7 @@ fn sccache_server_cfg(
             bwrap_path: DIST_IMAGE_BWRAP_PATH.into(),
             extracted_toolchain_cache_size: EXTRACTED_TC_CACHE_SIZE,
         },
-        cache_dir: Path::new(CONFIGS_CONTAINER_PATH).join(relpath),
+        cache_dir: Some(Path::new(CONFIGS_CONTAINER_PATH).join(relpath)),
         public_addr: server_addr,
         bind_address: Some(server_addr),
         scheduler_url,
@@ -304,6 +307,7 @@ fn sccache_server_cfg(
         },
         toolchain_cache_size: TC_CACHE_SIZE,
         toolchain_archive_sources: vec![],
+        native_worker: None,
     }
 }
 

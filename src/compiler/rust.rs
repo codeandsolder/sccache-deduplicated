@@ -21,11 +21,12 @@ use crate::compiler::args::{
     ArgDisposition, ArgInfo, ArgParseError, ArgParseResult, ArgToStringResult, ArgsIter, Argument,
     FromArg, IntoArg, NormalizedDisposition, PathTransformerFn, split_os_string_arg,
 };
-use crate::compiler::canonical_paths::CanonicalRustPaths;
+use crate::compiler::canonical_paths::{CanonicalRustPaths, RustEnvironmentPath};
 use crate::compiler::{
-    CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, Compiler,
-    CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, GenerateHashKeyContext,
-    HashResult, Language, SingleCompileCommand, c::ArtifactDescriptor,
+    CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, CompileTransport, Compiler,
+    CompilerArguments, CompilerCachePolicy, CompilerDiscovery, CompilerHasher, CompilerKind,
+    CompilerProxy, GenerateHashKeyContext, HashResult, Language, SingleCompileCommand,
+    c::ArtifactDescriptor,
 };
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
@@ -58,7 +59,7 @@ use std::fs::OpenOptions;
 use std::future::Future;
 use std::hash::Hash;
 #[cfg(feature = "dist-client")]
-use std::io::{self, Seek};
+use std::io;
 use std::io::{Read, Write};
 use std::iter;
 use std::path::{Path, PathBuf};
@@ -239,6 +240,8 @@ pub struct ParsedArguments {
     emit: HashSet<String>,
     /// Metadata-only invocations produce this file regardless of crate type.
     metadata_only_output: Option<String>,
+    split_link: bool,
+    split_link_metadata: Option<String>,
     /// The value of any `--color` option passed on the commandline.
     color_mode: ColorMode,
     /// Whether `--json` was passed to this invocation.
@@ -284,6 +287,8 @@ pub struct RustCompilation {
     #[cfg(feature = "dist-client")]
     dlltool_files: Vec<PathBuf>,
     canonical_paths: Option<CanonicalRustPaths>,
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    native_link: Option<super::rust_link::NativeLinkLayout>,
 }
 
 #[cfg(target_os = "linux")]
@@ -878,31 +883,6 @@ fn is_clippy_driver(executable: &Path) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case("clippy-driver"))
 }
 
-fn rust_shadow_plain_env(name: &std::ffi::OsStr) -> bool {
-    matches!(
-        name.to_str(),
-        Some(
-            "CARGO"
-                | "CARGO_HOME"
-                | "CARGO_INSTALL_ROOT"
-                | "CARGO_MANIFEST_DIR"
-                | "CARGO_MANIFEST_PATH"
-                | "CARGO_TARGET_DIR"
-                | "CARGO_TARGET_TMPDIR"
-                | "OUT_DIR"
-                | "PWD"
-                | "RUSTC"
-                | "RUSTDOC"
-                | "TMPDIR"
-                | "TMP"
-                | "TEMP"
-                | "TEMPDIR"
-        )
-    ) || name
-        .to_str()
-        .is_some_and(|name| name.starts_with("CARGO_BIN_EXE_"))
-}
-
 fn rust_shadow_digest(value: &std::ffi::OsStr) -> String {
     blake3::hash(value.as_encoded_bytes()).to_hex().to_string()
 }
@@ -916,7 +896,7 @@ fn rust_shadow_env_value(
         || raw.to_owned(),
         |canonical| canonical.env_value_to_canonical(name, raw),
     );
-    let show_text = rust_shadow_plain_env(name);
+    let show_text = RustEnvironmentPath::classify(name).disclose_in_shadow();
     RustShadowEnvValue {
         raw_text: show_text.then(|| raw.to_string_lossy().into_owned()),
         raw_blake3: rust_shadow_digest(raw),
@@ -1411,15 +1391,64 @@ fn canonical_bwrap_arguments(
     canonical.bwrap_arguments(executable, &arguments, cwd)
 }
 
+async fn discover_rust_sysroot<T: CommandCreatorSync>(
+    mut creator: T,
+    executable: &Path,
+    env_vars: &[(OsString, OsString)],
+    dist_archive: Option<PathBuf>,
+) -> Result<(PathBuf, Vec<PathBuf>)> {
+    let mut cmd = creator.new_command_sync(executable);
+    cmd.stdout(process::Stdio::piped())
+        .stderr(process::Stdio::null())
+        .arg("--print=sysroot")
+        .env_clear()
+        .envs(env_vars.to_vec());
+    let output = run_input_output(cmd, None).await?;
+    let outstr = String::from_utf8(output.stdout).context("Error parsing sysroot")?;
+    let sysroot = PathBuf::from(outstr.trim_end());
+    let libs_path = sysroot.join(LIBS_DIR);
+    let mut libs = fs::read_dir(&libs_path)
+        .with_context(|| {
+            format!(
+                "Failed to list rustc sysroot: `{}`",
+                crate::util::debug_display(&libs_path)
+            )
+        })?
+        .filter_map(|e| {
+            e.ok().and_then(|e| {
+                e.file_type().ok().and_then(|t| {
+                    let p = e.path();
+                    if (t.is_file() || t.is_symlink() && p.is_file())
+                        && p.extension().is_some_and(|e| e == DLL_EXTENSION)
+                    {
+                        Some(p)
+                    } else {
+                        None
+                    }
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    if let Some(path) = dist_archive {
+        trace!(
+            "Hashing {} along with rustc libs.",
+            crate::util::debug_display(&path)
+        );
+        libs.push(path);
+    }
+    libs.sort();
+    Ok((sysroot, libs))
+}
+
 impl Rust {
     /// Create a new Rust compiler instance, calculating the hashes of
     /// all the shared libraries in its sysroot.
     pub async fn new<T>(
-        mut creator: T,
+        creator: T,
         executable: PathBuf,
         env_vars: &[(OsString, OsString)],
         rustc_verbose_version: &str,
-        dist_archive: Option<PathBuf>,
+        discovery: CompilerDiscovery,
         pool: tokio::runtime::Handle,
     ) -> Result<Self>
     where
@@ -1433,55 +1462,14 @@ impl Rust {
             .context("rustc verbose version didn't have a line for `host:`")?
             .to_string();
 
-        // it's fine to use the `executable` directly no matter if proxied or not
-        let mut cmd = creator.new_command_sync(&executable);
-        cmd.stdout(process::Stdio::piped())
-            .stderr(process::Stdio::null())
-            .arg("--print=sysroot")
-            .env_clear()
-            .envs(env_vars.to_vec());
-        let hashed_archive = dist_archive.clone();
-        let sysroot_and_libs = async move {
-            let output = run_input_output(cmd, None).await?;
-            //debug!("output.and_then: {}", output);
-            let outstr = String::from_utf8(output.stdout).context("Error parsing sysroot")?;
-            let sysroot = PathBuf::from(outstr.trim_end());
-            let libs_path = sysroot.join(LIBS_DIR);
-            let mut libs = fs::read_dir(&libs_path)
-                .with_context(|| {
-                    format!(
-                        "Failed to list rustc sysroot: `{}`",
-                        crate::util::debug_display(&libs_path)
-                    )
-                })?
-                .filter_map(|e| {
-                    e.ok().and_then(|e| {
-                        e.file_type().ok().and_then(|t| {
-                            let p = e.path();
-                            if (t.is_file() || t.is_symlink() && p.is_file())
-                                && p.extension().is_some_and(|e| e == DLL_EXTENSION)
-                            {
-                                Some(p)
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                })
-                .collect::<Vec<_>>();
-            if let Some(path) = hashed_archive {
-                trace!(
-                    "Hashing {} along with rustc libs.",
-                    crate::util::debug_display(&path)
-                );
-                libs.push(path);
-            }
-            libs.sort();
-            Result::Ok((sysroot, libs))
-        };
-
+        let sysroot_and_libs = discover_rust_sysroot(
+            creator,
+            &executable,
+            env_vars,
+            discovery.dist_archive.clone(),
+        );
         #[cfg(feature = "dist-client")]
-        {
+        let ((sysroot, libs), rlib_dep_reader) = {
             use futures::TryFutureExt;
             let rlib_dep_reader = {
                 let executable = executable.clone();
@@ -1502,29 +1490,21 @@ impl Rust {
                     None
                 }
             };
-            hash_all(&libs, &pool).await.map(move |digests| Self {
-                executable,
-                host,
-                version: rustc_verbose_version.to_string(),
-                sysroot,
-                compiler_shlibs_digests: digests,
-                dist_archive,
-                rlib_dep_reader,
-            })
-        }
-
+            ((sysroot, libs), rlib_dep_reader)
+        };
         #[cfg(not(feature = "dist-client"))]
-        {
-            let (sysroot, libs) = sysroot_and_libs.await?;
-            hash_all(&libs, &pool).await.map(move |digests| Rust {
-                executable,
-                host,
-                version: rustc_verbose_version.to_string(),
-                sysroot,
-                compiler_shlibs_digests: digests,
-                dist_archive,
-            })
-        }
+        let (sysroot, libs) = sysroot_and_libs.await?;
+        let digests = discovery.hash_toolchain_files(&libs, &pool).await?;
+        Ok(Self {
+            executable,
+            host,
+            version: rustc_verbose_version.to_string(),
+            sysroot,
+            compiler_shlibs_digests: digests,
+            dist_archive: discovery.dist_archive,
+            #[cfg(feature = "dist-client")]
+            rlib_dep_reader,
+        })
     }
 }
 
@@ -1561,8 +1541,17 @@ where
         arguments: &[OsString],
         cwd: &Path,
         _env_vars: &[(OsString, OsString)],
+        policy: CompilerCachePolicy,
     ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>> {
-        match parse_arguments(arguments, cwd) {
+        let split_native_links = cfg!(all(target_os = "linux", feature = "dist-client"))
+            && policy == CompilerCachePolicy::Native
+            && !is_clippy_driver(&self.executable)
+            && self
+                .version
+                .lines()
+                .next()
+                .is_some_and(|version| version.contains("-nightly"));
+        match parse_arguments(arguments, cwd, split_native_links) {
             CompilerArguments::Ok(args) => CompilerArguments::Ok(Box::new(RustHasher {
                 executable: self.executable.clone(), // if rustup exists, this must already contain the true resolved compiler path
                 host: self.host.clone(),
@@ -2114,7 +2103,11 @@ counted_array!(static ARGS: [ArgInfo<ArgData>; _] = [
     clippy::too_many_lines,
     reason = "single-pass argument parser keeps interdependent flag state and ordering visible; splitting would require a state bag threaded through helpers"
 )]
-fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<ParsedArguments> {
+fn parse_arguments(
+    arguments: &[OsString],
+    cwd: &Path,
+    split_native_links: bool,
+) -> CompilerArguments<ParsedArguments> {
     let mut args = vec![];
 
     let mut emit: Option<HashSet<String>> = None;
@@ -2325,7 +2318,26 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
         cannot_cache!("unsupported --emit");
     }
     let metadata_only = emit.contains("metadata") && !emit.contains("link");
-    if !metadata_only {
+    // rustc currently tracks -Zno-link in the crate metadata hash. An
+    // unchanged Rust dependency rebuilt through that path could invalidate
+    // existing downstream artifacts (E0460/E0463). Native consumers need
+    // only the final machine-code/ABI artifact, not a Rust crate identity.
+    // A test harness always emits an executable regardless of crate type.
+    let metadata_bearing =
+        !test_harness && (crate_types.rlib || other_crate_types.iter().any(|kind| kind != "bin"));
+    let native_leaf = test_harness
+        || crate_types.staticlib
+        || crate_types.cdylib
+        || other_crate_types.contains("bin");
+    let split_link = split_native_links
+        && !metadata_only
+        && emit.contains("link")
+        && native_leaf
+        && !metadata_bearing;
+    if split_native_links && !metadata_only && metadata_bearing && native_leaf {
+        cannot_cache!("mixed Rust metadata and native link outputs");
+    }
+    if !metadata_only && !split_link {
         // General linked Rust artifacts remain non-cacheable: their native
         // linker inputs are opaque. A test harness always links an executable,
         // irrespective of an explicit crate type.
@@ -2359,12 +2371,14 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     // --print file-names reports the *linked* output even for --emit=metadata.
     // Rust metadata instead uses lib<crate-name><extra-filename>.rmeta, even
     // for executable targets where the file is an empty Cargo marker.
-    let metadata_only_output = metadata_only.then(|| {
+    let metadata_filename = || {
         format!(
             "lib{crate_name}{}.rmeta",
             extra_filename.as_deref().unwrap_or_default()
         )
-    });
+    };
+    let metadata_only_output = metadata_only.then(metadata_filename);
+    let split_link_metadata = (split_link && emit.contains("metadata")).then(metadata_filename);
 
     // Figure out the dep-info filename, if emitting dep-info.
     let dep_info = if emit.contains("dep-info") {
@@ -2393,7 +2407,7 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     // Locate all static libs specified on the commandline.
     let staticlibs = static_lib_names
         .into_iter()
-        .filter(|(_, bundle, _)| *bundle || crate_types.cdylib)
+        .filter(|(_, bundle, _)| !split_link && (*bundle || crate_types.cdylib))
         .flat_map(|(name, _, verbatim)| {
             // Search target-dependent filename alternatives instead of
             // assuming the compiler uses the host archive convention.
@@ -2432,6 +2446,8 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
         gcno: gcno.map(std::convert::Into::into),
         emit,
         metadata_only_output,
+        split_link,
+        split_link_metadata,
         color_mode,
         has_json,
         target_json,
@@ -2525,13 +2541,13 @@ fn relocate_rust_operands(
 /// linker options, repeated options, and option spellings remain exact.
 #[cfg(target_os = "linux")]
 pub(super) fn native_link_stage_input(
-    arguments: &[OsString],
+    expanded: Vec<OsString>,
     cwd: &Path,
+    resolve_directory: impl FnMut(&Path, &Path) -> Result<PathBuf>,
 ) -> Result<super::rust_link::RustLinkStages> {
     use anyhow::ensure;
     use std::cell::Cell;
 
-    let expanded = super::rust_response::expand(arguments, cwd)?;
     let consumed = Cell::new(0);
     let mut input = None;
     let mut after_separator = false;
@@ -2539,6 +2555,8 @@ pub(super) fn native_link_stage_input(
     let mut out_dir = None;
     let mut output_file = None;
     let mut explicit_outputs = Vec::new();
+    let mut codegen_arguments = Vec::with_capacity(expanded.len());
+    let mut previous = 0;
     for argument in ArgsIter::new(
         expanded
             .iter()
@@ -2549,6 +2567,18 @@ pub(super) fn native_link_stage_input(
     .with_double_dashes()
     {
         let argument = argument?;
+        let end = consumed.get();
+        // These options are consumed exclusively by the native linker.
+        // Keep their exact original spelling in the link-stage arguments,
+        // but exclude them from the generated-tree action identity.
+        if !matches!(
+            argument.get_data(),
+            Some(CodeGen(ArgCodegen { opt, .. }))
+                if matches!(opt.as_str(), "link-arg" | "link-args" | "link_arg" | "link_args")
+        ) {
+            codegen_arguments.extend_from_slice(&expanded[previous..end]);
+        }
+        previous = end;
         match &argument {
             Argument::Raw(value) if value == "--" && !after_separator => after_separator = true,
             Argument::Raw(_) => {
@@ -2592,12 +2622,16 @@ pub(super) fn native_link_stage_input(
         "Rust invocation does not emit a linked artifact"
     );
     super::rust_link::RustLinkStages::from_parsed(
-        expanded,
-        input.context("missing Rust source operand")?,
+        super::rust_link::ParsedLinkArguments {
+            original: expanded,
+            codegen: codegen_arguments,
+            input: input.context("missing Rust source operand")?,
+        },
         cwd,
         out_dir.as_deref(),
         output_file.as_deref(),
         &explicit_outputs,
+        resolve_directory,
     )
 }
 
@@ -3337,6 +3371,11 @@ where
         // 10. The version of the compiler.
         self.version.hash(&mut HashToDigest { digest: &mut m });
 
+        if let Some(metadata) = &self.parsed_args.split_link_metadata
+            && !outputs.contains(metadata)
+        {
+            outputs.push(metadata.clone());
+        }
         if self.parsed_args.emit.contains("metadata")
             && self.parsed_args.metadata_only_output.is_none()
         {
@@ -3539,6 +3578,16 @@ where
             }
         }
 
+        #[cfg(all(feature = "dist-client", target_os = "linux"))]
+        let native_link = self.parsed_args.split_link.then(|| {
+            super::rust_link::NativeLinkLayout::new(
+                canonical_paths.as_ref(),
+                self.parsed_args
+                    .dep_info
+                    .as_ref()
+                    .map(|name| cwd.join(&self.parsed_args.output_dir).join(name)),
+            )
+        });
         Ok(HashResult {
             key,
             compilation: Box::new(RustCompilation {
@@ -3551,15 +3600,16 @@ where
                 crate_link_paths: self.parsed_args.crate_link_paths.clone(),
                 crate_name: self.parsed_args.crate_name.clone(),
                 #[cfg(feature = "dist-client")]
-                can_trim_rlibs: self.parsed_args.metadata_only_output.is_some()
-                    || matches!(
-                        self.parsed_args.crate_types,
-                        CrateTypes {
-                            rlib: true,
-                            staticlib: false,
-                            cdylib: false,
-                        }
-                    ),
+                can_trim_rlibs: !self.parsed_args.split_link
+                    && (self.parsed_args.metadata_only_output.is_some()
+                        || matches!(
+                            self.parsed_args.crate_types,
+                            CrateTypes {
+                                rlib: true,
+                                staticlib: false,
+                                cdylib: false,
+                            }
+                        )),
                 cwd,
                 env_vars,
                 env_dep_names,
@@ -3567,6 +3617,8 @@ where
                 #[cfg(feature = "dist-client")]
                 dlltool_files: dlltool_plan.map_or_else(Vec::new, |plan| plan.files),
                 canonical_paths,
+                #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                native_link,
                 #[cfg(feature = "dist-client")]
                 rlib_dep_reader: self.rlib_dep_reader.clone(),
             }),
@@ -3600,7 +3652,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
     fn generate_compile_commands(
         &self,
         path_transformer: &mut dist::PathTransformer,
-        _rewrite_includes_only: bool,
+        transport: CompileTransport,
     ) -> Result<(
         Box<dyn CompileCommand<T>>,
         Option<dist::CompileCommand>,
@@ -3630,6 +3682,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             let _ = host;
             let _ = sysroot;
             let _ = allow_dist;
+            let _ = transport;
         }
 
         trace!("[{crate_name}]: compile");
@@ -3697,10 +3750,14 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             }
 
             // Dependency files are derived from the local source-discovery
-            // pass. Never make a worker write them to the client's --out-dir,
-            // which need not exist in the worker sandbox.
+            // pass. Archive workers omit this emission because their output
+            // directory need not exist. Native workers preserve the original
+            // emission flags (which affect rlib metadata), but never publish
+            // the private dependency file.
             let mut worker_arguments = arguments.clone();
-            remove_dep_info_emit(&mut worker_arguments);
+            if transport != CompileTransport::Native {
+                remove_dep_info_emit(&mut worker_arguments);
+            }
             let mut dist_arguments = vec![];
             let mut saw_target = false;
 
@@ -3723,8 +3780,6 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                 }
             }
 
-            // We can't rely on the packaged toolchain necessarily having the same default target triple
-            // as us (typically host triple), so make sure to always explicitly specify a target.
             if let Some(canonical) = canonical_paths {
                 for value in &mut dist_arguments {
                     *value = canonical
@@ -3734,7 +3789,9 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
                 }
             }
 
-            if !saw_target {
+            // Archive workers historically require an explicit target. Native
+            // workers use the exact packaged compiler under its platform contract.
+            if !saw_target && transport != CompileTransport::Native {
                 dist_arguments.push(format!("--target={host}"));
             }
 
@@ -3830,6 +3887,11 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
         })();
 
         Ok((command, dist_command, Cacheable::Yes))
+    }
+
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    fn native_link_layout(&self) -> Option<&super::rust_link::NativeLinkLayout> {
+        self.native_link.as_ref()
     }
 
     #[cfg(feature = "dist-client")]
@@ -4400,6 +4462,57 @@ fn test_dist_dependency_inspection_failure_keeps_all_candidates() -> Result<()> 
     Ok(())
 }
 
+#[cfg(all(feature = "dist-client", feature = "native-store", target_os = "linux"))]
+#[test]
+fn native_rust_inputs_retain_complete_dependency_artifacts() -> Result<()> {
+    use crate::build_runtime::NativeStore;
+    use crate::dist::pkg::InputsPackager as _;
+    let tmp = tempfile::tempdir()?;
+    let source = tmp.path().join("project");
+    let deps = source.join("deps");
+    fs::create_dir_all(&deps)?;
+    let explicit = deps.join("libdirect-abc.rlib");
+    let mut bytes = Vec::new();
+    {
+        let mut archive = ar::Builder::new(&mut bytes);
+        archive.append(&ar::Header::new(b"code.o".to_vec(), 4), &b"code"[..])?;
+        archive.append(
+            &ar::Header::new(b"rust.metadata.bin".to_vec(), 4),
+            &b"meta"[..],
+        )?;
+    }
+    fs::write(&explicit, &bytes)?;
+    fs::write(deps.join("libtransitive-def.rmeta"), b"metadata")?;
+    fs::write(deps.join("unrelated.txt"), b"not a dependency")?;
+    let mut transformer = dist::PathTransformer::new();
+    transformer.add_root_mapping(source, "/work");
+    let packager = RustInputsPackager {
+        env_vars: Vec::new(),
+        input_dirs: Vec::new(),
+        crate_link_paths: vec![deps],
+        can_trim_rlibs: true,
+        inputs: vec![explicit],
+        path_transformer: transformer,
+        rlib_dep_reader: None,
+    };
+    let store = NativeStore::open(&tmp.path().join("store"))?;
+    let tree = Box::new(packager)
+        .native_mapping()?
+        .prepare()?
+        .import(&store)?;
+    let view = tree.materialize(tmp.path())?;
+    assert_eq!(
+        fs::read(view.root().join("work/deps/libdirect-abc.rlib"))?,
+        bytes
+    );
+    assert_eq!(
+        fs::read(view.root().join("work/deps/libtransitive-def.rmeta"))?,
+        b"metadata"
+    );
+    assert!(!view.root().join("work/deps/unrelated.txt").exists());
+    Ok(())
+}
+
 #[test]
 #[cfg(feature = "dist-client")]
 fn test_dist_rlib_trimming_preserves_recognized_metadata() -> Result<()> {
@@ -4431,58 +4544,11 @@ fn test_dist_rlib_trimming_preserves_recognized_metadata() -> Result<()> {
 #[cfg(feature = "dist-client")]
 impl pkg::InputsPackager for RustInputsPackager {
     fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<()> {
-        debug!("Packaging compile inputs for compile");
-        let Self {
-            crate_link_paths,
-            can_trim_rlibs,
-            inputs,
-            path_transformer,
-            rlib_dep_reader,
-            env_vars,
-            input_dirs,
-        } = *{ self };
-
-        let dependency_names =
-            rust_dependency_names(&inputs, &env_vars, rlib_dep_reader.as_deref());
-        let crate_libraries =
-            rust_dependency_candidates(&crate_link_paths, dependency_names.as_ref())?;
-
-        let mut paths = pkg::InputArchivePaths::new(path_transformer);
-        let mut all_tar_inputs = Vec::with_capacity(inputs.len() + crate_libraries.len());
-        for input_path in inputs.into_iter().chain(crate_libraries) {
-            if !super::CAN_DIST_DYLIBS
-                && input_path
-                    .extension()
-                    .is_some_and(|ext| ext == DLL_EXTENSION)
-            {
-                bail!(
-                    "Cannot distribute dylib input {} on this platform",
-                    input_path.display()
-                );
-            }
-            all_tar_inputs.push(paths.file(&input_path)?);
-        }
-        // The explicit externs and implicit search directories can refer to
-        // the same file, including via symlink aliases.
-        all_tar_inputs.sort_unstable();
-        all_tar_inputs.dedup();
-        for directory in input_dirs {
-            paths.directory(&directory)?;
-        }
-
-        let mut builder = tar::Builder::new(wtr);
-
-        for (input_path, dist_input_path) in &all_tar_inputs {
-            let mut file_header = pkg::make_tar_header(input_path, dist_input_path)?;
-            let mut file = fs::File::open(input_path)?;
+        let can_trim_rlibs = self.can_trim_rlibs;
+        (*self).discover()?.write_archive(wtr, |input_path, file| {
             if can_trim_rlibs && can_trim_this(input_path) {
-                match rlib_metadata_archive(&mut file) {
-                    Ok(Some(metadata_ar)) => {
-                        file_header.set_size(metadata_ar.len() as u64);
-                        file_header.set_cksum();
-                        builder.append(&file_header, metadata_ar.as_slice())?;
-                        continue;
-                    }
+                match rlib_metadata_archive(file) {
+                    Ok(Some(metadata_ar)) => return Ok(Some(metadata_ar)),
                     Ok(None) => debug!(
                         "No recognized metadata member in {}; transferring full rlib",
                         input_path.display()
@@ -4492,16 +4558,52 @@ impl pkg::InputsPackager for RustInputsPackager {
                         input_path.display()
                     ),
                 }
-                file.rewind()?;
             }
-            file_header.set_cksum();
-            builder.append(&file_header, file)?;
-        }
+            Ok(None)
+        })
+    }
 
-        paths.append_support_entries(&mut builder)?;
-        // Finish archive
-        builder.into_inner()?;
-        Ok(())
+    // The native store shares complete dependency artifacts across actions,
+    // including metadata and linkable code. Do not introduce a second
+    // representation of rlibs merely to reduce a per-job archive.
+    #[cfg(target_os = "linux")]
+    fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
+        (*self).discover()?.into_native_mapping()
+    }
+}
+
+#[cfg(feature = "dist-client")]
+impl RustInputsPackager {
+    fn discover(self) -> Result<pkg::CompilerInputs> {
+        let Self {
+            crate_link_paths,
+            can_trim_rlibs: _,
+            inputs,
+            path_transformer,
+            rlib_dep_reader,
+            env_vars,
+            input_dirs,
+        } = self;
+
+        let dependency_names =
+            rust_dependency_names(&inputs, &env_vars, rlib_dep_reader.as_deref());
+        let crate_libraries =
+            rust_dependency_candidates(&crate_link_paths, dependency_names.as_ref())?;
+        let mut plan = pkg::CompilerInputs::new(path_transformer);
+        for input_path in inputs.into_iter().chain(crate_libraries) {
+            if !super::CAN_DIST_DYLIBS
+                && input_path
+                    .extension()
+                    .is_some_and(|ext| ext == DLL_EXTENSION)
+            {
+                bail!("Cannot distribute dylib input {}", input_path.display());
+            }
+            plan.file(&input_path, None)?;
+        }
+        for directory in input_dirs {
+            plan.directory(&directory)?;
+        }
+        Ok(plan)
     }
 }
 
@@ -4684,22 +4786,7 @@ fn test_dist_toolchain_archive_contains_only_required_installed_targets() -> Res
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-impl pkg::ToolchainPackager for RustToolchainPackager {
-    fn prepare_namespace(self: Box<Self>) -> Result<(String, Box<dyn pkg::ToolchainPackager>)> {
-        self.package_builder()?.prepare_namespace()
-    }
-
-    fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()> {
-        self.package_builder()?.write_compressed_tar(f)
-    }
-}
-
-#[cfg(all(
-    feature = "dist-client",
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-impl RustToolchainPackager {
+impl pkg::DiscoverToolchain for RustToolchainPackager {
     fn package_builder(self) -> Result<pkg::ToolchainPackageBuilder> {
         info!(
             "Packaging Rust compiler for sysroot {}",
@@ -5260,9 +5347,52 @@ mod test {
         assert!(native_tune_requested(&[tune("znver2"), tune("native")]));
     }
 
+    #[test_case::test_case("bin", false, true; "executable")]
+    #[test_case::test_case("rlib", true, true; "test_harness")]
+    #[test_case::test_case("cdylib", false, true; "native_shared_library")]
+    #[test_case::test_case("staticlib", false, true; "native_static_library")]
+    #[test_case::test_case("rlib", false, false; "rlib")]
+    #[test_case::test_case("proc-macro", false, false; "proc_macro")]
+    #[test_case::test_case("dylib", false, false; "rust_dynamic_library")]
+    #[test_case::test_case("rlib,cdylib", false, false; "mixed_metadata")]
+    fn native_link_policy_respects_rust_metadata_identity(
+        crate_type: &str,
+        test_harness: bool,
+        expected: bool,
+    ) {
+        let mut args = [
+            "--crate-name",
+            "probe",
+            "--crate-type",
+            crate_type,
+            "--out-dir",
+            "out",
+            "--emit=metadata,link,dep-info",
+            "probe.rs",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        if test_harness {
+            args.push("--test".into());
+        }
+        match parse_arguments(&args, Path::new("."), true) {
+            CompilerArguments::Ok(parsed) => {
+                assert_eq!(parsed.split_link, expected);
+                if expected {
+                    assert_eq!(
+                        parsed.split_link_metadata.as_deref(),
+                        Some("libprobe.rmeta")
+                    );
+                }
+            }
+            CompilerArguments::CannotCache(_, _) if !expected => {}
+            other => panic!("unexpected native policy outcome {other:?}"),
+        }
+    }
+
     fn _parse_arguments(arguments: &[String]) -> CompilerArguments<ParsedArguments> {
         let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
-        parse_arguments(&arguments, ".".as_ref())
+        parse_arguments(&arguments, ".".as_ref(), false)
     }
 
     macro_rules! parses {
@@ -5482,7 +5612,7 @@ LLVM version: 15.0.2
         ] {
             let args = args.iter().map(OsString::from).collect::<Vec<_>>();
             assert_eq!(
-                parse_arguments(&args, Path::new(".")),
+                parse_arguments(&args, Path::new("."), false),
                 CompilerArguments::NotCompilation
             );
         }
@@ -5588,7 +5718,8 @@ LLVM version: 15.0.2
                 }
                 args.extend(["--emit", "dep-info,metadata"]);
                 let args = args.into_iter().map(OsString::from).collect::<Vec<_>>();
-                let CompilerArguments::Ok(parsed) = parse_arguments(&args, Path::new(".")) else {
+                let CompilerArguments::Ok(parsed) = parse_arguments(&args, Path::new("."), false)
+                else {
                     panic!("metadata-only compile rejected: {args:?}");
                 };
                 assert_eq!(
@@ -6470,7 +6601,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 "foo.rs",
             ]
             .map(OsString::from);
-            let CompilerArguments::Ok(parsed_args) = parse_arguments(&args, f.tempdir.path())
+            let CompilerArguments::Ok(parsed_args) =
+                parse_arguments(&args, f.tempdir.path(), false)
             else {
                 bail!("could not parse metadata compile for {crate_type}");
             };
@@ -6514,9 +6646,12 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             #[cfg(feature = "dist-client")]
             {
                 let mut transformer = dist::PathTransformer::new();
-                let (_, command, _) = result
-                    .compilation
-                    .generate_compile_commands(&mut transformer, false)?;
+                let (_, command, _) = result.compilation.generate_compile_commands(
+                    &mut transformer,
+                    CompileTransport::Archive {
+                        rewrite_includes_only: false,
+                    },
+                )?;
                 let command = command.context("metadata-only command should be distributable")?;
                 assert!(
                     command
@@ -6564,6 +6699,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 dep_info: Some("foo-abc.d".into()),
                 emit,
                 metadata_only_output: None,
+                split_link: false,
+                split_link_metadata: None,
                 color_mode: ColorMode::Auto,
                 has_json: false,
                 gcno: None,
@@ -6667,6 +6804,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 dep_info: None,
                 emit,
                 metadata_only_output: None,
+                split_link: false,
+                split_link_metadata: None,
                 color_mode: ColorMode::Auto,
                 has_json: false,
                 gcno: None,
@@ -6917,7 +7056,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         F: Fn(&Path) -> Result<()>,
     {
         let oargs = args.iter().map(OsString::from).collect::<Vec<OsString>>();
-        let parsed_args = match parse_arguments(&oargs, f.tempdir.path()) {
+        let parsed_args = match parse_arguments(&oargs, f.tempdir.path(), false) {
             CompilerArguments::Ok(parsed_args) => parsed_args,
             o => panic!("Got unexpected parse result: {o:?}"),
         };
@@ -6968,6 +7107,66 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             .wait()
             .unwrap();
         (result.key, result.weak_toolchain_key)
+    }
+
+    #[test]
+    fn test_destination_cpu_changes_rust_cache_key_not_gcc_only_flags() {
+        let f = TestFixture::new();
+        let args_v2 = [
+            "--emit",
+            "metadata",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "-C",
+            "target-cpu=x86-64-v2",
+        ];
+        let args_v4 = [
+            "--emit",
+            "metadata",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "-C",
+            "target-cpu=x86-64-v4",
+        ];
+        let no_env = &[];
+        let gcc_v2 = [(
+            OsString::from("CFLAGS_x86_64_unknown_linux_gnu"),
+            OsString::from("-march=x86-64-v2"),
+        )];
+        let gcc_v4 = [(
+            OsString::from("CFLAGS_x86_64_unknown_linux_gnu"),
+            OsString::from("-march=x86-64-v4"),
+        )];
+        let key = |args: &[&'static str], env: &[(OsString, OsString)]| {
+            hash_key(&f, args, env, |_| Ok(()), false)
+        };
+        let rust_v2 = key(&args_v2, no_env);
+        let rust_v4 = key(&args_v4, no_env);
+        assert_ne!(
+            rust_v2, rust_v4,
+            "effective target-cpu must partition Rust cache"
+        );
+        assert_eq!(rust_v2, key(&args_v2, no_env));
+        assert_eq!(
+            rust_v2,
+            key(&args_v2, &gcc_v2),
+            "unobserved GCC-only flags cannot change Rust compilation identity"
+        );
+        assert_eq!(
+            rust_v2,
+            key(&args_v2, &gcc_v4),
+            "unobserved GCC-only flags cannot change Rust compilation identity"
+        );
     }
 
     #[test]
@@ -7122,7 +7321,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 "src/lib.rs",
             ]
             .map(OsString::from);
-            let parsed = match parse_arguments(&requested_arguments, &cwd) {
+            let parsed = match parse_arguments(&requested_arguments, &cwd, false) {
                 CompilerArguments::Ok(parsed) => parsed,
                 other => bail!("unexpected parse result: {other:?}"),
             };
@@ -7145,13 +7344,18 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 #[cfg(feature = "dist-client")]
                 dlltool_files: Vec::new(),
                 canonical_paths: None,
+                #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                native_link: None,
             };
             let mut transformer = dist::PathTransformer::new();
-            let (local, distributed, _) = <RustCompilation as Compilation<
-                ProcessCommandCreator,
-            >>::generate_compile_commands(
-                &compilation, &mut transformer, false
-            )?;
+            let (local, distributed, _) =
+                <RustCompilation as Compilation<ProcessCommandCreator>>::generate_compile_commands(
+                    &compilation,
+                    &mut transformer,
+                    CompileTransport::Archive {
+                        rewrite_includes_only: false,
+                    },
+                )?;
             let local_arguments = local.get_arguments();
             assert!(
                 local_arguments
@@ -7218,6 +7422,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 "out".into(),
             ],
             &build,
+            false,
         ) {
             CompilerArguments::Ok(parsed) => parsed,
             other => bail!("unexpected parse result: {other:?}"),
@@ -7256,13 +7461,17 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             #[cfg(feature = "dist-client")]
             dlltool_files: Vec::new(),
             canonical_paths: Some(canonical),
+            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+            native_link: None,
         };
         let mut transformer = dist::PathTransformer::new();
         let (local, dist_command, _) =
             <RustCompilation as Compilation<ProcessCommandCreator>>::generate_compile_commands(
                 &compilation,
                 &mut transformer,
-                false,
+                CompileTransport::Archive {
+                    rewrite_includes_only: false,
+                },
             )?;
         let local_args = local.get_arguments();
         assert!(
@@ -7297,7 +7506,9 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 <RustCompilation as Compilation<ProcessCommandCreator>>::generate_compile_commands(
                     &noncanonical,
                     &mut legacy_transformer,
-                    false,
+                    CompileTransport::Archive {
+                        rewrite_includes_only: false,
+                    },
                 )?;
             let legacy_dist = legacy_dist.context("noncanonical distributed command missing")?;
             assert_eq!(
@@ -7335,7 +7546,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             "target-cpu=native",
         ];
         let oargs = raw.iter().map(OsString::from).collect::<Vec<_>>();
-        let parsed_args = match parse_arguments(&oargs, f.tempdir.path()) {
+        let parsed_args = match parse_arguments(&oargs, f.tempdir.path(), false) {
             CompilerArguments::Ok(parsed_args) => parsed_args,
             other => bail!("unexpected parse result: {other:?}"),
         };
@@ -7406,9 +7617,12 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         );
 
         let mut transformer = dist::PathTransformer::new();
-        let (local_command, dist_command, _) = dist_znver2
-            .compilation
-            .generate_compile_commands(&mut transformer, false)?;
+        let (local_command, dist_command, _) = dist_znver2.compilation.generate_compile_commands(
+            &mut transformer,
+            CompileTransport::Archive {
+                rewrite_includes_only: false,
+            },
+        )?;
 
         let local_args = local_command.get_arguments();
         assert!(local_args.iter().any(|arg| arg == "target-cpu=x86-64"));
@@ -7470,6 +7684,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 OsString::from("out"),
             ],
             temp.path(),
+            false,
         ) {
             CompilerArguments::Ok(parsed) => parsed,
             other => bail!("unexpected parse result: {other:?}"),
@@ -7497,6 +7712,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             #[cfg(feature = "dist-client")]
             dlltool_files: Vec::new(),
             canonical_paths: None,
+            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+            native_link: None,
         };
 
         let mut transformer = dist::PathTransformer::new();
@@ -7504,7 +7721,9 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             <RustCompilation as Compilation<ProcessCommandCreator>>::generate_compile_commands(
                 &compilation,
                 &mut transformer,
-                false,
+                CompileTransport::Archive {
+                    rewrite_includes_only: false,
+                },
             )?;
         let dist_command = dist_command.context("distributed command unexpectedly disabled")?;
         let cargo_value = dist_command
@@ -7541,6 +7760,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 OsString::from("out"),
             ],
             temp.path(),
+            false,
         ) {
             CompilerArguments::Ok(parsed) => parsed,
             other => bail!("unexpected parse result: {other:?}"),
@@ -7568,6 +7788,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             #[cfg(feature = "dist-client")]
             dlltool_files: Vec::new(),
             canonical_paths: None,
+            #[cfg(all(feature = "dist-client", target_os = "linux"))]
+            native_link: None,
         };
 
         let mut transformer = dist::PathTransformer::new();
@@ -7575,7 +7797,9 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             <RustCompilation as Compilation<ProcessCommandCreator>>::generate_compile_commands(
                 &compilation,
                 &mut transformer,
-                false,
+                CompileTransport::Archive {
+                    rewrite_includes_only: false,
+                },
             )?;
         assert!(dist_command.is_some());
         assert!(
@@ -7612,7 +7836,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 "lib",
             ];
             let oargs = args.iter().map(OsString::from).collect::<Vec<_>>();
-            let parsed_args = match parse_arguments(&oargs, f.tempdir.path()) {
+            let parsed_args = match parse_arguments(&oargs, f.tempdir.path(), false) {
                 CompilerArguments::Ok(parsed_args) => parsed_args,
                 other => panic!("Got unexpected parse result: {other:?}"),
             };
@@ -7687,7 +7911,12 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             let mut transformer = dist::PathTransformer::new();
             let (command, distributed, _) = result
                 .compilation
-                .generate_compile_commands(&mut transformer, false)
+                .generate_compile_commands(
+                    &mut transformer,
+                    CompileTransport::Archive {
+                        rewrite_includes_only: false,
+                    },
+                )
                 .unwrap();
             let manifest_env = command
                 .get_env_vars()
@@ -7731,8 +7960,9 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         assert_ne!(key_a, key_b);
     }
 
-    #[test]
-    fn test_canonical_unknown_source_falls_back_without_failing() -> Result<()> {
+    #[test_case::test_case(true; "unknown_source")]
+    #[test_case::test_case(false; "output_under_read_only_build")]
+    fn test_canonical_layout_falls_back_without_failing(external_dependency: bool) -> Result<()> {
         let f = TestFixture::new();
         f.touch("foo.rs")?;
         let external = tempfile::tempdir()?;
@@ -7744,26 +7974,28 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             "link,dep-info",
             "foo.rs",
             "--out-dir",
-            "target/out",
+            if external_dependency {
+                "target/out"
+            } else {
+                "out"
+            },
             "--crate-name",
             "foo",
             "--crate-type",
             "lib",
         ];
         let oargs = raw.iter().map(OsString::from).collect::<Vec<_>>();
-        let parsed_args = match parse_arguments(&oargs, f.tempdir.path()) {
+        let parsed_args = match parse_arguments(&oargs, f.tempdir.path(), false) {
             CompilerArguments::Ok(parsed_args) => parsed_args,
             other => bail!("unexpected parse result: {other:?}"),
         };
 
         let creator = new_creator();
-        mock_dep_info(
-            &creator,
-            &[
-                "foo.rs",
-                external_source.to_str().context("non-UTF-8 temp path")?,
-            ],
-        );
+        let mut dependencies = vec!["foo.rs"];
+        if external_dependency {
+            dependencies.push(external_source.to_str().context("non-UTF-8 temp path")?);
+        }
+        mock_dep_info(&creator, &dependencies);
         mock_file_names(&creator, &["foo.rlib"]);
         let runtime = single_threaded_runtime();
         let pool = runtime.handle().clone();
@@ -7808,100 +8040,17 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             .wait()?;
 
         let mut transformer = dist::PathTransformer::new();
-        let (command, _, _) = result
-            .compilation
-            .generate_compile_commands(&mut transformer, false)?;
+        let (command, _, _) = result.compilation.generate_compile_commands(
+            &mut transformer,
+            CompileTransport::Archive {
+                rewrite_includes_only: false,
+            },
+        )?;
         let arguments = command.get_arguments();
 
         assert!(
             !arguments.iter().any(|arg| arg == "--die-with-parent"),
             "fallback unexpectedly kept canonical bubblewrap execution"
-        );
-        assert!(
-            arguments
-                .windows(2)
-                .any(|pair| pair[0] == "--emit" && pair[1] == "link,dep-info"),
-            "ordinary fallback did not preserve the caller's dep-info emission"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_canonical_output_outside_target_falls_back_without_failing() -> Result<()> {
-        let f = TestFixture::new();
-        f.touch("foo.rs")?;
-
-        let raw = [
-            "--emit",
-            "link,dep-info",
-            "foo.rs",
-            "--out-dir",
-            "out",
-            "--crate-name",
-            "foo",
-            "--crate-type",
-            "lib",
-        ];
-        let oargs = raw.iter().map(OsString::from).collect::<Vec<_>>();
-        let parsed_args = match parse_arguments(&oargs, f.tempdir.path()) {
-            CompilerArguments::Ok(parsed_args) => parsed_args,
-            other => bail!("unexpected parse result: {other:?}"),
-        };
-
-        let creator = new_creator();
-        mock_dep_info(&creator, &["foo.rs"]);
-        mock_file_names(&creator, &["foo.rlib"]);
-        let runtime = single_threaded_runtime();
-        let pool = runtime.handle().clone();
-        let mut hasher = RustHasher {
-            executable: "rustc".into(),
-            host: "x86_64-unknown-linux-gnu".to_owned(),
-            version: TEST_RUSTC_VERSION.to_string(),
-            sysroot: f.tempdir.path().join("sysroot"),
-            compiler_shlibs_digests: vec![],
-            dist_archive: None,
-            #[cfg(feature = "dist-client")]
-            rlib_dep_reader: None,
-            native_profile: Some("test-native".into()),
-            parsed_args,
-        };
-        let env = vec![
-            (
-                OsString::from("SCCACHE_EXPERIMENTAL_CANONICAL_RUST"),
-                OsString::from("1"),
-            ),
-            (
-                OsString::from("SCCACHE_CANONICAL_BUILD_ROOT"),
-                f.tempdir.path().as_os_str().to_owned(),
-            ),
-            (
-                OsString::from("SCCACHE_CANONICAL_TARGET_ROOT"),
-                f.tempdir.path().join("target").into_os_string(),
-            ),
-        ];
-
-        let result = hasher
-            .generate_hash_key(GenerateHashKeyContext {
-                creator: &creator,
-                cwd: f.tempdir.path().to_owned(),
-                env_vars: env,
-                may_dist: false,
-                pool: &pool,
-                rewrite_includes_only: false,
-                storage: Arc::new(MockStorage::new(None, false)),
-                cache_control: CacheControl::Default,
-            })
-            .wait()?;
-
-        let mut transformer = dist::PathTransformer::new();
-        let (command, _, _) = result
-            .compilation
-            .generate_compile_commands(&mut transformer, false)?;
-        let arguments = command.get_arguments();
-        assert!(
-            !arguments.iter().any(|arg| arg == "--die-with-parent"),
-            "output under read-only /build unexpectedly kept canonical execution"
         );
         assert!(
             arguments
@@ -8596,7 +8745,7 @@ version='2.0.0'
             .unwrap();
         let arg = format!("@{}", td.path().join("args").display());
         let args: Vec<OsString> = vec![OsString::from(arg)];
-        let result = parse_arguments(&args, td.path());
+        let result = parse_arguments(&args, td.path(), false);
         let parsed = match result {
             CompilerArguments::Ok(args) => args,
             o => panic!("Got unexpected parse result: {o:?}"),
@@ -8611,7 +8760,7 @@ version='2.0.0'
         // Do not generate a cache key from arguments rustc cannot expand.
         let cwd = Path::new("/nonexistent");
         let args: Vec<OsString> = vec![OsString::from("@missing_file")];
-        let result = parse_arguments(&args, cwd);
+        let result = parse_arguments(&args, cwd, false);
         assert!(matches!(result, CompilerArguments::CannotCache(..)));
     }
 }

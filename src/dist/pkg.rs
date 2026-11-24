@@ -25,6 +25,20 @@ use crate::errors::{Context, Result, anyhow, bail};
 ))]
 pub use self::toolchain_imp::ToolchainPackageBuilder;
 
+mod inputs;
+pub(crate) use inputs::CompilerInputs;
+
+#[cfg(target_os = "linux")]
+pub(crate) fn native_directory_metadata() -> Result<crate::build_runtime::TreeMetadata> {
+    Ok(crate::build_runtime::TreeMetadata {
+        mode: 0o755,
+        modified: crate::build_runtime::TreeTimestamp {
+            seconds: i64::try_from(tar::DETERMINISTIC_TIMESTAMP)?,
+            nanoseconds: 0,
+        },
+    })
+}
+
 pub trait ToolchainPackager: Send {
     /// Additional identity of files and search paths used to build this package.
     ///
@@ -54,6 +68,50 @@ pub trait ToolchainPackager: Send {
     ///
     /// Returns an error if packaging or writing the toolchain fails.
     fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()>;
+
+    /// Discover the files and logical paths of a native toolchain.
+    ///
+    /// # Errors
+    /// Returns an error if discovery fails or this packager has no native mapping.
+    #[cfg(target_os = "linux")]
+    fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
+        bail!("native mapping not supported by this toolchain packager")
+    }
+}
+
+/// Compiler-specific discovery shared by the archive and native transports.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) trait DiscoverToolchain: Send + Sized {
+    fn key_extension(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn package_builder(self) -> Result<ToolchainPackageBuilder>;
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+impl<T: DiscoverToolchain> ToolchainPackager for T {
+    fn cache_key_extension(&self) -> Result<Option<String>> {
+        self.key_extension()
+    }
+
+    fn prepare_namespace(self: Box<Self>) -> Result<(String, Box<dyn ToolchainPackager>)> {
+        self.package_builder()?.prepare_namespace()
+    }
+
+    fn write_pkg(self: Box<Self>, f: fs::File) -> Result<()> {
+        self.package_builder()?.write_compressed_tar(f)
+    }
+
+    fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree> {
+        self.package_builder()?.into_native_mapping()
+    }
 }
 
 pub trait InputsPackager: Send {
@@ -63,6 +121,13 @@ pub trait InputsPackager: Send {
     ///
     /// Returns an error if packaging or writing an input fails.
     fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<()>;
+
+    /// Discover compiler input files directly in the native content namespace.
+    ///
+    /// # Errors
+    /// Returns an error for unavailable sources or conflicting logical paths.
+    #[cfg(target_os = "linux")]
+    fn native_mapping(self: Box<Self>) -> Result<crate::build_runtime::MappedTree>;
 }
 
 #[cfg(not(all(
@@ -361,6 +426,60 @@ mod toolchain_imp {
             Ok(())
         }
 
+        /// Convert discovered toolchain paths directly into native CAS inputs.
+        ///
+        /// # Errors
+        /// Returns an error for conflicting paths or a source that cannot be resolved.
+        pub fn into_native_mapping(self) -> Result<crate::build_runtime::MappedTree> {
+            use crate::build_runtime::{MappedMetadata, MappedTree, TreePath};
+            use std::os::unix::ffi::OsStrExt;
+
+            let directories = super::native_directory_metadata()?;
+            let modified = directories.modified;
+            let mut mapping = MappedTree::new(directories);
+            let relative = |path: &Path| TreePath::new(path.as_os_str().as_bytes().to_vec());
+            for mount in ["out", "tmp", "dev", "proc"] {
+                mapping.add_directory(relative(Path::new(mount))?)?;
+            }
+            for path in self.dir_set.keys() {
+                mapping.add_directory(relative(path)?)?;
+            }
+            for (destination, source) in &self.file_set {
+                let resolved = source.canonicalize()?;
+                anyhow::ensure!(
+                    tar_safe_path(self.map_path(&resolved)) == *destination,
+                    "toolchain path changed after discovery: {}",
+                    source.display()
+                );
+                mapping.add_file(
+                    relative(destination)?,
+                    resolved,
+                    MappedMetadata::Normalize(modified),
+                )?;
+            }
+            for (from, to) in &self.symlinks {
+                let from = self.map_path(from);
+                let to = self.map_path(to);
+                if from != to {
+                    mapping.add_symlink(
+                        relative(&tar_safe_path(from))?,
+                        to.as_os_str().as_bytes().to_vec(),
+                        modified,
+                    )?;
+                }
+            }
+            Ok(mapping)
+        }
+
+        fn map_path(&self, path: &Path) -> PathBuf {
+            for (local_root, archive_root) in &self.root_mappings {
+                if let Ok(suffix) = path.strip_prefix(local_root) {
+                    return archive_root.join(suffix);
+                }
+            }
+            path.to_owned()
+        }
+
         /// Simplify the path and strip the leading slash.
         ///
         /// Symlinks in the path are recorded for inclusion in the tarball.
@@ -370,13 +489,7 @@ mod toolchain_imp {
             }
             .simplify(path)?;
 
-            for (local_root, archive_root) in &self.root_mappings {
-                if let Ok(suffix) = simplified.strip_prefix(local_root) {
-                    return Ok(tar_safe_path(archive_root.join(suffix)));
-                }
-            }
-
-            Ok(tar_safe_path(simplified))
+            Ok(tar_safe_path(self.map_path(&simplified)))
         }
     }
 
@@ -511,6 +624,33 @@ mod toolchain_imp {
             builder.tarify_path(&rustc)?,
             PathBuf::from("rust/bin/rustc")
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "native-store")]
+    #[test]
+    fn native_toolchain_mapping_rebases_symlink_sources_and_targets() -> Result<()> {
+        use crate::build_runtime::{NativeStore, TreeEntry, TreePath};
+        let temp = tempfile::tempdir()?;
+        let sysroot = temp.path().join("toolchain");
+        std::fs::create_dir_all(sysroot.join("bin"))?;
+        std::fs::write(sysroot.join("bin/compiler"), b"compiler")?;
+        std::os::unix::fs::symlink("compiler", sysroot.join("bin/alias"))?;
+
+        let mut builder = ToolchainPackageBuilder::new();
+        builder.add_root_mapping(sysroot.clone(), "/rust".into());
+        builder.add_file(sysroot.join("bin/alias"))?;
+        let store = NativeStore::open(&temp.path().join("cas"))?;
+        let tree = builder.into_native_mapping()?.prepare()?.import(&store)?;
+        let entries = &tree.manifest().entries;
+        assert!(matches!(
+            entries.get(&TreePath::new(b"rust/bin/compiler".to_vec())?),
+            Some(TreeEntry::File { .. })
+        ));
+        assert!(matches!(
+            entries.get(&TreePath::new(b"rust/bin/alias".to_vec())?),
+            Some(TreeEntry::Symlink { target, .. }) if target == b"/rust/bin/compiler"
+        ));
         Ok(())
     }
 
@@ -663,13 +803,15 @@ impl InputArchivePaths {
         Ok((path, remote))
     }
 
-    pub(crate) fn directory(&mut self, path: &Path) -> Result<()> {
+    pub(crate) fn directory(&mut self, path: &Path) -> Result<String> {
         #[cfg(unix)]
         if let Some(physical) = self.physical.as_mut() {
-            return physical.add_directory(path);
+            let resolved = physical.add_directory(path)?;
+            return self.archive_path(&resolved);
         }
         let path = self.resolve(path)?;
-        self.add_mapped_directory(path)
+        self.add_mapped_directory(path.clone())?;
+        self.archive_path(&path)
     }
 
     /// Emit supporting entries after all files, so extraction never writes
@@ -771,7 +913,7 @@ impl PhysicalInputLayout {
         Ok(current)
     }
 
-    fn add_directory(&mut self, path: &Path) -> Result<()> {
+    fn add_directory(&mut self, path: &Path) -> Result<PathBuf> {
         let resolved = self.resolve(path)?;
         if !resolved.is_dir() {
             bail!(
@@ -780,9 +922,9 @@ impl PhysicalInputLayout {
             );
         }
         if resolved != Path::new("/") {
-            self.directories.insert(resolved);
+            self.directories.insert(resolved.clone());
         }
-        Ok(())
+        Ok(resolved)
     }
 
     /// Add the empty traversal directories and the original symlink spellings.

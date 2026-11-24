@@ -1,0 +1,1018 @@
+//! Connect ordinary compiler discovery to the native execution contract.
+//! The scheduler owns results; the client neither initializes nor writes an
+//! archive cache. The existing compiler frontends still determine whether
+//! a compilation is cacheable and supply its input closure.
+
+use std::{
+    collections::BTreeMap,
+    os::unix::ffi::OsStrExt,
+    path::{Path, PathBuf},
+    process,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result, ensure};
+
+use crate::{
+    build_runtime::{
+        ActionMode, BuildPath, CommandSpec, ContentId, ExecutionRoot, ExecutionSpec, OutputKind,
+        OutputSpec, PreparedTree, SourceDigestCache, TreeRecipe,
+    },
+    cache::FileObjectSource,
+    client::{SharedConnection, connection_task},
+    config::{DistAuth, DistToolchainConfig, HTTPUrl, NativeClientConfig},
+    dist::{
+        self,
+        native::{LocalExecutor, NativeBuildResult, NativeBuildSource, NativeCacheClient, broker},
+        pkg,
+    },
+    mock_command::CommandCreatorSync,
+    protocol::{NativeNamespacePolicy, Request, Response},
+    server::{DistClientContainer, DistInfo, SccacheService},
+};
+
+use super::{
+    CacheControl, Cacheable, Compilation, CompileResult, CompileTransport, DistPackagers, DistType,
+    MissType,
+};
+
+struct DirectEndpoint {
+    config: NativeClientConfig,
+    scheduler: Option<HTTPUrl>,
+    auth: DistAuth,
+    local: Option<LocalExecutor>,
+}
+
+enum Endpoint {
+    Direct(Box<DirectEndpoint>),
+    Namespace {
+        connection: SharedConnection,
+        chunk_bytes: usize,
+    },
+}
+
+pub struct NativeCompilerClient {
+    endpoint: Endpoint,
+    policy: NativeNamespacePolicy,
+    toolchains: Vec<DistToolchainConfig>,
+    toolchain_digests: Arc<SourceDigestCache>,
+}
+
+fn installed_digest_cache(catalogs: &[PathBuf]) -> Arc<SourceDigestCache> {
+    let mut cache = SourceDigestCache::default();
+    for path in catalogs {
+        if let Err(error) = cache.load_catalog(path) {
+            warn!(
+                "Native installation catalog {} unavailable: {error:#}",
+                path.display()
+            );
+        }
+    }
+    Arc::new(cache)
+}
+
+impl NativeCompilerClient {
+    pub fn new(
+        config: NativeClientConfig,
+        scheduler: Option<HTTPUrl>,
+        auth: DistAuth,
+        toolchains: Vec<DistToolchainConfig>,
+        catalogs: &[PathBuf],
+    ) -> Self {
+        let policy = NativeNamespacePolicy {
+            platform: ContentId::of(config.platform_contract.as_bytes()),
+            build_timeout_secs: config.build_timeout_secs,
+            renewal_interval_secs: config.renewal_interval_secs,
+            max_metadata_bytes: config.max_metadata_bytes,
+            max_result_bytes: config.max_result_bytes,
+        };
+        let local = config
+            .local_execution
+            .clone()
+            .map(|config| LocalExecutor::new(config, policy.platform));
+        Self {
+            endpoint: Endpoint::Direct(Box::new(DirectEndpoint {
+                config,
+                scheduler,
+                auth,
+                local,
+            })),
+            policy,
+            toolchains,
+            toolchain_digests: installed_digest_cache(catalogs),
+        }
+    }
+
+    pub fn from_namespace(
+        connection: SharedConnection,
+        chunk_bytes: usize,
+        policy: NativeNamespacePolicy,
+        toolchains: Vec<DistToolchainConfig>,
+        catalogs: &[PathBuf],
+    ) -> Self {
+        Self {
+            endpoint: Endpoint::Namespace {
+                connection,
+                chunk_bytes,
+            },
+            policy,
+            toolchains,
+            toolchain_digests: installed_digest_cache(catalogs),
+        }
+    }
+
+    pub fn toolchain_digests(&self) -> Arc<SourceDigestCache> {
+        Arc::clone(&self.toolchain_digests)
+    }
+
+    pub const fn namespace_policy(&self) -> &NativeNamespacePolicy {
+        &self.policy
+    }
+
+    pub fn serve_namespace(&self, stream: broker::DaemonStream) -> Result<()> {
+        let client = self.connect_http()?;
+        let Endpoint::Direct(endpoint) = &self.endpoint else {
+            anyhow::bail!("native namespace endpoint cannot serve");
+        };
+        broker::serve_action(&client, &self.policy, stream, endpoint.local.as_ref())
+    }
+
+    pub async fn status(&self) -> DistInfo {
+        match &self.endpoint {
+            Endpoint::Namespace { connection, .. } => {
+                let result = connection_task(Arc::clone(connection), |conn| {
+                    let Response::DistStatus(status) = conn.request(Request::DistStatus)? else {
+                        anyhow::bail!("unexpected native namespace distribution status");
+                    };
+                    Ok(status)
+                })
+                .await;
+                result.unwrap_or_else(|error| {
+                    DistInfo::NotConnected(None, format!("native daemon unavailable: {error:#}"))
+                })
+            }
+            Endpoint::Direct(endpoint) => {
+                let DirectEndpoint {
+                    config, scheduler, ..
+                } = endpoint.as_ref();
+                let result = async {
+                    let scheduler = scheduler.as_ref().context("scheduler URL unavailable")?;
+                    let url = dist::http::urls::scheduler_status(&scheduler.to_url())?;
+                    let client = crate::http_client::new_reqwest_client_builder()?
+                        .timeout(Duration::from_secs(config.request_timeout_secs))
+                        .build()?;
+                    dist::http::transport::send_async(
+                        client.get(url),
+                        dist::http::transport::RequestClass::Control,
+                    )
+                    .await
+                }
+                .await;
+                match result {
+                    Ok(status) => DistInfo::SchedulerStatus(scheduler.clone(), status),
+                    Err(error) => DistInfo::NotConnected(
+                        scheduler.clone(),
+                        format!("native scheduler unavailable: {error:#}"),
+                    ),
+                }
+            }
+        }
+    }
+
+    fn allows_automatic_toolchain(&self, executable: &Path) -> bool {
+        !self.toolchains.iter().any(|configured| match configured {
+            DistToolchainConfig::NoDist {
+                compiler_executable,
+            }
+            | DistToolchainConfig::PathOverride {
+                compiler_executable,
+                ..
+            } => compiler_executable == executable,
+        })
+    }
+
+    fn connect_http(&self) -> Result<NativeCacheClient> {
+        let Endpoint::Direct(endpoint) = &self.endpoint else {
+            anyhow::bail!("namespace client cannot authenticate directly with scheduler");
+        };
+        let DirectEndpoint { config, auth, .. } = endpoint.as_ref();
+        let token = match auth {
+            DistAuth::Token { token } => token.clone(),
+            DistAuth::Oauth2CodeGrantPKCE { auth_url, .. }
+            | DistAuth::Oauth2Implicit { auth_url, .. } => {
+                DistClientContainer::get_cached_config_auth_token(auth_url)?
+            }
+        };
+        NativeCacheClient::new(
+            config.endpoint.to_url(),
+            token,
+            Duration::from_secs(config.request_timeout_secs),
+            config.max_metadata_bytes,
+        )
+    }
+
+    async fn execute(
+        self: Arc<Self>,
+        plan: CompilerPlan,
+        mode: ActionMode,
+        pool: &tokio::runtime::Handle,
+    ) -> Result<NativeBuildResult> {
+        match &self.endpoint {
+            Endpoint::Direct(_) => {
+                pool.spawn_blocking(move || {
+                    let Endpoint::Direct(endpoint) = &self.endpoint else {
+                        unreachable!()
+                    };
+                    self.connect_http()?.run_action(
+                        &plan.spec,
+                        &plan.inputs,
+                        &plan.destinations,
+                        &self.policy.build_policy(mode),
+                        endpoint.local.as_ref(),
+                    )
+                })
+                .await?
+            }
+            Endpoint::Namespace {
+                connection,
+                chunk_bytes,
+            } => {
+                broker::run_action(
+                    Arc::clone(connection),
+                    *chunk_bytes,
+                    self.policy.clone(),
+                    plan.spec,
+                    mode,
+                    plan.inputs,
+                    plan.destinations,
+                )
+                .await
+            }
+        }
+    }
+}
+
+struct NativeOutput {
+    name: String,
+    source: PathBuf,
+    destination: PathBuf,
+    required: bool,
+    kind: OutputKind,
+}
+
+impl NativeOutput {
+    fn file(cwd: &Path, output: FileObjectSource) -> Self {
+        let path = cwd.join(output.path);
+        Self {
+            name: output.key,
+            source: path.clone(),
+            destination: path,
+            required: !output.optional,
+            kind: OutputKind::File,
+        }
+    }
+    const fn generated(name: String, source: PathBuf, destination: PathBuf) -> Self {
+        Self {
+            name,
+            source,
+            destination,
+            required: true,
+            kind: OutputKind::GeneratedTree,
+        }
+    }
+
+    fn remote_path(&self, layout: &mut pkg::CompilerInputs) -> Result<BuildPath> {
+        let path = if self.kind.is_tree() {
+            PathBuf::from(layout.directory(&self.source)?)
+        } else {
+            ensure!(
+                self.source != Path::new("/dev/null"),
+                "native outputs must be regular files"
+            );
+            match std::fs::symlink_metadata(&self.source) {
+                Ok(metadata) => ensure!(
+                    metadata.is_file(),
+                    "native output would replace a nonregular file"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("inspect native output destination"),
+            }
+            let parent = self
+                .source
+                .parent()
+                .context("native output parent missing")?;
+            let name = self
+                .source
+                .file_name()
+                .context("native output name missing")?;
+            Path::new(&layout.directory(parent)?).join(name)
+        };
+        BuildPath::new(path.as_os_str().as_bytes().to_vec())
+    }
+}
+
+struct CompilerPlan {
+    spec: ExecutionSpec,
+    inputs: Vec<PreparedTree>,
+    destinations: BTreeMap<String, PathBuf>,
+}
+
+impl CompilerPlan {
+    fn prepare(
+        command: dist::CompileCommand,
+        cwd: &Path,
+        outputs: Vec<NativeOutput>,
+        transformer: dist::PathTransformer,
+        packagers: DistPackagers,
+        platform: ContentId,
+        toolchain_digests: &SourceDigestCache,
+    ) -> Result<Self> {
+        let mut layout = pkg::CompilerInputs::new(transformer);
+        layout.directory(cwd)?;
+        let mut paths = BTreeMap::new();
+        let mut destinations = BTreeMap::new();
+        for output in outputs {
+            let path = output.remote_path(&mut layout)?;
+            ensure!(
+                paths
+                    .insert(
+                        output.name.clone(),
+                        OutputSpec {
+                            path,
+                            required: output.required,
+                            kind: output.kind,
+                        }
+                    )
+                    .is_none(),
+                "duplicate native output key"
+            );
+            destinations.insert(output.name, output.destination);
+        }
+        let (inputs, toolchain) = packagers;
+        let before = toolchain_digests.catalog_hits();
+        let start = Instant::now();
+        let toolchain = toolchain
+            .native_mapping()?
+            .prepare_with_cache(toolchain_digests)?;
+        let after = toolchain_digests.catalog_hits();
+        debug!(
+            "native toolchain preparation took {:.3}s; verified installation memo: {} files, {} bytes (process totals: {} files, {} bytes)",
+            start.elapsed().as_secs_f64(),
+            after.0.saturating_sub(before.0),
+            after.1.saturating_sub(before.1),
+            after.0,
+            after.1
+        );
+        let inputs = inputs.native_mapping()?.prepare()?;
+        let layout = layout.into_native_mapping()?.prepare()?;
+        let directories = pkg::native_directory_metadata()?;
+        let inputs = vec![toolchain, inputs, layout];
+        let recipe = TreeRecipe::union(directories, inputs.iter().map(PreparedTree::id));
+        let root = ExecutionRoot::resolve(
+            recipe,
+            &inputs
+                .iter()
+                .map(|tree| (tree.id(), tree.manifest()))
+                .collect(),
+        )?;
+        let spec = ExecutionSpec {
+            platform,
+            root,
+            mounts: BTreeMap::new(),
+            command: CommandSpec {
+                executable: BuildPath::new(command.executable.into_bytes())?,
+                arguments: command
+                    .arguments
+                    .into_iter()
+                    .map(String::into_bytes)
+                    .collect(),
+                cwd: BuildPath::new(command.cwd.into_bytes())?,
+                environment: command
+                    .env_vars
+                    .into_iter()
+                    .map(|(name, value)| (name.into_bytes(), value.into_bytes()))
+                    .collect(),
+            },
+            outputs: paths,
+        };
+        spec.validate()?;
+        Ok(Self {
+            spec,
+            inputs,
+            destinations,
+        })
+    }
+}
+
+/// Split a Rust action without changing its logical cwd, argument ordering,
+/// target, or environment. The private delivery directories are independent
+/// of all of those key fields.
+struct NativeLink {
+    workspace: super::rust_link::NativeLinkWorkspace,
+    layout: super::rust_link::NativeLinkLayout,
+    executable: PathBuf,
+    logical_cwd: PathBuf,
+    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    expected: Vec<FileObjectSource>,
+    physical_cwd: PathBuf,
+}
+
+impl NativeLink {
+    fn prepare(
+        layout: super::rust_link::NativeLinkLayout,
+        remote: &mut dist::CompileCommand,
+        transformer: &dist::PathTransformer,
+        scratch: &Path,
+        local_environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+        expected: Vec<FileObjectSource>,
+        physical_cwd: PathBuf,
+    ) -> Result<Self> {
+        use super::rust_link::{NativeLinkWorkspace, RustLinkStages};
+
+        let args = remote
+            .arguments
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect();
+        let logical_cwd = PathBuf::from(&remote.cwd);
+        let stages = RustLinkStages::from_expanded(args, &logical_cwd, |cwd, path| {
+            let logical = cwd.join(path);
+            let physical = transformer
+                .to_local(logical.to_str().context("non-UTF8 logical output root")?)?
+                .canonicalize()?;
+            let mut mapping = dist::PathTransformer::new();
+            for (local, remote) in transformer.path_mappings() {
+                mapping.add_root_mapping(local, &remote);
+            }
+            Ok(PathBuf::from(
+                mapping
+                    .as_dist_abs(&physical)
+                    .context("output path has no native mapping")?,
+            ))
+        })?;
+        let workspace = NativeLinkWorkspace::new(stages, scratch, |root| {
+            transformer.to_local(root.to_str().context("non-UTF8 output root")?)
+        })?;
+        remote.arguments = workspace
+            .codegen_arguments()
+            .into_iter()
+            .map(|arg| {
+                arg.into_string()
+                    .map_err(|_| anyhow::anyhow!("non-UTF8 native argument"))
+            })
+            .collect::<Result<_>>()?;
+        // Literal leading @ arguments have already been expanded by the
+        // frontend. The worker command cannot regenerate response files.
+        ensure!(
+            !remote.arguments.iter().any(|arg| arg.starts_with('@')),
+            "native worker would expand a literal response-file operand"
+        );
+        Ok(Self {
+            workspace,
+            layout,
+            executable: PathBuf::from(&remote.executable),
+            logical_cwd,
+            environment: local_environment,
+            expected,
+            physical_cwd,
+        })
+    }
+
+    fn outputs(&self) -> Vec<NativeOutput> {
+        self.workspace
+            .outputs()
+            .enumerate()
+            .map(|(index, (_, physical, destination))| {
+                NativeOutput::generated(
+                    format!("codegen-{index}"),
+                    physical.to_owned(),
+                    destination.to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    async fn finish<T: CommandCreatorSync>(
+        &self,
+        creator: &T,
+        mut generated: process::Output,
+    ) -> Result<process::Output> {
+        use crate::errors::ProcessError;
+        use crate::mock_command::RunCommand;
+        let mut args = self.layout.mounts.clone();
+        args.extend(self.workspace.overlay_arguments()?);
+        args.extend([
+            "--chdir".into(),
+            self.logical_cwd.clone().into_os_string(),
+            "--".into(),
+            self.executable.clone().into_os_string(),
+        ]);
+        args.extend(self.workspace.link_arguments()?);
+
+        let mut command = creator.clone().new_command_sync("/usr/bin/bwrap");
+        command
+            .args(&args)
+            .env_clear()
+            .envs(self.environment.clone())
+            .current_dir("/");
+        command.share_jobserver();
+        let linked = match crate::util::run_input_output(command, None).await {
+            Ok(output) => output,
+            Err(error) => match error.downcast::<ProcessError>() {
+                Ok(ProcessError(output)) => output,
+                Err(error) => return Err(error),
+            },
+        };
+        if linked.status.success() {
+            self.workspace.publish(
+                &self.expected,
+                &self.physical_cwd,
+                self.layout.dep_info.as_deref(),
+            )?;
+        }
+        if !linked.status.success() {
+            debug!(
+                "native local link failed with {}: {}",
+                linked.status,
+                String::from_utf8_lossy(&linked.stderr)
+            );
+        }
+        generated.status = linked.status;
+        generated.stdout.extend(linked.stdout);
+        generated.stderr.extend(linked.stderr);
+        Ok(generated)
+    }
+}
+
+fn prepare_dispatch(
+    compilation: Box<dyn Compilation<impl CommandCreatorSync>>,
+    remote: &mut dist::CompileCommand,
+    transformer: dist::PathTransformer,
+    cwd: &Path,
+    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    scratch: &mut Option<tempfile::TempDir>,
+    split: &mut Option<NativeLink>,
+) -> Result<(Vec<NativeOutput>, dist::PathTransformer, DistPackagers)> {
+    super::core::validate_dist_environment_dependencies(
+        remote,
+        &compilation.dist_environment_dependencies(),
+    )?;
+    let expected = compilation
+        .outputs()
+        .filter(|output| output.key != "d")
+        .collect::<Vec<_>>();
+    let outputs = if let Some(layout) = compilation.native_link_layout() {
+        let directory = tempfile::Builder::new()
+            .prefix("sccache-native-link-")
+            .tempdir()?;
+        let link = NativeLink::prepare(
+            layout.clone(),
+            remote,
+            &transformer,
+            directory.path(),
+            environment,
+            expected,
+            cwd.to_owned(),
+        )?;
+        let outputs = link.outputs();
+        *scratch = Some(directory);
+        *split = Some(link);
+        outputs
+    } else {
+        expected
+            .into_iter()
+            .map(|output| NativeOutput::file(cwd, output))
+            .collect()
+    };
+    let mut layout = dist::PathTransformer::new();
+    for (local, remote) in transformer.path_mappings() {
+        layout.add_root_mapping(local, &remote);
+    }
+    let packagers = compilation.into_dist_packagers(transformer)?;
+    Ok((outputs, layout, packagers))
+}
+
+fn classify_source(
+    source: NativeBuildSource,
+    mode: ActionMode,
+    elapsed: Duration,
+) -> CompileResult {
+    let miss = if mode == ActionMode::Refresh {
+        MissType::ForcedRecache
+    } else {
+        MissType::Normal
+    };
+    match source {
+        NativeBuildSource::Hit => CompileResult::CacheHit(elapsed),
+        NativeBuildSource::Local => CompileResult::NativeMiss(miss, DistType::NoDist, elapsed),
+        NativeBuildSource::Worker(addr) => {
+            CompileResult::NativeMiss(miss, DistType::Ok(addr.to_string()), elapsed)
+        }
+    }
+}
+
+pub(super) async fn compile<T: CommandCreatorSync>(
+    client: Arc<NativeCompilerClient>,
+    service: &SccacheService<T>,
+    creator: T,
+    cwd: PathBuf,
+    compilation: Box<dyn Compilation<T>>,
+    control: CacheControl,
+    pool: &tokio::runtime::Handle,
+) -> Result<(CompileResult, process::Output)> {
+    let start = Instant::now();
+    let mut transformer = dist::PathTransformer::new();
+    let (local, remote, cacheable) =
+        compilation.generate_compile_commands(&mut transformer, CompileTransport::Native)?;
+    let eligible = control != CacheControl::ForceNoCache
+        && cacheable == Cacheable::Yes
+        && compilation.is_locally_preprocessed()
+        && compilation.automatic_dist_toolchain_is_ready()
+        && client.allows_automatic_toolchain(&local.get_executable());
+    let mode = if control == CacheControl::ForceRecache {
+        ActionMode::Refresh
+    } else {
+        ActionMode::Reuse
+    };
+    let mut fallback = DistType::NoDist;
+    if let Some(mut remote) = remote.filter(|_| eligible) {
+        // Hold the temporary parent until link completion and artifact
+        // publication. It is private scratch, not a cache tier.
+        let mut scratch = None;
+        let mut split = None;
+        let result = (|| {
+            let (outputs, layout, packagers) = prepare_dispatch(
+                compilation,
+                &mut remote,
+                transformer,
+                &cwd,
+                local.get_env_vars(),
+                &mut scratch,
+                &mut split,
+            )?;
+            let preparation_client = Arc::clone(&client);
+            Ok::<_, anyhow::Error>(pool.spawn_blocking(move || {
+                CompilerPlan::prepare(
+                    remote,
+                    &cwd,
+                    outputs,
+                    layout,
+                    packagers,
+                    preparation_client.policy.platform,
+                    &preparation_client.toolchain_digests,
+                )
+            }))
+        })();
+        let result = match result {
+            Ok(task) => match task.await? {
+                Ok(plan) => client.execute(plan, mode, pool).await,
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        let result = match (result, split.as_ref()) {
+            (Ok(mut result), Some(link)) if result.output.status.success() => {
+                match link.finish(&creator, result.output).await {
+                    Ok(output) => {
+                        result.output = output;
+                        Ok(result)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            (result, _) => result,
+        };
+        // Explicit drop order: the workspace's TempDirs reference scratch.
+        drop(split);
+        drop(scratch);
+        match result {
+            Ok(result) if result.output.status.success() => {
+                let elapsed = start.elapsed();
+                let classification = classify_source(result.source, mode, elapsed);
+                return Ok((classification, result.output));
+            }
+            Ok(result) => {
+                // Incomplete compiler environment discovery can also produce
+                // an ordinary nonzero exit. Preserve caller semantics by
+                // rerunning locally without writing an archive cache.
+                warn!(
+                    "native compilation failed on {:?}; retrying locally",
+                    result.source
+                );
+                fallback = DistType::Error;
+            }
+            Err(error) if error.is::<crate::client::IpcTransportFailure>() => return Err(error),
+            Err(error) => {
+                warn!("native compilation unavailable; compiling locally: {error:#}");
+                fallback = DistType::Error;
+            }
+        }
+    }
+    let output = local.execute(service, &creator).await?;
+    let result = if output.status.success() {
+        CompileResult::NotCached(fallback, start.elapsed())
+    } else {
+        CompileResult::CompileFailed(fallback, start.elapsed())
+    };
+    Ok((result, output))
+}
+
+#[cfg(all(test, feature = "native-store"))]
+mod tests {
+    use super::*;
+    use crate::{
+        build_runtime::{ExecutionPolicy, NativeStore, execute},
+        cache::storage_from_config,
+        compiler::{CompilerArguments, GenerateHashKeyContext, get_compiler_info},
+        config::Config,
+        jobserver::Client,
+        mock_command::ProcessCommandCreator,
+    };
+    use std::{ffi::OsString, io::Read};
+
+    fn config() -> Result<Config> {
+        let endpoint = HTTPUrl::from_url(reqwest::Url::parse("http://127.0.0.1:1/")?);
+        let mut config = Config::default();
+        config.dist.scheduler_url = Some(endpoint.clone());
+        config.dist.native = Some(NativeClientConfig {
+            endpoint,
+            platform_contract: "test".into(),
+            request_timeout_secs: 1,
+            build_timeout_secs: 60,
+            renewal_interval_secs: 1,
+            max_metadata_bytes: 64 * 1024 * 1024,
+            max_result_bytes: 64 * 1024 * 1024,
+            local_execution: None,
+        });
+        Ok(config)
+    }
+
+    fn verify_compilation(
+        executable: &Path,
+        args: &[&str],
+        name: &str,
+        source: &str,
+        split_link: bool,
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cwd = temp.path().canonicalize()?;
+        std::fs::write(cwd.join(name), source)?;
+        std::fs::create_dir(cwd.join("build"))?;
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let environment = vec![("PATH".into(), "/usr/bin:/bin".into())];
+        let rt = tokio::runtime::Runtime::new()?;
+        let pool = rt.handle();
+        let mut config = config()?;
+        config.fallback_cache.dir = cwd.join("unexpected-archive-cache");
+        config.dist.cache_dir = cwd.join("unexpected-toolchain-cache");
+        let storage = storage_from_config(&config, pool)?;
+        assert_eq!(storage.cache_type_name(), "native");
+        let creator = ProcessCommandCreator::new(&Client::new_num(1));
+        let (compiler, _) = rt.block_on(get_compiler_info(
+            creator.clone(),
+            executable,
+            &cwd,
+            &args,
+            &environment,
+            pool,
+            crate::compiler::CompilerDiscovery::default(),
+        ))?;
+        let CompilerArguments::Ok(mut hasher) = compiler.parse_arguments(
+            &args,
+            &cwd,
+            &environment,
+            super::super::CompilerCachePolicy::Native,
+        ) else {
+            anyhow::bail!("real compiler arguments are not cacheable");
+        };
+        let hashed = rt.block_on(hasher.generate_hash_key(GenerateHashKeyContext {
+            creator: &creator,
+            cwd: cwd.clone(),
+            env_vars: environment.clone(),
+            may_dist: true,
+            pool,
+            rewrite_includes_only: false,
+            storage,
+            cache_control: CacheControl::Default,
+        }))?;
+        assert_eq!(hashed.cache_control, CacheControl::Default);
+        let compilation = hashed.compilation;
+        let mut transformer = dist::PathTransformer::new();
+        let (_, remote, cacheable) =
+            compilation.generate_compile_commands(&mut transformer, CompileTransport::Native)?;
+        assert_eq!(cacheable, Cacheable::Yes);
+        let mut remote = remote.context("no distributed command for real compiler")?;
+        super::super::core::validate_dist_environment_dependencies(
+            &remote,
+            &compilation.dist_environment_dependencies(),
+        )?;
+        let expected = compilation
+            .outputs()
+            .filter(|output| output.key != "d")
+            .collect::<Vec<_>>();
+        let mut replay = None;
+        let outputs = if split_link {
+            let layout = compilation
+                .native_link_layout()
+                .context("linked Rust invocation did not select split linking")?
+                .clone();
+            let link = NativeLink::prepare(
+                layout,
+                &mut remote,
+                &transformer,
+                &cwd,
+                environment.clone(),
+                expected.clone(),
+                cwd.clone(),
+            )?;
+            let outputs = link.outputs();
+            replay = Some(link);
+            outputs
+        } else {
+            assert!(compilation.native_link_layout().is_none());
+            expected
+                .into_iter()
+                .map(|output| NativeOutput::file(&cwd, output))
+                .collect()
+        };
+        let mut layout = dist::PathTransformer::new();
+        for (local, remote) in transformer.path_mappings() {
+            layout.add_root_mapping(local, &remote);
+        }
+        let platform = ContentId::of(b"test");
+        let plan = CompilerPlan::prepare(
+            remote,
+            &cwd,
+            outputs,
+            layout,
+            compilation.into_dist_packagers(transformer)?,
+            platform,
+            &SourceDigestCache::default(),
+        )?;
+        let store = NativeStore::open(&cwd.join("native-store"))?;
+        let _leases = plan
+            .inputs
+            .iter()
+            .map(|tree| tree.import(&store))
+            .collect::<Result<Vec<_>>>()?;
+        let result = execute(
+            &plan.spec,
+            &store,
+            &ExecutionPolicy {
+                platform,
+                bubblewrap: "/usr/bin/bwrap".into(),
+                scratch: cwd.clone(),
+                timeout: Duration::from_secs(60),
+                max_result_bytes: 64 * 1024 * 1024,
+            },
+            || Ok(()),
+        )?;
+        if !result.status().success() {
+            let mut stderr = Vec::new();
+            if let Some(blob) = result.diagnostics().1 {
+                result.open_blob(blob.id)?.read_to_end(&mut stderr)?;
+            }
+            anyhow::bail!(
+                "isolated compiler failed: {}",
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+        let manifest = result
+            .successful_result()
+            .context("compiler produced no result")?;
+        plan.spec.action_request()?.validate_result(manifest)?;
+        let mut replayed = BTreeMap::new();
+        if let Some(link) = &replay {
+            use crate::build_runtime::{Artifact, materialize_tree};
+            for (index, (_, _, destination)) in link.workspace.outputs().enumerate() {
+                let Artifact::GeneratedTree(manifest) =
+                    &manifest.outputs[&format!("codegen-{index}")]
+                else {
+                    anyhow::bail!("expected generated codegen tree");
+                };
+                let staged = materialize_tree(
+                    manifest,
+                    destination.parent().context("stage parent")?,
+                    |blob, path| {
+                        std::io::copy(
+                            &mut result.open_blob(blob.id)?,
+                            &mut std::fs::File::create(path)?,
+                        )?;
+                        Ok(())
+                    },
+                )?;
+                staged.publish(destination)?;
+            }
+            let output = rt.block_on(link.finish(
+                &creator,
+                process::Output {
+                    status: result.status(),
+                    stdout: vec![],
+                    stderr: vec![],
+                },
+            ))?;
+            ensure!(
+                output.status.success(),
+                "native link failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for output in &link.expected {
+                let physical = cwd.join(&output.path);
+                if output.optional && !physical.exists() {
+                    continue;
+                }
+                replayed.insert(physical.clone(), std::fs::read(physical)?);
+            }
+            ensure!(
+                !replayed.is_empty(),
+                "local link did not produce an artifact"
+            );
+            assert!(!cwd.join("build/input-stage.rlink").exists());
+        }
+        let reference = process::Command::new(executable)
+            .args(&args)
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(environment)
+            .output()?;
+        ensure!(
+            reference.status.success(),
+            "local compiler failed: {}",
+            String::from_utf8_lossy(&reference.stderr)
+        );
+        if split_link {
+            for (path, bytes) in replayed {
+                assert_eq!(ContentId::of(&bytes), ContentId::of(&std::fs::read(path)?));
+            }
+        } else {
+            for (name, output) in &manifest.outputs {
+                let mut bytes = Vec::new();
+                let crate::build_runtime::Artifact::File { blob, .. } = output else {
+                    anyhow::bail!("expected file output");
+                };
+                result.open_blob(blob.id)?.read_to_end(&mut bytes)?;
+                assert_eq!(
+                    ContentId::of(&bytes),
+                    ContentId::of(&std::fs::read(&plan.destinations[name])?),
+                    "output {name} differs from local compile"
+                );
+            }
+        }
+        assert!(!config.fallback_cache.dir.exists());
+        assert!(!config.dist.cache_dir.exists());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires GCC, ldd and Linux Bubblewrap"]
+    fn native_gcc_compiler_plan() -> Result<()> {
+        verify_compilation(
+            Path::new("/usr/bin/gcc"),
+            &[
+                "-c",
+                "input.c",
+                "-o",
+                "build/input.o",
+                "-MMD",
+                "-MF",
+                "build/input.d",
+            ],
+            "input.c",
+            "int square(int x) { return x*x; }\n",
+            false,
+        )
+    }
+
+    #[test_case::test_case(false; "completed_rlib")]
+    #[test_case::test_case(true; "split_link_bin")]
+    #[ignore = "requires a nightly Rust toolchain, ldd and Linux Bubblewrap"]
+    fn native_rust_compiler_plan(split_link: bool) -> Result<()> {
+        let sysroot = process::Command::new("rustc")
+            .args(["--print", "sysroot"])
+            .output()?;
+        ensure!(sysroot.status.success(), "rustc sysroot lookup failed");
+        let sysroot = PathBuf::from(String::from_utf8(sysroot.stdout)?.trim());
+        verify_compilation(
+            &sysroot.join("bin/rustc"),
+            &[
+                "--crate-name",
+                "input",
+                "--crate-type",
+                if split_link { "bin" } else { "rlib" },
+                "--emit=link,dep-info",
+                "--out-dir",
+                "build",
+                "-Cextra-filename=-stage",
+                "input.rs",
+            ],
+            "input.rs",
+            if split_link {
+                "fn main() { println!(\"{}\", 7 * 7); }\n"
+            } else {
+                "pub fn square(x: i32) -> i32 { x*x }\n"
+            },
+            split_link,
+        )
+    }
+}

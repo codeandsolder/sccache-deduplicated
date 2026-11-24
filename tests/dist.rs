@@ -9,6 +9,8 @@ use crate::harness::{
     cargo_command, clear_cache_local_daemon, get_stats, init_cargo, sccache_command,
     start_local_daemon, stop_local_daemon, write_json_cfg, write_source,
 };
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use anyhow::ensure;
 use assert_cmd::prelude::*;
 use sccache::config::HTTPUrl;
 use sccache::dist::{
@@ -192,6 +194,276 @@ fn test_dist_basic() {
         assert_eq!(0, info.stats.cache_hits.all());
         assert_eq!(1, info.stats.cache_misses.all());
     });
+}
+
+/// GCC and Clang embed the effective compilation directory in DWARF even
+/// when their preprocessed C inputs are otherwise identical. The worker must
+/// compile both distinct debug contexts, then restore each from its own key.
+#[cfg(target_os = "linux")]
+#[test]
+#[cfg_attr(
+    not(feature = "dist-tests"),
+    ignore = "requires isolated Docker distribution harness"
+)]
+fn test_dist_c_debug_compilation_directory_is_cache_identity() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
+    system.add_scheduler();
+    system.add_server(&[]);
+    let mut config = dist_test_sccache_client_cfg(root, system.scheduler_url());
+    config
+        .cache
+        .disk
+        .as_mut()
+        .context("missing disk cache")?
+        .size = 128 * 1024 * 1024;
+    let config_path = root.join("sccache-cfg.json");
+    write_json_cfg(root, "sccache-cfg.json", &config);
+    let cached_config = root.join("sccache-cached-cfg");
+    let _ = stop_local_daemon();
+    start_local_daemon(&config_path, &cached_config);
+
+    for compiler in ["gcc", "clang"] {
+        let compiler_path = which::which(compiler)?;
+        let mut objects = Vec::new();
+        for directory in ["a", "b"] {
+            let cwd = root.join(compiler).join(directory);
+            std::fs::create_dir_all(&cwd)?;
+            write_source(&cwd, "probe.c", "int multiply(int x) { return x * 7; }\n");
+            let output = cwd.join("probe.o");
+            let compile = || -> Result<Vec<u8>> {
+                let result = sccache_command()
+                    .arg(&compiler_path)
+                    .args(["-g", "-O2", "-c", "probe.c", "-o", "probe.o"])
+                    .current_dir(&cwd)
+                    .env("SCCACHE_CONF", &config_path)
+                    .env("SCCACHE_CACHED_CONF", &cached_config)
+                    .output()?;
+                assert!(
+                    result.status.success(),
+                    "{compiler} {directory}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                Ok(std::fs::read(&output)?)
+            };
+            let cold = compile()?;
+            std::fs::remove_file(&output)?;
+            assert_eq!(
+                cold,
+                compile()?,
+                "cached object differs for {compiler}/{directory}"
+            );
+            objects.push(cold);
+        }
+        assert_ne!(
+            objects[0], objects[1],
+            "{compiler} debug objects aliased across different working directories"
+        );
+    }
+    get_stats(|info| {
+        assert_eq!(4, info.stats.dist_compiles.values().sum::<usize>());
+        assert_eq!(0, info.stats.dist_errors);
+        assert_eq!(8, info.stats.compile_requests);
+        assert_eq!(4, info.stats.cache_hits.all());
+        assert_eq!(4, info.stats.cache_misses.all());
+    });
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn write_cpu_target_sources(root: &Path) {
+    write_source(
+        root,
+        "native_target.c",
+        r#"
+unsigned native_target_has_avx2(void) {
+#if defined(__AVX2__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+unsigned long native_target(unsigned long x, unsigned long y) {
+    return (x * 17UL + y) ^ (y >> 7);
+}
+"#,
+    );
+    write_source(
+        root,
+        "specific_target.c",
+        r#"
+#include <immintrin.h>
+#if !defined(__AVX512F__)
+#error explicit x86-64-v4 target must enable AVX-512 codegen
+#endif
+void specific_target(int *dst, const int *a, const int *b) {
+    __m512i va = _mm512_loadu_si512((const void *)a);
+    __m512i vb = _mm512_loadu_si512((const void *)b);
+    _mm512_storeu_si512((void *)dst, _mm512_add_epi32(va, vb));
+}
+"#,
+    );
+    write_source(
+        root,
+        "native_target.cpp",
+        r#"
+extern "C" unsigned native_target_cpp_has_avx2(void) {
+#if defined(__AVX2__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+template<unsigned N> constexpr unsigned scale(unsigned x) { return x * N; }
+static_assert(scale<3>(7) == 21);
+extern "C" unsigned long native_target_cpp(unsigned long x, unsigned long y) {
+    return (x * 17UL + y) ^ (y >> 7);
+}
+"#,
+    );
+    write_source(
+        root,
+        "specific_target.cpp",
+        r#"
+#include <immintrin.h>
+#if !defined(__AVX512F__)
+#error explicit x86-64-v4 must enable AVX-512 in C++ too
+#endif
+static_assert(2 * 3 == 6);
+extern "C" void specific_target_cpp(int *dst, const int *a, const int *b) {
+    __m512i va = _mm512_loadu_si512((const void *)a);
+    __m512i vb = _mm512_loadu_si512((const void *)b);
+    _mm512_storeu_si512((void *)dst, _mm512_add_epi32(va, vb));
+}
+"#,
+    );
+}
+
+/// GCC/Clang C and C++ jobs targeting native and explicit v4 must match the
+/// initiating compiler's exact codegen even on a different worker CPU, and
+/// every repeat must hit cache.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+#[cfg_attr(
+    not(feature = "dist-tests"),
+    ignore = "requires isolated Docker distribution harness"
+)]
+fn test_dist_c_native_target_codegen_and_cache() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
+    system.add_scheduler();
+    system.add_server(&[]);
+    let mut config = dist_test_sccache_client_cfg(root, system.scheduler_url());
+    // Unlike the minimal distribution smoke test, retain objects for the
+    // repeat-request cache verification.
+    config
+        .cache
+        .disk
+        .as_mut()
+        .context("missing test disk cache")?
+        .size = 128 * 1024 * 1024;
+    let config_path = root.join("sccache-cfg.json");
+    write_json_cfg(root, "sccache-cfg.json", &config);
+    let cached_config = root.join("sccache-cached-cfg");
+    let _ = stop_local_daemon();
+    start_local_daemon(&config_path, &cached_config);
+
+    write_cpu_target_sources(root);
+    let mut replay_pairs = Vec::new();
+    for (index, compiler) in ["gcc", "clang", "g++", "clang++"].into_iter().enumerate() {
+        let compiler_path = which::which(compiler)?;
+        let is_cxx = compiler.ends_with("++");
+        for (case, flags, source) in [
+            (
+                "native",
+                &["-O2", "-march=native", "-mno-avx2", "-mtune=native"][..],
+                if is_cxx {
+                    "native_target.cpp"
+                } else {
+                    "native_target.c"
+                },
+            ),
+            (
+                "v4",
+                &["-O2", "-march=x86-64-v4"][..],
+                if is_cxx {
+                    "specific_target.cpp"
+                } else {
+                    "specific_target.c"
+                },
+            ),
+        ] {
+            let output = root.join(format!("{case}-{index}.o"));
+            let compile_object = || {
+                let mut command = sccache_command();
+                command.arg(&compiler_path).args(flags);
+                if is_cxx {
+                    command.arg("-std=c++20");
+                }
+                let result = command
+                    .arg("-c")
+                    .arg(root.join(source))
+                    .arg("-o")
+                    .arg(&output)
+                    .env("SCCACHE_CONF", &config_path)
+                    .env("SCCACHE_CACHED_CONF", &cached_config)
+                    .output()?;
+                ensure!(
+                    result.status.success(),
+                    "{} {case} compilation failed: {}",
+                    compiler_path.display(),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                Ok::<_, anyhow::Error>(std::fs::read(&output)?)
+            };
+            let first = compile_object()?;
+            ensure!(!first.is_empty(), "distributed compile produced no object");
+            // Native is whatever the *requesting compiler* considers its CPU.
+            // Different hosted runner CPUs, compiler versions, or ISA feature
+            // dependencies can affect whether -mno-avx2 disables __AVX2__.
+            // Comparing the complete object against the initiating compiler's
+            // actual direct invocation tests equivalence without guessing that
+            // feature state or weakening the requirement for exact codegen.
+            let reference_output = root.join(format!("reference-{case}-{index}.o"));
+            let mut reference = std::process::Command::new(&compiler_path);
+            reference.args(flags);
+            if is_cxx {
+                reference.arg("-std=c++20");
+            }
+            let reference_result = reference
+                .arg("-c")
+                .arg(root.join(source))
+                .arg("-o")
+                .arg(&reference_output)
+                .output()?;
+            ensure!(
+                reference_result.status.success(),
+                "{} direct {case} reference failed: {}",
+                compiler_path.display(),
+                String::from_utf8_lossy(&reference_result.stderr)
+            );
+            assert_eq!(
+                first,
+                std::fs::read(reference_output)?,
+                "{} {case} distributed codegen differs from requesting compiler",
+                compiler_path.display()
+            );
+            replay_pairs.push((compile_object()?, first));
+        }
+    }
+    for (actual, expected) in replay_pairs {
+        assert_eq!(actual, expected);
+    }
+    get_stats(|info| {
+        assert_eq!(8, info.stats.dist_compiles.values().sum::<usize>());
+        assert_eq!(0, info.stats.dist_errors);
+        assert_eq!(16, info.stats.compile_requests);
+        assert_eq!(8, info.stats.cache_hits.all());
+        assert_eq!(8, info.stats.cache_misses.all());
+    });
+    Ok(())
 }
 
 /// The daemon sees deliberately different sources at the exact paths used by
@@ -539,6 +811,38 @@ fn test_dist_nobuilder() {
 
 struct FailingServer;
 impl ServerIncoming for FailingServer {
+    fn executing_jobs(&self) -> usize {
+        0
+    }
+    fn native_metadata_limit(&self) -> Option<usize> {
+        None
+    }
+
+    fn handle_native_blob(
+        &self,
+        _blob: sccache::build_runtime::BlobRef,
+    ) -> Result<Option<(std::fs::File, sccache::build_runtime::BlobEncoding)>> {
+        Ok(None)
+    }
+
+    fn capabilities(&self) -> sccache::dist::WorkerCapabilities {
+        sccache::dist::WorkerCapabilities::ARCHIVE
+    }
+    fn handle_assign_native_job(
+        &self,
+        _requester: std::sync::Arc<dyn ServerOutgoing>,
+        _job_id: JobId,
+        _assignment: sccache::dist::NativeAssignment,
+    ) -> Result<AssignJobResult> {
+        anyhow::bail!("mock does not accept native assignments")
+    }
+    fn handle_run_native_job(
+        &self,
+        _job_id: JobId,
+        _request: sccache::build_runtime::wire::NativeRunRequest,
+    ) -> Result<sccache::build_runtime::wire::NativeRunResult> {
+        anyhow::bail!("mock does not execute native assignments")
+    }
     fn handle_reconcile_assignments(
         &self,
         _assigned_job_ids: &[JobId],

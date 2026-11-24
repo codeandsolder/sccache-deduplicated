@@ -19,25 +19,23 @@ use crate::compiler::args::{
 #[cfg(feature = "dist-client")]
 use crate::compiler::c::is_native_codegen_arg;
 use crate::compiler::c::{
-    ArtifactDescriptor, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
-    ParsedArguments, assembler_include_dirs,
+    ArtifactDescriptor, CCompileCommands, CCompileContext, CCompilerImpl, CCompilerKind,
+    CPreprocessContext, ParsedArguments, assembler_include_dirs,
 };
 use crate::compiler::response_files::ResponseFileExpansion;
 use crate::compiler::{
-    CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
-    SingleCompileCommand, clang,
+    Cacheable, ColorMode, CompilerArguments, Language, SingleCompileCommand, clang,
 };
+use crate::counted_array;
+#[cfg(any(feature = "dist-client", test))]
+use crate::dist;
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::{OsStrExt, run_input_output};
-use crate::{counted_array, dist};
 use async_trait::async_trait;
-use fs::File;
-use fs_err as fs;
 use log::Level::Trace;
 use std::collections::HashMap;
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -53,6 +51,8 @@ pub struct Gcc {
 
 #[async_trait]
 impl CCompilerImpl for Gcc {
+    type LocalCommand = SingleCompileCommand;
+
     fn kind(&self) -> CCompilerKind {
         CCompilerKind::Gcc
     }
@@ -110,40 +110,11 @@ impl CCompilerImpl for Gcc {
         .await
     }
 
-    fn generate_compile_commands<T>(
+    fn generate_compile_commands(
         &self,
         context: CCompileContext<'_>,
-    ) -> Result<(
-        Box<dyn CompileCommand<T>>,
-        Option<dist::CompileCommand>,
-        Cacheable,
-    )>
-    where
-        T: CommandCreatorSync,
-    {
-        let CCompileContext {
-            path_transformer,
-            executable,
-            parsed_args,
-            cwd,
-            env_vars,
-            rewrite_includes_only,
-        } = context;
-        generate_compile_commands(
-            path_transformer,
-            executable,
-            parsed_args,
-            cwd,
-            env_vars,
-            GccCompileConfig {
-                kind: self.kind(),
-                rewrite_includes_only,
-                language_to_arg: language_to_gcc_arg,
-            },
-        )
-        .map(|(command, dist_command, cacheable)| {
-            (CCompileCommand::boxed(command), dist_command, cacheable)
-        })
+    ) -> CCompileCommands<Self::LocalCommand> {
+        generate_compile_commands(context, self.kind(), language_to_gcc_arg)
     }
 }
 
@@ -869,6 +840,7 @@ where
         extra_hash_files,
         uses_external_assembler: !integrated_assembler,
         msvc_show_includes: false,
+        msvc_explicit_language: false,
         profile_generate,
         color_mode,
         suppress_rewrite_includes_only,
@@ -912,12 +884,6 @@ pub struct GccPreprocessConfig<F> {
     pub kind: CCompilerKind,
     pub rewrite_includes_only: bool,
     pub ignorable_whitespace_flags: Vec<String>,
-    pub language_to_arg: F,
-}
-
-pub struct GccCompileConfig<F> {
-    pub kind: CCompilerKind,
-    pub rewrite_includes_only: bool,
     pub language_to_arg: F,
 }
 
@@ -1082,32 +1048,20 @@ fn dist_assembler_include_args(
 }
 
 pub fn generate_compile_commands<F>(
-    path_transformer: &mut dist::PathTransformer,
-    executable: &Path,
-    parsed_args: &ParsedArguments,
-    cwd: &Path,
-    env_vars: &[(OsString, OsString)],
-    config: GccCompileConfig<F>,
-) -> Result<(
-    SingleCompileCommand,
-    Option<dist::CompileCommand>,
-    Cacheable,
-)>
+    context: CCompileContext<'_>,
+    kind: CCompilerKind,
+    language_to_arg: F,
+) -> CCompileCommands<SingleCompileCommand>
 where
     F: Fn(Language) -> Option<&'static str>,
 {
-    let GccCompileConfig {
-        kind,
-        rewrite_includes_only,
-        language_to_arg,
-    } = config;
-    // Unused arguments
+    let rewrite_includes_only = context.rewrite_includes_only;
+    let parsed_args = context.parsed_args;
+    #[cfg(feature = "dist-client")]
+    let cwd = context.cwd;
+    let executable = context.executable;
     #[cfg(not(feature = "dist-client"))]
-    {
-        let _ = path_transformer;
-        let _ = kind;
-        let _ = rewrite_includes_only;
-    }
+    let _ = (kind, rewrite_includes_only);
 
     let out_file = match parsed_args.outputs.get("obj") {
         Some(obj) => &obj.path,
@@ -1129,13 +1083,15 @@ where
     let has_verbose_flag = arguments.contains(&OsString::from("-v"))
         || arguments.contains(&OsString::from("--verbose"));
 
-    let command = SingleCompileCommand {
-        executable: executable.to_owned(),
-        arguments,
-        env_vars: env_vars.to_owned(),
-        cwd: cwd.to_owned(),
-        share_jobserver: false,
-    };
+    let command = context.local_command(arguments);
+    #[cfg(feature = "dist-client")]
+    let CCompileContext {
+        path_transformer,
+        executable,
+        env_vars,
+        native_resolution,
+        ..
+    } = context;
 
     #[cfg(not(feature = "dist-client"))]
     let dist_command = None;
@@ -1150,7 +1106,8 @@ where
         // runs. Sending it verbatim to a worker would silently change codegen.
         // C/C++ native requests therefore stay local until the full driver
         // expansion is transported explicitly; their cache key is host-safe.
-        || parsed_args.common_args.iter().any(|arg| is_native_codegen_arg(arg))
+        || (parsed_args.common_args.iter().any(|arg| is_native_codegen_arg(arg))
+            && native_resolution.is_none())
     {
         None
     } else {
@@ -1198,6 +1155,10 @@ where
                 arguments.push("-fpreprocessed".into());
             }
             let common_args = dist_common_args(parsed_args, worker_reprocesses);
+            let common_args = match native_resolution {
+                Some(resolution) => resolution.rewrite_arguments(common_args),
+                None => common_args,
+            };
             arguments.extend(dist::osstrings_to_strings(&common_args)?);
             arguments.extend(dist_assembler_include_args(
                 path_transformer,
@@ -1271,14 +1232,8 @@ impl Iterator for ExpandIncludeFile<'_> {
             // back to invoking the compiler directly.
             //
             // [1]: https://gcc.gnu.org/onlinedocs/gcc/Overall-Options.html#Overall-Options
-            if !self.expansion.expand(&file, || {
-                let mut contents = String::new();
-                let res = File::open(&file).and_then(|mut f| f.read_to_string(&mut contents));
-                if let Err(error) = res {
-                    debug!("failed to read response file {}: {error}", file.display());
-                    return None;
-                }
-                Some(split_gnu_response_file_args(&contents))
+            if !self.expansion.expand(&file, |contents| {
+                Some(split_gnu_response_file_args(contents))
             }) {
                 return Some(arg);
             }
@@ -1359,14 +1314,13 @@ fn split_gnu_response_file_args(contents: &str) -> Vec<OsString> {
 #[cfg(test)]
 mod test {
     use fs::File;
+    use fs_err as fs;
     use itertools::assert_equal;
     use std::io::Write;
 
     use super::*;
     use crate::compiler::*;
     use crate::mock_command::*;
-    use crate::server;
-    use crate::test::mock_storage::MockStorage;
     use crate::test::utils::*;
 
     use temp_env::{with_var, with_var_unset};
@@ -2990,24 +2944,7 @@ mod test {
                 .contains(&OsString::from("-fno-unwind-tables"))
         );
 
-        let f = TestFixture::new();
-        let mut path_transformer = dist::PathTransformer::new();
-        let (_, dist_command, _) = generate_compile_commands(
-            &mut path_transformer,
-            &f.bins[0],
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-            GccCompileConfig {
-                kind: CCompilerKind::Clang,
-                rewrite_includes_only: false,
-                language_to_arg: language_to_gcc_arg,
-            },
-        )
-        .unwrap();
-        let arguments = dist_command
-            .expect("assembler compile should distribute")
-            .arguments;
+        let arguments = dist_assembler_arguments(&parsed_args, false);
         assert!(arguments.windows(2).any(|w| w == ["-x", "assembler"]));
         assert!(!arguments.iter().any(|arg| arg == "-DMAGIC=1"));
         assert!(!arguments.iter().any(|arg| arg == "-UOLD_MAGIC"));
@@ -3017,6 +2954,30 @@ mod test {
                 .any(|arg| arg == "-fno-asynchronous-unwind-tables")
         );
         assert!(!arguments.iter().any(|arg| arg == "-fno-unwind-tables"));
+    }
+
+    #[cfg(feature = "dist-client")]
+    fn mapped_clang_command(
+        fixture: &TestFixture,
+        parsed: &ParsedArguments,
+    ) -> dist::CompileCommand {
+        let mut paths = dist::PathTransformer::new();
+        paths.add_root_mapping(fixture.tempdir.path().to_owned(), "/work");
+        let (_, remote, _) = generate_compile_commands(
+            CCompileContext {
+                path_transformer: &mut paths,
+                executable: &fixture.bins[0],
+                parsed_args: parsed,
+                cwd: fixture.tempdir.path(),
+                env_vars: &[],
+                rewrite_includes_only: false,
+                native_resolution: None,
+            },
+            CCompilerKind::Clang,
+            language_to_gcc_arg,
+        )
+        .unwrap();
+        remote.expect("mapped Clang compile should distribute")
     }
 
     #[test]
@@ -3040,22 +3001,7 @@ mod test {
             };
 
             let f = TestFixture::new();
-            let mut path_transformer = dist::PathTransformer::new();
-            path_transformer.add_root_mapping(f.tempdir.path().to_owned(), "/work");
-            let (_, dist_command, _) = generate_compile_commands(
-                &mut path_transformer,
-                &f.bins[0],
-                &parsed_args,
-                f.tempdir.path(),
-                &[],
-                GccCompileConfig {
-                    kind: CCompilerKind::Clang,
-                    rewrite_includes_only: false,
-                    language_to_arg: language_to_gcc_arg,
-                },
-            )
-            .unwrap();
-            let dist_command = dist_command.expect("assembler compile should distribute");
+            let dist_command = mapped_clang_command(&f, &parsed_args);
             assert!(
                 dist_command
                     .arguments
@@ -3082,22 +3028,7 @@ mod test {
             .tempdir
             .path()
             .join("arch/arm64/kvm/../../../virt/kvm/eventfd.c");
-        let mut path_transformer = dist::PathTransformer::new();
-        path_transformer.add_root_mapping(f.tempdir.path().to_owned(), "/work");
-        let (_, dist_command, _) = generate_compile_commands(
-            &mut path_transformer,
-            &f.bins[0],
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-            GccCompileConfig {
-                kind: CCompilerKind::Clang,
-                rewrite_includes_only: false,
-                language_to_arg: language_to_gcc_arg,
-            },
-        )
-        .unwrap();
-        let dist_command = dist_command.expect("C compile should distribute");
+        let dist_command = mapped_clang_command(&f, &parsed_args);
 
         assert!(
             dist_command
@@ -3107,6 +3038,28 @@ mod test {
             "{:?}",
             dist_command.arguments
         );
+    }
+
+    #[cfg(feature = "dist-client")]
+    fn dist_assembler_arguments(parsed_args: &ParsedArguments, rewrite: bool) -> Vec<String> {
+        let f = TestFixture::new();
+        let (_, dist_command, _) = generate_compile_commands(
+            CCompileContext {
+                path_transformer: &mut dist::PathTransformer::new(),
+                executable: &f.bins[0],
+                parsed_args,
+                cwd: f.tempdir.path(),
+                env_vars: &[],
+                rewrite_includes_only: rewrite,
+                native_resolution: None,
+            },
+            CCompilerKind::Clang,
+            language_to_gcc_arg,
+        )
+        .unwrap();
+        dist_command
+            .expect("assembler compile should distribute")
+            .arguments
     }
 
     #[test]
@@ -3129,24 +3082,7 @@ mod test {
             other => panic!("Got unexpected parse result: {other:?}"),
         };
 
-        let f = TestFixture::new();
-        let mut path_transformer = dist::PathTransformer::new();
-        let (_, dist_command, _) = generate_compile_commands(
-            &mut path_transformer,
-            &f.bins[0],
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-            GccCompileConfig {
-                kind: CCompilerKind::Clang,
-                rewrite_includes_only: true,
-                language_to_arg: language_to_gcc_arg,
-            },
-        )
-        .unwrap();
-        let arguments = dist_command
-            .expect("assembler compile should distribute")
-            .arguments;
+        let arguments = dist_assembler_arguments(&parsed_args, true);
         assert!(
             arguments
                 .windows(2)
@@ -3174,214 +3110,43 @@ mod test {
         };
         parsed_args.suppress_rewrite_includes_only = true;
 
-        let f = TestFixture::new();
-        let mut path_transformer = dist::PathTransformer::new();
-        let (_, dist_command, _) = generate_compile_commands(
-            &mut path_transformer,
-            &f.bins[0],
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-            GccCompileConfig {
-                kind: CCompilerKind::Clang,
-                rewrite_includes_only: true,
-                language_to_arg: language_to_gcc_arg,
-            },
-        )
-        .unwrap();
-        let arguments = dist_command
-            .expect("assembler compile should distribute")
-            .arguments;
+        let arguments = dist_assembler_arguments(&parsed_args, true);
         assert!(arguments.windows(2).any(|w| w == ["-x", "assembler"]));
         assert!(!arguments.iter().any(|arg| arg == "-DMAGIC=1"));
     }
 
-    #[test]
-    fn test_compile_simple() {
-        let creator = new_creator();
+    #[test_case::test_case(None; "ordinary")]
+    #[test_case::test_case(Some("-v"); "verbose short")]
+    #[test_case::test_case(Some("--verbose"); "verbose long")]
+    fn test_compile_simple(verbose: Option<&str>) -> Result<()> {
         let f = TestFixture::new();
         let parsed_args = ParsedArguments {
-            input: "foo.c".into(),
-            double_dash_input: false,
-            language: Language::C,
-            compilation_flag: "-c".into(),
-            depfile: None,
-            outputs: vec![(
-                "obj",
-                ArtifactDescriptor {
-                    path: "foo.o".into(),
-                    optional: false,
-                },
-            )]
-            .into_iter()
-            .collect(),
-            dependency_args: vec![],
-            preprocessor_args: vec![],
-            common_args: vec![],
-            arch_args: vec![],
-            unhashed_args: vec![],
-            extra_dist_files: vec![],
-            extra_hash_files: vec![],
-            uses_external_assembler: false,
-            msvc_show_includes: false,
-            profile_generate: false,
-            color_mode: ColorMode::Auto,
-            suppress_rewrite_includes_only: false,
-            too_hard_for_preprocessor_cache_mode: None,
+            common_args: verbose.into_iter().map(OsString::from).collect(),
+            ..ParsedArguments::test_compile("foo.c", "foo.o", Language::C)
         };
-        let runtime = single_threaded_runtime();
-        let storage = MockStorage::new(None, false);
-        let storage: std::sync::Arc<MockStorage> = std::sync::Arc::new(storage);
-        let service = server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
         let compiler = &f.bins[0];
-        // Compiler invocation.
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
         let mut path_transformer = dist::PathTransformer::new();
         let (command, dist_command, cacheable) = generate_compile_commands(
-            &mut path_transformer,
-            compiler,
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-            GccCompileConfig {
-                kind: CCompilerKind::Gcc,
+            CCompileContext {
+                path_transformer: &mut path_transformer,
+                executable: compiler,
+                parsed_args: &parsed_args,
+                cwd: f.tempdir.path(),
+                env_vars: &[],
                 rewrite_includes_only: false,
-                language_to_arg: language_to_gcc_arg,
+                native_resolution: None,
             },
+            CCompilerKind::Gcc,
+            language_to_gcc_arg,
         )
         .unwrap();
-        #[cfg(feature = "dist-client")]
-        assert!(dist_command.is_some());
-        #[cfg(not(feature = "dist-client"))]
-        assert!(dist_command.is_none());
-        let _ = command.execute(&service, &creator).wait();
+        assert_eq!(
+            dist_command.is_some(),
+            cfg!(feature = "dist-client") && verbose.is_none()
+        );
+        assert_compile_command_executes(&command)?;
         assert_eq!(Cacheable::Yes, cacheable);
-        // Ensure that we ran all processes.
-        assert_eq!(0, creator.lock().unwrap().children.len());
-    }
-
-    #[test]
-    fn test_compile_simple_verbose_short() {
-        let creator = new_creator();
-        let f = TestFixture::new();
-        let parsed_args = ParsedArguments {
-            input: "foo.c".into(),
-            double_dash_input: false,
-            language: Language::C,
-            compilation_flag: "-c".into(),
-            depfile: None,
-            outputs: vec![(
-                "obj",
-                ArtifactDescriptor {
-                    path: "foo.o".into(),
-                    optional: false,
-                },
-            )]
-            .into_iter()
-            .collect(),
-            dependency_args: vec![],
-            preprocessor_args: vec![],
-            common_args: vec!["-v".into()],
-            arch_args: vec![],
-            unhashed_args: vec![],
-            extra_dist_files: vec![],
-            extra_hash_files: vec![],
-            uses_external_assembler: false,
-            msvc_show_includes: false,
-            profile_generate: false,
-            color_mode: ColorMode::Auto,
-            suppress_rewrite_includes_only: false,
-            too_hard_for_preprocessor_cache_mode: None,
-        };
-        let runtime = single_threaded_runtime();
-        let storage = MockStorage::new(None, false);
-        let storage: std::sync::Arc<MockStorage> = std::sync::Arc::new(storage);
-        let service = server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
-        let compiler = &f.bins[0];
-        // Compiler invocation.
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
-        let mut path_transformer = dist::PathTransformer::new();
-        let (command, dist_command, cacheable) = generate_compile_commands(
-            &mut path_transformer,
-            compiler,
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-            GccCompileConfig {
-                kind: CCompilerKind::Gcc,
-                rewrite_includes_only: false,
-                language_to_arg: language_to_gcc_arg,
-            },
-        )
-        .unwrap();
-        // -v should never generate a dist_command
-        assert!(dist_command.is_none());
-        let _ = command.execute(&service, &creator).wait();
-        assert_eq!(Cacheable::Yes, cacheable);
-        // Ensure that we ran all processes.
-        assert_eq!(0, creator.lock().unwrap().children.len());
-    }
-
-    #[test]
-    fn test_compile_simple_verbose_long() {
-        let creator = new_creator();
-        let f = TestFixture::new();
-        let parsed_args = ParsedArguments {
-            input: "foo.c".into(),
-            double_dash_input: false,
-            language: Language::C,
-            compilation_flag: "-c".into(),
-            depfile: None,
-            outputs: vec![(
-                "obj",
-                ArtifactDescriptor {
-                    path: "foo.o".into(),
-                    optional: false,
-                },
-            )]
-            .into_iter()
-            .collect(),
-            dependency_args: vec![],
-            preprocessor_args: vec![],
-            common_args: vec!["--verbose".into()],
-            arch_args: vec![],
-            unhashed_args: vec![],
-            extra_dist_files: vec![],
-            extra_hash_files: vec![],
-            uses_external_assembler: false,
-            msvc_show_includes: false,
-            profile_generate: false,
-            color_mode: ColorMode::Auto,
-            suppress_rewrite_includes_only: false,
-            too_hard_for_preprocessor_cache_mode: None,
-        };
-        let runtime = single_threaded_runtime();
-        let storage = MockStorage::new(None, false);
-        let storage: std::sync::Arc<MockStorage> = std::sync::Arc::new(storage);
-        let service = server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
-        let compiler = &f.bins[0];
-        // Compiler invocation.
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
-        let mut path_transformer = dist::PathTransformer::new();
-        let (command, dist_command, cacheable) = generate_compile_commands(
-            &mut path_transformer,
-            compiler,
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-            GccCompileConfig {
-                kind: CCompilerKind::Gcc,
-                rewrite_includes_only: false,
-                language_to_arg: language_to_gcc_arg,
-            },
-        )
-        .unwrap();
-        // --verbose should never generate a dist_command
-        assert!(dist_command.is_none());
-        let _ = command.execute(&service, &creator).wait();
-        assert_eq!(Cacheable::Yes, cacheable);
-        // Ensure that we ran all processes.
-        assert_eq!(0, creator.lock().unwrap().children.len());
+        Ok(())
     }
 
     #[test]
@@ -3396,21 +3161,56 @@ mod test {
                 };
             let mut path_transformer = dist::PathTransformer::new();
             let (_, dist_command, _) = generate_compile_commands(
-                &mut path_transformer,
-                &f.bins[0],
-                &parsed_args,
-                f.tempdir.path(),
-                &[],
-                GccCompileConfig {
-                    kind: CCompilerKind::Gcc,
+                CCompileContext {
+                    path_transformer: &mut path_transformer,
+                    executable: &f.bins[0],
+                    parsed_args: &parsed_args,
+                    cwd: f.tempdir.path(),
+                    env_vars: &[],
                     rewrite_includes_only: false,
-                    language_to_arg: language_to_gcc_arg,
+                    native_resolution: None,
                 },
+                CCompilerKind::Gcc,
+                language_to_gcc_arg,
             )
             .unwrap();
             assert!(
                 dist_command.is_none(),
                 "{flag} must stay local unless resolved"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_clang_native_codegen_is_not_distributed() {
+        let f = TestFixture::new();
+        for flag in ["-march=native", "-mtune=native"] {
+            let parsed_args = match parse_arguments_clang(
+                stringvec![flag, "-c", "foo.c", "-o", "foo.o"],
+                false,
+            ) {
+                CompilerArguments::Ok(args) => args,
+                other => panic!("Got unexpected parse result: {other:?}"),
+            };
+            let mut path_transformer = dist::PathTransformer::new();
+            let (_, dist_command, _) = generate_compile_commands(
+                CCompileContext {
+                    path_transformer: &mut path_transformer,
+                    executable: &f.bins[0],
+                    parsed_args: &parsed_args,
+                    cwd: f.tempdir.path(),
+                    env_vars: &[],
+                    rewrite_includes_only: false,
+                    native_resolution: None,
+                },
+                CCompilerKind::Clang,
+                clang::language_to_clang_arg,
+            )
+            .unwrap();
+            assert!(
+                dist_command.is_none(),
+                "{flag} must resolve to the requesting CPU before running remotely"
             );
         }
     }
@@ -3426,16 +3226,17 @@ mod test {
         let compiler = &f.bins[0];
         let mut path_transformer = dist::PathTransformer::new();
         let (command, _, _) = generate_compile_commands(
-            &mut path_transformer,
-            compiler,
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-            GccCompileConfig {
-                kind: CCompilerKind::Clang,
+            CCompileContext {
+                path_transformer: &mut path_transformer,
+                executable: compiler,
+                parsed_args: &parsed_args,
+                cwd: f.tempdir.path(),
+                env_vars: &[],
                 rewrite_includes_only: false,
-                language_to_arg: language_to_gcc_arg,
+                native_resolution: None,
             },
+            CCompilerKind::Clang,
+            language_to_gcc_arg,
         )
         .unwrap();
         let expected_args = ovec![

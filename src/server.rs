@@ -15,8 +15,9 @@
 use crate::cache::readonly::ReadOnlyStorage;
 use crate::cache::{CacheMode, Storage, storage_from_config};
 use crate::compiler::{
-    CacheCompileContext, CacheControl, CompileResult, Compiler, CompilerArguments, CompilerHasher,
-    CompilerKind, CompilerProxy, DistType, Language, MissType, get_compiler_info,
+    CacheCompileContext, CacheControl, CompileResult, Compiler, CompilerArguments,
+    CompilerCachePolicy, CompilerHasher, CompilerKind, CompilerProxy, DistType, Language, MissType,
+    get_compiler_info,
 };
 #[cfg(feature = "dist-client")]
 use crate::config;
@@ -237,6 +238,8 @@ pub struct DistClientContainer {
     // The actual dist client state
     #[cfg(feature = "dist-client")]
     state: futures::lock::Mutex<DistClientState>,
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    native: Option<Arc<crate::compiler::NativeCompilerClient>>,
 }
 
 #[cfg(feature = "dist-client")]
@@ -300,6 +303,17 @@ impl DistClientContainer {
 #[cfg(feature = "dist-client")]
 impl DistClientContainer {
     fn new(config: &Config, pool: &tokio::runtime::Handle) -> Self {
+        #[cfg(target_os = "linux")]
+        if let Some(native) = &config.dist.native {
+            return Self::new_native(crate::compiler::NativeCompilerClient::new(
+                native.clone(),
+                config.dist.scheduler_url.clone(),
+                config.dist.auth.clone(),
+                config.dist.toolchains.clone(),
+                &config.dist.native_installation_catalogs,
+            ));
+        }
+
         let config = DistClientConfig {
             pool: pool.clone(),
             scheduler_url: config.dist.scheduler_url.clone(),
@@ -313,6 +327,17 @@ impl DistClientContainer {
         let state = pool.block_on(state);
         Self {
             state: futures::lock::Mutex::new(state),
+            #[cfg(target_os = "linux")]
+            native: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[must_use = "the returned container owns native compiler state"]
+    pub fn new_native(client: crate::compiler::NativeCompilerClient) -> Self {
+        Self {
+            state: futures::lock::Mutex::new(DistClientState::Disabled),
+            native: Some(Arc::new(client)),
         }
     }
 
@@ -321,6 +346,8 @@ impl DistClientContainer {
     pub const fn new_with_state(state: DistClientState) -> Self {
         Self {
             state: futures::lock::Mutex::new(state),
+            #[cfg(target_os = "linux")]
+            native: None,
         }
     }
 
@@ -328,6 +355,8 @@ impl DistClientContainer {
     pub const fn new_disabled() -> Self {
         Self {
             state: futures::lock::Mutex::new(DistClientState::Disabled),
+            #[cfg(target_os = "linux")]
+            native: None,
         }
     }
 
@@ -348,6 +377,11 @@ impl DistClientContainer {
     }
 
     pub async fn get_status(&self) -> DistInfo {
+        #[cfg(target_os = "linux")]
+        if let Some(native) = &self.native {
+            return native.status().await;
+        }
+
         let mut guard = self.state.lock().await;
         let state = &mut *guard;
         Self::maybe_recreate_state(state).await;
@@ -501,7 +535,7 @@ impl DistClientContainer {
         }
     }
 
-    fn get_cached_config_auth_token(auth_url: &str) -> Result<String> {
+    pub(crate) fn get_cached_config_auth_token(auth_url: &str) -> Result<String> {
         let cached_config = config::CachedConfig::reload()?;
         cached_config
             .with(|c| c.dist.auth_tokens.get(auth_url).map(String::to_owned))?
@@ -676,6 +710,9 @@ fn notify_server_bind_error(notify: Option<&OsString>, error: &io::Error) -> Res
         )
     }
 }
+
+/// The address accepted by the in-process server API.
+pub use crate::net::SocketAddr;
 
 /// Start an sccache server, listening on `addr`.
 ///
@@ -1004,6 +1041,9 @@ where
     #[cfg(feature = "dist-client")]
     namespace_reservations: Arc<namespace::ToolchainReservations>,
 
+    /// Cache policy of this invocation, inherited by decomposed subcommands.
+    cache_control: CacheControl,
+
     /// Cache storage.
     storage: Arc<dyn Storage>,
 
@@ -1114,6 +1154,8 @@ where
             }
             Request::StorageHandshake => {
                 debug!("handle_client: storage_handshake");
+                let dist_rewrite_includes_only =
+                    transfers.initialize_distribution(&self.dist_client).await;
                 let info = StorageHandshakeInfo {
                     location: self.storage.location(),
                     cache_type_name: self.storage.cache_type_name().to_owned(),
@@ -1123,9 +1165,8 @@ where
                     max_size: self.storage.max_size().await.unwrap_or(None),
                     namespace_protocol: crate::protocol::NAMESPACE_PROTOCOL_VERSION,
                     transfer_chunk_bytes: transfers.chunk_bytes(),
-                    dist_rewrite_includes_only: transfers
-                        .initialize_distribution(&self.dist_client)
-                        .await,
+                    dist_rewrite_includes_only,
+                    native: transfers.native_policy(),
                 };
                 Ok(Message::WithoutBody(Response::StorageHandshake(info)))
             }
@@ -1134,6 +1175,9 @@ where
                 Ok(Message::WithoutBody(Response::Transfer(
                     result.map_err(|error| format!("{error:#}")),
                 )))
+            }
+            Request::ObserveCompile(_) | Request::ObservePhase(_) => {
+                bail!("observation RPC requires a dedicated connection")
             }
             Request::CancelCompile(id) => Ok(Message::WithoutBody(
                 Response::CompileCancellationRequested(self.activities.cancel(&id)),
@@ -1168,6 +1212,7 @@ where
             activities: Arc::default(),
             compile_limits: CompileLimits::default(),
             stats: Arc::default(),
+            cache_control: CacheControl::Default,
             dist_client: Arc::new(dist_client),
             storage,
             compiler_aliases: Arc::new(compiler_aliases),
@@ -1191,6 +1236,7 @@ where
             activities: Arc::default(),
             compile_limits: CompileLimits::default(),
             stats: Arc::default(),
+            cache_control: CacheControl::Default,
             dist_client: Arc::new(dist_client),
             storage,
             compiler_aliases: Arc::default(),
@@ -1218,6 +1264,7 @@ where
             activities: Arc::default(),
             compile_limits: CompileLimits::default(),
             stats: Arc::default(),
+            cache_control: CacheControl::Default,
             dist_client: Arc::new(DistClientContainer::new_with_state(DistClientState::Some(
                 Box::new(DistClientConfig {
                     pool: rt.clone(),
@@ -1278,25 +1325,36 @@ where
         // Conversely, a disconnected reader drops the abort-on-drop writer
         // and all of its pending compiler futures.
         let mut handler = util::spawn(async move {
+            let mut next = match reqs_rx.recv().await {
+                Some(Message::WithoutBody(Request::ObserveCompile(identity))) => {
+                    return me.serve_observer(identity, &mut reqs_rx, &mut sink).await;
+                }
+                first => first,
+            };
             let mut transfers = TransferSession::new(
                 chunk_bytes,
                 #[cfg(feature = "dist-client")]
                 Arc::clone(&me.namespace_reservations),
             );
-            while let Some(req) = reqs_rx.recv().await {
+            while let Some(req) = next {
                 if let Message::WithoutBody(Request::Compile(compile)) = &req {
                     let registration = me.activities.begin(compile);
                     me.serve_compile(&registration.activity, req, &mut transfers, &mut sink)
                         .await?;
                 } else {
-                    let Message::WithoutBody(message) = me.dispatch(req, &mut transfers).await?
+                    let budget = transfers.request_budget(&req, me.compile_limits);
+                    let Message::WithoutBody(message) =
+                        Self::monitor_control(&mut sink, me.dispatch(req, &mut transfers), budget)
+                            .await?
                     else {
                         bail!("unexpected compiler body outside a compile request");
                     };
-                    sink.send(Frame::Message { message }).await?;
+                    send_ipc_frame(&mut sink, Frame::Message { message }).await?;
                 }
+                next = reqs_rx.recv().await;
             }
 
+            drop(transfers);
             Ok::<_, Error>(())
         });
 
@@ -1314,6 +1372,56 @@ where
             result = &mut handler => result.context("response handler task failed")?,
             result = reader => result,
         }
+    }
+
+    async fn serve_observer<S>(
+        &self,
+        identity: crate::protocol::CompileIdentity,
+        requests: &mut tokio::sync::mpsc::Receiver<SccacheRequest>,
+        sink: &mut S,
+    ) -> Result<()>
+    where
+        S: Sink<Frame<Response, Response>, Error = Error> + Unpin,
+    {
+        drop(self.tx.clone().start_send(ServerMessage::Request));
+        let registration = self
+            .activities
+            .register(&identity, activity::CompileOwner::Namespace);
+        let activity = &registration.activity;
+        send_ipc_frame(
+            sink,
+            Frame::Message {
+                message: Response::CompileObserved(activity.snapshot().id),
+            },
+        )
+        .await?;
+        while let Some(request) =
+            time::timeout(activity::IPC_INACTIVITY_TIMEOUT, requests.recv()).await?
+        {
+            drop(self.tx.clone().start_send(ServerMessage::Request));
+            let Message::WithoutBody(Request::ObservePhase(sample)) = request else {
+                bail!("unexpected request on compile observation connection");
+            };
+            activity.observe(sample)?;
+            if let Some(reason) = activity.snapshot().deadline_error(self.compile_limits) {
+                send_ipc_frame(
+                    sink,
+                    Frame::Message {
+                        message: Response::RequestAborted(reason.clone()),
+                    },
+                )
+                .await?;
+                bail!("{reason}");
+            }
+            send_ipc_frame(
+                sink,
+                Frame::Message {
+                    message: Response::ObservationAccepted,
+                },
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     async fn serve_compile<S>(
@@ -1337,16 +1445,16 @@ where
             {
                 Message::WithoutBody(message) => {
                     activity.phase(Phase::SendReply);
-                    sink.send(Frame::Message { message }).await?;
+                    send_ipc_frame(sink, Frame::Message { message }).await?;
                 }
                 Message::WithBody(message, body) => {
-                    sink.send(Frame::Message { message }).await?;
+                    send_ipc_frame(sink, Frame::Message { message }).await?;
                     let body = activity::scope(activity, async {
                         util::spawn(activity::inherit(body)).await?
                     });
                     let message = self.monitor_compile(activity, sink, body).await?;
                     activity.phase(Phase::SendReply);
-                    sink.send(Frame::Body { chunk: message }).await?;
+                    send_ipc_frame(sink, Frame::Body { chunk: message }).await?;
                 }
             }
             Ok::<_, Error>(())
@@ -1355,14 +1463,48 @@ where
         if let Err(error) = result {
             // The monitored future has been dropped. Some blocking I/O
             // may still finish, so the outcome is explicitly ambiguous.
-            let _ = sink
-                .send(Frame::Message {
-                    message: Response::CompileAborted(format!("{error:#}")),
-                })
+            if !error.is::<IpcSendFailure>() {
+                let _ = send_ipc_frame(
+                    sink,
+                    Frame::Message {
+                        message: Response::CompileAborted(format!("{error:#}")),
+                    },
+                )
                 .await;
+            }
             return Err(error);
         }
         Ok(())
+    }
+
+    async fn monitor_control<F, R, S>(sink: &mut S, work: F, budget: Duration) -> Result<R>
+    where
+        F: Future<Output = Result<R>> + Send,
+        S: Sink<Frame<Response, Response>, Error = Error> + Unpin,
+    {
+        let mut ticker = time::interval_at(
+            time::Instant::now() + activity::HEARTBEAT_INTERVAL,
+            activity::HEARTBEAT_INTERVAL,
+        );
+        ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        let deadline = time::sleep(budget);
+        tokio::pin!(work, deadline);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut work => return result,
+                () = &mut deadline => {
+                    let reason = "IPC operation exceeded its deadline; session abandoned";
+                    send_ipc_frame(sink, Frame::Message {
+                        message: Response::RequestAborted(reason.into()),
+                    }).await?;
+                    bail!("{reason}");
+                }
+                _ = ticker.tick() => {
+                    send_ipc_frame(sink, Frame::Message { message: Response::Heartbeat }).await?;
+                }
+            }
+        }
     }
 
     async fn monitor_compile<F, R, S>(
@@ -1385,16 +1527,15 @@ where
             tokio::select! {
                 biased;
                 () = activity.cancellation.cancelled() => {
-                    let snapshot = activity.snapshot();
-                    bail!("compile request {} cancellation requested during {:?}; outcome unknown", snapshot.id, snapshot.phase);
+                    bail!("{}", activity.snapshot().deadline_error(self.compile_limits).unwrap_or_else(|| "compile cancelled".into()));
                 }
                 result = &mut work => return result,
                 _ = ticker.tick() => {
                     let snapshot = activity.snapshot();
-                    if Duration::from_millis(snapshot.phase_age_ms) >= self.compile_limits.budget(snapshot.phase) {
-                        bail!("compile request {} exceeded its {:?} phase deadline after {} ms; outcome unknown", snapshot.id, snapshot.phase, snapshot.phase_age_ms);
+                    if let Some(reason) = snapshot.deadline_error(self.compile_limits) {
+                        bail!("{reason}");
                     }
-                    sink.send(Frame::Message { message: Response::CompileProgress(snapshot) }).await?;
+                    send_ipc_frame(sink, Frame::Message { message: Response::CompileProgress(snapshot) }).await?;
                 }
             }
         }
@@ -1406,6 +1547,11 @@ where
     }
 
     /// Get info and stats about the cache.
+    #[cfg(all(feature = "dist-client", target_os = "linux"))]
+    pub(crate) fn native_compiler(&self) -> Option<Arc<crate::compiler::NativeCompilerClient>> {
+        self.dist_client.native.clone()
+    }
+
     pub(crate) async fn get_info(&self) -> Result<ServerInfo> {
         let stats = self.stats.lock().await.clone();
         ServerInfo::new(stats, Some(&*self.storage)).await
@@ -1435,10 +1581,11 @@ where
         let exe = compile.exe;
         let cmd = compile.args;
         let cwd: PathBuf = compile.cwd.into();
-        let env_vars = compile.env_vars;
-        let me = self.clone();
+        let mut env_vars = compile.env_vars;
+        let mut me = self.clone();
+        me.cache_control = consume_cache_control(&mut env_vars);
 
-        let info = self
+        let info = me
             .compiler_info(exe.into(), cwd.clone(), &cmd, &env_vars)
             .await;
         activity::phase(Phase::ParseArguments);
@@ -1458,11 +1605,15 @@ where
         &self,
         compile: Compile,
     ) -> Result<(CompileResponse, Option<CompileFinished>)> {
-        match self.handle_compile(compile).await? {
+        self.storage.validate_session()?;
+        let response = self.handle_compile(compile).await?;
+        self.storage.validate_session()?;
+        match response {
             Message::WithBody(Response::Compile(resp), body) => {
                 let Response::CompileFinished(finished) = body.await? else {
                     bail!("unexpected body response from compile_direct")
                 };
+                self.storage.validate_session()?;
                 Ok((resp, Some(finished)))
             }
             Message::WithoutBody(Response::Compile(resp)) => Ok((resp, None)),
@@ -1486,7 +1637,13 @@ where
             args,
             env,
             &self.rt,
-            dist_info.clone().map(|(archive, _)| archive),
+            crate::compiler::CompilerDiscovery {
+                dist_archive: dist_info.clone().map(|(archive, _)| archive),
+                #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                native_digests: self
+                    .native_compiler()
+                    .map(|client| client.toolchain_digests()),
+            },
         )
         .await;
 
@@ -1638,7 +1795,14 @@ where
                 debug!("check_compiler: Supported compiler");
                 // Now check that we can handle this compiler with
                 // the provided commandline.
-                match c.parse_arguments(&cmd, &cwd, &env_vars) {
+                let policy = CompilerCachePolicy::FinishedArtifact;
+                #[cfg(all(feature = "dist-client", target_os = "linux"))]
+                let policy = if self.native_compiler().is_some() {
+                    CompilerCachePolicy::Native
+                } else {
+                    policy
+                };
+                match c.parse_arguments(&cmd, &cwd, &env_vars, policy) {
                     CompilerArguments::Ok(hasher) => {
                         debug!("parse_arguments: Ok: {cmd:?}");
                         activity::output(hasher.output_pretty().into_owned());
@@ -1699,16 +1863,7 @@ where
         activity::phase(Phase::ResolveDistribution);
         self.stats.lock().await.requests_executed += 1;
 
-        let force_recache = env_vars.iter().any(|(k, _v)| k == "SCCACHE_RECACHE");
-        let force_no_cache = env_vars.iter().any(|(k, _v)| k == "SCCACHE_NO_CACHE");
-
-        let cache_control = if force_no_cache {
-            CacheControl::ForceNoCache
-        } else if force_recache {
-            CacheControl::ForceRecache
-        } else {
-            CacheControl::Default
-        };
+        let cache_control = self.cache_control;
 
         let out_pretty = hasher.output_pretty().into_owned();
         let color_mode = hasher.color_mode();
@@ -1813,6 +1968,16 @@ where
                             stats.compiler_write_duration += duration;
                             debug!("stats after compile result: {stats:?}");
                             cache_write = Some(future);
+                        }
+                        CompileResult::NativeMiss(miss_type, dt, duration) => {
+                            if miss_type == MissType::ForcedRecache {
+                                stats.forced_recaches += 1;
+                            }
+                            dist_type = dt;
+                            stats.compilations += 1;
+                            stats.cache_misses.increment(&kind, lang);
+                            stats.compiler_write_duration += duration;
+                            stats.cache_writes += 1;
                         }
                         CompileResult::NotCached(dt, duration) => {
                             debug!("[{out_pretty}]: compile result: not cached");
@@ -2589,6 +2754,27 @@ enum Frame<R, R1> {
     Message { message: R },
 }
 
+#[derive(Debug)]
+struct IpcSendFailure;
+
+impl std::fmt::Display for IpcSendFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IPC response delivery failed")
+    }
+}
+
+impl std::error::Error for IpcSendFailure {}
+
+async fn send_ipc_frame<S>(sink: &mut S, frame: Frame<Response, Response>) -> Result<()>
+where
+    S: Sink<Frame<Response, Response>, Error = Error> + Unpin,
+{
+    time::timeout(activity::IPC_INACTIVITY_TIMEOUT, sink.send(frame))
+        .await
+        .context(IpcSendFailure)?
+        .context(IpcSendFailure)
+}
+
 struct Body<R> {
     receiver: mpsc::Receiver<Result<R>>,
 }
@@ -2792,6 +2978,25 @@ fn waits_until_zero() {
     assert_eq!(wait.now_or_never(), Some(()));
 }
 
+/// Cache controls are consumed by sccache, not passed to the compiler.
+fn consume_cache_control(env: &mut Vec<(OsString, OsString)>) -> CacheControl {
+    let mut control = CacheControl::Default;
+    env.retain(|(key, _)| {
+        if key == "SCCACHE_NO_CACHE" {
+            control = CacheControl::ForceNoCache;
+            false
+        } else if key == "SCCACHE_RECACHE" {
+            if control != CacheControl::ForceNoCache {
+                control = CacheControl::ForceRecache;
+            }
+            false
+        } else {
+            true
+        }
+    });
+    control
+}
+
 fn fatal_error_message(err: &anyhow::Error) -> String {
     let mut message = format!("sccache: encountered fatal error\nsccache: error: {err}\n");
     for cause in err.chain().skip(1) {
@@ -2896,6 +3101,140 @@ mod tests {
             env_vars: vec![],
         };
         (service, request)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn namespace_observer_mirrors_phase_and_cancels_only_selected_caller() -> Result<()> {
+        let (service, request) = watchdog_fixture(31);
+        let other = service.activities.begin(&request);
+        let identity = crate::protocol::CompileIdentity::from(&request);
+        let (socket, peer) = tokio::io::duplex(4096);
+        let handler = util::spawn(service.clone().bind(peer));
+        let mut client = tokio_util::codec::Framed::new(socket, LengthDelimitedCodec::new());
+        client
+            .send(Bytes::from(bincode::serialize(&Request::ObserveCompile(
+                identity.clone(),
+            ))?))
+            .await?;
+        let frame = client
+            .next()
+            .await
+            .context("observer registration missing")??;
+        let Response::CompileObserved(id) = bincode::deserialize::<Response>(&frame)? else {
+            bail!("unexpected observer registration");
+        };
+        let local =
+            activity::Activity::new(id.clone(), &identity, activity::CompileOwner::Namespace);
+        local.phase(Phase::RunDistributed);
+        time::advance(Duration::from_secs(15)).await;
+        client
+            .send(Bytes::from(bincode::serialize(&Request::ObservePhase(
+                local.snapshot(),
+            ))?))
+            .await?;
+        let frame = client.next().await.context("observer update missing")??;
+        assert!(matches!(
+            bincode::deserialize::<Response>(&frame)?,
+            Response::ObservationAccepted
+        ));
+        let snapshot = service
+            .activities
+            .snapshots()
+            .into_iter()
+            .find(|sample| sample.id == id)
+            .context("namespace request missing")?;
+        assert_eq!(snapshot.owner, activity::CompileOwner::Namespace);
+        assert_eq!(snapshot.phase, Phase::RunDistributed);
+        assert_eq!(snapshot.phase_age_ms, 15000);
+        assert!(service.activities.cancel(&id));
+        client
+            .send(Bytes::from(bincode::serialize(&Request::ObservePhase(
+                local.snapshot(),
+            ))?))
+            .await?;
+        let frame = client
+            .next()
+            .await
+            .context("observer cancel response missing")??;
+        let Response::RequestAborted(reason) = bincode::deserialize::<Response>(&frame)? else {
+            bail!("observer cancellation did not abort");
+        };
+        assert!(reason.contains("cancellation requested"));
+        assert!(handler.await?.is_err());
+        assert!(!other.activity.snapshot().cancellation_requested);
+        assert_eq!(service.activities.snapshots().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn namespace_observer_aborts_actual_caller_future() -> Result<()> {
+        let (service, request) = watchdog_fixture(31);
+        let identity = crate::protocol::CompileIdentity::from(&request);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = crate::net::SocketAddr::Net(listener.local_addr()?);
+        let peer = service.clone();
+        let server = util::spawn(async move {
+            let (socket, _) = listener.accept().await?;
+            peer.bind(socket).await
+        });
+        let observer = tokio::task::spawn_blocking(move || {
+            crate::client::CompileObserver::connect(&addr, &identity)
+        })
+        .await??;
+        let (held, dropped) = tokio::sync::oneshot::channel::<()>();
+        let work = async move {
+            activity::phase(Phase::RunDistributed);
+            let _held = held;
+            future::pending::<Result<()>>().await
+        };
+        let cancel = async {
+            time::sleep(Duration::from_secs(16)).await;
+            let active = service.activities.snapshots();
+            assert_eq!(active.len(), 1);
+            assert_eq!(active[0].phase, Phase::RunDistributed);
+            assert_eq!(active[0].owner, activity::CompileOwner::Namespace);
+            assert!(service.activities.cancel(&active[0].id));
+        };
+        let (result, ()) = tokio::join!(observer.run(work), cancel);
+        let error = result.expect_err("caller-side work must abort");
+        assert!(format!("{error:#}").contains("cancellation requested"));
+        assert!(dropped.await.is_err());
+        assert!(server.await?.is_err());
+        assert!(service.activities.snapshots().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn control_rpc_heartbeats_do_not_extend_deadline() -> Result<()> {
+        let (tx, mut rx) = mpsc::unbounded();
+        let mut sink = tx.sink_err_into::<Error>();
+        let monitor = SccacheService::<ProcessCommandCreator>::monitor_control(
+            &mut sink,
+            future::pending::<Result<()>>(),
+            Duration::from_secs(31),
+        );
+        tokio::pin!(monitor);
+        let result = async {
+            for _ in 0..2 {
+                assert!(matches!(
+                    rx.next().await,
+                    Some(Frame::Message {
+                        message: Response::Heartbeat
+                    })
+                ));
+            }
+            assert!(matches!(
+                rx.next().await,
+                Some(Frame::Message {
+                    message: Response::RequestAborted(_)
+                })
+            ));
+            Ok::<_, Error>(())
+        };
+        let (error, received) = tokio::join!(monitor, result);
+        received?;
+        assert!(error.is_err());
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]

@@ -3,6 +3,7 @@ extern crate log;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
+use sccache::build_runtime::{NetworkSnapshot, Peer};
 use sccache::config::{
     INSECURE_DIST_CLIENT_TOKEN,
     scheduler::{self as scheduler_config, JobSlackConfig},
@@ -10,10 +11,11 @@ use sccache::config::{
 };
 use sccache::dist::{
     self, AllocJobResult, AssignJobResult, BuilderIncoming, CompileCommand, HeartbeatServerResult,
-    InputsReader, JobAlloc, JobAuthorizer, JobComplete, JobId, JobState, OutputRequest,
-    RunJobResult, SchedulerIncoming, SchedulerOutgoing, SchedulerStatusResult, ServerId,
-    ServerIncoming, ServerNonce, ServerOutgoing, StagedToolchainArchive, SubmitToolchainResult,
-    TcCache, Toolchain, ToolchainReader, UpdateJobStateResult,
+    InputsReader, JobAlloc, JobAssignment, JobAuthorizer, JobComplete, JobId, JobState,
+    NativeAssignment, OutputRequest, RunJobResult, SchedulerIncoming, SchedulerOutgoing,
+    SchedulerStatusResult, ServerId, ServerIncoming, ServerNonce, ServerOutgoing,
+    StagedToolchainArchive, SubmitToolchainResult, TcCache, Toolchain, ToolchainReader,
+    UpdateJobStateResult,
 };
 use sccache::util::BASE64_URL_SAFE_ENGINE;
 use sccache::util::daemonize;
@@ -31,7 +33,21 @@ mod build;
 mod cmdline;
 mod command_helpers;
 mod job_telemetry;
+mod placement;
+use placement::{Exploration, NativeTransferPlan, choose_worker, native_estimate};
+#[cfg(target_os = "linux")]
+mod native;
+#[cfg(target_os = "linux")]
+mod native_dispatch;
+#[cfg(target_os = "linux")]
+mod rustup;
+#[cfg(target_os = "linux")]
+mod system_packages;
 mod token_check;
+#[cfg(target_os = "linux")]
+use native::NativeWorker;
+#[cfg(target_os = "linux")]
+use native_dispatch::NativeDispatcher;
 
 use cmdline::{AuthSubcommand, Command};
 
@@ -170,8 +186,287 @@ fn check_jwt_server_token(
         .ok()
 }
 
+/// Install metadata as one atomic file. Readers always see either the
+/// complete old or complete new document, never a partial catalog.
+fn write_installation_metadata(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> Result<()>,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    write(temp.as_file_mut())?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)?;
+    Ok(())
+}
+
+fn package_client(client_config: &Path) -> Result<sccache::dist::native::NativeCacheClient> {
+    use sccache::{
+        config::{DistAuth, FileConfig, try_read_config_file},
+        dist::native::NativeCacheClient,
+    };
+    let config: FileConfig =
+        try_read_config_file(client_config)?.context("client configuration unavailable")?;
+    let native = config
+        .dist
+        .native
+        .context("missing native client configuration")?;
+    let DistAuth::Token { token } = config.dist.auth else {
+        bail!("original-package provisioning requires token authentication");
+    };
+    NativeCacheClient::new(
+        native.endpoint.to_url(),
+        token,
+        Duration::from_secs(native.request_timeout_secs),
+        native.max_metadata_bytes,
+    )
+}
+
+fn provision_rust_package(
+    client_config: &Path,
+    archive: Option<&Path>,
+    source: sccache::build_runtime::PackageSource,
+    manifest_output: Option<&Path>,
+) -> Result<()> {
+    let client = package_client(client_config)?;
+    let (manifest, reused) = if let Some(manifest) = client.lookup_rust_package(source.identity)? {
+        anyhow::ensure!(
+            manifest.source == source,
+            "original package length differs from verified source"
+        );
+        (manifest, true)
+    } else {
+        let archive = archive.context("upstream package unavailable; supply --archive")?;
+        (
+            client.import_rust_package(source, std::fs::File::open(archive)?)?,
+            false,
+        )
+    };
+    if let Some(path) = manifest_output {
+        write_installation_metadata(path, |file| manifest.write(file))?;
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&package_report(source, &manifest, reused)?)?
+    );
+    Ok(())
+}
+
+fn package_report(
+    source: sccache::build_runtime::PackageSource,
+    manifest: &sccache::build_runtime::InstallationManifest,
+    reused: bool,
+) -> Result<serde_json::Value> {
+    let components = manifest
+        .components
+        .iter()
+        .map(|(name, tree)| Ok((name, tree.id()?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    Ok(serde_json::json!({
+        "source": source,
+        "package": manifest.package,
+        "components": components,
+        "reused_original_package": reused,
+    }))
+}
+
 fn run(command: Command) -> Result<i32> {
     match command {
+        Command::NativeDecodePackage {
+            compression,
+            max_tar_bytes,
+            memory_bytes,
+        } => {
+            sccache::build_runtime::decode_package_process(
+                compression,
+                max_tar_bytes,
+                memory_bytes,
+            )?;
+            Ok(0)
+        }
+        Command::NativeProvisionPackage {
+            client_config,
+            archive,
+            identity,
+            expected_size,
+            locator,
+        } => {
+            use sccache::build_runtime::PackageSource;
+            let client = package_client(&client_config)?;
+            let (receipt, reused) = if let Some(receipt) = client.lookup_package(identity)? {
+                (receipt, true)
+            } else if let Some(locator) = locator {
+                let acquired = client.acquire_package(&locator)?;
+                (acquired.package, acquired.reused)
+            } else {
+                let archive = std::fs::File::open(archive.context(
+                    "upstream package unavailable; supply --archive or --upstream and --path",
+                )?)?;
+                let size = archive.metadata()?.len();
+                anyhow::ensure!(
+                    expected_size.is_none_or(|expected| expected == size),
+                    "original package length differs from supplied size"
+                );
+                (
+                    client.import_package(PackageSource { identity, size }, archive)?,
+                    false,
+                )
+            };
+            anyhow::ensure!(
+                expected_size.is_none_or(|expected| expected == receipt.source.size),
+                "original package length differs from supplied size"
+            );
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "source": receipt.source, "package": receipt.tree, "reused_original_package": reused,
+                }))?
+            );
+            Ok(0)
+        }
+        Command::NativeProvisionRust {
+            client_config,
+            archive,
+            source,
+            manifest_output,
+        } => {
+            provision_rust_package(
+                &client_config,
+                archive.as_deref(),
+                source,
+                manifest_output.as_deref(),
+            )?;
+            Ok(0)
+        }
+        Command::NativeImportRust {
+            store,
+            archive,
+            source,
+            max_entries,
+            max_expanded_bytes,
+            max_tar_bytes,
+            manifest_output,
+        } => {
+            use sccache::build_runtime::{ArchiveLength, NativeStore, PackagePolicy};
+            let mut policy = PackagePolicy::normalized_archive(
+                max_entries,
+                max_expanded_bytes,
+                max_tar_bytes,
+                64 * 1024 * 1024,
+            )?;
+            policy.retain_original = true;
+            let store = NativeStore::open(&store)?;
+            let (package, reused) = if let Some(existing) =
+                store.lookup_package(source.identity, policy)?
+            {
+                anyhow::ensure!(
+                    existing.source() == source,
+                    "original package length differs from verified source"
+                );
+                (existing, true)
+            } else {
+                let archive = archive.context("upstream package unavailable; supply --archive")?;
+                (
+                    store.import_package(
+                        source.identity,
+                        ArchiveLength::Exact(source.size),
+                        policy,
+                        std::fs::File::open(archive)?,
+                        sccache::build_runtime::PackageDecoder::Isolated {
+                            executable: &std::env::current_exe()?,
+                            memory_bytes: 512 * 1024 * 1024,
+                            timeout: Duration::from_secs(600),
+                        },
+                    )?,
+                    false,
+                )
+            };
+            let before = store.stats()?;
+            let manifest = store.publish_rust_installer(&package, policy.directory)?;
+            if let Some(path) = manifest_output {
+                write_installation_metadata(&path, |file| manifest.write(file))?;
+            }
+            let after = store.stats()?;
+            anyhow::ensure!(
+                before.logical_bytes == after.logical_bytes && before.blobs == after.blobs,
+                "installer projection unexpectedly created content"
+            );
+            let mut report = package_report(source, &manifest, reused)?;
+            report["logical_bytes"] = after.logical_bytes.into();
+            report["blobs"] = after.blobs.into();
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(0)
+        }
+        #[cfg(target_os = "linux")]
+        Command::NativeSyncSystem {
+            client_config,
+            paths,
+            cache_dir,
+            jobs,
+        } => {
+            let client = package_client(&client_config)?;
+            let report = system_packages::sync_packages(&client, &paths, &cache_dir, jobs)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(0)
+        }
+        Command::NativeSyncRust {
+            root,
+            client_config,
+            output,
+            recipe_output,
+            full,
+            jobs,
+        } => {
+            rustup::sync(&root, &client_config, &output, &recipe_output, full, jobs)?;
+            Ok(0)
+        }
+        #[cfg(target_os = "linux")]
+        Command::NativeAttestInstallation {
+            root,
+            manifests,
+            recipe,
+            output,
+        } => {
+            use sccache::build_runtime::{
+                InstallationCatalog, InstallationManifest, InstallationRecipe,
+            };
+            let manifests = if let Some(recipe) = recipe {
+                InstallationRecipe::read(std::fs::File::open(recipe)?)?.selected_manifests()?
+            } else {
+                manifests
+                    .iter()
+                    .map(|path| InstallationManifest::read(std::fs::File::open(path)?))
+                    .collect::<Result<Vec<_>>>()?
+            };
+            let (catalog, report) = InstallationCatalog::attest(&root, &manifests, Some(&output))?;
+            write_installation_metadata(&output, |file| catalog.write(file))?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(0)
+        }
+        Command::NativeAudit {
+            index,
+            schema,
+            without,
+        } => {
+            let audit = sccache::build_runtime::NativeIndexAudit::open(&index)?;
+            if let Some(schema) = schema {
+                let comparison = audit.compare(&schema, &without)?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema": schema,
+                        "without": without,
+                        "comparison": comparison,
+                    }))?
+                );
+            } else {
+                println!("{}", serde_json::to_string_pretty(&audit.inventory()?)?);
+            }
+            Ok(0)
+        }
         Command::Auth(AuthSubcommand::Base64 { num_bytes }) => {
             let mut bytes = vec![0; num_bytes];
             rand::fill(&mut bytes);
@@ -197,6 +492,7 @@ fn run(command: Command) -> Result<i32> {
             server_auth,
             maintenance_drain_file,
             job_slack,
+            native_cache,
         }) => {
             let check_client_auth: Box<dyn dist::http::ClientAuthCheck> = match client_auth {
                 scheduler_config::ClientAuth::Insecure => Box::new(token_check::EqCheck::new(
@@ -262,11 +558,20 @@ fn run(command: Command) -> Result<i32> {
             );
             let scheduler =
                 Scheduler::new_with_job_slack_and_drain(job_slack, maintenance_drain_file);
+            if let Some(config) = &native_cache {
+                config.session_limits()?;
+                placement::start_checkpoint(
+                    &scheduler.cost_book,
+                    config.directory.join("action-costs.bin"),
+                    config.public_addr,
+                )?;
+            }
             let http_scheduler = dist::http::Scheduler::new(
                 public_addr,
                 scheduler,
                 check_client_auth,
                 check_server_auth,
+                native_cache,
             );
             // A running server never exits successfully (Result<Infallible>).
             match http_scheduler.start()? {}
@@ -281,43 +586,61 @@ fn run(command: Command) -> Result<i32> {
             scheduler_auth,
             toolchain_cache_size,
             toolchain_archive_sources,
+            native_worker,
         }) => {
-            let builder: Box<dyn dist::BuilderIncoming> = match builder {
+            let builder: Option<Box<dyn dist::BuilderIncoming>> = match builder {
+                server_config::BuilderType::Native => None,
                 #[cfg(not(target_os = "freebsd"))]
-                server_config::BuilderType::Docker => {
-                    Box::new(build::DockerBuilder::new().context("Docker builder failed to start")?)
-                }
+                server_config::BuilderType::Docker => Some(Box::new(
+                    build::DockerBuilder::new().context("Docker builder failed to start")?,
+                )),
                 #[cfg(not(target_os = "freebsd"))]
                 server_config::BuilderType::Overlay {
                     bwrap_path,
                     build_dir,
                     extracted_toolchain_cache_size,
-                } => Box::new(
+                } => Some(Box::new(
                     build::OverlayBuilder::new(
                         bwrap_path,
                         build_dir,
                         extracted_toolchain_cache_size,
                     )
                     .context("Overlay builder failed to start")?,
-                ),
+                )),
                 #[cfg(target_os = "freebsd")]
                 server_config::BuilderType::Pot {
                     pot_fs_root,
                     clone_from,
                     pot_cmd,
                     pot_clone_args,
-                } => Box::new(
+                } => Some(Box::new(
                     build::PotBuilder::new(pot_fs_root, clone_from, pot_cmd, pot_clone_args)
                         .context("Pot builder failed to start")?,
-                ),
-                _ => bail!(
-                    "Builder type `{}` not supported on this platform",
-                    format!("{:?}", builder)
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("")
-                ),
+                )),
+                _ => bail!("Builder type not supported on this platform: {builder:?}"),
             };
+            if builder.is_none() {
+                anyhow::ensure!(
+                    native_worker.is_some(),
+                    "native builder requires native_worker configuration"
+                );
+                anyhow::ensure!(
+                    cache_dir.is_none() && toolchain_archive_sources.is_empty(),
+                    "native-only worker cannot configure archive cache paths"
+                );
+            }
+            let archive = builder
+                .map(|builder| {
+                    ArchiveWorker::new(
+                        builder,
+                        cache_dir
+                            .as_deref()
+                            .context("archive builder requires cache_dir")?,
+                        toolchain_cache_size,
+                        toolchain_archive_sources,
+                    )
+                })
+                .transpose()?;
 
             let server_id = ServerId::new(public_addr);
             let scheduler_auth = match scheduler_auth {
@@ -343,13 +666,27 @@ fn run(command: Command) -> Result<i32> {
                 }
             };
 
-            let server = Server::new(
-                builder,
-                &cache_dir,
-                toolchain_cache_size,
-                toolchain_archive_sources,
-            )
-            .context("Failed to create sccache server instance")?;
+            #[cfg(target_os = "linux")]
+            let native_worker = native_worker
+                .map(|config| NativeWorker::new(config, scheduler_auth.clone()))
+                .transpose()?;
+            #[cfg(not(target_os = "linux"))]
+            if native_worker.is_some() {
+                bail!("native worker requires Linux");
+            }
+            let server = Server::new(archive);
+            #[cfg(target_os = "linux")]
+            let server = Server {
+                native_worker: native_worker
+                    .map(|worker| {
+                        NativeDispatcher::new(
+                            worker,
+                            std::sync::Arc::clone(&server.execution_queue),
+                        )
+                    })
+                    .transpose()?,
+                ..server
+            };
             let worker_name = dist_worker_name()?;
             let http_server = dist::http::Server::new_with_worker_name(
                 public_addr,
@@ -400,6 +737,11 @@ struct JobDetail {
     state_since: Instant,
     // First heartbeat that did not report this Started job as executing.
     missing_since: Option<Instant>,
+    inputs_staged_at: Option<Instant>,
+    publication_began_at: Option<Instant>,
+    assigned_at: Instant,
+    prediction: Option<placement::PlacementEstimate>,
+    observed_result: bool,
 }
 
 impl JobDetail {
@@ -450,6 +792,25 @@ impl CompletedJobAcks {
         self.recent.push_back((job_id, server_id, now));
     }
 
+    fn reconcile_native_queue(
+        &mut self,
+        owner: ServerId,
+        queue: &mut dist::NativeQueueSnapshot,
+        now: Instant,
+    ) {
+        use sccache::build_runtime::wire::NativeJobPhase;
+        self.prune(now);
+        // A known completed reservation may still have a replayable terminal
+        // response on the worker. Preserve occupancy but never charge CPU
+        // work from a snapshot captured before its completion.
+        for &(id, server, completed) in &self.recent {
+            if server == owner && queue.jobs.contains_key(&id) {
+                placement::Milestone::reached(NativeJobPhase::Terminal, completed)
+                    .apply(queue, id, now);
+            }
+        }
+    }
+
     fn contains(&mut self, job_id: JobId, server_id: ServerId, now: Instant) -> bool {
         self.prune(now);
         self.recent
@@ -473,10 +834,13 @@ pub struct Scheduler {
     jobs: Mutex<BTreeMap<JobId, JobDetail>>,
     servers: Mutex<HashMap<ServerId, ServerDetails>>,
     completed_acks: Mutex<CompletedJobAcks>,
+    exploration: Mutex<Exploration>,
+    cost_book: std::sync::Arc<Mutex<placement::CostBook>>,
 }
 
 struct ServerDetails {
-    jobs_assigned: HashSet<JobId>,
+    // Native input closures are reserved with the assignment, even before transfer.
+    jobs_assigned: HashMap<JobId, Option<placement::AssignedNative>>,
     // Reservations for assignment RPCs still in flight. Once assigned,
     // the state and unclaimed timeout are owned exclusively by JobDetail.
     jobs_assigning: HashMap<JobId, Instant>,
@@ -485,7 +849,64 @@ struct ServerDetails {
     cpu_capacity: f64,
     server_nonce: ServerNonce,
     worker_name: Option<String>,
+    capabilities: dist::WorkerCapabilities,
+    recent_residency: placement::RecentResidency,
     job_authorizer: Box<dyn JobAuthorizer>,
+}
+
+impl ServerDetails {
+    fn apply_milestones(&mut self, now: Instant) {
+        if let Some(placement) = &mut self.capabilities.native_placement {
+            for (&id, assigned) in &self.jobs_assigned {
+                if let Some(milestone) = assigned.as_ref().and_then(|job| job.milestone) {
+                    milestone.apply(&mut placement.queue, id, now);
+                }
+            }
+        }
+    }
+
+    fn native_milestone(
+        &mut self,
+        id: JobId,
+        phase: sccache::build_runtime::wire::NativeJobPhase,
+        now: Instant,
+    ) {
+        if let Some(assigned) = self.jobs_assigned.get_mut(&id).and_then(Option::as_mut) {
+            placement::Milestone::advance(&mut assigned.milestone, phase, now);
+            if let Some(milestone) = assigned.milestone
+                && let Some(placement) = &mut self.capabilities.native_placement
+            {
+                milestone.apply(&mut placement.queue, id, now);
+            }
+        }
+    }
+
+    fn compiler_demand(&self) -> usize {
+        self.capabilities.native_placement.as_ref().map_or_else(
+            || self.jobs_assigned.len(),
+            |placement| {
+                placement
+                    .queue
+                    .compiler_demand(self.jobs_assigned.keys().copied())
+            },
+        )
+    }
+
+    fn native_headroom(&self) -> usize {
+        if self.capabilities.archive {
+            return usize::MAX;
+        }
+        self.capabilities
+            .native_placement
+            .as_ref()
+            .map_or(0, |placement| {
+                placement.queue.available_reservations(
+                    self.jobs_assigned
+                        .iter()
+                        .filter_map(|(&id, inputs)| inputs.is_some().then_some(id)),
+                )
+            })
+    }
 }
 
 impl Scheduler {
@@ -510,10 +931,12 @@ impl Scheduler {
         )
     }
 
+    #[cfg(test)]
     fn with_job_id_base(job_id_base: u64) -> Self {
         Self::with_job_id_base_and_slack(job_id_base, JobSlackConfig::default())
     }
 
+    #[cfg(test)]
     fn with_job_id_base_and_slack(job_id_base: u64, job_slack: JobSlackConfig) -> Self {
         Self::with_job_id_base_and_slack_and_drain(job_id_base, job_slack, None)
     }
@@ -531,6 +954,8 @@ impl Scheduler {
             jobs: Mutex::new(BTreeMap::new()),
             servers: Mutex::new(HashMap::new()),
             completed_acks: Mutex::new(CompletedJobAcks::default()),
+            exploration: Mutex::new(Exploration::default()),
+            cost_book: std::sync::Arc::new(Mutex::new(placement::CostBook::default())),
         }
     }
 
@@ -579,7 +1004,7 @@ impl Scheduler {
                 error!("server {server_id:?} disappeared while pruning");
                 continue;
             };
-            for job_id in server_details.jobs_assigned {
+            for job_id in server_details.jobs_assigned.into_keys() {
                 warn!(
                     "dist_job_lost job_id={job_id} worker={} reason=heartbeat_timeout previous_state={:?}",
                     server_id.addr(),
@@ -627,35 +1052,98 @@ fn weighted_server(candidates: &[(ServerId, f64)], draw: f64) -> Option<ServerId
         .map(|(id, _)| *id)
 }
 
-impl SchedulerIncoming for Scheduler {
-    fn handle_alloc_job(
+impl Scheduler {
+    fn allocate_job(
         &self,
         requester: &dyn SchedulerOutgoing,
-        tc: Toolchain,
+        mut assignment: JobAssignment,
+        network: &NetworkSnapshot,
+        packages: std::sync::Arc<sccache::build_runtime::PackageCatalog>,
     ) -> Result<AllocJobResult> {
         if self.is_draining() {
             return Ok(AllocJobResult::Fail {
                 msg: "scheduler is draining for maintenance".to_owned(),
             });
         }
-        let (job_id, server_id, auth) = {
+        let native = match &assignment {
+            JobAssignment::Archive(_) => None,
+            JobAssignment::Native(native) => Some(native.as_ref()),
+        };
+        let native_platform = native.map(|assignment| assignment.spec.platform);
+        let native_inputs = native.map(|assignment| &assignment.input_blobs);
+        let class = native
+            .map(|assignment| placement::ActionClass::from_spec(&assignment.spec))
+            .transpose()?;
+        let assigned_at = Instant::now();
+        let (job_id, server_id, auth, prediction, estimated_result_bytes) = {
             // LOCKS
             let mut servers = self
                 .servers
                 .lock()
                 .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
 
+            let cost_book = self
+                .cost_book
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let transfer_plan = native_inputs
+                .as_ref()
+                .map(|_| NativeTransferPlan::new(network, &servers, Some(&packages)));
             let res = {
                 let mut healthy = Vec::new();
                 let mut retry = Vec::new();
+                let mut predictions = BTreeMap::new();
                 let now = Instant::now();
                 for (&server_id, details) in servers.iter_mut() {
+                    let compatible = match native_platform {
+                        Some(platform) => details.capabilities.native_platform == Some(platform),
+                        None => details.capabilities.archive,
+                    };
+                    if !compatible {
+                        continue;
+                    }
                     let Some(weight) = admission_weight(
-                        details.jobs_assigned.len(),
+                        details.compiler_demand(),
                         details.cpu_capacity,
                         self.job_slack,
                     ) else {
                         continue;
+                    };
+                    let weight = if let (Some(inputs), Some(plan)) =
+                        (native_inputs, transfer_plan.as_ref())
+                    {
+                        let Some(placement) = details.capabilities.native_placement.as_ref() else {
+                            continue;
+                        };
+                        if !placement.queue.has_capacity(
+                            details
+                                .jobs_assigned
+                                .iter()
+                                .filter_map(|(&id, inputs)| inputs.is_some().then_some(id)),
+                        ) {
+                            continue;
+                        }
+                        let learned = class.zip(native_platform).map(|(class, platform)| {
+                            cost_book.predict(
+                                placement::WorkerScope {
+                                    address: server_id.addr(),
+                                    platform,
+                                },
+                                class,
+                                placement,
+                                now,
+                            )
+                        });
+                        let Some(forecast) = placement::WorkerForecast::new(details, learned)
+                        else {
+                            continue;
+                        };
+                        let estimate =
+                            native_estimate(forecast, inputs, Peer::Worker(server_id.addr()), plan);
+                        predictions.insert(server_id.addr(), estimate);
+                        estimate.seconds
+                    } else {
+                        weight
                     };
                     if details.last_error.is_some_and(|when| {
                         now.duration_since(when) > SERVER_REMEMBER_ERROR_TIMEOUT
@@ -668,9 +1156,32 @@ impl SchedulerIncoming for Scheduler {
                         healthy.push((server_id, weight));
                     }
                 }
-                let selected = [&healthy, &retry]
-                    .into_iter()
-                    .find_map(|candidates| weighted_server(candidates, rand::random::<f64>()));
+                let estimated_result_bytes =
+                    class.zip(native_platform).and_then(|(class, platform)| {
+                        cost_book.result_reservation(platform, class, now)
+                    });
+                drop(cost_book);
+                let selected = [&healthy, &retry].into_iter().find_map(|candidates| {
+                    if let (Some(inputs), Some(plan)) =
+                        (native_inputs.as_ref(), transfer_plan.as_ref())
+                    {
+                        let mut history = self
+                            .exploration
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        choose_worker(
+                            candidates,
+                            &servers,
+                            inputs,
+                            &predictions,
+                            plan,
+                            &mut history,
+                            now,
+                        )
+                    } else {
+                        weighted_server(candidates, rand::random::<f64>())
+                    }
+                });
                 if let Some(server_id) = selected {
                     let server_details = servers.get_mut(&server_id).ok_or_else(|| {
                         anyhow::anyhow!("selected worker disappeared while scheduler lock held")
@@ -684,7 +1195,31 @@ impl SchedulerIncoming for Scheduler {
                         .job_authorizer
                         .generate_token(job_id)
                         .context("Could not create an auth token for this job")?;
-                    assert!(server_details.jobs_assigned.insert(job_id));
+                    let prediction = predictions.get(&server_id.addr()).copied();
+                    if let Some(class) = class {
+                        trace!(target: "native_placement_replay", "{}", serde_json::json!({
+                            "kind": "assigned", "job": job_id.0, "worker": server_id.addr(), "class": class,
+                            "candidates": predictions,
+                            "estimated_result_bytes": estimated_result_bytes,
+                            "host_prior": server_details.capabilities.native_placement.as_ref().map(placement::ActionCost::baseline),
+                            "healthy": healthy.iter().map(|(id, _)| id.addr()).collect::<Vec<_>>(),
+                        }));
+                    }
+                    let assigned = native_inputs.map(|inputs| placement::AssignedNative {
+                        packages: std::sync::Arc::clone(&packages),
+                        inputs: inputs.clone(),
+                        class,
+                        cost: predictions
+                            .get(&server_id.addr())
+                            .map(|estimate| estimate.cost),
+                        milestone: None,
+                    });
+                    assert!(
+                        server_details
+                            .jobs_assigned
+                            .insert(job_id, assigned)
+                            .is_none()
+                    );
                     assert!(
                         server_details
                             .jobs_assigning
@@ -696,7 +1231,7 @@ impl SchedulerIncoming for Scheduler {
                         "Job {} created and will be assigned to server {:?}",
                         job_id, server_id
                     );
-                    Some((job_id, server_id, auth))
+                    Some((job_id, server_id, auth, prediction, estimated_result_bytes))
                 } else {
                     None
                 }
@@ -712,11 +1247,14 @@ impl SchedulerIncoming for Scheduler {
                 return Ok(AllocJobResult::Fail { msg });
             }
         };
+        if let JobAssignment::Native(native) = &mut assignment {
+            native.estimated_result_bytes = estimated_result_bytes;
+        }
         let AssignJobResult {
             state,
             need_toolchain,
         } = requester
-            .do_assign_job(server_id, job_id, tc, auth.clone())
+            .do_assign_job(server_id, job_id, assignment, auth.clone())
             .with_context(|| {
                 // LOCKS
                 let Ok(mut servers) = self.servers.lock() else {
@@ -725,7 +1263,7 @@ impl SchedulerIncoming for Scheduler {
                 if let Some(entry) = servers.get_mut(&server_id) {
                     entry.last_error = Some(Instant::now());
                     entry.jobs_assigning.remove(&job_id);
-                    if !entry.jobs_assigned.remove(&job_id) {
+                    if entry.jobs_assigned.remove(&job_id).is_none() {
                         "assign job failed and job not known to the server"
                     } else {
                         "assign job failed, job un-assigned from the server"
@@ -750,7 +1288,7 @@ impl SchedulerIncoming for Scheduler {
                 warn!("{msg}");
                 return Ok(AllocJobResult::Fail { msg });
             };
-            if !details.jobs_assigned.contains(&job_id)
+            if !details.jobs_assigned.contains_key(&job_id)
                 || !details.jobs_assigning.contains_key(&job_id)
             {
                 let msg = format!(
@@ -770,6 +1308,11 @@ impl SchedulerIncoming for Scheduler {
                         state,
                         state_since: Instant::now(),
                         missing_since: None,
+                        inputs_staged_at: None,
+                        publication_began_at: None,
+                        assigned_at,
+                        prediction,
+                        observed_result: false,
                     }
                 )
                 .is_none()
@@ -790,6 +1333,221 @@ impl SchedulerIncoming for Scheduler {
             need_toolchain,
         })
     }
+}
+
+impl SchedulerIncoming for Scheduler {
+    fn handle_alloc_job(
+        &self,
+        requester: &dyn SchedulerOutgoing,
+        tc: Toolchain,
+    ) -> Result<AllocJobResult> {
+        self.allocate_job(
+            requester,
+            JobAssignment::Archive(tc),
+            &NetworkSnapshot::default(),
+            Default::default(),
+        )
+    }
+
+    fn handle_alloc_native_job(
+        &self,
+        requester: &dyn SchedulerOutgoing,
+        assignment: NativeAssignment,
+        network: &NetworkSnapshot,
+        packages: std::sync::Arc<sccache::build_runtime::PackageCatalog>,
+    ) -> Result<AllocJobResult> {
+        assignment.spec.validate()?;
+        self.allocate_job(
+            requester,
+            JobAssignment::Native(Box::new(assignment)),
+            network,
+            packages,
+        )
+    }
+
+    fn observe_native_lifecycle(
+        &self,
+        server_id: ServerId,
+        job: JobId,
+        event: dist::NativeLifecycleEvent<'_>,
+    ) {
+        let now = Instant::now();
+        // Same lock order as assignment and heartbeat processing. The
+        // scheduler-epoch job ID ties the receipt to the current worker
+        // incarnation even if the address is reused after a restart.
+        let (Ok(mut jobs), Ok(mut servers)) = (self.jobs.lock(), self.servers.lock()) else {
+            warn!("Native output locality update skipped: scheduler state poisoned");
+            return;
+        };
+        let Some(detail) = jobs.get_mut(&job) else {
+            return;
+        };
+        let Some(server) = servers.get_mut(&server_id) else {
+            return;
+        };
+        if detail.server_id != server_id
+            || !server.jobs_assigned.get(&job).is_some_and(Option::is_some)
+        {
+            return;
+        }
+        use sccache::build_runtime::wire::NativeJobPhase;
+        match event {
+            dist::NativeLifecycleEvent::InputsStaged => {
+                detail.inputs_staged_at.get_or_insert(now);
+                server.native_milestone(job, NativeJobPhase::Ready, now);
+            }
+            dist::NativeLifecycleEvent::Negotiated => {
+                server.native_milestone(job, NativeJobPhase::Publishing, now);
+                if detail.publication_began_at.is_none() {
+                    detail.publication_began_at = Some(now);
+                    if let Some(assigned) = server.jobs_assigned.get(&job).and_then(Option::as_ref)
+                    {
+                        server.recent_residency.record_inputs(&assigned.inputs, now);
+                    }
+                }
+            }
+            dist::NativeLifecycleEvent::Committed {
+                manifest,
+                retained_after_begin,
+                observation,
+            } => {
+                if let Some(anchor) = detail.publication_began_at
+                    && let Err(error) =
+                        server
+                            .recent_residency
+                            .record(manifest, anchor, retained_after_begin, now)
+                {
+                    warn!("Native output locality update failed: {error:#}");
+                }
+                if !detail.observed_result && detail.publication_began_at.is_some() {
+                    detail.observed_result = true;
+                    server.native_milestone(job, NativeJobPhase::Terminal, now);
+                    if let Some(assigned) = server.jobs_assigned.get(&job).and_then(Option::as_ref)
+                    {
+                        server.recent_residency.record_inputs(&assigned.inputs, now);
+                    }
+                    if let Some(assigned) = server.jobs_assigned.get(&job).and_then(Option::as_ref)
+                        && let (Some(class), Some(observed)) = (
+                            assigned.class,
+                            observation.filter(|sample| {
+                                sample.valid()
+                                    && manifest.blobs().is_ok_and(|blobs| {
+                                        sample.upload_bytes
+                                            <= blobs.values().copied().fold(0, u64::saturating_add)
+                                            && sample.upload_requests
+                                                <= u64::try_from(blobs.len()).unwrap_or(u64::MAX)
+                                    })
+                            }),
+                        )
+                    {
+                        if let Some(timing) = observed.worker_timing
+                            && let Some(placement) = server.capabilities.native_placement.as_mut()
+                        {
+                            placement.timing.adopt(timing);
+                        }
+                        if let Some(platform) = server.capabilities.native_platform {
+                            self.cost_book
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .observe(
+                                    placement::WorkerScope {
+                                        address: server_id.addr(),
+                                        platform,
+                                    },
+                                    class,
+                                    observed,
+                                    manifest.blobs().map_or(0, |blobs| {
+                                        blobs.values().copied().fold(0, u64::saturating_add)
+                                    }),
+                                    now,
+                                );
+                        }
+                        trace!(target: "native_placement_replay", "{}", serde_json::json!({
+                            "kind": "completed", "job": job.0, "worker": server_id.addr(),
+                            "class": class, "predicted_seconds": detail.prediction.map(|prediction| prediction.completion_seconds),
+                            "actual_inputs_ready_seconds": detail.inputs_staged_at.map(|staged| staged.saturating_duration_since(detail.assigned_at).as_secs_f64()),
+                            "actual_result_negotiation_seconds": detail.publication_began_at.map(|began| began.saturating_duration_since(detail.assigned_at).as_secs_f64()),
+                            "actual_staging_start_seconds": (detail.state == JobState::Started).then(|| detail.state_since.saturating_duration_since(detail.assigned_at).as_secs_f64()),
+                            "actual_seconds": now.saturating_duration_since(detail.assigned_at).as_secs_f64(),
+                            "result_bytes": manifest.blobs().ok().map(|blobs| blobs.values().copied().fold(0_u64, u64::saturating_add)),
+                            "execution_nanoseconds": observed.execution_nanoseconds,
+                            "worker_timing": observed.worker_timing,
+                            "warm_staging_nanoseconds": observed.warm_staging_nanoseconds,
+                            "publication_setup_nanoseconds": observed.publication_setup_nanoseconds,
+                            "upload_bytes": observed.upload_bytes, "upload_requests": observed.upload_requests,
+                            "upload_nanoseconds": observed.upload_nanoseconds, "predicted_cost": assigned.cost,
+                        }));
+                    }
+                }
+            }
+        }
+        drop(servers);
+        drop(jobs);
+    }
+
+    fn native_blob_sources(
+        &self,
+        blob: sccache::build_runtime::BlobRef,
+        requester: Option<std::net::SocketAddr>,
+    ) -> Result<Vec<dist::NativeBlobSource>> {
+        let servers = self
+            .servers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
+        // Result receipts may name a just-produced blob that has not yet
+        // appeared in a heartbeat. For result recovery prefer positive
+        // inventory hints, but allow other native workers to answer exactly.
+        let mut candidates = servers
+            .iter()
+            .filter_map(|(id, details)| {
+                let placement = details.capabilities.native_placement.as_ref()?;
+                let now = Instant::now();
+                let pinned = details.jobs_assigned.iter().any(|(id, assigned)| {
+                    placement
+                        .queue
+                        .jobs
+                        .get(id)
+                        .is_some_and(|progress| progress.phase.inputs_ready())
+                        && assigned
+                            .as_ref()
+                            .is_some_and(|job| job.inputs.get(&blob.id) == Some(&blob.size))
+                });
+                let locality =
+                    if pinned || details.recent_residency.retained(blob.id, blob.size, now) {
+                        3_u8
+                    } else if details.recent_residency.contains(blob.id, blob.size, now) {
+                        2_u8
+                    } else {
+                        u8::from(
+                            placement
+                                .residency
+                                .as_ref()
+                                .is_some_and(|residency| residency.may_contain(blob.id)),
+                        )
+                    };
+                (Some(id.addr()) != requester
+                    && details.last_seen.elapsed() < Duration::from_secs(20)
+                    && details.last_error.is_none()
+                    && (requester.is_none() || locality > 0))
+                    .then_some((id, details, locality))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by(|(a, left, left_predicted), (b, right, right_predicted)| {
+            right_predicted
+                .cmp(left_predicted)
+                .then_with(|| right.last_seen.cmp(&left.last_seen))
+                .then_with(|| a.addr().cmp(&b.addr()))
+        });
+        candidates
+            .into_iter()
+            .map(|(&server, details, _)| {
+                Ok(dist::NativeBlobSource {
+                    server,
+                    token: details.job_authorizer.generate_blob_token(blob)?,
+                })
+            })
+            .collect()
+    }
 
     fn handle_heartbeat_server(
         &self,
@@ -798,6 +1556,7 @@ impl SchedulerIncoming for Scheduler {
         cpu_capacity: f64,
         active_job_ids: &[JobId],
         job_authorizer: Box<dyn JobAuthorizer>,
+        mut capabilities: dist::WorkerCapabilities,
     ) -> Result<HeartbeatServerResult> {
         // LOCKS
         let mut jobs = self
@@ -814,11 +1573,53 @@ impl SchedulerIncoming for Scheduler {
         if !cpu_capacity.is_finite() || cpu_capacity < 0.0 {
             bail!("invalid worker CPU capacity {cpu_capacity}");
         }
+        anyhow::ensure!(
+            capabilities.archive || capabilities.native_platform.is_some(),
+            "worker advertises no build engine"
+        );
+        anyhow::ensure!(
+            capabilities.native_platform.is_some() == capabilities.native_placement.is_some(),
+            "native worker telemetry must match advertised engine"
+        );
+        if let Some(placement) = &capabilities.native_placement {
+            anyhow::ensure!(
+                placement.timing.valid()
+                    && placement.queue.valid()
+                    && placement
+                        .package_limits
+                        .is_none_or(sccache::build_runtime::PackageDeliveryLimits::valid),
+                "invalid native result or queue telemetry"
+            );
+            anyhow::ensure!(
+                placement
+                    .residency
+                    .as_ref()
+                    .is_none_or(sccache::build_runtime::BlobResidency::valid),
+                "invalid native placement telemetry"
+            );
+        }
         match servers.get_mut(&server_id) {
             Some(ref mut details) if details.server_nonce == server_nonce => {
                 let now = Instant::now();
                 details.last_seen = now;
                 details.cpu_capacity = cpu_capacity;
+                if details.capabilities.native_platform == capabilities.native_platform
+                    && let (Some(previous), Some(incoming)) = (
+                        details.capabilities.native_placement.as_ref(),
+                        capabilities.native_placement.as_mut(),
+                    )
+                {
+                    incoming.timing.adopt(previous.timing);
+                }
+                details.capabilities = capabilities;
+                details.apply_milestones(now);
+                if let Some(placement) = &mut details.capabilities.native_placement {
+                    self.completed_acks
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("completion acknowledgment mutex poisoned"))?
+                        .reconcile_native_queue(server_id, &mut placement.queue, now);
+                }
+                details.recent_residency.reap(now);
 
                 // Executing jobs and transfers with recent byte progress have
                 // live request owners. A Started job missing from one heartbeat
@@ -826,7 +1627,7 @@ impl SchedulerIncoming for Scheduler {
                 let active: HashSet<JobId> = active_job_ids.iter().copied().collect();
                 let stale_jobs: Vec<_> = details
                     .jobs_assigned
-                    .iter()
+                    .keys()
                     .copied()
                     .filter(|job_id| match jobs.get_mut(job_id) {
                         Some(detail) if detail.server_id == server_id => {
@@ -865,7 +1666,7 @@ impl SchedulerIncoming for Scheduler {
                             server_id.addr(),
                             jobs.get(&job_id).map(|detail| detail.state)
                         );
-                        if !details.jobs_assigned.remove(&job_id) {
+                        if details.jobs_assigned.remove(&job_id).is_none() {
                             warn!(
                                 "Stale job for server {} not assigned: {}",
                                 server_id.addr(),
@@ -877,7 +1678,7 @@ impl SchedulerIncoming for Scheduler {
                     }
                 }
 
-                let mut assigned_job_ids: Vec<_> = details.jobs_assigned.iter().copied().collect();
+                let mut assigned_job_ids: Vec<_> = details.jobs_assigned.keys().copied().collect();
                 assigned_job_ids.sort_unstable();
                 return Ok(HeartbeatServerResult {
                     is_new: false,
@@ -885,7 +1686,7 @@ impl SchedulerIncoming for Scheduler {
                 });
             }
             Some(ref mut details) if details.server_nonce != server_nonce => {
-                for job_id in details.jobs_assigned.iter() {
+                for job_id in details.jobs_assigned.keys() {
                     warn!(
                         "dist_job_lost job_id={job_id} worker={} reason=worker_restarted previous_state={:?}",
                         server_id.addr(),
@@ -908,11 +1709,13 @@ impl SchedulerIncoming for Scheduler {
             ServerDetails {
                 last_seen: Instant::now(),
                 last_error: None,
-                jobs_assigned: HashSet::new(),
+                jobs_assigned: HashMap::new(),
                 jobs_assigning: HashMap::new(),
                 cpu_capacity,
                 server_nonce,
                 worker_name: None,
+                capabilities,
+                recent_residency: placement::RecentResidency::default(),
                 job_authorizer,
             },
         );
@@ -1020,7 +1823,7 @@ impl SchedulerIncoming for Scheduler {
             let details = servers.get_mut(&server_id).ok_or_else(|| {
                 anyhow::anyhow!("Job state updated, but server is not known to scheduler")
             })?;
-            if !details.jobs_assigned.contains(&job_id) {
+            if !details.jobs_assigned.contains_key(&job_id) {
                 bail!("job {job_id} was not assigned to server {server_id:?}");
             }
 
@@ -1032,11 +1835,32 @@ impl SchedulerIncoming for Scheduler {
                 (JobState::Pending, JobState::Ready) | (JobState::Ready, JobState::Started) => {
                     entry.get_mut().transition_to(job_state, now);
                 }
-                (JobState::Started, JobState::Complete) => {
+                (from, JobState::Complete)
+                    if from == JobState::Started
+                        || details
+                            .jobs_assigned
+                            .get(&job_id)
+                            .is_some_and(Option::is_some) =>
+                {
                     let mut acks = self
                         .completed_acks
                         .lock()
                         .map_err(|_| anyhow::anyhow!("completion acknowledgment mutex poisoned"))?;
+                    // The worker has drained the assignment. Remember its verified
+                    // inputs even if compilation itself failed.
+                    if let Some(assigned) =
+                        details.jobs_assigned.get(&job_id).and_then(Option::as_ref)
+                        && assigned.milestone.is_some()
+                    {
+                        details
+                            .recent_residency
+                            .record_inputs(&assigned.inputs, now);
+                    }
+                    details.native_milestone(
+                        job_id,
+                        sccache::build_runtime::wire::NativeJobPhase::Terminal,
+                        now,
+                    );
                     details.jobs_assigned.remove(&job_id);
                     entry.remove_entry();
                     acks.record(job_id, server_id, now);
@@ -1097,7 +1921,8 @@ impl SchedulerIncoming for Scheduler {
                     .map(|v| {
                         self.job_slack
                             .max_jobs(v.cpu_capacity)
-                            .saturating_sub(v.jobs_assigned.len())
+                            .saturating_sub(v.compiler_demand())
+                            .min(v.native_headroom())
                     })
                     .fold(0, usize::saturating_add)
             },
@@ -1106,28 +1931,33 @@ impl SchedulerIncoming for Scheduler {
 }
 
 struct LocalAssignment {
-    toolchain: Toolchain,
+    assignment: JobAssignment,
     // Local time of receipt, not the scheduler's assignment timestamp.
     accepted_at: Instant,
 }
 
-pub struct Server {
+#[cfg(target_os = "linux")]
+struct NativeInputPins {
+    _trees: Vec<sccache::build_runtime::TreeLease>,
+    _blobs: sccache::build_runtime::UploadReservation,
+}
+
+struct ArchiveWorker {
     builder: Box<dyn BuilderIncoming>,
     cache: Mutex<TcCache>,
     staging_dir: PathBuf,
     toolchain_cache_size: u64,
     #[cfg(target_os = "linux")]
     toolchain_archive_sources: Vec<PathBuf>,
-    job_toolchains: Mutex<HashMap<JobId, LocalAssignment>>,
 }
 
-impl Server {
-    pub fn new(
+impl ArchiveWorker {
+    fn new(
         builder: Box<dyn BuilderIncoming>,
         cache_dir: &Path,
         toolchain_cache_size: u64,
         toolchain_archive_sources: Vec<PathBuf>,
-    ) -> Result<Server> {
+    ) -> Result<Self> {
         if toolchain_archive_sources
             .iter()
             .any(|path| !path.is_absolute())
@@ -1140,14 +1970,13 @@ impl Server {
         }
         let cache = TcCache::new(&cache_dir.join("tc"), toolchain_cache_size)
             .context("Failed to create toolchain cache")?;
-        Ok(Server {
+        Ok(Self {
             builder,
             cache: Mutex::new(cache),
             staging_dir: cache_dir.join("tc"),
             toolchain_cache_size,
             #[cfg(target_os = "linux")]
             toolchain_archive_sources,
-            job_toolchains: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1200,7 +2029,75 @@ impl Server {
     }
 }
 
+pub struct Server {
+    archive: Option<ArchiveWorker>,
+    execution_queue: std::sync::Arc<dist::execution_queue::ExecutionQueue>,
+    job_toolchains: Mutex<HashMap<JobId, LocalAssignment>>,
+    #[cfg(target_os = "linux")]
+    native_worker: Option<NativeDispatcher>,
+}
+
+impl Server {
+    fn new(archive: Option<ArchiveWorker>) -> Self {
+        Self {
+            archive,
+            execution_queue: std::sync::Arc::new(dist::execution_queue::ExecutionQueue::new(
+                std::num::NonZeroUsize::new(sccache::util::num_cpus())
+                    .unwrap_or(std::num::NonZeroUsize::MIN),
+            )),
+            job_toolchains: Mutex::new(HashMap::new()),
+            #[cfg(target_os = "linux")]
+            native_worker: None,
+        }
+    }
+}
+
+impl Server {
+    fn begin_execution(
+        &self,
+        requester: &dyn ServerOutgoing,
+        job_id: JobId,
+    ) -> Result<Option<LocalAssignment>> {
+        let assigned = {
+            let mut jobs = self
+                .job_toolchains
+                .lock()
+                .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?;
+            match jobs.entry(job_id) {
+                std::collections::hash_map::Entry::Occupied(entry) => Some(entry.remove()),
+                _ => None,
+            }
+        };
+        let Some(assigned) = assigned else {
+            return Ok(None);
+        };
+        let transition = requester
+            .do_update_job_state(job_id, JobState::Started)
+            .and_then(|reply| match reply {
+                UpdateJobStateResult::Success => Ok(()),
+                UpdateJobStateResult::Fail { msg } => {
+                    Err(anyhow::anyhow!("scheduler rejected start: {msg}"))
+                }
+            });
+        if let Err(error) = transition {
+            let mut jobs = self
+                .job_toolchains
+                .lock()
+                .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?;
+            if jobs.insert(job_id, assigned).is_some() {
+                bail!("job {job_id} reappeared while restoring failed start transition");
+            }
+            return Err(error).context("Updating job state failed");
+        }
+        Ok(Some(assigned))
+    }
+}
+
 impl ServerIncoming for Server {
+    fn executing_jobs(&self) -> usize {
+        self.execution_queue.active()
+    }
+
     fn handle_reconcile_assignments(
         &self,
         assigned_job_ids: &[JobId],
@@ -1219,11 +2116,114 @@ impl ServerIncoming for Server {
         });
         let removed = before - local.len();
         drop(local);
+        #[cfg(target_os = "linux")]
+        let removed = removed
+            + self.native_worker.as_ref().map_or(0, |dispatcher| {
+                dispatcher.reconcile(&known, heartbeat_started_at)
+            });
         Ok(removed)
     }
 
+    fn capabilities(&self) -> dist::WorkerCapabilities {
+        #[cfg(target_os = "linux")]
+        let native_platform = self
+            .native_worker
+            .as_ref()
+            .map(|dispatcher| dispatcher.worker().policy.platform);
+        #[cfg(not(target_os = "linux"))]
+        let native_platform = None;
+        #[cfg(target_os = "linux")]
+        let native_placement = self.native_worker.as_ref().map(NativeDispatcher::placement);
+        #[cfg(not(target_os = "linux"))]
+        let native_placement = None;
+        dist::WorkerCapabilities {
+            archive: self.archive.is_some(),
+            native_platform,
+            native_placement,
+        }
+    }
+
+    fn native_metadata_limit(&self) -> Option<usize> {
+        #[cfg(target_os = "linux")]
+        {
+            self.native_worker
+                .as_ref()
+                .map(|dispatcher| dispatcher.worker().metadata_limit)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
+    fn handle_native_blob(
+        &self,
+        blob: sccache::build_runtime::BlobRef,
+    ) -> Result<Option<(std::fs::File, sccache::build_runtime::BlobEncoding)>> {
+        #[cfg(target_os = "linux")]
+        {
+            self.native_worker
+                .as_ref()
+                .context("native worker unavailable")?
+                .worker()
+                .open_blob(blob)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = blob;
+            Ok(None)
+        }
+    }
+
+    fn handle_assign_native_job(
+        &self,
+        requester: std::sync::Arc<dyn ServerOutgoing>,
+        job_id: JobId,
+        assignment: NativeAssignment,
+    ) -> Result<AssignJobResult> {
+        #[cfg(target_os = "linux")]
+        {
+            self.native_worker
+                .as_ref()
+                .context("native worker unavailable")?
+                .assign(job_id, assignment, requester)?;
+            Ok(AssignJobResult {
+                state: JobState::Ready,
+                need_toolchain: false,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (requester, job_id, assignment);
+            bail!("native worker requires Linux")
+        }
+    }
+
+    fn handle_run_native_job(
+        &self,
+        job_id: JobId,
+        request: sccache::build_runtime::wire::NativeRunRequest,
+    ) -> Result<sccache::build_runtime::wire::NativeRunResult> {
+        #[cfg(target_os = "linux")]
+        {
+            self.native_worker
+                .as_ref()
+                .context("native worker unavailable")?
+                .poll(job_id, request)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (job_id, request);
+            bail!("native worker requires Linux")
+        }
+    }
+
     fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> Result<AssignJobResult> {
-        let need_toolchain = !self.has_or_reuse_toolchain(&tc)?;
+        let need_toolchain = !self
+            .archive
+            .as_ref()
+            .context("archive worker disabled")?
+            .has_or_reuse_toolchain(&tc)?;
         let mut assignments = self
             .job_toolchains
             .lock()
@@ -1234,7 +2234,7 @@ impl ServerIncoming for Server {
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(LocalAssignment {
-                    toolchain: tc,
+                    assignment: JobAssignment::Archive(tc),
                     accepted_at: Instant::now(),
                 });
             }
@@ -1257,22 +2257,27 @@ impl ServerIncoming for Server {
         job_id: JobId,
         tc_rdr: ToolchainReader,
     ) -> Result<SubmitToolchainResult> {
+        let archive = self.archive.as_ref().context("archive worker disabled")?;
         let tc = match self
             .job_toolchains
             .lock()
             .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?
             .get(&job_id)
         {
-            Some(assigned) => assigned.toolchain.clone(),
+            Some(LocalAssignment {
+                assignment: JobAssignment::Archive(tc),
+                ..
+            }) => tc.clone(),
+            Some(_) => return Ok(SubmitToolchainResult::JobNotFound),
             None => return Ok(SubmitToolchainResult::JobNotFound),
         };
         // Streaming and hashing large archives must not hold the cache mutex:
         // other toolchains still need to be assigned while uploads are slow.
         let staged = match StagedToolchainArchive::receive(
-            &self.staging_dir,
+            &archive.staging_dir,
             tc,
             tc_rdr,
-            self.toolchain_cache_size,
+            archive.toolchain_cache_size,
         ) {
             Ok(staged) => staged,
             Err(error) => {
@@ -1280,7 +2285,7 @@ impl ServerIncoming for Server {
                 return Ok(SubmitToolchainResult::CannotCache);
             }
         };
-        let inserted = self
+        let inserted = archive
             .cache
             .lock()
             .map_err(|_| anyhow::anyhow!("toolchain cache mutex poisoned"))?
@@ -1312,26 +2317,12 @@ impl ServerIncoming for Server {
         outputs: OutputRequest,
         inputs_rdr: InputsReader,
     ) -> Result<RunJobResult> {
-        // Claim the local job before sending any scheduler transition. A
-        // duplicate/unknown run must never mark someone else's job Started.
-        let assigned = self
-            .job_toolchains
-            .lock()
-            .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?
-            .remove(&job_id);
-        let Some(assigned) = assigned else {
+        let Some(assigned) = self.begin_execution(requester, job_id)? else {
             return Ok(RunJobResult::JobNotFound);
         };
-        if let Err(error) = requester.do_update_job_state(job_id, JobState::Started) {
-            let mut jobs = self
-                .job_toolchains
-                .lock()
-                .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?;
-            if jobs.insert(job_id, assigned).is_some() {
-                bail!("job {job_id} reappeared while restoring failed start transition");
-            }
-            return Err(error).context("Updating job state failed");
-        }
+        let JobAssignment::Archive(toolchain) = assigned.assignment else {
+            bail!("archive job assignment type changed");
+        };
 
         let (crate_name, command_fingerprint) = job_telemetry::identity(&command);
         info!(
@@ -1341,16 +2332,15 @@ impl ServerIncoming for Server {
             command.arguments.len()
         );
         let started = Instant::now();
+        let archive = self.archive.as_ref().context("archive worker disabled")?;
         let res = self
-            .builder
-            .run_build(
-                job_id,
-                assigned.toolchain,
-                command,
-                outputs,
-                inputs_rdr,
-                &self.cache,
-            )
+            .execution_queue
+            .acquire(|| Ok(()))
+            .and_then(|_permit| {
+                archive
+                    .builder
+                    .run_build(job_id, toolchain, command, outputs, inputs_rdr, &archive.cache)
+            })
             .map(|res| {
                 info!(
                     "dist_job_result job_id={job_id} result=complete exit_code={} output_count={} elapsed_ms={}",
@@ -1447,7 +2437,7 @@ mod scheduler_tests {
         assert_eq!(weighted_server(&[(c, 0.0)], 0.0), None);
     }
 
-    struct TestJobAuthorizer;
+    pub(super) struct TestJobAuthorizer;
 
     impl JobAuthorizer for TestJobAuthorizer {
         fn generate_token(&self, _job_id: JobId) -> Result<String> {
@@ -1457,11 +2447,30 @@ mod scheduler_tests {
         fn verify_token(&self, _job_id: JobId, _token: &str) -> Result<()> {
             Ok(())
         }
+
+        fn generate_blob_token(&self, _blob: sccache::build_runtime::BlobRef) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn verify_blob_token(
+            &self,
+            _blob: sccache::build_runtime::BlobRef,
+            _token: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
     }
 
     fn register_test_server(scheduler: &Scheduler, server_id: ServerId, nonce: ServerNonce) {
         scheduler
-            .handle_heartbeat_server(server_id, nonce, 1.0, &[], Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(
+                server_id,
+                nonce,
+                1.0,
+                &[],
+                Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
+            )
             .unwrap();
     }
 
@@ -1480,7 +2489,7 @@ mod scheduler_tests {
             &self,
             _server_id: ServerId,
             _job_id: JobId,
-            _tc: Toolchain,
+            _assignment: JobAssignment,
             _auth: String,
         ) -> Result<AssignJobResult> {
             Ok(AssignJobResult {
@@ -1488,6 +2497,549 @@ mod scheduler_tests {
                 need_toolchain: false,
             })
         }
+    }
+
+    #[test]
+    fn native_eta_uses_transfer_speed_residency_and_queued_input_union() {
+        use sccache::build_runtime::{BlobResidency, ContentId};
+        let a = ContentId::of(b"a");
+        let b = ContentId::of(b"b");
+        let mut fast = dist::NativePlacement::default();
+        fast.timing.transfer.download_bytes_per_second = 100_000_000;
+        fast.timing.transfer.raw_request_nanoseconds = 0;
+        let mut slow = fast.clone();
+        slow.timing.transfer.download_bytes_per_second = 1_000_000;
+        let inputs = BTreeMap::from([(a, 100_000_000), (b, 1_000_000)]);
+        let empty = HashMap::new();
+        let network = NetworkSnapshot::default();
+        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None);
+        let peer = Peer::Worker("127.0.0.1:10501".parse().unwrap());
+        let eta = |capacity, assigned: &HashMap<_, _>, placement: &dist::NativePlacement| {
+            native_estimate(
+                placement::WorkerForecast {
+                    capacity,
+                    assigned,
+                    placement,
+                    recent: &placement::RecentResidency::default(),
+                    cost: placement::ActionCost::baseline(placement),
+                },
+                &inputs,
+                peer,
+                &plan,
+            )
+            .seconds
+        };
+        assert!(eta(4.0, &empty, &fast) < eta(4.0, &empty, &slow));
+        let mut filter = BlobResidency::for_count(2).unwrap();
+        filter.insert(a);
+        slow.residency = Some(filter);
+        assert!(eta(4.0, &empty, &slow) < eta(4.0, &empty, &fast));
+        let queued = HashMap::from([
+            (
+                JobId(1),
+                Some(placement::AssignedNative {
+                    packages: Default::default(),
+                    inputs: inputs.clone(),
+                    class: None,
+                    cost: None,
+                    milestone: None,
+                }),
+            ),
+            (
+                JobId(2),
+                Some(placement::AssignedNative {
+                    packages: Default::default(),
+                    inputs: inputs.clone(),
+                    class: None,
+                    cost: None,
+                    milestone: None,
+                }),
+            ),
+        ]);
+        assert_eq!(eta(4.0, &queued, &fast), eta(4.0, &empty, &fast));
+        assert!(eta(1.0, &queued, &fast) > eta(4.0, &empty, &fast));
+    }
+
+    #[test]
+    fn peer_blob_sources_exclude_requester_and_do_not_reserve_jobs() -> Result<()> {
+        use sccache::build_runtime::{BlobRef, BlobResidency, ContentId};
+        let scheduler = Scheduler::new();
+        let requester: ServerId = "127.0.0.1:10501".parse()?;
+        let peer: ServerId = "127.0.0.2:10501".parse()?;
+        let empty: ServerId = "127.0.0.3:10501".parse()?;
+        let blob = BlobRef {
+            id: ContentId::of(b"shared"),
+            size: 6,
+        };
+        for (server, resident) in [(requester, true), (peer, true), (empty, false)] {
+            let mut filter = BlobResidency::for_count(1).context("residency allocation")?;
+            if resident {
+                filter.insert(blob.id);
+            }
+            let placement = dist::NativePlacement {
+                residency: Some(filter),
+                ..Default::default()
+            };
+            scheduler.handle_heartbeat_server(
+                server,
+                ServerNonce::new(),
+                1.0,
+                &[],
+                Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities {
+                    archive: false,
+                    native_platform: Some(ContentId::of(server.addr().to_string().as_bytes())),
+                    native_placement: Some(placement),
+                },
+            )?;
+        }
+        let sources = scheduler.native_blob_sources(blob, Some(requester.addr()))?;
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].server, peer);
+        let recovery = scheduler.native_blob_sources(blob, None)?;
+        assert_eq!(recovery.len(), 3);
+        assert_eq!(recovery[2].server, empty);
+        for server in [requester, peer, empty] {
+            assert_no_assigned_jobs(&scheduler, &server);
+        }
+        Ok(())
+    }
+
+    fn native_test_assignment(
+        platform: sccache::build_runtime::ContentId,
+        input_blobs: dist::NativeInputBlobs,
+    ) -> Result<NativeAssignment> {
+        use sccache::build_runtime::{
+            BuildPath, CommandSpec, ExecutionRoot, ExecutionSpec, TreeId, TreeMetadata, TreeRecipe,
+            TreeTimestamp, wire::Ticket,
+        };
+        Ok(NativeAssignment {
+            ticket: Ticket([42; 32]),
+            input_blobs,
+            estimated_result_bytes: None,
+            spec: ExecutionSpec {
+                platform,
+                root: ExecutionRoot {
+                    id: TreeId([0; 32]),
+                    recipe: TreeRecipe::union(
+                        TreeMetadata {
+                            mode: 0o755,
+                            modified: TreeTimestamp {
+                                seconds: 1,
+                                nanoseconds: 0,
+                            },
+                        },
+                        [TreeId([0; 32])],
+                    ),
+                },
+                mounts: BTreeMap::new(),
+                command: CommandSpec {
+                    executable: BuildPath::new(b"/bin/tool".to_vec())?,
+                    arguments: Vec::new(),
+                    cwd: BuildPath::new(b"/".to_vec())?,
+                    environment: BTreeMap::new(),
+                },
+                outputs: BTreeMap::new(),
+            },
+        })
+    }
+
+    #[test]
+    fn native_staged_closure_survives_stale_heartbeat_and_failed_compilation() -> Result<()> {
+        use sccache::build_runtime::{BlobRef, ContentId, wire::NativeJobPhase};
+        let scheduler = Scheduler::new();
+        let worker: ServerId = "127.0.0.1:10501".parse()?;
+        let peer: ServerId = "127.0.0.2:10501".parse()?;
+        let platform = ContentId::of(b"native-staging-test");
+        let nonce = ServerNonce::new();
+        let capabilities = dist::WorkerCapabilities {
+            archive: false,
+            native_platform: Some(platform),
+            native_placement: Some(dist::NativePlacement::default()),
+        };
+        let heartbeat = |active: &[JobId]| {
+            scheduler.handle_heartbeat_server(
+                worker,
+                nonce.clone(),
+                4.0,
+                active,
+                Box::new(TestJobAuthorizer),
+                capabilities.clone(),
+            )
+        };
+        heartbeat(&[])?;
+        let blob = BlobRef {
+            id: ContentId::of(b"input"),
+            size: 512 << 20,
+        };
+        let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_native_job(
+            &AcceptAssign,
+            native_test_assignment(platform, BTreeMap::from([(blob.id, blob.size)]))?,
+            &NetworkSnapshot::default(),
+            Default::default(),
+        )?
+        else {
+            bail!("worker unavailable");
+        };
+        let id = job_alloc.job_id;
+        assert!(
+            scheduler
+                .native_blob_sources(blob, Some(peer.addr()))?
+                .is_empty()
+        );
+        scheduler.observe_native_lifecycle(peer, id, dist::NativeLifecycleEvent::InputsStaged);
+        assert!(
+            scheduler
+                .native_blob_sources(blob, Some(peer.addr()))?
+                .is_empty()
+        );
+        scheduler.observe_native_lifecycle(worker, id, dist::NativeLifecycleEvent::InputsStaged);
+        heartbeat(&[id])?;
+        assert_eq!(
+            scheduler
+                .native_blob_sources(blob, Some(peer.addr()))?
+                .len(),
+            1
+        );
+        {
+            let servers = scheduler.servers.lock().unwrap();
+            let queue = &servers[&worker]
+                .capabilities
+                .native_placement
+                .as_ref()
+                .context("missing placement")?
+                .queue;
+            assert_eq!(queue.jobs[&id].phase, NativeJobPhase::Ready);
+            assert_eq!(queue.jobs[&id].remaining_input_bytes, 0);
+            assert_eq!(servers[&worker].compiler_demand(), 1);
+        }
+        scheduler.handle_update_job_state(id, worker, JobState::Complete)?;
+        assert_eq!(
+            scheduler
+                .native_blob_sources(blob, Some(peer.addr()))?
+                .len(),
+            1
+        );
+        assert_eq!(
+            scheduler.servers.lock().unwrap()[&worker].compiler_demand(),
+            0
+        );
+        // A heartbeat captured before completion can arrive after the
+        // scheduler has removed the assignment. Its obsolete CPU charge
+        // must not resurrect a completed job.
+        let mut stale = capabilities.clone();
+        let queue = &mut stale
+            .native_placement
+            .as_mut()
+            .context("missing placement")?
+            .queue;
+        queue.compiler_active = 1;
+        queue.jobs.insert(
+            id,
+            dist::NativeJobProgress {
+                phase: NativeJobPhase::Executing,
+                phase_nanoseconds: 0,
+                remaining_input_bytes: 0,
+                remaining_input_blobs: 0,
+            },
+        );
+        scheduler.handle_heartbeat_server(
+            worker,
+            nonce,
+            4.0,
+            &[id],
+            Box::new(TestJobAuthorizer),
+            stale,
+        )?;
+        let servers = scheduler.servers.lock().unwrap();
+        let details = &servers[&worker];
+        let queue = &details
+            .capabilities
+            .native_placement
+            .as_ref()
+            .context("missing placement")?
+            .queue;
+        assert_eq!(queue.jobs[&id].phase, NativeJobPhase::Terminal);
+        assert_eq!(queue.compiler_active, 0);
+        assert_eq!(details.compiler_demand(), 0);
+        assert_eq!(
+            queue.available_reservations(std::iter::empty()),
+            queue.capacity as usize - 1
+        );
+        drop(servers);
+        Ok(())
+    }
+
+    #[test]
+    fn native_completed_timing_supersedes_heartbeat_until_worker_restart() -> Result<()> {
+        use sccache::build_runtime::{
+            ContentId, ResultManifest,
+            wire::{ActionObservation, WorkerTiming},
+        };
+        let scheduler = Scheduler::new();
+        let worker: ServerId = "127.0.0.1:10501".parse()?;
+        let platform = ContentId::of(b"timing-platform");
+        let nonce = ServerNonce::new();
+        let capabilities = dist::WorkerCapabilities {
+            archive: false,
+            native_platform: Some(platform),
+            native_placement: Some(dist::NativePlacement::default()),
+        };
+        let heartbeat = |nonce, caps, active: &[JobId]| {
+            scheduler.handle_heartbeat_server(
+                worker,
+                nonce,
+                4.0,
+                active,
+                Box::new(TestJobAuthorizer),
+                caps,
+            )
+        };
+        heartbeat(nonce.clone(), capabilities.clone(), &[])?;
+        let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_native_job(
+            &AcceptAssign,
+            native_test_assignment(platform, BTreeMap::new())?,
+            &NetworkSnapshot::default(),
+            Default::default(),
+        )?
+        else {
+            bail!("worker unavailable");
+        };
+        let id = job_alloc.job_id;
+        let timing = WorkerTiming {
+            revision: 7,
+            execution_nanoseconds: 50_000_000,
+            ..Default::default()
+        };
+        let manifest = ResultManifest {
+            outputs: BTreeMap::new(),
+            stdout: None,
+            stderr: None,
+        };
+        let observation = ActionObservation {
+            worker_timing: Some(timing),
+            warm_staging_nanoseconds: None,
+            publication_setup_nanoseconds: None,
+            execution_nanoseconds: 50_000_000,
+            upload_bytes: 0,
+            upload_requests: 0,
+            upload_nanoseconds: 0,
+        };
+        scheduler.observe_native_lifecycle(worker, id, dist::NativeLifecycleEvent::Negotiated);
+        scheduler.observe_native_lifecycle(
+            worker,
+            id,
+            dist::NativeLifecycleEvent::Committed {
+                manifest: &manifest,
+                retained_after_begin: Duration::ZERO,
+                observation: Some(observation),
+            },
+        );
+        let current = || {
+            scheduler.servers.lock().unwrap()[&worker]
+                .capabilities
+                .native_placement
+                .as_ref()
+                .unwrap()
+                .timing
+        };
+        assert_eq!(current(), timing);
+        heartbeat(nonce.clone(), capabilities.clone(), &[id])?;
+        assert_eq!(current(), timing);
+        let mut newer = capabilities.clone();
+        let fresh = WorkerTiming {
+            revision: 8,
+            execution_nanoseconds: 60_000_000,
+            ..timing
+        };
+        newer
+            .native_placement
+            .as_mut()
+            .context("missing worker placement")?
+            .timing = fresh;
+        heartbeat(nonce, newer, &[id])?;
+        assert_eq!(current(), fresh);
+        heartbeat(ServerNonce::new(), capabilities, &[])?;
+        assert_eq!(current(), WorkerTiming::default());
+        Ok(())
+    }
+
+    #[test]
+    fn native_producer_receipt_places_consumer_before_next_heartbeat() -> Result<()> {
+        use sccache::build_runtime::{Artifact, BlobRef, ContentId, ResultManifest};
+        let scheduler = Scheduler::new();
+        let producer: ServerId = "127.0.0.1:10501".parse()?;
+        let other: ServerId = "127.0.0.2:10501".parse()?;
+        let platform = ContentId::of(b"test");
+        let register = |id, execution_nanoseconds| {
+            scheduler.handle_heartbeat_server(
+                id,
+                ServerNonce::new(),
+                4.0,
+                &[],
+                Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities {
+                    archive: false,
+                    native_platform: Some(platform),
+                    native_placement: Some(dist::NativePlacement {
+                        timing: sccache::build_runtime::wire::WorkerTiming {
+                            execution_nanoseconds,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                },
+            )
+        };
+        register(producer, 2_000_000_000)?;
+        let network = NetworkSnapshot::default();
+        let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_native_job(
+            &AcceptAssign,
+            native_test_assignment(platform, BTreeMap::new())?,
+            &network,
+            Default::default(),
+        )?
+        else {
+            bail!("producer not allocated")
+        };
+        assert_eq!(job_alloc.server_id, producer);
+        let job = job_alloc.job_id;
+        let blob = BlobRef {
+            id: ContentId::of(b"result"),
+            size: 512 << 20,
+        };
+        let manifest = ResultManifest {
+            outputs: BTreeMap::from([("obj".into(), Artifact::File { blob, mode: None })]),
+            stdout: None,
+            stderr: None,
+        };
+        let committed = || dist::NativeLifecycleEvent::Committed {
+            manifest: &manifest,
+            retained_after_begin: Duration::from_secs(300),
+            observation: None,
+        };
+        register(other, 1_000_000_000)?;
+        scheduler.observe_native_lifecycle(producer, job, committed());
+        assert!(
+            scheduler
+                .native_blob_sources(blob, Some(other.addr()))?
+                .is_empty()
+        );
+        scheduler.observe_native_lifecycle(producer, job, dist::NativeLifecycleEvent::Negotiated);
+        scheduler.observe_native_lifecycle(other, job, committed());
+        assert!(
+            scheduler
+                .native_blob_sources(blob, Some(other.addr()))?
+                .is_empty()
+        );
+        scheduler.observe_native_lifecycle(producer, job, committed());
+        let sources = scheduler.native_blob_sources(blob, Some(other.addr()))?;
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].server, producer);
+        scheduler.handle_update_job_state(job, producer, JobState::Complete)?;
+        let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_native_job(
+            &AcceptAssign,
+            native_test_assignment(platform, BTreeMap::from([(blob.id, blob.size)]))?,
+            &network,
+            Default::default(),
+        )?
+        else {
+            bail!("consumer not allocated")
+        };
+        // Producer is slower but avoids fetching a 512 MiB dependency.
+        assert_eq!(job_alloc.server_id, producer);
+        // Worker incarnation changes invalidate the hints and prior job IDs.
+        register(producer, 2_000_000_000)?;
+        scheduler.observe_native_lifecycle(producer, job, dist::NativeLifecycleEvent::Negotiated);
+        scheduler.observe_native_lifecycle(producer, job, committed());
+        assert!(
+            scheduler
+                .native_blob_sources(blob, Some(other.addr()))?
+                .is_empty()
+        );
+        let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_native_job(
+            &AcceptAssign,
+            native_test_assignment(platform, BTreeMap::from([(blob.id, blob.size)]))?,
+            &network,
+            Default::default(),
+        )?
+        else {
+            bail!("consumer not allocated after restart")
+        };
+        assert_eq!(job_alloc.server_id, other);
+        Ok(())
+    }
+
+    #[test]
+    fn native_jobs_select_compatible_workers_using_shared_capacity() -> Result<()> {
+        use sccache::build_runtime::ContentId;
+        let scheduler = Scheduler::new_with_job_slack(JobSlackConfig {
+            static_jobs: 0,
+            percent: 0.0,
+        });
+        let a: ServerId = "127.0.0.1:10501".parse()?;
+        let b: ServerId = "127.0.0.2:10501".parse()?;
+        let nonce_a = ServerNonce::new();
+        let nonce_b = ServerNonce::new();
+        let platform = ContentId::of(b"native-test");
+        scheduler.handle_heartbeat_server(
+            a,
+            nonce_a,
+            1.0,
+            &[],
+            Box::new(TestJobAuthorizer),
+            dist::WorkerCapabilities {
+                archive: false,
+                native_platform: Some(platform),
+                native_placement: Some(dist::NativePlacement::default()),
+            },
+        )?;
+        scheduler.handle_heartbeat_server(
+            b,
+            nonce_b,
+            1.0,
+            &[],
+            Box::new(TestJobAuthorizer),
+            dist::WorkerCapabilities {
+                archive: true,
+                native_platform: Some(ContentId::of(b"other")),
+                native_placement: Some(dist::NativePlacement::default()),
+            },
+        )?;
+        let assignment =
+            native_test_assignment(platform, BTreeMap::from([(ContentId([1; 32]), 10)]))?;
+        let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_native_job(
+            &AcceptAssign,
+            assignment.clone(),
+            &NetworkSnapshot::default(),
+            Default::default(),
+        )?
+        else {
+            bail!("compatible worker unavailable");
+        };
+        assert_eq!(job_alloc.server_id, a);
+        assert_eq!(
+            scheduler.servers.lock().unwrap()[&a].jobs_assigned[&job_alloc.job_id]
+                .as_ref()
+                .map(|job| &job.inputs),
+            Some(&BTreeMap::from([(ContentId([1; 32]), 10)]))
+        );
+        assert!(matches!(
+            scheduler.handle_alloc_native_job(
+                &AcceptAssign,
+                assignment,
+                &NetworkSnapshot::default(),
+                Default::default(),
+            )?,
+            AllocJobResult::Fail { .. }
+        ));
+        let AllocJobResult::Success { job_alloc, .. } =
+            scheduler.handle_alloc_job(&AcceptAssign, test_toolchain('a'))?
+        else {
+            bail!("archive worker unavailable");
+        };
+        assert_eq!(job_alloc.server_id, b);
+        Ok(())
     }
 
     #[test]
@@ -1504,7 +3056,14 @@ mod scheduler_tests {
         let nonce = ServerNonce::new();
         for (id, cpus) in ids.into_iter().zip([1.0, 3.0, 0.0]) {
             scheduler
-                .handle_heartbeat_server(id, nonce.clone(), cpus, &[], Box::new(TestJobAuthorizer))
+                .handle_heartbeat_server(
+                    id,
+                    nonce.clone(),
+                    cpus,
+                    &[],
+                    Box::new(TestJobAuthorizer),
+                    dist::WorkerCapabilities::ARCHIVE,
+                )
                 .unwrap();
         }
         let status = scheduler.handle_status().unwrap();
@@ -1532,10 +3091,24 @@ mod scheduler_tests {
             (13, 13, 0)
         );
         scheduler
-            .handle_heartbeat_server(ids[0], nonce.clone(), 0.0, &[], Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(
+                ids[0],
+                nonce.clone(),
+                0.0,
+                &[],
+                Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
+            )
             .unwrap();
         scheduler
-            .handle_heartbeat_server(ids[1], nonce, 4.0, &[], Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(
+                ids[1],
+                nonce,
+                4.0,
+                &[],
+                Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
+            )
             .unwrap();
         let status = scheduler.handle_status().unwrap();
         // Three jobs remain assigned to the now-busy worker; the other worker
@@ -1553,7 +3126,7 @@ mod scheduler_tests {
             &self,
             _server_id: ServerId,
             _job_id: JobId,
-            _tc: Toolchain,
+            _assignment: JobAssignment,
             _auth: String,
         ) -> Result<AssignJobResult> {
             // Status must include reservations even before a JobDetail exists.
@@ -1577,7 +3150,7 @@ mod scheduler_tests {
             &self,
             server_id: ServerId,
             job_id: JobId,
-            _tc: Toolchain,
+            _assignment: JobAssignment,
             _auth: String,
         ) -> Result<AssignJobResult> {
             let snapshot = self.scheduler.handle_heartbeat_server(
@@ -1586,6 +3159,7 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
             )?;
             assert_eq!(snapshot.assigned_job_ids, vec![job_id]);
             Ok(AssignJobResult {
@@ -1617,6 +3191,7 @@ mod scheduler_tests {
             1.0,
             &[],
             Box::new(TestJobAuthorizer),
+            dist::WorkerCapabilities::ARCHIVE,
         )?;
         assert_eq!(snapshot.assigned_job_ids, vec![job_alloc.job_id]);
         for state in [JobState::Ready, JobState::Started, JobState::Complete] {
@@ -1628,6 +3203,7 @@ mod scheduler_tests {
             1.0,
             &[],
             Box::new(TestJobAuthorizer),
+            dist::WorkerCapabilities::ARCHIVE,
         )?;
         assert!(snapshot.assigned_job_ids.is_empty());
         Ok(())
@@ -1669,6 +3245,7 @@ mod scheduler_tests {
                     capacity,
                     &[],
                     Box::new(TestJobAuthorizer),
+                    dist::WorkerCapabilities::ARCHIVE,
                 )
                 .unwrap();
         }
@@ -1757,7 +3334,7 @@ mod scheduler_tests {
             &self,
             server_id: ServerId,
             job_id: JobId,
-            _tc: Toolchain,
+            _assignment: JobAssignment,
             _auth: String,
         ) -> Result<AssignJobResult> {
             assert_eq!(server_id, self.server_id);
@@ -1776,6 +3353,7 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
             )?;
             assert!(!heartbeat.is_new);
 
@@ -1817,6 +3395,7 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
             )
             .unwrap();
         assert_eq!(
@@ -1830,7 +3409,14 @@ mod scheduler_tests {
                 .unwrap();
         }
         scheduler
-            .handle_heartbeat_server(server_id, nonce, 1.0, &[], Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(
+                server_id,
+                nonce,
+                1.0,
+                &[],
+                Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
+            )
             .unwrap();
         assert_no_assigned_jobs(&scheduler, &server_id);
     }
@@ -1865,6 +3451,7 @@ mod scheduler_tests {
             1.0,
             &[job_id],
             Box::new(TestJobAuthorizer),
+            dist::WorkerCapabilities::ARCHIVE,
         )?;
         assert!(
             !scheduler
@@ -1883,6 +3470,7 @@ mod scheduler_tests {
             1.0,
             &[],
             Box::new(TestJobAuthorizer),
+            dist::WorkerCapabilities::ARCHIVE,
         )?;
         assert_no_assigned_jobs(&scheduler, &server_id);
         Ok(())
@@ -1914,6 +3502,7 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
             )
             .unwrap();
         assert_no_assigned_jobs(&scheduler, &server_id);
@@ -1936,7 +3525,14 @@ mod scheduler_tests {
                 .unwrap();
         }
         scheduler
-            .handle_heartbeat_server(server_id, nonce, 1.0, &[], Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(
+                server_id,
+                nonce,
+                1.0,
+                &[],
+                Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
+            )
             .unwrap();
         assert_eq!(
             scheduler
@@ -1964,6 +3560,18 @@ mod scheduler_tests {
         fn verify_token(&self, _job_id: JobId, _token: &str) -> Result<()> {
             Ok(())
         }
+
+        fn generate_blob_token(&self, _blob: sccache::build_runtime::BlobRef) -> Result<String> {
+            bail!("synthetic authorization failure")
+        }
+
+        fn verify_blob_token(
+            &self,
+            _blob: sccache::build_runtime::BlobRef,
+            _token: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -1977,6 +3585,7 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(RejectToken),
+                dist::WorkerCapabilities::ARCHIVE,
             )
             .unwrap();
         assert!(
@@ -2032,7 +3641,7 @@ mod scheduler_tests {
                 .get_mut(&server_id)
                 .unwrap()
                 .jobs_assigned
-                .insert(job_alloc.job_id);
+                .insert(job_alloc.job_id, None);
         }
         scheduler
             .handle_update_job_state(job_alloc.job_id, server_id, JobState::Complete)
@@ -2072,6 +3681,7 @@ mod scheduler_tests {
                 1.0,
                 &[job_id],
                 Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
             )
             .unwrap();
         assert!(scheduler.jobs.lock().unwrap().contains_key(&job_id));
@@ -2084,6 +3694,7 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
             )
             .unwrap();
         assert!(scheduler.jobs.lock().unwrap().contains_key(&job_id));
@@ -2096,7 +3707,14 @@ mod scheduler_tests {
             );
         }
         scheduler
-            .handle_heartbeat_server(server_id, nonce, 1.0, &[], Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(
+                server_id,
+                nonce,
+                1.0,
+                &[],
+                Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
+            )
             .unwrap();
         assert_no_assigned_jobs(&scheduler, &server_id);
         // Reconciliation is not a successful completion. A late terminal
@@ -2192,6 +3810,7 @@ mod scheduler_tests {
                 1.0,
                 &[],
                 Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
             )
             .unwrap();
         assert!(
@@ -2211,6 +3830,7 @@ mod scheduler_tests {
                 1.0,
                 &[job_id],
                 Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
             )
             .unwrap();
         assert!(
@@ -2224,7 +3844,14 @@ mod scheduler_tests {
                 .is_none()
         );
         scheduler
-            .handle_heartbeat_server(server_id, nonce, 1.0, &[], Box::new(TestJobAuthorizer))
+            .handle_heartbeat_server(
+                server_id,
+                nonce,
+                1.0,
+                &[],
+                Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
+            )
             .unwrap();
         assert!(scheduler.jobs.lock().unwrap().contains_key(&job_id));
         scheduler
@@ -2274,6 +3901,7 @@ mod scheduler_tests {
                 8.0,
                 &[],
                 Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
             )
             .unwrap();
         assert_eq!(scheduler.handle_get_worker_name(server_id).unwrap(), None);
@@ -2300,6 +3928,7 @@ mod scheduler_tests {
                 8.0,
                 &[],
                 Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
             )
             .unwrap();
         assert!(heartbeat.is_new);
@@ -2315,7 +3944,14 @@ mod scheduler_tests {
         let second_nonce = ServerNonce::new();
         for (server_id, nonce) in [(first, first_nonce.clone()), (second, second_nonce.clone())] {
             scheduler
-                .handle_heartbeat_server(server_id, nonce, 8.0, &[], Box::new(TestJobAuthorizer))
+                .handle_heartbeat_server(
+                    server_id,
+                    nonce,
+                    8.0,
+                    &[],
+                    Box::new(TestJobAuthorizer),
+                    dist::WorkerCapabilities::ARCHIVE,
+                )
                 .unwrap();
         }
         scheduler
@@ -2339,6 +3975,7 @@ mod scheduler_tests {
                 8.0,
                 &[],
                 Box::new(TestJobAuthorizer),
+                dist::WorkerCapabilities::ARCHIVE,
             )
             .unwrap();
         scheduler
@@ -2411,7 +4048,12 @@ mod server_upload_tests {
 
     fn test_server() -> Result<(tempfile::TempDir, Arc<Server>)> {
         let dir = tempfile::tempdir()?;
-        let server = Server::new(Box::new(NoopBuilder), dir.path(), 1024 * 1024, vec![])?;
+        let server = Server::new(Some(ArchiveWorker::new(
+            Box::new(NoopBuilder),
+            dir.path(),
+            1024 * 1024,
+            vec![],
+        )?));
         Ok((dir, Arc::new(server)))
     }
 
@@ -2571,7 +4213,10 @@ mod server_upload_tests {
                 .lock()
                 .unwrap()
                 .get(&job_id)
-                .map(|assigned| &assigned.toolchain),
+                .and_then(|assigned| match &assigned.assignment {
+                    JobAssignment::Archive(toolchain) => Some(toolchain),
+                    JobAssignment::Native(_) => None,
+                }),
             Some(&toolchain)
         );
         Ok(())
@@ -2636,7 +4281,8 @@ mod server_upload_tests {
             contents.as_slice(),
             1024 * 1024,
         )?;
-        server.cache.lock().unwrap().insert_staged(staged)?;
+        let archive = server.archive.as_ref().context("archive worker disabled")?;
+        archive.cache.lock().unwrap().insert_staged(staged)?;
 
         let first = server.handle_assign_job(JobId(45), toolchain.clone())?;
         assert!(!first.need_toolchain);
@@ -2648,7 +4294,7 @@ mod server_upload_tests {
         let next = server.handle_assign_job(JobId(46), toolchain.clone())?;
         assert!(next.need_toolchain);
         assert!(matches!(next.state, JobState::Pending));
-        assert!(!server.cache.lock().unwrap().contains_toolchain(&toolchain));
+        assert!(!archive.has_cached_toolchain(&toolchain)?);
         Ok(())
     }
 
@@ -2665,7 +4311,16 @@ mod server_upload_tests {
         )?;
         assert!(matches!(result, SubmitToolchainResult::CannotCache));
         assert!(requester.0.lock().unwrap().is_empty());
-        assert!(!server.cache.lock().unwrap().contains_toolchain(&expected));
+        assert!(
+            !server
+                .archive
+                .as_ref()
+                .unwrap()
+                .cache
+                .lock()
+                .unwrap()
+                .contains_toolchain(&expected)
+        );
         Ok(())
     }
 
@@ -2683,7 +4338,16 @@ mod server_upload_tests {
         )?;
         assert!(matches!(result, SubmitToolchainResult::CannotCache));
         assert!(requester.0.lock().unwrap().is_empty());
-        assert!(!server.cache.lock().unwrap().contains_toolchain(&expected));
+        assert!(
+            !server
+                .archive
+                .as_ref()
+                .unwrap()
+                .cache
+                .lock()
+                .unwrap()
+                .contains_toolchain(&expected)
+        );
         Ok(())
     }
 }

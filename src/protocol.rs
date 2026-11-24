@@ -33,6 +33,10 @@ pub enum Request {
     ActiveCompiles,
     /// Request cancellation of one active daemon-owned compile.
     CancelCompile(String),
+    /// Open a dedicated observation connection for a caller-owned compile.
+    ObserveCompile(CompileIdentity),
+    /// Report caller-monotonic phase ages on that connection.
+    ObservePhase(crate::server::activity::CompileActivity),
 }
 
 /// A server response.
@@ -65,12 +69,19 @@ pub enum Response {
     /// Active daemon-owned compiler requests.
     ActiveCompiles(Vec<crate::server::activity::CompileActivity>),
     CompileCancellationRequested(bool),
+    /// Liveness for a pending non-compile RPC.
+    Heartbeat,
+    /// The connection-owned operation was abandoned; the session is invalid.
+    RequestAborted(String),
+    /// The daemon registered a caller-owned compile with this ID.
+    CompileObserved(String),
+    ObservationAccepted,
 }
 
 /// Maximum application payload in a transfer frame. The framing envelope
 /// stays well below the default 8 MiB IPC frame limit.
 pub const TRANSFER_CHUNK_BYTES: usize = 1024 * 1024;
-pub const NAMESPACE_PROTOCOL_VERSION: u32 = 2;
+pub const NAMESPACE_PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum StorageBlob {
@@ -112,7 +123,13 @@ pub enum TransferRequest {
     WorkerLabel {
         server: ServerId,
     },
-    WriteChunk(Vec<u8>),
+    // Native action stream: only a connection that completed the native
+    // handshake can start one. No scheduler tickets or credentials cross IPC.
+    NativeStart,
+    NativeRead,
+    NativeWrite(#[serde(with = "serde_bytes")] Vec<u8>),
+    NativeEnd,
+    WriteChunk(#[serde(with = "serde_bytes")] Vec<u8>),
     FinishWrite,
     ReadChunk,
     Abort,
@@ -122,7 +139,7 @@ pub enum TransferRequest {
 pub enum TransferReply {
     ReadStarted(Option<u64>),
     WriteStarted,
-    Chunk(Vec<u8>),
+    Chunk(#[serde(with = "serde_bytes")] Vec<u8>),
     Toolchain(Option<Toolchain>),
     Allocation {
         server: ServerId,
@@ -150,6 +167,10 @@ impl std::fmt::Debug for TransferRequest {
             Self::BeginRun { .. } => "BeginRun",
             Self::Status => "Status",
             Self::WorkerLabel { .. } => "WorkerLabel",
+            Self::NativeStart => "NativeStart",
+            Self::NativeRead => "NativeRead",
+            Self::NativeWrite(_) => "NativeWrite",
+            Self::NativeEnd => "NativeEnd",
             Self::WriteChunk(_) => "WriteChunk",
             Self::FinishWrite => "FinishWrite",
             Self::ReadChunk => "ReadChunk",
@@ -225,6 +246,25 @@ pub struct Compile {
     pub env_vars: Vec<(OsString, OsString)>,
 }
 
+/// Compiler identity for observation only. Arguments and environment are
+/// never sent to the daemon merely to observe a caller-owned compile.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompileIdentity {
+    pub client_pid: u32,
+    pub exe: OsString,
+    pub cwd: OsString,
+}
+
+impl From<&Compile> for CompileIdentity {
+    fn from(value: &Compile) -> Self {
+        Self {
+            client_pid: value.client_pid,
+            exe: value.exe.clone(),
+            cwd: value.cwd.clone(),
+        }
+    }
+}
+
 /// Cache metadata returned by the daemon on `StorageHandshake`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StorageHandshakeInfo {
@@ -237,4 +277,52 @@ pub struct StorageHandshakeInfo {
     pub namespace_protocol: u32,
     pub transfer_chunk_bytes: usize,
     pub dist_rewrite_includes_only: Option<bool>,
+    pub native: Option<NativeNamespacePolicy>,
+}
+
+/// Public execution limits and platform identity for a namespace caller.
+/// Endpoints, authentication and worker allocation capabilities are private
+/// to the daemon.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NativeNamespacePolicy {
+    pub platform: crate::build_runtime::ContentId,
+    pub build_timeout_secs: u64,
+    pub renewal_interval_secs: u64,
+    pub max_metadata_bytes: u64,
+    pub max_result_bytes: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bulk_transfer_frames_roundtrip_full_chunk() -> anyhow::Result<()> {
+        let payload = (0..TRANSFER_CHUNK_BYTES)
+            .map(|index| index.to_le_bytes()[0])
+            .collect::<Vec<_>>();
+        for request in [
+            TransferRequest::NativeWrite(payload.clone()),
+            TransferRequest::WriteChunk(payload.clone()),
+        ] {
+            let bytes = bincode::serialize(&Request::Transfer(request))?;
+            assert!(bytes.len() <= payload.len() + 32);
+            match bincode::deserialize(&bytes)? {
+                Request::Transfer(
+                    TransferRequest::NativeWrite(decoded) | TransferRequest::WriteChunk(decoded),
+                ) => assert_eq!(decoded, payload),
+                _ => anyhow::bail!("unexpected decoded transfer request"),
+            }
+        }
+        let bytes = bincode::serialize(&Response::Transfer(Ok(TransferReply::Chunk(
+            payload.clone(),
+        ))))?;
+        assert!(bytes.len() <= payload.len() + 32);
+        let Response::Transfer(Ok(TransferReply::Chunk(decoded))) = bincode::deserialize(&bytes)?
+        else {
+            anyhow::bail!("unexpected decoded transfer response");
+        };
+        assert_eq!(decoded, payload);
+        Ok(())
+    }
 }
