@@ -803,7 +803,7 @@ compiler width) bounds reservations across assignments, staging, ready jobs,
 execution, publication and unacknowledged terminal responses.
 
 Already cached input trees and partial resident blobs are pinned when the
-assignment is accepted. Assignment protocol v4 enqueues the job immediately
+assignment is accepted. Assignment protocol v5 enqueues the job immediately
 and acknowledges it without waiting for staging, authorization or execution.
 The staging pool verifies its immutable execution declaration against the
 scheduler's delegated session before reporting Started or acquiring missing
@@ -971,9 +971,18 @@ Candidate estimates use the learned service duration and negotiated output
 traffic. Each admitted native reservation carries its own predicted cost
 through the staging, compiler and publication forecasts, rather than applying
 a candidate's cost to unrelated queued work. Unseen commands use the host
-prior. Output size here means negotiated missing payload, not total result
-size or an eviction reservation; measured logical result size is logged
-separately for future reservation sizing.
+prior. Upload size here means negotiated missing payload. Separately, the scheduler
+records the peak verified unique logical result size for each fresh command
+family across compatible workers. The assignment carries an advisory
+reservation of peak plus 25% and 64 KiB, clamped to the worker hard limit;
+unknown families retain the maximum-result forecast. Grace admission uses
+this forecast, but exact publication supersedes all outstanding forecasts.
+The worker maintains the full configured CAS staging headroom and execution
+result limit. Publication pins its local result, then atomically charges only
+additional unique bytes into the grace pool; if actual capacity is exhausted,
+it waits outside the compiler slot with cancellation and lease checks. Existing
+grace leases never expire early. New forecast admission pauses while exact
+publishers are waiting. The persistent history format is version 2.
 
 The opt-in `native_placement_replay` trace target logs JSON assignment records
 with job ID, hashed command family, selected worker, all eligible workers'

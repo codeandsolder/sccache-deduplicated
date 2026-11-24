@@ -139,14 +139,37 @@ impl CostBook {
         })
     }
 
+    /// Use actual logical result size, independent of the negotiated upload.
+    /// All compatible workers can contribute to this conservative soft hint.
+    pub(crate) fn result_reservation(
+        &self,
+        platform: ContentId,
+        class: ActionClass,
+        now: Instant,
+    ) -> Option<u64> {
+        let peak = self
+            .workers
+            .iter()
+            .filter(|(scope, _)| scope.platform == platform)
+            .filter_map(|(_, history)| history.fresh(class, now))
+            .map(|sample| sample.result_peak_bytes)
+            .max()?;
+        Some(
+            peak.saturating_add(peak.div_ceil(4))
+                .saturating_add(64 << 10),
+        )
+    }
+
     pub(crate) fn observe(
         &mut self,
         scope: WorkerScope,
         class: ActionClass,
         observation: ActionObservation,
+        result_bytes: u64,
         now: Instant,
     ) {
-        if !observation.valid() {
+        if !observation.valid() || result_bytes > 1 << 40 || observation.upload_bytes > result_bytes
+        {
             return;
         }
         if !self.workers.contains_key(&scope)
@@ -162,7 +185,7 @@ impl CostBook {
         self.workers
             .entry(scope)
             .or_default()
-            .observe(class, observation, now);
+            .observe(class, observation, result_bytes, now);
         self.revision = self.revision.wrapping_add(1);
     }
 }
@@ -195,7 +218,7 @@ mod tests {
         let fast = scope(2);
         let class = ActionClass(ContentId::of(b"requested"));
         for _ in 0..4 {
-            book.observe(slow, class, observation(800_000_000), now);
+            book.observe(slow, class, observation(800_000_000), 100, now);
         }
         let placement = NativePlacement::default();
         assert_eq!(
@@ -208,8 +231,8 @@ mod tests {
         for name in [b"common-one".as_slice(), b"common-two"] {
             let common = ActionClass(ContentId::of(name));
             for _ in 0..2 {
-                book.observe(slow, common, observation(400_000_000), now);
-                book.observe(fast, common, observation(100_000_000), now);
+                book.observe(slow, common, observation(400_000_000), 100, now);
+                book.observe(fast, common, observation(100_000_000), 100, now);
             }
         }
         assert_eq!(
@@ -218,7 +241,7 @@ mod tests {
             400_000_000
         );
         for _ in 0..4 {
-            book.observe(fast, class, observation(123_000_000), now);
+            book.observe(fast, class, observation(123_000_000), 100, now);
         }
         assert_eq!(
             book.predict(fast, class, &placement, now)
@@ -240,6 +263,36 @@ mod tests {
         assert_eq!(
             book.predict(fast, class, &placement, now + MAX_AGE),
             ActionCost::baseline(&placement)
+        );
+    }
+
+    #[test]
+    fn native_result_reservation_uses_peak_logical_bytes_not_upload_bytes() {
+        let mut book = CostBook::default();
+        let now = Instant::now();
+        let first = scope(1);
+        let second = scope(2);
+        let class = ActionClass(ContentId::of(b"crate"));
+        let measured = ActionObservation {
+            upload_bytes: 0,
+            upload_requests: 0,
+            ..observation(100_000_000)
+        };
+        assert_eq!(book.result_reservation(first.platform, class, now), None);
+        book.observe(first, class, measured, 4 << 20, now);
+        book.observe(second, class, measured, 8 << 20, now);
+        book.observe(second, class, measured, 1 << 20, now);
+        assert_eq!(
+            book.result_reservation(first.platform, class, now),
+            Some((10 << 20) + (64 << 10))
+        );
+        assert_eq!(
+            book.result_reservation(ContentId::of(b"other"), class, now),
+            None
+        );
+        assert_eq!(
+            book.result_reservation(first.platform, class, now + MAX_AGE),
+            None
         );
     }
 }

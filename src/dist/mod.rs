@@ -977,6 +977,8 @@ pub struct NativeAssignment {
     pub ticket: crate::build_runtime::wire::Ticket,
     pub spec: crate::build_runtime::ExecutionSpec,
     pub input_blobs: NativeInputBlobs,
+    /// Scheduler's advisory logical result-size forecast, never a hard limit.
+    pub estimated_result_bytes: Option<u64>,
 }
 
 /// One scheduler assignment routed through the common capacity accounting.

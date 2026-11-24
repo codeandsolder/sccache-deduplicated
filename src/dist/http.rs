@@ -265,7 +265,7 @@ pub mod urls {
     /// Returns an error if the generated server URL is invalid.
     pub fn server_assign_native_job(server_id: ServerId, job_id: JobId) -> Result<reqwest::Url> {
         Ok(reqwest::Url::parse(&format!(
-            "https://{}/api/v4/distserver/assign_native_job/{job_id}",
+            "https://{}/api/v5/distserver/assign_native_job/{job_id}",
             server_id.addr()
         ))?)
     }
@@ -1713,7 +1713,7 @@ mod server {
                         let res: AssignJobResult = try_or_500_log!(req_id, handler.handle_assign_job(job_id, toolchain));
                         prepare_response(request, &res)
                     },
-                    (POST) (/api/v4/distserver/assign_native_job/{job_id: JobId}) => {
+                    (POST) (/api/v5/distserver/assign_native_job/{job_id: JobId}) => {
                         job_auth_or_401!(request, &job_authorizer, job_id);
                         let limit = try_or_400_log!(req_id, handler.native_metadata_limit().context("native worker disabled"));
                         let assignment: NativeAssignment = try_or_400_log!(req_id, native::metadata(request, limit));

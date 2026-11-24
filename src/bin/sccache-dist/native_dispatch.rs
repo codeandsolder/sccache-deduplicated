@@ -228,6 +228,7 @@ impl Shared {
             &assignment.spec,
             &self.queue,
             WorkerPreparation {
+                estimated_result_bytes: assignment.spec.estimated_result_bytes,
                 cancelled: Arc::clone(&job.cancelled),
                 on_tree: &mut on_tree,
                 on_authorized: &|| match job

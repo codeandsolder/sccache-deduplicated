@@ -19,7 +19,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const LIMIT: u64 = 16 << 20;
 const INTERVAL: Duration = Duration::from_secs(60);
 
@@ -27,6 +27,7 @@ const INTERVAL: Duration = Duration::from_secs(60);
 struct SavedSample {
     class: ActionClass,
     cost: ActionCost,
+    result_peak_bytes: u64,
     age_millis: u64,
     observations: u64,
 }
@@ -72,6 +73,7 @@ impl Snapshot {
                         (age < MAX_AGE).then(|| SavedSample {
                             class,
                             cost: sample.cost,
+                            result_peak_bytes: sample.result_peak_bytes,
                             age_millis: u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
                             observations: sample.observations,
                         })
@@ -113,7 +115,12 @@ impl Snapshot {
             let mut entries = BTreeMap::new();
             for sample in worker.samples {
                 let age = Duration::from_millis(elapsed.saturating_add(sample.age_millis));
-                if age >= MAX_AGE || sample.observations == 0 || !sample.cost.valid() {
+                if age >= MAX_AGE
+                    || sample.observations == 0
+                    || !sample.cost.valid()
+                    || sample.result_peak_bytes > 1 << 40
+                    || sample.cost.output_bytes > sample.result_peak_bytes
+                {
                     continue;
                 }
                 if let Some(seen) = now.checked_sub(age) {
@@ -123,6 +130,7 @@ impl Snapshot {
                                 sample.class,
                                 Sample {
                                     cost: sample.cost,
+                                    result_peak_bytes: sample.result_peak_bytes,
                                     seen,
                                     observations: sample.observations,
                                 }
@@ -261,6 +269,7 @@ mod tests {
                     upload_requests: 1,
                     upload_nanoseconds: 1000,
                 },
+                752,
                 now,
             );
         }

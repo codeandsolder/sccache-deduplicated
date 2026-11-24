@@ -524,7 +524,13 @@ impl NativeCacheClient {
                 store,
                 policy,
             },
-            Some(delivery.artifact_grace),
+            Some((
+                delivery.artifact_grace,
+                preparation
+                    .estimated_result_bytes
+                    .unwrap_or(policy.max_result_bytes)
+                    .clamp(1, policy.max_result_bytes),
+            )),
             |id, check, on_tree| self.fetch_tree(ticket, id, store, delivery, check, on_tree),
             &|| lease.check(),
             preparation.on_tree,
@@ -556,7 +562,7 @@ impl NativeCacheClient {
             self.verify_execution(ticket, spec.clone())?;
             let prepared = self.prepare_execution(
                 context,
-                control.grace,
+                control.grace.map(|grace| (grace, policy.max_result_bytes)),
                 |id, check, _| fetch(id, check),
                 check,
                 &mut |_| {},
@@ -573,7 +579,7 @@ impl NativeCacheClient {
     fn prepare_execution(
         &self,
         context: ExecutionContext<'_>,
-        grace: Option<&super::ArtifactGrace>,
+        grace: Option<(&super::ArtifactGrace, u64)>,
         mut fetch: impl FnMut(TreeId, &LeaseCheck<'_>, &mut dyn FnMut(&TreeLease)) -> Result<TreeLease>,
         check: &LeaseCheck<'_>,
         on_tree: &mut dyn FnMut(&TreeLease),
@@ -584,7 +590,7 @@ impl NativeCacheClient {
             store,
             policy,
         } = context;
-        if let Some(grace) = grace {
+        if let Some((grace, _)) = grace {
             grace.reap();
         }
         if let Some(report) = store.maintain_space()? {
@@ -600,11 +606,11 @@ impl NativeCacheClient {
         );
         // Reserve output headroom before staged inputs can consume it. Wait for
         // grace capacity without occupying a compiler slot.
-        let output = if let Some(grace) = grace {
+        let output = if let Some((grace, predicted)) = grace {
             let started = Instant::now();
             let reservation = loop {
                 check()?;
-                if let Some(reservation) = grace.reserve(policy.max_result_bytes)? {
+                if let Some(reservation) = grace.reserve(predicted)? {
                     break reservation;
                 }
                 ensure!(
@@ -686,6 +692,7 @@ impl NativeCacheClient {
                     &prepared.request.action_fingerprint()?,
                     manifest,
                     &captured,
+                    (context.policy.timeout, check),
                 )?
             } else {
                 None
@@ -873,6 +880,7 @@ impl Drop for WorkerLease {
 
 /// Cancellation and verified-tree progress for worker-side preparation.
 pub struct WorkerPreparation<'a> {
+    pub estimated_result_bytes: Option<u64>,
     pub cancelled: Arc<AtomicBool>,
     pub on_tree: &'a mut dyn FnMut(&TreeLease),
     pub on_authorized: &'a dyn Fn() -> Result<()>,

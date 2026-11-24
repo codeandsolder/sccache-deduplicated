@@ -474,6 +474,7 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
             &policy,
             delivery,
             crate::dist::native::WorkerPreparation {
+                estimated_result_bytes: None,
                 cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 on_tree: &mut |_| {},
                 on_authorized: &|| Ok(()),

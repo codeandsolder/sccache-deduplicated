@@ -618,6 +618,7 @@ fn dispatch(
                             ticket,
                             spec,
                             input_blobs: inputs,
+                            estimated_result_bytes: None,
                         },
                         &snapshot,
                     )

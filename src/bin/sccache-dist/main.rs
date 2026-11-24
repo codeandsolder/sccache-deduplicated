@@ -1036,7 +1036,7 @@ impl Scheduler {
     fn allocate_job(
         &self,
         requester: &dyn SchedulerOutgoing,
-        assignment: JobAssignment,
+        mut assignment: JobAssignment,
         network: &NetworkSnapshot,
     ) -> Result<AllocJobResult> {
         if self.is_draining() {
@@ -1054,7 +1054,7 @@ impl Scheduler {
             .map(|assignment| placement::ActionClass::from_spec(&assignment.spec))
             .transpose()?;
         let assigned_at = Instant::now();
-        let (job_id, server_id, auth, predicted_seconds) = {
+        let (job_id, server_id, auth, predicted_seconds, estimated_result_bytes) = {
             // LOCKS
             let mut servers = self
                 .servers
@@ -1135,6 +1135,10 @@ impl Scheduler {
                         healthy.push((server_id, weight));
                     }
                 }
+                let estimated_result_bytes =
+                    class.zip(native_platform).and_then(|(class, platform)| {
+                        cost_book.result_reservation(platform, class, now)
+                    });
                 drop(cost_book);
                 let selected = [&healthy, &retry].into_iter().find_map(|candidates| {
                     if let (Some(inputs), Some(plan)) =
@@ -1177,6 +1181,7 @@ impl Scheduler {
                         trace!(target: "native_placement_replay", "{}", serde_json::json!({
                             "kind": "assigned", "job": job_id.0, "worker": server_id.addr(), "class": class,
                             "candidates": predictions,
+                            "estimated_result_bytes": estimated_result_bytes,
                             "host_prior": server_details.capabilities.native_placement.as_ref().map(placement::ActionCost::baseline),
                             "healthy": healthy.iter().map(|(id, _)| id.addr()).collect::<Vec<_>>(),
                         }));
@@ -1206,7 +1211,13 @@ impl Scheduler {
                         "Job {} created and will be assigned to server {:?}",
                         job_id, server_id
                     );
-                    Some((job_id, server_id, auth, predicted_seconds))
+                    Some((
+                        job_id,
+                        server_id,
+                        auth,
+                        predicted_seconds,
+                        estimated_result_bytes,
+                    ))
                 } else {
                     None
                 }
@@ -1222,6 +1233,9 @@ impl Scheduler {
                 return Ok(AllocJobResult::Fail { msg });
             }
         };
+        if let JobAssignment::Native(native) = &mut assignment {
+            native.estimated_result_bytes = estimated_result_bytes;
+        }
         let AssignJobResult {
             state,
             need_toolchain,
@@ -1418,6 +1432,9 @@ impl SchedulerIncoming for Scheduler {
                                     },
                                     class,
                                     observed,
+                                    manifest.blobs().map_or(0, |blobs| {
+                                        blobs.values().copied().fold(0, u64::saturating_add)
+                                    }),
                                     now,
                                 );
                         }
@@ -2552,6 +2569,7 @@ mod scheduler_tests {
         Ok(NativeAssignment {
             ticket: Ticket([42; 32]),
             input_blobs,
+            estimated_result_bytes: None,
             spec: ExecutionSpec {
                 platform,
                 root: ExecutionRoot {

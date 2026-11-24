@@ -91,7 +91,7 @@ fn native_cost_history_shrinks_expires_and_bounds_samples() -> anyhow::Result<()
         upload_nanoseconds: 0,
     };
     assert_eq!(costs.predict(Some(class), &placement, now), prior);
-    costs.observe(class, observation, now);
+    costs.observe(class, observation, 752, now);
     assert_eq!(
         costs
             .predict(Some(class), &placement, now)
@@ -99,7 +99,7 @@ fn native_cost_history_shrinks_expires_and_bounds_samples() -> anyhow::Result<()
         3_000_000_000
     );
     for _ in 0..3 {
-        costs.observe(class, observation, now);
+        costs.observe(class, observation, 752, now);
     }
     assert_eq!(
         costs.predict(Some(class), &placement, now),
@@ -116,15 +116,17 @@ fn native_cost_history_shrinks_expires_and_bounds_samples() -> anyhow::Result<()
             execution_nanoseconds: 0,
             ..observation
         },
+        752,
         now,
     );
     assert_eq!(costs.entries[&class].observations, 4);
-    costs.observe(class, observation, now + MAX_AGE);
+    costs.observe(class, observation, 752, now + MAX_AGE);
     assert_eq!(costs.entries[&class].observations, 1);
     for n in 0..MAX_CLASSES {
         costs.observe(
             ActionClass(ContentId::of(&n.to_le_bytes())),
             observation,
+            752,
             now + MAX_AGE + Duration::from_secs(1),
         );
     }

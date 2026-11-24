@@ -1074,6 +1074,7 @@ fn verify_learned_placement_trace(log: &Path) -> Result<()> {
         .collect::<Vec<_>>();
     assert_eq!(repeated.len(), 5);
     let mut estimate = None;
+    let mut peak_result = 0_u64;
     for value in repeated {
         let observed = value["execution_nanoseconds"]
             .as_u64()
@@ -1098,6 +1099,11 @@ fn verify_learned_placement_trace(log: &Path) -> Result<()> {
             .context("missing action forecast")?;
         let previous: Option<(u64, usize)> = estimate;
         if let Some((learned, count)) = previous {
+            assert_eq!(
+                assignment["estimated_result_bytes"],
+                peak_result + peak_result.div_ceil(4) + 65_536,
+                "result retention forecast must reflect full output, even with zero negotiated upload"
+            );
             if count >= 4 {
                 assert_eq!(
                     predicted, learned,
@@ -1113,6 +1119,11 @@ fn verify_learned_placement_trace(log: &Path) -> Result<()> {
         } else {
             estimate = Some((observed, 1));
         }
+        peak_result = peak_result.max(
+            value["result_bytes"]
+                .as_u64()
+                .context("missing verified result size")?,
+        );
     }
     // Expose actual canary records in --nocapture logs for the report tool.
     for value in assignments.values().chain(completed.iter()) {

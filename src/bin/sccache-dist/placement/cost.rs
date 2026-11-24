@@ -117,6 +117,7 @@ pub(crate) struct AssignedNative {
 #[derive(Clone, Copy)]
 struct Sample {
     cost: ActionCost,
+    result_peak_bytes: u64,
     seen: Instant,
     observations: u64,
 }
@@ -172,9 +173,10 @@ impl ActionCosts {
         &mut self,
         class: ActionClass,
         observed: ActionObservation,
+        result_bytes: u64,
         now: Instant,
     ) {
-        if !observed.valid() {
+        if !observed.valid() || result_bytes > 1 << 40 || observed.upload_bytes > result_bytes {
             return;
         }
         let cost = ActionCost {
@@ -186,6 +188,7 @@ impl ActionCosts {
             if now.saturating_duration_since(sample.seen) >= MAX_AGE {
                 *sample = Sample {
                     cost,
+                    result_peak_bytes: result_bytes,
                     seen: now,
                     observations: 1,
                 };
@@ -206,6 +209,7 @@ impl ActionCosts {
                 output_bytes: smooth(sample.cost.output_bytes, cost.output_bytes),
                 output_requests: smooth(sample.cost.output_requests, cost.output_requests),
             };
+            sample.result_peak_bytes = sample.result_peak_bytes.max(result_bytes);
             sample.seen = now;
             sample.observations = sample.observations.saturating_add(1);
             return;
@@ -223,6 +227,7 @@ impl ActionCosts {
             class,
             Sample {
                 cost,
+                result_peak_bytes: result_bytes,
                 seen: now,
                 observations: 1,
             },
