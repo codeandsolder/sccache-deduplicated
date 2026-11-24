@@ -55,6 +55,28 @@ remote dispatch; unresolved GCC/Clang native requests execute locally and
 include the initiating compiler's CPU expansion in their cache key. See
 [distributed native behavior](../../docs/Distributed.md#native-cpu-is-the-requesting-host-not-the-worker).
 
+## Choose a target directly, or use a saved profile
+
+All three target sources use the same CPU selection API and compiler-specific
+output backends. A direct native selection describes the machine **requesting**
+the build, never its distributed worker. Named models may be completely absent
+from both requesting and worker CPUs.
+
+~~~sh
+# The requesting machine's currently usable CPU capabilities.
+cargo run --manifest-path tools/cpu-target-profile/Cargo.toml -- emit --target x86_64-unknown-linux-gnu --cpu native --format gcc --compiler /usr/bin/gcc
+# Any explicitly selected model, independently of the actual machine.
+cargo run --manifest-path tools/cpu-target-profile/Cargo.toml -- emit --target x86_64-unknown-linux-gnu --cpu x86_64_v4 --format cargo --compiler /usr/bin/rustc
+# The CPU recorded on an offline destination (no local CPU detection).
+cargo run --manifest-path tools/cpu-target-profile/Cargo.toml -- emit --profile destination.json --format clang --compiler /usr/bin/clang
+~~~
+
+Without --profile, --target is required; omitting --cpu selects native. With
+--profile, --cpu=native uses the saved profile's native model and a named
+--cpu selects a compatible down-target. For targeting CPUs with OS- or
+hypervisor-masked ISA, the serialized profile records the safe, currently
+usable feature intersection, rather than trusting a physical model name.
+
 ## Render only the settings consumed by each compiler
 
 Execute the tool on any build host, using the actual compiler binary:

@@ -67,6 +67,35 @@ pub struct DestinationProfile {
     pub features: Vec<String>,
 }
 
+/// The three supported ways to select a CPU target. Every output backend
+/// resolves one of these to the same portable destination description.
+#[derive(Debug, Clone, Copy)]
+pub enum CpuTargetSelection<'a> {
+    /// The machine that initiates the compile request (never its worker).
+    Native { target_triple: &'a str },
+    /// An explicit target model, regardless of the compiler execution host.
+    Model { target_triple: &'a str, cpu: &'a str },
+    /// An exact saved capability snapshot, potentially from an offline host.
+    Profile(&'a DestinationProfile),
+}
+
+impl CpuTargetSelection<'_> {
+    /// Normalize native, named and captured selections to one target profile.
+    ///
+    /// # Errors
+    /// CPU detection, schema validation or architecture selection fails.
+    pub fn resolve(self) -> Result<DestinationProfile> {
+        match self {
+            Self::Native { target_triple } => DestinationProfile::capture(target_triple),
+            Self::Model { target_triple, cpu } => DestinationProfile::named(target_triple, cpu),
+            Self::Profile(profile) => {
+                profile.resolve(None)?;
+                Ok(profile.clone())
+            }
+        }
+    }
+}
+
 impl DestinationProfile {
     /// Detect current CPU for the provided target triple.
     ///
@@ -556,6 +585,24 @@ pub fn show_flags(flags: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn target_selection_uses_one_profile_for_named_and_saved_machine() -> Result<()> {
+        let named = CpuTargetSelection::Model {
+            target_triple: "x86_64-unknown-linux-gnu",
+            cpu: "x86_64_v3",
+        }.resolve()?;
+        let saved = CpuTargetSelection::Profile(&named).resolve()?;
+        assert_eq!(saved, named);
+        let cargo = rustc_flags(&saved, None, std::path::Path::new("rustc"))?;
+        assert_eq!(cargo, rustc_flags(&named, None, std::path::Path::new("rustc"))?);
+        assert!(CpuTargetSelection::Model {
+            target_triple: "aarch64-unknown-linux-gnu",
+            cpu: "zen2",
+        }.resolve().is_err());
+        Ok(())
+    }
+
+
     use super::*;
 
     fn mock_profile(name: &str) -> Result<DestinationProfile> {

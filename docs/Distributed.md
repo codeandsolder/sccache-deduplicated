@@ -41,14 +41,20 @@ CPU features in virtual machines; `-Z tune-cpu=native` uses the initiating
 host's tuning model. Native CPU identity also enters the Rust cache key.
 Where native resolution is unproven, the compilation remains local.
 
-For GCC and Clang, unresolved `-march=native`, `-mcpu=native`, and
-`-mtune=native` requests currently remain on the initiating machine;
-their local compiler driver expansion is included in the cache identity.
-Distributing such requests requires first transporting a **proven-equivalent
-explicit compiler invocation**, including ISA features, tuning and virtualized
-CPU feature masks. The worker's own detection must never decide codegen for
-the initiator's `native` request. Sandboxed `/proc/cpuinfo` spoofing is not
-used: CPUID and other hardware probes would disagree.
+For GCC and Clang, the initiating compiler's `-###` frontend expansion is
+used to resolve the **complete final CPU target state**, including named CPU
+options, ISA feature masks and tuning options interleaved with `native`.
+The compiler-specific target flags are shipped explicitly in the distributed
+compile command, without an unresolved `native`. The original local command
+retains the user-provided options, and the hash includes the initiating
+compiler's expansion. Clang's cc1 target-feature settings are forwarded after
+the normal options to preserve precedence of explicit `-mno-*` flags; GCC
+receives its observed `-m*` options and cache-size parameters. If the
+compiler cannot resolve or expose its native frontend settings, sccache does
+not distribute an unproven native request or store it in the cache.
+The worker's own detection must never decide codegen for the initiator's
+`native` request. Sandboxed `/proc/cpuinfo` spoofing is not used: CPUID
+and other hardware probes would disagree.
 
 For deliberate builds targeting another machine, use the explicit destination
 CPU profile exporter in `tools/cpu-target-profile`; this is distinct from

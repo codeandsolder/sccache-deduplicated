@@ -16,6 +16,7 @@ use crate::compiler::args::{
     ArgDisposition, ArgInfo, ArgToStringResult, ArgsIter, Argument, FromArg, IntoArg,
     NormalizedDisposition, PathTransformerFn, SearchableArgInfo,
 };
+use crate::compiler::c::NativeCodegenResolution;
 #[cfg(feature = "dist-client")]
 use crate::compiler::c::is_native_codegen_arg;
 use crate::compiler::c::{
@@ -128,6 +129,7 @@ impl CCompilerImpl for Gcc {
             cwd,
             env_vars,
             rewrite_includes_only,
+            native_resolution,
         } = context;
         generate_compile_commands(
             path_transformer,
@@ -139,6 +141,7 @@ impl CCompilerImpl for Gcc {
                 kind: self.kind(),
                 rewrite_includes_only,
                 language_to_arg: language_to_gcc_arg,
+                native_resolution,
             },
         )
         .map(|(command, dist_command, cacheable)| {
@@ -915,10 +918,11 @@ pub struct GccPreprocessConfig<F> {
     pub language_to_arg: F,
 }
 
-pub struct GccCompileConfig<F> {
+pub struct GccCompileConfig<'a, F> {
     pub kind: CCompilerKind,
     pub rewrite_includes_only: bool,
     pub language_to_arg: F,
+    pub native_resolution: Option<&'a NativeCodegenResolution>,
 }
 
 fn preprocess_cmd<F, T>(
@@ -1100,6 +1104,7 @@ where
         kind,
         rewrite_includes_only,
         language_to_arg,
+        native_resolution,
     } = config;
     // Unused arguments
     #[cfg(not(feature = "dist-client"))]
@@ -1107,6 +1112,7 @@ where
         let _ = path_transformer;
         let _ = kind;
         let _ = rewrite_includes_only;
+        let _ = native_resolution;
     }
 
     let out_file = match parsed_args.outputs.get("obj") {
@@ -1150,7 +1156,8 @@ where
         // runs. Sending it verbatim to a worker would silently change codegen.
         // C/C++ native requests therefore stay local until the full driver
         // expansion is transported explicitly; their cache key is host-safe.
-        || parsed_args.common_args.iter().any(|arg| is_native_codegen_arg(arg))
+        || (parsed_args.common_args.iter().any(|arg| is_native_codegen_arg(arg))
+            && native_resolution.is_none())
     {
         None
     } else {
@@ -1198,6 +1205,10 @@ where
                 arguments.push("-fpreprocessed".into());
             }
             let common_args = dist_common_args(parsed_args, worker_reprocesses);
+            let common_args = native_resolution.map_or_else(
+                || common_args.clone(),
+                |resolution| resolution.rewrite_arguments(common_args),
+            );
             arguments.extend(dist::osstrings_to_strings(&common_args)?);
             arguments.extend(dist_assembler_include_args(
                 path_transformer,
@@ -3002,6 +3013,7 @@ mod test {
                 kind: CCompilerKind::Clang,
                 rewrite_includes_only: false,
                 language_to_arg: language_to_gcc_arg,
+                native_resolution: None,
             },
         )
         .unwrap();
@@ -3052,6 +3064,7 @@ mod test {
                     kind: CCompilerKind::Clang,
                     rewrite_includes_only: false,
                     language_to_arg: language_to_gcc_arg,
+                    native_resolution: None,
                 },
             )
             .unwrap();
@@ -3094,6 +3107,7 @@ mod test {
                 kind: CCompilerKind::Clang,
                 rewrite_includes_only: false,
                 language_to_arg: language_to_gcc_arg,
+                native_resolution: None,
             },
         )
         .unwrap();
@@ -3141,6 +3155,7 @@ mod test {
                 kind: CCompilerKind::Clang,
                 rewrite_includes_only: true,
                 language_to_arg: language_to_gcc_arg,
+                native_resolution: None,
             },
         )
         .unwrap();
@@ -3186,6 +3201,7 @@ mod test {
                 kind: CCompilerKind::Clang,
                 rewrite_includes_only: true,
                 language_to_arg: language_to_gcc_arg,
+                native_resolution: None,
             },
         )
         .unwrap();
@@ -3247,6 +3263,7 @@ mod test {
                 kind: CCompilerKind::Gcc,
                 rewrite_includes_only: false,
                 language_to_arg: language_to_gcc_arg,
+                native_resolution: None,
             },
         )
         .unwrap();
@@ -3311,6 +3328,7 @@ mod test {
                 kind: CCompilerKind::Gcc,
                 rewrite_includes_only: false,
                 language_to_arg: language_to_gcc_arg,
+                native_resolution: None,
             },
         )
         .unwrap();
@@ -3373,6 +3391,7 @@ mod test {
                 kind: CCompilerKind::Gcc,
                 rewrite_includes_only: false,
                 language_to_arg: language_to_gcc_arg,
+                native_resolution: None,
             },
         )
         .unwrap();
@@ -3405,6 +3424,7 @@ mod test {
                     kind: CCompilerKind::Gcc,
                     rewrite_includes_only: false,
                     language_to_arg: language_to_gcc_arg,
+                    native_resolution: None,
                 },
             )
             .unwrap();
@@ -3438,6 +3458,7 @@ mod test {
                     kind: CCompilerKind::Clang,
                     rewrite_includes_only: false,
                     language_to_arg: clang::language_to_clang_arg,
+                    native_resolution: None,
                 },
             )
             .unwrap();
@@ -3468,6 +3489,7 @@ mod test {
                 kind: CCompilerKind::Clang,
                 rewrite_includes_only: false,
                 language_to_arg: language_to_gcc_arg,
+                native_resolution: None,
             },
         )
         .unwrap();
