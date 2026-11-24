@@ -15,7 +15,7 @@
 
 use crate::cache::CacheMode;
 use crate::errors::{Result, anyhow};
-use crate::util::new_reqwest_client_builder;
+use crate::http_client::{self, new_reqwest_client_builder};
 use opendal::Operator;
 use opendal::{OperationContext, services::Gcs};
 use opendal_layer_logging::LoggingLayer;
@@ -99,15 +99,22 @@ async fn fetch_taskcluster_token(url: &str, scope: &str) -> Result<String> {
     let client = new_reqwest_client_builder()?
         .user_agent(user_agent)
         .build()?;
-    let res = client.get(url).send().await?;
+    let res = client
+        .get(url)
+        .timeout(http_client::AUTH_REQUEST_TIMEOUT)
+        .send()
+        .await?;
 
     if res.status().is_success() {
-        let resp = res.json::<TaskClusterToken>().await?;
+        let resp: TaskClusterToken =
+            http_client::read_bounded_json_async(res, http_client::TOKEN_JSON_LIMIT).await?;
         debug!("gcs: token load succeeded for scope: {scope}");
         Ok(resp.access_token)
     } else {
         let status_code = res.status();
-        let content = res.text().await?;
+        let body =
+            http_client::read_bounded_bytes_async(res, http_client::TOKEN_JSON_LIMIT).await?;
+        let content = String::from_utf8_lossy(&body);
         Err(anyhow!(
             "token load failed for: code: {status_code}, {content}"
         ))

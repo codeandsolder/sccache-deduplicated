@@ -1,4 +1,4 @@
-use crate::util::new_reqwest_client_builder;
+use crate::http_client::new_reqwest_client_builder;
 use opendal::HttpTransporter;
 use opendal_http_transport_reqwest::ReqwestTransport;
 

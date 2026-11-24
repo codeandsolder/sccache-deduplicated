@@ -13,12 +13,13 @@
 // limitations under the License.
 
 use super::command_helpers::{CommandExt, run_with_environment};
+use crate::job_telemetry;
 use anyhow::{Context, Error, Result, anyhow, bail};
 use sccache::compression::ZstdFrame;
 use sccache::compression::deflate::unpack_gzip;
 use sccache::dist::{
-    BuildResult, BuilderIncoming, CompileCommand, InputsReader, OutputRequest, ProcessOutput,
-    TcCache, Toolchain,
+    BuildResult, BuilderIncoming, CompileCommand, InputsReader, JobId, OutputRequest,
+    ProcessOutput, TcCache, Toolchain,
 };
 use sccache::lru_disk_cache::Error as LruError;
 use std::collections::{HashMap, hash_map};
@@ -308,6 +309,7 @@ impl PotBuilder {
     }
 
     fn perform_build(
+        job_id: JobId,
         compile_command: CompileCommand,
         inputs_rdr: InputsReader,
         outputs: OutputRequest,
@@ -362,7 +364,8 @@ impl PotBuilder {
         cmd.args(["/bin/sh", "-c", shell_cmd]);
         cmd.arg(&executable);
         cmd.arg(cwd);
-        let compile_output = run_with_environment(&mut cmd, env_vars, executable, arguments)?;
+        let compile_output =
+            run_with_environment(job_id, &mut cmd, env_vars, executable, arguments)?;
         trace!("compile_output: {:?}", compile_output);
 
         let mut outputs = vec![];
@@ -397,6 +400,7 @@ impl BuilderIncoming for PotBuilder {
     // From Server
     fn run_build(
         &self,
+        job_id: JobId,
         tc: Toolchain,
         command: CompileCommand,
         outputs: OutputRequest,
@@ -408,8 +412,15 @@ impl BuilderIncoming for PotBuilder {
             .get_container(&tc, tccache)
             .context("Failed to get a container for build")?;
         debug!("Performing build with container {}", cid);
-        let result = Self::perform_build(command, inputs_rdr, outputs, &cid, &self.pot_fs_root)
-            .context("Failed to perform build");
+        let result = Self::perform_build(
+            job_id,
+            command,
+            inputs_rdr,
+            outputs,
+            &cid,
+            &self.pot_fs_root,
+        )
+        .context("Failed to perform build");
         debug!("Finishing with container {}", cid);
         let cloned = self.clone();
         loop {

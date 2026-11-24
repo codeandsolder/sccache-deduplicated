@@ -17,10 +17,7 @@ use crate::compiler::args::{
     ArgDisposition, ArgInfo, ArgToStringResult, ArgsIter, Argument, FromArg, IntoArg,
     PathTransformerFn, SearchableArgInfo,
 };
-use crate::compiler::c::{
-    ArtifactDescriptor, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
-    ParsedArguments,
-};
+use crate::compiler::c::{ArtifactDescriptor, CCompileContext, CCompilerKind, ParsedArguments};
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
     SingleCompileCommand,
@@ -28,8 +25,6 @@ use crate::compiler::{
 use crate::{counted_array, dist};
 
 use crate::mock_command::CommandCreatorSync;
-
-use async_trait::async_trait;
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -55,66 +50,59 @@ pub fn is_ptxas_input(arg: impl AsRef<OsStr>) -> bool {
     arg.as_ref().to_string_lossy().ends_with(PTXAS_INPUT_SUFFIX)
 }
 
-#[async_trait]
-impl CCompilerImpl for Cicc {
-    fn kind(&self) -> CCompilerKind {
-        CCompilerKind::Cicc
-    }
-    fn plusplus(&self) -> bool {
-        true
-    }
-    fn version(&self) -> Option<String> {
-        self.version.clone()
-    }
-    fn parse_arguments(
-        &self,
-        arguments: &[OsString],
-        cwd: &Path,
-        _env_vars: &[(OsString, OsString)],
-    ) -> CompilerArguments<ParsedArguments> {
-        parse_arguments(arguments, cwd, Language::Ptx, &ARGS[..], 3)
-    }
-    async fn preprocess<T>(&self, context: CPreprocessContext<'_, T>) -> Result<process::Output>
-    where
-        T: CommandCreatorSync,
-    {
-        let CPreprocessContext {
-            parsed_args, cwd, ..
-        } = context;
-        preprocess(cwd, parsed_args)
-    }
-    fn generate_compile_commands<T>(
-        &self,
-        context: CCompileContext<'_>,
-    ) -> Result<(
-        Box<dyn CompileCommand<T>>,
-        Option<dist::CompileCommand>,
-        Cacheable,
-    )>
-    where
-        T: CommandCreatorSync,
-    {
-        let CCompileContext {
-            path_transformer,
-            executable,
-            parsed_args,
-            cwd,
-            env_vars,
-            ..
-        } = context;
-        generate_compile_commands(
-            path_transformer,
-            executable,
-            parsed_args,
-            cwd,
-            env_vars,
-            OutputStyle::ObjectFile,
-        )
-        .map(|(command, dist_command, cacheable)| {
-            (CCompileCommand::boxed(command), dist_command, cacheable)
-        })
-    }
+// Three CUDA compiler frontends share the same CCompilerImpl lifecycle.
+// Only their compiler kind, input syntax and output style differ. Keep the
+// complete lifecycle in one place rather than duplicating trait impls.
+macro_rules! impl_cuda_stage_compiler {
+    ($stage:ident, $kind:expr, $language:expr, $args:expr, $offset:expr, $style:expr $(,)?) => {
+        #[async_trait::async_trait]
+        impl crate::compiler::c::CCompilerImpl for $stage {
+            fn kind(&self) -> crate::compiler::c::CCompilerKind {
+                $kind
+            }
+            fn plusplus(&self) -> bool {
+                true
+            }
+            fn version(&self) -> Option<String> {
+                self.version.clone()
+            }
+            fn parse_arguments(
+                &self,
+                arguments: &[std::ffi::OsString],
+                cwd: &std::path::Path,
+                _env_vars: &[(std::ffi::OsString, std::ffi::OsString)],
+            ) -> crate::compiler::CompilerArguments<crate::compiler::c::ParsedArguments> {
+                crate::compiler::cicc::parse_arguments(arguments, cwd, $language, $args, $offset)
+            }
+            async fn preprocess<T>(
+                &self,
+                context: crate::compiler::c::CPreprocessContext<'_, T>,
+            ) -> crate::errors::Result<std::process::Output>
+            where
+                T: crate::mock_command::CommandCreatorSync,
+            {
+                crate::compiler::cicc::preprocess(context.cwd, context.parsed_args)
+            }
+            fn generate_compile_commands<T>(
+                &self,
+                context: crate::compiler::c::CCompileContext<'_>,
+            ) -> crate::errors::Result<crate::compiler::cicc::CudaStageCompileCommands<T>>
+            where
+                T: crate::mock_command::CommandCreatorSync,
+            {
+                crate::compiler::cicc::boxed_compile_commands(context, $style)
+            }
+        }
+    };
 }
+impl_cuda_stage_compiler!(
+    Cicc,
+    CCompilerKind::Cicc,
+    Language::Ptx,
+    &ARGS[..],
+    3,
+    OutputStyle::ObjectFile,
+);
 
 #[expect(
     clippy::too_many_lines,
@@ -342,6 +330,38 @@ impl OutputStyle {
     }
 }
 
+/// Common `CCompilerImpl` result for all three CUDA device compiler stages.
+pub(super) type CudaStageCompileCommands<T> = (
+    Box<dyn CompileCommand<T>>,
+    Option<dist::CompileCommand>,
+    Cacheable,
+);
+/// Box a CUDA device compiler command using the frontend-specific output style.
+/// The three stage adapters share path transformation and command ownership.
+pub(super) fn boxed_compile_commands<T: CommandCreatorSync>(
+    context: CCompileContext<'_>,
+    output_style: OutputStyle,
+) -> Result<CudaStageCompileCommands<T>> {
+    let CCompileContext {
+        path_transformer,
+        executable,
+        parsed_args,
+        cwd,
+        env_vars,
+        ..
+    } = context;
+    generate_compile_commands(
+        path_transformer,
+        executable,
+        parsed_args,
+        cwd,
+        env_vars,
+        output_style,
+    )
+    .map(|(command, dist_command, cacheable)| {
+        (CCompileCommand::boxed(command), dist_command, cacheable)
+    })
+}
 pub fn generate_compile_commands(
     path_transformer: &mut dist::PathTransformer,
     executable: &Path,
@@ -449,6 +469,75 @@ mod test {
 
     fn os_strings(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn cuda_stage_trait_dispatch_keeps_compiler_specific_semantics() {
+        use crate::compiler::c::CCompilerImpl;
+        use crate::compiler::cudafe::CudaFE;
+        use crate::compiler::ptxas::Ptxas;
+
+        fn verify<C: CCompilerImpl>(
+            compiler: &C,
+            kind: CCompilerKind,
+            language: Language,
+            arguments: &[&str],
+            input: &str,
+            output: &str,
+        ) {
+            assert_eq!(compiler.kind(), kind);
+            assert!(compiler.plusplus());
+            assert_eq!(compiler.version().as_deref(), Some("device stage"));
+            let parsed = compiler.parse_arguments(&os_strings(arguments), Path::new("."), &[]);
+            let CompilerArguments::Ok(parsed) = parsed else {
+                panic!("stage {kind:?} rejected valid arguments: {parsed:?}");
+            };
+            assert_eq!(parsed.language, language);
+            assert_eq!(parsed.input, PathBuf::from(input));
+            let expected_output = Path::new(".").join(output);
+            assert_eq!(
+                parsed
+                    .outputs
+                    .get("obj")
+                    .map(|descriptor| descriptor.path.as_path()),
+                Some(expected_output.as_path()),
+            );
+        }
+
+        verify(
+            &Cicc {
+                version: Some("device stage".into()),
+            },
+            CCompilerKind::Cicc,
+            Language::Ptx,
+            &["kernel.cpp1.ii", "-o", "kernel.ptx"],
+            "kernel.cpp1.ii",
+            "kernel.ptx",
+        );
+        verify(
+            &CudaFE {
+                version: Some("device stage".into()),
+            },
+            CCompilerKind::CudaFE,
+            Language::CudaFE,
+            &[
+                "--module_id_file_name",
+                "kernel.module_id",
+                "kernel.cpp1.ii",
+            ],
+            "kernel.cpp1.ii",
+            "kernel.module_id",
+        );
+        verify(
+            &Ptxas {
+                version: Some("device stage".into()),
+            },
+            CCompilerKind::Ptxas,
+            Language::Cubin,
+            &["kernel.ptx", "-o=kernel.cubin"],
+            "kernel.ptx",
+            "kernel.cubin",
+        );
     }
 
     #[test]

@@ -40,6 +40,8 @@ pub use compiler::rust_link;
 pub mod compression;
 pub mod config;
 pub mod dist;
+#[cfg(feature = "reqwest")]
+pub mod http_client;
 mod jobserver;
 pub mod lru_disk_cache;
 mod mock_command;

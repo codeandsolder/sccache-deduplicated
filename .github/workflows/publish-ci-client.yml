@@ -8,53 +8,40 @@ on:
         required: true
         default: main
         type: string
-      release_tag:
-        description: Immutable release tag
-        required: true
-        type: string
-  workflow_run:
-    workflows: ["ci", "Strict Rust"]
-    types: [completed]
 
 permissions:
   actions: read
   contents: write
 
 concurrency:
-  group: publish-ci-sccache-${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.event.workflow_run.head_sha }}
+  group: publish-ci-sccache-${{ inputs.ref }}
   cancel-in-progress: false
 
 jobs:
   required-gates:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     outputs:
       ready: ${{ steps.gates.outputs.ready }}
+      sha: ${{ steps.gates.outputs.sha }}
     steps:
       - name: Check required workflow gates
         id: gates
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          sha="${{ github.event.workflow_run.head_sha }}"
+          # Only explicitly requested releases of the current, CI-verified
+          # main revision may become the new fleet version.
+          sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_REF" --jq '.sha')"
           latest="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')"
           if [[ "$sha" != "$latest" ]]; then
-            echo "Skipping superseded main revision $sha (current: $latest)"
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "Ref $RELEASE_REF resolves to $sha, not current main $latest" >&2
+            exit 1
           fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
           ready=true
           for workflow in ci.yml rust-skills2-strict.yml; do
             conclusion="$(
@@ -79,7 +66,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.event.workflow_run.head_sha }}
+          ref: ${{ needs.required-gates.outputs.sha }}
 
       - name: Resolve source revision
         id: rev
@@ -190,17 +177,14 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || format('sccache-ci-{0}', github.event.workflow_run.head_sha) }}
+          RELEASE_TAG: sccache-ci-${{ needs.required-gates.outputs.sha }}
         run: |
           set -euo pipefail
-          # Completed older main runs must not publish a downgrade after a
-          # newer revision became the default branch.
-          if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
-            latest="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')"
-            if [[ "$latest" != "${{ steps.rev.outputs.sha }}" ]]; then
-              echo "Skipping superseded main release (latest: $latest)"
-              exit 0
-            fi
+          # A newer main revision must not be overwritten by an older build.
+          latest="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha')"
+          if [[ "$latest" != "${{ steps.rev.outputs.sha }}" ]]; then
+            echo "Skipping superseded main release (latest: $latest)"
+            exit 0
           fi
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             echo "Release $RELEASE_TAG already exists; immutable release is already published."

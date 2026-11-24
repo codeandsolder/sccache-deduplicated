@@ -25,6 +25,27 @@ use sccache::errors::*;
 
 pub mod harness;
 
+/// Each Rust distribution test needs an isolated compilation cache, but it
+/// should not repack the identical sysroot for every independent test case.
+/// Serialize reuse: each test stops the previous local daemon before opening
+/// this shared archive index, while workers and compilation caches stay isolated.
+fn shared_rust_toolchain_cache() -> (std::sync::MutexGuard<'static, ()>, &'static Path) {
+    static CACHE: std::sync::LazyLock<(std::sync::Mutex<()>, tempfile::TempDir)> =
+        std::sync::LazyLock::new(|| {
+            (
+                std::sync::Mutex::new(()),
+                tempfile::tempdir().expect("create Rust distribution test toolchain cache"),
+            )
+        });
+    (
+        CACHE
+            .0
+            .lock()
+            .expect("Rust distribution test cache mutex poisoned"),
+        CACHE.1.path(),
+    )
+}
+
 fn basic_compile(tmpdir: &Path, sccache_cfg_path: &Path, sccache_cached_cfg_path: &Path) {
     let envs: Vec<(_, &OsStr)> = vec![
         ("RUST_BACKTRACE", "1".as_ref()),
@@ -658,12 +679,14 @@ fn test_dist_cargo_build() {
 #[cfg(unix)]
 #[cfg_attr(not(feature = "dist-tests"), ignore)]
 fn test_dist_rust_observed_environment() {
+    let (_rust_toolchain_cache_guard, rust_toolchain_cache_dir) = shared_rust_toolchain_cache();
     let tmpdir = tempfile::tempdir().unwrap();
     let root = tmpdir.path();
     let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
     system.add_scheduler();
     let _server_handle = system.add_server(&[("SCCACHE_OBSERVED_MISSING", "worker-only")]);
-    let cfg = dist_test_sccache_client_cfg(root, system.scheduler_url());
+    let mut cfg = dist_test_sccache_client_cfg(root, system.scheduler_url());
+    cfg.dist.cache_dir = rust_toolchain_cache_dir.to_owned();
     let cfg_path = root.join("sccache-cfg.json");
     write_json_cfg(root, "sccache-cfg.json", &cfg);
     let cached_cfg = root.join("sccache-cached-cfg");
@@ -725,6 +748,7 @@ fn main() {
 #[cfg(unix)]
 #[cfg_attr(not(feature = "dist-tests"), ignore)]
 fn test_dist_rust_clippy_observed_paths() -> Result<()> {
+    let (_rust_toolchain_cache_guard, rust_toolchain_cache_dir) = shared_rust_toolchain_cache();
     use std::fs;
     use std::os::unix::fs::symlink;
 
@@ -734,6 +758,7 @@ fn test_dist_rust_clippy_observed_paths() -> Result<()> {
     system.add_scheduler();
     let _worker = system.add_server(&[]);
     let mut cfg = harness::sccache_client_cfg(&root, false);
+    cfg.dist.cache_dir = rust_toolchain_cache_dir.to_owned();
     cfg.dist.scheduler_url = Some(system.scheduler_url());
     let cfg_path = root.join("sccache-cfg.json");
     write_json_cfg(&root, "sccache-cfg.json", &cfg);
@@ -901,6 +926,7 @@ pub fn marker() -> u32 {{ let policy_denied_name = 11; policy_denied_name + 1 }}
 #[cfg(target_os = "linux")]
 #[cfg_attr(not(feature = "dist-tests"), ignore)]
 fn test_dist_rust_windows_gnu_dlltool() -> Result<()> {
+    let (_rust_toolchain_cache_guard, rust_toolchain_cache_dir) = shared_rust_toolchain_cache();
     use std::io::Write;
     let tmpdir = tempfile::tempdir()?;
     let root = tmpdir.path();
@@ -908,6 +934,7 @@ fn test_dist_rust_windows_gnu_dlltool() -> Result<()> {
     system.add_scheduler();
     let _worker = system.add_server(&[]);
     let mut cfg = harness::sccache_client_cfg(root, false);
+    cfg.dist.cache_dir = rust_toolchain_cache_dir.to_owned();
     cfg.dist.scheduler_url = Some(system.scheduler_url());
     let cfg_path = root.join("sccache-cfg.json");
     write_json_cfg(root, "sccache-cfg.json", &cfg);
@@ -990,12 +1017,14 @@ pub fn ticks() -> u32 { unsafe { GetTickCount() } }
 #[cfg(unix)]
 #[cfg_attr(not(feature = "dist-tests"), ignore)]
 fn test_dist_rust_metadata_outputs() -> Result<()> {
+    let (_rust_toolchain_cache_guard, rust_toolchain_cache_dir) = shared_rust_toolchain_cache();
     let tmpdir = tempfile::tempdir()?;
     let root = tmpdir.path();
     let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
     system.add_scheduler();
     let _worker = system.add_server(&[]);
     let mut cfg = harness::sccache_client_cfg(root, false);
+    cfg.dist.cache_dir = rust_toolchain_cache_dir.to_owned();
     cfg.dist.scheduler_url = Some(system.scheduler_url());
     let cfg_path = root.join("sccache-cfg.json");
     write_json_cfg(root, "sccache-cfg.json", &cfg);
@@ -1257,12 +1286,14 @@ fn test_dist_rust_dependency_chain_relative_sibling() -> Result<()> {
 
 #[cfg(unix)]
 fn dist_rust_dependency_chain(relative: Option<&str>) -> Result<()> {
+    let (_rust_toolchain_cache_guard, rust_toolchain_cache_dir) = shared_rust_toolchain_cache();
     let temp = tempfile::tempdir()?;
     let root = temp.path();
     let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
     system.add_scheduler();
     let _worker = system.add_server(&[]);
     let mut cfg = harness::sccache_client_cfg(root, false);
+    cfg.dist.cache_dir = rust_toolchain_cache_dir.to_owned();
     cfg.dist.scheduler_url = Some(system.scheduler_url());
     let cfg_path = root.join("sccache-cfg.json");
     write_json_cfg(root, "sccache-cfg.json", &cfg);
@@ -1375,12 +1406,14 @@ fn dist_rust_dependency_chain(relative: Option<&str>) -> Result<()> {
 #[cfg(target_os = "linux")]
 #[cfg_attr(not(feature = "dist-tests"), ignore)]
 fn test_dist_rust_cargo_split_root_proc_macro() -> Result<()> {
+    let (_rust_toolchain_cache_guard, rust_toolchain_cache_dir) = shared_rust_toolchain_cache();
     let temp = tempfile::tempdir()?;
     let root = temp.path();
     let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
     system.add_scheduler();
     let _worker = system.add_server(&[]);
     let mut cfg = harness::sccache_client_cfg(root, false);
+    cfg.dist.cache_dir = rust_toolchain_cache_dir.to_owned();
     cfg.dist.scheduler_url = Some(system.scheduler_url());
     let cfg_path = root.join("sccache-cfg.json");
     write_json_cfg(root, "sccache-cfg.json", &cfg);

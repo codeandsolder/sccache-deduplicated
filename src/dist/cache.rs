@@ -79,6 +79,47 @@ mod client {
         }
     }
 
+    /// Read a best-effort shortcut index; archive contents live in the disk LRU.
+    /// A malformed JSON document is disposable, but filesystem errors are not.
+    fn load_weak_map(cache_dir: &Path) -> Result<HashMap<String, String>> {
+        let weak_map_path = cache_dir.join("weak_map.json");
+        if !weak_map_path.exists() {
+            fs::File::create(&weak_map_path)
+                .and_then(|mut f| f.write_all(b"{}"))
+                .context(format!(
+                    "failed to create new toolchain weak map file: {}",
+                    weak_map_path.display()
+                ))?;
+        }
+        let weak_map_file = fs::File::open(&weak_map_path).with_context(|| {
+            format!(
+                "failed to open toolchain weak map: {}",
+                weak_map_path.display()
+            )
+        })?;
+        // This index is only a shortcut. A truncated or malformed JSON file
+        // must not stop sccache from starting or discard cached archives.
+        let weak_map: HashMap<String, String> = match serde_json::from_reader(weak_map_file) {
+            Ok(map) => map,
+            Err(error) if !error.is_io() => {
+                warn!(
+                    "Ignoring invalid toolchain weak map {}: {error}",
+                    weak_map_path.display()
+                );
+                HashMap::new()
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to read toolchain weak map: {}",
+                        weak_map_path.display()
+                    )
+                });
+            }
+        };
+        Ok(weak_map)
+    }
+
     pub struct ClientToolchains {
         cache_dir: PathBuf,
         cache: Mutex<TcCache>,
@@ -121,22 +162,7 @@ mod client {
                 toolchain_creation_dir.display()
             ))?;
 
-            let weak_map_path = cache_dir.join("weak_map.json");
-            if !weak_map_path.exists() {
-                fs::File::create(&weak_map_path)
-                    .and_then(|mut f| f.write_all(b"{}"))
-                    .context(format!(
-                        "failed to create new toolchain weak map file: {}",
-                        weak_map_path.display()
-                    ))?;
-            }
-            let weak_map = fs::File::open(&weak_map_path)
-                .map_err(Error::from)
-                .and_then(|f| serde_json::from_reader(f).map_err(Error::from))
-                .context(format!(
-                    "failed to load toolchain weak map: {}",
-                    weak_map_path.display()
-                ))?;
+            let weak_map = load_weak_map(&cache_dir)?;
 
             let tc_cache_dir = cache_dir.join("tc");
             let cache = TcCache::new(&tc_cache_dir, cache_size)
@@ -652,6 +678,38 @@ mod client {
             any(target_arch = "x86_64", target_arch = "aarch64")
         ))]
         #[test]
+        fn malformed_weak_map_json_recovers_without_losing_archives() -> Result<()> {
+            for broken in [
+                b"{".as_slice(),
+                b"[]".as_slice(),
+                b"{\"weak_key\":false}".as_slice(),
+            ] {
+                let (_td, cache_dir, first, expected) = cached_toolchain()?;
+                drop(first);
+                std::fs::write(cache_dir.join("weak_map.json"), broken)?;
+
+                let recovered = ClientToolchains::new(&cache_dir, 1024 * 1024, &[])?;
+                assert!(recovered.get_toolchain(&expected)?.is_some());
+                assert_eq!(recovered.weak_to_strong("weak_key")?, None);
+
+                let (toolchain, _) = recovered.put_toolchain(
+                    "/my/compiler".as_ref(),
+                    "weak_key",
+                    Box::new(StaticToolchainPackager),
+                )?;
+                assert_eq!(toolchain, expected);
+                let persisted: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(cache_dir.join("weak_map.json"))?)?;
+                assert_eq!(persisted["weak_key"], expected.archive_id.to_string());
+            }
+            Ok(())
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        #[test]
         fn missing_archive_file_repackages_without_restart() -> Result<()> {
             let (_td, cache_dir, client, toolchain) = cached_toolchain()?;
 
@@ -1067,44 +1125,15 @@ impl TcCache {
     /// Returns an error if the cache cannot install the archive.
     pub fn insert_staged(&mut self, staged: StagedToolchainArchive) -> Result<()> {
         let StagedToolchainArchive { toolchain, file } = staged;
-        if !self.contains_toolchain(&toolchain) {
-            self.inner
-                .insert_file(make_lru_key_path(&toolchain.archive_id), file.path())?;
+        match self.get_file(&toolchain) {
+            Ok(_) => {}
+            Err(crate::lru_disk_cache::Error::FileNotInCache) => {
+                self.inner
+                    .insert_file(make_lru_key_path(&toolchain.archive_id), file.path())?;
+            }
+            Err(error) => return Err(error.into()),
         }
         Ok(())
-    }
-
-    /// Insert a toolchain archive produced by `with` and verify its content hash.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if writing, reading, hashing, or validating the archive fails.
-    pub fn insert_with<F: FnOnce(fs::File) -> io::Result<()>>(
-        &mut self,
-        tc: &Toolchain,
-        with: F,
-    ) -> Result<()> {
-        self.inner
-            .insert_with(make_lru_key_path(&tc.archive_id), with)?;
-        let verified = (|| -> Result<()> {
-            let verified_archive_id = file_key(self.get(tc)?)?;
-            if verified_archive_id == tc.archive_id.as_str() {
-                Ok(())
-            } else {
-                Err(anyhow!("written file does not match expected hash key"))
-            }
-        })();
-        if verified.is_err() {
-            // Never retain an incorrectly keyed archive in the LRU index,
-            // including when validation failed because of a read error.
-            if let Err(error) = self.remove(tc) {
-                log::warn!(
-                    "Failed to remove invalid toolchain archive {}: {error}",
-                    tc.archive_id
-                );
-            }
-        }
-        verified
     }
 
     /// Open a cached toolchain archive as a file.
@@ -1169,7 +1198,6 @@ fn make_lru_key_path(key: &ArchiveId) -> PathBuf {
 #[cfg(test)]
 mod cache_validation_tests {
     use super::*;
-    use std::io::Write;
 
     #[cfg(all(target_os = "linux", feature = "dist-server"))]
     #[test]
@@ -1238,21 +1266,104 @@ mod cache_validation_tests {
     }
 
     #[test]
+    fn staged_archive_replaces_missing_cached_file_without_trusting_stale_index() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let bytes = b"toolchain from verified upload";
+        let toolchain = Toolchain {
+            archive_id: ArchiveId::try_from(Digest::reader_sync(bytes.as_slice())?)?,
+        };
+        let mut cache = TcCache::new(temp.path(), 1024)?;
+        let staged = StagedToolchainArchive::receive(
+            temp.path(),
+            toolchain.clone(),
+            bytes.as_slice(),
+            1024,
+        )?;
+        cache.insert_staged(staged)?;
+        let key = make_lru_key_path(&toolchain.archive_id);
+        fs::remove_file(temp.path().join(&key))?;
+        assert!(cache.contains_toolchain(&toolchain));
+
+        let retry = StagedToolchainArchive::receive(
+            temp.path(),
+            toolchain.clone(),
+            bytes.as_slice(),
+            1024,
+        )?;
+        cache.insert_staged(retry)?;
+        let mut actual = Vec::new();
+        cache.get(&toolchain)?.read_to_end(&mut actual)?;
+        assert_eq!(actual, bytes);
+        assert_eq!(cache.len(), 1);
+
+        #[cfg(unix)]
+        {
+            fs::remove_file(temp.path().join(&key))?;
+            std::os::unix::fs::symlink(
+                key.file_name()
+                    .ok_or_else(|| anyhow!("cache path has no filename"))?,
+                temp.path().join(&key),
+            )?;
+            let retry = StagedToolchainArchive::receive(
+                temp.path(),
+                toolchain.clone(),
+                bytes.as_slice(),
+                1024,
+            )?;
+            assert!(cache.insert_staged(retry).is_err());
+            assert!(
+                fs::symlink_metadata(temp.path().join(&key))?
+                    .file_type()
+                    .is_symlink()
+            );
+            // The cache index is retained for an actionable filesystem error.
+            assert!(cache.contains_toolchain(&toolchain));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn rejected_digest_does_not_leave_a_cached_archive() -> Result<()> {
         let tempdir = tempfile::tempdir()?;
+        let expected = b"expected";
         let tc = Toolchain {
-            archive_id: ArchiveId::try_from(Digest::reader_sync(b"expected".as_slice())?)?,
+            archive_id: ArchiveId::try_from(Digest::reader_sync(expected.as_slice())?)?,
         };
         let mut cache = TcCache::new(tempdir.path(), 1024 * 1024)?;
-        let failure = cache
-            .insert_with(&tc, |mut file| file.write_all(b"not the expected archive"))
-            .expect_err("mismatched archive digest must fail");
-        assert!(failure.to_string().contains("written file does not match"));
+        assert!(
+            StagedToolchainArchive::receive(
+                tempdir.path(),
+                tc.clone(),
+                b"not the expected archive".as_slice(),
+                1024 * 1024,
+            )
+            .is_err()
+        );
         assert!(!cache.contains_toolchain(&tc));
         assert!(matches!(
             cache.get(&tc),
             Err(crate::lru_disk_cache::Error::FileNotInCache)
         ));
+
+        let staged = StagedToolchainArchive::receive(
+            tempdir.path(),
+            tc.clone(),
+            expected.as_slice(),
+            1024 * 1024,
+        )?;
+        cache.insert_staged(staged)?;
+        assert!(
+            StagedToolchainArchive::receive(
+                tempdir.path(),
+                tc.clone(),
+                b"invalid replacement".as_slice(),
+                1024 * 1024,
+            )
+            .is_err()
+        );
+        let mut persisted = Vec::new();
+        cache.get(&tc)?.read_to_end(&mut persisted)?;
+        assert_eq!(persisted, expected);
         Ok(())
     }
 }

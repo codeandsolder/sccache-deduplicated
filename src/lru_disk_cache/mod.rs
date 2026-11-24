@@ -172,11 +172,6 @@ pub trait ReadSeek: Read + Seek + Send {}
 
 impl<T: Read + Seek + Send> ReadSeek for T {}
 
-enum AddFile<'a> {
-    AbsPath(PathBuf),
-    RelPath(&'a OsStr),
-}
-
 struct PendingReservation {
     pending_size: Arc<AtomicU64>,
     size: u64,
@@ -330,8 +325,7 @@ impl LruDiskCache {
                     );
                 }
             } else {
-                let add_file = AddFile::AbsPath(file);
-                self.add_file(&add_file, size)
+                self.add_file(&file, size)
                     .unwrap_or_else(|e| error!("Error adding file: {e}"));
             }
         }
@@ -371,18 +365,47 @@ impl LruDiskCache {
         Ok(())
     }
 
-    /// Add the file at `path` of size `size` to the cache.
-    fn add_file(&mut self, addfile_path: &AddFile<'_>, size: u64) -> Result<()> {
-        let rel_path = match addfile_path {
-            AddFile::AbsPath(path) => path
-                .strip_prefix(&self.root)
-                .map_err(|_| Error::InvalidCacheKey(path.clone()))?
-                .as_os_str(),
-            AddFile::RelPath(path) => *path,
-        };
+    /// Index an existing file while scanning the cache at startup.
+    fn add_file(&mut self, path: &Path, size: u64) -> Result<()> {
+        let rel_path = path
+            .strip_prefix(&self.root)
+            .map_err(|_| Error::InvalidCacheKey(path.to_owned()))?
+            .as_os_str();
         Self::validate_key(rel_path)?;
         self.make_space(size)?;
         self.lru.insert(rel_path.to_owned(), size);
+        Ok(())
+    }
+
+    // Retain the previous on-disk value and restore its LRU accounting if
+    // admission or atomic publication fails.
+    fn commit_replacement<F: FnOnce(&Path) -> io::Result<()>>(
+        &mut self,
+        key: &OsStr,
+        size: u64,
+        publish: F,
+    ) -> Result<()> {
+        Self::validate_key(key)?;
+        if !self.can_store(size) {
+            return Err(Error::FileTooLarge);
+        }
+        let destination = self.rel_to_abs_path(key);
+        let parent = destination
+            .parent()
+            .ok_or_else(|| Error::InvalidCacheKey(PathBuf::from(key)))?;
+        fs::create_dir_all(parent)?;
+
+        let previous = self.lru.remove(key);
+        let published = self
+            .make_space(size)
+            .and_then(|()| publish(&destination).map_err(Error::Io));
+        if let Err(error) = published {
+            if let Some(previous_size) = previous {
+                self.lru.insert(key.to_owned(), previous_size);
+            }
+            return Err(error);
+        }
+        self.lru.insert(key.to_owned(), size);
         Ok(())
     }
 
@@ -392,38 +415,24 @@ impl LruDiskCache {
         size: Option<u64>,
         by: F,
     ) -> Result<()> {
-        if let Some(size) = size
-            && !self.can_store(size)
-        {
+        let key = key.as_ref();
+        Self::validate_key(key)?;
+        if size.is_some_and(|size| !self.can_store(size)) {
             return Err(Error::FileTooLarge);
         }
-        let rel_path = key.as_ref();
-        Self::validate_key(rel_path)?;
-        let path = self.rel_to_abs_path(rel_path);
-        let parent = path
-            .parent()
-            .ok_or_else(|| Error::InvalidCacheKey(PathBuf::from(rel_path)))?;
-        fs::create_dir_all(parent)?;
-        by(&path)?;
-        let size = match size {
-            Some(size) => size,
-            None => fs::metadata(path)?.len(),
-        };
-        self.add_file(&AddFile::RelPath(rel_path), size)
-            .map_err(|e| {
-                error!(
-                    "Failed to insert file `{}`: {e}",
-                    rel_path.to_string_lossy()
-                );
-                let cleanup_path = self.rel_to_abs_path(rel_path);
-                if let Err(cleanup_error) = fs::remove_file(&cleanup_path) {
-                    warn!(
-                        "Failed to remove rejected cache file {}: {cleanup_error}",
-                        cleanup_path.display()
-                    );
-                }
-                e
-            })
+        // The callback must never write the existing live entry. Staged names
+        // are also discarded if a process restarts before publication.
+        let staged = tempfile::Builder::new()
+            .prefix(TEMPFILE_PREFIX)
+            .tempfile_in(&self.root)?;
+        by(staged.path())?;
+        let actual_size = staged.as_file().metadata()?.len();
+        self.commit_replacement(key, actual_size, |destination| {
+            staged
+                .persist(destination)
+                .map_err(|error| error.error)
+                .map(|_| ())
+        })
     }
 
     /// Add a file by calling `with` with the open `File` corresponding to the cache at path `key`.
@@ -458,16 +467,71 @@ impl LruDiskCache {
     ///
     /// Returns an error if the source cannot be read/moved, the key is invalid, or the cache cannot make space.
     pub fn insert_file<K: AsRef<OsStr>, P: AsRef<OsStr>>(&mut self, key: K, path: P) -> Result<()> {
-        let size = fs::metadata(path.as_ref())?.len();
-        self.insert_by(key, Some(size), |new_path| {
-            fs::rename(path.as_ref(), new_path).or_else(|_| {
-                warn!("fs::rename failed, falling back to copy!");
-                fs::copy(path.as_ref(), new_path)?;
-                fs::remove_file(path.as_ref()).unwrap_or_else(|e| {
-                    error!("Failed to remove original file in insert_file: {e}");
-                });
-                Ok(())
+        let source = Path::new(path.as_ref());
+        let metadata = fs::symlink_metadata(source)?;
+        if !metadata.file_type().is_file() {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cache source must be a regular file",
+            )));
+        }
+        // A renamed hard link would keep the cache sharing an inode with a
+        // mutable external path. Only the unique-link fast path may rename.
+        #[cfg(unix)]
+        let has_external_links = {
+            use std::os::unix::fs::MetadataExt;
+            metadata.nlink() > 1
+        };
+        #[cfg(windows)]
+        let has_external_links = {
+            use std::mem::MaybeUninit;
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+            };
+
+            let check = || -> io::Result<bool> {
+                let file = File::open(source)?;
+                let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+                // SAFETY: the open File owns a valid live handle; Windows fills
+                // the complete output record on success and retains no pointer.
+                let status =
+                    unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) };
+                if status == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: the API successfully initialized every field.
+                Ok(unsafe { info.assume_init() }.nNumberOfLinks > 1)
+            };
+            check().unwrap_or_else(|error| {
+                warn!("Cannot inspect cache source hard links: {error}; copying instead");
+                true
             })
+        };
+        #[cfg(not(any(unix, windows)))]
+        let has_external_links = true;
+
+        let size = metadata.len();
+        let root = self.root.clone();
+        self.commit_replacement(key.as_ref(), size, |destination| {
+            if !has_external_links
+                && (source == destination || fs::rename(source, destination).is_ok())
+            {
+                return Ok(());
+            }
+            // Shared inodes and cross-device imports need their own contents;
+            // stage the copy so a failure cannot truncate a live cache entry.
+            let staged = tempfile::Builder::new()
+                .prefix(TEMPFILE_PREFIX)
+                .tempfile_in(root)?;
+            fs::copy(source, staged.path())?;
+            staged.persist(destination).map_err(|error| error.error)?;
+            if source != destination
+                && let Err(error) = fs::remove_file(source)
+            {
+                error!("Failed to remove original file in insert_file: {error}");
+            }
+            Ok(())
         })
     }
 
@@ -517,18 +581,11 @@ impl LruDiskCache {
 
         file.flush()?;
         let real_size = file.as_file().metadata()?.len();
-        self.make_space(real_size)?;
-
-        let path = self.rel_to_abs_path(&key);
-        let parent = path.parent().ok_or_else(|| {
-            Error::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cache entry path has no parent directory",
-            ))
+        self.commit_replacement(&key, real_size, |destination| {
+            file.persist(destination)
+                .map_err(|error| error.error)
+                .map(|_| ())
         })?;
-        fs::create_dir_all(parent)?;
-        file.persist(path).map_err(|error| error.error)?;
-        self.lru.insert(key, real_size);
         Ok(())
     }
 
@@ -549,26 +606,33 @@ impl LruDiskCache {
     pub fn get_file<K: AsRef<OsStr>>(&mut self, key: K) -> Result<File> {
         let rel_path = key.as_ref();
         let path = self.rel_to_abs_path(rel_path);
-        self.lru
-            .get(rel_path)
-            .ok_or(Error::FileNotInCache)
-            .and_then(|_| {
-                let mut options = File::options();
-                options.read(true);
-                // Windows requires FILE_WRITE_ATTRIBUTES to set timestamps on
-                // an otherwise read-only handle; do not request write-data access.
-                #[cfg(windows)]
-                {
-                    use fs_err::os::windows::fs::OpenOptionsExt;
-                    use windows_sys::Win32::Foundation::GENERIC_READ;
-                    use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
-                    options.access_mode(GENERIC_READ | FILE_WRITE_ATTRIBUTES);
-                }
-                let file = options.open(path)?;
-                let now = SystemTime::now();
-                file.set_times(FileTimes::new().set_accessed(now).set_modified(now))?;
-                Ok(file)
-            })
+        if self.lru.get(rel_path).is_none() {
+            return Err(Error::FileNotInCache);
+        }
+        let mut options = File::options();
+        options.read(true);
+        // Windows requires FILE_WRITE_ATTRIBUTES to set timestamps on
+        // an otherwise read-only handle; do not request write-data access.
+        #[cfg(windows)]
+        {
+            use fs_err::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Foundation::GENERIC_READ;
+            use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
+            options.access_mode(GENERIC_READ | FILE_WRITE_ATTRIBUTES);
+        }
+        let file = match options.open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // An externally removed cache file is a miss, not an I/O failure.
+                // Forget its size now instead of retaining a phantom LRU entry.
+                self.lru.remove(rel_path);
+                return Err(Error::FileNotInCache);
+            }
+            Err(error) => return Err(Error::Io(error)),
+        };
+        let now = SystemTime::now();
+        file.set_times(FileTimes::new().set_accessed(now).set_modified(now))?;
+        Ok(file)
     }
 
     /// Get an opened readable and seekable handle to the file at `key`, if one exists and can
@@ -589,16 +653,24 @@ impl LruDiskCache {
     ///
     /// Returns an error if an existing cached file cannot be removed.
     pub fn remove<K: AsRef<OsStr>>(&mut self, key: K) -> Result<()> {
-        match self.lru.remove(key.as_ref()) {
-            Some(_) => {
-                let path = self.rel_to_abs_path(key.as_ref());
-                fs::remove_file(&path).map_err(|e| {
-                    error!("Error removing file from cache: `{}`: {e}", path.display());
-                    Into::into(e)
-                })
-            }
-            None => Ok(()),
+        let key = key.as_ref();
+        if !self.lru.contains_key(key) {
+            return Ok(());
         }
+        let path = self.rel_to_abs_path(key);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                error!(
+                    "Error removing file from cache: `{}`: {error}",
+                    path.display()
+                );
+                return Err(Error::Io(error));
+            }
+        }
+        self.lru.remove(key);
+        Ok(())
     }
 }
 
@@ -923,6 +995,122 @@ mod tests {
     }
 
     #[test]
+    fn failed_streaming_replacement_preserves_live_entry_and_restart_state() -> Result<()> {
+        let fixture = TestFixture::new()?;
+        let root = fixture.tmp().join("cache");
+        let mut cache = LruDiskCache::new(&root, 8)?;
+        cache.insert_bytes("key", b"original")?;
+
+        let failure = cache.insert_with("key", |mut file| {
+            file.write_all(b"partial")?;
+            Err(io::Error::other("stream interrupted"))
+        });
+        assert!(failure.is_err());
+        assert_eq!(read_all(&mut cache.get("key")?)?, b"original");
+        assert_eq!(cache.size(), 8);
+        assert!(matches!(
+            cache.insert_with("key", |mut file| file.write_all(b"oversized")),
+            Err(Error::FileTooLarge)
+        ));
+        assert_eq!(read_all(&mut cache.get("key")?)?, b"original");
+
+        cache.insert_bytes("key", b"updated!")?;
+        assert_eq!(cache.size(), 8);
+        assert_eq!(read_all(&mut cache.get("key")?)?, b"updated!");
+        drop(cache);
+        let mut cache = LruDiskCache::new(&root, 8)?;
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.size(), 8);
+        assert_eq!(read_all(&mut cache.get("key")?)?, b"updated!");
+        Ok(())
+    }
+
+    #[test]
+    fn file_replacement_preserves_source_and_cached_entry_on_admission_failure() -> Result<()> {
+        let fixture = TestFixture::new()?;
+        let root = fixture.tmp().join("cache");
+        let mut cache = LruDiskCache::new(&root, 8)?;
+        cache.insert_bytes("key", b"original")?;
+
+        let too_large = fixture.tmp().join("large-source");
+        fs::write(&too_large, b"ninebytes")?;
+        assert!(matches!(
+            cache.insert_file("key", &too_large),
+            Err(Error::FileTooLarge)
+        ));
+        assert_eq!(fs::read(&too_large)?, b"ninebytes");
+        assert_eq!(read_all(&mut cache.get("key")?)?, b"original");
+
+        let replacement = fixture.tmp().join("new-source");
+        fs::write(&replacement, b"replaced")?;
+        cache.insert_file("key", &replacement)?;
+        assert!(!replacement.exists());
+        assert_eq!(cache.size(), 8);
+        assert_eq!(read_all(&mut cache.get("key")?)?, b"replaced");
+        Ok(())
+    }
+
+    #[test]
+    fn non_file_sources_do_not_replace_cached_content() -> Result<()> {
+        let fixture = TestFixture::new()?;
+        let mut cache = LruDiskCache::new(fixture.tmp().join("cache"), 32)?;
+        cache.insert_bytes("entry", b"original")?;
+
+        let directory = fixture.tmp().join("source-directory");
+        fs::create_dir(&directory)?;
+        assert!(matches!(
+            cache.insert_file("entry", &directory),
+            Err(Error::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
+        ));
+
+        #[cfg(unix)]
+        {
+            let source = fixture.tmp().join("external-source");
+            fs::write(&source, b"other")?;
+            let symlink = fixture.tmp().join("source-symlink");
+            std::os::unix::fs::symlink(&source, &symlink)?;
+            assert!(matches!(
+                cache.insert_file("entry", &symlink),
+                Err(Error::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
+            ));
+            assert!(fs::symlink_metadata(&symlink)?.file_type().is_symlink());
+            assert_eq!(fs::read(&source)?, b"other");
+        }
+
+        assert_eq!(read_all(&mut cache.get("entry")?)?, b"original");
+        assert_eq!(cache.size(), 8);
+        Ok(())
+    }
+
+    #[test]
+    fn importing_hardlinks_detaches_external_mutable_inodes() -> Result<()> {
+        let fixture = TestFixture::new()?;
+        let root = fixture.tmp().join("cache");
+        let mut cache = LruDiskCache::new(&root, 32)?;
+        let source = fixture.tmp().join("source");
+        let alias = fixture.tmp().join("external-alias");
+        fs::write(&source, b"original")?;
+        fs::hard_link(&source, &alias)?;
+
+        cache.insert_file("entry", &source)?;
+        assert!(!source.exists());
+        assert_eq!(fs::read(&alias)?, b"original");
+        fs::write(&alias, b"changed!")?;
+        assert_eq!(read_all(&mut cache.get("entry")?)?, b"original");
+
+        // Reimporting the cache's own pathname must also detach any newly
+        // created outside hard link, without deleting the destination.
+        let external = fixture.tmp().join("second-alias");
+        fs::hard_link(root.join("entry"), &external)?;
+        cache.insert_file("entry", root.join("entry"))?;
+        fs::write(&external, b"mutated!")?;
+        assert_eq!(read_all(&mut cache.get("entry")?)?, b"original");
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.size(), 8);
+        Ok(())
+    }
+
+    #[test]
     fn test_prepare_and_commit() -> Result<()> {
         let f = TestFixture::new()?;
         let cache_dir = f.tmp();
@@ -984,6 +1172,63 @@ mod tests {
         // The temporary file should not be there anymore.
         assert!(get_all_files(cache_dir).all(|(file, _)| file != path));
 
+        Ok(())
+    }
+
+    #[test]
+    fn failed_removal_preserves_lru_accounting() -> Result<()> {
+        let fixture = TestFixture::new()?;
+        let root = fixture.tmp().join("cache");
+        let mut cache = LruDiskCache::new(&root, 32)?;
+        cache.insert_bytes("entry", b"payload")?;
+        let path = root.join("entry");
+
+        fs::remove_file(&path)?;
+        fs::create_dir(&path)?;
+        assert!(matches!(cache.remove("entry"), Err(Error::Io(_))));
+        assert!(cache.contains_key("entry"));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.size(), 7);
+
+        fs::remove_dir(&path)?;
+        cache.remove("entry")?;
+        assert!(!cache.contains_key("entry"));
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.size(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn vanished_cache_file_becomes_a_miss_and_releases_accounting() -> Result<()> {
+        let fixture = TestFixture::new()?;
+        let root = fixture.tmp().join("cache");
+        let mut cache = LruDiskCache::new(&root, 32)?;
+        cache.insert_bytes("entry", b"original")?;
+        let path = root.join("entry");
+        fs::remove_file(&path)?;
+
+        #[cfg(unix)]
+        {
+            // A broken path which is not simply missing must keep its
+            // accounting until the filesystem error is resolved.
+            std::os::unix::fs::symlink("entry", &path)?;
+            assert!(matches!(cache.get_file("entry"), Err(Error::Io(_))));
+            assert!(cache.contains_key("entry"));
+            assert_eq!(cache.size(), 8);
+            fs::remove_file(&path)?;
+        }
+
+        assert!(matches!(
+            cache.get_file("entry"),
+            Err(Error::FileNotInCache)
+        ));
+        assert!(!cache.contains_key("entry"));
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.size(), 0);
+
+        cache.insert_bytes("entry", b"replacement")?;
+        assert_eq!(read_all(&mut cache.get("entry")?)?, b"replacement");
+        assert_eq!(cache.size(), 11);
         Ok(())
     }
 
