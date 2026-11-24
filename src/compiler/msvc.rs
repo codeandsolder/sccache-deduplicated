@@ -2724,10 +2724,21 @@ mod test {
         assert_eq!(cmd.args, expected_args);
     }
 
-    #[test]
-    fn test_compile_simple() -> Result<()> {
+    #[test_case::test_case(false; "ordinary")]
+    #[test_case::test_case(true; "existing pdb")]
+    fn test_compile_simple(existing_pdb: bool) -> Result<()> {
         let f = TestFixture::new();
-        let parsed_args = ParsedArguments::test_compile("foo.c", "foo.obj", Language::C);
+        let mut parsed_args = ParsedArguments::test_compile("foo.c", "foo.obj", Language::C);
+        if existing_pdb {
+            parsed_args.compilation_flag = "/c".into();
+            parsed_args.outputs.insert(
+                "pdb",
+                ArtifactDescriptor {
+                    path: f.touch("foo.pdb")?,
+                    optional: false,
+                },
+            );
+        }
         let compiler = &f.bins[0];
         let mut path_transformer = dist::PathTransformer::new();
         let (command, dist_command, cacheable) = generate_compile_commands(CCompileContext {
@@ -2744,7 +2755,14 @@ mod test {
         #[cfg(not(feature = "dist-client"))]
         assert!(dist_command.is_none());
         assert_compile_command_executes(&command)?;
-        assert_eq!(Cacheable::Yes, cacheable);
+        assert_eq!(
+            if existing_pdb {
+                Cacheable::No
+            } else {
+                Cacheable::Yes
+            },
+            cacheable
+        );
         Ok(())
     }
 
@@ -2769,68 +2787,6 @@ mod test {
         .unwrap();
         let expected_args = ovec!["-c", "-Fofoo.obj", "--", "foo.c"];
         assert_eq!(command.arguments, expected_args);
-    }
-
-    #[test]
-    fn test_compile_not_cacheable_pdb() -> Result<()> {
-        let f = TestFixture::new();
-        let pdb = f.touch("foo.pdb").unwrap();
-        let parsed_args = ParsedArguments {
-            input: "foo.c".into(),
-            double_dash_input: false,
-            language: Language::C,
-            compilation_flag: "/c".into(),
-            depfile: None,
-            outputs: vec![
-                (
-                    "obj",
-                    ArtifactDescriptor {
-                        path: "foo.obj".into(),
-                        optional: false,
-                    },
-                ),
-                (
-                    "pdb",
-                    ArtifactDescriptor {
-                        path: pdb,
-                        optional: false,
-                    },
-                ),
-            ]
-            .into_iter()
-            .collect(),
-            dependency_args: vec![],
-            preprocessor_args: vec![],
-            common_args: vec![],
-            arch_args: vec![],
-            unhashed_args: vec![],
-            extra_dist_files: vec![],
-            extra_hash_files: vec![],
-            uses_external_assembler: false,
-            msvc_show_includes: false,
-            profile_generate: false,
-            color_mode: ColorMode::Auto,
-            suppress_rewrite_includes_only: false,
-            too_hard_for_preprocessor_cache_mode: None,
-        };
-        let compiler = &f.bins[0];
-        let mut path_transformer = dist::PathTransformer::new();
-        let (command, dist_command, cacheable) = generate_compile_commands(CCompileContext {
-            path_transformer: &mut path_transformer,
-            executable: compiler,
-            parsed_args: &parsed_args,
-            cwd: f.tempdir.path(),
-            env_vars: &[],
-            rewrite_includes_only: false,
-        })
-        .unwrap();
-        #[cfg(feature = "dist-client")]
-        assert!(dist_command.is_some());
-        #[cfg(not(feature = "dist-client"))]
-        assert!(dist_command.is_none());
-        assert_compile_command_executes(&command)?;
-        assert_eq!(Cacheable::No, cacheable);
-        Ok(())
     }
 
     #[test]

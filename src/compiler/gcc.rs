@@ -2937,24 +2937,7 @@ mod test {
                 .contains(&OsString::from("-fno-unwind-tables"))
         );
 
-        let f = TestFixture::new();
-        let mut path_transformer = dist::PathTransformer::new();
-        let (_, dist_command, _) = generate_compile_commands(
-            CCompileContext {
-                path_transformer: &mut path_transformer,
-                executable: &f.bins[0],
-                parsed_args: &parsed_args,
-                cwd: f.tempdir.path(),
-                env_vars: &[],
-                rewrite_includes_only: false,
-            },
-            CCompilerKind::Clang,
-            language_to_gcc_arg,
-        )
-        .unwrap();
-        let arguments = dist_command
-            .expect("assembler compile should distribute")
-            .arguments;
+        let arguments = dist_assembler_arguments(&parsed_args, false);
         assert!(arguments.windows(2).any(|w| w == ["-x", "assembler"]));
         assert!(!arguments.iter().any(|arg| arg == "-DMAGIC=1"));
         assert!(!arguments.iter().any(|arg| arg == "-UOLD_MAGIC"));
@@ -3056,6 +3039,27 @@ mod test {
         );
     }
 
+    #[cfg(feature = "dist-client")]
+    fn dist_assembler_arguments(parsed_args: &ParsedArguments, rewrite: bool) -> Vec<String> {
+        let f = TestFixture::new();
+        let (_, dist_command, _) = generate_compile_commands(
+            CCompileContext {
+                path_transformer: &mut dist::PathTransformer::new(),
+                executable: &f.bins[0],
+                parsed_args,
+                cwd: f.tempdir.path(),
+                env_vars: &[],
+                rewrite_includes_only: rewrite,
+            },
+            CCompilerKind::Clang,
+            language_to_gcc_arg,
+        )
+        .unwrap();
+        dist_command
+            .expect("assembler compile should distribute")
+            .arguments
+    }
+
     #[test]
     #[cfg(feature = "dist-client")]
     fn test_dist_rewrite_includes_drops_preprocessor_args() {
@@ -3076,24 +3080,7 @@ mod test {
             other => panic!("Got unexpected parse result: {other:?}"),
         };
 
-        let f = TestFixture::new();
-        let mut path_transformer = dist::PathTransformer::new();
-        let (_, dist_command, _) = generate_compile_commands(
-            CCompileContext {
-                path_transformer: &mut path_transformer,
-                executable: &f.bins[0],
-                parsed_args: &parsed_args,
-                cwd: f.tempdir.path(),
-                env_vars: &[],
-                rewrite_includes_only: true,
-            },
-            CCompilerKind::Clang,
-            language_to_gcc_arg,
-        )
-        .unwrap();
-        let arguments = dist_command
-            .expect("assembler compile should distribute")
-            .arguments;
+        let arguments = dist_assembler_arguments(&parsed_args, true);
         assert!(
             arguments
                 .windows(2)
@@ -3121,24 +3108,7 @@ mod test {
         };
         parsed_args.suppress_rewrite_includes_only = true;
 
-        let f = TestFixture::new();
-        let mut path_transformer = dist::PathTransformer::new();
-        let (_, dist_command, _) = generate_compile_commands(
-            CCompileContext {
-                path_transformer: &mut path_transformer,
-                executable: &f.bins[0],
-                parsed_args: &parsed_args,
-                cwd: f.tempdir.path(),
-                env_vars: &[],
-                rewrite_includes_only: true,
-            },
-            CCompilerKind::Clang,
-            language_to_gcc_arg,
-        )
-        .unwrap();
-        let arguments = dist_command
-            .expect("assembler compile should distribute")
-            .arguments;
+        let arguments = dist_assembler_arguments(&parsed_args, true);
         assert!(arguments.windows(2).any(|w| w == ["-x", "assembler"]));
         assert!(!arguments.iter().any(|arg| arg == "-DMAGIC=1"));
     }
