@@ -21,6 +21,8 @@
 use std::{
     collections::{BTreeMap, HashSet},
     ffi::{OsStr, OsString},
+    fs::Metadata,
+    hash::Hash,
     io::Write,
     path::{Path, PathBuf},
     sync::LazyLock,
@@ -28,12 +30,14 @@ use std::{
 };
 
 use anyhow::Context;
-use chrono::Datelike;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     config::PreprocessorCacheModeConfig,
-    util::{Digest, MetadataCtimeExt, Timestamp, encode_path, strip_basedirs},
+    util::{
+        Digest, HashToDigest, MetadataCtimeExt, TimeMacroFinder, Timestamp, encode_path,
+        strip_basedirs,
+    },
 };
 
 use super::Language;
@@ -61,11 +65,15 @@ pub struct PreprocessorCacheEntry {
 }
 
 impl PreprocessorCacheEntry {
+    #[must_use = "the new entry holds preprocessor results"]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Tries to deserialize a preprocessor cache entry from `contents`
+    /// Tries to deserialize a preprocessor cache entry from `contents`.
+    ///
+    /// # Errors
+    /// Returns an error for an unknown format version or invalid encoded entry.
     pub fn read(contents: &[u8]) -> Result<Self, Error> {
         if contents.is_empty() {
             Ok(Self {
@@ -79,7 +87,10 @@ impl PreprocessorCacheEntry {
         }
     }
 
-    /// Serialize the preprocessor cache entry to `buf`
+    /// Serialize the preprocessor cache entry to `buf`.
+    ///
+    /// # Errors
+    /// Returns an error if writing or serializing the entry fails.
     pub fn serialize_to(&self, mut buf: impl Write) -> Result<(), Error> {
         // Add the starting byte for version check since `bincode` doesn't
         // support it.
@@ -175,32 +186,15 @@ impl PreprocessorCacheEntry {
 
     /// Returns the digest of the first result whose expected included files
     /// are already on disk and have not changed.
-    pub fn lookup_result_digest(
-        &mut self,
-        config: PreprocessorCacheModeConfig,
-        updated: &mut bool,
-    ) -> Option<String> {
-        // Check newest result first since it's more likely to match.
-        for (digest, includes) in self.results.iter_mut().rev() {
-            let result_matches = Self::result_matches(digest, includes, config, updated);
-            if result_matches {
-                return Some(digest.clone());
-            }
-        }
-        None
+    #[must_use = "the returned digest identifies a validated compilation result"]
+    pub fn lookup_result_digest(&self, config: PreprocessorCacheModeConfig) -> Option<String> {
+        self.results.iter().rev().find_map(|(digest, includes)| {
+            Self::result_matches(includes, config).then(|| digest.clone())
+        })
     }
 
-    /// A result matches if all of its include files exist on disk and have not changed.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "preprocessor validation intentionally short-circuits metadata and content checks in policy order; one routine keeps that policy reviewable"
-    )]
-    fn result_matches(
-        digest: &str,
-        includes: &mut [IncludeEntry],
-        config: PreprocessorCacheModeConfig,
-        updated: &mut bool,
-    ) -> bool {
+    /// A result matches if all included files still have the recorded contents.
+    fn result_matches(includes: &[IncludeEntry], config: PreprocessorCacheModeConfig) -> bool {
         for include in includes {
             let path = Path::new(include.path.as_os_str());
             let meta = match std::fs::symlink_metadata(path) {
@@ -219,7 +213,7 @@ impl PreprocessorCacheEntry {
                 }
             };
 
-            if config.file_stat_matches {
+            if config.file_stat_matches && !meta.file_type().is_symlink() {
                 match (include.mtime, include.ctime) {
                     (Some(mtime), Some(ctime)) if config.use_ctime_for_stat => {
                         let mtime_matches = meta.modified().map(Into::into).ok() == Some(mtime);
@@ -242,108 +236,26 @@ impl PreprocessorCacheEntry {
                 }
             }
 
-            let file = match std::fs::File::open(path) {
-                Ok(file) => file,
+            let (new_digest, finder) = match file_digest(path, Some(&meta)) {
+                Ok(digest) => digest,
                 Err(e) => {
                     debug!(
-                        "{} is in a preprocessor cache entry but can't be opened ({e})",
+                        "{} is in a preprocessor cache entry but can't be read ({e:#})",
                         path.display()
                     );
                     return false;
                 }
             };
 
-            if config.ignore_time_macros {
-                match Digest::reader_sync(file) {
-                    Ok(new_digest) => {
-                        if include.digest != new_digest {
-                            return false;
-                        }
-                    }
-                    Err(e) => {
-                        debug!(
-                            "{} is in a preprocessor cache entry but can't be read ({e})",
-                            path.display()
-                        );
-                        return false;
-                    }
-                }
-            } else {
-                let (new_digest, finder): (String, _) = match Digest::reader_sync_time_macros(file)
-                {
-                    Ok((new_digest, finder)) => (new_digest, finder),
-                    Err(e) => {
-                        debug!(
-                            "{} is in a preprocessor cache entry but can't be read ({e})",
-                            path.display()
-                        );
-                        return false;
-                    }
-                };
-                if !finder.found_time_macros() && include.digest != new_digest {
-                    return false;
-                }
-                if finder.found_time() {
-                    // We don't know for sure that the program actually uses the __TIME__ macro,
-                    // but we have to assume it anyway and hash the time stamp. However, that's
-                    // not very useful since the chance that we get a cache hit later the same
-                    // second should be quite slim... So, just signal back to the caller that
-                    // __TIME__ has been found so that the preprocessor cache mode can be disabled.
-                    debug!("Found __TIME__ in {}", path.display());
-                    return false;
-                }
-
-                // __DATE__ or __TIMESTAMP__ found. We now make sure that the digest changes
-                // if the (potential) expansion of those macros changes by computing a new
-                // digest comprising the file digest and time information that represents the
-                // macro expansions.
-                let mut new_digest = Digest::new();
-                new_digest.update(digest.as_bytes());
-
-                if finder.found_date() {
-                    debug!("found __DATE__ in {}", path.display());
-                    new_digest.delimiter(b"date");
-                    let date = chrono::Local::now().date_naive();
-                    new_digest.update(&date.year().to_le_bytes());
-                    new_digest.update(&date.month().to_le_bytes());
-                    new_digest.update(&date.day().to_le_bytes());
-
-                    // If the compiler has support for it, the expansion of __DATE__ will change
-                    // according to the value of SOURCE_DATE_EPOCH. Note: We have to hash both
-                    // SOURCE_DATE_EPOCH and the current date since we can't be sure that the
-                    // compiler honors SOURCE_DATE_EPOCH.
-                    if let Ok(source_date_epoch) = std::env::var("SOURCE_DATE_EPOCH") {
-                        new_digest.update(source_date_epoch.as_bytes());
-                    }
-                }
-
-                if finder.found_timestamp() {
-                    debug!("found __TIMESTAMP__ in {}", path.display());
-                    let meta = match std::fs::symlink_metadata(path) {
-                        Ok(meta) => meta,
-                        Err(e) => {
-                            debug!(
-                                "{} is in a preprocessor cache entry but can't be read ({e})",
-                                path.display()
-                            );
-                            return false;
-                        }
-                    };
-                    let Ok(mtime) = meta.modified() else {
-                        debug!(
-                            "Couldn't get mtime of {} which contains __TIMESTAMP__",
-                            path.display()
-                        );
-                        return false;
-                    };
-                    let mtime: chrono::DateTime<chrono::Local> = chrono::DateTime::from(mtime);
-                    new_digest.delimiter(b"timestamp");
-                    new_digest.update(&mtime.naive_local().and_utc().timestamp().to_le_bytes());
-                    include.digest = new_digest.finish();
-                    // Signal that the preprocessor cache entry has been updated and needs to be
-                    // written to disk.
-                    *updated = true;
-                }
+            if !config.ignore_time_macros && finder.found_time_macros() {
+                // The compiler owns the expansion semantics (including its
+                // environment and clock). Only the preprocessed bytes can
+                // establish equivalence in this case. A direct hit cannot.
+                debug!("Time macro in {}", path.display());
+                return false;
+            }
+            if include.digest != new_digest {
+                return false;
             }
         }
         true
@@ -406,6 +318,8 @@ pub fn preprocessor_cache_entry_hash_key(
     // we have to incorporate that into the hash as well.
     m.update(&[u8::from(plusplus)]);
     m.update(&[FORMAT_VERSION]);
+    m.delimiter(b"direct-time-policy-v1");
+    m.update(&[u8::from(config.ignore_time_macros)]);
     m.update(language.as_str().as_bytes());
     hash_arguments(&mut m, arguments, basedirs);
     // Include every value that participates in the result key before storing
@@ -430,28 +344,175 @@ pub fn preprocessor_cache_entry_hash_key(
     // Strip basedirs from the input file path if configured
     let buf_to_hash = strip_basedirs(&buf, basedirs);
     hash_length_prefixed(&mut m, &buf_to_hash);
-    let reader = std::fs::File::open(input_file)
+    let (digest, finder) = file_digest(input_file, None)
         .with_context(|| format!("while hashing the input file '{}'", input_file.display()))?;
-
-    let digest = if config.ignore_time_macros {
-        Digest::reader_sync(reader)?
-    } else {
-        let (digest, finder) = Digest::reader_sync_time_macros(reader)?;
-        if finder.found_time() {
-            // Disable preprocessor cache mode
-            debug!("Found __TIME__ in {}", input_file.display());
-            return Ok(None);
-        }
-        digest
-    };
+    if !config.ignore_time_macros && finder.found_time_macros() {
+        // Disable preprocessor cache mode
+        debug!("Time macro in {}", input_file.display());
+        return Ok(None);
+    }
     m.update(digest.as_bytes());
     Ok(Some(m.finish()))
+}
+
+/// Digest of the contents of `path`, and the time macros found in it.
+/// `lstat` is the caller's `symlink_metadata` of `path`, if it has one: unless
+/// `path` is a symlink, it saves stat-ing the file again.
+#[cfg(unix)]
+fn file_digest(path: &Path, lstat: Option<&Metadata>) -> anyhow::Result<(String, TimeMacroFinder)> {
+    digest_cache::file_digest_at(path, lstat, SystemTime::now())
+}
+
+// Not remembered on Windows: there is no inode number, and the creation time
+// that stands in for the ctime does not change when a file is rewritten.
+#[cfg(not(unix))]
+fn file_digest(
+    path: &Path,
+    _lstat: Option<&Metadata>,
+) -> anyhow::Result<(String, TimeMacroFinder)> {
+    Digest::reader_sync_time_macros(std::fs::File::open(path)?)
+}
+
+#[cfg(unix)]
+mod digest_cache {
+    use super::{
+        Digest, Metadata, MetadataCtimeExt, Path, PathBuf, SystemTime, TimeMacroFinder, Timestamp,
+    };
+    use crate::lru_disk_cache::lru_cache::LruCache;
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::{LazyLock, Mutex};
+    use std::time::Duration;
+
+    /// Digests of the files hashed for the preprocessor cache, so that a
+    /// direct-mode hit does not re-read and re-hash every header.
+    pub(super) static FILE_DIGESTS: LazyLock<Mutex<LruCache<PathBuf, CachedFileDigest>>> =
+        LazyLock::new(|| Mutex::new(LruCache::new(MAX_CACHED_FILE_DIGESTS)));
+
+    /// Maximum number of memoized paths; cold entries are evicted individually.
+    const MAX_CACHED_FILE_DIGESTS: u64 = 100_000;
+
+    /// How old a file's mtime and ctime must be for its digest to be remembered.
+    /// File timestamps come from a coarse clock, so a file rewritten right after
+    /// being hashed can keep the timestamps it was hashed with.
+    const MIN_CACHED_FILE_AGE: Duration = Duration::from_secs(2);
+
+    /// What has to be unchanged for a remembered digest to be reused.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct FileStat {
+        len: u64,
+        mtime: Option<Timestamp>,
+        ctime: Option<Timestamp>,
+        dev: u64,
+        ino: u64,
+    }
+
+    impl FileStat {
+        fn new(meta: &Metadata) -> Self {
+            Self {
+                len: meta.len(),
+                mtime: meta.modified().ok().map(Into::into),
+                ctime: meta.ctime_or_creation().ok(),
+                dev: meta.dev(),
+                ino: meta.ino(),
+            }
+        }
+
+        /// Whether the file was last changed long enough before `now` for its
+        /// timestamps to tell any later change apart.
+        fn is_settled(&self, now: SystemTime) -> bool {
+            let Some(limit) = now.checked_sub(MIN_CACHED_FILE_AGE) else {
+                return false;
+            };
+            matches!((self.mtime, self.ctime), (Some(mtime), Some(ctime)) if mtime.max(ctime) < limit.into())
+        }
+    }
+
+    #[derive(Debug)]
+    pub(super) struct CachedFileDigest {
+        stat: FileStat,
+        digest: String,
+        found_date: bool,
+        found_time: bool,
+        found_timestamp: bool,
+    }
+
+    /// The digest remembered for `path`, if the file has not changed since.
+    fn remembered_file_digest(
+        path: &Path,
+        lstat: Option<&Metadata>,
+    ) -> Option<(String, TimeMacroFinder)> {
+        // A stat of the path is enough to reuse a digest: it describes the file as
+        // it is now, which is what the digest has to match.
+        let target_meta;
+        let meta = match lstat {
+            Some(meta) if !meta.file_type().is_symlink() => meta,
+            _ => {
+                target_meta = std::fs::metadata(path).ok()?;
+                &target_meta
+            }
+        };
+        if !meta.is_file() {
+            return None;
+        }
+        let stat = FileStat::new(meta);
+        let (digest, date, time, timestamp) = {
+            let mut digests = FILE_DIGESTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cached = digests.get(path).filter(|cached| cached.stat == stat)?;
+            let result = (
+                cached.digest.clone(),
+                cached.found_date,
+                cached.found_time,
+                cached.found_timestamp,
+            );
+            drop(digests);
+            result
+        };
+        Some((digest, TimeMacroFinder::with_found(date, time, timestamp)))
+    }
+
+    /// [`file_digest`], with `now` deciding whether the file is old enough to be
+    /// remembered.
+    pub(super) fn file_digest_at(
+        path: &Path,
+        lstat: Option<&Metadata>,
+        now: SystemTime,
+    ) -> anyhow::Result<(String, TimeMacroFinder)> {
+        if let Some(cached) = remembered_file_digest(path, lstat) {
+            return Ok(cached);
+        }
+
+        let file = std::fs::File::open(path)?;
+        // From the open file rather than the path, so that it describes what is read.
+        let metadata = file.metadata()?;
+        let stat = FileStat::new(&metadata);
+        let (digest, finder) = Digest::reader_sync_time_macros(&file)?;
+        // Not remembered if it changed while being read.
+        if metadata.is_file() && stat.is_settled(now) && FileStat::new(&file.metadata()?) == stat {
+            let mut digests = FILE_DIGESTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            digests.insert(
+                path.to_owned(),
+                CachedFileDigest {
+                    stat,
+                    digest: digest.clone(),
+                    found_date: finder.found_date(),
+                    found_time: finder.found_time(),
+                    found_timestamp: finder.found_timestamp(),
+                },
+            );
+        }
+        Ok((digest, finder))
+    }
 }
 
 /// Corresponds to a cached include file used in the pre-processor stage
 #[derive(Clone, Deserialize, Serialize, Debug, PartialEq, Eq)]
 pub struct IncludeEntry {
     /// Its absolute path
+    #[serde(deserialize_with = "deserialize_os_string")]
     path: OsString,
     /// The hash of its contents
     digest: String,
@@ -461,6 +522,68 @@ pub struct IncludeEntry {
     mtime: Option<Timestamp>,
     /// Its status change time, `None` if not recorded.
     ctime: Option<Timestamp>,
+}
+
+/// Reads an `OsString` in serde's encoding of it, but its bytes as one buffer
+/// rather than one at a time: bincode encodes both the same way.
+fn deserialize_os_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<OsString, D::Error> {
+    // The other platform's variant is only read to be rejected.
+    #[derive(Deserialize)]
+    enum OsStringRepr {
+        Unix(Bytes),
+        Windows(Vec<u16>),
+    }
+
+    match OsStringRepr::deserialize(deserializer)? {
+        #[cfg(unix)]
+        OsStringRepr::Unix(Bytes(bytes)) => Ok(std::os::unix::ffi::OsStringExt::from_vec(bytes)),
+        #[cfg(windows)]
+        OsStringRepr::Windows(wide) => Ok(std::os::windows::ffi::OsStringExt::from_wide(&wide)),
+        #[cfg(not(unix))]
+        OsStringRepr::Unix(Bytes(bytes)) => {
+            drop(bytes);
+            Err(serde::de::Error::custom(
+                "cannot deserialize an OsString from another platform",
+            ))
+        }
+        #[cfg(not(windows))]
+        OsStringRepr::Windows(wide) => {
+            drop(wide);
+            Err(serde::de::Error::custom(
+                "cannot deserialize an OsString from another platform",
+            ))
+        }
+    }
+}
+
+/// A `Vec<u8>` read as a byte buffer rather than as a sequence of bytes.
+// Only `Unix` paths are made of bytes; elsewhere they are only read to be rejected.
+struct Bytes(Vec<u8>);
+
+impl<'de> Deserialize<'de> for Bytes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BytesVisitor;
+
+        impl serde::de::Visitor<'_> for BytesVisitor {
+            type Value = Bytes;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("bytes")
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Bytes, E> {
+                Ok(Bytes(v.to_vec()))
+            }
+
+            fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Bytes, E> {
+                Ok(Bytes(v))
+            }
+        }
+
+        deserializer.deserialize_byte_buf(BytesVisitor)
+    }
 }
 
 #[derive(Debug)]
@@ -500,7 +623,11 @@ impl std::error::Error for Error {}
 mod test {
     use crate::util::{HASH_BUFFER_SIZE, MAX_TIME_MACRO_HAYSTACK_LEN};
 
+    #[cfg(unix)]
+    use super::digest_cache::{FILE_DIGESTS, file_digest_at};
     use super::*;
+    #[cfg(unix)]
+    use std::time::Duration;
 
     #[cfg(unix)]
     #[test]
@@ -720,7 +847,7 @@ mod test {
         fs::write(&first_path, first_contents).unwrap();
         fs::write(&second_path, second_contents).unwrap();
 
-        let mut includes = vec![
+        let includes = vec![
             IncludeEntry {
                 path: first_path.into_os_string(),
                 digest: Digest::reader_sync(first_contents.as_slice()).unwrap(),
@@ -743,18 +870,80 @@ mod test {
             ignore_time_macros: true,
             ..PreprocessorCacheModeConfig::activated()
         };
-        let mut updated = false;
+        assert!(!PreprocessorCacheEntry::result_matches(&includes, config));
+    }
 
-        assert!(!PreprocessorCacheEntry::result_matches(
-            "result-digest",
-            &mut includes,
-            config,
-            &mut updated
-        ));
+    #[test_case::test_case("__DATE__"; "date")]
+    #[test_case::test_case("__TIME__"; "time")]
+    #[test_case::test_case("__TIMESTAMP__"; "timestamp")]
+    fn time_macros_require_the_actual_preprocessor(token: &str) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("header.h");
+        let source = format!("const char *value = {token};");
+        std::fs::write(&file, &source)?;
+        let config = PreprocessorCacheModeConfig::activated();
+        let ignored = PreprocessorCacheModeConfig {
+            ignore_time_macros: true,
+            ..config
+        };
+        let key = |config| {
+            preprocessor_cache_entry_hash_key(PreprocessorCacheKey {
+                compiler_digest: "compiler",
+                language: Language::C,
+                arguments: &[],
+                extra_hashes: &[],
+                assembler_digest: None,
+                env_vars: &[],
+                input_file: &file,
+                plusplus: false,
+                config,
+                basedirs: &[],
+            })
+        };
+
+        assert!(key(config)?.is_none());
+        assert!(key(ignored)?.is_some());
+
+        let includes = [IncludeEntry {
+            path: file.into_os_string(),
+            digest: Digest::reader_sync(source.as_bytes())?,
+            file_size: source.len() as u64,
+            mtime: None,
+            ctime: None,
+        }];
+        assert!(!PreprocessorCacheEntry::result_matches(&includes, config));
+        assert!(PreprocessorCacheEntry::result_matches(&includes, ignored));
+        Ok(())
     }
 
     #[test]
-    fn test_basename_aware_direct_index_rejects_old_keys() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    fn metadata_shortcut_never_trusts_the_symlink_instead_of_the_target() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("real.h");
+        let link = dir.path().join("link.h");
+        std::fs::write(&target, b"int a;")?;
+        std::os::unix::fs::symlink(&target, &link)?;
+        let meta = std::fs::symlink_metadata(&link)?;
+        let includes = [IncludeEntry {
+            path: link.into_os_string(),
+            digest: Digest::reader_sync(&b"int a;"[..])?,
+            file_size: meta.len(),
+            mtime: Some(meta.modified()?.into()),
+            ctime: Some(meta.ctime_or_creation()?),
+        }];
+        let config = PreprocessorCacheModeConfig {
+            file_stat_matches: true,
+            ..PreprocessorCacheModeConfig::activated()
+        };
+        assert!(PreprocessorCacheEntry::result_matches(&includes, config));
+        std::fs::write(&target, b"int b;")?;
+        assert!(!PreprocessorCacheEntry::result_matches(&includes, config));
+        Ok(())
+    }
+
+    #[test]
+    fn test_basename_domain_only_affects_non_device_direct_index_keys() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let file = dir.path().join("test.c");
         let source = b"int x;";
@@ -785,6 +974,8 @@ mod test {
             let mut without_name = Digest::new();
             without_name.update(b"compiler");
             without_name.update(&[0, FORMAT_VERSION]);
+            without_name.delimiter(b"direct-time-policy-v1");
+            without_name.update(&[0]);
             without_name.update(language.as_str().as_bytes());
             hash_arguments(&mut without_name, &[], &[]);
             hash_auxiliary_inputs(&mut without_name, &[], None);
@@ -881,5 +1072,167 @@ mod test {
             hash1_no_basedirs, hash2_no_basedirs,
             "Hashes should be different without basedirs for files in different directories"
         );
+    }
+
+    #[cfg(unix)]
+    fn is_digest_cached(path: &Path) -> bool {
+        FILE_DIGESTS.lock().unwrap().contains_key(path)
+    }
+
+    /// Writes `contents` to `path` until its ctime changes: file timestamps come
+    /// from a coarse clock, which ticks once a second on some filesystems.
+    #[cfg(unix)]
+    fn rewrite_with_new_ctime(path: &Path, contents: &[u8]) {
+        let ctime = || {
+            std::fs::metadata(path)
+                .unwrap()
+                .ctime_or_creation()
+                .unwrap()
+        };
+        let before = ctime();
+        for _ in 0..300 {
+            std::thread::sleep(Duration::from_millis(10));
+            std::fs::write(path, contents).unwrap();
+            if ctime() != before {
+                return;
+            }
+        }
+        panic!("the ctime of {} did not change", path.display());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_file_digest_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("header.h");
+        std::fs::write(&path, b"#define A __DATE__\n").unwrap();
+        // Far enough ahead for the file to count as settled.
+        let later = SystemTime::now() + Duration::from_secs(60);
+
+        let (digest, finder) = file_digest_at(&path, None, later).unwrap();
+        assert!(is_digest_cached(&path));
+        assert!(finder.found_date() && !finder.found_time());
+
+        let (cached_digest, cached_finder) = file_digest_at(&path, None, later).unwrap();
+        assert_eq!(digest, cached_digest);
+        assert!(cached_finder.found_date() && !cached_finder.found_time());
+
+        // Same size, different contents, mtime put back: the ctime still changes.
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        rewrite_with_new_ctime(&path, b"#define B __TIME__\n");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+
+        let (new_digest, new_finder) = file_digest_at(&path, None, later).unwrap();
+        assert_ne!(digest, new_digest);
+        assert_eq!(
+            new_digest,
+            Digest::reader_sync(&b"#define B __TIME__\n"[..]).unwrap()
+        );
+        assert!(new_finder.found_time() && !new_finder.found_date());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_file_digest_recent_file_not_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("header.h");
+        std::fs::write(&path, b"int x;\n").unwrap();
+
+        let (digest, _) = file_digest(&path, None).unwrap();
+        assert_eq!(digest, Digest::reader_sync(&b"int x;\n"[..]).unwrap());
+        assert!(!is_digest_cached(&path));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_file_digest_cache_through_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.h");
+        let link = dir.path().join("link.h");
+        std::fs::write(&target, b"int a;\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let later = SystemTime::now() + Duration::from_secs(60);
+
+        let lstat = std::fs::symlink_metadata(&link).unwrap();
+        let (digest, _) = file_digest_at(&link, Some(&lstat), later).unwrap();
+        assert!(is_digest_cached(&link));
+
+        // The link itself is untouched, so its lstat is the same: only the
+        // target's stat can tell that the contents changed.
+        rewrite_with_new_ctime(&target, b"int b;\n");
+        let lstat = std::fs::symlink_metadata(&link).unwrap();
+        let (new_digest, _) = file_digest_at(&link, Some(&lstat), later).unwrap();
+        assert_ne!(digest, new_digest);
+        assert_eq!(new_digest, Digest::reader_sync(&b"int b;\n"[..]).unwrap());
+    }
+
+    #[test]
+    fn test_deserialize_os_string_matches_serde_encoding() {
+        #[derive(Deserialize)]
+        struct Path(#[serde(deserialize_with = "deserialize_os_string")] OsString);
+
+        let paths = [
+            OsString::new(),
+            OsString::from("/usr/include/stdio.h"),
+            OsString::from("/home/\u{e9}t\u{e9}/header with spaces.h"),
+        ];
+        #[cfg(unix)]
+        let paths = paths
+            .into_iter()
+            .chain([std::os::unix::ffi::OsStringExt::from_vec(vec![
+                b'/', 0xff, 0xfe, b'x',
+            ])]);
+        for path in paths {
+            let encoded = bincode::serialize(&path).unwrap();
+            let decoded: Path = bincode::deserialize(&encoded).unwrap();
+            assert_eq!(decoded.0, path);
+        }
+    }
+
+    #[test]
+    fn test_deserialize_os_string_from_other_platform() {
+        #[derive(Deserialize)]
+        struct Path(#[serde(deserialize_with = "deserialize_os_string")] OsString);
+        #[derive(Serialize)]
+        enum OsStringRepr {
+            Unix(Vec<u8>),
+            Windows(Vec<u16>),
+        }
+
+        let other = if cfg!(unix) {
+            OsStringRepr::Windows(vec![u16::from(b'a')])
+        } else {
+            OsStringRepr::Unix(b"a".to_vec())
+        };
+        let encoded = bincode::serialize(&other).unwrap();
+        match bincode::deserialize::<Path>(&encoded) {
+            Ok(path) => panic!("read {:?} from another platform", path.0),
+            Err(e) => assert!(e.to_string().contains("another platform"), "{e}"),
+        }
+    }
+
+    #[test]
+    fn test_preprocessor_cache_entry_roundtrip() {
+        let mut entry = PreprocessorCacheEntry::new();
+        let includes = (0..300)
+            .map(|i| IncludeEntry {
+                path: OsString::from(format!("/usr/include/c++/14/header{i}.h")),
+                digest: format!("digest{i}"),
+                file_size: i,
+                mtime: Some(Timestamp::from(SystemTime::UNIX_EPOCH)),
+                ctime: None,
+            })
+            .collect();
+        entry.number_of_entries = 300;
+        entry.results.insert("result".to_owned(), includes);
+
+        let mut buf = vec![];
+        entry.serialize_to(&mut buf).unwrap();
+        assert_eq!(PreprocessorCacheEntry::read(&buf).unwrap(), entry);
     }
 }
