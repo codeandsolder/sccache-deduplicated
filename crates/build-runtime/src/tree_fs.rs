@@ -105,7 +105,7 @@ impl Drop for MaterializedTree {
     }
 }
 
-pub(crate) fn restore_mutable_directories(root: &Path) {
+pub fn restore_mutable_directories(root: &Path) {
     // Execution has stopped. The private parent is never exposed to the
     // sandbox. Walk the current tree without following replacement links.
     let mut pending = vec![root.to_owned()];
@@ -205,13 +205,13 @@ pub fn materialize_tree(
     Ok(tree)
 }
 
-pub(crate) fn apply_metadata(path: &Path, metadata: TreeMetadata) -> Result<()> {
+pub fn apply_metadata(path: &Path, metadata: TreeMetadata) -> Result<()> {
     set_timestamp(path, metadata.modified)?;
     fs::set_permissions(path, fs::Permissions::from_mode(metadata.mode))?;
     Ok(())
 }
 
-pub(crate) fn set_timestamp(path: &Path, timestamp: TreeTimestamp) -> Result<()> {
+pub fn set_timestamp(path: &Path, timestamp: TreeTimestamp) -> Result<()> {
     let time = Timespec {
         tv_sec: timestamp.seconds,
         tv_nsec: timestamp.nanoseconds.into(),

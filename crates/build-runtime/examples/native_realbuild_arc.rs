@@ -500,13 +500,15 @@ mod linux {
                 execution.status()
             );
         }
-        let blob = execution
+        let artifact = execution
             .successful_result()
             .context("successful result missing")?
             .outputs
             .get("obj")
-            .context("output object missing")?
-            .blob;
+            .context("output object missing")?;
+        let sccache_build::Artifact::File { blob, .. } = artifact else {
+            anyhow::bail!("compiler object is not a file");
+        };
         let mut compiled = Vec::new();
         execution.open_blob(blob.id)?.read_to_end(&mut compiled)?;
         ensure!(
