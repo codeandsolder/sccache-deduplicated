@@ -683,8 +683,9 @@ impl NativeStore {
         })
     }
 
-    /// Retain an already encoded CAS object without re-encoding it.
-    /// The decoded bytes must match the advertised original content ID.
+    /// Verify incoming physical content and retain it in the local backend's
+    /// format. ZFS stores plaintext; non-ZFS stores independently compressed
+    /// chunks. Logical IDs are always checked against decoded bytes.
     ///
     /// # Errors
     /// Returns an error for corruption, truncation or unexpected content.

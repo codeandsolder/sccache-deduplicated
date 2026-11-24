@@ -1,6 +1,7 @@
 //! Run a declared native action and retain independently readable output
-//! descriptors. Each captured output is compressed and hashed once. The
-//! worker uploads that representation directly, without an intermediary archive.
+//! descriptors. Captured outputs are hashed once and stored in the worker's
+//! selected physical format: plain on ZFS, indexed Zstd elsewhere. Transfers
+//! may encode the plain ZFS bytes temporarily to save network bandwidth.
 
 use std::{
     collections::{BTreeMap, BTreeSet},

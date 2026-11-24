@@ -402,8 +402,9 @@ impl NativeCacheClient {
         })
     }
 
-    /// Publish a tree that is already resident as encoded CAS objects.
-    /// The wire bytes are sent exactly as stored, without another compression pass.
+    /// Publish a tree from its local physical CAS representation.
+    /// Already encoded data travels unchanged, while native ZFS raw content
+    /// is compressed temporarily for transfer without changing its disk format.
     ///
     /// # Errors
     /// Returns an error if a reserved blob is absent or fails remote validation.
@@ -563,8 +564,8 @@ impl NativeCacheClient {
         self.upload_stored_file(ticket, blob, BlobEncoding::ZstdChunks, encoded)
     }
 
-    /// Transfer an already-compressed immutable CAS blob without encoding again.
-    /// Encoded bytes are independently verified by the receiving scheduler.
+    /// Transfer an immutable physical CAS payload as supplied, including its
+    /// explicit raw or Zstd encoding. The receiver verifies decoded identity.
     ///
     /// # Errors
     /// Returns an error for a missing physical file or rejected transfer.

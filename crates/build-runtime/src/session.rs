@@ -913,7 +913,9 @@ impl NativeSessions {
         })
     }
 
-    /// Open only declared content with an owned file descriptor.
+    /// Open declared content for transport. Generated raw ZFS files are
+    /// temporarily encoded for efficient wire transfer; original package
+    /// archives are returned byte-for-byte.
     ///
     /// # Errors
     /// Returns an error for unknown tickets, unavailable or undeclared content.
