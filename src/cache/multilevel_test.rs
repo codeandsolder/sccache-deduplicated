@@ -1711,6 +1711,54 @@ fn test_put_mode_all_fails_on_any_error() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn all_required_writes_finish_before_reporting_another_tiers_failure() -> Result<()> {
+    let slow = Arc::new(SlowWriteStorage::new(Duration::from_millis(40)));
+    let storage = MultiLevelStorage::with_write_error_policy(
+        vec![
+            Arc::new(InMemoryStorage::new()) as Arc<dyn Storage>,
+            Arc::new(FailingStorage) as Arc<dyn Storage>,
+            slow.clone() as Arc<dyn Storage>,
+        ],
+        WriteErrorPolicy::All,
+    );
+    let error = storage
+        .put_raw("failed_and_slow", Bytes::from_static(b"payload"))
+        .await
+        .expect_err("a required tier failed");
+    assert!(error.to_string().contains("cache level 1"));
+    assert_eq!(
+        slow.writes.load(Ordering::SeqCst),
+        1,
+        "a successful slow tier must finish before the failure is returned"
+    );
+    assert_eq!(slow.in_flight.load(Ordering::SeqCst), 0);
+    assert_eq!(storage.stats().0[1].write_failures, 1);
+    assert_eq!(storage.stats().0[2].writes, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn required_write_reports_closed_slow_level_semaphore() -> Result<()> {
+    let slow = Arc::new(SlowWriteStorage::new(Duration::ZERO));
+    let storage = MultiLevelStorage::with_write_error_policy(
+        vec![
+            Arc::new(InMemoryStorage::new()) as Arc<dyn Storage>,
+            slow.clone() as Arc<dyn Storage>,
+        ],
+        WriteErrorPolicy::All,
+    );
+    storage.slow_level_semaphore.close();
+    let error = storage
+        .put_raw("closed_semaphore", Bytes::from_static(b"payload"))
+        .await
+        .expect_err("required semaphore acquisition failed");
+    assert!(error.to_string().contains("semaphore closed"));
+    assert_eq!(slow.writes.load(Ordering::SeqCst), 0);
+    assert_eq!(storage.stats().0[1].write_failures, 1);
+    Ok(())
+}
+
 #[test]
 fn test_put_mode_all_succeeds_when_all_ok() -> Result<()> {
     let runtime = RuntimeBuilder::new_multi_thread()
