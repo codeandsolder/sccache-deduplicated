@@ -152,7 +152,7 @@ fn benchmark_native_zfs_clones_against_fuse_views() -> Result<()> {
             .lookup_tree(zfs_lease.id())?
             .context("ZFS tree missing")?;
         let start = Instant::now();
-        let view = zfs.mount_tree(lease, zfs_dir.path())?;
+        let view = zfs.mount_tree_protected(lease, zfs_dir.path(), &[])?;
         let setup = start.elapsed().as_micros();
         let start = Instant::now();
         let mut total = 0_u64;
@@ -169,7 +169,7 @@ fn benchmark_native_zfs_clones_against_fuse_views() -> Result<()> {
             .lookup_tree(fuse_lease.id())?
             .context("FUSE tree missing")?;
         let start = Instant::now();
-        let view = non_zfs.mount_tree(lease, memory_dir.path())?;
+        let view = non_zfs.mount_tree_protected(lease, memory_dir.path(), &[])?;
         let setup = start.elapsed().as_micros();
         let start = Instant::now();
         let mut total = 0_u64;

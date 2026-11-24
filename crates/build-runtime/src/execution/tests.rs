@@ -79,6 +79,112 @@ fn shell_root(store: &NativeStore) -> Result<crate::TreeId> {
     store.publish_tree(&manifest, staged.into_values().collect())
 }
 
+/// Compile-like execution with a stable executable and header tree but
+/// different source content. A whole-tree action identity is still supplied
+/// each time; the worker reuses the pinned base view internally.
+#[test]
+#[ignore = "requires Linux Bubblewrap and ldd"]
+fn distinct_roots_execute_their_own_source_bytes_via_cached_file_overlays() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let store = NativeStore::open(&temporary.path().join("store"))?;
+    let toolchain = shell_root(&store)?;
+    let mut manifest = store
+        .lookup_tree(toolchain)?
+        .context("test shell tree missing")?
+        .manifest()
+        .clone();
+    let source_path = TreePath::new(b"src/source".to_vec())?;
+    let original = store.stage(&b"first\n"[..])?;
+    manifest.entries.insert(
+        source_path.clone(),
+        TreeEntry::File {
+            blob: original.reference(),
+            metadata: metadata(0o644),
+        },
+    );
+    let header = store.stage(&b"identical header\n"[..])?;
+    for index in 0..96 {
+        manifest.entries.insert(
+            TreePath::new(format!("src/header-{index:03}").into_bytes())?,
+            TreeEntry::File {
+                blob: header.reference(),
+                metadata: metadata(0o644),
+            },
+        );
+    }
+    let first = store.publish_tree(&manifest, vec![original, header])?;
+    let platform = ContentId::of(b"overlay test platform");
+    let mut spec = ExecutionSpec {
+        platform,
+        root: ExecutionRoot {
+            id: first,
+            recipe: TreeRecipe::union(metadata(0o755), [first]),
+        },
+        mounts: BTreeMap::new(),
+        command: CommandSpec {
+            executable: BuildPath::new(b"/bin/sh".to_vec())?,
+            arguments: vec![
+                b"-c".to_vec(),
+                br#"IFS= read -r line < /src/source; printf '%s' "$line" > /out/nested/object"#
+                    .to_vec(),
+            ],
+            cwd: BuildPath::new(b"/src".to_vec())?,
+            environment: BTreeMap::new(),
+        },
+        outputs: BTreeMap::from([(
+            "object".into(),
+            OutputSpec {
+                path: BuildPath::new(b"/out/nested/object".to_vec())?,
+                required: true,
+            },
+        )]),
+    };
+    let policy = ExecutionPolicy {
+        platform,
+        bubblewrap: "/usr/bin/bwrap".into(),
+        scratch: temporary.path().to_owned(),
+        timeout: Duration::from_secs(20),
+        max_result_bytes: 1024,
+    };
+    let output = |spec: &ExecutionSpec| -> Result<Vec<u8>> {
+        let execution = execute(spec, &store, &policy, || Ok(()))?;
+        let manifest = execution
+            .successful_result()
+            .context("overlay action failed")?;
+        let mut bytes = Vec::new();
+        execution
+            .open_blob(manifest.outputs["object"].blob.id)?
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    assert_eq!(output(&spec)?, b"first");
+
+    let changed = store.stage(&b"second\n"[..])?;
+    manifest.entries.insert(
+        source_path,
+        TreeEntry::File {
+            blob: changed.reference(),
+            metadata: metadata(0o644),
+        },
+    );
+    let second = store.publish_tree(&manifest, vec![changed])?;
+    spec.root = ExecutionRoot {
+        id: second,
+        recipe: TreeRecipe::union(metadata(0o755), [second]),
+    };
+    assert_eq!(output(&spec)?, b"second");
+    let target = store.lookup_tree(second)?.context("second input missing")?;
+    let view = store.mount_tree_protected(target, temporary.path(), &[PathBuf::from("out")])?;
+    assert_eq!(view.overlay_bindings().count(), 1);
+    assert_eq!(
+        view.overlay_stats()
+            .context("missing clone statistics")?
+            .cloned_files,
+        u64::from(store.uses_native_zfs())
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires Linux Bubblewrap and ldd"]
 fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives() -> Result<()> {

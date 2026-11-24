@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     io,
@@ -18,7 +19,7 @@ use rustix::{
 use tempfile::TempDir;
 
 use super::TreeLease;
-use crate::{BlobRef, TreeEntry, TreeMetadata, TreeTimestamp};
+use crate::{BlobRef, TreeEntry, TreeMetadata, TreePath, TreeTimestamp};
 
 /// Materialization work, reporting explicit block clones separately from copies.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +27,15 @@ pub struct MaterializationStats {
     pub cloned_files: u64,
     pub copied_files: u64,
     pub copied_bytes: u64,
+}
+
+/// Private file bindings for changed entries of a composed tree.
+/// The target lease pins its blobs; the cached base holds the unchanged files.
+pub struct OverlayFiles {
+    _lease: TreeLease,
+    _directory: TempDir,
+    pub(super) replacements: BTreeMap<TreePath, PathBuf>,
+    pub(crate) stats: MaterializationStats,
 }
 
 /// A private materialized input tree.
@@ -116,6 +126,36 @@ pub(super) fn restore_mutable_directories(root: &Path) {
 }
 
 impl TreeLease {
+    pub(crate) fn materialize_overlays(
+        self,
+        changed: &[TreePath],
+        parent: &Path,
+    ) -> Result<OverlayFiles> {
+        let directory = tempfile::Builder::new()
+            .prefix("build-file-overlays-")
+            .tempdir_in(parent)?;
+        let mut replacements = BTreeMap::new();
+        let mut stats = MaterializationStats::default();
+        for (index, path) in changed.iter().enumerate() {
+            let Some(TreeEntry::File { blob, metadata }) = self.manifest.entries.get(path) else {
+                anyhow::bail!("overlay source must be a regular file");
+            };
+            let physical = directory.path().join(index.to_string());
+            self.materialize_file(*blob, &physical, &mut stats)?;
+            apply_metadata(&physical, *metadata)?;
+            ensure!(
+                replacements.insert(path.clone(), physical).is_none(),
+                "duplicate overlay path"
+            );
+        }
+        Ok(OverlayFiles {
+            _lease: self,
+            _directory: directory,
+            replacements,
+            stats,
+        })
+    }
+
     /// Materialize a validated tree in a fresh private directory on the
     /// selected filesystem. Try a filesystem copy-on-write clone for each regular file,
     /// then a streamed copy if cloning is unsupported. Never hardlink a CAS
