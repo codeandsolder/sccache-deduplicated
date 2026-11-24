@@ -1190,36 +1190,39 @@ impl SchedulerIncoming for Scheduler {
     fn native_blob_sources(
         &self,
         blob: sccache::build_runtime::BlobRef,
-        requester: std::net::SocketAddr,
+        requester: Option<std::net::SocketAddr>,
     ) -> Result<Vec<dist::NativeBlobSource>> {
         let servers = self
             .servers
             .lock()
             .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
+        // Result receipts may name a just-produced blob that has not yet
+        // appeared in a heartbeat. For result recovery prefer positive
+        // inventory hints, but allow other native workers to answer exactly.
         let mut candidates = servers
             .iter()
-            .filter(|(id, details)| {
-                id.addr() != requester
+            .filter_map(|(id, details)| {
+                let placement = details.capabilities.native_placement.as_ref()?;
+                let predicted = placement
+                    .residency
+                    .as_ref()
+                    .is_some_and(|residency| residency.may_contain(blob.id));
+                (Some(id.addr()) != requester
                     && details.last_seen.elapsed() < Duration::from_secs(20)
                     && details.last_error.is_none()
-                    && details
-                        .capabilities
-                        .native_placement
-                        .as_ref()
-                        .and_then(|placement| placement.residency.as_ref())
-                        .is_some_and(|residency| residency.may_contain(blob.id))
+                    && (requester.is_none() || predicted))
+                    .then_some((id, details, predicted))
             })
             .collect::<Vec<_>>();
-        candidates.sort_unstable_by(|(a, left), (b, right)| {
-            right
-                .last_seen
-                .cmp(&left.last_seen)
+        candidates.sort_unstable_by(|(a, left, left_predicted), (b, right, right_predicted)| {
+            right_predicted
+                .cmp(left_predicted)
+                .then_with(|| right.last_seen.cmp(&left.last_seen))
                 .then_with(|| a.addr().cmp(&b.addr()))
         });
         candidates
             .into_iter()
-            .take(2)
-            .map(|(&server, details)| {
+            .map(|(&server, details, _)| {
                 Ok(dist::NativeBlobSource {
                     server,
                     token: details.job_authorizer.generate_blob_token(blob)?,
@@ -2197,9 +2200,12 @@ mod scheduler_tests {
                 },
             )?;
         }
-        let sources = scheduler.native_blob_sources(blob, requester.addr())?;
+        let sources = scheduler.native_blob_sources(blob, Some(requester.addr()))?;
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].server, peer);
+        let recovery = scheduler.native_blob_sources(blob, None)?;
+        assert_eq!(recovery.len(), 3);
+        assert_eq!(recovery[2].server, empty);
         for server in [requester, peer, empty] {
             assert_no_assigned_jobs(&scheduler, &server);
         }

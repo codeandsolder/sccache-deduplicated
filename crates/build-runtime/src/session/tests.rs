@@ -916,7 +916,11 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
     assert_eq!(claim.requester(), address);
     assert!(service.input_demands(ticket)?.is_empty());
     assert!(service.claim_peer_input(Duration::ZERO)?.is_none());
-    service.publish_peer_input(claim, &b"peer bytes"[..])?;
+    service.recover_peer_input(
+        claim,
+        Instant::now() + Duration::from_secs(1),
+        |blob, store, _| Ok(Some(store.stage_expected(blob, &b"peer bytes"[..])?)),
+    )?;
     let mut bytes = Vec::new();
     service
         .download(delivery, worker, first.id)?
@@ -933,7 +937,11 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
     // releases the same single flight to the origin.
     assert!(
         service
-            .publish_peer_input(claim, &b"wrong bytes!"[..])
+            .recover_peer_input(
+                claim,
+                Instant::now() + Duration::from_secs(1),
+                |_, store, _| { Ok(Some(store.stage(&b"wrong bytes!"[..])?)) }
+            )
             .is_err()
     );
     assert!(service.store().open_available_blob(second)?.is_none());
@@ -987,7 +995,11 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
     let claim = service
         .claim_peer_input(Duration::ZERO)?
         .context("periodic peer retry missing")?;
-    service.publish_peer_input(claim, &b"late peer"[..])?;
+    service.recover_peer_input(
+        claim,
+        Instant::now() + Duration::from_secs(1),
+        |blob, store, _| Ok(Some(store.stage_expected(blob, &b"late peer"[..])?)),
+    )?;
     bytes.clear();
     service
         .download(delivery, worker, third.id)?
@@ -996,5 +1008,136 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
     assert_eq!(service.active_uploads.load(Ordering::Acquire), 0);
     service.close(delivery, worker)?;
     service.fail(ticket, worker)?;
+    Ok(())
+}
+
+#[test]
+fn evicted_result_is_restored_once_from_only_missing_peer_blobs() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let req = request()?;
+    let fingerprint = req.action_fingerprint()?;
+    let key = fingerprint.key()?;
+    let mut output = manifest(b"peer object");
+    let local = BlobRef {
+        id: ContentId::of(b"local stderr"),
+        size: 12,
+    };
+    output.stderr = Some(local);
+    {
+        let service = service(dir.path())?;
+        let store = service.store();
+        let staged = store.stage_expected(local, &b"local stderr"[..])?;
+        store.publish_tree(&NativeStore::blob_retention_manifest(local)?, vec![staged])?;
+        let staged = store.stage_expected(output.outputs["obj"].blob, &b"peer object"[..])?;
+        store.publish(&fingerprint, &output, vec![staged], ActionMode::Reuse)?;
+        store.evict(key)?;
+        store.collect_garbage(32)?;
+        assert!(store.lookup(key)?.is_none());
+    }
+    let mut service = service(dir.path())?;
+    service.limits.peer_discovery_timeout = Duration::from_millis(25);
+    for _ in 0..2 {
+        assert_eq!(
+            service.admit(
+                req.clone(),
+                Publisher::Client,
+                ActionMode::Reuse,
+                BTreeMap::new()
+            )?,
+            NativeAdmission::InFlight
+        );
+    }
+    let calls = std::cell::Cell::new(0);
+    assert!(
+        service.recover_next_result(Duration::ZERO, |blob, store, _| {
+            calls.set(calls.get() + 1);
+            assert_eq!(blob, output.outputs["obj"].blob);
+            Ok(Some(store.stage_expected(blob, &b"peer object"[..])?))
+        })?
+    );
+    assert_eq!(calls.get(), 1);
+    assert!(!service.recover_next_result(Duration::ZERO, |_, _, _| unreachable!())?);
+    let NativeAdmission::Hit { ticket, manifest } =
+        service.admit(req, Publisher::Client, ActionMode::Reuse, BTreeMap::new())?
+    else {
+        bail!("recovered result should be a hit");
+    };
+    assert_eq!(manifest, output);
+    let mut data = Vec::new();
+    service
+        .download(ticket, Publisher::Client, output.outputs["obj"].blob.id)?
+        .read_to_end(&mut data)?;
+    assert_eq!(data, b"peer object");
+    service.close(ticket, Publisher::Client)?;
+    assert_eq!(service.active_uploads.load(Ordering::Acquire), 0);
+    Ok(())
+}
+
+#[test]
+fn failed_result_recovery_preserves_partial_content_and_allows_compilation() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut service = service(dir.path())?;
+    service.limits.peer_discovery_timeout = Duration::from_millis(25);
+    let req = request()?;
+    let fingerprint = req.action_fingerprint()?;
+    let key = fingerprint.key()?;
+    let mut output = manifest(b"larger object");
+    let missing = BlobRef {
+        id: ContentId::of(b"err"),
+        size: 3,
+    };
+    output.stderr = Some(missing);
+    let store = service.store();
+    let object = output.outputs["obj"].blob;
+    store.publish(
+        &fingerprint,
+        &output,
+        vec![
+            store.stage_expected(object, &b"larger object"[..])?,
+            store.stage_expected(missing, &b"err"[..])?,
+        ],
+        ActionMode::Reuse,
+    )?;
+    store.evict(key)?;
+    store.collect_garbage(32)?;
+    assert_eq!(
+        service.admit(
+            req.clone(),
+            Publisher::Client,
+            ActionMode::Reuse,
+            BTreeMap::new()
+        )?,
+        NativeAdmission::InFlight
+    );
+    assert!(
+        service.recover_next_result(Duration::ZERO, |blob, store, _| {
+            if blob == object {
+                Ok(Some(store.stage_expected(blob, &b"larger object"[..])?))
+            } else {
+                assert_eq!(blob, missing);
+                Ok(None)
+            }
+        })?
+    );
+    assert!(store.open_available_blob(object)?.is_some());
+    assert!(store.open_available_blob(missing)?.is_none());
+    assert!(store.lookup(key)?.is_none());
+    let NativeAdmission::Compile { ticket } = service.admit(
+        req.clone(),
+        Publisher::Client,
+        ActionMode::Reuse,
+        BTreeMap::new(),
+    )?
+    else {
+        bail!("failed recovery must permit a fresh build");
+    };
+    service.close(ticket, Publisher::Client)?;
+    let NativeAdmission::Compile { ticket } =
+        service.admit(req, Publisher::Client, ActionMode::Refresh, BTreeMap::new())?
+    else {
+        bail!("explicit refresh must never use recovery");
+    };
+    service.close(ticket, Publisher::Client)?;
+    assert_eq!(service.active_uploads.load(Ordering::Acquire), 0);
     Ok(())
 }

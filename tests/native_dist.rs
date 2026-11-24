@@ -1537,10 +1537,21 @@ fn run_worker_only_inputs(peer_source: bool) -> Result<()> {
     let delivered = root.join("delivered.o");
     let destinations = BTreeMap::from([("object".into(), delivered.clone())]);
 
-    for pass in 0..2 {
+    let mut action_keys = Vec::new();
+    let object = BlobRef {
+        id: ContentId::of(&fs::read(&reference)?),
+        size: fs::metadata(&reference)?.len(),
+    };
+    for pass in 0..3 {
         if pass == 1 {
             spec.command.arguments.insert(0, b"--64".to_vec());
+        }
+        if pass > 0 {
             fs::remove_file(&delivered)?;
+        }
+        let action = spec.action_request()?.action_fingerprint()?.key()?;
+        if pass < 2 {
+            action_keys.push(action);
         }
         let fleet = Fleet::start(root, BTreeMap::new())?;
         let peer = if pass == 0 && peer_source {
@@ -1557,7 +1568,11 @@ fn run_worker_only_inputs(peer_source: bool) -> Result<()> {
         let result = client.run_action(&spec, &inputs, &destinations, &policy, None)?;
         assert_eq!(
             result.source,
-            NativeBuildSource::Worker(fleet.worker_address)
+            if pass == 2 {
+                NativeBuildSource::Hit
+            } else {
+                NativeBuildSource::Worker(fleet.worker_address)
+            },
         );
         assert!(result.output.status.success());
         assert_eq!(fs::read(&delivered)?, fs::read(&reference)?);
@@ -1584,6 +1599,29 @@ fn run_worker_only_inputs(peer_source: bool) -> Result<()> {
         assert!(scheduler.open_available_blob(missing)?.is_none());
         let worker = NativeStore::open(&root.join("worker-store"))?;
         assert!(worker.lookup_tree(inputs[1].id())?.is_some());
+        assert!(worker.open_available_blob(object)?.is_some());
+        if pass == 1 {
+            // Both distinct actions share their output, so evict both to
+            // force physical reclamation rather than a scheduler-local hit.
+            for &key in &action_keys {
+                assert!(matches!(
+                    scheduler.evict(key)?,
+                    sccache::build_runtime::Eviction::Removed { .. }
+                ));
+                assert!(scheduler.result_receipt(key)?.is_some());
+            }
+            scheduler.collect_garbage(128)?;
+            assert!(scheduler.open_available_blob(object)?.is_none());
+            // A recovered result must work even without the original source.
+            if !peer_source {
+                fs::remove_file(&input)?;
+            }
+        }
+        if pass == 2 {
+            assert!(scheduler.lookup(action)?.is_some());
+            assert!(scheduler.open_available_blob(object)?.is_some());
+            assert_eq!(worker.stats()?.actions, 2);
+        }
     }
     Ok(())
 }

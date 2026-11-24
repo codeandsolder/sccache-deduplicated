@@ -305,7 +305,7 @@ struct BackfillState {
     peer_retry_at: Option<Instant>,
     claim: Option<BackfillClaim>,
     uploading: bool,
-    ready: Option<TreeLease>,
+    ready: Option<Arc<TreeLease>>,
 }
 
 struct BackfillClaim {
@@ -414,6 +414,7 @@ pub struct NativeSessions {
     backfills: Mutex<HashMap<ContentId, Weak<Backfill>>>,
     peer_wake: Condvar,
     manifests: Mutex<ManifestCatalog>,
+    recovery: recovery::RecoveryQueue,
 }
 
 /// A bounded service slot is occupied. Clients can retry without changing
@@ -461,6 +462,7 @@ impl NativeSessions {
     /// Returns an error for invalid limits.
     pub fn new(store: NativeStore, limits: SessionLimits) -> Result<Self> {
         limits.validate()?;
+        store.enable_result_history(u64::try_from(limits.max_manifest_cache_bytes)?)?;
         Ok(Self {
             coordinator: BuildCoordinator::new(store),
             limits,
@@ -469,6 +471,7 @@ impl NativeSessions {
             backfills: Mutex::new(HashMap::new()),
             peer_wake: Condvar::new(),
             manifests: Mutex::new(ManifestCatalog::default()),
+            recovery: recovery::RecoveryQueue::default(),
         })
     }
 
@@ -618,6 +621,7 @@ impl NativeSessions {
         // Release permits even if an expired upload still owns a session Arc.
         drop(expired);
         self.reap_backfills(now)?;
+        self.recovery.reap()?;
         Ok(count)
     }
 
@@ -711,6 +715,8 @@ impl NativeSessions {
         match self.coordinator.admit(fingerprint, mode)? {
             Admission::InFlight => Ok(NativeAdmission::InFlight),
             Admission::Cached(lease) => {
+                self.recovery
+                    .release_ready(request.action_fingerprint()?.key()?)?;
                 request.validate_result(lease.manifest())?;
                 let manifest = lease.manifest().clone();
                 let ticket =
@@ -718,6 +724,26 @@ impl NativeSessions {
                 Ok(NativeAdmission::Hit { ticket, manifest })
             }
             Admission::Compile(permit) => {
+                let permit = if mode == ActionMode::Reuse
+                    && !self.limits.peer_discovery_timeout.is_zero()
+                    && let Some(manifest) = self.store().result_receipt(permit.key())?
+                {
+                    request.validate_result(&manifest)?;
+                    self.limits.check_blobs(Kind::Action, &manifest.blobs()?)?;
+                    let Some(permit) = self.recovery.offer(
+                        permit,
+                        manifest,
+                        self.limits.max_sessions,
+                        self.limits.max_manifest_cache_bytes,
+                        self.limits.idle_timeout,
+                    )?
+                    else {
+                        return Ok(NativeAdmission::InFlight);
+                    };
+                    permit
+                } else {
+                    permit
+                };
                 ensure!(
                     declared.keys().all(|id| request.input_trees.contains(id)),
                     "undeclared input manifest"
@@ -1389,13 +1415,23 @@ impl NativeSessions {
         }
     }
 
-    /// Verify and publish bytes acquired from an authenticated peer.
+    /// Recover verified peer content using the same durable blob acquisition
+    /// flight as result recovery. A failed peer releases the origin claim.
     ///
     /// # Errors
-    /// Returns an error for invalid content or storage failure.
-    pub fn publish_peer_input(&self, claim: PeerInputClaim, reader: impl Read) -> Result<()> {
-        let blob = claim.blob();
-        self.publish_backfill(claim.0, blob, reader)
+    /// Returns an error for unavailable or invalid content or storage failure.
+    pub fn recover_peer_input(
+        &self,
+        claim: PeerInputClaim,
+        deadline: Instant,
+        fetch: impl Fn(BlobRef, &NativeStore, Instant) -> Result<Option<StagedBlob>>,
+    ) -> Result<()> {
+        let lease = self.acquire_peer_blob(claim.blob(), deadline, &fetch)?;
+        let mut pending = claim.0.flight.lock()?;
+        pending.ready = Some(lease);
+        pending.peer_until = None;
+        pending.peer_retry_at = None;
+        Ok(())
     }
 
     fn finish_backfills(
@@ -1638,7 +1674,7 @@ impl NativeSessions {
         let staged = vec![self.store().stage_expected(blob, reader)?];
         let lease = self.store().publish_tree_pinned(&manifest, staged)?;
         let mut pending = guard.flight.lock()?;
-        pending.ready = Some(lease);
+        pending.ready = Some(Arc::new(lease));
         pending.peer_until = None;
         pending.peer_retry_at = None;
         Ok(())
@@ -1700,6 +1736,8 @@ impl Drop for UploadSlot {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
+
+mod recovery;
 
 #[cfg(test)]
 mod tests;

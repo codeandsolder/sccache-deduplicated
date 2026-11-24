@@ -242,7 +242,20 @@ fn missing_content_is_not_returned_as_a_hit() -> Result<()> {
         crate::ActionMode::Reuse,
     )?;
     fs::remove_file(store.inner.blob_path(object.id))?;
-    assert!(store.lookup(published.action).is_err());
+    assert!(store.lookup(published.action)?.is_none());
+    assert_eq!(
+        store.result_receipt(published.action)?,
+        Some(result(object))
+    );
+    let staged = store.stage_expected(object, &b"object"[..])?;
+    let repaired = store.publish_pinned(
+        &action("invalid"),
+        &result(object),
+        vec![staged],
+        ActionMode::Reuse,
+    )?;
+    assert_eq!(repaired.manifest(), &result(object));
+    assert_eq!(store.stats()?.logical_bytes, 6);
     Ok(())
 }
 
@@ -563,6 +576,59 @@ fn replaced_or_modified_staging_file_cannot_be_published() -> Result<()> {
             .install_blob(second, &mut BTreeSet::new())
             .is_err()
     );
+    assert_eq!(store.stats()?.blobs, 0);
+    Ok(())
+}
+
+#[test]
+fn evicted_result_receipts_survive_restart_and_remain_bounded() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let a = action("a");
+    let b = action("b");
+    let manifest;
+    {
+        let store = NativeStore::open(dir.path())?;
+        store.enable_result_history(1024)?;
+        let blob = store.stage(&b"object"[..])?;
+        manifest = result(blob.reference());
+        store.publish(&a, &manifest, vec![blob], ActionMode::Reuse)?;
+        store.publish(&b, &manifest, vec![], ActionMode::Reuse)?;
+        store.evict(a.key()?)?;
+        store.evict(b.key()?)?;
+        store.collect_garbage(32)?;
+        assert_eq!(store.stats()?.blobs, 0);
+    }
+    let store = NativeStore::open(dir.path())?;
+    // Offline eviction also honors the previously configured limit.
+    assert_eq!(store.result_receipt(a.key()?)?, Some(manifest.clone()));
+    assert_eq!(store.result_receipt(b.key()?)?, Some(manifest.clone()));
+    let blob = store.stage(&b"new object"[..])?;
+    let replacement = result(blob.reference());
+    store.publish(&b, &replacement, vec![blob], ActionMode::Refresh)?;
+    assert_eq!(store.result_receipt(b.key()?)?, Some(replacement.clone()));
+    store.evict(b.key()?)?;
+    assert_eq!(store.result_receipt(b.key()?)?, Some(replacement));
+    store.enable_result_history(0)?;
+    assert!(store.result_receipt(a.key()?)?.is_none());
+    assert!(store.result_receipt(b.key()?)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn result_receipt_budget_evicts_oldest_metadata_only() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    store.enable_result_history(200)?;
+    let staged = store.stage(&b"object"[..])?;
+    let manifest = result(staged.reference());
+    let first = store.publish(&action("first"), &manifest, vec![staged], ActionMode::Reuse)?;
+    let second = store.publish(&action("second"), &manifest, vec![], ActionMode::Reuse)?;
+    store.evict(first.action)?;
+    assert_eq!(store.result_receipt(first.action)?, Some(manifest.clone()));
+    store.evict(second.action)?;
+    assert!(store.result_receipt(first.action)?.is_none());
+    assert_eq!(store.result_receipt(second.action)?, Some(manifest));
+    store.collect_garbage(32)?;
     assert_eq!(store.stats()?.blobs, 0);
     Ok(())
 }

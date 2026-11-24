@@ -1216,8 +1216,11 @@ mod server {
                             Ok(ScheduleReply::Unavailable { message: msg })
                         }
                     },
-                    move |blob, requester| {
+                    move |blob, requester, store, deadline| {
                         for source in peer_handler.native_blob_sources(blob, requester)? {
+                            if std::time::Instant::now() >= deadline {
+                                break;
+                            }
                             let certificate = peer_certs
                                 .lock()
                                 .map_err(|_| anyhow!("server certificate mutex poisoned"))?
@@ -1226,8 +1229,17 @@ mod server {
                             let Some(certificate) = certificate else {
                                 continue;
                             };
-                            match peer_http.fetch(source, blob, &certificate, &peer_network) {
-                                Ok(Some(reader)) => return Ok(Some(reader)),
+                            match peer_http.fetch(
+                                source,
+                                blob,
+                                &certificate,
+                                &peer_network,
+                                deadline,
+                            ) {
+                                Ok(Some(reader)) => match store.stage_expected(blob, reader) {
+                                    Ok(staged) => return Ok(Some(staged)),
+                                    Err(error) => debug!("native peer content rejected: {error:#}"),
+                                },
                                 Ok(None) => {}
                                 Err(error) => debug!("native peer lookup failed: {error:#}"),
                             }

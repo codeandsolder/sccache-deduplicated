@@ -4,7 +4,10 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, atomic::AtomicU64},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Instant,
 };
 
@@ -227,6 +230,7 @@ struct Inner {
     // Releases never acquire the space admission lock, avoiding lock-order
     // inversion with transactional publication and eviction.
     space_released: AtomicU64,
+    result_history_limit: AtomicU64,
 }
 
 impl Inner {
@@ -432,6 +436,7 @@ impl NativeStore {
         File::open(&root)?.sync_all()?;
         let write = db.begin_write()?;
         write.open_table(ACTIONS)?;
+        history::initialize(&write)?;
         write.open_table(RESULTS)?;
         write.open_table(TREES)?;
         write.open_table(PACKAGES)?;
@@ -462,6 +467,7 @@ impl NativeStore {
                 pins.usage.insert(root, record);
             }
         }
+        let result_history_limit = history::configured_limit(&db)?;
         let inner = Arc::new(Inner {
             root,
             db,
@@ -472,6 +478,7 @@ impl NativeStore {
             space_policy,
             space: Mutex::default(),
             space_released: AtomicU64::new(0),
+            result_history_limit: AtomicU64::new(result_history_limit),
         });
         inner.recover_orphans()?;
         Ok(Self { inner })
@@ -684,9 +691,34 @@ impl NativeStore {
                     "conflicting native action fingerprint"
                 );
                 if stored.result == result {
+                    let mut complete = true;
                     for (&id, &size) in &blobs {
-                        self.inner.check_blob(id, size)?;
+                        complete &= self.inner.blob_present(id, size)?;
                     }
+                    if complete {
+                        self.inner.lock_pins()?.touch(space::Root::Action(action));
+                        return Ok(Published {
+                            action,
+                            result,
+                            new_action: false,
+                        });
+                    }
+                    // A physically incomplete indexed result can be repaired
+                    // in place without changing its references or accounting.
+                    self.attach_blobs(
+                        &write,
+                        &result.0,
+                        &blobs,
+                        staged,
+                        true,
+                        &mut staged_reservations,
+                    )?;
+                    drop(result_actions);
+                    drop(results);
+                    drop(actions);
+                    history::forget(&write, action)?;
+                    write.commit()?;
+                    drop(staged_reservations);
                     self.inner.lock_pins()?.touch(space::Root::Action(action));
                     return Ok(Published {
                         action,
@@ -694,8 +726,18 @@ impl NativeStore {
                         new_action: false,
                     });
                 }
+                // A fresh build may replace an unavailable result; ordinary
+                // reuse must still never overwrite a complete result.
+                let old = results
+                    .get(&stored.result.0)?
+                    .context("missing indexed result")?;
+                let old: ResultManifest = encoding().deserialize(old.value())?;
+                let mut complete = true;
+                for (id, size) in old.blobs()? {
+                    complete &= self.inner.blob_present(id, size)?;
+                }
                 ensure!(
-                    mode == ActionMode::Refresh,
+                    mode == ActionMode::Refresh || !complete,
                     "conflicting result for action {action:?}"
                 );
             }
@@ -735,6 +777,7 @@ impl NativeStore {
                 )?;
             }
         }
+        history::forget(&write, action)?;
         // Files and their directory entries are durable before the index
         // exposes them. Orphans from an interrupted write are harmless.
         write.commit()?;
@@ -898,7 +941,9 @@ impl NativeStore {
         );
         let blobs = manifest.blobs()?;
         for (&id, &size) in &blobs {
-            self.inner.check_blob(id, size)?;
+            if !self.inner.blob_present(id, size)? {
+                return Ok(None);
+            }
         }
         let count = pins
             .actions
@@ -966,6 +1011,14 @@ impl NativeStore {
                 return Ok(Eviction::Missing);
             };
             let record: ActionRecord = encoding().deserialize(record.value())?;
+            let limit = self.inner.result_history_limit.load(Ordering::Acquire);
+            if limit != 0 {
+                let manifest = results
+                    .get(&record.result.0)?
+                    .context("missing indexed result")?;
+                let manifest: ResultManifest = encoding().deserialize(manifest.value())?;
+                history::remember(&write, action, manifest, limit)?;
+            }
             unreferenced_logical_bytes = Self::release_result_reference(
                 &write,
                 &mut results,
@@ -1263,6 +1316,7 @@ impl<L> Seek for LeasedReader<'_, L> {
     }
 }
 
+mod history;
 mod space;
 use crate::SpacePolicy;
 pub use space::{SpaceReport, StageBudget};

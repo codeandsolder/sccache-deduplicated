@@ -7,7 +7,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -20,8 +20,8 @@ use crate::{
     build_runtime::{
         ActionMode, ArchiveLength, BlobRef, ContentId, Direction, ExecutionSpec,
         NativeContentPending, NativeInputRejected, NativeServiceBusy, NativeSessions, NativeStore,
-        NetworkMeter, PackageIdentity, PackageImportLimits, PackageSource, Peer, TreeId,
-        TreeManifest, VerifiedPackage,
+        NetworkMeter, PackageIdentity, PackageImportLimits, PackageSource, Peer, StagedBlob,
+        TreeId, TreeManifest, VerifiedPackage,
         wire::{Publisher, ScheduleReply, UploadHeader},
     },
     config::scheduler::NativeCacheConfig,
@@ -119,7 +119,12 @@ pub(super) fn spawn(
     + Send
     + Sync
     + 'static,
-    fetch_peer: impl Fn(BlobRef, std::net::SocketAddr) -> Result<Option<Box<dyn Read + Send>>>
+    fetch_peer: impl Fn(
+        BlobRef,
+        Option<std::net::SocketAddr>,
+        &NativeStore,
+        Instant,
+    ) -> Result<Option<StagedBlob>>
     + Send
     + Sync
     + 'static,
@@ -145,20 +150,43 @@ pub(super) fn spawn(
             .spawn(move || {
                 while let Some(sessions) = sessions.upgrade() {
                     match sessions.claim_peer_input(Duration::from_millis(100)) {
-                        Ok(Some(claim)) => match fetch_peer(claim.blob(), claim.requester()) {
-                            Ok(Some(reader)) => {
-                                if let Err(error) = sessions.publish_peer_input(claim, reader) {
-                                    debug!("native peer backfill failed: {error:#}");
-                                }
+                        Ok(Some(claim)) => {
+                            let requester = claim.requester();
+                            let deadline = Instant::now() + limits.idle_timeout;
+                            if let Err(error) = sessions.recover_peer_input(
+                                claim,
+                                deadline,
+                                |blob, store, deadline| {
+                                    fetch_peer(blob, Some(requester), store, deadline)
+                                },
+                            ) {
+                                debug!("native peer backfill unavailable: {error:#}");
                             }
-                            Ok(None) => {}
-                            Err(error) => debug!("native peer backfill unavailable: {error:#}"),
-                        },
+                        }
                         Ok(None) => {}
                         Err(error) => {
                             warn!("native peer claim failed: {error:#}");
                             thread::sleep(Duration::from_millis(100));
                         }
+                    }
+                }
+            })?;
+    }
+    // Result recovery holds the action permit but no compiler slot. It
+    // runs outside HTTP and uses the same bounded upload budget as inputs.
+    {
+        let sessions = Arc::downgrade(&sessions);
+        thread::Builder::new()
+            .name("native-result-recovery".into())
+            .spawn(move || {
+                while let Some(sessions) = sessions.upgrade() {
+                    if let Err(error) = sessions
+                        .recover_next_result(Duration::from_millis(100), |blob, store, deadline| {
+                            fetch_peer(blob, None, store, deadline)
+                        })
+                    {
+                        warn!("native result recovery failed: {error:#}");
+                        thread::sleep(Duration::from_millis(100));
                     }
                 }
             })?;
@@ -299,10 +327,14 @@ impl PeerHttp {
         blob: BlobRef,
         certificate: &[u8],
         network: &NetworkMeter,
+        deadline: Instant,
     ) -> Result<Option<Box<dyn Read + Send>>> {
         // Bounded source probe: allow roughly 4 MiB/s plus setup time,
         // with an absolute ceiling; a slow peer falls back to the origin.
-        let timeout = Duration::from_secs((2 + blob.size.div_ceil(4 * 1024 * 1024)).min(30));
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(!remaining.is_zero(), "native peer deadline expired");
+        let timeout =
+            Duration::from_secs((5 + blob.size.div_ceil(1024 * 1024)).min(60)).min(remaining);
         let response = self
             .client(source.server, certificate)?
             .post(super::super::urls::server_native_blob(source.server)?)

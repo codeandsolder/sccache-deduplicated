@@ -1086,7 +1086,7 @@ pub trait SchedulerIncoming: Send + Sync {
     fn native_blob_sources(
         &self,
         blob: crate::build_runtime::BlobRef,
-        requester: std::net::SocketAddr,
+        requester: Option<std::net::SocketAddr>,
     ) -> ExtResult<Vec<NativeBlobSource>, Error>;
     // From Server
     fn handle_heartbeat_server(

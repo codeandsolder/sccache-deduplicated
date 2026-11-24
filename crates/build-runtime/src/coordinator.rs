@@ -127,7 +127,7 @@ impl CompilePermit {
     /// # Errors
     /// Returns an error for invalid results, missing content or storage failure.
     pub fn publish_pinned(
-        self,
+        &self,
         manifest: &ResultManifest,
         staged: Vec<StagedBlob>,
     ) -> Result<ResultLease> {
