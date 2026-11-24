@@ -214,7 +214,7 @@ impl Metrics {
             self.inputs_ready_seconds.add(predicted, actual)?;
         }
         if let Some((predicted, actual)) = selected
-            .ready_at
+            .negotiation_at
             .zip(completion.actual_result_negotiation_seconds)
         {
             self.result_negotiation_seconds.add(predicted, actual)?;
