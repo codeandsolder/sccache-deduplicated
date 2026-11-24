@@ -186,9 +186,18 @@ impl MappedTree {
                         id: ContentId::of(&data),
                         size: u64::try_from(data.len())?,
                     };
-                    sources
-                        .entry(blob.id)
-                        .or_insert_with(|| PreparedSource::Bytes(data.into()));
+                    // Generated immutable bytes supersede file locators: they
+                    // are always available and cannot change after preparation.
+                    match sources.entry(blob.id) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(PreparedSource::Bytes(data.into()));
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            if matches!(entry.get(), PreparedSource::File { .. }) {
+                                entry.insert(PreparedSource::Bytes(data.into()));
+                            }
+                        }
+                    }
                     TreeEntry::File { blob, metadata }
                 }
                 Source::File {
@@ -211,9 +220,25 @@ impl MappedTree {
                             modified,
                         },
                     };
-                    sources
-                        .entry(blob.id)
-                        .or_insert(PreparedSource::File { path, stat });
+                    let file = PreparedFile { path, stat };
+                    match sources.entry(blob.id) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(PreparedSource::File {
+                                primary: file,
+                                alternatives: Vec::new(),
+                            });
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            if let PreparedSource::File {
+                                primary,
+                                alternatives,
+                            } = entry.get_mut()
+                                && primary.path != file.path
+                            {
+                                alternatives.push(file);
+                            }
+                        }
+                    }
                     TreeEntry::File { blob, metadata }
                 }
             };
@@ -260,8 +285,24 @@ fn hash_open_source(file: &File, stat: &Stat) -> Result<BlobRef> {
     })
 }
 
+struct PreparedFile {
+    path: PathBuf,
+    stat: Stat,
+}
+
+impl PreparedFile {
+    fn open(&self) -> Result<File> {
+        let (file, current) = open_source(&self.path)?;
+        unchanged(&self.stat, &current)?;
+        Ok(file)
+    }
+}
+
 enum PreparedSource {
-    File { path: PathBuf, stat: Stat },
+    File {
+        primary: PreparedFile,
+        alternatives: Vec<PreparedFile>,
+    },
     Bytes(Arc<[u8]>),
 }
 
@@ -290,11 +331,21 @@ impl PreparedTree {
     /// Returns an error for unknown content or a changed source file.
     pub fn open_blob(&self, id: ContentId) -> Result<Box<dyn Read + Send>> {
         match self.sources.get(&id).context("undeclared mapped content")? {
-            PreparedSource::File { path, stat } => {
-                let (file, current) = open_source(path)?;
-                unchanged(stat, &current)?;
-                Ok(Box::new(file))
-            }
+            PreparedSource::File {
+                primary,
+                alternatives,
+            } => match primary.open() {
+                Ok(file) => Ok(Box::new(file)),
+                Err(primary_error) => {
+                    for source in alternatives {
+                        if let Ok(file) = source.open() {
+                            return Ok(Box::new(file));
+                        }
+                    }
+                    Err(primary_error
+                        .context("all prepared locators for this content are unavailable"))
+                }
+            },
             PreparedSource::Bytes(bytes) => Ok(Box::new(Cursor::new(Arc::clone(bytes)))),
         }
     }
@@ -369,6 +420,64 @@ mod tests {
         let mut bytes = Vec::new();
         tree.open_blob(blob.id)?.read_to_end(&mut bytes)?;
         assert_eq!(bytes, b"selected");
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_content_recovers_from_an_unavailable_alias() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        fs::write(&first, b"same immutable content")?;
+        fs::write(&second, b"same immutable content")?;
+        let metadata = TreeMetadata {
+            mode: 0o755,
+            modified: TreeTimestamp {
+                seconds: 1,
+                nanoseconds: 0,
+            },
+        };
+        let mut mapping = MappedTree::new(metadata);
+        mapping.add_file(
+            TreePath::new(b"a".to_vec())?,
+            first.clone(),
+            MappedMetadata::Preserve,
+        )?;
+        mapping.add_file(
+            TreePath::new(b"b".to_vec())?,
+            second.clone(),
+            MappedMetadata::Preserve,
+        )?;
+        let prepared = mapping.prepare()?;
+        assert_eq!(prepared.manifest().blobs()?.len(), 1);
+        let id = ContentId::of(b"same immutable content");
+        fs::remove_file(first)?;
+        let mut bytes = Vec::new();
+        prepared.open_blob(id)?.read_to_end(&mut bytes)?;
+        assert_eq!(bytes, b"same immutable content");
+        fs::remove_file(second)?;
+        assert!(prepared.open_blob(id).is_err());
+
+        let source = dir.path().join("source");
+        fs::write(&source, b"generated alias")?;
+        let mut mapping = MappedTree::new(metadata);
+        mapping.add_file(
+            TreePath::new(b"a".to_vec())?,
+            source.clone(),
+            MappedMetadata::Preserve,
+        )?;
+        mapping.add_bytes(
+            TreePath::new(b"b".to_vec())?,
+            b"generated alias".to_vec(),
+            metadata,
+        )?;
+        let prepared = mapping.prepare()?;
+        fs::remove_file(source)?;
+        bytes.clear();
+        prepared
+            .open_blob(ContentId::of(b"generated alias"))?
+            .read_to_end(&mut bytes)?;
+        assert_eq!(bytes, b"generated alias");
         Ok(())
     }
 
