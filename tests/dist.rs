@@ -9,6 +9,7 @@ use crate::harness::{
     cargo_command, clear_cache_local_daemon, get_stats, init_cargo, sccache_command,
     start_local_daemon, stop_local_daemon, write_json_cfg, write_source,
 };
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use anyhow::ensure;
 use assert_cmd::prelude::*;
 use sccache::config::HTTPUrl;
