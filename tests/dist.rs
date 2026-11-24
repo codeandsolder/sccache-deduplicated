@@ -196,9 +196,9 @@ fn test_dist_basic() {
     });
 }
 
-/// Real GCC and Clang native target jobs must execute on the worker with
-/// explicit requesting-host ISA flags, not silently fall back to local C
-/// compilation. Repeating each request must then use the same cache key.
+/// Real GCC/Clang jobs for native and an explicit v4 CPU target must execute
+/// on the worker, without substituting the worker's own CPU. Repeating each
+/// request must hit the same cache key.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 #[cfg_attr(
@@ -238,44 +238,66 @@ unsigned long native_target(unsigned long x, unsigned long y) {
 }
 "#,
     );
+    write_source(
+        root,
+        "specific_target.c",
+        r#"
+#include <immintrin.h>
+#if !defined(__AVX512F__)
+#error explicit x86-64-v4 target must enable AVX-512 codegen
+#endif
+void specific_target(int *dst, const int *a, const int *b) {
+    __m512i va = _mm512_loadu_si512((const void *)a);
+    __m512i vb = _mm512_loadu_si512((const void *)b);
+    _mm512_storeu_si512((void *)dst, _mm512_add_epi32(va, vb));
+}
+"#,
+    );
     let mut originals = Vec::new();
     for (index, compiler) in ["gcc", "clang"].into_iter().enumerate() {
         let compiler = which::which(compiler)?;
-        let output = root.join(format!("native-{index}.o"));
-        let compile = || {
-            let result = sccache_command()
-                .arg(&compiler)
-                .args(["-O2", "-march=native", "-mno-avx2", "-mtune=native", "-c"])
-                .arg(root.join("native_target.c"))
-                .arg("-o")
-                .arg(&output)
-                .env("SCCACHE_CONF", &config_path)
-                .env("SCCACHE_CACHED_CONF", &cached_config)
-                .output()?;
-            ensure!(
-                result.status.success(),
-                "{} native compilation failed: {}",
-                compiler.display(),
-                String::from_utf8_lossy(&result.stderr)
-            );
-            Ok::<_, anyhow::Error>(std::fs::read(&output)?)
-        };
-        let first = compile()?;
-        ensure!(
-            !first.is_empty(),
-            "native distributed compile produced no object"
-        );
-        originals.push((compile()?, first));
+        for (case, flags, source) in [
+            (
+                "native",
+                &["-O2", "-march=native", "-mno-avx2", "-mtune=native"][..],
+                "native_target.c",
+            ),
+            ("v4", &["-O2", "-march=x86-64-v4"][..], "specific_target.c"),
+        ] {
+            let output = root.join(format!("{case}-{index}.o"));
+            let compile = || {
+                let result = sccache_command()
+                    .arg(&compiler)
+                    .args(flags)
+                    .arg("-c")
+                    .arg(root.join(source))
+                    .arg("-o")
+                    .arg(&output)
+                    .env("SCCACHE_CONF", &config_path)
+                    .env("SCCACHE_CACHED_CONF", &cached_config)
+                    .output()?;
+                ensure!(
+                    result.status.success(),
+                    "{} {case} compilation failed: {}",
+                    compiler.display(),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                Ok::<_, anyhow::Error>(std::fs::read(&output)?)
+            };
+            let first = compile()?;
+            ensure!(!first.is_empty(), "distributed compile produced no object");
+            originals.push((compile()?, first));
+        }
     }
     for (replayed, original) in originals {
         assert_eq!(replayed, original);
     }
     get_stats(|info| {
-        assert_eq!(2, info.stats.dist_compiles.values().sum::<usize>());
+        assert_eq!(4, info.stats.dist_compiles.values().sum::<usize>());
         assert_eq!(0, info.stats.dist_errors);
-        assert_eq!(4, info.stats.compile_requests);
-        assert_eq!(2, info.stats.cache_hits.all());
-        assert_eq!(2, info.stats.cache_misses.all());
+        assert_eq!(8, info.stats.compile_requests);
+        assert_eq!(4, info.stats.cache_hits.all());
+        assert_eq!(4, info.stats.cache_misses.all());
     });
     Ok(())
 }
