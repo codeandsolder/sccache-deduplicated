@@ -56,6 +56,60 @@ fn sample_tree(blob: BlobRef) -> Result<TreeManifest> {
 }
 
 #[test]
+fn zfs_plain_content_materializes_without_fuse() -> Result<()> {
+    use std::{io::Read, os::unix::fs::MetadataExt};
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let original = b"compiler-output-with-repeating-structure".repeat(18_000);
+    let staged = store.stage(original.as_slice())?;
+    let blob = staged.reference();
+    let tree = TreeManifest {
+        root: metadata(0o755),
+        entries: BTreeMap::from([
+            (
+                TreePath::new(b"bin".to_vec())?,
+                TreeEntry::Directory(metadata(0o755)),
+            ),
+            (
+                TreePath::new(b"bin/compiler".to_vec())?,
+                TreeEntry::File {
+                    blob,
+                    metadata: metadata(0o755),
+                },
+            ),
+            (
+                TreePath::new(b"bin/alias".to_vec())?,
+                TreeEntry::Hardlink(TreePath::new(b"bin/compiler".to_vec())?),
+            ),
+        ]),
+    };
+    let id = store.publish_tree(&tree, vec![staged])?;
+    let lease = store
+        .lookup_tree(id)?
+        .context("missing native ZFS test tree")?;
+    let view = lease.materialize(dir.path())?;
+    assert_eq!(std::fs::read(view.root().join("bin/compiler"))?, original);
+    assert_eq!(
+        std::fs::metadata(view.root().join("bin/compiler"))?.ino(),
+        std::fs::metadata(view.root().join("bin/alias"))?.ino()
+    );
+    assert_eq!(view.stats().cloned_files + view.stats().copied_files, 1);
+    eprintln!(
+        "CAS backing ZFS={} cloned_files={} copied_files={} copied_bytes={}",
+        store.uses_native_zfs(),
+        view.stats().cloned_files,
+        view.stats().copied_files,
+        view.stats().copied_bytes
+    );
+    if store.uses_native_zfs() {
+        let mut physical = Vec::new();
+        lease.open_file(blob.id)?.read_to_end(&mut physical)?;
+        assert_eq!(physical, original);
+    }
+    Ok(())
+}
+
+#[test]
 fn package_trees_and_actions_share_one_blob_index_across_restart() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let store = NativeStore::open(dir.path())?;

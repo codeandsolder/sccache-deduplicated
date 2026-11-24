@@ -463,12 +463,19 @@ impl NativeCacheClient {
                         blobs.get(&missing.id) == Some(&missing.size),
                         "scheduler requested undeclared output"
                     );
-                    self.upload_stored_file(
-                        ticket,
-                        missing,
-                        crate::build_runtime::BlobEncoding::ZstdChunks,
-                        captured.open_file(missing.id)?,
-                    )?;
+                    match captured.physical_encoding() {
+                        crate::build_runtime::BlobEncoding::Raw => {
+                            self.upload(ticket, missing, captured.open_file(missing.id)?)?;
+                        }
+                        crate::build_runtime::BlobEncoding::ZstdChunks => {
+                            self.upload_stored_file(
+                                ticket,
+                                missing,
+                                captured.physical_encoding(),
+                                captured.open_file(missing.id)?,
+                            )?;
+                        }
+                    }
                 }
                 ensure!(
                     self.commit(ticket)? == *manifest,

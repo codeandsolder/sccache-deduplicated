@@ -36,6 +36,21 @@ const TREES: TableDefinition<'static, &[u8; 32], &[u8]> = TableDefinition::new("
 const BLOBS: TableDefinition<'static, &[u8; 32], u64> = TableDefinition::new("blobs_v1");
 const BLOB_LAYOUTS: TableDefinition<'static, &[u8; 32], u8> =
     TableDefinition::new("blob_layouts_v1");
+// ZFS ARC manages compression transparently; adding Zstd frames on top
+// prevents ARC from seeing and sharing the native file's uncompressed bytes.
+#[cfg(target_os = "linux")]
+const ZFS_SUPER_MAGIC: rustix::fs::FsWord = 0x2fc1_2fc1;
+
+#[cfg(target_os = "linux")]
+fn is_native_zfs(path: &Path) -> Result<bool> {
+    Ok(rustix::fs::statfs(path)?.f_type == ZFS_SUPER_MAGIC)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_native_zfs(_path: &Path) -> Result<bool> {
+    Ok(false)
+}
+
 const RESULT_ACTIONS: MultimapTableDefinition<'static, &[u8; 32], &[u8; 32]> =
     MultimapTableDefinition::new("result_actions_v1");
 const ACCOUNTING: TableDefinition<'static, u8, u64> = TableDefinition::new("accounting_v1");
@@ -414,6 +429,7 @@ impl MountCache {
 
 pub struct NativeStore {
     inner: Arc<Inner>,
+    physical_encoding: BlobEncoding,
     #[cfg(target_os = "linux")]
     mounts: Mutex<MountCache>,
 }
@@ -507,6 +523,11 @@ impl NativeStore {
             }
         }
         write.commit()?;
+        let physical_encoding = if is_native_zfs(&root.join("staging"))? {
+            BlobEncoding::Raw
+        } else {
+            BlobEncoding::ZstdChunks
+        };
         let inner = Arc::new(Inner {
             root,
             db,
@@ -519,18 +540,51 @@ impl NativeStore {
         inner.recover_orphans()?;
         Ok(Self {
             inner,
+            physical_encoding,
             #[cfg(target_os = "linux")]
             mounts: Mutex::new(MountCache::default()),
         })
     }
 
-    /// Encode generated content exactly once with indexed Zstandard blocks.
-    /// Physical bytes are portable across worker filesystems and transports.
+    /// The storage format selected for this store's backing filesystem.
+    /// ZFS retains ordinary files; other filesystems retain indexed Zstd frames.
+    #[must_use]
+    pub const fn physical_encoding(&self) -> BlobEncoding {
+        self.physical_encoding
+    }
+
+    /// True when the backing store is on ZFS and can share native ARC buffers.
+    #[must_use]
+    pub const fn uses_native_zfs(&self) -> bool {
+        matches!(self.physical_encoding, BlobEncoding::Raw)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn can_clone_into(&self, scratch: &Path) -> Result<bool> {
+        if !self.uses_native_zfs() {
+            return Ok(false);
+        }
+        ensure!(
+            is_native_zfs(scratch)?
+                && fs::metadata(scratch)?.dev() == fs::metadata(&self.inner.root)?.dev(),
+            "native ZFS CAS and sandbox scratch must be on the same ZFS dataset for block cloning"
+        );
+        Ok(true)
+    }
+
+    /// Stage generated content in the backing filesystem's preferred format.
     ///
     /// # Errors
     /// Returns an error if the stream or filesystem fails.
     pub fn stage(&self, reader: impl Read) -> Result<StagedBlob> {
-        self.stage_compressed_inner(reader, None)
+        self.stage_local_inner(reader, None)
+    }
+
+    fn stage_local_inner(&self, reader: impl Read, bound: Option<u64>) -> Result<StagedBlob> {
+        match self.physical_encoding {
+            BlobEncoding::Raw => self.stage_inner(reader, bound),
+            BlobEncoding::ZstdChunks => self.stage_compressed_inner(reader, bound),
+        }
     }
 
     // Original upstream package archives retain their exact bytes.
@@ -636,10 +690,28 @@ impl NativeStore {
         encoding: BlobEncoding,
         reader: impl Read,
     ) -> Result<StagedBlob> {
+        // Convert physical storage at ingress, instead of persisting the
+        // sender's encoding on an incompatible backing filesystem.
+        if self.physical_encoding == BlobEncoding::ZstdChunks && encoding == BlobEncoding::Raw {
+            let mut original = tempfile::tempfile_in(self.inner.root.join("staging"))?;
+            blob_codec::transfer(reader, io::sink(), &mut original, expected, encoding)?;
+            original.rewind()?;
+            let staged = self.stage_compressed_inner(original, Some(expected.size))?;
+            ensure!(
+                staged.reference == expected,
+                "CAS re-encoding digest mismatch"
+            );
+            return Ok(staged);
+        }
         let mut budget = space::StageBudget::new(self);
         budget.grow_to(expected.size)?;
         let mut staged = NamedTempFile::new_in(self.inner.root.join("staging"))?;
-        blob_codec::transfer(reader, staged.as_file_mut(), io::sink(), expected, encoding)?;
+        if self.physical_encoding == encoding {
+            blob_codec::transfer(reader, staged.as_file_mut(), io::sink(), expected, encoding)?;
+        } else {
+            // ZFS receives compressed content, but stores decoded ordinary files.
+            blob_codec::transfer(reader, io::sink(), staged.as_file_mut(), expected, encoding)?;
+        }
         staged
             .as_file()
             .set_permissions(fs::Permissions::from_mode(0o400))?;
@@ -649,7 +721,7 @@ impl NativeStore {
             path: staged.into_temp_path(),
             metadata,
             reference: expected,
-            encoding,
+            encoding: self.physical_encoding,
             owner: Arc::clone(&self.inner),
         })
     }
@@ -664,7 +736,7 @@ impl NativeStore {
             .size
             .checked_add(1)
             .context("blob length overflow")?;
-        let staged = self.stage_compressed_inner(reader.take(limit), Some(limit))?;
+        let staged = self.stage_local_inner(reader.take(limit), Some(limit))?;
         ensure!(
             staged.reference() == expected,
             "uploaded content does not match its declared digest and length"

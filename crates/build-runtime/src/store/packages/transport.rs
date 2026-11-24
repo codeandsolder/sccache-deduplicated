@@ -182,7 +182,9 @@ mod tests {
             retain_original: true,
             ..PackagePolicy::normalized_archive(100, 1 << 20, 1 << 20, 1 << 20)?
         };
-        let staged = store.stage(original.as_slice())?;
+        // Force the preexisting encoded representation to test an original
+        // package whose content ID was already occupied by that CAS layout.
+        let staged = store.stage_compressed_inner(original.as_slice(), None)?;
         let reference = staged.reference();
         let tree = TreeManifest {
             root: policy.directory,

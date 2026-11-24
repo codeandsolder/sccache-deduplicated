@@ -21,8 +21,8 @@ use rustix::{
 };
 
 use crate::{
-    Artifact, BlobRef, BuildPath, ContentId, ExecutionSpec, MountedTree, NativeStore,
-    ResultManifest, TreeEntry, TreeLease, TreePath,
+    Artifact, BlobEncoding, BlobRef, BuildPath, ContentId, ExecutionSpec, MaterializedTree,
+    MountedTree, NativeStore, ResultManifest, TreeEntry, TreeLease, TreePath,
     sandbox::{MountAccess, SandboxInvocation, SandboxPath, SandboxPlan},
 };
 
@@ -48,6 +48,7 @@ pub struct CapturedExecution {
     status: ExitStatus,
     manifest: ResultManifest,
     files: BTreeMap<ContentId, File>,
+    encoding: BlobEncoding,
 }
 
 impl CapturedExecution {
@@ -96,7 +97,12 @@ impl CapturedExecution {
     /// # Errors
     /// Returns an error for an undeclared blob or descriptor failure.
     pub fn open_blob(&self, id: ContentId) -> Result<impl Read + Send + 'static> {
-        crate::BlobReader::open(self.open_file(id)?, crate::BlobEncoding::ZstdChunks)
+        crate::BlobReader::open(self.open_file(id)?, self.encoding)
+    }
+
+    #[must_use]
+    pub const fn physical_encoding(&self) -> BlobEncoding {
+        self.encoding
     }
 
     /// Open the immutable physical CAS representation without decoding it,
@@ -120,12 +126,43 @@ struct OutputLocation {
     relative: PathBuf,
 }
 
+/// ZFS operates directly on native ARC buffers and block-cloned inodes;
+/// other filesystems use the independently compressed FUSE representation.
+enum InputView {
+    Zfs(MaterializedTree),
+    Fuse(MountedTree),
+}
+
+impl InputView {
+    fn root(&self) -> &Path {
+        match self {
+            Self::Zfs(view) => view.root(),
+            Self::Fuse(view) => view.root(),
+        }
+    }
+
+    fn mark_writable(&mut self, relative: &Path) -> Result<()> {
+        match self {
+            Self::Zfs(view) => {
+                view.mark_writable(relative);
+                Ok(())
+            }
+            Self::Fuse(view) => view.mark_writable(relative),
+        }
+    }
+
+    fn writable_path(&self, relative: &Path) -> Result<PathBuf> {
+        match self {
+            Self::Zfs(view) => Ok(view.root().join(relative)),
+            Self::Fuse(view) => Ok(view.writable_path(relative)?.to_path_buf()),
+        }
+    }
+}
+
 struct PreparedBuild {
     plan: SandboxPlan,
     outputs: BTreeMap<String, OutputLocation>,
-    // One independently cloned view per namespace location, even when two
-    // locations reference the same tree ID.
-    _views: BTreeMap<BuildPath, MountedTree>,
+    _views: BTreeMap<BuildPath, InputView>,
 }
 
 fn host_path(bytes: &[u8]) -> &Path {
@@ -209,7 +246,7 @@ fn writable_locations(
 
 fn capture_locations(
     spec: &ExecutionSpec,
-    views: &BTreeMap<BuildPath, MountedTree>,
+    views: &BTreeMap<BuildPath, InputView>,
     writable: &BTreeSet<BuildPath>,
 ) -> Result<BTreeMap<String, OutputLocation>> {
     let mut outputs = BTreeMap::new();
@@ -260,12 +297,20 @@ impl PreparedBuild {
             require_directory(root, host_path(&path[1..]))?;
         }
         let writable = writable_locations(spec, &leases)?;
-        // Each immutable input remains encoded in CAS. Mount a read-only tree
-        // and construct writable scratch only for explicitly declared output
-        // parents. The mounted lease pins its backing blobs through execution.
-        let mut views: BTreeMap<BuildPath, MountedTree> = leases
+        // On ZFS, a private tree of copy-on-write block clones is visible to
+        // native ARC and needs neither user-space decompression nor FUSE.
+        // On other filesystems, keep the compressed read-only FUSE views.
+        let native_zfs = store.can_clone_into(scratch)?;
+        let mut views: BTreeMap<BuildPath, InputView> = leases
             .into_iter()
-            .map(|(path, lease)| Ok((path, store.mount_tree(lease, scratch)?)))
+            .map(|(path, lease)| {
+                let view = if native_zfs {
+                    InputView::Zfs(lease.materialize(scratch)?)
+                } else {
+                    InputView::Fuse(store.mount_tree(lease, scratch)?)
+                };
+                Ok((path, view))
+            })
             .collect::<Result<_>>()?;
         for path in &writable {
             let (point, _) = backing(&views, path)?;
@@ -281,10 +326,10 @@ impl PreparedBuild {
         let root_source = if root_writable {
             root.writable_path(Path::new(""))?
         } else {
-            root.root()
+            root.root().to_owned()
         };
         let mut plan = SandboxPlan::new(
-            root_source,
+            &root_source,
             if root_writable {
                 MountAccess::Writable
             } else {
@@ -297,10 +342,10 @@ impl PreparedBuild {
                 let source = if is_writable {
                     view.writable_path(Path::new(""))?
                 } else {
-                    view.root()
+                    view.root().to_owned()
                 };
                 plan.bind(
-                    source,
+                    &source,
                     SandboxPath::new(host_path(path.as_bytes()))?,
                     if is_writable {
                         MountAccess::Writable
@@ -318,7 +363,7 @@ impl PreparedBuild {
             }
             let (point, view) = backing(&views, path)?;
             plan.bind(
-                view.writable_path(relative(path, point)?)?,
+                &view.writable_path(relative(path, point)?)?,
                 SandboxPath::new(host_path(path.as_bytes()))?,
                 MountAccess::Writable,
             )?;
@@ -406,6 +451,7 @@ pub fn execute(
         files: BTreeMap::new(),
         remaining: policy.max_result_bytes,
         scratch: policy.scratch.clone(),
+        encoding: store.physical_encoding(),
     };
     let stdout = capture.diagnostic(stdout)?;
     let stderr = capture.diagnostic(stderr)?;
@@ -422,6 +468,7 @@ pub fn execute(
             stderr,
         },
         files: capture.files,
+        encoding: store.physical_encoding(),
     })
 }
 
@@ -429,6 +476,7 @@ struct Capture {
     files: BTreeMap<ContentId, File>,
     remaining: u64,
     scratch: PathBuf,
+    encoding: BlobEncoding,
 }
 
 impl Capture {
@@ -447,7 +495,14 @@ impl Capture {
         ensure!(size <= self.remaining, "native result byte limit exceeded");
         file.seek(SeekFrom::Start(0))?;
         let mut physical = tempfile::tempfile_in(&self.scratch)?;
-        let reference = crate::encode_native_blob(&mut file, &mut physical, Some(size))?;
+        let reference = match self.encoding {
+            BlobEncoding::Raw => {
+                crate::encode_native_raw_blob(&mut file, &mut physical, Some(size))?
+            }
+            BlobEncoding::ZstdChunks => {
+                crate::encode_native_blob(&mut file, &mut physical, Some(size))?
+            }
+        };
         ensure!(
             reference.size == size
                 && file.stream_position()? == size

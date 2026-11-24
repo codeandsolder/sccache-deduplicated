@@ -415,7 +415,12 @@ impl NativeCacheClient {
     ) -> Result<Ticket> {
         self.push_tree_with(manifest, renewal_interval, |ticket, blob| {
             let (file, encoding) = open(blob.id)?;
-            self.upload_stored_file(ticket, blob, encoding, file)
+            match encoding {
+                // Preserve network compression even though ZFS stores the
+                // plain bytes and lets ARC compress them natively.
+                BlobEncoding::Raw => self.upload(ticket, blob, file),
+                BlobEncoding::ZstdChunks => self.upload_stored_file(ticket, blob, encoding, file),
+            }
         })
     }
 

@@ -305,6 +305,39 @@ impl Seek for BlobReader {
     }
 }
 
+/// Store original bytes while hashing them. Native ZFS compression operates
+/// below the file API, with no application-level frame overhead.
+///
+/// # Errors
+/// Returns an error if the stream fails or exceeds the stated bound.
+pub fn encode_raw(mut reader: impl Read, target: &mut File, bound: Option<u64>) -> Result<BlobRef> {
+    let mut digest = blake3::Hasher::new();
+    let mut size = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if count == 0 {
+            break;
+        }
+        size = size
+            .checked_add(u64::try_from(count)?)
+            .context("raw CAS size overflow")?;
+        if let Some(bound) = bound {
+            ensure!(size <= bound, "raw CAS input exceeds declared size");
+        }
+        target.write_all(&buffer[..count])?;
+        digest.update(&buffer[..count]);
+    }
+    Ok(BlobRef {
+        id: ContentId(*digest.finalize().as_bytes()),
+        size,
+    })
+}
+
 /// Write one immutable compressed representation while hashing its logical
 /// content. This is one compression pass with bounded buffering.
 ///

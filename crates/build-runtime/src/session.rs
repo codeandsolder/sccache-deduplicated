@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs::File,
-    io::Read,
+    io::{Read, Seek},
     path::Path,
     sync::{
         Arc, Mutex, MutexGuard,
@@ -929,9 +929,24 @@ impl NativeSessions {
         let Phase::Ready(lease) = &state.phase else {
             bail!("native content not available");
         };
-        let file = lease.open_physical(id);
+        // Archive offers must deliver original bytes verbatim. Ordinary CAS
+        // content is compressed for transfer even when its ZFS backing file
+        // is plaintext; the receiver selects its own persistent encoding.
+        let original_archive =
+            matches!(lease, Ready::Tree(tree) if tree.packages.contains_key(&id));
+        let (mut file, encoding) = lease.open_physical(id)?;
         drop(state);
-        file
+        if original_archive || encoding == BlobEncoding::ZstdChunks {
+            return Ok((file, encoding));
+        }
+        let mut wire = tempfile::tempfile()?;
+        let reference = crate::encode_native_blob(&mut file, &mut wire, None)?;
+        ensure!(
+            reference.id == id,
+            "native wire encoding changed content identity"
+        );
+        wire.rewind()?;
+        Ok((wire, BlobEncoding::ZstdChunks))
     }
 
     /// Release a delivery ticket, or cancel an unfinished action.

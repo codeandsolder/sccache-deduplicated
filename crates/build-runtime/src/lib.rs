@@ -32,7 +32,8 @@ pub use tree::{TreeEntry, TreeId, TreeManifest, TreeMetadata, TreePath, TreeTime
 mod blob_codec;
 #[cfg(feature = "store")]
 pub use blob_codec::{
-    BlobEncoding, BlobReader, encode as encode_native_blob, transfer as transfer_native_blob,
+    BlobEncoding, BlobReader, encode as encode_native_blob, encode_raw as encode_native_raw_blob,
+    transfer as transfer_native_blob,
 };
 
 #[cfg(all(unix, feature = "store"))]

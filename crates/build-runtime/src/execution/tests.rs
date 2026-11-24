@@ -223,6 +223,7 @@ fn rejects_symlink_and_fifo_outputs_without_following_or_blocking() -> Result<()
         files: BTreeMap::new(),
         remaining: 100,
         scratch: dir.path().to_path_buf(),
+        encoding: crate::BlobEncoding::ZstdChunks,
     };
     let spec = ExecutionSpec {
         platform: ContentId::of(b"platform"),

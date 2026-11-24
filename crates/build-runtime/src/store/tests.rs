@@ -27,6 +27,72 @@ fn result(blob: BlobRef) -> ResultManifest {
 }
 
 #[test]
+fn local_filesystem_policy_and_cross_format_ingest_preserve_logical_content() -> Result<()> {
+    use std::{
+        io::{Seek, SeekFrom},
+        path::Path,
+    };
+    let dir = tempfile::tempdir()?;
+    let store = NativeStore::open(dir.path())?;
+    let expected_encoding = if is_native_zfs(dir.path())? {
+        BlobEncoding::Raw
+    } else {
+        BlobEncoding::ZstdChunks
+    };
+    assert_eq!(store.physical_encoding(), expected_encoding);
+    let original = b"native-artifact-over-zfs-arc".repeat(32_000);
+    let staged = store.stage(original.as_slice())?;
+    let reference = staged.reference();
+    assert_eq!(reference.id, ContentId::of(&original));
+    assert_eq!(staged.encoding, expected_encoding);
+    let mut staged_bytes = Vec::new();
+    staged.open_file()?.read_to_end(&mut staged_bytes)?;
+    if expected_encoding == BlobEncoding::Raw {
+        assert_eq!(staged_bytes, original);
+    } else {
+        assert_ne!(staged_bytes, original);
+    }
+
+    // Both physical wire representations must be converted to the locally
+    // chosen format, with no change to the original content identity.
+    let mut compressed = tempfile::tempfile()?;
+    assert_eq!(
+        blob_codec::encode(original.as_slice(), &mut compressed, None)?,
+        reference
+    );
+    compressed.seek(SeekFrom::Start(0))?;
+    for (encoding, reader) in [
+        (
+            BlobEncoding::Raw,
+            Box::new(original.as_slice()) as Box<dyn Read>,
+        ),
+        (
+            BlobEncoding::ZstdChunks,
+            Box::new(compressed) as Box<dyn Read>,
+        ),
+    ] {
+        let received = store.stage_expected_physical(reference, encoding, reader)?;
+        assert_eq!(received.reference(), reference);
+        assert_eq!(received.encoding, expected_encoding);
+        let mut reader = BlobReader::open(received.open_file()?, received.encoding)?;
+        let mut roundtrip = Vec::new();
+        reader.read_to_end(&mut roundtrip)?;
+        assert_eq!(roundtrip, original);
+    }
+    // A different filesystem must not inadvertently adopt ZFS's raw policy.
+    if Path::new("/dev/shm").is_dir() && !is_native_zfs(Path::new("/dev/shm"))? {
+        let tmp = tempfile::tempdir_in("/dev/shm")?;
+        let other = NativeStore::open(tmp.path())?;
+        assert_eq!(other.physical_encoding(), BlobEncoding::ZstdChunks);
+        let encoded = other.stage(original.as_slice())?;
+        assert_eq!(encoded.encoding, BlobEncoding::ZstdChunks);
+        assert_eq!(encoded.reference(), reference);
+        assert!(encoded.open_file()?.metadata()?.len() < original.len() as u64);
+    }
+    Ok(())
+}
+
+#[test]
 fn literal_magic_prefix_in_raw_cas_blob_survives_restart() -> Result<()> {
     use crate::{TreeEntry, TreeManifest, TreeMetadata, TreePath, TreeTimestamp};
     let directory = tempfile::tempdir()?;
@@ -577,8 +643,7 @@ fn staging_many_blobs_does_not_hold_file_descriptors() -> Result<()> {
     assert_eq!(fs::read_dir(&staging)?.count(), staged.len());
     for (index, blob) in staged.iter().enumerate() {
         let mut bytes = Vec::new();
-        crate::BlobReader::open(blob.open_file()?, crate::BlobEncoding::ZstdChunks)?
-            .read_to_end(&mut bytes)?;
+        crate::BlobReader::open(blob.open_file()?, blob.encoding)?.read_to_end(&mut bytes)?;
         assert_eq!(bytes, u32::try_from(index)?.to_le_bytes());
     }
     drop(staged);
