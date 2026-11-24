@@ -75,12 +75,16 @@ Scheduling a miss selects a worker whose advertised platform contract
 matches and accounts for capacity in the same pool as ordinary jobs.
 Repeating scheduling for the same pending ticket replays the allocation.
 
-On ZFS workers, each tree is materialized into a private filesystem view
-using native CoW block clones instead of application-compressed FUSE input
-files. ZFS owns compression and the compressed ARC. On non-ZFS workers,
-independently Zstd-compressed CAS objects are exposed through a read-only
-FUSE view with separate writable output scratch. Bubblewrap binds views
-read-only except for declared output parent directories and private `/tmp`. The command and its output
+On ZFS workers, each immutable tree is materialized **once per cached
+TreeId** as ordinary files backed by native CoW block clones and reused
+through read-only Bubblewrap binds. ZFS owns compression and the compressed
+ARC, without application-level FUSE decoding. Each action block-clones only
+the directory subtrees that it can modify; cross-boundary hardlink groups
+instead use a complete private CoW tree so POSIX inode identity and write
+visibility remain correct. On non-ZFS workers, independently Zstd-compressed
+CAS objects are exposed through a cached read-only FUSE view with separate
+writable output scratch. Bubblewrap binds both types of immutable views
+read-only except for declared output parents and private `/tmp`. The command and its output
 paths need not be rewritten into a special `/out` directory. Every output
 parent and mount destination must be a real declared directory; an output
 cannot replace an input entry, mount root, or namespace device/proc path.

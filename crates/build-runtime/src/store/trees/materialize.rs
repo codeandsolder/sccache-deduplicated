@@ -87,7 +87,7 @@ impl Drop for MaterializedTree {
     }
 }
 
-fn restore_mutable_directories(root: &Path) {
+pub(super) fn restore_mutable_directories(root: &Path) {
     // Execution has stopped. The private parent is never exposed to the
     // sandbox. Walk the current tree without following replacement links.
     let mut pending = vec![root.to_owned()];

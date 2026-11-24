@@ -22,8 +22,8 @@ use rustix::{
 };
 
 use crate::{
-    Artifact, BlobEncoding, BlobRef, BuildPath, ContentId, ExecutionSpec, MaterializedTree,
-    MountedTree, NativeStore, ResultManifest, TreeEntry, TreeLease, TreePath,
+    Artifact, BlobEncoding, BlobRef, BuildPath, ContentId, ExecutionSpec, MountedTree, NativeStore,
+    ResultManifest, TreeEntry, TreeLease, TreePath,
     sandbox::{MountAccess, SandboxInvocation, SandboxPath, SandboxPlan},
 };
 
@@ -127,43 +127,10 @@ struct OutputLocation {
     relative: PathBuf,
 }
 
-/// ZFS operates directly on native ARC buffers and block-cloned inodes;
-/// other filesystems use the independently compressed FUSE representation.
-enum InputView {
-    Zfs(MaterializedTree),
-    Fuse(MountedTree),
-}
-
-impl InputView {
-    fn root(&self) -> &Path {
-        match self {
-            Self::Zfs(view) => view.root(),
-            Self::Fuse(view) => view.root(),
-        }
-    }
-
-    fn mark_writable(&mut self, relative: &Path) -> Result<()> {
-        match self {
-            Self::Zfs(view) => {
-                view.mark_writable(relative);
-                Ok(())
-            }
-            Self::Fuse(view) => view.mark_writable(relative),
-        }
-    }
-
-    fn writable_path(&self, relative: &Path) -> Result<PathBuf> {
-        match self {
-            Self::Zfs(view) => Ok(view.root().join(relative)),
-            Self::Fuse(view) => Ok(view.writable_path(relative)?.to_path_buf()),
-        }
-    }
-}
-
 struct PreparedBuild {
     plan: SandboxPlan,
     outputs: BTreeMap<String, OutputLocation>,
-    _views: BTreeMap<BuildPath, InputView>,
+    _views: BTreeMap<BuildPath, MountedTree>,
 }
 
 fn host_path(bytes: &[u8]) -> &Path {
@@ -247,7 +214,7 @@ fn writable_locations(
 
 fn capture_locations(
     spec: &ExecutionSpec,
-    views: &BTreeMap<BuildPath, InputView>,
+    views: &BTreeMap<BuildPath, MountedTree>,
     writable: &BTreeSet<BuildPath>,
 ) -> Result<BTreeMap<String, OutputLocation>> {
     let mut outputs = BTreeMap::new();
@@ -298,20 +265,11 @@ impl PreparedBuild {
             require_directory(root, host_path(&path[1..]))?;
         }
         let writable = writable_locations(spec, &leases)?;
-        // On ZFS, a private tree of copy-on-write block clones is visible to
-        // native ARC and needs neither user-space decompression nor FUSE.
-        // On other filesystems, keep the compressed read-only FUSE views.
-        let native_zfs = store.can_clone_into(scratch)?;
-        let mut views: BTreeMap<BuildPath, InputView> = leases
+        // Reuse immutable native-ZFS CoW tree views (or compressed FUSE
+        // mounts on non-ZFS). Only output parents need private scratch.
+        let mut views: BTreeMap<BuildPath, MountedTree> = leases
             .into_iter()
-            .map(|(path, lease)| {
-                let view = if native_zfs {
-                    InputView::Zfs(lease.materialize(scratch)?)
-                } else {
-                    InputView::Fuse(store.mount_tree(lease, scratch)?)
-                };
-                Ok((path, view))
-            })
+            .map(|(path, lease)| Ok((path, store.mount_tree(lease, scratch)?)))
             .collect::<Result<_>>()?;
         for path in &writable {
             let (point, _) = backing(&views, path)?;
@@ -325,7 +283,7 @@ impl PreparedBuild {
         let root = views.get(&root_point).context("native root view missing")?;
         let root_writable = writable.contains(&root_point);
         let root_source = if root_writable {
-            root.writable_path(Path::new(""))?
+            root.writable_path(Path::new(""))?.to_owned()
         } else {
             root.root().to_owned()
         };
@@ -341,7 +299,7 @@ impl PreparedBuild {
             if path != &root_point {
                 let is_writable = writable.contains(path);
                 let source = if is_writable {
-                    view.writable_path(Path::new(""))?
+                    view.writable_path(Path::new(""))?.to_owned()
                 } else {
                     view.root().to_owned()
                 };
@@ -364,7 +322,7 @@ impl PreparedBuild {
             }
             let (point, view) = backing(&views, path)?;
             plan.bind(
-                &view.writable_path(relative(path, point)?)?,
+                view.writable_path(relative(path, point)?)?,
                 SandboxPath::new(host_path(path.as_bytes()))?,
                 MountAccess::Writable,
             )?;

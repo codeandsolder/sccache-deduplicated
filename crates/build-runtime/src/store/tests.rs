@@ -185,6 +185,32 @@ fn heterogeneous_zfs_and_non_zfs_stores_exchange_all_physical_encodings() -> Res
 }
 
 #[test]
+fn orphaned_native_views_are_reclaimed_without_following_links() -> Result<()> {
+    use std::{
+        fs,
+        os::unix::fs::{PermissionsExt, symlink},
+    };
+
+    let temp = tempfile::tempdir()?;
+    let store = NativeStore::open(temp.path())?;
+    drop(store);
+    let mount_root = temp.path().join("mounts");
+    let orphan = mount_root.join("old-cached-zfs-tree");
+    let restricted = orphan.join("readonly");
+    fs::create_dir_all(restricted.join("nested"))?;
+    fs::write(restricted.join("nested/stale"), b"old build data")?;
+    let outside = temp.path().join("outside");
+    fs::write(&outside, b"keep")?;
+    symlink(&outside, orphan.join("redirect"))?;
+    fs::set_permissions(&restricted, fs::Permissions::from_mode(0o000))?;
+    let reopened = NativeStore::open(temp.path())?;
+    assert!(!orphan.exists(), "stale tree should be reclaimed");
+    assert_eq!(fs::read(&outside)?, b"keep");
+    drop(reopened);
+    Ok(())
+}
+
+#[test]
 fn literal_magic_prefix_in_raw_cas_blob_survives_restart() -> Result<()> {
     use crate::{TreeEntry, TreeManifest, TreeMetadata, TreePath, TreeTimestamp};
     let directory = tempfile::tempdir()?;

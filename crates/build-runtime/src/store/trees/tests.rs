@@ -55,22 +55,10 @@ fn sample_tree(blob: BlobRef) -> Result<TreeManifest> {
     })
 }
 
-/// Repeatable warm-cache benchmark of real compiler header trees.
-/// Only runs explicitly when ignored tests are enabled.
-#[test]
-#[ignore = "benchmark native ZFS clones against reuse of compressed FUSE trees"]
-fn benchmark_native_zfs_clones_against_fuse_views() -> Result<()> {
-    use std::{fs, io, path::PathBuf, time::Instant};
+/// Copy representative real C/C++ headers into a deterministic CAS input.
+fn compiler_header_corpus(input: &std::path::Path) -> Result<(Vec<String>, u64)> {
+    use std::{fs, path::PathBuf};
 
-    let zfs_dir = tempfile::tempdir()?;
-    let memory_dir = tempfile::tempdir_in("/dev/shm")?;
-    let zfs = NativeStore::open(&zfs_dir.path().join("store"))?;
-    let non_zfs = NativeStore::open(&memory_dir.path().join("store"))?;
-    if !zfs.uses_native_zfs() {
-        return Ok(());
-    }
-    let input = zfs_dir.path().join("real-compiler-inputs");
-    fs::create_dir(&input)?;
     let mut todo = vec![PathBuf::from("/usr/include")];
     let mut bytes = 0_u64;
     let mut names = Vec::new();
@@ -78,7 +66,9 @@ fn benchmark_native_zfs_clones_against_fuse_views() -> Result<()> {
         let Ok(entries) = fs::read_dir(dir) else {
             continue;
         };
-        let mut entries = entries.filter_map(|entry| entry.ok()).collect::<Vec<_>>();
+        let mut entries = entries
+            .filter_map(std::result::Result::ok)
+            .collect::<Vec<_>>();
         entries.sort_by_key(fs::DirEntry::path);
         for entry in entries {
             let kind = entry.file_type()?;
@@ -109,6 +99,26 @@ fn benchmark_native_zfs_clones_against_fuse_views() -> Result<()> {
         }
     }
     anyhow::ensure!(names.len() > 100, "insufficient real compiler inputs");
+    Ok((names, bytes))
+}
+
+/// Repeatable warm-cache benchmark of real compiler header trees.
+/// Only runs explicitly when ignored tests are enabled.
+#[test]
+#[ignore = "benchmark native ZFS clones against reuse of compressed FUSE trees"]
+fn benchmark_native_zfs_clones_against_fuse_views() -> Result<()> {
+    use std::{fs, io, time::Instant};
+
+    let zfs_dir = tempfile::tempdir()?;
+    let memory_dir = tempfile::tempdir_in("/dev/shm")?;
+    let zfs = NativeStore::open(&zfs_dir.path().join("store"))?;
+    let non_zfs = NativeStore::open(&memory_dir.path().join("store"))?;
+    if !zfs.uses_native_zfs() {
+        return Ok(());
+    }
+    let input = zfs_dir.path().join("real-compiler-inputs");
+    fs::create_dir(&input)?;
+    let (names, bytes) = compiler_header_corpus(&input)?;
     eprintln!("BENCH corpus files={} logical_bytes={}", names.len(), bytes);
     let start = Instant::now();
     let zfs_lease = zfs.capture_tree(&input)?;
@@ -138,6 +148,23 @@ fn benchmark_native_zfs_clones_against_fuse_views() -> Result<()> {
         );
     }
     for iteration in 0..6 {
+        let lease = zfs
+            .lookup_tree(zfs_lease.id())?
+            .context("ZFS tree missing")?;
+        let start = Instant::now();
+        let view = zfs.mount_tree(lease, zfs_dir.path())?;
+        let setup = start.elapsed().as_micros();
+        let start = Instant::now();
+        let mut total = 0_u64;
+        for name in &names {
+            let mut file = fs::File::open(view.root().join(name))?;
+            total += io::copy(&mut file, &mut io::sink())?;
+        }
+        let reading = start.elapsed().as_micros();
+        anyhow::ensure!(total == bytes, "cached ZFS content mismatch");
+        eprintln!("BENCH run={iteration} backend=zfs_cached setup_us={setup} read_us={reading}");
+    }
+    for iteration in 0..6 {
         let lease = non_zfs
             .lookup_tree(fuse_lease.id())?
             .context("FUSE tree missing")?;
@@ -152,10 +179,7 @@ fn benchmark_native_zfs_clones_against_fuse_views() -> Result<()> {
         }
         let reading = start.elapsed().as_micros();
         anyhow::ensure!(total == bytes, "FUSE virtual content mismatch");
-        eprintln!(
-            "BENCH run={} backend=fuse setup_us={} read_us={}",
-            iteration, setup, reading,
-        );
+        eprintln!("BENCH run={iteration} backend=fuse setup_us={setup} read_us={reading}");
     }
     Ok(())
 }

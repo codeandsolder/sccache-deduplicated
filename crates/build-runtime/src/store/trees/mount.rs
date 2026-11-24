@@ -20,11 +20,11 @@ use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, Request, Session, SessionUnmounter,
 };
-use rustix::fs::{AtFlags, CWD, Timestamps, utimensat};
+use rustix::fs::{AtFlags, CWD, Timestamps, ioctl_ficlone, utimensat};
 use rustix::time::Timespec;
 use tempfile::TempDir;
 
-use super::TreeLease;
+use super::{MaterializedTree, TreeLease};
 use crate::{BlobReader, BlobRef, TreeEntry, TreeMetadata, TreeTimestamp};
 
 const TTL: Duration = Duration::from_secs(3600);
@@ -346,17 +346,23 @@ impl Filesystem for VirtualFs {
     }
 }
 
-/// Owns a long-lived readonly FUSE mount and its backing content pins.
-/// Destruction synchronously unmounts and joins the worker before releasing pins.
-pub struct ReadOnlyView {
-    unmount: SessionUnmounter,
-    thread: Option<JoinHandle<io::Result<()>>>,
-    _directory: TempDir,
-    mountpoint: PathBuf,
+/// A pinned immutable tree view. Native ZFS files use ARC directly; other
+/// filesystems expose indexed compressed objects through a read-only FUSE mount.
+pub enum ReadOnlyView {
+    Fuse {
+        unmount: SessionUnmounter,
+        thread: Option<JoinHandle<io::Result<()>>>,
+        _directory: TempDir,
+        mountpoint: PathBuf,
+    },
+    Zfs {
+        lease: TreeLease,
+        materialized: MaterializedTree,
+    },
 }
 
 impl ReadOnlyView {
-    pub(crate) fn mount(lease: TreeLease, parent: &Path) -> Result<Self> {
+    pub(crate) fn mount_fuse(lease: TreeLease, parent: &Path) -> Result<Self> {
         let filesystem = VirtualFs::new(lease)?;
         let directory = tempfile::Builder::new()
             .prefix("build-fuse-")
@@ -374,7 +380,7 @@ impl ReadOnlyView {
         )?;
         let unmount = session.unmount_callable();
         let thread = thread::spawn(move || session.run());
-        Ok(Self {
+        Ok(Self::Fuse {
             unmount,
             thread: Some(thread),
             _directory: directory,
@@ -382,34 +388,84 @@ impl ReadOnlyView {
         })
     }
 
+    pub(crate) fn materialize_zfs(lease: TreeLease, parent: &Path) -> Result<Self> {
+        // Clone each immutable CAS tree only on its first use. Subsequent
+        // actions share this view and expose it only through read-only binds.
+        let materialized = lease.materialize(parent)?;
+        Ok(Self::Zfs {
+            lease,
+            materialized,
+        })
+    }
+
     fn root(&self) -> &Path {
-        &self.mountpoint
+        match self {
+            Self::Fuse { mountpoint, .. } => mountpoint,
+            Self::Zfs { materialized, .. } => materialized.root(),
+        }
+    }
+
+    const fn is_zfs(&self) -> bool {
+        matches!(self, Self::Zfs { .. })
+    }
+
+    fn private_zfs_view(&self, parent: &Path) -> Result<MaterializedTree> {
+        let Self::Zfs { lease, .. } = self else {
+            anyhow::bail!("private native ZFS materialization requires a ZFS input");
+        };
+        lease.materialize(parent)
+    }
+
+    /// An output region that contains one hardlink but not its other link
+    /// cannot be cloned independently without changing POSIX inode identity.
+    /// Fall back to one per-action private ZFS tree for that entire layout.
+    fn crosses_hardlink_boundary(&self, regions: &[PathBuf]) -> bool {
+        let Self::Zfs { lease, .. } = self else {
+            return false;
+        };
+        let region_for = |bytes: &[u8]| {
+            let path = Path::new(OsStr::from_bytes(bytes));
+            regions
+                .iter()
+                .position(|region| region.as_os_str().is_empty() || path.starts_with(region))
+        };
+        lease.manifest().entries.iter().any(|(path, entry)| {
+            let TreeEntry::Hardlink(target) = entry else {
+                return false;
+            };
+            region_for(path.as_bytes()) != region_for(target.as_bytes())
+        })
     }
 }
 
 impl Drop for ReadOnlyView {
     fn drop(&mut self) {
-        if let Err(error) = self.unmount.unmount() {
-            log::warn!("cannot unmount compressed CAS tree: {error}");
-        }
-        if let Some(thread) = self.thread.take() {
-            match thread.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => log::warn!("compressed CAS FUSE worker failed: {error}"),
-                Err(_) => log::error!("compressed CAS FUSE worker panicked"),
+        if let Self::Fuse {
+            unmount, thread, ..
+        } = self
+        {
+            if let Err(error) = unmount.unmount() {
+                log::warn!("cannot unmount compressed CAS tree: {error}");
+            }
+            if let Some(thread) = thread.take() {
+                match thread.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => log::warn!("compressed CAS FUSE worker failed: {error}"),
+                    Err(_) => log::error!("compressed CAS FUSE worker panicked"),
+                }
             }
         }
     }
 }
 
-/// A read-only CAS tree with per-action writable scratch.
-///
-/// The kernel can reuse decoded pages through the shared FUSE inode whenever
-/// another build mounts the same immutable tree.
+/// One immutable view per tree identity, with private `CoW` scratch for each
+/// action. Native ZFS shares ARC-backed cloned inodes; non-ZFS shares FUSE.
 pub struct MountedTree {
     view: Arc<ReadOnlyView>,
+    private_zfs: Option<MaterializedTree>,
     directory: TempDir,
     writable: BTreeMap<PathBuf, PathBuf>,
+    scratch_directories: Vec<PathBuf>,
 }
 
 impl MountedTree {
@@ -419,30 +475,71 @@ impl MountedTree {
             .tempdir_in(parent)?;
         Ok(Self {
             view,
+            private_zfs: None,
             directory,
             writable: BTreeMap::new(),
+            scratch_directories: Vec::new(),
         })
     }
 
     #[must_use]
     pub fn root(&self) -> &Path {
-        self.view.root()
+        self.private_zfs
+            .as_ref()
+            .map_or_else(|| self.view.root(), MaterializedTree::root)
     }
 
-    /// Copy the contents of one directory into private writable scratch.
-    /// This is necessary only for paths that the build may modify.
+    /// Build a private output-directory view. ZFS block-clones only the
+    /// writable subtree, while non-ZFS copies decoded FUSE content. Hardlink
+    /// groups crossing an output binding receive one complete private ZFS view
+    /// to preserve POSIX inode identity and write propagation.
     ///
     /// # Errors
-    /// Returns an error for invalid backing directories, file types or I/O failures.
+    /// Returns an error for invalid directories, clone failure or I/O failure.
     pub fn mark_writable(&mut self, relative: &Path) -> Result<()> {
-        let source = self.view.root().join(relative);
+        if self.writable.contains_key(relative) {
+            return Ok(());
+        }
+        let source = self.root().join(relative);
         ensure!(source.is_dir(), "writable mount source is not a directory");
+
+        let regions = self
+            .writable
+            .keys()
+            .cloned()
+            .chain(std::iter::once(relative.to_owned()))
+            .collect::<Vec<_>>();
+        if self.private_zfs.is_none() && self.view.crosses_hardlink_boundary(&regions) {
+            let mut private = self.view.private_zfs_view(self.directory.path())?;
+            for existing in self.writable.keys() {
+                private.mark_writable(existing);
+            }
+            private.mark_writable(relative);
+            for (existing, value) in &mut self.writable {
+                *value = private.root().join(existing);
+            }
+            self.writable
+                .insert(relative.to_owned(), private.root().join(relative));
+            self.private_zfs = Some(private);
+            return Ok(());
+        }
+
+        if let Some(private) = self.private_zfs.as_mut() {
+            private.mark_writable(relative);
+            self.writable
+                .insert(relative.to_owned(), private.root().join(relative));
+            return Ok(());
+        }
+
         let scratch = self
             .directory
             .path()
             .join(format!("mutable-{}", self.writable.len()));
+        // Track partial scratch trees too, so failures cannot leave mode-000
+        // directories behind after cleanup.
+        self.scratch_directories.push(scratch.clone());
         let mut links = BTreeMap::new();
-        copy_directory(&source, &scratch, &mut links)?;
+        copy_directory(&source, &scratch, &mut links, self.view.is_zfs())?;
         self.writable.insert(relative.to_owned(), scratch);
         Ok(())
     }
@@ -459,7 +556,22 @@ impl MountedTree {
     }
 }
 
-fn copy_directory(src: &Path, dst: &Path, links: &mut BTreeMap<(u64, u64), PathBuf>) -> Result<()> {
+impl Drop for MountedTree {
+    fn drop(&mut self) {
+        // Make the private scratch tree traversable before TempDir recursively
+        // removes it. Original manifest directories may be mode 000 or 0555.
+        for path in &self.scratch_directories {
+            super::materialize::restore_mutable_directories(path);
+        }
+    }
+}
+
+fn copy_directory(
+    src: &Path,
+    dst: &Path,
+    links: &mut BTreeMap<(u64, u64), PathBuf>,
+    clone_zfs: bool,
+) -> Result<()> {
     fs::create_dir(dst)?;
     let src_meta = fs::symlink_metadata(src)?;
     for entry in fs::read_dir(src)? {
@@ -468,7 +580,7 @@ fn copy_directory(src: &Path, dst: &Path, links: &mut BTreeMap<(u64, u64), PathB
         let dst_path = dst.join(entry.file_name());
         let meta = fs::symlink_metadata(&src_path)?;
         if meta.is_dir() {
-            copy_directory(&src_path, &dst_path, links)?;
+            copy_directory(&src_path, &dst_path, links, clone_zfs)?;
         } else if meta.is_symlink() {
             symlink(fs::read_link(&src_path)?, &dst_path)?;
             copy_time(&dst_path, &meta)?;
@@ -479,7 +591,12 @@ fn copy_directory(src: &Path, dst: &Path, links: &mut BTreeMap<(u64, u64), PathB
             } else {
                 let mut source = File::open(&src_path)?;
                 let mut target = File::create(&dst_path)?;
-                io::copy(&mut source, &mut target)?;
+                if clone_zfs {
+                    ioctl_ficlone(&target, &source)
+                        .context("native ZFS CoW clone failed for writable subtree")?;
+                } else {
+                    io::copy(&mut source, &mut target)?;
+                }
                 links.insert(identity, dst_path.clone());
                 fs::set_permissions(&dst_path, fs::Permissions::from_mode(meta.mode() & 0o777))?;
                 copy_time(&dst_path, &meta)?;
@@ -517,7 +634,7 @@ impl TreeLease {
     /// # Errors
     /// Returns an error when the mount, manifest or filesystem is unavailable.
     pub fn mount_readonly(self, parent: &Path) -> Result<MountedTree> {
-        MountedTree::from_view(Arc::new(ReadOnlyView::mount(self, parent)?), parent)
+        MountedTree::from_view(Arc::new(ReadOnlyView::mount_fuse(self, parent)?), parent)
     }
 }
 
@@ -568,6 +685,107 @@ mod tests {
         assert_eq!(fs::read(root.join("out/original"))?, b"untouched");
         drop(mounted);
         assert!(!root.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn cached_zfs_view_clones_only_writable_subtree_and_isolates_builds() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("input");
+        fs::create_dir_all(input.join("out"))?;
+        fs::create_dir_all(input.join("bin"))?;
+        fs::write(input.join("bin/tool"), b"immutable compiler binary")?;
+        fs::write(input.join("out/source"), b"unmodified")?;
+        fs::hard_link(input.join("out/source"), input.join("out/alias"))?;
+        symlink("../bin/tool", input.join("out/tool-link"))?;
+        let store = NativeStore::open(&temp.path().join("store"))?;
+        if !store.uses_native_zfs() {
+            return Ok(());
+        }
+        let lease = store.capture_tree(&input)?;
+        let id = lease.id();
+        let scratch_one = temp.path().join("action-one");
+        let scratch_two = temp.path().join("action-two");
+        fs::create_dir(&scratch_one)?;
+        fs::create_dir(&scratch_two)?;
+        let mut first = store.mount_tree(lease, &scratch_one)?;
+        let root = first.root().to_owned();
+        let cached_tool_inode = fs::metadata(root.join("bin/tool"))?.ino();
+        let lease = store.lookup_tree(id)?.context("missing native ZFS tree")?;
+        let mut second = store.mount_tree(lease, &scratch_two)?;
+        assert_eq!(root, second.root(), "immutable ZFS tree should be shared");
+        assert_eq!(
+            fs::metadata(second.root().join("bin/tool"))?.ino(),
+            cached_tool_inode
+        );
+
+        first.mark_writable(Path::new("out"))?;
+        second.mark_writable(Path::new("out"))?;
+        assert!(first.private_zfs.is_none());
+        assert!(second.private_zfs.is_none());
+        let first_out = first.writable_path(Path::new("out"))?.to_owned();
+        let second_out = second.writable_path(Path::new("out"))?.to_owned();
+        assert_ne!(first_out, second_out);
+        assert_ne!(
+            fs::metadata(root.join("out/source"))?.ino(),
+            fs::metadata(first_out.join("source"))?.ino()
+        );
+        assert_eq!(
+            fs::metadata(first_out.join("source"))?.ino(),
+            fs::metadata(first_out.join("alias"))?.ino()
+        );
+        assert_eq!(
+            fs::read_link(first_out.join("tool-link"))?,
+            Path::new("../bin/tool")
+        );
+        fs::write(first_out.join("source"), b"first action")?;
+        fs::write(second_out.join("source"), b"second action")?;
+        assert_eq!(fs::read(root.join("out/source"))?, b"unmodified");
+        assert_eq!(fs::read(first_out.join("alias"))?, b"first action");
+        assert_eq!(fs::read(second_out.join("source"))?, b"second action");
+        assert_eq!(
+            fs::read(root.join("bin/tool"))?,
+            b"immutable compiler binary"
+        );
+        drop(first);
+        drop(second);
+        assert!(matches!(store.evict_tree(id)?, Eviction::Removed { .. }));
+        assert!(!root.exists(), "eviction drops the cached ZFS tree");
+        Ok(())
+    }
+
+    #[test]
+    fn hardlinks_crossing_output_mounts_keep_one_private_zfs_inode_group() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("input");
+        fs::create_dir_all(input.join("out"))?;
+        fs::create_dir_all(input.join("lib"))?;
+        fs::write(input.join("lib/shared"), b"before")?;
+        fs::hard_link(input.join("lib/shared"), input.join("out/alias"))?;
+        let store = NativeStore::open(&temp.path().join("store"))?;
+        if !store.uses_native_zfs() {
+            return Ok(());
+        }
+        let lease = store.capture_tree(&input)?;
+        let mut mounted = store.mount_tree(lease, temp.path())?;
+        let immutable_root = mounted.root().to_owned();
+        mounted.mark_writable(Path::new("out"))?;
+        assert!(
+            mounted.private_zfs.is_some(),
+            "cross-mount hardlinks need one private CoW tree"
+        );
+        let private_root = mounted.root().to_owned();
+        assert_ne!(private_root, immutable_root);
+        let output = mounted.writable_path(Path::new("out"))?.to_owned();
+        assert_eq!(
+            fs::metadata(private_root.join("lib/shared"))?.ino(),
+            fs::metadata(output.join("alias"))?.ino()
+        );
+        fs::write(output.join("alias"), b"modified")?;
+        assert_eq!(fs::read(private_root.join("lib/shared"))?, b"modified");
+        assert_eq!(fs::read(immutable_root.join("lib/shared"))?, b"before");
+        drop(mounted);
+        assert!(!private_root.exists());
         Ok(())
     }
 

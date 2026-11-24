@@ -51,6 +51,30 @@ fn is_native_zfs(_path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+// An unexpected process exit can leave native CoW tree hierarchies behind.
+// The Redb lock is already held by the caller, so no live store can own the
+// transient mounts being reclaimed. Never follow symlinks during cleanup.
+fn clean_orphan_mounts(directory: &Path) -> Result<()> {
+    fn remove(path: &Path) -> Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.is_dir() {
+            // Tree manifests can contain directories with restrictive modes.
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+            for child in fs::read_dir(path)? {
+                remove(&child?.path())?;
+            }
+            fs::remove_dir(path)?;
+        } else {
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+    for entry in fs::read_dir(directory)? {
+        remove(&entry?.path())?;
+    }
+    Ok(())
+}
+
 const RESULT_ACTIONS: MultimapTableDefinition<'static, &[u8; 32], &[u8; 32]> =
     MultimapTableDefinition::new("result_actions_v1");
 const ACCOUNTING: TableDefinition<'static, u8, u64> = TableDefinition::new("accounting_v1");
@@ -389,6 +413,7 @@ impl MountCache {
         lease: trees::TreeLease,
         persistent: &Path,
         scratch: &Path,
+        native_zfs: bool,
     ) -> Result<trees::MountedTree> {
         let key = lease.id();
         if let Some(view) = self.entries.get(&key) {
@@ -397,7 +422,11 @@ impl MountCache {
             self.order.push_back(key);
             return Ok(mounted);
         }
-        let view = Arc::new(trees::ReadOnlyView::mount(lease, persistent)?);
+        let view = Arc::new(if native_zfs {
+            trees::ReadOnlyView::materialize_zfs(lease, persistent)?
+        } else {
+            trees::ReadOnlyView::mount_fuse(lease, persistent)?
+        });
         let mounted = trees::MountedTree::from_view(Arc::clone(&view), scratch)?;
         self.entries.insert(key, view);
         self.order.push_back(key);
@@ -441,10 +470,11 @@ impl NativeStore {
         lease: trees::TreeLease,
         parent: &Path,
     ) -> Result<trees::MountedTree> {
+        let native_zfs = self.can_clone_into(parent)?;
         self.mounts
             .lock()
             .map_err(|_| anyhow!("native CAS mount cache lock poisoned"))?
-            .mount(lease, &self.inner.root.join("mounts"), parent)
+            .mount(lease, &self.inner.root.join("mounts"), parent, native_zfs)
     }
 
     #[cfg(target_os = "linux")]
@@ -500,6 +530,7 @@ impl NativeStore {
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
             }
         }
+        clean_orphan_mounts(&root.join("mounts"))?;
         File::open(&root)?.sync_all()?;
         let write = db.begin_write()?;
         write.open_table(ACTIONS)?;
