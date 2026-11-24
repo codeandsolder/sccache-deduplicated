@@ -32,8 +32,8 @@ pub struct MaterializationStats {
 /// Private file bindings for changed entries of a composed tree.
 /// The target lease pins its blobs; the cached base holds the unchanged files.
 pub struct OverlayFiles {
-    _lease: TreeLease,
-    _directory: TempDir,
+    lease: TreeLease,
+    directory: TempDir,
     pub(super) replacements: BTreeMap<TreePath, PathBuf>,
     pub(crate) stats: MaterializationStats,
 }
@@ -153,20 +153,20 @@ impl TreeLease {
         // mid-operation failure runs the same safe cleanup as success, even
         // if an already-created child directory has restrictive permissions.
         let mut overlays = OverlayFiles {
-            _lease: self,
-            _directory: directory,
+            lease: self,
+            directory,
             replacements: BTreeMap::new(),
             stats: MaterializationStats::default(),
         };
         for (index, path) in plan.files.iter().enumerate() {
             let Some(TreeEntry::File { blob, metadata }) =
-                overlays._lease.manifest.entries.get(path)
+                overlays.lease.manifest.entries.get(path)
             else {
                 anyhow::bail!("overlay source must be a regular file");
             };
-            let physical = overlays._directory.path().join(format!("file-{index}"));
+            let physical = overlays.directory.path().join(format!("file-{index}"));
             overlays
-                ._lease
+                .lease
                 .materialize_file(*blob, &physical, &mut overlays.stats)?;
             apply_metadata(&physical, *metadata)?;
             ensure!(
@@ -178,7 +178,7 @@ impl TreeLease {
             );
         }
         for (index, anchor) in plan.directories.iter().enumerate() {
-            let physical = overlays._directory.path().join(format!("dir-{index}"));
+            let physical = overlays.directory.path().join(format!("dir-{index}"));
             ensure!(
                 overlays
                     .replacements
@@ -187,7 +187,7 @@ impl TreeLease {
                 "duplicate overlay directory"
             );
             overlays
-                ._lease
+                .lease
                 .materialize_overlay_subtree(anchor, &physical, &mut overlays.stats)?;
         }
         Ok(overlays)
