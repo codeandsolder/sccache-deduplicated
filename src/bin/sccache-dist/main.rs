@@ -3292,6 +3292,11 @@ mod server_upload_tests {
     #[test]
     fn missing_cached_archive_requires_fresh_upload_on_assignment() -> Result<()> {
         let (dir, server) = test_server()?;
+        let cache = &server
+            .archive
+            .as_ref()
+            .context("archive worker missing")?
+            .cache;
         let contents = b"verified archive removed after publication";
         let toolchain = tc(contents)?;
         let root = dir.path().join("tc");
@@ -3301,7 +3306,7 @@ mod server_upload_tests {
             contents.as_slice(),
             1024 * 1024,
         )?;
-        server.cache.lock().unwrap().insert_staged(staged)?;
+        cache.lock().unwrap().insert_staged(staged)?;
 
         let first = server.handle_assign_job(JobId(45), toolchain.clone())?;
         assert!(!first.need_toolchain);
@@ -3313,7 +3318,7 @@ mod server_upload_tests {
         let next = server.handle_assign_job(JobId(46), toolchain.clone())?;
         assert!(next.need_toolchain);
         assert!(matches!(next.state, JobState::Pending));
-        assert!(!server.cache.lock().unwrap().contains_toolchain(&toolchain));
+        assert!(!cache.lock().unwrap().contains_toolchain(&toolchain));
         Ok(())
     }
 
