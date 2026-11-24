@@ -22,7 +22,6 @@ use std::{
     collections::{BTreeMap, HashSet},
     ffi::{OsStr, OsString},
     fs::Metadata,
-    hash::Hash,
     io::Write,
     path::{Path, PathBuf},
     sync::LazyLock,
@@ -34,10 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::PreprocessorCacheModeConfig,
-    util::{
-        Digest, HashToDigest, MetadataCtimeExt, TimeMacroFinder, Timestamp, encode_path,
-        strip_basedirs,
-    },
+    util::{Digest, MetadataCtimeExt, TimeMacroFinder, Timestamp, encode_path, strip_basedirs},
 };
 
 use super::Language;

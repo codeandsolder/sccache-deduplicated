@@ -212,27 +212,43 @@ impl NativeCompilerClient {
         )
     }
 
-    fn execute(&self, plan: &CompilerPlan, mode: ActionMode) -> Result<NativeBuildResult> {
+    async fn execute(
+        self: Arc<Self>,
+        plan: CompilerPlan,
+        mode: ActionMode,
+        pool: &tokio::runtime::Handle,
+    ) -> Result<NativeBuildResult> {
         match &self.endpoint {
-            Endpoint::Direct(endpoint) => self.connect_http()?.run_action(
-                &plan.spec,
-                &plan.inputs,
-                &plan.destinations,
-                &self.policy.build_policy(mode),
-                endpoint.local.as_ref(),
-            ),
+            Endpoint::Direct(_) => {
+                pool.spawn_blocking(move || {
+                    let Endpoint::Direct(endpoint) = &self.endpoint else {
+                        unreachable!()
+                    };
+                    self.connect_http()?.run_action(
+                        &plan.spec,
+                        &plan.inputs,
+                        &plan.destinations,
+                        &self.policy.build_policy(mode),
+                        endpoint.local.as_ref(),
+                    )
+                })
+                .await?
+            }
             Endpoint::Namespace {
                 connection,
                 chunk_bytes,
-            } => broker::run_action(
-                connection,
-                *chunk_bytes,
-                &self.policy,
-                &plan.spec,
-                mode,
-                &plan.inputs,
-                &plan.destinations,
-            ),
+            } => {
+                broker::run_action(
+                    Arc::clone(connection),
+                    *chunk_bytes,
+                    self.policy.clone(),
+                    plan.spec,
+                    mode,
+                    plan.inputs,
+                    plan.destinations,
+                )
+                .await
+            }
         }
     }
 }
@@ -389,21 +405,24 @@ pub(super) async fn compile<T: CommandCreatorSync>(
                 layout.add_root_mapping(local, &remote);
             }
             let packagers = compilation.into_dist_packagers(transformer)?;
+            let preparation_client = Arc::clone(&client);
             Ok::<_, anyhow::Error>(pool.spawn_blocking(move || {
-                let plan = CompilerPlan::prepare(
+                CompilerPlan::prepare(
                     remote,
                     &cwd,
                     outputs,
                     layout,
                     packagers,
-                    client.policy.platform,
-                    &client.toolchain_digests,
-                )?;
-                client.execute(&plan, mode)
+                    preparation_client.policy.platform,
+                    &preparation_client.toolchain_digests,
+                )
             }))
         })();
         let result = match result {
-            Ok(task) => task.await?,
+            Ok(task) => match task.await? {
+                Ok(plan) => client.execute(plan, mode, pool).await,
+                Err(error) => Err(error),
+            },
             Err(error) => Err(error),
         };
         match result {
@@ -436,6 +455,7 @@ pub(super) async fn compile<T: CommandCreatorSync>(
                 );
                 fallback = DistType::Error;
             }
+            Err(error) if error.is::<crate::client::IpcTransportFailure>() => return Err(error),
             Err(error) => {
                 warn!("native compilation unavailable; compiling locally: {error:#}");
                 fallback = DistType::Error;

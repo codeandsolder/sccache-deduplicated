@@ -384,10 +384,10 @@ impl TimeMacroFinder {
     /// A finder for a file already known to contain the given macros.
     #[must_use = "the returned finder carries the cached macro observations"]
     pub fn with_found(date: bool, time: bool, timestamp: bool) -> Self {
-        let finder = Self::new();
-        finder.found_date.set(date);
-        finder.found_time.set(time);
-        finder.found_timestamp.set(timestamp);
+        let mut finder = Self::new();
+        finder.found_date = date;
+        finder.found_time = time;
+        finder.found_timestamp = timestamp;
         finder
     }
 }

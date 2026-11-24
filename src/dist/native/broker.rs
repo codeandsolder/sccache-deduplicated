@@ -19,7 +19,7 @@ use crate::{
         ActionMode, BlobRef, ContentId, ExecutionSpec, PreparedTree, ResultManifest, TreeId,
         TreeManifest, wire::NativeRunResult,
     },
-    client::SharedConnection,
+    client::{SharedConnection, connection_task},
     protocol::{NativeNamespacePolicy, TransferReply, TransferRequest},
 };
 
@@ -205,56 +205,55 @@ fn serve_inner(
     Ok(())
 }
 
-pub fn run_action(
-    connection: &SharedConnection,
+pub async fn run_action(
+    connection: SharedConnection,
     chunk_bytes: usize,
-    policy: &NativeNamespacePolicy,
-    spec: &ExecutionSpec,
+    policy: NativeNamespacePolicy,
+    spec: ExecutionSpec,
     mode: ActionMode,
-    inputs: &[PreparedTree],
-    destinations: &BTreeMap<String, PathBuf>,
+    inputs: Vec<PreparedTree>,
+    destinations: BTreeMap<String, PathBuf>,
 ) -> Result<NativeBuildResult> {
     ensure!(
         spec.platform == policy.platform,
         "native namespace platform mismatch"
     );
-    let inputs = LocalInputs::new(spec, inputs)?;
-    let destinations = verify_destinations(spec, destinations)?;
-    let mut connection = connection
-        .lock()
-        .map_err(|_| anyhow::anyhow!("IPC connection lock poisoned"))?;
-    ensure!(
-        matches!(
-            connection.transfer(TransferRequest::NativeStart)?,
-            TransferReply::Ack
-        ),
-        "unexpected native stream start response"
-    );
-    let result = run_inner(
-        &mut pipe::CallerStream::new(&mut connection, chunk_bytes),
-        policy,
-        spec,
-        mode,
-        &inputs,
-        &destinations,
-    );
-    let request = if result.is_ok() {
-        TransferRequest::NativeEnd
-    } else {
-        TransferRequest::Abort
-    };
-    let close = connection.transfer(request);
-    drop(connection);
-    match result {
-        Ok(result) => {
-            ensure!(
-                matches!(close?, TransferReply::Ack),
-                "unexpected native stream end response"
-            );
-            Ok(result)
+    connection_task(connection, move |connection| {
+        let inputs = LocalInputs::new(&spec, &inputs)?;
+        let destinations = verify_destinations(&spec, &destinations)?;
+        ensure!(
+            matches!(
+                connection.transfer(TransferRequest::NativeStart)?,
+                TransferReply::Ack
+            ),
+            "unexpected native stream start response"
+        );
+        let result = run_inner(
+            &mut pipe::CallerStream::new(connection, chunk_bytes),
+            &policy,
+            &spec,
+            mode,
+            &inputs,
+            &destinations,
+        );
+        let request = if result.is_ok() {
+            TransferRequest::NativeEnd
+        } else {
+            TransferRequest::Abort
+        };
+        let close = connection.transfer(request);
+        match result {
+            Ok(result) => {
+                ensure!(
+                    matches!(close?, TransferReply::Ack),
+                    "unexpected native stream end response"
+                );
+                Ok(result)
+            }
+            Err(error) => Err(error),
         }
-        Err(error) => Err(error),
-    }
+    })
+    .await
 }
 
 fn run_inner(
