@@ -1024,6 +1024,87 @@ pub struct NativeBlobSource {
 #[cfg(feature = "dist-server")]
 pub type NativeInputBlobs = std::collections::BTreeMap<crate::build_runtime::ContentId, u64>;
 
+/// Verified progress for one worker reservation; durations are relative to
+/// the heartbeat snapshot, not synchronized wall clocks.
+#[cfg(feature = "dist-server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeJobProgress {
+    pub phase: crate::build_runtime::wire::NativeJobPhase,
+    pub phase_nanoseconds: u64,
+    pub remaining_input_bytes: u64,
+    pub remaining_input_blobs: u64,
+}
+
+/// Bounded snapshot of the worker-owned pipeline, including terminal
+/// responses still occupying reservation capacity.
+#[cfg(feature = "dist-server")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeQueueSnapshot {
+    pub capacity: u32,
+    pub compiler_slots: u32,
+    pub compiler_active: u32,
+    pub staging_slots: u32,
+    pub publication_slots: u32,
+    pub jobs: std::collections::BTreeMap<JobId, NativeJobProgress>,
+}
+
+#[cfg(feature = "dist-server")]
+impl NativeQueueSnapshot {
+    pub const MAX_CAPACITY: u32 = 65_536;
+
+    #[must_use = "invalid telemetry must not drive scheduling"]
+    pub fn valid(&self) -> bool {
+        (1..=Self::MAX_CAPACITY).contains(&self.capacity)
+            && (1..=Self::MAX_CAPACITY).contains(&self.compiler_slots)
+            && self.compiler_active <= self.compiler_slots
+            && (1..=self.compiler_slots).contains(&self.staging_slots)
+            && (1..=self.compiler_slots).contains(&self.publication_slots)
+            && self.jobs.len() <= self.capacity as usize
+            && self.jobs.values().all(|job| {
+                !job.phase.inputs_ready()
+                    || (job.remaining_input_bytes == 0 && job.remaining_input_blobs == 0)
+            })
+    }
+
+    #[must_use = "the dispatcher must have room for an additional reservation"]
+    pub fn has_capacity(&self, assigned: impl Iterator<Item = JobId>) -> bool {
+        self.available_reservations(assigned) != 0
+    }
+
+    #[must_use = "unobserved reservations and terminal replies also consume local capacity"]
+    pub fn available_reservations(&self, assigned: impl Iterator<Item = JobId>) -> usize {
+        let unobserved = assigned.filter(|id| !self.jobs.contains_key(id)).count();
+        (self.capacity as usize).saturating_sub(self.jobs.len().saturating_add(unobserved))
+    }
+
+    #[must_use = "compiler admission excludes publication-only reservations"]
+    pub fn compiler_demand(&self, assigned: impl Iterator<Item = JobId>) -> usize {
+        let local = self
+            .jobs
+            .values()
+            .filter(|job| job.phase.needs_compiler())
+            .count();
+        // Unknown scheduler reservations include legacy jobs and native
+        // assignments made since the snapshot. Orphaned local reservations
+        // still compete until their cancellation has drained.
+        local.saturating_add(assigned.filter(|id| !self.jobs.contains_key(id)).count())
+    }
+}
+
+#[cfg(feature = "dist-server")]
+impl Default for NativeQueueSnapshot {
+    fn default() -> Self {
+        Self {
+            capacity: Self::MAX_CAPACITY,
+            compiler_slots: Self::MAX_CAPACITY,
+            compiler_active: 0,
+            staging_slots: 4,
+            publication_slots: 4,
+            jobs: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
 /// Advisory worker telemetry, never part of action identity or verification.
 #[cfg(feature = "dist-server")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1032,6 +1113,7 @@ pub struct NativePlacement {
     pub transfer: crate::build_runtime::PackageTransferCost,
     pub execution_nanoseconds: u64,
     pub result: crate::build_runtime::ResultTransferEstimate,
+    pub queue: NativeQueueSnapshot,
 }
 
 #[cfg(feature = "dist-server")]
@@ -1042,6 +1124,7 @@ impl Default for NativePlacement {
             transfer: crate::build_runtime::PackageTransferCost::default(),
             execution_nanoseconds: 1_000_000_000,
             result: crate::build_runtime::ResultTransferEstimate::default(),
+            queue: NativeQueueSnapshot::default(),
         }
     }
 }
@@ -1131,7 +1214,6 @@ pub trait SchedulerIncoming: Send + Sync {
 pub trait ServerIncoming: Send + Sync {
     /// Compiler slots in use, excluding jobs waiting for input or a slot.
     fn executing_jobs(&self) -> usize;
-    fn active_native_jobs(&self) -> Vec<JobId>;
     // From Scheduler
     fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> ExtResult<AssignJobResult, Error>;
     fn capabilities(&self) -> WorkerCapabilities;

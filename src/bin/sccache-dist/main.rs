@@ -807,7 +807,7 @@ pub struct Scheduler {
 
 struct ServerDetails {
     // Native input closures are reserved with the assignment, even before transfer.
-    jobs_assigned: HashMap<JobId, dist::NativeInputBlobs>,
+    jobs_assigned: HashMap<JobId, Option<dist::NativeInputBlobs>>,
     // Reservations for assignment RPCs still in flight. Once assigned,
     // the state and unclaimed timeout are owned exclusively by JobDetail.
     jobs_assigning: HashMap<JobId, Instant>,
@@ -818,6 +818,35 @@ struct ServerDetails {
     worker_name: Option<String>,
     capabilities: dist::WorkerCapabilities,
     job_authorizer: Box<dyn JobAuthorizer>,
+}
+
+impl ServerDetails {
+    fn compiler_demand(&self) -> usize {
+        self.capabilities.native_placement.as_ref().map_or_else(
+            || self.jobs_assigned.len(),
+            |placement| {
+                placement
+                    .queue
+                    .compiler_demand(self.jobs_assigned.keys().copied())
+            },
+        )
+    }
+
+    fn native_headroom(&self) -> usize {
+        if self.capabilities.archive {
+            return usize::MAX;
+        }
+        self.capabilities
+            .native_placement
+            .as_ref()
+            .map_or(0, |placement| {
+                placement.queue.available_reservations(
+                    self.jobs_assigned
+                        .iter()
+                        .filter_map(|(&id, inputs)| inputs.is_some().then_some(id)),
+                )
+            })
+    }
 }
 
 impl Scheduler {
@@ -1003,7 +1032,7 @@ impl Scheduler {
                         continue;
                     }
                     let Some(weight) = admission_weight(
-                        details.jobs_assigned.len(),
+                        details.compiler_demand(),
                         details.cpu_capacity,
                         self.job_slack,
                     ) else {
@@ -1015,6 +1044,14 @@ impl Scheduler {
                         let Some(placement) = details.capabilities.native_placement.as_ref() else {
                             continue;
                         };
+                        if !placement.queue.has_capacity(
+                            details
+                                .jobs_assigned
+                                .iter()
+                                .filter_map(|(&id, inputs)| inputs.is_some().then_some(id)),
+                        ) {
+                            continue;
+                        }
                         native_estimate(
                             details.cpu_capacity,
                             &details.jobs_assigned,
@@ -1067,7 +1104,7 @@ impl Scheduler {
                     assert!(
                         server_details
                             .jobs_assigned
-                            .insert(job_id, native_inputs.cloned().unwrap_or_default())
+                            .insert(job_id, native_inputs.cloned())
                             .is_none()
                     );
                     assert!(
@@ -1283,8 +1320,8 @@ impl SchedulerIncoming for Scheduler {
         if let Some(placement) = &capabilities.native_placement {
             placement.transfer.validate()?;
             anyhow::ensure!(
-                placement.result.valid(),
-                "invalid native result transfer telemetry"
+                placement.result.valid() && placement.queue.valid(),
+                "invalid native result or queue telemetry"
             );
             anyhow::ensure!(
                 placement.execution_nanoseconds > 0
@@ -1581,7 +1618,8 @@ impl SchedulerIncoming for Scheduler {
                     .map(|v| {
                         self.job_slack
                             .max_jobs(v.cpu_capacity)
-                            .saturating_sub(v.jobs_assigned.len())
+                            .saturating_sub(v.compiler_demand())
+                            .min(v.native_headroom())
                     })
                     .fold(0, usize::saturating_add)
             },
@@ -1757,14 +1795,6 @@ impl ServerIncoming for Server {
         self.execution_queue.active()
     }
 
-    fn active_native_jobs(&self) -> Vec<JobId> {
-        #[cfg(target_os = "linux")]
-        if let Some(dispatcher) = &self.native_worker {
-            return dispatcher.active_jobs();
-        }
-        Vec::new()
-    }
-
     fn handle_reconcile_assignments(
         &self,
         assigned_job_ids: &[JobId],
@@ -1800,10 +1830,7 @@ impl ServerIncoming for Server {
         #[cfg(not(target_os = "linux"))]
         let native_platform = None;
         #[cfg(target_os = "linux")]
-        let native_placement = self
-            .native_worker
-            .as_ref()
-            .map(|dispatcher| dispatcher.worker().placement());
+        let native_placement = self.native_worker.as_ref().map(NativeDispatcher::placement);
         #[cfg(not(target_os = "linux"))]
         let native_placement = None;
         dist::WorkerCapabilities {
@@ -2192,7 +2219,10 @@ mod scheduler_tests {
         filter.insert(a);
         slow.residency = Some(filter);
         assert!(eta(4.0, &empty, &slow) < eta(4.0, &empty, &fast));
-        let queued = HashMap::from([(JobId(1), inputs.clone()), (JobId(2), inputs.clone())]);
+        let queued = HashMap::from([
+            (JobId(1), Some(inputs.clone())),
+            (JobId(2), Some(inputs.clone())),
+        ]);
         assert_eq!(eta(4.0, &queued, &fast), eta(4.0, &empty, &fast));
         assert!(eta(1.0, &queued, &fast) > eta(4.0, &empty, &fast));
     }
@@ -2320,7 +2350,7 @@ mod scheduler_tests {
         assert_eq!(job_alloc.server_id, a);
         assert_eq!(
             scheduler.servers.lock().unwrap()[&a].jobs_assigned[&job_alloc.job_id],
-            BTreeMap::from([(ContentId([1; 32]), 10)])
+            Some(BTreeMap::from([(ContentId([1; 32]), 10)]))
         );
         assert!(matches!(
             scheduler.handle_alloc_native_job(
@@ -2938,7 +2968,7 @@ mod scheduler_tests {
                 .get_mut(&server_id)
                 .unwrap()
                 .jobs_assigned
-                .insert(job_alloc.job_id, BTreeMap::new());
+                .insert(job_alloc.job_id, None);
         }
         scheduler
             .handle_update_job_state(job_alloc.job_id, server_id, JobState::Complete)
@@ -3578,7 +3608,8 @@ mod server_upload_tests {
             contents.as_slice(),
             1024 * 1024,
         )?;
-        server.cache.lock().unwrap().insert_staged(staged)?;
+        let archive = server.archive.as_ref().context("archive worker disabled")?;
+        archive.cache.lock().unwrap().insert_staged(staged)?;
 
         let first = server.handle_assign_job(JobId(45), toolchain.clone())?;
         assert!(!first.need_toolchain);
@@ -3590,7 +3621,7 @@ mod server_upload_tests {
         let next = server.handle_assign_job(JobId(46), toolchain.clone())?;
         assert!(next.need_toolchain);
         assert!(matches!(next.state, JobState::Pending));
-        assert!(!server.cache.lock().unwrap().contains_toolchain(&toolchain));
+        assert!(!archive.has_cached_toolchain(&toolchain)?);
         Ok(())
     }
 

@@ -82,17 +82,18 @@ The HTTP implementation of sccache has the following API, where all HTTP body co
       - Called by a client to retrieve the (dynamically created) HTTPS
         certificate for a server, for use in communication with that server.
       - Returns a digest and PEM for the temporary server HTTPS certificate.
-   - `POST /api/v1/scheduler/heartbeat_server`
+   - `POST /api/v2/scheduler/heartbeat_server`
       - Called (repeatedly) by servers to register as available for jobs.
       - Every five seconds, advertises fractional effective CPU capacity from
         host idle CPU time plus the worker's currently executing jobs (capped
-        at the available CPU count). The scheduler subtracts all outstanding
-        assignments, including in-flight reservations, and randomly selects
-        a healthy worker with weight max(0, effective CPUs - assigned jobs) + 0.5.
-        Even a fully busy worker remains eligible unless its admission limit
-        is reached; there is no separate queue-slot draw. The previous busy
-        cutoff and re-enable delay are removed.
-      - Includes active `run_job` IDs. A `Started` job absent for a full
+        at the available CPU count). Admission counts assignments still
+        requiring compiler capacity, including newly reserved jobs not yet
+        visible in the heartbeat; native publication and terminal replies
+        use separate bounded dispatcher capacity. Legacy selection weights
+        healthy workers by remaining compiler capacity. Native selection
+        predicts staging, execution and publication completion from the
+        queue snapshot and measured transfer costs (see NativeCache.md).
+      - Includes active legacy `run_job` IDs and native dispatcher phases. A `Started` job absent for a full
         heartbeat timeout is released, while long compilations remain
         assigned as long as the worker reports them running.
       - The response includes the scheduler's assigned-job IDs, including

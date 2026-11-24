@@ -18,7 +18,7 @@ use sccache::{
         JobId, NativeAssignment, NativePlacement,
         native::{
             CompletedWorker, NativeCacheClient, PackageTransportTracker, PreparedWorker,
-            WorkerDelivery,
+            WorkerDelivery, WorkerPreparation,
         },
     },
 };
@@ -145,7 +145,7 @@ impl NativeWorker {
         self.store.open_available_blob(blob)
     }
 
-    pub(super) fn placement(&self) -> NativePlacement {
+    pub(super) fn placement(&self, queue: sccache::dist::NativeQueueSnapshot) -> NativePlacement {
         self.artifact_grace.reap();
         let timing = WorkerTiming {
             transfer: self.package_transfer.estimate(),
@@ -156,7 +156,7 @@ impl NativeWorker {
             .placement
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        cache.refresh(&self.store, timing)
+        cache.refresh(&self.store, timing, queue)
     }
 
     pub(super) fn transfer_parallelism(&self) -> usize {
@@ -181,7 +181,7 @@ impl NativeWorker {
         job: JobId,
         assignment: &NativeAssignment,
         queue: &sccache::dist::execution_queue::ExecutionQueue,
-        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        preparation: WorkerPreparation<'_>,
     ) -> Result<PreparedWorker> {
         self.client.clone().for_worker(job).prepare_on_worker(
             assignment.ticket,
@@ -189,7 +189,7 @@ impl NativeWorker {
             &self.store,
             &self.policy,
             self.delivery(queue),
-            cancelled,
+            preparation,
         )
     }
 
@@ -284,7 +284,12 @@ impl PlacementCache {
         )
     }
 
-    fn refresh(&mut self, store: &NativeStore, timing: WorkerTiming) -> NativePlacement {
+    fn refresh(
+        &mut self,
+        store: &NativeStore,
+        timing: WorkerTiming,
+        queue: sccache::dist::NativeQueueSnapshot,
+    ) -> NativePlacement {
         let now = Instant::now();
         if self
             .inventory
@@ -314,6 +319,7 @@ impl PlacementCache {
             transfer: timing.transfer,
             execution_nanoseconds: timing.execution_nanoseconds,
             result: timing.result,
+            queue,
         }
     }
 

@@ -811,7 +811,7 @@ completion or cancellation. Successful and failed compiler outcomes leave
 the compiler pool before publication or remote cleanup.
 
 Native run protocol v4 returns short, idempotent status replies (queued,
-staging, ready, executing or publishing). A terminal result is replayable
+staging, ready, executing, awaiting publication or publishing). A terminal result is replayable
 until the client acknowledges it or the five-minute retention expires.
 Repeated claims cannot launch duplicate executions. Heartbeats report
 active dispatched jobs separately from actual occupied compiler slots.
@@ -853,16 +853,35 @@ input transfers. These estimates are checkpointed atomically to
 per minute. Restart uses a validated checkpoint no older than 24 hours, scoped
 to the cache endpoint and platform; a new route starts from configuration.
 
-For each candidate the scheduler estimates raw transfer duration from unique
-missing bytes and batches of missing requests, adds the outstanding transfer
-backlog (also deduplicated), and overlaps that with estimated compiler queue
-wait. A fully resident job need not wait for unrelated transfers. A native
-job goes to the eligible worker with the lowest estimated completion time.
-Legacy archive admission retains its existing capacity-weighted selection.
-The residency summary and timing estimates are advisory; neither changes
-content identity or bypasses verification. The model currently uses raw
-delivery cost for placement (package reconstruction is optimized separately)
-and one average slot duration per worker, not per-action compute forecasts.
+Heartbeat protocol v2 includes the dispatcher reservation limit, staging,
+compiler and publication widths, occupied shared compiler slots, and a
+bounded job-ID map of phase, phase age and remaining unverified input bytes
+and blob count. Initial remaining counts come from the assignment's exact
+partial-residency pin; verified raw batches and completed trees remove their blobs once,
+even when trees overlap. Full input closures are known from scheduler
+reservations and can override a stale Bloom inventory. Terminal responses
+and scheduler reservations not yet observed both consume admission headroom,
+but publication-only work is excluded from compiler admission. Legacy jobs
+share compiler capacity without consuming the native reservation limit.
+
+Placement forecasts separate staging, compiler and publication timelines.
+Staging considers occupied staging slots, aggregate directional bandwidth,
+unique future input availability and request overhead. Shared pending content
+is charged once; consumers wait for its predicted availability. Verified
+progress limits residual input work. Warm candidates bypass unrelated wire
+work if a staging slot is available. Ready jobs use predicted compiler release
+times, including elapsed service for already executing work. Publication-only
+jobs and terminal replies do not occupy compiler slots; forecast publication
+pool availability affects output-transfer start time. Candidate outputs then
+use the existing directional shared-link simulation. Legacy archive selection
+remains capacity-weighted, without charging its jobs to native publication.
+
+All predictions are advisory; they never authorize bytes or change action
+identity. The aggregate input-delivery timeline is approximate rather than
+a per-stream packet simulation. Partial progress reports counts rather than
+exact blob deltas. Placement uses raw delivery costs and mean worker service
+times; package-specific placement and per-action output/compute estimates
+remain separate improvements.
 
 ### Directional shared-network estimation
 

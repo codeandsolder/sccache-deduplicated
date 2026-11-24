@@ -522,6 +522,7 @@ impl NativeCacheClient {
         store: &crate::build_runtime::NativeStore,
         delivery: worker::WorkerDelivery<'_>,
         action_check: &LeaseCheck<'_>,
+        on_tree: &mut dyn FnMut(&crate::build_runtime::TreeLease),
     ) -> Result<crate::build_runtime::TreeLease> {
         action_check()?;
         let transport = delivery.transport;
@@ -571,9 +572,13 @@ impl NativeCacheClient {
                     ticket: read.ticket,
                     missing: chunk.to_vec(),
                 })?;
-                acquired.extend(map_packages(chunk, transport.parallelism(), |blob| {
+                let leases = map_packages(chunk, transport.parallelism(), |blob| {
                     self.fetch_input_blob(read.ticket, *blob, store, transport, check)
-                })?);
+                })?;
+                for lease in &leases {
+                    on_tree(lease);
+                }
+                acquired.extend(leases);
             }
             let tree = store.publish_tree_pinned(&read.manifest, Vec::new())?;
             drop(acquired);
@@ -970,7 +975,9 @@ mod worker;
 #[cfg(all(target_os = "linux", feature = "native-store"))]
 pub use grace::ArtifactGrace;
 #[cfg(all(target_os = "linux", feature = "native-store"))]
-pub use worker::{CompletedWorker, PackageTransportTracker, PreparedWorker, WorkerDelivery};
+pub use worker::{
+    CompletedWorker, PackageTransportTracker, PreparedWorker, WorkerDelivery, WorkerPreparation,
+};
 
 #[cfg(all(target_os = "linux", feature = "dist-client"))]
 mod client;

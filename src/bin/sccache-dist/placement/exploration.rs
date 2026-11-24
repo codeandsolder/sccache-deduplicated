@@ -89,19 +89,29 @@ fn question(
 }
 
 fn additional_inputs(details: &ServerDetails, requested: &NativeInputBlobs) -> NativeInputBlobs {
-    let resident = details
-        .capabilities
-        .native_placement
-        .as_ref()
-        .and_then(|placement| placement.residency.as_ref());
+    let placement = details.capabilities.native_placement.as_ref();
+    let confirmed = placement.map_or_else(Default::default, |placement| {
+        super::pipeline::confirmed_inputs(&details.jobs_assigned, placement)
+    });
     let mut missing: NativeInputBlobs = requested
         .iter()
-        .filter(|(id, _)| !resident.is_some_and(|filter| filter.may_contain(**id)))
+        .filter(|(id, _)| {
+            !placement
+                .is_some_and(|placement| super::pipeline::resident(placement, &confirmed, **id))
+        })
         .map(|(&id, &bytes)| (id, bytes))
         .collect();
     for id in details
         .jobs_assigned
-        .values()
+        .iter()
+        .filter(|(id, _)| {
+            placement.is_none_or(|placement| {
+                placement.queue.jobs.get(id).is_none_or(|job| {
+                    job.phase != sccache::build_runtime::wire::NativeJobPhase::Terminal
+                })
+            })
+        })
+        .filter_map(|(_, inputs)| inputs.as_ref())
         .flat_map(|inputs| inputs.keys())
     {
         missing.remove(id);

@@ -88,6 +88,15 @@ impl ServerOutgoing for PausingRequester {
     }
 }
 
+fn active_jobs(dispatcher: &NativeDispatcher) -> Vec<JobId> {
+    dispatcher
+        .snapshot()
+        .jobs
+        .into_iter()
+        .filter_map(|(id, job)| job.phase.active().then_some(id))
+        .collect()
+}
+
 fn terminal(
     dispatcher: &NativeDispatcher,
     requester: &Arc<dyn ServerOutgoing>,
@@ -133,7 +142,7 @@ fn native_dispatcher_claim_is_nonblocking_and_replayable_with_bounded_reservatio
         dispatcher.assign(first, assignment(1)?)?;
         dispatcher.assign(second, assignment(2)?)?;
         assert!(dispatcher.assign(third, assignment(3)?).is_err());
-        assert!(dispatcher.active_jobs().is_empty());
+        assert!(active_jobs(&dispatcher).is_empty());
 
         assert_eq!(
             dispatcher.poll(first, Arc::clone(&requester), NativeRunRequest::Poll)?,
@@ -156,7 +165,7 @@ fn native_dispatcher_claim_is_nonblocking_and_replayable_with_bounded_reservatio
             NativeRunResult::Pending(NativeJobPhase::Queued)
         );
         assert_eq!(
-            dispatcher.active_jobs().into_iter().collect::<HashSet<_>>(),
+            active_jobs(&dispatcher).into_iter().collect::<HashSet<_>>(),
             HashSet::from([first, second])
         );
         assert_eq!(queue.active(), 0);
@@ -199,7 +208,7 @@ fn native_dispatcher_claim_is_nonblocking_and_replayable_with_bounded_reservatio
                 NativeRunResult::Unavailable
             );
         }
-        assert!(dispatcher.active_jobs().is_empty());
+        assert!(active_jobs(&dispatcher).is_empty());
         assert!(dispatcher.assign(third, assignment(3)?).is_err());
         assert_eq!(
             dispatcher.poll(first, Arc::clone(&requester), NativeRunRequest::Acknowledge)?,
@@ -260,6 +269,8 @@ fn native_dispatcher_reaps_only_expired_terminal_reservations() {
             id,
             Reservation {
                 accepted_at: now,
+                phase_since: now,
+                remaining: RemainingInputs::default(),
                 cancelled: Arc::new(AtomicBool::new(false)),
                 state,
             },

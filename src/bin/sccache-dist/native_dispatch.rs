@@ -2,7 +2,7 @@
 //! stages; ready jobs retain their inputs without owning a compiler thread.
 
 use std::{
-    collections::{HashMap, HashSet, hash_map::Entry},
+    collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
@@ -15,13 +15,14 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use sccache::{
     build_runtime::{
-        CapturedExecution,
+        CapturedExecution, TreeLease,
         wire::{NativeJobPhase, NativeRunRequest, NativeRunResult},
     },
     dist::{
-        JobId, JobState, NativeAssignment, ServerOutgoing, UpdateJobStateResult,
+        JobId, JobState, NativeAssignment, NativeJobProgress, NativePlacement, NativeQueueSnapshot,
+        ServerOutgoing, UpdateJobStateResult,
         execution_queue::ExecutionQueue,
-        native::{CompletedWorker, PreparedWorker},
+        native::{CompletedWorker, PreparedWorker, WorkerPreparation},
     },
 };
 
@@ -72,8 +73,47 @@ enum State {
 
 struct Reservation {
     accepted_at: Instant,
+    phase_since: Instant,
+    remaining: RemainingInputs,
     cancelled: Arc<AtomicBool>,
     state: State,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RemainingInputs {
+    bytes: u64,
+    blobs: u64,
+}
+
+impl RemainingInputs {
+    fn from_missing(missing: &[sccache::build_runtime::BlobRef]) -> Self {
+        Self {
+            bytes: missing
+                .iter()
+                .map(|blob| blob.size)
+                .fold(0, u64::saturating_add),
+            blobs: u64::try_from(missing.len()).unwrap_or(u64::MAX),
+        }
+    }
+}
+
+impl Reservation {
+    fn progress(&self, now: Instant) -> NativeJobProgress {
+        let phase = match self.state {
+            State::Assigned(_) => NativeJobPhase::Assigned,
+            State::Active(phase) => phase,
+            State::Terminal { .. } => NativeJobPhase::Terminal,
+        };
+        NativeJobProgress {
+            phase,
+            phase_nanoseconds: u64::try_from(
+                now.saturating_duration_since(self.phase_since).as_nanos(),
+            )
+            .unwrap_or(u64::MAX),
+            remaining_input_bytes: self.remaining.bytes,
+            remaining_input_blobs: self.remaining.blobs,
+        }
+    }
 }
 
 struct Job {
@@ -102,6 +142,7 @@ struct Shared {
     queue: Arc<ExecutionQueue>,
     reservations: Mutex<HashMap<JobId, Reservation>>,
     capacity: usize,
+    io_width: usize,
 }
 
 impl Shared {
@@ -118,6 +159,20 @@ impl Shared {
             .unwrap_or_else(PoisonError::into_inner);
         if let Some(entry) = reservations.get_mut(&job) {
             entry.state = State::Active(phase);
+            entry.phase_since = Instant::now();
+            if phase.inputs_ready() {
+                entry.remaining = RemainingInputs::default();
+            }
+        }
+    }
+
+    fn remaining(&self, job: JobId, remaining: RemainingInputs) {
+        let mut reservations = self
+            .reservations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = reservations.get_mut(&job) {
+            entry.remaining = remaining;
         }
     }
 
@@ -127,10 +182,13 @@ impl Shared {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if let Some(entry) = reservations.get_mut(&job) {
+            let now = Instant::now();
             entry.state = State::Terminal {
                 result: Arc::new(result),
-                completed_at: Instant::now(),
+                completed_at: now,
             };
+            entry.phase_since = now;
+            entry.remaining = RemainingInputs::default();
         }
     }
 
@@ -172,12 +230,27 @@ impl Shared {
             );
             Ok(())
         })();
+        let missing = assignment._pins._blobs.missing();
+        let mut remaining = RemainingInputs::from_missing(missing);
+        let mut missing: BTreeMap<_, _> = missing.iter().map(|blob| (blob.id, blob.size)).collect();
+        let mut on_tree = |tree: &TreeLease| {
+            for id in tree.blobs().keys() {
+                if let Some(bytes) = missing.remove(id) {
+                    remaining.bytes = remaining.bytes.saturating_sub(bytes);
+                    remaining.blobs = remaining.blobs.saturating_sub(1);
+                }
+            }
+            self.remaining(job.id, remaining);
+        };
         let result = match result {
             Ok(()) => self.worker.prepare(
                 job.id,
                 &assignment.spec,
                 &self.queue,
-                Arc::clone(&job.cancelled),
+                WorkerPreparation {
+                    cancelled: Arc::clone(&job.cancelled),
+                    on_tree: &mut on_tree,
+                },
             ),
             Err(error) => {
                 self.worker.fail(job.id, assignment.spec.ticket);
@@ -208,7 +281,7 @@ impl Shared {
         let completed = self.worker.execute(prepared, &self.queue, || {
             self.phase(job.id, NativeJobPhase::Executing)
         });
-        self.phase(job.id, NativeJobPhase::Publishing);
+        self.phase(job.id, NativeJobPhase::AwaitingPublication);
         if let Err(error) = publishing.send(Publishing { job, completed }) {
             let Publishing { job, completed } = error.0;
             drop(completed);
@@ -218,6 +291,7 @@ impl Shared {
 
     fn publish(&self, publishing: Publishing) {
         let Publishing { job, completed } = publishing;
+        self.phase(job.id, NativeJobPhase::Publishing);
         let result = self.worker.publish(completed);
         self.finish(job, result);
     }
@@ -275,14 +349,16 @@ impl NativeDispatcher {
             .max_inflight_jobs
             .unwrap_or_else(|| width.saturating_mul(4));
         ensure!(
-            capacity > 0,
-            "native dispatcher reservation limit must be nonzero"
+            (1..=NativeQueueSnapshot::MAX_CAPACITY as usize).contains(&capacity)
+                && width <= NativeQueueSnapshot::MAX_CAPACITY as usize,
+            "native dispatcher reservation or compiler limit out of range"
         );
         let shared = Arc::new(Shared {
             worker,
             queue,
             reservations: Mutex::new(HashMap::new()),
             capacity,
+            io_width,
         });
         let (staging, staging_rx) = mpsc::sync_channel(capacity);
         let (ready, ready_rx) = mpsc::sync_channel(capacity);
@@ -325,6 +401,7 @@ impl NativeDispatcher {
     pub(super) fn assign(&self, id: JobId, spec: NativeAssignment) -> Result<()> {
         spec.spec.validate()?;
         let pins = self.shared.worker.pin_resident_inputs(&spec)?;
+        let remaining = RemainingInputs::from_missing(pins._blobs.missing());
         let mut reservations = self
             .shared
             .reservations
@@ -340,6 +417,8 @@ impl NativeDispatcher {
             Entry::Vacant(entry) => {
                 entry.insert(Reservation {
                     accepted_at: Instant::now(),
+                    phase_since: Instant::now(),
+                    remaining,
                     cancelled: Arc::new(AtomicBool::new(false)),
                     state: State::Assigned(Box::new(Assignment { spec, _pins: pins })),
                 });
@@ -349,17 +428,34 @@ impl NativeDispatcher {
         Ok(())
     }
 
-    pub(super) fn active_jobs(&self) -> Vec<JobId> {
+    pub(super) fn snapshot(&self) -> NativeQueueSnapshot {
         let mut reservations = self
             .shared
             .reservations
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         Shared::reap(&mut reservations);
-        reservations
-            .iter()
-            .filter_map(|(&id, entry)| matches!(entry.state, State::Active(_)).then_some(id))
-            .collect()
+        let now = Instant::now();
+        NativeQueueSnapshot {
+            capacity: u32::try_from(self.shared.capacity)
+                .unwrap_or(NativeQueueSnapshot::MAX_CAPACITY),
+            compiler_slots: u32::try_from(self.shared.queue.width().get())
+                .unwrap_or(NativeQueueSnapshot::MAX_CAPACITY),
+            compiler_active: u32::try_from(self.shared.queue.active())
+                .unwrap_or(NativeQueueSnapshot::MAX_CAPACITY),
+            staging_slots: u32::try_from(self.shared.io_width)
+                .unwrap_or(NativeQueueSnapshot::MAX_CAPACITY),
+            publication_slots: u32::try_from(self.shared.io_width)
+                .unwrap_or(NativeQueueSnapshot::MAX_CAPACITY),
+            jobs: reservations
+                .iter()
+                .map(|(&id, entry)| (id, entry.progress(now)))
+                .collect(),
+        }
+    }
+
+    pub(super) fn placement(&self) -> NativePlacement {
+        self.shared.worker.placement(self.snapshot())
     }
 
     pub(super) fn reconcile(&self, known: &HashSet<JobId>, cutoff: Instant) -> usize {
@@ -429,6 +525,7 @@ impl NativeDispatcher {
                 else {
                     anyhow::bail!("native assignment changed while locked");
                 };
+                entry.phase_since = Instant::now();
                 let job = Job {
                     id,
                     requester,

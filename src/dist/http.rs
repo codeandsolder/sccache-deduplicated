@@ -234,7 +234,7 @@ pub mod urls {
     ///
     /// Returns an error if `scheduler_url` cannot be used as a base URL.
     pub fn scheduler_heartbeat_server(scheduler_url: &reqwest::Url) -> Result<reqwest::Url> {
-        Ok(scheduler_url.join("/api/v1/scheduler/heartbeat_server")?)
+        Ok(scheduler_url.join("/api/v2/scheduler/heartbeat_server")?)
     }
 
     /// Build the scheduler job-state endpoint for `job_id`.
@@ -1345,7 +1345,7 @@ mod server {
                         );
                         prepare_response(request, &WorkerNameHttpResponse { worker_name })
                     },
-                    (POST) (/api/v1/scheduler/heartbeat_server) => {
+                    (POST) (/api/v2/scheduler/heartbeat_server) => {
                         let server_id = check_server_auth_or_err!(request);
                         let worker_name = request
                             .header("X-Sccache-Worker-Name")
@@ -1612,16 +1612,21 @@ mod server {
                     let capabilities = heartbeat_handler.capabilities();
                     // Transfers keep their assignment alive, but do not count as
                     // executing compiler processes for CPU-capacity restoration.
-                    let active_job_ids = running_job_ids
-                        .into_iter()
-                        .chain(heartbeat_handler.active_native_jobs())
-                        .chain(recently_progressing_uploads(
-                            &heartbeat_upload_activity,
-                            Instant::now(),
-                        ))
-                        .collect::<HashSet<_>>()
-                        .into_iter()
-                        .collect();
+                    let active_job_ids =
+                        running_job_ids
+                            .into_iter()
+                            .chain(capabilities.native_placement.iter().flat_map(|placement| {
+                                placement.queue.jobs.iter().filter_map(|(&id, progress)| {
+                                    progress.phase.active().then_some(id)
+                                })
+                            }))
+                            .chain(recently_progressing_uploads(
+                                &heartbeat_upload_activity,
+                                Instant::now(),
+                            ))
+                            .collect::<HashSet<_>>()
+                            .into_iter()
+                            .collect();
                     let heartbeat_req = HeartbeatServerHttpRequest {
                         cpu_capacity: advertised_cpus,
                         active_job_ids,

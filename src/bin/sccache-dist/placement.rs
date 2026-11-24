@@ -2,13 +2,14 @@
 //! directional shared-link observations.
 use super::ServerDetails;
 mod exploration;
+mod pipeline;
 pub(super) use exploration::{Exploration, choose_worker};
 use sccache::{
     build_runtime::{
         DirectionSnapshot, NetworkSnapshot, Peer, ResultTransferEstimate, TransferDemand,
         transfer_seconds,
     },
-    dist::{self, JobId, ServerId},
+    dist::{self, ServerId},
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -18,16 +19,12 @@ use std::{
 /// Exact missing content union for a worker, excluding advisory resident blobs.
 /// A warm new action does not depend on the unrelated backlog.
 fn native_missing_inputs(
-    assigned: &HashMap<JobId, dist::NativeInputBlobs>,
+    assigned: &pipeline::Assignments,
     placement: &dist::NativePlacement,
     requested: Option<&dist::NativeInputBlobs>,
 ) -> (u128, usize) {
-    let resident = |id| {
-        placement
-            .residency
-            .as_ref()
-            .is_some_and(|filter| filter.may_contain(id))
-    };
+    let confirmed = pipeline::confirmed_inputs(assigned, placement);
+    let resident = |id| pipeline::resident(placement, &confirmed, id);
     let mut missing = dist::NativeInputBlobs::new();
     if let Some(inputs) = requested {
         missing.extend(
@@ -40,7 +37,16 @@ fn native_missing_inputs(
             return (0, 0);
         }
     }
-    for (&id, &size) in assigned.values().flat_map(|inputs| inputs.iter()) {
+    for (&id, &size) in assigned
+        .iter()
+        .filter(|(job, _)| {
+            placement.queue.jobs.get(job).is_none_or(|progress| {
+                progress.phase != sccache::build_runtime::wire::NativeJobPhase::Terminal
+            })
+        })
+        .filter_map(|(_, inputs)| inputs.as_ref())
+        .flat_map(|inputs| inputs.iter())
+    {
         if !resident(id) {
             missing.entry(id).or_insert(size);
         }
@@ -204,30 +210,42 @@ pub(super) struct PlacementEstimate {
 /// effective application service time and the marginal delay to other peers.
 pub(super) fn native_estimate(
     capacity: f64,
-    assigned: &HashMap<JobId, dist::NativeInputBlobs>,
+    assigned: &pipeline::Assignments,
     placement: &dist::NativePlacement,
     requested: &dist::NativeInputBlobs,
     peer: Peer,
     plan: &NativeTransferPlan<'_>,
 ) -> PlacementEstimate {
-    let (bytes, requests) = native_missing_inputs(assigned, placement, Some(requested));
+    let (bytes, _) = native_missing_inputs(assigned, placement, Some(requested));
     let cost = placement.transfer;
     let (network, externality) = plan.input_completion(peer, bytes, cost.download_bytes_per_second);
     let logical_rate = plan.send.logical_rate(peer, cost.download_bytes_per_second);
-    let staging_seconds = transfer_seconds(bytes, logical_rate);
-    let batches = (requests as u128).div_ceil(u128::from(cost.raw_parallelism));
-    let overhead = Duration::from_nanos(
-        u64::try_from(batches * u128::from(cost.raw_request_nanoseconds)).unwrap_or(u64::MAX),
-    )
-    .as_secs_f64();
-    let input_seconds = network.max(staging_seconds) + overhead;
-    let execution = Duration::from_nanos(placement.execution_nanoseconds).as_secs_f64();
-    let capacity = capacity.max(1.0);
-    let queue = (f64::from(u32::try_from(assigned.len()).unwrap_or(u32::MAX)) + 1.0 - capacity)
-        .max(0.0)
-        / capacity
-        * execution;
-    let ready_at = queue.max(input_seconds) + execution;
+    // A warm candidate adds no network traffic but existing staging still
+    // consumes the worker's aggregate link. Use the baseline contention for it.
+    let (backlog, network_time) = if bytes == 0 {
+        let (backlog, _) = native_missing_inputs(assigned, placement, None);
+        (
+            backlog,
+            plan.input_completion(peer, backlog, cost.download_bytes_per_second)
+                .0,
+        )
+    } else {
+        (bytes, network)
+    };
+    let unconstrained = transfer_seconds(backlog, logical_rate);
+    let contention = if unconstrained > 0.0 {
+        (network_time / unconstrained).max(1.0)
+    } else {
+        1.0
+    };
+    let ready_at = pipeline::publication_start(
+        capacity,
+        assigned,
+        placement,
+        requested,
+        logical_rate,
+        contention,
+    );
     let (output_network, output_externality) =
         plan.result_completion(peer, ready_at, placement.result);
     let output_processing = transfer_seconds(

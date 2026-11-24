@@ -508,9 +508,6 @@ fn test_dist_nobuilder() {
 
 struct FailingServer;
 impl ServerIncoming for FailingServer {
-    fn active_native_jobs(&self) -> Vec<JobId> {
-        Vec::new()
-    }
     fn executing_jobs(&self) -> usize {
         0
     }

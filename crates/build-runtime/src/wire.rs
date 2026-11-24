@@ -211,11 +211,37 @@ pub enum ScheduleReply {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativeJobPhase {
+    Assigned,
     Queued,
     Staging,
     Ready,
     Executing,
+    AwaitingPublication,
     Publishing,
+    Terminal,
+}
+
+impl NativeJobPhase {
+    #[must_use = "active jobs retain a scheduler assignment"]
+    pub const fn active(self) -> bool {
+        !matches!(self, Self::Assigned | Self::Terminal)
+    }
+
+    #[must_use = "only pre-publication work competes for compiler admission"]
+    pub const fn needs_compiler(self) -> bool {
+        matches!(
+            self,
+            Self::Assigned | Self::Queued | Self::Staging | Self::Ready | Self::Executing
+        )
+    }
+
+    #[must_use = "verified inputs may be reused by other assignments"]
+    pub const fn inputs_ready(self) -> bool {
+        matches!(
+            self,
+            Self::Ready | Self::Executing | Self::AwaitingPublication | Self::Publishing
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

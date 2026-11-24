@@ -1,0 +1,168 @@
+use super::*;
+use sccache::dist::NativeQueueSnapshot;
+
+fn progress(phase: NativeJobPhase, elapsed: Duration, remaining: u64) -> NativeJobProgress {
+    NativeJobProgress {
+        phase,
+        phase_nanoseconds: u64::try_from(elapsed.as_nanos()).unwrap(),
+        remaining_input_bytes: remaining,
+        remaining_input_blobs: u64::from(remaining != 0),
+    }
+}
+
+fn placement() -> NativePlacement {
+    let mut placement = NativePlacement {
+        queue: NativeQueueSnapshot {
+            capacity: 16,
+            compiler_slots: 4,
+            compiler_active: 0,
+            staging_slots: 2,
+            publication_slots: 2,
+            jobs: Default::default(),
+        },
+        execution_nanoseconds: 1_000_000_000,
+        ..Default::default()
+    };
+    placement.transfer.raw_request_nanoseconds = 0;
+    placement.result.expected_bytes = 100;
+    placement.result.bytes_per_second = 100;
+    placement.result.expected_requests = 0;
+    placement
+}
+
+fn start(
+    placement: &NativePlacement,
+    assigned: &Assignments,
+    requested: &NativeInputBlobs,
+    cpus: f64,
+) -> f64 {
+    publication_start(cpus, assigned, placement, requested, 100, 1.0)
+}
+
+#[test]
+fn native_pipeline_does_not_charge_publication_or_terminal_as_cpu_work() {
+    let mut placement = placement();
+    let inputs = NativeInputBlobs::new();
+    let assigned = Assignments::from([
+        (JobId(1), Some(inputs.clone())),
+        (JobId(2), Some(inputs.clone())),
+    ]);
+    placement.queue.jobs.insert(
+        JobId(1),
+        progress(NativeJobPhase::Publishing, Duration::ZERO, 0),
+    );
+    placement.queue.jobs.insert(
+        JobId(2),
+        progress(NativeJobPhase::Terminal, Duration::ZERO, 0),
+    );
+    assert_eq!(start(&placement, &assigned, &inputs, 1.0), 1.0);
+    placement.queue.jobs.insert(
+        JobId(1),
+        progress(NativeJobPhase::Executing, Duration::from_millis(750), 0),
+    );
+    placement.queue.compiler_active = 1;
+    assert_eq!(start(&placement, &assigned, &inputs, 1.0), 1.25);
+    placement
+        .queue
+        .jobs
+        .insert(JobId(1), progress(NativeJobPhase::Ready, Duration::ZERO, 0));
+    placement.queue.compiler_active = 0;
+    assert_eq!(start(&placement, &assigned, &inputs, 1.0), 2.0);
+}
+
+#[test]
+fn native_pipeline_waits_for_staging_slots_and_reuses_future_content() {
+    let mut placement = placement();
+    let shared = ContentId::of(b"shared");
+    let independent = ContentId::of(b"independent");
+    let inputs = NativeInputBlobs::from([(shared, 1_000)]);
+    let assigned = Assignments::from([(JobId(1), Some(inputs.clone()))]);
+    placement.queue.jobs.insert(
+        JobId(1),
+        progress(NativeJobPhase::Staging, Duration::ZERO, 200),
+    );
+    // Two staging slots allow a warm new job to pass a slow download.
+    assert_eq!(
+        start(&placement, &assigned, &NativeInputBlobs::new(), 2.0),
+        1.0
+    );
+    // A consumer of the same immutable blob waits for the existing transfer,
+    // not another 1000-byte transfer. Only 200 bytes remain.
+    assert_eq!(start(&placement, &assigned, &inputs, 2.0), 3.0);
+    let new = NativeInputBlobs::from([(shared, 1_000), (independent, 100)]);
+    assert_eq!(start(&placement, &assigned, &new, 2.0), 4.0);
+    placement.queue.staging_slots = 1;
+    assert_eq!(
+        start(&placement, &assigned, &NativeInputBlobs::new(), 2.0),
+        3.0
+    );
+    // Verified closure overrides a stale or absent Bloom snapshot.
+    placement
+        .queue
+        .jobs
+        .insert(JobId(1), progress(NativeJobPhase::Ready, Duration::ZERO, 0));
+    assert_eq!(start(&placement, &assigned, &inputs, 2.0), 1.0);
+    assert!(confirmed_inputs(&assigned, &placement).contains(&shared));
+}
+
+#[test]
+fn native_pipeline_predicts_publication_backpressure_separately() {
+    let mut placement = placement();
+    placement.queue.publication_slots = 1;
+    let inputs = NativeInputBlobs::new();
+    let assigned = Assignments::from([
+        (JobId(1), Some(inputs.clone())),
+        (JobId(2), Some(inputs.clone())),
+    ]);
+    placement.queue.jobs.insert(
+        JobId(1),
+        progress(NativeJobPhase::Publishing, Duration::ZERO, 0),
+    );
+    placement.queue.jobs.insert(
+        JobId(2),
+        progress(NativeJobPhase::AwaitingPublication, Duration::ZERO, 0),
+    );
+    assert_eq!(start(&placement, &assigned, &inputs, 4.0), 2.0);
+    placement.queue.publication_slots = 2;
+    assert_eq!(start(&placement, &assigned, &inputs, 4.0), 1.0);
+}
+
+#[test]
+fn native_pipeline_capacity_counts_local_and_unobserved_reservations_once() {
+    let mut placement = placement();
+    placement.queue.capacity = 3;
+    placement
+        .queue
+        .jobs
+        .insert(JobId(1), progress(NativeJobPhase::Ready, Duration::ZERO, 0));
+    placement.queue.jobs.insert(
+        JobId(2),
+        progress(NativeJobPhase::Terminal, Duration::ZERO, 0),
+    );
+    assert!(placement.queue.valid());
+    assert!(placement.queue.has_capacity([JobId(1)].into_iter()));
+    assert!(
+        !placement
+            .queue
+            .has_capacity([JobId(1), JobId(3)].into_iter())
+    );
+    placement
+        .queue
+        .jobs
+        .get_mut(&JobId(1))
+        .unwrap()
+        .remaining_input_blobs = 1;
+    assert!(!placement.queue.valid());
+}
+
+#[test]
+fn native_pipeline_legacy_execution_shares_compiler_not_publication_slots() {
+    let mut placement = placement();
+    placement.queue.publication_slots = 1;
+    let assigned = Assignments::from([(JobId(1), None), (JobId(2), None)]);
+    let inputs = NativeInputBlobs::new();
+    assert_eq!(start(&placement, &assigned, &inputs, 1.0), 3.0);
+    assert_eq!(start(&placement, &assigned, &inputs, 3.0), 1.0);
+    placement.queue.compiler_active = 2;
+    assert_eq!(start(&placement, &assigned, &inputs, 2.0), 2.0);
+}

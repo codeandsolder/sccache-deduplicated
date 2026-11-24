@@ -504,9 +504,14 @@ impl NativeCacheClient {
         store: &NativeStore,
         policy: &ExecutionPolicy,
         delivery: WorkerDelivery<'_>,
-        cancelled: Arc<AtomicBool>,
+        preparation: WorkerPreparation<'_>,
     ) -> Result<PreparedWorker> {
-        let lease = WorkerLease::start(self.clone(), ticket, delivery.renewal_interval, cancelled)?;
+        let lease = WorkerLease::start(
+            self.clone(),
+            ticket,
+            delivery.renewal_interval,
+            preparation.cancelled,
+        )?;
         lease.check()?;
         let prepared = self.prepare_execution(
             ExecutionContext {
@@ -516,8 +521,9 @@ impl NativeCacheClient {
                 policy,
             },
             Some(delivery.artifact_grace),
-            |id, check| self.fetch_tree(ticket, id, store, delivery, check),
+            |id, check, on_tree| self.fetch_tree(ticket, id, store, delivery, check, on_tree),
             &|| lease.check(),
+            preparation.on_tree,
         )?;
         Ok(PreparedWorker {
             lease,
@@ -534,7 +540,7 @@ impl NativeCacheClient {
         store: &NativeStore,
         policy: &ExecutionPolicy,
         control: ExecutionControl<'_>,
-        fetch: impl FnMut(TreeId, &LeaseCheck<'_>) -> Result<TreeLease>,
+        mut fetch: impl FnMut(TreeId, &LeaseCheck<'_>) -> Result<TreeLease>,
     ) -> Result<CapturedExecution> {
         let context = ExecutionContext {
             ticket,
@@ -543,7 +549,13 @@ impl NativeCacheClient {
             policy,
         };
         let result = self.with_renewal(ticket, control.renewal_interval, |check| {
-            let prepared = self.prepare_execution(context, control.grace, fetch, check)?;
+            let prepared = self.prepare_execution(
+                context,
+                control.grace,
+                |id, check, _| fetch(id, check),
+                check,
+                &mut |_| {},
+            )?;
             let captured = compile(context, control.queue, control.transport, check, || {})?;
             self.publish_execution(context, prepared, captured, control.transport, check)
         });
@@ -557,8 +569,9 @@ impl NativeCacheClient {
         &self,
         context: ExecutionContext<'_>,
         grace: Option<&super::ArtifactGrace>,
-        mut fetch: impl FnMut(TreeId, &LeaseCheck<'_>) -> Result<TreeLease>,
+        mut fetch: impl FnMut(TreeId, &LeaseCheck<'_>, &mut dyn FnMut(&TreeLease)) -> Result<TreeLease>,
         check: &LeaseCheck<'_>,
+        on_tree: &mut dyn FnMut(&TreeLease),
     ) -> Result<PreparedExecution> {
         let ExecutionContext {
             ticket,
@@ -603,7 +616,7 @@ impl NativeCacheClient {
         let mut inputs = Vec::new();
         for id in &request.input_trees {
             check()?;
-            let (tree, hit) = store.acquire_tree(*id, check, || fetch(*id, check))?;
+            let (tree, hit) = store.acquire_tree(*id, check, || fetch(*id, check, on_tree))?;
             if log::log_enabled!(target: "native_cas_replay", log::Level::Trace) {
                 let blobs = tree
                     .manifest()
@@ -622,6 +635,7 @@ impl NativeCacheClient {
                 })
                 );
             }
+            on_tree(&tree);
             inputs.push(tree);
         }
         // The notification is idempotent. A lost response must not
@@ -799,6 +813,12 @@ impl Drop for WorkerLease {
             let _ = self.client.fail(self.ticket);
         }
     }
+}
+
+/// Cancellation and verified-tree progress for worker-side preparation.
+pub struct WorkerPreparation<'a> {
+    pub cancelled: Arc<AtomicBool>,
+    pub on_tree: &'a mut dyn FnMut(&TreeLease),
 }
 
 /// A ready action owns its verified input closure and output reservation.

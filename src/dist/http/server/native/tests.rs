@@ -422,7 +422,10 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
             &worker_store,
             &policy,
             delivery,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            crate::dist::native::WorkerPreparation {
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                on_tree: &mut |_| {},
+            },
         )?;
         assert_eq!(execution_queue.active(), 1);
         drop(busy);
