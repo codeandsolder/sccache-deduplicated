@@ -307,6 +307,7 @@ where
         extra_hash_files: vec![],
         uses_external_assembler: false,
         msvc_show_includes: false,
+        msvc_explicit_language: false,
         profile_generate: false,
         // FIXME: Implement me.
         color_mode: ColorMode::Auto,

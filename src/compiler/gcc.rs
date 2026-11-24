@@ -840,6 +840,7 @@ where
         extra_hash_files,
         uses_external_assembler: !integrated_assembler,
         msvc_show_includes: false,
+        msvc_explicit_language: false,
         profile_generate,
         color_mode,
         suppress_rewrite_includes_only,
@@ -2917,17 +2918,17 @@ mod test {
         let fixture = TestFixture::new();
         let mut transformer = dist::PathTransformer::new();
         let (_, dist_command, _) = generate_compile_commands(
-            &mut transformer,
-            &fixture.bins[0],
-            parsed_args,
-            fixture.tempdir.path(),
-            &[],
-            GccCompileConfig {
-                kind: CCompilerKind::Clang,
+            CCompileContext {
+                path_transformer: &mut transformer,
+                executable: &fixture.bins[0],
+                parsed_args,
+                cwd: fixture.tempdir.path(),
+                env_vars: &[],
                 rewrite_includes_only,
-                language_to_arg: language_to_gcc_arg,
                 native_resolution: None,
             },
+            CCompilerKind::Clang,
+            language_to_gcc_arg,
         )
         .unwrap();
         dist_command

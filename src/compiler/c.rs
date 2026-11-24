@@ -120,6 +120,8 @@ pub struct ParsedArguments {
     pub uses_external_assembler: bool,
     /// Whether or not the `-showIncludes` argument is passed on MSVC
     pub msvc_show_includes: bool,
+    /// Whether the MSVC input was given with `/Tc` or `/Tp`
+    pub msvc_explicit_language: bool,
     /// Whether the compilation is generating profiling or coverage data.
     pub profile_generate: bool,
     /// The color mode.
@@ -3233,6 +3235,7 @@ mod test {
             extra_hash_files: vec![],
             uses_external_assembler: false,
             msvc_show_includes: false,
+            msvc_explicit_language: false,
             profile_generate: false,
             color_mode: ColorMode::Auto,
             suppress_rewrite_includes_only: false,
