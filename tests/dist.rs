@@ -196,36 +196,8 @@ fn test_dist_basic() {
     });
 }
 
-/// Real GCC/Clang jobs for native and an explicit v4 CPU target must execute
-/// on the worker, without substituting the worker's own CPU. Repeating each
-/// request must hit the same cache key.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#[test]
-#[cfg_attr(
-    not(feature = "dist-tests"),
-    ignore = "requires isolated Docker distribution harness"
-)]
-fn test_dist_c_native_target_codegen_and_cache() -> Result<()> {
-    let temp = tempfile::tempdir()?;
-    let root = temp.path();
-    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
-    system.add_scheduler();
-    system.add_server(&[]);
-    let mut config = dist_test_sccache_client_cfg(root, system.scheduler_url());
-    // Unlike the minimal distribution smoke test, retain objects for the
-    // repeat-request cache verification.
-    config
-        .cache
-        .disk
-        .as_mut()
-        .context("missing test disk cache")?
-        .size = 128 * 1024 * 1024;
-    let config_path = root.join("sccache-cfg.json");
-    write_json_cfg(root, "sccache-cfg.json", &config);
-    let cached_config = root.join("sccache-cached-cfg");
-    let _ = stop_local_daemon();
-    start_local_daemon(&config_path, &cached_config);
-
+fn write_cpu_target_sources(root: &Path) {
     write_source(
         root,
         "native_target.c",
@@ -253,22 +225,100 @@ void specific_target(int *dst, const int *a, const int *b) {
 }
 "#,
     );
+    write_source(
+        root,
+        "native_target.cpp",
+        r#"
+#if defined(__AVX2__)
+#error explicit -mno-avx2 must override native ISA in C++ too
+#endif
+template<unsigned N> constexpr unsigned scale(unsigned x) { return x * N; }
+static_assert(scale<3>(7) == 21);
+extern "C" unsigned long native_target_cpp(unsigned long x, unsigned long y) {
+    return (x * 17UL + y) ^ (y >> 7);
+}
+"#,
+    );
+    write_source(
+        root,
+        "specific_target.cpp",
+        r#"
+#include <immintrin.h>
+#if !defined(__AVX512F__)
+#error explicit x86-64-v4 must enable AVX-512 in C++ too
+#endif
+static_assert(2 * 3 == 6);
+extern "C" void specific_target_cpp(int *dst, const int *a, const int *b) {
+    __m512i va = _mm512_loadu_si512((const void *)a);
+    __m512i vb = _mm512_loadu_si512((const void *)b);
+    _mm512_storeu_si512((void *)dst, _mm512_add_epi32(va, vb));
+}
+"#,
+    );
+}
+
+/// Real GCC/Clang C and C++ jobs for native and explicit v4 must execute
+/// on the worker without substituting its CPU. Every repeat must hit cache.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+#[cfg_attr(
+    not(feature = "dist-tests"),
+    ignore = "requires isolated Docker distribution harness"
+)]
+fn test_dist_c_native_target_codegen_and_cache() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
+    system.add_scheduler();
+    system.add_server(&[]);
+    let mut config = dist_test_sccache_client_cfg(root, system.scheduler_url());
+    // Unlike the minimal distribution smoke test, retain objects for the
+    // repeat-request cache verification.
+    config
+        .cache
+        .disk
+        .as_mut()
+        .context("missing test disk cache")?
+        .size = 128 * 1024 * 1024;
+    let config_path = root.join("sccache-cfg.json");
+    write_json_cfg(root, "sccache-cfg.json", &config);
+    let cached_config = root.join("sccache-cached-cfg");
+    let _ = stop_local_daemon();
+    start_local_daemon(&config_path, &cached_config);
+
+    write_cpu_target_sources(root);
     let mut replay_pairs = Vec::new();
-    for (index, compiler) in ["gcc", "clang"].into_iter().enumerate() {
+    for (index, compiler) in ["gcc", "clang", "g++", "clang++"].into_iter().enumerate() {
         let compiler_path = which::which(compiler)?;
+        let is_cxx = compiler.ends_with("++");
         for (case, flags, source) in [
             (
                 "native",
                 &["-O2", "-march=native", "-mno-avx2", "-mtune=native"][..],
-                "native_target.c",
+                if is_cxx {
+                    "native_target.cpp"
+                } else {
+                    "native_target.c"
+                },
             ),
-            ("v4", &["-O2", "-march=x86-64-v4"][..], "specific_target.c"),
+            (
+                "v4",
+                &["-O2", "-march=x86-64-v4"][..],
+                if is_cxx {
+                    "specific_target.cpp"
+                } else {
+                    "specific_target.c"
+                },
+            ),
         ] {
             let output = root.join(format!("{case}-{index}.o"));
             let compile_object = || {
-                let result = sccache_command()
-                    .arg(&compiler_path)
-                    .args(flags)
+                let mut command = sccache_command();
+                command.arg(&compiler_path).args(flags);
+                if is_cxx {
+                    command.arg("-std=c++20");
+                }
+                let result = command
                     .arg("-c")
                     .arg(root.join(source))
                     .arg("-o")
@@ -293,11 +343,11 @@ void specific_target(int *dst, const int *a, const int *b) {
         assert_eq!(actual, expected);
     }
     get_stats(|info| {
-        assert_eq!(4, info.stats.dist_compiles.values().sum::<usize>());
+        assert_eq!(8, info.stats.dist_compiles.values().sum::<usize>());
         assert_eq!(0, info.stats.dist_errors);
-        assert_eq!(8, info.stats.compile_requests);
-        assert_eq!(4, info.stats.cache_hits.all());
-        assert_eq!(4, info.stats.cache_misses.all());
+        assert_eq!(16, info.stats.compile_requests);
+        assert_eq!(8, info.stats.cache_hits.all());
+        assert_eq!(8, info.stats.cache_misses.all());
     });
     Ok(())
 }
