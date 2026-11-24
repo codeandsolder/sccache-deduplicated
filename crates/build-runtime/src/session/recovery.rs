@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, ensure};
 use bincode::Options;
 
-use super::{NativeServiceBusy, NativeSessions};
+use super::{NativeServiceBusy, NativeSessions, UploadSource};
 use crate::{
     ActionKey, BlobRef, CompilePermit, NativeStore, ResultLease, ResultManifest, StagedBlob,
     TreeLease, UploadReservation,
@@ -213,7 +213,7 @@ impl NativeSessions {
         for blob in missing {
             let _slot = loop {
                 check()?;
-                match self.upload_slot() {
+                match self.upload_slot(UploadSource::Peer) {
                     Ok(slot) => break slot,
                     Err(error) if error.is::<NativeServiceBusy>() => {
                         std::thread::sleep(Duration::from_millis(25))

@@ -148,6 +148,14 @@ pub struct InputDemand {
     pub blob: BlobRef,
 }
 
+/// Origin polling ends as soon as the executor has pinned every input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputPoll {
+    Waiting,
+    Demand(InputDemand),
+    Complete,
+}
+
 /// Negotiated result manifest and missing content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BeginResult {

@@ -15,7 +15,9 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 
-use super::{LeaseCheck, NativeCacheClient, PackagePlanRequest, map_packages};
+use super::{
+    LeaseCheck, NativeCacheClient, PackagePlanRequest, map_packages, retryable_transport_error,
+};
 use crate::build_runtime::{
     ArchiveLength, BlobRef, CapturedExecution, ExecutionPolicy, ExecutionSpec, NativeServiceBusy,
     NativeStore, PackageArchive, PackageImportLimits, PackageTransferCost, ResultTransferEstimate,
@@ -589,6 +591,22 @@ impl NativeCacheClient {
                     );
                 }
                 inputs.push(tree);
+            }
+            // The notification is idempotent. A lost response must not
+            // discard the already pinned input closure.
+            let announced = Instant::now();
+            loop {
+                check()?;
+                match self.inputs_staged(ticket) {
+                    Ok(()) => break,
+                    Err(error)
+                        if retryable_transport_error(&error)
+                            && announced.elapsed() < policy.timeout =>
+                    {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             // Keep input leases through the ready queue wait. Only execution consumes compiler capacity.
             let captured = {

@@ -525,7 +525,10 @@ fn adaptive_blob_response_compresses_only_when_transfer_saves_bytes() -> Result<
 
 #[test]
 fn lazy_admission_prefetch_and_origin_backfill_over_http() -> Result<()> {
-    use crate::build_runtime::{TreeEntry, TreePath, wire::InputDemand};
+    use crate::build_runtime::{
+        TreeEntry, TreePath,
+        wire::{InputDemand, InputPoll},
+    };
     with_native_service(|url, sessions, _network| {
         let client = make_client(url, "client-token")?;
         let worker = make_client(url, "worker-token")?.for_worker(JobId(42));
@@ -602,20 +605,24 @@ fn lazy_admission_prefetch_and_origin_backfill_over_http() -> Result<()> {
             .send()?;
         assert_eq!(pending.status(), reqwest::StatusCode::ACCEPTED);
         assert_eq!(
-            client.input_demands(ticket)?,
-            vec![InputDemand {
+            client.poll_input(ticket)?,
+            InputPoll::Demand(InputDemand {
                 tree: id,
                 blob: missing
-            }]
+            })
         );
         client.backfill_input(ticket, missing, Cursor::new(bytes))?;
         let mut actual = Vec::new();
         worker.download(read.ticket, missing, &mut actual)?;
         assert_eq!(actual, bytes);
-        assert!(client.input_demands(ticket)?.is_empty());
+        assert_eq!(client.poll_input(ticket)?, InputPoll::Waiting);
         assert_eq!(sessions.store().stats()?.blobs, 1);
         assert!(sessions.store().open_available_blob(unused)?.is_none());
         worker.close(read.ticket)?;
+        assert!(client.inputs_staged(ticket).is_err());
+        worker.inputs_staged(ticket)?;
+        worker.inputs_staged(ticket)?;
+        assert_eq!(client.poll_input(ticket)?, InputPoll::Complete);
         worker.fail(ticket)?;
         client.close(ticket)?;
         Ok(())

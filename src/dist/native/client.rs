@@ -21,7 +21,10 @@ use super::{LocalExecutor, NativeCacheClient, copy_verified, retryable_transport
 use crate::build_runtime::{
     ActionMode, BlobRef, CapturedExecution, ExecutionSpec, PreparedTree, ResultManifest, TreeId,
     TreeManifest,
-    wire::{InputDemand, NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply, Ticket},
+    wire::{
+        InputDemand, InputPoll, NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply,
+        Ticket,
+    },
 };
 
 /// Explicit client admission and delivery bounds.
@@ -344,8 +347,8 @@ impl NativeCacheClient {
                         start.elapsed() < policy.timeout,
                         "native worker deadline exceeded"
                     );
-                    let demands = match self.input_demands(pin.ticket) {
-                        Ok(demands) => demands,
+                    let poll = match self.poll_input(pin.ticket) {
+                        Ok(poll) => poll,
                         Err(error) if retryable_transport_error(&error) => {
                             debug!("retrying native input demand poll: {error:#}");
                             thread::sleep(idle);
@@ -354,20 +357,21 @@ impl NativeCacheClient {
                         }
                         Err(error) => return Err(error),
                     };
-                    if demands.is_empty() {
-                        thread::sleep(idle);
-                        idle = (idle * 2).min(Duration::from_millis(200));
-                        continue;
+                    match poll {
+                        InputPoll::Complete => break,
+                        InputPoll::Waiting => {
+                            thread::sleep(idle);
+                            idle = (idle * 2).min(Duration::from_millis(200));
+                        }
+                        InputPoll::Demand(demand) => {
+                            idle = Duration::from_millis(10);
+                            ensure!(
+                                request.input_trees.contains(&demand.tree),
+                                "scheduler requested undeclared tree"
+                            );
+                            self.supply_demand(pin.ticket, demand, inputs, start, policy)?;
+                        }
                     }
-                    idle = Duration::from_millis(10);
-                    for demand in demands {
-                        ensure!(
-                            request.input_trees.contains(&demand.tree),
-                            "scheduler requested undeclared tree"
-                        );
-                        self.supply_demand(pin.ticket, demand, inputs, start, policy)?;
-                    }
-                    // A nonempty batch is followed immediately by another poll.
                 }
                 Ok(())
             })();

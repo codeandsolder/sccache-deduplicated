@@ -444,8 +444,8 @@ fn input_manifest_survives_scheduler_eviction_and_worker_fetch_is_scoped() -> Re
             .is::<NativeContentPending>()
     );
     assert_eq!(
-        service.input_demands(ticket)?,
-        vec![InputDemand { tree: id, blob }]
+        service.poll_input(ticket)?,
+        InputPoll::Demand(InputDemand { tree: id, blob })
     );
     service.backfill_input(ticket, blob, &b"tree data"[..])?;
     let mut contents = Vec::new();
@@ -716,14 +716,14 @@ fn lazy_manifest_admission_and_cross_action_backfill_are_single_flight() -> Resu
     service.request_inputs(ta, worker1, vec![blob])?;
     service.request_inputs(tb, worker2, vec![blob])?;
     assert_eq!(
-        service.input_demands(a)?,
-        vec![InputDemand { tree: id, blob }]
+        service.poll_input(a)?,
+        InputPoll::Demand(InputDemand { tree: id, blob })
     );
     assert_eq!(
-        service.input_demands(a)?,
-        vec![InputDemand { tree: id, blob }]
+        service.poll_input(a)?,
+        InputPoll::Demand(InputDemand { tree: id, blob })
     );
-    assert!(service.input_demands(b)?.is_empty());
+    assert_eq!(service.poll_input(b)?, InputPoll::Waiting);
     assert!(service.backfill_input(b, blob, &bytes[..]).is_err());
     assert!(service.backfill_input(a, other, &b"unused"[..]).is_err());
     assert!(
@@ -740,8 +740,8 @@ fn lazy_manifest_admission_and_cross_action_backfill_are_single_flight() -> Resu
             .is::<NativeServiceBusy>()
     );
     assert_eq!(
-        service.input_demands(a)?,
-        vec![InputDemand { tree: id, blob }]
+        service.poll_input(a)?,
+        InputPoll::Demand(InputDemand { tree: id, blob })
     );
     assert!(
         service
@@ -750,12 +750,12 @@ fn lazy_manifest_admission_and_cross_action_backfill_are_single_flight() -> Resu
             .is::<NativeInputRejected>()
     );
     assert_eq!(
-        service.input_demands(b)?,
-        vec![InputDemand { tree: id, blob }]
+        service.poll_input(b)?,
+        InputPoll::Demand(InputDemand { tree: id, blob })
     );
     service.backfill_input(b, blob, &bytes[..])?;
-    assert!(service.input_demands(a)?.is_empty());
-    assert!(service.input_demands(b)?.is_empty());
+    assert_eq!(service.poll_input(a)?, InputPoll::Waiting);
+    assert_eq!(service.poll_input(b)?, InputPoll::Waiting);
     for (ticket, worker) in [(ta, worker1), (tb, worker2)] {
         let mut actual = Vec::new();
         service
@@ -773,7 +773,14 @@ fn lazy_manifest_admission_and_cross_action_backfill_are_single_flight() -> Resu
 }
 
 #[test]
-fn cancelled_source_releases_claim_to_another_live_origin() -> Result<()> {
+fn cancelled_or_staged_source_releases_claim_to_another_live_origin() -> Result<()> {
+    for staged in [false, true] {
+        exercise_source_release(staged)?;
+    }
+    Ok(())
+}
+
+fn exercise_source_release(staged: bool) -> Result<()> {
     use crate::{TreeEntry, TreePath};
     let directory = tempfile::tempdir()?;
     let service = service(directory.path())?;
@@ -825,14 +832,31 @@ fn cancelled_source_releases_claim_to_another_live_origin() -> Result<()> {
     let tb = service.open_tree(id, worker, b)?.ticket;
     service.request_inputs(ta, worker, vec![blob])?;
     service.request_inputs(tb, worker, vec![blob])?;
-    assert_eq!(service.input_demands(a)?.len(), 1);
-    assert!(service.input_demands(b)?.is_empty());
-    service.close(a, Publisher::Client)?;
+    assert_eq!(
+        service.poll_input(a)?,
+        InputPoll::Demand(InputDemand { tree: id, blob })
+    );
+    assert_eq!(service.poll_input(b)?, InputPoll::Waiting);
+    if staged {
+        // A worker independently acquired the blob. Mark staging complete
+        // even though the origin had already claimed an unnecessary upload.
+        assert!(service.inputs_staged(a, Publisher::Client).is_err());
+        service.inputs_staged(a, worker)?;
+        service.inputs_staged(a, worker)?;
+        assert_eq!(service.poll_input(a)?, InputPoll::Complete);
+        assert!(service.open_tree(id, worker, a).is_err());
+        assert_eq!(service.active_uploads.load(Ordering::Acquire), 0);
+    } else {
+        service.close(a, Publisher::Client)?;
+    }
     // The shared flight survives A, but its dead claim must not retain
     // the global upload slot until B happens to poll it.
     service.reap()?;
     assert_eq!(service.active_uploads.load(Ordering::Acquire), 0);
-    assert_eq!(service.input_demands(b)?.len(), 1);
+    assert_eq!(
+        service.poll_input(b)?,
+        InputPoll::Demand(InputDemand { tree: id, blob })
+    );
     service.backfill_input(b, blob, &bytes[..])?;
     assert_eq!(service.active_uploads.load(Ordering::Acquire), 0);
     let mut actual = Vec::new();
@@ -908,13 +932,13 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
     };
     let delivery = service.open_tree(id, worker, ticket)?.ticket;
     service.request_inputs(delivery, worker, vec![first])?;
-    assert!(service.input_demands(ticket)?.is_empty());
+    assert_eq!(service.poll_input(ticket)?, InputPoll::Waiting);
     let claim = service
         .claim_peer_input(Duration::ZERO)?
         .context("peer claim missing")?;
     assert_eq!(claim.blob(), first);
     assert_eq!(claim.requester(), address);
-    assert!(service.input_demands(ticket)?.is_empty());
+    assert_eq!(service.poll_input(ticket)?, InputPoll::Waiting);
     assert!(service.claim_peer_input(Duration::ZERO)?.is_none());
     service.recover_peer_input(
         claim,
@@ -926,7 +950,7 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
         .download(delivery, worker, first.id)?
         .read_to_end(&mut bytes)?;
     assert_eq!(bytes, b"peer bytes");
-    assert!(service.input_demands(ticket)?.is_empty());
+    assert_eq!(service.poll_input(ticket)?, InputPoll::Waiting);
 
     service.request_inputs(delivery, worker, vec![second])?;
     let claim = service
@@ -946,11 +970,11 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
     );
     assert!(service.store().open_available_blob(second)?.is_none());
     assert_eq!(
-        service.input_demands(ticket)?,
-        vec![InputDemand {
+        service.poll_input(ticket)?,
+        InputPoll::Demand(InputDemand {
             tree: id,
             blob: second
-        }]
+        })
     );
     service.backfill_input(ticket, second, &b"origin bytes"[..])?;
     bytes.clear();
@@ -966,11 +990,11 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
             .context("initial peer claim missing")?,
     );
     assert_eq!(
-        service.input_demands(ticket)?,
-        vec![InputDemand {
+        service.poll_input(ticket)?,
+        InputPoll::Demand(InputDemand {
             tree: id,
             blob: third
-        }]
+        })
     );
     let decline = InputDemand {
         tree: id,
@@ -979,7 +1003,7 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
     service.input_unavailable(ticket, decline)?;
     service.input_unavailable(ticket, decline)?; // lost acknowledgement
 
-    assert!(service.input_demands(ticket)?.is_empty());
+    assert_eq!(service.poll_input(ticket)?, InputPoll::Waiting);
     let claim = service
         .claim_peer_input(Duration::ZERO)?
         .context("renewed peer claim missing")?;
@@ -1138,6 +1162,30 @@ fn failed_result_recovery_preserves_partial_content_and_allows_compilation() -> 
         bail!("explicit refresh must never use recovery");
     };
     service.close(ticket, Publisher::Client)?;
+    assert_eq!(service.active_uploads.load(Ordering::Acquire), 0);
+    Ok(())
+}
+
+#[test]
+fn peer_recovery_cannot_consume_last_direct_upload_slot() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let mut service = service(directory.path())?;
+    let mut peers = Vec::new();
+    for _ in 0..3 {
+        peers.push(service.upload_slot(UploadSource::Peer)?);
+    }
+    assert!(
+        matches!(service.upload_slot(UploadSource::Peer), Err(error) if error.is::<NativeServiceBusy>())
+    );
+    let direct = service.upload_slot(UploadSource::Direct)?;
+    assert!(service.upload_slot(UploadSource::Direct).is_err());
+    drop(direct);
+    assert!(service.upload_slot(UploadSource::Peer).is_err());
+    drop(peers);
+    service.limits.max_total_uploads = 1;
+    let peer = service.upload_slot(UploadSource::Peer)?;
+    assert!(service.upload_slot(UploadSource::Direct).is_err());
+    drop(peer);
     assert_eq!(service.active_uploads.load(Ordering::Acquire), 0);
     Ok(())
 }

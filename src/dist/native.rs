@@ -15,8 +15,8 @@ use crate::build_runtime::{
     ActionMode, BlobRef, ContentId, ExecutionSpec, InstallationManifest, PackageIdentity,
     PackageReceipt, PackageSource, PackageTransferCost, ResultManifest, TreeId, TreeManifest,
     wire::{
-        BeginResult, InputDemand, NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply,
-        Ticket, TreeOffer, TreeRead, UploadHeader, WorkerAllocation,
+        BeginResult, InputDemand, InputPoll, NativeAdmission, NativeRunResult, NativeStatus,
+        ScheduleReply, Ticket, TreeOffer, TreeRead, UploadHeader, WorkerAllocation,
     },
 };
 use crate::dist::JobId;
@@ -324,8 +324,12 @@ impl NativeCacheClient {
         self.control("admit", &(spec, mode, declared))
     }
 
-    pub(super) fn input_demands(&self, ticket: Ticket) -> Result<Vec<InputDemand>> {
-        self.control("input_demands", &ticket)
+    pub(super) fn poll_input(&self, ticket: Ticket) -> Result<InputPoll> {
+        self.control("poll_input", &ticket)
+    }
+
+    pub(super) fn inputs_staged(&self, ticket: Ticket) -> Result<()> {
+        self.control("inputs_staged", &ticket)
     }
 
     fn input_unavailable(&self, ticket: Ticket, demand: InputDemand) -> Result<()> {

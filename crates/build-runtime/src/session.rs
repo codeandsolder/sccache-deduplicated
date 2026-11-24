@@ -22,8 +22,8 @@ use crate::{
     PackageTransferCost, ResultLease, ResultManifest, StagedBlob, TreeId, TreeLease, TreeManifest,
     UploadReservation, VerifiedPackage,
     wire::{
-        ActionRequest, BeginResult, InputDemand, NativeAdmission, NativeStatus, Publisher,
-        ScheduleReply, Ticket, TreeOffer, TreeRead, WorkerAllocation,
+        ActionRequest, BeginResult, InputDemand, InputPoll, NativeAdmission, NativeStatus,
+        Publisher, ScheduleReply, Ticket, TreeOffer, TreeRead, WorkerAllocation,
     },
 };
 
@@ -204,6 +204,7 @@ struct PendingAction {
     request: ActionRequest,
     permit: CompilePermit,
     inputs: BTreeMap<TreeId, Arc<InputManifest>>,
+    inputs_staged: bool,
     demands: BTreeMap<ContentId, (TreeId, Arc<Backfill>)>,
     unavailable: BTreeSet<(TreeId, ContentId)>,
     origin: Arc<()>,
@@ -509,7 +510,7 @@ impl NativeSessions {
         let result = self
             .store()
             .acquire_package(identity, length, limits, executable, || {
-                upload = Some(self.upload_slot()?);
+                upload = Some(self.upload_slot(UploadSource::Direct)?);
                 acquire()
             });
         drop(upload);
@@ -771,6 +772,7 @@ impl NativeSessions {
                     request,
                     permit,
                     inputs,
+                    inputs_staged: false,
                     demands: BTreeMap::new(),
                     unavailable: BTreeSet::new(),
                     origin: Arc::new(()),
@@ -883,10 +885,14 @@ impl NativeSessions {
         }
     }
 
-    fn upload_slot(&self) -> Result<UploadSlot> {
+    fn upload_slot(&self, source: UploadSource) -> Result<UploadSlot> {
+        let limit = match source {
+            UploadSource::Direct => self.limits.max_total_uploads,
+            UploadSource::Peer => self.limits.max_total_uploads.saturating_sub(1).max(1),
+        };
         let mut active = self.active_uploads.load(Ordering::Acquire);
         loop {
-            if active >= self.limits.max_total_uploads {
+            if active >= limit {
                 return Err(NativeServiceBusy.into());
             }
             match self.active_uploads.compare_exchange_weak(
@@ -1001,8 +1007,8 @@ impl NativeSessions {
             bail!("native executor ticket is not an action");
         };
         ensure!(
-            action.request.input_trees.contains(&id),
-            "tree is not an input of this action"
+            !action.inputs_staged && action.request.input_trees.contains(&id),
+            "tree is not an available input of this action"
         );
         let input = Arc::clone(
             action
@@ -1085,7 +1091,7 @@ impl NativeSessions {
         blob: BlobRef,
         reader: impl Read,
     ) -> Result<()> {
-        let _slot = self.upload_slot()?;
+        let _slot = self.upload_slot(UploadSource::Direct)?;
         let session = self.get(ticket)?;
         {
             let mut state = Self::lock(&session)?;
@@ -1309,6 +1315,10 @@ impl NativeSessions {
         let Pending::Action(action) = &mut **pending else {
             bail!("native action required");
         };
+        ensure!(
+            !action.inputs_staged,
+            "native input staging already finished"
+        );
         let input = action.inputs.get(&tree).context("undeclared input tree")?;
         let Publisher::Worker {
             address: requester, ..
@@ -1389,7 +1399,7 @@ impl NativeSessions {
                     pending.peer_until = None;
                     continue;
                 }
-                match self.upload_slot() {
+                match self.upload_slot(UploadSource::Peer) {
                     Ok(slot) => {
                         pending.peer_until = None;
                         pending.uploading = true;
@@ -1465,21 +1475,59 @@ impl NativeSessions {
         Ok(())
     }
 
+    /// The executor has pinned all input trees and no longer needs origin
+    /// transfers. Release unconsumed claims before entering the CPU queue.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid or unauthorized action ticket.
+    pub fn inputs_staged(&self, ticket: Ticket, publisher: Publisher) -> Result<()> {
+        let session = self.get(ticket)?;
+        let mut state = Self::lock(&session)?;
+        self.authorize(&mut state, publisher)?;
+        let Phase::Pending(pending) = &mut state.phase else {
+            bail!("native action no longer pending");
+        };
+        let Pending::Action(action) = &mut **pending else {
+            bail!("native action required");
+        };
+        if !action.inputs_staged {
+            // A flight can remain live through another action even when
+            // this action no longer needs it. Release only our own claim.
+            for (_, flight) in action.demands.values() {
+                let mut pending = flight.lock()?;
+                if pending
+                    .claim
+                    .as_ref()
+                    .is_some_and(|claim| claim.ticket == ticket)
+                {
+                    pending.claim = None;
+                }
+            }
+            action.demands.clear();
+            action.unavailable.clear();
+            action.inputs_staged = true;
+        }
+        Ok(())
+    }
+
     /// Poll missing inputs requested by the assigned worker. Claims are shared
     /// by content identity across actions and expire if their source disappears.
     ///
     /// # Errors
     /// Returns an error for an invalid or expired action ticket.
-    pub fn input_demands(&self, ticket: Ticket) -> Result<Vec<InputDemand>> {
+    pub fn poll_input(&self, ticket: Ticket) -> Result<InputPoll> {
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
         self.authorize_reader(&mut state, Publisher::Client)?;
         let Phase::Pending(pending) = &state.phase else {
-            return Ok(Vec::new());
+            return Ok(InputPoll::Complete);
         };
         let Pending::Action(action) = &**pending else {
             bail!("native action required");
         };
+        if action.inputs_staged {
+            return Ok(InputPoll::Complete);
+        }
         let now = Instant::now();
         // A lost poll reply is replayable. At most one reserved upload per
         // origin keeps sequential namespace streams from hoarding slots.
@@ -1502,10 +1550,10 @@ impl NativeSessions {
             if let Some(claim) = &mut pending.claim {
                 if claim.ticket == ticket {
                     claim.expires = self.deadline();
-                    return Ok(vec![InputDemand {
+                    return Ok(InputPoll::Demand(InputDemand {
                         tree: *tree,
                         blob: flight.blob,
-                    }]);
+                    }));
                 }
             } else if candidate.is_none() {
                 candidate = Some((*tree, flight));
@@ -1518,7 +1566,7 @@ impl NativeSessions {
                 && pending.claim.is_none()
                 && pending.peer_until.is_none_or(|until| until <= now)
             {
-                match self.upload_slot() {
+                match self.upload_slot(UploadSource::Direct) {
                     Ok(slot) => {
                         pending.claim = Some(BackfillClaim {
                             ticket,
@@ -1526,17 +1574,17 @@ impl NativeSessions {
                             origin: Arc::downgrade(&action.origin),
                             slot,
                         });
-                        return Ok(vec![InputDemand {
+                        return Ok(InputPoll::Demand(InputDemand {
                             tree,
                             blob: flight.blob,
-                        }]);
+                        }));
                     }
                     Err(error) if error.is::<NativeServiceBusy>() => {}
                     Err(error) => return Err(error),
                 }
             }
         }
-        Ok(Vec::new())
+        Ok(InputPoll::Waiting)
     }
 
     /// Release a claim when the original file cannot be reopened. Other
@@ -1727,6 +1775,12 @@ impl NativeSessions {
         drop(previous);
         Ok(())
     }
+}
+
+#[derive(Clone, Copy)]
+enum UploadSource {
+    Direct,
+    Peer,
 }
 
 struct UploadSlot(Arc<AtomicUsize>);

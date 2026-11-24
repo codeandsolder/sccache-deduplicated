@@ -560,8 +560,12 @@ fn dispatch(
             sessions.request_inputs(ticket, publisher, missing)?;
             encode(&(), limit)
         }
-        "input_demands" if publisher == Publisher::Client => {
-            encode(&sessions.input_demands(metadata(request, limit)?)?, limit)
+        "poll_input" if publisher == Publisher::Client => {
+            encode(&sessions.poll_input(metadata(request, limit)?)?, limit)
+        }
+        "inputs_staged" => {
+            sessions.inputs_staged(metadata(request, limit)?, publisher)?;
+            encode(&(), limit)
         }
         "input_unavailable" if publisher == Publisher::Client => {
             let (ticket, demand) = metadata(request, limit)?;

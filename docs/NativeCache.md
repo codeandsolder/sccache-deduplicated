@@ -46,7 +46,12 @@ If no peer provides the bytes, the scheduler requests them from an active
 submitting client; claims share the global upload budget. An origin that
 cannot reopen its source can decline the demand, allowing another declared
 source tree, live origin, or another peer lookup to satisfy the same flight.
-Neither peer lookup nor backfill consumes a compiler slot.
+Neither peer lookup nor backfill consumes a compiler slot. Peer transfers
+leave one shared upload slot available for direct uploads when the configured
+budget permits. Once the executor has pinned every input, it acknowledges
+staging completion before waiting for CPU capacity. That releases unconsumed
+origin claims and ends the origin's demand polling, including for long-running
+compilations.
 
 All incoming bytes are length- and digest-verified before publication.
 Individual verified acquisitions survive failures of other blobs, use the
