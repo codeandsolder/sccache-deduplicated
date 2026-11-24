@@ -1010,23 +1010,45 @@ pub trait JobAuthorizer: Send {
     fn verify_token(&self, job_id: JobId, token: &str) -> Result<()>;
 }
 
+/// Scheduler-owned union of the verified input blobs in an admitted action.
+#[cfg(feature = "dist-server")]
+pub type NativeInputBlobs = std::collections::BTreeMap<crate::build_runtime::ContentId, u64>;
+
+/// Advisory worker telemetry, never part of action identity or verification.
+#[cfg(feature = "dist-server")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativePlacement {
+    pub residency: Option<crate::build_runtime::BlobResidency>,
+    pub transfer: crate::build_runtime::PackageTransferCost,
+    pub execution_nanoseconds: u64,
+}
+
+#[cfg(feature = "dist-server")]
+impl Default for NativePlacement {
+    fn default() -> Self {
+        Self {
+            residency: None,
+            transfer: crate::build_runtime::PackageTransferCost::default(),
+            execution_nanoseconds: 1_000_000_000,
+        }
+    }
+}
+
 /// Worker build engines advertised atomically with its scheduler heartbeat.
 #[cfg(feature = "dist-server")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerCapabilities {
     pub archive: bool,
     pub native_platform: Option<crate::build_runtime::ContentId>,
-    /// Advisory recent native tree residency, bounded by MAX_CACHED_TREES.
-    pub cached_trees: Vec<crate::build_runtime::TreeId>,
+    pub native_placement: Option<NativePlacement>,
 }
 
 #[cfg(feature = "dist-server")]
 impl WorkerCapabilities {
-    pub const MAX_CACHED_TREES: usize = 32;
     pub const ARCHIVE: Self = Self {
         archive: true,
         native_platform: None,
-        cached_trees: Vec::new(),
+        native_placement: None,
     };
 }
 
@@ -1046,6 +1068,7 @@ pub trait SchedulerIncoming: Send + Sync {
         &self,
         requester: &dyn SchedulerOutgoing,
         assignment: NativeAssignment,
+        inputs: NativeInputBlobs,
     ) -> ExtResult<AllocJobResult, Error>;
     // From Server
     fn handle_heartbeat_server(

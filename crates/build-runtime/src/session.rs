@@ -524,7 +524,7 @@ impl NativeSessions {
         &self,
         ticket: Ticket,
         request: &ActionRequest,
-        allocate: impl FnOnce() -> Result<ScheduleReply>,
+        allocate: impl FnOnce(BTreeMap<ContentId, u64>) -> Result<ScheduleReply>,
     ) -> Result<ScheduleReply> {
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
@@ -547,7 +547,18 @@ impl NativeSessions {
             publisher == Publisher::Client && action.upload.is_none(),
             "native action already has a publisher"
         );
-        let reply = allocate()?;
+        let mut blobs = BTreeMap::new();
+        for tree in &action.inputs {
+            for (&id, &size) in tree.blobs() {
+                ensure!(
+                    blobs
+                        .insert(id, size)
+                        .is_none_or(|previous| previous == size),
+                    "inconsistent input blob length"
+                );
+            }
+        }
+        let reply = allocate(blobs)?;
         if let ScheduleReply::Assigned(allocation) = &reply {
             action.allocation = Some(allocation.clone());
             state.publisher = Publisher::Worker {

@@ -124,7 +124,10 @@ impl ArchiveLength {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackageTransferCost {
+    /// Effective logical blob bytes delivered and staged per second.
     pub download_bytes_per_second: u64,
+    /// Original archive bytes delivered per second, before archive expansion.
+    pub archive_download_bytes_per_second: u64,
     /// Approximate setup/staging latency of one original HTTP blob request.
     pub raw_request_nanoseconds: u64,
     /// Maximum simultaneous raw blob fetches across worker jobs.
@@ -142,6 +145,7 @@ impl Default for PackageTransferCost {
         const MIB: u64 = 1 << 20;
         Self {
             download_bytes_per_second: 128 * MIB,
+            archive_download_bytes_per_second: 128 * MIB,
             raw_request_nanoseconds: 2_000_000,
             raw_parallelism: 4,
             decode_tar_bytes_per_second: 512 * MIB,
@@ -161,6 +165,7 @@ impl PackageTransferCost {
     pub fn validate(self) -> Result<()> {
         let rates = [
             self.download_bytes_per_second,
+            self.archive_download_bytes_per_second,
             self.decode_tar_bytes_per_second,
             self.decode_gzip_bytes_per_second,
             self.decode_xz_bytes_per_second,
@@ -202,7 +207,8 @@ impl PackageTransferCost {
             PackageCompression::Xz => self.decode_xz_bytes_per_second,
             PackageCompression::Zstd => self.decode_zstd_bytes_per_second,
         };
-        let archive_cost = u128::from(archive.source.size) * SECOND / rate
+        let archive_cost = u128::from(archive.source.size) * SECOND
+            / u128::from(self.archive_download_bytes_per_second)
             + request
             + u128::from(archive.expanded_bytes) * SECOND / u128::from(decode_rate)
             + u128::from(archive.entry_count) * u128::from(self.per_entry_nanoseconds)
@@ -259,6 +265,7 @@ mod transport_cost_tests {
         );
         let slow_link = PackageTransferCost {
             download_bytes_per_second: 20 << 20,
+            archive_download_bytes_per_second: 20 << 20,
             ..fast_link
         };
         assert!(
@@ -292,6 +299,7 @@ mod transport_cost_tests {
         );
         let latency = PackageTransferCost {
             download_bytes_per_second: 1 << 30,
+            archive_download_bytes_per_second: 1 << 30,
             raw_request_nanoseconds: 2_000_000,
             raw_parallelism: 1,
             startup_nanoseconds: 0,

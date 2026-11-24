@@ -15,6 +15,8 @@ pub use package::{
     PackageSource, PackageTransferCost,
 };
 mod recipe;
+mod residency;
+pub use residency::BlobResidency;
 mod space_policy;
 pub use space_policy::SpacePolicy;
 mod spec;

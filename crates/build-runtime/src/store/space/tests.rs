@@ -441,80 +441,6 @@ fn committed_tree_releases_staging_reservations_into_resident_accounting() -> Re
 }
 
 #[test]
-fn worker_cache_hints_are_bounded_recent_and_survive_restart() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let (hot, warm, cold) = {
-        let store = NativeStore::open(dir.path())?;
-        let mut manifest = TreeManifest {
-            root: TreeMetadata {
-                mode: 0o755,
-                modified: TreeTimestamp {
-                    seconds: 0,
-                    nanoseconds: 0,
-                },
-            },
-            entries: BTreeMap::new(),
-        };
-        let cold = store.publish_tree(&manifest, vec![])?;
-        manifest.root.mode = 0o700;
-        let warm = store.publish_tree(&manifest, vec![])?;
-        manifest.root.mode = 0o750;
-        let hot = store.publish_tree(&manifest, vec![])?;
-        for _ in 0..4 {
-            drop(store.lookup_tree(warm)?.context("missing warm tree")?);
-        }
-        for _ in 0..32 {
-            drop(store.lookup_tree(hot)?.context("missing hot tree")?);
-        }
-        assert_eq!(store.recent_trees(0)?, Vec::new());
-        assert_eq!(store.recent_trees(1)?, vec![hot]);
-        assert_eq!(store.recent_trees(2)?, vec![hot, warm]);
-        (hot, warm, cold)
-    };
-    let store = NativeStore::open(dir.path())?;
-    assert_eq!(store.recent_trees(3)?, vec![hot, warm, cold]);
-    assert!(matches!(store.evict_tree(warm)?, Eviction::Removed { .. }));
-    assert_eq!(store.recent_trees(3)?, vec![hot, cold]);
-    Ok(())
-}
-
-#[test]
-fn worker_cache_heartbeat_hints_remain_bounded_as_store_grows() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let store = NativeStore::open(dir.path())?;
-    let mut manifest = TreeManifest {
-        root: TreeMetadata {
-            mode: 0o755,
-            modified: TreeTimestamp {
-                seconds: 0,
-                nanoseconds: 0,
-            },
-        },
-        entries: BTreeMap::new(),
-    };
-    let mut published = Vec::new();
-    for second in 0..64 {
-        manifest.root.modified.seconds = second;
-        published.push(store.publish_tree(&manifest, vec![])?);
-    }
-    assert_eq!(
-        store.recent_trees(64)?,
-        published.iter().rev().take(32).copied().collect::<Vec<_>>()
-    );
-    assert_eq!(
-        store.recent_trees(1)?,
-        vec![*published.last().context("missing last tree")?]
-    );
-    let evicted = published[63];
-    assert!(matches!(
-        store.evict_tree(evicted)?,
-        Eviction::Removed { .. }
-    ));
-    assert_eq!(store.recent_trees(1)?, vec![published[62]]);
-    Ok(())
-}
-
-#[test]
 fn eviction_prefers_exclusive_blobs_over_shared_result_aliases() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let store = NativeStore::open(temp.path())?;
@@ -835,5 +761,30 @@ fn rejected_reserved_upload_releases_its_charge() -> Result<()> {
             .reserved_bytes,
         0
     );
+    Ok(())
+}
+
+#[test]
+fn residency_snapshot_tracks_live_outputs_across_eviction_and_restart() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let retained = ContentId::of(b"retained");
+    let removed = ContentId::of(b"removed");
+    {
+        let store = NativeStore::open(dir.path())?;
+        let keep = publish(&store, "retained")?;
+        let drop_key = publish(&store, "removed")?;
+        let before = store.blob_residency()?.context("missing inventory")?;
+        assert!(before.may_contain(retained));
+        assert!(before.may_contain(removed));
+        assert!(matches!(store.evict(drop_key)?, Eviction::Removed { .. }));
+        let after = store.blob_residency()?.context("missing inventory")?;
+        assert!(after.may_contain(retained));
+        assert!(!after.may_contain(removed));
+        assert!(store.lookup(keep)?.is_some());
+    }
+    let store = NativeStore::open(dir.path())?;
+    let restored = store.blob_residency()?.context("missing inventory")?;
+    assert!(restored.may_contain(retained));
+    assert!(!restored.may_contain(removed));
     Ok(())
 }

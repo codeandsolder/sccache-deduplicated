@@ -96,7 +96,7 @@ fn with_native_service(
             respond(
                 request,
                 &sessions,
-                &move |_| {
+                &move |_, _| {
                     Ok(ScheduleReply::Assigned(WorkerAllocation {
                         address: worker.addr(),
                         job: 42,
@@ -305,8 +305,7 @@ fn metadata_is_bounded_and_rejects_trailing_bytes() -> Result<()> {
 #[test]
 #[cfg(target_os = "linux")]
 #[ignore = "requires Linux Bubblewrap and ldd"]
-fn native_action_transfers_inputs_executes_and_publishes_without_worker_result_store() -> Result<()>
-{
+fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result<()> {
     use crate::build_runtime::ExecutionPolicy;
     use std::{fs, process::Command};
     with_native_service(|url, sessions| {

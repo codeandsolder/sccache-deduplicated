@@ -132,8 +132,7 @@ mod common {
         pub cpu_capacity: f64,
         // Executing jobs and pending jobs receiving bytes from a client.
         pub active_job_ids: Vec<dist::JobId>,
-        /// Small recent immutable-tree inventory, only a scheduling hint.
-        pub cached_trees: Vec<crate::build_runtime::TreeId>,
+        pub native_placement: Option<dist::NativePlacement>,
         pub server_nonce: dist::ServerNonce,
         pub cert_digest: Vec<u8>,
         pub cert_pem: Vec<u8>,
@@ -145,7 +144,7 @@ mod common {
             f.debug_struct("HeartbeatServerHttpRequest")
                 .field("cpu_capacity", &self.cpu_capacity)
                 .field("active_job_ids", &self.active_job_ids)
-                .field("cached_tree_count", &self.cached_trees.len())
+                .field("native_placement_present", &self.native_placement.is_some())
                 .field("server_nonce", &self.server_nonce)
                 .field(
                     "cert_digest",
@@ -167,7 +166,7 @@ mod common {
                 jwt_key,
                 cpu_capacity: 4.0,
                 active_job_ids: Vec::new(),
-                cached_trees: Vec::new(),
+                native_placement: None,
                 server_nonce: dist::ServerNonce::new(),
                 cert_digest: vec![1, 2, 3],
                 cert_pem: b"certificate".to_vec(),
@@ -1099,9 +1098,11 @@ mod server {
                 let certs = Arc::clone(&server_certificates);
                 native::spawn(
                     &config,
-                    move |assignment| match handler
-                        .handle_alloc_native_job(&*requester, assignment)?
-                    {
+                    move |assignment, inputs| match handler.handle_alloc_native_job(
+                        &*requester,
+                        assignment,
+                        inputs,
+                    )? {
                         AllocJobResult::Success {
                             job_alloc,
                             need_toolchain,
@@ -1242,7 +1243,7 @@ mod server {
                         trace!(target: "sccache_heartbeat", "Req {}: heartbeat_server: {:?}", req_id, heartbeat_server);
 
                         let HeartbeatServerHttpRequest {
-                            cpu_capacity, active_job_ids, cached_trees, jwt_key,
+                            cpu_capacity, active_job_ids, native_placement, jwt_key,
                             server_nonce, cert_digest, cert_pem,
                         } = heartbeat_server;
                         let job_authorizer = try_or_400_log!(req_id, JWTJobAuthorizer::boxed(&jwt_key));
@@ -1269,7 +1270,7 @@ mod server {
                             server_id, server_nonce,
                             cpu_capacity, &active_job_ids,
                             job_authorizer, dist::WorkerCapabilities {
-                                archive, native_platform, cached_trees,
+                                archive, native_platform, native_placement,
                             }
                         ));
                         if let Some(worker_name) = worker_name
@@ -1502,7 +1503,7 @@ mod server {
                     let heartbeat_req = HeartbeatServerHttpRequest {
                         cpu_capacity: advertised_cpus,
                         active_job_ids,
-                        cached_trees: capabilities.cached_trees,
+                        native_placement: capabilities.native_placement,
                         jwt_key: heartbeat_jwt_key.clone(),
                         server_nonce: server_nonce.clone(),
                         cert_digest: cert_digest.clone(),

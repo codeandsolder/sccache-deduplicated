@@ -3,8 +3,13 @@
 //! scheduler. There is no legacy archive creation or client-side reupload.
 
 use std::{
+    cell::Cell,
+    io::{self, Read},
     num::NonZeroUsize,
-    sync::{Arc, Condvar, Mutex, PoisonError},
+    sync::{
+        Arc, Condvar, Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -24,6 +29,7 @@ use crate::build_runtime::{
 #[derive(Clone)]
 pub struct PackageTransportTracker {
     rates: Arc<Mutex<PackageTransferCost>>,
+    execution_nanoseconds: Arc<AtomicU64>,
     slots: Arc<RawDownloadSlots>,
 }
 
@@ -54,6 +60,7 @@ impl PackageTransportTracker {
             .context("zero raw download parallelism")?;
         Ok(Self {
             rates: Arc::new(Mutex::new(initial)),
+            execution_nanoseconds: Arc::new(AtomicU64::new(0)),
             slots: Arc::new(RawDownloadSlots {
                 limit,
                 active: Mutex::new(0),
@@ -102,6 +109,35 @@ impl PackageTransportTracker {
         *self.rates.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Estimated time spent occupying an execution slot, excluding staging and queue waits.
+    #[must_use = "the estimate is used for worker placement"]
+    pub fn execution_nanoseconds(&self) -> u64 {
+        let observed = self.execution_nanoseconds.load(Ordering::Relaxed);
+        if observed == 0 {
+            1_000_000_000
+        } else {
+            observed
+        }
+    }
+
+    /// Update the service-time estimate from a completed sandbox execution.
+    pub fn observe_execution(&self, duration: Duration) {
+        let observed = u64::try_from(duration.as_nanos())
+            .unwrap_or(u64::MAX)
+            .clamp(1_000_000, 3_600_000_000_000);
+        let _ = self.execution_nanoseconds.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |previous| {
+                Some(if previous == 0 {
+                    observed
+                } else {
+                    (3 * previous + observed).div_ceil(4)
+                })
+            },
+        );
+    }
+
     fn smooth(rate: &mut u64, bytes: u64, duration: Duration) {
         let nanos = duration.as_nanos();
         if bytes < (1 << 20) || nanos < 1_000_000 {
@@ -136,16 +172,20 @@ impl PackageTransportTracker {
     }
 
     /// Observe original delivery plus verified full-package reconstruction.
-    /// Subtract the current predicted download cost before attributing the
-    /// remainder to the decoder. Queue-wait time is excluded by the caller.
-    pub fn observe_archive(&self, archive: PackageArchive, duration: Duration) {
+    /// Measure archive-byte transfer separately from logical raw-blob goodput;
+    /// subtract the actual download duration before attributing time to decoding.
+    pub fn observe_archive(&self, archive: PackageArchive, duration: Duration, download: Duration) {
         let mut rates = self.rates.lock().unwrap_or_else(PoisonError::into_inner);
-        let transfer_ns = u128::from(archive.source.size) * 1_000_000_000
-            / u128::from(rates.download_bytes_per_second);
+        let effective_download =
+            download.saturating_sub(Duration::from_nanos(rates.raw_request_nanoseconds));
+        Self::smooth(
+            &mut rates.archive_download_bytes_per_second,
+            archive.source.size,
+            effective_download,
+        );
+        let transfer_ns = download.as_nanos();
         let entry_cost = u128::from(rates.per_entry_nanoseconds) * u128::from(archive.entry_count);
-        let overhead_ns = u128::from(rates.startup_nanoseconds)
-            + u128::from(rates.raw_request_nanoseconds)
-            + entry_cost;
+        let overhead_ns = u128::from(rates.startup_nanoseconds) + entry_cost;
         let decode_ns = duration
             .as_nanos()
             .saturating_sub(transfer_ns.saturating_add(overhead_ns));
@@ -185,6 +225,7 @@ pub(super) struct ExecutionControl<'a> {
     pub renewal_interval: Duration,
     pub queue: Option<&'a crate::dist::execution_queue::ExecutionQueue>,
     pub grace: Option<&'a super::ArtifactGrace>,
+    pub transport: Option<&'a PackageTransportTracker>,
 }
 
 #[cfg(test)]
@@ -272,15 +313,40 @@ mod transport_tests {
             expanded_bytes: 64 << 20,
             entry_count: 250,
         };
-        tracker.observe_archive(archive, Duration::from_secs(6));
+        tracker.observe_archive(archive, Duration::from_secs(6), Duration::from_secs(1));
         assert!(
             tracker.estimate().decode_zstd_bytes_per_second < observed.decode_zstd_bytes_per_second
+        );
+        assert_eq!(
+            tracker.estimate().download_bytes_per_second,
+            observed.download_bytes_per_second
+        );
+        assert!(
+            tracker.estimate().archive_download_bytes_per_second
+                < observed.archive_download_bytes_per_second
         );
         assert_eq!(
             tracker.estimate().decode_xz_bytes_per_second,
             observed.decode_xz_bytes_per_second
         );
         Ok(())
+    }
+}
+
+// Measure the actual archive transfer independently of its subsequent decoder.
+struct TimedDownload<'a, R> {
+    reader: R,
+    start: Instant,
+    elapsed: &'a Cell<Option<Duration>>,
+}
+
+impl<R: Read> Read for TimedDownload<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self.reader.read(buffer)?;
+        if count == 0 && !buffer.is_empty() && self.elapsed.get().is_none() {
+            self.elapsed.set(Some(self.start.elapsed()));
+        }
+        Ok(count)
     }
 }
 
@@ -348,12 +414,20 @@ impl NativeCacheClient {
         loop {
             check()?;
             let attempted = Instant::now();
+            let downloaded = Cell::new(None);
             let (package, reused) = match store.acquire_package(
                 offer.source.identity,
                 ArchiveLength::Exact(offer.source.size),
                 limits,
                 &executable,
-                || self.download_response(ticket, offer.blob.id),
+                || {
+                    let start = Instant::now();
+                    Ok(TimedDownload {
+                        reader: self.download_response(ticket, offer.blob.id)?,
+                        start,
+                        elapsed: &downloaded,
+                    })
+                },
             ) {
                 Ok(package) => package,
                 Err(error) if error.is::<NativeServiceBusy>() => {
@@ -371,7 +445,9 @@ impl NativeCacheClient {
                 "reconstructed original package identity mismatch"
             );
             if !reused {
-                transport.observe_archive(offer, attempted.elapsed());
+                if let Some(download) = downloaded.get() {
+                    transport.observe_archive(offer, attempted.elapsed(), download);
+                }
                 debug!(
                     "native package transfer estimate after import: {:?}",
                     transport.estimate()
@@ -412,6 +488,7 @@ impl NativeCacheClient {
                 renewal_interval: delivery.renewal_interval,
                 queue: Some(delivery.execution_queue),
                 grace: Some(delivery.artifact_grace),
+                transport: Some(delivery.transport),
             },
             |id, check| self.fetch_tree(ticket, id, store, delivery, check),
         )
@@ -491,7 +568,14 @@ impl NativeCacheClient {
                     .queue
                     .map(|queue| queue.acquire(check))
                     .transpose()?;
-                execute(spec, store, policy, check)?
+                let started = Instant::now();
+                let captured = execute(spec, store, policy, check)?;
+                if captured.successful_result().is_some()
+                    && let Some(transport) = control.transport
+                {
+                    transport.observe_execution(started.elapsed());
+                }
+                captured
             };
             check()?;
             if let Some(manifest) = captured.successful_result() {

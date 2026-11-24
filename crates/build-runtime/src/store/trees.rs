@@ -405,7 +405,6 @@ impl NativeStore {
         write.commit()?;
         pins.usage.remove(&Root::Tree(id));
         pins.dirty_usage.remove(&Root::Tree(id));
-        pins.cached_trees.retain(|cached| *cached != id);
         drop(pins);
         Ok(Eviction::Removed {
             unreferenced_logical_bytes: bytes,
@@ -431,6 +430,12 @@ impl TreeLease {
     #[must_use = "the manifest describes the leased tree"]
     pub const fn manifest(&self) -> &TreeManifest {
         &self.manifest
+    }
+
+    /// Unique content lengths in this verified tree closure.
+    #[must_use = "the returned map describes the pinned content"]
+    pub const fn blobs(&self) -> &BTreeMap<ContentId, u64> {
+        &self.blobs
     }
 
     /// Open declared content for streaming independently of the tree lease.

@@ -29,8 +29,9 @@ use crate::{
     },
 };
 
-pub(super) type Allocator =
-    dyn Fn(crate::dist::NativeAssignment) -> Result<ScheduleReply> + Send + Sync;
+pub(super) type Allocator = dyn Fn(crate::dist::NativeAssignment, crate::dist::NativeInputBlobs) -> Result<ScheduleReply>
+    + Send
+    + Sync;
 
 struct PackageService {
     limits: PackageImportLimits,
@@ -96,7 +97,13 @@ impl PackageService {
 
 pub(super) fn spawn(
     config: &NativeCacheConfig,
-    allocate: impl Fn(crate::dist::NativeAssignment) -> Result<ScheduleReply> + Send + Sync + 'static,
+    allocate: impl Fn(
+        crate::dist::NativeAssignment,
+        crate::dist::NativeInputBlobs,
+    ) -> Result<ScheduleReply>
+    + Send
+    + Sync
+    + 'static,
     client_auth: Arc<dyn ClientAuthCheck>,
     server_auth: Arc<ServerAuthenticator>,
 ) -> Result<()> {
@@ -349,8 +356,8 @@ fn dispatch(
             let ExecutionRequest { ticket, spec } = metadata(request, limit)?;
             let request = spec.action_request()?;
             encode(
-                &sessions.schedule(ticket, &request, || {
-                    allocate(crate::dist::NativeAssignment { ticket, spec })
+                &sessions.schedule(ticket, &request, |inputs| {
+                    allocate(crate::dist::NativeAssignment { ticket, spec }, inputs)
                 })?,
                 limit,
             )

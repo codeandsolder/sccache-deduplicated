@@ -219,11 +219,11 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     };
     let expected = ScheduleReply::Assigned(allocation);
     assert_eq!(
-        service.schedule(ticket, &request()?, || Ok(expected.clone()))?,
+        service.schedule(ticket, &request()?, |_| Ok(expected.clone()))?,
         expected
     );
     assert_eq!(
-        service.schedule(ticket, &request()?, || bail!("duplicate allocation"))?,
+        service.schedule(ticket, &request()?, |_| bail!("duplicate allocation"))?,
         expected
     );
     assert!(service.renew(ticket, Publisher::Client).is_err());
@@ -231,7 +231,7 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     changed.required_outputs.insert("other".into());
     assert!(
         service
-            .schedule(ticket, &changed, || bail!("wrong declaration"))
+            .schedule(ticket, &changed, |_| bail!("wrong declaration"))
             .is_err()
     );
     service.renew(
@@ -254,7 +254,7 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
         manifest(b"object"),
     )?;
     assert_eq!(
-        service.schedule(ticket, &request()?, || bail!("duplicate assignment"))?,
+        service.schedule(ticket, &request()?, |_| bail!("duplicate assignment"))?,
         expected
     );
     Ok(())

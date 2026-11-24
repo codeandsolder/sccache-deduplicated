@@ -135,6 +135,7 @@ mod tests {
     fn slow_link() -> PackageTransferCost {
         PackageTransferCost {
             download_bytes_per_second: 1 << 20,
+            archive_download_bytes_per_second: 1 << 20,
             startup_nanoseconds: 0,
             ..PackageTransferCost::default()
         }

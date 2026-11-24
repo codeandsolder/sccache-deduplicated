@@ -169,14 +169,17 @@ remove the last remaining shared reference. Candidate selection runs only
 under pressure, holds at most the configured eviction batch in memory,
 and takes no pin mutex over filesystem metadata I/O.
 
-Native workers include up to 32 recently used immutable tree IDs in each
-scheduler heartbeat. The scheduler considers their overlap with the native
-action's input-tree closure when weighing eligible workers; this modest
-locality bonus supplements (never replaces) CPU capacity, compatibility and
-the unhealthy-worker fallback. The inventory is advisory and can be stale;
-actual worker retrieval still verifies the tree and downloads its missing
-blobs. The heartbeat protocol changed with native support; update scheduler
-and worker binaries together.
+Native workers advertise an advisory Bloom summary of the live content index
+(12 bits per blob, at most 1 MiB, refreshed every 15 seconds). This includes
+produced artifacts and partial overlap between different immutable trees.
+An oversized inventory is reported as unknown rather than saturated.
+The scheduler uses the union of verified action input blobs and outstanding
+worker reservations to estimate missing bytes. The heartbeat also carries
+measured transfer throughput, request overhead and execution duration.
+Native placement minimizes estimated completion time among eligible healthy
+workers, with queue waiting and input staging overlapping; platform and
+capacity constraints remain mandatory. Actual retrieval still verifies every
+input. Update scheduler and worker binaries together after protocol changes.
 
 Native blob downloads negotiate Zstandard independently from the immutable
 blob representation. The scheduler samples at most 128 KiB of each requested
@@ -553,14 +556,15 @@ downloads per worker, full-package Zstandard expansion at 64 MiB/s, XZ at
 plus 20 microseconds per archive entry and 75 ms of fixed work.
 These are **starting estimates, not measured universal rates**. The worker
 smooths raw download+staging throughput, small-file request overhead,
-and successful full-package reconstruction throughput across jobs to adjust its future choices. Samples
-below 1 MiB are ignored, and a package's predicted transfer time is
-subtracted from its measured reconstruction time before updating the
-codec's decode rate. Override initial values for the network and hardware:
+and successful full-package reconstruction throughput across jobs to adjust its future choices. Large verified transfers update throughput, while small-file samples update
+request overhead. Original archive throughput is tracked separately from
+logical blob goodput; actual archive transfer time is subtracted from its
+measured reconstruction time before updating the codec's decode rate. Override initial values for the network and hardware:
 
 ```toml
 [native_worker.package_transfer]
 download_bytes_per_second = 20971520
+archive_download_bytes_per_second = 20971520
 raw_request_nanoseconds = 2000000
 raw_parallelism = 4
 decode_tar_bytes_per_second = 536870912
@@ -727,8 +731,8 @@ does not consume a compiler slot. Already cached input trees are pinned when
 the assignment is accepted, and released on completion or reconciliation.
 Heartbeats use actual occupied execution slots for CPU restoration, separately
 from active HTTP requests that maintain job liveness. The scheduler includes
-the input closures of outstanding assignments in advisory tree-locality
-scoring (counting each matching tree once), before those transfers complete.
+the input blobs of outstanding assignments in the transfer backlog before
+those transfers complete (counting shared content once).
 Concurrent acquisitions of an identical missing tree share one transfer and
 its verified lease. If the producer fails or is cancelled, a waiting consumer
 may retry using its own authorized action; other consumers remain independent.
@@ -749,3 +753,27 @@ resident bytes; no second capacity charge or silent retention bypass occurs.
 Failed or cancelled jobs release reservations. Grace expiry never releases
 independent consumer leases. The maximum-result bound is deliberately
 conservative until output sizes can be predicted with a reliable upper bound.
+
+### Measured worker placement
+
+The worker sends its latest exponentially smoothed transfer and execution
+estimates in each heartbeat. Large raw downloads measure effective logical
+bytes per second including verification/staging and negotiated decompression;
+small requests estimate setup latency. Original archives measure transfer
+separately from their subsequent package decoder. Successful sandbox
+executions update the occupied-slot duration without including queue waits or
+input transfers. These estimates are checkpointed atomically to
+`worker-timing.json` under the worker CAS directory when changed, at most once
+per minute. Restart uses a validated checkpoint no older than 24 hours, scoped
+to the cache endpoint and platform; a new route starts from configuration.
+
+For each candidate the scheduler estimates raw transfer duration from unique
+missing bytes and batches of missing requests, adds the outstanding transfer
+backlog (also deduplicated), and overlaps that with estimated compiler queue
+wait. A fully resident job need not wait for unrelated transfers. A native
+job goes to the eligible worker with the lowest estimated completion time.
+Legacy archive admission retains its existing capacity-weighted selection.
+The residency summary and timing estimates are advisory; neither changes
+content identity or bypasses verification. The model currently uses raw
+delivery cost for placement (package reconstruction is optimized separately)
+and one average slot duration per worker, not per-action compute forecasts.

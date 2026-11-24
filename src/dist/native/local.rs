@@ -156,6 +156,7 @@ impl LocalExecutor {
                 renewal_interval: policy.renewal_interval,
                 queue: None,
                 grace: None,
+                transport: None,
             },
             |id, check| self.prepare_input(id, inputs, check),
         )

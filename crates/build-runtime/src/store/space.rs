@@ -130,17 +130,21 @@ impl NativeStore {
         Ok(budget)
     }
 
-    /// Recent immutable tree IDs for advisory worker placement. Heartbeats
-    /// only clone a bounded MRU index; they never scan the full usage map or
-    /// hold the pin lock across filesystem or index I/O.
-    ///
+    /// Build a bounded residency summary from a consistent live-blob index snapshot.
     /// # Errors
-    /// Returns an error when the store's in-memory pin lock is unavailable.
-    pub fn recent_trees(&self, limit: usize) -> Result<Vec<TreeId>> {
-        let pins = self.inner.lock_pins()?;
-        let ids = pins.cached_trees.iter().take(limit).copied().collect();
-        drop(pins);
-        Ok(ids)
+    /// Returns an error for index failure.
+    pub fn blob_residency(&self) -> Result<Option<crate::BlobResidency>> {
+        use redb::ReadableTableMetadata;
+        let read = self.inner.db.begin_read()?;
+        let blobs = read.open_table(super::BLOBS)?;
+        let Some(mut summary) = crate::BlobResidency::for_count(blobs.len()?) else {
+            return Ok(None);
+        };
+        for entry in blobs.iter()? {
+            let (id, _) = entry?;
+            summary.insert(ContentId(*id.value()));
+        }
+        Ok(Some(summary))
     }
 
     /// Persist only dirty usage records in one bounded write transaction,
@@ -442,41 +446,11 @@ fn reuse_utility(usage: Option<&UsageRecord>, bytes: u64, now: u64) -> u64 {
 }
 
 impl super::Pins {
-    const RECENT_TREE_LIMIT: usize = 32;
-
-    /// Reconstruct the bounded MRU list once on store open. Usage history is
-    /// authoritative; the recent-tree list is just a cheap scheduling hint.
-    pub(super) fn restore_tree_hints(&mut self) {
-        use std::cmp::Reverse;
-        let mut recent = BinaryHeap::new();
-        for (&root, stats) in &self.usage {
-            if let Root::Tree(id) = root {
-                let rank = Reverse((stats.last_used_ms, stats.hits, id));
-                if recent.len() < Self::RECENT_TREE_LIMIT {
-                    recent.push(rank);
-                } else if recent.peek().is_some_and(|oldest| rank < *oldest) {
-                    recent.pop();
-                    recent.push(rank);
-                }
-            }
-        }
-        self.cached_trees = recent
-            .into_sorted_vec()
-            .into_iter()
-            .map(|Reverse((_, _, id))| id)
-            .collect();
-    }
-
     pub(super) fn touch(&mut self, root: Root) {
         let record = self.usage.entry(root).or_default();
         record.hits = record.hits.saturating_add(1);
         record.last_used_ms = now_ms();
         self.dirty_usage.insert(root);
-        if let Root::Tree(id) = root {
-            self.cached_trees.retain(|cached| *cached != id);
-            self.cached_trees.push_front(id);
-            self.cached_trees.truncate(Self::RECENT_TREE_LIMIT);
-        }
     }
 }
 
