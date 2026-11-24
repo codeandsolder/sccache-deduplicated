@@ -491,10 +491,15 @@ impl<'a> StageBudget<'a> {
         let staged = self
             .store
             .stage_inner(reader.take(limit), Some(expected.size), child)?;
+        let actual = staged.reference();
         ensure!(
-            staged.reference() == expected,
-            "uploaded content does not match its declared digest and length"
+            actual.size == expected.size,
+            super::BlobIntegrityError::Length {
+                expected: expected.size,
+                actual: actual.size
+            }
         );
+        ensure!(actual.id == expected.id, super::BlobIntegrityError::Digest);
         Ok(staged)
     }
 

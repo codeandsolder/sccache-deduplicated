@@ -300,6 +300,9 @@ struct Backfill {
 struct BackfillState {
     // Give a bounded peer discovery window before requesting the origin.
     peer_until: Option<Instant>,
+    // Retry only after an origin has explicitly exhausted its sources.
+    // Between probes any other live origin can claim the input.
+    peer_retry_at: Option<Instant>,
     claim: Option<BackfillClaim>,
     uploading: bool,
     ready: Option<TreeLease>,
@@ -425,6 +428,19 @@ impl std::fmt::Display for NativeServiceBusy {
 }
 
 impl std::error::Error for NativeServiceBusy {}
+
+/// The origin supplied complete bytes that do not match the requested content.
+/// This source locator should be declined rather than retried.
+#[derive(Debug)]
+pub struct NativeInputRejected;
+
+impl std::fmt::Display for NativeInputRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native input bytes rejected")
+    }
+}
+
+impl std::error::Error for NativeInputRejected {}
 
 /// An authorized input is being requested from its submitting client.
 #[derive(Debug)]
@@ -1303,6 +1319,10 @@ impl NativeSessions {
                 let mut pending = flight.lock()?;
                 if pending.ready.is_some() && self.store().open_available_blob(blob)?.is_none() {
                     pending.ready = None;
+                    if !self.limits.peer_discovery_timeout.is_zero() {
+                        pending.peer_until =
+                            Some(Instant::now() + self.limits.peer_discovery_timeout);
+                    }
                 }
             }
             action.demands.entry(blob.id).or_insert((tree, flight));
@@ -1329,14 +1349,18 @@ impl NativeSessions {
                 let Ok(mut pending) = flight.state.try_lock() else {
                     continue;
                 };
+                if pending.uploading || pending.ready.is_some() || pending.claim.is_some() {
+                    continue;
+                }
+                if pending.peer_retry_at.is_some_and(|at| at <= now) {
+                    pending.peer_until = Some(now + self.limits.peer_discovery_timeout);
+                    pending.peer_retry_at = Some(now + Duration::from_secs(1));
+                }
                 let Some(until) = pending.peer_until else {
                     continue;
                 };
                 if until <= now {
                     pending.peer_until = None;
-                    continue;
-                }
-                if pending.uploading || pending.ready.is_some() || pending.claim.is_some() {
                     continue;
                 }
                 match self.upload_slot() {
@@ -1484,7 +1508,11 @@ impl NativeSessions {
     ///
     /// # Errors
     /// Returns an error for an invalid ticket or unclaimed input.
-    pub fn input_unavailable(&self, ticket: Ticket, blob: BlobRef) -> Result<()> {
+    pub fn input_unavailable(&self, ticket: Ticket, demand: InputDemand) -> Result<()> {
+        let InputDemand {
+            tree: declined,
+            blob,
+        } = demand;
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
         self.authorize_reader(&mut state, Publisher::Client)?;
@@ -1494,31 +1522,46 @@ impl NativeSessions {
         let Pending::Action(action) = &mut **pending else {
             bail!("native action required");
         };
-        let (tree, flight) = action
-            .demands
-            .get_mut(&blob.id)
-            .context("unrequested input unavailable")?;
-        ensure!(flight.blob == blob, "unavailable input length mismatch");
-        let mut pending = flight.lock()?;
         ensure!(
-            pending
-                .claim
-                .as_ref()
-                .is_some_and(|claim| claim.ticket == ticket),
-            "unavailable input not claimed"
+            action
+                .inputs
+                .get(&declined)
+                .is_some_and(|input| input.blobs.get(&blob.id) == Some(&blob.size)),
+            "undeclared unavailable input"
         );
-        pending.claim = None;
-        action.unavailable.insert((*tree, blob.id));
+        // Replayed declines must not consume the claim for an alternate
+        // source tree or a different origin.
+        if action.unavailable.contains(&(declined, blob.id)) {
+            return Ok(());
+        }
+        let Some((tree, flight)) = action.demands.get_mut(&blob.id) else {
+            // The worker can finish a download before the decline arrives.
+            return Ok(());
+        };
+        ensure!(
+            *tree == declined && flight.blob == blob,
+            "unavailable input differs from demand"
+        );
+        let mut pending = flight.lock()?;
+        // An expired claim may already belong to another origin. Do not
+        // disturb it; this notification applies only to our source.
+        if pending
+            .claim
+            .as_ref()
+            .is_some_and(|claim| claim.ticket == ticket)
+        {
+            pending.claim = None;
+        }
+        action.unavailable.insert((declined, blob.id));
         if let Some((&alternate, _)) = action.inputs.iter().find(|(id, input)| {
             input.blobs.get(&blob.id) == Some(&blob.size)
                 && !action.unavailable.contains(&(**id, blob.id))
         }) {
             *tree = alternate;
-        } else if !self.limits.peer_discovery_timeout.is_zero() {
-            // No origin source remains for this action. Give peer discovery
-            // another bounded chance without cancelling the queued build.
-            pending.peer_until =
-                Some(Instant::now() + Duration::from_secs(1).min(self.limits.idle_timeout));
+        } else if !self.limits.peer_discovery_timeout.is_zero() && pending.ready.is_none() {
+            let now = Instant::now();
+            pending.peer_until = Some(now + self.limits.peer_discovery_timeout);
+            pending.peer_retry_at = Some(now + Duration::from_secs(1));
         }
         drop(pending);
         drop(state);
@@ -1566,7 +1609,21 @@ impl NativeSessions {
                 _slot: claim.slot,
             }
         };
-        self.publish_backfill(guard, blob, reader)
+        self.publish_backfill(guard, blob, reader).map_err(|error| {
+            use crate::store::BlobIntegrityError;
+            match error.downcast_ref::<BlobIntegrityError>() {
+                Some(BlobIntegrityError::Digest) => error.context(NativeInputRejected),
+                Some(BlobIntegrityError::Length { expected, actual }) if actual > expected => {
+                    error.context(NativeInputRejected)
+                }
+                // Short/truncated bodies and local storage failures leave the
+                // claim retryable; another source may still satisfy it.
+                _ => {
+                    log::debug!("native backfill publication interrupted: {error:#}");
+                    error.context(NativeServiceBusy)
+                }
+            }
+        })
     }
 
     fn publish_backfill(
@@ -1580,7 +1637,10 @@ impl NativeSessions {
         // Still verify the stream if concurrent publication supplied the same content.
         let staged = vec![self.store().stage_expected(blob, reader)?];
         let lease = self.store().publish_tree_pinned(&manifest, staged)?;
-        guard.flight.lock()?.ready = Some(lease);
+        let mut pending = guard.flight.lock()?;
+        pending.ready = Some(lease);
+        pending.peer_until = None;
+        pending.peer_retry_at = None;
         Ok(())
     }
 

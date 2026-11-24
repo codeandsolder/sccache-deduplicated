@@ -42,7 +42,8 @@ mod coordinator;
 mod session;
 #[cfg(all(unix, feature = "store"))]
 pub use session::{
-    NativeContentPending, NativeServiceBusy, NativeSessions, PeerInputClaim, SessionLimits,
+    NativeContentPending, NativeInputRejected, NativeServiceBusy, NativeSessions, PeerInputClaim,
+    SessionLimits,
 };
 #[cfg(all(unix, feature = "store"))]
 mod store;

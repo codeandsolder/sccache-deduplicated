@@ -26,8 +26,8 @@ use crate::{
 use super::{
     LocalExecutor, NativeBuildPolicy, NativeBuildResult, NativeBuildSource, NativeCacheClient,
     client::{
-        InputProvider, LocalInputs, Outcome, failed_output, fetch_result, validate_manifest,
-        verify_destinations,
+        InputBlob, InputProvider, LocalInputs, Outcome, failed_output, fetch_result,
+        validate_manifest, verify_destinations,
     },
     codec, copy_verified,
 };
@@ -117,10 +117,16 @@ impl InputProvider for RemoteInputs<'_> {
         receive(self.stream, self.limit)
     }
 
-    fn open_blob(&mut self, tree: TreeId, blob: BlobRef) -> Result<Option<Box<dyn Read + Send>>> {
+    fn open_blob(&mut self, tree: TreeId, blob: BlobRef) -> Result<Option<InputBlob>> {
         send(self.stream, &Event::NeedBlob { tree, blob }, self.limit)?;
         let available: bool = receive(self.stream, self.limit)?;
-        Ok(available.then(|| Box::new(self.stream.blob_reader(blob.size)) as Box<dyn Read + Send>))
+        Ok(available.then(|| {
+            InputBlob::new(
+                Box::new(self.stream.blob_reader(blob.size)),
+                blob.size,
+                true,
+            )
+        }))
     }
 }
 

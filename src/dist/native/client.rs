@@ -4,11 +4,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{Read, Write},
+    io::{self, Read, Take, Write},
     net::SocketAddr,
     os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::{ExitStatus, Output},
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -16,11 +17,11 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use tempfile::NamedTempFile;
 
-use super::{LocalExecutor, NativeCacheClient, copy_verified};
+use super::{LocalExecutor, NativeCacheClient, copy_verified, retryable_transport_error};
 use crate::build_runtime::{
     ActionMode, BlobRef, CapturedExecution, ExecutionSpec, PreparedTree, ResultManifest, TreeId,
     TreeManifest,
-    wire::{NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply, Ticket},
+    wire::{InputDemand, NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply, Ticket},
 };
 
 /// Explicit client admission and delivery bounds.
@@ -45,9 +46,47 @@ pub struct NativeBuildResult {
     pub output: Output,
 }
 
+/// An input reader that can be abandoned on a direct upload, or drained
+/// exactly to its frame boundary when the caller supplied it over IPC.
+#[derive(Clone)]
+pub(super) struct InputBlob {
+    reader: Arc<Mutex<Take<Box<dyn Read + Send>>>>,
+    framed: bool,
+}
+
+impl InputBlob {
+    pub(super) fn new(reader: Box<dyn Read + Send>, size: u64, framed: bool) -> Self {
+        Self {
+            reader: Arc::new(Mutex::new(reader.take(size))),
+            framed,
+        }
+    }
+
+    fn discard_unread(&self) -> Result<()> {
+        if self.framed {
+            let mut reader = self
+                .reader
+                .lock()
+                .map_err(|_| anyhow::anyhow!("native input reader poisoned"))?;
+            io::copy(&mut *reader, &mut io::sink())?;
+            ensure!(reader.limit() == 0, "truncated native IPC input frame");
+        }
+        Ok(())
+    }
+}
+
+impl Read for InputBlob {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.reader
+            .lock()
+            .map_err(|_| io::Error::other("native input reader poisoned"))?
+            .read(buffer)
+    }
+}
+
 pub(super) trait InputProvider {
     fn manifest(&mut self, tree: TreeId) -> Result<TreeManifest>;
-    fn open_blob(&mut self, tree: TreeId, blob: BlobRef) -> Result<Option<Box<dyn Read + Send>>>;
+    fn open_blob(&mut self, tree: TreeId, blob: BlobRef) -> Result<Option<InputBlob>>;
 }
 
 pub(super) struct LocalInputs<'a>(BTreeMap<TreeId, &'a PreparedTree>);
@@ -92,8 +131,10 @@ impl InputProvider for LocalInputs<'_> {
         Ok(self.tree(tree)?.manifest().clone())
     }
 
-    fn open_blob(&mut self, tree: TreeId, blob: BlobRef) -> Result<Option<Box<dyn Read + Send>>> {
-        self.open_source(tree, blob)
+    fn open_blob(&mut self, tree: TreeId, blob: BlobRef) -> Result<Option<InputBlob>> {
+        Ok(self
+            .open_source(tree, blob)?
+            .map(|reader| InputBlob::new(reader, blob.size, false)))
     }
 }
 
@@ -303,7 +344,16 @@ impl NativeCacheClient {
                         start.elapsed() < policy.timeout,
                         "native worker deadline exceeded"
                     );
-                    let demands = self.input_demands(pin.ticket)?;
+                    let demands = match self.input_demands(pin.ticket) {
+                        Ok(demands) => demands,
+                        Err(error) if retryable_transport_error(&error) => {
+                            debug!("retrying native input demand poll: {error:#}");
+                            thread::sleep(idle);
+                            idle = (idle * 2).min(Duration::from_millis(200));
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     if demands.is_empty() {
                         thread::sleep(idle);
                         idle = (idle * 2).min(Duration::from_millis(200));
@@ -315,11 +365,7 @@ impl NativeCacheClient {
                             request.input_trees.contains(&demand.tree),
                             "scheduler requested undeclared tree"
                         );
-                        if let Some(reader) = inputs.open_blob(demand.tree, demand.blob)? {
-                            self.backfill_input(pin.ticket, demand.blob, reader)?;
-                        } else {
-                            self.input_unavailable(pin.ticket, demand.blob)?;
-                        }
+                        self.supply_demand(pin.ticket, demand, inputs, start, policy)?;
                     }
                     // A nonempty batch is followed immediately by another poll.
                 }
@@ -360,6 +406,55 @@ impl NativeCacheClient {
             NativeRunResult::JobNotFound => bail!("native worker lost its assigned job"),
         }
     }
+    fn supply_demand(
+        &self,
+        ticket: Ticket,
+        demand: InputDemand,
+        inputs: &mut impl InputProvider,
+        start: Instant,
+        policy: &NativeBuildPolicy,
+    ) -> Result<()> {
+        if let Some(reader) = inputs.open_blob(demand.tree, demand.blob)? {
+            match self.backfill_input(ticket, demand.blob, reader.clone()) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    // An interrupted HTTP request may have consumed only a
+                    // prefix of the IPC frame. Realign before another demand.
+                    reader.discard_unread()?;
+                    let status = error
+                        .downcast_ref::<reqwest::Error>()
+                        .and_then(reqwest::Error::status);
+                    if retryable_transport_error(&error)
+                        || status == Some(reqwest::StatusCode::CONFLICT)
+                    {
+                        debug!("retrying native input upload after polling: {error:#}");
+                        thread::sleep(Duration::from_millis(50));
+                        return Ok(());
+                    }
+                    if status != Some(reqwest::StatusCode::UNPROCESSABLE_ENTITY) {
+                        return Err(error);
+                    }
+                    // Only a verified content mismatch makes this locator
+                    // unsuitable; ordinary I/O and claim failures are retried.
+                    debug!("native input upload rejected: {error:#}");
+                }
+            }
+        }
+        loop {
+            ensure!(
+                start.elapsed() < policy.timeout,
+                "native source decline deadline exceeded"
+            );
+            match self.input_unavailable(ticket, demand) {
+                Ok(()) => return Ok(()),
+                Err(error) if retryable_transport_error(&error) => {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     fn run_local<'a>(
         &self,
         pin: Pin<'a>,
@@ -524,4 +619,26 @@ pub(super) fn verify_destinations(
         verified.insert(name.clone(), path);
     }
     Ok(verified)
+}
+
+#[cfg(test)]
+mod input_blob_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn aborted_framed_input_drains_exactly_the_remaining_payload() -> Result<()> {
+        let source = InputBlob::new(Box::new(Cursor::new(b"firstnext")), 5, true);
+        let mut uploader = source.clone();
+        let mut prefix = [0; 2];
+        uploader.read_exact(&mut prefix)?;
+        assert_eq!(&prefix, b"fi");
+        source.discard_unread()?;
+        assert_eq!(uploader.read(&mut prefix)?, 0);
+        let mut reader = source.reader.lock().unwrap();
+        let mut next = Vec::new();
+        reader.get_mut().read_to_end(&mut next)?;
+        assert_eq!(next, b"next");
+        Ok(())
+    }
 }

@@ -328,8 +328,8 @@ impl NativeCacheClient {
         self.control("input_demands", &ticket)
     }
 
-    fn input_unavailable(&self, ticket: Ticket, blob: BlobRef) -> Result<()> {
-        self.control("input_unavailable", &UploadHeader { ticket, blob })
+    fn input_unavailable(&self, ticket: Ticket, demand: InputDemand) -> Result<()> {
+        self.control("input_unavailable", &(ticket, demand))
     }
 
     pub(super) fn backfill_input(
@@ -603,7 +603,7 @@ impl NativeCacheClient {
                             }
                         }
                         Ok(None) => {}
-                        Err(error) if retryable_download_error(&error) => {
+                        Err(error) if retryable_transport_error(&error) => {
                             debug!("retrying native blob request {blob:?}: {error:#}");
                         }
                         Err(error) => return Err(error),
@@ -811,11 +811,12 @@ impl<R: Read> Read for InputDownload<R> {
 }
 
 #[cfg(all(target_os = "linux", feature = "native-store"))]
-fn retryable_download_error(error: &anyhow::Error) -> bool {
+fn retryable_transport_error(error: &anyhow::Error) -> bool {
     if let Some(error) = error.downcast_ref::<reqwest::Error>() {
         return error.is_timeout()
             || error.is_connect()
             || error.is_body()
+            || error.is_request()
             || error.status().is_some_and(|status| {
                 status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
             });

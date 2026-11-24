@@ -735,8 +735,19 @@ fn lazy_manifest_admission_and_cross_action_backfill_are_single_flight() -> Resu
     // A rejected source stream releases its reservation so a different origin can supply it.
     assert!(
         service
+            .backfill_input(a, blob, &b"short"[..])
+            .unwrap_err()
+            .is::<NativeServiceBusy>()
+    );
+    assert_eq!(
+        service.input_demands(a)?,
+        vec![InputDemand { tree: id, blob }]
+    );
+    assert!(
+        service
             .backfill_input(a, blob, &b"wrong content!"[..])
-            .is_err()
+            .unwrap_err()
+            .is::<NativeInputRejected>()
     );
     assert_eq!(
         service.input_demands(b)?,
@@ -953,11 +964,29 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
             blob: third
         }]
     );
-    service.input_unavailable(ticket, third)?;
+    let decline = InputDemand {
+        tree: id,
+        blob: third,
+    };
+    service.input_unavailable(ticket, decline)?;
+    service.input_unavailable(ticket, decline)?; // lost acknowledgement
+
     assert!(service.input_demands(ticket)?.is_empty());
     let claim = service
         .claim_peer_input(Duration::ZERO)?
         .context("renewed peer claim missing")?;
+    drop(claim);
+    let flight = service
+        .backfills
+        .lock()
+        .unwrap()
+        .get(&third.id)
+        .and_then(Weak::upgrade)
+        .context("missing flight")?;
+    flight.lock()?.peer_retry_at = Some(Instant::now());
+    let claim = service
+        .claim_peer_input(Duration::ZERO)?
+        .context("periodic peer retry missing")?;
     service.publish_peer_input(claim, &b"late peer"[..])?;
     bytes.clear();
     service

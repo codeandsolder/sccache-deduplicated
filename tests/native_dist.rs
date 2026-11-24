@@ -1605,7 +1605,8 @@ impl LocalService {
     ) -> Result<Self> {
         let _ = env_logger::builder()
             .is_test(true)
-            .filter_level(log::LevelFilter::Debug)
+            .filter_level(log::LevelFilter::Warn)
+            .filter_module("sccache::compiler::native", log::LevelFilter::Debug)
             .try_init();
         let socket = root.join("client.sock");
         let caller_config = root.join("caller.toml");
@@ -1903,7 +1904,11 @@ fn audit_index(index: &Path, component: &str) -> Result<ComponentAudit> {
 #[test]
 #[ignore = "requires Linux Bubblewrap, GCC, Rust toolchain and ldd"]
 fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
-    let temp = tempfile::tempdir()?;
+    // /dev/shm is useful for store-only tests, but /dev is reserved in
+    // the execution contract and cannot contain real compiler outputs.
+    let temp = tempfile::Builder::new()
+        .prefix("native-cli-")
+        .tempdir_in("/tmp")?;
     let root = temp.path().canonicalize()?;
     let fleet = Fleet::start(&root, BTreeMap::new())?;
     let mut service = LocalService::start(&root, &fleet, None)?;
@@ -2029,7 +2034,11 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
 #[test]
 #[ignore = "requires Linux Bubblewrap, GCC, Rust toolchain and ldd"]
 fn native_local_execution_in_networkless_namespace_shares_remote_actions() -> Result<()> {
-    let temp = tempfile::tempdir()?;
+    // /dev/shm is useful for store-only tests, but /dev is reserved in
+    // the execution contract and cannot contain real compiler outputs.
+    let temp = tempfile::Builder::new()
+        .prefix("native-cli-")
+        .tempdir_in("/tmp")?;
     let root = temp.path().canonicalize()?;
     let fleet = Fleet::start(&root, BTreeMap::new())?;
     let rustc = Command::new("rustc")

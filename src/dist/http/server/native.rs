@@ -19,9 +19,9 @@ use super::{ClientAuthCheck, ServerAuthenticator, authenticate_client, authentic
 use crate::{
     build_runtime::{
         ActionMode, ArchiveLength, BlobRef, ContentId, Direction, ExecutionSpec,
-        NativeContentPending, NativeServiceBusy, NativeSessions, NativeStore, NetworkMeter,
-        PackageIdentity, PackageImportLimits, PackageSource, Peer, TreeId, TreeManifest,
-        VerifiedPackage,
+        NativeContentPending, NativeInputRejected, NativeServiceBusy, NativeSessions, NativeStore,
+        NetworkMeter, PackageIdentity, PackageImportLimits, PackageSource, Peer, TreeId,
+        TreeManifest, VerifiedPackage,
         wire::{Publisher, ScheduleReply, UploadHeader},
     },
     config::scheduler::NativeCacheConfig,
@@ -393,6 +393,9 @@ fn respond(
         Err(error) if error.is::<NativeContentPending>() => {
             Response::text("native input pending").with_status_code(202)
         }
+        Err(error) if error.is::<NativeInputRejected>() => {
+            Response::text("native input bytes rejected").with_status_code(422)
+        }
         Err(error) if error.is::<NativeServiceBusy>() => {
             Response::text("native service busy").with_status_code(503)
         }
@@ -529,8 +532,8 @@ fn dispatch(
             encode(&sessions.input_demands(metadata(request, limit)?)?, limit)
         }
         "input_unavailable" if publisher == Publisher::Client => {
-            let UploadHeader { ticket, blob } = metadata(request, limit)?;
-            sessions.input_unavailable(ticket, blob)?;
+            let (ticket, demand) = metadata(request, limit)?;
+            sessions.input_unavailable(ticket, demand)?;
             encode(&(), limit)
         }
         "backfill_input" if publisher == Publisher::Client => {

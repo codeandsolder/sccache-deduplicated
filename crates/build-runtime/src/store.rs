@@ -48,6 +48,26 @@ struct ActionRecord {
     result: ResultId,
 }
 
+/// Distinguish invalid immutable bytes from interrupted streams and storage errors.
+#[derive(Debug)]
+pub(crate) enum BlobIntegrityError {
+    Length { expected: u64, actual: u64 },
+    Digest,
+}
+
+impl std::fmt::Display for BlobIntegrityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Length { expected, actual } => {
+                write!(f, "native blob length {actual} differs from {expected}")
+            }
+            Self::Digest => f.write_str("native blob digest mismatch"),
+        }
+    }
+}
+
+impl std::error::Error for BlobIntegrityError {}
+
 /// A verified immutable blob staged for publication.
 ///
 /// Dropping it before publication discards the temporary file. Closed, owner-private paths
@@ -490,7 +510,13 @@ impl NativeStore {
                         .checked_add(u64::try_from(count)?)
                         .context("blob length overflow")?;
                     if let Some(bound) = bound {
-                        ensure!(size <= bound, "native staged stream exceeds upper bound");
+                        ensure!(
+                            size <= bound,
+                            BlobIntegrityError::Length {
+                                expected: bound,
+                                actual: size
+                            }
+                        );
                     } else {
                         // Grow unknown-length streams in 4 MiB increments.
                         const CHUNK: u64 = 4 * 1024 * 1024;
