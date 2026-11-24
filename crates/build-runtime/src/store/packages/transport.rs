@@ -199,7 +199,7 @@ mod tests {
         let staged = store.stage_compressed_inner(
             original.as_slice(),
             None,
-            super::super::space::StageBudget::new(&store),
+            crate::StageBudget::new(&store),
         )?;
         let reference = staged.reference();
         let tree = TreeManifest {

@@ -1264,7 +1264,9 @@ impl NativeSessions {
         };
         let original = matches!(lease, Ready::Tree(tree) if tree.packages.contains_key(&id));
         let (file, encoding) = match lease {
-            Ready::Result(lease) => Ok((lease.open_file(id)?, lease.physical_encoding(id)?)),
+            Ready::Result(lease) => {
+                Ok::<_, anyhow::Error>((lease.open_file(id)?, lease.physical_encoding(id)?))
+            }
             Ready::Tree(delivery) => {
                 if let Some(package) = delivery.packages.get(&id) {
                     return Ok((package.open_file()?, BlobEncoding::Raw));
