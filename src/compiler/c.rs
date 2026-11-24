@@ -3292,7 +3292,7 @@ mod test {
         let gcc_tune = native_driver_replacement(
             "/usr/lib/gcc/cc1 -mtune=znver2 -march=x86-64",
             CCompilerKind::Gcc,
-            &ovec!["-mtune=native"],
+            &[OsString::from("-mtune=native")],
         )?;
         assert_eq!(gcc_tune, ovec!["-mtune=znver2", "-march=x86-64"]);
         let clang = native_driver_replacement(

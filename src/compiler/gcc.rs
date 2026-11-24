@@ -2967,6 +2967,32 @@ mod test {
         ));
     }
 
+    #[cfg(feature = "dist-client")]
+    fn clang_assembler_dist_arguments(
+        parsed_args: &ParsedArguments,
+        rewrite_includes_only: bool,
+    ) -> Vec<String> {
+        let fixture = TestFixture::new();
+        let mut transformer = dist::PathTransformer::new();
+        let (_, dist_command, _) = generate_compile_commands(
+            &mut transformer,
+            &fixture.bins[0],
+            parsed_args,
+            fixture.tempdir.path(),
+            &[],
+            GccCompileConfig {
+                kind: CCompilerKind::Clang,
+                rewrite_includes_only,
+                language_to_arg: language_to_gcc_arg,
+                native_resolution: None,
+            },
+        )
+        .unwrap();
+        dist_command
+            .expect("assembler compile should distribute")
+            .arguments
+    }
+
     #[test]
     #[cfg(feature = "dist-client")]
     fn test_dist_preprocessed_assembler_drops_preprocessor_args() {
@@ -3001,25 +3027,7 @@ mod test {
                 .contains(&OsString::from("-fno-unwind-tables"))
         );
 
-        let f = TestFixture::new();
-        let mut path_transformer = dist::PathTransformer::new();
-        let (_, dist_command, _) = generate_compile_commands(
-            &mut path_transformer,
-            &f.bins[0],
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-            GccCompileConfig {
-                kind: CCompilerKind::Clang,
-                rewrite_includes_only: false,
-                language_to_arg: language_to_gcc_arg,
-                native_resolution: None,
-            },
-        )
-        .unwrap();
-        let arguments = dist_command
-            .expect("assembler compile should distribute")
-            .arguments;
+        let arguments = clang_assembler_dist_arguments(&parsed_args, false);
         assert!(arguments.windows(2).any(|w| w == ["-x", "assembler"]));
         assert!(!arguments.iter().any(|arg| arg == "-DMAGIC=1"));
         assert!(!arguments.iter().any(|arg| arg == "-UOLD_MAGIC"));
@@ -3143,25 +3151,7 @@ mod test {
             other => panic!("Got unexpected parse result: {other:?}"),
         };
 
-        let f = TestFixture::new();
-        let mut path_transformer = dist::PathTransformer::new();
-        let (_, dist_command, _) = generate_compile_commands(
-            &mut path_transformer,
-            &f.bins[0],
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-            GccCompileConfig {
-                kind: CCompilerKind::Clang,
-                rewrite_includes_only: true,
-                language_to_arg: language_to_gcc_arg,
-                native_resolution: None,
-            },
-        )
-        .unwrap();
-        let arguments = dist_command
-            .expect("assembler compile should distribute")
-            .arguments;
+        let arguments = clang_assembler_dist_arguments(&parsed_args, true);
         assert!(
             arguments
                 .windows(2)
@@ -3189,31 +3179,12 @@ mod test {
         };
         parsed_args.suppress_rewrite_includes_only = true;
 
-        let f = TestFixture::new();
-        let mut path_transformer = dist::PathTransformer::new();
-        let (_, dist_command, _) = generate_compile_commands(
-            &mut path_transformer,
-            &f.bins[0],
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-            GccCompileConfig {
-                kind: CCompilerKind::Clang,
-                rewrite_includes_only: true,
-                language_to_arg: language_to_gcc_arg,
-                native_resolution: None,
-            },
-        )
-        .unwrap();
-        let arguments = dist_command
-            .expect("assembler compile should distribute")
-            .arguments;
+        let arguments = clang_assembler_dist_arguments(&parsed_args, true);
         assert!(arguments.windows(2).any(|w| w == ["-x", "assembler"]));
         assert!(!arguments.iter().any(|arg| arg == "-DMAGIC=1"));
     }
 
-    #[test]
-    fn test_compile_simple() {
+    fn assert_simple_compile_command(verbose_flag: Option<&str>) {
         let creator = new_creator();
         let f = TestFixture::new();
         let parsed_args = ParsedArguments {
@@ -3233,7 +3204,7 @@ mod test {
             .collect(),
             dependency_args: vec![],
             preprocessor_args: vec![],
-            common_args: vec![],
+            common_args: verbose_flag.into_iter().map(OsString::from).collect(),
             arch_args: vec![],
             unhashed_args: vec![],
             extra_dist_files: vec![],
@@ -3267,140 +3238,30 @@ mod test {
             },
         )
         .unwrap();
-        #[cfg(feature = "dist-client")]
-        assert!(dist_command.is_some());
-        #[cfg(not(feature = "dist-client"))]
-        assert!(dist_command.is_none());
+        assert_eq!(
+            dist_command.is_some(),
+            verbose_flag.is_none() && cfg!(feature = "dist-client"),
+            "a verbose compiler invocation must not be distributed"
+        );
         let _ = command.execute(&service, &creator).wait();
         assert_eq!(Cacheable::Yes, cacheable);
         // Ensure that we ran all processes.
         assert_eq!(0, creator.lock().unwrap().children.len());
+    }
+
+    #[test]
+    fn test_compile_simple() {
+        assert_simple_compile_command(None);
     }
 
     #[test]
     fn test_compile_simple_verbose_short() {
-        let creator = new_creator();
-        let f = TestFixture::new();
-        let parsed_args = ParsedArguments {
-            input: "foo.c".into(),
-            double_dash_input: false,
-            language: Language::C,
-            compilation_flag: "-c".into(),
-            depfile: None,
-            outputs: vec![(
-                "obj",
-                ArtifactDescriptor {
-                    path: "foo.o".into(),
-                    optional: false,
-                },
-            )]
-            .into_iter()
-            .collect(),
-            dependency_args: vec![],
-            preprocessor_args: vec![],
-            common_args: vec!["-v".into()],
-            arch_args: vec![],
-            unhashed_args: vec![],
-            extra_dist_files: vec![],
-            extra_hash_files: vec![],
-            uses_external_assembler: false,
-            msvc_show_includes: false,
-            profile_generate: false,
-            color_mode: ColorMode::Auto,
-            suppress_rewrite_includes_only: false,
-            too_hard_for_preprocessor_cache_mode: None,
-        };
-        let runtime = single_threaded_runtime();
-        let storage = MockStorage::new(None, false);
-        let storage: std::sync::Arc<MockStorage> = std::sync::Arc::new(storage);
-        let service = server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
-        let compiler = &f.bins[0];
-        // Compiler invocation.
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
-        let mut path_transformer = dist::PathTransformer::new();
-        let (command, dist_command, cacheable) = generate_compile_commands(
-            &mut path_transformer,
-            compiler,
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-            GccCompileConfig {
-                kind: CCompilerKind::Gcc,
-                rewrite_includes_only: false,
-                language_to_arg: language_to_gcc_arg,
-                native_resolution: None,
-            },
-        )
-        .unwrap();
-        // -v should never generate a dist_command
-        assert!(dist_command.is_none());
-        let _ = command.execute(&service, &creator).wait();
-        assert_eq!(Cacheable::Yes, cacheable);
-        // Ensure that we ran all processes.
-        assert_eq!(0, creator.lock().unwrap().children.len());
+        assert_simple_compile_command(Some("-v"));
     }
 
     #[test]
     fn test_compile_simple_verbose_long() {
-        let creator = new_creator();
-        let f = TestFixture::new();
-        let parsed_args = ParsedArguments {
-            input: "foo.c".into(),
-            double_dash_input: false,
-            language: Language::C,
-            compilation_flag: "-c".into(),
-            depfile: None,
-            outputs: vec![(
-                "obj",
-                ArtifactDescriptor {
-                    path: "foo.o".into(),
-                    optional: false,
-                },
-            )]
-            .into_iter()
-            .collect(),
-            dependency_args: vec![],
-            preprocessor_args: vec![],
-            common_args: vec!["--verbose".into()],
-            arch_args: vec![],
-            unhashed_args: vec![],
-            extra_dist_files: vec![],
-            extra_hash_files: vec![],
-            uses_external_assembler: false,
-            msvc_show_includes: false,
-            profile_generate: false,
-            color_mode: ColorMode::Auto,
-            suppress_rewrite_includes_only: false,
-            too_hard_for_preprocessor_cache_mode: None,
-        };
-        let runtime = single_threaded_runtime();
-        let storage = MockStorage::new(None, false);
-        let storage: std::sync::Arc<MockStorage> = std::sync::Arc::new(storage);
-        let service = server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
-        let compiler = &f.bins[0];
-        // Compiler invocation.
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
-        let mut path_transformer = dist::PathTransformer::new();
-        let (command, dist_command, cacheable) = generate_compile_commands(
-            &mut path_transformer,
-            compiler,
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-            GccCompileConfig {
-                kind: CCompilerKind::Gcc,
-                rewrite_includes_only: false,
-                language_to_arg: language_to_gcc_arg,
-                native_resolution: None,
-            },
-        )
-        .unwrap();
-        // --verbose should never generate a dist_command
-        assert!(dist_command.is_none());
-        let _ = command.execute(&service, &creator).wait();
-        assert_eq!(Cacheable::Yes, cacheable);
-        // Ensure that we ran all processes.
-        assert_eq!(0, creator.lock().unwrap().children.len());
+        assert_simple_compile_command(Some("--verbose"));
     }
 
     #[test]
