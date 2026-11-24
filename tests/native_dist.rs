@@ -87,7 +87,7 @@ impl Process {
             .arg(file)
             // Existing foreground control of the subprocess under test.
             .env("SCCACHE_NO_DAEMON", "1")
-            .env("SCCACHE_LOG", "info")
+            .env("SCCACHE_LOG", "info,native_placement_replay=trace")
             .stdin(Stdio::null())
             .stdout(output.try_clone()?)
             .stderr(output)
@@ -1045,6 +1045,77 @@ fn provision_compressed_fixture(
     Ok(receipt)
 }
 
+fn verify_learned_placement_trace(log: &Path) -> Result<()> {
+    let contents = fs::read_to_string(log)?;
+    let mut assignments = BTreeMap::new();
+    let mut completed = Vec::new();
+    for line in contents
+        .lines()
+        .filter(|line| line.contains("native_placement_replay"))
+    {
+        let Some(start) = line.find('{') else {
+            continue;
+        };
+        let value: serde_json::Value = serde_json::from_str(&line[start..])?;
+        let job = value["job"].as_u64().context("missing trace job ID")?;
+        match value["kind"].as_str() {
+            Some("assigned") => {
+                assert!(assignments.insert(job, value).is_none());
+            }
+            Some("completed") => completed.push(value),
+            _ => (),
+        }
+    }
+    assert_eq!(completed.len(), 6);
+    let class = completed.last().context("no successful worker actions")?["class"].clone();
+    let repeated = completed
+        .iter()
+        .filter(|value| value["class"] == class)
+        .collect::<Vec<_>>();
+    assert_eq!(repeated.len(), 5);
+    let mut estimate = None;
+    for value in repeated {
+        let observed = value["execution_nanoseconds"]
+            .as_u64()
+            .context("missing real execution time")?;
+        let job = value["job"].as_u64().context("missing completion job ID")?;
+        let assignment = assignments.get(&job).context("missing allocation trace")?;
+        assert_eq!(assignment["worker"], value["worker"]);
+        assert_eq!(assignment["class"], value["class"]);
+        assert!(
+            value["actual_seconds"]
+                .as_f64()
+                .is_some_and(|seconds| seconds > 0.0)
+        );
+        assert!(observed > 0);
+        let predicted = value["predicted_cost"]["execution_nanoseconds"]
+            .as_u64()
+            .context("missing action forecast")?;
+        let previous: Option<(u64, usize)> = estimate;
+        if let Some((learned, count)) = previous {
+            if count >= 4 {
+                assert_eq!(
+                    predicted, learned,
+                    "the learned command cost should replace the host prior"
+                );
+            }
+            let smoothed = if observed >= learned {
+                learned + (observed - learned).div_ceil(4)
+            } else {
+                learned - (learned - observed).div_ceil(4)
+            };
+            estimate = Some((smoothed, count + 1));
+        } else {
+            estimate = Some((observed, 1));
+        }
+    }
+    // Expose actual canary records in --nocapture logs for the report tool.
+    for value in assignments.values().chain(completed.iter()) {
+        println!("{value}");
+    }
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires Linux Bubblewrap, GNU assembler and ldd"]
 fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()> {
@@ -1285,6 +1356,19 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let hit = client.run_action(&second, &inputs, &destinations, &policy, None)?;
     assert_eq!(hit.source, NativeBuildSource::Hit);
 
+    // Repeated real executions of the same command family exercise the
+    // scheduler's learned service time rather than its worker-wide prior.
+    let remote_refresh = NativeBuildPolicy {
+        mode: ActionMode::Refresh,
+        ..policy
+    };
+    for _ in 0..4 {
+        let result = client.run_action(&second, &inputs, &destinations, &remote_refresh, None)?;
+        assert_eq!(result.source, NativeBuildSource::Worker(worker_address));
+        assert!(result.output.status.success());
+        assert_eq!(fs::read(&delivered)?, fs::read(&reference)?);
+    }
+
     // The exact sandbox on the client host can publish and refresh the same
     // action as the remote worker; its successful result needs no download.
     let local = LocalExecutor::new(
@@ -1361,7 +1445,9 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     assert!(!failed.output.status.success());
     assert!(!failed.output.stderr.is_empty());
     let worker_directory = fleet.worker_directory.clone();
+    let scheduler_log = fleet.scheduler.log.clone();
     let (scheduler_stats, worker_stats) = fleet.finish()?;
+    verify_learned_placement_trace(&scheduler_log)?;
     let store = NativeStore::open(&worker_directory)?;
     let policy = sccache::build_runtime::PackagePolicy::normalized_archive(
         100000,

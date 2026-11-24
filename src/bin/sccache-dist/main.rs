@@ -1118,6 +1118,7 @@ impl Scheduler {
                         trace!(target: "native_placement_replay", "{}", serde_json::json!({
                             "kind": "assigned", "job": job_id.0, "worker": server_id.addr(), "class": class,
                             "candidates": predictions,
+                            "host_prior": server_details.capabilities.native_placement.as_ref().map(placement::ActionCost::baseline),
                             "healthy": healthy.iter().map(|(id, _)| id.addr()).collect::<Vec<_>>(),
                         }));
                     }

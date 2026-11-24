@@ -952,13 +952,25 @@ separately for future reservation sizing.
 The opt-in `native_placement_replay` trace target logs JSON assignment records
 with job ID, hashed command family, selected worker, all eligible workers'
 predicted completion and contention-penalized scores, and healthy candidates.
-Verified completion records contain the original prediction, scheduler
+Assignment records also include the selected worker's contemporaneous host-wide
+prior. Verified completion records contain the original prediction, scheduler
 assignment-to-commit elapsed time, predicted cost, actual execution time,
 total result bytes and negotiated upload measurements. Join by job ID within
 the scheduler epoch. This supports evaluating prediction error and selection
 behavior on genuine compilation workloads. Counterfactual worker timings
 are forecasts, not measured speedups; a full causal trace replay requires
-additional queue and residency state.
+additional queue and residency state. Evaluate the matched actual observations
+with:
+
+```sh
+cargo run --locked -p sccache-build --example placement_trace_report < placement-trace.jsonl
+```
+
+The JSON report includes unmatched counts, per-worker and overall timing
+errors (signed bias, MAE, median and p90 absolute error, weighted absolute
+percentage error), learned versus host-prior execution/upload prediction
+errors and the predicted score gap to the best eligible candidate. Unmatched
+assignments are not counted as compiler failures or as zero-duration jobs.
 
 ### Directional shared-network estimation
 
