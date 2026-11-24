@@ -147,11 +147,13 @@ pub struct BeginResult {
     pub missing: Vec<BlobRef>,
 }
 
-/// Fixed header of an upload. Follow it with the exact raw blob bytes.
+/// Fixed header of an upload. Physical bytes follow in the declared encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UploadHeader {
     pub ticket: Ticket,
     pub blob: BlobRef,
+    /// Byte representation of the verified `BlobEncoding` enum.
+    pub encoding: u8,
 }
 
 /// Reservation for publishing one immutable input or package tree.

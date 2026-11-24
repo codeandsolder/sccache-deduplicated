@@ -28,6 +28,14 @@ pub use identity::{
 };
 pub use tree::{TreeEntry, TreeId, TreeManifest, TreeMetadata, TreePath, TreeTimestamp};
 
+#[cfg(feature = "store")]
+mod blob_codec;
+#[cfg(feature = "store")]
+pub use blob_codec::{
+    BlobEncoding, BlobReader, encode as encode_native_blob, encode_raw as encode_native_raw_blob,
+    transfer as transfer_native_blob,
+};
+
 #[cfg(all(unix, feature = "store"))]
 mod coordinator;
 #[cfg(all(unix, feature = "store"))]
@@ -54,7 +62,7 @@ pub mod sandbox;
 pub use execution::{CapturedExecution, ExecutionPolicy, execute};
 
 #[cfg(all(target_os = "linux", feature = "store"))]
-pub use store::{MaterializationStats, MaterializedTree};
+pub use store::{MaterializationStats, MaterializedTree, MountedTree};
 
 #[cfg(all(target_os = "linux", feature = "mapping"))]
 mod mapped;

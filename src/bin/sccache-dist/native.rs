@@ -49,6 +49,7 @@ impl NativeWorker {
         }
         std::fs::create_dir_all(&config.scratch)?;
         let store = NativeStore::open_managed(&config.directory, config.space)?;
+        let _ = store.can_clone_into(&config.scratch)?;
         let client = NativeCacheClient::new(
             config.cache_url.to_url(),
             auth,

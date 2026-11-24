@@ -1,17 +1,14 @@
 //! Run a declared native action and retain independently readable output
-//! descriptors. The worker uploads the captured bytes directly; no result
-//! archive, local CAS publication, or intermediary copy is required.
+//! descriptors. Captured outputs are hashed once and stored in the worker's
+//! selected physical format: plain on ZFS, indexed Zstd elsewhere. Transfers
+//! may encode the plain ZFS bytes temporarily to save network bandwidth.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     fs::File,
-    io::{self, Read, Seek, SeekFrom},
-    os::unix::{
-        ffi::OsStrExt,
-        fs::{FileExt, MetadataExt},
-        process::ExitStatusExt,
-    },
+    io::{Read, Seek, SeekFrom},
+    os::unix::{ffi::OsStrExt, fs::MetadataExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::{Child, ExitStatus, Stdio},
     thread,
@@ -25,7 +22,7 @@ use rustix::{
 };
 
 use crate::{
-    Artifact, BlobRef, BuildPath, ContentId, ExecutionSpec, MaterializedTree, NativeStore,
+    Artifact, BlobEncoding, BlobRef, BuildPath, ContentId, ExecutionSpec, MountedTree, NativeStore,
     ResultManifest, TreeEntry, TreeLease, TreePath,
     sandbox::{MountAccess, SandboxInvocation, SandboxPath, SandboxPlan},
 };
@@ -52,6 +49,7 @@ pub struct CapturedExecution {
     status: ExitStatus,
     manifest: ResultManifest,
     files: BTreeMap<ContentId, File>,
+    encoding: BlobEncoding,
 }
 
 impl CapturedExecution {
@@ -100,28 +98,27 @@ impl CapturedExecution {
     /// # Errors
     /// Returns an error for an undeclared blob or descriptor failure.
     pub fn open_blob(&self, id: ContentId) -> Result<impl Read + Send + 'static> {
-        let file = self
+        crate::BlobReader::open(self.open_file(id)?, self.encoding)
+    }
+
+    #[must_use]
+    pub const fn physical_encoding(&self) -> BlobEncoding {
+        self.encoding
+    }
+
+    /// Open the immutable physical CAS representation without decoding it,
+    /// suitable for verified scheduler upload without another compression.
+    ///
+    /// # Errors
+    /// Returns an error for undeclared content or descriptor failure.
+    pub fn open_file(&self, id: ContentId) -> Result<File> {
+        let mut file = self
             .files
             .get(&id)
             .context("uncaptured result blob")?
             .try_clone()?;
-        Ok(PositionalReader { file, offset: 0 })
-    }
-}
-
-struct PositionalReader {
-    file: File,
-    offset: u64,
-}
-
-impl Read for PositionalReader {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let count = self.file.read_at(buffer, self.offset)?;
-        self.offset = self
-            .offset
-            .checked_add(count as u64)
-            .ok_or_else(|| io::Error::other("result read offset overflow"))?;
-        Ok(count)
+        file.rewind()?;
+        Ok(file)
     }
 }
 
@@ -133,9 +130,7 @@ struct OutputLocation {
 struct PreparedBuild {
     plan: SandboxPlan,
     outputs: BTreeMap<String, OutputLocation>,
-    // One independently cloned view per namespace location, even when two
-    // locations reference the same tree ID.
-    _views: BTreeMap<BuildPath, MaterializedTree>,
+    _views: BTreeMap<BuildPath, MountedTree>,
 }
 
 fn host_path(bytes: &[u8]) -> &Path {
@@ -217,6 +212,32 @@ fn writable_locations(
     Ok(result)
 }
 
+fn capture_locations(
+    spec: &ExecutionSpec,
+    views: &BTreeMap<BuildPath, MountedTree>,
+    writable: &BTreeSet<BuildPath>,
+) -> Result<BTreeMap<String, OutputLocation>> {
+    let mut outputs = BTreeMap::new();
+    for (name, output) in &spec.outputs {
+        // Capture from the *writable bind's* backing directory, not the
+        // underlying immutable FUSE tree hidden by that bind.
+        let parent = writable
+            .iter()
+            .filter(|path| output.path.within(path.as_bytes()))
+            .max_by_key(|path| path.as_bytes().len())
+            .context("output is not in a declared writable mount")?;
+        let (point, view) = backing(views, parent)?;
+        outputs.insert(
+            name.clone(),
+            OutputLocation {
+                directory: File::open(view.writable_path(relative(parent, point)?)?)?,
+                relative: relative(&output.path, parent)?.to_owned(),
+            },
+        );
+    }
+    Ok(outputs)
+}
+
 impl PreparedBuild {
     fn prepare(spec: &ExecutionSpec, store: &NativeStore, scratch: &Path) -> Result<Self> {
         let root_point = BuildPath::new(b"/".to_vec())?;
@@ -244,58 +265,69 @@ impl PreparedBuild {
             require_directory(root, host_path(&path[1..]))?;
         }
         let writable = writable_locations(spec, &leases)?;
-        let mut views: BTreeMap<BuildPath, MaterializedTree> = leases
-            .iter()
-            .map(|(path, lease)| Ok((path.clone(), lease.materialize(scratch)?)))
+        // Reuse immutable native-ZFS CoW tree views (or compressed FUSE
+        // mounts on non-ZFS). Only output parents need private scratch.
+        let mut views: BTreeMap<BuildPath, MountedTree> = leases
+            .into_iter()
+            .map(|(path, lease)| Ok((path, store.mount_tree(lease, scratch)?)))
             .collect::<Result<_>>()?;
         for path in &writable {
-            let (point, _) = backing(&leases, path)?;
+            let (point, _) = backing(&views, path)?;
+            let point = point.clone();
+            let relative = relative(path, &point)?.to_owned();
             views
-                .get_mut(point)
-                .context("native view missing")?
-                .mark_writable(relative(path, point)?);
+                .get_mut(&point)
+                .context("native input view missing")?
+                .mark_writable(&relative)?;
         }
-        let access = |path: &BuildPath| {
-            if writable.contains(path) {
+        let root = views.get(&root_point).context("native root view missing")?;
+        let root_writable = writable.contains(&root_point);
+        let root_source = if root_writable {
+            root.writable_path(Path::new(""))?.to_owned()
+        } else {
+            root.root().to_owned()
+        };
+        let mut plan = SandboxPlan::new(
+            &root_source,
+            if root_writable {
                 MountAccess::Writable
             } else {
                 MountAccess::ReadOnly
-            }
-        };
-        let root = views.get(&root_point).context("native root view missing")?;
-        let mut plan = SandboxPlan::new(root.root(), access(&root_point))?;
+            },
+        )?;
         for (path, view) in &views {
             if path != &root_point {
+                let is_writable = writable.contains(path);
+                let source = if is_writable {
+                    view.writable_path(Path::new(""))?.to_owned()
+                } else {
+                    view.root().to_owned()
+                };
                 plan.bind(
-                    view.root(),
+                    &source,
                     SandboxPath::new(host_path(path.as_bytes()))?,
-                    access(path),
+                    if is_writable {
+                        MountAccess::Writable
+                    } else {
+                        MountAccess::ReadOnly
+                    },
                 )?;
             }
         }
         for path in &writable {
-            // The mount root itself already has the correct access mode.
+            // A writable view root is bound above; nested paths override the
+            // immutable source with a private writable directory.
             if views.contains_key(path) {
                 continue;
             }
             let (point, view) = backing(&views, path)?;
             plan.bind(
-                &view.root().join(relative(path, point)?),
+                view.writable_path(relative(path, point)?)?,
                 SandboxPath::new(host_path(path.as_bytes()))?,
                 MountAccess::Writable,
             )?;
         }
-        let mut outputs = BTreeMap::new();
-        for (name, output) in &spec.outputs {
-            let (point, view) = backing(&views, &output.path)?;
-            outputs.insert(
-                name.clone(),
-                OutputLocation {
-                    directory: File::open(view.root())?,
-                    relative: relative(&output.path, point)?.to_owned(),
-                },
-            );
-        }
+        let outputs = capture_locations(spec, &views, &writable)?;
         Ok(Self {
             plan,
             outputs,
@@ -377,6 +409,8 @@ pub fn execute(
     let mut capture = Capture {
         files: BTreeMap::new(),
         remaining: policy.max_result_bytes,
+        scratch: policy.scratch.clone(),
+        encoding: store.physical_encoding(),
     };
     let stdout = capture.diagnostic(stdout)?;
     let stderr = capture.diagnostic(stderr)?;
@@ -393,12 +427,15 @@ pub fn execute(
             stderr,
         },
         files: capture.files,
+        encoding: store.physical_encoding(),
     })
 }
 
 struct Capture {
     files: BTreeMap<ContentId, File>,
     remaining: u64,
+    scratch: PathBuf,
+    encoding: BlobEncoding,
 }
 
 impl Capture {
@@ -416,16 +453,25 @@ impl Capture {
         let size = metadata.len();
         ensure!(size <= self.remaining, "native result byte limit exceeded");
         file.seek(SeekFrom::Start(0))?;
-        let mut hash = blake3::Hasher::new();
-        hash.update_reader((&mut file).take(size.checked_add(1).context("result size overflow")?))?;
+        let mut physical = tempfile::tempfile_in(&self.scratch)?;
+        let reference = match self.encoding {
+            BlobEncoding::Raw => {
+                crate::encode_native_raw_blob(&mut file, &mut physical, Some(size))?
+            }
+            BlobEncoding::ZstdChunks => {
+                crate::encode_native_blob(&mut file, &mut physical, Some(size))?
+            }
+        };
         ensure!(
-            file.stream_position()? == size && file.metadata()?.len() == size,
-            "native output changed while hashing"
+            reference.size == size
+                && file.stream_position()? == size
+                && file.metadata()?.len() == size,
+            "native output changed during compression and hashing"
         );
+        physical.rewind()?;
         self.remaining -= size;
-        let id = ContentId(*hash.finalize().as_bytes());
-        self.files.entry(id).or_insert(file);
-        Ok(BlobRef { id, size })
+        self.files.entry(reference.id).or_insert(physical);
+        Ok(reference)
     }
 
     fn outputs(
