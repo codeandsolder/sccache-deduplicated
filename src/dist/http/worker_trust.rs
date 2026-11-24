@@ -196,7 +196,7 @@ mod tests {
         let bytes = bincode::serialize(&response)?;
         let server = rouille::Server::new_ssl(
             address,
-            move |_| rouille::Response::data("application/octet-stream", bytes.clone()),
+            move |_| rouille::Response::from_data("application/octet-stream", bytes.clone()),
             cert_pem.clone(),
             key,
         )
@@ -247,7 +247,7 @@ mod tests {
             guard
                 .get(&id)
                 .map_or_else(rouille::Response::empty_404, |cert| {
-                    rouille::Response::data(
+                    rouille::Response::from_data(
                         "application/octet-stream",
                         bincode::serialize(cert).unwrap(),
                     )
