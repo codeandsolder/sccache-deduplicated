@@ -320,7 +320,7 @@ pub type CCompileCommands<C> = Result<(C, Option<dist::CompileCommand>, Cacheabl
 
 /// Construct a local-only frontend command using the shared -o convention.
 pub(super) fn local_dash_o_compile_commands(
-    context: CCompileContext<'_>,
+    context: &CCompileContext<'_>,
 ) -> CCompileCommands<SingleCompileCommand> {
     trace!("compile");
     let parsed = context.parsed_args;

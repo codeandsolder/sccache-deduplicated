@@ -237,16 +237,11 @@ mod path_transform {
             normal_mappings.into_iter().chain(verbatim_mappings)
         }
 
-        #[cfg(unix)]
-        pub fn disk_mappings(&self) -> impl Iterator<Item = (PathBuf, String)> + '_ {
-            std::iter::empty()
-        }
-
         pub fn path_mappings(&self) -> impl Iterator<Item = (PathBuf, String)> + '_ {
-            self.root_mappings
-                .iter()
-                .cloned()
-                .chain(self.disk_mappings())
+            let mappings = self.root_mappings.iter().cloned();
+            #[cfg(windows)]
+            let mappings = mappings.chain(self.disk_mappings());
+            mappings
         }
 
         /// Transform a distributed path back to its local path.
@@ -266,11 +261,11 @@ mod path_transform {
             #[cfg(windows)]
             return Err(crate::errors::anyhow!("unknown distributed path: {p}"));
             #[cfg(unix)]
-            self.decode_unmapped(p)
+            Ok(self.decode_unmapped(p))
         }
 
         #[cfg(unix)]
-        fn decode_unmapped(&self, p: &str) -> crate::errors::Result<PathBuf> {
+        fn decode_unmapped(&self, p: &str) -> PathBuf {
             let path = Path::new(p);
             if let Some((local, suffix, _)) = self
                 .root_mappings
@@ -283,9 +278,9 @@ mod path_transform {
                 })
                 .min_by_key(|(_, _, depth)| std::cmp::Reverse(*depth))
             {
-                return Ok(local.join(suffix));
+                return local.join(suffix);
             }
-            Ok(path.to_owned())
+            path.to_owned()
         }
     }
 

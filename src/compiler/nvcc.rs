@@ -271,7 +271,7 @@ impl CCompilerImpl for Nvcc {
         &self,
         context: CCompileContext<'_>,
     ) -> CCompileCommands<Self::LocalCommand> {
-        generate_compile_commands(context, &self.host_compiler)
+        generate_compile_commands(&context, &self.host_compiler)
     }
 }
 
@@ -329,7 +329,7 @@ fn effective_nvcc_threads(requested: usize, device_groups: usize) -> usize {
     reason = "NVCC expands one logical compile into an ordered multi-stage command graph; keeping stage construction contiguous makes dependencies visible"
 )]
 pub fn generate_compile_commands(
-    context: CCompileContext<'_>,
+    context: &CCompileContext<'_>,
     host_compiler: &NvccHostCompiler,
 ) -> CCompileCommands<NvccCompileCommand> {
     let CCompileContext {
@@ -338,7 +338,7 @@ pub fn generate_compile_commands(
         cwd,
         env_vars,
         ..
-    } = context;
+    } = *context;
     let mut unhashed_args = parsed_args.unhashed_args.clone();
 
     let keep_dir = {
@@ -2518,7 +2518,7 @@ mod test {
 
             assert!(
                 generate_compile_commands(
-                    CCompileContext {
+                    &CCompileContext {
                         path_transformer: &mut dist::PathTransformer::new(),
                         executable: Path::new("nvcc"),
                         parsed_args: &parsed,

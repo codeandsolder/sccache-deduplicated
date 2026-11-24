@@ -98,7 +98,7 @@ impl CCompilerImpl for TaskingVX {
         &self,
         context: CCompileContext<'_>,
     ) -> CCompileCommands<Self::LocalCommand> {
-        crate::compiler::c::local_dash_o_compile_commands(context)
+        crate::compiler::c::local_dash_o_compile_commands(&context)
     }
 }
 
