@@ -148,7 +148,7 @@ fn initial_directory_execution_tree(store: &NativeStore) -> Result<(TreeManifest
 
 fn shell_output_fixture(
     parent: &Path,
-    first: TreeId,
+    first: crate::TreeId,
     platform: ContentId,
     script: &[u8],
 ) -> Result<(ExecutionSpec, ExecutionPolicy)> {

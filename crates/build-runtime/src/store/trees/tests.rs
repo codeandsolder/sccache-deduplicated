@@ -561,7 +561,9 @@ fn result_tree_and_input_tree_share_and_retain_leaf_blobs() -> Result<()> {
     );
     assert_eq!(store.evict(published.action)?, Eviction::Pinned);
     assert_eq!(lease.manifest(), &result);
-    assert_eq!(lease.open_blob(blob.id)?.len(), blob.size);
+    let mut restored = Vec::new();
+    std::io::Read::read_to_end(&mut lease.open_blob(blob.id)?, &mut restored)?;
+    assert_eq!(restored, b"codegen unit");
     drop(lease);
     assert_eq!(
         store.evict(published.action)?,

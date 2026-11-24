@@ -668,8 +668,12 @@ fn tree_result_contract_rejects_wrong_kinds_and_duplicate_logical_overflow() -> 
     request
         .required_outputs
         .insert("obj".into(), OutputKind::Tree);
-    let NativeAdmission::Compile { ticket } =
-        service.admit(request.clone(), Publisher::Client, ActionMode::Reuse)?
+    let NativeAdmission::Compile { ticket } = service.admit(
+        request.clone(),
+        Publisher::Client,
+        ActionMode::Reuse,
+        BTreeMap::new(),
+    )?
     else {
         bail!("expected tree miss");
     };
@@ -725,19 +729,21 @@ fn tree_result_contract_rejects_wrong_kinds_and_duplicate_logical_overflow() -> 
             .missing,
         vec![blob]
     );
-    service.upload(ticket, Publisher::Client, blob, data.as_slice())?;
+    upload_encoded(&service, ticket, Publisher::Client, blob, data.as_slice())?;
     assert_eq!(service.commit(ticket, Publisher::Client)?, result);
     service.close(ticket, Publisher::Client)?;
-    let NativeAdmission::Hit { ticket, manifest } =
-        service.admit(request, Publisher::Client, ActionMode::Reuse)?
+    let NativeAdmission::Hit { ticket, manifest } = service.admit(
+        request,
+        Publisher::Client,
+        ActionMode::Reuse,
+        BTreeMap::new(),
+    )?
     else {
         bail!("expected tree hit");
     };
     assert_eq!(manifest, result);
     let mut restored = Vec::new();
-    service
-        .download(ticket, Publisher::Client, blob.id)?
-        .read_to_end(&mut restored)?;
+    decoded_download(&service, ticket, Publisher::Client, blob.id)?.read_to_end(&mut restored)?;
     assert_eq!(restored, data);
     Ok(())
 }
