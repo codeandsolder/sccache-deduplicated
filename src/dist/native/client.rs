@@ -408,6 +408,12 @@ impl NativeCacheClient {
             }
             failure @ NativeRunResult::Failed { .. } => Ok(Outcome::Failed { source, failure }),
             NativeRunResult::JobNotFound => bail!("native worker lost its assigned job"),
+            NativeRunResult::Unavailable => {
+                bail!("native worker could not execute its assigned job")
+            }
+            NativeRunResult::Pending(_) | NativeRunResult::Acknowledged => {
+                bail!("unexpected nonterminal worker result")
+            }
         }
     }
     fn supply_demand(

@@ -15,8 +15,8 @@ use crate::build_runtime::{
     ActionMode, BlobRef, ContentId, ExecutionSpec, InstallationManifest, PackageIdentity,
     PackageReceipt, PackageSource, PackageTransferCost, ResultManifest, TreeId, TreeManifest,
     wire::{
-        BeginResult, InputDemand, InputPoll, NativeAdmission, NativeRunResult, NativeStatus,
-        ScheduleReply, Ticket, TreeOffer, TreeRead, UploadHeader, WorkerAllocation,
+        BeginResult, InputDemand, InputPoll, NativeAdmission, NativeRunRequest, NativeRunResult,
+        NativeStatus, ScheduleReply, Ticket, TreeOffer, TreeRead, UploadHeader, WorkerAllocation,
     },
 };
 use crate::dist::JobId;
@@ -393,12 +393,50 @@ impl NativeCacheClient {
             crate::dist::ServerId::new(allocation.address),
             JobId(allocation.job),
         )?;
-        let response = http
-            .post(url)
-            .bearer_auth(&allocation.auth)
-            .send()?
-            .error_for_status()?;
-        decode_response(response, max_response_bytes)
+        let max_response_bytes = max_response_bytes
+            .checked_add(64)
+            .context("native response limit overflow")?;
+        let started = Instant::now();
+        let mut idle = Duration::from_millis(5);
+        let rpc = |operation, remaining: Duration| -> Result<NativeRunResult> {
+            let response = http
+                .post(url.clone())
+                .bearer_auth(&allocation.auth)
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                .timeout(remaining.min(Duration::from_secs(5)))
+                .body(codec().serialize(&operation)?)
+                .send()?
+                .error_for_status()?;
+            decode_response(response, max_response_bytes)
+        };
+        loop {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            ensure!(!remaining.is_zero(), "native worker deadline exceeded");
+            match rpc(NativeRunRequest::Poll, remaining) {
+                Ok(NativeRunResult::Pending(_)) => {}
+                Ok(NativeRunResult::Acknowledged) => {
+                    anyhow::bail!("unexpected native worker acknowledgement")
+                }
+                Ok(result) => {
+                    if !matches!(result, NativeRunResult::JobNotFound) {
+                        let remaining = timeout.saturating_sub(started.elapsed());
+                        if !remaining.is_zero() {
+                            let _ = rpc(
+                                NativeRunRequest::Acknowledge,
+                                remaining.min(Duration::from_millis(250)),
+                            );
+                        }
+                    }
+                    return Ok(result);
+                }
+                Err(error) if retryable_transport_error(&error) => {
+                    debug!("retrying native worker status: {error:#}")
+                }
+                Err(error) => return Err(error),
+            }
+            std::thread::sleep(idle.min(remaining));
+            idle = (idle * 2).min(Duration::from_millis(100));
+        }
     }
 
     /// Negotiate and upload a tree using the sender's immutable content.
@@ -814,7 +852,6 @@ impl<R: Read> Read for InputDownload<R> {
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "native-store"))]
 fn retryable_transport_error(error: &anyhow::Error) -> bool {
     if let Some(error) = error.downcast_ref::<reqwest::Error>() {
         return error.is_timeout()
@@ -933,7 +970,7 @@ mod worker;
 #[cfg(all(target_os = "linux", feature = "native-store"))]
 pub use grace::ArtifactGrace;
 #[cfg(all(target_os = "linux", feature = "native-store"))]
-pub use worker::{PackageTransportTracker, WorkerDelivery};
+pub use worker::{CompletedWorker, PackageTransportTracker, PreparedWorker, WorkerDelivery};
 
 #[cfg(all(target_os = "linux", feature = "dist-client"))]
 mod client;

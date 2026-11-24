@@ -209,10 +209,28 @@ pub enum ScheduleReply {
     Unavailable { message: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeJobPhase {
+    Queued,
+    Staging,
+    Ready,
+    Executing,
+    Publishing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeRunRequest {
+    Poll,
+    Acknowledge,
+}
+
 /// Successful output bytes are retrieved from the scheduler. Failed
 /// compilations deliver their diagnostics once, without creating a cache hit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativeRunResult {
+    Pending(NativeJobPhase),
+    Unavailable,
+    Acknowledged,
     Stored,
     Failed {
         code: Option<i32>,

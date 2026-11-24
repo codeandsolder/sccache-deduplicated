@@ -498,7 +498,7 @@ impl NativeStore {
         &self,
         mut reader: impl Read,
         bound: Option<u64>,
-        mut budget: space::StageBudget<'_>,
+        mut budget: space::StageBudget,
     ) -> Result<StagedBlob> {
         if let Some(bound) = bound {
             budget.grow_to(bound)?;

@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, VecDeque, btree_map::Entry},
-    sync::{Mutex, PoisonError},
+    sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -58,10 +58,11 @@ impl State {
 }
 
 /// Logical grace budget, including prospective outputs of running/staging jobs.
+#[derive(Clone)]
 pub struct ArtifactGrace {
     duration: Duration,
     max_bytes: u64,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
 }
 
 impl ArtifactGrace {
@@ -75,7 +76,7 @@ impl ArtifactGrace {
         Ok(Self {
             duration,
             max_bytes,
-            state: Mutex::new(State::default()),
+            state: Arc::new(Mutex::new(State::default())),
         })
     }
 
@@ -87,7 +88,7 @@ impl ArtifactGrace {
             .reap(Instant::now());
     }
 
-    pub(super) fn reserve(&self, limit: u64) -> Result<Option<GraceReservation<'_>>> {
+    pub(super) fn reserve(&self, limit: u64) -> Result<Option<GraceReservation>> {
         ensure!(
             limit <= self.max_bytes,
             "result limit exceeds worker artifact grace budget"
@@ -99,20 +100,23 @@ impl ArtifactGrace {
         }
         state.pending += limit;
         drop(state);
-        Ok(Some(GraceReservation { pool: self, limit }))
+        Ok(Some(GraceReservation {
+            pool: self.clone(),
+            limit,
+        }))
     }
 }
 
-pub(super) struct GraceReservation<'a> {
-    pool: &'a ArtifactGrace,
+pub(super) struct GraceReservation {
+    pool: ArtifactGrace,
     limit: u64,
 }
 
-impl GraceReservation<'_> {
+impl GraceReservation {
     pub(super) fn retain(
         self,
         store: &NativeStore,
-        budget: &mut StageBudget<'_>,
+        budget: &mut StageBudget,
         fingerprint: &ActionFingerprint,
         manifest: &ResultManifest,
         captured: &CapturedExecution,
@@ -173,7 +177,7 @@ impl GraceReservation<'_> {
     }
 }
 
-impl Drop for GraceReservation<'_> {
+impl Drop for GraceReservation {
     fn drop(&mut self) {
         if self.limit != 0 {
             self.pool

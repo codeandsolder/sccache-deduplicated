@@ -2355,6 +2355,7 @@ pub mod server {
         #[serde(default = "default_artifact_grace_secs")]
         pub artifact_grace_secs: u64,
         pub artifact_grace_bytes: Option<u64>,
+        pub max_inflight_jobs: Option<std::num::NonZeroUsize>,
         pub package_import: Option<crate::build_runtime::PackageImportLimits>,
         #[serde(default)]
         pub package_transfer: crate::build_runtime::PackageTransferCost,

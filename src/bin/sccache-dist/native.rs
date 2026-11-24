@@ -10,13 +10,16 @@ use std::{
 use anyhow::{Result, ensure};
 use sccache::{
     build_runtime::{
-        BlobResidency, ContentId, ExecutionPolicy, NativeStore, PackageImportLimits,
-        PackageTransferCost, wire::NativeRunResult,
+        BlobResidency, CapturedExecution, ContentId, ExecutionPolicy, NativeStore,
+        PackageImportLimits, PackageTransferCost,
     },
     config::server::NativeWorkerConfig,
     dist::{
         JobId, NativeAssignment, NativePlacement,
-        native::{NativeCacheClient, PackageTransportTracker, WorkerDelivery},
+        native::{
+            CompletedWorker, NativeCacheClient, PackageTransportTracker, PreparedWorker,
+            WorkerDelivery,
+        },
     },
 };
 
@@ -30,6 +33,7 @@ pub(super) struct NativeWorker {
     artifact_grace: sccache::dist::native::ArtifactGrace,
     placement: Mutex<PlacementCache>,
     pub(super) metadata_limit: usize,
+    pub(super) max_inflight_jobs: Option<usize>,
 }
 
 impl NativeWorker {
@@ -109,6 +113,7 @@ impl NativeWorker {
             artifact_grace,
             placement: Mutex::new(placement),
             metadata_limit: usize::try_from(config.max_metadata_bytes)?,
+            max_inflight_jobs: config.max_inflight_jobs.map(std::num::NonZeroUsize::get),
         })
     }
 
@@ -154,29 +159,55 @@ impl NativeWorker {
         cache.refresh(&self.store, timing)
     }
 
-    pub(super) fn run(
+    pub(super) fn transfer_parallelism(&self) -> usize {
+        self.package_transfer.parallelism().get()
+    }
+
+    fn delivery<'a>(
+        &'a self,
+        queue: &'a sccache::dist::execution_queue::ExecutionQueue,
+    ) -> WorkerDelivery<'a> {
+        WorkerDelivery {
+            renewal_interval: self.renewal_interval,
+            package_import: self.package_import,
+            transport: &self.package_transfer,
+            execution_queue: queue,
+            artifact_grace: &self.artifact_grace,
+        }
+    }
+
+    pub(super) fn prepare(
         &self,
         job: JobId,
         assignment: &NativeAssignment,
-        execution_queue: &sccache::dist::execution_queue::ExecutionQueue,
-    ) -> Result<NativeRunResult> {
-        let captured = self.client.clone().for_worker(job).execute_on_worker(
+        queue: &sccache::dist::execution_queue::ExecutionQueue,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<PreparedWorker> {
+        self.client.clone().for_worker(job).prepare_on_worker(
             assignment.ticket,
             &assignment.spec,
             &self.store,
             &self.policy,
-            WorkerDelivery {
-                renewal_interval: self.renewal_interval,
-                package_import: self.package_import,
-                transport: &self.package_transfer,
-                execution_queue,
-                artifact_grace: &self.artifact_grace,
-            },
-        )?;
-        if captured.successful_result().is_some() {
-            return Ok(NativeRunResult::Stored);
-        }
-        captured.failure_result()
+            self.delivery(queue),
+            cancelled,
+        )
+    }
+
+    pub(super) fn execute(
+        &self,
+        prepared: PreparedWorker,
+        queue: &sccache::dist::execution_queue::ExecutionQueue,
+        on_start: impl FnOnce(),
+    ) -> CompletedWorker {
+        prepared.execute(&self.store, &self.policy, self.delivery(queue), on_start)
+    }
+
+    pub(super) fn publish(&self, completed: CompletedWorker) -> Result<CapturedExecution> {
+        completed.publish(&self.store, &self.policy, &self.package_transfer)
+    }
+
+    pub(super) fn fail(&self, job: JobId, ticket: sccache::build_runtime::wire::Ticket) {
+        let _ = self.client.clone().for_worker(job).fail(ticket);
     }
 }
 

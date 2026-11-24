@@ -8,7 +8,7 @@ use std::{
     num::NonZeroUsize,
     sync::{
         Arc, Condvar, Mutex, PoisonError,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -21,7 +21,8 @@ use super::{
 use crate::build_runtime::{
     ArchiveLength, BlobRef, CapturedExecution, ExecutionPolicy, ExecutionSpec, NativeServiceBusy,
     NativeStore, PackageArchive, PackageImportLimits, PackageTransferCost, ResultTransferEstimate,
-    TreeId, TreeLease, VerifiedPackage, execute, wire::Ticket,
+    StageBudget, TreeId, TreeLease, VerifiedPackage, execute,
+    wire::{ActionRequest, Ticket},
 };
 
 /// Per-worker observed transfer and decoding rates.
@@ -245,6 +246,7 @@ pub struct WorkerDelivery<'a> {
     pub artifact_grace: &'a super::ArtifactGrace,
 }
 
+#[cfg(feature = "dist-client")]
 pub(super) struct ExecutionControl<'a> {
     pub renewal_interval: Duration,
     pub queue: Option<&'a crate::dist::execution_queue::ExecutionQueue>,
@@ -492,38 +494,39 @@ impl NativeCacheClient {
         }
     }
 
-    /// Execute an admitted native build and publish successful outputs directly.
-    ///
-    /// The independent renewal loop keeps the scheduler reservation live
-    /// during slow content transfers as well as compilation. Failures abort
-    /// the session; the returned failed execution still owns its diagnostics.
-    ///
+    /// Acquire and pin an admitted worker action before it enters the compiler queue.
     /// # Errors
-    /// Returns an error for mismatched admission, transfer failure, lost
-    /// reservation, invalid output or failed publication.
-    pub fn execute_on_worker(
+    /// Returns an error if the lease, execution contract or staging fails.
+    pub fn prepare_on_worker(
         &self,
         ticket: Ticket,
         spec: &ExecutionSpec,
         store: &NativeStore,
         policy: &ExecutionPolicy,
         delivery: WorkerDelivery<'_>,
-    ) -> Result<CapturedExecution> {
-        self.execute_admitted(
-            ticket,
-            spec,
-            store,
-            policy,
-            ExecutionControl {
-                renewal_interval: delivery.renewal_interval,
-                queue: Some(delivery.execution_queue),
-                grace: Some(delivery.artifact_grace),
-                transport: Some(delivery.transport),
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<PreparedWorker> {
+        let lease = WorkerLease::start(self.clone(), ticket, delivery.renewal_interval, cancelled)?;
+        lease.check()?;
+        let prepared = self.prepare_execution(
+            ExecutionContext {
+                ticket,
+                spec,
+                store,
+                policy,
             },
+            Some(delivery.artifact_grace),
             |id, check| self.fetch_tree(ticket, id, store, delivery, check),
-        )
+            &|| lease.check(),
+        )?;
+        Ok(PreparedWorker {
+            lease,
+            prepared,
+            spec: spec.clone(),
+        })
     }
 
+    #[cfg(feature = "dist-client")]
     pub(super) fn execute_admitted(
         &self,
         ticket: Ticket,
@@ -531,143 +534,345 @@ impl NativeCacheClient {
         store: &NativeStore,
         policy: &ExecutionPolicy,
         control: ExecutionControl<'_>,
-        mut fetch: impl FnMut(TreeId, &LeaseCheck<'_>) -> Result<TreeLease>,
+        fetch: impl FnMut(TreeId, &LeaseCheck<'_>) -> Result<TreeLease>,
     ) -> Result<CapturedExecution> {
+        let context = ExecutionContext {
+            ticket,
+            spec,
+            store,
+            policy,
+        };
         let result = self.with_renewal(ticket, control.renewal_interval, |check| {
-            self.verify_execution(ticket, spec.clone())?;
-            if let Some(grace) = control.grace {
-                grace.reap();
-            }
-            if let Some(report) = store.maintain_space()? {
-                ensure!(
-                    report.minimum_satisfied,
-                    "native executor store lacks allocatable space: {report:?}"
-                );
-            }
-            let request = spec.action_request()?;
-            ensure!(
-                spec.platform == policy.platform,
-                "native executor platform mismatch"
-            );
-            // Reserve output headroom before staged inputs can consume it. Wait for
-            // grace capacity without occupying a compiler slot.
-            let mut output = if let Some(grace) = control.grace {
-                let started = Instant::now();
-                let reservation = loop {
-                    check()?;
-                    if let Some(reservation) = grace.reserve(policy.max_result_bytes)? {
-                        break reservation;
-                    }
-                    ensure!(
-                        started.elapsed() < policy.timeout,
-                        "native artifact grace admission timed out"
-                    );
-                    std::thread::sleep(Duration::from_millis(100));
-                };
-                Some((reservation, store.reserve_staging(policy.max_result_bytes)?))
-            } else {
-                None
-            };
-            let mut inputs = Vec::new();
-            for id in &request.input_trees {
-                check()?;
-                let (tree, hit) = store.acquire_tree(*id, check, || fetch(*id, check))?;
-                if log::log_enabled!(target: "native_cas_replay", log::Level::Trace) {
-                    let blobs = tree
-                        .manifest()
-                        .blobs()?
-                        .into_iter()
-                        .map(|(id, size)| BlobRef { id, size })
-                        .collect::<Vec<_>>();
-                    log::trace!(
-                        target: "native_cas_replay",
-                        "{}",
-                        serde_json::json!({
-                            "kind": "tree_access",
-                            "tree": id,
-                            "hit": hit,
-                            "blobs": blobs,
-                        })
-                    );
-                }
-                inputs.push(tree);
-            }
-            // The notification is idempotent. A lost response must not
-            // discard the already pinned input closure.
-            let announced = Instant::now();
-            loop {
-                check()?;
-                match self.inputs_staged(ticket) {
-                    Ok(()) => break,
-                    Err(error)
-                        if retryable_transport_error(&error)
-                            && announced.elapsed() < policy.timeout =>
-                    {
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            // Keep input leases through the ready queue wait. Only execution consumes compiler capacity.
-            let captured = {
-                let _permit = control
-                    .queue
-                    .map(|queue| queue.acquire(check))
-                    .transpose()?;
-                let started = Instant::now();
-                let captured = execute(spec, store, policy, check)?;
-                if captured.successful_result().is_some()
-                    && let Some(transport) = control.transport
-                {
-                    transport.observe_execution(started.elapsed());
-                }
-                captured
-            };
-            check()?;
-            if let Some(manifest) = captured.successful_result() {
-                request.validate_result(manifest)?;
-                let blobs = manifest.blobs()?;
-                if let Some((grace, mut budget)) = output.take() {
-                    grace.retain(
-                        store,
-                        &mut budget,
-                        &request.action_fingerprint()?,
-                        manifest,
-                        &captured,
-                    )?;
-                }
-                let missing = self.begin(ticket, manifest.clone())?.missing;
-                let bytes = missing
-                    .iter()
-                    .map(|blob| blob.size)
-                    .fold(0_u64, u64::saturating_add);
-                let requests = u64::try_from(missing.len())?;
-                let started = Instant::now();
-                for missing in missing {
-                    check()?;
-                    ensure!(
-                        blobs.get(&missing.id) == Some(&missing.size),
-                        "scheduler requested undeclared output"
-                    );
-                    self.upload(ticket, missing, captured.open_blob(missing.id)?)?;
-                }
-                let upload_duration = started.elapsed();
-                ensure!(
-                    self.commit(ticket)? == *manifest,
-                    "native publication manifest mismatch"
-                );
-                if let Some(transport) = control.transport {
-                    transport.observe_result(bytes, requests, upload_duration);
-                }
-            } else {
-                self.fail(ticket)?;
-            }
-            drop(inputs);
-            Ok(captured)
+            let prepared = self.prepare_execution(context, control.grace, fetch, check)?;
+            let captured = compile(context, control.queue, control.transport, check, || {})?;
+            self.publish_execution(context, prepared, captured, control.transport, check)
         });
         if result.is_err() {
             let _ = self.fail(ticket);
         }
         result
+    }
+
+    fn prepare_execution(
+        &self,
+        context: ExecutionContext<'_>,
+        grace: Option<&super::ArtifactGrace>,
+        mut fetch: impl FnMut(TreeId, &LeaseCheck<'_>) -> Result<TreeLease>,
+        check: &LeaseCheck<'_>,
+    ) -> Result<PreparedExecution> {
+        let ExecutionContext {
+            ticket,
+            spec,
+            store,
+            policy,
+        } = context;
+        self.verify_execution(ticket, spec.clone())?;
+        if let Some(grace) = grace {
+            grace.reap();
+        }
+        if let Some(report) = store.maintain_space()? {
+            ensure!(
+                report.minimum_satisfied,
+                "native executor store lacks allocatable space: {report:?}"
+            );
+        }
+        let request = spec.action_request()?;
+        ensure!(
+            spec.platform == policy.platform,
+            "native executor platform mismatch"
+        );
+        // Reserve output headroom before staged inputs can consume it. Wait for
+        // grace capacity without occupying a compiler slot.
+        let output = if let Some(grace) = grace {
+            let started = Instant::now();
+            let reservation = loop {
+                check()?;
+                if let Some(reservation) = grace.reserve(policy.max_result_bytes)? {
+                    break reservation;
+                }
+                ensure!(
+                    started.elapsed() < policy.timeout,
+                    "native artifact grace admission timed out"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            Some((reservation, store.reserve_staging(policy.max_result_bytes)?))
+        } else {
+            None
+        };
+        let mut inputs = Vec::new();
+        for id in &request.input_trees {
+            check()?;
+            let (tree, hit) = store.acquire_tree(*id, check, || fetch(*id, check))?;
+            if log::log_enabled!(target: "native_cas_replay", log::Level::Trace) {
+                let blobs = tree
+                    .manifest()
+                    .blobs()?
+                    .into_iter()
+                    .map(|(id, size)| BlobRef { id, size })
+                    .collect::<Vec<_>>();
+                log::trace!(
+                target: "native_cas_replay",
+                "{}",
+                serde_json::json!({
+                    "kind": "tree_access",
+                    "tree": id,
+                    "hit": hit,
+                    "blobs": blobs,
+                })
+                );
+            }
+            inputs.push(tree);
+        }
+        // The notification is idempotent. A lost response must not
+        // discard the already pinned input closure.
+        let announced = Instant::now();
+        loop {
+            check()?;
+            match self.inputs_staged(ticket) {
+                Ok(()) => break,
+                Err(error)
+                    if retryable_transport_error(&error)
+                        && announced.elapsed() < policy.timeout =>
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(PreparedExecution {
+            request,
+            _inputs: inputs,
+            output,
+        })
+    }
+
+    fn publish_execution(
+        &self,
+        context: ExecutionContext<'_>,
+        mut prepared: PreparedExecution,
+        captured: CapturedExecution,
+        transport: Option<&PackageTransportTracker>,
+        check: &LeaseCheck<'_>,
+    ) -> Result<CapturedExecution> {
+        let ExecutionContext { ticket, store, .. } = context;
+        check()?;
+        if let Some(manifest) = captured.successful_result() {
+            prepared.request.validate_result(manifest)?;
+            let blobs = manifest.blobs()?;
+            if let Some((grace, mut budget)) = prepared.output.take() {
+                grace.retain(
+                    store,
+                    &mut budget,
+                    &prepared.request.action_fingerprint()?,
+                    manifest,
+                    &captured,
+                )?;
+            }
+            let missing = self.begin(ticket, manifest.clone())?.missing;
+            let bytes = missing
+                .iter()
+                .map(|blob| blob.size)
+                .fold(0_u64, u64::saturating_add);
+            let requests = u64::try_from(missing.len())?;
+            let started = Instant::now();
+            for missing in missing {
+                check()?;
+                ensure!(
+                    blobs.get(&missing.id) == Some(&missing.size),
+                    "scheduler requested undeclared output"
+                );
+                self.upload(ticket, missing, captured.open_blob(missing.id)?)?;
+            }
+            let upload_duration = started.elapsed();
+            ensure!(
+                self.commit(ticket)? == *manifest,
+                "native publication manifest mismatch"
+            );
+            if let Some(transport) = transport {
+                transport.observe_result(bytes, requests, upload_duration);
+            }
+        } else {
+            self.fail(ticket)?;
+        }
+        Ok(captured)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ExecutionContext<'a> {
+    ticket: Ticket,
+    spec: &'a ExecutionSpec,
+    store: &'a NativeStore,
+    policy: &'a ExecutionPolicy,
+}
+
+struct PreparedExecution {
+    request: ActionRequest,
+    _inputs: Vec<Arc<TreeLease>>,
+    output: Option<(super::grace::GraceReservation, StageBudget)>,
+}
+
+fn compile(
+    context: ExecutionContext<'_>,
+    queue: Option<&crate::dist::execution_queue::ExecutionQueue>,
+    transport: Option<&PackageTransportTracker>,
+    check: &LeaseCheck<'_>,
+    on_start: impl FnOnce(),
+) -> Result<CapturedExecution> {
+    let _permit = queue.map(|queue| queue.acquire(check)).transpose()?;
+    on_start();
+    let started = Instant::now();
+    let captured = execute(context.spec, context.store, context.policy, check)?;
+    if captured.successful_result().is_some()
+        && let Some(transport) = transport
+    {
+        transport.observe_execution(started.elapsed());
+    }
+    Ok(captured)
+}
+
+// The lease owns cancellation and renewal across queue handoffs. Errors
+// release all local reservations and cancel the remote action exactly once.
+struct WorkerLease {
+    client: NativeCacheClient,
+    ticket: Ticket,
+    renewals: Option<super::renewal::Renewals>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl WorkerLease {
+    fn start(
+        client: NativeCacheClient,
+        ticket: Ticket,
+        interval: Duration,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        let mut lease = Self {
+            client,
+            ticket,
+            renewals: None,
+            cancelled,
+        };
+        let result = (|| {
+            lease.client.renew(ticket)?;
+            let renewals = super::renewal::Renewals::start(lease.client.clone(), interval)?;
+            renewals.add(ticket)?;
+            Ok(renewals)
+        })();
+        match result {
+            Ok(renewals) => {
+                lease.renewals = Some(renewals);
+                Ok(lease)
+            }
+            Err(error) => {
+                let _ = lease.client.fail(ticket);
+                Err(error)
+            }
+        }
+    }
+
+    fn check(&self) -> Result<()> {
+        ensure!(
+            !self.cancelled.load(Ordering::Acquire),
+            "native worker assignment cancelled"
+        );
+        self.renewals
+            .as_ref()
+            .context("native worker lease already finished")?
+            .check()
+    }
+
+    fn finish(mut self) {
+        if let Some(renewals) = self.renewals.take()
+            && let Err(error) = renewals.finish()
+        {
+            debug!("Native worker lease ended after terminal publication: {error:#}");
+        }
+    }
+}
+
+impl Drop for WorkerLease {
+    fn drop(&mut self) {
+        if let Some(renewals) = self.renewals.take() {
+            drop(renewals);
+            let _ = self.client.fail(self.ticket);
+        }
+    }
+}
+
+/// A ready action owns its verified input closure and output reservation.
+pub struct PreparedWorker {
+    prepared: PreparedExecution,
+    spec: ExecutionSpec,
+    lease: WorkerLease,
+}
+
+impl PreparedWorker {
+    /// Execute only after compiler admission, retaining output descriptors.
+    #[must_use = "publication must finish the lease"]
+    pub fn execute(
+        self,
+        store: &NativeStore,
+        policy: &ExecutionPolicy,
+        delivery: WorkerDelivery<'_>,
+        on_start: impl FnOnce(),
+    ) -> CompletedWorker {
+        let context = ExecutionContext {
+            ticket: self.lease.ticket,
+            spec: &self.spec,
+            store,
+            policy,
+        };
+        let captured = compile(
+            context,
+            Some(delivery.execution_queue),
+            Some(delivery.transport),
+            &|| self.lease.check(),
+            on_start,
+        );
+        CompletedWorker {
+            worker: self,
+            captured,
+        }
+    }
+}
+
+/// A compiler has exited; publication does not occupy a compiler slot.
+pub struct CompletedWorker {
+    worker: PreparedWorker,
+    captured: Result<CapturedExecution>,
+}
+
+impl CompletedWorker {
+    /// Publish retained outputs and finish the scheduler lease.
+    /// # Errors
+    /// Returns an error for failed publication, verification or cancellation.
+    pub fn publish(
+        self,
+        store: &NativeStore,
+        policy: &ExecutionPolicy,
+        transport: &PackageTransportTracker,
+    ) -> Result<CapturedExecution> {
+        let PreparedWorker {
+            lease,
+            prepared,
+            spec,
+        } = self.worker;
+        let context = ExecutionContext {
+            ticket: lease.ticket,
+            spec: &spec,
+            store,
+            policy,
+        };
+        let captured = lease.client.publish_execution(
+            context,
+            prepared,
+            self.captured?,
+            Some(transport),
+            &|| lease.check(),
+        )?;
+        lease.finish();
+        Ok(captured)
     }
 }

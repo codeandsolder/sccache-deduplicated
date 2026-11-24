@@ -192,6 +192,7 @@ fn native_worker_config(
             max_metadata_bytes: 64 * 1024 * 1024,
             artifact_grace_secs: 300,
             artifact_grace_bytes: None,
+            max_inflight_jobs: None,
             package_import: Some(package_limits(false)),
             package_transfer: transfer,
         }),

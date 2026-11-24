@@ -408,19 +408,29 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
             crate::dist::execution_queue::ExecutionQueue::new(std::num::NonZeroUsize::MIN);
         let artifact_grace =
             crate::dist::native::ArtifactGrace::new(Duration::from_secs(300), 1024)?;
-        let result = worker.execute_on_worker(
+        let delivery = crate::dist::native::WorkerDelivery {
+            renewal_interval: Duration::from_secs(1),
+            package_import: None,
+            transport: &transport,
+            execution_queue: &execution_queue,
+            artifact_grace: &artifact_grace,
+        };
+        let busy = execution_queue.acquire(|| Ok(()))?;
+        let prepared = worker.prepare_on_worker(
             ticket,
             &spec,
             &worker_store,
             &policy,
-            crate::dist::native::WorkerDelivery {
-                renewal_interval: Duration::from_secs(1),
-                package_import: None,
-                transport: &transport,
-                execution_queue: &execution_queue,
-                artifact_grace: &artifact_grace,
-            },
+            delivery,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )?;
+        assert_eq!(execution_queue.active(), 1);
+        drop(busy);
+        let completed = prepared.execute(&worker_store, &policy, delivery, || {
+            assert_eq!(execution_queue.active(), 1)
+        });
+        assert_eq!(execution_queue.active(), 0);
+        let result = completed.publish(&worker_store, &policy, &transport)?;
         let manifest = result
             .successful_result()
             .context("native execution failed")?;

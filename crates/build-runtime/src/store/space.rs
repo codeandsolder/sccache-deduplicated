@@ -124,7 +124,7 @@ impl NativeStore {
     /// The budget transfers directly into staged blobs without a second charge.
     /// # Errors
     /// Returns an error if the managed store cannot admit the reservation.
-    pub fn reserve_staging(&self, bytes: u64) -> Result<StageBudget<'_>> {
+    pub fn reserve_staging(&self, bytes: u64) -> Result<StageBudget> {
         let mut budget = StageBudget::new(self);
         budget.grow_to(bytes)?;
         Ok(budget)
@@ -457,14 +457,19 @@ impl super::Pins {
 /// Uncompressed upper bound on concurrent in-flight writers. Retain the
 /// reservation until fsync; completed staging files are already represented
 /// by filesystem space counters.
-pub struct StageBudget<'a> {
-    store: &'a NativeStore,
+pub struct StageBudget {
+    store: NativeStore,
     reserved: u64,
 }
 
-impl<'a> StageBudget<'a> {
-    pub(super) const fn new(store: &'a NativeStore) -> Self {
-        Self { store, reserved: 0 }
+impl StageBudget {
+    pub(super) fn new(store: &NativeStore) -> Self {
+        Self {
+            store: NativeStore {
+                inner: Arc::clone(&store.inner),
+            },
+            reserved: 0,
+        }
     }
 
     /// Stage a verified blob using space already reserved by this budget.
@@ -485,7 +490,9 @@ impl<'a> StageBudget<'a> {
         );
         self.reserved -= expected.size;
         let child = Self {
-            store: self.store,
+            store: NativeStore {
+                inner: Arc::clone(&self.store.inner),
+            },
             reserved: expected.size,
         };
         let staged = self
@@ -590,7 +597,7 @@ impl Drop for StagingReservation {
     }
 }
 
-impl Drop for StageBudget<'_> {
+impl Drop for StageBudget {
     fn drop(&mut self) {
         if self.reserved > 0 && self.store.inner.space_policy.is_some() {
             self.store

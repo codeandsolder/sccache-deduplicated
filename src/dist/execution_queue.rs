@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
 
 #[derive(Default)]
 struct State {
@@ -41,23 +41,33 @@ impl ExecutionQueue {
             .active
     }
 
+    #[must_use = "the dispatcher uses the same physical compiler width"]
+    pub const fn width(&self) -> NonZeroUsize {
+        self.width
+    }
+
     /// Wait for a compiler slot, removing cancelled waiters before returning.
     ///
     /// # Errors
-    /// Returns an error on cancellation, queue exhaustion or identifier exhaustion.
+    /// Returns an error on cancellation or identifier exhaustion.
     pub fn acquire(&self, check: impl Fn() -> Result<()>) -> Result<ExecutionPermit<'_>> {
-        check()?;
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        ensure!(
-            state.waiting.len() < self.width.get().saturating_mul(2),
-            "worker ready queue is full"
-        );
-        let id = state.next;
-        state.next = id
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("worker queue identifier exhausted"))?;
-        state.waiting.push_back(id);
-        drop(state);
+        let id = loop {
+            check()?;
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if state.waiting.len() < self.width.get().saturating_mul(2) {
+                let id = state.next;
+                state.next = id
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("worker queue identifier exhausted"))?;
+                state.waiting.push_back(id);
+                break id;
+            }
+            drop(
+                self.available
+                    .wait_timeout(state, Duration::from_millis(100))
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+        };
         let _waiter = Waiter { queue: self, id };
         loop {
             check()?;
@@ -113,6 +123,7 @@ impl Drop for ExecutionPermit<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::ensure;
     use std::{
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -166,7 +177,16 @@ mod tests {
             wait_for_queued(&queue, 2);
             assert_eq!(queue.active(), 1);
             assert!(received.try_recv().is_err());
-            assert!(queue.acquire(|| Ok(())).is_err());
+            let overflow = scope.spawn(|| {
+                let deadline = Instant::now() + Duration::from_millis(150);
+                queue
+                    .acquire(|| {
+                        ensure!(Instant::now() < deadline, "cancelled overflow");
+                        Ok(())
+                    })
+                    .map(drop)
+            });
+            assert!(overflow.join().unwrap().is_err());
             cancel.store(true, Ordering::Relaxed);
             assert!(cancelled.join().unwrap().is_err());
             wait_for_queued(&queue, 1);

@@ -999,7 +999,7 @@ pub trait SchedulerOutgoing {
 }
 
 #[cfg(feature = "dist-server")]
-pub trait ServerOutgoing {
+pub trait ServerOutgoing: Send + Sync {
     // To Scheduler
     fn do_update_job_state(&self, job_id: JobId, state: JobState) -> Result<UpdateJobStateResult>;
 }
@@ -1131,6 +1131,7 @@ pub trait SchedulerIncoming: Send + Sync {
 pub trait ServerIncoming: Send + Sync {
     /// Compiler slots in use, excluding jobs waiting for input or a slot.
     fn executing_jobs(&self) -> usize;
+    fn active_native_jobs(&self) -> Vec<JobId>;
     // From Scheduler
     fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> ExtResult<AssignJobResult, Error>;
     fn capabilities(&self) -> WorkerCapabilities;
@@ -1149,14 +1150,15 @@ pub trait ServerIncoming: Send + Sync {
         job_id: JobId,
         assignment: NativeAssignment,
     ) -> ExtResult<AssignJobResult, Error>;
-    /// Claim and execute an assigned native action.
+    /// Claim or observe an assigned native action without blocking for compilation.
     ///
     /// # Errors
     /// Returns an error if execution, scheduler reporting or publication fails.
     fn handle_run_native_job(
         &self,
-        requester: &dyn ServerOutgoing,
+        requester: std::sync::Arc<dyn ServerOutgoing>,
         job_id: JobId,
+        request: crate::build_runtime::wire::NativeRunRequest,
     ) -> ExtResult<crate::build_runtime::wire::NativeRunResult, Error>;
     // Reconcile scheduler-side reservations against local unclaimed jobs.
     // The cutoff predates the heartbeat request; later assignments must survive.

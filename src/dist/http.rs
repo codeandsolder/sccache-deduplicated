@@ -284,7 +284,7 @@ pub mod urls {
     /// Returns an error if the generated server URL is invalid.
     pub fn server_run_native_job(server_id: ServerId, job_id: JobId) -> Result<reqwest::Url> {
         Ok(reqwest::Url::parse(&format!(
-            "https://{}/api/v3/distserver/run_native_job/{job_id}",
+            "https://{}/api/v4/distserver/run_native_job/{job_id}",
             server_id.addr()
         ))?)
     }
@@ -1585,11 +1585,11 @@ mod server {
             let heartbeat_cert_pem = cert_pem.clone();
             let job_authorizer = JWTJobAuthorizer::boxed(&jwt_key)?;
             let heartbeat_url = urls::scheduler_heartbeat_server(&scheduler_url)?;
-            let requester = ServerRequester {
+            let requester = Arc::new(ServerRequester {
                 client: transport::blocking_client(Vec::new())?,
                 scheduler_url,
                 scheduler_auth: scheduler_auth.clone(),
-            };
+            });
 
             let heartbeat_client = transport::blocking_client(Vec::new())?;
             // TODO: detect if this panics
@@ -1614,6 +1614,7 @@ mod server {
                     // executing compiler processes for CPU-capacity restoration.
                     let active_job_ids = running_job_ids
                         .into_iter()
+                        .chain(heartbeat_handler.active_native_jobs())
                         .chain(recently_progressing_uploads(
                             &heartbeat_upload_activity,
                             Instant::now(),
@@ -1725,10 +1726,10 @@ mod server {
                             None => rouille::Response::empty_404(),
                         }
                     },
-                    (POST) (/api/v3/distserver/run_native_job/{job_id: JobId}) => {
+                    (POST) (/api/v4/distserver/run_native_job/{job_id: JobId}) => {
                         job_auth_or_401!(request, &job_authorizer, job_id);
-                        let _running_job = try_or_500_log!(req_id, RunningJobGuard::new(&running_jobs, job_id));
-                        let res = try_or_500_log!(req_id, handler.handle_run_native_job(&requester, job_id));
+                        let operation: crate::build_runtime::wire::NativeRunRequest = try_or_400_log!(req_id, native::metadata(request, 16));
+                        let res = try_or_500_log!(req_id, handler.handle_run_native_job(requester.clone(), job_id, operation));
                         let data = try_or_500_log!(req_id, crate::dist::native::codec().serialize(&res));
                         rouille::Response::from_data("application/octet-stream", data)
                     },
@@ -1744,7 +1745,7 @@ mod server {
                         );
                         let progress = try_or_500_log!(req_id, ProgressReader::new(body, &upload_activity, job_id));
                         let toolchain_rdr = ToolchainReader(Box::new(progress));
-                        let res: SubmitToolchainResult = try_or_500_log!(req_id, handler.handle_submit_toolchain(&requester, job_id, toolchain_rdr));
+                        let res: SubmitToolchainResult = try_or_500_log!(req_id, handler.handle_submit_toolchain(requester.as_ref(), job_id, toolchain_rdr));
                         prepare_response(request, &res)
                     },
                     (POST) (/api/v2/distserver/run_job/{job_id: JobId}) => {
@@ -1766,7 +1767,7 @@ mod server {
                         let inputs_rdr = InputsReader::new(Box::new(body));
 
                         let _running_job = try_or_500_log!(req_id, RunningJobGuard::new(&running_jobs, job_id));
-                        let res: RunJobResult = try_or_500_log!(req_id, handler.handle_run_job(&requester, job_id, command, outputs, inputs_rdr));
+                        let res: RunJobResult = try_or_500_log!(req_id, handler.handle_run_job(requester.as_ref(), job_id, command, outputs, inputs_rdr));
                         prepare_response(request, &res)
                     },
                     _ => {

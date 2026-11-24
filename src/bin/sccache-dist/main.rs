@@ -38,12 +38,16 @@ use placement::{Exploration, NativeTransferPlan, choose_worker, native_estimate}
 #[cfg(target_os = "linux")]
 mod native;
 #[cfg(target_os = "linux")]
+mod native_dispatch;
+#[cfg(target_os = "linux")]
 mod rustup;
 #[cfg(target_os = "linux")]
 mod system_packages;
 mod token_check;
 #[cfg(target_os = "linux")]
 use native::NativeWorker;
+#[cfg(target_os = "linux")]
+use native_dispatch::NativeDispatcher;
 
 use cmdline::{AuthSubcommand, Command};
 
@@ -665,7 +669,14 @@ fn run(command: Command) -> Result<i32> {
             let server = Server::new(archive);
             #[cfg(target_os = "linux")]
             let server = Server {
-                native_worker,
+                native_worker: native_worker
+                    .map(|worker| {
+                        NativeDispatcher::new(
+                            worker,
+                            std::sync::Arc::clone(&server.execution_queue),
+                        )
+                    })
+                    .transpose()?,
                 ..server
             };
             let worker_name = dist_worker_name()?;
@@ -1505,7 +1516,7 @@ impl SchedulerIncoming for Scheduler {
                 (JobState::Pending, JobState::Ready) | (JobState::Ready, JobState::Started) => {
                     entry.get_mut().transition_to(job_state, now);
                 }
-                (JobState::Started, JobState::Complete) => {
+                (JobState::Pending | JobState::Ready | JobState::Started, JobState::Complete) => {
                     let mut acks = self
                         .completed_acks
                         .lock()
@@ -1580,12 +1591,11 @@ impl SchedulerIncoming for Scheduler {
 
 struct LocalAssignment {
     assignment: JobAssignment,
-    // Protect both complete trees and partial resident inputs before staging.
-    _input_pins: Option<NativeInputPins>,
     // Local time of receipt, not the scheduler's assignment timestamp.
     accepted_at: Instant,
 }
 
+#[cfg(target_os = "linux")]
 struct NativeInputPins {
     _trees: Vec<sccache::build_runtime::TreeLease>,
     _blobs: sccache::build_runtime::UploadReservation,
@@ -1680,20 +1690,20 @@ impl ArchiveWorker {
 
 pub struct Server {
     archive: Option<ArchiveWorker>,
-    execution_queue: dist::execution_queue::ExecutionQueue,
+    execution_queue: std::sync::Arc<dist::execution_queue::ExecutionQueue>,
     job_toolchains: Mutex<HashMap<JobId, LocalAssignment>>,
     #[cfg(target_os = "linux")]
-    native_worker: Option<NativeWorker>,
+    native_worker: Option<NativeDispatcher>,
 }
 
 impl Server {
     fn new(archive: Option<ArchiveWorker>) -> Self {
         Self {
             archive,
-            execution_queue: dist::execution_queue::ExecutionQueue::new(
+            execution_queue: std::sync::Arc::new(dist::execution_queue::ExecutionQueue::new(
                 std::num::NonZeroUsize::new(sccache::util::num_cpus())
                     .unwrap_or(std::num::NonZeroUsize::MIN),
-            ),
+            )),
             job_toolchains: Mutex::new(HashMap::new()),
             #[cfg(target_os = "linux")]
             native_worker: None,
@@ -1702,26 +1712,10 @@ impl Server {
 }
 
 impl Server {
-    fn pin_resident_inputs(&self, assignment: &NativeAssignment) -> Result<NativeInputPins> {
-        #[cfg(target_os = "linux")]
-        {
-            self.native_worker
-                .as_ref()
-                .context("native worker unavailable")?
-                .pin_resident_inputs(assignment)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = assignment;
-            bail!("native worker requires Linux")
-        }
-    }
-
     fn begin_execution(
         &self,
         requester: &dyn ServerOutgoing,
         job_id: JobId,
-        native: bool,
     ) -> Result<Option<LocalAssignment>> {
         let assigned = {
             let mut jobs = self
@@ -1729,11 +1723,7 @@ impl Server {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?;
             match jobs.entry(job_id) {
-                std::collections::hash_map::Entry::Occupied(entry)
-                    if matches!(entry.get().assignment, JobAssignment::Native(_)) == native =>
-                {
-                    Some(entry.remove())
-                }
+                std::collections::hash_map::Entry::Occupied(entry) => Some(entry.remove()),
                 _ => None,
             }
         };
@@ -1766,6 +1756,15 @@ impl ServerIncoming for Server {
     fn executing_jobs(&self) -> usize {
         self.execution_queue.active()
     }
+
+    fn active_native_jobs(&self) -> Vec<JobId> {
+        #[cfg(target_os = "linux")]
+        if let Some(dispatcher) = &self.native_worker {
+            return dispatcher.active_jobs();
+        }
+        Vec::new()
+    }
+
     fn handle_reconcile_assignments(
         &self,
         assigned_job_ids: &[JobId],
@@ -1784,6 +1783,11 @@ impl ServerIncoming for Server {
         });
         let removed = before - local.len();
         drop(local);
+        #[cfg(target_os = "linux")]
+        let removed = removed
+            + self.native_worker.as_ref().map_or(0, |dispatcher| {
+                dispatcher.reconcile(&known, heartbeat_started_at)
+            });
         Ok(removed)
     }
 
@@ -1792,11 +1796,14 @@ impl ServerIncoming for Server {
         let native_platform = self
             .native_worker
             .as_ref()
-            .map(|worker| worker.policy.platform);
+            .map(|dispatcher| dispatcher.worker().policy.platform);
         #[cfg(not(target_os = "linux"))]
         let native_platform = None;
         #[cfg(target_os = "linux")]
-        let native_placement = self.native_worker.as_ref().map(NativeWorker::placement);
+        let native_placement = self
+            .native_worker
+            .as_ref()
+            .map(|dispatcher| dispatcher.worker().placement());
         #[cfg(not(target_os = "linux"))]
         let native_placement = None;
         dist::WorkerCapabilities {
@@ -1811,7 +1818,7 @@ impl ServerIncoming for Server {
         {
             self.native_worker
                 .as_ref()
-                .map(|worker| worker.metadata_limit)
+                .map(|dispatcher| dispatcher.worker().metadata_limit)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -1828,6 +1835,7 @@ impl ServerIncoming for Server {
             self.native_worker
                 .as_ref()
                 .context("native worker unavailable")?
+                .worker()
                 .open_blob(blob)
         }
         #[cfg(not(target_os = "linux"))]
@@ -1842,58 +1850,42 @@ impl ServerIncoming for Server {
         job_id: JobId,
         assignment: NativeAssignment,
     ) -> Result<AssignJobResult> {
-        assignment.spec.validate()?;
-        let input_pins = self.pin_resident_inputs(&assignment)?;
-        let mut assignments = self
-            .job_toolchains
-            .lock()
-            .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?;
-        match assignments.entry(job_id) {
-            std::collections::hash_map::Entry::Occupied(_) => {
-                bail!("duplicate assignment for job {job_id}")
-            }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(LocalAssignment {
-                    assignment: JobAssignment::Native(Box::new(assignment)),
-                    _input_pins: Some(input_pins),
-                    accepted_at: Instant::now(),
-                });
-            }
+        #[cfg(target_os = "linux")]
+        {
+            self.native_worker
+                .as_ref()
+                .context("native worker unavailable")?
+                .assign(job_id, assignment)?;
+            Ok(AssignJobResult {
+                state: JobState::Ready,
+                need_toolchain: false,
+            })
         }
-        drop(assignments);
-        Ok(AssignJobResult {
-            state: JobState::Ready,
-            need_toolchain: false,
-        })
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (job_id, assignment);
+            bail!("native worker requires Linux")
+        }
     }
 
     fn handle_run_native_job(
         &self,
-        requester: &dyn ServerOutgoing,
+        requester: std::sync::Arc<dyn ServerOutgoing>,
         job_id: JobId,
+        request: sccache::build_runtime::wire::NativeRunRequest,
     ) -> Result<sccache::build_runtime::wire::NativeRunResult> {
-        use sccache::build_runtime::wire::NativeRunResult;
-        let Some(assigned) = self.begin_execution(requester, job_id, true)? else {
-            return Ok(NativeRunResult::JobNotFound);
-        };
-        let JobAssignment::Native(assignment) = assigned.assignment else {
-            bail!("native job assignment type changed");
-        };
         #[cfg(target_os = "linux")]
-        let result = self
-            .native_worker
-            .as_ref()
-            .context("native worker unavailable")
-            .and_then(|worker| worker.run(job_id, &assignment, &self.execution_queue));
+        {
+            self.native_worker
+                .as_ref()
+                .context("native worker unavailable")?
+                .poll(job_id, requester, request)
+        }
         #[cfg(not(target_os = "linux"))]
-        let result = {
-            let _ = assignment;
-            Err(anyhow::anyhow!("native worker requires Linux"))
-        };
-        requester
-            .do_update_job_state(job_id, JobState::Complete)
-            .context("Updating native job state failed")?;
-        result
+        {
+            let _ = (requester, job_id, request);
+            bail!("native worker requires Linux")
+        }
     }
 
     fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> Result<AssignJobResult> {
@@ -1913,7 +1905,6 @@ impl ServerIncoming for Server {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(LocalAssignment {
                     assignment: JobAssignment::Archive(tc),
-                    _input_pins: None,
                     accepted_at: Instant::now(),
                 });
             }
@@ -1996,7 +1987,7 @@ impl ServerIncoming for Server {
         outputs: OutputRequest,
         inputs_rdr: InputsReader,
     ) -> Result<RunJobResult> {
-        let Some(assigned) = self.begin_execution(requester, job_id, false)? else {
+        let Some(assigned) = self.begin_execution(requester, job_id)? else {
             return Ok(RunJobResult::JobNotFound);
         };
         let JobAssignment::Archive(toolchain) = assigned.assignment else {

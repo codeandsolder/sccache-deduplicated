@@ -508,6 +508,9 @@ fn test_dist_nobuilder() {
 
 struct FailingServer;
 impl ServerIncoming for FailingServer {
+    fn active_native_jobs(&self) -> Vec<JobId> {
+        Vec::new()
+    }
     fn executing_jobs(&self) -> usize {
         0
     }
@@ -534,8 +537,9 @@ impl ServerIncoming for FailingServer {
     }
     fn handle_run_native_job(
         &self,
-        _requester: &dyn ServerOutgoing,
+        _requester: std::sync::Arc<dyn ServerOutgoing>,
         _job_id: JobId,
+        _request: sccache::build_runtime::wire::NativeRunRequest,
     ) -> Result<sccache::build_runtime::wire::NativeRunResult> {
         anyhow::bail!("mock does not execute native assignments")
     }
