@@ -1143,6 +1143,17 @@ async fn multilevel_size_metrics_distinguish_known_zero_from_unavailable() -> Re
     assert_eq!(usage.current_size().await?, Some(0));
     assert_eq!(usage.max_size().await?, Some(1024));
 
+    let large = Arc::new(DiskCache::new(
+        &dir.path().join("large"),
+        u64::MAX,
+        &tokio::runtime::Handle::current(),
+        PreprocessorCacheModeConfig::default(),
+        CacheMode::ReadWrite,
+        vec![],
+    ));
+    let saturated = MultiLevelStorage::new(vec![large.clone(), large]);
+    assert_eq!(saturated.max_size().await?, Some(u64::MAX));
+
     let unknown_only = MultiLevelStorage::new(vec![unknown]);
     assert_eq!(unknown_only.current_size().await?, None);
     assert_eq!(unknown_only.max_size().await?, None);

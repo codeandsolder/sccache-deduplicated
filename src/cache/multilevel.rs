@@ -408,7 +408,26 @@ pub struct MultiLevelStorage {
     background_tasks: Arc<BackgroundTasks>,
 }
 
+enum SizeMetric {
+    Current,
+    Maximum,
+}
+
 impl MultiLevelStorage {
+    async fn aggregate_size(&self, metric: SizeMetric) -> Result<Option<u64>> {
+        let mut total = None;
+        for level in &self.levels {
+            let size = match metric {
+                SizeMetric::Current => level.current_size().await?,
+                SizeMetric::Maximum => level.max_size().await?,
+            };
+            if let Some(size) = size {
+                total = Some(total.unwrap_or(0u64).saturating_add(size));
+            }
+        }
+        Ok(total)
+    }
+
     /// Collect and deduplicate basedirs from all cache levels.
     fn collect_basedirs(levels: &[Arc<dyn Storage>]) -> Vec<Vec<u8>> {
         let mut seen = Vec::new();
@@ -1031,23 +1050,11 @@ impl Storage for MultiLevelStorage {
     }
 
     async fn current_size(&self) -> Result<Option<u64>> {
-        let mut total = None;
-        for level in &self.levels {
-            if let Some(size) = level.current_size().await? {
-                total = Some(total.unwrap_or(0u64).saturating_add(size));
-            }
-        }
-        Ok(total)
+        self.aggregate_size(SizeMetric::Current).await
     }
 
     async fn max_size(&self) -> Result<Option<u64>> {
-        let mut total = None;
-        for level in &self.levels {
-            if let Some(size) = level.max_size().await? {
-                total = Some(total.unwrap_or(0u64).saturating_add(size));
-            }
-        }
-        Ok(total)
+        self.aggregate_size(SizeMetric::Maximum).await
     }
 
     fn multilevel_stats(&self) -> Option<crate::cache::multilevel::MultiLevelStats> {
