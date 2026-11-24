@@ -77,7 +77,6 @@ impl Counters {
 /// even when the transport aborts before the body has been consumed.
 pub struct MeteredReader<R> {
     reader: R,
-    _activity: WorkActivity,
     counters: Arc<Counters>,
     logical_size: u64,
     exact_wire_size: Option<u64>,
@@ -147,9 +146,10 @@ struct PeerRecord {
     previous: Sample,
     peak: u64,
     peak_at: Instant,
+    isolated: u64,
+    isolated_at: Instant,
     wire_per_mille: u64,
     last_active: Instant,
-    latest_rate: u64,
 }
 
 impl PeerRecord {
@@ -159,9 +159,10 @@ impl PeerRecord {
             previous: Sample::default(),
             peak: 0,
             peak_at: now,
+            isolated: 0,
+            isolated_at: now,
             wire_per_mille: 1000,
             last_active: now,
-            latest_rate: 0,
         }
     }
 }
@@ -186,8 +187,7 @@ pub struct PeerCapacity {
     /// Largest recent sustained observation; an observed lower bound, not a
     /// proven physical link ceiling.
     pub observed_bytes_per_second: u64,
-    pub calibrated_bytes_per_second: u64,
-    pub latest_bytes_per_second: u64,
+    pub isolated_bytes_per_second: u64,
     pub wire_per_mille: u64,
     pub active_remaining_bytes: u64,
     pub body_bytes: u64,
@@ -197,6 +197,7 @@ pub struct PeerCapacity {
 pub struct DirectionSnapshot {
     pub peers: BTreeMap<Peer, PeerCapacity>,
     pub shared: Vec<SharedCapacity>,
+    pub independent: Vec<ConcurrentCapacity>,
 }
 
 impl DirectionSnapshot {
@@ -234,13 +235,7 @@ impl DirectionSnapshot {
         self.peers
             .get(&peer)
             .map_or(fallback, |entry| {
-                if entry.calibrated_bytes_per_second == 0 {
-                    entry.observed_bytes_per_second.max(fallback)
-                } else {
-                    entry
-                        .observed_bytes_per_second
-                        .max(entry.calibrated_bytes_per_second)
-                }
+                entry.observed_bytes_per_second.max(fallback)
             })
             .max(1)
     }
@@ -256,6 +251,7 @@ pub struct NetworkSnapshot {
 struct DirectionMeter {
     peers: BTreeMap<Peer, PeerRecord>,
     evidence: BTreeMap<BTreeSet<Peer>, Evidence>,
+    independent: BTreeMap<BTreeSet<Peer>, overlap::IndependentEvidence>,
 }
 
 impl DirectionMeter {
@@ -289,13 +285,15 @@ impl DirectionMeter {
             if now.duration_since(record.peak_at) > MAX_AGE {
                 record.peak = 0;
             }
+            if now.duration_since(record.isolated_at) > MAX_AGE {
+                record.isolated = 0;
+            }
             if bytes != 0 || current.active != 0 {
                 record.last_active = now;
             }
             let rate = u64::try_from(u128::from(bytes) * 1_000_000_000 / elapsed.as_nanos())
                 .unwrap_or(MAX_RATE)
                 .min(MAX_RATE);
-            record.latest_rate = rate;
             if rate > 0 {
                 current_rates.insert(peer, rate);
             }
@@ -303,7 +301,7 @@ impl DirectionMeter {
                 && record.previous.active > 0
                 && current.idle_epoch == record.previous.idle_epoch;
             if continuous && rate >= MIN_RATE {
-                sustained.insert(peer, (rate, record.peak));
+                sustained.insert(peer, (rate, record.isolated));
                 if rate >= record.peak {
                     record.peak = rate;
                     record.peak_at = now;
@@ -328,6 +326,18 @@ impl DirectionMeter {
                 && total <= evidence.maximum.saturating_mul(115) / 100
         });
 
+        self.independent
+            .retain(|_, evidence| now.duration_since(evidence.seen) <= MAX_AGE);
+        if !partial
+            && sustained.len() == 1
+            && let Some((peer, &(rate, _))) = sustained.first_key_value()
+            && let Some(record) = self.peers.get_mut(peer)
+        {
+            if rate >= record.isolated {
+                record.isolated = rate;
+                record.isolated_at = now;
+            }
+        }
         // Only infer contention from aligned, continuously backlogged body
         // windows with evidence that every participant can go faster.
         if partial || sustained.len() < 2 || sustained.contains_key(&Peer::Other) {
@@ -340,6 +350,7 @@ impl DirectionMeter {
             .values()
             .all(|&(rate, peak)| peak > 0 && rate.saturating_mul(100) <= peak.saturating_mul(85));
         if !slowed || total.saturating_mul(100) > independent.saturating_mul(80) {
+            self.observe_independence(&members, &sustained, now);
             return;
         }
         if self.evidence.len() >= MAX_GROUPS
@@ -352,6 +363,8 @@ impl DirectionMeter {
         {
             self.evidence.remove(&oldest);
         }
+        self.independent
+            .retain(|cohort, _| !members.is_subset(cohort));
         let evidence = self.evidence.entry(members).or_insert(Evidence {
             count: 0,
             minimum: total,
@@ -385,8 +398,7 @@ impl DirectionMeter {
                         peer,
                         PeerCapacity {
                             observed_bytes_per_second: record.peak,
-                            calibrated_bytes_per_second: 0,
-                            latest_bytes_per_second: record.latest_rate,
+                            isolated_bytes_per_second: record.isolated,
                             wire_per_mille: record.wire_per_mille,
                             active_remaining_bytes: record
                                 .counters
@@ -395,6 +407,14 @@ impl DirectionMeter {
                             body_bytes: record.counters.bytes.load(Ordering::Relaxed),
                         },
                     )
+                })
+                .collect(),
+            independent: self
+                .independent
+                .values()
+                .filter(|evidence| evidence.count >= 3)
+                .map(|evidence| ConcurrentCapacity {
+                    rates: evidence.rates.clone(),
                 })
                 .collect(),
             shared: self
@@ -428,14 +448,12 @@ impl State {
 /// One scheduler-wide meter across all authenticated native body transfers.
 /// Byte accounting is per-peer and atomic; no global lock during I/O.
 pub struct NetworkMeter {
-    gate: Arc<IdleGate>,
     state: Mutex<State>,
 }
 
 impl Default for NetworkMeter {
     fn default() -> Self {
         Self {
-            gate: Arc::new(IdleGate::default()),
             state: Mutex::new(State {
                 last_sample: Instant::now(),
                 send: DirectionMeter::default(),
@@ -446,12 +464,6 @@ impl Default for NetworkMeter {
 }
 
 impl NetworkMeter {
-    /// Shared idle gate for real request admission and low-priority probes.
-    #[must_use = "the same gate coordinates probes and real transfers"]
-    pub const fn idle_gate(&self) -> &Arc<IdleGate> {
-        &self.gate
-    }
-
     /// Observe encoded bytes and the logical size of a streaming body.
     /// For compressed bodies the total wire size is not known until EOF.
     pub fn meter<R>(
@@ -482,7 +494,6 @@ impl NetworkMeter {
         drop(state);
         MeteredReader {
             reader,
-            _activity: self.gate.begin(),
             counters,
             logical_size,
             exact_wire_size,
@@ -515,9 +526,8 @@ impl NetworkMeter {
     }
 }
 
-mod calibration;
-mod idle;
-pub use idle::{IdleGate, IdlePermit, ProbePayload, ProbeStream, WorkActivity};
+mod overlap;
+pub use overlap::ConcurrentCapacity;
 mod checkpoint;
 pub use checkpoint::NetworkCheckpoint;
 mod simulation;

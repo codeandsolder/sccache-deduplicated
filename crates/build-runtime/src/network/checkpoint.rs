@@ -20,12 +20,15 @@ pub struct NetworkCheckpoint {
 struct DirectionCheckpoint {
     peers: Vec<PeerCheckpoint>,
     groups: Vec<GroupCheckpoint>,
+    independent: Vec<IndependentCheckpoint>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PeerCheckpoint {
     peer: Peer,
     peak: u64,
+    isolated: u64,
+    isolated_age_secs: u64,
     wire_per_mille: u64,
     age_secs: u64,
 }
@@ -36,6 +39,12 @@ struct GroupCheckpoint {
     minimum: u64,
     maximum: u64,
     count: u8,
+    age_secs: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IndependentCheckpoint {
+    rates: Vec<(Peer, u64)>,
     age_secs: u64,
 }
 
@@ -66,8 +75,25 @@ impl DirectionCheckpoint {
                 .map(|(&peer, record)| PeerCheckpoint {
                     peer,
                     peak: record.peak,
+                    isolated: record.isolated,
+                    isolated_age_secs: now.saturating_duration_since(record.isolated_at).as_secs(),
                     wire_per_mille: record.wire_per_mille,
                     age_secs: now.saturating_duration_since(record.peak_at).as_secs(),
+                })
+                .collect(),
+            independent: direction
+                .independent
+                .values()
+                .filter(|evidence| {
+                    evidence.count >= 3 && now.saturating_duration_since(evidence.seen) <= MAX_AGE
+                })
+                .map(|evidence| IndependentCheckpoint {
+                    rates: evidence
+                        .rates
+                        .iter()
+                        .map(|(&peer, &rate)| (peer, rate))
+                        .collect(),
+                    age_secs: now.saturating_duration_since(evidence.seen).as_secs(),
                 })
                 .collect(),
             groups: direction
@@ -98,6 +124,12 @@ impl DirectionCheckpoint {
             };
             let mut record = PeerRecord::new(seen);
             record.peak = peer.peak;
+            if peer.isolated <= MAX_RATE
+                && let Some(isolated_at) = observed_at(now, elapsed, peer.isolated_age_secs)
+            {
+                record.isolated = peer.isolated;
+                record.isolated_at = isolated_at;
+            }
             record.wire_per_mille = peer.wire_per_mille;
             direction.peers.insert(peer.peer, record);
         }
@@ -124,6 +156,32 @@ impl DirectionCheckpoint {
                 },
             );
         }
+        for group in self.independent.into_iter().take(MAX_GROUPS) {
+            if group.rates.len() < 2
+                || group.rates.len() > MAX_PEERS
+                || group
+                    .rates
+                    .iter()
+                    .any(|(_, rate)| !(1..=MAX_RATE).contains(rate))
+            {
+                continue;
+            }
+            let Some(seen) = observed_at(now, elapsed, group.age_secs) else {
+                continue;
+            };
+            let rates: std::collections::BTreeMap<_, _> = group.rates.into_iter().collect();
+            if rates.len() < 2 {
+                continue;
+            }
+            direction.independent.insert(
+                rates.keys().copied().collect(),
+                super::overlap::IndependentEvidence {
+                    count: 3,
+                    rates,
+                    seen,
+                },
+            );
+        }
         direction
     }
 }
@@ -144,6 +202,8 @@ impl NetworkMeter {
             && receive.peers.is_empty()
             && send.groups.is_empty()
             && receive.groups.is_empty()
+            && send.independent.is_empty()
+            && receive.independent.is_empty()
         {
             return None;
         }

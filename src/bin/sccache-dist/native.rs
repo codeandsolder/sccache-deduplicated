@@ -33,11 +33,7 @@ pub(super) struct NativeWorker {
 }
 
 impl NativeWorker {
-    pub(super) fn new(
-        config: NativeWorkerConfig,
-        auth: String,
-        activity: &std::sync::Arc<sccache::build_runtime::IdleGate>,
-    ) -> Result<Self> {
+    pub(super) fn new(config: NativeWorkerConfig, auth: String) -> Result<Self> {
         ensure!(
             config.directory.is_absolute()
                 && config.scratch.is_absolute()
@@ -97,9 +93,6 @@ impl NativeWorker {
             Duration::from_secs(config.request_timeout_secs),
             config.max_metadata_bytes,
         )?;
-        if config.network_probe {
-            client.start_calibration(activity)?;
-        }
         Ok(Self {
             store,
             client,

@@ -67,7 +67,7 @@ pub(super) fn start(meter: &Arc<NetworkMeter>, path: PathBuf, listener: SocketAd
         .spawn(move || {
             let mut checkpoint = Instant::now();
             loop {
-                thread::sleep(Duration::from_secs(1));
+                thread::sleep(Duration::from_millis(250));
                 let Some(meter) = meter.upgrade() else {
                     break;
                 };

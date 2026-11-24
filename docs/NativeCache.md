@@ -784,7 +784,7 @@ The native cache listener meters encoded HTTP payload bytes before delivery
 to the transport or after reception from it; logical lengths are tracked
 separately. Authenticated worker addresses, client source IPs, and upstream
 package traffic have separate counters in each direction. A dedicated
-one-second sampler aggregates overlapping streams without a global lock in
+250 ms sampler aggregates overlapping streams without a global lock in
 the body read path. Long observations include transport backpressure and
 may also reflect endpoint processing or storage limitations: these are
 effective service-rate estimates, not physical interface line rates.
@@ -817,59 +817,44 @@ current incoming traffic to predicted compiler completion before adding the
 new upload demand. Send and receive constraints are independent. The
 forecast does not yet predict the arrival of other not-yet-produced results.
 
-Active memory-to-memory calibration probes are a follow-up: use them only
-when passive observations are insufficient or stale, coordinate isolated and
-selected concurrent tests, and cancel them when actual build traffic needs
-the relevant resources. The current implementation introduces no synthetic
-traffic.
+### Workload-only network calibration
 
-### Adaptive idle-time calibration
+There is no synthetic probe protocol, speculative probe payload, idle poll,
+or calibration-only download. All observations come from authenticated
+ordinary CAS traffic. Aligned directional body samples are taken every
+250 ms. Per-peer isolated throughput is recorded separately from aggregate
+effective goodput; three sustained concurrent windows are needed to infer
+contention or demonstrate no observed contention at the measured rates.
+Concurrent-only observations cannot establish isolated capacity. Successful
+no-contention observations can also answer subset questions at the same or
+lower measured rates. Higher isolated rates or conflicting shared-resource
+observations invalidate the relevant evidence. Fresh isolated and concurrent
+evidence persists in the normal network timing checkpoint.
 
-Both the scheduler and each participating worker must opt in. Example
-configuration for unmetered links:
+The scheduler first predicts the normal fastest compatible placement. If
+that placement naturally provides a useful unresolved overlap, it is used
+unchanged. Otherwise it may choose another already admissible worker to
+learn an unanswered directional concurrency relationship, subject to:
 
-```toml
-[native_cache]
-network_probe_bytes = 67108864
+- The existing transfer and the new required transfer are predicted to
+  overlap for at least 1.25 seconds. Every involved peer has a recent
+  isolated baseline. Uploads are evaluated at predicted compiler completion.
+- The alternative must require a subset of the baseline's additional input
+  content IDs, no additional predicted encoded input bytes, and no larger
+  estimated result upload. These are advisory estimates, not promises about
+  future Bloom-filter misses or transfer outcomes.
+- The alternative must have a predicted total completion time within both
+  1% and 20 ms of the normal best placement. No job or transfer waits for an
+  experiment, and known shared constraints still affect the ETA.
+- An intentionally explored directional cohort has a one-minute cooldown;
+  unanswered questions may be revisited later only if useful work offers an
+  opportunity.
 
-[native_worker]
-network_probe = true
-```
+Workers also start the largest already-required missing blobs first within
+a tree staging batch, retaining the existing bounded request concurrency
+and content verification. This reduces straggler transfers and provides
+longer useful measurement windows. No extra files are fetched for it.
 
-The scheduler setting caps each grant at 64 MiB in this example (allowed
-range 1–256 MiB). The scheduler additionally has a shared token bucket of
-16 times that cap, refilled over one hour; it reserves the entire worst-case
-cohort budget before issuing grants, including failed/preempted rounds.
-Worker participation defaults to false, and a scheduler without the byte
-budget issues no grants. Keep the probe option disabled on metered routes.
-
-Workers poll only when their local assignment gate has been idle for ten
-seconds. The scheduler also requires ten seconds without real native
-requests or streaming bodies. It grants isolated directional probes to
-workers without fresh passive or calibrated rates, then coordinated larger
-cohorts to measure shared limits. Pairwise refinement is driven by observed
-contention when larger cohorts fit. A round has a four-second join window;
-each worker gets a relative start delay, an authenticated single-use grant,
-and a byte budget sized from the available previous rate when known.
-
-Payloads are deterministic pseudorandom memory streams over the same native
-HTTP route, not CAS files. The generating side stops after two seconds or
-the byte cap; HTTP requests have a five-second timeout. Download receipts
-must match the actual server-sent byte count; isolated goodput uses the
-longer sender/receiver elapsed time. Cohort constraints use synchronized
-body observations and require a completed, non-preempted round. Probes use
-at most four spare native HTTP threads, leaving at least two for control
-traffic; a stream retains its slot until it actually closes even if its
-round expires.
-
-Any real native request/body or local job assignment invalidates the
-corresponding idle generation immediately. Streams check cancellation before
-and after every bounded read, while already buffered/socket-blocked I/O
-remains bounded by transport timeouts. No job waits for a probe to finish.
-Aborted rounds do not update the model. Calibration-only observations are
-checkpointed separately in `network-calibration.json`; they constrain
-network service estimates without modifying passive compression ratios or
-application-side processing estimates. Contradictory real traffic removes
-a synthetic shared constraint. Successful probes cool down for 30 minutes;
-unsuccessful/preempted rounds retry no sooner than one minute and remain
-subject to the global budget.
+The only learning action is a choice among real placements, or a reordering
+of real input fetches. If there is no useful opportunity, the system simply
+uses the fastest predicted placement. New jobs can always proceed normally.

@@ -21,8 +21,6 @@ use crate::build_runtime::{
 use crate::dist::JobId;
 
 mod package;
-#[cfg(feature = "dist-server")]
-pub(crate) mod probe;
 pub use package::{
     PackageAcquisition, PackageLocator, map_packages, validate_upstream_base,
     validate_upstream_name,
@@ -67,8 +65,6 @@ pub(super) struct PackagePlanRequest {
 enum Role {
     Client,
     Worker(JobId),
-    #[cfg(feature = "dist-server")]
-    Calibration,
 }
 
 /// Bounded streaming HTTP client for native result publication and retrieval.
@@ -135,8 +131,6 @@ impl NativeCacheClient {
         let (role, job) = match self.role {
             Role::Client => ("client", None),
             Role::Worker(job) => ("worker", Some(job)),
-            #[cfg(feature = "dist-server")]
-            Role::Calibration => ("worker", None),
         };
         let url = self
             .base
@@ -489,8 +483,9 @@ impl NativeCacheClient {
                     .sum::<u128>(),
                 transport.parallelism()
             );
-            let raw_missing = updated.missing().to_vec();
-            let staged = map_packages(updated.missing(), transport.parallelism(), |blob| {
+            let mut raw_missing = updated.missing().to_vec();
+            raw_missing.sort_unstable_by_key(|blob| std::cmp::Reverse(blob.size));
+            let staged = map_packages(&raw_missing, transport.parallelism(), |blob| {
                 check()?;
                 let _slot = transport.raw_slot(check)?;
                 let start = Instant::now();

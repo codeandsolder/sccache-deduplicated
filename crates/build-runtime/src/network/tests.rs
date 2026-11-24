@@ -116,6 +116,7 @@ fn fair_sharing_reallocates_capacity_when_a_transfer_finishes() {
     assert_eq!(independent.finish_times(&demands)[&b], 2.0);
     let shared = DirectionSnapshot {
         peers: BTreeMap::new(),
+        independent: Vec::new(),
         shared: vec![SharedCapacity {
             members: BTreeSet::from([a, b]),
             bytes_per_second: 100_000_000,
@@ -146,6 +147,7 @@ fn overlapping_constraints_do_not_serialise_independent_paths() {
         .collect();
     let network = DirectionSnapshot {
         peers: BTreeMap::new(),
+        independent: Vec::new(),
         shared: vec![
             SharedCapacity {
                 members: BTreeSet::from([a, b]),
@@ -207,6 +209,7 @@ fn future_arrivals_only_compete_with_remaining_bytes() {
     let demands = BTreeMap::from([(a, demand(20_000_000)), (b, demand(200_000_000))]);
     let shared = DirectionSnapshot {
         peers: BTreeMap::new(),
+        independent: Vec::new(),
         shared: vec![SharedCapacity {
             members: BTreeSet::from([a, b]),
             bytes_per_second: 100_000_000,
@@ -216,4 +219,49 @@ fn future_arrivals_only_compete_with_remaining_bytes() {
     assert!(!remaining.contains_key(&a));
     assert_eq!(remaining[&b].bytes, 180_000_000);
     assert!(shared.remaining_after(&demands, 3.0).is_empty());
+}
+
+#[test]
+fn concurrent_capacity_requires_independent_baselines_and_covers_subsets() {
+    let a = worker(1);
+    let b = worker(2);
+    let c = worker(3);
+    let members = BTreeSet::from([a, b, c]);
+    let start = Instant::now();
+    let mut meter = DirectionMeter::default();
+    for peer in [a, b, c] {
+        meter.record(peer, start);
+    }
+    let full = [(a, 100_000_000), (b, 100_000_000), (c, 100_000_000)];
+    // The first concurrent run alone cannot tell us whether it is saturated.
+    for second in 1..=5 {
+        feed(&mut meter, start + Duration::from_secs(second), &full);
+    }
+    assert!(!meter.snapshot().overlap_known(&members));
+    for (index, peer) in [a, b, c].into_iter().enumerate() {
+        for second in 0..3 {
+            feed(
+                &mut meter,
+                start + Duration::from_secs(6 + 3 * index as u64 + second),
+                &[(peer, 100_000_000)],
+            );
+        }
+    }
+    for second in 15..=18 {
+        feed(&mut meter, start + Duration::from_secs(second), &full);
+    }
+    let measured = meter.snapshot();
+    assert!(measured.shared.is_empty());
+    assert!(measured.overlap_known(&members));
+    assert!(measured.overlap_known(&BTreeSet::from([a, b])));
+    assert!(!measured.overlap_known(&BTreeSet::from([a, worker(4)])));
+    // Faster isolated rates can make the old experiment uninformative.
+    for second in 19..=22 {
+        feed(
+            &mut meter,
+            start + Duration::from_secs(second),
+            &[(a, 200_000_000)],
+        );
+    }
+    assert!(!meter.snapshot().overlap_known(&members));
 }
