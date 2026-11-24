@@ -1156,13 +1156,14 @@ impl NativeStore {
                     "conflicting native action fingerprint"
                 );
                 if stored.result == result {
+                    let published = Published {
+                        action,
+                        result,
+                        new_action: false,
+                    };
                     if self.blobs_present(&blobs)? {
                         self.inner.lock_pins()?.touch(space::Root::Action(action));
-                        return Ok(Published {
-                            action,
-                            result,
-                            new_action: false,
-                        });
+                        return Ok(published);
                     }
                     // A physically incomplete indexed result can be repaired
                     // in place without changing its references or accounting.
@@ -1177,15 +1178,7 @@ impl NativeStore {
                     drop(result_actions);
                     drop(results);
                     drop(actions);
-                    return self.commit_result(
-                        write,
-                        staged_reservations,
-                        Published {
-                            action,
-                            result,
-                            new_action: false,
-                        },
-                    );
+                    return self.commit_result(write, staged_reservations, published);
                 }
                 // A fresh build may replace an unavailable result; ordinary
                 // reuse must still never overwrite a complete result.

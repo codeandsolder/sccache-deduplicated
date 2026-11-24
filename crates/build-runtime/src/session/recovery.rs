@@ -80,13 +80,15 @@ impl RecoveryQueue {
     }
 
     fn take(&self, wait: Duration) -> Result<Option<RecoveryJob>> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("result recovery queue poisoned"))?;
         let (mut state, _) = self
             .wake
-            .wait_timeout_while(state, wait, |state| state.jobs.is_empty())
+            .wait_timeout_while(
+                self.state
+                    .lock()
+                    .map_err(|_| anyhow!("result recovery queue poisoned"))?,
+                wait,
+                |state| state.jobs.is_empty(),
+            )
             .map_err(|_| anyhow!("result recovery queue poisoned"))?;
         let job = state.jobs.pop_front();
         if let Some(job) = &job {

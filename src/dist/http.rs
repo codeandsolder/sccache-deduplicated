@@ -22,6 +22,8 @@ pub use self::server::{
 };
 
 pub(crate) mod transport;
+#[cfg(feature = "dist-client")]
+mod worker_trust;
 
 mod common {
     use reqwest::header;
@@ -628,7 +630,9 @@ mod server {
         }
     }
 
-    fn create_https_cert_and_privkey(addr: SocketAddr) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    pub(super) fn create_https_cert_and_privkey(
+        addr: SocketAddr,
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
         let rsa_key = openssl::rsa::Rsa::<openssl::pkey::Private>::generate(2048)
             .context("failed to generate rsa privkey")?;
         let privkey_pem = rsa_key
@@ -1169,7 +1173,7 @@ mod server {
                 native_cache,
             } = self;
             let requester = Arc::new(SchedulerRequester {
-                client: Mutex::new(transport::blocking_client(Vec::new())?),
+                clients: Mutex::default(),
             });
             let server_certificates =
                 Arc::new(Mutex::new(HashMap::<ServerId, (Vec<u8>, Vec<u8>)>::new()));
@@ -1269,7 +1273,7 @@ mod server {
             }
 
             fn maybe_update_certs(
-                client: &mut reqwest::blocking::Client,
+                clients: &mut HashMap<ServerId, reqwest::blocking::Client>,
                 certs: &mut HashMap<ServerId, (Vec<u8>, Vec<u8>)>,
                 server_id: ServerId,
                 cert_digest: Vec<u8>,
@@ -1277,6 +1281,7 @@ mod server {
             ) -> Result<()> {
                 if let Some((saved_cert_digest, _)) = certs.get(&server_id)
                     && saved_cert_digest == &cert_digest
+                    && clients.contains_key(&server_id)
                 {
                     return Ok(());
                 }
@@ -1284,16 +1289,9 @@ mod server {
                     "Adding new certificate for {} to scheduler",
                     server_id.addr()
                 );
-                let roots = transport::certificate_roots(
-                    &cert_pem,
-                    certs
-                        .iter()
-                        .filter(|(id, _)| **id != server_id)
-                        .map(|(_, (_, pem))| pem.as_slice()),
-                )?;
-                let new_client = transport::blocking_client(roots)?;
-                // Use the updated certificates
-                *client = new_client;
+                let certificate = transport::verified_worker_certificate(&cert_digest, &cert_pem)?;
+                let new_client = transport::pinned_blocking_client(certificate)?;
+                clients.insert(server_id, new_client);
                 certs.insert(server_id, (cert_digest, cert_pem));
                 Ok(())
             }
@@ -1324,6 +1322,7 @@ mod server {
                         prepare_response(request, &res)
                     },
                     (GET) (/api/v1/scheduler/server_certificate/{server_id: ServerId}) => {
+                        if let Err(response) = authenticate_client(request, &*check_client_auth) { return response; }
                         let certs = {
                             let guard = try_or_500_log!(
                                 req_id,
@@ -1378,7 +1377,7 @@ mod server {
                         let mut requester_client = try_or_500_log!(
                             req_id,
                             requester
-                                .client
+                                .clients
                                 .lock()
                                 .map_err(|_| anyhow!("scheduler HTTP client mutex poisoned"))
                         );
@@ -1393,6 +1392,8 @@ mod server {
                             &mut certs,
                             server_id, cert_digest, cert_pem
                         ));
+                        drop(certs);
+                        drop(requester_client);
                         let worker_name_nonce = server_nonce.clone();
                         let res: HeartbeatServerResult = try_or_500_log!(req_id, handler.handle_heartbeat_server(
                             server_id, server_nonce,
@@ -1451,7 +1452,7 @@ mod server {
     }
 
     struct SchedulerRequester {
-        client: Mutex<reqwest::blocking::Client>,
+        clients: Mutex<HashMap<ServerId, reqwest::blocking::Client>>,
     }
 
     impl dist::SchedulerOutgoing for SchedulerRequester {
@@ -1467,11 +1468,14 @@ mod server {
                 JobAssignment::Native(_) => urls::server_assign_native_job(server_id, job_id)?,
             };
             let req = {
-                let client = self
-                    .client
+                let clients = self
+                    .clients
                     .lock()
                     .map_err(|_| anyhow!("scheduler HTTP client mutex poisoned"))?;
-                client.post(url)
+                clients
+                    .get(&server_id)
+                    .context("worker TLS pin unavailable")?
+                    .post(url)
             };
             let req = req.bearer_auth(auth).timeout(ASSIGN_JOB_TIMEOUT);
             let req = match assignment {
@@ -1593,12 +1597,12 @@ mod server {
             let job_authorizer = JWTJobAuthorizer::boxed(&jwt_key)?;
             let heartbeat_url = urls::scheduler_heartbeat_server(&scheduler_url)?;
             let requester = Arc::new(ServerRequester {
-                client: transport::blocking_client(Vec::new())?,
+                client: transport::blocking_client()?,
                 scheduler_url,
                 scheduler_auth: scheduler_auth.clone(),
             });
 
-            let heartbeat_client = transport::blocking_client(Vec::new())?;
+            let heartbeat_client = transport::blocking_client()?;
             // TODO: detect if this panics
             thread::spawn(move || {
                 let client = heartbeat_client;
@@ -1940,12 +1944,12 @@ mod client {
     use std::time::{Duration, Instant};
 
     use super::common::{
-        AllocJobHttpResponse, ReqwestRequestBuilderExt, RunJobHttpRequest,
-        ServerCertificateHttpResponse, WorkerNameHttpResponse,
+        AllocJobHttpResponse, ReqwestRequestBuilderExt, RunJobHttpRequest, WorkerNameHttpResponse,
     };
     use super::transport::{self, RequestClass, send_async};
     use super::urls;
-    use crate::errors::{Context, Result, anyhow};
+    use super::worker_trust::WorkerTrustCache;
+    use crate::errors::{Context, Result};
 
     const WORKER_NAME_CACHE_TTL: Duration = Duration::from_secs(300);
     const WORKER_NAME_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -1955,12 +1959,11 @@ mod client {
     pub struct Client {
         auth_token: String,
         scheduler_url: reqwest::Url,
-        // cert_digest -> cert_pem
-        server_certs: Arc<Mutex<HashMap<Vec<u8>, Vec<u8>>>>,
+        worker_trust: WorkerTrustCache,
         // server_id -> (optional display name, lookup time). Successful names are
         // stable for a server identity; negative/legacy results are retried later.
         server_names: Arc<Mutex<WorkerNameCache>>,
-        http: Arc<Mutex<reqwest::Client>>,
+        http: reqwest::Client,
         pool: tokio::runtime::Handle,
         tc_cache: Arc<cache::ClientToolchains>,
         rewrite_includes_only: bool,
@@ -1981,40 +1984,22 @@ mod client {
             auth_token: String,
             rewrite_includes_only: bool,
         ) -> Result<Self> {
-            let client = transport::async_client(Vec::new())?;
+            let client = transport::async_client()?;
+            let worker_trust =
+                WorkerTrustCache::new(client.clone(), scheduler_url.clone(), auth_token.clone());
             let client_toolchains =
                 cache::ClientToolchains::new(cache_dir, cache_size, toolchain_configs)
                     .context("failed to initialise client toolchains")?;
             Ok(Self {
                 auth_token,
                 scheduler_url,
-                server_certs: Arc::default(),
+                worker_trust,
                 server_names: Arc::default(),
-                http: Arc::new(Mutex::new(client)),
+                http: client,
                 pool: pool.clone(),
                 tc_cache: Arc::new(client_toolchains),
                 rewrite_includes_only,
             })
-        }
-
-        fn update_certs(
-            client: &mut reqwest::Client,
-            certs: &mut HashMap<Vec<u8>, Vec<u8>>,
-            cert_digest: Vec<u8>,
-            cert_pem: Vec<u8>,
-        ) -> Result<()> {
-            let roots = transport::certificate_roots(
-                &cert_pem,
-                certs
-                    .iter()
-                    .filter(|(digest, _)| **digest != cert_digest)
-                    .map(|(_, pem)| pem.as_slice()),
-            )?;
-            let new_client_async = transport::async_client(roots)?;
-            // Use the updated certificates
-            *client = new_client_async;
-            certs.insert(cert_digest, cert_pem);
-            Ok(())
         }
     }
 
@@ -2023,17 +2008,11 @@ mod client {
         async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
             let scheduler_url = self.scheduler_url.clone();
             let url = urls::scheduler_alloc_job(&scheduler_url)?;
-            let mut req = {
-                let client = self
-                    .http
-                    .lock()
-                    .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
-                client.post(url)
-            };
-            req = req.bearer_auth(self.auth_token.clone()).bincode(&tc)?;
-
-            let http_client = self.http.clone();
-            let server_certs = self.server_certs.clone();
+            let req = self
+                .http
+                .post(url)
+                .bearer_auth(&self.auth_token)
+                .bincode(&tc)?;
 
             match send_async(req, RequestClass::Control).await? {
                 AllocJobHttpResponse::Success {
@@ -2041,60 +2020,13 @@ mod client {
                     need_toolchain,
                     cert_digest,
                 } => {
-                    let server_id = job_alloc.server_id;
-                    let alloc_job_res = Ok(AllocJobResult::Success {
+                    self.worker_trust
+                        .allocation(job_alloc.server_id, &cert_digest)
+                        .await?;
+                    Ok(AllocJobResult::Success {
                         job_alloc,
                         need_toolchain,
-                    });
-                    let has_certificate = server_certs
-                        .lock()
-                        .map_err(|_| anyhow!("server certificate mutex poisoned"))?
-                        .contains_key(&cert_digest);
-                    if has_certificate {
-                        return alloc_job_res;
-                    }
-                    info!(
-                        "Need to request new certificate for server {}",
-                        server_id.addr()
-                    );
-                    let url = urls::scheduler_server_certificate(&scheduler_url, server_id)?;
-                    let req = {
-                        let client = http_client
-                            .lock()
-                            .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
-                        client.get(url)
-                    };
-                    let res: ServerCertificateHttpResponse = send_async(req, RequestClass::Control)
-                        .await
-                        .context("GET to scheduler server_certificate failed")?;
-
-                    // TODO: Move to asynchronous reqwest client only.
-                    // This function internally builds a blocking reqwest client;
-                    // However, it does so by utilizing a runtime which it drops,
-                    // triggering (rightfully) a sanity check that prevents from
-                    // dropping a runtime in asynchronous context.
-                    // For the time being, we work around this by off-loading it
-                    // to a dedicated blocking-friendly thread pool.
-                    self.pool
-                        .spawn_blocking(move || -> Result<()> {
-                            let mut client = http_client
-                                .lock()
-                                .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
-                            let mut certs = server_certs
-                                .lock()
-                                .map_err(|_| anyhow!("server certificate mutex poisoned"))?;
-                            Self::update_certs(
-                                &mut client,
-                                &mut certs,
-                                res.cert_digest,
-                                res.cert_pem,
-                            )
-                            .context("failed to update server certificates")
-                        })
-                        .await
-                        .context("certificate update task failed")??;
-
-                    alloc_job_res
+                    })
                 }
                 AllocJobHttpResponse::Fail { msg } => Ok(AllocJobResult::Fail { msg }),
             }
@@ -2126,13 +2058,7 @@ mod client {
                     return fallback;
                 }
             };
-            let req = {
-                let Ok(client) = self.http.lock() else {
-                    debug!("HTTP client mutex poisoned during worker-name lookup");
-                    return fallback;
-                };
-                client.get(url).bearer_auth(self.auth_token.clone())
-            };
+            let req = self.http.get(url).bearer_auth(&self.auth_token);
 
             let checked_at = Instant::now();
             match send_async::<WorkerNameHttpResponse>(req, RequestClass::WorkerName).await {
@@ -2159,13 +2085,7 @@ mod client {
         async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
             let scheduler_url = self.scheduler_url.clone();
             let url = urls::scheduler_status(&scheduler_url)?;
-            let req = {
-                let client = self
-                    .http
-                    .lock()
-                    .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
-                client.get(url)
-            };
+            let req = self.http.get(url);
             send_async(req, RequestClass::Control).await
         }
 
@@ -2174,25 +2094,26 @@ mod client {
             job_alloc: JobAlloc,
             tc: Toolchain,
         ) -> Result<SubmitToolchainResult> {
-            match self.tc_cache.get_toolchain(&tc) {
-                Ok(Some(toolchain_file)) => {
-                    let url = urls::server_submit_toolchain(job_alloc.server_id, job_alloc.job_id)?;
-                    let req = {
-                        let client = self
-                            .http
-                            .lock()
-                            .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
-                        client.post(url)
-                    };
-                    let toolchain_file = tokio::fs::File::from_std(toolchain_file.into());
-                    let toolchain_file_stream = tokio_util::io::ReaderStream::new(toolchain_file);
-                    let body = Body::wrap_stream(toolchain_file_stream);
-                    let req = req.bearer_auth(job_alloc.auth).body(body);
-                    send_async(req, RequestClass::ToolchainUpload).await
-                }
-                Ok(None) => Err(anyhow!("couldn't find toolchain locally")),
-                Err(e) => Err(e),
-            }
+            let url = urls::server_submit_toolchain(job_alloc.server_id, job_alloc.job_id)?;
+            self.worker_trust
+                .send(
+                    job_alloc.server_id,
+                    RequestClass::ToolchainUpload,
+                    |client| {
+                        let toolchain_file = self
+                            .tc_cache
+                            .get_toolchain(&tc)?
+                            .context("couldn't find toolchain locally")?;
+                        let stream = tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(
+                            toolchain_file.into(),
+                        ));
+                        Ok(client
+                            .post(url.clone())
+                            .bearer_auth(&job_alloc.auth)
+                            .body(Body::wrap_stream(stream)))
+                    },
+                )
+                .await
         }
 
         async fn do_run_job(
@@ -2238,15 +2159,17 @@ mod client {
                 })
                 .await??;
             crate::server::activity::phase(crate::server::activity::Phase::RunDistributed);
-            let mut req = {
-                let client = self
-                    .http
-                    .lock()
-                    .map_err(|_| anyhow!("HTTP client mutex poisoned"))?;
-                client.post(url)
-            };
-            req = req.bearer_auth(job_alloc.auth.clone()).bytes(body);
-            send_async(req, RequestClass::BuildResult).await
+            let body = bytes::Bytes::from(body);
+            self.worker_trust
+                .send(job_alloc.server_id, RequestClass::BuildResult, |client| {
+                    Ok(client
+                        .post(url.clone())
+                        .bearer_auth(&job_alloc.auth)
+                        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                        .header(reqwest::header::CONTENT_LENGTH, body.len())
+                        .body(body.clone()))
+                })
+                .await
         }
 
         async fn put_toolchain(

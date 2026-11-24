@@ -251,6 +251,7 @@ dist-client = [
 # Enables the sccache-dist binary
 dist-server = [
   "native-store",
+  "sha2",
   "url/serde",
   "jwt",
   "zlib-rs-fast",
