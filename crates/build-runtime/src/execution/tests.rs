@@ -160,6 +160,7 @@ fn shell_output_fixture(
         },
         mounts: BTreeMap::new(),
         command: CommandSpec {
+            umask: 0o022,
             executable: BuildPath::new(b"/bin/sh".to_vec())?,
             arguments: vec![b"-c".to_vec(), script.to_vec()],
             cwd: BuildPath::new(b"/src".to_vec())?,
@@ -343,6 +344,7 @@ fn executes_from_content_addressed_inputs_and_captures_outputs_without_archives(
         platform, root: ExecutionRoot { id: root, recipe: TreeRecipe::union(metadata(0o755), [root]) },
         mounts: BTreeMap::from([(BuildPath::new(b"/src".to_vec())?, src)]),
         command: CommandSpec {
+            umask: 0o022,
             executable: BuildPath::new(b"/bin/sh".to_vec())?,
             arguments: vec![b"-c".to_vec(), b"IFS= read -r word < /src/input; printf '%s' \"$word\" > /out/nested/object; printf 'diagnostic' >&2".to_vec()],
             cwd: BuildPath::new(b"/src".to_vec())?,
@@ -558,6 +560,7 @@ fn rejects_symlink_and_fifo_outputs_without_following_or_blocking() -> Result<()
         },
         mounts: BTreeMap::new(),
         command: CommandSpec {
+            umask: 0o022,
             executable: BuildPath::new(b"/bin/sh".to_vec())?,
             arguments: Vec::new(),
             cwd: BuildPath::new(b"/".to_vec())?,

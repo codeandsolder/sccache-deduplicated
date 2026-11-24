@@ -1352,6 +1352,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
         )?,
         mounts: BTreeMap::new(),
         command: CommandSpec {
+            umask: 0o022,
             executable: BuildPath::new(b"/usr/bin/as".to_vec())?,
             arguments: [b"-o".as_slice(), b"object.o", b"/src/input.s"]
                 .map(<[u8]>::to_vec)
@@ -1790,6 +1791,7 @@ fn run_worker_only_inputs(peer_source: bool) -> Result<()> {
         )?,
         mounts: BTreeMap::new(),
         command: CommandSpec {
+            umask: 0o022,
             executable: BuildPath::new(b"/usr/bin/as".to_vec())?,
             arguments: [b"-o".as_slice(), b"object.o", b"/src/input.s"]
                 .map(<[u8]>::to_vec)

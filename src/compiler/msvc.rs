@@ -1268,6 +1268,7 @@ fn generate_compile_commands(
         );
 
         Some(dist::CompileCommand {
+            umask: crate::util::current_umask(),
             executable: path_transformer.as_dist(executable)?,
             arguments,
             env_vars: dist::osstring_tuples_to_strings(env_vars)?,

@@ -2,6 +2,7 @@
 # Run only on a disposable Linux CI runner, through sudo. The managed fleet
 # must not be touched. The optional JSON file supplies native distribution.
 set -euo pipefail
+umask 022
 
 binary=${1:?sccache test binary required}
 dist=${2:-}
@@ -87,6 +88,22 @@ user_client /usr/bin/gcc -c probe.c -o probe.o
 [[ $(stat -c '%u:%g' probe.o) == "$uid:$gid" ]]
 [[ $(sha256sum probe.o | cut -d' ' -f1) == "$reference" ]]
 
+# Different masks must produce distinct entries, including on the remote
+# worker. A hit must preserve the exact restrictive output mode.
+rm probe.o
+before=$(stats | jq '.stats.cache_hits.counts | [.[]] | add // 0')
+(umask 077; user_client /usr/bin/gcc -c probe.c -o probe.o)
+[[ $(stat -c '%a' probe.o) == 600 ]]
+[[ $(stat -c '%u:%g' probe.o) == "$uid:$gid" ]]
+[[ $(sha256sum probe.o | cut -d' ' -f1) == "$reference" ]]
+after=$(stats | jq '.stats.cache_hits.counts | [.[]] | add // 0')
+(( after == before ))
+rm probe.o
+(umask 077; user_client /usr/bin/gcc -c probe.c -o probe.o)
+[[ $(stat -c '%a' probe.o) == 600 ]]
+after=$(stats | jq '.stats.cache_hits.counts | [.[]] | add // 0')
+(( after == before + 1 ))
+
 # A root-private source is available to root, not to the ordinary caller.
 cd "$root/root-private"
 printf 'int root_private_value(void) { return 7; }\n' > private.c
@@ -122,6 +139,82 @@ awk -v uid="$uid" -v parent="$server_pid" '
     END { exit bad || NR == 0 }
 ' ancestry
 [[ $(stat -c '%u' wrapper.o) == "$uid" ]]
+
+# Overlap local root and ordinary-user compiler execution. Each actual
+# invocation must rendezvous with the other before returning. Discovery
+# probes and preprocessing do not participate.
+if [[ -z $dist ]]; then
+    cat > concurrent-wrapper <<'WRAPPER'
+#!/bin/sh
+case " $* " in
+    *" -c "*parallel-a.o*) touch parallel-a.started ;;
+    *" -c "*parallel-b.o*) touch parallel-b.started ;;
+    *) exec /usr/bin/gcc "$@" ;;
+esac
+for i in $(seq 1 200); do
+    if [ -e parallel-a.started ] && [ -e parallel-b.started ]; then
+        exec /usr/bin/gcc "$@"
+    fi
+    sleep .05
+done
+exit 1
+WRAPPER
+    chmod 755 concurrent-wrapper
+    chown "$uid:$gid" concurrent-wrapper
+    printf 'int parallel_a(void) { return 1; }\n' > parallel-a.c
+    printf 'int parallel_b(void) { return 2; }\n' > parallel-b.c
+    chown "$uid:$gid" parallel-*.c
+    client "$root/user-private/concurrent-wrapper" -c parallel-a.c -o parallel-a.o &
+    a=$!
+    user_client "$root/user-private/concurrent-wrapper" -c parallel-b.c -o parallel-b.o &
+    b=$!
+    wait "$a"
+    wait "$b"
+    [[ $(stat -c '%u' parallel-a.o) == 0 ]]
+    [[ $(stat -c '%u' parallel-b.o) == "$uid" ]]
+
+    # Cancel an accepted server-owned compile by disconnecting its caller.
+    # The daemon must terminate the whole compiler group and remain usable.
+    cat > cancel-wrapper <<'WRAPPER'
+#!/bin/sh
+case " $* " in
+    *" -c "*cancel.o*)
+        printf '%s\n' "$$" > cancel.started
+        sleep 60
+        ;;
+esac
+exec /usr/bin/gcc "$@"
+WRAPPER
+    chmod 755 cancel-wrapper
+    chown "$uid:$gid" cancel-wrapper
+    printf 'int cancelled(void) { return 3; }\n' > cancel.c
+    chown "$uid:$gid" cancel.c
+    setpriv --reuid "$uid" --regid "$gid" --groups "$gid" -- \
+        env -i PATH=/usr/bin:/bin HOME="$root/user-private" SCCACHE_CONF="$root/client.toml" \
+        SCCACHE_SERVER_UDS="$root/service.sock" SCCACHE_NO_AUTO_START_SERVER=1 \
+        "$root/sccache" "$root/user-private/cancel-wrapper" -c cancel.c -o cancel.o &
+    caller=$!
+    for ((i=0; i<200; i++)); do
+        [[ -s cancel.started ]] && break
+        kill -0 "$caller"
+        sleep .05
+    done
+    [[ -s cancel.started ]]
+    compiler_pid=$(cat cancel.started)
+    kill "$caller"
+    wait "$caller" || true
+    for ((i=0; i<200; i++)); do
+        [[ ! -r /proc/$compiler_pid/stat ]] && break
+        [[ $(awk '{print $3}' "/proc/$compiler_pid/stat" 2>/dev/null || true) == Z ]] && break
+        sleep .05
+    done
+    if [[ -r /proc/$compiler_pid/stat ]]; then
+        [[ $(awk '{print $3}' "/proc/$compiler_pid/stat" 2>/dev/null || true) == Z ]]
+    fi
+    [[ ! -e cancel.o ]]
+    user_client /usr/bin/gcc -c cancel.c -o aftercancel.o
+    [[ $(stat -c '%u' aftercancel.o) == "$uid" ]]
+fi
 
 # Socket group membership alone is insufficient. An ordinary authorized UID
 # also cannot use administrative or raw namespace/client-side compile RPCs.

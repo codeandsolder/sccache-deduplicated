@@ -381,6 +381,9 @@ impl CompilerPlan {
             root,
             mounts: BTreeMap::new(),
             command: CommandSpec {
+                umask: command
+                    .umask
+                    .context("native execution requires a known process umask")?,
                 executable: BuildPath::new(command.executable.into_bytes())?,
                 arguments: command
                     .arguments

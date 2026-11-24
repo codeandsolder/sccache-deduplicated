@@ -3879,6 +3879,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             let sysroot_executable = sysroot.join(BINS_DIR).join(executable.file_name()?);
 
             Some(dist::CompileCommand {
+                umask: crate::util::current_umask(),
                 executable: path_transformer.as_dist(&sysroot_executable)?,
                 arguments: dist_arguments,
                 env_vars,

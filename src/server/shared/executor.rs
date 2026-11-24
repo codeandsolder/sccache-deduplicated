@@ -189,6 +189,7 @@ pub(super) fn run() -> Result<()> {
     let mut input = io::stdin().lock();
     let credentials: Credentials = read_frame(&mut input)?;
     assume(&credentials, &mount, &root)?;
+    crate::util::initialize_shared_umask(credentials.umask)?;
     drop(mount);
     drop(root);
     // Only now is the user-provided compiler request decoded.

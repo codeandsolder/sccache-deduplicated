@@ -82,6 +82,9 @@ executor, reproduces the caller's mount view, root, supplementary groups and
 umask, and drops to the kernel-authenticated caller credentials before
 compiler detection, preprocessing, local compilation or materialization.
 The executor uses a private IPC channel for cache and scheduler operations.
+The creation mask is part of both legacy and native Linux cache identity,
+and is carried to isolated remote execution. Cache hits do not reuse
+outputs captured with a different creation mask.
 
 The server requires Linux 6.5+ (SO_PEERPIDFD), a root-owned non-setuid binary,
 a pathname Unix socket under canonical root-owned non-writable directories,

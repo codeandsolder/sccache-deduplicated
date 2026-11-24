@@ -61,6 +61,7 @@ fn assignment(marker: u8) -> Result<NativeAssignment> {
             },
             mounts: BTreeMap::new(),
             command: CommandSpec {
+                umask: 0o022,
                 executable: BuildPath::new(b"/bin/tool".to_vec())?,
                 arguments: Vec::new(),
                 cwd: BuildPath::new(b"/".to_vec())?,
