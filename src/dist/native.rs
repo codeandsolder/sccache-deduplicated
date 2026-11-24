@@ -328,6 +328,10 @@ impl NativeCacheClient {
         self.control("input_demands", &ticket)
     }
 
+    fn input_unavailable(&self, ticket: Ticket, blob: BlobRef) -> Result<()> {
+        self.control("input_unavailable", &UploadHeader { ticket, blob })
+    }
+
     pub(super) fn backfill_input(
         &self,
         ticket: Ticket,

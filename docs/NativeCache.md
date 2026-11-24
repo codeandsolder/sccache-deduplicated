@@ -36,14 +36,27 @@ Assignments include the exact input blob identities and lengths. The worker
 pins resident input content at assignment, including partial trees, and
 acquires only missing content before taking a compiler slot. The scheduler
 serves available blobs directly; a missing blob registers a shared backfill
-flight and returns HTTP 202 while an eligible submitting client provides it.
-Claims are bounded by upload concurrency and can transfer to another active
-origin if the first one disappears. Downloads and origin uploads verify the
-exact length and digest. Individual verified acquisitions survive failures
-of other blobs, use the same deduplicated store, and remain pinned during
-staging. Indexed trees with missing payloads are repaired rather than
-requiring an entirely new tree. A stale residency prediction therefore
-requires only acquisition of the missing content, not a new assignment.
+flight and returns HTTP 202 while a source is selected. A bounded peer-source
+pool first tries workers whose latest residency summary predicts the blob.
+The peer uses a separate expiring HTTPS capability bound to the exact digest
+and length (not a compilation job token), with its registered certificate.
+A short discovery window and bounded source-probe deadlines prevent a stale
+hint or a busy peer service from indefinitely delaying the original client.
+If no peer provides the bytes, the scheduler requests them from an active
+submitting client; claims share the global upload budget. An origin that
+cannot reopen its source can decline the demand, allowing another declared
+source tree, live origin, or another peer lookup to satisfy the same flight.
+Neither peer lookup nor backfill consumes a compiler slot.
+
+All incoming bytes are length- and digest-verified before publication.
+Individual verified acquisitions survive failures of other blobs, use the
+same deduplicated store, and remain pinned during staging. Interrupted or
+truncated input downloads retry that blob under the existing deadline.
+Indexed trees with missing payloads are repaired rather than requiring an
+entirely new tree; pending-GC content remains usable until actually removed.
+A stale residency prediction therefore requires only acquisition of the
+missing content, not a new assignment. Results still publish to the scheduler
+CAS; action-result discovery from peer caches is a separate operation.
 
 Workers compose the recipe directly in memory from the leased constituent
 manifests, including their selected subtrees and logical destinations.
@@ -309,8 +322,10 @@ In client-side mode, the caller needs only
 The daemon supplies the platform and resource policy in its namespace
 handshake; endpoint URLs, authentication and job capabilities remain private.
 The native action transaction runs in the daemon, requesting manifests and
-missing blobs over a connection-owned bounded byte stream. The caller alone
-discovers sources and installs outputs. The daemon verifies scheduler result
+missing blobs over a connection-owned bounded byte stream. A blob request is
+authorized against the caller's prepared manifest even when the scheduler
+already knows that manifest; a source availability reply precedes its bytes.
+The caller alone discovers sources and installs outputs. The daemon verifies scheduler result
 streams, the caller independently verifies them, and final completion
 precedes publication. No client or daemon archive staging is required.
 The stream has bounded queues, frame limits and an absolute deadline;

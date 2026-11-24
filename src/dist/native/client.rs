@@ -47,7 +47,7 @@ pub struct NativeBuildResult {
 
 pub(super) trait InputProvider {
     fn manifest(&mut self, tree: TreeId) -> Result<TreeManifest>;
-    fn open_blob(&mut self, tree: TreeId, blob: BlobRef) -> Result<Box<dyn Read + Send>>;
+    fn open_blob(&mut self, tree: TreeId, blob: BlobRef) -> Result<Option<Box<dyn Read + Send>>>;
 }
 
 pub(super) struct LocalInputs<'a>(BTreeMap<TreeId, &'a PreparedTree>);
@@ -71,6 +71,20 @@ impl<'a> LocalInputs<'a> {
             .copied()
             .context("scheduler requested undeclared input tree")
     }
+
+    pub(super) fn open_source(
+        &self,
+        tree: TreeId,
+        blob: BlobRef,
+    ) -> Result<Option<Box<dyn Read + Send>>> {
+        match self.tree(tree)?.open_blob(blob.id) {
+            Ok(reader) => Ok(Some(reader)),
+            Err(error) => {
+                debug!("native origin cannot supply {blob:?}: {error:#}");
+                Ok(None)
+            }
+        }
+    }
 }
 
 impl InputProvider for LocalInputs<'_> {
@@ -78,8 +92,8 @@ impl InputProvider for LocalInputs<'_> {
         Ok(self.tree(tree)?.manifest().clone())
     }
 
-    fn open_blob(&mut self, tree: TreeId, blob: BlobRef) -> Result<Box<dyn Read + Send>> {
-        self.tree(tree)?.open_blob(blob.id)
+    fn open_blob(&mut self, tree: TreeId, blob: BlobRef) -> Result<Option<Box<dyn Read + Send>>> {
+        self.open_source(tree, blob)
     }
 }
 
@@ -301,11 +315,11 @@ impl NativeCacheClient {
                             request.input_trees.contains(&demand.tree),
                             "scheduler requested undeclared tree"
                         );
-                        self.backfill_input(
-                            pin.ticket,
-                            demand.blob,
-                            inputs.open_blob(demand.tree, demand.blob)?,
-                        )?;
+                        if let Some(reader) = inputs.open_blob(demand.tree, demand.blob)? {
+                            self.backfill_input(pin.ticket, demand.blob, reader)?;
+                        } else {
+                            self.input_unavailable(pin.ticket, demand.blob)?;
+                        }
                     }
                     // A nonempty batch is followed immediately by another poll.
                 }

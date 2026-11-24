@@ -468,6 +468,11 @@ fn dispatch(
         "input_demands" if publisher == Publisher::Client => {
             encode(&sessions.input_demands(metadata(request, limit)?)?, limit)
         }
+        "input_unavailable" if publisher == Publisher::Client => {
+            let UploadHeader { ticket, blob } = metadata(request, limit)?;
+            sessions.input_unavailable(ticket, blob)?;
+            encode(&(), limit)
+        }
         "backfill_input" if publisher == Publisher::Client => {
             let mut body = request.data().context("missing native backfill body")?;
             let header: UploadHeader = codec().with_limit(72).deserialize_from(&mut body)?;

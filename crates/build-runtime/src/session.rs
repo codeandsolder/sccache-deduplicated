@@ -205,6 +205,7 @@ struct PendingAction {
     permit: CompilePermit,
     inputs: BTreeMap<TreeId, Arc<InputManifest>>,
     demands: BTreeMap<ContentId, (TreeId, Arc<Backfill>)>,
+    unavailable: BTreeSet<(TreeId, ContentId)>,
     origin: Arc<()>,
     upload: Option<(ResultManifest, Transfer)>,
     allocation: Option<WorkerAllocation>,
@@ -729,6 +730,7 @@ impl NativeSessions {
                     permit,
                     inputs,
                     demands: BTreeMap::new(),
+                    unavailable: BTreeSet::new(),
                     origin: Arc::new(()),
                     upload: None,
                     allocation: None,
@@ -1423,6 +1425,9 @@ impl NativeSessions {
         // origin keeps sequential namespace streams from hoarding slots.
         let mut candidate = None;
         for (tree, flight) in action.demands.values() {
+            if action.unavailable.contains(&(*tree, flight.blob.id)) {
+                continue;
+            }
             let mut pending = flight.lock()?;
             if pending.claim.as_ref().is_some_and(|claim| !claim.live(now)) {
                 pending.claim = None;
@@ -1472,6 +1477,53 @@ impl NativeSessions {
             }
         }
         Ok(Vec::new())
+    }
+
+    /// Release a claim when the original file cannot be reopened. Other
+    /// declared source trees, live origins and peers may still satisfy it.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid ticket or unclaimed input.
+    pub fn input_unavailable(&self, ticket: Ticket, blob: BlobRef) -> Result<()> {
+        let session = self.get(ticket)?;
+        let mut state = Self::lock(&session)?;
+        self.authorize_reader(&mut state, Publisher::Client)?;
+        let Phase::Pending(pending) = &mut state.phase else {
+            return Ok(());
+        };
+        let Pending::Action(action) = &mut **pending else {
+            bail!("native action required");
+        };
+        let (tree, flight) = action
+            .demands
+            .get_mut(&blob.id)
+            .context("unrequested input unavailable")?;
+        ensure!(flight.blob == blob, "unavailable input length mismatch");
+        let mut pending = flight.lock()?;
+        ensure!(
+            pending
+                .claim
+                .as_ref()
+                .is_some_and(|claim| claim.ticket == ticket),
+            "unavailable input not claimed"
+        );
+        pending.claim = None;
+        action.unavailable.insert((*tree, blob.id));
+        if let Some((&alternate, _)) = action.inputs.iter().find(|(id, input)| {
+            input.blobs.get(&blob.id) == Some(&blob.size)
+                && !action.unavailable.contains(&(**id, blob.id))
+        }) {
+            *tree = alternate;
+        } else if !self.limits.peer_discovery_timeout.is_zero() {
+            // No origin source remains for this action. Give peer discovery
+            // another bounded chance without cancelling the queued build.
+            pending.peer_until =
+                Some(Instant::now() + Duration::from_secs(1).min(self.limits.idle_timeout));
+        }
+        drop(pending);
+        drop(state);
+        self.peer_wake.notify_all();
+        Ok(())
     }
 
     /// Backfill exactly one demanded input from its claimed origin.

@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 
 use super::{LeaseCheck, NativeBuildPolicy, NativeCacheClient, client::InputProvider};
 use crate::{
@@ -118,7 +118,10 @@ impl LocalExecutor {
         let mut staged = Vec::new();
         for &blob in reservation.missing() {
             check()?;
-            staged.push(store.stage_expected(blob, inputs.open_blob(id, blob)?)?);
+            let reader = inputs
+                .open_blob(id, blob)?
+                .context("local native input unavailable")?;
+            staged.push(store.stage_expected(blob, reader)?);
         }
         store.publish_tree_pinned(&manifest, staged)
     }

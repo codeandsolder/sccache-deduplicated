@@ -847,6 +847,10 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
         id: ContentId::of(b"origin bytes"),
         size: 12,
     };
+    let third = BlobRef {
+        id: ContentId::of(b"late peer"),
+        size: 9,
+    };
     let tree = TreeManifest {
         root,
         entries: BTreeMap::from([
@@ -861,6 +865,13 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
                 TreePath::new(b"second".to_vec())?,
                 TreeEntry::File {
                     blob: second,
+                    metadata: root,
+                },
+            ),
+            (
+                TreePath::new(b"third".to_vec())?,
+                TreeEntry::File {
+                    blob: third,
                     metadata: root,
                 },
             ),
@@ -928,6 +939,31 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
         .download(delivery, worker, second.id)?
         .read_to_end(&mut bytes)?;
     assert_eq!(bytes, b"origin bytes");
+
+    service.request_inputs(delivery, worker, vec![third])?;
+    drop(
+        service
+            .claim_peer_input(Duration::ZERO)?
+            .context("initial peer claim missing")?,
+    );
+    assert_eq!(
+        service.input_demands(ticket)?,
+        vec![InputDemand {
+            tree: id,
+            blob: third
+        }]
+    );
+    service.input_unavailable(ticket, third)?;
+    assert!(service.input_demands(ticket)?.is_empty());
+    let claim = service
+        .claim_peer_input(Duration::ZERO)?
+        .context("renewed peer claim missing")?;
+    service.publish_peer_input(claim, &b"late peer"[..])?;
+    bytes.clear();
+    service
+        .download(delivery, worker, third.id)?
+        .read_to_end(&mut bytes)?;
+    assert_eq!(bytes, b"late peer");
     assert_eq!(service.active_uploads.load(Ordering::Acquire), 0);
     service.close(delivery, worker)?;
     service.fail(ticket, worker)?;

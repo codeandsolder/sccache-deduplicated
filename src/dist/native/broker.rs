@@ -117,9 +117,10 @@ impl InputProvider for RemoteInputs<'_> {
         receive(self.stream, self.limit)
     }
 
-    fn open_blob(&mut self, tree: TreeId, blob: BlobRef) -> Result<Box<dyn Read + Send>> {
+    fn open_blob(&mut self, tree: TreeId, blob: BlobRef) -> Result<Option<Box<dyn Read + Send>>> {
         send(self.stream, &Event::NeedBlob { tree, blob }, self.limit)?;
-        Ok(Box::new(self.stream.blob_reader(blob.size)))
+        let available: bool = receive(self.stream, self.limit)?;
+        Ok(available.then(|| Box::new(self.stream.blob_reader(blob.size)) as Box<dyn Read + Send>))
     }
 }
 
@@ -270,11 +271,24 @@ fn run_inner(
                 send(stream, manifest, limit)?;
             }
             Event::NeedBlob { tree, blob } => {
+                // A manifest may already be known by the scheduler. The
+                // caller must authorize against its prepared input even if
+                // this connection never received NeedTree for that tree.
+                let blobs = match advertised.entry(tree) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(inputs.tree(tree)?.manifest().blobs()?)
+                    }
+                };
                 ensure!(
-                    advertised.get(&tree).and_then(|blobs| blobs.get(&blob.id)) == Some(&blob.size),
-                    "unadvertised native input blob"
+                    blobs.get(&blob.id) == Some(&blob.size),
+                    "undeclared native input blob"
                 );
-                let mut reader = inputs.tree(tree)?.open_blob(blob.id)?;
+                let Some(mut reader) = inputs.open_source(tree, blob)? else {
+                    send(stream, &false, limit)?;
+                    continue;
+                };
+                send(stream, &true, limit)?;
                 let mut remaining = blob.size;
                 while remaining > 0 {
                     let count = usize::try_from(remaining.min(u64::try_from(buffer.len())?))?;
