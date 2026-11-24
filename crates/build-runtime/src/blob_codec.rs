@@ -28,7 +28,7 @@ pub enum BlobEncoding {
 }
 
 impl BlobEncoding {
-    #[must_use]
+    #[must_use = "the receiver requires the physical encoding to decode transferred CAS bytes"]
     pub const fn http_value(self) -> &'static str {
         match self {
             Self::Raw => "raw",
@@ -218,17 +218,17 @@ impl BlobReader {
         })
     }
 
-    #[must_use]
+    #[must_use = "the decoded length must be validated against the logical CAS reference"]
     pub const fn len(&self) -> u64 {
         self.plain_len
     }
 
-    #[must_use]
+    #[must_use = "empty logical files are handled without attempting to load a chunk"]
     pub const fn is_empty(&self) -> bool {
         self.plain_len == 0
     }
 
-    #[must_use]
+    #[must_use = "the caller must not expose encoded physical bytes as logical content"]
     pub const fn is_encoded(&self) -> bool {
         self.encoded
     }

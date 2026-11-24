@@ -101,7 +101,7 @@ impl CapturedExecution {
         crate::BlobReader::open(self.open_file(id)?, self.encoding)
     }
 
-    #[must_use]
+    #[must_use = "result transport must advertise the physical encoding actually captured"]
     pub const fn physical_encoding(&self) -> BlobEncoding {
         self.encoding
     }
