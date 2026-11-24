@@ -93,6 +93,93 @@ fn local_filesystem_policy_and_cross_format_ingest_preserve_logical_content() ->
 }
 
 #[test]
+fn heterogeneous_zfs_and_non_zfs_stores_exchange_all_physical_encodings() -> Result<()> {
+    use crate::{TreeEntry, TreeManifest, TreeMetadata, TreePath, TreeTimestamp};
+    use std::path::Path;
+
+    if !is_native_zfs(Path::new("/home"))?
+        || !Path::new("/dev/shm").is_dir()
+        || is_native_zfs(Path::new("/dev/shm"))?
+    {
+        return Ok(());
+    }
+
+    let zfs_dir = tempfile::tempdir()?;
+    let memory_dir = tempfile::tempdir_in("/dev/shm")?;
+    let zfs = NativeStore::open(zfs_dir.path())?;
+    let non_zfs = NativeStore::open(memory_dir.path())?;
+    assert_eq!(zfs.physical_encoding(), BlobEncoding::Raw);
+    assert_eq!(non_zfs.physical_encoding(), BlobEncoding::ZstdChunks);
+    let metadata = TreeMetadata {
+        mode: 0o555,
+        modified: TreeTimestamp {
+            seconds: 1234,
+            nanoseconds: 0,
+        },
+    };
+    let mut incompressible = vec![0_u8; 525_011];
+    blake3::Hasher::new()
+        .finalize_xof()
+        .fill(&mut incompressible);
+    let corpus = [
+        b"compiler-output-with-structure".repeat(28_000),
+        incompressible,
+        b"SC-CAS-ZSTD-0002".repeat(41),
+        Vec::new(),
+    ];
+
+    // Every source-to-destination pairing, including identical backends,
+    // must produce the exact same logical content with the receiver's local
+    // physical representation. This exercises both source file descriptors
+    // and destination CAS index lookup after publication.
+    for (direction, (source, destination)) in [
+        (&zfs, &zfs),
+        (&zfs, &non_zfs),
+        (&non_zfs, &zfs),
+        (&non_zfs, &non_zfs),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (sample, original) in corpus.iter().enumerate() {
+            let source_staged = source.stage(original.as_slice())?;
+            let expected = source_staged.reference();
+            assert_eq!(expected.id, ContentId::of(original));
+            let staged = destination.stage_expected_physical(
+                expected,
+                source_staged.encoding,
+                source_staged.open_file()?,
+            )?;
+            assert_eq!(staged.reference(), expected);
+            assert_eq!(staged.encoding, destination.physical_encoding());
+            let path = TreePath::new(format!("artifact-{direction}-{sample}").into_bytes())?;
+            let manifest = TreeManifest {
+                root: metadata,
+                entries: BTreeMap::from([(
+                    path,
+                    TreeEntry::File {
+                        blob: expected,
+                        metadata,
+                    },
+                )]),
+            };
+            let id = destination.publish_tree(&manifest, vec![staged])?;
+            let lease = destination
+                .lookup_tree(id)?
+                .context("transferred CAS tree missing")?;
+            assert_eq!(
+                lease.physical_encoding(expected.id)?,
+                destination.physical_encoding()
+            );
+            let mut recovered = Vec::new();
+            lease.open_blob(expected.id)?.read_to_end(&mut recovered)?;
+            assert_eq!(&recovered, original);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn literal_magic_prefix_in_raw_cas_blob_survives_restart() -> Result<()> {
     use crate::{TreeEntry, TreeManifest, TreeMetadata, TreePath, TreeTimestamp};
     let directory = tempfile::tempdir()?;
