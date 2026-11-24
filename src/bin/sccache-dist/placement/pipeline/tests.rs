@@ -50,35 +50,41 @@ fn start(
     )
 }
 
+fn phase_assignments(
+    placement: &mut NativePlacement,
+    inputs: &NativeInputBlobs,
+    phases: impl IntoIterator<Item = (JobId, NativeJobPhase)>,
+) -> Assignments {
+    phases
+        .into_iter()
+        .map(|(id, phase)| {
+            placement
+                .queue
+                .jobs
+                .insert(id, progress(phase, Duration::ZERO, 0));
+            (
+                id,
+                Some(AssignedNative {
+                    inputs: inputs.clone(),
+                    class: None,
+                    cost: None,
+                }),
+            )
+        })
+        .collect()
+}
+
 #[test]
 fn native_pipeline_does_not_charge_publication_or_terminal_as_cpu_work() {
     let mut placement = placement();
     let inputs = NativeInputBlobs::new();
-    let assigned = Assignments::from([
-        (
-            JobId(1),
-            Some(AssignedNative {
-                inputs: inputs.clone(),
-                class: None,
-                cost: None,
-            }),
-        ),
-        (
-            JobId(2),
-            Some(AssignedNative {
-                inputs: inputs.clone(),
-                class: None,
-                cost: None,
-            }),
-        ),
-    ]);
-    placement.queue.jobs.insert(
-        JobId(1),
-        progress(NativeJobPhase::Publishing, Duration::ZERO, 0),
-    );
-    placement.queue.jobs.insert(
-        JobId(2),
-        progress(NativeJobPhase::Terminal, Duration::ZERO, 0),
+    let assigned = phase_assignments(
+        &mut placement,
+        &inputs,
+        [
+            (JobId(1), NativeJobPhase::Publishing),
+            (JobId(2), NativeJobPhase::Terminal),
+        ],
     );
     assert_eq!(start(&placement, &assigned, &inputs, 1.0), 1.0);
     placement.queue.jobs.insert(
@@ -142,31 +148,13 @@ fn native_pipeline_predicts_publication_backpressure_separately() {
     let mut placement = placement();
     placement.queue.publication_slots = 1;
     let inputs = NativeInputBlobs::new();
-    let assigned = Assignments::from([
-        (
-            JobId(1),
-            Some(AssignedNative {
-                inputs: inputs.clone(),
-                class: None,
-                cost: None,
-            }),
-        ),
-        (
-            JobId(2),
-            Some(AssignedNative {
-                inputs: inputs.clone(),
-                class: None,
-                cost: None,
-            }),
-        ),
-    ]);
-    placement.queue.jobs.insert(
-        JobId(1),
-        progress(NativeJobPhase::Publishing, Duration::ZERO, 0),
-    );
-    placement.queue.jobs.insert(
-        JobId(2),
-        progress(NativeJobPhase::AwaitingPublication, Duration::ZERO, 0),
+    let assigned = phase_assignments(
+        &mut placement,
+        &inputs,
+        [
+            (JobId(1), NativeJobPhase::Publishing),
+            (JobId(2), NativeJobPhase::AwaitingPublication),
+        ],
     );
     assert_eq!(start(&placement, &assigned, &inputs, 4.0), 2.0);
     placement.queue.publication_slots = 2;
