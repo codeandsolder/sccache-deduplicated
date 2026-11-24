@@ -184,6 +184,50 @@ fn heterogeneous_zfs_and_non_zfs_stores_exchange_all_physical_encodings() -> Res
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn mountinfo_path_preserves_all_linux_escape_sequences() -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let original = b"/tmp/space here\ttab\nline\\slash\xff";
+    let parsed = mountinfo_path(b"/tmp/space\\040here\\011tab\\012line\\134slash\xff")?;
+    assert_eq!(parsed.as_os_str().as_bytes(), original);
+    assert!(mountinfo_path(b"/tmp/\\777").is_err());
+    assert!(mountinfo_path(b"/tmp/\\09").is_err());
+    assert!(mountinfo_path(b"/tmp/\\").is_err());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn reopening_store_detaches_owned_readonly_fuse_mounts() -> Result<()> {
+    use fuser::{Filesystem, MountOption, Session};
+
+    struct EmptyFilesystem;
+    impl Filesystem for EmptyFilesystem {}
+
+    let tmp = tempfile::tempdir()?;
+    let store = NativeStore::open(tmp.path())?;
+    drop(store);
+    let parent = tmp.path().join("mounts").join("build-fuse-abandoned-test");
+    let mountpoint = parent.join("root");
+    fs::create_dir_all(&mountpoint)?;
+    let mut session = Session::new(
+        EmptyFilesystem,
+        &mountpoint,
+        &[MountOption::RO, MountOption::DefaultPermissions],
+    )?;
+    let service = thread::spawn(move || session.run());
+    // The FUSE mount is intentionally still live while reopening the store.
+    // It simulates the same persisted mountpoint as a killed worker; the Redb
+    // store lock is free, so the recovery path must reclaim the mount first.
+    let reopened = NativeStore::open(tmp.path())?;
+    assert!(!parent.exists(), "stale FUSE view was not removed");
+    drop(reopened);
+    let _ = service.join();
+    Ok(())
+}
+
 #[test]
 fn orphaned_native_views_are_reclaimed_without_following_links() -> Result<()> {
     use std::{

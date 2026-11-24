@@ -51,6 +51,105 @@ fn is_native_zfs(_path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+// Linux mountinfo encodes spaces, tabs, newlines, and backslashes with octal
+// escapes. Parse as bytes so non-UTF-8 mountpoint names remain representable.
+#[cfg(target_os = "linux")]
+fn mountinfo_path(raw: &[u8]) -> Result<PathBuf> {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    let mut decoded = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'\\' {
+            ensure!(
+                i + 3 < raw.len()
+                    && raw[i + 1..i + 4]
+                        .iter()
+                        .all(|digit| (b'0'..=b'7').contains(digit)),
+                "invalid octal escape in Linux mountinfo path"
+            );
+            let octet = u16::from(raw[i + 1] - b'0') * 64
+                + u16::from(raw[i + 2] - b'0') * 8
+                + u16::from(raw[i + 3] - b'0');
+            decoded.push(u8::try_from(octet).context("mountinfo escape exceeds one byte")?);
+            i += 4;
+        } else {
+            decoded.push(raw[i]);
+            i += 1;
+        }
+    }
+    Ok(PathBuf::from(OsStr::from_bytes(&decoded)))
+}
+
+/// Detach abandoned FUSE mounts before deleting their directories.
+///
+/// An abrupt worker exit can leave its kernel FUSE mounts in the caller's
+/// mount namespace. chmod(2) on the FUSE root then returns EROFS (even after
+/// the daemon has exited), preventing store reopening and garbage recovery.
+/// Only the store's own build-fuse-*/root mountpoints are considered. The
+/// exclusive Redb lock is held by the caller before this function runs.
+#[cfg(target_os = "linux")]
+fn detach_orphan_fuse_mounts(directory: &Path) -> Result<()> {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt, process::Command};
+
+    let mountinfo = fs::read("/proc/self/mountinfo")?;
+    let mut stale = Vec::new();
+    for line in mountinfo.split(|&byte| byte == b'\n') {
+        let Some(split) = line.windows(3).position(|window| window == b" - ") else {
+            continue;
+        };
+        let kind = line[split + 3..]
+            .split(|&byte| byte == b' ')
+            .next()
+            .unwrap_or_default();
+        if kind != b"fuse" && !kind.starts_with(b"fuse.") {
+            continue;
+        }
+        let Some(point) = line[..split].split(|&byte| byte == b' ').nth(4) else {
+            continue;
+        };
+        let mounted = mountinfo_path(point)?;
+        let Ok(relative) = mounted.strip_prefix(directory) else {
+            continue;
+        };
+        let Some(name) = relative.parent().and_then(Path::file_name) else {
+            continue;
+        };
+        if relative.file_name() != Some(OsStr::new("root"))
+            || !name.as_bytes().starts_with(b"build-fuse-")
+            || relative.components().count() != 2
+        {
+            continue;
+        }
+        stale.push(mounted);
+    }
+    stale.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for mountpoint in stale {
+        let output = Command::new("fusermount3")
+            .args(["-u", "-z"])
+            .arg(&mountpoint)
+            .output()
+            .with_context(|| {
+                format!(
+                    "invoke fusermount3 to release orphaned native CAS mount {}",
+                    mountpoint.display()
+                )
+            })?;
+        ensure!(
+            output.status.success(),
+            "could not unmount abandoned native CAS FUSE view {}: {}",
+            mountpoint.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detach_orphan_fuse_mounts(_directory: &Path) -> Result<()> {
+    Ok(())
+}
+
 // An unexpected process exit can leave native CoW tree hierarchies behind.
 // The Redb lock is already held by the caller, so no live store can own the
 // transient mounts being reclaimed. Never follow symlinks during cleanup.
@@ -69,6 +168,7 @@ fn clean_orphan_mounts(directory: &Path) -> Result<()> {
         }
         Ok(())
     }
+    detach_orphan_fuse_mounts(directory)?;
     for entry in fs::read_dir(directory)? {
         remove(&entry?.path())?;
     }
