@@ -24,6 +24,7 @@ fn publication_start(
             raw,
             archive: forecast
                 .placement
+                .timing
                 .transfer
                 .archive_download_bytes_per_second,
             wire_per_mille: 1000,
