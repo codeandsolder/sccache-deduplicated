@@ -53,8 +53,10 @@ explicit baseline rather than changing the meaning of `native`.
 The current sccache implementation resolves Rust native CPU requests on the
 initiating host before remote dispatch. GCC/Clang native requests are also
 expanded before remote dispatch: the requesting compiler's complete final
-frontend target state supplies explicit ISA/tuning arguments and participates
-in the cache identity. No worker uses its own CPU to reinterpret `native`. See
+frontend target state supplies explicit ISA/tuning arguments. The full
+requesting-compiler frontend expansion, including its working directory, enters
+the native-specific cache fingerprint. This protects debug metadata identity
+where otherwise identical preprocessed sources can embed different paths. No worker uses its own CPU to reinterpret `native`. See
 [distributed native behavior](../../docs/Distributed.md#native-cpu-is-the-requesting-host-not-the-worker).
 
 ## Choose a target directly, or use a saved profile

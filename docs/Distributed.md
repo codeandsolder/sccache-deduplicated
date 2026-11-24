@@ -46,10 +46,15 @@ used to resolve the **complete final CPU target state**, including named CPU
 options, ISA feature masks and tuning options interleaved with `native`.
 The compiler-specific target flags are shipped explicitly in the distributed
 compile command, without an unresolved `native`. The original local command
-retains the user-provided options, and the hash includes the initiating
-compiler's expansion. Clang's cc1 target-feature settings are forwarded after
-the normal options to preserve precedence of explicit `-mno-*` flags; GCC
-receives its observed `-m*` options and cache-size parameters. If the
+retains the user-provided options. The native-specific cache supplement hashes
+the initiating compiler's **complete observed frontend invocation**, including
+its compilation directory: debug information can depend on that path even
+when the preprocessed source is identical. The driver probe uses the actual
+source language (including C++/Objective-C++) and requesting working directory
+to preserve frontend options and relative driver paths.
+Clang's cc1 target-feature settings are forwarded after the normal options to
+preserve precedence of explicit `-mno-*` flags; GCC receives its observed
+`-m*` options and cache-size parameters. If the
 compiler cannot resolve or expose its native frontend settings, sccache does
 not distribute an unproven native request or store it in the cache.
 The worker's own detection must never decide codegen for the initiator's

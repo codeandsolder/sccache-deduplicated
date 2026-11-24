@@ -169,12 +169,17 @@ impl NativeCodegenResolution {
     }
 }
 
+fn is_native_driver_frontend(arg: &str) -> bool {
+    let executable = arg.rsplit(['/', '\\']).next().unwrap_or(arg);
+    matches!(
+        executable.strip_suffix(".exe").unwrap_or(executable),
+        "-cc1" | "cc1" | "cc1plus" | "cc1obj" | "cc1objplus"
+    )
+}
+
 fn native_driver_args(driver_line: &str) -> Result<Vec<String>> {
     let args = shlex::split(driver_line).context("unparseable compiler native expansion")?;
-    if !args
-        .iter()
-        .any(|arg| arg == "-cc1" || arg.ends_with("/cc1") || arg.ends_with("/cc1plus"))
-    {
+    if !args.iter().any(|arg| is_native_driver_frontend(arg)) {
         bail!("native probe did not identify GCC/Clang compiler frontend");
     }
     if args
@@ -275,11 +280,31 @@ fn native_driver_replacement(
     Ok(flags)
 }
 
+/// The compiler driver must resolve the ISA in the *requested language*.
+/// Probing C for C++ can change frontend options (or reject C++-only flags)
+/// and then fingerprint a state different from the actual compilation.
+/// For assembly/other modes with no C frontend, use a C frontend solely to
+/// determine CPU codegen flags, not the syntax of the source.
+const fn native_probe_language(language: Language) -> &'static str {
+    match language {
+        Language::Cxx | Language::CxxHeader | Language::CxxPreprocessed | Language::CxxModule => {
+            "c++"
+        }
+        Language::ObjectiveCxx
+        | Language::ObjectiveCxxHeader
+        | Language::ObjectiveCxxPreprocessed => "objective-c++",
+        Language::ObjectiveC | Language::ObjectiveCHeader | Language::ObjectiveCPreprocessed => {
+            "objective-c"
+        }
+        _ => "c",
+    }
+}
+
 async fn native_codegen_resolution<T>(
     creator: &T,
     executable: &Path,
     parsed_args: &ParsedArguments,
-    _cwd: &Path,
+    cwd: &Path,
     env_vars: &[(OsString, OsString)],
     kind: CCompilerKind,
 ) -> Result<Option<NativeCodegenResolution>>
@@ -298,27 +323,29 @@ where
     cmd.arg("-###")
         .arg("-E")
         .arg("-x")
-        .arg("c")
+        .arg(native_probe_language(parsed_args.language))
         .arg("-")
         .args(&parsed_args.common_args)
         .args(&parsed_args.arch_args)
         .env_clear()
         .envs(env_vars.to_vec())
-        .current_dir(std::env::temp_dir());
+        .current_dir(cwd);
     let output = run_input_output(cmd, Some(Vec::new())).await?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     let driver_line = stderr
         .lines()
         .find(|line| {
-            line.contains(" -cc1 ")
-                || line.contains("/cc1 ")
-                || line.contains("/cc1plus ")
-                || line.contains(" \"-cc1\"")
+            shlex::split(line)
+                .is_some_and(|args| args.iter().any(|arg| is_native_driver_frontend(arg)))
         })
         .context("compiler did not expose a native CPU frontend expansion")?;
     let flags = native_driver_replacement(driver_line, kind, &native_args)?;
+    // Preserve the requesting compiler's full observed frontend state in the
+    // native-only cache supplement. The working directory can affect emitted
+    // debug metadata without changing preprocessed bytes (notably Clang -g),
+    // so hashing only the CPU switches could alias materially different objects.
     let mut digest = Digest::new();
-    digest.update(b"sccache-native-target-resolution-v3\0");
+    digest.update(b"sccache-native-target-resolution-v4\0");
     digest.update(driver_line.as_bytes());
     #[cfg(not(feature = "dist-client"))]
     let _ = flags;
@@ -3395,7 +3422,45 @@ mod test {
     }
 
     #[test]
-    fn test_native_codegen_fingerprint_tracks_driver_expansion() {
+    fn test_native_codegen_probe_respects_cxx_language_and_options() -> Result<()> {
+        let mut parsed = native_parsed_arguments();
+        parsed.language = Language::Cxx;
+        parsed.common_args.push(OsString::from("-std=c++20"));
+        let creator = new_creator();
+        next_command_calls(&creator, |args| {
+            assert!(args.windows(2).any(|pair| pair == ["-x", "c++"]));
+            assert!(args.iter().any(|arg| arg == "-std=c++20"));
+            assert!(args.iter().any(|arg| arg == "-march=native"));
+            Ok(MockChild::new(
+                exit_status(0),
+                "",
+                "/usr/lib/gcc/cc1plus -march=znver2 -mtune=znver2 -std=c++20",
+            ))
+        });
+        let result = single_threaded_runtime().block_on(native_codegen_resolution(
+            &creator,
+            Path::new("/usr/bin/g++"),
+            &parsed,
+            Path::new("/project"),
+            &[],
+            CCompilerKind::Gcc,
+        ))?;
+        assert!(result.is_some());
+        assert_eq!(native_probe_language(Language::CxxModule), "c++");
+        assert_eq!(
+            native_probe_language(Language::ObjectiveCxx),
+            "objective-c++"
+        );
+        assert_eq!(native_probe_language(Language::ObjectiveC), "objective-c");
+        assert_eq!(native_probe_language(Language::AssemblerToPreprocess), "c");
+        assert!(native_driver_args(" cc1obj -march=znver2 -mtune=znver2").is_ok());
+        assert!(native_driver_args(" cc1objplus -march=znver2 -mtune=znver2").is_ok());
+        assert!(is_native_driver_frontend(r"C:\gcc\libexec\cc1plus.exe"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_native_codegen_fingerprint_tracks_effective_cpu_state() {
         fn fingerprint(driver_line: &str) -> String {
             let creator = new_creator();
             next_command(
@@ -3422,6 +3487,19 @@ mod test {
 
         assert_eq!(znver2, znver2_again);
         assert_ne!(znver2, skylake);
+        // Debug compilation directories can affect emitted DW_AT_comp_dir even
+        // when preprocessing output and CPU ISA are otherwise identical.
+        assert_ne!(
+            znver2,
+            fingerprint(
+                "/usr/lib/gcc/cc1 -march=znver2 -mtune=znver2 -fdebug-compilation-dir=/other/worktree"
+            )
+        );
+        // Conversely, an effective ISA change must never alias the cache.
+        assert_ne!(
+            znver2,
+            fingerprint("/usr/lib/gcc/cc1 -march=znver2 -mtune=znver2 -mno-avx2")
+        );
     }
 
     #[test]
