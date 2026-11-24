@@ -7,6 +7,8 @@ on:
       - Cargo.lock
       - rust-toolchain.toml
       - src/dist/**
+      - crates/build-runtime/**
+      - tests/native_dist.rs
       - src/compiler/rust.rs
       - src/compiler/rust_dlltool.rs
       - src/compiler/dynamic_dependencies.rs
@@ -17,21 +19,8 @@ on:
       - src/bin/sccache-dist/**
       - .github/workflows/dist-jwt-regression.yml
   push:
+    # Every main SHA must have a distributed-runtime result for fleet promotion.
     branches: [main]
-    paths:
-      - Cargo.toml
-      - Cargo.lock
-      - rust-toolchain.toml
-      - src/dist/**
-      - src/compiler/rust.rs
-      - src/compiler/rust_dlltool.rs
-      - src/compiler/dynamic_dependencies.rs
-      - src/compiler/compiler.rs
-      - src/compiler/canonical_paths.rs
-      - tests/dist.rs
-      - tests/harness/**
-      - src/bin/sccache-dist/**
-      - .github/workflows/dist-jwt-regression.yml
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
