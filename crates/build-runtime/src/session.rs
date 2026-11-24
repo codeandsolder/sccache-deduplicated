@@ -1295,7 +1295,7 @@ impl NativeSessions {
                         delivery.requested.insert(id);
                         drop(state);
                         self.request_backfills(action, reader, tree, &[blob])?;
-                        Err(NativeContentPending.into())
+                        return Err(NativeContentPending.into());
                     }
                 }
             }
