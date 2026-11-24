@@ -9,6 +9,7 @@ use crate::harness::{
     cargo_command, clear_cache_local_daemon, get_stats, init_cargo, sccache_command,
     start_local_daemon, stop_local_daemon, write_json_cfg, write_source,
 };
+use anyhow::ensure;
 use assert_cmd::prelude::*;
 use sccache::config::HTTPUrl;
 use sccache::dist::{
@@ -192,6 +193,90 @@ fn test_dist_basic() {
         assert_eq!(0, info.stats.cache_hits.all());
         assert_eq!(1, info.stats.cache_misses.all());
     });
+}
+
+/// Real GCC and Clang native target jobs must execute on the worker with
+/// explicit requesting-host ISA flags, not silently fall back to local C
+/// compilation. Repeating each request must then use the same cache key.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+#[cfg_attr(
+    not(feature = "dist-tests"),
+    ignore = "requires isolated Docker distribution harness"
+)]
+fn test_dist_c_native_target_codegen_and_cache() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
+    system.add_scheduler();
+    system.add_server(&[]);
+    let mut config = dist_test_sccache_client_cfg(root, system.scheduler_url());
+    // Unlike the minimal distribution smoke test, retain objects for the
+    // repeat-request cache verification.
+    config
+        .cache
+        .disk
+        .as_mut()
+        .context("missing test disk cache")?
+        .size = 128 * 1024 * 1024;
+    let config_path = root.join("sccache-cfg.json");
+    write_json_cfg(root, "sccache-cfg.json", &config);
+    let cached_config = root.join("sccache-cached-cfg");
+    let _ = stop_local_daemon();
+    start_local_daemon(&config_path, &cached_config);
+
+    write_source(
+        root,
+        "native_target.c",
+        r#"
+#if defined(__AVX2__)
+#error explicit -mno-avx2 must override native ISA
+#endif
+unsigned long native_target(unsigned long x, unsigned long y) {
+    return (x * 17UL + y) ^ (y >> 7);
+}
+"#,
+    );
+    let mut originals = Vec::new();
+    for (index, compiler) in ["gcc", "clang"].into_iter().enumerate() {
+        let compiler = which::which(compiler)?;
+        let output = root.join(format!("native-{index}.o"));
+        let compile = || {
+            let result = sccache_command()
+                .arg(&compiler)
+                .args(["-O2", "-march=native", "-mno-avx2", "-mtune=native", "-c"])
+                .arg(root.join("native_target.c"))
+                .arg("-o")
+                .arg(&output)
+                .env("SCCACHE_CONF", &config_path)
+                .env("SCCACHE_CACHED_CONF", &cached_config)
+                .output()?;
+            ensure!(
+                result.status.success(),
+                "{} native compilation failed: {}",
+                compiler.display(),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            Ok::<_, anyhow::Error>(std::fs::read(&output)?)
+        };
+        let first = compile()?;
+        ensure!(
+            !first.is_empty(),
+            "native distributed compile produced no object"
+        );
+        originals.push((compile()?, first));
+    }
+    for (replayed, original) in originals {
+        assert_eq!(replayed, original);
+    }
+    get_stats(|info| {
+        assert_eq!(2, info.stats.dist_compiles.values().sum::<usize>());
+        assert_eq!(0, info.stats.dist_errors);
+        assert_eq!(4, info.stats.compile_requests);
+        assert_eq!(2, info.stats.cache_hits.all());
+        assert_eq!(2, info.stats.cache_misses.all());
+    });
+    Ok(())
 }
 
 /// The daemon sees deliberately different sources at the exact paths used by
