@@ -25,11 +25,27 @@ bytes without a local CAS. File metadata is checked before and after hashing
 and again when a missing blob is opened; the scheduler verifies its exact
 digest and length. Sources must remain quiescent across the operation.
 Admission precedes upload: a cache hit does not require input trees to still
-exist, and a miss reports only the missing tree identities. The client
-offers those constituent manifests and uploads missing blobs directly.
-A successful miss admission pins every source tree in the action's root
-recipe and independent mounts.
-Workers compose the recipe directly in memory from the pinned package
+exist, and a miss requests only unknown constituent manifests. Admission
+validates the complete immutable input identities without requiring the
+scheduler to hold their payloads. The scheduler retains the admitted manifests
+for the action and uses a bounded manifest cache across actions.
+The submitting client keeps its input provider available until the action
+finishes; it uploads bytes only in response to an explicit content demand.
+
+Assignments include the exact input blob identities and lengths. The worker
+pins resident input content at assignment, including partial trees, and
+acquires only missing content before taking a compiler slot. The scheduler
+serves available blobs directly; a missing blob registers a shared backfill
+flight and returns HTTP 202 while an eligible submitting client provides it.
+Claims are bounded by upload concurrency and can transfer to another active
+origin if the first one disappears. Downloads and origin uploads verify the
+exact length and digest. Individual verified acquisitions survive failures
+of other blobs, use the same deduplicated store, and remain pinned during
+staging. Indexed trees with missing payloads are repaired rather than
+requiring an entirely new tree. A stale residency prediction therefore
+requires only acquisition of the missing content, not a new assignment.
+
+Workers compose the recipe directly in memory from the leased constituent
 manifests, including their selected subtrees and logical destinations.
 The combined root is neither uploaded nor published to either CAS index.
 Conflicting file entries are rejected, directory metadata normalization
@@ -179,7 +195,7 @@ measured transfer throughput, request overhead and execution duration.
 Native placement minimizes estimated completion time among eligible healthy
 workers, with queue waiting and input staging overlapping; platform and
 capacity constraints remain mandatory. Actual retrieval still verifies every
-input. Update scheduler and worker binaries together after protocol changes.
+input. Update scheduler, worker and client binaries together after protocol changes.
 
 Native blob downloads negotiate Zstandard independently from the immutable
 blob representation. The scheduler samples at most 128 KiB of each requested
@@ -727,7 +743,7 @@ files. The catalog alone does not place a package in the scheduler.
 The worker uses a bounded FIFO ready queue shared by native and legacy
 execution, with compiler slots derived from available logical CPUs. Native
 inputs are staged and leased before acquiring a compiler slot; publication
-does not consume a compiler slot. Already cached input trees are pinned when
+does not consume a compiler slot. Already cached input trees and partial resident blobs are pinned when
 the assignment is accepted, and released on completion or reconciliation.
 Heartbeats use actual occupied execution slots for CPU restoration, separately
 from active HTTP requests that maintain job liveness. The scheduler includes
