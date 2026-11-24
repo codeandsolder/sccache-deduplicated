@@ -1109,6 +1109,57 @@ fn test_empty_levels_new() {
     assert!(location.contains('0'));
 }
 
+#[tokio::test]
+async fn multilevel_size_metrics_distinguish_known_zero_from_unavailable() -> Result<()> {
+    let dir = TempBuilder::new()
+        .prefix("sccache_multilevel_zero_size_")
+        .tempdir()?;
+    let zero_capacity = Arc::new(DiskCache::new(
+        &dir.path().join("zero"),
+        0,
+        &tokio::runtime::Handle::current(),
+        PreprocessorCacheModeConfig::default(),
+        CacheMode::ReadWrite,
+        vec![],
+    ));
+    let zero_usage = Arc::new(DiskCache::new(
+        &dir.path().join("empty"),
+        1024,
+        &tokio::runtime::Handle::current(),
+        PreprocessorCacheModeConfig::default(),
+        CacheMode::ReadWrite,
+        vec![],
+    ));
+    zero_usage.put_raw("empty", Bytes::new()).await?;
+    assert_eq!(zero_usage.current_size().await?, Some(0));
+
+    // None means the metric is unavailable; Some(0) is a known zero and
+    // must not be discarded just because the accumulator starts at zero.
+    let unknown = Arc::new(InMemoryStorage::new()) as Arc<dyn Storage>;
+    let sizes = MultiLevelStorage::new(vec![unknown.clone(), zero_capacity as Arc<dyn Storage>]);
+    assert_eq!(sizes.max_size().await?, Some(0));
+
+    let usage = MultiLevelStorage::new(vec![unknown.clone(), zero_usage as Arc<dyn Storage>]);
+    assert_eq!(usage.current_size().await?, Some(0));
+    assert_eq!(usage.max_size().await?, Some(1024));
+
+    let large = Arc::new(DiskCache::new(
+        &dir.path().join("large"),
+        u64::MAX,
+        &tokio::runtime::Handle::current(),
+        PreprocessorCacheModeConfig::default(),
+        CacheMode::ReadWrite,
+        vec![],
+    ));
+    let saturated = MultiLevelStorage::new(vec![large.clone(), large]);
+    assert_eq!(saturated.max_size().await?, Some(u64::MAX));
+
+    let unknown_only = MultiLevelStorage::new(vec![unknown]);
+    assert_eq!(unknown_only.current_size().await?, None);
+    assert_eq!(unknown_only.max_size().await?, None);
+    Ok(())
+}
+
 #[test]
 fn test_preprocessor_cache_methods() -> Result<()> {
     // Test get_preprocessor_cache_entry and put_preprocessor_cache_entry
