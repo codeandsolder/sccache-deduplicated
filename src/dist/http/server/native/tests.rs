@@ -82,7 +82,7 @@ fn make_client(url: &reqwest::Url, token: &str) -> Result<NativeCacheClient> {
 }
 
 fn with_native_service(
-    operation: impl FnOnce(&reqwest::Url, &NativeSessions) -> Result<()>,
+    operation: impl FnOnce(&reqwest::Url, &NativeSessions, &NetworkMeter) -> Result<()>,
 ) -> Result<()> {
     let directory = tempfile::tempdir()?;
     let sessions = Arc::new(NativeSessions::new(
@@ -90,12 +90,18 @@ fn with_native_service(
         limits(),
     )?);
     let worker: ServerId = "127.0.0.1:10501".parse()?;
+    let network = Arc::new(NetworkMeter::default());
     let server = rouille::Server::new("127.0.0.1:0", {
         let sessions = Arc::clone(&sessions);
+        let network = Arc::clone(&network);
         move |request| {
             respond(
                 request,
-                &sessions,
+                NativeServices {
+                    sessions: &sessions,
+                    packages: None,
+                    network: &network,
+                },
                 &move |_, _| {
                     Ok(ScheduleReply::Assigned(WorkerAllocation {
                         address: worker.addr(),
@@ -107,7 +113,6 @@ fn with_native_service(
                 &ClientCheck,
                 &move |token| (token == "worker-token").then_some(worker),
                 1024 * 1024,
-                None,
             )
         }
     })
@@ -115,7 +120,7 @@ fn with_native_service(
     .pool_size(4);
     let url = reqwest::Url::parse(&format!("http://{}/", server.server_addr()))?;
     let (handle, stop) = server.stoppable();
-    let outcome = operation(&url, &sessions);
+    let outcome = operation(&url, &sessions, &network);
     stop.send(()).map_err(|error| anyhow!("{error}"))?;
     handle
         .join()
@@ -157,7 +162,7 @@ fn verify_compressed_download(
 
 #[test]
 fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
-    with_native_service(|url, sessions| {
+    with_native_service(|url, sessions, network| {
         let client = make_client(url, "client-token")?;
         let worker_client = make_client(url, "worker-token")?.for_worker(JobId(42));
         let wrong_job = worker_client.clone().for_worker(JobId(43));
@@ -246,6 +251,13 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
         client.download(ticket, blob, &mut downloaded)?;
         assert_eq!(downloaded, bytes);
         verify_compressed_download(url, ticket, blob, &bytes)?;
+        let measured = network.snapshot();
+        let worker = Peer::Worker("127.0.0.1:10501".parse()?);
+        let client_peer = Peer::Client("127.0.0.1".parse()?);
+        assert!(measured.receive.peers[&worker].body_bytes >= blob.size);
+        assert_eq!(measured.receive.peers[&worker].active_remaining_bytes, 0);
+        assert!(measured.send.peers[&client_peer].body_bytes > 0);
+        assert!(measured.send.peers[&client_peer].body_bytes < blob.size);
         assert!(
             client
                 .download(
@@ -308,7 +320,7 @@ fn metadata_is_bounded_and_rejects_trailing_bytes() -> Result<()> {
 fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result<()> {
     use crate::build_runtime::ExecutionPolicy;
     use std::{fs, process::Command};
-    with_native_service(|url, sessions| {
+    with_native_service(|url, sessions, _network| {
         let directory = tempfile::tempdir()?;
         let sender = NativeStore::open(&directory.path().join("sender"))?;
         let worker_store = NativeStore::open(&directory.path().join("worker"))?;
@@ -370,6 +382,7 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
         };
         let transport = crate::dist::native::PackageTransportTracker::new(
             crate::build_runtime::PackageTransferCost::default(),
+            crate::build_runtime::ResultTransferEstimate::default(),
         )?;
         let execution_queue =
             crate::dist::execution_queue::ExecutionQueue::new(std::num::NonZeroUsize::MIN);

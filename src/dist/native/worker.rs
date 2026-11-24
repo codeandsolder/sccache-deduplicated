@@ -18,8 +18,8 @@ use anyhow::{Context, Result, ensure};
 use super::{LeaseCheck, NativeCacheClient, PackagePlanRequest, map_packages};
 use crate::build_runtime::{
     ArchiveLength, BlobRef, CapturedExecution, ExecutionPolicy, ExecutionSpec, NativeServiceBusy,
-    NativeStore, PackageArchive, PackageImportLimits, PackageTransferCost, TreeId, TreeLease,
-    VerifiedPackage, execute, wire::Ticket,
+    NativeStore, PackageArchive, PackageImportLimits, PackageTransferCost, ResultTransferEstimate,
+    TreeId, TreeLease, VerifiedPackage, execute, wire::Ticket,
 };
 
 /// Per-worker observed transfer and decoding rates.
@@ -30,6 +30,7 @@ use crate::build_runtime::{
 pub struct PackageTransportTracker {
     rates: Arc<Mutex<PackageTransferCost>>,
     execution_nanoseconds: Arc<AtomicU64>,
+    result: Arc<Mutex<ResultTransferEstimate>>,
     slots: Arc<RawDownloadSlots>,
 }
 
@@ -54,13 +55,15 @@ impl PackageTransportTracker {
     /// Construct a rate tracker and the shared raw download budget.
     /// # Errors
     /// Returns an error when the initial costs or concurrency are invalid.
-    pub fn new(initial: PackageTransferCost) -> Result<Self> {
+    pub fn new(initial: PackageTransferCost, result: ResultTransferEstimate) -> Result<Self> {
         initial.validate()?;
+        ensure!(result.valid(), "invalid result transfer estimate");
         let limit = NonZeroUsize::new(usize::try_from(initial.raw_parallelism)?)
             .context("zero raw download parallelism")?;
         Ok(Self {
             rates: Arc::new(Mutex::new(initial)),
             execution_nanoseconds: Arc::new(AtomicU64::new(0)),
+            result: Arc::new(Mutex::new(result)),
             slots: Arc::new(RawDownloadSlots {
                 limit,
                 active: Mutex::new(0),
@@ -109,6 +112,19 @@ impl PackageTransportTracker {
         *self.rates.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Return the latest successful result publication estimate.
+    #[must_use = "the estimate predicts result upload cost"]
+    pub fn result_estimate(&self) -> ResultTransferEstimate {
+        *self.result.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn observe_result(&self, bytes: u64, requests: u64, duration: Duration) {
+        self.result
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .observe(bytes, requests, duration);
+    }
+
     /// Estimated time spent occupying an execution slot, excluding staging and queue waits.
     #[must_use = "the estimate is used for worker placement"]
     pub fn execution_nanoseconds(&self) -> u64 {
@@ -125,17 +141,23 @@ impl PackageTransportTracker {
         let observed = u64::try_from(duration.as_nanos())
             .unwrap_or(u64::MAX)
             .clamp(1_000_000, 3_600_000_000_000);
-        let _ = self.execution_nanoseconds.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |previous| {
-                Some(if previous == 0 {
-                    observed
-                } else {
-                    (3 * previous + observed).div_ceil(4)
-                })
-            },
-        );
+        let mut previous = self.execution_nanoseconds.load(Ordering::Relaxed);
+        loop {
+            let updated = if previous == 0 {
+                observed
+            } else {
+                (3 * previous + observed).div_ceil(4)
+            };
+            match self.execution_nanoseconds.compare_exchange_weak(
+                previous,
+                updated,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => previous = actual,
+            }
+        }
     }
 
     fn smooth(rate: &mut u64, bytes: u64, duration: Duration) {
@@ -241,10 +263,13 @@ mod transport_tests {
             Barrier,
             atomic::{AtomicUsize, Ordering},
         };
-        let tracker = PackageTransportTracker::new(PackageTransferCost {
-            raw_parallelism: 2,
-            ..PackageTransferCost::default()
-        })?;
+        let tracker = PackageTransportTracker::new(
+            PackageTransferCost {
+                raw_parallelism: 2,
+                ..PackageTransferCost::default()
+            },
+            ResultTransferEstimate::default(),
+        )?;
         let barrier = Barrier::new(8);
         let running = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
@@ -289,7 +314,10 @@ mod transport_tests {
 
     #[test]
     fn observed_rates_change_future_costs_without_overreacting_to_tiny_files() -> Result<()> {
-        let tracker = PackageTransportTracker::new(PackageTransferCost::default())?;
+        let tracker = PackageTransportTracker::new(
+            PackageTransferCost::default(),
+            ResultTransferEstimate::default(),
+        )?;
         let initial = tracker.estimate();
         tracker.observe_raw(100, Duration::from_secs(20));
         assert_eq!(tracker.estimate(), initial);
@@ -590,7 +618,14 @@ impl NativeCacheClient {
                         &captured,
                     )?;
                 }
-                for missing in self.begin(ticket, manifest.clone())?.missing {
+                let missing = self.begin(ticket, manifest.clone())?.missing;
+                let bytes = missing
+                    .iter()
+                    .map(|blob| blob.size)
+                    .fold(0_u64, u64::saturating_add);
+                let requests = u64::try_from(missing.len())?;
+                let started = Instant::now();
+                for missing in missing {
                     check()?;
                     ensure!(
                         blobs.get(&missing.id) == Some(&missing.size),
@@ -598,10 +633,14 @@ impl NativeCacheClient {
                     );
                     self.upload(ticket, missing, captured.open_blob(missing.id)?)?;
                 }
+                let upload_duration = started.elapsed();
                 ensure!(
                     self.commit(ticket)? == *manifest,
                     "native publication manifest mismatch"
                 );
+                if let Some(transport) = control.transport {
+                    transport.observe_result(bytes, requests, upload_duration);
+                }
             } else {
                 self.fail(ticket)?;
             }

@@ -777,3 +777,48 @@ The residency summary and timing estimates are advisory; neither changes
 content identity or bypasses verification. The model currently uses raw
 delivery cost for placement (package reconstruction is optimized separately)
 and one average slot duration per worker, not per-action compute forecasts.
+
+### Directional shared-network estimation
+
+The native cache listener meters encoded HTTP payload bytes before delivery
+to the transport or after reception from it; logical lengths are tracked
+separately. Authenticated worker addresses, client source IPs, and upstream
+package traffic have separate counters in each direction. A dedicated
+one-second sampler aggregates overlapping streams without a global lock in
+the body read path. Long observations include transport backpressure and
+may also reflect endpoint processing or storage limitations: these are
+effective service-rate estimates, not physical interface line rates.
+
+Sustained per-peer observations provide lower bounds on available bandwidth.
+A group becomes a shared effective constraint after at least three aligned
+windows in which all members remain active, every member runs below its
+previous sustained rate, and the group total remains near a plateau.
+Unsaturated or nonoverlapping windows do not establish a ceiling. A higher
+subsequent observed group total invalidates the constraint. Peer and group
+evidence expires after 30 minutes; the scheduler atomically checkpoints
+fresh measurements to `network-timing.json` each minute, scoped to the native
+listener address. Active requests and their remaining bytes are not restored
+after restart.
+
+Native placement converts predicted missing logical bytes to encoded demand
+using measured per-peer compression ratios and uses sustained aggregate
+goodput in addition to the worker's per-request estimates. Outstanding
+worker input closures are deduplicated before estimating demand; currently
+active client downloads participate in the same model. Progressive max-min
+sharing allocates bandwidth across overlapping shared-resource constraints
+and reallocates capacity when a peer finishes. Placement includes the
+marginal completion delay imposed on other peers, not only the selected job's
+estimated finish time.
+
+Workers learn expected missing result-upload bytes, request counts, upload
+throughput and request overhead from successful publications. These estimates
+join the existing worker timing checkpoint and heartbeat. Placement advances
+current incoming traffic to predicted compiler completion before adding the
+new upload demand. Send and receive constraints are independent. The
+forecast does not yet predict the arrival of other not-yet-produced results.
+
+Active memory-to-memory calibration probes are a follow-up: use them only
+when passive observations are insufficient or stale, coordinate isolated and
+selected concurrent tests, and cancel them when actual build traffic needs
+the relevant resources. The current implementation introduces no synthetic
+traffic.

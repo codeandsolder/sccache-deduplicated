@@ -3,6 +3,7 @@ extern crate log;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
+use sccache::build_runtime::{NetworkSnapshot, Peer};
 use sccache::config::{
     INSECURE_DIST_CLIENT_TOKEN,
     scheduler::{self as scheduler_config, JobSlackConfig},
@@ -31,6 +32,8 @@ mod build;
 
 mod cmdline;
 mod command_helpers;
+mod placement;
+use placement::{NativeTransferPlan, native_eta_seconds};
 #[cfg(target_os = "linux")]
 mod native;
 #[cfg(target_os = "linux")]
@@ -922,48 +925,6 @@ fn admission_weight(job_count: usize, cpu_capacity: f64, job_slack: JobSlackConf
         .then_some((cpu_capacity - job_count as f64).max(0.0) + 0.5)
 }
 
-/// Predict end-to-end completion, overlapping queued compute with input delivery.
-/// A job's required content and outstanding transfer backlog are unions, not
-/// counts of trees. A warm job can run without waiting on unrelated transfers.
-fn native_eta_seconds(
-    capacity: f64,
-    assigned: &HashMap<JobId, dist::NativeInputBlobs>,
-    placement: &dist::NativePlacement,
-    requested: &dist::NativeInputBlobs,
-) -> f64 {
-    let resident = |id| {
-        placement
-            .residency
-            .as_ref()
-            .is_some_and(|filter| filter.may_contain(id))
-    };
-    let mut missing: HashMap<_, _> = requested
-        .iter()
-        .filter(|(id, _)| !resident(**id))
-        .map(|(&id, &size)| (id, size))
-        .collect();
-    let transfer_seconds = if missing.is_empty() {
-        0.0
-    } else {
-        for (&id, &size) in assigned.values().flat_map(|inputs| inputs.iter()) {
-            if !resident(id) {
-                missing.entry(id).or_insert(size);
-            }
-        }
-        let bytes: u128 = missing.values().map(|&size| u128::from(size)).sum();
-        let cost = placement.transfer;
-        let nanos = bytes.saturating_mul(1_000_000_000)
-            / u128::from(cost.download_bytes_per_second)
-            + (missing.len() as u128).div_ceil(u128::from(cost.raw_parallelism))
-                * u128::from(cost.raw_request_nanoseconds);
-        Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX)).as_secs_f64()
-    };
-    let execution = Duration::from_nanos(placement.execution_nanoseconds).as_secs_f64();
-    let capacity = capacity.max(1.0);
-    let queue = (assigned.len() as f64 + 1.0 - capacity).max(0.0) / capacity * execution;
-    queue.max(transfer_seconds) + execution
-}
-
 fn weighted_server(candidates: &[(ServerId, f64)], draw: f64) -> Option<ServerId> {
     let total: f64 = candidates.iter().map(|(_, weight)| weight).sum();
     let mut ticket = draw * total;
@@ -988,6 +949,7 @@ impl Scheduler {
         requester: &dyn SchedulerOutgoing,
         assignment: JobAssignment,
         native_inputs: Option<dist::NativeInputBlobs>,
+        network: &NetworkSnapshot,
     ) -> Result<AllocJobResult> {
         if self.is_draining() {
             return Ok(AllocJobResult::Fail {
@@ -1005,6 +967,9 @@ impl Scheduler {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
 
+            let transfer_plan = native_inputs
+                .as_ref()
+                .map(|_| NativeTransferPlan::new(network, &servers));
             let res = {
                 let mut healthy = Vec::new();
                 let mut retry = Vec::new();
@@ -1024,7 +989,9 @@ impl Scheduler {
                     ) else {
                         continue;
                     };
-                    let weight = if let Some(inputs) = native_inputs.as_ref() {
+                    let weight = if let (Some(inputs), Some(plan)) =
+                        (native_inputs.as_ref(), transfer_plan.as_ref())
+                    {
                         let Some(placement) = details.capabilities.native_placement.as_ref() else {
                             continue;
                         };
@@ -1033,6 +1000,8 @@ impl Scheduler {
                             &details.jobs_assigned,
                             placement,
                             inputs,
+                            Peer::Worker(server_id.addr()),
+                            plan,
                         )
                     } else {
                         weight
@@ -1192,7 +1161,12 @@ impl SchedulerIncoming for Scheduler {
         requester: &dyn SchedulerOutgoing,
         tc: Toolchain,
     ) -> Result<AllocJobResult> {
-        self.allocate_job(requester, JobAssignment::Archive(tc), None)
+        self.allocate_job(
+            requester,
+            JobAssignment::Archive(tc),
+            None,
+            &NetworkSnapshot::default(),
+        )
     }
 
     fn handle_alloc_native_job(
@@ -1200,12 +1174,14 @@ impl SchedulerIncoming for Scheduler {
         requester: &dyn SchedulerOutgoing,
         assignment: NativeAssignment,
         inputs: dist::NativeInputBlobs,
+        network: &NetworkSnapshot,
     ) -> Result<AllocJobResult> {
         assignment.spec.validate()?;
         self.allocate_job(
             requester,
             JobAssignment::Native(Box::new(assignment)),
             Some(inputs),
+            network,
         )
     }
 
@@ -1243,6 +1219,10 @@ impl SchedulerIncoming for Scheduler {
         );
         if let Some(placement) = &capabilities.native_placement {
             placement.transfer.validate()?;
+            anyhow::ensure!(
+                placement.result.valid(),
+                "invalid native result transfer telemetry"
+            );
             anyhow::ensure!(
                 placement.execution_nanoseconds > 0
                     && placement.execution_nanoseconds <= 3_600_000_000_000
@@ -2093,26 +2073,20 @@ mod scheduler_tests {
         slow.transfer.download_bytes_per_second = 1_000_000;
         let inputs = BTreeMap::from([(a, 100_000_000), (b, 1_000_000)]);
         let empty = HashMap::new();
-        assert!(
-            native_eta_seconds(4.0, &empty, &fast, &inputs)
-                < native_eta_seconds(4.0, &empty, &slow, &inputs)
-        );
+        let network = NetworkSnapshot::default();
+        let plan = NativeTransferPlan::new(&network, &HashMap::new());
+        let peer = Peer::Worker("127.0.0.1:10501".parse().unwrap());
+        let eta = |capacity, assigned, placement| {
+            native_eta_seconds(capacity, assigned, placement, &inputs, peer, &plan)
+        };
+        assert!(eta(4.0, &empty, &fast) < eta(4.0, &empty, &slow));
         let mut filter = BlobResidency::for_count(2).unwrap();
         filter.insert(a);
         slow.residency = Some(filter);
-        assert!(
-            native_eta_seconds(4.0, &empty, &slow, &inputs)
-                < native_eta_seconds(4.0, &empty, &fast, &inputs)
-        );
+        assert!(eta(4.0, &empty, &slow) < eta(4.0, &empty, &fast));
         let queued = HashMap::from([(JobId(1), inputs.clone()), (JobId(2), inputs.clone())]);
-        assert_eq!(
-            native_eta_seconds(4.0, &queued, &fast, &inputs),
-            native_eta_seconds(4.0, &empty, &fast, &inputs)
-        );
-        assert!(
-            native_eta_seconds(1.0, &queued, &fast, &inputs)
-                > native_eta_seconds(4.0, &empty, &fast, &inputs)
-        );
+        assert_eq!(eta(4.0, &queued, &fast), eta(4.0, &empty, &fast));
+        assert!(eta(1.0, &queued, &fast) > eta(4.0, &empty, &fast));
     }
 
     #[test]
@@ -2185,6 +2159,7 @@ mod scheduler_tests {
             &AcceptAssign,
             assignment.clone(),
             BTreeMap::from([(ContentId([1; 32]), 10)]),
+            &NetworkSnapshot::default(),
         )?
         else {
             bail!("compatible worker unavailable");
@@ -2195,7 +2170,12 @@ mod scheduler_tests {
             BTreeMap::from([(ContentId([1; 32]), 10)])
         );
         assert!(matches!(
-            scheduler.handle_alloc_native_job(&AcceptAssign, assignment, BTreeMap::new())?,
+            scheduler.handle_alloc_native_job(
+                &AcceptAssign,
+                assignment,
+                BTreeMap::new(),
+                &NetworkSnapshot::default()
+            )?,
             AllocJobResult::Fail { .. }
         ));
         let AllocJobResult::Success { job_alloc, .. } =

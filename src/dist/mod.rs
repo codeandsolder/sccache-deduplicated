@@ -1021,6 +1021,7 @@ pub struct NativePlacement {
     pub residency: Option<crate::build_runtime::BlobResidency>,
     pub transfer: crate::build_runtime::PackageTransferCost,
     pub execution_nanoseconds: u64,
+    pub result: crate::build_runtime::ResultTransferEstimate,
 }
 
 #[cfg(feature = "dist-server")]
@@ -1030,6 +1031,7 @@ impl Default for NativePlacement {
             residency: None,
             transfer: crate::build_runtime::PackageTransferCost::default(),
             execution_nanoseconds: 1_000_000_000,
+            result: crate::build_runtime::ResultTransferEstimate::default(),
         }
     }
 }
@@ -1069,6 +1071,7 @@ pub trait SchedulerIncoming: Send + Sync {
         requester: &dyn SchedulerOutgoing,
         assignment: NativeAssignment,
         inputs: NativeInputBlobs,
+        network: &crate::build_runtime::NetworkSnapshot,
     ) -> ExtResult<AllocJobResult, Error>;
     // From Server
     fn handle_heartbeat_server(

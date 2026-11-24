@@ -18,8 +18,9 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::{ClientAuthCheck, ServerAuthenticator, authenticate_client, authenticate_server};
 use crate::{
     build_runtime::{
-        ActionMode, ArchiveLength, ExecutionSpec, NativeServiceBusy, NativeSessions, NativeStore,
-        PackageIdentity, PackageImportLimits, PackageSource, VerifiedPackage,
+        ActionMode, ArchiveLength, Direction, ExecutionSpec, NativeServiceBusy, NativeSessions,
+        NativeStore, NetworkMeter, PackageIdentity, PackageImportLimits, PackageSource, Peer,
+        VerifiedPackage,
         wire::{Publisher, ScheduleReply, UploadHeader},
     },
     config::scheduler::NativeCacheConfig,
@@ -28,6 +29,8 @@ use crate::{
         PackageLocator, PackagePlanRequest, codec,
     },
 };
+
+mod network;
 
 pub(super) type Allocator = dyn Fn(crate::dist::NativeAssignment, crate::dist::NativeInputBlobs) -> Result<ScheduleReply>
     + Send
@@ -61,6 +64,7 @@ impl PackageService {
         &self,
         sessions: &NativeSessions,
         locator: &PackageLocator,
+        network: &NetworkMeter,
     ) -> Result<(VerifiedPackage, bool)> {
         locator.validate()?;
         let (base, client) = self
@@ -89,7 +93,14 @@ impl PackageService {
                         .is_none_or(|size| length.accepts(size)),
                     "upstream package length violates expectation"
                 );
-                Ok(response)
+                let size = response.content_length().or(locator.expected_size);
+                Ok(network.meter(
+                    Direction::Receive,
+                    Peer::Upstream,
+                    response,
+                    size.unwrap_or(0),
+                    size,
+                ))
             },
         )
     }
@@ -106,6 +117,7 @@ pub(super) fn spawn(
     + 'static,
     client_auth: Arc<dyn ClientAuthCheck>,
     server_auth: Arc<ServerAuthenticator>,
+    network: Arc<NetworkMeter>,
 ) -> Result<()> {
     let limits = config.session_limits()?;
     let sessions = Arc::new(NativeSessions::new(
@@ -115,15 +127,23 @@ pub(super) fn spawn(
     let maintenance = Arc::downgrade(&sessions);
     let metadata_limit = config.max_metadata_bytes;
     let packages = PackageService::new(config)?;
+    network::start(
+        &network,
+        config.directory.join("network-timing.json"),
+        config.public_addr,
+    )?;
     let server = rouille::Server::new(config.public_addr, move |request| {
         respond(
             request,
-            &sessions,
+            NativeServices {
+                sessions: &sessions,
+                packages: packages.as_ref(),
+                network: &network,
+            },
             &allocate,
             &*client_auth,
             &*server_auth,
             metadata_limit,
-            packages.as_ref(),
         )
     })
     .map_err(|error| anyhow!("could not bind native cache listener: {error}"))?
@@ -194,14 +214,20 @@ fn blob_response(mut file: File, accept_zstd: bool) -> Result<Response> {
     })
 }
 
+#[derive(Clone, Copy)]
+struct NativeServices<'a> {
+    sessions: &'a NativeSessions,
+    packages: Option<&'a PackageService>,
+    network: &'a NetworkMeter,
+}
+
 fn respond(
     request: &Request,
-    sessions: &NativeSessions,
+    services: NativeServices<'_>,
     allocate: &Allocator,
     client_auth: &dyn ClientAuthCheck,
     server_auth: &ServerAuthenticator,
     limit: usize,
-    packages: Option<&PackageService>,
 ) -> Response {
     if request.method() != "POST" {
         return Response::empty_404();
@@ -241,9 +267,7 @@ fn respond(
     if request.header("Content-Type") != Some("application/octet-stream") {
         return Response::empty_400();
     }
-    match dispatch(
-        request, sessions, allocate, publisher, operation, limit, packages,
-    ) {
+    match dispatch(request, services, allocate, publisher, operation, limit) {
         Ok(response) => response,
         Err(error) if error.is::<NativeServiceBusy>() => {
             Response::text("native service busy").with_status_code(503)
@@ -259,13 +283,21 @@ fn respond(
 
 fn dispatch(
     request: &Request,
-    sessions: &NativeSessions,
+    services: NativeServices<'_>,
     allocate: &Allocator,
     publisher: Publisher,
     operation: &str,
     limit: usize,
-    packages: Option<&PackageService>,
 ) -> Result<Response> {
+    let NativeServices {
+        sessions,
+        packages,
+        network,
+    } = services;
+    let peer = match publisher {
+        Publisher::Client => Peer::Client(request.remote_addr().ip()),
+        Publisher::Worker { address, .. } => Peer::Worker(address),
+    };
     match operation {
         "package_lookup" | "rust_package_lookup"
             if publisher == Publisher::Client && packages.is_some() =>
@@ -297,7 +329,7 @@ fn dispatch(
         {
             let locator: PackageLocator = metadata(request, limit)?;
             let service = packages.context("native original-package provisioning disabled")?;
-            let (package, reused) = service.acquire(sessions, &locator)?;
+            let (package, reused) = service.acquire(sessions, &locator, network)?;
             if operation == "rust_package_acquire" {
                 let manifest = sessions
                     .store()
@@ -332,7 +364,15 @@ fn dispatch(
                 ArchiveLength::Exact(source.size),
                 service.limits,
                 &std::env::current_exe()?,
-                || Ok(body),
+                || {
+                    Ok(network.meter(
+                        Direction::Receive,
+                        peer,
+                        body,
+                        source.size,
+                        Some(source.size),
+                    ))
+                },
             )?;
             if operation == "rust_package_import" {
                 encode(
@@ -372,10 +412,24 @@ fn dispatch(
         "download" => {
             let DownloadRequest { ticket, id } = metadata(request, limit)?;
             let file = sessions.download(ticket, publisher, id)?;
-            blob_response(
+            let logical = file.metadata()?.len();
+            let mut response = blob_response(
                 file,
                 request.header("X-Sccache-Accept-Blob-Codec") == Some("zstd"),
-            )
+            )?;
+            let (reader, size) = response.data.into_reader_and_size();
+            let reader = network.meter(
+                Direction::Send,
+                peer,
+                reader,
+                logical,
+                size.map(|size| size as u64),
+            );
+            response.data = match size {
+                Some(size) => ResponseBody::from_reader_and_size(reader, size),
+                None => ResponseBody::from_reader(reader),
+            };
+            Ok(response)
         }
         "tree_offer" if publisher == Publisher::Client => {
             encode(&sessions.offer_tree(metadata(request, limit)?)?, limit)
@@ -412,7 +466,14 @@ fn dispatch(
             let mut body = request.data().context("missing native upload body")?;
             // Fixed-width header, never deserialize or buffer the actual blob.
             let header: UploadHeader = codec().with_limit(72).deserialize_from(&mut body)?;
-            sessions.upload(header.ticket, publisher, header.blob, body)?;
+            let reader = network.meter(
+                Direction::Receive,
+                peer,
+                body,
+                header.blob.size,
+                Some(header.blob.size),
+            );
+            sessions.upload(header.ticket, publisher, header.blob, reader)?;
             encode(&(), limit)
         }
         "commit" => encode(

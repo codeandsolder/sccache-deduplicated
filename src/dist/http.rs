@@ -1096,12 +1096,15 @@ mod server {
                 let handler = Arc::clone(&handler);
                 let requester = Arc::clone(&requester);
                 let certs = Arc::clone(&server_certificates);
+                let network = Arc::new(crate::build_runtime::NetworkMeter::default());
+                let placement_network = Arc::clone(&network);
                 native::spawn(
                     &config,
                     move |assignment, inputs| match handler.handle_alloc_native_job(
                         &*requester,
                         assignment,
                         inputs,
+                        &placement_network.snapshot(),
                     )? {
                         AllocJobResult::Success {
                             job_alloc,
@@ -1128,6 +1131,7 @@ mod server {
                     },
                     Arc::clone(&check_client_auth),
                     Arc::clone(&check_server_auth),
+                    network,
                 )?;
             }
 

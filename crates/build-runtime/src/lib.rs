@@ -8,6 +8,11 @@
 
 mod identity;
 mod installation;
+mod network;
+pub use network::{
+    Direction, DirectionSnapshot, MeteredReader, NetworkCheckpoint, NetworkMeter, NetworkSnapshot,
+    Peer, PeerCapacity, ResultTransferEstimate, SharedCapacity, TransferDemand,
+};
 mod package;
 pub use installation::{InstallationManifest, InstallationRecipe, InstalledComponent};
 pub use package::{
