@@ -253,9 +253,9 @@ void specific_target(int *dst, const int *a, const int *b) {
 }
 "#,
     );
-    let mut originals = Vec::new();
+    let mut replay_pairs = Vec::new();
     for (index, compiler) in ["gcc", "clang"].into_iter().enumerate() {
-        let compiler = which::which(compiler)?;
+        let compiler_path = which::which(compiler)?;
         for (case, flags, source) in [
             (
                 "native",
@@ -265,9 +265,9 @@ void specific_target(int *dst, const int *a, const int *b) {
             ("v4", &["-O2", "-march=x86-64-v4"][..], "specific_target.c"),
         ] {
             let output = root.join(format!("{case}-{index}.o"));
-            let compile = || {
+            let compile_object = || {
                 let result = sccache_command()
-                    .arg(&compiler)
+                    .arg(&compiler_path)
                     .args(flags)
                     .arg("-c")
                     .arg(root.join(source))
@@ -279,18 +279,18 @@ void specific_target(int *dst, const int *a, const int *b) {
                 ensure!(
                     result.status.success(),
                     "{} {case} compilation failed: {}",
-                    compiler.display(),
+                    compiler_path.display(),
                     String::from_utf8_lossy(&result.stderr)
                 );
                 Ok::<_, anyhow::Error>(std::fs::read(&output)?)
             };
-            let first = compile()?;
+            let first = compile_object()?;
             ensure!(!first.is_empty(), "distributed compile produced no object");
-            originals.push((compile()?, first));
+            replay_pairs.push((compile_object()?, first));
         }
     }
-    for (replayed, original) in originals {
-        assert_eq!(replayed, original);
+    for (actual, expected) in replay_pairs {
+        assert_eq!(actual, expected);
     }
     get_stats(|info| {
         assert_eq!(4, info.stats.dist_compiles.values().sum::<usize>());
