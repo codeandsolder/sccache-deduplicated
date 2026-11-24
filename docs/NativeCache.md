@@ -63,8 +63,33 @@ namespace clients drain an interrupted blob frame before requesting another.
 Only complete digest mismatches or overlong bodies reject the source locator
 (HTTP 422); short streams and storage failures are retryable (HTTP 503).
 A stale residency prediction therefore requires only acquisition of the
-missing content, not a new assignment. Results still publish to the scheduler
-CAS; action-result discovery from peer caches is a separate operation.
+missing content, not a new assignment.
+
+Successful results still publish to the scheduler CAS for verified delivery.
+Evicting an action retains its exact authoritative result manifest in a
+separate durable, FIFO-bounded receipt index (logical metadata budget equal
+to the configured maximum metadata size). Receipts do not retain any payload
+reference or prevent ordinary content eviction. The configured limit and
+receipts survive restart, including offline eviction. Publication replaces
+or removes the receipt atomically with the new action mapping; an explicit
+refresh never recovers a previous result.
+
+On reuse admission, a known receipt with absent payloads enters a bounded
+recovery queue under the normal exclusive action permit. A dedicated
+recovery worker reserves resident content and fetches only missing digest
+and length pairs through the same authenticated peer-blob route, without
+allocating a compiler job or blocking HTTP admission threads. Positive
+residency hints are preferred, but result recovery can ask other live native
+workers for an exact blob if the hint is stale. Every candidate is verified
+before selection, and concurrent peer acquisitions share the same CAS
+retention-root flight. Successfully recovered partial content survives
+later source misses. The scheduler publishes the complete verified result
+under the original action key and returns an ordinary cache hit, pinning
+it briefly until delivery admission. Failed recovery releases the exclusive
+permit and applies a bounded negative cooldown before attempting another
+peer recovery; a fresh compilation is then admissible. Physically missing
+indexed result content is also treated as a recoverable miss and can be
+repaired without changing its logical accounting.
 
 Workers compose the recipe directly in memory from the leased constituent
 manifests, including their selected subtrees and logical destinations.
