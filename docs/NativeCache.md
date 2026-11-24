@@ -20,6 +20,14 @@ optional output paths. The scheduler derives the action fingerprint from
 this declaration and the worker verifies the same specification before
 execution. There is no translation from an old compiler cache key.
 
+Metadata-only source digest reuse is restricted to mature file versions:
+rapid same-size rewrites can leave both ctime and mtime unchanged within one
+filesystem clock tick (reproduced on Acer ZFS). Fresh files are hashed rather
+than retained in the digest memo or installation attestation catalog. Original
+package verification and tree capture still hash exact bytes. The catalog
+identity is versioned so previously attested fresh files are never silently
+trusted after this policy change.
+
 The client prepares manifests directly from mapped source files and generated
 bytes without a local CAS. File metadata is checked before and after hashing
 and again when a missing blob is opened; the scheduler verifies its exact

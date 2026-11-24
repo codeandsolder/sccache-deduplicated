@@ -52,6 +52,11 @@ fn verified_installation_reuses_digest_without_reading_and_rejects_mutation() ->
     let mut encoded = Vec::new();
     manifest.write(&mut encoded)?;
     let decoded = InstallationManifest::read(encoded.as_slice())?;
+    let (fresh_catalog, fresh_report) =
+        InstallationCatalog::attest(&root, std::slice::from_ref(&decoded), None)?;
+    assert_eq!(fresh_report.verified_files, 1);
+    assert!(fresh_catalog.files.is_empty());
+    std::thread::sleep(std::time::Duration::from_secs(3));
     let (catalog, report) =
         InstallationCatalog::attest(&root, std::slice::from_ref(&decoded), None)?;
     assert_eq!(report.verified_files, 1);
