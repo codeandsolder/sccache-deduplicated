@@ -21,7 +21,7 @@ use crate::compiler::args::{
     ArgDisposition, ArgInfo, ArgParseError, ArgParseResult, ArgToStringResult, ArgsIter, Argument,
     FromArg, IntoArg, NormalizedDisposition, PathTransformerFn, split_os_string_arg,
 };
-use crate::compiler::canonical_paths::CanonicalRustPaths;
+use crate::compiler::canonical_paths::{CanonicalRustPaths, RustEnvironmentPath};
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, Compiler,
     CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, GenerateHashKeyContext,
@@ -878,31 +878,6 @@ fn is_clippy_driver(executable: &Path) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case("clippy-driver"))
 }
 
-fn rust_shadow_plain_env(name: &std::ffi::OsStr) -> bool {
-    matches!(
-        name.to_str(),
-        Some(
-            "CARGO"
-                | "CARGO_HOME"
-                | "CARGO_INSTALL_ROOT"
-                | "CARGO_MANIFEST_DIR"
-                | "CARGO_MANIFEST_PATH"
-                | "CARGO_TARGET_DIR"
-                | "CARGO_TARGET_TMPDIR"
-                | "OUT_DIR"
-                | "PWD"
-                | "RUSTC"
-                | "RUSTDOC"
-                | "TMPDIR"
-                | "TMP"
-                | "TEMP"
-                | "TEMPDIR"
-        )
-    ) || name
-        .to_str()
-        .is_some_and(|name| name.starts_with("CARGO_BIN_EXE_"))
-}
-
 fn rust_shadow_digest(value: &std::ffi::OsStr) -> String {
     blake3::hash(value.as_encoded_bytes()).to_hex().to_string()
 }
@@ -916,7 +891,7 @@ fn rust_shadow_env_value(
         || raw.to_owned(),
         |canonical| canonical.env_value_to_canonical(name, raw),
     );
-    let show_text = rust_shadow_plain_env(name);
+    let show_text = RustEnvironmentPath::classify(name).disclose_in_shadow();
     RustShadowEnvValue {
         raw_text: show_text.then(|| raw.to_string_lossy().into_owned()),
         raw_blake3: rust_shadow_digest(raw),

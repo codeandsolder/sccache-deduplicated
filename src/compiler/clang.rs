@@ -16,7 +16,8 @@ use crate::compiler::args::{ArgDisposition, ArgInfo, FromArg};
 #[cfg(test)]
 use crate::compiler::c::ArtifactDescriptor;
 use crate::compiler::c::{
-    CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext, ParsedArguments,
+    CCompileCommands, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
+    ParsedArguments,
 };
 use crate::compiler::gcc::ArgData::{
     ClangModuleOutput, ClangProfileUse, DepArgumentPath, DepTarget, DiagnosticsColorFlag,
@@ -25,11 +26,9 @@ use crate::compiler::gcc::ArgData::{
     PreprocessorArgumentFlag, PreprocessorArgumentPath, ProfileGenerate, TooHard, TooHardFlag,
     Unhashed, XClang,
 };
-use crate::compiler::{
-    CCompileCommand, Cacheable, CompileCommand, CompilerArguments, Language, gcc,
-};
+use crate::compiler::{CompilerArguments, Language, SingleCompileCommand, gcc};
+use crate::counted_array;
 use crate::mock_command::CommandCreatorSync;
-use crate::{counted_array, dist};
 use async_trait::async_trait;
 use semver::{BuildMetadata, Prerelease, Version};
 use std::ffi::OsString;
@@ -83,6 +82,8 @@ impl Clang {
 
 #[async_trait]
 impl CCompilerImpl for Clang {
+    type LocalCommand = SingleCompileCommand;
+
     fn kind(&self) -> CCompilerKind {
         CCompilerKind::Clang
     }
@@ -153,40 +154,11 @@ impl CCompilerImpl for Clang {
         .await
     }
 
-    fn generate_compile_commands<T>(
+    fn generate_compile_commands(
         &self,
         context: CCompileContext<'_>,
-    ) -> Result<(
-        Box<dyn CompileCommand<T>>,
-        Option<dist::CompileCommand>,
-        Cacheable,
-    )>
-    where
-        T: CommandCreatorSync,
-    {
-        let CCompileContext {
-            path_transformer,
-            executable,
-            parsed_args,
-            cwd,
-            env_vars,
-            rewrite_includes_only,
-        } = context;
-        gcc::generate_compile_commands(
-            path_transformer,
-            executable,
-            parsed_args,
-            cwd,
-            env_vars,
-            gcc::GccCompileConfig {
-                kind: self.kind(),
-                rewrite_includes_only,
-                language_to_arg: language_to_clang_arg,
-            },
-        )
-        .map(|(command, dist_command, cacheable)| {
-            (CCompileCommand::boxed(command), dist_command, cacheable)
-        })
+    ) -> CCompileCommands<Self::LocalCommand> {
+        gcc::generate_compile_commands(context, self.kind(), language_to_clang_arg)
     }
 }
 
@@ -331,9 +303,7 @@ mod test {
     use super::*;
     use crate::compiler::gcc;
     use crate::compiler::*;
-    use crate::mock_command::*;
-    use crate::server;
-    use crate::test::mock_storage::MockStorage;
+    use crate::dist;
     use crate::test::utils::*;
     use std::path::PathBuf;
 
@@ -1702,64 +1672,28 @@ mod test {
     }
 
     #[test]
-    fn test_compile_clang_cuda_does_not_dist_compile() {
-        let creator = new_creator();
+    fn test_compile_clang_cuda_does_not_dist_compile() -> Result<()> {
         let f = TestFixture::new();
-        let parsed_args = ParsedArguments {
-            input: "foo.cu".into(),
-            double_dash_input: false,
-            language: Language::Cuda,
-            compilation_flag: "-c".into(),
-            depfile: None,
-            outputs: vec![(
-                "obj",
-                ArtifactDescriptor {
-                    path: "foo.cu.o".into(),
-                    optional: false,
-                },
-            )]
-            .into_iter()
-            .collect(),
-            dependency_args: vec![],
-            preprocessor_args: vec![],
-            common_args: vec![],
-            arch_args: vec![],
-            unhashed_args: vec![],
-            extra_dist_files: vec![],
-            extra_hash_files: vec![],
-            uses_external_assembler: false,
-            msvc_show_includes: false,
-            profile_generate: false,
-            color_mode: ColorMode::Auto,
-            suppress_rewrite_includes_only: false,
-            too_hard_for_preprocessor_cache_mode: None,
-        };
-        let runtime = single_threaded_runtime();
-        let storage = MockStorage::new(None, false);
-        let storage: std::sync::Arc<MockStorage> = std::sync::Arc::new(storage);
-        let service = server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
+        let parsed_args = ParsedArguments::test_compile("foo.cu", "foo.cu.o", Language::Cuda);
         let compiler = &f.bins[0];
-        // Compiler invocation.
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
         let mut path_transformer = dist::PathTransformer::new();
         let (command, dist_command, cacheable) = gcc::generate_compile_commands(
-            &mut path_transformer,
-            compiler,
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-            gcc::GccCompileConfig {
-                kind: CCompilerKind::Clang,
+            CCompileContext {
+                path_transformer: &mut path_transformer,
+                executable: compiler,
+                parsed_args: &parsed_args,
+                cwd: f.tempdir.path(),
+                env_vars: &[],
                 rewrite_includes_only: false,
-                language_to_arg: language_to_clang_arg,
             },
+            CCompilerKind::Clang,
+            language_to_clang_arg,
         )
         .unwrap();
         // ClangCUDA cannot be dist-compiled
         assert!(dist_command.is_none());
-        let _ = command.execute(&service, &creator).wait();
+        assert_compile_command_executes(&command)?;
         assert_eq!(Cacheable::Yes, cacheable);
-        // Ensure that we ran all processes.
-        assert_eq!(0, creator.lock().unwrap().children.len());
+        Ok(())
     }
 }

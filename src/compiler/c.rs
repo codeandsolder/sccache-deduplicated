@@ -19,8 +19,9 @@ use crate::compiler::preprocessor_cache::{
     PreprocessorCacheKey, preprocessor_cache_entry_hash_key,
 };
 use crate::compiler::{
-    Cacheable, ColorMode, Compilation, CompileCommand, Compiler, CompilerArguments, CompilerHasher,
-    CompilerKind, GenerateCompileCommandsResult, GenerateHashKeyContext, HashResult, Language,
+    CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, CompileCommandImpl,
+    Compiler, CompilerArguments, CompilerHasher, CompilerKind, GenerateHashKeyContext, HashResult,
+    Language, SingleCompileCommand,
 };
 use crate::config::PreprocessorCacheModeConfig;
 use crate::dist;
@@ -126,6 +127,39 @@ pub struct ParsedArguments {
     pub suppress_rewrite_includes_only: bool,
     /// Arguments are incompatible with preprocessor cache mode
     pub too_hard_for_preprocessor_cache_mode: Option<OsString>,
+}
+
+#[cfg(test)]
+impl ParsedArguments {
+    pub(super) fn test_compile(input: &str, output: &str, language: Language) -> Self {
+        Self {
+            input: input.into(),
+            double_dash_input: false,
+            language,
+            compilation_flag: "-c".into(),
+            depfile: None,
+            outputs: HashMap::from([(
+                "obj",
+                ArtifactDescriptor {
+                    path: output.into(),
+                    optional: false,
+                },
+            )]),
+            dependency_args: vec![],
+            preprocessor_args: vec![],
+            common_args: vec![],
+            arch_args: vec![],
+            unhashed_args: vec![],
+            extra_dist_files: vec![],
+            extra_hash_files: vec![],
+            uses_external_assembler: false,
+            msvc_show_includes: false,
+            profile_generate: false,
+            color_mode: ColorMode::Auto,
+            suppress_rewrite_includes_only: false,
+            too_hard_for_preprocessor_cache_mode: None,
+        }
+    }
 }
 
 pub fn is_native_codegen_arg(arg: &OsStr) -> bool {
@@ -270,9 +304,46 @@ pub struct CCompileContext<'a> {
     pub rewrite_includes_only: bool,
 }
 
+impl CCompileContext<'_> {
+    pub(super) fn local_command(&self, arguments: Vec<OsString>) -> SingleCompileCommand {
+        SingleCompileCommand {
+            executable: self.executable.to_owned(),
+            arguments,
+            env_vars: self.env_vars.to_owned(),
+            cwd: self.cwd.to_owned(),
+            share_jobserver: false,
+        }
+    }
+}
+
+pub type CCompileCommands<C> = Result<(C, Option<dist::CompileCommand>, Cacheable)>;
+
+/// Construct a local-only frontend command using the shared -o convention.
+pub(super) fn local_dash_o_compile_commands(
+    context: CCompileContext<'_>,
+) -> CCompileCommands<SingleCompileCommand> {
+    trace!("compile");
+    let parsed = context.parsed_args;
+    let output = parsed
+        .outputs
+        .get("obj")
+        .context("Missing object file output")?;
+    let mut arguments = vec![
+        parsed.compilation_flag.clone(),
+        parsed.input.clone().into(),
+        "-o".into(),
+        output.path.as_os_str().into(),
+    ];
+    arguments.extend_from_slice(&parsed.preprocessor_args);
+    arguments.extend_from_slice(&parsed.unhashed_args);
+    arguments.extend_from_slice(&parsed.common_args);
+    Ok((context.local_command(arguments), None, Cacheable::Yes))
+}
+
 /// An interface to a specific C compiler.
 #[async_trait]
 pub trait CCompilerImpl: Clone + fmt::Debug + Send + Sync + 'static {
+    type LocalCommand: CompileCommandImpl;
     /// Return the kind of compiler.
     fn kind(&self) -> CCompilerKind;
     /// Return true iff this is g++ or clang++.
@@ -297,12 +368,10 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + Sync + 'static {
         T: CommandCreatorSync;
     /// Generate a command that can be used to invoke the C compiler to perform
     /// the compilation.
-    fn generate_compile_commands<T>(
+    fn generate_compile_commands(
         &self,
         context: CCompileContext<'_>,
-    ) -> GenerateCompileCommandsResult<T>
-    where
-        T: CommandCreatorSync;
+    ) -> CCompileCommands<Self::LocalCommand>;
 }
 
 impl<I> CCompiler<I>
@@ -1937,7 +2006,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
         if !self.allow_dist {
             dist_command = None;
         }
-        Ok((command, dist_command, cacheable))
+        Ok((CCompileCommand::boxed(command), dist_command, cacheable))
     }
 
     #[cfg(all(feature = "dist-client", target_os = "linux"))]

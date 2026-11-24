@@ -146,26 +146,49 @@ fn target_root_from_output_dir(output_dir: &Path, target: Option<&OsStr>) -> Opt
     marked_cargo_root(output_dir, target)
 }
 
-fn path_env(name: &OsStr) -> bool {
-    matches!(
-        name.to_str(),
-        Some(
-            "CARGO"
-                | "CARGO_HOME"
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RustEnvironmentPath {
+    Ordinary,
+    Temporary,
+    Home,
+    ClippyConfig,
+    Cargo,
+    Rustc,
+    Rustdoc,
+    Other,
+}
+
+impl RustEnvironmentPath {
+    pub(super) fn classify(name: &OsStr) -> Self {
+        match name.to_str() {
+            Some("TMPDIR" | "TMP" | "TEMP" | "TEMPDIR") => Self::Temporary,
+            Some("HOME") => Self::Home,
+            Some("CLIPPY_CONF_DIR") => Self::ClippyConfig,
+            Some("CARGO") => Self::Cargo,
+            Some("RUSTC") => Self::Rustc,
+            Some("RUSTDOC") => Self::Rustdoc,
+            Some(
+                "CARGO_HOME"
                 | "CARGO_INSTALL_ROOT"
                 | "CARGO_MANIFEST_DIR"
                 | "CARGO_MANIFEST_PATH"
                 | "CARGO_TARGET_DIR"
                 | "CARGO_TARGET_TMPDIR"
-                | "CLIPPY_CONF_DIR"
                 | "OUT_DIR"
-                | "PWD"
-                | "RUSTC"
-                | "RUSTDOC"
+                | "PWD",
+            ) => Self::Ordinary,
+            Some(name) if name.starts_with("CARGO_BIN_EXE_") => Self::Ordinary,
+            _ => Self::Other,
+        }
+    }
+
+    // Diagnostic disclosure is intentionally narrower than canonicalization.
+    pub(super) const fn disclose_in_shadow(self) -> bool {
+        matches!(
+            self,
+            Self::Ordinary | Self::Temporary | Self::Cargo | Self::Rustc | Self::Rustdoc
         )
-    ) || name
-        .to_str()
-        .is_some_and(|name| name.starts_with("CARGO_BIN_EXE_"))
+    }
 }
 
 fn embedded_path_match_is_token(text: &str, start: usize, end: usize) -> bool {
@@ -471,35 +494,26 @@ impl CanonicalRustPaths {
     }
 
     pub(crate) fn env_value_to_canonical(&self, name: &OsStr, value: &OsStr) -> OsString {
-        if matches!(name.to_str(), Some("TMPDIR" | "TMP" | "TEMP" | "TEMPDIR")) {
-            OsString::from("/tmp")
-        } else if name == "HOME" {
-            OsString::from("/tmp/home")
-        } else if name == "CLIPPY_CONF_DIR" {
-            self.clippy_config_dir.as_ref().map_or_else(
+        match RustEnvironmentPath::classify(name) {
+            RustEnvironmentPath::Temporary => OsString::from("/tmp"),
+            RustEnvironmentPath::Home => OsString::from("/tmp/home"),
+            RustEnvironmentPath::ClippyConfig => self.clippy_config_dir.as_ref().map_or_else(
                 || self.normalize_os_value(value),
                 |dir| self.to_canonical(dir).into_os_string(),
-            )
-        } else if name == "CARGO" {
-            // Cargo may invoke procedural macros that call Cargo again (for
-            // example proc-macro-crate uses `cargo locate-project`). The
-            // client-side CARGO can point at a site wrapper outside the
-            // packaged sysroot, which does not exist on a dist worker. Prefer
-            // a preserved real Cargo when the local toolchain has one; ordinary
-            // toolchains package `bin/cargo` directly.
-            if self.rust_root.join("bin/cargo.real").is_file() {
-                OsString::from("/rust/bin/cargo.real")
-            } else {
-                OsString::from("/rust/bin/cargo")
+            ),
+            RustEnvironmentPath::Cargo => {
+                // Cargo may invoke procedural macros that call Cargo again. A
+                // site wrapper may not exist on the worker; use packaged Cargo.
+                if self.rust_root.join("bin/cargo.real").is_file() {
+                    OsString::from("/rust/bin/cargo.real")
+                } else {
+                    OsString::from("/rust/bin/cargo")
+                }
             }
-        } else if name == "RUSTC" {
-            OsString::from("/rust/bin/rustc")
-        } else if name == "RUSTDOC" {
-            OsString::from("/rust/bin/rustdoc")
-        } else if path_env(name) {
-            self.os_to_canonical(value)
-        } else {
-            self.normalize_os_value(value)
+            RustEnvironmentPath::Rustc => OsString::from("/rust/bin/rustc"),
+            RustEnvironmentPath::Rustdoc => OsString::from("/rust/bin/rustdoc"),
+            RustEnvironmentPath::Ordinary => self.os_to_canonical(value),
+            RustEnvironmentPath::Other => self.normalize_os_value(value),
         }
     }
 
@@ -623,7 +637,30 @@ impl CanonicalRustPaths {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+
+    #[test]
+    fn rust_environment_classification_preserves_disclosure_policy() {
+        use super::RustEnvironmentPath as Kind;
+        use std::ffi::OsStr;
+        for (name, expected, disclose) in [
+            ("CARGO_BIN_EXE_example", Kind::Ordinary, true),
+            ("CARGO_MANIFEST_PATH", Kind::Ordinary, true),
+            ("TMPDIR", Kind::Temporary, true),
+            ("TEMPDIR", Kind::Temporary, true),
+            ("HOME", Kind::Home, false),
+            ("CLIPPY_CONF_DIR", Kind::ClippyConfig, false),
+            ("CARGO", Kind::Cargo, true),
+            ("RUSTC", Kind::Rustc, true),
+            ("RUSTDOC", Kind::Rustdoc, true),
+            ("CARGO_REGISTRIES_PRIVATE_TOKEN", Kind::Other, false),
+        ] {
+            let kind = Kind::classify(OsStr::new(name));
+            assert_eq!(kind, expected, "{name}");
+            assert_eq!(kind.disclose_in_shadow(), disclose, "{name}");
+        }
+    }
 
     #[test]
     fn maps_roots_with_target_precedence() {

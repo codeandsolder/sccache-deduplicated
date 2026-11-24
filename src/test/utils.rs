@@ -87,6 +87,22 @@ pub fn new_creator() -> Arc<Mutex<MockCommandCreator>> {
     Arc::new(Mutex::new(MockCommandCreator::new(&client)))
 }
 
+/// Run one generated compiler command against a single successful mock process.
+pub fn assert_compile_command_executes(
+    command: &impl crate::compiler::CompileCommandImpl,
+) -> Result<()> {
+    let creator = new_creator();
+    let runtime = single_threaded_runtime();
+    let storage = Arc::new(super::mock_storage::MockStorage::new(None, false));
+    let service =
+        crate::server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
+    next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
+    let output = runtime.block_on(command.execute(&service, &creator))?;
+    assert!(output.status.success());
+    assert_eq!(0, creator.lock().unwrap().children.len());
+    Ok(())
+}
+
 pub fn next_command(creator: &Arc<Mutex<MockCommandCreator>>, child: Result<MockChild>) {
     creator.lock().unwrap().next_command_spawns(child);
 }

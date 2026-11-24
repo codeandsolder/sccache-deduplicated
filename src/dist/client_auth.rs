@@ -4,14 +4,15 @@ use http::HeaderValue;
 use http::StatusCode;
 use http::header::CONTENT_TYPE;
 use http_body_util::Full;
-use hyper::Response;
+use hyper::{Method, Response, Uri};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::io;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
@@ -53,7 +54,7 @@ fn html_response(body: &'static str) -> Response<Full<Bytes>> {
     response(StatusCode::OK, "text/html; charset=utf-8", body)
 }
 
-fn json_response<T: Serialize>(data: &T) -> Result<Response<Full<Bytes>>> {
+fn json_response<T: Serialize + ?Sized>(data: &T) -> Result<Response<Full<Bytes>>> {
     let body = serde_json::to_vec(data).context("Failed to serialize to JSON")?;
     Ok(response(StatusCode::OK, "application/json", body))
 }
@@ -86,26 +87,17 @@ const REDIRECT_WITH_AUTH_JSON: &str = r#"<!doctype html>
 "#;
 
 mod code_grant_pkce {
-    use super::{
-        MIN_TOKEN_VALIDITY, MIN_TOKEN_VALIDITY_WARNING, REDIRECT_WITH_AUTH_JSON, html_response,
-        json_response, query_pairs, safe_request_path,
-    };
+    use super::warn_if_short_lived;
     use crate::http_client::{self, new_reqwest_blocking_client};
     use crate::util::BASE64_URL_SAFE_ENGINE;
     use base64::Engine;
-    use bytes::Bytes;
-    use futures::channel::oneshot;
-    use http_body_util::Full;
-    use hyper::{Method, Request, Response, StatusCode};
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
-    use std::sync::Mutex;
-    use std::sync::mpsc;
     use std::time::{Duration, Instant};
     use url::Url;
 
-    use crate::errors::{Context, Result, anyhow, bail};
+    use crate::errors::{Context, Result, bail};
 
     // Code request - https://tools.ietf.org/html/rfc7636#section-4.3
     const CLIENT_ID_PARAM: &str = "client_id";
@@ -141,15 +133,6 @@ mod code_grant_pkce {
 
     const NUM_CODE_VERIFIER_BYTES: usize = 256 / 8;
 
-    pub struct State {
-        pub auth_url: String,
-        pub auth_state_value: String,
-        pub code_tx: mpsc::SyncSender<String>,
-        pub shutdown_tx: Option<oneshot::Sender<()>>,
-    }
-
-    pub static STATE: Mutex<Option<State>> = Mutex::new(None);
-
     #[must_use = "the verifier and matching challenge must be retained for the OAuth exchange"]
     pub fn generate_verifier_and_challenge() -> (String, String) {
         let mut code_verifier_bytes = vec![0; NUM_CODE_VERIFIER_BYTES];
@@ -177,7 +160,9 @@ mod code_grant_pkce {
             .append_pair(STATE_PARAM, state);
     }
 
-    fn handle_code_response(params: &HashMap<String, String>) -> Result<(String, String)> {
+    pub(super) fn handle_code_response(
+        params: &HashMap<String, String>,
+    ) -> Result<(String, String)> {
         let code = params
             .get(CODE_RESULT_PARAM)
             .context("No code found in response")?;
@@ -199,70 +184,12 @@ mod code_grant_pkce {
         Ok((token, expires_at))
     }
 
-    const SUCCESS_AFTER_REDIRECT: &str = r#"<!doctype html>
+    pub(super) const SUCCESS_AFTER_REDIRECT: &str = r#"<!doctype html>
     <html lang="en">
     <head><meta charset="utf-8"></head>
     <body>In-browser step of authentication complete, you can now close this page!</body>
     </html>
     "#;
-
-    pub fn serve(req: &Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>> {
-        debug!("Handling {} {}", req.method(), safe_request_path(req.uri()));
-        match (req.method(), req.uri().path()) {
-            (&Method::GET, "/") => Ok(html_response(REDIRECT_WITH_AUTH_JSON)),
-            (&Method::GET, "/auth_detail.json") => {
-                let auth_url = {
-                    let guard = STATE
-                        .lock()
-                        .map_err(|_| anyhow!("OAuth PKCE state lock is poisoned"))?;
-                    guard
-                        .as_ref()
-                        .context("OAuth PKCE state is not initialized")?
-                        .auth_url
-                        .clone()
-                };
-                json_response(&auth_url)
-            }
-            (&Method::GET, "/redirect") => {
-                let query_pairs = query_pairs(&req.uri().to_string())?;
-                let (code, auth_state) = handle_code_response(&query_pairs)
-                    .context("Failed to handle response from redirect")?;
-                let (code_tx, shutdown_tx) = {
-                    let mut guard = STATE
-                        .lock()
-                        .map_err(|_| anyhow!("OAuth PKCE state lock is poisoned"))?;
-                    let state = guard
-                        .as_mut()
-                        .context("OAuth PKCE state is not initialized")?;
-                    if auth_state != state.auth_state_value {
-                        return Err(anyhow!("Mismatched auth states after redirect"));
-                    }
-                    let code_tx = state.code_tx.clone();
-                    let shutdown_tx = state
-                        .shutdown_tx
-                        .take()
-                        .context("OAuth PKCE shutdown was already requested")?;
-                    let result = (code_tx, shutdown_tx);
-                    drop(guard);
-                    result
-                };
-                // Deliver after releasing the global state lock.
-                code_tx
-                    .try_send(code)
-                    .map_err(|error| anyhow!("Failed to deliver OAuth code: {error}"))?;
-                shutdown_tx
-                    .send(())
-                    .map_err(|()| anyhow!("OAuth server shutdown receiver was dropped"))?;
-                Ok(html_response(SUCCESS_AFTER_REDIRECT))
-            }
-            _ => {
-                warn!("Route not found");
-                Ok(Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body("".into())?)
-            }
-        }
-    }
 
     pub fn code_to_token(
         token_url: &str,
@@ -295,26 +222,14 @@ mod code_grant_pkce {
             http_client::read_bounded_json(res, http_client::TOKEN_JSON_LIMIT)
                 .context("Failed to parse token response as JSON")?,
         )?;
-        if expires_at.saturating_duration_since(Instant::now()) < MIN_TOKEN_VALIDITY {
-            warn!("Token retrieved expires in under {MIN_TOKEN_VALIDITY_WARNING}");
-            eprintln!("sccache: Token retrieved expires in under {MIN_TOKEN_VALIDITY_WARNING}");
-        }
+        warn_if_short_lived(expires_at);
         Ok(token)
     }
 }
 
 mod implicit {
-    use super::{
-        MIN_TOKEN_VALIDITY, MIN_TOKEN_VALIDITY_WARNING, REDIRECT_WITH_AUTH_JSON, html_response,
-        json_response, query_pairs, safe_request_path,
-    };
-    use bytes::Bytes;
-    use futures::channel::oneshot;
-    use http_body_util::Full;
-    use hyper::{Method, Request, Response, StatusCode};
+
     use std::collections::HashMap;
-    use std::sync::Mutex;
-    use std::sync::mpsc;
     use std::time::{Duration, Instant};
     use url::Url;
 
@@ -333,15 +248,6 @@ mod implicit {
     const EXPIRES_IN_RESULT_PARAM: &str = "expires_in"; // Technically not required by the spec
     const STATE_RESULT_PARAM: &str = "state";
 
-    pub struct State {
-        pub auth_url: String,
-        pub auth_state_value: String,
-        pub token_tx: mpsc::SyncSender<String>,
-        pub shutdown_tx: Option<oneshot::Sender<()>>,
-    }
-
-    pub static STATE: Mutex<Option<State>> = Mutex::new(None);
-
     pub fn finish_url(client_id: &str, url: &mut Url, redirect_uri: &str, state: &str) {
         url.query_pairs_mut()
             .append_pair(CLIENT_ID_PARAM, client_id)
@@ -350,7 +256,9 @@ mod implicit {
             .append_pair(STATE_PARAM, state);
     }
 
-    fn handle_response(params: &HashMap<String, String>) -> Result<(String, Instant, String)> {
+    pub(super) fn handle_response(
+        params: &HashMap<String, String>,
+    ) -> Result<(String, Instant, String)> {
         let token = params
             .get(TOKEN_RESULT_PARAM)
             .context("No token found in response")?;
@@ -376,7 +284,7 @@ mod implicit {
         Ok((token.to_owned(), expires_at, state.to_owned()))
     }
 
-    const SAVE_AUTH_AFTER_REDIRECT: &str = r#"<!doctype html>
+    pub(super) const SAVE_AUTH_AFTER_REDIRECT: &str = r#"<!doctype html>
     <html lang="en">
     <head><meta charset="utf-8"></head>
     <body>
@@ -404,74 +312,81 @@ mod implicit {
     </body>
     </html>
     "#;
+}
 
-    pub fn serve(req: &Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>> {
-        debug!("Handling {} {}", req.method(), safe_request_path(req.uri()));
-        match (req.method(), req.uri().path()) {
-            (&Method::GET, "/") => Ok(html_response(REDIRECT_WITH_AUTH_JSON)),
-            (&Method::GET, "/auth_detail.json") => {
-                let auth_url = {
-                    let guard = STATE
-                        .lock()
-                        .map_err(|_| anyhow!("OAuth implicit state lock is poisoned"))?;
-                    guard
-                        .as_ref()
-                        .context("OAuth implicit state is not initialized")?
-                        .auth_url
-                        .clone()
-                };
-                json_response(&auth_url)
+use tokio::net::TcpListener;
+
+fn warn_if_short_lived(expires_at: Instant) {
+    if expires_at.saturating_duration_since(Instant::now()) < MIN_TOKEN_VALIDITY {
+        warn!("Token retrieved expires in under {MIN_TOKEN_VALIDITY_WARNING}");
+        eprintln!("sccache: Token retrieved expires in under {MIN_TOKEN_VALIDITY_WARNING}");
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CallbackFlow {
+    Code,
+    Implicit,
+}
+
+struct CallbackSession {
+    flow: CallbackFlow,
+    auth_url: Url,
+    expected_state: String,
+    result: Mutex<Option<oneshot::Sender<String>>>,
+}
+
+impl CallbackSession {
+    fn complete(&self, state: &str, value: String) -> Result<()> {
+        if state != self.expected_state {
+            bail!("Mismatched auth states after redirect");
+        }
+        let sender = self
+            .result
+            .lock()
+            .map_err(|_| anyhow!("OAuth callback lock is poisoned"))?
+            .take()
+            .context("OAuth callback already completed")?;
+        // A dropped receiver must not expose the authorization code or token.
+        sender
+            .send(value)
+            .map_err(|_| anyhow!("OAuth callback receiver was dropped"))
+    }
+
+    fn handle(&self, method: &Method, uri: &Uri) -> Result<Response<Full<Bytes>>> {
+        debug!("Handling {method} {}", safe_request_path(uri));
+        match (self.flow, method, uri.path()) {
+            (_, &Method::GET, "/") => Ok(html_response(REDIRECT_WITH_AUTH_JSON)),
+            (_, &Method::GET, "/auth_detail.json") => json_response(self.auth_url.as_str()),
+            (CallbackFlow::Code, &Method::GET, "/redirect") => {
+                let params = query_pairs(&uri.to_string())?;
+                let (code, state) = code_grant_pkce::handle_code_response(&params)
+                    .context("Failed to handle response from redirect")?;
+                self.complete(&state, code)?;
+                Ok(html_response(code_grant_pkce::SUCCESS_AFTER_REDIRECT))
             }
-            (&Method::GET, "/redirect") => Ok(html_response(SAVE_AUTH_AFTER_REDIRECT)),
-            (&Method::POST, "/save_auth") => {
-                let query_pairs = query_pairs(&req.uri().to_string())?;
-                let (token, expires_at, auth_state) =
-                    handle_response(&query_pairs).context("Failed to save auth after redirect")?;
-                if expires_at.saturating_duration_since(Instant::now()) < MIN_TOKEN_VALIDITY {
-                    warn!("Token retrieved expires in under {MIN_TOKEN_VALIDITY_WARNING}");
-                    eprintln!(
-                        "sccache: Token retrieved expires in under {MIN_TOKEN_VALIDITY_WARNING}"
-                    );
-                }
-                let (token_tx, shutdown_tx) = {
-                    let mut guard = STATE
-                        .lock()
-                        .map_err(|_| anyhow!("OAuth implicit state lock is poisoned"))?;
-                    let state = guard
-                        .as_mut()
-                        .context("OAuth implicit state is not initialized")?;
-                    if auth_state != state.auth_state_value {
-                        return Err(anyhow!("Mismatched auth states after redirect"));
-                    }
-                    let token_tx = state.token_tx.clone();
-                    let shutdown_tx = state
-                        .shutdown_tx
-                        .take()
-                        .context("OAuth implicit shutdown was already requested")?;
-                    let result = (token_tx, shutdown_tx);
-                    drop(guard);
-                    result
-                };
-                // Deliver after releasing the global state lock.
-                token_tx
-                    .try_send(token)
-                    .map_err(|error| anyhow!("Failed to deliver OAuth token: {error}"))?;
-                shutdown_tx
-                    .send(())
-                    .map_err(|()| anyhow!("OAuth server shutdown receiver was dropped"))?;
+            (CallbackFlow::Implicit, &Method::GET, "/redirect") => {
+                Ok(html_response(implicit::SAVE_AUTH_AFTER_REDIRECT))
+            }
+            (CallbackFlow::Implicit, &Method::POST, "/save_auth") => {
+                let params = query_pairs(&uri.to_string())?;
+                let (token, expires_at, state) = implicit::handle_response(&params)
+                    .context("Failed to save auth after redirect")?;
+                self.complete(&state, token)?;
+                warn_if_short_lived(expires_at);
                 json_response(&"")
             }
             _ => {
                 warn!("Route not found");
-                Ok(Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body("".into())?)
+                Ok(response(
+                    StatusCode::NOT_FOUND,
+                    "text/plain; charset=utf-8",
+                    "",
+                ))
             }
         }
     }
 }
-
-use tokio::net::TcpListener;
 
 struct HyperBuilderWrap {
     listener: TcpListener,
@@ -484,41 +399,67 @@ impl HyperBuilderWrap {
         Ok(Self { listener })
     }
 
-    // Typing out a hyper service is a major pain, so let's focus on our simple
-    // `fn(Request<Body>) -> Response<Body>` handler functions; to reduce repetition
-    // we create a relevant service using hyper's own helper factory functions.
-    async fn serve<F>(&self, sfn: F) -> io::Result<()>
-    where
-        F: Fn(&hyper::Request<hyper::body::Incoming>) -> anyhow::Result<Response<Full<Bytes>>>
-            + Send
-            + 'static
-            + Copy
-            + Sync,
-    {
+    async fn serve(
+        &self,
+        session: Arc<CallbackSession>,
+        mut result: oneshot::Receiver<String>,
+    ) -> Result<String> {
         use hyper::server::conn::http1;
         use hyper_util::rt::tokio::TokioIo;
 
-        loop {
-            let (tcp, _) = self.listener.accept().await?;
-            let io = TokioIo::new(tcp);
-            tokio::task::spawn(async move {
-                let conn = http1::Builder::new().serve_connection(
-                    io,
-                    hyper::service::service_fn(|req| async move {
-                        let uri = req.uri().clone();
-                        let response = match sfn(&req) {
-                            Ok(response) => response,
-                            Err(error) => error_code_response(&uri, error),
-                        };
-                        Ok::<_, Infallible>(response)
-                    }),
-                );
-                tokio::pin!(conn);
-                if let Err(error) = conn.await {
-                    warn!("OAuth client connection failed: {error}");
+        let shutdown = CancellationToken::new();
+        let mut connections = tokio::task::JoinSet::new();
+        let value = loop {
+            tokio::select! {
+                biased;
+                value = &mut result => break value.context("OAuth callback result was dropped"),
+                completed = connections.join_next(), if !connections.is_empty() => {
+                    completed.context("missing OAuth connection task")??;
                 }
-            });
-        }
+                accepted = self.listener.accept() => {
+                    let (tcp, _) = accepted.context("OAuth client auth web server failed")?;
+                    let session = Arc::clone(&session);
+                    let shutdown = shutdown.clone();
+                    connections.spawn(async move {
+                        let connection = http1::Builder::new().serve_connection(
+                            TokioIo::new(tcp),
+                            hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                                let session = Arc::clone(&session);
+                                async move {
+                                    let response = session
+                                        .handle(req.method(), req.uri())
+                                        .unwrap_or_else(|error| error_code_response(req.uri(), error));
+                                    Ok::<_, Infallible>(response)
+                                }
+                            }),
+                        );
+                        tokio::pin!(connection);
+                        let outcome = tokio::select! {
+                            outcome = &mut connection => outcome,
+                            () = shutdown.cancelled() => {
+                                connection.as_mut().graceful_shutdown();
+                                connection.await
+                            }
+                        };
+                        if let Err(error) = outcome {
+                            warn!("OAuth client connection failed: {error}");
+                        }
+                    });
+                }
+            }
+        };
+        // Flush the callback response before dropping the current-thread runtime.
+        // A peer that never finishes reading must not block authentication indefinitely.
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(completed) = connections.join_next().await {
+                if let Err(error) = completed {
+                    warn!("OAuth client connection task failed: {error}");
+                }
+            }
+        })
+        .await;
+        value
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -576,27 +517,29 @@ async fn try_bind() -> Result<HyperBuilderWrap> {
     bail!("Could not bind to any valid port: ({VALID_PORTS:?})")
 }
 
-async fn serve_until_shutdown<F>(
-    server: &HyperBuilderWrap,
-    sfn: F,
-    shutdown_rx: oneshot::Receiver<()>,
-) -> Result<()>
-where
-    F: Fn(&hyper::Request<hyper::body::Incoming>) -> anyhow::Result<Response<Full<Bytes>>>
-        + Send
-        + 'static
-        + Copy
-        + Sync,
-{
-    tokio::select! {
-        result = server.serve(sfn) => {
-            result.context("OAuth client auth web server failed")?;
-        }
-        result = shutdown_rx => {
-            result.context("OAuth client auth shutdown signal was dropped")?;
-        }
-    }
-    Ok(())
+fn run_callback(
+    flow: CallbackFlow,
+    mut auth_url: Url,
+    configure: impl FnOnce(&mut Url, &str, &str),
+) -> Result<(String, String)> {
+    let runtime = new_client_runtime()?;
+    let server = runtime.block_on(try_bind())?;
+    let port = server.local_addr()?.port();
+    let redirect_uri = format!("http://localhost:{port}/redirect");
+    let expected_state = Uuid::new_v4().as_simple().to_string();
+    configure(&mut auth_url, &redirect_uri, &expected_state);
+
+    let (sender, receiver) = oneshot::channel();
+    let session = Arc::new(CallbackSession {
+        flow,
+        auth_url,
+        expected_state,
+        result: Mutex::new(Some(sender)),
+    });
+    info!("Listening on http://localhost:{port} with 1 thread.");
+    println!("sccache: Please visit http://localhost:{port} in your browser");
+    let value = runtime.block_on(server.serve(session, receiver))?;
+    Ok((value, redirect_uri))
 }
 
 /// Complete an `OAuth2` authorization-code + PKCE flow using a temporary local callback server.
@@ -609,63 +552,14 @@ where
 /// <https://auth0.com/docs/api-auth/tutorials/authorization-code-grant-pkce>
 pub fn get_token_oauth2_code_grant_pkce(
     client_id: &str,
-    mut auth_url: Url,
+    auth_url: Url,
     token_url: &str,
 ) -> Result<String> {
-    let runtime = new_client_runtime()?;
-    let server = runtime.block_on(async move { try_bind().await })?;
-    let port = server.local_addr()?.port();
-
-    let _guard = runtime.enter();
-    let redirect_uri = format!("http://localhost:{port}/redirect");
-    let auth_state_value = Uuid::new_v4().as_simple().to_string();
     let (verifier, challenge) = code_grant_pkce::generate_verifier_and_challenge();
-    code_grant_pkce::finish_url(
-        client_id,
-        &mut auth_url,
-        &redirect_uri,
-        &auth_state_value,
-        &challenge,
-    );
-
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let (code_tx, code_rx) = mpsc::sync_channel(1);
-    let state = code_grant_pkce::State {
-        auth_url: auth_url.to_string(),
-        auth_state_value,
-        code_tx,
-        shutdown_tx: Some(shutdown_tx),
-    };
-    {
-        let mut state_slot = code_grant_pkce::STATE
-            .lock()
-            .map_err(|_| anyhow!("OAuth PKCE state lock is poisoned"))?;
-        if state_slot.is_some() {
-            bail!("OAuth PKCE authentication is already in progress");
-        }
-        *state_slot = Some(state);
-    }
-
-    info!("Listening on http://localhost:{port} with 1 thread.");
-    println!("sccache: Please visit http://localhost:{port} in your browser");
-
-    let serve_result = runtime.block_on(serve_until_shutdown(
-        &server,
-        code_grant_pkce::serve,
-        shutdown_rx,
-    ));
-    let code_result = code_rx
-        .try_recv()
-        .context("OAuth server stopped without returning an authorization code");
-    let clear_result = code_grant_pkce::STATE
-        .lock()
-        .map_err(|_| anyhow!("OAuth PKCE state lock is poisoned"))
-        .map(|mut state_slot| *state_slot = None);
-
-    serve_result?;
-    clear_result?;
-    let code = code_result?;
-
+    let (code, redirect_uri) =
+        run_callback(CallbackFlow::Code, auth_url, |url, redirect, state| {
+            code_grant_pkce::finish_url(client_id, url, redirect, state, &challenge);
+        })?;
     info!("Server finished, using code to request token");
     code_grant_pkce::code_to_token(token_url, client_id, &verifier, &code, &redirect_uri)
         .context("Failed to convert oauth2 code into a token")
@@ -679,57 +573,142 @@ pub fn get_token_oauth2_code_grant_pkce(
 /// maintained, or the authorization callback does not yield a valid token.
 ///
 /// <https://auth0.com/docs/api-auth/tutorials/implicit-grant>
-pub fn get_token_oauth2_implicit(client_id: &str, mut auth_url: Url) -> Result<String> {
-    let runtime = new_client_runtime()?;
-    let server = runtime.block_on(async move { try_bind().await })?;
-    let port = server.local_addr()?.port();
-    let _guard = runtime.enter();
-
-    let redirect_uri = format!("http://localhost:{port}/redirect");
-    let auth_state_value = Uuid::new_v4().as_simple().to_string();
-    implicit::finish_url(client_id, &mut auth_url, &redirect_uri, &auth_state_value);
-
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let (token_tx, token_rx) = mpsc::sync_channel(1);
-    let state = implicit::State {
-        auth_url: auth_url.to_string(),
-        auth_state_value,
-        token_tx,
-        shutdown_tx: Some(shutdown_tx),
-    };
-    {
-        let mut state_slot = implicit::STATE
-            .lock()
-            .map_err(|_| anyhow!("OAuth implicit state lock is poisoned"))?;
-        if state_slot.is_some() {
-            bail!("OAuth implicit authentication is already in progress");
-        }
-        *state_slot = Some(state);
-    }
-
-    info!("Listening on http://localhost:{port} with 1 thread.");
-    println!("sccache: Please visit http://localhost:{port} in your browser");
-
-    let serve_result =
-        runtime.block_on(serve_until_shutdown(&server, implicit::serve, shutdown_rx));
-    let token_result = token_rx
-        .try_recv()
-        .context("OAuth server stopped without returning a token");
-    let clear_result = implicit::STATE
-        .lock()
-        .map_err(|_| anyhow!("OAuth implicit state lock is poisoned"))
-        .map(|mut state_slot| *state_slot = None);
-
-    serve_result?;
-    clear_result?;
-
+pub fn get_token_oauth2_implicit(client_id: &str, auth_url: Url) -> Result<String> {
+    let (token, _) = run_callback(CallbackFlow::Implicit, auth_url, |url, redirect, state| {
+        implicit::finish_url(client_id, url, redirect, state);
+    })?;
     info!("Server finished, returning token");
-    token_result
+    Ok(token)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::safe_request_path;
+    use super::*;
+    use http_body_util::BodyExt as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    fn session(
+        flow: CallbackFlow,
+        expected_state: &str,
+    ) -> Result<(Arc<CallbackSession>, oneshot::Receiver<String>)> {
+        let (sender, receiver) = oneshot::channel();
+        Ok((
+            Arc::new(CallbackSession {
+                flow,
+                auth_url: Url::parse("https://example.invalid/authorize")?,
+                expected_state: expected_state.to_owned(),
+                result: Mutex::new(Some(sender)),
+            }),
+            receiver,
+        ))
+    }
+
+    #[test]
+    fn callbacks_are_isolated_and_single_use() -> Result<()> {
+        let (first, mut first_result) = session(CallbackFlow::Code, "first")?;
+        let (second, mut second_result) = session(CallbackFlow::Code, "second")?;
+        let wrong = "/redirect?code=wrong&state=second".parse()?;
+        assert!(first.handle(&Method::GET, &wrong).is_err());
+        assert_eq!(first_result.try_recv()?, None);
+
+        let valid = "/redirect?code=one&state=first".parse()?;
+        assert_eq!(first.handle(&Method::GET, &valid)?.status(), StatusCode::OK);
+        assert_eq!(first_result.try_recv()?.as_deref(), Some("one"));
+        assert!(first.handle(&Method::GET, &valid).is_err());
+        assert_eq!(second_result.try_recv()?, None);
+
+        let valid = "/redirect?code=two&state=second".parse()?;
+        assert_eq!(
+            second.handle(&Method::GET, &valid)?.status(),
+            StatusCode::OK
+        );
+        assert_eq!(second_result.try_recv()?.as_deref(), Some("two"));
+        Ok(())
+    }
+
+    #[test]
+    fn implicit_callback_validates_token_and_state() -> Result<()> {
+        let (session, mut result) = session(CallbackFlow::Implicit, "expected")?;
+        let redirect = "/redirect".parse()?;
+        assert_eq!(
+            session.handle(&Method::GET, &redirect)?.status(),
+            StatusCode::OK
+        );
+        assert_eq!(result.try_recv()?, None);
+
+        for callback in [
+            "/save_auth?access_token=token&token_type=other&expires_in=999999&state=expected",
+            "/save_auth?access_token=token&token_type=bearer&expires_in=invalid&state=expected",
+            "/save_auth?access_token=token&token_type=bearer&expires_in=999999&state=wrong",
+        ] {
+            assert!(session.handle(&Method::POST, &callback.parse()?).is_err());
+            assert_eq!(result.try_recv()?, None);
+        }
+        let valid =
+            "/save_auth?access_token=token&token_type=Bearer&expires_in=999999&state=expected"
+                .parse()?;
+        assert_eq!(
+            session.handle(&Method::GET, &valid)?.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            session.handle(&Method::POST, &valid)?.status(),
+            StatusCode::OK
+        );
+        assert_eq!(result.try_recv()?.as_deref(), Some("token"));
+        assert!(session.handle(&Method::POST, &valid).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn callback_server_delivers_response_before_shutdown() -> Result<()> {
+        let server = HyperBuilderWrap::try_bind("127.0.0.1:0".parse()?).await?;
+        let address = server.local_addr()?;
+        let (session, result) = session(CallbackFlow::Code, "expected")?;
+
+        let request = async {
+            let mut stream = tokio::net::TcpStream::connect(address).await?;
+            stream
+                .write_all(
+                    b"GET /redirect?code=abc&state=expected HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                )
+                .await?;
+            let mut received = String::new();
+            stream.read_to_string(&mut received).await?;
+            assert!(received.starts_with("HTTP/1.1 200 OK"), "{received}");
+            assert!(received.contains("In-browser step of authentication complete"));
+            Ok::<_, anyhow::Error>(())
+        };
+        let (code, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::try_join!(server.serve(session, result), request)
+        })
+        .await??;
+        assert_eq!(code, "abc");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auth_details_belong_to_the_session() -> Result<()> {
+        let (session, _) = session(CallbackFlow::Code, "expected")?;
+        let response = session.handle(&Method::GET, &"/auth_detail.json".parse()?)?;
+        let body = response.into_body().collect().await?.to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<String>(&body)?,
+            "https://example.invalid/authorize"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn closed_receiver_does_not_disclose_code() -> Result<()> {
+        let (session, result) = session(CallbackFlow::Code, "expected")?;
+        drop(result);
+        let error = session
+            .complete("expected", "private-code".to_owned())
+            .unwrap_err();
+        assert!(!format!("{error:?}").contains("private-code"));
+        Ok(())
+    }
 
     #[test]
     fn oauth_log_path_excludes_query_secrets() -> anyhow::Result<()> {
