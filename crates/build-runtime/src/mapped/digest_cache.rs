@@ -21,7 +21,7 @@ use super::{
 };
 use crate::{
     BlobRef,
-    source::{same_version, unchanged},
+    source::{same_version, unchanged, version_is_mature},
 };
 
 type Slot = Arc<Mutex<Option<(Stat, BlobRef)>>>;
@@ -135,13 +135,18 @@ impl SourceDigestCache {
             .lock()
             .map_err(|_| anyhow::anyhow!("source digest slot poisoned"))?;
         unchanged(version, &fstat(file)?)?;
-        if let Some((old_version, blob)) = cached.as_ref()
+        // A same-size rewrite can preserve both timestamps within one coarse
+        // filesystem tick. A digest first measured during that tick is never
+        // safe to reuse, even after it becomes old.
+        let mature = version_is_mature(version);
+        if mature
+            && let Some((old_version, blob)) = cached.as_ref()
             && same_version(old_version, version)
         {
             return Ok(*blob);
         }
         let blob = hash_open_source(file, version)?;
-        *cached = Some((*version, blob));
+        *cached = mature.then_some((*version, blob));
         drop(cached);
         Ok(blob)
     }
@@ -167,6 +172,9 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("tool");
         fs::write(&path, b"version1")?;
+        // Exercise the stable fast path after the filesystem timestamp tick,
+        // then exercise immediate same-size mutations below.
+        std::thread::sleep(std::time::Duration::from_secs(3));
         let cache = SourceDigestCache::new(NonZeroUsize::MIN);
         let (mut file, version) = open_source(&path)?;
         let initial = cache.digest(&path, &file, &version)?;

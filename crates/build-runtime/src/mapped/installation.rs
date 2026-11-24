@@ -20,10 +20,10 @@ use super::{hash_open_source, open_source};
 use crate::{
     BlobRef, InstallationManifest,
     installation::{read_document, write_document},
-    source::FileVersion,
+    source::{FileVersion, version_is_mature},
 };
 
-const CATALOG_MAGIC: &[u8] = b"sccache-installation-catalog-v1\0";
+const CATALOG_MAGIC: &[u8] = b"sccache-installation-catalog-v2\0";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct AttestedFile {
@@ -134,13 +134,18 @@ impl InstallationCatalog {
                 report.differing_files += 1;
                 continue;
             }
-            let record = AttestedFile {
-                version: FileVersion::from(&stat),
-                blob,
-            };
-            let path = resolved.into_os_string().into_vec();
-            if let Some(previous) = catalog.files.insert(path, record) {
-                ensure!(previous == record, "installation changed while verifying");
+            // Attest the verified bytes, but never publish a metadata-only
+            // fast path for a file whose original digest was acquired within
+            // a timestamp tick that may still conceal same-size rewrites.
+            if version_is_mature(&stat) {
+                let record = AttestedFile {
+                    version: FileVersion::from(&stat),
+                    blob,
+                };
+                let path = resolved.into_os_string().into_vec();
+                if let Some(previous) = catalog.files.insert(path, record) {
+                    ensure!(previous == record, "installation changed while verifying");
+                }
             }
             report.verified_files += 1;
             report.verified_bytes += blob.size;
