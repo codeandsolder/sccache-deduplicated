@@ -148,7 +148,9 @@ impl NativeCargoPaths {
             .map(|map| format!("-ffile-prefix-map={}={}", map.physical, map.canonical).into())
     }
 
-    fn map_bytes<'a>(&self, path: &'a [u8]) -> Cow<'a, [u8]> {
+    /// Map any compiler-observed path, including its DWARF compilation dir,
+    /// through the exact same prefix maps as its emitted code and line markers.
+    pub(super) fn map_bytes<'a>(&self, path: &'a [u8]) -> Cow<'a, [u8]> {
         // Prefix-map options are string-prefix substitutions, not arbitrary
         // search-and-replace. Mirror the compiler's last-match precedence.
         for map in self.maps.iter().rev() {

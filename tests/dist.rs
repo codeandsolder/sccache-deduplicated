@@ -194,6 +194,81 @@ fn test_dist_basic() {
     });
 }
 
+/// GCC and Clang embed the effective compilation directory in DWARF even
+/// when their preprocessed C inputs are otherwise identical. The worker must
+/// compile both distinct debug contexts, then restore each from its own key.
+#[cfg(target_os = "linux")]
+#[test]
+#[cfg_attr(
+    not(feature = "dist-tests"),
+    ignore = "requires isolated Docker distribution harness"
+)]
+fn test_dist_c_debug_compilation_directory_is_cache_identity() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let mut system = harness::DistSystem::new(&harness::sccache_dist_path(), root);
+    system.add_scheduler();
+    system.add_server(&[]);
+    let mut config = dist_test_sccache_client_cfg(root, system.scheduler_url());
+    config
+        .cache
+        .disk
+        .as_mut()
+        .context("missing disk cache")?
+        .size = 128 * 1024 * 1024;
+    let config_path = root.join("sccache-cfg.json");
+    write_json_cfg(root, "sccache-cfg.json", &config);
+    let cached_config = root.join("sccache-cached-cfg");
+    let _ = stop_local_daemon();
+    start_local_daemon(&config_path, &cached_config);
+
+    for compiler in ["gcc", "clang"] {
+        let compiler_path = which::which(compiler)?;
+        let mut objects = Vec::new();
+        for directory in ["a", "b"] {
+            let cwd = root.join(compiler).join(directory);
+            std::fs::create_dir_all(&cwd)?;
+            write_source(&cwd, "probe.c", "int multiply(int x) { return x * 7; }\n");
+            let output = cwd.join("probe.o");
+            let compile = || -> Result<Vec<u8>> {
+                let result = sccache_command()
+                    .arg(&compiler_path)
+                    .args(["-g", "-O2", "-c", "probe.c", "-o", "probe.o"])
+                    .current_dir(&cwd)
+                    .env("SCCACHE_CONF", &config_path)
+                    .env("SCCACHE_CACHED_CONF", &cached_config)
+                    .output()?;
+                assert!(
+                    result.status.success(),
+                    "{compiler} {directory}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                Ok(std::fs::read(&output)?)
+            };
+            let cold = compile()?;
+            std::fs::remove_file(&output)?;
+            assert_eq!(
+                cold,
+                compile()?,
+                "cached object differs for {compiler}/{directory}"
+            );
+            objects.push(cold);
+        }
+        assert_ne!(
+            objects[0], objects[1],
+            "{compiler} debug objects aliased across different working directories"
+        );
+    }
+    get_stats(|info| {
+        assert_eq!(4, info.stats.dist_compiles.values().sum::<usize>());
+        assert_eq!(0, info.stats.dist_errors);
+        assert_eq!(8, info.stats.compile_requests);
+        assert_eq!(4, info.stats.cache_hits.all());
+        assert_eq!(4, info.stats.cache_misses.all());
+    });
+    Ok(())
+}
+
 /// The daemon sees deliberately different sources at the exact paths used by
 /// the caller. Cold misses must execute on a worker, not on the host.
 #[cfg(target_os = "linux")]
