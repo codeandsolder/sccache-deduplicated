@@ -127,13 +127,11 @@ impl NativeStore {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             flights.retain(|_, flight| flight.strong_count() > 0);
-            if let Some(flight) = flights.get(&id).and_then(Weak::upgrade) {
-                flight
-            } else {
+            flights.get(&id).and_then(Weak::upgrade).unwrap_or_else(|| {
                 let flight = Arc::new(TreeFlight::default());
                 flights.insert(id, Arc::downgrade(&flight));
                 flight
-            }
+            })
         };
         loop {
             check()?;

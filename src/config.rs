@@ -2139,6 +2139,7 @@ pub mod scheduler {
         pub max_total_uploads: usize,
         pub http_threads: usize,
         pub max_metadata_bytes: usize,
+        pub network_probe_bytes: Option<u64>,
         pub package_import: Option<crate::build_runtime::PackageImportLimits>,
         #[serde(default)]
         pub package_upstreams: std::collections::BTreeMap<String, PackageUpstream>,
@@ -2157,6 +2158,16 @@ pub mod scheduler {
                 bail!(
                     "native cache requires spare HTTP threads for control traffic and a nonzero metadata limit"
                 );
+            }
+            if let Some(bytes) = self.network_probe_bytes {
+                use crate::dist::native::probe::{PROBE_MAX_BYTES, PROBE_MIN_BYTES};
+                if !(PROBE_MIN_BYTES..=PROBE_MAX_BYTES).contains(&bytes)
+                    || self.http_threads.saturating_sub(self.max_total_uploads) < 3
+                {
+                    bail!(
+                        "network calibration needs a bounded byte budget and at least three spare HTTP threads"
+                    );
+                }
             }
             let limits = crate::build_runtime::SessionLimits {
                 idle_timeout: std::time::Duration::from_secs(self.idle_timeout_secs),
@@ -2352,6 +2363,8 @@ pub mod server {
         pub execution_timeout_secs: u64,
         pub max_result_bytes: u64,
         pub max_metadata_bytes: u64,
+        #[serde(default)]
+        pub network_probe: bool,
         #[serde(default = "default_artifact_grace_secs")]
         pub artifact_grace_secs: u64,
         pub artifact_grace_bytes: Option<u64>,

@@ -33,7 +33,11 @@ pub(super) struct NativeWorker {
 }
 
 impl NativeWorker {
-    pub(super) fn new(config: NativeWorkerConfig, auth: String) -> Result<Self> {
+    pub(super) fn new(
+        config: NativeWorkerConfig,
+        auth: String,
+        activity: &std::sync::Arc<sccache::build_runtime::IdleGate>,
+    ) -> Result<Self> {
         ensure!(
             config.directory.is_absolute()
                 && config.scratch.is_absolute()
@@ -83,7 +87,7 @@ impl NativeWorker {
             scope,
             config.package_transfer,
         );
-        let package_transfer = PackageTransportTracker::new(timing.transfer)?;
+        let package_transfer = PackageTransportTracker::new(timing.transfer, timing.result)?;
         if timing.execution_nanoseconds != 0 {
             package_transfer.observe_execution(Duration::from_nanos(timing.execution_nanoseconds));
         }
@@ -93,6 +97,9 @@ impl NativeWorker {
             Duration::from_secs(config.request_timeout_secs),
             config.max_metadata_bytes,
         )?;
+        if config.network_probe {
+            client.start_calibration(activity)?;
+        }
         Ok(Self {
             store,
             client,
@@ -145,6 +152,7 @@ impl NativeWorker {
         let timing = WorkerTiming {
             transfer: self.package_transfer.estimate(),
             execution_nanoseconds: self.package_transfer.execution_nanoseconds(),
+            result: self.package_transfer.result_estimate(),
         };
         let mut cache = self
             .placement
@@ -183,6 +191,7 @@ impl NativeWorker {
 struct WorkerTiming {
     transfer: PackageTransferCost,
     execution_nanoseconds: u64,
+    result: sccache::build_runtime::ResultTransferEstimate,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -216,6 +225,7 @@ impl PlacementCache {
         let mut timing = WorkerTiming {
             transfer: configured,
             execution_nanoseconds: 0,
+            result: sccache::build_runtime::ResultTransferEstimate::default(),
         };
         match std::fs::File::open(&path) {
             Ok(file) => match serde_json::from_reader::<_, SavedTiming>(file) {
@@ -225,7 +235,8 @@ impl PlacementCache {
                             .checked_sub(saved.observed_at)
                             .is_some_and(|age| age <= 24 * 60 * 60)
                         && saved.timing.transfer.validate().is_ok()
-                        && saved.timing.execution_nanoseconds <= 3_600_000_000_000 =>
+                        && saved.timing.execution_nanoseconds <= 3_600_000_000_000
+                        && saved.timing.result.valid() =>
                 {
                     timing = saved.timing;
                     // Concurrency is configuration, not a learned rate.
@@ -278,6 +289,7 @@ impl PlacementCache {
                 .and_then(|(_, summary)| summary.clone()),
             transfer: timing.transfer,
             execution_nanoseconds: timing.execution_nanoseconds,
+            result: timing.result,
         }
     }
 

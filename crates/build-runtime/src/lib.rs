@@ -8,6 +8,12 @@
 
 mod identity;
 mod installation;
+mod network;
+pub use network::{
+    Direction, DirectionSnapshot, IdleGate, IdlePermit, MeteredReader, NetworkCheckpoint,
+    NetworkMeter, NetworkSnapshot, Peer, PeerCapacity, ProbePayload, ProbeStream,
+    ResultTransferEstimate, SharedCapacity, TransferDemand, WorkActivity, transfer_seconds,
+};
 mod package;
 pub use installation::{InstallationManifest, InstallationRecipe, InstalledComponent};
 pub use package::{

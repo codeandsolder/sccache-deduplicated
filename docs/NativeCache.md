@@ -808,3 +808,99 @@ The residency summary and timing estimates are advisory; neither changes
 content identity or bypasses verification. The model currently uses raw
 delivery cost for placement (package reconstruction is optimized separately)
 and one average slot duration per worker, not per-action compute forecasts.
+
+### Directional shared-network estimation
+
+The native cache listener meters encoded HTTP payload bytes before delivery
+to the transport or after reception from it; logical lengths are tracked
+separately. Authenticated worker addresses, client source IPs, and upstream
+package traffic have separate counters in each direction. A dedicated
+one-second sampler aggregates overlapping streams without a global lock in
+the body read path. Long observations include transport backpressure and
+may also reflect endpoint processing or storage limitations: these are
+effective service-rate estimates, not physical interface line rates.
+
+Sustained per-peer observations provide lower bounds on available bandwidth.
+A group becomes a shared effective constraint after at least three aligned
+windows in which all members remain active, every member runs below its
+previous sustained rate, and the group total remains near a plateau.
+Unsaturated or nonoverlapping windows do not establish a ceiling. A higher
+subsequent observed group total invalidates the constraint. Peer and group
+evidence expires after 30 minutes; the scheduler atomically checkpoints
+fresh measurements to `network-timing.json` each minute, scoped to the native
+listener address. Active requests and their remaining bytes are not restored
+after restart.
+
+Native placement converts predicted missing logical bytes to encoded demand
+using measured per-peer compression ratios and uses sustained aggregate
+goodput in addition to the worker's per-request estimates. Outstanding
+worker input closures are deduplicated before estimating demand; currently
+active client downloads participate in the same model. Progressive max-min
+sharing allocates bandwidth across overlapping shared-resource constraints
+and reallocates capacity when a peer finishes. Placement includes the
+marginal completion delay imposed on other peers, not only the selected job's
+estimated finish time.
+
+Workers learn expected missing result-upload bytes, request counts, upload
+throughput and request overhead from successful publications. These estimates
+join the existing worker timing checkpoint and heartbeat. Placement advances
+current incoming traffic to predicted compiler completion before adding the
+new upload demand. Send and receive constraints are independent. The
+forecast does not yet predict the arrival of other not-yet-produced results.
+
+Active memory-to-memory calibration probes are a follow-up: use them only
+when passive observations are insufficient or stale, coordinate isolated and
+selected concurrent tests, and cancel them when actual build traffic needs
+the relevant resources. The current implementation introduces no synthetic
+traffic.
+
+### Adaptive idle-time calibration
+
+Both the scheduler and each participating worker must opt in. Example
+configuration for unmetered links:
+
+```toml
+[native_cache]
+network_probe_bytes = 67108864
+
+[native_worker]
+network_probe = true
+```
+
+The scheduler setting caps each grant at 64 MiB in this example (allowed
+range 1–256 MiB). The scheduler additionally has a shared token bucket of
+16 times that cap, refilled over one hour; it reserves the entire worst-case
+cohort budget before issuing grants, including failed/preempted rounds.
+Worker participation defaults to false, and a scheduler without the byte
+budget issues no grants. Keep the probe option disabled on metered routes.
+
+Workers poll only when their local assignment gate has been idle for ten
+seconds. The scheduler also requires ten seconds without real native
+requests or streaming bodies. It grants isolated directional probes to
+workers without fresh passive or calibrated rates, then coordinated larger
+cohorts to measure shared limits. Pairwise refinement is driven by observed
+contention when larger cohorts fit. A round has a four-second join window;
+each worker gets a relative start delay, an authenticated single-use grant,
+and a byte budget sized from the available previous rate when known.
+
+Payloads are deterministic pseudorandom memory streams over the same native
+HTTP route, not CAS files. The generating side stops after two seconds or
+the byte cap; HTTP requests have a five-second timeout. Download receipts
+must match the actual server-sent byte count; isolated goodput uses the
+longer sender/receiver elapsed time. Cohort constraints use synchronized
+body observations and require a completed, non-preempted round. Probes use
+at most four spare native HTTP threads, leaving at least two for control
+traffic; a stream retains its slot until it actually closes even if its
+round expires.
+
+Any real native request/body or local job assignment invalidates the
+corresponding idle generation immediately. Streams check cancellation before
+and after every bounded read, while already buffered/socket-blocked I/O
+remains bounded by transport timeouts. No job waits for a probe to finish.
+Aborted rounds do not update the model. Calibration-only observations are
+checkpointed separately in `network-calibration.json`; they constrain
+network service estimates without modifying passive compression ratios or
+application-side processing estimates. Contradictory real traffic removes
+a synthetic shared constraint. Successful probes cool down for 30 minutes;
+unsuccessful/preempted rounds retry no sooner than one minute and remain
+subject to the global budget.

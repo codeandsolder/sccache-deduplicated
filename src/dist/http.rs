@@ -1184,11 +1184,15 @@ mod server {
                 let peer_handler = Arc::clone(&handler);
                 let peer_certs = Arc::clone(&server_certificates);
                 let peer_http = native::PeerHttp::default();
+                let network = Arc::new(crate::build_runtime::NetworkMeter::default());
+                let peer_network = Arc::clone(&network);
                 native::spawn(
                     &config,
-                    move |assignment| match handler
-                        .handle_alloc_native_job(&*requester, assignment)?
-                    {
+                    move |assignment, snapshot| match handler.handle_alloc_native_job(
+                        &*requester,
+                        assignment,
+                        snapshot,
+                    )? {
                         AllocJobResult::Success {
                             job_alloc,
                             need_toolchain,
@@ -1222,7 +1226,7 @@ mod server {
                             let Some(certificate) = certificate else {
                                 continue;
                             };
-                            match peer_http.fetch(source, blob, &certificate) {
+                            match peer_http.fetch(source, blob, &certificate, &peer_network) {
                                 Ok(Some(reader)) => return Ok(Some(reader)),
                                 Ok(None) => {}
                                 Err(error) => debug!("native peer lookup failed: {error:#}"),
@@ -1232,6 +1236,7 @@ mod server {
                     },
                     Arc::clone(&check_client_auth),
                     Arc::clone(&check_server_auth),
+                    network,
                 )?;
             }
 
@@ -1703,7 +1708,7 @@ mod server {
                         }
                         let file = try_or_500_log!(req_id, handler.handle_native_blob(blob));
                         match file {
-                            Some(file) => try_or_500_log!(req_id, native::blob_response(file,
+                            Some((file, activity)) => try_or_500_log!(req_id, native::peer_blob_response(file, activity,
                                 request.header("X-Sccache-Accept-Blob-Codec") == Some("zstd"))),
                             None => rouille::Response::empty_404(),
                         }

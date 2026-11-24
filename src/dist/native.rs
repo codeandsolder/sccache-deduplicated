@@ -22,6 +22,8 @@ use crate::build_runtime::{
 use crate::dist::JobId;
 
 mod package;
+#[cfg(feature = "dist-server")]
+pub(crate) mod probe;
 pub use package::{
     PackageAcquisition, PackageLocator, map_packages, validate_upstream_base,
     validate_upstream_name,
@@ -72,6 +74,8 @@ pub(super) struct PackagePlanRequest {
 enum Role {
     Client,
     Worker(JobId),
+    #[cfg(feature = "dist-server")]
+    Calibration,
 }
 
 /// Bounded streaming HTTP client for native result publication and retrieval.
@@ -138,6 +142,8 @@ impl NativeCacheClient {
         let (role, job) = match self.role {
             Role::Client => ("client", None),
             Role::Worker(job) => ("worker", Some(job)),
+            #[cfg(feature = "dist-server")]
+            Role::Calibration => ("worker", None),
         };
         let url = self
             .base

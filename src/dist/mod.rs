@@ -1031,6 +1031,7 @@ pub struct NativePlacement {
     pub residency: Option<crate::build_runtime::BlobResidency>,
     pub transfer: crate::build_runtime::PackageTransferCost,
     pub execution_nanoseconds: u64,
+    pub result: crate::build_runtime::ResultTransferEstimate,
 }
 
 #[cfg(feature = "dist-server")]
@@ -1040,6 +1041,7 @@ impl Default for NativePlacement {
             residency: None,
             transfer: crate::build_runtime::PackageTransferCost::default(),
             execution_nanoseconds: 1_000_000_000,
+            result: crate::build_runtime::ResultTransferEstimate::default(),
         }
     }
 }
@@ -1078,6 +1080,7 @@ pub trait SchedulerIncoming: Send + Sync {
         &self,
         requester: &dyn SchedulerOutgoing,
         assignment: NativeAssignment,
+        network: &crate::build_runtime::NetworkSnapshot,
     ) -> ExtResult<AllocJobResult, Error>;
     /// Select likely sources for a missing exact blob without allocating a job.
     fn native_blob_sources(
@@ -1136,7 +1139,7 @@ pub trait ServerIncoming: Send + Sync {
     fn handle_native_blob(
         &self,
         blob: crate::build_runtime::BlobRef,
-    ) -> ExtResult<Option<std::fs::File>, Error>;
+    ) -> ExtResult<Option<(std::fs::File, crate::build_runtime::WorkActivity)>, Error>;
     /// Accept an immutable native action assignment.
     ///
     /// # Errors

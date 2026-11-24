@@ -18,9 +18,10 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::{ClientAuthCheck, ServerAuthenticator, authenticate_client, authenticate_server};
 use crate::{
     build_runtime::{
-        ActionMode, ArchiveLength, BlobRef, ContentId, ExecutionSpec, NativeContentPending,
-        NativeServiceBusy, NativeSessions, NativeStore, PackageIdentity, PackageImportLimits,
-        PackageSource, TreeId, TreeManifest, VerifiedPackage,
+        ActionMode, ArchiveLength, BlobRef, ContentId, Direction, ExecutionSpec,
+        NativeContentPending, NativeServiceBusy, NativeSessions, NativeStore, NetworkMeter,
+        PackageIdentity, PackageImportLimits, PackageSource, Peer, TreeId, TreeManifest,
+        VerifiedPackage,
         wire::{Publisher, ScheduleReply, UploadHeader},
     },
     config::scheduler::NativeCacheConfig,
@@ -30,8 +31,15 @@ use crate::{
     },
 };
 
-pub(super) type Allocator =
-    dyn Fn(crate::dist::NativeAssignment) -> Result<ScheduleReply> + Send + Sync;
+mod network;
+mod probe;
+
+pub(super) type Allocator = dyn Fn(
+        crate::dist::NativeAssignment,
+        &crate::build_runtime::NetworkSnapshot,
+    ) -> Result<ScheduleReply>
+    + Send
+    + Sync;
 
 struct PackageService {
     limits: PackageImportLimits,
@@ -61,6 +69,7 @@ impl PackageService {
         &self,
         sessions: &NativeSessions,
         locator: &PackageLocator,
+        network: &NetworkMeter,
     ) -> Result<(VerifiedPackage, bool)> {
         locator.validate()?;
         let (base, client) = self
@@ -89,7 +98,14 @@ impl PackageService {
                         .is_none_or(|size| length.accepts(size)),
                     "upstream package length violates expectation"
                 );
-                Ok(response)
+                let size = response.content_length().or(locator.expected_size);
+                Ok(network.meter(
+                    Direction::Receive,
+                    Peer::Upstream,
+                    response,
+                    size.unwrap_or(0),
+                    size,
+                ))
             },
         )
     }
@@ -97,13 +113,20 @@ impl PackageService {
 
 pub(super) fn spawn(
     config: &NativeCacheConfig,
-    allocate: impl Fn(crate::dist::NativeAssignment) -> Result<ScheduleReply> + Send + Sync + 'static,
+    allocate: impl Fn(
+        crate::dist::NativeAssignment,
+        &crate::build_runtime::NetworkSnapshot,
+    ) -> Result<ScheduleReply>
+    + Send
+    + Sync
+    + 'static,
     fetch_peer: impl Fn(BlobRef, std::net::SocketAddr) -> Result<Option<Box<dyn Read + Send>>>
     + Send
     + Sync
     + 'static,
     client_auth: Arc<dyn ClientAuthCheck>,
     server_auth: Arc<ServerAuthenticator>,
+    network: Arc<NetworkMeter>,
 ) -> Result<()> {
     let limits = config.session_limits()?;
     let sessions = Arc::new(NativeSessions::new(
@@ -118,20 +141,24 @@ pub(super) fn spawn(
     for index in 0..peer_threads {
         let sessions = Arc::downgrade(&sessions);
         let fetch_peer = Arc::clone(&fetch_peer);
+        let network = Arc::clone(&network);
         thread::Builder::new()
             .name(format!("native-peer-backfill-{index}"))
             .spawn(move || {
                 while let Some(sessions) = sessions.upgrade() {
                     match sessions.claim_peer_input(Duration::from_millis(100)) {
-                        Ok(Some(claim)) => match fetch_peer(claim.blob(), claim.requester()) {
-                            Ok(Some(reader)) => {
-                                if let Err(error) = sessions.publish_peer_input(claim, reader) {
-                                    debug!("native peer backfill failed: {error:#}");
+                        Ok(Some(claim)) => {
+                            let _activity = network.idle_gate().begin();
+                            match fetch_peer(claim.blob(), claim.requester()) {
+                                Ok(Some(reader)) => {
+                                    if let Err(error) = sessions.publish_peer_input(claim, reader) {
+                                        debug!("native peer backfill failed: {error:#}");
+                                    }
                                 }
+                                Ok(None) => {}
+                                Err(error) => debug!("native peer backfill unavailable: {error:#}"),
                             }
-                            Ok(None) => {}
-                            Err(error) => debug!("native peer backfill unavailable: {error:#}"),
-                        },
+                        }
                         Ok(None) => {}
                         Err(error) => {
                             warn!("native peer claim failed: {error:#}");
@@ -143,15 +170,40 @@ pub(super) fn spawn(
     }
     let metadata_limit = config.max_metadata_bytes;
     let packages = PackageService::new(config)?;
+    network::start(
+        &network,
+        config.directory.join("network-timing.json"),
+        config.public_addr,
+    )?;
+    let calibration = config
+        .network_probe_bytes
+        .map(|bytes| {
+            probe::ProbeCoordinator::start(
+                &network,
+                config.directory.join("network-calibration.json"),
+                config.public_addr,
+                bytes,
+                config
+                    .http_threads
+                    .saturating_sub(config.max_total_uploads)
+                    .saturating_sub(2)
+                    .min(4),
+            )
+        })
+        .transpose()?;
     let server = rouille::Server::new(config.public_addr, move |request| {
         respond(
             request,
-            &sessions,
+            NativeServices {
+                sessions: &sessions,
+                packages: packages.as_ref(),
+                network: &network,
+                calibration: calibration.as_deref(),
+            },
             &allocate,
             &*client_auth,
             &*server_auth,
             metadata_limit,
-            packages.as_ref(),
         )
     })
     .map_err(|error| anyhow!("could not bind native cache listener: {error}"))?
@@ -222,6 +274,35 @@ pub(super) fn blob_response(mut file: File, accept_zstd: bool) -> Result<Respons
     })
 }
 
+struct ActivePeerReader<R> {
+    inner: R,
+    _activity: crate::build_runtime::WorkActivity,
+}
+
+impl<R: Read> Read for ActivePeerReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buffer)
+    }
+}
+
+pub(super) fn peer_blob_response(
+    file: File,
+    activity: crate::build_runtime::WorkActivity,
+    accept_compressed: bool,
+) -> Result<Response> {
+    let mut response = blob_response(file, accept_compressed)?;
+    let (inner, size) = response.data.into_reader_and_size();
+    let reader = ActivePeerReader {
+        inner,
+        _activity: activity,
+    };
+    response.data = match size {
+        Some(size) => ResponseBody::from_reader_and_size(reader, size),
+        None => ResponseBody::from_reader(reader),
+    };
+    Ok(response)
+}
+
 /// Reuse TLS connections without broadening each peer's pinned trust root.
 #[derive(Default)]
 pub(super) struct PeerHttp {
@@ -268,6 +349,7 @@ impl PeerHttp {
         source: crate::dist::NativeBlobSource,
         blob: BlobRef,
         certificate: &[u8],
+        network: &NetworkMeter,
     ) -> Result<Option<Box<dyn Read + Send>>> {
         // Bounded source probe: allow roughly 4 MiB/s plus setup time,
         // with an absolute ceiling; a slow peer falls back to the origin.
@@ -285,7 +367,16 @@ impl PeerHttp {
             return Ok(None);
         }
         let response = response.error_for_status()?;
-        match response.headers().get("X-Sccache-Blob-Codec") {
+        let encoding = response.headers().get("X-Sccache-Blob-Codec").cloned();
+        let size = response.content_length();
+        let response = network.meter(
+            Direction::Receive,
+            Peer::Worker(source.server.addr()),
+            response,
+            blob.size,
+            size,
+        );
+        match encoding.as_ref() {
             None => Ok(Some(Box::new(response))),
             Some(codec) if codec.as_bytes() == b"zstd" => {
                 Ok(Some(Box::new(zstd::stream::read::Decoder::new(response)?)))
@@ -295,14 +386,21 @@ impl PeerHttp {
     }
 }
 
+#[derive(Clone, Copy)]
+struct NativeServices<'a> {
+    sessions: &'a NativeSessions,
+    packages: Option<&'a PackageService>,
+    network: &'a NetworkMeter,
+    calibration: Option<&'a probe::ProbeCoordinator>,
+}
+
 fn respond(
     request: &Request,
-    sessions: &NativeSessions,
+    services: NativeServices<'_>,
     allocate: &Allocator,
     client_auth: &dyn ClientAuthCheck,
     server_auth: &ServerAuthenticator,
     limit: usize,
-    packages: Option<&PackageService>,
 ) -> Response {
     if request.method() != "POST" {
         return Response::empty_404();
@@ -314,6 +412,9 @@ fn respond(
     let Some((role, operation)) = path.split_once('/') else {
         return Response::empty_404();
     };
+    if request.header("Content-Type") != Some("application/octet-stream") {
+        return Response::empty_400();
+    }
     let publisher = match role {
         "client" => {
             if let Err(response) = authenticate_client(request, client_auth) {
@@ -326,6 +427,24 @@ fn respond(
                 Ok(server) => server,
                 Err(response) => return response,
             };
+            if matches!(
+                operation,
+                "probe_offer" | "probe_download" | "probe_upload" | "probe_receipt"
+            ) {
+                let response = match services.calibration {
+                    Some(calibration) => {
+                        calibration.dispatch(request, server.addr(), operation, limit)
+                    }
+                    None if operation == "probe_offer" => {
+                        encode(&crate::dist::native::probe::ProbeOffer::Disabled, limit)
+                    }
+                    None => Ok(Response::empty_404()),
+                };
+                return response.unwrap_or_else(|error| {
+                    trace!("Native calibration request deferred: {error:#}");
+                    Response::text("calibration deferred").with_status_code(409)
+                });
+            }
             let Some(job) = request
                 .header("X-Sccache-Native-Job")
                 .and_then(|job| job.parse::<u64>().ok())
@@ -339,12 +458,8 @@ fn respond(
         }
         _ => return Response::empty_404(),
     };
-    if request.header("Content-Type") != Some("application/octet-stream") {
-        return Response::empty_400();
-    }
-    match dispatch(
-        request, sessions, allocate, publisher, operation, limit, packages,
-    ) {
+    let _real_work = services.network.idle_gate().begin();
+    match dispatch(request, services, allocate, publisher, operation, limit) {
         Ok(response) => response,
         Err(error) if error.is::<NativeContentPending>() => {
             Response::text("native input pending").with_status_code(202)
@@ -363,13 +478,22 @@ fn respond(
 
 fn dispatch(
     request: &Request,
-    sessions: &NativeSessions,
+    services: NativeServices<'_>,
     allocate: &Allocator,
     publisher: Publisher,
     operation: &str,
     limit: usize,
-    packages: Option<&PackageService>,
 ) -> Result<Response> {
+    let NativeServices {
+        sessions,
+        packages,
+        network,
+        calibration,
+    } = services;
+    let peer = match publisher {
+        Publisher::Client => Peer::Client(request.remote_addr().ip()),
+        Publisher::Worker { address, .. } => Peer::Worker(address),
+    };
     match operation {
         "package_lookup" | "rust_package_lookup"
             if publisher == Publisher::Client && packages.is_some() =>
@@ -401,7 +525,7 @@ fn dispatch(
         {
             let locator: PackageLocator = metadata(request, limit)?;
             let service = packages.context("native original-package provisioning disabled")?;
-            let (package, reused) = service.acquire(sessions, &locator)?;
+            let (package, reused) = service.acquire(sessions, &locator, network)?;
             if operation == "rust_package_acquire" {
                 let manifest = sessions
                     .store()
@@ -436,7 +560,15 @@ fn dispatch(
                 ArchiveLength::Exact(source.size),
                 service.limits,
                 &std::env::current_exe()?,
-                || Ok(body),
+                || {
+                    Ok(network.meter(
+                        Direction::Receive,
+                        peer,
+                        body,
+                        source.size,
+                        Some(source.size),
+                    ))
+                },
             )?;
             if operation == "rust_package_import" {
                 encode(
@@ -476,7 +608,14 @@ fn dispatch(
         "backfill_input" if publisher == Publisher::Client => {
             let mut body = request.data().context("missing native backfill body")?;
             let header: UploadHeader = codec().with_limit(72).deserialize_from(&mut body)?;
-            sessions.backfill_input(header.ticket, header.blob, body)?;
+            let reader = network.meter(
+                Direction::Receive,
+                peer,
+                body,
+                header.blob.size,
+                Some(header.blob.size),
+            );
+            sessions.backfill_input(header.ticket, header.blob, reader)?;
             encode(&(), limit)
         }
         "schedule" if publisher == Publisher::Client => {
@@ -484,11 +623,16 @@ fn dispatch(
             let request = spec.action_request()?;
             encode(
                 &sessions.schedule(ticket, &request, |inputs| {
-                    allocate(crate::dist::NativeAssignment {
-                        ticket,
-                        spec,
-                        input_blobs: inputs,
-                    })
+                    let snapshot = calibration
+                        .map_or_else(|| network.snapshot(), probe::ProbeCoordinator::snapshot);
+                    allocate(
+                        crate::dist::NativeAssignment {
+                            ticket,
+                            spec,
+                            input_blobs: inputs,
+                        },
+                        &snapshot,
+                    )
                 })?,
                 limit,
             )
@@ -503,10 +647,24 @@ fn dispatch(
         "download" => {
             let DownloadRequest { ticket, id } = metadata(request, limit)?;
             let file = sessions.download(ticket, publisher, id)?;
-            blob_response(
+            let logical = file.metadata()?.len();
+            let mut response = blob_response(
                 file,
                 request.header("X-Sccache-Accept-Blob-Codec") == Some("zstd"),
-            )
+            )?;
+            let (reader, size) = response.data.into_reader_and_size();
+            let reader = network.meter(
+                Direction::Send,
+                peer,
+                reader,
+                logical,
+                size.map(|size| size as u64),
+            );
+            response.data = match size {
+                Some(size) => ResponseBody::from_reader_and_size(reader, size),
+                None => ResponseBody::from_reader(reader),
+            };
+            Ok(response)
         }
         "tree_offer" if publisher == Publisher::Client => {
             encode(&sessions.offer_tree(metadata(request, limit)?)?, limit)
@@ -543,7 +701,14 @@ fn dispatch(
             let mut body = request.data().context("missing native upload body")?;
             // Fixed-width header, never deserialize or buffer the actual blob.
             let header: UploadHeader = codec().with_limit(72).deserialize_from(&mut body)?;
-            sessions.upload(header.ticket, publisher, header.blob, body)?;
+            let reader = network.meter(
+                Direction::Receive,
+                peer,
+                body,
+                header.blob.size,
+                Some(header.blob.size),
+            );
+            sessions.upload(header.ticket, publisher, header.blob, reader)?;
             encode(&(), limit)
         }
         "commit" => encode(

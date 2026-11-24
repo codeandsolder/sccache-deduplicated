@@ -497,7 +497,7 @@ impl ServerIncoming for FailingServer {
     fn handle_native_blob(
         &self,
         _blob: sccache::build_runtime::BlobRef,
-    ) -> Result<Option<std::fs::File>> {
+    ) -> Result<Option<(std::fs::File, sccache::build_runtime::WorkActivity)>> {
         Ok(None)
     }
 
