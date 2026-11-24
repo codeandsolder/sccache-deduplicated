@@ -148,8 +148,8 @@ impl VirtualFs {
             nodes,
             handles: BTreeMap::new(),
             next_handle: 1,
-            uid: unsafe { libc::geteuid() },
-            gid: unsafe { libc::getegid() },
+            uid: rustix::process::geteuid().as_raw(),
+            gid: rustix::process::getegid().as_raw(),
         })
     }
 
@@ -482,7 +482,7 @@ impl MountedTree {
         })
     }
 
-    #[must_use]
+    #[must_use = "the sandbox must bind the root of the pinned immutable view"]
     pub fn root(&self) -> &Path {
         self.private_zfs
             .as_ref()
