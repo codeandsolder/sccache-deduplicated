@@ -25,7 +25,7 @@ These are the source-of-truth copies of the machine-wide Cargo/sccache wrappers,
 ## Fleet release promotion
 
 Ordinary commits to `main` and pull requests are tested but **never published
-as fleet releases**. After the `ci` and `Strict Rust` push checks pass for
+as fleet releases**. After the CI, Strict Rust, duplicate-code and distributed-runtime push checks pass for
 current `main`, explicitly run:
 
 ```sh
@@ -34,7 +34,7 @@ gh workflow run publish-ci-client.yml \
   --ref main -f ref=main
 ```
 
-The workflow rechecks both gates against the exact current `main` revision,
+The workflow rechecks all four gates against the exact current `main` revision,
 then builds and verifies the Linux client and worker bundle. A successful
 promotion creates an immutable `sccache-ci-<full source SHA>` GitHub Release.
 The existing `sccache-release-update` service (invoked by `random-utils-update`)
