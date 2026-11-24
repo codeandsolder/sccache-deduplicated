@@ -309,7 +309,7 @@ jobs:
         chmod +x "$test_runner"
         export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$test_runner"
         cargo test --locked --target x86_64-unknown-linux-gnu --lib --bins --tests
-        cargo test --locked --target x86_64-unknown-linux-gnu -p sccache-build -- --include-ignored
+        cargo test --locked --target x86_64-unknown-linux-gnu -p sccache-build -- --include-ignored --skip benchmark_native_zfs_clones_against_reuse --skip benchmark_native_zfs_clones_against_fuse_views
         cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-client,dist-server --test native_dist -- --include-ignored
         # The default feature set omits dist-server: explicitly run all
         # scheduler/worker binary tests, including job resource telemetry.

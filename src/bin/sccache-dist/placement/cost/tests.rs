@@ -78,6 +78,32 @@ fn native_cost_class_ignores_rust_identity_hashes_but_not_codegen() -> anyhow::R
 }
 
 #[test]
+fn native_cost_class_distinguishes_output_contracts() -> anyhow::Result<()> {
+    use sccache::build_runtime::{OutputKind, OutputSpec};
+    let mut action = spec(&["--crate-name", "foo"])?;
+    let mut classes = Vec::new();
+    for kind in [
+        OutputKind::File,
+        OutputKind::Tree,
+        OutputKind::GeneratedTree,
+    ] {
+        action.outputs.insert(
+            "artifact".into(),
+            OutputSpec {
+                path: BuildPath::new(b"/src/output".to_vec())?,
+                required: true,
+                kind,
+            },
+        );
+        classes.push(ActionClass::from_spec(&action)?);
+    }
+    assert_ne!(classes[0], classes[1]);
+    assert_ne!(classes[1], classes[2]);
+    assert_ne!(classes[0], classes[2]);
+    Ok(())
+}
+
+#[test]
 fn native_cost_history_shrinks_expires_and_bounds_samples() -> anyhow::Result<()> {
     let class = ActionClass::from_spec(&spec(&["--crate-name", "foo"])?)?;
     let now = Instant::now();

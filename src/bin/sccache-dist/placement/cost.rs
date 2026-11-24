@@ -65,10 +65,21 @@ impl ActionClass {
             stable.push(arg.as_slice());
         }
         let mut hash = blake3::Hasher::new();
-        hash.update(b"sccache-placement-command-v1\0");
+        hash.update(b"sccache-placement-command-v2\0");
+        let outputs = spec
+            .outputs
+            .iter()
+            .map(|(name, output)| (name, output.kind, output.required))
+            .collect::<Vec<_>>();
         bincode::serialize_into(
             &mut hash,
-            &(spec.platform, &command.executable, &command.cwd, stable),
+            &(
+                spec.platform,
+                &command.executable,
+                &command.cwd,
+                stable,
+                outputs,
+            ),
         )?;
         Ok(Self(ContentId(*hash.finalize().as_bytes())))
     }

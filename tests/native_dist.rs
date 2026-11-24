@@ -1069,7 +1069,7 @@ fn verify_learned_placement_trace(log: &Path, expected_archive_bytes: u64) -> Re
             _ => (),
         }
     }
-    assert_eq!(completed.len(), 6);
+    assert_eq!(completed.len(), 8);
     let cold = completed.first().context("missing cold completion")?;
     assert!(cold["warm_staging_nanoseconds"].is_null());
     let id = cold["job"].as_u64().context("missing cold job")?;
@@ -1084,7 +1084,7 @@ fn verify_learned_placement_trace(log: &Path, expected_archive_bytes: u64) -> Re
                 .as_u64()
                 .context("missing logical forecast")?
     );
-    let class = completed.last().context("no successful worker actions")?["class"].clone();
+    let class = completed.get(1).context("no repeated file-output action")?["class"].clone();
     let repeated = completed
         .iter()
         .filter(|value| value["class"] == class)
@@ -2343,7 +2343,8 @@ fn native_compiler_cli_direct_and_networkless_namespace() -> Result<()> {
     assert_eq!(observed.conflicting_pairs, 1);
     assert_eq!(unused.examined_actions, 11);
     eprintln!("actual Rust environment audit: {unused:?}; {observed:?}");
-    assert_eq!(worker.actions, 7);
+    // All eleven distinct remotely produced actions are retained.
+    assert_eq!(worker.actions, 11);
     Ok(())
 }
 
@@ -2413,7 +2414,8 @@ fn native_local_execution_in_networkless_namespace_shares_remote_actions() -> Re
     assert!(!root.join("unexpected-archive-cache").exists());
     service.stop()?;
     let (scheduler, worker) = fleet.finish()?;
+    // The scheduler owns all four actions, including the two produced locally.
     assert_eq!(scheduler.actions, 4);
-    assert_eq!(worker.actions, 4);
+    assert_eq!(worker.actions, 2);
     Ok(())
 }
