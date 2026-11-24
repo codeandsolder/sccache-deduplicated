@@ -20,7 +20,7 @@ use tempfile::NamedTempFile;
 use super::{LocalExecutor, NativeCacheClient, copy_verified, retryable_transport_error};
 use crate::build_runtime::{
     ActionMode, Artifact, BlobRef, CapturedExecution, ExecutionSpec, MaterializedTree,
-    PreparedTree, ResultManifest, TreeId, TreeLease, TreeManifest, materialize_tree,
+    PreparedTree, ResultManifest, TreeId, TreeManifest, materialize_tree,
     wire::{
         InputDemand, InputPoll, NativeAdmission, NativeRunResult, NativeStatus, ScheduleReply,
         Ticket,
