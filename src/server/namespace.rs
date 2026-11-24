@@ -140,6 +140,30 @@ impl TransferSession {
         }
     }
 
+    pub(super) const fn request_budget(
+        &self,
+        request: &super::SccacheRequest,
+        limits: super::activity::CompileLimits,
+    ) -> std::time::Duration {
+        #[cfg(feature = "dist-client")]
+        if matches!(
+            (&self.state, request),
+            (
+                Transfer::Upload {
+                    kind: UploadKind::Run { .. },
+                    ..
+                },
+                super::Message::WithoutBody(crate::protocol::Request::Transfer(
+                    TransferRequest::FinishWrite
+                ))
+            )
+        ) {
+            return limits.budget(super::activity::Phase::RunDistributed);
+        }
+        let _ = request;
+        limits.budget(super::activity::Phase::IdentifyToolchain)
+    }
+
     pub(super) const fn chunk_bytes(&self) -> usize {
         self.chunk_bytes
     }
@@ -743,11 +767,8 @@ mod tests {
             let expected = data.clone();
             let key_copy = key.clone();
             let other_copy = other.clone();
-            let client = tokio::task::spawn_blocking(move || -> Result<IpcStorage> {
-                let socket = std::net::TcpStream::connect(addr)?;
-                IpcStorage::connect(ServerConnection::new(Box::new(socket))?)
-            })
-            .await??;
+            let socket = std::net::TcpStream::connect(addr)?;
+            let client = IpcStorage::connect(ServerConnection::new(Box::new(socket))?).await?;
             assert!(client.get_raw(&key).await?.is_none());
             client.put_raw(&key, data.into()).await?;
             assert_eq!(

@@ -717,7 +717,9 @@ where
             .collect::<Vec<_>>();
 
         activity::phase(Phase::CacheLookup);
-        let lookup = match cache_status.await {
+        let cache_status = cache_status.await;
+        storage.validate_session()?;
+        let lookup = match cache_status {
             (Ok(Ok(Cache::Hit(mut entry))), duration) => {
                 debug!(
                     "[{out_pretty}]: Cache hit in {}",
@@ -1282,7 +1284,7 @@ where
 
     do_dist_compile
         .or_else(move |e| async move {
-            if let Some(HttpClientError(_)) = e.downcast_ref::<HttpClientError>() {
+            if e.is::<crate::client::IpcTransportFailure>() || e.is::<HttpClientError>() {
                 Err(e)
             } else if matches!(e.downcast_ref::<lru_disk_cache::Error>(), Some(lru_disk_cache::Error::FileTooLarge))
             {
@@ -3346,7 +3348,7 @@ LLVM version: 6.0",
         const COMPILER_STDERR: &[u8] = b"compiler stderr";
         let obj = f.tempdir.path().join("foo.o");
         // Dist client will do the compilation
-        let dist_client = test_dist::OneshotClient::client(
+        let dist_client = test_dist::MockDistClient::success(
             0,
             COMPILER_STDOUT.to_owned(),
             COMPILER_STDERR.to_owned(),
@@ -3746,10 +3748,10 @@ LLVM version: 6.0",
         let runtime = Runtime::new()?;
         let pool = runtime.handle().clone();
         let dist_clients = vec![
-            test_dist::ErrorPutToolchainClient::client(),
-            test_dist::ErrorAllocJobClient::client(),
-            test_dist::ErrorSubmitToolchainClient::client(),
-            test_dist::ErrorRunJobClient::client(),
+            test_dist::MockDistClient::failure(test_dist::Stage::PutToolchain),
+            test_dist::MockDistClient::failure(test_dist::Stage::Allocate),
+            test_dist::MockDistClient::failure(test_dist::Stage::SubmitToolchain),
+            test_dist::MockDistClient::failure(test_dist::Stage::Run),
         ];
         // Write a dummy input file so the preprocessor cache mode can work
         std::fs::write(f.tempdir.path().join("foo.c"), "whatever")?;
@@ -3976,7 +3978,7 @@ mod test_dist {
     };
     use async_trait::async_trait;
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, atomic::AtomicBool};
+    use std::sync::{Arc, Mutex};
 
     use crate::errors::*;
 
@@ -3986,281 +3988,72 @@ mod test_dist {
         }
     }
 
-    pub struct ErrorPutToolchainClient;
-    impl ErrorPutToolchainClient {
-        pub fn client() -> Arc<dyn dist::Client> {
-            Arc::new(Self)
-        }
-    }
-    #[async_trait]
-    impl dist::Client for ErrorPutToolchainClient {
-        async fn do_alloc_job(&self, _: Toolchain) -> Result<AllocJobResult> {
-            return Err(anyhow!("unexpected mock client call"));
-        }
-        async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
-            return Err(anyhow!("unexpected mock client call"));
-        }
-        async fn do_submit_toolchain(
-            &self,
-            _: JobAlloc,
-            _: Toolchain,
-        ) -> Result<SubmitToolchainResult> {
-            return Err(anyhow!("unexpected mock client call"));
-        }
-        async fn do_run_job(
-            &self,
-            _: JobAlloc,
-            _: CompileCommand,
-            _: Vec<String>,
-            _: Box<dyn pkg::InputsPackager>,
-        ) -> Result<RunJobResult> {
-            return Err(anyhow!("unexpected mock client call"));
-        }
-        async fn put_toolchain(
-            &self,
-            _: PathBuf,
-            _: String,
-            _: Box<dyn pkg::ToolchainPackager>,
-        ) -> Result<(Toolchain, Option<dist::CustomToolchainOverride>)> {
-            Err(anyhow!("MOCK: put toolchain failure"))
-        }
-        fn rewrite_includes_only(&self) -> bool {
-            false
-        }
-        fn get_custom_toolchain(&self, _exe: &Path) -> Option<PathBuf> {
-            None
-        }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Stage {
+        PutToolchain,
+        Allocate,
+        SubmitToolchain,
+        Run,
+        Done,
     }
 
-    pub struct ErrorAllocJobClient {
-        tc: Toolchain,
+    enum Outcome {
+        Failure(Stage),
+        Success {
+            output: ProcessOutput,
+            worker_label: String,
+        },
     }
-    impl ErrorAllocJobClient {
-        pub fn client() -> Arc<dyn dist::Client> {
+
+    pub(super) struct MockDistClient {
+        stage: Mutex<Stage>,
+        toolchain: Toolchain,
+        outcome: Outcome,
+    }
+
+    impl MockDistClient {
+        fn new(outcome: Outcome) -> Arc<dyn dist::Client> {
             Arc::new(Self {
-                tc: mock_toolchain(),
+                stage: Mutex::new(Stage::PutToolchain),
+                toolchain: mock_toolchain(),
+                outcome,
             })
         }
-    }
-    #[async_trait]
-    impl dist::Client for ErrorAllocJobClient {
-        async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
-            assert_eq!(self.tc, tc);
-            Err(anyhow!("MOCK: alloc job failure"))
-        }
-        async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
-            return Err(anyhow!("unexpected mock client call"));
-        }
-        async fn do_submit_toolchain(
-            &self,
-            _: JobAlloc,
-            _: Toolchain,
-        ) -> Result<SubmitToolchainResult> {
-            return Err(anyhow!("unexpected mock client call"));
-        }
-        async fn do_run_job(
-            &self,
-            _: JobAlloc,
-            _: CompileCommand,
-            _: Vec<String>,
-            _: Box<dyn pkg::InputsPackager>,
-        ) -> Result<RunJobResult> {
-            return Err(anyhow!("unexpected mock client call"));
-        }
-        async fn put_toolchain(
-            &self,
-            _: PathBuf,
-            _: String,
-            _: Box<dyn pkg::ToolchainPackager>,
-        ) -> Result<(Toolchain, Option<dist::CustomToolchainOverride>)> {
-            Ok((self.tc.clone(), None))
-        }
-        fn rewrite_includes_only(&self) -> bool {
-            false
-        }
-        fn get_custom_toolchain(&self, _exe: &Path) -> Option<PathBuf> {
-            None
-        }
-    }
 
-    pub struct ErrorSubmitToolchainClient {
-        has_started: AtomicBool,
-        tc: Toolchain,
-    }
-    impl ErrorSubmitToolchainClient {
-        pub fn client() -> Arc<dyn dist::Client> {
-            Arc::new(Self {
-                has_started: AtomicBool::default(),
-                tc: mock_toolchain(),
-            })
+        pub(super) fn failure(stage: Stage) -> Arc<dyn dist::Client> {
+            assert_ne!(stage, Stage::Done);
+            Self::new(Outcome::Failure(stage))
         }
-    }
 
-    #[async_trait]
-    impl dist::Client for ErrorSubmitToolchainClient {
-        async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
-            assert!(
-                !self
-                    .has_started
-                    .swap(true, std::sync::atomic::Ordering::AcqRel)
-            );
-            assert_eq!(self.tc, tc);
-            Ok(AllocJobResult::Success {
-                job_alloc: JobAlloc {
-                    auth: "abcd".to_owned(),
-                    job_id: JobId(0),
-                    server_id: ServerId::new(([0, 0, 0, 0], 1).into()),
-                },
-                need_toolchain: true,
-            })
-        }
-        async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
-            return Err(anyhow!("fn do_get_status is not used for this test. qed"));
-        }
-        async fn do_submit_toolchain(
-            &self,
-            job_alloc: JobAlloc,
-            tc: Toolchain,
-        ) -> Result<SubmitToolchainResult> {
-            assert_eq!(job_alloc.job_id, JobId(0));
-            assert_eq!(self.tc, tc);
-            Err(anyhow!("MOCK: submit toolchain failure"))
-        }
-        async fn do_run_job(
-            &self,
-            _: JobAlloc,
-            _: CompileCommand,
-            _: Vec<String>,
-            _: Box<dyn pkg::InputsPackager>,
-        ) -> Result<RunJobResult> {
-            return Err(anyhow!("fn do_run_job is not used for this test. qed"));
-        }
-        async fn put_toolchain(
-            &self,
-            _: PathBuf,
-            _: String,
-            _: Box<dyn pkg::ToolchainPackager>,
-        ) -> Result<(Toolchain, Option<dist::CustomToolchainOverride>)> {
-            Ok((self.tc.clone(), None))
-        }
-        fn rewrite_includes_only(&self) -> bool {
-            false
-        }
-        fn get_custom_toolchain(&self, _exe: &Path) -> Option<PathBuf> {
-            None
-        }
-    }
-
-    pub struct ErrorRunJobClient {
-        has_started: AtomicBool,
-        tc: Toolchain,
-    }
-    impl ErrorRunJobClient {
-        pub fn client() -> Arc<dyn dist::Client> {
-            Arc::new(Self {
-                has_started: AtomicBool::default(),
-                tc: mock_toolchain(),
-            })
-        }
-    }
-
-    #[async_trait]
-    impl dist::Client for ErrorRunJobClient {
-        async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
-            assert!(
-                !self
-                    .has_started
-                    .swap(true, std::sync::atomic::Ordering::AcqRel)
-            );
-            assert_eq!(self.tc, tc);
-            Ok(AllocJobResult::Success {
-                job_alloc: JobAlloc {
-                    auth: "abcd".to_owned(),
-                    job_id: JobId(0),
-                    server_id: ServerId::new(([0, 0, 0, 0], 1).into()),
-                },
-                need_toolchain: true,
-            })
-        }
-        async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
-            return Err(anyhow!("unexpected mock client call"));
-        }
-        async fn do_submit_toolchain(
-            &self,
-            job_alloc: JobAlloc,
-            tc: Toolchain,
-        ) -> Result<SubmitToolchainResult> {
-            assert_eq!(job_alloc.job_id, JobId(0));
-            assert_eq!(self.tc, tc);
-            Ok(SubmitToolchainResult::Success)
-        }
-        async fn do_run_job(
-            &self,
-            job_alloc: JobAlloc,
-            command: CompileCommand,
-            _: Vec<String>,
-            _: Box<dyn pkg::InputsPackager>,
-        ) -> Result<RunJobResult> {
-            assert_eq!(job_alloc.job_id, JobId(0));
-            assert_eq!(command.executable, "/overridden/compiler");
-            Err(anyhow!("MOCK: run job failure"))
-        }
-        async fn put_toolchain(
-            &self,
-            _: PathBuf,
-            _: String,
-            _: Box<dyn pkg::ToolchainPackager>,
-        ) -> Result<(Toolchain, Option<dist::CustomToolchainOverride>)> {
-            Ok((
-                self.tc.clone(),
-                Some(dist::CustomToolchainOverride {
-                    compiler_executable: "/overridden/compiler".to_owned(),
-                    archive: PathBuf::from("somearchiveid"),
-                    cargo_executable: None,
-                }),
-            ))
-        }
-        fn rewrite_includes_only(&self) -> bool {
-            false
-        }
-        fn get_custom_toolchain(&self, _exe: &Path) -> Option<PathBuf> {
-            None
-        }
-    }
-
-    pub struct OneshotClient {
-        has_started: AtomicBool,
-        tc: Toolchain,
-        output: ProcessOutput,
-        worker_label: String,
-    }
-
-    impl OneshotClient {
-        pub fn client(
+        pub(super) fn success(
             code: i32,
             stdout: Vec<u8>,
             stderr: Vec<u8>,
             worker_label: String,
         ) -> Arc<dyn dist::Client> {
-            Arc::new(Self {
-                has_started: AtomicBool::default(),
-                tc: mock_toolchain(),
+            Self::new(Outcome::Success {
                 output: ProcessOutput::fake_output(code, stdout, stderr),
                 worker_label,
             })
         }
+
+        fn advance(&self, expected: Stage, next: Stage) -> Result<()> {
+            let mut stage = self.stage.lock().expect("mock client stage lock");
+            assert_eq!(*stage, expected, "unexpected mock client call");
+            if matches!(self.outcome, Outcome::Failure(failure) if failure == expected) {
+                *stage = Stage::Done;
+                bail!("MOCK: {expected:?} failure");
+            }
+            *stage = next;
+            Ok(())
+        }
     }
 
     #[async_trait]
-    impl dist::Client for OneshotClient {
+    impl dist::Client for MockDistClient {
         async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
-            assert!(
-                !self
-                    .has_started
-                    .swap(true, std::sync::atomic::Ordering::AcqRel)
-            );
-            assert_eq!(self.tc, tc);
-
+            assert_eq!(self.toolchain, tc);
+            self.advance(Stage::Allocate, Stage::SubmitToolchain)?;
             Ok(AllocJobResult::Success {
                 job_alloc: JobAlloc {
                     auth: "abcd".to_owned(),
@@ -4270,19 +4063,22 @@ mod test_dist {
                 need_toolchain: true,
             })
         }
+
         async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
-            return Err(anyhow!("fn do_get_status is not used for this test. qed"));
+            bail!("unexpected mock client status request");
         }
+
         async fn do_submit_toolchain(
             &self,
             job_alloc: JobAlloc,
             tc: Toolchain,
         ) -> Result<SubmitToolchainResult> {
             assert_eq!(job_alloc.job_id, JobId(0));
-            assert_eq!(self.tc, tc);
-
+            assert_eq!(self.toolchain, tc);
+            self.advance(Stage::SubmitToolchain, Stage::Run)?;
             Ok(SubmitToolchainResult::Success)
         }
+
         async fn do_run_job(
             &self,
             job_alloc: JobAlloc,
@@ -4292,6 +4088,10 @@ mod test_dist {
         ) -> Result<RunJobResult> {
             assert_eq!(job_alloc.job_id, JobId(0));
             assert_eq!(command.executable, "/overridden/compiler");
+            self.advance(Stage::Run, Stage::Done)?;
+            let Outcome::Success { output, .. } = &self.outcome else {
+                bail!("unexpected successful mock client run");
+            };
 
             let mut inputs = vec![];
             inputs_packager.write_inputs(&mut inputs)?;
@@ -4306,33 +4106,42 @@ mod test_dist {
                     Ok((name, data))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let result = RunJobResult::Complete(JobComplete {
-                output: self.output.clone(),
+            Ok(RunJobResult::Complete(JobComplete {
+                output: output.clone(),
                 outputs,
-            });
-            Ok(result)
+            }))
         }
-        async fn worker_label(&self, _server_id: ServerId) -> String {
-            self.worker_label.clone()
+
+        async fn worker_label(&self, server_id: ServerId) -> String {
+            match &self.outcome {
+                Outcome::Success { worker_label, .. } => worker_label.clone(),
+                Outcome::Failure(_) => server_id.addr().to_string(),
+            }
         }
+
         async fn put_toolchain(
             &self,
             _: PathBuf,
             _: String,
             _: Box<dyn pkg::ToolchainPackager>,
         ) -> Result<(Toolchain, Option<dist::CustomToolchainOverride>)> {
-            Ok((
-                self.tc.clone(),
-                Some(dist::CustomToolchainOverride {
-                    compiler_executable: "/overridden/compiler".to_owned(),
-                    archive: PathBuf::from("somearchiveid"),
-                    cargo_executable: None,
-                }),
-            ))
+            self.advance(Stage::PutToolchain, Stage::Allocate)?;
+            let custom = matches!(
+                self.outcome,
+                Outcome::Success { .. } | Outcome::Failure(Stage::Run)
+            )
+            .then(|| dist::CustomToolchainOverride {
+                compiler_executable: "/overridden/compiler".to_owned(),
+                archive: PathBuf::from("somearchiveid"),
+                cargo_executable: None,
+            });
+            Ok((self.toolchain.clone(), custom))
         }
+
         fn rewrite_includes_only(&self) -> bool {
             false
         }
+
         fn get_custom_toolchain(&self, _exe: &Path) -> Option<PathBuf> {
             None
         }

@@ -15,19 +15,18 @@
 
 use crate::{
     compiler::{
-        CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
-        SingleCompileCommand,
+        ColorMode, CompilerArguments, Language, SingleCompileCommand,
         args::{
             ArgDisposition, ArgInfo, ArgToStringResult, ArgsIter, Argument, FromArg, IntoArg,
             NormalizedDisposition, PathTransformerFn, SearchableArgInfo,
         },
         c::{
-            ArtifactDescriptor, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
-            ParsedArguments,
+            ArtifactDescriptor, CCompileCommands, CCompileContext, CCompilerImpl, CCompilerKind,
+            CPreprocessContext, ParsedArguments,
         },
     },
-    counted_array, dist,
-    errors::{Result, anyhow},
+    counted_array,
+    errors::Result,
     mock_command::{CommandCreatorSync, RunCommand},
     util::run_input_output,
 };
@@ -46,6 +45,8 @@ pub struct TaskingVX;
 
 #[async_trait]
 impl CCompilerImpl for TaskingVX {
+    type LocalCommand = SingleCompileCommand;
+
     fn kind(&self) -> CCompilerKind {
         CCompilerKind::TaskingVX
     }
@@ -93,30 +94,11 @@ impl CCompilerImpl for TaskingVX {
         .await
     }
 
-    fn generate_compile_commands<T>(
+    fn generate_compile_commands(
         &self,
         context: CCompileContext<'_>,
-    ) -> Result<(
-        Box<dyn CompileCommand<T>>,
-        Option<dist::CompileCommand>,
-        Cacheable,
-    )>
-    where
-        T: CommandCreatorSync,
-    {
-        let CCompileContext {
-            path_transformer,
-            executable,
-            parsed_args,
-            cwd,
-            env_vars,
-            ..
-        } = context;
-        generate_compile_commands(path_transformer, executable, parsed_args, cwd, env_vars).map(
-            |(command, dist_command, cacheable)| {
-                (CCompileCommand::boxed(command), dist_command, cacheable)
-            },
-        )
+    ) -> CCompileCommands<Self::LocalCommand> {
+        crate::compiler::c::local_dash_o_compile_commands(&context)
     }
 }
 
@@ -298,6 +280,7 @@ where
         extra_hash_files: vec![],
         uses_external_assembler: false,
         msvc_show_includes: false,
+        msvc_explicit_language: false,
         profile_generate: false,
         color_mode: ColorMode::Auto,
         suppress_rewrite_includes_only: false,
@@ -367,54 +350,12 @@ where
     }
 }
 
-fn generate_compile_commands(
-    _: &mut dist::PathTransformer,
-    executable: &Path,
-    parsed_args: &ParsedArguments,
-    cwd: &Path,
-    env_vars: &[(OsString, OsString)],
-) -> Result<(
-    SingleCompileCommand,
-    Option<dist::CompileCommand>,
-    Cacheable,
-)> {
-    trace!("compile");
-
-    let Some(out_file) = parsed_args.outputs.get("obj") else {
-        return Err(anyhow!("Missing object file output"));
-    };
-
-    let mut arguments: Vec<OsString> = vec![
-        parsed_args.compilation_flag.clone(),
-        parsed_args.input.clone().into(),
-        "-o".into(),
-        out_file.path.as_os_str().into(),
-    ];
-    arguments.extend_from_slice(&parsed_args.preprocessor_args);
-    arguments.extend_from_slice(&parsed_args.unhashed_args);
-    arguments.extend_from_slice(&parsed_args.common_args);
-    let command = SingleCompileCommand {
-        executable: executable.to_owned(),
-        arguments,
-        env_vars: env_vars.to_owned(),
-        cwd: cwd.to_owned(),
-        share_jobserver: false,
-    };
-
-    Ok((command, None, Cacheable::Yes))
-}
-
 #[cfg(test)]
 mod test {
-    use super::{
-        ARGS, Language, OsString, ParsedArguments, PathBuf, dist, generate_compile_commands,
-        parse_arguments,
-    };
-    use crate::compiler::c::ArtifactDescriptor;
+    use super::{ARGS, Language, OsString, ParsedArguments, PathBuf, TaskingVX, parse_arguments};
+    use crate::compiler::c::{ArtifactDescriptor, CCompileContext, CCompilerImpl};
     use crate::compiler::*;
-    use crate::mock_command::*;
-    use crate::server;
-    use crate::test::mock_storage::MockStorage;
+    use crate::dist;
     use crate::test::utils::*;
 
     fn parse_arguments_(arguments: Vec<String>) -> CompilerArguments<ParsedArguments> {
@@ -422,41 +363,13 @@ mod test {
         parse_arguments(&args, ".".as_ref(), &ARGS[..])
     }
 
-    #[test]
-    fn test_parse_arguments_simple() {
-        let args = stringvec!["-c", "foo.c", "-o", "foo.o"];
-        let ParsedArguments {
-            input,
-            language,
-            outputs,
-            preprocessor_args,
-            msvc_show_includes,
-            common_args,
-            ..
-        } = match parse_arguments_(args) {
-            CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {o:?}"),
-        };
-        assert_eq!(Some("foo.c"), input.to_str());
-        assert_eq!(Language::C, language);
-        assert_map_contains!(
-            outputs,
-            (
-                "obj",
-                ArtifactDescriptor {
-                    path: PathBuf::from("foo.o"),
-                    optional: false
-                }
-            )
-        );
-        assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
-        assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
-        assert!(!msvc_show_includes);
-    }
-
-    #[test]
-    fn test_parse_arguments_default_name() {
-        let args = stringvec!["-c", "foo.c"];
+    #[test_case::test_case(true; "explicit output")]
+    #[test_case::test_case(false; "default output")]
+    fn test_parse_arguments_simple(explicit_output: bool) {
+        let mut args = stringvec!["-c", "foo.c"];
+        if explicit_output {
+            args.extend(stringvec!["-o", "foo.o"]);
+        }
         let ParsedArguments {
             input,
             language,
@@ -706,116 +619,53 @@ mod test {
     }
 
     #[test]
-    fn test_compile_simple() {
-        let creator = new_creator();
+    fn test_compile_simple() -> crate::errors::Result<()> {
         let f = TestFixture::new();
-        let parsed_args = ParsedArguments {
-            input: "foo.c".into(),
-            double_dash_input: false,
-            language: Language::C,
-            compilation_flag: "-c".into(),
-            depfile: None,
-            outputs: vec![(
-                "obj",
-                ArtifactDescriptor {
-                    path: "foo.o".into(),
-                    optional: false,
-                },
-            )]
-            .into_iter()
-            .collect(),
-            dependency_args: vec![],
-            preprocessor_args: vec![],
-            common_args: vec![],
-            arch_args: vec![],
-            unhashed_args: vec![],
-            extra_dist_files: vec![],
-            extra_hash_files: vec![],
-            uses_external_assembler: false,
-            msvc_show_includes: false,
-            profile_generate: false,
-            color_mode: ColorMode::Auto,
-            suppress_rewrite_includes_only: false,
-            too_hard_for_preprocessor_cache_mode: None,
-        };
-        let runtime = single_threaded_runtime();
-        let storage = MockStorage::new(None, false);
-        let storage: std::sync::Arc<MockStorage> = std::sync::Arc::new(storage);
-        let service = server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
+        let parsed_args = ParsedArguments::test_compile("foo.c", "foo.o", Language::C);
         let compiler = &f.bins[0];
-        // Compiler invocation.
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
         let mut path_transformer = dist::PathTransformer::new();
-        let (command, _, cacheable) = generate_compile_commands(
-            &mut path_transformer,
-            compiler,
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-        )
-        .unwrap();
-        let _ = command.execute(&service, &creator).wait();
+        let (command, _, cacheable) = TaskingVX
+            .generate_compile_commands(CCompileContext {
+                path_transformer: &mut path_transformer,
+                executable: compiler,
+                parsed_args: &parsed_args,
+                cwd: f.tempdir.path(),
+                env_vars: &[],
+                rewrite_includes_only: false,
+                native_resolution: None,
+            })
+            .unwrap();
+        assert_compile_command_executes(&command)?;
         assert_eq!(Cacheable::Yes, cacheable);
-        // Ensure that we ran all processes.
-        assert_eq!(0, creator.lock().unwrap().children.len());
+        Ok(())
     }
 
     #[test]
-    fn test_cuda_threads_included_in_compile_command() {
-        let creator = new_creator();
+    fn test_cuda_threads_included_in_compile_command() -> crate::errors::Result<()> {
         let f = TestFixture::new();
         let parsed_args = ParsedArguments {
-            input: "foo.cu".into(),
-            double_dash_input: false,
-            language: Language::Cuda,
-            compilation_flag: "-c".into(),
-            depfile: None,
-            outputs: vec![(
-                "obj",
-                ArtifactDescriptor {
-                    path: "foo.o".into(),
-                    optional: false,
-                },
-            )]
-            .into_iter()
-            .collect(),
-            dependency_args: vec![],
-            preprocessor_args: vec![],
-            common_args: vec![],
-            arch_args: vec![],
             unhashed_args: ovec!["--threads", "2"],
-            extra_dist_files: vec![],
-            extra_hash_files: vec![],
-            uses_external_assembler: false,
-            msvc_show_includes: false,
-            profile_generate: false,
-            color_mode: ColorMode::Auto,
-            suppress_rewrite_includes_only: false,
-            too_hard_for_preprocessor_cache_mode: None,
+            ..ParsedArguments::test_compile("foo.cu", "foo.o", Language::Cuda)
         };
-        let runtime = single_threaded_runtime();
-        let storage = MockStorage::new(None, false);
-        let storage: std::sync::Arc<MockStorage> = std::sync::Arc::new(storage);
-        let service = server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
         let compiler = &f.bins[0];
-        // Compiler invocation.
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
         let mut path_transformer = dist::PathTransformer::new();
-        let (command, _, cacheable) = generate_compile_commands(
-            &mut path_transformer,
-            compiler,
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-        )
-        .unwrap();
+        let (command, _, cacheable) = TaskingVX
+            .generate_compile_commands(CCompileContext {
+                path_transformer: &mut path_transformer,
+                executable: compiler,
+                parsed_args: &parsed_args,
+                cwd: f.tempdir.path(),
+                env_vars: &[],
+                rewrite_includes_only: false,
+                native_resolution: None,
+            })
+            .unwrap();
         assert_eq!(
             ovec!["-c", "foo.cu", "-o", "foo.o", "--threads", "2"],
             command.arguments
         );
-        let _ = command.execute(&service, &creator).wait();
+        assert_compile_command_executes(&command)?;
         assert_eq!(Cacheable::Yes, cacheable);
-        // Ensure that we ran all processes.
-        assert_eq!(0, creator.lock().unwrap().children.len());
+        Ok(())
     }
 }

@@ -20,7 +20,9 @@ use anyhow::ensure;
 use backon::BlockingRetryable;
 use byteorder::{BigEndian, ByteOrder};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 /// A connection to an sccache server.
 pub struct ServerConnection {
@@ -28,22 +30,28 @@ pub struct ServerConnection {
     reader: BufReader<Box<dyn Connection>>,
     /// A writer for the socket connected to the server.
     writer: BufWriter<Box<dyn Connection>>,
+    closed: CancellationToken,
 }
 
 impl ServerConnection {
     /// Create a new connection using `stream`.
     pub fn new(conn: Box<dyn Connection>) -> io::Result<Self> {
+        conn.set_io_timeout(crate::server::activity::IPC_INACTIVITY_TIMEOUT)?;
         let write_conn = conn.try_clone()?;
         Ok(Self {
             reader: BufReader::new(conn),
             writer: BufWriter::new(write_conn),
+            closed: CancellationToken::new(),
         })
     }
 
     /// Send `request` to the server, read and return a `Response`.
     pub fn request(&mut self, request: Request) -> Result<Response> {
         trace!("ServerConnection::request");
-        util::write_length_prefixed_bincode(&mut self.writer, request)?;
+        ensure!(!self.closed.is_cancelled(), IpcTransportFailure);
+        if let Err(error) = util::write_length_prefixed_bincode(&mut self.writer, request) {
+            return self.invalidate(Err(error));
+        }
         trace!("ServerConnection::request: sent request");
         self.read_one_response()
     }
@@ -51,7 +59,7 @@ impl ServerConnection {
     pub(crate) fn transfer(&mut self, request: TransferRequest) -> Result<TransferReply> {
         match self.request(Request::Transfer(request))? {
             Response::Transfer(reply) => reply.map_err(|error| anyhow!("{error}")),
-            other => bail!("unexpected transfer response: {other:?}"),
+            other => self.invalidate(Err(anyhow!("unexpected transfer response: {other:?}"))),
         }
     }
 
@@ -78,7 +86,7 @@ impl ServerConnection {
             }
             Ok(())
         })();
-        if result.is_err() {
+        if result.is_err() && !self.closed.is_cancelled() {
             let _ = self.transfer(TransferRequest::Abort);
         }
         result
@@ -108,25 +116,29 @@ impl ServerConnection {
             }
             Ok(())
         })();
-        if result.is_err() {
+        if result.is_err() && !self.closed.is_cancelled() {
             let _ = self.transfer(TransferRequest::Abort);
         }
         result
     }
 
-    /// Bound IPC inactivity. A compile heartbeat prevents ordinary long
-    /// asynchronous work from exhausting this socket deadline.
-    pub fn set_compile_timeout(&self) -> Result<()> {
-        self.reader
-            .get_ref()
-            .set_io_timeout(crate::server::activity::IPC_INACTIVITY_TIMEOUT)?;
-        Ok(())
+    pub(crate) fn session_health(&self) -> CancellationToken {
+        self.closed.clone()
     }
 
-    /// Consume progress notifications until an actual response arrives.
-    pub fn read_compile_response(&mut self, mut response: Response) -> Result<Response> {
+    fn invalidate<T>(&self, result: Result<T>) -> Result<T> {
+        result.map_err(|error| {
+            self.closed.cancel();
+            let _ = self.reader.get_ref().shutdown();
+            error.context(IpcTransportFailure)
+        })
+    }
+
+    /// Read the next terminal response, consuming liveness notifications.
+    pub fn read_one_response(&mut self) -> Result<Response> {
         loop {
-            match response {
+            let frame = self.read_frame();
+            match self.invalidate(frame)? {
                 Response::CompileProgress(activity) => {
                     debug!(
                         "compile request {} {:?}, phase age {} ms, job {:?}, worker {:?}",
@@ -137,15 +149,17 @@ impl ServerConnection {
                         activity.worker
                     );
                 }
-                Response::CompileAborted(reason) => bail!("server aborted compile: {reason}"),
+                Response::Heartbeat => {}
+                Response::CompileAborted(reason) | Response::RequestAborted(reason) => {
+                    return self.invalidate(Err(anyhow!("server abandoned request: {reason}")));
+                }
                 other => return Ok(other),
             }
-            response = self.read_one_response()?;
         }
     }
 
     /// Read a single `Response` from the server.
-    pub fn read_one_response(&mut self) -> Result<Response> {
+    fn read_frame(&mut self) -> Result<Response> {
         trace!("ServerConnection::read_one_response");
         let mut bytes = [0; 4];
         self.reader.read_exact(&mut bytes).map_err(|e| {
@@ -166,20 +180,128 @@ impl ServerConnection {
     }
 }
 
+/// IPC failures invalidate the session rather than masquerading as a cache
+/// miss or a safe distributed retry.
+#[derive(Debug)]
+pub struct IpcTransportFailure;
+
+impl std::fmt::Display for IpcTransportFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("managed IPC session is no longer usable")
+    }
+}
+
+impl std::error::Error for IpcTransportFailure {}
+
 pub type SharedConnection = Arc<Mutex<ServerConnection>>;
+
+struct AbortTransfer {
+    socket: Box<dyn Connection>,
+    closed: CancellationToken,
+    armed: bool,
+}
+
+impl Drop for AbortTransfer {
+    fn drop(&mut self) {
+        if self.armed {
+            self.closed.cancel();
+            let _ = self.socket.shutdown();
+        }
+    }
+}
 
 pub async fn connection_task<T: Send + 'static>(
     connection: SharedConnection,
     task: impl FnOnce(&mut ServerConnection) -> Result<T> + Send + 'static,
 ) -> Result<T> {
+    // Waiting for the lock is itself cancellable and occupies no blocking
+    // thread. Only the owner of a transaction may invalidate its socket.
+    let (mut abort, worker) = {
+        let connection = connection.lock_owned().await;
+        ensure!(!connection.closed.is_cancelled(), IpcTransportFailure);
+        let abort = AbortTransfer {
+            socket: connection
+                .invalidate(connection.reader.get_ref().try_clone().map_err(Into::into))?,
+            closed: connection.closed.clone(),
+            armed: true,
+        };
+        (abort, spawn_transaction(connection, task))
+    };
+    let (guard, result) = worker.await.context(IpcTransportFailure)?;
+    // Keep exclusive ownership until the cancellation guard is disarmed.
+    // No next transaction may start in the completion/cancellation race.
+    abort.armed = false;
+    drop(guard);
+    result
+}
+
+fn spawn_transaction<T: Send + 'static>(
+    mut connection: tokio::sync::OwnedMutexGuard<ServerConnection>,
+    task: impl FnOnce(&mut ServerConnection) -> Result<T> + Send + 'static,
+) -> tokio::task::JoinHandle<(tokio::sync::OwnedMutexGuard<ServerConnection>, Result<T>)> {
     tokio::task::spawn_blocking(move || {
-        let mut connection = connection
-            .lock()
-            .map_err(|_| anyhow!("IPC connection lock poisoned"))?;
-        task(&mut connection)
+        let result = if connection.closed.is_cancelled() {
+            Err(IpcTransportFailure.into())
+        } else {
+            task(&mut connection)
+        };
+        (connection, result)
     })
-    .await
-    .context("IPC connection task failed")?
+}
+
+/// Dedicated control link, independent of a long-running data transfer.
+pub struct CompileObserver {
+    connection: SharedConnection,
+    activity: Arc<crate::server::activity::Activity>,
+}
+
+impl CompileObserver {
+    pub fn connect(
+        address: &crate::net::SocketAddr,
+        identity: &crate::protocol::CompileIdentity,
+    ) -> Result<Self> {
+        let mut connection = connect_to_server(address)?;
+        let Response::CompileObserved(id) =
+            connection.request(Request::ObserveCompile(identity.clone()))?
+        else {
+            bail!("unexpected namespace observation registration reply");
+        };
+        let activity = Arc::new(crate::server::activity::Activity::new(
+            id,
+            identity,
+            crate::server::activity::CompileOwner::Namespace,
+        ));
+        Ok(Self {
+            connection: Arc::new(Mutex::new(connection)),
+            activity,
+        })
+    }
+
+    pub async fn run<T>(self, work: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        tokio::select! {
+            biased;
+            result = self.report() => result.and_then(|()| Err(anyhow!("namespace observation ended prematurely"))),
+            result = crate::server::activity::scope(&self.activity, work) => result,
+        }
+    }
+
+    async fn report(&self) -> Result<()> {
+        let interval = crate::server::activity::HEARTBEAT_INTERVAL;
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let observation = self.activity.snapshot();
+            let response = connection_task(Arc::clone(&self.connection), move |connection| {
+                connection.request(Request::ObservePhase(observation))
+            })
+            .await?;
+            ensure!(
+                matches!(response, Response::ObservationAccepted),
+                "unexpected namespace compile observation reply"
+            );
+        }
+    }
 }
 
 /// Establish a TCP connection to an sccache server listening on `addr`.
@@ -225,10 +347,13 @@ mod test {
         let progress = CompileActivity {
             id: "generation-7".into(),
             client_pid: 123,
+            owner: crate::server::activity::CompileOwner::Daemon,
             output: Some("crate".into()),
             compiler: "rustc".into(),
             cwd: "/build".into(),
             phase: Phase::RunDistributed,
+            phase_sequence: 3,
+            observation_age_ms: None,
             cancellation_requested: false,
             elapsed_ms: 15000,
             phase_age_ms: 15000,
@@ -242,6 +367,7 @@ mod test {
             Response::CompileProgress(progress.clone()),
         )?;
         util::write_length_prefixed_bincode(&mut server, Response::CompileProgress(progress))?;
+        util::write_length_prefixed_bincode(&mut server, Response::Heartbeat)?;
         util::write_length_prefixed_bincode(
             &mut server,
             Response::CompileFinished(crate::protocol::CompileFinished {
@@ -250,12 +376,44 @@ mod test {
             }),
         )?;
         let mut conn = ServerConnection::new(Box::new(stream))?;
-        conn.set_compile_timeout()?;
-        let initial = conn.read_one_response()?;
-        let Response::CompileFinished(finished) = conn.read_compile_response(initial)? else {
+        let Response::CompileFinished(finished) = conn.read_one_response()? else {
             bail!("heartbeat replaced terminal response");
         };
         assert_eq!(finished.retcode, Some(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_transaction_closes_socket_and_releases_lock() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let stream = TcpStream::connect(listener.local_addr()?)?;
+        let (peer, _) = listener.accept().await?;
+        let connection = Arc::new(Mutex::new(ServerConnection::new(Box::new(stream))?));
+        let closed = connection.lock().await.session_health();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(connection_task(Arc::clone(&connection), move |conn| {
+            let _ = started.send(());
+            conn.read_one_response()
+        }));
+        running.await?;
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("transaction must be cancelled")
+                .is_cancelled()
+        );
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            connection_task(connection, |conn| conn.request(Request::GetStats)),
+        )
+        .await?;
+        assert!(
+            next.expect_err("closed session must not be reused")
+                .is::<IpcTransportFailure>()
+        );
+        assert!(closed.is_cancelled());
+        peer.readable().await?;
+        assert_eq!(peer.try_read(&mut [0; 1])?, 0);
         Ok(())
     }
 
@@ -265,8 +423,10 @@ mod test {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let stream = TcpStream::connect(listener.local_addr()?)?;
         let (_server, _) = listener.accept()?;
-        Connection::set_io_timeout(&stream, Duration::from_millis(100))?;
         let mut conn = ServerConnection::new(Box::new(stream))?;
+        conn.reader
+            .get_ref()
+            .set_io_timeout(Duration::from_millis(100))?;
         let error = conn
             .read_one_response()
             .expect_err("silent open socket must time out");
@@ -289,8 +449,8 @@ mod test {
             Some(io::ErrorKind::UnexpectedEof)
         );
         assert!(
-            err.to_string()
-                .starts_with("the sccache server closed the connection without replying"),
+            format!("{err:#}")
+                .contains("the sccache server closed the connection without replying"),
             "{err:#}"
         );
         Ok(())

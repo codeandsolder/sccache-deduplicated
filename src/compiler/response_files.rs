@@ -47,7 +47,7 @@ impl ResponseFileExpansion {
     pub(super) fn expand(
         &mut self,
         file: &Path,
-        read_and_split: impl FnOnce() -> Option<Vec<OsString>>,
+        split: impl FnOnce(&str) -> Option<Vec<OsString>>,
     ) -> bool {
         let canonical = match fs::canonicalize(file) {
             Ok(canonical) => canonical,
@@ -63,7 +63,14 @@ impl ResponseFileExpansion {
             debug!("cyclic response file reference at {}", file.display());
             return false;
         }
-        let Some(arguments) = read_and_split() else {
+        let contents = match fs::read_to_string(file) {
+            Ok(contents) => contents,
+            Err(error) => {
+                debug!("failed to read response file {}: {error}", file.display());
+                return false;
+            }
+        };
+        let Some(arguments) = split(&contents) else {
             return false;
         };
         self.active.insert(canonical.clone());

@@ -127,19 +127,28 @@ impl Acceptor for tokio::net::TcpListener {
 pub trait Connection: std::io::Read + std::io::Write + Send {
     fn try_clone(&self) -> std::io::Result<Box<dyn Connection>>;
     fn set_io_timeout(&self, timeout: std::time::Duration) -> std::io::Result<()>;
+    fn shutdown(&self) -> std::io::Result<()>;
 }
 
-impl Connection for std::net::TcpStream {
-    #[inline]
-    fn try_clone(&self) -> std::io::Result<Box<dyn Connection>> {
-        let stream = Self::try_clone(self)?;
-        Ok(Box::new(stream))
-    }
-    fn set_io_timeout(&self, timeout: std::time::Duration) -> std::io::Result<()> {
-        self.set_read_timeout(Some(timeout))?;
-        self.set_write_timeout(Some(timeout))
-    }
+macro_rules! impl_connection {
+    ($stream:ty) => {
+        impl Connection for $stream {
+            #[inline]
+            fn try_clone(&self) -> std::io::Result<Box<dyn Connection>> {
+                let stream = Self::try_clone(self)?;
+                Ok(Box::new(stream))
+            }
+            fn set_io_timeout(&self, timeout: std::time::Duration) -> std::io::Result<()> {
+                self.set_read_timeout(Some(timeout))?;
+                self.set_write_timeout(Some(timeout))
+            }
+            fn shutdown(&self) -> std::io::Result<()> {
+                Self::shutdown(self, std::net::Shutdown::Both)
+            }
+        }
+    };
 }
+impl_connection!(std::net::TcpStream);
 
 /// Report a failure to disable Nagle's algorithm on `stream`, which is not worth
 /// failing the connection over. Without it, the last segment of a message
@@ -202,15 +211,5 @@ mod unix_imp {
         }
     }
 
-    impl Connection for std::os::unix::net::UnixStream {
-        #[inline]
-        fn try_clone(&self) -> std::io::Result<Box<dyn Connection>> {
-            let stream = Self::try_clone(self)?;
-            Ok(Box::new(stream))
-        }
-        fn set_io_timeout(&self, timeout: std::time::Duration) -> std::io::Result<()> {
-            self.set_read_timeout(Some(timeout))?;
-            self.set_write_timeout(Some(timeout))
-        }
-    }
+    impl_connection!(std::os::unix::net::UnixStream);
 }

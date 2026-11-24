@@ -17,14 +17,11 @@ use crate::compiler::args::{
     ArgDisposition, ArgInfo, ArgToStringResult, ArgsIter, Argument, FromArg, IntoArg,
     PathTransformerFn, SearchableArgInfo,
 };
-use crate::compiler::c::{ArtifactDescriptor, CCompileContext, CCompilerKind, ParsedArguments};
-use crate::compiler::{
-    CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
-    SingleCompileCommand,
+use crate::compiler::c::{
+    ArtifactDescriptor, CCompileCommands, CCompileContext, CCompilerKind, ParsedArguments,
 };
+use crate::compiler::{Cacheable, ColorMode, CompilerArguments, Language, SingleCompileCommand};
 use crate::{counted_array, dist};
-
-use crate::mock_command::CommandCreatorSync;
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -57,6 +54,8 @@ macro_rules! impl_cuda_stage_compiler {
     ($stage:ident, $kind:expr, $language:expr, $args:expr, $offset:expr, $style:expr $(,)?) => {
         #[async_trait::async_trait]
         impl crate::compiler::c::CCompilerImpl for $stage {
+            type LocalCommand = crate::compiler::SingleCompileCommand;
+
             fn kind(&self) -> crate::compiler::c::CCompilerKind {
                 $kind
             }
@@ -83,14 +82,11 @@ macro_rules! impl_cuda_stage_compiler {
             {
                 crate::compiler::cicc::preprocess(context.cwd, context.parsed_args)
             }
-            fn generate_compile_commands<T>(
+            fn generate_compile_commands(
                 &self,
                 context: crate::compiler::c::CCompileContext<'_>,
-            ) -> crate::errors::Result<crate::compiler::cicc::CudaStageCompileCommands<T>>
-            where
-                T: crate::mock_command::CommandCreatorSync,
-            {
-                crate::compiler::cicc::boxed_compile_commands(context, $style)
+            ) -> crate::compiler::c::CCompileCommands<Self::LocalCommand> {
+                crate::compiler::cicc::generate_compile_commands(context, $style)
             }
         }
     };
@@ -261,6 +257,7 @@ where
         extra_hash_files: extra_dist_files,
         uses_external_assembler: false,
         msvc_show_includes: false,
+        msvc_explicit_language: false,
         profile_generate: false,
         color_mode: ColorMode::Off,
         suppress_rewrite_includes_only: false,
@@ -330,56 +327,14 @@ impl OutputStyle {
     }
 }
 
-/// Common `CCompilerImpl` result for all three CUDA device compiler stages.
-pub(super) type CudaStageCompileCommands<T> = (
-    Box<dyn CompileCommand<T>>,
-    Option<dist::CompileCommand>,
-    Cacheable,
-);
-/// Box a CUDA device compiler command using the frontend-specific output style.
-/// The three stage adapters share path transformation and command ownership.
-pub(super) fn boxed_compile_commands<T: CommandCreatorSync>(
+/// Construct local and distributed commands for a CUDA device compiler stage.
+pub fn generate_compile_commands(
     context: CCompileContext<'_>,
     output_style: OutputStyle,
-) -> Result<CudaStageCompileCommands<T>> {
-    let CCompileContext {
-        path_transformer,
-        executable,
-        parsed_args,
-        cwd,
-        env_vars,
-        ..
-    } = context;
-    generate_compile_commands(
-        path_transformer,
-        executable,
-        parsed_args,
-        cwd,
-        env_vars,
-        output_style,
-    )
-    .map(|(command, dist_command, cacheable)| {
-        (CCompileCommand::boxed(command), dist_command, cacheable)
-    })
-}
-pub fn generate_compile_commands(
-    path_transformer: &mut dist::PathTransformer,
-    executable: &Path,
-    parsed_args: &ParsedArguments,
-    cwd: &Path,
-    env_vars: &[(OsString, OsString)],
-    output_style: OutputStyle,
-) -> Result<(
-    SingleCompileCommand,
-    Option<dist::CompileCommand>,
-    Cacheable,
-)> {
-    // Unused arguments
-    #[cfg(not(feature = "dist-client"))]
-    {
-        let _ = path_transformer;
-    }
-
+) -> CCompileCommands<SingleCompileCommand> {
+    let parsed_args = context.parsed_args;
+    let executable = context.executable;
+    let cwd = context.cwd;
     let lang_str = &parsed_args.language.as_str();
     let out_file = match parsed_args.outputs.get("obj") {
         Some(obj) => &obj.path,
@@ -412,13 +367,13 @@ pub fn generate_compile_commands(
         );
     }
 
-    let command = SingleCompileCommand {
-        executable: executable.to_owned(),
-        arguments,
-        env_vars: env_vars.to_owned(),
-        cwd: cwd.to_owned(),
-        share_jobserver: false,
-    };
+    let command = context.local_command(arguments);
+    #[cfg(feature = "dist-client")]
+    let CCompileContext {
+        path_transformer,
+        env_vars,
+        ..
+    } = context;
 
     #[cfg(not(feature = "dist-client"))]
     let dist_command = None;

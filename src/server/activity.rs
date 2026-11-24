@@ -1,7 +1,8 @@
 //! Observable compile-request lifetimes. Heartbeats prove transport liveness;
 //! only actual phase transitions reset the phase deadline.
 
-use crate::protocol::Compile;
+use crate::protocol::{Compile, CompileIdentity};
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -81,16 +82,27 @@ pub enum Phase {
     SendReply,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompileOwner {
+    Daemon,
+    Namespace,
+}
+
 /// Snapshot of one request, using monotonic elapsed time instead of wall time.
 /// No command arguments or environment variables are exposed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompileActivity {
     pub id: String,
     pub client_pid: u32,
+    pub owner: CompileOwner,
     pub output: Option<String>,
     pub compiler: String,
     pub cwd: String,
     pub phase: Phase,
+    pub phase_sequence: u64,
+    /// Age of last caller observation (namespace requests only).
+    pub observation_age_ms: Option<u64>,
     pub cancellation_requested: bool,
     pub elapsed_ms: u64,
     pub phase_age_ms: u64,
@@ -101,6 +113,8 @@ pub struct CompileActivity {
 }
 
 struct State {
+    sequence: u64,
+    observed: Option<Instant>,
     output: Option<String>,
     phase: Phase,
     changed: Instant,
@@ -110,9 +124,10 @@ struct State {
     worker: Option<String>,
 }
 
-pub(super) struct Activity {
+pub(crate) struct Activity {
     id: String,
     client_pid: u32,
+    owner: CompileOwner,
     compiler: String,
     cwd: String,
     started: Instant,
@@ -131,24 +146,58 @@ fn millis(duration: Duration) -> u64 {
 }
 
 impl Activity {
+    pub(crate) fn new(id: String, identity: &CompileIdentity, owner: CompileOwner) -> Self {
+        let now = Instant::now();
+        Self {
+            id,
+            client_pid: identity.client_pid,
+            owner,
+            compiler: Path::new(&identity.exe)
+                .file_name()
+                .unwrap_or(identity.exe.as_os_str())
+                .to_string_lossy()
+                .into_owned(),
+            cwd: identity.cwd.to_string_lossy().into_owned(),
+            started: now,
+            cancellation: CancellationToken::new(),
+            state: Mutex::new(State {
+                sequence: 0,
+                observed: None,
+                output: None,
+                phase: Phase::DetectCompiler,
+                changed: now,
+                waiting_for_jobserver: 0,
+                compiler_children: 0,
+                distributed_job: None,
+                worker: None,
+            }),
+        }
+    }
+
     pub(super) fn phase(&self, phase: Phase) {
         let mut state = lock(&self.state);
         if state.phase != phase {
             state.phase = phase;
+            state.sequence = state.sequence.saturating_add(1);
             state.changed = Instant::now();
         }
     }
 
-    pub(super) fn snapshot(&self) -> CompileActivity {
+    pub(crate) fn snapshot(&self) -> CompileActivity {
         let state = lock(&self.state);
         let now = Instant::now();
         CompileActivity {
             id: self.id.clone(),
             client_pid: self.client_pid,
+            owner: self.owner,
             output: state.output.clone(),
             compiler: self.compiler.clone(),
             cwd: self.cwd.clone(),
             phase: state.phase,
+            phase_sequence: state.sequence,
+            observation_age_ms: state
+                .observed
+                .map(|received| millis(now.duration_since(received))),
             cancellation_requested: self.cancellation.is_cancelled(),
             elapsed_ms: millis(now.duration_since(self.started)),
             phase_age_ms: millis(now.duration_since(state.changed)),
@@ -156,6 +205,66 @@ impl Activity {
             compiler_children: state.compiler_children,
             distributed_job: state.distributed_job,
             worker: state.worker.clone(),
+        }
+    }
+
+    // The caller supplies monotonic elapsed phase time, not an absolute
+    // clock value. Repeated observations of a phase can never renew it.
+    pub(super) fn observe(&self, sample: CompileActivity) -> Result<()> {
+        ensure!(
+            self.owner == CompileOwner::Namespace
+                && sample.owner == self.owner
+                && sample.id == self.id
+                && sample.client_pid == self.client_pid
+                && sample.compiler == self.compiler
+                && sample.cwd == self.cwd,
+            "namespace compile observation identity mismatch"
+        );
+        let now = Instant::now();
+        let age = Duration::from_millis(sample.phase_age_ms).min(now.duration_since(self.started));
+        let changed = now - age;
+        let mut state = lock(&self.state);
+        match sample.phase_sequence.cmp(&state.sequence) {
+            std::cmp::Ordering::Less => anyhow::bail!("out-of-order namespace compile observation"),
+            std::cmp::Ordering::Equal => {
+                ensure!(
+                    sample.phase == state.phase,
+                    "inconsistent namespace phase sequence"
+                );
+                state.changed = state.changed.min(changed);
+            }
+            std::cmp::Ordering::Greater => {
+                state.sequence = sample.phase_sequence;
+                state.phase = sample.phase;
+                state.changed = changed;
+            }
+        }
+        state.observed = Some(now);
+        state.output = sample.output;
+        state.waiting_for_jobserver = sample.waiting_for_jobserver;
+        state.compiler_children = sample.compiler_children;
+        state.distributed_job = sample.distributed_job;
+        state.worker = sample.worker;
+        drop(state);
+        Ok(())
+    }
+}
+
+impl CompileActivity {
+    pub(super) fn deadline_error(&self, limits: CompileLimits) -> Option<String> {
+        let snapshot = self;
+        if snapshot.cancellation_requested {
+            Some(format!(
+                "compile request {} cancellation requested during {:?}; outcome unknown",
+                snapshot.id, snapshot.phase
+            ))
+        } else if Duration::from_millis(snapshot.phase_age_ms) >= limits.budget(snapshot.phase) {
+            Some(format!(
+                "compile request {} exceeded its {:?} phase deadline after {} ms; outcome unknown",
+                snapshot.id, snapshot.phase, snapshot.phase_age_ms
+            ))
+        } else {
+            None
         }
     }
 }
@@ -178,30 +287,17 @@ impl Default for Registry {
 
 impl Registry {
     pub(super) fn begin(&self, compile: &Compile) -> Registration<'_> {
+        self.register(&CompileIdentity::from(compile), CompileOwner::Daemon)
+    }
+
+    pub(super) fn register(
+        &self,
+        identity: &CompileIdentity,
+        owner: CompileOwner,
+    ) -> Registration<'_> {
         let sequence = self.next.fetch_add(1, Ordering::Relaxed);
         let id = format!("{:016x}-{sequence:x}", self.generation);
-        let now = Instant::now();
-        let activity = Arc::new(Activity {
-            id: id.clone(),
-            client_pid: compile.client_pid,
-            compiler: Path::new(&compile.exe)
-                .file_name()
-                .unwrap_or(compile.exe.as_os_str())
-                .to_string_lossy()
-                .into_owned(),
-            cwd: compile.cwd.to_string_lossy().into_owned(),
-            started: now,
-            cancellation: CancellationToken::new(),
-            state: Mutex::new(State {
-                output: None,
-                phase: Phase::DetectCompiler,
-                changed: now,
-                waiting_for_jobserver: 0,
-                compiler_children: 0,
-                distributed_job: None,
-                worker: None,
-            }),
-        });
+        let activity = Arc::new(Activity::new(id.clone(), identity, owner));
         lock(&self.active).insert(id, Arc::clone(&activity));
         Registration {
             registry: self,
@@ -246,7 +342,7 @@ pub(super) fn inherit<F: Future>(future: F) -> impl Future<Output = F::Output> {
     CURRENT.scope(CURRENT.try_with(Clone::clone).ok().flatten(), future)
 }
 
-pub(super) fn scope<F: Future>(
+pub(crate) fn scope<F: Future>(
     activity: &Arc<Activity>,
     future: F,
 ) -> impl Future<Output = F::Output> {
@@ -326,6 +422,51 @@ pub fn job(id: u64, worker: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn caller_observation_cannot_renew_same_phase_and_preserves_transition_age() -> Result<()>
+    {
+        let identity = CompileIdentity {
+            client_pid: 17,
+            exe: "/usr/bin/rustc".into(),
+            cwd: "/build".into(),
+        };
+        let registry = Registry::default();
+        let registration = registry.register(&identity, CompileOwner::Namespace);
+        let daemon = &registration.activity;
+        let caller = Activity::new(daemon.snapshot().id, &identity, CompileOwner::Namespace);
+        let limits = CompileLimits {
+            phase_timeout_secs: 10,
+            execution_timeout_secs: 30,
+        };
+        tokio::time::advance(Duration::from_secs(5)).await;
+        daemon.observe(caller.snapshot())?;
+        assert_eq!(daemon.snapshot().phase_age_ms, 5000);
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let mut stale = caller.snapshot();
+        stale.phase_age_ms = 0;
+        daemon.observe(stale)?;
+        assert_eq!(daemon.snapshot().phase_age_ms, 11000);
+        assert!(daemon.snapshot().deadline_error(limits).is_some());
+
+        // A caller may leave and reenter the same named phase between
+        // observations. Its real sequence/age, not the receipt time, wins.
+        caller.phase(Phase::HashInputs);
+        caller.phase(Phase::DetectCompiler);
+        tokio::time::advance(Duration::from_secs(3)).await;
+        daemon.observe(caller.snapshot())?;
+        let snapshot = daemon.snapshot();
+        assert_eq!(snapshot.phase_sequence, 2);
+        assert_eq!(snapshot.phase_age_ms, 3000);
+        assert_eq!(snapshot.observation_age_ms, Some(0));
+        assert!(snapshot.deadline_error(limits).is_none());
+        let mut invalid = caller.snapshot();
+        invalid.phase_sequence = 1;
+        assert!(daemon.observe(invalid).is_err());
+        assert!(registry.cancel(&snapshot.id));
+        assert!(daemon.snapshot().deadline_error(limits).is_some());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn phase_context_survives_spawn_and_registration_cancels() -> anyhow::Result<()> {

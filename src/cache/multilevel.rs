@@ -408,7 +408,26 @@ pub struct MultiLevelStorage {
     background_tasks: Arc<BackgroundTasks>,
 }
 
+enum SizeMetric {
+    Current,
+    Maximum,
+}
+
 impl MultiLevelStorage {
+    async fn aggregate_size(&self, metric: SizeMetric) -> Result<Option<u64>> {
+        let mut total = None;
+        for level in &self.levels {
+            let size = match metric {
+                SizeMetric::Current => level.current_size().await?,
+                SizeMetric::Maximum => level.max_size().await?,
+            };
+            if let Some(size) = size {
+                total = Some(total.unwrap_or(0u64).saturating_add(size));
+            }
+        }
+        Ok(total)
+    }
+
     /// Collect and deduplicate basedirs from all cache levels.
     fn collect_basedirs(levels: &[Arc<dyn Storage>]) -> Vec<Vec<u8>> {
         let mut seen = Vec::new();
@@ -888,52 +907,67 @@ impl MultiLevelStorage {
     }
 
     async fn put_raw_all(&self, key: &str, data: &Bytes) -> Result<Duration> {
-        use tokio::sync::mpsc;
-
-        let (tx, mut rx) = mpsc::channel(self.levels.len());
+        let mut tasks = tokio::task::JoinSet::new();
         for (idx, level) in self.levels.iter().enumerate() {
             let data = data.clone();
             let key = key.to_string();
             let level = Arc::clone(level);
-            let tx = tx.clone();
             let stats = self.atomic_stats.get(idx).map(Arc::clone);
             let semaphore = (idx > 0).then(|| Arc::clone(&self.slow_level_semaphore));
 
             let write_task = async move {
                 let _permit = if let Some(semaphore) = semaphore {
-                    Some(
-                        semaphore
-                            .acquire_owned()
-                            .await
-                            .map_err(|_| anyhow!("slow-level write semaphore closed"))?,
-                    )
+                    match semaphore.acquire_owned().await {
+                        Ok(permit) => Some(permit),
+                        Err(_) => {
+                            return (
+                                idx,
+                                Err(anyhow!("slow-level write semaphore closed")),
+                                level,
+                                Duration::ZERO,
+                                stats,
+                            );
+                        }
+                    }
                 } else {
                     None
                 };
                 let start = Instant::now();
                 let result = Self::write_entry_from_bytes(&level, &key, &data).await;
-                Ok::<_, anyhow::Error>((idx, result, level, start.elapsed(), stats))
+                (idx, result, level, start.elapsed(), stats)
             };
 
             if idx == 0 {
-                let (idx, result, level, duration, stats) = write_task.await?;
+                let (idx, result, level, duration, stats) = write_task.await;
                 Self::finish_required_write(idx, result, &level, duration, stats.as_deref())
                     .await?;
             } else {
-                tokio::spawn(async move {
-                    match write_task.await {
-                        Ok(result) => {
-                            let _ = tx.send(result).await;
-                        }
-                        Err(error) => debug!("Slow-level write setup failed: {error}"),
-                    }
-                });
+                tasks.spawn(write_task);
             }
         }
-        drop(tx);
 
-        while let Some((idx, result, level, duration, stats)) = rx.recv().await {
-            Self::finish_required_write(idx, result, &level, duration, stats.as_deref()).await?;
+        // All means every started write has finished before reporting success
+        // or failure. Returning on the first error leaves other writes racing
+        // a caller retry; JoinSet also cancels them if the caller is dropped.
+        let mut first_error = None;
+        while let Some(joined) = tasks.join_next().await {
+            let write_result = match joined {
+                Ok((idx, result, level, duration, stats)) => {
+                    Self::finish_required_write(idx, result, &level, duration, stats.as_deref())
+                        .await
+                }
+                Err(error) => Err(anyhow!("required cache write task failed: {error}")),
+            };
+            if let Err(error) = write_result {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                } else {
+                    debug!("Additional required cache write failed: {error:#}");
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(Duration::ZERO)
     }
@@ -1031,23 +1065,11 @@ impl Storage for MultiLevelStorage {
     }
 
     async fn current_size(&self) -> Result<Option<u64>> {
-        let mut total = 0u64;
-        for level in &self.levels {
-            if let Some(size) = level.current_size().await? {
-                total = total.saturating_add(size);
-            }
-        }
-        if total > 0 { Ok(Some(total)) } else { Ok(None) }
+        self.aggregate_size(SizeMetric::Current).await
     }
 
     async fn max_size(&self) -> Result<Option<u64>> {
-        let mut total = 0u64;
-        for level in &self.levels {
-            if let Some(size) = level.max_size().await? {
-                total = total.saturating_add(size);
-            }
-        }
-        if total > 0 { Ok(Some(total)) } else { Ok(None) }
+        self.aggregate_size(SizeMetric::Maximum).await
     }
 
     fn multilevel_stats(&self) -> Option<crate::cache::multilevel::MultiLevelStats> {
@@ -1069,10 +1091,26 @@ impl Storage for MultiLevelStorage {
         &self,
         key: &str,
     ) -> Result<Option<Box<dyn crate::lru_disk_cache::ReadSeek>>> {
-        for level in &self.levels {
-            if let Some(entry) = level.get_preprocessor_cache_entry(key).await? {
-                return Ok(Some(entry));
+        let mut first_error = None;
+        for (idx, level) in self.levels.iter().enumerate() {
+            match level.get_preprocessor_cache_entry(key).await {
+                Ok(Some(entry)) => return Ok(Some(entry)),
+                Ok(None) => {}
+                Err(error) => {
+                    inc_stat!(self.atomic_stats.get(idx), read_errors, 1);
+                    warn!(
+                        "Error checking preprocessor cache level {idx}: {error:#}, trying next level"
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(error.context(format!(
+                            "preprocessor cache level {idx} lookup failed for key {key}"
+                        )));
+                    }
+                }
             }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(None)
     }

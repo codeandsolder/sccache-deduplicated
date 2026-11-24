@@ -17,16 +17,18 @@ use crate::compiler::args::{
     NormalizedDisposition, PathTransformerFn,
 };
 use crate::compiler::c::{
-    ArtifactDescriptor, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
-    ParsedArguments,
+    ArtifactDescriptor, CCompileCommands, CCompileContext, CCompilerImpl, CCompilerKind,
+    CPreprocessContext, ParsedArguments,
 };
 use crate::compiler::{
-    CCompileCommand, Cacheable, ColorMode, CompileCommand, CompilerArguments, Language,
-    SingleCompileCommand, clang, gcc, write_temp_file,
+    Cacheable, ColorMode, CompilerArguments, Language, SingleCompileCommand, clang, gcc,
+    write_temp_file,
 };
+use crate::counted_array;
+#[cfg(any(feature = "dist-client", test))]
+use crate::dist;
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::{OsStrExt, encode_path, run_input_output};
-use crate::{counted_array, dist};
 use async_trait::async_trait;
 use fs::File;
 use fs_err as fs;
@@ -52,6 +54,8 @@ pub struct Msvc {
 
 #[async_trait]
 impl CCompilerImpl for Msvc {
+    type LocalCommand = SingleCompileCommand;
+
     fn kind(&self) -> CCompilerKind {
         CCompilerKind::Msvc
     }
@@ -100,30 +104,11 @@ impl CCompilerImpl for Msvc {
         .await
     }
 
-    fn generate_compile_commands<T>(
+    fn generate_compile_commands(
         &self,
         context: CCompileContext<'_>,
-    ) -> Result<(
-        Box<dyn CompileCommand<T>>,
-        Option<dist::CompileCommand>,
-        Cacheable,
-    )>
-    where
-        T: CommandCreatorSync,
-    {
-        let CCompileContext {
-            path_transformer,
-            executable,
-            parsed_args,
-            cwd,
-            env_vars,
-            ..
-        } = context;
-        generate_compile_commands(path_transformer, executable, parsed_args, cwd, env_vars).map(
-            |(command, dist_command, cacheable)| {
-                (CCompileCommand::boxed(command), dist_command, cacheable)
-            },
-        )
+    ) -> CCompileCommands<Self::LocalCommand> {
+        generate_compile_commands(context)
     }
 }
 
@@ -247,13 +232,16 @@ ArgData! {
     XClang(OsString), // -Xclang ...
     Clang(OsString), // -clang:...
     ExternalIncludePath(PathBuf),
+    DirectClangProfileUse(PathBuf),
+    CInput(PathBuf), // /Tc
+    CxxInput(PathBuf), // /Tp
 }
 
 use self::ArgData::{
-    Clang, DebugInfo, DepFile, DoCompilation, ExternalIncludePath, ExtraHashFile, Ignore,
-    IgnoreWithSuffix, Output, PassThrough, PassThroughWithPath, PassThroughWithSuffix,
-    PreprocessorArgument, PreprocessorArgumentPath, ProgramDatabase, ShowIncludes,
-    SuppressCompilation, TooHard, TooHardFlag, TooHardPath, XClang,
+    CInput, Clang, CxxInput, DebugInfo, DepFile, DirectClangProfileUse, DoCompilation,
+    ExternalIncludePath, ExtraHashFile, Ignore, IgnoreWithSuffix, Output, PassThrough,
+    PassThroughWithPath, PassThroughWithSuffix, PreprocessorArgument, PreprocessorArgumentPath,
+    ProgramDatabase, ShowIncludes, SuppressCompilation, TooHard, TooHardFlag, TooHardPath, XClang,
 };
 
 macro_rules! msvc_args {
@@ -373,8 +361,10 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     msvc_flag!("Qvec-report:1", PassThrough),
     msvc_flag!("Qvec-report:2", PassThrough),
     msvc_take_arg!("RTC", OsString, Concatenated, PassThroughWithSuffix),
-    msvc_flag!("TC", PassThrough), // TODO: disable explicit language check, hope for the best for now? Also, handle /Tc & /Tp.
+    msvc_flag!("TC", PassThrough), // TODO: disable explicit language check, hope for the best for now?
     msvc_flag!("TP", PassThrough), // As above.
+    msvc_take_arg!("Tc", PathBuf, CanBeSeparated, CInput),
+    msvc_take_arg!("Tp", PathBuf, CanBeSeparated, CxxInput),
     msvc_take_arg!("U", OsString, Concatenated, PreprocessorArgument),
     msvc_take_arg!("V", OsString, Concatenated, PassThroughWithSuffix),
     msvc_flag!("W0", PassThrough),
@@ -460,6 +450,8 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     msvc_flag!("forceInterlockedFunctions-", PassThrough),
     msvc_take_arg!("fp:", OsString, Concatenated, PassThroughWithSuffix),
     msvc_take_arg!("fpcvt:", OsString, Concatenated, PassThroughWithSuffix),
+    msvc_take_arg!("fprofile-instr-use", PathBuf, Concatenated(b'='), DirectClangProfileUse),
+    msvc_take_arg!("fprofile-use", PathBuf, Concatenated(b'='), DirectClangProfileUse),
     msvc_flag!("fsanitize-address-asan-compat-lib", PassThrough),
     msvc_flag!("fsanitize-address-use-after-return", PassThrough),
     msvc_take_arg!("fsanitize-blacklist", PathBuf, Concatenated(b'='), ExtraHashFile),
@@ -556,6 +548,7 @@ pub fn parse_arguments(
 ) -> CompilerArguments<ParsedArguments> {
     let mut output_arg = None;
     let mut input_arg = None;
+    let mut explicit_language = None;
     let mut double_dash_input = false;
     let mut common_args = vec![];
     let mut unhashed_args = vec![];
@@ -628,6 +621,22 @@ pub fn parse_arguments(
             }
             Some(XClang(s)) => xclangs.push(s.clone()),
             Some(Clang(s)) => clangs.push(s.clone()),
+            Some(DirectClangProfileUse(path)) if is_clang => {
+                extra_hash_files.push(clang::resolve_profile_use_path(path, cwd));
+            }
+            Some(DirectClangProfileUse(_)) => {
+                cannot_cache!(arg.flag_str().unwrap_or("profile-use"))
+            }
+            Some(CInput(path) | CxxInput(path)) => {
+                if path.as_os_str().is_empty() {
+                    cannot_cache!("no input file");
+                }
+                if input_arg.is_some() {
+                    multiple_input = true;
+                    multiple_input_files.push(path.clone().into_os_string());
+                }
+                input_arg = Some(path.clone().into_os_string());
+            }
             None => {
                 match arg {
                     Argument::Raw(ref val) if val == "--" => {
@@ -656,6 +665,7 @@ pub fn parse_arguments(
                 ),
             Some(
                 ProgramDatabase(_)
+                | DirectClangProfileUse(_)
                 | DebugInfo
                 | PassThrough
                 | PassThroughWithPath(_)
@@ -694,6 +704,8 @@ pub fn parse_arguments(
             // so we just skip them entirely. -FS may also have a side effect of creating
             // race conditions in which we may try to read the PDB before MSPDBSRC is done
             // writing it, so we're better off ignoring the flags.
+            Some(CInput(_)) => explicit_language = Some(Language::C),
+            Some(CxxInput(_)) => explicit_language = Some(Language::Cxx),
             _ => {}
         }
     }
@@ -805,7 +817,7 @@ pub fn parse_arguments(
         );
     }
     let (input, language) = match input_arg {
-        Some(i) => match Language::from_file_name(Path::new(&i)) {
+        Some(i) => match explicit_language.or_else(|| Language::from_file_name(Path::new(&i))) {
             Some(l) => (i, l),
             None => cannot_cache!("unknown source language"),
         },
@@ -898,6 +910,13 @@ pub fn parse_arguments(
     if debug_info && !is_clang {
         match pdb {
             Some(p) => {
+                // A trailing separator makes cl.exe write a shared vc<NNN>.pdb
+                // inside that directory, like the -Fd-less case below, so the
+                // program database cannot be tracked as a per-compilation
+                // artifact.
+                if p.as_os_str().to_string_lossy().ends_with(['\\', '/']) {
+                    cannot_cache!("shared pdb");
+                }
                 // Append the default .pdb prefix if none was given, like how MSVC does.
                 let path = if p.extension().is_none() {
                     let mut path = p;
@@ -940,6 +959,7 @@ pub fn parse_arguments(
         extra_hash_files,
         uses_external_assembler: false,
         msvc_show_includes: show_includes,
+        msvc_explicit_language: explicit_language.is_some(),
         profile_generate,
         // FIXME: implement color_mode for msvc.
         color_mode: ColorMode::Auto,
@@ -982,6 +1002,21 @@ fn normpath(path: &str) -> String {
 #[cfg(not(windows))]
 fn normpath(path: &str) -> String {
     path.to_owned()
+}
+
+// An input given with /Tc or /Tp has to keep the flag attached, otherwise
+// cl.exe falls back to guessing the language from the extension.
+fn msvc_input_arg(parsed_args: &ParsedArguments, input: &OsStr) -> OsString {
+    let mut arg = OsString::new();
+    if parsed_args.msvc_explicit_language {
+        match parsed_args.language {
+            Language::C => arg.push("-Tc"),
+            Language::Cxx => arg.push("-Tp"),
+            _ => {}
+        }
+    }
+    arg.push(input);
+    arg
 }
 
 pub fn preprocess_cmd<T>(
@@ -1038,7 +1073,7 @@ pub fn preprocess_cmd<T>(
     if parsed_args.double_dash_input {
         cmd.arg("--");
     }
-    cmd.arg(&parsed_args.input);
+    cmd.arg(msvc_input_arg(parsed_args, parsed_args.input.as_os_str()));
 }
 
 pub struct MsvcPreprocessConfig<'a> {
@@ -1160,19 +1195,10 @@ where
 }
 
 fn generate_compile_commands(
-    path_transformer: &mut dist::PathTransformer,
-    executable: &Path,
-    parsed_args: &ParsedArguments,
-    cwd: &Path,
-    env_vars: &[(OsString, OsString)],
-) -> Result<(
-    SingleCompileCommand,
-    Option<dist::CompileCommand>,
-    Cacheable,
-)> {
-    #[cfg(not(feature = "dist-client"))]
-    let _ = path_transformer;
-
+    context: CCompileContext<'_>,
+) -> CCompileCommands<SingleCompileCommand> {
+    let parsed_args = context.parsed_args;
+    let cwd = context.cwd;
     trace!("compile");
     let out_file = match parsed_args.outputs.get("obj") {
         Some(obj) => &obj.path,
@@ -1204,14 +1230,15 @@ fn generate_compile_commands(
     if parsed_args.double_dash_input {
         arguments.push("--".into());
     }
-    arguments.push(parsed_args.input.clone().into());
-    let command = SingleCompileCommand {
-        executable: executable.to_owned(),
-        arguments,
-        env_vars: env_vars.to_owned(),
-        cwd: cwd.to_owned(),
-        share_jobserver: false,
-    };
+    arguments.push(msvc_input_arg(parsed_args, parsed_args.input.as_os_str()));
+    let command = context.local_command(arguments);
+    #[cfg(feature = "dist-client")]
+    let CCompileContext {
+        path_transformer,
+        executable,
+        env_vars,
+        ..
+    } = context;
 
     #[cfg(not(feature = "dist-client"))]
     let dist_command = None;
@@ -1233,7 +1260,12 @@ fn generate_compile_commands(
         if parsed_args.double_dash_input {
             arguments.push("--".into());
         }
-        arguments.push(path_transformer.as_dist(&parsed_args.input)?);
+        let input = path_transformer.as_dist(&parsed_args.input)?;
+        arguments.push(
+            msvc_input_arg(parsed_args, input.as_ref())
+                .into_string()
+                .ok()?,
+        );
 
         Some(dist::CompileCommand {
             executable: path_transformer.as_dist(executable)?,
@@ -1502,8 +1534,6 @@ mod test {
     use super::*;
     use crate::compiler::*;
     use crate::mock_command::*;
-    use crate::server;
-    use crate::test::mock_storage::MockStorage;
     use crate::test::utils::*;
 
     fn parse_arguments(arguments: Vec<OsString>) -> CompilerArguments<ParsedArguments> {
@@ -1704,6 +1734,45 @@ mod test {
     }
 
     #[test]
+    fn test_parse_arguments_explicit_language_input() {
+        for (args, expected_input, expected_language) in [
+            (ovec!["-c", "-Tp", "foo.cc"], "foo.cc", Language::Cxx),
+            (ovec!["/c", "/Tp", "foo.cc"], "foo.cc", Language::Cxx),
+            (ovec!["-c", "-Tpfoo.cc"], "foo.cc", Language::Cxx),
+            (ovec!["/c", "/Tpsrc/foo.cpp"], "src/foo.cpp", Language::Cxx),
+            (ovec!["-c", "-Tp", "foo.c"], "foo.c", Language::Cxx),
+            (ovec!["-c", "-Tc", "foo.cpp"], "foo.cpp", Language::C),
+            (ovec!["/c", "/Tcfoo.cpp"], "foo.cpp", Language::C),
+            (ovec!["-c", "-Tcfoo.inc"], "foo.inc", Language::C),
+        ] {
+            let ParsedArguments {
+                input,
+                language,
+                common_args,
+                ..
+            } = match parse_arguments(args.clone()) {
+                CompilerArguments::Ok(parsed) => parsed,
+                o => panic!("Got unexpected parse result for {:?}: {:?}", args, o),
+            };
+            assert_eq!(Some(expected_input), input.to_str(), "{:?}", args);
+            assert_eq!(expected_language, language, "{:?}", args);
+            assert!(common_args.is_empty(), "{:?}", args);
+        }
+    }
+
+    #[test]
+    fn test_parse_arguments_explicit_language_input_not_cacheable() {
+        assert_eq!(
+            CompilerArguments::CannotCache("multiple input files", Some("[\"bar.c\"]".to_string())),
+            parse_arguments(ovec!["-c", "-Tp", "foo.cc", "bar.c"])
+        );
+        assert_eq!(
+            CompilerArguments::CannotCache("no input file", None),
+            parse_arguments(ovec!["-c", "-Tp"])
+        );
+    }
+
+    #[test]
     fn test_parse_arguments_double_dash() {
         let args = ovec!["-c", "-Fofoo.obj", "--", "foo.c"];
         let ParsedArguments {
@@ -1843,6 +1912,25 @@ mod test {
             assert_eq!(preprocessor_args, [] as [std::ffi::OsString; 0]);
             assert_eq!(common_args, [] as [std::ffi::OsString; 0]);
             assert!(!msvc_show_includes);
+        }
+    }
+
+    #[test]
+    fn test_parse_arguments_clang_profile_use() {
+        let cwd = std::env::current_dir().unwrap();
+        for flag in ["-fprofile-instr-use", "-fprofile-use"] {
+            let option = format!("{flag}=profile.profdata");
+            let args = ovec!["-c", "foo.c", option.clone()];
+            let parsed = match parse_arguments_clang(args.clone()) {
+                CompilerArguments::Ok(parsed) => parsed,
+                other => panic!("Unexpected parse result: {other:?}"),
+            };
+            assert_eq!(parsed.common_args, ovec![option]);
+            assert_eq!(parsed.extra_hash_files, vec![cwd.join("profile.profdata")]);
+            assert!(matches!(
+                parse_arguments(args),
+                CompilerArguments::CannotCache(..)
+            ));
         }
     }
 
@@ -2734,6 +2822,36 @@ mod test {
     }
 
     #[test]
+    fn test_parse_arguments_pdb_directory() {
+        // A trailing separator makes cl.exe write a shared vc<NNN>.pdb in that
+        // directory, which cannot be cached as part of this compilation.
+        for args in [
+            ovec!["-c", "foo.c", "-Zi", "-Fdpdb\\", "-Fofoo.obj"],
+            ovec!["-c", "foo.c", "-Zi", "-Fdpdb/", "-Fofoo.obj"],
+        ] {
+            assert_eq!(
+                CompilerArguments::CannotCache("shared pdb", None),
+                parse_arguments(args)
+            );
+        }
+
+        // Without debug information cl.exe ignores -Fd entirely.
+        let a = match parse_arguments(ovec!["-c", "foo.c", "-Fdpdb\\", "-Fofoo.obj"]) {
+            CompilerArguments::Ok(a) => a,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert!(!a.outputs.contains_key("pdb"));
+
+        // An explicit file name is a per-compilation artifact and can be cached.
+        let a = match parse_arguments(ovec!["-c", "foo.c", "-Zi", "-Fdpdb\\foo.pdb", "-Fofoo.obj"])
+        {
+            CompilerArguments::Ok(a) => a,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert_eq!(Path::new("pdb\\foo.pdb"), a.outputs["pdb"].path);
+    }
+
+    #[test]
     fn test_preprocess_double_dash_input() {
         let args = ovec!["-c", "-Fofoo.o.bj", "--", "foo.c"];
         let parsed_args = match parse_arguments_clang(args) {
@@ -2749,63 +2867,47 @@ mod test {
         assert_eq!(cmd.args, expected_args);
     }
 
-    #[test]
-    fn test_compile_simple() {
-        let creator = new_creator();
+    #[test_case::test_case(false; "ordinary")]
+    #[test_case::test_case(true; "existing pdb")]
+    fn test_compile_simple(existing_pdb: bool) -> Result<()> {
         let f = TestFixture::new();
-        let parsed_args = ParsedArguments {
-            input: "foo.c".into(),
-            double_dash_input: false,
-            language: Language::C,
-            compilation_flag: "-c".into(),
-            depfile: None,
-            outputs: vec![(
-                "obj",
+        let mut parsed_args = ParsedArguments::test_compile("foo.c", "foo.obj", Language::C);
+        if existing_pdb {
+            parsed_args.compilation_flag = "/c".into();
+            parsed_args.outputs.insert(
+                "pdb",
                 ArtifactDescriptor {
-                    path: "foo.obj".into(),
+                    path: f.touch("foo.pdb")?,
                     optional: false,
                 },
-            )]
-            .into_iter()
-            .collect(),
-            dependency_args: vec![],
-            preprocessor_args: vec![],
-            common_args: vec![],
-            arch_args: vec![],
-            unhashed_args: vec![],
-            extra_dist_files: vec![],
-            extra_hash_files: vec![],
-            uses_external_assembler: false,
-            msvc_show_includes: false,
-            profile_generate: false,
-            color_mode: ColorMode::Auto,
-            suppress_rewrite_includes_only: false,
-            too_hard_for_preprocessor_cache_mode: None,
-        };
-        let runtime = single_threaded_runtime();
-        let storage = MockStorage::new(None, false);
-        let storage: std::sync::Arc<MockStorage> = std::sync::Arc::new(storage);
-        let service = server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
+            );
+        }
         let compiler = &f.bins[0];
-        // Compiler invocation.
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
         let mut path_transformer = dist::PathTransformer::new();
-        let (command, dist_command, cacheable) = generate_compile_commands(
-            &mut path_transformer,
-            compiler,
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-        )
+        let (command, dist_command, cacheable) = generate_compile_commands(CCompileContext {
+            path_transformer: &mut path_transformer,
+            executable: compiler,
+            parsed_args: &parsed_args,
+            cwd: f.tempdir.path(),
+            env_vars: &[],
+            rewrite_includes_only: false,
+            native_resolution: None,
+        })
         .unwrap();
         #[cfg(feature = "dist-client")]
         assert!(dist_command.is_some());
         #[cfg(not(feature = "dist-client"))]
         assert!(dist_command.is_none());
-        let _ = command.execute(&service, &creator).wait();
-        assert_eq!(Cacheable::Yes, cacheable);
-        // Ensure that we ran all processes.
-        assert_eq!(0, creator.lock().unwrap().children.len());
+        assert_compile_command_executes(&command)?;
+        assert_eq!(
+            if existing_pdb {
+                Cacheable::No
+            } else {
+                Cacheable::Yes
+            },
+            cacheable
+        );
+        Ok(())
     }
 
     #[test]
@@ -2818,85 +2920,78 @@ mod test {
         let f = TestFixture::new();
         let compiler = &f.bins[0];
         let mut path_transformer = dist::PathTransformer::new();
-        let (command, _, _) = generate_compile_commands(
-            &mut path_transformer,
-            compiler,
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-        )
+        let (command, _, _) = generate_compile_commands(CCompileContext {
+            path_transformer: &mut path_transformer,
+            executable: compiler,
+            parsed_args: &parsed_args,
+            cwd: f.tempdir.path(),
+            env_vars: &[],
+            rewrite_includes_only: false,
+            native_resolution: None,
+        })
         .unwrap();
         let expected_args = ovec!["-c", "-Fofoo.obj", "--", "foo.c"];
         assert_eq!(command.arguments, expected_args);
     }
 
     #[test]
-    fn test_compile_not_cacheable_pdb() {
-        let creator = new_creator();
-        let f = TestFixture::new();
-        let pdb = f.touch("foo.pdb").unwrap();
-        let parsed_args = ParsedArguments {
-            input: "foo.c".into(),
-            double_dash_input: false,
-            language: Language::C,
-            compilation_flag: "/c".into(),
-            depfile: None,
-            outputs: vec![
-                (
-                    "obj",
-                    ArtifactDescriptor {
-                        path: "foo.obj".into(),
-                        optional: false,
-                    },
-                ),
-                (
-                    "pdb",
-                    ArtifactDescriptor {
-                        path: pdb,
-                        optional: false,
-                    },
-                ),
-            ]
-            .into_iter()
-            .collect(),
-            dependency_args: vec![],
-            preprocessor_args: vec![],
-            common_args: vec![],
-            arch_args: vec![],
-            unhashed_args: vec![],
-            extra_dist_files: vec![],
-            extra_hash_files: vec![],
-            uses_external_assembler: false,
-            msvc_show_includes: false,
-            profile_generate: false,
-            color_mode: ColorMode::Auto,
-            suppress_rewrite_includes_only: false,
-            too_hard_for_preprocessor_cache_mode: None,
+    fn test_preprocess_explicit_language_input() {
+        for (args, expected_input) in [
+            (ovec!["-c", "-Fofoo.obj", "-Tp", "foo.cc"], "-Tpfoo.cc"),
+            (ovec!["/c", "/Fofoo.obj", "/Tpfoo.cc"], "-Tpfoo.cc"),
+            (ovec!["-c", "-Fofoo.obj", "-Tc", "foo.cpp"], "-Tcfoo.cpp"),
+        ] {
+            let parsed_args = match parse_arguments(args) {
+                CompilerArguments::Ok(args) => args,
+                o => panic!("Got unexpected parse result: {:?}", o),
+            };
+            let mut cmd = MockCommand {
+                child: None,
+                args: vec![],
+            };
+            preprocess_cmd(
+                &mut cmd,
+                &parsed_args,
+                Path::new(""),
+                &[],
+                false,
+                false,
+                false,
+            );
+            let expected_args = ovec!["-EP", "-nologo", "/WX-", expected_input];
+            assert_eq!(cmd.args, expected_args);
+        }
+    }
+
+    #[test]
+    fn test_compile_explicit_language_input() {
+        let args = ovec!["-c", "-Fofoo.obj", "-Tp", "foo.cc"];
+        let parsed_args = match parse_arguments(args) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
         };
-        let runtime = single_threaded_runtime();
-        let storage = MockStorage::new(None, false);
-        let storage: std::sync::Arc<MockStorage> = std::sync::Arc::new(storage);
-        let service = server::SccacheService::mock_with_storage(storage, runtime.handle().clone());
+        let f = TestFixture::new();
         let compiler = &f.bins[0];
-        // Compiler invocation.
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
         let mut path_transformer = dist::PathTransformer::new();
-        let (command, dist_command, cacheable) = generate_compile_commands(
-            &mut path_transformer,
-            compiler,
-            &parsed_args,
-            f.tempdir.path(),
-            &[],
-        )
+        let (command, dist_command, _) = generate_compile_commands(CCompileContext {
+            path_transformer: &mut path_transformer,
+            executable: compiler,
+            parsed_args: &parsed_args,
+            cwd: f.tempdir.path(),
+            env_vars: &[],
+            rewrite_includes_only: false,
+            native_resolution: None,
+        })
         .unwrap();
+        let expected_args = ovec!["-c", "-Fofoo.obj", "-Tpfoo.cc"];
+        assert_eq!(command.arguments, expected_args);
         #[cfg(feature = "dist-client")]
-        assert!(dist_command.is_some());
+        assert_eq!(
+            dist_command.expect("dist command").arguments,
+            stringvec!["-c", "-Fofoo.obj", "-Tpfoo.cc"]
+        );
         #[cfg(not(feature = "dist-client"))]
         assert!(dist_command.is_none());
-        let _ = command.execute(&service, &creator).wait();
-        assert_eq!(Cacheable::No, cacheable);
-        // Ensure that we ran all processes.
-        assert_eq!(0, creator.lock().unwrap().children.len());
     }
 
     #[test]

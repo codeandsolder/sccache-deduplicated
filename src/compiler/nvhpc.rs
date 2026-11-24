@@ -17,18 +17,17 @@ use crate::compiler::args::{ArgDisposition, ArgInfo, FromArg};
 #[cfg(test)]
 use crate::compiler::c::ArtifactDescriptor;
 use crate::compiler::c::{
-    CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext, ParsedArguments,
+    CCompileCommands, CCompileContext, CCompilerImpl, CCompilerKind, CPreprocessContext,
+    ParsedArguments,
 };
 use crate::compiler::gcc::ArgData::{
     Language as LanguageArg, PassThrough, PassThroughFlag, PreprocessorArgument,
     PreprocessorArgumentFlag, PreprocessorArgumentPath, Standard,
 };
-use crate::compiler::{
-    CCompileCommand, Cacheable, CompileCommand, CompilerArguments, Language, gcc,
-};
+use crate::compiler::{CompilerArguments, Language, SingleCompileCommand, gcc};
+use crate::counted_array;
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::run_input_output;
-use crate::{counted_array, dist};
 use async_trait::async_trait;
 use log::Level::Trace;
 use std::ffi::OsString;
@@ -47,6 +46,8 @@ pub struct Nvhpc {
 
 #[async_trait]
 impl CCompilerImpl for Nvhpc {
+    type LocalCommand = SingleCompileCommand;
+
     fn kind(&self) -> CCompilerKind {
         CCompilerKind::Nvhpc
     }
@@ -155,40 +156,11 @@ impl CCompilerImpl for Nvhpc {
         }
     }
 
-    fn generate_compile_commands<T>(
+    fn generate_compile_commands(
         &self,
         context: CCompileContext<'_>,
-    ) -> Result<(
-        Box<dyn CompileCommand<T>>,
-        Option<dist::CompileCommand>,
-        Cacheable,
-    )>
-    where
-        T: CommandCreatorSync,
-    {
-        let CCompileContext {
-            path_transformer,
-            executable,
-            parsed_args,
-            cwd,
-            env_vars,
-            rewrite_includes_only,
-        } = context;
-        gcc::generate_compile_commands(
-            path_transformer,
-            executable,
-            parsed_args,
-            cwd,
-            env_vars,
-            gcc::GccCompileConfig {
-                kind: self.kind(),
-                rewrite_includes_only,
-                language_to_arg: gcc::language_to_gcc_arg,
-            },
-        )
-        .map(|(command, dist_command, cacheable)| {
-            (CCompileCommand::boxed(command), dist_command, cacheable)
-        })
+    ) -> CCompileCommands<Self::LocalCommand> {
+        gcc::generate_compile_commands(context, self.kind(), gcc::language_to_gcc_arg)
     }
 }
 

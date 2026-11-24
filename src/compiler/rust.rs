@@ -21,7 +21,7 @@ use crate::compiler::args::{
     ArgDisposition, ArgInfo, ArgParseError, ArgParseResult, ArgToStringResult, ArgsIter, Argument,
     FromArg, IntoArg, NormalizedDisposition, PathTransformerFn, split_os_string_arg,
 };
-use crate::compiler::canonical_paths::CanonicalRustPaths;
+use crate::compiler::canonical_paths::{CanonicalRustPaths, RustEnvironmentPath};
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, CompileTransport, Compiler,
     CompilerArguments, CompilerDiscovery, CompilerHasher, CompilerKind, CompilerProxy,
@@ -878,31 +878,6 @@ fn is_clippy_driver(executable: &Path) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case("clippy-driver"))
 }
 
-fn rust_shadow_plain_env(name: &std::ffi::OsStr) -> bool {
-    matches!(
-        name.to_str(),
-        Some(
-            "CARGO"
-                | "CARGO_HOME"
-                | "CARGO_INSTALL_ROOT"
-                | "CARGO_MANIFEST_DIR"
-                | "CARGO_MANIFEST_PATH"
-                | "CARGO_TARGET_DIR"
-                | "CARGO_TARGET_TMPDIR"
-                | "OUT_DIR"
-                | "PWD"
-                | "RUSTC"
-                | "RUSTDOC"
-                | "TMPDIR"
-                | "TMP"
-                | "TEMP"
-                | "TEMPDIR"
-        )
-    ) || name
-        .to_str()
-        .is_some_and(|name| name.starts_with("CARGO_BIN_EXE_"))
-}
-
 fn rust_shadow_digest(value: &std::ffi::OsStr) -> String {
     blake3::hash(value.as_encoded_bytes()).to_hex().to_string()
 }
@@ -916,7 +891,7 @@ fn rust_shadow_env_value(
         || raw.to_owned(),
         |canonical| canonical.env_value_to_canonical(name, raw),
     );
-    let show_text = rust_shadow_plain_env(name);
+    let show_text = RustEnvironmentPath::classify(name).disclose_in_shadow();
     RustShadowEnvValue {
         raw_text: show_text.then(|| raw.to_string_lossy().into_owned()),
         raw_blake3: rust_shadow_digest(raw),
@@ -7001,6 +6976,66 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             .wait()
             .unwrap();
         (result.key, result.weak_toolchain_key)
+    }
+
+    #[test]
+    fn test_destination_cpu_changes_rust_cache_key_not_gcc_only_flags() {
+        let f = TestFixture::new();
+        let args_v2 = [
+            "--emit",
+            "metadata",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "-C",
+            "target-cpu=x86-64-v2",
+        ];
+        let args_v4 = [
+            "--emit",
+            "metadata",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "-C",
+            "target-cpu=x86-64-v4",
+        ];
+        let no_env = &[];
+        let gcc_v2 = [(
+            OsString::from("CFLAGS_x86_64_unknown_linux_gnu"),
+            OsString::from("-march=x86-64-v2"),
+        )];
+        let gcc_v4 = [(
+            OsString::from("CFLAGS_x86_64_unknown_linux_gnu"),
+            OsString::from("-march=x86-64-v4"),
+        )];
+        let key = |args: &[&'static str], env: &[(OsString, OsString)]| {
+            hash_key(&f, args, env, |_| Ok(()), false)
+        };
+        let rust_v2 = key(&args_v2, no_env);
+        let rust_v4 = key(&args_v4, no_env);
+        assert_ne!(
+            rust_v2, rust_v4,
+            "effective target-cpu must partition Rust cache"
+        );
+        assert_eq!(rust_v2, key(&args_v2, no_env));
+        assert_eq!(
+            rust_v2,
+            key(&args_v2, &gcc_v2),
+            "unobserved GCC-only flags cannot change Rust compilation identity"
+        );
+        assert_eq!(
+            rust_v2,
+            key(&args_v2, &gcc_v4),
+            "unobserved GCC-only flags cannot change Rust compilation identity"
+        );
     }
 
     #[test]

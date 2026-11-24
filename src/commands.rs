@@ -514,11 +514,10 @@ where
         env_vars,
     });
     trace!("request_compile: {req:?}");
-    conn.set_compile_timeout()?;
     let response = conn
         .request(req)
         .context("Failed to send data to or receive data from server")?;
-    if let Response::Compile(response) = conn.read_compile_response(response)? {
+    if let Response::Compile(response) = response {
         Ok(response)
     } else {
         bail!("Unexpected response from server")
@@ -632,7 +631,7 @@ where
     let result = match &response {
         CompileResponse::CompileStarted => {
             debug!("Server sent CompileStarted");
-            match conn.read_one_response().and_then(|initial| conn.read_compile_response(initial)).context(
+            match conn.read_one_response().context(
                 "accepted compile lost its terminal response; outcome unknown, refusing duplicate local compilation",
             )? {
                 Response::CompileFinished(result) => Some(result),
@@ -642,32 +641,48 @@ where
         _ => None,
     };
 
-    handle_compile_result(
-        creator, runtime, response, result, invocation, stdout, stderr,
-    )
+    runtime
+        .block_on(resolve_compile_result(
+            creator, response, result, invocation,
+        ))?
+        .finish(stdout, stderr)
+}
+
+enum CompileOutcome {
+    Captured(CompileFinished),
+    Inherited(process::ExitStatus),
+}
+
+impl CompileOutcome {
+    fn finish(self, stdout: &mut dyn Write, stderr: &mut dyn Write) -> Result<i32> {
+        match self {
+            Self::Captured(finished) => handle_compile_finished(&finished, stdout, stderr),
+            Self::Inherited(status) => Ok(status.code().unwrap_or_else(|| {
+                if let Some(sig) = status_signal(status) {
+                    println!("sccache: Compile terminated by signal {sig}");
+                }
+                2
+            })),
+        }
+    }
 }
 
 /// Dispatch the outcome of a compile, whether received from the daemon over IPC
 /// or produced by a local `SccacheService` in client-side mode.
-fn handle_compile_result<T>(
+async fn resolve_compile_result<T>(
     mut creator: T,
-    runtime: &Runtime,
     response: CompileResponse,
     finished: Option<CompileFinished>,
     invocation: &CompileInvocation<'_>,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-) -> Result<i32>
+) -> Result<CompileOutcome>
 where
     T: CommandCreatorSync,
 {
     match response {
         CompileResponse::CompileStarted => {
-            return handle_compile_finished(
-                &finished.context("accepted compile has no terminal result")?,
-                stdout,
-                stderr,
-            );
+            return Ok(CompileOutcome::Captured(
+                finished.context("accepted compile has no terminal result")?,
+            ));
         }
         CompileResponse::UnsupportedCompiler(s) => {
             debug!(
@@ -692,21 +707,15 @@ where
         trace!("running command: {cmd:?}");
     }
 
-    let status = runtime.block_on(async move {
-        let child = cmd.spawn().await?;
-        child
-            .wait()
-            .await
-            .with_context(|| "failed to wait for a child")
-    })?;
+    server::activity::phase(server::activity::Phase::LocalCompile);
+    let status = cmd
+        .spawn()
+        .await?
+        .wait()
+        .await
+        .context("failed to wait for a child")?;
 
-    Ok(status.code().unwrap_or_else(|| {
-        if let Some(sig) = status_signal(status) {
-            println!("sccache: Compile terminated by signal {sig}");
-        }
-        // Arbitrary.
-        2
-    }))
+    Ok(CompileOutcome::Inherited(status))
 }
 
 /// Send a `Compile` request to the sccache server `conn`, and handle the response.
@@ -761,7 +770,7 @@ where
 /// Run a compile in client-side mode: the compile pipeline executes in this
 /// process, and only cache I/O is forwarded to the daemon via `conn`.
 ///
-/// Shares `handle_compile_result` with the daemon-IPC path so local-fallback
+/// Shares `resolve_compile_result` with the daemon-IPC path so local-fallback
 /// execution is not duplicated.
 pub fn do_compile_client_side<C>(
     jobserver: &Client,
@@ -777,23 +786,6 @@ where
 {
     trace!("do_compile_client_side");
     let exe_path = which_in(invocation.exe, env::var_os("PATH"), invocation.cwd)?;
-    let storage = IpcStorage::connect(conn)?;
-    let conn_arc = storage.conn();
-    let (tx, _rx) = futures::channel::mpsc::channel(1);
-    let (_, info) = server::WaitUntilZero::new();
-    #[cfg(feature = "dist-client")]
-    let dist_client = storage.dist_client(&config.dist);
-    #[cfg(not(feature = "dist-client"))]
-    let dist_client = server::DistClientContainer::new_disabled();
-    let service = server::SccacheService::<C>::new(
-        dist_client,
-        Arc::new(storage),
-        jobserver,
-        runtime.handle().clone(),
-        tx,
-        info,
-        config.compiler_aliases.clone(),
-    );
     let compile = Compile {
         client_pid: std::process::id(),
         exe: exe_path.as_os_str().to_owned(),
@@ -801,32 +793,50 @@ where
         args: invocation.cmdline.clone(),
         env_vars: invocation.env_vars.clone(),
     };
-    let (compile_resp, finished) = runtime.block_on(service.compile_direct(compile))?;
+    let observer = crate::client::CompileObserver::connect(&get_addr(), &(&compile).into())?;
     let creator = C::new(jobserver);
     let invocation = CompileInvocation {
         exe: &exe_path,
         ..invocation
     };
-    let exit_code = handle_compile_result(
-        creator,
-        runtime,
-        compile_resp,
-        finished,
-        &invocation,
-        stdout,
-        stderr,
-    )?;
-    // Ship accumulated stats back to the daemon (best-effort; don't fail the build on error).
-    let delta: ServerStats = runtime.block_on(service.take_stats());
-    if let Ok(mut conn) = conn_arc.lock() {
-        let _ = conn.request(Request::RecordStats(Box::new(delta)));
-    }
-    Ok(exit_code)
+    runtime
+        .block_on(observer.run(async {
+            server::activity::phase(server::activity::Phase::ResolveDistribution);
+            let storage = IpcStorage::connect(conn).await?;
+            let conn_arc = storage.conn();
+            let (tx, _rx) = futures::channel::mpsc::channel(1);
+            let (_, info) = server::WaitUntilZero::new();
+            #[cfg(feature = "dist-client")]
+            let dist_client = storage.dist_client(&config.dist);
+            #[cfg(not(feature = "dist-client"))]
+            let dist_client = server::DistClientContainer::new_disabled();
+            let service = server::SccacheService::<C>::new(
+                dist_client,
+                Arc::new(storage),
+                jobserver,
+                runtime.handle().clone(),
+                tx,
+                info,
+                config.compiler_aliases.clone(),
+            );
+            server::activity::phase(server::activity::Phase::DetectCompiler);
+            let (compile_resp, finished) = service.compile_direct(compile).await?;
+            let outcome =
+                resolve_compile_result(creator, compile_resp, finished, &invocation).await?;
+            // Ship accumulated stats back to the daemon (best-effort; don't fail the build on error).
+            server::activity::phase(server::activity::Phase::RecordResult);
+            let delta: ServerStats = service.take_stats().await;
+            let _ = crate::client::connection_task(conn_arc, move |conn| {
+                conn.request(Request::RecordStats(Box::new(delta)))
+            })
+            .await;
+            Ok(outcome)
+        }))?
+        .finish(stdout, stderr)
 }
 
 fn show_active_compiles() -> Result<()> {
     let mut conn = connect_to_server(&get_addr()).context("could not connect to managed daemon")?;
-    conn.set_compile_timeout()?;
     let Response::ActiveCompiles(active) = conn.request(Request::ActiveCompiles)? else {
         bail!("unexpected active compile response");
     };
@@ -837,7 +847,6 @@ fn show_active_compiles() -> Result<()> {
 
 fn cancel_compile(id: String) -> Result<()> {
     let mut conn = connect_to_server(&get_addr()).context("could not connect to managed daemon")?;
-    conn.set_compile_timeout()?;
     match conn.request(Request::CancelCompile(id))? {
         Response::CompileCancellationRequested(true) => println!("Cancellation requested."),
         Response::CompileCancellationRequested(false) => {
@@ -1219,6 +1228,9 @@ mod test {
         fn set_io_timeout(&self, _timeout: Duration) -> io::Result<()> {
             Ok(())
         }
+        fn shutdown(&self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -1267,15 +1279,14 @@ mod test {
         let mut stdout = vec![];
         let mut stderr = vec![];
 
-        let code = handle_compile_result(
-            creator,
-            &runtime,
-            CompileResponse::UnhandledCompile,
-            None,
-            &invocation,
-            &mut stdout,
-            &mut stderr,
-        )?;
+        let code = runtime
+            .block_on(resolve_compile_result(
+                creator,
+                CompileResponse::UnhandledCompile,
+                None,
+                &invocation,
+            ))?
+            .finish(&mut stdout, &mut stderr)?;
 
         assert_eq!(code, 0);
         Ok(())
