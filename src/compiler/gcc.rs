@@ -2910,32 +2910,6 @@ mod test {
         ));
     }
 
-    #[cfg(feature = "dist-client")]
-    fn clang_assembler_dist_arguments(
-        parsed_args: &ParsedArguments,
-        rewrite_includes_only: bool,
-    ) -> Vec<String> {
-        let fixture = TestFixture::new();
-        let mut transformer = dist::PathTransformer::new();
-        let (_, dist_command, _) = generate_compile_commands(
-            CCompileContext {
-                path_transformer: &mut transformer,
-                executable: &fixture.bins[0],
-                parsed_args,
-                cwd: fixture.tempdir.path(),
-                env_vars: &[],
-                rewrite_includes_only,
-                native_resolution: None,
-            },
-            CCompilerKind::Clang,
-            language_to_gcc_arg,
-        )
-        .unwrap();
-        dist_command
-            .expect("assembler compile should distribute")
-            .arguments
-    }
-
     #[test]
     #[cfg(feature = "dist-client")]
     fn test_dist_preprocessed_assembler_drops_preprocessor_args() {
@@ -2982,6 +2956,30 @@ mod test {
         assert!(!arguments.iter().any(|arg| arg == "-fno-unwind-tables"));
     }
 
+    #[cfg(feature = "dist-client")]
+    fn mapped_clang_command(
+        fixture: &TestFixture,
+        parsed: &ParsedArguments,
+    ) -> dist::CompileCommand {
+        let mut paths = dist::PathTransformer::new();
+        paths.add_root_mapping(fixture.tempdir.path().to_owned(), "/work");
+        let (_, remote, _) = generate_compile_commands(
+            CCompileContext {
+                path_transformer: &mut paths,
+                executable: &fixture.bins[0],
+                parsed_args: parsed,
+                cwd: fixture.tempdir.path(),
+                env_vars: &[],
+                rewrite_includes_only: false,
+                native_resolution: None,
+            },
+            CCompilerKind::Clang,
+            language_to_gcc_arg,
+        )
+        .unwrap();
+        remote.expect("mapped Clang compile should distribute")
+    }
+
     #[test]
     #[cfg(feature = "dist-client")]
     fn test_dist_assembler_preserves_transformed_include_search_path() {
@@ -3003,23 +3001,7 @@ mod test {
             };
 
             let f = TestFixture::new();
-            let mut path_transformer = dist::PathTransformer::new();
-            path_transformer.add_root_mapping(f.tempdir.path().to_owned(), "/work");
-            let (_, dist_command, _) = generate_compile_commands(
-                CCompileContext {
-                    path_transformer: &mut path_transformer,
-                    executable: &f.bins[0],
-                    parsed_args: &parsed_args,
-                    cwd: f.tempdir.path(),
-                    env_vars: &[],
-                    rewrite_includes_only: false,
-                    native_resolution: None,
-                },
-                CCompilerKind::Clang,
-                language_to_gcc_arg,
-            )
-            .unwrap();
-            let dist_command = dist_command.expect("assembler compile should distribute");
+            let dist_command = mapped_clang_command(&f, &parsed_args);
             assert!(
                 dist_command
                     .arguments
@@ -3046,23 +3028,7 @@ mod test {
             .tempdir
             .path()
             .join("arch/arm64/kvm/../../../virt/kvm/eventfd.c");
-        let mut path_transformer = dist::PathTransformer::new();
-        path_transformer.add_root_mapping(f.tempdir.path().to_owned(), "/work");
-        let (_, dist_command, _) = generate_compile_commands(
-            CCompileContext {
-                path_transformer: &mut path_transformer,
-                executable: &f.bins[0],
-                parsed_args: &parsed_args,
-                cwd: f.tempdir.path(),
-                env_vars: &[],
-                rewrite_includes_only: false,
-                native_resolution: None,
-            },
-            CCompilerKind::Clang,
-            language_to_gcc_arg,
-        )
-        .unwrap();
-        let dist_command = dist_command.expect("C compile should distribute");
+        let dist_command = mapped_clang_command(&f, &parsed_args);
 
         assert!(
             dist_command

@@ -245,11 +245,11 @@ impl Pending {
                 let PendingAction { permit, upload, .. } = *action;
                 let (manifest, transfer) = upload.context("missing result negotiation")?;
                 let result = transfer.publish(|staged| permit.publish_pinned(&manifest, staged));
-                Ok(Ready::Result(result?))
+                Ok(Ready::Result(Box::new(result?)))
             }
-            Self::Tree { manifest, transfer } => Ok(Ready::Tree(TreeDelivery::new(
+            Self::Tree { manifest, transfer } => Ok(Ready::Tree(Box::new(TreeDelivery::new(
                 transfer.publish(|staged| store.publish_tree_pinned(&manifest, staged))?,
-            ))),
+            )))),
         }
     }
 }
@@ -347,20 +347,20 @@ impl Drop for BackfillUpload {
 pub struct PeerInputClaim(BackfillUpload);
 
 impl PeerInputClaim {
-    #[must_use]
+    #[must_use = "identifies the content claimed for recovery"]
     pub fn blob(&self) -> BlobRef {
         self.0.flight.blob
     }
 
-    #[must_use]
+    #[must_use = "identifies the worker awaiting recovered content"]
     pub fn requester(&self) -> SocketAddr {
         self.0.flight.requester
     }
 }
 
 enum Ready {
-    Result(ResultLease),
-    Tree(TreeDelivery),
+    Result(Box<ResultLease>),
+    Tree(Box<TreeDelivery>),
 }
 
 impl Ready {
@@ -643,12 +643,10 @@ impl NativeSessions {
                 .map_err(|_| anyhow!("native backfill map poisoned"))?;
             let mut live = Vec::new();
             map.retain(|_, flight| {
-                if let Some(flight) = flight.upgrade() {
+                flight.upgrade().is_some_and(|flight| {
                     live.push(flight);
                     true
-                } else {
-                    false
-                }
+                })
             });
             live
         };
@@ -666,12 +664,12 @@ impl NativeSessions {
         id: TreeId,
         declared: Option<TreeManifest>,
     ) -> Result<Option<Arc<InputManifest>>> {
-        if let Some(input) = self
+        let cached = self
             .manifests
             .lock()
             .map_err(|_| anyhow!("native manifest catalog poisoned"))?
-            .get(id)
-        {
+            .get(id);
+        if let Some(input) = cached {
             ensure!(
                 declared
                     .as_ref()
@@ -726,8 +724,11 @@ impl NativeSessions {
                     .release_ready(request.action_fingerprint()?.key()?)?;
                 request.validate_result(lease.manifest())?;
                 let manifest = lease.manifest().clone();
-                let ticket =
-                    self.register(Kind::Action, publisher, Phase::Ready(Ready::Result(lease)))?;
+                let ticket = self.register(
+                    Kind::Action,
+                    publisher,
+                    Phase::Ready(Ready::Result(Box::new(lease))),
+                )?;
                 Ok(NativeAdmission::Hit { ticket, manifest })
             }
             Admission::Compile(permit) => {
@@ -999,7 +1000,7 @@ impl NativeSessions {
         self.limits.check_blobs(Kind::Tree, &manifest.blobs()?)?;
         let (phase, missing) = if let Some(lease) = self.store().lookup_tree(id)? {
             (
-                Phase::Ready(Ready::Tree(TreeDelivery::new(lease))),
+                Phase::Ready(Ready::Tree(Box::new(TreeDelivery::new(lease)))),
                 Vec::new(),
             )
         } else {
@@ -1054,7 +1055,7 @@ impl NativeSessions {
         let ticket = self.register(
             Kind::Tree,
             reader,
-            Phase::Ready(Ready::Tree(TreeDelivery {
+            Phase::Ready(Ready::Tree(Box::new(TreeDelivery {
                 source: TreeSource::Action {
                     ticket: action_ticket,
                     id,
@@ -1063,7 +1064,7 @@ impl NativeSessions {
                 packages: BTreeMap::new(),
                 requested: BTreeSet::new(),
                 reservation: None,
-            })),
+            }))),
         )?;
         Ok(TreeRead { ticket, manifest })
     }
@@ -1412,6 +1413,7 @@ impl NativeSessions {
             action.demands.entry(blob.id).or_insert((tree, flight));
         }
         drop(flights);
+        drop(state);
         self.peer_wake.notify_all();
         Ok(())
     }
@@ -1489,6 +1491,8 @@ impl NativeSessions {
         pending.ready = Some(lease);
         pending.peer_until = None;
         pending.peer_retry_at = None;
+        drop(pending);
+        drop(claim);
         Ok(())
     }
 
@@ -1520,6 +1524,7 @@ impl NativeSessions {
                 }
             }
         }
+        drop(state);
         Ok(())
     }
 
@@ -1555,6 +1560,7 @@ impl NativeSessions {
             action.unavailable.clear();
             action.inputs_staged = true;
         }
+        drop(state);
         Ok(())
     }
 
@@ -1631,7 +1637,9 @@ impl NativeSessions {
                     Err(error) => return Err(error),
                 }
             }
+            drop(pending);
         }
+        drop(state);
         Ok(InputPoll::Waiting)
     }
 
@@ -1736,10 +1744,13 @@ impl NativeSessions {
                 .take()
                 .context("input upload claim disappeared")?;
             pending.uploading = true;
-            BackfillUpload {
+            let upload = BackfillUpload {
                 flight: Arc::clone(flight),
                 _slot: claim.slot,
-            }
+            };
+            drop(pending);
+            drop(state);
+            upload
         };
         self.publish_backfill(guard, blob, reader).map_err(|error| {
             use crate::store::BlobIntegrityError;
@@ -1773,6 +1784,8 @@ impl NativeSessions {
         pending.ready = Some(Arc::new(lease));
         pending.peer_until = None;
         pending.peer_retry_at = None;
+        drop(pending);
+        drop(guard);
         Ok(())
     }
 

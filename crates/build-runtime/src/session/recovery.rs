@@ -92,6 +92,7 @@ impl RecoveryQueue {
         if let Some(job) = &job {
             state.queued_bytes -= job.bytes;
         }
+        drop(state);
         Ok(job)
     }
 
@@ -153,6 +154,7 @@ impl RecoveryQueue {
                 state.failed.insert(key, now + RETRY_COOLDOWN);
             }
         }
+        drop(state);
         Ok(())
     }
 }
@@ -216,7 +218,7 @@ impl NativeSessions {
                 match self.upload_slot(UploadSource::Peer) {
                     Ok(slot) => break slot,
                     Err(error) if error.is::<NativeServiceBusy>() => {
-                        std::thread::sleep(Duration::from_millis(25))
+                        std::thread::sleep(Duration::from_millis(25));
                     }
                     Err(error) => return Err(error),
                 }

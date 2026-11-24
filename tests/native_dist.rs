@@ -564,6 +564,9 @@ fn rustup_sync_acquires_once_and_reuses_portable_recipe_and_catalog() -> Result<
             },
         )]),
     )?;
+    // Installed files must be older than the source digest race window before
+    // metadata-only attestation can safely remember them.
+    std::thread::sleep(Duration::from_secs(3));
     let config = provisioning_config(root, &fleet.cache_url)?;
     let catalog = root.join("installation.catalog");
     let recipe = root.join("installation.recipe");

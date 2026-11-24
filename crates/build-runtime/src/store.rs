@@ -197,7 +197,7 @@ struct ActionRecord {
 
 /// Distinguish invalid immutable bytes from interrupted streams and storage errors.
 #[derive(Debug)]
-pub(crate) enum BlobIntegrityError {
+pub enum BlobIntegrityError {
     Length { expected: u64, actual: u64 },
     Digest,
 }
@@ -1156,11 +1156,7 @@ impl NativeStore {
                     "conflicting native action fingerprint"
                 );
                 if stored.result == result {
-                    let mut complete = true;
-                    for (&id, &size) in &blobs {
-                        complete &= self.inner.blob_present(id, size)?;
-                    }
-                    if complete {
+                    if self.blobs_present(&blobs)? {
                         self.inner.lock_pins()?.touch(space::Root::Action(action));
                         return Ok(Published {
                             action,
@@ -1181,15 +1177,15 @@ impl NativeStore {
                     drop(result_actions);
                     drop(results);
                     drop(actions);
-                    history::forget(&write, action)?;
-                    write.commit()?;
-                    drop(staged_reservations);
-                    self.inner.lock_pins()?.touch(space::Root::Action(action));
-                    return Ok(Published {
-                        action,
-                        result,
-                        new_action: false,
-                    });
+                    return self.commit_result(
+                        write,
+                        staged_reservations,
+                        Published {
+                            action,
+                            result,
+                            new_action: false,
+                        },
+                    );
                 }
                 // A fresh build may replace an unavailable result; ordinary
                 // reuse must still never overwrite a complete result.
@@ -1197,12 +1193,8 @@ impl NativeStore {
                     .get(&stored.result.0)?
                     .context("missing indexed result")?;
                 let old: ResultManifest = encoding().deserialize(old.value())?;
-                let mut complete = true;
-                for (id, size) in old.blobs()? {
-                    complete &= self.inner.blob_present(id, size)?;
-                }
                 ensure!(
-                    mode == ActionMode::Refresh || !complete,
+                    mode == ActionMode::Refresh || !self.blobs_present(&old.blobs()?)?,
                     "conflicting result for action {action:?}"
                 );
             }
@@ -1242,19 +1234,42 @@ impl NativeStore {
                 )?;
             }
         }
-        history::forget(&write, action)?;
+        self.commit_result(
+            write,
+            staged_reservations,
+            Published {
+                action,
+                result,
+                new_action,
+            },
+        )
+    }
+
+    fn blobs_present(&self, blobs: &BTreeMap<ContentId, u64>) -> Result<bool> {
+        for (&id, &size) in blobs {
+            if !self.inner.blob_present(id, size)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn commit_result(
+        &self,
+        write: WriteTransaction,
+        staged_reservations: Vec<space::StagingReservation>,
+        published: Published,
+    ) -> Result<Published> {
+        history::forget(&write, published.action)?;
         // Files and their directory entries are durable before the index
         // exposes them. Orphans from an interrupted write are harmless.
         write.commit()?;
-        // Do not let a concurrent staging admission spend this space before
-        // the committed resident byte count includes the new content.
+        // Keep the staging budget reserved until the resident count includes the new bytes.
         drop(staged_reservations);
-        self.inner.lock_pins()?.touch(space::Root::Action(action));
-        Ok(Published {
-            action,
-            result,
-            new_action,
-        })
+        self.inner
+            .lock_pins()?
+            .touch(space::Root::Action(published.action));
+        Ok(published)
     }
 
     fn prepare_staging(

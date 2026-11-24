@@ -80,52 +80,75 @@ pub struct BlobReader {
     current: Option<(usize, Vec<u8>)>,
 }
 
-fn read_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> io::Result<()> {
-    while !buffer.is_empty() {
-        #[cfg(unix)]
-        let n = file.read_at(buffer, offset)?;
-        #[cfg(windows)]
-        let n = file.seek_read(buffer, offset)?;
-        #[cfg(not(any(unix, windows)))]
-        let n = {
-            let mut cloned = file.try_clone()?;
-            cloned.seek(SeekFrom::Start(offset))?;
-            cloned.read(buffer)?
-        };
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "short CAS payload",
-            ));
+fn transfer_at(
+    length: usize,
+    mut offset: u64,
+    short: io::ErrorKind,
+    mut transfer: impl FnMut(usize, u64) -> io::Result<usize>,
+) -> io::Result<()> {
+    let mut done = 0;
+    while done < length {
+        match transfer(done, offset) {
+            Ok(0) => return Err(short.into()),
+            Ok(n) => {
+                done += n;
+                offset = offset
+                    .checked_add(n as u64)
+                    .ok_or(io::ErrorKind::InvalidInput)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
-        offset += n as u64;
-        buffer = &mut buffer[n..];
     }
     Ok(())
 }
 
-fn write_at(file: &File, mut bytes: &[u8], mut offset: u64) -> io::Result<()> {
-    while !bytes.is_empty() {
-        #[cfg(unix)]
-        let n = file.write_at(bytes, offset)?;
-        #[cfg(windows)]
-        let n = file.seek_write(bytes, offset)?;
-        #[cfg(not(any(unix, windows)))]
-        let n = {
-            let mut cloned = file.try_clone()?;
-            cloned.seek(SeekFrom::Start(offset))?;
-            cloned.write(bytes)?
-        };
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "short CAS header write",
-            ));
-        }
-        offset += n as u64;
-        bytes = &bytes[n..];
-    }
-    Ok(())
+fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<()> {
+    transfer_at(
+        buffer.len(),
+        offset,
+        io::ErrorKind::UnexpectedEof,
+        |done, offset| {
+            #[cfg(unix)]
+            {
+                file.read_at(&mut buffer[done..], offset)
+            }
+            #[cfg(windows)]
+            {
+                file.seek_read(&mut buffer[done..], offset)
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                let mut cloned = file.try_clone()?;
+                cloned.seek(SeekFrom::Start(offset))?;
+                cloned.read(&mut buffer[done..])
+            }
+        },
+    )
+}
+
+fn write_at(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> {
+    transfer_at(
+        bytes.len(),
+        offset,
+        io::ErrorKind::WriteZero,
+        |done, offset| {
+            #[cfg(unix)]
+            {
+                file.write_at(&bytes[done..], offset)
+            }
+            #[cfg(windows)]
+            {
+                file.seek_write(&bytes[done..], offset)
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                let mut cloned = file.try_clone()?;
+                cloned.seek(SeekFrom::Start(offset))?;
+                cloned.write(&bytes[done..])
+            }
+        },
+    )
 }
 
 impl BlobReader {
@@ -532,6 +555,28 @@ fn transfer_zstd_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn positional_io_retries_interruptions_and_rejects_short_transfers() -> Result<()> {
+        let mut attempts = 0;
+        let mut offsets = Vec::new();
+        transfer_at(5, 12, io::ErrorKind::UnexpectedEof, |done, offset| {
+            attempts += 1;
+            if attempts == 1 {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            offsets.push((done, offset));
+            Ok((5 - done).min(2))
+        })?;
+        assert_eq!(offsets, [(0, 12), (2, 14), (4, 16)]);
+        for short in [io::ErrorKind::UnexpectedEof, io::ErrorKind::WriteZero] {
+            assert_eq!(
+                transfer_at(1, 0, short, |_, _| Ok(0)).unwrap_err().kind(),
+                short
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn verified_random_access_and_raw_blocks() -> Result<()> {

@@ -146,11 +146,13 @@ fn initial_directory_execution_tree(store: &NativeStore) -> Result<(TreeManifest
     Ok((manifest, first))
 }
 
-fn verify_directory_execution(parent: &Path) -> Result<()> {
-    let store = NativeStore::open(&parent.join("store"))?;
-    let (mut manifest, first) = initial_directory_execution_tree(&store)?;
-    let platform = ContentId::of(b"subtree differential");
-    let mut spec = ExecutionSpec {
+fn shell_output_fixture(
+    parent: &Path,
+    first: TreeId,
+    platform: ContentId,
+    script: &[u8],
+) -> Result<(ExecutionSpec, ExecutionPolicy)> {
+    let spec = ExecutionSpec {
         platform,
         root: ExecutionRoot {
             id: first,
@@ -159,10 +161,7 @@ fn verify_directory_execution(parent: &Path) -> Result<()> {
         mounts: BTreeMap::new(),
         command: CommandSpec {
             executable: BuildPath::new(b"/bin/sh".to_vec())?,
-            arguments: vec![
-                b"-c".to_vec(),
-                br#"IFS= read -r line < /src/work/sym; if test -e /src/work/removed; then suffix=old; else suffix=new; fi; printf '%s:%s' "$line" "$suffix" > /out/nested/object"#.to_vec(),
-            ],
+            arguments: vec![b"-c".to_vec(), script.to_vec()],
             cwd: BuildPath::new(b"/src".to_vec())?,
             environment: BTreeMap::new(),
         },
@@ -181,15 +180,31 @@ fn verify_directory_execution(parent: &Path) -> Result<()> {
         timeout: Duration::from_secs(20),
         max_result_bytes: 1024,
     };
-    let run = |spec: &ExecutionSpec| -> Result<Vec<u8>> {
-        let completed = execute(spec, &store, &policy, || Ok(()))?;
-        let manifest = completed.successful_result().context("sandbox failed")?;
-        let mut bytes = Vec::new();
-        completed
-            .open_blob(manifest.outputs["object"].blob.id)?
-            .read_to_end(&mut bytes)?;
-        Ok(bytes)
-    };
+    Ok((spec, policy))
+}
+
+fn read_shell_output(
+    spec: &ExecutionSpec,
+    store: &NativeStore,
+    policy: &ExecutionPolicy,
+) -> Result<Vec<u8>> {
+    let execution = execute(spec, store, policy, || Ok(()))?;
+    let manifest = execution
+        .successful_result()
+        .context("shell action failed")?;
+    let mut bytes = Vec::new();
+    execution
+        .open_blob(manifest.outputs["object"].blob.id)?
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn verify_directory_execution(parent: &Path) -> Result<()> {
+    let store = NativeStore::open(&parent.join("store"))?;
+    let (mut manifest, first) = initial_directory_execution_tree(&store)?;
+    let platform = ContentId::of(b"subtree differential");
+    let (mut spec, policy) = shell_output_fixture(parent, first, platform, br#"IFS= read -r line < /src/work/sym; if test -e /src/work/removed; then suffix=old; else suffix=new; fi; printf '%s:%s' "$line" "$suffix" > /out/nested/object"#)?;
+    let run = |spec: &ExecutionSpec| read_shell_output(spec, &store, &policy);
     assert_eq!(run(&spec)?, b"alpha:old");
 
     let second_source = store.stage(&b"beta\n"[..])?;
@@ -268,49 +283,13 @@ fn distinct_roots_execute_their_own_source_bytes_via_cached_file_overlays() -> R
     }
     let first = store.publish_tree(&manifest, vec![original, header])?;
     let platform = ContentId::of(b"overlay test platform");
-    let mut spec = ExecutionSpec {
+    let (mut spec, policy) = shell_output_fixture(
+        temporary.path(),
+        first,
         platform,
-        root: ExecutionRoot {
-            id: first,
-            recipe: TreeRecipe::union(metadata(0o755), [first]),
-        },
-        mounts: BTreeMap::new(),
-        command: CommandSpec {
-            executable: BuildPath::new(b"/bin/sh".to_vec())?,
-            arguments: vec![
-                b"-c".to_vec(),
-                br#"IFS= read -r line < /src/source; printf '%s' "$line" > /out/nested/object"#
-                    .to_vec(),
-            ],
-            cwd: BuildPath::new(b"/src".to_vec())?,
-            environment: BTreeMap::new(),
-        },
-        outputs: BTreeMap::from([(
-            "object".into(),
-            OutputSpec {
-                path: BuildPath::new(b"/out/nested/object".to_vec())?,
-                required: true,
-            },
-        )]),
-    };
-    let policy = ExecutionPolicy {
-        platform,
-        bubblewrap: "/usr/bin/bwrap".into(),
-        scratch: temporary.path().to_owned(),
-        timeout: Duration::from_secs(20),
-        max_result_bytes: 1024,
-    };
-    let output = |spec: &ExecutionSpec| -> Result<Vec<u8>> {
-        let execution = execute(spec, &store, &policy, || Ok(()))?;
-        let manifest = execution
-            .successful_result()
-            .context("overlay action failed")?;
-        let mut bytes = Vec::new();
-        execution
-            .open_blob(manifest.outputs["object"].blob.id)?
-            .read_to_end(&mut bytes)?;
-        Ok(bytes)
-    };
+        br#"IFS= read -r line < /src/source; printf '%s' "$line" > /out/nested/object"#,
+    )?;
+    let output = |spec: &ExecutionSpec| read_shell_output(spec, &store, &policy);
     assert_eq!(output(&spec)?, b"first");
 
     let changed = store.stage(&b"second\n"[..])?;

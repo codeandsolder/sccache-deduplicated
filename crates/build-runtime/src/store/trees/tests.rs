@@ -147,39 +147,25 @@ fn benchmark_native_zfs_clones_against_fuse_views() -> Result<()> {
             iteration, setup, reading, stats.cloned_files, stats.copied_files, stats.copied_bytes,
         );
     }
-    for iteration in 0..6 {
-        let lease = zfs
-            .lookup_tree(zfs_lease.id())?
-            .context("ZFS tree missing")?;
-        let start = Instant::now();
-        let view = zfs.mount_tree_protected(lease, zfs_dir.path(), &[])?;
-        let setup = start.elapsed().as_micros();
-        let start = Instant::now();
-        let mut total = 0_u64;
-        for name in &names {
-            let mut file = fs::File::open(view.root().join(name))?;
-            total += io::copy(&mut file, &mut io::sink())?;
+    for (backend, store, id, parent) in [
+        ("zfs_cached", &zfs, zfs_lease.id(), zfs_dir.path()),
+        ("fuse", &non_zfs, fuse_lease.id(), memory_dir.path()),
+    ] {
+        for iteration in 0..6 {
+            let lease = store.lookup_tree(id)?.context("benchmark tree missing")?;
+            let start = Instant::now();
+            let view = store.mount_tree_protected(lease, parent, &[])?;
+            let setup = start.elapsed().as_micros();
+            let start = Instant::now();
+            let mut total = 0_u64;
+            for name in &names {
+                let mut file = fs::File::open(view.root().join(name))?;
+                total += io::copy(&mut file, &mut io::sink())?;
+            }
+            let reading = start.elapsed().as_micros();
+            anyhow::ensure!(total == bytes, "{backend} materialized content mismatch");
+            eprintln!("BENCH run={iteration} backend={backend} setup_us={setup} read_us={reading}");
         }
-        let reading = start.elapsed().as_micros();
-        anyhow::ensure!(total == bytes, "cached ZFS content mismatch");
-        eprintln!("BENCH run={iteration} backend=zfs_cached setup_us={setup} read_us={reading}");
-    }
-    for iteration in 0..6 {
-        let lease = non_zfs
-            .lookup_tree(fuse_lease.id())?
-            .context("FUSE tree missing")?;
-        let start = Instant::now();
-        let view = non_zfs.mount_tree_protected(lease, memory_dir.path(), &[])?;
-        let setup = start.elapsed().as_micros();
-        let start = Instant::now();
-        let mut total = 0_u64;
-        for name in &names {
-            let mut file = fs::File::open(view.root().join(name))?;
-            total += io::copy(&mut file, &mut io::sink())?;
-        }
-        let reading = start.elapsed().as_micros();
-        anyhow::ensure!(total == bytes, "FUSE virtual content mismatch");
-        eprintln!("BENCH run={iteration} backend=fuse setup_us={setup} read_us={reading}");
     }
     Ok(())
 }
