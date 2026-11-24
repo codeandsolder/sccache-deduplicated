@@ -1362,6 +1362,164 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     Ok(())
 }
 
+#[test]
+#[ignore = "requires Linux Bubblewrap, GNU assembler and isolated scheduler/worker processes"]
+fn native_worker_only_inputs_survive_scheduler_eviction_and_restart() -> Result<()> {
+    use sccache::build_runtime::BlobRef;
+
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let source_dir = root.join("source");
+    fs::create_dir(&source_dir)?;
+    let assembly = b".text\n.globl entry\nentry:\n.include \"input.inc\"\n";
+    let include = b".byte 1, 2, 3, 4\n";
+    let input = source_dir.join("input.s");
+    let include_path = source_dir.join("input.inc");
+    fs::write(&input, assembly)?;
+    fs::write(&include_path, include)?;
+
+    let reference = root.join("reference.o");
+    ensure!(
+        Command::new("/usr/bin/as")
+            .current_dir(&source_dir)
+            .arg("-o")
+            .arg(&reference)
+            .arg(&input)
+            .status()?
+            .success(),
+        "local assembler failed"
+    );
+    let mut discovery = ToolchainPackageBuilder::new();
+    discovery.add_executable_and_deps("/usr/bin/as".into())?;
+    let root_tree = discovery.into_native_mapping()?.prepare()?;
+    let mut mapping = MappedTree::new(root_tree.manifest().root);
+    mapping.add_file(
+        TreePath::new(b"input.s".to_vec())?,
+        input,
+        MappedMetadata::Preserve,
+    )?;
+    mapping.add_file(
+        TreePath::new(b"input.inc".to_vec())?,
+        include_path,
+        MappedMetadata::Preserve,
+    )?;
+    let source_tree = mapping.prepare()?;
+
+    let present = BlobRef {
+        id: ContentId::of(include),
+        size: u64::try_from(include.len())?,
+    };
+    let missing = BlobRef {
+        id: ContentId::of(assembly),
+        size: u64::try_from(assembly.len())?,
+    };
+    let mut worker_only = root_tree.manifest().blobs()?;
+    worker_only.insert(present.id, present.size);
+    {
+        let store = NativeStore::open(&root.join("worker-store"))?;
+        root_tree.import(&store)?;
+        let retention = NativeStore::blob_retention_manifest(present)?;
+        store.publish_tree(
+            &retention,
+            vec![store.stage_expected(present, &include[..])?],
+        )?;
+        assert!(store.lookup_tree(source_tree.id())?.is_none());
+    }
+    let mut spec = ExecutionSpec {
+        platform: ContentId::of(PLATFORM.as_bytes()),
+        root: ExecutionRoot::resolve(
+            TreeRecipe {
+                directories: root_tree.manifest().root,
+                layers: vec![
+                    TreeLayer {
+                        tree: root_tree.id(),
+                        source: None,
+                        destination: None,
+                    },
+                    TreeLayer {
+                        tree: source_tree.id(),
+                        source: None,
+                        destination: Some(TreePath::new(b"src".to_vec())?),
+                    },
+                ],
+            },
+            &BTreeMap::from([
+                (root_tree.id(), root_tree.manifest()),
+                (source_tree.id(), source_tree.manifest()),
+            ]),
+        )?,
+        mounts: BTreeMap::new(),
+        command: CommandSpec {
+            executable: BuildPath::new(b"/usr/bin/as".to_vec())?,
+            arguments: [b"-o".as_slice(), b"object.o", b"/src/input.s"]
+                .map(<[u8]>::to_vec)
+                .to_vec(),
+            cwd: BuildPath::new(b"/src".to_vec())?,
+            environment: BTreeMap::new(),
+        },
+        outputs: BTreeMap::from([(
+            "object".into(),
+            OutputSpec {
+                path: BuildPath::new(b"/src/object.o".to_vec())?,
+                required: true,
+            },
+        )]),
+    };
+    let inputs = [root_tree, source_tree];
+    let policy = NativeBuildPolicy {
+        mode: ActionMode::Reuse,
+        timeout: Duration::from_secs(60),
+        renewal_interval: Duration::from_secs(1),
+        max_result_bytes: 16 * 1024 * 1024,
+    };
+    let delivered = root.join("delivered.o");
+    let destinations = BTreeMap::from([("object".into(), delivered.clone())]);
+
+    for pass in 0..2 {
+        if pass == 1 {
+            spec.command.arguments.insert(0, b"--64".to_vec());
+            fs::remove_file(&delivered)?;
+        }
+        let fleet = Fleet::start(root, BTreeMap::new())?;
+        let client = NativeCacheClient::new(
+            fleet.cache_url.clone(),
+            CLIENT_TOKEN.into(),
+            Duration::from_secs(10),
+            1024 * 1024,
+        )?;
+        let result = client.run_action(&spec, &inputs, &destinations, &policy, None)?;
+        assert_eq!(
+            result.source,
+            NativeBuildSource::Worker(fleet.worker_address)
+        );
+        assert!(result.output.status.success());
+        assert_eq!(fs::read(&delivered)?, fs::read(&reference)?);
+        fleet.finish()?;
+        let scheduler = NativeStore::open(&root.join("scheduler-store"))?;
+        for (&id, &size) in &worker_only {
+            assert!(
+                scheduler
+                    .open_available_blob(BlobRef { id, size })?
+                    .is_none(),
+                "worker-resident input was unnecessarily uploaded"
+            );
+        }
+        if pass == 0 {
+            assert!(scheduler.open_available_blob(missing)?.is_some());
+            let retention = NativeStore::blob_retention_manifest(missing)?.id()?;
+            assert!(matches!(
+                scheduler.evict_tree(retention)?,
+                sccache::build_runtime::Eviction::Removed { .. }
+            ));
+            scheduler.collect_garbage(128)?;
+        }
+        assert!(scheduler.open_available_blob(missing)?.is_none());
+        let worker = NativeStore::open(&root.join("worker-store"))?;
+        assert!(worker.lookup_tree(inputs[1].id())?.is_some());
+    }
+    Ok(())
+}
+
 /// A test-owned in-process service, not a separately launched managed
 /// sccache daemon. It listens exclusively on a temporary Unix socket.
 struct LocalService {

@@ -575,12 +575,37 @@ impl NativeSessions {
         };
         // Release permits even if an expired upload still owns a session Arc.
         drop(expired);
-        // Weak flight entries do not retain storage or upload capacity.
-        self.backfills
-            .lock()
-            .map_err(|_| anyhow!("native backfill map poisoned"))?
-            .retain(|_, flight| flight.strong_count() > 0);
+        self.reap_backfills(now)?;
         Ok(count)
+    }
+
+    // A canceled origin can leave an upload claim alive in a flight shared
+    // by other actions. Reclaim those slots even if none of the remaining
+    // origins polls that particular blob again.
+    fn reap_backfills(&self, now: Instant) -> Result<()> {
+        let flights = {
+            let mut map = self
+                .backfills
+                .lock()
+                .map_err(|_| anyhow!("native backfill map poisoned"))?;
+            let mut live = Vec::new();
+            map.retain(|_, flight| {
+                if let Some(flight) = flight.upgrade() {
+                    live.push(flight);
+                    true
+                } else {
+                    false
+                }
+            });
+            live
+        };
+        for flight in flights {
+            let mut pending = flight.lock()?;
+            if pending.claim.as_ref().is_some_and(|claim| !claim.live(now)) {
+                pending.claim = None;
+            }
+        }
+        Ok(())
     }
 
     fn input_manifest(
@@ -1368,7 +1393,7 @@ impl NativeSessions {
                     && pending
                         .claim
                         .as_ref()
-                        .is_some_and(|claim| claim.ticket == ticket),
+                        .is_some_and(|claim| claim.ticket == ticket && claim.live(Instant::now())),
                 "input upload not claimed"
             );
             let claim = pending

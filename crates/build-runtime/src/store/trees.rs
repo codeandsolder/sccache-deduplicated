@@ -56,13 +56,15 @@ impl NativeStore {
     pub fn open_available_blob(&self, blob: BlobRef) -> Result<Option<File>> {
         let read = self.inner.db.begin_read()?;
         let live = read.open_table(super::BLOBS)?;
-        let Some(size) = live.get(&blob.id.0)? else {
-            return Ok(None);
+        let pending = read.open_table(super::PENDING_DELETIONS)?;
+        let size = match live.get(&blob.id.0)? {
+            Some(size) => size.value(),
+            None => match pending.get(&blob.id.0)? {
+                Some(size) => size.value(),
+                None => return Ok(None),
+            },
         };
-        ensure!(
-            size.value() == blob.size,
-            "inconsistent indexed blob length"
-        );
+        ensure!(size == blob.size, "inconsistent indexed blob length");
         if !self.inner.blob_present(blob.id, blob.size)? {
             return Ok(None);
         }

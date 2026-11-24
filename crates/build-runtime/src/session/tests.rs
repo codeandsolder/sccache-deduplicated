@@ -416,6 +416,9 @@ fn input_manifest_survives_scheduler_eviction_and_worker_fetch_is_scoped() -> Re
             unreferenced_logical_bytes: 9,
         }
     );
+    // Tree eviction queues physical deletion; force actual reclamation so
+    // this case tests a scheduler payload miss, not pending-GC reuse.
+    service.store().collect_garbage(16)?;
     assert!(service.open_tree(id, worker, Ticket([0; 32])).is_err());
     let unrelated = service.store().publish_tree(
         &TreeManifest {
@@ -813,6 +816,10 @@ fn cancelled_source_releases_claim_to_another_live_origin() -> Result<()> {
     assert_eq!(service.input_demands(a)?.len(), 1);
     assert!(service.input_demands(b)?.is_empty());
     service.close(a, Publisher::Client)?;
+    // The shared flight survives A, but its dead claim must not retain
+    // the global upload slot until B happens to poll it.
+    service.reap()?;
+    assert_eq!(service.active_uploads.load(Ordering::Acquire), 0);
     assert_eq!(service.input_demands(b)?.len(), 1);
     service.backfill_input(b, blob, &bytes[..])?;
     assert_eq!(service.active_uploads.load(Ordering::Acquire), 0);

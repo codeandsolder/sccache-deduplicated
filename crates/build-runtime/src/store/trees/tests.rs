@@ -326,3 +326,29 @@ fn indexed_tree_repairs_only_physically_missing_content() -> Result<()> {
     assert!(store.lookup_tree(id)?.is_some());
     Ok(())
 }
+
+#[test]
+fn pending_gc_content_is_still_available_until_last_pin_releases() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let store = NativeStore::open(directory.path())?;
+    let staged = store.stage(&b"retained by reservation"[..])?;
+    let blob = staged.reference();
+    let tree = sample_tree(blob)?;
+    let id = store.publish_tree(&tree, vec![staged])?;
+    let reservation = store.reserve_blobs(BTreeMap::from([(blob.id, blob.size)]))?;
+    assert!(reservation.missing().is_empty());
+    assert!(matches!(store.evict_tree(id)?, Eviction::Removed { .. }));
+    assert!(store.lookup_tree(id)?.is_none());
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut store
+            .open_available_blob(blob)?
+            .context("reserved content missing")?,
+        &mut bytes,
+    )?;
+    assert_eq!(bytes, b"retained by reservation");
+    drop(reservation);
+    store.collect_garbage(16)?;
+    assert!(store.open_available_blob(blob)?.is_none());
+    Ok(())
+}

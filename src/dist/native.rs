@@ -575,18 +575,38 @@ impl NativeCacheClient {
                 loop {
                     check()?;
                     let slot = transport.raw_slot(check)?;
+                    let remaining = self.timeout.checked_sub(start.elapsed())
+                        .filter(|remaining| !remaining.is_zero())
+                        .context("native input backfill timed out")?;
                     let transfer = Instant::now();
-                    if let Some(response) = self.try_download_response(ticket, blob.id)? {
-                        let staged = store.stage_expected(blob, response)?;
-                        transport.observe_raw(blob.size, transfer.elapsed());
-                        break vec![staged];
+                    match self.try_download_response(ticket, blob.id, remaining) {
+                        Ok(Some(response)) => {
+                            let mut stream = InputDownload {
+                                reader: response,
+                                remaining: blob.size,
+                                interrupted: false,
+                            };
+                            match store.stage_expected(blob, &mut stream) {
+                                Ok(staged) => {
+                                    transport.observe_raw(blob.size, transfer.elapsed());
+                                    break vec![staged];
+                                }
+                                Err(error) if stream.interrupted => {
+                                    debug!("retrying interrupted native blob transfer {blob:?}: {error:#}");
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) if retryable_download_error(&error) => {
+                            debug!("retrying native blob request {blob:?}: {error:#}");
+                        }
+                        Err(error) => return Err(error),
                     }
                     drop(slot);
-                    ensure!(
-                        start.elapsed() < self.timeout,
-                        "native input backfill timed out"
-                    );
-                    std::thread::sleep(delay);
+                    let remaining = self.timeout.saturating_sub(start.elapsed());
+                    ensure!(!remaining.is_zero(), "native input backfill timed out");
+                    std::thread::sleep(delay.min(remaining));
                     delay = (delay * 2).min(Duration::from_millis(200));
                 }
             };
@@ -724,7 +744,7 @@ impl NativeCacheClient {
     }
 
     fn download_response(&self, ticket: Ticket, id: ContentId) -> Result<Box<dyn Read + Send>> {
-        self.try_download_response(ticket, id)?
+        self.try_download_response(ticket, id, self.timeout)?
             .context("native content not yet available")
     }
 
@@ -732,10 +752,12 @@ impl NativeCacheClient {
         &self,
         ticket: Ticket,
         id: ContentId,
+        timeout: Duration,
     ) -> Result<Option<Box<dyn Read + Send>>> {
         let request = codec().serialize(&DownloadRequest { ticket, id })?;
         let response = self
             .request("download")?
+            .timeout(timeout)
             .header("X-Sccache-Accept-Blob-Codec", "zstd")
             .body(request)
             .send()?;
@@ -751,6 +773,82 @@ impl NativeCacheClient {
             Some(other) => anyhow::bail!("unsupported native blob codec: {other:?}"),
         }
     }
+}
+
+// Only remote transport interruptions are retried. Local CAS errors and
+// complete streams with the wrong digest are not silently treated as misses.
+#[cfg(all(target_os = "linux", feature = "native-store"))]
+struct InputDownload<R> {
+    reader: R,
+    remaining: u64,
+    interrupted: bool,
+}
+
+#[cfg(all(target_os = "linux", feature = "native-store"))]
+impl<R: Read> Read for InputDownload<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self.reader.read(buffer) {
+            Ok(count) => {
+                if count == 0 && !buffer.is_empty() && self.remaining != 0 {
+                    self.interrupted = true;
+                }
+                self.remaining = self.remaining.saturating_sub(count as u64);
+                Ok(count)
+            }
+            Err(error) => {
+                if error.kind() != io::ErrorKind::Interrupted {
+                    self.interrupted = true;
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "native-store"))]
+fn retryable_download_error(error: &anyhow::Error) -> bool {
+    if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+        return error.is_timeout()
+            || error.is_connect()
+            || error.is_body()
+            || error.status().is_some_and(|status| {
+                status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            });
+    }
+    error.downcast_ref::<io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::TimedOut
+                | io::ErrorKind::BrokenPipe
+        )
+    })
+}
+
+#[cfg(all(test, target_os = "linux", feature = "native-store"))]
+#[test]
+fn native_input_stream_distinguishes_truncation_from_complete_transfer() -> Result<()> {
+    let mut short = InputDownload {
+        reader: Cursor::new(b"short"),
+        remaining: 8,
+        interrupted: false,
+    };
+    let mut bytes = Vec::new();
+    short.read_to_end(&mut bytes)?;
+    assert!(short.interrupted);
+    assert_eq!(short.remaining, 3);
+    let mut complete = InputDownload {
+        reader: Cursor::new(b"complete"),
+        remaining: 8,
+        interrupted: false,
+    };
+    bytes.clear();
+    complete.read_to_end(&mut bytes)?;
+    assert!(!complete.interrupted);
+    assert_eq!(complete.remaining, 0);
+    Ok(())
 }
 
 fn copy_verified(reader: impl Read, blob: BlobRef, mut destination: impl Write) -> Result<()> {
