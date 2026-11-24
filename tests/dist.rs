@@ -202,9 +202,13 @@ fn write_cpu_target_sources(root: &Path) {
         root,
         "native_target.c",
         r#"
+unsigned native_target_has_avx2(void) {
 #if defined(__AVX2__)
-#error explicit -mno-avx2 must override native ISA
+    return 1;
+#else
+    return 0;
 #endif
+}
 unsigned long native_target(unsigned long x, unsigned long y) {
     return (x * 17UL + y) ^ (y >> 7);
 }
@@ -229,9 +233,13 @@ void specific_target(int *dst, const int *a, const int *b) {
         root,
         "native_target.cpp",
         r#"
+extern "C" unsigned native_target_cpp_has_avx2(void) {
 #if defined(__AVX2__)
-#error explicit -mno-avx2 must override native ISA in C++ too
+    return 1;
+#else
+    return 0;
 #endif
+}
 template<unsigned N> constexpr unsigned scale(unsigned x) { return x * N; }
 static_assert(scale<3>(7) == 21);
 extern "C" unsigned long native_target_cpp(unsigned long x, unsigned long y) {
@@ -257,8 +265,9 @@ extern "C" void specific_target_cpp(int *dst, const int *a, const int *b) {
     );
 }
 
-/// Real GCC/Clang C and C++ jobs for native and explicit v4 must execute
-/// on the worker without substituting its CPU. Every repeat must hit cache.
+/// GCC/Clang C and C++ jobs targeting native and explicit v4 must match the
+/// initiating compiler's exact codegen even on a different worker CPU, and
+/// every repeat must hit cache.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 #[cfg_attr(
@@ -336,6 +345,36 @@ fn test_dist_c_native_target_codegen_and_cache() -> Result<()> {
             };
             let first = compile_object()?;
             ensure!(!first.is_empty(), "distributed compile produced no object");
+            // Native is whatever the *requesting compiler* considers its CPU.
+            // Different hosted runner CPUs, compiler versions, or ISA feature
+            // dependencies can affect whether -mno-avx2 disables __AVX2__.
+            // Comparing the complete object against the initiating compiler's
+            // actual direct invocation tests equivalence without guessing that
+            // feature state or weakening the requirement for exact codegen.
+            let reference_output = root.join(format!("reference-{case}-{index}.o"));
+            let mut reference = std::process::Command::new(&compiler_path);
+            reference.args(flags);
+            if is_cxx {
+                reference.arg("-std=c++20");
+            }
+            let reference_result = reference
+                .arg("-c")
+                .arg(root.join(source))
+                .arg("-o")
+                .arg(&reference_output)
+                .output()?;
+            ensure!(
+                reference_result.status.success(),
+                "{} direct {case} reference failed: {}",
+                compiler_path.display(),
+                String::from_utf8_lossy(&reference_result.stderr)
+            );
+            assert_eq!(
+                first,
+                std::fs::read(reference_output)?,
+                "{} {case} distributed codegen differs from requesting compiler",
+                compiler_path.display()
+            );
             replay_pairs.push((compile_object()?, first));
         }
     }
