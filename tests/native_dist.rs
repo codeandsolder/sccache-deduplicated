@@ -1082,6 +1082,11 @@ fn verify_learned_placement_trace(log: &Path) -> Result<()> {
         let assignment = assignments.get(&job).context("missing allocation trace")?;
         assert_eq!(assignment["worker"], value["worker"]);
         assert_eq!(assignment["class"], value["class"]);
+        let worker = value["worker"].as_str().context("missing worker address")?;
+        assert_eq!(
+            assignment["candidates"][worker]["missing_input_union_bytes"], 0,
+            "warm closure must be recognized before the next heartbeat"
+        );
         assert!(
             value["actual_seconds"]
                 .as_f64()

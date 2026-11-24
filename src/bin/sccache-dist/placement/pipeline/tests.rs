@@ -41,7 +41,7 @@ fn start(
             capacity: cpus,
             assigned,
             placement,
-            recent: &RecentOutputs::default(),
+            recent: &RecentResidency::default(),
             cost: ActionCost::baseline(placement),
         },
         requested,
@@ -240,7 +240,7 @@ fn native_pipeline_uses_each_reservations_learned_service_time() {
         progress(NativeJobPhase::Executing, Duration::from_secs(3), 0),
     );
     placement.queue.compiler_active = 1;
-    let recent = RecentOutputs::default();
+    let recent = RecentResidency::default();
     let forecast = super::super::WorkerForecast {
         capacity: 1.0,
         assigned: &assigned,

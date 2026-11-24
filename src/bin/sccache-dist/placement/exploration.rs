@@ -94,7 +94,7 @@ fn additional_inputs(details: &ServerDetails, requested: &NativeInputBlobs) -> N
         super::pipeline::WorkerResidency::new(
             &details.jobs_assigned,
             placement,
-            &details.recent_outputs,
+            &details.recent_residency,
         )
     });
     let mut missing: NativeInputBlobs = requested

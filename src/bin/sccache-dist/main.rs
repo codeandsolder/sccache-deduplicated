@@ -822,7 +822,7 @@ struct ServerDetails {
     server_nonce: ServerNonce,
     worker_name: Option<String>,
     capabilities: dist::WorkerCapabilities,
-    recent_outputs: placement::RecentOutputs,
+    recent_residency: placement::RecentResidency,
     job_authorizer: Box<dyn JobAuthorizer>,
 }
 
@@ -1299,7 +1299,13 @@ impl SchedulerIncoming for Scheduler {
         }
         match event {
             dist::NativeResultEvent::Negotiated => {
-                detail.publication_began_at.get_or_insert(now);
+                if detail.publication_began_at.is_none() {
+                    detail.publication_began_at = Some(now);
+                    if let Some(assigned) = server.jobs_assigned.get(&job).and_then(Option::as_ref)
+                    {
+                        server.recent_residency.record_inputs(&assigned.inputs, now);
+                    }
+                }
             }
             dist::NativeResultEvent::Committed {
                 manifest,
@@ -1309,13 +1315,17 @@ impl SchedulerIncoming for Scheduler {
                 if let Some(anchor) = detail.publication_began_at
                     && let Err(error) =
                         server
-                            .recent_outputs
+                            .recent_residency
                             .record(manifest, anchor, retained_after_begin, now)
                 {
                     warn!("Native output locality update failed: {error:#}");
                 }
                 if !detail.observed_result && detail.publication_began_at.is_some() {
                     detail.observed_result = true;
+                    if let Some(assigned) = server.jobs_assigned.get(&job).and_then(Option::as_ref)
+                    {
+                        server.recent_residency.record_inputs(&assigned.inputs, now);
+                    }
                     if let Some(assigned) = server.jobs_assigned.get(&job).and_then(Option::as_ref)
                         && let (Some(class), Some(observed)) = (
                             assigned.class,
@@ -1364,20 +1374,19 @@ impl SchedulerIncoming for Scheduler {
             .iter()
             .filter_map(|(id, details)| {
                 let placement = details.capabilities.native_placement.as_ref()?;
-                let locality =
-                    if details
-                        .recent_outputs
-                        .contains(blob.id, blob.size, Instant::now())
-                    {
-                        2_u8
-                    } else {
-                        u8::from(
-                            placement
-                                .residency
-                                .as_ref()
-                                .is_some_and(|residency| residency.may_contain(blob.id)),
-                        )
-                    };
+                let now = Instant::now();
+                let locality = if details.recent_residency.retained(blob.id, blob.size, now) {
+                    3_u8
+                } else if details.recent_residency.contains(blob.id, blob.size, now) {
+                    2_u8
+                } else {
+                    u8::from(
+                        placement
+                            .residency
+                            .as_ref()
+                            .is_some_and(|residency| residency.may_contain(blob.id)),
+                    )
+                };
                 (Some(id.addr()) != requester
                     && details.last_seen.elapsed() < Duration::from_secs(20)
                     && details.last_error.is_none()
@@ -1456,7 +1465,7 @@ impl SchedulerIncoming for Scheduler {
                 details.last_seen = now;
                 details.cpu_capacity = cpu_capacity;
                 details.capabilities = capabilities;
-                details.recent_outputs.reap(now);
+                details.recent_residency.reap(now);
 
                 // Executing jobs and transfers with recent byte progress have
                 // live request owners. A Started job missing from one heartbeat
@@ -1552,7 +1561,7 @@ impl SchedulerIncoming for Scheduler {
                 server_nonce,
                 worker_name: None,
                 capabilities,
-                recent_outputs: placement::RecentOutputs::default(),
+                recent_residency: placement::RecentResidency::default(),
                 action_costs: placement::ActionCosts::default(),
                 job_authorizer,
             },
@@ -2343,7 +2352,7 @@ mod scheduler_tests {
                     capacity,
                     assigned,
                     placement,
-                    recent: &placement::RecentOutputs::default(),
+                    recent: &placement::RecentResidency::default(),
                     cost: placement::ActionCost::baseline(placement),
                 },
                 &inputs,

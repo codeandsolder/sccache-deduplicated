@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{ActionCost, AssignedNative, RecentOutputs};
+use super::{ActionCost, AssignedNative, RecentResidency};
 
 pub(super) type Assignments = HashMap<JobId, Option<AssignedNative>>;
 
@@ -34,7 +34,7 @@ pub(super) fn confirmed_inputs(
 pub(super) struct WorkerResidency<'a> {
     placement: &'a NativePlacement,
     confirmed: HashSet<ContentId>,
-    recent: &'a RecentOutputs,
+    recent: &'a RecentResidency,
     now: Instant,
 }
 
@@ -42,7 +42,7 @@ impl<'a> WorkerResidency<'a> {
     pub(super) fn new(
         assigned: &Assignments,
         placement: &'a NativePlacement,
-        recent: &'a RecentOutputs,
+        recent: &'a RecentResidency,
     ) -> Self {
         Self {
             placement,

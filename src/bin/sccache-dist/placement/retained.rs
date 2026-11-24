@@ -1,4 +1,4 @@
-//! Short-lived exact output residency hints from authenticated publication.
+//! Short-lived residency hints from authenticated native publication.
 //! The worker's real grace and consumer leases, not this index, own the bytes.
 
 use sccache::build_runtime::{ContentId, ResultManifest};
@@ -8,22 +8,24 @@ use std::{
 };
 
 const MAX_BLOBS: usize = 8192;
+const MAX_INPUT_BLOBS: usize = 65_536;
+const INPUT_LIFETIME: Duration = Duration::from_secs(20);
 const MAX_LIFETIME: Duration = Duration::from_mins(30);
 
 #[derive(Default)]
-pub(crate) struct RecentOutputs {
+struct ExpiringBlobs {
     blobs: BTreeMap<ContentId, (u64, Instant)>,
     expiry: BTreeSet<(Instant, ContentId)>,
 }
 
-impl RecentOutputs {
-    pub(crate) fn contains(&self, id: ContentId, bytes: u64, now: Instant) -> bool {
+impl ExpiringBlobs {
+    fn contains(&self, id: ContentId, bytes: u64, now: Instant) -> bool {
         self.blobs
             .get(&id)
             .is_some_and(|&(size, expires)| size == bytes && expires > now)
     }
 
-    pub(crate) fn reap(&mut self, now: Instant) {
+    fn reap(&mut self, now: Instant) {
         while self
             .expiry
             .first()
@@ -35,21 +37,18 @@ impl RecentOutputs {
         }
     }
 
-    pub(crate) fn record(
+    fn record(
         &mut self,
-        manifest: &ResultManifest,
-        anchor: Instant,
-        retained_after_begin: Duration,
+        blobs: impl IntoIterator<Item = (ContentId, u64)>,
+        expires: Instant,
         now: Instant,
-    ) -> anyhow::Result<()> {
+        limit: usize,
+    ) {
         self.reap(now);
-        let Some(expires) = anchor.checked_add(retained_after_begin.min(MAX_LIFETIME)) else {
-            return Ok(());
-        };
         if expires <= now {
-            return Ok(());
+            return;
         }
-        for (id, size) in manifest.blobs()? {
+        for (id, size) in blobs {
             if let Some(&(previous_size, previous_expiry)) = self.blobs.get(&id) {
                 // A duplicate digest can refresh only its existing extent.
                 if previous_size != size || previous_expiry >= expires {
@@ -59,13 +58,62 @@ impl RecentOutputs {
             }
             self.blobs.insert(id, (size, expires));
             self.expiry.insert((expires, id));
-        }
-        while self.blobs.len() > MAX_BLOBS {
-            if let Some((_, id)) = self.expiry.pop_first() {
+            if self.blobs.len() > limit
+                && let Some((_, id)) = self.expiry.pop_first()
+            {
                 self.blobs.remove(&id);
             }
         }
+    }
+}
+
+/// The two evidence sources have different lifetimes and strength.
+/// Acquired inputs were verified and pinned at publication, but may be
+/// evicted after the job releases its leases. They bridge the heartbeat
+/// inventory refresh interval, not the artifact-grace period.
+#[derive(Default)]
+pub(crate) struct RecentResidency {
+    retained: ExpiringBlobs,
+    acquired: ExpiringBlobs,
+}
+
+impl RecentResidency {
+    pub(crate) fn contains(&self, id: ContentId, bytes: u64, now: Instant) -> bool {
+        self.retained.contains(id, bytes, now) || self.acquired.contains(id, bytes, now)
+    }
+
+    pub(crate) fn retained(&self, id: ContentId, bytes: u64, now: Instant) -> bool {
+        self.retained.contains(id, bytes, now)
+    }
+
+    pub(crate) fn reap(&mut self, now: Instant) {
+        self.retained.reap(now);
+        self.acquired.reap(now);
+    }
+
+    pub(crate) fn record(
+        &mut self,
+        manifest: &ResultManifest,
+        anchor: Instant,
+        retained_after_begin: Duration,
+        now: Instant,
+    ) -> anyhow::Result<()> {
+        if let Some(expires) = anchor.checked_add(retained_after_begin.min(MAX_LIFETIME)) {
+            self.retained
+                .record(manifest.blobs()?, expires, now, MAX_BLOBS);
+        }
         Ok(())
+    }
+
+    pub(crate) fn record_inputs(&mut self, inputs: &sccache::dist::NativeInputBlobs, now: Instant) {
+        if let Some(expires) = now.checked_add(INPUT_LIFETIME) {
+            self.acquired.record(
+                inputs.iter().map(|(&id, &size)| (id, size)),
+                expires,
+                now,
+                MAX_INPUT_BLOBS,
+            );
+        }
     }
 }
 
@@ -83,6 +131,21 @@ mod tests {
     }
 
     #[test]
+    fn native_recent_acquired_inputs_have_independent_expiry_and_capacity() {
+        let now = Instant::now();
+        let blob = ContentId::of(b"input");
+        let mut recent = RecentResidency::default();
+        recent.record_inputs(&BTreeMap::from([(blob, 5)]), now);
+        assert!(recent.contains(blob, 5, now));
+        assert!(!recent.retained(blob, 5, now));
+        assert!(!recent.contains(blob, 6, now));
+        assert!(!recent.contains(blob, 5, now + INPUT_LIFETIME));
+        recent.reap(now + INPUT_LIFETIME);
+        assert!(recent.acquired.blobs.is_empty());
+        assert!(recent.acquired.expiry.is_empty());
+    }
+
+    #[test]
     fn native_retained_outputs_expire_from_negotiation_not_commit_time() -> anyhow::Result<()> {
         let now = Instant::now();
         let blob = BlobRef {
@@ -90,7 +153,7 @@ mod tests {
             size: 6,
         };
         let manifest = manifest(blob);
-        let mut outputs = RecentOutputs::default();
+        let mut outputs = RecentResidency::default();
         let grace = Duration::from_secs(300);
         let committed = now + Duration::from_secs(120);
         outputs.record(&manifest, now, grace, committed)?;
@@ -101,10 +164,10 @@ mod tests {
         assert!(outputs.contains(blob.id, blob.size, now + Duration::from_secs(299)));
         assert!(!outputs.contains(blob.id, blob.size, now + grace));
         outputs.reap(now + grace);
-        assert!(outputs.blobs.is_empty());
-        assert!(outputs.expiry.is_empty());
+        assert!(outputs.retained.blobs.is_empty());
+        assert!(outputs.retained.expiry.is_empty());
         outputs.record(&manifest, now, grace, now + grace)?;
-        assert!(outputs.blobs.is_empty());
+        assert!(outputs.retained.blobs.is_empty());
         Ok(())
     }
 
@@ -116,7 +179,7 @@ mod tests {
             size: 6,
         };
         let manifest = manifest(blob);
-        let mut outputs = RecentOutputs::default();
+        let mut outputs = RecentResidency::default();
         outputs.record(&manifest, now, Duration::from_secs(10), now)?;
         outputs.record(
             &manifest,
@@ -125,7 +188,7 @@ mod tests {
             now + Duration::from_secs(2),
         )?;
         outputs.record(&manifest, now, Duration::from_secs(5), now)?;
-        assert_eq!(outputs.expiry.len(), 1);
+        assert_eq!(outputs.retained.expiry.len(), 1);
         assert!(outputs.contains(blob.id, blob.size, now + Duration::from_secs(21)));
         let mut large = ResultManifest {
             outputs: BTreeMap::new(),
@@ -145,8 +208,8 @@ mod tests {
             );
         }
         outputs.record(&large, now, Duration::from_secs(60), now)?;
-        assert_eq!(outputs.blobs.len(), MAX_BLOBS);
-        assert_eq!(outputs.expiry.len(), MAX_BLOBS);
+        assert_eq!(outputs.retained.blobs.len(), MAX_BLOBS);
+        assert_eq!(outputs.retained.expiry.len(), MAX_BLOBS);
         assert!(!outputs.contains(blob.id, blob.size, now));
         Ok(())
     }

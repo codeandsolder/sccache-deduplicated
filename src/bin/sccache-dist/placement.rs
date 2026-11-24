@@ -7,7 +7,7 @@ pub(super) use cost::{ActionClass, ActionCost, ActionCosts, AssignedNative};
 mod pipeline;
 mod retained;
 pub(super) use exploration::{Exploration, choose_worker};
-pub(super) use retained::RecentOutputs;
+pub(super) use retained::RecentResidency;
 use sccache::{
     build_runtime::{
         DirectionSnapshot, NetworkSnapshot, Peer, ResultTransferEstimate, TransferDemand,
@@ -25,7 +25,7 @@ use std::{
 fn native_missing_inputs(
     assigned: &pipeline::Assignments,
     placement: &dist::NativePlacement,
-    recent: &RecentOutputs,
+    recent: &RecentResidency,
     requested: Option<&dist::NativeInputBlobs>,
 ) -> (u128, usize) {
     let residency = pipeline::WorkerResidency::new(assigned, placement, recent);
@@ -126,7 +126,7 @@ impl<'a> NativeTransferPlan<'a> {
                     let (bytes, _) = native_missing_inputs(
                         &details.jobs_assigned,
                         placement,
-                        &details.recent_outputs,
+                        &details.recent_residency,
                         None,
                     );
                     let demand = Self::input_demand(
@@ -213,6 +213,7 @@ impl<'a> NativeTransferPlan<'a> {
 pub(super) struct PlacementEstimate {
     pub(super) seconds: f64,
     pub(super) completion_seconds: f64,
+    missing_input_union_bytes: u128,
     ready_at: f64,
 }
 
@@ -224,7 +225,7 @@ pub(super) struct WorkerForecast<'a> {
     pub capacity: f64,
     pub assigned: &'a pipeline::Assignments,
     pub placement: &'a dist::NativePlacement,
-    pub recent: &'a RecentOutputs,
+    pub recent: &'a RecentResidency,
     pub cost: ActionCost,
 }
 
@@ -239,7 +240,7 @@ impl<'a> WorkerForecast<'a> {
             capacity: details.cpu_capacity,
             assigned: &details.jobs_assigned,
             placement,
-            recent: &details.recent_outputs,
+            recent: &details.recent_residency,
             cost: details.action_costs.predict(class, placement, now),
         })
     }
@@ -295,6 +296,7 @@ pub(super) fn native_estimate(
     PlacementEstimate {
         ready_at,
         completion_seconds,
+        missing_input_union_bytes: bytes,
         seconds: completion_seconds + externality + output_externality,
     }
 }
