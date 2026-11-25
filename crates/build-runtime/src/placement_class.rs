@@ -21,13 +21,13 @@ impl ExecutionSpec {
         while let Some(arg) = args.get(i) {
             i += 1;
             if rust {
-                if arg == b"--extern" {
-                    if let Some(value) = args.get(i) {
-                        stable.push(arg.as_slice());
-                        stable.push(value.split(|&byte| byte == b'=').next().unwrap_or(value));
-                        i += 1;
-                        continue;
-                    }
+                if arg == b"--extern"
+                    && let Some(value) = args.get(i)
+                {
+                    stable.push(arg.as_slice());
+                    stable.push(value.split(|&byte| byte == b'=').next().unwrap_or(value));
+                    i += 1;
+                    continue;
                 }
                 if let Some(value) = arg.strip_prefix(b"--extern=") {
                     stable.push(b"--extern");

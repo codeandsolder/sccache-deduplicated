@@ -1,18 +1,21 @@
 //! Cluster transport shared by the legacy archive and native CAS RPCs.
 use std::{
     collections::HashMap,
-    net::SocketAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+
+#[cfg(feature = "dist-server")]
+use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
 use sccache_cluster_identity::{
     ClusterHttpClient, PeerConfig, PeerCredentials, PeerId, Role, TlsCredentials,
 };
 
+pub use super::cluster_routes::Route;
 use super::cluster_routes::{
-    MeasuredReader, PROBE_PATH, PROBE_TIMEOUT, Probe, RouteBook, Transfer,
+    ConnectionPath, MeasuredReader, PROBE_PATH, PROBE_TIMEOUT, Probe, RouteBook, Transfer,
 };
 use sccache_peer_identity::RouteSet;
 
@@ -58,7 +61,7 @@ pub fn open_peer(
 struct PathKey {
     peer: PeerId,
     role: Role,
-    address: SocketAddr,
+    address: Route,
 }
 
 struct TransportPath {
@@ -90,7 +93,7 @@ impl BlockingRoutes {
     fn probe(&self, peer: PeerId, role: Role, probe: Probe) {
         let address = probe.address;
         let start = Instant::now();
-        let result = (|| -> Result<(bool, Option<sccache_peer_identity::NetworkPath>)> {
+        let result = (|| -> Result<(bool, ConnectionPath)> {
             let (client, base) = self.endpoint(peer, role, address)?;
             let response = client
                 .get(base.join(PROBE_PATH)?)
@@ -98,19 +101,21 @@ impl BlockingRoutes {
                 .send()?;
             Ok((
                 response.status() == reqwest::StatusCode::NO_CONTENT,
-                super::cluster_routes::reported_path(response.headers()),
+                ConnectionPath::from_response(response.headers(), response.extensions()),
             ))
         })();
         let (elapsed, path) = result
             .ok()
             .filter(|(success, _)| *success)
-            .map_or((None, None), |(_, path)| (Some(start.elapsed()), path));
+            .map_or((None, ConnectionPath::default()), |(_, path)| {
+                (Some(start.elapsed()), path)
+            });
         self.book.observe_path(peer, role, address, elapsed, path);
         drop(probe);
     }
 
     /// Probe in parallel, without sending any application request or job token.
-    pub fn select(&self, peer: PeerId, role: Role, routes: &RouteSet) -> Vec<SocketAddr> {
+    pub fn select(&self, peer: PeerId, role: Role, routes: &RouteSet) -> Vec<Route> {
         self.probe_routes([(peer, role, routes)]);
         self.book.ordered(peer, role, routes, None)
     }
@@ -139,7 +144,7 @@ impl BlockingRoutes {
         }
     }
 
-    pub fn ordered(&self, peer: PeerId, role: Role, routes: &RouteSet) -> Vec<SocketAddr> {
+    pub fn ordered(&self, peer: PeerId, role: Role, routes: &RouteSet) -> Vec<Route> {
         self.book.ordered(peer, role, routes, None)
     }
 
@@ -149,7 +154,7 @@ impl BlockingRoutes {
         role: Role,
         routes: &RouteSet,
         transfer: Transfer,
-    ) -> Vec<SocketAddr> {
+    ) -> Vec<Route> {
         self.book.ordered(peer, role, routes, Some(transfer))
     }
 
@@ -167,8 +172,8 @@ impl BlockingRoutes {
     pub(super) fn verified_download(
         &self,
         peer: PeerId,
-        address: SocketAddr,
-        path: sccache_peer_identity::NetworkPath,
+        address: Route,
+        path: ConnectionPath,
         bytes: u64,
         elapsed: Duration,
     ) {
@@ -195,10 +200,10 @@ impl BlockingRoutes {
         &self,
         peer: PeerId,
         role: Role,
-        address: SocketAddr,
+        address: Route,
         transfer: Transfer,
         elapsed: Duration,
-        path: Option<sccache_peer_identity::NetworkPath>,
+        path: ConnectionPath,
     ) {
         self.book
             .transferred(peer, role, address, transfer, elapsed, path);
@@ -208,11 +213,11 @@ impl BlockingRoutes {
         &self,
         peer: PeerId,
         role: Role,
-        address: SocketAddr,
+        address: Route,
         response: reqwest::blocking::Response,
     ) -> MeasuredReader<reqwest::blocking::Response> {
         let length = response.content_length();
-        let path = super::cluster_routes::reported_path(response.headers());
+        let path = ConnectionPath::from_response(response.headers(), response.extensions());
         MeasuredReader::new(
             response,
             Arc::clone(&self.book),
@@ -224,7 +229,16 @@ impl BlockingRoutes {
         )
     }
 
-    pub fn failed(&self, peer: PeerId, role: Role, address: SocketAddr) {
+    pub(super) fn local_source(
+        &self,
+        peer: PeerId,
+        role: Role,
+        address: Route,
+    ) -> Option<std::net::IpAddr> {
+        self.book.local_source(peer, role, address)
+    }
+
+    pub fn failed(&self, peer: PeerId, role: Role, address: Route) {
         self.book.observe(peer, role, address, None);
     }
 
@@ -232,7 +246,7 @@ impl BlockingRoutes {
         &self,
         peer: PeerId,
         role: Role,
-        address: SocketAddr,
+        address: Route,
         open: impl FnOnce(&mut TransportPath) -> Result<T>,
     ) -> Result<T> {
         let credentials = (self.current)()?;
@@ -273,18 +287,20 @@ impl BlockingRoutes {
         &self,
         peer: PeerId,
         role: Role,
-        address: SocketAddr,
+        address: Route,
     ) -> Result<(reqwest::blocking::Client, reqwest::Url)> {
         self.with_path(peer, role, address, |path| {
             if let Some(client) = &path.blocking {
                 return Ok(client.clone());
             }
-            let client = sccache_cluster_identity::blocking_client(
+            let binding = address.binding();
+            let client = sccache_cluster_identity::blocking_client_bound(
                 &path.credentials,
                 peer,
                 role,
-                address,
+                address.address,
                 Duration::from_mins(20),
+                binding.as_ref().map(|(ip, name)| (*ip, name.as_deref())),
             )?;
             path.blocking = Some(client.clone());
             Ok(client)
@@ -295,18 +311,23 @@ impl BlockingRoutes {
         &self,
         peer: PeerId,
         role: Role,
-        address: SocketAddr,
+        address: Route,
     ) -> Result<Arc<ClusterHttpClient>> {
         self.with_path(peer, role, address, |path| {
             if let Some(client) = &path.streaming {
                 return Ok(Arc::clone(client));
             }
-            let client = Arc::new(ClusterHttpClient::new(
-                &path.credentials,
-                peer,
-                role,
-                address,
-            )?);
+            let binding = address.binding();
+            let client = Arc::new(match binding.as_ref() {
+                Some((ip, name)) => ClusterHttpClient::new_bound(
+                    &path.credentials,
+                    peer,
+                    role,
+                    address.address,
+                    (*ip, name.as_deref()),
+                )?,
+                None => ClusterHttpClient::new(&path.credentials, peer, role, address.address)?,
+            });
             path.streaming = Some(Arc::clone(&client));
             Ok(client)
         })

@@ -1,6 +1,9 @@
 //! Enrollment client that authenticates the scheduler before sending a token.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use anyhow::{Result, ensure};
 use bincode::Options;
@@ -55,7 +58,35 @@ impl ClusterHttpClient {
         role: Role,
         address: SocketAddr,
     ) -> Result<Self> {
-        Self::with_trust(&credentials.ca, expected, role, address, Some(credentials))
+        Self::with_trust(
+            &credentials.ca,
+            expected,
+            role,
+            address,
+            Some(credentials),
+            None,
+        )
+    }
+
+    /// Pin a pooled transport to a local source and, on Linux, its device.
+    ///
+    /// # Errors
+    /// Returns an error for invalid trust or transport configuration.
+    pub fn new_bound(
+        credentials: &TlsCredentials,
+        expected: PeerId,
+        role: Role,
+        address: SocketAddr,
+        source: (IpAddr, Option<&str>),
+    ) -> Result<Self> {
+        Self::with_trust(
+            &credentials.ca,
+            expected,
+            role,
+            address,
+            Some(credentials),
+            Some(source),
+        )
     }
 
     fn with_trust(
@@ -64,6 +95,7 @@ impl ClusterHttpClient {
         role: Role,
         address: SocketAddr,
         credentials: Option<&TlsCredentials>,
+        source: Option<(IpAddr, Option<&str>)>,
     ) -> Result<Self> {
         let config = client_config(ca, credentials)?;
         ensure!(
@@ -72,7 +104,7 @@ impl ClusterHttpClient {
         );
         let name = role.tls_name(expected);
         let base = reqwest::Url::parse(&format!("https://{name}:{}/", address.port()))?;
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .tls_backend_preconfigured(config)
             .resolve(&name, address)
             .no_proxy()
@@ -80,8 +112,17 @@ impl ClusterHttpClient {
             .pool_idle_timeout(std::time::Duration::from_secs(20))
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONTROL_TIMEOUT)
-            .read_timeout(std::time::Duration::from_secs(90))
-            .build()?;
+            .read_timeout(std::time::Duration::from_secs(90));
+        if let Some((ip, device)) = source {
+            builder = builder.local_address(ip);
+            #[cfg(target_os = "linux")]
+            if let Some(device) = device {
+                builder = builder.interface(device);
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = device;
+        }
+        let client = builder.build()?;
         Ok(Self { client, base })
     }
 
@@ -124,13 +165,28 @@ pub fn blocking_client(
     address: SocketAddr,
     timeout: std::time::Duration,
 ) -> Result<(reqwest::blocking::Client, reqwest::Url)> {
+    blocking_client_bound(credentials, expected, role, address, timeout, None)
+}
+
+/// Blocking transport with an optional explicit local address/device.
+///
+/// # Errors
+/// Returns an error for invalid trust or transport configuration.
+pub fn blocking_client_bound(
+    credentials: &TlsCredentials,
+    expected: PeerId,
+    role: Role,
+    address: SocketAddr,
+    timeout: std::time::Duration,
+    source: Option<(IpAddr, Option<&str>)>,
+) -> Result<(reqwest::blocking::Client, reqwest::Url)> {
     ensure!(
         role != Role::Client,
         "client-only identity has no TLS service"
     );
     let name = role.tls_name(expected);
     let base = reqwest::Url::parse(&format!("https://{name}:{}/", address.port()))?;
-    let client = reqwest::blocking::Client::builder()
+    let mut builder = reqwest::blocking::Client::builder()
         .tls_backend_preconfigured(client_config(&credentials.ca, Some(credentials))?)
         .resolve(&name, address)
         .no_proxy()
@@ -138,8 +194,17 @@ pub fn blocking_client(
         .pool_idle_timeout(std::time::Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONTROL_TIMEOUT)
-        .timeout(timeout)
-        .build()?;
+        .timeout(timeout);
+    if let Some((ip, device)) = source {
+        builder = builder.local_address(ip);
+        #[cfg(target_os = "linux")]
+        if let Some(device) = device {
+            builder = builder.interface(device);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = device;
+    }
+    let client = builder.build()?;
     Ok((client, base))
 }
 
@@ -161,8 +226,14 @@ impl EnrollmentClient {
         address: SocketAddr,
         credentials: Option<&TlsCredentials>,
     ) -> Result<Self> {
-        let transport =
-            ClusterHttpClient::with_trust(ca, scheduler, Role::Scheduler, address, credentials)?;
+        let transport = ClusterHttpClient::with_trust(
+            ca,
+            scheduler,
+            Role::Scheduler,
+            address,
+            credentials,
+            None,
+        )?;
         Ok(Self {
             transport,
             ca: ca.clone(),
@@ -530,6 +601,33 @@ mod worker_tests {
                 .await?,
             scheduler_id.to_string()
         );
+        #[cfg(target_os = "linux")]
+        {
+            // A second source address to the very same remote service is a
+            // separate pooled path, without changing TLS principal identity.
+            let source = "127.0.0.2".parse()?;
+            let bound = ClusterHttpClient::new_bound(
+                &scheduler,
+                worker_id,
+                Role::Worker,
+                first_addr,
+                (source, Some("lo")),
+            )?;
+            let response = bound
+                .request(reqwest::Method::GET, "/probe")?
+                .send()
+                .await?
+                .error_for_status()?;
+            let path: crate::NetworkPath = response
+                .headers()
+                .get(super::super::PATH_HEADER)
+                .ok_or_else(|| anyhow::anyhow!("missing authenticated path"))?
+                .to_str()?
+                .parse()?;
+            assert_eq!(path.remote, source);
+            assert_eq!(path.local, first_addr.ip());
+            assert_eq!(response.text().await?, scheduler_id.to_string());
+        }
         let (renewed, role) = authority
             .renew(&worker_request, worker_id, Role::Worker)?
             .into_certificate()?;
@@ -563,7 +661,7 @@ mod worker_tests {
                 .is_err()
         );
         let anonymous =
-            ClusterHttpClient::with_trust(&ca, worker_id, Role::Worker, first_addr, None)?;
+            ClusterHttpClient::with_trust(&ca, worker_id, Role::Worker, first_addr, None, None)?;
         assert!(
             anonymous
                 .request(reqwest::Method::GET, "/probe")?

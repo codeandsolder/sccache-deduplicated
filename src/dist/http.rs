@@ -1416,11 +1416,15 @@ mod server {
                 .context("worker route unavailable")
         }
 
-        fn endpoints(&self, id: ServerId) -> Result<Vec<SocketAddr>> {
+        fn endpoints(&self, id: ServerId) -> Result<Vec<crate::dist::cluster_routes::Route>> {
             Ok(self.routes.ordered(id, Role::Worker, &self.addresses(id)?))
         }
 
-        fn download_endpoints(&self, id: ServerId, size: u64) -> Result<Vec<SocketAddr>> {
+        fn download_endpoints(
+            &self,
+            id: ServerId,
+            size: u64,
+        ) -> Result<Vec<crate::dist::cluster_routes::Route>> {
             Ok(self.routes.ordered_transfer(
                 id,
                 Role::Worker,
@@ -1432,12 +1436,12 @@ mod server {
         fn endpoint(
             &self,
             id: ServerId,
-            address: SocketAddr,
+            address: crate::dist::cluster_routes::Route,
         ) -> Result<(reqwest::blocking::Client, reqwest::Url)> {
             self.routes.endpoint(id, Role::Worker, address)
         }
 
-        fn failed(&self, id: ServerId, address: SocketAddr) {
+        fn failed(&self, id: ServerId, address: crate::dist::cluster_routes::Route) {
             self.routes.failed(id, Role::Worker, address);
         }
     }
@@ -1781,7 +1785,7 @@ mod server {
             self.routes.endpoint(
                 self.peer.scheduler_id(),
                 Role::Scheduler,
-                self.peer.scheduler_address(),
+                crate::dist::cluster_routes::Route::unbound(self.peer.scheduler_address()),
             )
         }
     }

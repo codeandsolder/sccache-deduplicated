@@ -3,7 +3,6 @@ use anyhow::{Context, Result};
 use sccache_cluster_identity::{ClusterHttpClient, PeerCredentials, Role, TlsCredentials};
 use std::{
     collections::HashMap,
-    net::SocketAddr,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -15,7 +14,7 @@ use super::{
 };
 use crate::dist::{
     ServerId,
-    cluster_routes::{PROBE_PATH, PROBE_TIMEOUT, Probe, RouteBook},
+    cluster_routes::{ConnectionPath, PROBE_PATH, PROBE_TIMEOUT, Probe, Route, RouteBook},
 };
 use sccache_peer_identity::RouteSet;
 
@@ -24,7 +23,7 @@ type Path = (Arc<TlsCredentials>, Arc<ClusterHttpClient>);
 pub(super) struct WorkerRoutes {
     peer: Arc<PeerCredentials>,
     workers: Mutex<HashMap<ServerId, RouteSet>>,
-    paths: Mutex<HashMap<(ServerId, Role, SocketAddr), Path>>,
+    paths: Mutex<HashMap<(ServerId, Role, Route), Path>>,
     book: RouteBook,
 }
 
@@ -42,7 +41,7 @@ impl WorkerRoutes {
         &self,
         id: ServerId,
         role: Role,
-        address: SocketAddr,
+        address: Route,
     ) -> Result<Arc<ClusterHttpClient>> {
         let credentials = match self.peer.refresh().await {
             Ok(credentials) => credentials,
@@ -61,7 +60,17 @@ impl WorkerRoutes {
         {
             return Ok(Arc::clone(path));
         }
-        let path = Arc::new(ClusterHttpClient::new(&credentials, id, role, address)?);
+        let binding = address.binding();
+        let path = Arc::new(match binding.as_ref() {
+            Some((ip, name)) => ClusterHttpClient::new_bound(
+                &credentials,
+                id,
+                role,
+                address.address,
+                (*ip, name.as_deref()),
+            )?,
+            None => ClusterHttpClient::new(&credentials, id, role, address.address)?,
+        });
         if paths.len() >= 256 {
             paths.clear();
         }
@@ -74,7 +83,7 @@ impl WorkerRoutes {
         self.path(
             self.peer.scheduler_id(),
             Role::Scheduler,
-            self.peer.scheduler_address(),
+            Route::unbound(self.peer.scheduler_address()),
         )
         .await
     }
@@ -127,14 +136,16 @@ impl WorkerRoutes {
                 .await?;
             Ok::<_, anyhow::Error>((
                 response.status() == reqwest::StatusCode::NO_CONTENT,
-                crate::dist::cluster_routes::reported_path(response.headers()),
+                ConnectionPath::from_response(response.headers(), response.extensions()),
             ))
         }
         .await;
         let (elapsed, path) = result
             .ok()
             .filter(|(success, _)| *success)
-            .map_or((None, None), |(_, path)| (Some(start.elapsed()), path));
+            .map_or((None, ConnectionPath::default()), |(_, path)| {
+                (Some(start.elapsed()), path)
+            });
         self.book
             .observe_path(server, Role::Worker, address, elapsed, path);
         drop(probe);

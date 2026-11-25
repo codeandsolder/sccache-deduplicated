@@ -536,7 +536,7 @@ fn run(command: Command) -> Result<i32> {
             let (http, base) = routes.endpoint(
                 peer.scheduler_id(),
                 Role::Scheduler,
-                peer.scheduler_address(),
+                sccache::dist::cluster::Route::unbound(peer.scheduler_address()),
             )?;
             let status: dist::SchedulerStatusResult = http
                 .get(dist::http::urls::scheduler_status(&base)?)

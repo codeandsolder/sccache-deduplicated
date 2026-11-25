@@ -1208,7 +1208,21 @@ fn verify_learned_placement_trace(log: &Path, expected_archive_bytes: u64) -> Re
     let mut peak_result = 0_u64;
     let mut staging_observed = None;
     let mut previous_timing = cold["worker_timing"].clone();
-    for value in repeated {
+    for value in completed.iter().skip(1) {
+        let previous = std::mem::replace(&mut previous_timing, value["worker_timing"].clone());
+        let previous_stage = staging_observed;
+        if let Some(stage) = value["warm_staging_nanoseconds"].as_u64() {
+            staging_observed = Some(previous_stage.map_or(stage, |old: u64| {
+                if stage >= old {
+                    old + (stage - old).div_ceil(4)
+                } else {
+                    old - (old - stage).div_ceil(4)
+                }
+            }));
+        }
+        if value["class"] != class {
+            continue;
+        }
         let observed = value["execution_nanoseconds"]
             .as_u64()
             .context("missing real execution time")?;
@@ -1232,32 +1246,23 @@ fn verify_learned_placement_trace(log: &Path, expected_archive_bytes: u64) -> Re
         // authenticated commit, not the periodic heartbeat.
         assert_eq!(
             assignment["host_prior"]["execution_nanoseconds"],
-            previous_timing["execution_nanoseconds"]
+            previous["execution_nanoseconds"]
         );
         assert_eq!(
             assignment["host_prior"]["output_bytes"],
-            previous_timing["result"]["expected_bytes"]
+            previous["result"]["expected_bytes"]
         );
         let revision = value["worker_timing"]["revision"]
             .as_u64()
             .context("missing timing revision")?;
         assert!(
             revision
-                > previous_timing["revision"]
+                > previous["revision"]
                     .as_u64()
                     .context("missing previous timing revision")?
         );
-        previous_timing = value["worker_timing"].clone();
-        if let Some(previous) = staging_observed {
+        if let Some(previous) = previous_stage {
             assert_eq!(forecast_phase["staging_nanoseconds"], previous);
-            let updated = if stage >= previous {
-                previous + (stage - previous).div_ceil(4)
-            } else {
-                previous - (previous - stage).div_ceil(4)
-            };
-            staging_observed = Some(updated);
-        } else {
-            staging_observed = Some(stage);
         }
         assert!(
             value["publication_setup_nanoseconds"]

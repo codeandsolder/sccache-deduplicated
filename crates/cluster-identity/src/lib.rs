@@ -256,7 +256,7 @@ pub use registry::Registry;
 mod http;
 pub use http::{
     AuthenticatedPeer, ClusterBody, ClusterHttpClient, ClusterListener, EnrollmentClient,
-    PATH_HEADER, SchedulerEnrollment, blocking_client,
+    PATH_HEADER, SchedulerEnrollment, blocking_client, blocking_client_bound,
 };
 
 mod lifecycle;

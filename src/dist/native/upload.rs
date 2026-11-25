@@ -24,7 +24,7 @@ pub(super) struct Attempt {
 
 pub(super) struct Reply {
     pub bytes: Vec<u8>,
-    pub path: Option<sccache_peer_identity::NetworkPath>,
+    pub path: super::super::cluster_routes::ConnectionPath,
 }
 
 async fn reply(
@@ -49,7 +49,10 @@ async fn reply(
         .send()
         .await?
         .error_for_status()?;
-    let path = super::super::cluster_routes::reported_path(response.headers());
+    let path = super::super::cluster_routes::ConnectionPath::from_response(
+        response.headers(),
+        response.extensions(),
+    );
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {
         ensure!(

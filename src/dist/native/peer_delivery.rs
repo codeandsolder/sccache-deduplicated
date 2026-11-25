@@ -128,14 +128,16 @@ impl NativeCacheClient {
                 let attempt = Instant::now();
                 match self.receive_peer_blob(blob, source, address, remaining) {
                     Ok(Some((reader, encoding))) => {
-                        let path = reader.path();
+                        let (mut connection, evidence) = reader.connection_evidence();
                         match consume(reader, encoding) {
                             Ok(value) => {
-                                if let Some(path) = path {
+                                if connection.reported.is_some() {
+                                    connection.quality = evidence
+                                        .map_or(connection.quality, |sample| sample.quality());
                                     self.routes.verified_download(
                                         source.peer,
                                         address,
-                                        path,
+                                        connection,
                                         blob.size,
                                         attempt.elapsed(),
                                     );
@@ -164,7 +166,7 @@ impl NativeCacheClient {
         &self,
         blob: BlobRef,
         source: &BlobSource,
-        address: std::net::SocketAddr,
+        address: crate::dist::cluster_routes::Route,
         remaining: Duration,
     ) -> Result<Option<(MeasuredReader<reqwest::blocking::Response>, BlobEncoding)>> {
         let (client, base) = self.routes.endpoint(source.peer, Role::Worker, address)?;

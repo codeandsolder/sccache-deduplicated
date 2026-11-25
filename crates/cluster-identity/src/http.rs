@@ -32,7 +32,7 @@ use super::{
 
 mod client;
 mod idle_write;
-pub use client::{ClusterHttpClient, EnrollmentClient, blocking_client};
+pub use client::{ClusterHttpClient, EnrollmentClient, blocking_client, blocking_client_bound};
 
 pub const PATH_HEADER: &str = "x-sccache-network-path";
 

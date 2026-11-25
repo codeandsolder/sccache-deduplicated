@@ -1,5 +1,7 @@
 //! Short-lived, authenticated path measurements. A peer's identity remains
 //! independent of the currently preferred interface.
+pub(super) mod interface;
+
 use crate::build_runtime::wire::CachePathRate;
 #[cfg(all(target_os = "linux", feature = "native-store"))]
 use crate::build_runtime::wire::{MAX_PEER_DOWNLOAD_RATES, PeerDownloadRate};
@@ -7,7 +9,7 @@ use sccache_peer_identity::{NetworkPath, PeerId, Role, RouteSet};
 use std::{
     collections::HashMap,
     io::{self, Read},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicUsize, Ordering},
@@ -26,13 +28,82 @@ const MIN_SAMPLE_BYTES: u64 = 1024 * 1024;
 const DEFAULT_RATE: u64 = 16 * 1024 * 1024;
 static PROBES: AtomicUsize = AtomicUsize::new(0);
 
+/// A concrete outbound transport candidate. Source-bound routes are only
+/// discovered for local on-link networks; unbound routes preserve policy
+/// routing, VPN and routed fallbacks.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
+pub struct Route {
+    pub address: SocketAddr,
+    pub source: Option<IpAddr>,
+}
+
+impl Route {
+    pub const fn unbound(address: SocketAddr) -> Self {
+        Self {
+            address,
+            source: None,
+        }
+    }
+    pub fn binding(self) -> Option<(IpAddr, Option<String>)> {
+        self.source.map(|ip| (ip, interface::binding(ip)))
+    }
+}
+
+fn candidates(routes: &RouteSet) -> Vec<Route> {
+    let mut candidates = routes.iter().map(Route::unbound).collect::<Vec<_>>();
+    for address in routes.iter() {
+        candidates.extend(
+            interface::direct_sources(address.ip())
+                .into_iter()
+                .map(|source| Route {
+                    address,
+                    source: Some(source),
+                }),
+        );
+    }
+    candidates
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct ConnectionPath {
+    pub reported: Option<NetworkPath>,
+    pub local: Option<IpAddr>,
+    pub quality: interface::Quality,
+}
+
+impl ConnectionPath {
+    pub fn from_response(
+        headers: &reqwest::header::HeaderMap,
+        extensions: &http::Extensions,
+    ) -> Self {
+        let reported = reported_path(headers);
+        let local = extensions
+            .get::<hyper_util::client::legacy::connect::HttpInfo>()
+            .map(|info| info.local_addr().ip().to_canonical())
+            .or_else(|| reported.map(|path| path.remote));
+        Self {
+            reported,
+            local,
+            quality: interface::Quality::Unknown,
+        }
+    }
+    #[cfg(test)]
+    fn reported(path: Option<NetworkPath>) -> Self {
+        Self {
+            local: path.map(|path| path.remote),
+            reported: path,
+            quality: interface::Quality::Unknown,
+        }
+    }
+}
+
 /// Global admission for probe tasks, released on cancellation as well.
 pub struct Probe {
-    pub address: SocketAddr,
+    pub address: Route,
 }
 
 impl Probe {
-    fn acquire(address: SocketAddr) -> Option<Self> {
+    fn acquire(address: Route) -> Option<Self> {
         let mut count = PROBES.load(Ordering::Relaxed);
         while count < MAX_PROBES {
             match PROBES.compare_exchange_weak(
@@ -79,21 +150,60 @@ impl Transfer {
 #[derive(Clone, Copy)]
 struct Rate {
     path: Option<NetworkPath>,
+    local: Option<IpAddr>,
+    quality: interface::Quality,
     bytes_per_second: u64,
     expires: Instant,
+}
+
+fn updated_rate(
+    previous: Option<Rate>,
+    connection: ConnectionPath,
+    observed: u64,
+    now: Instant,
+) -> Rate {
+    let previous = previous.filter(|rate| {
+        rate.expires > now && rate.path == connection.reported && rate.local == connection.local
+    });
+    if let Some(prior) = previous
+        && prior.quality == interface::Quality::Clean
+        && connection.quality != interface::Quality::Clean
+        && observed <= prior.bytes_per_second
+    {
+        // Do not extend an old clean estimate indefinitely with busy samples.
+        return prior;
+    }
+    let rate = previous.map_or(observed, |prior| {
+        if connection.quality == interface::Quality::Clean
+            && prior.quality != interface::Quality::Clean
+        {
+            observed
+        } else {
+            (prior.bytes_per_second + observed).div_ceil(2)
+        }
+    });
+    Rate {
+        path: connection.reported,
+        local: connection.local,
+        quality: connection.quality,
+        bytes_per_second: rate,
+        expires: now + RATE_TTL,
+    }
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct Key {
     peer: PeerId,
     role: Role,
-    address: SocketAddr,
+    address: Route,
 }
 
 #[derive(Clone, Copy)]
 struct Sample {
     measured: Option<Duration>,
+    local: Option<IpAddr>,
     expires: Instant,
+    pending_until: Instant,
     rates: [Option<Rate>; 2],
     verified: Option<Rate>,
 }
@@ -116,18 +226,21 @@ impl RouteBook {
         if samples.len() >= MAX_PATHS {
             samples.retain(|_, sample| {
                 sample.expires > now
+                    || sample.pending_until > now
                     || sample.rates.iter().flatten().any(|rate| rate.expires > now)
                     || sample.verified.is_some_and(|rate| rate.expires > now)
             });
         }
         let mut pending = Vec::new();
-        for address in routes.iter() {
+        for address in candidates(routes) {
             let key = Key {
                 peer,
                 role,
                 address,
             };
-            if samples.get(&key).is_some_and(|sample| sample.expires > now)
+            if samples
+                .get(&key)
+                .is_some_and(|sample| sample.expires > now || sample.pending_until > now)
                 || (samples.len() >= MAX_PATHS && !samples.contains_key(&key))
             {
                 continue;
@@ -137,37 +250,32 @@ impl RouteBook {
             };
             let sample = samples.entry(key).or_insert(Sample {
                 measured: None,
+                local: None,
                 expires: now,
+                pending_until: now,
                 rates: [None; 2],
                 verified: None,
             });
-            sample.expires = now + FAILURE_TTL;
-            // Expired observations cannot qualify a path while its refresh is pending.
-            sample.measured = None;
+            sample.pending_until = now + FAILURE_TTL;
             pending.push(probe);
         }
         drop(samples);
         pending
     }
 
-    pub fn observe(
-        &self,
-        peer: PeerId,
-        role: Role,
-        address: SocketAddr,
-        elapsed: Option<Duration>,
-    ) {
-        self.observe_path(peer, role, address, elapsed, None);
+    pub fn observe(&self, peer: PeerId, role: Role, address: Route, elapsed: Option<Duration>) {
+        self.observe_path(peer, role, address, elapsed, ConnectionPath::default());
     }
 
     pub fn observe_path(
         &self,
         peer: PeerId,
         role: Role,
-        address: SocketAddr,
+        address: Route,
         elapsed: Option<Duration>,
-        path: Option<NetworkPath>,
+        connection: ConnectionPath,
     ) {
+        let path = connection.reported;
         let mut samples = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
         let key = Key {
             peer,
@@ -177,7 +285,9 @@ impl RouteBook {
         if samples.len() < MAX_PATHS || samples.contains_key(&key) {
             let sample = samples.entry(key).or_insert_with(|| Sample {
                 measured: None,
+                local: None,
                 expires: Instant::now(),
+                pending_until: Instant::now(),
                 rates: [None; 2],
                 verified: None,
             });
@@ -196,7 +306,9 @@ impl RouteBook {
             {
                 sample.verified = None;
             }
+            sample.pending_until = Instant::now();
             sample.measured = elapsed;
+            sample.local = connection.local;
             sample.expires = Instant::now()
                 + if elapsed.is_some() {
                     SUCCESS_TTL
@@ -213,10 +325,10 @@ impl RouteBook {
         &self,
         peer: PeerId,
         role: Role,
-        address: SocketAddr,
+        address: Route,
         transfer: Transfer,
         elapsed: Duration,
-        path: Option<NetworkPath>,
+        connection: ConnectionPath,
     ) {
         if transfer.bytes() < MIN_SAMPLE_BYTES || elapsed < Duration::from_millis(2) {
             return;
@@ -233,26 +345,22 @@ impl RouteBook {
         }
         let sample = samples.entry(key).or_insert(Sample {
             measured: None,
+            local: None,
             expires: now,
+            pending_until: now,
             rates: [None; 2],
             verified: None,
         });
+        if sample.measured.is_some() {
+            sample.expires = now + SUCCESS_TTL;
+        }
         let slot = &mut sample.rates[transfer.index()];
         let observed = u64::try_from(
             (u128::from(transfer.bytes()) * 1_000_000_000 / elapsed.as_nanos())
                 .clamp(64 * 1024, 1_000_000_000_000),
         )
         .unwrap_or(1_000_000_000_000);
-        let rate = slot
-            .filter(|rate| rate.expires > now && rate.path == path)
-            .map_or(observed, |rate| {
-                (rate.bytes_per_second + observed).div_ceil(2)
-            });
-        *slot = Some(Rate {
-            path,
-            bytes_per_second: rate,
-            expires: now + RATE_TTL,
-        });
+        *slot = Some(updated_rate(*slot, connection, observed, now));
         drop(samples);
     }
 
@@ -261,12 +369,15 @@ impl RouteBook {
     pub fn verified_download(
         &self,
         peer: PeerId,
-        address: SocketAddr,
-        path: NetworkPath,
+        address: Route,
+        connection: ConnectionPath,
         bytes: u64,
         elapsed: Duration,
     ) {
-        if bytes < MIN_SAMPLE_BYTES || elapsed < Duration::from_millis(2) || !path.valid() {
+        if bytes < MIN_SAMPLE_BYTES
+            || elapsed < Duration::from_millis(2)
+            || !connection.reported.is_some_and(NetworkPath::valid)
+        {
             return;
         }
         let now = Instant::now();
@@ -283,17 +394,7 @@ impl RouteBook {
                 .clamp(64 * 1024, 1_000_000_000_000),
         )
         .unwrap_or(1_000_000_000_000);
-        let rate = sample
-            .verified
-            .filter(|rate| rate.expires > now && rate.path == Some(path))
-            .map_or(observed, |rate| {
-                (rate.bytes_per_second + observed).div_ceil(2)
-            });
-        sample.verified = Some(Rate {
-            path: Some(path),
-            bytes_per_second: rate,
-            expires: now + RATE_TTL,
-        });
+        sample.verified = Some(updated_rate(sample.verified, connection, observed, now));
         drop(samples);
     }
 
@@ -347,37 +448,44 @@ impl RouteBook {
         routes: &RouteSet,
         transfer: Transfer,
     ) -> Option<CachePathRate> {
+        let representative = match transfer {
+            Transfer::Upload(_) => Transfer::Upload(4 << 20),
+            Transfer::Download(_) => Transfer::Download(4 << 20),
+        };
+        let ranked = self.ranked(peer, role, routes, Some(representative), false);
         let now = Instant::now();
         let samples = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
-        routes
-            .iter()
-            .filter_map(|address| {
-                let sample = samples.get(&Key {
+        let best = ranked.into_iter().find_map(|(_, _, _, address)| {
+            let rate = samples
+                .get(&Key {
                     peer,
                     role,
                     address,
-                })?;
-                // Alternate paths require a fresh authenticated reachability probe.
-                // An actually used configured primary needs no extra probe when it
-                // is the only endpoint; a recent failure disqualifies either path.
-                let usable = if address == routes.primary {
-                    sample.measured.is_some() || sample.expires <= now
-                } else {
-                    sample.measured.is_some() && sample.expires > now
-                };
-                if !usable {
-                    return None;
-                }
-                sample.rates[transfer.index()]
-                    .filter(|rate| rate.expires > now)
-                    .and_then(|rate| {
-                        Some(CachePathRate {
-                            path: rate.path?,
-                            bytes_per_second: rate.bytes_per_second,
-                        })
-                    })
+                })?
+                .rates[transfer.index()]
+            .filter(|rate| rate.expires > now)?;
+            Some(CachePathRate {
+                path: rate.path?,
+                bytes_per_second: rate.bytes_per_second,
             })
-            .max_by_key(|rate| rate.bytes_per_second)
+        });
+        drop(samples);
+        best
+    }
+
+    pub(super) fn local_source(&self, peer: PeerId, role: Role, address: Route) -> Option<IpAddr> {
+        address.source.or_else(|| {
+            self.samples
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&Key {
+                    peer,
+                    role,
+                    address,
+                })
+                .and_then(|sample| sample.rates[Transfer::Upload(0).index()])
+                .and_then(|rate| rate.local)
+        })
     }
 
     /// Rank by authenticated RTT for control messages, or estimated
@@ -389,7 +497,7 @@ impl RouteBook {
         role: Role,
         routes: &RouteSet,
         transfer: Option<Transfer>,
-    ) -> Vec<SocketAddr> {
+    ) -> Vec<Route> {
         let explore = transfer.is_some_and(|transfer| transfer.bytes() >= MIN_SAMPLE_BYTES)
             && self
                 .transfers
@@ -400,8 +508,8 @@ impl RouteBook {
             .into_iter()
             .map(|(_, _, _, address)| address)
             .collect::<Vec<_>>();
-        if !result.contains(&routes.primary) {
-            result.push(routes.primary);
+        if !result.contains(&Route::unbound(routes.primary)) {
+            result.push(Route::unbound(routes.primary));
         }
         result
     }
@@ -426,8 +534,10 @@ impl RouteBook {
         routes: &RouteSet,
         transfer: Option<Transfer>,
         explore: bool,
-    ) -> Vec<(bool, u128, bool, SocketAddr)> {
+    ) -> Vec<(bool, u128, bool, Route)> {
         let now = Instant::now();
+        let interfaces = interface::snapshot();
+        let candidates = candidates(routes);
         let samples = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
         let rate = |address| {
             transfer.and_then(|transfer| {
@@ -447,35 +557,54 @@ impl RouteBook {
                     .map(|rate| rate.bytes_per_second)
             })
         };
-        let baseline = routes.iter().filter_map(rate).max().unwrap_or(DEFAULT_RATE);
-        let mut ranked = routes
+        let baseline = candidates
             .iter()
+            .copied()
+            .filter_map(rate)
+            .max()
+            .unwrap_or(DEFAULT_RATE);
+        let mut ranked = candidates
+            .into_iter()
             .filter_map(|address| {
                 let sample = samples.get(&Key {
                     peer,
                     role,
                     address,
                 })?;
-                let rtt = (sample.expires > now)
+                let rtt = (sample.expires > now
+                    || (sample.pending_until > now
+                        && now.saturating_duration_since(sample.expires) < FAILURE_TTL))
                     .then_some(sample.measured)
                     .flatten()?;
                 let known = rate(address);
                 let cost = rtt.as_nanos()
                     + transfer.map_or(0, |transfer| {
-                        (u128::from(transfer.bytes()) * 1_000_000_000).div_ceil(u128::from(
-                            known.unwrap_or_else(|| {
-                                if address.ip().is_loopback() {
-                                    baseline.max(256 << 20)
-                                } else {
-                                    baseline
-                                }
-                            }),
-                        ))
+                        let rate = known.unwrap_or_else(|| {
+                            if address.address.ip().is_loopback() {
+                                baseline.max(256 << 20)
+                            } else {
+                                baseline
+                            }
+                        });
+                        let nominal = (u128::from(transfer.bytes()) * 1_000_000_000)
+                            .div_ceil(u128::from(rate));
+                        let local = address.source.or_else(|| {
+                            sample.rates[transfer.index()]
+                                .filter(|rate| rate.expires > now)
+                                .and_then(|rate| rate.local)
+                                .or(sample.local)
+                        });
+                        let clean_wire = sample.rates[transfer.index()]
+                            .filter(|rate| {
+                                rate.expires > now && rate.quality == interface::Quality::Clean
+                            })
+                            .map(|rate| rate.bytes_per_second);
+                        interfaces.cost(local, transfer, clean_wire, nominal)
                     });
                 Some((
                     !explore || known.is_some(),
                     cost,
-                    address != routes.primary,
+                    address.source.is_none(),
                     address,
                 ))
             })
@@ -509,7 +638,8 @@ pub struct MeasuredReader<R> {
     bytes: u64,
     start: Instant,
     finished: bool,
-    path: Option<NetworkPath>,
+    connection: ConnectionPath,
+    interface: Option<interface::Activity>,
 }
 
 impl<R> MeasuredReader<R> {
@@ -518,9 +648,9 @@ impl<R> MeasuredReader<R> {
         book: Arc<RouteBook>,
         peer: PeerId,
         role: Role,
-        address: SocketAddr,
+        address: Route,
         length: Option<u64>,
-        path: Option<NetworkPath>,
+        connection: ConnectionPath,
     ) -> Self {
         Self {
             reader,
@@ -534,13 +664,20 @@ impl<R> MeasuredReader<R> {
             bytes: 0,
             start: Instant::now(),
             finished: false,
-            path,
+            connection,
+            interface: interface::activity(
+                connection.local,
+                Transfer::Download(length.unwrap_or(0)),
+            ),
         }
     }
 
     #[cfg(all(target_os = "linux", feature = "native-store"))]
-    pub const fn path(&self) -> Option<NetworkPath> {
-        self.path
+    pub fn connection_evidence(&self) -> (ConnectionPath, Option<interface::Evidence>) {
+        (
+            self.connection,
+            self.interface.as_ref().map(interface::Activity::evidence),
+        )
     }
 
     pub const fn content_length(&self) -> Option<u64> {
@@ -566,18 +703,26 @@ impl<R: Read> Read for MeasuredReader<R> {
                 .observe(self.key.peer, self.key.role, self.key.address, None);
         }
         self.bytes = self.bytes.saturating_add(count as u64);
+        if let Some(activity) = &mut self.interface {
+            activity.bytes(count as u64);
+        }
         if !self.finished
             && (self.length == Some(self.bytes)
                 || (self.length.is_none() && count == 0 && !buffer.is_empty()))
         {
             self.finished = true;
+            if let Some(activity) = self.interface.take() {
+                let evidence = activity.evidence();
+                drop(activity);
+                self.connection.quality = evidence.quality();
+            }
             self.book.transferred(
                 self.key.peer,
                 self.key.role,
                 self.key.address,
                 Transfer::Download(self.bytes),
                 self.start.elapsed(),
-                self.path,
+                self.connection,
             );
         }
         Ok(count)
@@ -632,64 +777,115 @@ pub fn discover(primary: SocketAddr, bind: SocketAddr) -> RouteSet {
 mod tests {
     use super::*;
     #[test]
+    fn busy_samples_do_not_replace_clean_rate_or_extend_its_lifetime() {
+        let now = Instant::now();
+        let clean = ConnectionPath {
+            quality: interface::Quality::Clean,
+            ..ConnectionPath::default()
+        };
+        let busy = ConnectionPath {
+            quality: interface::Quality::Busy,
+            ..clean
+        };
+        let fast = updated_rate(None, clean, 100 << 20, now);
+        let later = now + Duration::from_secs(1);
+        let observed = updated_rate(Some(fast), busy, 5 << 20, later);
+        assert_eq!(observed.bytes_per_second, fast.bytes_per_second);
+        assert_eq!(observed.expires, fast.expires);
+        let expired = updated_rate(Some(fast), busy, 5 << 20, fast.expires);
+        assert_eq!(expired.bytes_per_second, 5 << 20);
+        let recovered = updated_rate(Some(expired), clean, 100 << 20, fast.expires);
+        assert_eq!(recovered.bytes_per_second, 100 << 20);
+    }
+
+    #[test]
     fn route_selection_is_identity_bound_and_retains_fallback() -> anyhow::Result<()> {
-        let primary = "100.64.0.1:10501".parse()?;
-        let lan = "192.168.0.1:10501".parse()?;
+        let primary = "192.0.2.1:10501".parse()?;
+        let lan = "198.51.100.1:10501".parse()?;
         let routes = RouteSet::new(primary, [lan, lan, "0.0.0.0:10501".parse()?]);
         assert!(routes.valid());
         let peer = PeerId::from_digest([1; 32]);
         let other = PeerId::from_digest([2; 32]);
         let book = RouteBook::default();
-        assert_eq!(book.ordered(peer, Role::Worker, &routes, None), [primary]);
+        assert_eq!(
+            book.ordered(peer, Role::Worker, &routes, None),
+            [Route::unbound(primary)]
+        );
         assert_eq!(
             book.reserve(peer, Role::Worker, &routes)
                 .iter()
                 .map(|probe| probe.address)
                 .collect::<Vec<_>>(),
-            [primary, lan]
+            [Route::unbound(primary), Route::unbound(lan)]
         );
         assert!(book.reserve(peer, Role::Worker, &routes).is_empty());
-        book.observe(peer, Role::Worker, primary, Some(Duration::from_millis(20)));
-        book.observe(peer, Role::Worker, lan, Some(Duration::from_millis(2)));
+        book.observe(
+            peer,
+            Role::Worker,
+            Route::unbound(primary),
+            Some(Duration::from_millis(20)),
+        );
+        book.observe(
+            peer,
+            Role::Worker,
+            Route::unbound(lan),
+            Some(Duration::from_millis(2)),
+        );
         assert_eq!(
             book.ordered(peer, Role::Worker, &routes, None),
-            [lan, primary]
+            [Route::unbound(lan), Route::unbound(primary)]
         );
-        assert_eq!(book.ordered(other, Role::Worker, &routes, None), [primary]);
-        book.observe(peer, Role::Worker, lan, None);
-        assert_eq!(book.ordered(peer, Role::Worker, &routes, None), [primary]);
+        assert_eq!(
+            book.ordered(other, Role::Worker, &routes, None),
+            [Route::unbound(primary)]
+        );
+        book.observe(peer, Role::Worker, Route::unbound(lan), None);
+        assert_eq!(
+            book.ordered(peer, Role::Worker, &routes, None),
+            [Route::unbound(primary)]
+        );
         Ok(())
     }
     #[test]
     fn route_selection_distinguishes_latency_and_direction() -> anyhow::Result<()> {
-        let primary = "100.64.0.1:10501".parse()?;
-        let lan = "192.168.0.1:10501".parse()?;
+        let primary = "192.0.2.1:10501".parse()?;
+        let lan = "198.51.100.1:10501".parse()?;
         let routes = RouteSet::new(primary, [lan]);
         let peer = PeerId::from_digest([1; 32]);
         let book = RouteBook::default();
-        book.observe(peer, Role::Worker, primary, Some(Duration::from_millis(1)));
-        book.observe(peer, Role::Worker, lan, Some(Duration::from_millis(10)));
+        book.observe(
+            peer,
+            Role::Worker,
+            Route::unbound(primary),
+            Some(Duration::from_millis(1)),
+        );
+        book.observe(
+            peer,
+            Role::Worker,
+            Route::unbound(lan),
+            Some(Duration::from_millis(10)),
+        );
         for (address, upload, download) in [(primary, 2, 100), (lan, 100, 2)] {
             book.transferred(
                 peer,
                 Role::Worker,
-                address,
+                Route::unbound(address),
                 Transfer::Upload(upload << 20),
                 Duration::from_secs(1),
-                None,
+                ConnectionPath::reported(None),
             );
             book.transferred(
                 peer,
                 Role::Worker,
-                address,
+                Route::unbound(address),
                 Transfer::Download(download << 20),
                 Duration::from_secs(1),
-                None,
+                ConnectionPath::reported(None),
             );
         }
         assert_eq!(
             book.ordered(peer, Role::Worker, &routes, None),
-            [primary, lan]
+            [Route::unbound(primary), Route::unbound(lan)]
         );
         assert_eq!(
             book.ordered(
@@ -698,7 +894,7 @@ mod tests {
                 &routes,
                 Some(Transfer::Upload(100 << 20))
             ),
-            [lan, primary]
+            [Route::unbound(lan), Route::unbound(primary)]
         );
         assert_eq!(
             book.ordered(
@@ -707,33 +903,33 @@ mod tests {
                 &routes,
                 Some(Transfer::Download(100 << 20))
             ),
-            [primary, lan]
+            [Route::unbound(primary), Route::unbound(lan)]
         );
         Ok(())
     }
     #[test]
     fn changed_source_does_not_reuse_rate_or_invalidate_other_pool() -> anyhow::Result<()> {
-        let primary = "100.64.0.1:10501".parse()?;
+        let primary = "192.0.2.1:10501".parse()?;
         let peer = PeerId::from_digest([1; 32]);
         let routes = RouteSet::new(primary, []);
         let book = RouteBook::default();
-        let first = "100.64.0.1,100.64.0.2".parse()?;
-        let second = "100.64.0.1,100.64.0.3".parse()?;
+        let first = "192.0.2.1,192.0.2.2".parse()?;
+        let second = "192.0.2.1,192.0.2.3".parse()?;
         book.observe_path(
             peer,
             Role::Scheduler,
-            primary,
+            Route::unbound(primary),
             Some(Duration::from_millis(1)),
-            Some(first),
+            ConnectionPath::reported(Some(first)),
         );
         for transfer in [Transfer::Upload(32 << 20), Transfer::Download(32 << 20)] {
             book.transferred(
                 peer,
                 Role::Scheduler,
-                primary,
+                Route::unbound(primary),
                 transfer,
                 Duration::from_secs(1),
-                Some(first),
+                ConnectionPath::reported(Some(first)),
             );
         }
         assert_eq!(
@@ -744,9 +940,9 @@ mod tests {
         book.observe_path(
             peer,
             Role::Scheduler,
-            primary,
+            Route::unbound(primary),
             Some(Duration::from_millis(1)),
-            Some(second),
+            ConnectionPath::reported(Some(second)),
         );
         assert!(
             book.best_rate(peer, Role::Scheduler, &routes, Transfer::Download(0))
@@ -762,10 +958,10 @@ mod tests {
         book.transferred(
             peer,
             Role::Scheduler,
-            primary,
+            Route::unbound(primary),
             Transfer::Upload(4 << 20),
             Duration::from_secs(1),
-            Some(second),
+            ConnectionPath::reported(Some(second)),
         );
         assert_eq!(
             book.best_rate(peer, Role::Scheduler, &routes, Transfer::Upload(0)),
@@ -786,20 +982,26 @@ mod tests {
         book.observe_path(
             peer,
             Role::Worker,
-            endpoint,
+            Route::unbound(endpoint),
             Some(Duration::from_millis(2)),
-            Some(path),
+            ConnectionPath::reported(Some(path)),
         );
         book.transferred(
             peer,
             Role::Worker,
-            endpoint,
+            Route::unbound(endpoint),
             Transfer::Download(4 << 20),
             Duration::from_secs(1),
-            Some(path),
+            ConnectionPath::reported(Some(path)),
         );
         assert!(book.peer_download_rates().is_empty());
-        book.verified_download(peer, endpoint, path, 8 << 20, Duration::from_secs(1));
+        book.verified_download(
+            peer,
+            Route::unbound(endpoint),
+            ConnectionPath::reported(Some(path)),
+            8 << 20,
+            Duration::from_secs(1),
+        );
         assert_eq!(
             book.peer_download_rates(),
             [PeerDownloadRate {
@@ -811,9 +1013,9 @@ mod tests {
         book.observe_path(
             peer,
             Role::Worker,
-            endpoint,
+            Route::unbound(endpoint),
             Some(Duration::from_millis(2)),
-            Some("192.168.76.1,192.168.76.3".parse()?),
+            ConnectionPath::reported(Some("192.168.76.1,192.168.76.3".parse()?)),
         );
         assert!(book.peer_download_rates().is_empty());
         Ok(())

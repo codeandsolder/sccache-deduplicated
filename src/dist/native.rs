@@ -194,7 +194,7 @@ impl NativeCacheClient {
             let (client, base) = self.routes.endpoint(
                 self.peer.scheduler_id(),
                 Role::Scheduler,
-                self.peer.scheduler_address(),
+                crate::dist::cluster_routes::Route::unbound(self.peer.scheduler_address()),
             )?;
             let response = client
                 .get(base.join("/api/v1/scheduler/native_routes")?)
@@ -272,7 +272,7 @@ impl NativeCacheClient {
     fn request_at(
         &self,
         operation: &str,
-        address: std::net::SocketAddr,
+        address: crate::dist::cluster_routes::Route,
     ) -> Result<reqwest::blocking::RequestBuilder> {
         let (path, job) = self.operation_path(operation);
         let (http, base) = self.routes.endpoint(
@@ -291,7 +291,10 @@ impl NativeCacheClient {
         Ok(request)
     }
 
-    fn cache_endpoints(&self, transfer: Option<Transfer>) -> Vec<std::net::SocketAddr> {
+    fn cache_endpoints(
+        &self,
+        transfer: Option<Transfer>,
+    ) -> Vec<crate::dist::cluster_routes::Route> {
         let routes = self.cache_routes();
         let peer = self.peer.scheduler_id();
         let role = sccache_cluster_identity::Role::Scheduler;
@@ -307,7 +310,10 @@ impl NativeCacheClient {
         body: Vec<u8>,
         timeout: Duration,
         transfer: Option<Transfer>,
-    ) -> Result<(reqwest::blocking::Response, std::net::SocketAddr)> {
+    ) -> Result<(
+        reqwest::blocking::Response,
+        crate::dist::cluster_routes::Route,
+    )> {
         let start = Instant::now();
         let mut last_error = None;
         let body = bytes::Bytes::from(body);
@@ -1067,14 +1073,20 @@ impl NativeCacheClient {
                 request = request.header("X-Sccache-Native-Job", job.to_string());
             }
             let started = Instant::now();
-            let attempt = upload::send(
-                request,
-                length,
-                self.metadata_limit,
+            let local = self.routes.local_source(peer, role, address);
+            let tracked = crate::dist::cluster_routes::interface::TrackedReader::new(
                 Cursor::new(&header).chain(&mut reader),
-            )?;
+                local,
+                Transfer::Upload(length),
+            );
+            let evidence = tracked.evidence();
+            let attempt = upload::send(request, length, self.metadata_limit, tracked)?;
             match attempt.result {
-                Ok(response) => {
+                Ok(mut response) => {
+                    if response.path.local == local {
+                        response.path.quality =
+                            evidence.map_or(response.path.quality, |sample| sample.quality());
+                    }
                     // An already-provisioned package can return before reading
                     // the entire archive; it supplies no full-body rate sample.
                     if attempt.consumed == length {

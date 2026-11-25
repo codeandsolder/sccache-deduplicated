@@ -23,7 +23,10 @@ use sccache_cluster_identity::{
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_util::io::{StreamReader, SyncIoBridge};
 
-use crate::errors::{Context, Result};
+use crate::{
+    dist::cluster_routes::{Transfer, interface::TrackedReader},
+    errors::{Context, Result},
+};
 
 /// The single request abstraction used by all synchronous dist handlers.
 pub(super) struct Request {
@@ -54,6 +57,14 @@ impl Request {
             }
         });
         let reader = SyncIoBridge::new(StreamReader::new(Box::pin(stream)));
+        let length = parts
+            .headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let reader =
+            TrackedReader::new(reader, Some(peer.path().local), Transfer::Download(length));
         Self {
             parts,
             id: peer.id(),
@@ -149,7 +160,16 @@ async fn dispatch(
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let response = handler(&request);
-        let (mut reader, length) = response.data.into_reader_and_size();
+        let (reader, length) = response.data.into_reader_and_size();
+        let mut reader = TrackedReader::new(
+            reader,
+            Some(request.path().local),
+            Transfer::Upload(
+                length
+                    .and_then(|length| u64::try_from(length).ok())
+                    .unwrap_or(0),
+            ),
+        );
         let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(2);
         let stream = stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|chunk| {
