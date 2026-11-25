@@ -93,7 +93,8 @@ impl ActionRequest {
     /// Verify a successful result's outputs against the original declaration.
     ///
     /// # Errors
-    /// Returns an error for missing required outputs or unexpected artifacts.
+    /// Returns an error for missing required outputs, unexpected artifacts, invalid metadata,
+    /// or conflicting content lengths anywhere in the result.
     pub fn validate_result(&self, result: &ResultManifest) -> Result<()> {
         ensure!(
             self.required_outputs
@@ -110,8 +111,8 @@ impl ActionRequest {
                 expected == Some(&artifact.kind()),
                 "unexpected output name or kind"
             );
-            artifact.validate()?;
         }
+        result.blobs()?;
         Ok(())
     }
 }

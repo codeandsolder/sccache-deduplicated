@@ -1177,6 +1177,28 @@ mod result_tests {
         .install()?;
         assert_eq!(downloads, 1);
         assert_eq!(fs::read(&output)?, b"final");
+        // An unselected tree can be internally valid while contradicting
+        // the length of a digest in a selected file.
+        let mut inconsistent = manifest.clone();
+        let Some(Artifact::Tree(tree)) = inconsistent.outputs.get_mut("intermediate") else {
+            anyhow::bail!("missing intermediate tree");
+        };
+        tree.entries.insert(
+            TreePath::new(b"conflict".to_vec())?,
+            crate::build_runtime::TreeEntry::File {
+                blob: BlobRef {
+                    id: ContentId::of(b"final"),
+                    size: 6,
+                },
+                metadata: metadata(0o644),
+            },
+        );
+        assert!(
+            inconsistent
+                .selected_blobs(&BTreeSet::from(["final".to_owned()]))
+                .is_ok()
+        );
+        assert!(validate_manifest(&spec, &inconsistent, 1024).is_err());
         manifest.outputs.remove("intermediate");
         assert!(
             fetch_result(&spec, &manifest, &selected, &inputs, 1024, |_, _| {
