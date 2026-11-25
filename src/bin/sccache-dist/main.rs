@@ -488,6 +488,7 @@ fn run(command: Command) -> Result<i32> {
                 "cluster directory must be absolute"
             );
             std::fs::create_dir_all(&directory)?;
+            let _registry = sccache_cluster_identity::scheduler_registry(&directory)?;
             let ca = sccache_cluster_identity::ClusterCa::open(&directory.join("ca-key.pem"))?;
             let identity = sccache_cluster_identity::Identity::open(&directory.join("key.pem"))?;
             sccache_cluster_identity::publish_trust_anchor(

@@ -327,7 +327,7 @@ mod tests {
     async fn server(directory: &std::path::Path, data_only: bool) -> Result<Server> {
         let authority = EnrollmentAuthority::new(
             ClusterCa::open(&directory.join("ca.pem"))?,
-            Registry::open(&directory.join("registry.bin"))?,
+            Registry::initialize(&directory.join("registry.bin"))?,
             7,
         )?;
         let scheduler = Identity::open(&directory.join("scheduler.pem"))?;
@@ -566,7 +566,7 @@ mod worker_tests {
         let directory = tempfile::tempdir()?;
         let authority = EnrollmentAuthority::new(
             ClusterCa::open(&directory.path().join("ca.pem"))?,
-            Registry::open(&directory.path().join("registry.bin"))?,
+            Registry::initialize(&directory.path().join("registry.bin"))?,
             7,
         )?;
         let ca = authority.certificate().clone();

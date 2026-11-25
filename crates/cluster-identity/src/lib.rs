@@ -253,6 +253,25 @@ pub use enrollment::{EnrollmentAuthority, EnrollmentRequest, EnrollmentResponse}
 mod registry;
 pub use registry::Registry;
 
+/// Open a scheduler's durable authorization store before loading its CA.
+/// A new directory may be initialized; an established cluster may not lose
+/// its enrollment registry or replace its CA silently.
+///
+/// # Errors
+/// Returns an error if established cluster state is missing or corrupt.
+pub fn scheduler_registry(directory: &Path) -> Result<Registry> {
+    let registry = directory.join("registry.bin");
+    let ca = directory.join("ca-key.pem");
+    let anchor = directory.join("ca.pem");
+    let identity = directory.join("key.pem");
+    if ca.try_exists()? || anchor.try_exists()? || identity.try_exists()? {
+        ensure!(ca.try_exists()?, "established cluster CA missing");
+        Registry::open(&registry).context("established cluster enrollment registry unavailable")
+    } else {
+        Registry::initialize(&registry)
+    }
+}
+
 mod http;
 pub use http::{
     AuthenticatedPeer, ClusterBody, ClusterHttpClient, ClusterListener, EnrollmentClient,

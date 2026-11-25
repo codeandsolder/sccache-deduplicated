@@ -249,6 +249,9 @@ impl Fleet {
         let worker_directory = root.join("worker-store");
         let cluster_directory = root.join("cluster");
         fs::create_dir_all(&cluster_directory)?;
+        drop(sccache_cluster_identity::scheduler_registry(
+            &cluster_directory,
+        )?);
         let ca = sccache_cluster_identity::ClusterCa::open(&cluster_directory.join("ca-key.pem"))?;
         let scheduler_id =
             sccache_cluster_identity::Identity::open(&cluster_directory.join("key.pem"))?.id()?;

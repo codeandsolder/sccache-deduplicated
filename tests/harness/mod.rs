@@ -394,6 +394,7 @@ impl DistSystem {
         fs::create_dir(&tmpdir).unwrap();
         let cluster = tmpdir.join("cluster");
         fs::create_dir_all(&cluster).unwrap();
+        drop(sccache_cluster_identity::scheduler_registry(&cluster).unwrap());
         let ca = sccache_cluster_identity::ClusterCa::open(&cluster.join("ca-key.pem")).unwrap();
         sccache_cluster_identity::Identity::open(&cluster.join("key.pem")).unwrap();
         sccache_cluster_identity::publish_trust_anchor(ca.certificate(), &cluster.join("ca.pem"))

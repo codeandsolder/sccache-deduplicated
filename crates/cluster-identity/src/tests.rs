@@ -253,7 +253,7 @@ fn first_enrollment_and_renewal_bind_roles_and_keys() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let authority = EnrollmentAuthority::new(
         ClusterCa::open(&directory.path().join("ca.pem"))?,
-        Registry::open(&directory.path().join("registry.bin"))?,
+        Registry::initialize(&directory.path().join("registry.bin"))?,
         7,
     )?;
     let worker = identity(&directory, "worker")?;
@@ -290,7 +290,9 @@ fn registry_persists_role_and_revocation_and_excludes_other_writers() -> Result<
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("registry.bin");
     let peer = identity(&directory, "worker")?.id()?;
-    let registry = Registry::open(&path)?;
+    assert!(Registry::open(&path).is_err());
+    let registry = Registry::initialize(&path)?;
+    assert!(path.is_file());
     assert!(Registry::open(&path).is_err());
     registry.register(peer, Role::Worker)?;
     registry.register(peer, Role::Worker)?;
@@ -348,5 +350,19 @@ fn public_anchor_preserves_existing_trust_and_permissions() -> Result<()> {
         X509::from_pem(&std::fs::read(&anchor)?)?.to_der()?,
         ca.certificate().to_der()?
     );
+    Ok(())
+}
+
+#[test]
+fn established_cluster_cannot_recreate_lost_registry() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let registry = scheduler_registry(directory.path())?;
+    let ca = ClusterCa::open(&directory.path().join("ca-key.pem"))?;
+    publish_trust_anchor(ca.certificate(), &directory.path().join("ca.pem"))?;
+    drop(registry);
+    drop(scheduler_registry(directory.path())?);
+    fs::remove_file(directory.path().join("registry.bin"))?;
+    assert!(scheduler_registry(directory.path()).is_err());
+    assert!(!directory.path().join("registry.bin").exists());
     Ok(())
 }

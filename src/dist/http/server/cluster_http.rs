@@ -7,7 +7,7 @@ use std::{
     io::{self, Read},
     net::{SocketAddr, TcpListener},
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -239,20 +239,23 @@ async fn dispatch(
 /// Until the initial authenticated snapshot arrives, no remote member except
 /// the scheduler may access a worker. Revocations are permanent and monotonic.
 #[derive(Default)]
-pub(super) struct Revocations(RwLock<Option<BTreeSet<PeerId>>>);
+pub(super) struct Revocations(RwLock<Option<(Instant, BTreeSet<PeerId>)>>);
 
 impl Revocations {
     pub(super) fn update(&self, revoked: Vec<PeerId>) {
         if let Ok(mut current) = self.0.write() {
-            current.get_or_insert_with(BTreeSet::new).extend(revoked);
+            let (updated, entries) =
+                current.get_or_insert_with(|| (Instant::now(), BTreeSet::new()));
+            *updated = Instant::now();
+            entries.extend(revoked);
         }
     }
 
     fn permits(&self, peer: PeerId) -> bool {
         self.0.read().is_ok_and(|current| {
-            current
-                .as_ref()
-                .is_some_and(|revoked| !revoked.contains(&peer))
+            current.as_ref().is_some_and(|(updated, revoked)| {
+                updated.elapsed() < super::HEARTBEAT_TIMEOUT && !revoked.contains(&peer)
+            })
         })
     }
 }
@@ -454,5 +457,28 @@ mod dual_stack_tests {
         assert!(listener.local_addr()?.is_ipv4());
         assert!(listener.local_addr()?.ip().is_loopback());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod revocation_tests {
+    use super::*;
+
+    #[test]
+    fn stale_snapshots_fail_closed_and_revocations_are_monotonic() {
+        let state = Revocations::default();
+        let a = PeerId::from_digest([1; 32]);
+        let b = PeerId::from_digest([2; 32]);
+        assert!(!state.permits(a));
+        state.update(vec![b]);
+        assert!(state.permits(a));
+        assert!(!state.permits(b));
+        if let Some((updated, _)) = state.0.write().unwrap().as_mut() {
+            *updated -= super::super::HEARTBEAT_TIMEOUT;
+        }
+        assert!(!state.permits(a));
+        state.update(Vec::new());
+        assert!(state.permits(a));
+        assert!(!state.permits(b));
     }
 }

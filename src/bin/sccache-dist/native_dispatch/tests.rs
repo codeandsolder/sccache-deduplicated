@@ -130,7 +130,7 @@ fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Res
     std::fs::create_dir_all(&cluster)?;
     let authority = EnrollmentAuthority::new(
         ClusterCa::open(&cluster.join("ca-key.pem"))?,
-        Registry::open(&cluster.join("registry.bin"))?,
+        Registry::initialize(&cluster.join("registry.bin"))?,
         7,
     )?;
     let identity = Identity::open(&cluster.join("key.pem"))?;

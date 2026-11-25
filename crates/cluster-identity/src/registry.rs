@@ -58,11 +58,24 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Open durable enrollment records; never recover corrupt data as empty.
+    /// Initialize a new durable empty registry before creating a cluster CA.
+    /// Never call this to recover an established cluster.
+    ///
+    /// # Errors
+    /// Returns an error if the records cannot be initialized or opened.
+    pub fn initialize(path: &Path) -> Result<Self> {
+        Self::open_inner(path, true)
+    }
+
+    /// Open durable enrollment records; never recover missing or corrupt data as empty.
     ///
     /// # Errors
     /// Returns an error for unreadable or invalid persisted records.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_inner(path, false)
+    }
+
+    fn open_inner(path: &Path, initialize: bool) -> Result<Self> {
         let mut lock_path = path.as_os_str().to_owned();
         lock_path.push(".lock");
         let lock = fs::OpenOptions::new()
@@ -87,7 +100,11 @@ impl Registry {
                 );
                 codec().deserialize(&bytes)?
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Records::new(),
+            Err(error) if initialize && error.kind() == std::io::ErrorKind::NotFound => {
+                let mut records = Records::new();
+                publish(path, &mut records, Records::new())?;
+                records
+            }
             Err(error) => return Err(error.into()),
         };
         Ok(Self {

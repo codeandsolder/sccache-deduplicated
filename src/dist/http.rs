@@ -279,7 +279,7 @@ mod server {
     use byteorder::{BigEndian, ReadBytesExt};
     use rouille::accept;
     use sccache_cluster_identity::{
-        ClusterCa, ClusterListener, EnrollmentAuthority, Identity, PeerCredentials, Registry, Role,
+        ClusterCa, ClusterListener, EnrollmentAuthority, Identity, PeerCredentials, Role,
         SchedulerEnrollment, TlsCredentials,
     };
     use serde::{Deserialize, Serialize};
@@ -1069,9 +1069,10 @@ mod server {
                 "scheduler cluster directory must be absolute"
             );
             std::fs::create_dir_all(&cluster_directory)?;
+            let registry = sccache_cluster_identity::scheduler_registry(&cluster_directory)?;
             let authority = EnrollmentAuthority::new(
                 ClusterCa::open(&cluster_directory.join("ca-key.pem"))?,
-                Registry::open(&cluster_directory.join("registry.bin"))?,
+                registry,
                 7,
             )?;
             let scheduler_key = cluster_directory.join("key.pem");
