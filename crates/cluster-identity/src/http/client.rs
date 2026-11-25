@@ -1,9 +1,6 @@
 //! Enrollment client that authenticates the scheduler before sending a token.
 
-use std::{
-    net::{IpAddr, SocketAddr},
-    sync::Arc,
-};
+use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{Result, ensure};
 use bincode::Options;
@@ -88,7 +85,7 @@ impl ClusterHttpClient {
             .tls_min_version(TlsVersion::TLS_1_3)
             .tls_max_version(TlsVersion::TLS_1_3)
             .http1_only()
-            .resolve(&name, address)
+            .resolve(name.clone(), address)
             .no_proxy()
             .pool_max_idle_per_host(2)
             .pool_idle_timeout(std::time::Duration::from_secs(20))
@@ -112,7 +109,7 @@ impl ClusterHttpClient {
             builder = builder.local_address(ip);
             #[cfg(target_os = "linux")]
             if let Some(device) = device {
-                builder = builder.interface(device);
+                builder = builder.interface(device.to_owned());
             }
             #[cfg(not(target_os = "linux"))]
             let _ = device;
