@@ -617,6 +617,8 @@ bind_address = "127.0.0.1:10604"
 assets = "/opt/sccache/dashboard/pkg"
 # Optional Prometheus-compatible data source, e.g. Liberta:
 # metrics_url = "http://127.0.0.1:8428"
+# Exact Certifex virtual host for the ingress panels:
+# metrics_ingress_host = "sccache.example.org"
 ```
 
 The dashboard is read-only and loopback-only. Access it locally or through an
@@ -637,9 +639,13 @@ produce a fresh reset; revision gaps cannot be silently ignored.
 
 The UI includes worker heartbeat age, capacity, errors, reservations and
 native phases, job state, input backlog and assignment-time predictions,
-CAS logical accounting, garbage collection and directional network estimates.
-All scheduler-owned active jobs are available through a searchable, paginated
-table. No thousand-job truncation. Expired workers are excluded without
+CAS logical accounting, garbage collection and directional network estimates, including shared bottleneck and observed
+concurrent-capacity groups. CAS/network samples have their own cadence and
+are not recomputed in response to scheduler mutations.
+All scheduler-owned reservations, including assignment RPCs in flight, are
+available through a searchable, paginated table. Archive and native admission
+headroom are shown separately; they share compiler capacity and must not be added.
+No thousand-job truncation. Expired workers are excluded without
 mutating scheduling state. Native compiler slots are not legacy allocations;
 logical CAS bytes are not physical filesystem usage; measured transport
 goodput is not physical link capacity.
@@ -649,14 +655,29 @@ goodput is not physical link capacity.
 If configured, Liberta supplies the existing Grafana dashboard's 33 query
 panels. Select an exact client or all clients and a range from 15 minutes
 to seven days. Requests use fixed server-side PromQL templates; user labels
-are escaped as literal regular expressions. Host-wide and ingress panels
-retain their independent scope. Range-dependent resolution is 5–1800 seconds;
+are escaped as literal regular expressions. Linux host-wide panels include monitored Linux hosts rather than claiming all
+are workers. Ingress panels require an explicit Certifex virtual host. Range-dependent resolution is 5–1800 seconds;
 rates span at least five minutes.
 
 `GET /api/metrics/events` has one shared producer for each selected view.
 At most eight active distinct views and four concurrent queries globally
-bound backend load. Inactive views stop querying. Rolling time-grid changes
-and late corrections are delivered as point-level patches rather than
-repeated complete histories. Both streams expose errors and resynchronize
+bound backend load. Inactive views stop querying. Normal queries refresh the trailing five minutes or four buckets, whichever
+is longer; a full reconciliation runs every ten minutes or four buckets,
+whichever is longer. Failed panels retain previous samples inside the range
+and retry a full range at the next grid. Rolling changes and corrections are
+delivered as point-level patches. Stat, time-series, distribution gauge and
+version table presentation are preserved. Both streams expose errors and resynchronize
 after connection loss. Native telemetry works independently of Liberta.
 Liberta's existing retention and data producers are unchanged.
+
+### Portable release package
+
+The CI release workflow additionally publishes
+`sccache-scheduler-dashboard-linux-x86_64-v2.tar.gz` and its SHA-256 file.
+The archive contains the dashboard-enabled scheduler executable, matching
+`pkg/` assets, build revision/protocol metadata and internal SHA-256 checksums.
+It is built from the same revision as the ordinary fleet binaries and subject
+to the same native ABI checks. Worker/client bundles and the existing automatic
+fleet updater continue to use the ordinary binaries; installing the separate
+scheduler package and switching the scheduler service are explicit deployment
+operations, not an automatic protocol rollout.

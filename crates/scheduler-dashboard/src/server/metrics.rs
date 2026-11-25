@@ -19,7 +19,8 @@ use serde::Deserialize;
 use tokio::sync::{Semaphore, watch};
 
 use crate::{
-    MetricPanel, MetricSeries, MetricsData, MetricsEvent, MetricsView, make_metrics_patch,
+    MetricPanel, MetricSeries, MetricsData, MetricsEvent, MetricsView, PanelKind,
+    make_metrics_patch,
 };
 
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -29,6 +30,7 @@ const MAX_VIEWS: usize = 8;
 
 #[derive(Clone, Deserialize)]
 struct PanelDefinition {
+    kind: PanelKind,
     title: String,
     unit: String,
     queries: Vec<QueryDefinition>,
@@ -61,6 +63,7 @@ struct Source {
     base: reqwest::Url,
     client: reqwest::Client,
     definitions: Vec<PanelDefinition>,
+    ingress_host: Option<String>,
     queries: Semaphore,
 }
 
@@ -138,7 +141,17 @@ impl Drop for Lease {
 }
 
 impl MetricsService {
-    pub(super) fn new(url: Option<&str>) -> Result<Self> {
+    pub(super) fn new(url: Option<&str>, ingress_host: Option<&str>) -> Result<Self> {
+        ensure!(
+            ingress_host.is_none_or(|host| !host.is_empty()
+                && host.len() <= 253
+                && !host.chars().any(char::is_control)),
+            "invalid metrics ingress host"
+        );
+        ensure!(
+            url.is_some() || ingress_host.is_none(),
+            "metrics ingress host requires a metrics URL"
+        );
         let source = url
             .map(|url| -> Result<_> {
                 let mut base = reqwest::Url::parse(url)?;
@@ -162,6 +175,7 @@ impl MetricsService {
                         .no_proxy()
                         .build()?,
                     definitions: serde_json::from_str(include_str!("../panels.json"))?,
+                    ingress_host: ingress_host.map(str::to_owned),
                     queries: Semaphore::new(4),
                 }))
             })
@@ -255,6 +269,11 @@ fn series_label(labels: &BTreeMap<String, String>, legend: &str) -> String {
     }
 }
 
+fn quote_label(value: &str) -> String {
+    let quoted = serde_json::Value::String(value.to_owned()).to_string();
+    quoted[1..quoted.len() - 1].to_owned()
+}
+
 fn quote_client(client: &str) -> String {
     // Escape the regex metacharacters, then the PromQL quoted-string layer.
     // The template already contains the enclosing quotation marks.
@@ -268,21 +287,37 @@ fn quote_client(client: &str) -> String {
         }
         pattern.push(ch);
     }
-    let quoted = serde_json::Value::String(pattern).to_string();
-    quoted[1..quoted.len() - 1].to_owned()
+    quote_label(&pattern)
 }
 
-fn expression(definition: &QueryDefinition, view: &MetricsView) -> String {
-    // Range windows stay explicit; rates are at least 5 min and span several
-    // points at coarser resolutions. No raw query from browser input.
-    definition
-        .expr
-        .replace(
-            "$__rate_interval",
-            &format!("{}s", (view.range.step() * 4).max(300)),
-        )
-        .replace("$__range", &format!("{}s", view.range.seconds()))
-        .replace("$client", &quote_client(&view.client))
+fn expression(
+    definition: &QueryDefinition,
+    view: &MetricsView,
+    ingress_host: Option<&str>,
+) -> String {
+    let rate = format!("{}s", (view.range.step() * 4).max(300));
+    let range = format!("{}s", view.range.seconds());
+    let client = quote_client(&view.client);
+    let host = quote_label(ingress_host.unwrap_or_default());
+    let substitutions = [
+        ("$__rate_interval", rate.as_str()),
+        ("$__range", range.as_str()),
+        ("$ingress_host", host.as_str()),
+        ("$client", client.as_str()),
+    ];
+    let mut output = String::new();
+    let mut rest = definition.expr.as_str();
+    while let Some((position, token, value)) = substitutions
+        .iter()
+        .filter_map(|(token, value)| rest.find(token).map(|position| (position, *token, *value)))
+        .min_by_key(|(position, _, _)| *position)
+    {
+        output.push_str(&rest[..position]);
+        output.push_str(value);
+        rest = &rest[position + token.len()..];
+    }
+    output.push_str(rest);
+    output
 }
 
 async fn get_json<T: serde::de::DeserializeOwned>(source: &Source, url: reqwest::Url) -> Result<T> {
@@ -312,7 +347,10 @@ async fn query(
 ) -> Result<Vec<MetricSeries>> {
     let mut url = source.base.join("api/v1/query_range")?;
     url.query_pairs_mut()
-        .append_pair("query", &expression(definition, view))
+        .append_pair(
+            "query",
+            &expression(definition, view, source.ingress_host.as_deref()),
+        )
         .append_pair("start", &window.start.to_string())
         .append_pair("end", &window.end.to_string())
         .append_pair("step", &view.range.step().to_string());
@@ -413,11 +451,21 @@ async fn read_panel(
 ) -> MetricPanel {
     let mut panel = MetricPanel {
         key,
+        kind: definition.kind,
         title: definition.title,
         unit: definition.unit,
         series: Vec::new(),
         error: None,
     };
+    if source.ingress_host.is_none()
+        && definition
+            .queries
+            .iter()
+            .any(|query| query.expr.contains("$ingress_host"))
+    {
+        panel.error = Some("Scheduler ingress hostname not configured".into());
+        return panel;
+    }
     let mut previous_by_query: BTreeMap<usize, Vec<MetricSeries>> = BTreeMap::new();
     if let Some(previous) = previous {
         for series in previous.series {
@@ -646,8 +694,10 @@ mod tests {
         let decoded: String = serde_json::from_str(&quoted)?;
         assert!(decoded.contains("\\.\\*"));
         assert!(panels.iter().flat_map(|panel| &panel.queries).all(|query| {
-            let result = expression(query, &view);
-            !result.contains("$__") && !result.contains("$client")
+            let result = expression(query, &view, Some("scheduler.example.org"));
+            !result.contains("$__")
+                && !result.contains("$client")
+                && !result.contains("$ingress_host")
         }));
         Ok(())
     }

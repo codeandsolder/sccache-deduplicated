@@ -18,7 +18,9 @@ pub(super) fn snapshot(
         }
         Err(error) => {
             warn!("dashboard CAS stats unavailable: {error:#}");
-            snapshot.cache_error = Some("CAS statistics unavailable".into());
+            snapshot.cache_error = Some(
+                "CAS statistics unavailable; showing last successful sample if present".into(),
+            );
         }
     }
     let network = network.snapshot();

@@ -1,6 +1,7 @@
 [
   {
     "title": "Workers",
+    "kind": "stat",
     "unit": "short",
     "queries": [
       {
@@ -11,6 +12,7 @@
   },
   {
     "title": "Advertised CPUs",
+    "kind": "stat",
     "unit": "short",
     "queries": [
       {
@@ -21,6 +23,7 @@
   },
   {
     "title": "Jobs in progress",
+    "kind": "stat",
     "unit": "short",
     "queries": [
       {
@@ -31,6 +34,7 @@
   },
   {
     "title": "Cluster occupancy",
+    "kind": "stat",
     "unit": "percent",
     "queries": [
       {
@@ -41,6 +45,7 @@
   },
   {
     "title": "Connected monitored clients",
+    "kind": "stat",
     "unit": "short",
     "queries": [
       {
@@ -51,6 +56,7 @@
   },
   {
     "title": "Cache hit rate (rolling)",
+    "kind": "stat",
     "unit": "percent",
     "queries": [
       {
@@ -69,6 +75,7 @@
   },
   {
     "title": "Distributed share (range)",
+    "kind": "stat",
     "unit": "percent",
     "queries": [
       {
@@ -79,6 +86,7 @@
   },
   {
     "title": "Dist errors (1h)",
+    "kind": "stat",
     "unit": "short",
     "queries": [
       {
@@ -89,6 +97,7 @@
   },
   {
     "title": "Request throughput",
+    "kind": "timeseries",
     "unit": "ops",
     "queries": [
       {
@@ -103,6 +112,7 @@
   },
   {
     "title": "Cache requests",
+    "kind": "timeseries",
     "unit": "ops",
     "queries": [
       {
@@ -113,6 +123,7 @@
   },
   {
     "title": "Distributed compiles by worker",
+    "kind": "timeseries",
     "unit": "ops",
     "queries": [
       {
@@ -123,6 +134,7 @@
   },
   {
     "title": "Cache hit rate by language",
+    "kind": "timeseries",
     "unit": "percent",
     "queries": [
       {
@@ -133,6 +145,7 @@
   },
   {
     "title": "Non-cacheable reasons",
+    "kind": "timeseries",
     "unit": "ops",
     "queries": [
       {
@@ -147,6 +160,7 @@
   },
   {
     "title": "Request disposition",
+    "kind": "timeseries",
     "unit": "ops",
     "queries": [
       {
@@ -157,6 +171,7 @@
   },
   {
     "title": "Average compile time",
+    "kind": "timeseries",
     "unit": "s",
     "queries": [
       {
@@ -167,6 +182,7 @@
   },
   {
     "title": "Cache operation latency",
+    "kind": "timeseries",
     "unit": "s",
     "queries": [
       {
@@ -181,6 +197,7 @@
   },
   {
     "title": "L0 cache latency",
+    "kind": "timeseries",
     "unit": "s",
     "queries": [
       {
@@ -195,6 +212,7 @@
   },
   {
     "title": "Cache-level operations",
+    "kind": "timeseries",
     "unit": "ops",
     "queries": [
       {
@@ -205,6 +223,7 @@
   },
   {
     "title": "Cache errors / unusual events",
+    "kind": "timeseries",
     "unit": "ops",
     "queries": [
       {
@@ -215,6 +234,7 @@
   },
   {
     "title": "Compile & distributed failures",
+    "kind": "timeseries",
     "unit": "ops",
     "queries": [
       {
@@ -229,6 +249,7 @@
   },
   {
     "title": "Distributed compiles in selected range",
+    "kind": "bargauge",
     "unit": "short",
     "queries": [
       {
@@ -239,26 +260,29 @@
   },
   {
     "title": "Certifex scheduler ingress",
+    "kind": "timeseries",
     "unit": "reqps",
     "queries": [
       {
-        "expr": "sum by(status_class)(rate(certifex_proxy_requests_total{host=\"sccache.onhir.eu\",resolution=\"raw\"}[$__rate_interval]))",
+        "expr": "sum by(status_class)(rate(certifex_proxy_requests_total{host=\"$ingress_host\",resolution=\"raw\"}[$__rate_interval]))",
         "legend": "{{status_class}}"
       }
     ]
   },
   {
     "title": "Certifex backend failures",
+    "kind": "timeseries",
     "unit": "ops",
     "queries": [
       {
-        "expr": "sum(rate(certifex_backend_failures_total{host=\"sccache.onhir.eu\",resolution=\"raw\"}[$__rate_interval]))",
+        "expr": "sum(rate(certifex_backend_failures_total{host=\"$ingress_host\",resolution=\"raw\"}[$__rate_interval]))",
         "legend": "backend failures/s"
       }
     ]
   },
   {
     "title": "Metrics freshness",
+    "kind": "timeseries",
     "unit": "s",
     "queries": [
       {
@@ -269,6 +293,7 @@
   },
   {
     "title": "Preprocessor cache mode",
+    "kind": "stat",
     "unit": "bool",
     "queries": [
       {
@@ -279,6 +304,7 @@
   },
   {
     "title": "Cache levels",
+    "kind": "stat",
     "unit": "short",
     "queries": [
       {
@@ -289,6 +315,7 @@
   },
   {
     "title": "Basedirs",
+    "kind": "stat",
     "unit": "short",
     "queries": [
       {
@@ -299,6 +326,7 @@
   },
   {
     "title": "Versions",
+    "kind": "table",
     "unit": "",
     "queries": [
       {
@@ -308,7 +336,8 @@
     ]
   },
   {
-    "title": "Linux worker CPU busy",
+    "title": "Linux host CPU busy",
+    "kind": "timeseries",
     "unit": "percent",
     "queries": [
       {
@@ -318,7 +347,8 @@
     ]
   },
   {
-    "title": "Linux worker memory used",
+    "title": "Linux host memory used",
+    "kind": "timeseries",
     "unit": "percent",
     "queries": [
       {
@@ -328,7 +358,8 @@
     ]
   },
   {
-    "title": "Linux worker load",
+    "title": "Linux host load",
+    "kind": "timeseries",
     "unit": "short",
     "queries": [
       {
@@ -339,6 +370,7 @@
   },
   {
     "title": "Compiler/language cache hit rate",
+    "kind": "timeseries",
     "unit": "percent",
     "queries": [
       {
@@ -349,6 +381,7 @@
   },
   {
     "title": "Compiler/language cache requests",
+    "kind": "timeseries",
     "unit": "ops",
     "queries": [
       {

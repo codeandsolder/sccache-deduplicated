@@ -58,6 +58,7 @@ impl DashboardState {
                     if !history
                         && state.snapshot.as_ref() == Some(&snapshot)
                         && state.error.is_none()
+                        && telemetry.is_none()
                     {
                         return Ok(None);
                     }
@@ -114,6 +115,7 @@ pub fn spawn(
     address: SocketAddr,
     assets: &Path,
     metrics_url: Option<&str>,
+    metrics_ingress_host: Option<&str>,
     snapshot: impl Fn() -> Result<Snapshot> + Send + 'static,
     telemetry: impl Fn() -> Option<NativeTelemetry> + Send + 'static,
     wake: std::sync::mpsc::Receiver<()>,
@@ -136,7 +138,7 @@ pub fn spawn(
             "dashboard asset missing: {name}"
         );
     }
-    let metrics = metrics::MetricsService::new(metrics_url)?;
+    let metrics = metrics::MetricsService::new(metrics_url, metrics_ingress_host)?;
     let listener = TcpListener::bind(address).context("bind scheduler dashboard")?;
     let address = listener.local_addr()?;
     listener.set_nonblocking(true)?;
@@ -281,6 +283,46 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn transport_samples_are_independent_and_failed_cas_retains_previous_stats() -> Result<()> {
+        let state = DashboardState::default();
+        let cache = crate::Cache {
+            actions: 7,
+            results: 2,
+            trees: 3,
+            blobs: 4,
+            logical_bytes: 5,
+            pending_gc_blobs: 6,
+            pending_gc_bytes: 7,
+        };
+        state.publish(
+            Ok(Snapshot::default()),
+            true,
+            Some(NativeTelemetry {
+                cache: Some(cache.clone()),
+                ..Default::default()
+            }),
+        )?;
+        let previous = state.snapshot();
+        state.publish(Ok(Snapshot::default()), false, None)?;
+        assert_eq!(state.snapshot(), previous);
+        state.publish(
+            Err(anyhow::anyhow!("scheduler failed")),
+            true,
+            Some(NativeTelemetry {
+                cache_error: Some("CAS unavailable; showing last successful sample".into()),
+                ..Default::default()
+            }),
+        )?;
+        let snapshot = state.snapshot();
+        assert!(snapshot.error.is_some());
+        assert_eq!(snapshot.history.len(), 1);
+        let telemetry = snapshot.telemetry.context("telemetry missing")?;
+        assert_eq!(telemetry.cache, Some(cache));
+        assert!(telemetry.cache_error.is_some());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn subscription_reset_has_no_gap_and_lag_is_resynchronizable() -> Result<()> {
         let state = DashboardState::default();
@@ -352,7 +394,7 @@ mod tests {
     async fn http_stream_reconnects_with_current_snapshot() -> Result<()> {
         let state = DashboardState::default();
         state.publish(Ok(Snapshot::default()), true, None)?;
-        let metrics = metrics::MetricsService::new(None)?;
+        let metrics = metrics::MetricsService::new(None, None)?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let base = format!("http://{}", listener.local_addr()?);
         let router = router(state.clone(), metrics, Path::new("."));

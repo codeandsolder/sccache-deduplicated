@@ -196,10 +196,15 @@ fn FleetMetrics() -> impl IntoView {
                 <For each=move || panels.get() key=|key| *key children=move |key| {
                     let panel = Memo::new(move |_| panel_data.with(|panels| panels.get(&key).cloned()));
                     view! {
-                        <article>{move || panel.get().map(|panel| view!{
-                            <h3>{panel.title}</h3>
-                            {panel.error.map(|error| view!{<p class=styles::warning>{error}</p>})}
-                            <chart::Graph series=panel.series unit=panel.unit step=step.get()/>
+                        <article>{move || panel.get().map(|panel| {
+                            let title = panel.title.clone();
+                            let error = panel.error.clone();
+                            let sampled_at = data.with(|data| data.sampled_at);
+                            view! {
+                                <h3>{title}</h3>
+                                {error.map(|error| view!{<p class=styles::warning>{error}</p>})}
+                                <chart::PanelContent panel=panel step=step.get() sampled_at=sampled_at/>
+                            }
                         })}</article>
                     }
                 }/>

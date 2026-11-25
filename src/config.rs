@@ -2221,6 +2221,7 @@ pub mod scheduler {
         pub bind_address: SocketAddr,
         pub assets: PathBuf,
         pub metrics_url: Option<String>,
+        pub metrics_ingress_host: Option<String>,
     }
 
     #[derive(Debug, Serialize, Deserialize)]

@@ -154,9 +154,19 @@ pub struct MetricSeries {
     pub points: Vec<(f64, Option<f64>)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PanelKind {
+    Stat,
+    Timeseries,
+    Bargauge,
+    Table,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricPanel {
     pub key: usize,
+    pub kind: PanelKind,
     pub title: String,
     pub unit: String,
     pub series: Vec<MetricSeries>,

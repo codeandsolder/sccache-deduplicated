@@ -161,3 +161,69 @@ mod tests {
         assert_eq!(path.matches('M').count(), 2);
     }
 }
+
+/// Grafana's original panels have different semantics: current values,
+/// historical traces, relative work distribution, and version metadata.
+#[component]
+pub(super) fn PanelContent(
+    panel: crate::MetricPanel,
+    step: u64,
+    sampled_at: Option<u64>,
+) -> impl IntoView {
+    use crate::PanelKind;
+    if panel.kind == PanelKind::Timeseries {
+        return view! { <Graph series=panel.series unit=panel.unit step=step/> }.into_any();
+    }
+    let rows = panel
+        .series
+        .into_iter()
+        .filter_map(|series| {
+            let (time, value) = series
+                .points
+                .iter()
+                .rev()
+                .find_map(|(time, value)| value.map(|value| (*time, value)))?;
+            Some((series.label, time, value))
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return view! {<p class=styles::muted>"No samples"</p>}.into_any();
+    }
+    let stale =
+        move |time: f64| sampled_at.is_some_and(|end| end as f64 - time > step as f64 * 1.5);
+    match panel.kind {
+        PanelKind::Stat => view! {
+            <div class=styles::metricstats>
+                {rows.into_iter().map(|(label,time,value)| view!{
+                    <div class=styles::metricstat><small>{label}</small><strong>{value_label(value,&panel.unit)}</strong>
+                        {stale(time).then(||view!{<small class=styles::warning>"Last observed "{axis_time(time,86_400.0)}" UTC"</small>})}
+                    </div>
+                }).collect_view()}
+            </div>
+        }.into_any(),
+        PanelKind::Bargauge => {
+            let mut rows = rows;
+            rows.sort_unstable_by(|a,b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+            let maximum = rows.iter().map(|(_,_,value)| *value).fold(0.0_f64,f64::max);
+            view! {
+                <div class=styles::gauges>
+                    {rows.into_iter().map(|(label,time,value)| view!{
+                        <div>
+                            <div class=styles::subhead><span>{label}</span><b>{value_label(value,&panel.unit)}</b></div>
+                            <meter min="0" max=maximum.max(1.0) value=value.max(0.0)/>
+                            {stale(time).then(||view!{<small class=styles::warning>"Last observed "{axis_time(time,86_400.0)}" UTC"</small>})}
+                        </div>
+                    }).collect_view()}
+                </div>
+            }.into_any()
+        }
+        PanelKind::Table => view! {
+            <div class=styles::tablewrap>
+                <table><thead><tr><th>"Client / version"</th><th>"Last observed (UTC)"</th></tr></thead><tbody>
+                    {rows.into_iter().map(|(label,time,_)|view!{<tr><td>{label}</td><td class=if stale(time) {styles::warning} else {styles::muted}>{axis_time(time,86_400.0)}</td></tr>}).collect_view()}
+                </tbody></table>
+            </div>
+        }.into_any(),
+        PanelKind::Timeseries => view!{<p class=styles::muted>"No samples"</p>}.into_any(),
+    }
+}

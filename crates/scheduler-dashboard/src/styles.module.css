@@ -65,3 +65,8 @@ td small { margin-top: .2rem; }
     .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .stat strong { font-size: 1.35rem; }
 }
+.metricstats { display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); gap: .65rem; }
+.metricstat { padding: .65rem; border-left: 2px solid var(--accent); background: var(--bg); }
+.metricstat strong { display: block; font-size: 1.7rem; margin-top: .3rem; }
+.gauges { display: grid; gap: .7rem; }
+.gauges meter { width: 100%; height: 1.2rem; accent-color: var(--accent); }

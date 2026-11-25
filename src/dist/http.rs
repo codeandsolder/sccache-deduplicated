@@ -1290,6 +1290,7 @@ mod server {
                     config.bind_address,
                     &config.assets,
                     config.metrics_url.as_deref(),
+                    config.metrics_ingress_host.as_deref(),
                     move || handler.handle_dashboard_snapshot(),
                     move || {
                         dashboard_native

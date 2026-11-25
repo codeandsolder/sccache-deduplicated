@@ -242,7 +242,7 @@ fn series_patch(old: &MetricSeries, new: &MetricSeries) -> Option<SeriesPatch> {
 }
 
 fn panel_patch(old: &MetricPanel, new: &MetricPanel) -> Option<PanelPatch> {
-    if old.title != new.title || old.unit != new.unit {
+    if old.title != new.title || old.unit != new.unit || old.kind != new.kind {
         return Some(PanelPatch::Replace(new.clone()));
     }
     let mut previous: BTreeMap<_, _> = old
@@ -387,6 +387,7 @@ mod metrics_tests {
     fn rolling_range_and_late_correction_reconstruct_exact_data() {
         let panel = MetricPanel {
             key: 0,
+            kind: crate::PanelKind::Timeseries,
             title: "Test".into(),
             unit: "s".into(),
             series: vec![MetricSeries {
