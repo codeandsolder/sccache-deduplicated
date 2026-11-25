@@ -35,8 +35,8 @@ pub enum Command {
     ClusterStatus {
         client_config: std::path::PathBuf,
     },
-    Scheduler(config::scheduler::Config),
-    Server(config::server::Config),
+    Scheduler(Box<config::scheduler::Config>),
+    Server(Box<config::server::Config>),
     NativeAudit {
         index: std::path::PathBuf,
         schema: Option<String>,

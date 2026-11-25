@@ -184,7 +184,25 @@ fn peer_links(
     }
 }
 
-pub(super) fn snapshot(scheduler: &Scheduler) -> Result<Snapshot> {
+fn accumulate_worker(snapshot: &mut Snapshot, worker: &Worker) {
+    let totals = &mut snapshot.totals;
+    totals.workers += 1;
+    totals.cpu_capacity += worker.cpu_capacity;
+    totals.assigned = totals.assigned.saturating_add(worker.assigned);
+    totals.assigning = totals.assigning.saturating_add(worker.assigning);
+    totals.compiler_demand = totals
+        .compiler_demand
+        .saturating_add(worker.compiler_demand);
+    totals.max_jobs = totals.max_jobs.saturating_add(worker.max_jobs);
+    totals.available = totals.available.saturating_add(worker.available);
+    if let Some(native) = &worker.native {
+        totals.compiler_active = totals
+            .compiler_active
+            .saturating_add(native.compiler_active as usize);
+    }
+}
+
+pub fn snapshot(scheduler: &Scheduler) -> Result<Snapshot> {
     // Filesystem checks and ordering work must not hold the scheduler mutexes.
     let draining = scheduler.is_draining();
     let jobs = scheduler
@@ -220,41 +238,30 @@ pub(super) fn snapshot(scheduler: &Scheduler) -> Result<Snapshot> {
         if let Some(placement) = &details.capabilities.native_placement {
             peer_links(&mut snapshot, id, &placement.peer_download_rates);
         }
-        let totals = &mut snapshot.totals;
-        totals.workers += 1;
-        totals.cpu_capacity += worker.cpu_capacity;
-        totals.assigned = totals.assigned.saturating_add(worker.assigned);
-        totals.assigning = totals.assigning.saturating_add(worker.assigning);
-        totals.compiler_demand = totals
-            .compiler_demand
-            .saturating_add(worker.compiler_demand);
-        totals.max_jobs = totals.max_jobs.saturating_add(worker.max_jobs);
-        totals.available = totals.available.saturating_add(worker.available);
-        if let Some(native) = &worker.native {
-            totals.compiler_active = totals
-                .compiler_active
-                .saturating_add(native.compiler_active as usize);
-        }
+        accumulate_worker(&mut snapshot, &worker);
         for job_id in details.jobs_assigned.keys() {
             let progress = details
                 .capabilities
                 .native_placement
                 .as_ref()
                 .and_then(|placement| placement.queue.jobs.get(job_id));
-            let (state, assigned_at, state_since, prediction) =
-                if let Some(detail) = jobs.get(job_id) {
+            let (state, assigned_at, state_since, prediction) = jobs.get(job_id).map_or_else(
+                || {
+                    details.jobs_assigning.get(job_id).map_or_else(
+                        // Preserve the reservation in the count, but never invent a timestamp.
+                        || ("Missing scheduler state".into(), None, None, None),
+                        |&since| ("Assigning".into(), Some(since), Some(since), None),
+                    )
+                },
+                |detail| {
                     (
                         detail.state.to_string(),
                         Some(detail.assigned_at),
                         Some(detail.state_since),
                         detail.prediction,
                     )
-                } else if let Some(&since) = details.jobs_assigning.get(job_id) {
-                    ("Assigning".into(), Some(since), Some(since), None)
-                } else {
-                    // Preserve the reservation in the count, but never invent a timestamp.
-                    ("Missing scheduler state".into(), None, None, None)
-                };
+                },
+            );
             snapshot.jobs.push(Job {
                 id: job_id.to_string(),
                 worker: worker.name.clone(),

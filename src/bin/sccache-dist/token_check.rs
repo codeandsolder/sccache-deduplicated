@@ -68,12 +68,12 @@ impl ClientAuthCheck for EqCheck {
     }
 }
 
-fn fixed_token_mismatch_log_message() -> &'static str {
+const fn fixed_token_mismatch_log_message() -> &'static str {
     "User token did not match configured fixed token"
 }
 
 impl EqCheck {
-    pub fn new(s: String) -> Self {
+    pub const fn new(s: String) -> Self {
         Self { s }
     }
 }
@@ -91,7 +91,7 @@ impl ClientAuthCheck for ProxyTokenCheck {
         match self.check_token_with_forwarding(token) {
             Ok(()) => Ok(()),
             Err(e) => {
-                warn!("Proxying token validation failed: {}", e);
+                warn!("Proxying token validation failed: {e}");
                 Err(ClientVisibleMsg::from_nonsensitive(
                     "Validation with token forwarding failed".to_owned(),
                 ))
@@ -123,7 +123,7 @@ impl ProxyTokenCheck {
     /// # Errors
     ///
     /// Returns an error if the blocking HTTP client cannot be initialized.
-    pub fn new(url: String, cache_secs: Option<u64>) -> Result<Self> {
+    pub fn new(url: &str, cache_secs: Option<u64>) -> Result<Self> {
         let maybe_auth_cache: Option<Mutex<(HashMap<String, Instant>, Duration)>> =
             cache_secs.map(|secs| Mutex::new((HashMap::new(), Duration::from_secs(secs))));
         Ok(Self {
@@ -140,11 +140,13 @@ impl ProxyTokenCheck {
         );
         // If the token is cached and not cache has not expired, return it
         if let Some(ref auth_cache) = self.maybe_auth_cache {
-            let mut auth_cache = auth_cache
+            let mut guard = auth_cache
                 .lock()
                 .map_err(|_| anyhow::anyhow!("proxy token auth cache mutex poisoned"))?;
-            let (ref mut auth_cache, cache_duration) = *auth_cache;
-            if cached_token_is_valid(auth_cache, cache_duration, token, Instant::now()) {
+            let (ref mut auth_cache, cache_duration) = *guard;
+            let valid = cached_token_is_valid(auth_cache, cache_duration, token, Instant::now());
+            drop(guard);
+            if valid {
                 return Ok(());
             }
         }
@@ -165,11 +167,12 @@ impl ProxyTokenCheck {
         }
         // Cache the token
         if let Some(ref auth_cache) = self.maybe_auth_cache {
-            let mut auth_cache = auth_cache
+            let mut guard = auth_cache
                 .lock()
                 .map_err(|_| anyhow::anyhow!("proxy token auth cache mutex poisoned"))?;
-            let (ref mut auth_cache, _) = *auth_cache;
+            let (ref mut auth_cache, _) = *guard;
             auth_cache.insert(token.to_owned(), Instant::now());
+            drop(guard);
         }
         Ok(())
     }
@@ -187,7 +190,7 @@ impl ClientAuthCheck for ValidJWTCheck {
         match self.check_jwt_validity(token) {
             Ok(()) => Ok(()),
             Err(e) => {
-                warn!("JWT validation failed: {}", e);
+                warn!("JWT validation failed: {e}");
                 Err(ClientVisibleMsg::from_nonsensitive(
                     "JWT could not be validated".to_owned(),
                 ))
@@ -223,6 +226,8 @@ impl ValidJWTCheck {
     }
 
     fn check_jwt_validity(&self, token: &str) -> Result<()> {
+        #[derive(Deserialize)]
+        struct Claims {}
         let header = jwt::decode_header(token).context("Could not decode jwt header")?;
         trace!("Validating JWT in scheduler");
         // Prepare validation
@@ -235,8 +240,6 @@ impl ValidJWTCheck {
         let mut validation = jwt::Validation::new(header.alg);
         validation.set_audience(&[&self.audience]);
         validation.set_issuer(&[&self.issuer]);
-        #[derive(Deserialize)]
-        struct Claims {}
         // Decode the JWT, discarding any claims - we just care about validity
         let _tokendata = jwt::decode::<Claims>(token, &pkcs1, &validation)
             .context("Unable to validate and decode jwt")?;

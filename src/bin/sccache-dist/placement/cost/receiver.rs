@@ -25,7 +25,7 @@ pub(super) struct Sample {
 }
 
 impl Sample {
-    pub(super) fn valid(self) -> bool {
+    pub(super) const fn valid(self) -> bool {
         self.remote <= self.selected && self.selected <= SCALE && self.count > 0
     }
 }

@@ -15,13 +15,13 @@ const MAX_CALIBRATION_CLASSES: usize = 32;
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
-pub(crate) struct WorkerScope {
+pub struct WorkerScope {
     pub peer: ServerId,
     pub platform: ContentId,
 }
 
 #[derive(Default)]
-pub(crate) struct CostBook {
+pub struct CostBook {
     pub(super) workers: BTreeMap<WorkerScope, ActionCosts>,
     pub(super) revision: u64,
     pub(super) receivers: super::receiver::DeliveryHistory,
@@ -89,7 +89,7 @@ impl CostBook {
     ) -> ActionCost {
         let baseline = ActionCost::baseline(placement);
         let target = self.workers.get(&scope);
-        let phase = target.map_or(super::PhaseCost::default(), |history| {
+        let phase = target.map_or_else(super::PhaseCost::default, |history| {
             history.overhead.estimate(now)
         });
         if let Some(sample) = target.and_then(|history| history.fresh(class, now))

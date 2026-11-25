@@ -12,10 +12,10 @@ use std::{
 
 mod checkpoint;
 mod receiver;
-pub(crate) use checkpoint::start as start_checkpoint;
+pub use checkpoint::start as start_checkpoint;
 mod history;
 mod overhead;
-pub(crate) use history::{CostBook, WorkerScope};
+pub use history::{CostBook, WorkerScope};
 use overhead::OverheadHistory;
 pub use overhead::PhaseCost;
 const MAX_CLASSES: usize = 4096;
@@ -24,7 +24,7 @@ const MAX_AGE: Duration = Duration::from_hours(24);
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
-pub(crate) struct ActionClass(ContentId);
+pub struct ActionClass(ContentId);
 
 impl ActionClass {
     pub(crate) fn from_spec(spec: &ExecutionSpec) -> anyhow::Result<Self> {
@@ -33,7 +33,7 @@ impl ActionClass {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct ActionCost {
+pub struct ActionCost {
     pub phase: PhaseCost,
     pub execution_nanoseconds: u64,
     /// Missing scheduler upload bytes.
@@ -75,7 +75,7 @@ impl ActionCost {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AssignedNative {
+pub struct AssignedNative {
     pub packages: std::sync::Arc<sccache::build_runtime::PackageCatalog>,
     pub inputs: NativeInputBlobs,
     pub class: Option<ActionClass>,
@@ -92,12 +92,12 @@ struct Sample {
 }
 
 #[derive(Default)]
-pub(crate) struct ActionCosts {
+pub struct ActionCosts {
     overhead: OverheadHistory,
     entries: BTreeMap<ActionClass, Sample>,
 }
 
-fn smooth(old: u64, new: u64) -> u64 {
+const fn smooth(old: u64, new: u64) -> u64 {
     if new >= old {
         old + (new - old).div_ceil(4)
     } else {

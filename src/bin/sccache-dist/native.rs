@@ -23,7 +23,7 @@ use sccache::{
     },
 };
 
-pub(super) struct NativeWorker {
+pub struct NativeWorker {
     store: NativeStore,
     client: NativeCacheClient,
     pub(super) policy: ExecutionPolicy,
@@ -135,7 +135,7 @@ impl NativeWorker {
         }
         Ok(super::NativeInputPins {
             _trees: trees,
-            _blobs: blobs,
+            blobs: blobs,
         })
     }
 
@@ -173,7 +173,7 @@ impl NativeWorker {
         self.package_transfer.parallelism().get()
     }
 
-    fn delivery<'a>(
+    const fn delivery<'a>(
         &'a self,
         queue: &'a sccache::dist::execution_queue::ExecutionQueue,
     ) -> WorkerDelivery<'a> {
@@ -315,9 +315,9 @@ impl PlacementCache {
                 .as_ref()
                 .and_then(|(_, summary)| summary.clone()),
             timing,
-            cache_path_rates: Default::default(),
+            cache_path_rates: sccache::build_runtime::wire::CachePathRates::default(),
             peer_download_rates: Vec::new(),
-            interfaces: Default::default(),
+            interfaces: sccache::build_runtime::wire::InterfaceReport::default(),
             queue,
         }
     }

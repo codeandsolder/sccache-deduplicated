@@ -29,7 +29,7 @@ struct Provisioned {
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct SyncReport {
+pub struct SyncReport {
     selected_files: usize,
     owned_packages: usize,
     provisioned: Vec<Provisioned>,
@@ -137,7 +137,7 @@ fn parse_repository_record(line: &str) -> Result<Candidate> {
     );
     let segment = parsed
         .path_segments()
-        .and_then(|segments| segments.last())
+        .and_then(|mut segments| segments.next_back())
         .context("repository package URL missing filename")?;
     let filename = percent_encoding::percent_decode_str(segment)
         .decode_utf8()
@@ -289,7 +289,7 @@ fn provision_one(
 /// # Errors
 /// Returns an error when the manager or cache service fails to provision an
 /// eligible package. Non-owned and unavailable versions are reported.
-pub(super) fn sync_packages(
+pub fn sync_packages(
     client: &NativeCacheClient,
     paths: &[PathBuf],
     cache_dir: &Path,

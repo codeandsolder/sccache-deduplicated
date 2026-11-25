@@ -66,7 +66,7 @@ pub(super) struct InputTraffic {
 }
 
 impl InputTraffic {
-    pub(super) fn extend(&mut self, other: Self) {
+    pub(super) const fn extend(&mut self, other: Self) {
         self.wire_bytes = self.wire_bytes.saturating_add(other.wire_bytes);
         self.archive_bytes = self.archive_bytes.saturating_add(other.archive_bytes);
         self.wire_time = self.wire_time.saturating_add(other.wire_time);

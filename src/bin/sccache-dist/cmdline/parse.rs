@@ -26,7 +26,7 @@ use crate::cmdline::{AuthSubcommand, Command};
 struct TokenLength(usize);
 
 impl TokenLength {
-    fn as_bytes(&self) -> usize {
+    const fn as_bytes(&self) -> usize {
         self.0 / 8
     }
 
@@ -72,7 +72,7 @@ impl FromStr for LogLevel {
             "info" => Self::Info,
             "debug" => Self::Debug,
             "trace" => Self::Trace,
-            _ => bail!("Unknown log level: {:?}", s),
+            _ => bail!("Unknown log level: {s:?}"),
         };
 
         Ok(variant)
@@ -319,7 +319,7 @@ pub fn try_parse_from(
                     matches
                         .get_one::<String>("secret-key")
                         .context("clap did not provide required `secret-key` value")?
-                        .to_string()
+                        .clone()
                 };
 
                 AuthSubcommand::JwtHS256ServerToken {
@@ -491,7 +491,7 @@ pub fn try_parse_from(
                 .get_one::<PathBuf>("config")
                 .context("clap did not provide required `config` value")?;
             if let Some(config) = config::scheduler::from_path(config_path)? {
-                Command::Scheduler(config)
+                Command::Scheduler(Box::new(config))
             } else {
                 bail!("Could not load config")
             }
@@ -508,7 +508,7 @@ pub fn try_parse_from(
                 .get_one::<PathBuf>("config")
                 .context("clap did not provide required `config` value")?;
             if let Some(config) = config::server::from_path(config_path)? {
-                Command::Server(config)
+                Command::Server(Box::new(config))
             } else {
                 bail!("Could not load config")
             }

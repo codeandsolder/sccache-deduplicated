@@ -106,18 +106,17 @@ fn main() {
     init_logging();
 
     let incr_env_strs = ["CARGO_BUILD_INCREMENTAL", "CARGO_INCREMENTAL"];
-    incr_env_strs
-        .iter()
-        .for_each(|incr_str| match env::var(incr_str) {
+    for incr_str in incr_env_strs {
+        match env::var(incr_str) {
             Ok(incr_val) if incr_val == "1" => {
                 println!(
-                    "sccache: incremental compilation is prohibited: Unset {} to continue.",
-                    incr_str
+                    "sccache: incremental compilation is prohibited: Unset {incr_str} to continue."
                 );
                 std::process::exit(1);
             }
             _ => (),
-        });
+        }
+    }
 
     let command = match cmdline::try_parse_from(env::args()) {
         Ok(cmd) => cmd,
@@ -136,10 +135,10 @@ fn main() {
     std::process::exit(match run(command) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("sccache-dist: error: {}", e);
+            eprintln!("sccache-dist: error: {e}");
 
             for e in e.chain().skip(1) {
-                eprintln!("sccache-dist: caused by: {}", e);
+                eprintln!("sccache-dist: caused by: {e}");
             }
             2
         }
@@ -147,7 +146,7 @@ fn main() {
 }
 
 fn create_server_token(server_id: ServerId, auth_token: &str) -> String {
-    format!("{} {}", server_id, auth_token)
+    format!("{server_id} {auth_token}")
 }
 fn check_server_token(server_token: &str, auth_token: &str) -> Option<ServerId> {
     let mut split = server_token.splitn(2, ' ');
@@ -567,230 +566,220 @@ fn run(command: Command) -> Result<i32> {
             let secret_key = BASE64_URL_SAFE_ENGINE.decode(secret_key)?;
             let token = create_jwt_server_token(server_id, &header, &secret_key)
                 .context("Failed to create server token")?;
-            println!("{}", token);
+            println!("{token}");
             Ok(0)
         }
 
-        Command::Scheduler(scheduler_config::Config {
-            cluster_directory,
-            dashboard,
-            public_addr,
-            client_auth,
-            server_auth,
-            maintenance_drain_file,
-            job_slack,
-            native_cache,
-        }) => {
-            let check_client_auth: Box<dyn dist::http::ClientAuthCheck> = match client_auth {
-                scheduler_config::ClientAuth::Insecure => Box::new(token_check::EqCheck::new(
-                    INSECURE_DIST_CLIENT_TOKEN.to_owned(),
-                )),
-                scheduler_config::ClientAuth::Token { token } => {
-                    Box::new(token_check::EqCheck::new(token))
-                }
-                scheduler_config::ClientAuth::JwtValidate {
-                    audience,
-                    issuer,
-                    jwks_url,
-                } => Box::new(
-                    token_check::ValidJWTCheck::new(audience, issuer, &jwks_url)
-                        .context("Failed to create a checker for valid JWTs")?,
-                ),
-                scheduler_config::ClientAuth::ProxyToken { url, cache_secs } => {
-                    Box::new(token_check::ProxyTokenCheck::new(url, cache_secs)?)
-                }
-            };
-
-            let check_server_auth: dist::http::ServerAuthCheck = match server_auth {
-                scheduler_config::ServerAuth::Insecure => {
-                    warn!("Scheduler starting with DANGEROUSLY_INSECURE server authentication");
-                    let token = INSECURE_DIST_SERVER_TOKEN;
-                    Box::new(move |server_token| check_server_token(server_token, token))
-                }
-                scheduler_config::ServerAuth::Token { token } => {
-                    Box::new(move |server_token| check_server_token(server_token, &token))
-                }
-                scheduler_config::ServerAuth::JwtHS256 { secret_key } => {
-                    let secret_key = BASE64_URL_SAFE_ENGINE
-                        .decode(secret_key)
-                        .context("Secret key base64 invalid")?;
-                    if secret_key.len() != 256 / 8 {
-                        bail!("Size of secret key incorrect")
-                    }
-                    let key = jwt::DecodingKey::from_secret(&secret_key)
-                        .context("Invalid JWT verification key")?;
-                    let validation = {
-                        let mut validation = jwt::Validation::new(jwt::Algorithm::HS256);
-                        validation.leeway = 0;
-                        validation.validate_exp = false;
-                        validation.validate_nbf = false;
-                        validation
-                    };
-                    Box::new(move |server_token| {
-                        check_jwt_server_token(server_token, &key, &validation)
-                    })
-                }
-            };
-
-            if maintenance_drain_file
-                .as_deref()
-                .is_some_and(|path| !path.is_absolute())
-            {
-                bail!("scheduler maintenance_drain_file must be absolute")
-            }
-            daemonize(&[])?;
-            info!(
-                "Distributed scheduler job slack: static={} percent={}%",
-                job_slack.static_jobs, job_slack.percent
-            );
-            let scheduler =
-                Scheduler::new_with_job_slack_and_drain(job_slack, maintenance_drain_file);
-            if let Some(config) = &native_cache {
-                config.session_limits()?;
-                placement::start_checkpoint(
-                    &scheduler.cost_book,
-                    config.directory.join("action-costs.bin"),
-                    config.public_addr,
-                )?;
-            }
-            let http_scheduler = dist::http::Scheduler::new(
-                cluster_directory,
-                public_addr,
-                scheduler,
-                check_client_auth,
-                check_server_auth,
-                native_cache,
-                dashboard,
-            );
-            // A running server never exits successfully (Result<Infallible>).
-            match http_scheduler.start()? {}
-        }
-
-        Command::Server(server_config::Config {
-            cluster,
-            builder,
-            cache_dir,
-            public_addr,
-            bind_address,
-            scheduler_url,
-            scheduler_auth,
-            toolchain_cache_size,
-            toolchain_archive_sources,
-            native_worker,
-        }) => {
-            let builder: Option<Box<dyn dist::BuilderIncoming>> = match builder {
-                server_config::BuilderType::Native => None,
-                #[cfg(not(target_os = "freebsd"))]
-                server_config::BuilderType::Docker => Some(Box::new(
-                    build::DockerBuilder::new().context("Docker builder failed to start")?,
-                )),
-                #[cfg(not(target_os = "freebsd"))]
-                server_config::BuilderType::Overlay {
-                    bwrap_path,
-                    build_dir,
-                    extracted_toolchain_cache_size,
-                } => Some(Box::new(
-                    build::OverlayBuilder::new(
-                        bwrap_path,
-                        build_dir,
-                        extracted_toolchain_cache_size,
-                    )
-                    .context("Overlay builder failed to start")?,
-                )),
-                #[cfg(target_os = "freebsd")]
-                server_config::BuilderType::Pot {
-                    pot_fs_root,
-                    clone_from,
-                    pot_cmd,
-                    pot_clone_args,
-                } => Some(Box::new(
-                    build::PotBuilder::new(pot_fs_root, clone_from, pot_cmd, pot_clone_args)
-                        .context("Pot builder failed to start")?,
-                )),
-                _ => bail!("Builder type not supported on this platform: {builder:?}"),
-            };
-            if builder.is_none() {
-                anyhow::ensure!(
-                    native_worker.is_some(),
-                    "native builder requires native_worker configuration"
-                );
-                anyhow::ensure!(
-                    cache_dir.is_none() && toolchain_archive_sources.is_empty(),
-                    "native-only worker cannot configure archive cache paths"
-                );
-            }
-            let archive = builder
-                .map(|builder| {
-                    ArchiveWorker::new(
-                        builder,
-                        cache_dir
-                            .as_deref()
-                            .context("archive builder requires cache_dir")?,
-                        toolchain_cache_size,
-                        toolchain_archive_sources,
-                    )
-                })
-                .transpose()?;
-
-            let server_id = sccache_cluster_identity::open_identity(&cluster)?.id()?;
-            let scheduler_auth = match scheduler_auth {
-                server_config::SchedulerAuth::Insecure => {
-                    warn!("Server starting with DANGEROUSLY_INSECURE scheduler authentication");
-                    create_server_token(server_id, INSECURE_DIST_SERVER_TOKEN)
-                }
-                server_config::SchedulerAuth::Token { token } => {
-                    create_server_token(server_id, &token)
-                }
-                server_config::SchedulerAuth::JwtToken { token } => {
-                    let token_server_id: ServerId =
-                        dangerous_insecure_extract_jwt_server_token(&token)
-                            .context("Could not decode scheduler auth jwt")?;
-                    if token_server_id != server_id {
-                        bail!(
-                            "JWT server id ({:?}) did not match configured server id ({:?})",
-                            token_server_id,
-                            server_id
-                        )
-                    }
-                    token
-                }
-            };
-
-            let peer = dist::cluster::open_peer(
-                cluster,
-                &scheduler_url.to_url(),
-                sccache_cluster_identity::Role::Worker,
-                || Ok(scheduler_auth),
-            )?;
-            #[cfg(target_os = "linux")]
-            let native_worker = native_worker
-                .map(|config| NativeWorker::new(config, std::sync::Arc::clone(&peer)))
-                .transpose()?;
-            #[cfg(not(target_os = "linux"))]
-            if native_worker.is_some() {
-                bail!("native worker requires Linux");
-            }
-            let server = Server::new(archive);
-            #[cfg(target_os = "linux")]
-            let server = Server {
-                native_worker: native_worker
-                    .map(|worker| {
-                        NativeDispatcher::new(
-                            worker,
-                            std::sync::Arc::clone(&server.execution_queue),
-                        )
-                    })
-                    .transpose()?,
-                ..server
-            };
-            let worker_name = dist_worker_name()?;
-            let http_server =
-                dist::http::Server::new(public_addr, bind_address, peer, Some(worker_name), server)
-                    .context("Failed to create sccache HTTP server instance")?;
-            // A running server never exits successfully (Result<Infallible>).
-            match http_server.start()? {}
-        }
+        Command::Scheduler(config) => start_scheduler(*config),
+        Command::Server(config) => start_worker(*config),
     }
+}
+
+fn start_scheduler(config: scheduler_config::Config) -> Result<i32> {
+    let scheduler_config::Config {
+        cluster_directory,
+        dashboard,
+        public_addr,
+        client_auth,
+        server_auth,
+        maintenance_drain_file,
+        job_slack,
+        native_cache,
+    } = config;
+
+    let check_client_auth: Box<dyn dist::http::ClientAuthCheck> = match client_auth {
+        scheduler_config::ClientAuth::Insecure => Box::new(token_check::EqCheck::new(
+            INSECURE_DIST_CLIENT_TOKEN.to_owned(),
+        )),
+        scheduler_config::ClientAuth::Token { token } => Box::new(token_check::EqCheck::new(token)),
+        scheduler_config::ClientAuth::JwtValidate {
+            audience,
+            issuer,
+            jwks_url,
+        } => Box::new(
+            token_check::ValidJWTCheck::new(audience, issuer, &jwks_url)
+                .context("Failed to create a checker for valid JWTs")?,
+        ),
+        scheduler_config::ClientAuth::ProxyToken { url, cache_secs } => {
+            Box::new(token_check::ProxyTokenCheck::new(&url, cache_secs)?)
+        }
+    };
+
+    let check_server_auth: dist::http::ServerAuthCheck = match server_auth {
+        scheduler_config::ServerAuth::Insecure => {
+            warn!("Scheduler starting with DANGEROUSLY_INSECURE server authentication");
+            let token = INSECURE_DIST_SERVER_TOKEN;
+            Box::new(move |server_token| check_server_token(server_token, token))
+        }
+        scheduler_config::ServerAuth::Token { token } => {
+            Box::new(move |server_token| check_server_token(server_token, &token))
+        }
+        scheduler_config::ServerAuth::JwtHS256 { secret_key } => {
+            let secret_key = BASE64_URL_SAFE_ENGINE
+                .decode(secret_key)
+                .context("Secret key base64 invalid")?;
+            if secret_key.len() != 256 / 8 {
+                bail!("Size of secret key incorrect")
+            }
+            let key = jwt::DecodingKey::from_secret(&secret_key)
+                .context("Invalid JWT verification key")?;
+            let validation = {
+                let mut validation = jwt::Validation::new(jwt::Algorithm::HS256);
+                validation.leeway = 0;
+                validation.validate_exp = false;
+                validation.validate_nbf = false;
+                validation
+            };
+            Box::new(move |server_token| check_jwt_server_token(server_token, &key, &validation))
+        }
+    };
+
+    if maintenance_drain_file
+        .as_deref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        bail!("scheduler maintenance_drain_file must be absolute")
+    }
+    daemonize(&[])?;
+    info!(
+        "Distributed scheduler job slack: static={} percent={}%",
+        job_slack.static_jobs, job_slack.percent
+    );
+    let scheduler = Scheduler::new_with_job_slack_and_drain(job_slack, maintenance_drain_file);
+    if let Some(config) = &native_cache {
+        config.session_limits()?;
+        placement::start_checkpoint(
+            &scheduler.cost_book,
+            config.directory.join("action-costs.bin"),
+            config.public_addr,
+        )?;
+    }
+    let http_scheduler = dist::http::Scheduler::new(
+        cluster_directory,
+        public_addr,
+        scheduler,
+        check_client_auth,
+        check_server_auth,
+        native_cache,
+        dashboard,
+    );
+    // A running server never exits successfully (Result<Infallible>).
+    match http_scheduler.start()? {}
+}
+
+fn start_worker(config: server_config::Config) -> Result<i32> {
+    let server_config::Config {
+        cluster,
+        builder,
+        cache_dir,
+        public_addr,
+        bind_address,
+        scheduler_url,
+        scheduler_auth,
+        toolchain_cache_size,
+        toolchain_archive_sources,
+        native_worker,
+    } = config;
+
+    let builder: Option<Box<dyn dist::BuilderIncoming>> = match builder {
+        server_config::BuilderType::Native => None,
+        #[cfg(not(target_os = "freebsd"))]
+        server_config::BuilderType::Docker => Some(Box::new(
+            build::DockerBuilder::new().context("Docker builder failed to start")?,
+        )),
+        #[cfg(not(target_os = "freebsd"))]
+        server_config::BuilderType::Overlay {
+            bwrap_path,
+            build_dir,
+            extracted_toolchain_cache_size,
+        } => Some(Box::new(
+            build::OverlayBuilder::new(bwrap_path, build_dir, extracted_toolchain_cache_size)
+                .context("Overlay builder failed to start")?,
+        )),
+        #[cfg(target_os = "freebsd")]
+        server_config::BuilderType::Pot {
+            pot_fs_root,
+            clone_from,
+            pot_cmd,
+            pot_clone_args,
+        } => Some(Box::new(
+            build::PotBuilder::new(pot_fs_root, clone_from, pot_cmd, pot_clone_args)
+                .context("Pot builder failed to start")?,
+        )),
+        _ => bail!("Builder type not supported on this platform: {builder:?}"),
+    };
+    if builder.is_none() {
+        anyhow::ensure!(
+            native_worker.is_some(),
+            "native builder requires native_worker configuration"
+        );
+        anyhow::ensure!(
+            cache_dir.is_none() && toolchain_archive_sources.is_empty(),
+            "native-only worker cannot configure archive cache paths"
+        );
+    }
+    let archive = builder
+        .map(|builder| {
+            ArchiveWorker::new(
+                builder,
+                cache_dir
+                    .as_deref()
+                    .context("archive builder requires cache_dir")?,
+                toolchain_cache_size,
+                toolchain_archive_sources,
+            )
+        })
+        .transpose()?;
+
+    let server_id = sccache_cluster_identity::open_identity(&cluster)?.id()?;
+    let scheduler_auth = match scheduler_auth {
+        server_config::SchedulerAuth::Insecure => {
+            warn!("Server starting with DANGEROUSLY_INSECURE scheduler authentication");
+            create_server_token(server_id, INSECURE_DIST_SERVER_TOKEN)
+        }
+        server_config::SchedulerAuth::Token { token } => create_server_token(server_id, &token),
+        server_config::SchedulerAuth::JwtToken { token } => {
+            let token_server_id: ServerId = dangerous_insecure_extract_jwt_server_token(&token)
+                .context("Could not decode scheduler auth jwt")?;
+            if token_server_id != server_id {
+                bail!(
+                    "JWT server id ({token_server_id:?}) did not match configured server id ({server_id:?})"
+                )
+            }
+            token
+        }
+    };
+
+    let peer = dist::cluster::open_peer(
+        cluster,
+        &scheduler_url.to_url(),
+        sccache_cluster_identity::Role::Worker,
+        || Ok(scheduler_auth),
+    )?;
+    #[cfg(target_os = "linux")]
+    let native_worker = native_worker
+        .map(|config| NativeWorker::new(config, std::sync::Arc::clone(&peer)))
+        .transpose()?;
+    #[cfg(not(target_os = "linux"))]
+    if native_worker.is_some() {
+        bail!("native worker requires Linux");
+    }
+    let server = Server::new(archive);
+    #[cfg(target_os = "linux")]
+    let server = Server {
+        native_worker: native_worker
+            .map(|worker| {
+                NativeDispatcher::new(worker, std::sync::Arc::clone(&server.execution_queue))
+            })
+            .transpose()?,
+        ..server
+    };
+    let worker_name = dist_worker_name()?;
+    let http_server =
+        dist::http::Server::new(public_addr, bind_address, peer, Some(worker_name), server)
+            .context("Failed to create sccache HTTP server instance")?;
+    // A running server never exits successfully (Result<Infallible>).
+    match http_server.start()? {}
 }
 
 fn init_logging() {
@@ -816,7 +805,7 @@ fn init_logging() {
 const SERVER_REMEMBER_ERROR_TIMEOUT: Duration = Duration::from_secs(300);
 // Temporary fleet relief for slow input staging and toolchain uploads.
 // Track progress explicitly instead of holding unclaimed reservations in #333.
-const UNCLAIMED_PENDING_TIMEOUT: Duration = Duration::from_secs(900);
+const UNCLAIMED_PENDING_TIMEOUT: Duration = Duration::from_mins(15);
 const UNCLAIMED_READY_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Copy, Clone)]
@@ -845,7 +834,7 @@ impl JobDetail {
         }
     }
 
-    fn transition_to(&mut self, state: JobState, now: Instant) {
+    const fn transition_to(&mut self, state: JobState, now: Instant) {
         self.state = state;
         self.state_since = now;
         self.missing_since = None;
@@ -987,14 +976,14 @@ impl ServerDetails {
     }
 
     fn compiler_demand(&self) -> usize {
-        self.capabilities.native_placement.as_ref().map_or_else(
-            || self.jobs_assigned.len(),
-            |placement| {
+        self.capabilities
+            .native_placement
+            .as_ref()
+            .map_or(self.jobs_assigned.len(), |placement| {
                 placement
                     .queue
                     .compiler_demand(self.jobs_assigned.keys().copied())
-            },
-        )
+            })
     }
 
     fn admission_slots(&self, job_slack: JobSlackConfig) -> usize {
@@ -1025,6 +1014,7 @@ impl Scheduler {
         }
     }
 
+    #[must_use = "the scheduler owns its worker and job state"]
     pub fn new() -> Self {
         Self::new_with_job_slack(JobSlackConfig::default())
     }
@@ -1061,7 +1051,7 @@ impl Scheduler {
         job_slack: JobSlackConfig,
         maintenance_drain_file: Option<PathBuf>,
     ) -> Self {
-        Scheduler {
+        Self {
             job_id_base,
             job_count: AtomicUsize::new(0),
             #[cfg(feature = "scheduler-dashboard")]
@@ -1100,7 +1090,6 @@ impl Scheduler {
     }
 
     fn prune_servers(
-        &self,
         servers: &mut MutexGuard<HashMap<ServerId, ServerDetails>>,
         jobs: &mut MutexGuard<BTreeMap<JobId, JobDetail>>,
     ) {
@@ -1115,10 +1104,7 @@ impl Scheduler {
         }
 
         for server_id in dead_servers {
-            warn!(
-                "Server {} appears to be dead, pruning it in the scheduler",
-                server_id
-            );
+            warn!("Server {server_id} appears to be dead, pruning it in the scheduler");
             let Some(server_details) = servers.remove(&server_id) else {
                 error!("server {server_id:?} disappeared while pruning");
                 continue;
@@ -1132,10 +1118,7 @@ impl Scheduler {
                 // A job may be missing here if it failed to allocate
                 // initially, so just warn if it's not present.
                 if jobs.remove(&job_id).is_none() {
-                    warn!(
-                        "Non-terminated job {} assignment originally failed.",
-                        job_id
-                    );
+                    warn!("Non-terminated job {job_id} assignment originally failed.");
                 }
             }
         }
@@ -1148,6 +1131,10 @@ impl Default for Scheduler {
     }
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Worker admission weights are approximate floating-point CPU capacity estimates"
+)]
 fn admission_weight(job_count: usize, cpu_capacity: f64, job_slack: JobSlackConfig) -> Option<f64> {
     (job_count < job_slack.max_jobs(cpu_capacity))
         .then_some((cpu_capacity - job_count as f64).max(0.0) + 0.5)
@@ -1177,7 +1164,7 @@ impl Scheduler {
         requester: &dyn SchedulerOutgoing,
         mut assignment: JobAssignment,
         network: &NetworkSnapshot,
-        packages: std::sync::Arc<sccache::build_runtime::PackageCatalog>,
+        packages: &std::sync::Arc<sccache::build_runtime::PackageCatalog>,
     ) -> Result<AllocJobResult> {
         #[cfg(feature = "scheduler-dashboard")]
         let _dashboard_change = DashboardChange(self);
@@ -1211,7 +1198,7 @@ impl Scheduler {
                 NativeTransferPlan::new(
                     network,
                     &servers,
-                    Some(&packages),
+                    Some(packages),
                     Some(inputs),
                     native.and_then(|assignment| assignment.receiver.as_ref()),
                 )
@@ -1342,7 +1329,7 @@ impl Scheduler {
                         }));
                     }
                     let assigned = native_inputs.map(|inputs| placement::AssignedNative {
-                        packages: std::sync::Arc::clone(&packages),
+                        packages: std::sync::Arc::clone(packages),
                         inputs: inputs.clone(),
                         class,
                         cost: predictions.get(&server_id).map(|estimate| estimate.cost),
@@ -1361,10 +1348,7 @@ impl Scheduler {
                             .is_none()
                     );
 
-                    info!(
-                        "Job {} created and will be assigned to server {:?}",
-                        job_id, server_id
-                    );
+                    info!("Job {job_id} created and will be assigned to server {server_id:?}");
                     Some((job_id, server_id, auth, prediction, estimated_result_bytes))
                 } else {
                     None
@@ -1372,6 +1356,7 @@ impl Scheduler {
             };
 
             if let Some(res) = res {
+                drop(servers);
                 res
             } else {
                 let msg = format!(
@@ -1454,10 +1439,9 @@ impl Scheduler {
                 .is_none()
             );
             details.jobs_assigning.remove(&job_id);
-            info!(
-                "Job {} successfully assigned and saved with state {:?}",
-                job_id, state
-            );
+            drop(servers);
+            drop(jobs);
+            info!("Job {job_id} successfully assigned and saved with state {state:?}");
         }
         let job_alloc = JobAlloc {
             auth,
@@ -1481,7 +1465,7 @@ impl SchedulerIncoming for Scheduler {
             requester,
             JobAssignment::Archive(tc),
             &NetworkSnapshot::default(),
-            Default::default(),
+            &std::sync::Arc::default(),
         )
     }
 
@@ -1512,7 +1496,7 @@ impl SchedulerIncoming for Scheduler {
             requester,
             JobAssignment::Native(Box::new(assignment)),
             network,
-            packages,
+            &packages,
         )
     }
 
@@ -1522,6 +1506,7 @@ impl SchedulerIncoming for Scheduler {
         job: JobId,
         event: dist::NativeLifecycleEvent<'_>,
     ) {
+        use sccache::build_runtime::wire::NativeJobPhase;
         #[cfg(feature = "scheduler-dashboard")]
         let _dashboard_change = DashboardChange(self);
         let now = Instant::now();
@@ -1552,7 +1537,6 @@ impl SchedulerIncoming for Scheduler {
         {
             return;
         }
-        use sccache::build_runtime::wire::NativeJobPhase;
         match event {
             dist::NativeLifecycleEvent::Delivered(_) => (),
             dist::NativeLifecycleEvent::InputsStaged => {
@@ -1740,7 +1724,7 @@ impl SchedulerIncoming for Scheduler {
         } else {
             sccache::build_runtime::wire::MAX_BLOB_SOURCES
         };
-        candidates
+        let sources = candidates
             .into_iter()
             .take(limit)
             .map(|(&server, details, _, _)| {
@@ -1751,7 +1735,9 @@ impl SchedulerIncoming for Scheduler {
                         .generate_blob_token(blob, recipient)?,
                 })
             })
-            .collect()
+            .collect();
+        drop(servers);
+        sources
     }
 
     fn handle_heartbeat_server(
@@ -1775,7 +1761,7 @@ impl SchedulerIncoming for Scheduler {
             .lock()
             .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
 
-        self.prune_servers(&mut servers, &mut jobs);
+        Self::prune_servers(&mut servers, &mut jobs);
 
         if !cpu_capacity.is_finite() || cpu_capacity < 0.0 {
             bail!("invalid worker CPU capacity {cpu_capacity}");
@@ -1872,10 +1858,7 @@ impl SchedulerIncoming for Scheduler {
                     .collect();
 
                 if !stale_jobs.is_empty() {
-                    warn!(
-                        "The following stale jobs will be de-allocated: {:?}",
-                        stale_jobs
-                    );
+                    warn!("The following stale jobs will be de-allocated: {stale_jobs:?}");
                     for job_id in stale_jobs {
                         warn!(
                             "dist_job_lost job_id={job_id} worker={} reason=stale_assignment previous_state={:?}",
@@ -1883,10 +1866,7 @@ impl SchedulerIncoming for Scheduler {
                             jobs.get(&job_id).map(|detail| detail.state)
                         );
                         if details.jobs_assigned.remove(&job_id).is_none() {
-                            warn!(
-                                "Stale job for server {} not assigned: {}",
-                                server_id, job_id
-                            );
+                            warn!("Stale job for server {server_id} not assigned: {job_id}");
                         }
                         details.jobs_assigning.remove(&job_id);
                         jobs.remove(&job_id);
@@ -1908,16 +1888,13 @@ impl SchedulerIncoming for Scheduler {
                         jobs.get(job_id).map(|detail| detail.state)
                     );
                     if jobs.remove(job_id).is_none() {
-                        warn!(
-                            "Unknown job found when replacing server {}: {}",
-                            server_id, job_id
-                        );
+                        warn!("Unknown job found when replacing server {server_id}: {job_id}");
                     }
                 }
             }
             _ => (),
         }
-        info!("Registered new server {:?}", server_id);
+        info!("Registered new server {server_id:?}");
         servers.insert(
             server_id,
             ServerDetails {
@@ -1933,6 +1910,8 @@ impl SchedulerIncoming for Scheduler {
                 job_authorizer,
             },
         );
+        drop(servers);
+        drop(jobs);
         Ok(HeartbeatServerResult {
             is_new: true,
             assigned_job_ids: Vec::new(),
@@ -1958,23 +1937,20 @@ impl SchedulerIncoming for Scheduler {
             .servers
             .lock()
             .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
-        self.prune_servers(&mut servers, &mut jobs);
+        Self::prune_servers(&mut servers, &mut jobs);
         drop(jobs);
-        let details = servers.get(&server_id).ok_or_else(|| {
-            anyhow::anyhow!("worker name update from unknown server {}", server_id)
-        })?;
+        let details = servers
+            .get(&server_id)
+            .ok_or_else(|| anyhow::anyhow!("worker name update from unknown server {server_id}"))?;
         if details.server_nonce != server_nonce {
-            bail!("worker name update from stale server epoch {}", server_id)
+            bail!("worker name update from stale server epoch {server_id}")
         }
         if let Some(existing) = details.worker_name.as_ref() {
             if existing == &worker_name {
                 return Ok(());
             }
             bail!(
-                "distributed worker {} changed name from {:?} to {:?} without restarting",
-                server_id,
-                existing,
-                worker_name
+                "distributed worker {server_id} changed name from {existing:?} to {worker_name:?} without restarting"
             )
         }
         if servers.iter().any(|(&id, details)| {
@@ -1988,10 +1964,8 @@ impl SchedulerIncoming for Scheduler {
             .get_mut(&server_id)
             .ok_or_else(|| anyhow::anyhow!("server disappeared while scheduler lock held"))?
             .worker_name = Some(worker_name.clone());
-        info!(
-            "Server {:?} registered worker name {:?}",
-            server_id, worker_name
-        );
+        drop(servers);
+        info!("Server {server_id:?} registered worker name {worker_name:?}");
         Ok(())
     }
 
@@ -2025,11 +1999,7 @@ impl SchedulerIncoming for Scheduler {
         if let btree_map::Entry::Occupied(mut entry) = jobs.entry(job_id) {
             let job_detail = entry.get();
             if job_detail.server_id != server_id {
-                bail!(
-                    "Job id {} is not registered on server {:?}",
-                    job_id,
-                    server_id
-                )
+                bail!("Job id {job_id} is not registered on server {server_id:?}")
             }
 
             let details = servers.get_mut(&server_id).ok_or_else(|| {
@@ -2077,9 +2047,9 @@ impl SchedulerIncoming for Scheduler {
                     entry.remove_entry();
                     acks.record(job_id, server_id, now);
                 }
-                (from, to) => bail!("Invalid job state transition from {} to {}", from, to),
+                (from, to) => bail!("Invalid job state transition from {from} to {to}"),
             }
-            info!("Job {} updated state to {:?}", job_id, job_state);
+            info!("Job {job_id} updated state to {job_state:?}");
         } else if job_state == JobState::Complete
             && self
                 .completed_acks
@@ -2092,6 +2062,8 @@ impl SchedulerIncoming for Scheduler {
         } else {
             bail!("Unknown job {job_id} for server {server_id:?}")
         }
+        drop(servers);
+        drop(jobs);
         Ok(UpdateJobStateResult::Success)
     }
 
@@ -2111,6 +2083,14 @@ impl SchedulerIncoming for Scheduler {
         dashboard::snapshot(self)
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Status reports whole CPU slots, rounded upward from validated capacity"
+    )]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "Heartbeat admission rejects negative CPU capacity"
+    )]
     fn handle_status(&self) -> Result<SchedulerStatusResult> {
         #[cfg(feature = "scheduler-dashboard")]
         let _dashboard_change = DashboardChange(self);
@@ -2124,7 +2104,7 @@ impl SchedulerIncoming for Scheduler {
             .lock()
             .map_err(|_| anyhow::anyhow!("servers mutex poisoned"))?;
 
-        self.prune_servers(&mut servers, &mut jobs);
+        Self::prune_servers(&mut servers, &mut jobs);
 
         Ok(SchedulerStatusResult {
             num_servers: servers.len(),
@@ -2167,7 +2147,7 @@ struct LocalAssignment {
 #[cfg(target_os = "linux")]
 struct NativeInputPins {
     _trees: Vec<sccache::build_runtime::TreeLease>,
-    _blobs: sccache::build_runtime::UploadReservation,
+    blobs: sccache::build_runtime::UploadReservation,
 }
 
 struct ArchiveWorker {
@@ -2293,7 +2273,7 @@ impl Server {
                 .map_err(|_| anyhow::anyhow!("job toolchain mutex poisoned"))?;
             match jobs.entry(job_id) {
                 std::collections::hash_map::Entry::Occupied(entry) => Some(entry.remove()),
-                _ => None,
+                std::collections::hash_map::Entry::Vacant(_) => None,
             }
         };
         let Some(assigned) = assigned else {
@@ -2315,6 +2295,7 @@ impl Server {
             if jobs.insert(job_id, assigned).is_some() {
                 bail!("job {job_id} reappeared while restoring failed start transition");
             }
+            drop(jobs);
             return Err(error).context("Updating job state failed");
         }
         Ok(Some(assigned))
@@ -2496,8 +2477,7 @@ impl ServerIncoming for Server {
                 assignment: JobAssignment::Archive(tc),
                 ..
             }) => tc.clone(),
-            Some(_) => return Ok(SubmitToolchainResult::JobNotFound),
-            None => return Ok(SubmitToolchainResult::JobNotFound),
+            Some(_) | None => return Ok(SubmitToolchainResult::JobNotFound),
         };
         // Streaming and hashing large archives must not hold the cache mutex:
         // other toolchains still need to be assigned while uploads are slow.
@@ -2554,9 +2534,8 @@ impl ServerIncoming for Server {
 
         let (crate_name, command_fingerprint) = job_telemetry::identity(&command);
         info!(
-            "dist_job_start job_id={job_id} compiler={:?} crate_name={:?} command_fingerprint={command_fingerprint:016x} argument_count={}",
+            "dist_job_start job_id={job_id} compiler={:?} crate_name={crate_name:?} command_fingerprint={command_fingerprint:016x} argument_count={}",
             command.executable,
-            crate_name,
             command.arguments.len()
         );
         let started = Instant::now();

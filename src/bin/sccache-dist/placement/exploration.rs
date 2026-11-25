@@ -22,7 +22,7 @@ const MAX_ATTEMPTS: usize = 128;
 type Question = (Direction, BTreeSet<Peer>);
 
 #[derive(Default)]
-pub(crate) struct Exploration {
+pub struct Exploration {
     attempts: BTreeMap<Question, Instant>,
 }
 
@@ -223,7 +223,7 @@ impl<'a> Opportunity<'a> {
 /// near-equivalent placements with no additional estimated traffic. This
 /// changes *which already admitted worker executes the real job*, not what
 /// data is requested. Never idle an executor or postpone a transfer.
-pub(crate) fn choose_worker(
+pub fn choose_worker(
     candidates: &[(ServerId, f64)],
     servers: &HashMap<ServerId, ServerDetails>,
     requested: &NativeInputBlobs,

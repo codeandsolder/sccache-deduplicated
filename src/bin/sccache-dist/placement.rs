@@ -5,15 +5,13 @@ mod cost;
 mod delivery;
 use delivery::{DeliveryRates, DirectInputs, InputTraffic};
 mod exploration;
-pub(super) use cost::{
-    ActionClass, ActionCost, AssignedNative, CostBook, WorkerScope, start_checkpoint,
-};
+pub use cost::{ActionClass, ActionCost, AssignedNative, CostBook, WorkerScope, start_checkpoint};
 mod milestone;
-pub(super) use milestone::Milestone;
+pub use milestone::Milestone;
 mod pipeline;
 mod retained;
-pub(super) use exploration::{Exploration, choose_worker};
-pub(super) use retained::RecentResidency;
+pub use exploration::{Exploration, choose_worker};
+pub use retained::RecentResidency;
 use sccache::{
     build_runtime::{
         Direction, DirectionSnapshot, NetworkSnapshot, PackageCatalog, Peer,
@@ -71,7 +69,7 @@ fn native_missing_inputs(
     )
 }
 
-pub(super) struct NativeTransferPlan<'a> {
+pub struct NativeTransferPlan<'a> {
     packages: Option<&'a PackageCatalog>,
     send: DirectionSnapshot,
     receive: DirectionSnapshot,
@@ -391,7 +389,7 @@ fn path_rates(
 /// Rank scheduler recovery candidates using the same measured directional
 /// transport costs as ordinary publication. Direct peer delivery uses the
 /// receiver's measurements instead, not scheduler-relative path rates.
-pub(super) struct PeerRecoveryPlan {
+pub struct PeerRecoveryPlan {
     receive: DirectionSnapshot,
     demands: BTreeMap<Peer, TransferDemand>,
     baseline: BTreeMap<Peer, f64>,
@@ -453,10 +451,10 @@ impl PeerRecoveryPlan {
             .peers
             .get(&peer)
             .map_or(0, |capacity| capacity.observed_bytes_per_second);
-        let bytes_per_second = rate.map_or_else(
-            || if observed == 0 { fallback } else { observed },
-            |rate| rate.bytes_per_second,
-        );
+        let bytes_per_second = rate
+            .map_or(if observed == 0 { fallback } else { observed }, |rate| {
+                rate.bytes_per_second
+            });
         let pending = self.demands.get(&peer).map_or(0, |demand| demand.bytes);
         let (completion, externality) = marginal_completion(
             &self.receive,
@@ -484,6 +482,37 @@ fn worker_interfaces(
                 .then(|| (Peer::Worker(id), placement.interfaces.clone()))
         })
         .collect()
+}
+
+fn update_path_demands(
+    send_demands: &mut BTreeMap<Peer, TransferDemand>,
+    receive_demands: &mut BTreeMap<Peer, TransferDemand>,
+    interfaces: &InterfaceReport,
+    path_rates: &BTreeMap<Peer, CachePathRates>,
+) {
+    for (demands, direction) in [
+        (&mut *send_demands, Direction::Send),
+        (&mut *receive_demands, Direction::Receive),
+    ] {
+        for (&peer, demand) in demands {
+            if let Some(path) = peer.path() {
+                demand.bytes_per_second =
+                    interface_rate(interfaces, path.local, direction, demand.bytes_per_second);
+            }
+        }
+    }
+    for (peer, rates) in path_rates {
+        if let Some(rate) = rates.download
+            && let Some(demand) = send_demands.get_mut(&peer.on_path(rate.path))
+        {
+            demand.bytes_per_second = rate.bytes_per_second;
+        }
+        if let Some(rate) = rates.upload
+            && let Some(demand) = receive_demands.get_mut(&peer.on_path(rate.path))
+        {
+            demand.bytes_per_second = rate.bytes_per_second;
+        }
+    }
 }
 
 impl<'a> NativeTransferPlan<'a> {
@@ -523,33 +552,12 @@ impl<'a> NativeTransferPlan<'a> {
         }
         let mut send_demands = active_demands(&send);
         let mut receive_demands = active_demands(&receive);
-        for (demands, direction) in [
-            (&mut send_demands, Direction::Send),
-            (&mut receive_demands, Direction::Receive),
-        ] {
-            for (&peer, demand) in demands {
-                if let Some(path) = peer.path() {
-                    demand.bytes_per_second = interface_rate(
-                        &network.interfaces,
-                        path.local,
-                        direction,
-                        demand.bytes_per_second,
-                    );
-                }
-            }
-        }
-        for (peer, rates) in &path_rates {
-            if let Some(rate) = rates.download
-                && let Some(demand) = send_demands.get_mut(&peer.on_path(rate.path))
-            {
-                demand.bytes_per_second = rate.bytes_per_second;
-            }
-            if let Some(rate) = rates.upload
-                && let Some(demand) = receive_demands.get_mut(&peer.on_path(rate.path))
-            {
-                demand.bytes_per_second = rate.bytes_per_second;
-            }
-        }
+        update_path_demands(
+            &mut send_demands,
+            &mut receive_demands,
+            &network.interfaces,
+            &path_rates,
+        );
         // Other workers' predicted input closures are only needed if they can
         // contend for a known shared resource. Avoid scanning them otherwise.
         if !send.shared.is_empty() {
@@ -866,7 +874,7 @@ impl<'a> NativeTransferPlan<'a> {
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
-pub(super) struct PlacementEstimate {
+pub struct PlacementEstimate {
     pub(super) seconds: f64,
     pub(super) completion_seconds: f64,
     missing_input_union_bytes: u128,
@@ -885,7 +893,7 @@ pub(super) struct PlacementEstimate {
 /// and input delivery. Include the measured
 /// effective application service time and the marginal delay to other peers.
 #[derive(Clone, Copy)]
-pub(super) struct WorkerForecast<'a> {
+pub struct WorkerForecast<'a> {
     pub capacity: f64,
     pub assigned: &'a pipeline::Assignments,
     pub placement: &'a dist::NativePlacement,
@@ -906,7 +914,7 @@ impl<'a> WorkerForecast<'a> {
     }
 }
 
-pub(super) fn native_estimate(
+pub fn native_estimate(
     forecast: WorkerForecast<'_>,
     requested: &dist::NativeInputBlobs,
     peer: Peer,

@@ -283,11 +283,7 @@ fn save(path: &Path, snapshot: &Snapshot) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn start(
-    book: &Arc<Mutex<CostBook>>,
-    path: PathBuf,
-    listener: SocketAddr,
-) -> Result<()> {
+pub fn start(book: &Arc<Mutex<CostBook>>, path: PathBuf, listener: SocketAddr) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

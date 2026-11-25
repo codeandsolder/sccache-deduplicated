@@ -302,7 +302,7 @@ impl Pipeline {
                     .reserve(Duration::ZERO, remaining(output, job.progress));
             }
             NativeJobPhase::AwaitingPublication => {
-                self.publish.push((Duration::ZERO, false, job.id, output))
+                self.publish.push((Duration::ZERO, false, job.id, output));
             }
             NativeJobPhase::Executing => {
                 let done = self
@@ -312,7 +312,7 @@ impl Pipeline {
             }
             NativeJobPhase::Ready => {
                 self.ready
-                    .push((Duration::ZERO, false, job.id, true, execution, output))
+                    .push((Duration::ZERO, false, job.id, true, execution, output));
             }
             NativeJobPhase::Assigned
             | NativeJobPhase::Queued
@@ -355,26 +355,7 @@ pub(super) struct PipelineForecast {
     pub traffic: InputTraffic,
 }
 
-pub(super) fn publication_forecast(
-    forecast: super::WorkerForecast<'_>,
-    requested: &NativeInputBlobs,
-    catalog: Option<&PackageCatalog>,
-    rates: DeliveryRates,
-    direct: Option<&DirectInputs>,
-) -> PipelineForecast {
-    let super::WorkerForecast {
-        capacity,
-        assigned,
-        placement,
-        recent,
-        cost,
-    } = forecast;
-    let jobs = assigned
-        .len()
-        .saturating_add(placement.queue.jobs.len())
-        .saturating_add(1);
-    let mut pipeline = Pipeline::new(capacity, placement, jobs);
-    let mut staging = Vec::new();
+fn pending_jobs<'a>(assigned: &'a Assignments, placement: &'a NativePlacement) -> Vec<Pending<'a>> {
     let mut pending: Vec<_> = placement
         .queue
         .jobs
@@ -395,6 +376,30 @@ pub(super) fn publication_forecast(
                 progress: None,
             }),
     );
+    pending
+}
+
+pub(super) fn publication_forecast(
+    forecast: super::WorkerForecast<'_>,
+    requested: &NativeInputBlobs,
+    catalog: Option<&PackageCatalog>,
+    rates: DeliveryRates,
+    direct: Option<&DirectInputs>,
+) -> PipelineForecast {
+    let super::WorkerForecast {
+        capacity,
+        assigned,
+        placement,
+        recent,
+        cost,
+    } = forecast;
+    let jobs = assigned
+        .len()
+        .saturating_add(placement.queue.jobs.len())
+        .saturating_add(1);
+    let mut pipeline = Pipeline::new(capacity, placement, jobs);
+    let mut staging = Vec::new();
+    let mut pending = pending_jobs(assigned, placement);
     let native_running = pending
         .iter()
         .filter(|job| job.phase() == NativeJobPhase::Executing)

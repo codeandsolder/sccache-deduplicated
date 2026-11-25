@@ -195,25 +195,22 @@ impl OverlayBuilder {
                 (Some(min), Some(seen)) => {
                     if seen < min {
                         bail!(
-                            "bubblewrap 0.3.0 or later is required, got {:?} for {:?}",
-                            out,
-                            bubblewrap
+                            "bubblewrap 0.3.0 or later is required, got {out:?} for {}",
+                            bubblewrap.display()
                         );
                     }
                 }
                 (_, _) => {
                     bail!(
-                        "Unexpected version format running {:?}: got {:?}, expected \"bubblewrap x.x.x\"",
-                        bubblewrap,
-                        out
+                        "Unexpected version format running {}: got {out:?}, expected \"bubblewrap x.x.x\"",
+                        bubblewrap.display()
                     );
                 }
             }
         } else {
             bail!(
-                "Unexpected version format running {:?}: got {:?}, expected \"bubblewrap x.x.x\"",
-                bubblewrap,
-                out
+                "Unexpected version format running {}: got {out:?}, expected \"bubblewrap x.x.x\"",
+                bubblewrap.display()
             );
         }
 
@@ -235,7 +232,7 @@ impl OverlayBuilder {
 
     fn cleanup(&self) -> Result<()> {
         if self.dir.exists() {
-            fs::remove_dir_all(&self.dir).context("Failed to clean up builder directory")?
+            fs::remove_dir_all(&self.dir).context("Failed to clean up builder directory")?;
         }
         Ok(())
     }
@@ -320,7 +317,9 @@ impl OverlayBuilder {
                 })?;
                 entry.build_count += 1;
                 entry.last_used = Instant::now();
-                entry.clone()
+                let result = entry.clone();
+                drop(toolchain_dir_map);
+                result
             } else {
                 // Once the archive file has been opened, extraction must not
                 // hold the global LRU mutex. The open descriptor remains valid
@@ -389,15 +388,16 @@ impl OverlayBuilder {
 
                 toolchain_dir_map.insert(tc.clone(), entry.clone());
                 self.prune_unused_toolchain_dirs(&mut toolchain_dir_map, tccache);
+                drop(toolchain_dir_map);
                 entry
             }
         };
 
-        trace!("Creating build directory for {}-{}", tc.archive_id, id);
+        trace!("Creating build directory for {}-{id}", tc.archive_id);
         let build_dir = self
             .dir
             .join("builds")
-            .join(format!("{}-{}", tc.archive_id, id));
+            .join(format!("{}-{id}", tc.archive_id));
         fs::create_dir(&build_dir)?;
         Ok(OverlaySpec {
             build_dir,
@@ -418,7 +418,7 @@ impl OverlayBuilder {
             paths: output_paths,
             compression_level,
         } = outputs;
-        trace!("Compile command: {:?}", compile_command);
+        trace!("Compile command: {compile_command:?}");
 
         std::thread::scope(|scope| {
             scope
@@ -459,7 +459,7 @@ impl OverlayBuilder {
                         // This error is unfortunately not Send+Sync
                     )
                     .mount()
-                    .map_err(|e| anyhow!("Failed to mount overlay FS: {}", e.to_string()))?;
+                    .map_err(|e| anyhow!("Failed to mount overlay FS: {e}"))?;
 
                     trace!("copying in inputs");
                     // Note that we don't unpack directly into the upperdir since there overlayfs has some
@@ -483,11 +483,9 @@ impl OverlayBuilder {
                     build_fs
                         .create_dir_all(cwd)
                         .context("Failed to create cwd")?;
-                    for path in output_paths.iter() {
+                    for path in &output_paths {
                         // If it doesn't have a parent, nothing needs creating
-                        let output_parent = if let Some(p) = Path::new(path).parent() {
-                            p
-                        } else {
+                        let Some(output_parent) = Path::new(path).parent() else {
                             continue;
                         };
                         build_fs
@@ -544,7 +542,7 @@ impl OverlayBuilder {
 
                     for (k, v) in env_vars {
                         if k.contains('=') {
-                            warn!("Skipping environment variable: {:?}", k);
+                            warn!("Skipping environment variable: {k:?}");
                             continue;
                         }
                         cmd.arg("--setenv").arg(k).arg(v);
@@ -554,10 +552,10 @@ impl OverlayBuilder {
                     cmd.args(arguments);
                     let compile_output = job_telemetry::run(job_id, &mut cmd)
                         .context("Failed to retrieve output from compile")?;
-                    trace!("compile_output: {:?}", compile_output);
+                    trace!("compile_output: {compile_output:?}");
 
                     let mut outputs = vec![];
-                    trace!("retrieving {:?}", output_paths);
+                    trace!("retrieving {output_paths:?}");
                     for path in output_paths {
                         // Follow output symlinks with the same root semantics
                         // as bubblewrap, never against the host filesystem.
@@ -565,11 +563,11 @@ impl OverlayBuilder {
                             Ok(file) => {
                                 let output = ZstdFrame::try_from_reader(file, compression_level)
                                     .context("Failed to read output file")?;
-                                outputs.push((path, output))
+                                outputs.push((path, output));
                             }
                             Err(e) => {
                                 if e.kind() == io::ErrorKind::NotFound {
-                                    debug!("Missing output path {:?}", path)
+                                    debug!("Missing output path {path:?}");
                                 } else {
                                     return Err(
                                         Error::from(e).context("Failed to open output file")
@@ -598,9 +596,8 @@ impl OverlayBuilder {
         // result should still be returned to the client.
         if let Err(e) = fs::remove_dir_all(&overlay.build_dir) {
             error!(
-                "Failed to remove build directory {}: {}",
-                overlay.build_dir.display(),
-                e
+                "Failed to remove build directory {}: {e}",
+                overlay.build_dir.display()
             );
         }
         // The compile and mount namespace have finished. Release the lease
@@ -629,7 +626,7 @@ impl BuilderIncoming for OverlayBuilder {
         let overlay = self
             .prepare_overlay_dirs(&tc, tccache)
             .context("failed to prepare overlay dirs")?;
-        debug!("Performing build in {:?}", overlay);
+        debug!("Performing build in {overlay:?}");
         let res = Self::perform_build(
             job_id,
             &self.bubblewrap,
@@ -705,13 +702,13 @@ impl DockerBuilder {
             image_map: Mutex::new(HashMap::new()),
             container_lists: Mutex::new(HashMap::new()),
         };
-        ret.cleanup()?;
+        Self::cleanup()?;
         Ok(ret)
     }
 
     // TODO: this should really reclaim, and should check in the image map and container lists, so
     // that when things are removed from there it becomes a form of GC
-    fn cleanup(&self) -> Result<()> {
+    fn cleanup() -> Result<()> {
         info!("Performing initial Docker cleanup");
 
         let containers = Command::new("docker")
@@ -756,32 +753,30 @@ impl DockerBuilder {
                 .map_err(|_| anyhow!("container list mutex poisoned"))?;
             map.entry(tc.clone()).or_default().pop()
         };
-        match container {
-            Some(cid) => Ok(cid),
-            None => {
-                // TODO: can improve parallelism (of creating multiple images at a time) by using another
-                // (more fine-grained) mutex around the entry value and checking if its empty a second time
-                let image = {
-                    let mut map = self
-                        .image_map
-                        .lock()
-                        .map_err(|_| anyhow!("image map mutex poisoned"))?;
-                    match map.entry(tc.clone()) {
-                        hash_map::Entry::Occupied(e) => e.get().clone(),
-                        hash_map::Entry::Vacant(e) => {
-                            info!("Creating Docker image for {:?} (may block requests)", tc);
-                            let image = Self::make_image(tc, tccache)?;
-                            e.insert(image.clone());
-                            image
-                        }
-                    }
-                };
-                Self::start_container(&image)
-            }
+        if let Some(cid) = container {
+            return Ok(cid);
         }
+        // TODO: can improve parallelism (of creating multiple images at a time) by using another
+        // (more fine-grained) mutex around the entry value and checking if its empty a second time
+        let image = {
+            let mut map = self
+                .image_map
+                .lock()
+                .map_err(|_| anyhow!("image map mutex poisoned"))?;
+            match map.entry(tc.clone()) {
+                hash_map::Entry::Occupied(e) => e.get().clone(),
+                hash_map::Entry::Vacant(e) => {
+                    info!("Creating Docker image for {tc:?} (may block requests)");
+                    let image = Self::make_image(tc, tccache)?;
+                    e.insert(image.clone());
+                    image
+                }
+            }
+        };
+        Self::start_container(&image)
     }
 
-    fn clean_container(&self, cid: &str) -> Result<()> {
+    fn clean_container(cid: &str) -> Result<()> {
         // Clean up any running processes
         Command::new("docker")
             .args(["exec", cid, "/busybox", "kill", "-9", "-1"])
@@ -808,18 +803,14 @@ impl DockerBuilder {
                     continue;
                 }
                 if changetype != "A" {
-                    bail!(
-                        "Path {} had a non-A changetype of {}",
-                        changepath,
-                        changetype
-                    );
+                    bail!("Path {changepath} had a non-A changetype of {changetype}");
                 }
                 // Docker diff paths are in alphabetical order and we do `rm -rf`, so we might be able to skip
                 // calling Docker more than necessary (since it's slow)
-                if let Some(lastpath) = lastpath {
-                    if Path::new(changepath).starts_with(lastpath) {
-                        continue;
-                    }
+                if let Some(lastpath) = lastpath
+                    && Path::new(changepath).starts_with(lastpath)
+                {
+                    continue;
                 }
                 lastpath = Some(changepath);
                 if let Err(e) = Command::new("docker")
@@ -827,17 +818,14 @@ impl DockerBuilder {
                     .check_run()
                 {
                     // We do a final check anyway, so just continue
-                    warn!("Failed to remove added path in a container: {}", e)
+                    warn!("Failed to remove added path in a container: {e}");
                 }
             }
 
             let newdiff = docker_diff(cid)?;
             // See note about changepath == "/tmp" above
             if !newdiff.is_empty() && newdiff != "C /tmp" {
-                bail!(
-                    "Attempted to delete files, but container still has a diff: {:?}",
-                    newdiff
-                );
+                bail!("Attempted to delete files, but container still has a diff: {newdiff:?}");
             }
         }
 
@@ -846,44 +834,36 @@ impl DockerBuilder {
 
     // Failing during cleanup is pretty unexpected, but we can still return the successful compile
     // TODO: if too many of these fail, we should mark this builder as faulty
-    fn finish_container(&self, tc: &Toolchain, cid: String) {
+    fn finish_container(&self, tc: &Toolchain, cid: &str) {
         // TODO: collect images
 
-        if let Err(e) = self.clean_container(&cid) {
-            info!("Failed to clean container {}: {}", cid, e);
-            if let Err(e) = docker_rm(&cid) {
-                warn!(
-                    "Failed to remove container {} after failed clean: {}",
-                    cid, e
-                );
+        if let Err(e) = Self::clean_container(cid) {
+            info!("Failed to clean container {cid}: {e}");
+            if let Err(e) = docker_rm(cid) {
+                warn!("Failed to remove container {cid} after failed clean: {e}");
             }
             return;
         }
 
         // Good as new, add it back to the container list. If the bookkeeping lock is poisoned,
         // discard the container rather than turning cleanup into a process-wide panic.
-        let reclaimed = match self.container_lists.lock() {
-            Ok(mut containers) => {
-                if let Some(entry) = containers.get_mut(tc) {
-                    debug!("Reclaimed container {}", cid);
-                    entry.push(cid.clone());
-                    true
-                } else {
-                    false
-                }
-            }
-            Err(_) => {
-                warn!("Container list mutex poisoned while reclaiming {}", cid);
-                false
-            }
+        let reclaimed = if let Ok(mut containers) = self.container_lists.lock() {
+            containers.get_mut(tc).is_some_and(|entry| {
+                debug!("Reclaimed container {cid}");
+                entry.push(cid.to_owned());
+                true
+            })
+        } else {
+            warn!("Container list mutex poisoned while reclaiming {cid}");
+            false
         };
         if !reclaimed {
             warn!(
-                "Could not reclaim container {} for toolchain {}; removing it",
-                cid, tc.archive_id
+                "Could not reclaim container {cid} for toolchain {}; removing it",
+                tc.archive_id
             );
-            if let Err(e) = docker_rm(&cid) {
-                warn!("Failed to remove container {}: {}", cid, e);
+            if let Err(e) = docker_rm(cid) {
+                warn!("Failed to remove container {cid}: {e}");
             }
         }
     }
@@ -919,7 +899,7 @@ impl DockerBuilder {
         let image_result = (|| -> Result<()> {
             trace!("Copying in toolchain");
             Command::new("docker")
-                .args(["cp", "-", &format!("{}:/", cid)])
+                .args(["cp", "-", &format!("{cid}:/")])
                 .check_piped(&mut |stdin| {
                     io::copy(&mut toolchain_rdr, stdin)?;
                     Ok(())
@@ -941,8 +921,7 @@ impl DockerBuilder {
             }
             (Err(error), Err(cleanup_error)) => {
                 warn!(
-                    "Failed to remove temporary container {} after image creation failed: {cleanup_error:#}",
-                    cid
+                    "Failed to remove temporary container {cid} after image creation failed: {cleanup_error:#}"
                 );
                 Err(error)
             }
@@ -975,12 +954,12 @@ impl DockerBuilder {
             paths: output_paths,
             compression_level,
         } = outputs;
-        trace!("Compile command: {:?}", compile_command);
+        trace!("Compile command: {compile_command:?}");
 
         trace!("copying in inputs");
         let mut inputs_rdr = inputs_rdr.into_decoded()?;
         Command::new("docker")
-            .args(["cp", "-", &format!("{}:/", cid)])
+            .args(["cp", "-", &format!("{cid}:/")])
             .check_piped(&mut |stdin| {
                 io::copy(&mut inputs_rdr, stdin)?;
                 Ok(())
@@ -1003,11 +982,9 @@ impl DockerBuilder {
         }
         let mut cmd = Command::new("docker");
         cmd.args(["exec", cid, "/busybox", "mkdir", "-p"]).arg(cwd);
-        for path in output_paths.iter() {
+        for path in &output_paths {
             // If it doesn't have a parent, nothing needs creating
-            let output_parent = if let Some(p) = Path::new(path).parent() {
-                p
-            } else {
+            let Some(output_parent) = Path::new(path).parent() else {
                 continue;
             };
             cmd.arg(cwd.join(output_parent));
@@ -1034,10 +1011,10 @@ impl DockerBuilder {
         }
         let compile_output =
             run_with_environment(job_id, &mut cmd, env_vars, executable, arguments)?;
-        trace!("compile_output: {:?}", compile_output);
+        trace!("compile_output: {compile_output:?}");
 
         let mut outputs = vec![];
-        trace!("retrieving {:?}", output_paths);
+        trace!("retrieving {output_paths:?}");
         for path in output_paths {
             let abspath = cwd.join(&path); // Resolve in case it's relative since we copy it from the root level
             // TODO: this isn't great, but cp gives it out as a tar
@@ -1049,9 +1026,9 @@ impl DockerBuilder {
             if output.status.success() {
                 let output = ZstdFrame::try_from_reader(&*output.stdout, compression_level)
                     .context("failed to compress build output")?;
-                outputs.push((path, output))
+                outputs.push((path, output));
             } else {
-                debug!("Missing output path {:?}", path)
+                debug!("Missing output path {path:?}");
             }
         }
 
@@ -1079,11 +1056,11 @@ impl BuilderIncoming for DockerBuilder {
         let cid = self
             .get_container(&tc, tccache)
             .context("Failed to get a container for build")?;
-        debug!("Performing build with container {}", cid);
+        debug!("Performing build with container {cid}");
         let result = Self::perform_build(job_id, command, inputs_rdr, outputs, &cid)
             .context("Failed to perform build");
-        debug!("Finishing with container {}", cid);
-        self.finish_container(&tc, cid);
+        debug!("Finishing with container {cid}");
+        self.finish_container(&tc, &cid);
         debug!("Returning result");
         result
     }

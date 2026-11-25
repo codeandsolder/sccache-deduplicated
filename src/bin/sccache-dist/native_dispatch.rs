@@ -32,7 +32,7 @@ const RESULT_RETENTION: Duration = Duration::from_mins(5);
 
 struct Assignment {
     spec: NativeAssignment,
-    _pins: NativeInputPins,
+    pins: NativeInputPins,
 }
 
 enum Terminal {
@@ -190,7 +190,7 @@ impl Shared {
         }
     }
 
-    fn finish(&self, job: Job, result: Result<CapturedExecution>) {
+    fn finish(&self, job: &Job, result: Result<CapturedExecution>) {
         // A lost completion acknowledgement must not discard successfully
         // published outputs or the original compiler diagnostics.
         match job
@@ -199,7 +199,7 @@ impl Shared {
         {
             Ok(UpdateJobStateResult::Success) => (),
             Ok(UpdateJobStateResult::Fail { msg }) => {
-                warn!("Native job {} completion rejected: {msg}", job.id)
+                warn!("Native job {} completion rejected: {msg}", job.id);
             }
             Err(error) => warn!(
                 "Native job {} completion acknowledgement failed: {error:#}",
@@ -211,7 +211,7 @@ impl Shared {
 
     fn stage(&self, staging: Staging, ready: &SyncSender<Ready>) {
         let Staging { job, assignment } = staging;
-        let missing = assignment._pins._blobs.missing();
+        let missing = assignment.pins.blobs.missing();
         let mut remaining = RemainingInputs::from_missing(missing);
         let mut missing: BTreeMap<_, _> = missing.iter().map(|blob| (blob.id, blob.size)).collect();
         let mut on_tree = |tree: &TreeLease| {
@@ -254,12 +254,12 @@ impl Shared {
                 if let Err(error) = ready.send(Ready { job, prepared }) {
                     let Ready { job, prepared } = error.0;
                     drop(prepared);
-                    self.finish(job, Err(anyhow::anyhow!("native compiler pool stopped")));
+                    self.finish(&job, Err(anyhow::anyhow!("native compiler pool stopped")));
                 }
             }
             Err(error) => {
                 drop(assignment);
-                self.finish(job, Err(error));
+                self.finish(&job, Err(error));
             }
         }
     }
@@ -267,13 +267,16 @@ impl Shared {
     fn compile(&self, ready: Ready, publishing: &SyncSender<Publishing>) {
         let Ready { job, prepared } = ready;
         let completed = self.worker.execute(prepared, &self.queue, || {
-            self.phase(job.id, NativeJobPhase::Executing)
+            self.phase(job.id, NativeJobPhase::Executing);
         });
         self.phase(job.id, NativeJobPhase::AwaitingPublication);
         if let Err(error) = publishing.send(Publishing { job, completed }) {
             let Publishing { job, completed } = error.0;
             drop(completed);
-            self.finish(job, Err(anyhow::anyhow!("native publication pool stopped")));
+            self.finish(
+                &job,
+                Err(anyhow::anyhow!("native publication pool stopped")),
+            );
         }
     }
 
@@ -281,7 +284,7 @@ impl Shared {
         let Publishing { job, completed } = publishing;
         self.phase(job.id, NativeJobPhase::Publishing);
         let result = self.worker.publish(completed);
-        self.finish(job, result);
+        self.finish(&job, result);
     }
 }
 
@@ -320,7 +323,7 @@ fn spawn_pool<T: Send + 'static>(
     Ok(threads)
 }
 
-pub(super) struct NativeDispatcher {
+pub struct NativeDispatcher {
     shared: Arc<Shared>,
     staging: Option<SyncSender<Staging>>,
     threads: Vec<JoinHandle<()>>,
@@ -354,7 +357,7 @@ impl NativeDispatcher {
         let mut threads = {
             let shared = Arc::clone(&shared);
             spawn_pool("native-publish", io_width, publishing_rx, move |task| {
-                shared.publish(task)
+                shared.publish(task);
             })?
         };
         {
@@ -394,7 +397,7 @@ impl NativeDispatcher {
     ) -> Result<()> {
         spec.spec.validate()?;
         let pins = self.shared.worker.pin_resident_inputs(&spec)?;
-        let remaining = RemainingInputs::from_missing(pins._blobs.missing());
+        let remaining = RemainingInputs::from_missing(pins.blobs.missing());
         let mut reservations = self
             .shared
             .reservations
@@ -424,7 +427,7 @@ impl NativeDispatcher {
                 requester,
                 cancelled,
             },
-            assignment: Box::new(Assignment { spec, _pins: pins }),
+            assignment: Box::new(Assignment { spec, pins: pins }),
         };
         // No authorization RPC on this request thread: schedule still holds
         // its session lock while awaiting our assignment acknowledgement.
