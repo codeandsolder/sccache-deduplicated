@@ -2266,12 +2266,17 @@ fn test_symlinked_exe() {
         .unwrap();
 
     let get_version = |compiler: &mut Command| {
-        compiler
+        let output = compiler
             .arg("--version")
             .current_dir(&tempdir)
             .output()
-            .unwrap()
-            .stdout
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "version command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
     };
 
     let mut sc_cmd = sccache_command();
@@ -2291,8 +2296,9 @@ fn test_symlinked_exe() {
         let sccache_compiler_alias = tempdir.path().join(exe_filename);
         unix_fs::symlink(&sccache_path, &sccache_compiler_alias).unwrap();
 
-        let compiler_alias_ver_stdout =
-            get_version(Command::new(&sccache_compiler_alias).envs(compiler.env_vars));
+        let compiler_alias_ver_stdout = get_version(
+            harness::prune_command(Command::new(&sccache_compiler_alias)).envs(compiler.env_vars),
+        );
         assert_eq!(compiler_ver_stdout, compiler_alias_ver_stdout);
 
         fs::remove_file(&sccache_compiler_alias).unwrap();

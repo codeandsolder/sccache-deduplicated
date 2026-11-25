@@ -1600,19 +1600,26 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     assert_eq!(hit.source, NativeBuildSource::Hit);
 
     // Output selection is a delivery policy, not an execution/cache identity.
-    // The complete result includes an already-present input file, but the
-    // first consumer requests only its final compiled object.
+    // The assembler produces a separate listing file in addition to its
+    // object. An immutable input cannot be declared as a writable file
+    // output, so exercise selection using two actual generated outputs.
     let mut selective = spec.clone();
+    selective
+        .command
+        .arguments
+        .insert(0, b"-al=listing.txt".to_vec());
     selective.outputs.insert(
         "intermediate".into(),
         OutputSpec {
-            path: BuildPath::new(b"/src/input.s".to_vec())?,
+            path: BuildPath::new(b"/src/listing.txt".to_vec())?,
             required: true,
             kind: sccache_build::OutputKind::File,
         },
     );
-    let intermediate = root.join("delivered-input.s");
-    let first = client.run_action(&selective, &inputs, &destinations, &policy, None)?;
+    let intermediate = root.join("delivered-listing.txt");
+    let first = client
+        .run_action(&selective, &inputs, &destinations, &policy, None)
+        .context("selective assembler listing compilation")?;
     assert_eq!(first.source, NativeBuildSource::Worker(fleet.worker_id));
     assert!(first.output.status.success());
     assert!(!intermediate.exists());
@@ -1621,7 +1628,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let second_result = client.run_action(&selective, &inputs, &all, &policy, None)?;
     assert_eq!(second_result.source, NativeBuildSource::Hit);
     assert!(second_result.output.status.success());
-    assert_eq!(fs::read(&intermediate)?, assembly);
+    assert!(fs::read_to_string(&intermediate)?.contains("repeated original assembly content"));
 
     // Repeated real executions of the same command family exercise the
     // scheduler's learned service time rather than its worker-wide prior.
