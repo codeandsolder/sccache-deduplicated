@@ -681,7 +681,7 @@ mod server {
     #[derive(Serialize)]
     pub struct ErrJson {
         description: String,
-        cause: Option<Box<ErrJson>>,
+        cause: Option<Box<Self>>,
     }
 
     impl ErrJson {
@@ -1345,7 +1345,7 @@ mod server {
                 num_cpus() * 8,
                 move |request| {
                     let req_id = request_count.fetch_add(1, atomic::Ordering::Relaxed);
-                    trace!(target: "sccache_http", "Req {}: {:?}", req_id, SafeRequest(request));
+                    trace!(target: "sccache_http", "Req {req_id}: {:?}", SafeRequest(request));
                     let response = (|| {
                         router!(request,
                             (POST) (/api/v1/scheduler/alloc_job) => {
@@ -1783,7 +1783,7 @@ mod server {
                 num_cpus() * 8,
                 move |request| {
                     let req_id = request_count.fetch_add(1, atomic::Ordering::Relaxed);
-                    trace!("Req {}: {:?}", req_id, SafeRequest(request));
+                    trace!("Req {req_id}: {:?}", SafeRequest(request));
                     let response = (|| {
                         router!(request,
                             (POST) (/api/v1/distserver/assign_job/{job_id: JobId}) => {
