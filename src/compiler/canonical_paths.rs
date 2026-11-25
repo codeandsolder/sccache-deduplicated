@@ -25,9 +25,13 @@ impl RootMapping {
 
     fn to_canonical(&self, path: &Path) -> Option<PathBuf> {
         self.aliases.iter().find_map(|physical| {
-            path.strip_prefix(physical)
-                .ok()
-                .map(|suffix| self.canonical.join(suffix))
+            path.strip_prefix(physical).ok().map(|suffix| {
+                if suffix.as_os_str().is_empty() {
+                    self.canonical.clone()
+                } else {
+                    self.canonical.join(suffix)
+                }
+            })
         })
     }
 
@@ -152,6 +156,7 @@ pub(super) enum RustEnvironmentPath {
     Temporary,
     Home,
     ClippyConfig,
+    CargoBuildDir,
     Cargo,
     Rustc,
     Rustdoc,
@@ -165,6 +170,7 @@ impl RustEnvironmentPath {
             Some("HOME") => Self::Home,
             Some("CLIPPY_CONF_DIR") => Self::ClippyConfig,
             Some("CARGO") => Self::Cargo,
+            Some("CARGO_BUILD_BUILD_DIR") => Self::CargoBuildDir,
             Some("RUSTC") => Self::Rustc,
             Some("RUSTDOC") => Self::Rustdoc,
             Some(
@@ -501,6 +507,30 @@ impl CanonicalRustPaths {
                 || self.normalize_os_value(value),
                 |dir| self.to_canonical(dir).into_os_string(),
             ),
+            RustEnvironmentPath::CargoBuildDir => {
+                // Cargo expands the standard workspace hash template before
+                // invoking rustc, but leaves the original template in its
+                // inherited environment. Map only a template that actually
+                // produced this invocation's discovered output root. The
+                // physical per-invocation lease must not enter the action key.
+                let root = self.intermediate_root.as_ref().unwrap_or(&self.target_root);
+                let template = Path::new(value);
+                if template.file_name() == Some(OsStr::new("{workspace-path-hash}"))
+                    && let Some(parent) = template.parent()
+                    && let Ok(suffix) = root.strip_prefix(parent)
+                {
+                    let components = suffix.components().collect::<Vec<_>>();
+                    if components.len() == 2
+                        && components.iter().all(|component| {
+                            let bytes = component.as_os_str().as_encoded_bytes();
+                            !bytes.is_empty() && bytes.iter().all(u8::is_ascii_hexdigit)
+                        })
+                    {
+                        return self.to_canonical(root).into_os_string();
+                    }
+                }
+                self.os_to_canonical(value)
+            }
             RustEnvironmentPath::Cargo => {
                 // Cargo may invoke procedural macros that call Cargo again. A
                 // site wrapper may not exist on the worker; use packaged Cargo.
@@ -660,6 +690,7 @@ mod tests {
             ("HOME", Kind::Home, false),
             ("CLIPPY_CONF_DIR", Kind::ClippyConfig, false),
             ("CARGO", Kind::Cargo, true),
+            ("CARGO_BUILD_BUILD_DIR", Kind::CargoBuildDir, false),
             ("RUSTC", Kind::Rustc, true),
             ("RUSTDOC", Kind::Rustdoc, true),
             ("CARGO_REGISTRIES_PRIVATE_TOKEN", Kind::Other, false),
@@ -801,7 +832,8 @@ mod tests {
             "cargo-ephemeral-build-first",
             "cargo-ephemeral-build-second",
         ] {
-            let intermediate = temp.path().join(temporary_name).join("cargo-target-hash");
+            let lease = temp.path().join(temporary_name);
+            let intermediate = lease.join("12/3456789abcdeff");
             let out_dir = intermediate.join("debug/build/some-crate-hash/out");
             let dep = intermediate.join("debug/deps/libsome_crate-hash.rmeta");
             let compiler_output = intermediate.join("debug/deps");
@@ -823,6 +855,10 @@ mod tests {
                     "codeandsolder-cargo-wrapper".into(),
                 ),
                 ("OUT_DIR".into(), out_dir.clone().into_os_string()),
+                (
+                    "CARGO_BUILD_BUILD_DIR".into(),
+                    lease.join("{workspace-path-hash}").into_os_string(),
+                ),
             ];
             let roots = CanonicalRustPaths::from_env_with_output_dir(
                 &env,
@@ -833,6 +869,19 @@ mod tests {
             )
             .unwrap();
             assert_eq!(roots.target_root, persistent_target);
+            let key = OsStr::new("CARGO_BUILD_BUILD_DIR");
+            let physical = lease.join("{workspace-path-hash}");
+            assert_eq!(
+                roots.env_value_to_canonical(key, physical.as_os_str()),
+                "/intermediate"
+            );
+            let preserved =
+                roots.env_to_canonical_preserving(&env, &HashSet::from([key.to_owned()]));
+            assert_eq!(
+                env_value(&preserved, "CARGO_BUILD_BUILD_DIR"),
+                Some(physical)
+            );
+
             assert_eq!(
                 roots.intermediate_root.as_deref(),
                 Some(intermediate.as_path())
@@ -1300,7 +1349,7 @@ mod tests {
         assert!(roots.root_is_known(&policy.join("clippy.toml")));
         assert_eq!(
             roots.env_value_to_canonical(OsStr::new("CLIPPY_CONF_DIR"), policy.as_os_str()),
-            OsString::from("/clippy-config/")
+            OsString::from("/clippy-config")
         );
         let args = roots.bwrap_arguments(
             Path::new("/rust/bin/clippy-driver"),
@@ -1332,7 +1381,7 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("canonical paths disabled"))?;
         assert_eq!(
             roots.env_value_to_canonical(OsStr::new("CLIPPY_CONF_DIR"), OsStr::new("../policy")),
-            OsString::from("/clippy-config/")
+            OsString::from("/clippy-config")
         );
         Ok(())
     }

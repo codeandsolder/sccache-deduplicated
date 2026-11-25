@@ -4,8 +4,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{self, Read, Take, Write},
-    os::unix::{fs::PermissionsExt, process::ExitStatusExt},
+    io::{self, Read, Seek, Take, Write},
+    os::unix::{
+        fs::{OpenOptionsExt, PermissionsExt},
+        process::ExitStatusExt,
+    },
     path::{Path, PathBuf},
     process::{ExitStatus, Output},
     sync::{Arc, Mutex},
@@ -18,7 +21,7 @@ use tempfile::NamedTempFile;
 
 use super::{LocalExecutor, NativeCacheClient, copy_verified, retryable_transport_error};
 use crate::build_runtime::{
-    ActionMode, Artifact, BlobRef, CapturedExecution, ExecutionSpec, MaterializedTree,
+    ActionMode, Artifact, BlobRef, CapturedExecution, ContentId, ExecutionSpec, MaterializedTree,
     PreparedTree, ResultManifest, TreeId, TreeManifest, materialize_tree,
     wire::{
         ClientDeliveryObservation, InputDemand, InputPoll, NativeAdmission, NativeRunResult,
@@ -125,6 +128,12 @@ impl<'a> LocalInputs<'a> {
             "prepared native inputs differ from the action declaration"
         );
         Ok(Self(inputs))
+    }
+
+    fn matching_sources(&self, id: ContentId) -> impl Iterator<Item = Box<dyn Read + Send>> + '_ {
+        self.0
+            .values()
+            .filter_map(move |tree| tree.open_blob(id).ok())
     }
 
     pub(super) fn tree(&self, id: TreeId) -> Result<&PreparedTree> {
@@ -292,6 +301,8 @@ impl NativeCacheClient {
     /// Admit an exact native action, supply only absent inputs, and execute
     /// in the configured exact sandbox when needed. Remote results use the
     /// fastest authorized source; local results use captured descriptors directly.
+    /// The caller may select any subset of declared outputs (including none).
+    /// All outputs are still captured and validated under the same action key.
     /// No result is repackaged into the legacy cache.
     ///
     /// # Errors
@@ -322,6 +333,7 @@ impl NativeCacheClient {
                             spec,
                             &manifest,
                             &destinations,
+                            &inputs,
                             policy.max_result_bytes,
                             download,
                         )
@@ -734,20 +746,129 @@ pub(super) fn validate_manifest(
     Ok(())
 }
 
+/// The result manifest is independent of delivery selection. Reuse verified
+/// bytes already available to this caller, and download each repeated blob
+/// at most once. Anonymous staging files cannot become a second persistent
+/// cache or be modified through an output pathname.
+struct ResultBlobs<'a, D> {
+    inputs: &'a LocalInputs<'a>,
+    repeated: BTreeSet<ContentId>,
+    verified: BTreeMap<ContentId, tempfile::TempPath>,
+    spool: Option<tempfile::TempDir>,
+    download: D,
+}
+
+impl<D: FnMut(BlobRef, &mut dyn Write) -> Result<()>> ResultBlobs<'_, D> {
+    fn spool_file(&mut self) -> Result<NamedTempFile> {
+        if self.spool.is_none() {
+            self.spool = Some(tempfile::tempdir()?);
+        }
+        Ok(NamedTempFile::new_in(
+            self.spool.as_ref().context("missing result spool")?.path(),
+        )?)
+    }
+
+    fn write(
+        &mut self,
+        blob: BlobRef,
+        existing: Option<&Path>,
+        output: &mut dyn Write,
+    ) -> Result<()> {
+        if let Some(path) = self.verified.get(&blob.id) {
+            io::copy(&mut fs::File::open(path)?, output)?;
+            return Ok(());
+        }
+
+        // Never consume a local candidate directly into the destination: it
+        // may have changed since discovery. Verify into private staging first.
+        let existing = existing.and_then(|path| {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)
+                .ok()?;
+            let metadata = file.metadata().ok()?;
+            (metadata.is_file() && metadata.len() == blob.size)
+                .then(|| Box::new(file) as Box<dyn Read + Send>)
+        });
+        let inputs = self.inputs;
+        for candidate in existing.into_iter().chain(inputs.matching_sources(blob.id)) {
+            let mut file = self.spool_file()?;
+            if copy_verified(candidate, blob, &mut file).is_ok() {
+                file.rewind()?;
+                io::copy(&mut file, output)?;
+                if self.repeated.contains(&blob.id) {
+                    self.verified.insert(blob.id, file.into_temp_path());
+                }
+                return Ok(());
+            }
+        }
+        if self.repeated.contains(&blob.id) {
+            let mut file = self.spool_file()?;
+            (self.download)(blob, &mut file)?;
+            file.rewind()?;
+            io::copy(&mut file, output)?;
+            self.verified.insert(blob.id, file.into_temp_path());
+            return Ok(());
+        }
+        (self.download)(blob, output)
+    }
+}
+
+fn repeated_result_blobs(
+    manifest: &ResultManifest,
+    destinations: &BTreeMap<String, PathBuf>,
+) -> BTreeSet<ContentId> {
+    let mut seen = BTreeSet::new();
+    let mut repeated = BTreeSet::new();
+    let mut count = |blob: BlobRef| {
+        if !seen.insert(blob.id) {
+            repeated.insert(blob.id);
+        }
+    };
+    for blob in manifest.stdout.into_iter().chain(manifest.stderr) {
+        count(blob);
+    }
+    for (name, artifact) in &manifest.outputs {
+        if !destinations.contains_key(name) {
+            continue;
+        }
+        match artifact {
+            Artifact::File { blob, .. } => count(*blob),
+            Artifact::Tree(tree) | Artifact::GeneratedTree(tree) => {
+                for entry in tree.entries.values() {
+                    if let crate::build_runtime::TreeEntry::File { blob, .. } = entry {
+                        count(*blob);
+                    }
+                }
+            }
+        }
+    }
+    repeated
+}
+
 /// Result installation is shared by direct HTTP and namespace callers.
 /// All content is verified before any destination is exposed.
 pub(super) fn fetch_result(
     spec: &ExecutionSpec,
     manifest: &ResultManifest,
     destinations: &BTreeMap<String, PathBuf>,
+    inputs: &LocalInputs<'_>,
     max_result_bytes: u64,
-    mut download: impl FnMut(BlobRef, &mut dyn Write) -> Result<()>,
+    download: impl FnMut(BlobRef, &mut dyn Write) -> Result<()>,
 ) -> Result<StagedResult> {
     validate_manifest(spec, manifest, max_result_bytes)?;
+    let mut blobs = ResultBlobs {
+        inputs,
+        repeated: repeated_result_blobs(manifest, destinations),
+        verified: BTreeMap::new(),
+        spool: None,
+        download,
+    };
     let mut diagnostic = |blob: Option<BlobRef>| -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         if let Some(blob) = blob {
-            download(blob, &mut bytes)?;
+            blobs.write(blob, None, &mut bytes)?;
         }
         Ok(bytes)
     };
@@ -755,12 +876,14 @@ pub(super) fn fetch_result(
     let stderr = diagnostic(manifest.stderr)?;
     let mut staged = Vec::new();
     for (name, artifact) in &manifest.outputs {
-        let path = destinations.get(name).context("unexpected native output")?;
+        let Some(path) = destinations.get(name) else {
+            continue;
+        };
         let parent = path.parent().context("native output has no parent")?;
         let temp = match artifact {
             Artifact::File { blob, mode } => {
                 let mut temp = NamedTempFile::new_in(parent)?;
-                download(*blob, &mut temp)?;
+                blobs.write(*blob, Some(path), &mut temp)?;
                 if let Some(mode) = mode {
                     temp.as_file()
                         .set_permissions(fs::Permissions::from_mode(*mode))?;
@@ -769,8 +892,9 @@ pub(super) fn fetch_result(
             }
             Artifact::Tree(manifest) | Artifact::GeneratedTree(manifest) => {
                 StagedOutput::Tree(materialize_tree(manifest, parent, |blob, path| {
-                    download(
+                    blobs.write(
                         blob,
+                        None,
                         &mut fs::OpenOptions::new()
                             .write(true)
                             .create_new(true)
@@ -813,8 +937,10 @@ pub(super) fn verify_destinations(
     destinations: &BTreeMap<String, PathBuf>,
 ) -> Result<BTreeMap<String, PathBuf>> {
     ensure!(
-        destinations.keys().eq(spec.outputs.keys()),
-        "native output destination contract differs"
+        destinations
+            .keys()
+            .all(|name| spec.outputs.contains_key(name)),
+        "native output destination is not declared"
     );
     let mut seen = BTreeSet::new();
     let mut verified = BTreeMap::new();
@@ -865,6 +991,195 @@ mod input_blob_tests {
         let mut next = Vec::new();
         reader.get_mut().read_to_end(&mut next)?;
         assert_eq!(next, b"next");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod result_tests {
+    use super::*;
+    use crate::build_runtime::{
+        BuildPath, CommandSpec, ExecutionRoot, MappedTree, OutputKind, OutputSpec, TreeMetadata,
+        TreePath, TreeRecipe, TreeTimestamp,
+    };
+
+    fn metadata(mode: u32) -> TreeMetadata {
+        TreeMetadata {
+            mode,
+            modified: TreeTimestamp {
+                seconds: 1,
+                nanoseconds: 0,
+            },
+        }
+    }
+
+    fn blob(data: &[u8]) -> BlobRef {
+        BlobRef {
+            id: ContentId::of(data),
+            size: data.len() as u64,
+        }
+    }
+
+    fn fixture() -> Result<(ExecutionSpec, PreparedTree, ResultManifest)> {
+        let mut input = MappedTree::new(metadata(0o755));
+        input.add_bytes(
+            TreePath::new(b"input".to_vec())?,
+            b"input".to_vec(),
+            metadata(0o644),
+        )?;
+        let input = input.prepare()?;
+        let mut intermediate = MappedTree::new(metadata(0o755));
+        for (name, data) in [
+            ("input-copy", b"input".as_slice()),
+            ("duplicate-a", b"codegen"),
+            ("duplicate-b", b"codegen"),
+        ] {
+            intermediate.add_bytes(
+                TreePath::new(name.as_bytes().to_vec())?,
+                data.to_vec(),
+                metadata(0o644),
+            )?;
+        }
+        let intermediate = intermediate.prepare()?;
+        let spec = ExecutionSpec {
+            platform: ContentId::of(b"platform"),
+            root: ExecutionRoot::resolve(
+                TreeRecipe::union(metadata(0o755), [input.id()]),
+                &BTreeMap::from([(input.id(), input.manifest())]),
+            )?,
+            mounts: BTreeMap::new(),
+            command: CommandSpec {
+                umask: 0o022,
+                executable: BuildPath::new(b"/tool".to_vec())?,
+                arguments: Vec::new(),
+                cwd: BuildPath::new(b"/".to_vec())?,
+                environment: BTreeMap::new(),
+            },
+            outputs: BTreeMap::from([
+                (
+                    "final".into(),
+                    OutputSpec {
+                        path: BuildPath::new(b"/final".to_vec())?,
+                        required: true,
+                        kind: OutputKind::File,
+                    },
+                ),
+                (
+                    "intermediate".into(),
+                    OutputSpec {
+                        path: BuildPath::new(b"/intermediate".to_vec())?,
+                        required: true,
+                        kind: OutputKind::Tree,
+                    },
+                ),
+            ]),
+        };
+        let manifest = ResultManifest {
+            outputs: BTreeMap::from([
+                (
+                    "final".into(),
+                    Artifact::File {
+                        blob: blob(b"final"),
+                        mode: Some(0o755),
+                    },
+                ),
+                (
+                    "intermediate".into(),
+                    Artifact::Tree(intermediate.manifest().clone()),
+                ),
+            ]),
+            stdout: None,
+            stderr: None,
+        };
+        Ok((spec, input, manifest))
+    }
+
+    #[test]
+    fn selected_results_reuse_verified_inputs_and_duplicate_content() -> Result<()> {
+        let (spec, input, manifest) = fixture()?;
+        let inputs = [input];
+        let inputs = LocalInputs::new(&spec, &inputs)?;
+        let root = tempfile::tempdir()?;
+        let final_path = root.path().join("final");
+        let intermediate_path = root.path().join("intermediate");
+        let final_only = verify_destinations(
+            &spec,
+            &BTreeMap::from([("final".into(), final_path.clone())]),
+        )?;
+        let mut requested = Vec::new();
+        fetch_result(
+            &spec,
+            &manifest,
+            &final_only,
+            &inputs,
+            1024,
+            |content, out| {
+                requested.push(content);
+                copy_verified(b"final".as_slice(), content, out)
+            },
+        )?
+        .install()?;
+        assert_eq!(requested, [blob(b"final")]);
+        assert_eq!(fs::read(&final_path)?, b"final");
+        assert!(!intermediate_path.exists());
+
+        let all = verify_destinations(
+            &spec,
+            &BTreeMap::from([
+                ("final".into(), final_path.clone()),
+                ("intermediate".into(), intermediate_path.clone()),
+            ]),
+        )?;
+        requested.clear();
+        fetch_result(&spec, &manifest, &all, &inputs, 1024, |content, out| {
+            requested.push(content);
+            copy_verified(b"codegen".as_slice(), content, out)
+        })?
+        .install()?;
+        assert_eq!(requested, [blob(b"codegen")]);
+        assert_eq!(fs::read(intermediate_path.join("input-copy"))?, b"input");
+        assert_eq!(fs::read(intermediate_path.join("duplicate-a"))?, b"codegen");
+        assert_eq!(fs::read(intermediate_path.join("duplicate-b"))?, b"codegen");
+        assert_eq!(fs::read(&final_path)?, b"final");
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_existing_output_is_replaced_and_unselected_outputs_still_validated() -> Result<()> {
+        let (spec, input, mut manifest) = fixture()?;
+        let inputs = [input];
+        let inputs = LocalInputs::new(&spec, &inputs)?;
+        let root = tempfile::tempdir()?;
+        let output = root.path().join("final");
+        fs::write(&output, b"wrong")?;
+        let selected =
+            verify_destinations(&spec, &BTreeMap::from([("final".into(), output.clone())]))?;
+        assert!(
+            verify_destinations(&spec, &BTreeMap::from([("unknown".into(), output.clone())]),)
+                .is_err()
+        );
+        let mut downloads = 0;
+        fetch_result(
+            &spec,
+            &manifest,
+            &selected,
+            &inputs,
+            1024,
+            |content, out| {
+                downloads += 1;
+                copy_verified(b"final".as_slice(), content, out)
+            },
+        )?
+        .install()?;
+        assert_eq!(downloads, 1);
+        assert_eq!(fs::read(&output)?, b"final");
+        manifest.outputs.remove("intermediate");
+        assert!(
+            fetch_result(&spec, &manifest, &selected, &inputs, 1024, |_, _| {
+                anyhow::bail!("invalid complete manifest must not transfer content")
+            })
+            .is_err()
+        );
         Ok(())
     }
 }

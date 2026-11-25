@@ -317,6 +317,7 @@ fn run_inner(
                     spec,
                     &manifest,
                     destinations,
+                    inputs,
                     policy.max_result_bytes,
                     |blob, destination| {
                         send(stream, &ResultRequest::Blob(blob), limit)?;
