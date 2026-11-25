@@ -831,6 +831,8 @@ pub struct Scheduler {
     // scheduler must not begin again at JobId(0).
     job_id_base: u64,
     job_count: AtomicUsize,
+    #[cfg(feature = "scheduler-dashboard")]
+    dashboard_waker: std::sync::OnceLock<std::sync::mpsc::SyncSender<()>>,
     job_slack: JobSlackConfig,
     maintenance_drain_file: Option<PathBuf>,
 
@@ -840,6 +842,16 @@ pub struct Scheduler {
     completed_acks: Mutex<CompletedJobAcks>,
     exploration: Mutex<Exploration>,
     cost_book: std::sync::Arc<Mutex<placement::CostBook>>,
+}
+
+#[cfg(feature = "scheduler-dashboard")]
+struct DashboardChange<'a>(&'a Scheduler);
+
+#[cfg(feature = "scheduler-dashboard")]
+impl Drop for DashboardChange<'_> {
+    fn drop(&mut self) {
+        self.0.dashboard_changed();
+    }
 }
 
 struct ServerDetails {
@@ -914,6 +926,13 @@ impl ServerDetails {
 }
 
 impl Scheduler {
+    #[cfg(feature = "scheduler-dashboard")]
+    fn dashboard_changed(&self) {
+        if let Some(sender) = self.dashboard_waker.get() {
+            let _ = sender.try_send(());
+        }
+    }
+
     pub fn new() -> Self {
         Self::new_with_job_slack(JobSlackConfig::default())
     }
@@ -953,6 +972,8 @@ impl Scheduler {
         Scheduler {
             job_id_base,
             job_count: AtomicUsize::new(0),
+            #[cfg(feature = "scheduler-dashboard")]
+            dashboard_waker: std::sync::OnceLock::new(),
             job_slack,
             maintenance_drain_file,
             jobs: Mutex::new(BTreeMap::new()),
@@ -1064,6 +1085,8 @@ impl Scheduler {
         network: &NetworkSnapshot,
         packages: std::sync::Arc<sccache::build_runtime::PackageCatalog>,
     ) -> Result<AllocJobResult> {
+        #[cfg(feature = "scheduler-dashboard")]
+        let _dashboard_change = DashboardChange(self);
         if self.is_draining() {
             return Ok(AllocJobResult::Fail {
                 msg: "scheduler is draining for maintenance".to_owned(),
@@ -1251,6 +1274,8 @@ impl Scheduler {
                 return Ok(AllocJobResult::Fail { msg });
             }
         };
+        #[cfg(feature = "scheduler-dashboard")]
+        self.dashboard_changed();
         if let JobAssignment::Native(native) = &mut assignment {
             native.estimated_result_bytes = estimated_result_bytes;
         }
@@ -1375,6 +1400,8 @@ impl SchedulerIncoming for Scheduler {
         job: JobId,
         event: dist::NativeLifecycleEvent<'_>,
     ) {
+        #[cfg(feature = "scheduler-dashboard")]
+        let _dashboard_change = DashboardChange(self);
         let now = Instant::now();
         // Same lock order as assignment and heartbeat processing. The
         // scheduler-epoch job ID ties the receipt to the current worker
@@ -1562,6 +1589,8 @@ impl SchedulerIncoming for Scheduler {
         job_authorizer: Box<dyn JobAuthorizer>,
         mut capabilities: dist::WorkerCapabilities,
     ) -> Result<HeartbeatServerResult> {
+        #[cfg(feature = "scheduler-dashboard")]
+        let _dashboard_change = DashboardChange(self);
         // LOCKS
         let mut jobs = self
             .jobs
@@ -1735,6 +1764,8 @@ impl SchedulerIncoming for Scheduler {
         server_nonce: ServerNonce,
         worker_name: String,
     ) -> Result<()> {
+        #[cfg(feature = "scheduler-dashboard")]
+        let _dashboard_change = DashboardChange(self);
         let worker_name = validate_worker_name(worker_name)?;
         // Match heartbeat lock ordering so a stale named worker cannot reserve
         // a display name after it has stopped heartbeating.
@@ -1804,6 +1835,8 @@ impl SchedulerIncoming for Scheduler {
         server_id: ServerId,
         job_state: JobState,
     ) -> Result<UpdateJobStateResult> {
+        #[cfg(feature = "scheduler-dashboard")]
+        let _dashboard_change = DashboardChange(self);
         // LOCKS
         let mut jobs = self
             .jobs
@@ -1892,11 +1925,20 @@ impl SchedulerIncoming for Scheduler {
     }
 
     #[cfg(feature = "scheduler-dashboard")]
+    fn install_dashboard_waker(&self, sender: std::sync::mpsc::SyncSender<()>) -> Result<()> {
+        self.dashboard_waker
+            .set(sender)
+            .map_err(|_| anyhow::anyhow!("dashboard waker already installed"))
+    }
+
+    #[cfg(feature = "scheduler-dashboard")]
     fn handle_dashboard_snapshot(&self) -> Result<sccache_dashboard::Snapshot> {
         dashboard::snapshot(self)
     }
 
     fn handle_status(&self) -> Result<SchedulerStatusResult> {
+        #[cfg(feature = "scheduler-dashboard")]
+        let _dashboard_change = DashboardChange(self);
         // LOCKS
         let mut jobs = self
             .jobs

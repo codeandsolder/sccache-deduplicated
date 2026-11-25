@@ -44,7 +44,7 @@
     "unit": "short",
     "queries": [
       {
-        "expr": "sum(sccache_dist_status{instance=~\".*\",resolution=\"raw\",kind=\"connected\"})",
+        "expr": "sum(sccache_dist_status{instance=~\"$client\",resolution=\"raw\",kind=\"connected\"})",
         "legend": ""
       }
     ]
@@ -54,15 +54,15 @@
     "unit": "percent",
     "queries": [
       {
-        "expr": "(100*sum(increase(sccache_cache_requests_total{instance=~\".*\",resolution=\"raw\",result=\"hit\"}[5m]))/clamp_min(sum(increase(sccache_cache_requests_total{instance=~\".*\",resolution=\"raw\",result=~\"hit|miss\"}[5m])),1)) and (sum(increase(sccache_cache_requests_total{instance=~\".*\",resolution=\"raw\",result=~\"hit|miss\"}[5m])) > 0)",
+        "expr": "(100*sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[5m]))/clamp_min(sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[5m])),1)) and (sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[5m])) > 0)",
         "legend": "5m"
       },
       {
-        "expr": "(100*sum(increase(sccache_cache_requests_total{instance=~\".*\",resolution=\"raw\",result=\"hit\"}[15m]))/clamp_min(sum(increase(sccache_cache_requests_total{instance=~\".*\",resolution=\"raw\",result=~\"hit|miss\"}[15m])),1)) and (sum(increase(sccache_cache_requests_total{instance=~\".*\",resolution=\"raw\",result=~\"hit|miss\"}[15m])) > 0)",
+        "expr": "(100*sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[15m]))/clamp_min(sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[15m])),1)) and (sum(increase(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[15m])) > 0)",
         "legend": "15m"
       },
       {
-        "expr": "100*sum(sccache_cache_requests_total{instance=~\".*\",resolution=\"raw\",result=\"hit\"})/clamp_min(sum(sccache_cache_requests_total{instance=~\".*\",resolution=\"raw\",result=~\"hit|miss\"}),1)",
+        "expr": "100*sum(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"})/clamp_min(sum(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}),1)",
         "legend": "since restart"
       }
     ]
@@ -72,7 +72,7 @@
     "unit": "percent",
     "queries": [
       {
-        "expr": "100*sum(increase(sccache_dist_compiles_total{instance=~\".*\",resolution=\"raw\"}[1h]))/clamp_min(sum(increase(sccache_compilations_total{instance=~\".*\",resolution=\"raw\",result=\"performed\"}[1h])),1)",
+        "expr": "100*sum(increase(sccache_dist_compiles_total{instance=~\"$client\",resolution=\"raw\"}[$__range]))/clamp_min(sum(increase(sccache_compilations_total{instance=~\"$client\",resolution=\"raw\",result=\"performed\"}[$__range])),1)",
         "legend": ""
       }
     ]
@@ -82,7 +82,7 @@
     "unit": "short",
     "queries": [
       {
-        "expr": "sum(increase(sccache_dist_events_total{instance=~\".*\",resolution=\"raw\",event=\"error\"}[1h]))",
+        "expr": "sum(increase(sccache_dist_events_total{instance=~\"$client\",resolution=\"raw\",event=\"error\"}[1h]))",
         "legend": ""
       }
     ]
@@ -92,11 +92,11 @@
     "unit": "ops",
     "queries": [
       {
-        "expr": "sum by(instance)(rate(sccache_requests_total{instance=~\".*\",resolution=\"raw\",result=\"compile\"}[5m]))",
+        "expr": "sum by(instance)(rate(sccache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"compile\"}[$__rate_interval]))",
         "legend": "{{instance}} compile/s"
       },
       {
-        "expr": "sum by(instance)(rate(sccache_requests_total{instance=~\".*\",resolution=\"raw\",result=\"executed\"}[5m]))",
+        "expr": "sum by(instance)(rate(sccache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"executed\"}[$__rate_interval]))",
         "legend": "{{instance}} executed/s"
       }
     ]
@@ -106,7 +106,7 @@
     "unit": "ops",
     "queries": [
       {
-        "expr": "sum by(instance,result)(rate(sccache_cache_requests_total{instance=~\".*\",resolution=\"raw\"}[5m]))",
+        "expr": "sum by(instance,result)(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\"}[$__rate_interval]))",
         "legend": "{{instance}} {{result}}"
       }
     ]
@@ -116,7 +116,7 @@
     "unit": "ops",
     "queries": [
       {
-        "expr": "((label_replace((sum by(server)(rate(sccache_dist_compiles_total{instance=~\".*\",resolution=\"raw\"}[5m]))), \"tailscale_ip\", \"$1\", \"server\", \"([^:]+):.*\")) * on(tailscale_ip) group_left(hostname) (max by(tailscale_ip,hostname) ({__name__=~\"tailscale_(peer|self)_info\",resolution=\"raw\",tailscale_ip!=\"\"}))) or (label_replace(((label_replace((sum by(server)(rate(sccache_dist_compiles_total{instance=~\".*\",resolution=\"raw\"}[5m]))), \"tailscale_ip\", \"$1\", \"server\", \"([^:]+):.*\")) unless on(tailscale_ip) (max by(tailscale_ip,hostname) ({__name__=~\"tailscale_(peer|self)_info\",resolution=\"raw\",tailscale_ip!=\"\"}))), \"hostname\", \"$1\", \"server\", \"(.*)\"))",
+        "expr": "((label_replace((sum by(server)(rate(sccache_dist_compiles_total{instance=~\"$client\",resolution=\"raw\"}[$__rate_interval]))), \"tailscale_ip\", \"$1\", \"server\", \"([^:]+):.*\")) * on(tailscale_ip) group_left(hostname) (max by(tailscale_ip,hostname) ({__name__=~\"tailscale_(peer|self)_info\",resolution=\"raw\",tailscale_ip!=\"\"}))) or (label_replace(((label_replace((sum by(server)(rate(sccache_dist_compiles_total{instance=~\"$client\",resolution=\"raw\"}[$__rate_interval]))), \"tailscale_ip\", \"$1\", \"server\", \"([^:]+):.*\")) unless on(tailscale_ip) (max by(tailscale_ip,hostname) ({__name__=~\"tailscale_(peer|self)_info\",resolution=\"raw\",tailscale_ip!=\"\"}))), \"hostname\", \"$1\", \"server\", \"(.*)\"))",
         "legend": "{{hostname}}"
       }
     ]
@@ -126,7 +126,7 @@
     "unit": "percent",
     "queries": [
       {
-        "expr": "100*sum by(language)(rate(sccache_cache_requests_total{instance=~\".*\",resolution=\"raw\",result=\"hit\"}[5m]))/sum by(language)(rate(sccache_cache_requests_total{instance=~\".*\",resolution=\"raw\",result=~\"hit|miss\"}[5m]))",
+        "expr": "100*sum by(language)(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[$__rate_interval]))/sum by(language)(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[$__rate_interval]))",
         "legend": "{{language}}"
       }
     ]
@@ -136,11 +136,11 @@
     "unit": "ops",
     "queries": [
       {
-        "expr": "sum by(reason)(rate(sccache_not_cached_total{instance=~\".*\",resolution=\"raw\"}[5m]))",
+        "expr": "sum by(reason)(rate(sccache_not_cached_total{instance=~\"$client\",resolution=\"raw\"}[$__rate_interval]))",
         "legend": "{{reason}}"
       },
       {
-        "expr": "sum by(crate_type)(rate(sccache_not_cached_crate_types_total{instance=~\".*\",resolution=\"raw\"}[5m]))",
+        "expr": "sum by(crate_type)(rate(sccache_not_cached_crate_types_total{instance=~\"$client\",resolution=\"raw\"}[$__rate_interval]))",
         "legend": "crate-type: {{crate_type}}"
       }
     ]
@@ -150,7 +150,7 @@
     "unit": "ops",
     "queries": [
       {
-        "expr": "sum by(instance,result)(rate(sccache_requests_total{instance=~\".*\",resolution=\"raw\",result=~\"executed|not_cacheable|unsupported_compiler|not_compile\"}[5m]))",
+        "expr": "sum by(instance,result)(rate(sccache_requests_total{instance=~\"$client\",resolution=\"raw\",result=~\"executed|not_cacheable|unsupported_compiler|not_compile\"}[$__rate_interval]))",
         "legend": "{{instance}} {{result}}"
       }
     ]
@@ -160,7 +160,7 @@
     "unit": "s",
     "queries": [
       {
-        "expr": "sum by(instance)(rate(sccache_duration_seconds_total{instance=~\".*\",resolution=\"raw\",operation=\"compile\"}[5m]))/clamp_min(sum by(instance)(rate(sccache_compilations_total{instance=~\".*\",resolution=\"raw\",result=\"performed\"}[5m])),1e-9)",
+        "expr": "sum by(instance)(rate(sccache_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"compile\"}[$__rate_interval]))/clamp_min(sum by(instance)(rate(sccache_compilations_total{instance=~\"$client\",resolution=\"raw\",result=\"performed\"}[$__rate_interval])),1e-9)",
         "legend": "{{instance}}"
       }
     ]
@@ -170,11 +170,11 @@
     "unit": "s",
     "queries": [
       {
-        "expr": "sum by(instance)(rate(sccache_duration_seconds_total{instance=~\".*\",resolution=\"raw\",operation=\"cache_write\"}[5m]))/clamp_min(sum by(instance)(rate(sccache_cache_events_total{instance=~\".*\",resolution=\"raw\",event=\"write\"}[5m])),1e-9)",
+        "expr": "sum by(instance)(rate(sccache_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"cache_write\"}[$__rate_interval]))/clamp_min(sum by(instance)(rate(sccache_cache_events_total{instance=~\"$client\",resolution=\"raw\",event=\"write\"}[$__rate_interval])),1e-9)",
         "legend": "{{instance}} write"
       },
       {
-        "expr": "sum by(instance)(rate(sccache_duration_seconds_total{instance=~\".*\",resolution=\"raw\",operation=\"cache_read_hit\"}[5m]))/clamp_min(sum by(instance)(rate(sccache_cache_requests_total{instance=~\".*\",resolution=\"raw\",result=\"hit\"}[5m])),1e-9)",
+        "expr": "sum by(instance)(rate(sccache_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"cache_read_hit\"}[$__rate_interval]))/clamp_min(sum by(instance)(rate(sccache_cache_requests_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[$__rate_interval])),1e-9)",
         "legend": "{{instance}} read hit"
       }
     ]
@@ -184,11 +184,11 @@
     "unit": "s",
     "queries": [
       {
-        "expr": "sum by(instance,name)(rate(sccache_cache_level_duration_seconds_total{instance=~\".*\",resolution=\"raw\",operation=\"write\"}[5m]))/clamp_min(sum by(instance,name)(rate(sccache_cache_level_operations_total{instance=~\".*\",resolution=\"raw\",operation=\"write\"}[5m])),1e-9)",
+        "expr": "sum by(instance,name)(rate(sccache_cache_level_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"write\"}[$__rate_interval]))/clamp_min(sum by(instance,name)(rate(sccache_cache_level_operations_total{instance=~\"$client\",resolution=\"raw\",operation=\"write\"}[$__rate_interval])),1e-9)",
         "legend": "{{instance}} {{name}} write"
       },
       {
-        "expr": "sum by(instance,name)(rate(sccache_cache_level_duration_seconds_total{instance=~\".*\",resolution=\"raw\",operation=\"hit\"}[5m]))/clamp_min(sum by(instance,name)(rate(sccache_cache_level_operations_total{instance=~\".*\",resolution=\"raw\",operation=\"hit\"}[5m])),1e-9)",
+        "expr": "sum by(instance,name)(rate(sccache_cache_level_duration_seconds_total{instance=~\"$client\",resolution=\"raw\",operation=\"hit\"}[$__rate_interval]))/clamp_min(sum by(instance,name)(rate(sccache_cache_level_operations_total{instance=~\"$client\",resolution=\"raw\",operation=\"hit\"}[$__rate_interval])),1e-9)",
         "legend": "{{instance}} {{name}} hit"
       }
     ]
@@ -198,7 +198,7 @@
     "unit": "ops",
     "queries": [
       {
-        "expr": "sum by(instance,name,operation)(rate(sccache_cache_level_operations_total{instance=~\".*\",resolution=\"raw\"}[5m]))",
+        "expr": "sum by(instance,name,operation)(rate(sccache_cache_level_operations_total{instance=~\"$client\",resolution=\"raw\"}[$__rate_interval]))",
         "legend": "{{instance}} {{name}} {{operation}}"
       }
     ]
@@ -208,7 +208,7 @@
     "unit": "ops",
     "queries": [
       {
-        "expr": "sum by(instance,event)(rate(sccache_cache_events_total{instance=~\".*\",resolution=\"raw\",event=~\"timeout|read_error|write_error|forced_recache|non_cacheable_compilation\"}[5m]))",
+        "expr": "sum by(instance,event)(rate(sccache_cache_events_total{instance=~\"$client\",resolution=\"raw\",event=~\"timeout|read_error|write_error|forced_recache|non_cacheable_compilation\"}[$__rate_interval]))",
         "legend": "{{instance}} {{event}}"
       }
     ]
@@ -218,11 +218,11 @@
     "unit": "ops",
     "queries": [
       {
-        "expr": "sum by(instance)(rate(sccache_compilations_total{instance=~\".*\",resolution=\"raw\",result=\"failed\"}[5m]))",
+        "expr": "sum by(instance)(rate(sccache_compilations_total{instance=~\"$client\",resolution=\"raw\",result=\"failed\"}[$__rate_interval]))",
         "legend": "{{instance}} compile failures/s"
       },
       {
-        "expr": "sum by(instance)(rate(sccache_dist_events_total{instance=~\".*\",resolution=\"raw\",event=\"error\"}[5m]))",
+        "expr": "sum by(instance)(rate(sccache_dist_events_total{instance=~\"$client\",resolution=\"raw\",event=\"error\"}[$__rate_interval]))",
         "legend": "{{instance}} dist errors/s"
       }
     ]
@@ -232,7 +232,7 @@
     "unit": "short",
     "queries": [
       {
-        "expr": "((label_replace((sum by(server)(increase(sccache_dist_compiles_total{instance=~\".*\",resolution=\"raw\"}[1h]))), \"tailscale_ip\", \"$1\", \"server\", \"([^:]+):.*\")) * on(tailscale_ip) group_left(hostname) (max by(tailscale_ip,hostname) ({__name__=~\"tailscale_(peer|self)_info\",resolution=\"raw\",tailscale_ip!=\"\"}))) or (label_replace(((label_replace((sum by(server)(increase(sccache_dist_compiles_total{instance=~\".*\",resolution=\"raw\"}[1h]))), \"tailscale_ip\", \"$1\", \"server\", \"([^:]+):.*\")) unless on(tailscale_ip) (max by(tailscale_ip,hostname) ({__name__=~\"tailscale_(peer|self)_info\",resolution=\"raw\",tailscale_ip!=\"\"}))), \"hostname\", \"$1\", \"server\", \"(.*)\"))",
+        "expr": "((label_replace((sum by(server)(increase(sccache_dist_compiles_total{instance=~\"$client\",resolution=\"raw\"}[$__range]))), \"tailscale_ip\", \"$1\", \"server\", \"([^:]+):.*\")) * on(tailscale_ip) group_left(hostname) (max by(tailscale_ip,hostname) ({__name__=~\"tailscale_(peer|self)_info\",resolution=\"raw\",tailscale_ip!=\"\"}))) or (label_replace(((label_replace((sum by(server)(increase(sccache_dist_compiles_total{instance=~\"$client\",resolution=\"raw\"}[$__range]))), \"tailscale_ip\", \"$1\", \"server\", \"([^:]+):.*\")) unless on(tailscale_ip) (max by(tailscale_ip,hostname) ({__name__=~\"tailscale_(peer|self)_info\",resolution=\"raw\",tailscale_ip!=\"\"}))), \"hostname\", \"$1\", \"server\", \"(.*)\"))",
         "legend": "{{hostname}}"
       }
     ]
@@ -242,7 +242,7 @@
     "unit": "reqps",
     "queries": [
       {
-        "expr": "sum by(status_class)(rate(certifex_proxy_requests_total{host=\"sccache.onhir.eu\",resolution=\"raw\"}[5m]))",
+        "expr": "sum by(status_class)(rate(certifex_proxy_requests_total{host=\"sccache.onhir.eu\",resolution=\"raw\"}[$__rate_interval]))",
         "legend": "{{status_class}}"
       }
     ]
@@ -252,7 +252,7 @@
     "unit": "ops",
     "queries": [
       {
-        "expr": "sum(rate(certifex_backend_failures_total{host=\"sccache.onhir.eu\",resolution=\"raw\"}[5m]))",
+        "expr": "sum(rate(certifex_backend_failures_total{host=\"sccache.onhir.eu\",resolution=\"raw\"}[$__rate_interval]))",
         "legend": "backend failures/s"
       }
     ]
@@ -262,7 +262,7 @@
     "unit": "s",
     "queries": [
       {
-        "expr": "time()-metrics_push_last_success_unixtime{instance=~\".*\",resolution=\"raw\"}",
+        "expr": "time()-metrics_push_last_success_unixtime{instance=~\"$client\",resolution=\"raw\"}",
         "legend": "{{instance}}"
       }
     ]
@@ -272,7 +272,7 @@
     "unit": "bool",
     "queries": [
       {
-        "expr": "max(sccache_preprocessor_cache_mode{instance=~\".*\",resolution=\"raw\"})",
+        "expr": "max(sccache_preprocessor_cache_mode{instance=~\"$client\",resolution=\"raw\"})",
         "legend": ""
       }
     ]
@@ -282,7 +282,7 @@
     "unit": "short",
     "queries": [
       {
-        "expr": "max(sccache_cache_levels{instance=~\".*\",resolution=\"raw\"})",
+        "expr": "max(sccache_cache_levels{instance=~\"$client\",resolution=\"raw\"})",
         "legend": ""
       }
     ]
@@ -292,7 +292,7 @@
     "unit": "short",
     "queries": [
       {
-        "expr": "max(sccache_basedirs{instance=~\".*\",resolution=\"raw\"})",
+        "expr": "max(sccache_basedirs{instance=~\"$client\",resolution=\"raw\"})",
         "legend": ""
       }
     ]
@@ -302,7 +302,7 @@
     "unit": "",
     "queries": [
       {
-        "expr": "sccache_info{instance=~\".*\",resolution=\"raw\"}",
+        "expr": "sccache_info{instance=~\"$client\",resolution=\"raw\"}",
         "legend": "{{instance}} {{version}}"
       }
     ]
@@ -312,7 +312,7 @@
     "unit": "percent",
     "queries": [
       {
-        "expr": "100*sum by(instance)(rate(cpu_seconds_total{instance=~\".+\",resolution=\"raw\",cpu=\"total\",mode!~\"idle|iowait\"}[5m]))/clamp_min(sum by(instance)(rate(cpu_seconds_total{instance=~\".+\",resolution=\"raw\",cpu=\"total\"}[5m])),1e-9)",
+        "expr": "100*sum by(instance)(rate(cpu_seconds_total{instance=~\".+\",resolution=\"raw\",cpu=\"total\",mode!~\"idle|iowait\"}[$__rate_interval]))/clamp_min(sum by(instance)(rate(cpu_seconds_total{instance=~\".+\",resolution=\"raw\",cpu=\"total\"}[$__rate_interval])),1e-9)",
         "legend": "{{instance}}"
       }
     ]
@@ -342,7 +342,7 @@
     "unit": "percent",
     "queries": [
       {
-        "expr": "100*sum by(compiler_language)(rate(sccache_cache_requests_advanced_total{instance=~\".*\",resolution=\"raw\",result=\"hit\"}[5m]))/sum by(compiler_language)(rate(sccache_cache_requests_advanced_total{instance=~\".*\",resolution=\"raw\",result=~\"hit|miss\"}[5m]))",
+        "expr": "100*sum by(compiler_language)(rate(sccache_cache_requests_advanced_total{instance=~\"$client\",resolution=\"raw\",result=\"hit\"}[$__rate_interval]))/sum by(compiler_language)(rate(sccache_cache_requests_advanced_total{instance=~\"$client\",resolution=\"raw\",result=~\"hit|miss\"}[$__rate_interval]))",
         "legend": "{{compiler_language}}"
       }
     ]
@@ -352,7 +352,7 @@
     "unit": "ops",
     "queries": [
       {
-        "expr": "sum by(compiler_language,result)(rate(sccache_cache_requests_advanced_total{instance=~\".*\",resolution=\"raw\"}[5m]))",
+        "expr": "sum by(compiler_language,result)(rate(sccache_cache_requests_advanced_total{instance=~\"$client\",resolution=\"raw\"}[$__rate_interval]))",
         "legend": "{{compiler_language}} {{result}}"
       }
     ]

@@ -1282,6 +1282,8 @@ mod server {
             #[cfg(feature = "scheduler-dashboard")]
             if let Some(config) = dashboard {
                 let handler = Arc::clone(&handler);
+                let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+                handler.install_dashboard_waker(sender)?;
                 sccache_dashboard::server::spawn(
                     config.bind_address,
                     &config.assets,
@@ -1293,6 +1295,7 @@ mod server {
                         }
                         Ok(snapshot)
                     },
+                    receiver,
                 )?;
             }
             #[cfg(not(feature = "scheduler-dashboard"))]

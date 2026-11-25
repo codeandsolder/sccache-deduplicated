@@ -1504,6 +1504,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
+name = "gloo-events"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d378d6dc490f9f6ea823f9eced8d2eb2bc410ce75e56f63e13f5ac9cc70b091"
+dependencies = [
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "gloo-net"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4342,20 +4352,26 @@ dependencies = [
 name = "sccache-dashboard"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "any_spawner",
+ "anyhow",
  "axum",
+ "chrono",
  "futures",
+ "gloo-events",
  "leptos",
  "leptos_axum",
  "leptos_meta",
  "log",
  "reqwest",
+ "send_wrapper",
  "serde",
  "serde_json",
+ "serde_urlencoded",
+ "stylance",
  "tokio",
  "tower-http 0.7.1",
  "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]
@@ -4752,6 +4768,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "siphasher"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4843,6 +4865,41 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "stylance"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "252bdc37547d27ee7ccd20e028dced7acfdb64b561ac4d8a58393cf1adec0f14"
+dependencies = [
+ "stylance-macros",
+]
+
+[[package]]
+name = "stylance-core"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd267d69de4c0bcb01423fdd641a3007798842c19fe4da6b6acac0efa9ed0b41"
+dependencies = [
+ "anyhow",
+ "serde",
+ "siphasher",
+ "toml",
+ "winnow",
+]
+
+[[package]]
+name = "stylance-macros"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c7a1fdbb4d152b969919646561e8a2d3beb0b03b1014570fd573e55a3b3b627"
+dependencies = [
+ "anyhow",
+ "proc-macro2",
+ "quote",
+ "stylance-core",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "subtle"

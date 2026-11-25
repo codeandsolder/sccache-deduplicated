@@ -1,5 +1,9 @@
 //! Read-only projection of the scheduler's authoritative state.
-use std::{collections::BTreeMap, sync::atomic::Ordering, time::Instant};
+use std::{
+    collections::BTreeMap,
+    sync::atomic::Ordering,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Result, anyhow};
 use sccache_dashboard::{Job, NativeWorker, Snapshot, Worker};
@@ -7,15 +11,30 @@ use sccache_dashboard::{Job, NativeWorker, Snapshot, Worker};
 use super::{Scheduler, ServerDetails};
 use sccache::dist::{self, ServerId};
 
-const MAX_DISPLAYED_JOBS: usize = 1000;
+fn timestamp_ms(instant: Instant) -> u64 {
+    static ORIGIN: std::sync::OnceLock<(Instant, u64)> = std::sync::OnceLock::new();
+    let (origin, unix_ms) = *ORIGIN.get_or_init(|| {
+        (
+            Instant::now(),
+            u64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX),
+        )
+    });
+    let millis =
+        |duration: std::time::Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+    if instant >= origin {
+        unix_ms.saturating_add(millis(instant.duration_since(origin)))
+    } else {
+        unix_ms.saturating_sub(millis(origin.duration_since(instant)))
+    }
+}
 
-fn worker(
-    id: ServerId,
-    details: &ServerDetails,
-    scheduler: &Scheduler,
-    now: Instant,
-    draining: bool,
-) -> Worker {
+fn worker(id: ServerId, details: &ServerDetails, scheduler: &Scheduler, draining: bool) -> Worker {
     let address = id.addr().to_string();
     let max_jobs = scheduler.job_slack.max_jobs(details.cpu_capacity);
     let demand = details.compiler_demand();
@@ -56,12 +75,8 @@ fn worker(
             .clone()
             .unwrap_or_else(|| address.clone()),
         address,
-        heartbeat_age_secs: now
-            .saturating_duration_since(details.last_seen)
-            .as_secs_f64(),
-        last_error_age_secs: details
-            .last_error
-            .map(|error| now.saturating_duration_since(error).as_secs_f64()),
+        heartbeat_at_ms: timestamp_ms(details.last_seen),
+        last_error_at_ms: details.last_error.map(timestamp_ms),
         cpu_capacity: details.cpu_capacity,
         assigned: details.jobs_assigned.len(),
         assigning: details.jobs_assigning.len(),
@@ -100,7 +115,7 @@ pub(super) fn snapshot(scheduler: &Scheduler) -> Result<Snapshot> {
     snapshot.totals.draining = draining;
     snapshot.totals.allocated_ids = scheduler.job_count.load(Ordering::Relaxed);
     for (&id, details) in live {
-        let worker = worker(id, details, scheduler, now, draining);
+        let worker = worker(id, details, scheduler, draining);
         let totals = &mut snapshot.totals;
         totals.workers += 1;
         totals.cpu_capacity += worker.cpu_capacity;
@@ -133,7 +148,7 @@ pub(super) fn snapshot(scheduler: &Scheduler) -> Result<Snapshot> {
         .collect::<Vec<_>>();
     snapshot.jobs_total = active.len();
     active.sort_unstable_by_key(|(id, detail, _)| (detail.assigned_at, **id));
-    for (id, detail, server) in active.into_iter().take(MAX_DISPLAYED_JOBS) {
+    for (id, detail, server) in active {
         let progress = server
             .capabilities
             .native_placement
@@ -147,12 +162,8 @@ pub(super) fn snapshot(scheduler: &Scheduler) -> Result<Snapshot> {
                 .unwrap_or_else(|| detail.server_id.addr().to_string()),
             state: detail.state.to_string(),
             native_phase: progress.map(|progress| format!("{:?}", progress.phase)),
-            age_secs: now
-                .saturating_duration_since(detail.assigned_at)
-                .as_secs_f64(),
-            phase_age_secs: now
-                .saturating_duration_since(detail.state_since)
-                .as_secs_f64(),
+            assigned_at_ms: timestamp_ms(detail.assigned_at),
+            state_since_ms: timestamp_ms(detail.state_since),
             remaining_input_bytes: progress.map(|progress| progress.remaining_input_bytes),
             remaining_input_blobs: progress.map(|progress| progress.remaining_input_blobs),
             predicted_completion_secs: detail
