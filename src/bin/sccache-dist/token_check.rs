@@ -231,6 +231,49 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn validates_rsa_jwk_components_without_der_conversion() -> anyhow::Result<()> {
+        // Test-only RSA public key and signed JWT; the private key is not retained.
+        let jwk = super::Jwk {
+            kid: "test".to_owned(),
+            kty: "RSA".to_owned(),
+            n: concat!(
+                "plNihBM7dUlJfdSaIFLxbReVSGxLb2-",
+                "9OSrK6Jr7z12UjAe7AhrKexVsxnwvcRNOS0_GFqoAyIGf7JzJwUH7Jk_Ygtpf3ge6SnUFqbqfLcaWpIR",
+                "MVC8zo24qy5M2tIKhT3uC7bqImKO_LJG0SdlCj930p69s8moYcLbOQCzhyCthsMNrWSxKXrO4EfN6f5d",
+                "oaKT8S1cbSj-ApIwobC35GRnDlKeLZNnLboaa3GWSus9_5b8jg1x_vVMz8HUwinq99vIvoJ7hNEAZuje",
+                "4f8hoSnVldhfHEp3Z9VTI-gfly8RnLDruC4LR8xuHbxpH6WNKz10XNVyORN-VUpY9Vsx1Ew",
+            )
+            .to_owned(),
+            e: "AQAB".to_owned(),
+        };
+        let key = jwk.decoding_key()?;
+        let mut checker = super::ValidJWTCheck {
+            audience: "audience".to_owned(),
+            issuer: "issuer".to_owned(),
+            keys: HashMap::from([(jwk.kid, key)]),
+        };
+        let token = concat!(
+            "eyJhbGciOiJSUzI1NiIsImtpZCI6InRlc3QifQ.eyJhdWQiOiJhdWRpZW5jZSIsImlzcyI6Imlzc3Vlc",
+            "iIsImV4cCI6NDEwMjQ0NDgwMH0.Mgf7ZwwrkTLblGdVqC6HaRABjCQecb0L6cCpvtcT2b9TgryYV_pYa",
+            "mnlCJHEcF6Ae1RGgPh48wf4nNQIli6StcNdVpI5sLytgpZZQ0Eo4hH6_OZrijD7oOu1Lh21ze1DxeSkt",
+            "rUkPIlpf-Z-ecYjPhuGPpKRaIYQJR8ESC_HHwongLhIKIWX2I1_VpX9QMd5AwYO7U1NTDb0Ky7QaGP8M",
+            "5kC3DnuJgJgmioxLJ-",
+            "e9_1AwgBPU6UYfSWZDHmqPMLlCEG6X2aQwZBiRwHfuOzMvFbR2jNeV0gkftDGFfjliInZHTq8JFMIOsD",
+            "yAy3S-YaCE9nc3TPZopV0JCgSPYKXZQ",
+        );
+        checker.check_jwt_validity(token)?;
+        checker.audience = "other".to_owned();
+        assert!(checker.check_jwt_validity(token).is_err());
+        checker.audience = "audience".to_owned();
+        checker.issuer = "other".to_owned();
+        assert!(checker.check_jwt_validity(token).is_err());
+        checker.issuer = "issuer".to_owned();
+        checker.keys.clear();
+        assert!(checker.check_jwt_validity(token).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn proxy_validation_url_logs_without_query_or_fragment() -> anyhow::Result<()> {
         let url: reqwest::Url = "https://example.test/check?api_key=secret#fragment".parse()?;
         let safe = url_without_query(&url);

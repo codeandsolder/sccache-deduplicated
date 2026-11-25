@@ -72,7 +72,7 @@ jwt = { package = "jsonwebtoken", version = "12", optional = true, default-featu
 libc = "0.2.153"
 linked-hash-map = "0.5"
 log = "0.4"
-lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "68a4a057a9b32e4a45fe7530a2fbd0fdf2566f43", optional = true }
+lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "26ba3601d569d22125494517005d8ebcc4fee287", optional = true }
 memchr = "2"
 mime = "0.3"
 object = { version = "0.41", default-features = false, features = ["read", "std"] }
@@ -121,7 +121,7 @@ webpki-root-certs = { version = "1", optional = true }
 which = { version = "8", default-features = false, features = ["real-sys"] }
 zip = { version = "9", default-features = false }
 zstd = "0.14"
-zlib-rs-fast = { package = "zlib-rs", git = "https://github.com/codeandsolder/zlib-rs-fast", rev = "98f76b3a242099f2229b048360eeb4707246a68f", optional = true, default-features = false, features = ["std"] }
+zlib-rs-fast = { package = "zlib-rs", version = "=0.6.8", optional = true, default-features = false, features = ["std"] }
 
 # dist-server only
 socket2 = { version = "0.6", optional = true }
@@ -296,3 +296,7 @@ ptr_as_ptr = "warn"
 ref_option = "warn"
 semicolon_if_nothing_returned = "warn"
 unnecessary_semicolon = "warn"
+
+# One source identity for direct streams and all Flate2 consumers.
+[patch.crates-io]
+zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast", rev = "98f76b3a242099f2229b048360eeb4707246a68f" }

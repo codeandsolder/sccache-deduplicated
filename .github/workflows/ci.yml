@@ -402,6 +402,21 @@ jobs:
           cargo +${{ steps.compiler.outputs.channel }} check --release --locked --no-default-features \
             --features s3,gha,dist-client,dist-server,direct-metrics,vendored-openssl \
             --bin sccache --bin sccache-dist
+      - name: Verify normalized scheduler dependency graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages="$(cargo +${{ steps.compiler.outputs.channel }} tree --locked --no-default-features \
+            --features s3,gha,dist-client,dist-server,direct-metrics,vendored-openssl,scheduler-dashboard \
+            --edges normal --prefix none --format '{p}')"
+          # These alternate application stacks were deliberately removed.
+          printf '%s\n' "$packages" | awk '
+            $1 ~ /^(rouille|tiny_http|ureq|ureq-proto|native-tls|hyper-tls|tokio-native-tls|ring|miniz_oxide|libmount|version-compare)$/ {
+              print "Unexpected release dependency: " $0 > "/dev/stderr"; invalid=1
+            }
+            END { exit invalid }'
+          zlib="$(printf '%s\n' "$packages" | awk '$1 == "zlib-rs" { sub(/ \(\*\)$/, ""); print }' | sort -u)"
+          [[ "$zlib" == *"github.com/codeandsolder/zlib-rs-fast"* && "$zlib" != *$'\n'* ]]
       - name: Check exact scheduler release feature profile
         shell: bash
         run: |
