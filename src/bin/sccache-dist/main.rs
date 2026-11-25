@@ -1171,9 +1171,9 @@ impl Scheduler {
                 .cost_book
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let transfer_plan = native_inputs
-                .as_ref()
-                .map(|_| NativeTransferPlan::new(network, &servers, Some(&packages)));
+            let transfer_plan = native_inputs.as_ref().map(|inputs| {
+                NativeTransferPlan::new(network, &servers, Some(&packages), Some(inputs))
+            });
             let res = {
                 let mut healthy = Vec::new();
                 let mut retry = Vec::new();
@@ -1582,6 +1582,17 @@ impl SchedulerIncoming for Scheduler {
         // Result receipts may name a just-produced blob that has not yet
         // appeared in a heartbeat. For result recovery prefer positive
         // inventory hints, but allow other native workers to answer exactly.
+        let receiver_rates = requester
+            .and_then(|id| servers.get(&id))
+            .and_then(|details| details.capabilities.native_placement.as_ref())
+            .map(|placement| placement.peer_download_rates.as_slice())
+            .unwrap_or_default();
+        let rate = |source: ServerId| {
+            receiver_rates
+                .binary_search_by_key(&source, |rate| rate.source)
+                .ok()
+                .map_or(0, |index| receiver_rates[index].logical_bytes_per_second)
+        };
         let mut candidates = servers
             .iter()
             .filter_map(|(id, details)| {
@@ -1625,6 +1636,7 @@ impl SchedulerIncoming for Scheduler {
         candidates.sort_unstable_by(|(a, left, left_predicted), (b, right, right_predicted)| {
             right_predicted
                 .cmp(left_predicted)
+                .then_with(|| rate(**b).cmp(&rate(**a)))
                 .then_with(|| right.last_seen.cmp(&left.last_seen))
                 .then_with(|| a.cmp(b))
         });
@@ -1686,6 +1698,13 @@ impl SchedulerIncoming for Scheduler {
             anyhow::ensure!(
                 placement.timing.valid()
                     && placement.cache_path_rates.valid()
+                    && sccache::build_runtime::wire::peer_download_rates_valid(
+                        &placement.peer_download_rates
+                    )
+                    && placement
+                        .peer_download_rates
+                        .iter()
+                        .all(|rate| rate.source != server_id)
                     && placement.queue.valid()
                     && placement
                         .package_limits
@@ -2611,7 +2630,7 @@ mod scheduler_tests {
         let inputs = BTreeMap::from([(a, 100_000_000), (b, 1_000_000)]);
         let empty = HashMap::new();
         let network = NetworkSnapshot::default();
-        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None);
+        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None);
         let peer = Peer::Worker(ServerId::from_digest([1; 32]));
         let eta = |capacity, assigned: &HashMap<_, _>, placement: &dist::NativePlacement| {
             native_estimate(

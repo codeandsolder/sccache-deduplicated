@@ -163,6 +163,24 @@ impl BlockingRoutes {
         self.book.estimated_cost(peer, role, routes, transfer)
     }
 
+    #[cfg(all(target_os = "linux", feature = "native-store"))]
+    pub(super) fn verified_download(
+        &self,
+        peer: PeerId,
+        address: SocketAddr,
+        path: sccache_peer_identity::NetworkPath,
+        bytes: u64,
+        elapsed: Duration,
+    ) {
+        self.book
+            .verified_download(peer, address, path, bytes, elapsed);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-store"))]
+    pub(super) fn peer_download_rates(&self) -> Vec<crate::build_runtime::wire::PeerDownloadRate> {
+        self.book.peer_download_rates()
+    }
+
     pub(super) fn best_rate(
         &self,
         peer: PeerId,

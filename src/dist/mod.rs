@@ -1111,6 +1111,7 @@ pub struct NativePlacement {
     pub residency: Option<crate::build_runtime::BlobResidency>,
     pub timing: crate::build_runtime::wire::WorkerTiming,
     pub cache_path_rates: crate::build_runtime::wire::CachePathRates,
+    pub peer_download_rates: Vec<crate::build_runtime::wire::PeerDownloadRate>,
     pub queue: NativeQueueSnapshot,
 }
 

@@ -3,7 +3,7 @@
 use super::ServerDetails;
 mod cost;
 mod delivery;
-use delivery::{DeliveryRates, InputTraffic};
+use delivery::{DeliveryRates, DirectInputs, InputTraffic};
 mod exploration;
 pub(super) use cost::{
     ActionClass, ActionCost, AssignedNative, CostBook, WorkerScope, start_checkpoint,
@@ -76,6 +76,7 @@ pub(super) struct NativeTransferPlan<'a> {
     send_baseline: BTreeMap<Peer, f64>,
     receive_demands: BTreeMap<Peer, TransferDemand>,
     path_rates: BTreeMap<Peer, CachePathRates>,
+    direct_inputs: BTreeMap<Peer, DirectInputs>,
 }
 
 const fn directional_rate(rates: CachePathRates, direction: Direction) -> Option<CachePathRate> {
@@ -155,11 +156,74 @@ fn marginal_completion(
     (completion, externality)
 }
 
+/// Build the bounded direct-source forecast from the exact input unions,
+/// current receiver measurements and the source's authenticated residency.
+fn direct_input_forecasts(
+    servers: &HashMap<ServerId, ServerDetails>,
+    requested: Option<&dist::NativeInputBlobs>,
+) -> BTreeMap<Peer, DirectInputs> {
+    let mut forecasts = BTreeMap::new();
+    let now = std::time::Instant::now();
+    for (&receiver, details) in servers {
+        let Some(placement) = &details.capabilities.native_placement else {
+            continue;
+        };
+        if placement.peer_download_rates.is_empty()
+            || now.duration_since(details.last_seen) >= Duration::from_secs(20)
+        {
+            continue;
+        }
+        let mut inputs = dist::NativeInputBlobs::new();
+        inputs.extend(
+            requested
+                .into_iter()
+                .flat_map(|inputs| inputs.iter())
+                .map(|(&id, &size)| (id, size)),
+        );
+        for job in details.jobs_assigned.values().flatten() {
+            inputs.extend(job.inputs.iter().map(|(&id, &size)| (id, size)));
+        }
+        let mut direct = DirectInputs::new();
+        for rate in &placement.peer_download_rates {
+            let Some(source) = servers.get(&rate.source) else {
+                continue;
+            };
+            if rate.source == receiver
+                || source.last_error.is_some()
+                || now.duration_since(source.last_seen) >= Duration::from_secs(20)
+            {
+                continue;
+            }
+            let Some(source_placement) = &source.capabilities.native_placement else {
+                continue;
+            };
+            let residency = pipeline::WorkerResidency::new(
+                &source.jobs_assigned,
+                source_placement,
+                &source.recent_residency,
+            );
+            for (&id, &size) in &inputs {
+                if residency.contains(id, size) {
+                    direct
+                        .entry(id)
+                        .and_modify(|best| *best = (*best).max(rate.logical_bytes_per_second))
+                        .or_insert(rate.logical_bytes_per_second);
+                }
+            }
+        }
+        if !direct.is_empty() {
+            forecasts.insert(Peer::Worker(receiver), direct);
+        }
+    }
+    forecasts
+}
+
 impl<'a> NativeTransferPlan<'a> {
     pub(super) fn new(
         network: &'a NetworkSnapshot,
         servers: &HashMap<ServerId, ServerDetails>,
         packages: Option<&'a PackageCatalog>,
+        requested: Option<&dist::NativeInputBlobs>,
     ) -> Self {
         let path_rates: BTreeMap<_, _> = servers
             .iter()
@@ -172,6 +236,7 @@ impl<'a> NativeTransferPlan<'a> {
                 rates.valid().then_some((Peer::Worker(id), rates))
             })
             .collect();
+        let direct_inputs = direct_input_forecasts(servers, requested);
         let mut send_demands = active_demands(&network.send);
         let mut receive_demands = active_demands(&network.receive);
         for (peer, rates) in &path_rates {
@@ -207,6 +272,7 @@ impl<'a> NativeTransferPlan<'a> {
                         &dist::NativeInputBlobs::new(),
                         None,
                         rates,
+                        direct_inputs.get(&Peer::Worker(id)),
                     )
                     .traffic;
                     if traffic.wire_bytes > 0 {
@@ -230,6 +296,7 @@ impl<'a> NativeTransferPlan<'a> {
             send_baseline,
             receive_demands,
             path_rates,
+            direct_inputs,
         }
     }
 
@@ -329,6 +396,7 @@ pub(super) struct PlacementEstimate {
     pub(super) completion_seconds: f64,
     missing_input_union_bytes: u128,
     input_wire_bytes: u128,
+    direct_input_bytes: u128,
     pub(super) archive_bytes: u128,
     pub(super) inputs_ready_at: f64,
     pub(super) ready_at: f64,
@@ -384,14 +452,15 @@ pub(super) fn native_estimate(
             .download
             .map(|rate| rate.bytes_per_second),
     );
-    let initial = pipeline::publication_forecast(forecast, requested, plan.packages, rates);
+    let direct = plan.direct_inputs.get(&peer.principal());
+    let initial = pipeline::publication_forecast(forecast, requested, plan.packages, rates, direct);
     let (network, externality) = plan.input_completion(peer, initial.traffic);
     let unconstrained = initial.traffic.wire_time.as_secs_f64();
     if unconstrained > 0.0 {
         rates.contention = (network / unconstrained).max(1.0);
     }
     let adjusted = if rates.contention > 1.0 {
-        pipeline::publication_forecast(forecast, requested, plan.packages, rates)
+        pipeline::publication_forecast(forecast, requested, plan.packages, rates, direct)
     } else {
         initial
     };
@@ -418,6 +487,7 @@ pub(super) fn native_estimate(
         completion_seconds,
         missing_input_union_bytes: bytes,
         input_wire_bytes: adjusted.traffic.wire_bytes,
+        direct_input_bytes: adjusted.traffic.direct_bytes,
         archive_bytes: adjusted.traffic.archive_bytes,
         cost: action,
         seconds: completion_seconds + externality + output_externality,
@@ -464,14 +534,15 @@ mod tests {
             send: constrained(a, b),
             receive: DirectionSnapshot::default(),
         };
-        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None);
+        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None);
         assert_eq!(
             plan.input_completion(
                 a,
                 InputTraffic {
                     wire_bytes: 100_000_000,
                     archive_bytes: 0,
-                    wire_time: Duration::from_secs(1)
+                    wire_time: Duration::from_secs(1),
+                    ..InputTraffic::default()
                 }
             ),
             (1.0, 0.0)
@@ -482,7 +553,8 @@ mod tests {
                 InputTraffic {
                     wire_bytes: 100_000_000,
                     archive_bytes: 0,
-                    wire_time: Duration::from_secs(1)
+                    wire_time: Duration::from_secs(1),
+                    ..InputTraffic::default()
                 }
             ),
             (2.0, 1.0)
@@ -493,7 +565,8 @@ mod tests {
                 InputTraffic {
                     wire_bytes: 100_000_000,
                     archive_bytes: 0,
-                    wire_time: Duration::from_secs(1)
+                    wire_time: Duration::from_secs(1),
+                    ..InputTraffic::default()
                 }
             ),
             (1.0, 0.0)
@@ -512,7 +585,7 @@ mod tests {
             send: DirectionSnapshot::default(),
             receive: constrained(a, b),
         };
-        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None);
+        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None);
         let result = ResultTransferEstimate {
             expected_bytes: 100_000_000,
             bytes_per_second: 100_000_000,
@@ -533,11 +606,12 @@ mod tests {
             send: constrained(a.on_path(overlay), b.on_path(other_overlay)),
             receive: DirectionSnapshot::default(),
         };
-        let mut plan = NativeTransferPlan::new(&network, &HashMap::new(), None);
+        let mut plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None);
         let traffic = InputTraffic {
             wire_bytes: 100_000_000,
             archive_bytes: 0,
             wire_time: Duration::from_secs(1),
+            ..InputTraffic::default()
         };
         let rate = |path| CachePathRate {
             path,

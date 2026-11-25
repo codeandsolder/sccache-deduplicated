@@ -16,7 +16,7 @@ use std::{
 
 use super::{
     ActionCost, AssignedNative, RecentResidency,
-    delivery::{Delivery, DeliveryRates, InputTraffic},
+    delivery::{Delivery, DeliveryRates, DirectInputs, InputTraffic},
 };
 
 pub(super) type Assignments = HashMap<JobId, Option<AssignedNative>>;
@@ -103,6 +103,7 @@ struct StagingTimeline<'a> {
     // Request setup can overlap with the next independent byte transfer.
     wire_free: Duration,
     rates: DeliveryRates,
+    direct: Option<&'a DirectInputs>,
     cost: PackageTransferCost,
     limits: Option<PackageDeliveryLimits>,
     traffic: InputTraffic,
@@ -150,24 +151,31 @@ impl StagingTimeline<'_> {
                 requests = progress.remaining_input_blobs;
             }
         }
-        let delivery = if bytes == exact_bytes
-            && requests == exact_requests
-            && self.limits.is_some()
-            && catalog.is_some_and(|catalog| !catalog.is_empty())
-        {
-            Delivery::plan(new.clone(), catalog, self.limits, self.cost, self.rates)
+        let delivery = if bytes == exact_bytes && requests == exact_requests {
+            Delivery::plan(
+                new.clone(),
+                catalog,
+                self.limits,
+                self.cost,
+                self.rates,
+                self.direct,
+            )
         } else {
             // Progress counts cannot identify which digests remain. Do not
             // invent a smaller package cover for this partial closure.
             Delivery::raw(bytes, requests, self.cost, self.rates)
         };
         self.traffic.extend(delivery.traffic);
-        let wire_done = if delivery.traffic.wire_bytes == 0 {
+        let wire_done = if delivery.traffic.wire_bytes == 0 && delivery.traffic.direct_bytes == 0 {
             start
         } else {
-            self.wire_free = self.wire_free.max(start).saturating_add(duration(
-                delivery.traffic.wire_time.as_secs_f64() * self.rates.contention,
-            ));
+            self.wire_free = self
+                .wire_free
+                .max(start)
+                .saturating_add(duration(
+                    delivery.traffic.wire_time.as_secs_f64() * self.rates.contention,
+                ))
+                .saturating_add(delivery.traffic.direct_time);
             self.wire_free
         };
         let setup = if bytes == 0
@@ -352,6 +360,7 @@ pub(super) fn publication_forecast(
     requested: &NativeInputBlobs,
     catalog: Option<&PackageCatalog>,
     rates: DeliveryRates,
+    direct: Option<&DirectInputs>,
 ) -> PipelineForecast {
     let super::WorkerForecast {
         capacity,
@@ -431,6 +440,7 @@ pub(super) fn publication_forecast(
         slots: Slots::new(placement.queue.staging_slots, jobs),
         wire_free: Duration::ZERO,
         rates,
+        direct,
         cost: placement.timing.transfer,
         limits: placement.package_limits,
         traffic: InputTraffic::default(),

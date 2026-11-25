@@ -1175,6 +1175,16 @@ endpoint serves scheduler recovery, worker-to-worker inputs, and client result
 delivery. Bloom-filter residency is advisory; an opened immutable descriptor
 and successful content verification are what establish a usable source.
 
+Worker heartbeats additionally carry up to 32 recent verified logical
+peer-download service rates, keyed by source principal and actual endpoint
+pair. Only a complete verified peer acquisition supplies this sample.
+Scheduler forecasts intersect these measurements with source residency and
+the exact remaining input union. Package reconstruction is forecast first,
+then direct raw transfers and scheduler raw transfers are accounted separately;
+scheduler shared-link contention does not automatically inflate direct
+transfer time. Per-worker aggregate staging remains serialized in the
+forecast; cross-worker direct-link contention is not yet inferred globally.
+
 The receiver compares authenticated route latency and directional effective
 goodput, using the scheduler as the durable fallback for committed results.
 An absent scheduler input can be obtained from a reachable worker without

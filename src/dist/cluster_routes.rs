@@ -1,6 +1,8 @@
 //! Short-lived, authenticated path measurements. A peer's identity remains
 //! independent of the currently preferred interface.
 use crate::build_runtime::wire::CachePathRate;
+#[cfg(all(target_os = "linux", feature = "native-store"))]
+use crate::build_runtime::wire::{MAX_PEER_DOWNLOAD_RATES, PeerDownloadRate};
 use sccache_peer_identity::{NetworkPath, PeerId, Role, RouteSet};
 use std::{
     collections::HashMap,
@@ -93,6 +95,7 @@ struct Sample {
     measured: Option<Duration>,
     expires: Instant,
     rates: [Option<Rate>; 2],
+    verified: Option<Rate>,
 }
 
 #[derive(Default)]
@@ -112,7 +115,9 @@ impl RouteBook {
         let mut samples = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
         if samples.len() >= MAX_PATHS {
             samples.retain(|_, sample| {
-                sample.expires > now || sample.rates.iter().flatten().any(|rate| rate.expires > now)
+                sample.expires > now
+                    || sample.rates.iter().flatten().any(|rate| rate.expires > now)
+                    || sample.verified.is_some_and(|rate| rate.expires > now)
             });
         }
         let mut pending = Vec::new();
@@ -134,6 +139,7 @@ impl RouteBook {
                 measured: None,
                 expires: now,
                 rates: [None; 2],
+                verified: None,
             });
             sample.expires = now + FAILURE_TTL;
             // Expired observations cannot qualify a path while its refresh is pending.
@@ -173,6 +179,7 @@ impl RouteBook {
                 measured: None,
                 expires: Instant::now(),
                 rates: [None; 2],
+                verified: None,
             });
             // The probe uses the same blocking pool as downloads. It cannot
             // invalidate the upload sample: the separate async upload pool
@@ -182,6 +189,12 @@ impl RouteBook {
                     .is_some_and(|rate| rate.path != Some(path))
             {
                 sample.rates[Transfer::Download(0).index()] = None;
+            }
+            if elapsed.is_none()
+                || path
+                    .is_some_and(|path| sample.verified.is_some_and(|rate| rate.path != Some(path)))
+            {
+                sample.verified = None;
             }
             sample.measured = elapsed;
             sample.expires = Instant::now()
@@ -222,6 +235,7 @@ impl RouteBook {
             measured: None,
             expires: now,
             rates: [None; 2],
+            verified: None,
         });
         let slot = &mut sample.rates[transfer.index()];
         let observed = u64::try_from(
@@ -240,6 +254,90 @@ impl RouteBook {
             expires: now + RATE_TTL,
         });
         drop(samples);
+    }
+
+    /// Only successful content verification supplies a logical service rate.
+    #[cfg(all(target_os = "linux", feature = "native-store"))]
+    pub fn verified_download(
+        &self,
+        peer: PeerId,
+        address: SocketAddr,
+        path: NetworkPath,
+        bytes: u64,
+        elapsed: Duration,
+    ) {
+        if bytes < MIN_SAMPLE_BYTES || elapsed < Duration::from_millis(2) || !path.valid() {
+            return;
+        }
+        let now = Instant::now();
+        let mut samples = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(sample) = samples.get_mut(&Key {
+            peer,
+            role: Role::Worker,
+            address,
+        }) else {
+            return;
+        };
+        let observed = u64::try_from(
+            (u128::from(bytes) * 1_000_000_000 / elapsed.as_nanos())
+                .clamp(64 * 1024, 1_000_000_000_000),
+        )
+        .unwrap_or(1_000_000_000_000);
+        let rate = sample
+            .verified
+            .filter(|rate| rate.expires > now && rate.path == Some(path))
+            .map_or(observed, |rate| {
+                (rate.bytes_per_second + observed).div_ceil(2)
+            });
+        sample.verified = Some(Rate {
+            path: Some(path),
+            bytes_per_second: rate,
+            expires: now + RATE_TTL,
+        });
+        drop(samples);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-store"))]
+    pub fn peer_download_rates(&self) -> Vec<PeerDownloadRate> {
+        let now = Instant::now();
+        let samples = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut best = std::collections::BTreeMap::<PeerId, PeerDownloadRate>::new();
+        for (key, sample) in samples.iter() {
+            if key.role != Role::Worker || sample.measured.is_none() || sample.expires <= now {
+                continue;
+            }
+            let Some(rate) = sample.verified.filter(|rate| rate.expires > now) else {
+                continue;
+            };
+            let Some(path) = rate.path else {
+                continue;
+            };
+            let observed = PeerDownloadRate {
+                source: key.peer,
+                path,
+                logical_bytes_per_second: rate.bytes_per_second,
+            };
+            best.entry(key.peer)
+                .and_modify(|current| {
+                    if (observed.logical_bytes_per_second, observed.path)
+                        > (current.logical_bytes_per_second, current.path)
+                    {
+                        *current = observed;
+                    }
+                })
+                .or_insert(observed);
+        }
+        drop(samples);
+        let mut best = best.into_values().collect::<Vec<_>>();
+        best.sort_unstable_by_key(|rate| {
+            (
+                std::cmp::Reverse(rate.logical_bytes_per_second),
+                rate.source,
+            )
+        });
+        best.truncate(MAX_PEER_DOWNLOAD_RATES);
+        best.sort_unstable_by_key(|rate| rate.source);
+        best
     }
 
     pub fn best_rate(
@@ -333,15 +431,20 @@ impl RouteBook {
         let samples = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
         let rate = |address| {
             transfer.and_then(|transfer| {
-                samples
-                    .get(&Key {
-                        peer,
-                        role,
-                        address,
-                    })?
-                    .rates[transfer.index()]
-                .filter(|rate| rate.expires > now)
-                .map(|rate| rate.bytes_per_second)
+                let sample = samples.get(&Key {
+                    peer,
+                    role,
+                    address,
+                })?;
+                let verified = if role == Role::Worker && matches!(transfer, Transfer::Download(_))
+                {
+                    sample.verified.filter(|rate| rate.expires > now)
+                } else {
+                    None
+                };
+                verified
+                    .or_else(|| sample.rates[transfer.index()].filter(|rate| rate.expires > now))
+                    .map(|rate| rate.bytes_per_second)
             })
         };
         let baseline = routes.iter().filter_map(rate).max().unwrap_or(DEFAULT_RATE);
@@ -433,6 +536,11 @@ impl<R> MeasuredReader<R> {
             finished: false,
             path,
         }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-store"))]
+    pub const fn path(&self) -> Option<NetworkPath> {
+        self.path
     }
 
     pub const fn content_length(&self) -> Option<u64> {
@@ -666,6 +774,48 @@ mod tests {
                 bytes_per_second: 4 << 20
             })
         );
+        Ok(())
+    }
+    #[cfg(all(target_os = "linux", feature = "native-store"))]
+    #[test]
+    fn only_verified_current_peer_rates_enter_the_snapshot() -> anyhow::Result<()> {
+        let peer = PeerId::from_digest([1; 32]);
+        let endpoint = "192.168.76.1:10501".parse()?;
+        let path = "192.168.76.1,192.168.76.2".parse()?;
+        let book = RouteBook::default();
+        book.observe_path(
+            peer,
+            Role::Worker,
+            endpoint,
+            Some(Duration::from_millis(2)),
+            Some(path),
+        );
+        book.transferred(
+            peer,
+            Role::Worker,
+            endpoint,
+            Transfer::Download(4 << 20),
+            Duration::from_secs(1),
+            Some(path),
+        );
+        assert!(book.peer_download_rates().is_empty());
+        book.verified_download(peer, endpoint, path, 8 << 20, Duration::from_secs(1));
+        assert_eq!(
+            book.peer_download_rates(),
+            [PeerDownloadRate {
+                source: peer,
+                path,
+                logical_bytes_per_second: 8 << 20
+            }]
+        );
+        book.observe_path(
+            peer,
+            Role::Worker,
+            endpoint,
+            Some(Duration::from_millis(2)),
+            Some("192.168.76.1,192.168.76.3".parse()?),
+        );
+        assert!(book.peer_download_rates().is_empty());
         Ok(())
     }
 }

@@ -279,6 +279,33 @@ impl CachePathRates {
     }
 }
 
+/// Effective verified logical delivery from a worker, including decoding
+/// and staging. Path endpoints are ordered source, receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerDownloadRate {
+    pub source: crate::PeerId,
+    pub path: crate::NetworkPath,
+    pub logical_bytes_per_second: u64,
+}
+
+pub const MAX_PEER_DOWNLOAD_RATES: usize = 32;
+
+impl PeerDownloadRate {
+    #[must_use = "untrusted delivery telemetry must be validated"]
+    pub fn valid(self) -> bool {
+        self.path.valid()
+            && (64 * 1024..=1_000_000_000_000).contains(&self.logical_bytes_per_second)
+    }
+}
+
+/// Validate a bounded snapshot, canonically sorted by source principal.
+#[must_use = "untrusted delivery telemetry must be validated"]
+pub fn peer_download_rates_valid(rates: &[PeerDownloadRate]) -> bool {
+    rates.len() <= MAX_PEER_DOWNLOAD_RATES
+        && rates.iter().all(|rate| rate.valid())
+        && rates.windows(2).all(|pair| pair[0].source < pair[1].source)
+}
+
 /// Coherent snapshot of a worker's measured transfer and compiler service.
 /// Revision is monotonic within the authenticated worker incarnation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

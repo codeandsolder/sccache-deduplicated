@@ -239,6 +239,14 @@ impl NativeCacheClient {
         rates
     }
 
+    /// Fresh verified worker-to-receiver logical delivery rates, bounded
+    /// for heartbeat transport. Never initiates network I/O.
+    #[cfg(all(target_os = "linux", feature = "native-store"))]
+    #[must_use = "the snapshot supplies peer delivery forecasts"]
+    pub fn peer_download_rates(&self) -> Vec<crate::build_runtime::wire::PeerDownloadRate> {
+        self.routes.peer_download_rates()
+    }
+
     fn operation_path(&self, operation: &str) -> (String, Option<JobId>) {
         let (role, job) = match self.role {
             Role::Client => ("client", None),

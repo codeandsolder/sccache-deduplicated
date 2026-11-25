@@ -125,11 +125,30 @@ impl NativeCacheClient {
                 if remaining.is_zero() {
                     break;
                 }
+                let attempt = Instant::now();
                 match self.receive_peer_blob(blob, source, address, remaining) {
-                    Ok(Some((reader, encoding))) => match consume(reader, encoding) {
-                        Ok(value) => return Some(value),
-                        Err(error) => debug!("native peer content rejected: {error:#}"),
-                    },
+                    Ok(Some((reader, encoding))) => {
+                        let path = reader.path();
+                        match consume(reader, encoding) {
+                            Ok(value) => {
+                                if let Some(path) = path {
+                                    self.routes.verified_download(
+                                        source.peer,
+                                        address,
+                                        path,
+                                        blob.size,
+                                        attempt.elapsed(),
+                                    );
+                                }
+                                return Some(value);
+                            }
+                            Err(error) => {
+                                self.routes.failed(source.peer, Role::Worker, address);
+                                debug!("native peer content rejected: {error:#}");
+                            }
+                        }
+                    }
+
                     Ok(None) => break,
                     Err(error) => {
                         self.routes.failed(source.peer, Role::Worker, address);

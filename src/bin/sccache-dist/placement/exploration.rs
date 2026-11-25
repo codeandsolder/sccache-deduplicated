@@ -153,9 +153,18 @@ impl<'a> Opportunity<'a> {
         plan: &NativeTransferPlan<'_>,
     ) -> Self {
         let inputs = additional_inputs(details, requested);
-        let encoded = plan.send.wire_bytes(
-            plan.path_peer(Peer::Worker(server), Direction::Send),
-            logical_size(&inputs),
+        let peer = plan.path_peer(Peer::Worker(server), Direction::Send);
+        let logical = logical_size(&inputs);
+        let encoded = prediction.map_or_else(
+            || plan.send.wire_bytes(peer, logical),
+            |estimate| {
+                // Never seek a scheduler-link overlap using content forecast to
+                // arrive directly. The prediction includes all reserved input
+                // demand, so keep the opportunity bounded by additional bytes.
+                estimate
+                    .input_wire_bytes
+                    .min(plan.send.wire_bytes(peer, logical))
+            },
         );
         Self {
             server,

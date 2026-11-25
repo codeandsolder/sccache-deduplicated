@@ -156,6 +156,7 @@ impl NativeWorker {
         let mut placement = cache.refresh(&self.store, timing, queue);
         drop(cache);
         placement.cache_path_rates = self.client.path_rates();
+        placement.peer_download_rates = self.client.peer_download_rates();
         placement.package_limits =
             self.package_import
                 .map(|limits| sccache::build_runtime::PackageDeliveryLimits {
@@ -314,6 +315,7 @@ impl PlacementCache {
                 .and_then(|(_, summary)| summary.clone()),
             timing,
             cache_path_rates: Default::default(),
+            peer_download_rates: Vec::new(),
             queue,
         }
     }
