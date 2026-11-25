@@ -45,7 +45,7 @@ fn scratch_base() -> Result<PathBuf> {
     }
     let metadata = fs::symlink_metadata(&base)?;
     ensure!(
-        metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o077 == 0,
+        metadata.is_dir() && metadata.uid() == uid && metadata.mode().trailing_zeros() >= 6,
         "Cargo scratch root must be a private directory owned by the caller"
     );
     Ok(base)
@@ -148,7 +148,10 @@ fn rustup_output(args: &[&OsStr]) -> Result<Vec<u8>> {
     ensure!(
         output.status.success(),
         "rustup {} failed: {}",
-        args.first().unwrap_or(&OsStr::new("")).to_string_lossy(),
+        args.first()
+            .copied()
+            .unwrap_or_else(|| OsStr::new(""))
+            .to_string_lossy(),
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(output.stdout)
@@ -165,7 +168,7 @@ fn toolchain(args: &mut Vec<OsString>) -> Result<OsString> {
     }
     let output = rustup_output(&[OsStr::new("show"), OsStr::new("active-toolchain")])?;
     let name = output
-        .split(|byte| byte.is_ascii_whitespace())
+        .split(u8::is_ascii_whitespace)
         .next()
         .filter(|name| !name.is_empty())
         .context("rustup did not report an active toolchain")?;
@@ -220,7 +223,7 @@ fn run(final_only: bool, args: Vec<OsString>) -> Result<i32> {
 
 /// The launcher is selected explicitly, before compiler argument parsing.
 /// The remainder is opaque Cargo syntax, not a second partial Cargo parser.
-pub(crate) fn run_if_requested() -> Option<Result<i32>> {
+pub fn run_if_requested() -> Option<Result<i32>> {
     let mut args = env::args_os().skip(1);
     let flag = args.next()?;
     let final_only = match flag.to_str()? {
@@ -230,7 +233,8 @@ pub(crate) fn run_if_requested() -> Option<Result<i32>> {
     };
     if args.next().as_deref() != Some(OsStr::new("--")) {
         return Some(Err(anyhow::anyhow!(
-            "usage: sccache {flag:?} -- [Cargo arguments]"
+            "usage: sccache {} -- [Cargo arguments]",
+            flag.to_string_lossy()
         )));
     }
     Some(run(final_only, args.collect()))

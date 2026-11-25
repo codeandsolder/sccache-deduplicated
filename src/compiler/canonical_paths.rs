@@ -25,9 +25,13 @@ impl RootMapping {
 
     fn to_canonical(&self, path: &Path) -> Option<PathBuf> {
         self.aliases.iter().find_map(|physical| {
-            path.strip_prefix(physical)
-                .ok()
-                .map(|suffix| self.canonical.join(suffix))
+            path.strip_prefix(physical).ok().map(|suffix| {
+                if suffix.as_os_str().is_empty() {
+                    self.canonical.clone()
+                } else {
+                    self.canonical.join(suffix)
+                }
+            })
         })
     }
 
