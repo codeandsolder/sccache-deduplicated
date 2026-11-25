@@ -112,9 +112,8 @@ bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --unshare-net --die-with-pare
  --bind "$tmp/var-lib" /var/lib \
  --bind "$tmp/var-cache" /var/cache \
  --bind "$tmp/var-tmp" /var/tmp \
- --ro-bind "$tmp/bin/systemctl" /usr/bin/systemctl \
- --ro-bind "$tmp/bin/runuser" /usr/bin/runuser \
- --setenv PATH /usr/bin:/bin \
+ --ro-bind "$tmp/bin" /run/test-bin \
+ --setenv PATH /run/test-bin:/usr/bin:/bin \
  /bin/bash -s -- "$sha" <<'INNER'
 set -euo pipefail
 sha=$1
