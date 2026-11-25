@@ -388,6 +388,104 @@ fn path_rates(
         .collect()
 }
 
+/// Rank scheduler recovery candidates using the same measured directional
+/// transport costs as ordinary publication. Direct peer delivery uses the
+/// receiver's measurements instead, not scheduler-relative path rates.
+pub(super) struct PeerRecoveryPlan {
+    receive: DirectionSnapshot,
+    demands: BTreeMap<Peer, TransferDemand>,
+    baseline: BTreeMap<Peer, f64>,
+    rates: BTreeMap<Peer, CachePathRates>,
+}
+
+impl PeerRecoveryPlan {
+    pub(super) fn new(
+        network: &NetworkSnapshot,
+        servers: &HashMap<ServerId, ServerDetails>,
+    ) -> Self {
+        let rates = path_rates(servers, &worker_interfaces(servers), &network.interfaces);
+        let mut receive = network.receive.clone();
+        scheduler_constraints(
+            &mut receive,
+            &network.interfaces,
+            Direction::Receive,
+            rates
+                .iter()
+                .filter_map(|(&peer, rates)| rates.upload.map(|rate| peer.on_path(rate.path))),
+        );
+        let mut demands = active_demands(&receive);
+        for (&peer, demand) in &mut demands {
+            if let Some(path) = peer.path() {
+                demand.bytes_per_second = interface_rate(
+                    &network.interfaces,
+                    path.local,
+                    Direction::Receive,
+                    demand.bytes_per_second,
+                );
+            }
+            if let Some(rate) = rates.get(&peer.principal()).and_then(|rates| rates.upload)
+                && peer.path() == Some(rate.path)
+            {
+                demand.bytes_per_second = rate.bytes_per_second;
+            }
+        }
+        let baseline = receive.finish_times(&demands);
+        Self {
+            receive,
+            demands,
+            baseline,
+            rates,
+        }
+    }
+
+    pub(super) fn score(&self, id: ServerId, size: u64, timing: ResultTransferEstimate) -> f64 {
+        let principal = Peer::Worker(id);
+        let rate = self.rates.get(&principal).and_then(|rates| rates.upload);
+        let peer = predicted_peer(principal, rate);
+        let fallback = u64::try_from(
+            self.receive
+                .wire_bytes(peer, u128::from(timing.bytes_per_second)),
+        )
+        .unwrap_or(u64::MAX)
+        .max(1);
+        let observed = self
+            .receive
+            .peers
+            .get(&peer)
+            .map_or(0, |capacity| capacity.observed_bytes_per_second);
+        let bytes_per_second = rate.map_or_else(
+            || if observed == 0 { fallback } else { observed },
+            |rate| rate.bytes_per_second,
+        );
+        let pending = self.demands.get(&peer).map_or(0, |demand| demand.bytes);
+        let (completion, externality) = marginal_completion(
+            &self.receive,
+            &self.demands,
+            &self.baseline,
+            peer,
+            TransferDemand {
+                bytes: pending.saturating_add(self.receive.wire_bytes(peer, u128::from(size))),
+                bytes_per_second,
+            },
+            Direction::Receive,
+        );
+        completion + externality + Duration::from_nanos(timing.request_nanoseconds).as_secs_f64()
+    }
+}
+
+fn worker_interfaces(
+    servers: &HashMap<ServerId, ServerDetails>,
+) -> BTreeMap<Peer, InterfaceReport> {
+    servers
+        .iter()
+        .filter_map(|(&id, details)| {
+            let placement = details.capabilities.native_placement.as_ref()?;
+            (details.last_seen.elapsed() < Duration::from_secs(20))
+                .then(|| (Peer::Worker(id), placement.interfaces.clone()))
+        })
+        .collect()
+}
+
 impl<'a> NativeTransferPlan<'a> {
     pub(super) fn new(
         network: &'a NetworkSnapshot,
@@ -396,14 +494,7 @@ impl<'a> NativeTransferPlan<'a> {
         requested: Option<&dist::NativeInputBlobs>,
         receiver: Option<&'a (ServerId, ClientDeliveryRates)>,
     ) -> Self {
-        let worker_interfaces = servers
-            .iter()
-            .filter_map(|(&id, details)| {
-                let placement = details.capabilities.native_placement.as_ref()?;
-                (details.last_seen.elapsed() < Duration::from_secs(20))
-                    .then(|| (Peer::Worker(id), placement.interfaces.clone()))
-            })
-            .collect::<BTreeMap<_, _>>();
+        let worker_interfaces = worker_interfaces(servers);
         let path_rates = path_rates(servers, &worker_interfaces, &network.interfaces);
         let direct_inputs = direct_input_forecasts(servers, requested);
         let mut send = network.send.clone();

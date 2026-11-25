@@ -1181,6 +1181,7 @@ pub trait SchedulerIncoming: Send + Sync {
         requester: Option<ServerId>,
         recipient: crate::build_runtime::wire::BlobRecipient,
         producer: Option<ServerId>,
+        recovery_network: Option<&crate::build_runtime::NetworkSnapshot>,
     ) -> ExtResult<Vec<NativeBlobSource>, Error>;
     /// Record advisory producer residency for the current worker epoch.
     fn observe_native_lifecycle(

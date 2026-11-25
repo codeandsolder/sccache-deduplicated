@@ -1191,11 +1191,14 @@ mod server {
                         }
                     },
                     move |blob, requester, store, deadline| {
+                        let mut snapshot = peer_network.snapshot();
+                        snapshot.interfaces = crate::dist::cluster::interface_report();
                         for source in peer_handler.native_blob_sources(
                             blob,
                             requester,
                             crate::build_runtime::wire::BlobRecipient::Scheduler,
                             None,
+                            Some(&snapshot),
                         )? {
                             if std::time::Instant::now() >= deadline {
                                 break;
@@ -1228,7 +1231,7 @@ mod server {
                                 _ => None,
                             };
                             let sources = source_handler
-                                .native_blob_sources(blob, requester, recipient, producer)?;
+                                .native_blob_sources(blob, requester, recipient, producer, None)?;
                             Ok(sources
                                 .into_iter()
                                 .filter_map(|source| {

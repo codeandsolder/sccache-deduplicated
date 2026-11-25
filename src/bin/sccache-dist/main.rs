@@ -1655,6 +1655,7 @@ impl SchedulerIncoming for Scheduler {
         requester: Option<ServerId>,
         recipient: sccache::build_runtime::wire::BlobRecipient,
         producer: Option<ServerId>,
+        recovery_network: Option<&NetworkSnapshot>,
     ) -> Result<Vec<dist::NativeBlobSource>> {
         let servers = self
             .servers
@@ -1674,6 +1675,8 @@ impl SchedulerIncoming for Scheduler {
                 .ok()
                 .map_or(0, |index| receiver_rates[index].logical_bytes_per_second)
         };
+        let recovery =
+            recovery_network.map(|network| placement::PeerRecoveryPlan::new(network, &servers));
         let mut candidates = servers
             .iter()
             .filter_map(|(id, details)| {
@@ -1711,16 +1714,24 @@ impl SchedulerIncoming for Scheduler {
                         sccache::build_runtime::wire::BlobRecipient::Scheduler
                     ) && requester.is_none()
                         || locality > 0))
-                    .then_some((id, details, locality))
+                    .then(|| {
+                        let score = recovery.as_ref().map_or(0.0, |plan| {
+                            plan.score(*id, blob.size, placement.timing.result)
+                        });
+                        (id, details, locality, score)
+                    })
             })
             .collect::<Vec<_>>();
-        candidates.sort_unstable_by(|(a, left, left_predicted), (b, right, right_predicted)| {
-            right_predicted
-                .cmp(left_predicted)
-                .then_with(|| rate(**b).cmp(&rate(**a)))
-                .then_with(|| right.last_seen.cmp(&left.last_seen))
-                .then_with(|| a.cmp(b))
-        });
+        candidates.sort_unstable_by(
+            |(a, left, left_predicted, left_score), (b, right, right_predicted, right_score)| {
+                right_predicted
+                    .cmp(left_predicted)
+                    .then_with(|| left_score.total_cmp(right_score))
+                    .then_with(|| rate(**b).cmp(&rate(**a)))
+                    .then_with(|| right.last_seen.cmp(&left.last_seen))
+                    .then_with(|| a.cmp(b))
+            },
+        );
         let limit = if matches!(
             recipient,
             sccache::build_runtime::wire::BlobRecipient::Scheduler
@@ -1732,7 +1743,7 @@ impl SchedulerIncoming for Scheduler {
         candidates
             .into_iter()
             .take(limit)
-            .map(|(&server, details, _)| {
+            .map(|(&server, details, _, _)| {
                 Ok(dist::NativeBlobSource {
                     server,
                     token: details
@@ -2820,6 +2831,7 @@ mod scheduler_tests {
             Some(requester),
             sccache::build_runtime::wire::BlobRecipient::Scheduler,
             None,
+            None,
         )?;
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].server, peer);
@@ -2828,14 +2840,38 @@ mod scheduler_tests {
             None,
             sccache::build_runtime::wire::BlobRecipient::Scheduler,
             None,
+            None,
         )?;
         assert_eq!(recovery.len(), 3);
         assert_eq!(recovery[2].server, empty);
+        let mut network = NetworkSnapshot::default();
+        for (id, rate, remaining) in [(requester, 100 << 20, 100 << 20), (peer, 10 << 20, 0)] {
+            network.receive.peers.insert(
+                Peer::Worker(id),
+                sccache::build_runtime::PeerCapacity {
+                    observed_bytes_per_second: rate,
+                    isolated_bytes_per_second: rate,
+                    wire_per_mille: 1000,
+                    active_remaining_bytes: remaining,
+                    body_bytes: 0,
+                },
+            );
+        }
+        let ranked = scheduler.native_blob_sources(
+            blob,
+            None,
+            sccache::build_runtime::wire::BlobRecipient::Scheduler,
+            None,
+            Some(&network),
+        )?;
+        assert_eq!(ranked[0].server, peer);
+        assert_eq!(ranked[2].server, empty);
         let direct = scheduler.native_blob_sources(
             blob,
             None,
             sccache::build_runtime::wire::BlobRecipient::Client(ServerId::from_digest([4; 32])),
             Some(empty),
+            None,
         )?;
         assert_eq!(direct[0].server, empty);
         assert_eq!(direct.len(), 3);
@@ -2843,6 +2879,7 @@ mod scheduler_tests {
             blob,
             None,
             sccache::build_runtime::wire::BlobRecipient::Client(ServerId::from_digest([4; 32])),
+            None,
             None,
         )?;
         assert_eq!(direct.len(), 2);
@@ -2938,6 +2975,7 @@ mod scheduler_tests {
                     blob,
                     Some(peer),
                     sccache::build_runtime::wire::BlobRecipient::Scheduler,
+                    None,
                     None
                 )?
                 .is_empty()
@@ -2949,6 +2987,7 @@ mod scheduler_tests {
                     blob,
                     Some(peer),
                     sccache::build_runtime::wire::BlobRecipient::Scheduler,
+                    None,
                     None
                 )?
                 .is_empty()
@@ -2961,6 +3000,7 @@ mod scheduler_tests {
                     blob,
                     Some(peer),
                     sccache::build_runtime::wire::BlobRecipient::Scheduler,
+                    None,
                     None
                 )?
                 .len(),
@@ -2985,6 +3025,7 @@ mod scheduler_tests {
                     blob,
                     Some(peer),
                     sccache::build_runtime::wire::BlobRecipient::Scheduler,
+                    None,
                     None
                 )?
                 .len(),
@@ -3196,6 +3237,7 @@ mod scheduler_tests {
                     blob,
                     Some(other),
                     sccache::build_runtime::wire::BlobRecipient::Scheduler,
+                    None,
                     None
                 )?
                 .is_empty()
@@ -3208,6 +3250,7 @@ mod scheduler_tests {
                     blob,
                     Some(other),
                     sccache::build_runtime::wire::BlobRecipient::Scheduler,
+                    None,
                     None
                 )?
                 .is_empty()
@@ -3217,6 +3260,7 @@ mod scheduler_tests {
             blob,
             Some(other),
             sccache::build_runtime::wire::BlobRecipient::Scheduler,
+            None,
             None,
         )?;
         assert_eq!(sources.len(), 1);
@@ -3243,6 +3287,7 @@ mod scheduler_tests {
                     blob,
                     Some(other),
                     sccache::build_runtime::wire::BlobRecipient::Scheduler,
+                    None,
                     None
                 )?
                 .is_empty()
