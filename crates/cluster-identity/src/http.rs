@@ -114,7 +114,7 @@ fn response(status: StatusCode, body: impl Into<Bytes>) -> Response<ClusterBody>
     response
 }
 
-fn server_config(credentials: &TlsCredentials) -> Result<ServerConfig> {
+fn server_config(credentials: &TlsCredentials, allow_enrollment: bool) -> Result<ServerConfig> {
     ensure!(
         credentials.role != Role::Client,
         "client-only credential cannot serve TLS"
@@ -124,7 +124,7 @@ fn server_config(credentials: &TlsCredentials) -> Result<ServerConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier =
         WebPkiClientVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&provider));
-    let verifier = if credentials.role == Role::Scheduler {
+    let verifier = if allow_enrollment {
         verifier.allow_unauthenticated()
     } else {
         verifier
@@ -151,6 +151,7 @@ pub struct ClusterListener {
     id: PeerId,
     role: Role,
     ca_fingerprint: [u8; 32],
+    allow_enrollment: bool,
 }
 
 impl ClusterListener {
@@ -159,8 +160,26 @@ impl ClusterListener {
     /// # Errors
     /// Returns an error if credentials cannot configure TLS.
     pub fn new(credentials: &TlsCredentials) -> Result<Self> {
+        Self::with_enrollment(credentials, credentials.role == Role::Scheduler)
+    }
+
+    /// Construct a scheduler data listener that requires a client certificate
+    /// during the TLS handshake and never accepts enrollment or renewal.
+    ///
+    /// # Errors
+    /// Returns an error for non-scheduler credentials or invalid TLS configuration.
+    pub fn new_data(credentials: &TlsCredentials) -> Result<Self> {
+        ensure!(
+            credentials.role == Role::Scheduler,
+            "not scheduler credentials"
+        );
+        Self::with_enrollment(credentials, false)
+    }
+
+    fn with_enrollment(credentials: &TlsCredentials, allow_enrollment: bool) -> Result<Self> {
         Ok(Self {
-            config: RwLock::new(Arc::new(server_config(credentials)?)),
+            config: RwLock::new(Arc::new(server_config(credentials, allow_enrollment)?)),
+            allow_enrollment,
             id: credentials.id()?,
             role: credentials.role,
             ca_fingerprint: openssl::sha::sha256(&credentials.ca.to_der()?),
@@ -178,7 +197,7 @@ impl ClusterListener {
                 && self.ca_fingerprint == openssl::sha::sha256(&credentials.ca.to_der()?),
             "listener renewal cannot change the local identity, role or CA"
         );
-        let config = Arc::new(server_config(credentials)?);
+        let config = Arc::new(server_config(credentials, self.allow_enrollment)?);
         *self
             .config
             .write()
@@ -202,12 +221,13 @@ impl ClusterListener {
     {
         ensure!(self.role == Role::Scheduler, "not a scheduler listener");
         let handler = Arc::new(handler);
+        let allow_enrollment = self.allow_enrollment;
         self.serve_connection(socket, move |peer, address, request| {
             let enrollment = Arc::clone(&enrollment);
             let handler = Arc::clone(&handler);
             async move {
                 enrollment
-                    .dispatch(peer, address, request, handler.as_ref())
+                    .dispatch(peer, address, request, handler.as_ref(), allow_enrollment)
                     .await
             }
         })
@@ -321,6 +341,7 @@ impl SchedulerEnrollment {
         address: SocketAddr,
         request: Request<Incoming>,
         handler: &H,
+        allow_enrollment: bool,
     ) -> Response<ClusterBody>
     where
         H: Fn(AuthenticatedPeer, Request<Incoming>) -> F,
@@ -332,6 +353,9 @@ impl SchedulerEnrollment {
             _ => None,
         };
         if let Some(role) = role {
+            if !allow_enrollment {
+                return response(StatusCode::NOT_FOUND, Bytes::new());
+            }
             if peer.is_some() {
                 return response(StatusCode::FORBIDDEN, "use authenticated renewal");
             }
@@ -351,6 +375,9 @@ impl SchedulerEnrollment {
             return response(StatusCode::NO_CONTENT, Bytes::new());
         }
         if request.uri().path() == RENEW {
+            if !allow_enrollment {
+                return response(StatusCode::NOT_FOUND, Bytes::new());
+            }
             return self.renew(peer, request).await;
         }
         handler(peer, request).await

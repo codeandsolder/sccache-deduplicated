@@ -1027,6 +1027,10 @@ mod server {
                 Role::Scheduler,
             )?);
             let tls = Arc::new(ClusterListener::new(&credential)?);
+            let native_tls = native_cache
+                .as_ref()
+                .map(|_| ClusterListener::new_data(&credential).map(Arc::new))
+                .transpose()?;
             let current = Arc::new(Mutex::new(credential));
             let outbound = Arc::clone(&current);
             let requester = Arc::new(SchedulerRequester {
@@ -1049,6 +1053,7 @@ mod server {
             ));
             let renewal_enrollment = Arc::clone(&enrollment);
             let renewal_tls = Arc::clone(&tls);
+            let renewal_native_tls = native_tls.clone();
             thread::Builder::new()
                 .name("scheduler-certificate-renewal".into())
                 .spawn(move || {
@@ -1069,6 +1074,9 @@ mod server {
                                     Role::Scheduler,
                                 )?);
                                 renewal_tls.reload(&next)?;
+                                if let Some(tls) = &renewal_native_tls {
+                                    tls.reload(&next)?;
+                                }
                                 *active = next;
                             }
                             Ok(())
@@ -1141,7 +1149,7 @@ mod server {
                     move |server, job, event| {
                         result_handler.observe_native_lifecycle(server, job, event)
                     },
-                    Arc::clone(&tls),
+                    native_tls.context("missing native data TLS listener")?,
                     Arc::clone(&enrollment),
                     network,
                 )?;
