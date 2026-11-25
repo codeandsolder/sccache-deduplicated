@@ -16,8 +16,9 @@ use anyhow::{Context, Result, ensure};
 
 use crate::{
     build_runtime::{
-        ActionMode, BuildPath, CommandSpec, ContentId, DescriptorDigestProvider, ExecutionRoot,
-        ExecutionSpec, OutputKind, OutputSpec, PreparedTree, SourceDigestCache, TreeRecipe,
+        ActionKey, ActionMode, BuildPath, CommandSpec, ContentId, DescriptorDigestProvider,
+        ExecutionRoot, ExecutionSpec, OutputKind, OutputSpec, PreparedTree, SourceDigestCache,
+        TreeRecipe,
     },
     cache::FileObjectSource,
     client::{SharedConnection, connection_task},
@@ -601,6 +602,21 @@ fn prepare_dispatch(
     Ok((outputs, layout, packagers))
 }
 
+async fn finish_link<T: CommandCreatorSync>(
+    result: Result<(NativeBuildResult, ActionKey)>,
+    split: Option<&NativeLink>,
+    creator: &T,
+) -> Result<(NativeBuildResult, ActionKey)> {
+    match (result, split) {
+        (Ok((mut result, key)), Some(link)) if result.output.status.success() => {
+            crate::server::activity::phase(crate::server::activity::Phase::LocalCompile);
+            result.output = link.finish(creator, result.output).await?;
+            Ok((result, key))
+        }
+        (result, _) => result,
+    }
+}
+
 pub(super) async fn compile<T: CommandCreatorSync>(
     client: Arc<NativeCompilerClient>,
     service: &SccacheService<T>,
@@ -664,19 +680,7 @@ pub(super) async fn compile<T: CommandCreatorSync>(
             },
             Err(error) => Err(error),
         };
-        let result = match (result, split.as_ref()) {
-            (Ok((mut result, key)), Some(link)) if result.output.status.success() => {
-                crate::server::activity::phase(crate::server::activity::Phase::LocalCompile);
-                match link.finish(&creator, result.output).await {
-                    Ok(output) => {
-                        result.output = output;
-                        Ok((result, key))
-                    }
-                    Err(error) => Err(error),
-                }
-            }
-            (result, _) => result,
-        };
+        let result = finish_link(result, split.as_ref(), &creator).await;
         // Explicit drop order: the workspace's TempDirs reference scratch.
         drop(split);
         drop(scratch);

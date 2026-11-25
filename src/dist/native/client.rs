@@ -406,44 +406,14 @@ impl NativeCacheClient {
         let result = thread::scope(|scope| {
             let worker =
                 scope.spawn(|| Self::run_worker(&allocation, remaining, policy.max_result_bytes));
-            let supply = (|| -> Result<()> {
-                let mut idle = Duration::from_millis(10);
-                while !worker.is_finished() {
-                    ensure!(
-                        start.elapsed() < policy.timeout,
-                        "native worker deadline exceeded"
-                    );
-                    let poll = match self.poll_input(pin.ticket) {
-                        Ok(poll) => poll,
-                        Err(error) if retryable_transport_error(&error) => {
-                            debug!("retrying native input demand poll: {error:#}");
-                            thread::sleep(idle);
-                            idle = (idle * 2).min(Duration::from_millis(200));
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    match poll {
-                        InputPoll::Complete => {
-                            inputs.progress(NativeProgress::Phase(Phase::RunDistributed))?;
-                            break;
-                        }
-                        InputPoll::Waiting => {
-                            thread::sleep(idle);
-                            idle = (idle * 2).min(Duration::from_millis(200));
-                        }
-                        InputPoll::Demand(demand) => {
-                            idle = Duration::from_millis(10);
-                            ensure!(
-                                request.input_trees.contains(&demand.tree),
-                                "scheduler requested undeclared tree"
-                            );
-                            self.supply_demand(pin.ticket, demand, inputs, start, policy)?;
-                        }
-                    }
-                }
-                Ok(())
-            })();
+            let supply = self.supply_until_ready(
+                pin.ticket,
+                &request.input_trees,
+                inputs,
+                start,
+                policy,
+                || worker.is_finished(),
+            );
             // A worker may become ready through a concurrent provider while
             // its previous origin request is still in transit. Preserve an
             // already terminal result instead of cancelling it.
@@ -492,6 +462,53 @@ impl NativeCacheClient {
             (Ok(_), None) => bail!("native worker did not publish its result"),
         }
     }
+    fn supply_until_ready(
+        &self,
+        ticket: Ticket,
+        input_trees: &BTreeSet<TreeId>,
+        inputs: &mut impl InputProvider,
+        start: Instant,
+        policy: &NativeBuildPolicy,
+        worker_finished: impl Fn() -> bool,
+    ) -> Result<()> {
+        let mut idle = Duration::from_millis(10);
+        while !worker_finished() {
+            ensure!(
+                start.elapsed() < policy.timeout,
+                "native worker deadline exceeded"
+            );
+            let poll = match self.poll_input(ticket) {
+                Ok(poll) => poll,
+                Err(error) if retryable_transport_error(&error) => {
+                    debug!("retrying native input demand poll: {error:#}");
+                    thread::sleep(idle);
+                    idle = (idle * 2).min(Duration::from_millis(200));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match poll {
+                InputPoll::Complete => {
+                    inputs.progress(NativeProgress::Phase(Phase::RunDistributed))?;
+                    break;
+                }
+                InputPoll::Waiting => {
+                    thread::sleep(idle);
+                    idle = (idle * 2).min(Duration::from_millis(200));
+                }
+                InputPoll::Demand(demand) => {
+                    idle = Duration::from_millis(10);
+                    ensure!(
+                        input_trees.contains(&demand.tree),
+                        "scheduler requested undeclared tree"
+                    );
+                    self.supply_demand(ticket, demand, inputs, start, policy)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn supply_demand(
         &self,
         ticket: Ticket,
