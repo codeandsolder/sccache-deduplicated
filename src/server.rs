@@ -1366,6 +1366,7 @@ where
                     pool: rt.clone(),
                     scheduler_url: None,
                     cluster: None,
+                    cluster: None,
                     auth: config::DistAuth::Token {
                         token: String::new(),
                     },
@@ -3512,6 +3513,7 @@ mod tests {
         let config = DistClientConfig {
             pool: runtime.handle().clone(),
             scheduler_url: None,
+            cluster: None,
             auth: config::DistAuth::Token {
                 token: String::new(),
             },
