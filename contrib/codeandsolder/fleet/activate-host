@@ -14,6 +14,7 @@ bundle=/var/lib/sccache-native-bundles/$sha
 state=/var/lib/sccache-autoupdate
 live=/usr/local/libexec/sccache-bin/sccache
 dist=/usr/local/bin/sccache-dist
+dashboard_link=/var/lib/sccache-dashboard/current
 rollback="$stage/rollback"
 drain=/dev/shm/sccache-maintenance-drain
 sched_drain=/run/sccache-scheduler-maintenance-drain
@@ -102,7 +103,9 @@ assert_bundle() {
   [[ $(field source_sha "$stage/published-build.txt") == "$sha" ]]
   [[ $(field dist_protocol "$stage/published-build.txt") == 5 ]]
   [[ $(field rollout_epoch "$stage/published-build.txt") == 6 ]]
-  /usr/local/libexec/host-native-metadata verify "$bundle" "$stage/published-build.txt"
+  local flags=()
+  if [[ "$role" == asus ]]; then flags+=(--scheduler-dashboard); fi
+  "$stage/host-native-metadata" verify "$bundle" "$stage/published-build.txt" "${flags[@]}"
 }
 assert_prepared() {
   sha256sum --check --status STAGED_SHA256SUMS
@@ -182,9 +185,9 @@ case "$phase" in
     updater_guard
     assert_updaters_paused
     assert_prepared
-    files=("$live" "$dist" /usr/local/bin/sccache /usr/local/libexec/sccache-client /usr/local/libexec/sccache-release-update /etc/sccache/client-shared.toml /etc/sccache/cluster-ca.pem /etc/sccache/wrapper.conf /etc/systemd/system/sccache-local.service.d/90-shared-daemon.conf /etc/systemd/system/sccache-release-update.service.d/zz-epoch6.conf)
+    files=("$live" "$dist" /usr/local/bin/sccache /usr/local/libexec/sccache-client /usr/local/libexec/sccache-release-update /usr/local/libexec/host-native-metadata /etc/sccache/client-shared.toml /etc/sccache/cluster-ca.pem /etc/sccache/wrapper.conf /etc/systemd/system/sccache-local.service.d/90-shared-daemon.conf /etc/systemd/system/sccache-release-update.service.d/zz-epoch6.conf)
     [[ ! -f server.conf ]] || files+=(/etc/sccache-dist/server.conf)
-    [[ ! -f scheduler.conf ]] || files+=(/etc/sccache-dist/scheduler.conf)
+    [[ ! -f scheduler.conf ]] || files+=(/etc/sccache-dist/scheduler.conf "$dashboard_link")
     [[ ! -f 90-real-binary.conf ]] || files+=(/etc/systemd/system/sccache-strict-local.service.d/90-real-binary.conf)
     [[ ! -f cargo-wrapper ]] || files+=(/usr/local/bin/cargo)
     [[ ! -f sccache-cmake-launcher ]] || files+=(/usr/local/libexec/sccache-cmake-launcher)
@@ -230,6 +233,7 @@ case "$phase" in
     install_atomic sccache-client /usr/local/bin/sccache 0755
     install_atomic sccache-client /usr/local/libexec/sccache-client 0755
     install_atomic sccache-release-update /usr/local/libexec/sccache-release-update 0755
+    install_atomic host-native-metadata /usr/local/libexec/host-native-metadata 0755
     if [[ -f cargo-wrapper ]]; then install_atomic cargo-wrapper /usr/local/bin/cargo 0755; fi
     if [[ -f sccache-cmake-launcher ]]; then install_atomic sccache-cmake-launcher /usr/local/libexec/sccache-cmake-launcher 0755; fi
     if [[ -f sccache-dist-client-preflight ]]; then install_atomic sccache-dist-client-preflight /usr/local/libexec/sccache-dist-client-preflight 0755; fi
@@ -251,6 +255,8 @@ case "$phase" in
     fi
     if [[ -f scheduler.conf ]]; then
       install_atomic scheduler.conf /etc/sccache-dist/scheduler.conf 0640 root sccache-scheduler
+      /usr/local/libexec/host-native-metadata dashboard-select "$bundle" "$dashboard_link"
+      runuser -u sccache-scheduler -- test -r "$dashboard_link/sccache-dashboard_bg.wasm"
       install -d -o sccache-scheduler -g sccache-scheduler -m 0700 /var/cache/sccache-native/scheduler
     fi
     systemctl daemon-reload
@@ -263,7 +269,9 @@ case "$phase" in
       rm -f "$sched_drain"
       systemctl is-active --quiet sccache-dist-scheduler.service
       for ((i=0;i<60;i++)); do
-        if "$dist" cluster-status --client-config /etc/sccache/client-shared.toml; then exit 0; fi
+        if "$dist" cluster-status --client-config /etc/sccache/client-shared.toml \
+          && curl --fail --silent --show-error --max-time 5 -o /dev/null http://127.0.0.1:10604/ \
+          && curl --fail --silent --show-error --max-time 5 -o /dev/null http://127.0.0.1:10604/pkg/sccache-dashboard_bg.wasm; then exit 0; fi
         sleep 1
       done
       echo "scheduler did not become ready" >&2; exit 1
@@ -332,7 +340,10 @@ case "$phase" in
       if active_before "$u"; then verify_running "$u" "$local_hash"; fi
     done
     if active_before sccache-dist-worker.service; then verify_running sccache-dist-worker.service "$dist_hash"; fi
-    if active_before sccache-dist-scheduler.service; then verify_running sccache-dist-scheduler.service "$dist_hash"; fi
+    if active_before sccache-dist-scheduler.service; then
+      verify_running sccache-dist-scheduler.service "$dist_hash"
+      [[ -L "$dashboard_link" && $(readlink "$dashboard_link") == "$bundle/pkg" ]]
+    fi
     if [[ $(systemctl show sccache-local-root.service -p LoadState --value) == loaded ]]; then
       systemctl disable sccache-local-root.service
     fi
@@ -356,6 +367,7 @@ case "$phase" in
     [[ $(cat "$state/source_sha") == "$sha" && $(cat "$state/dist_protocol") == 5 ]]
     rm -f "$drain"
     resume_updaters
+    if systemctl is-enabled --quiet sccache-release-update.timer; then systemctl start sccache-release-update.timer; fi
     ;;
   rollback-stop)
     updater_guard

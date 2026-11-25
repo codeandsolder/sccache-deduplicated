@@ -6,6 +6,12 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/sccache-fleet-activation-test.XXXXXX")
 trap 'rm -rf -- "$tmp"' EXIT
 mkdir -p "$tmp"/{usr-local/bin,usr-local/libexec/sccache-bin,etc/sccache,etc/sccache-dist,etc/systemd/system,var-lib/sccache-autoupdate,var-cache,var-tmp,shm,run,bin}
 cp /etc/{passwd,group,nsswitch.conf,machine-id} "$tmp/etc/"
+if ! rg -q '^sccache-scheduler:' "$tmp/etc/passwd"; then
+    printf 'sccache-scheduler:x:0:0:Fixture scheduler:/var/lib:/bin/sh\n' >> "$tmp/etc/passwd"
+fi
+if ! rg -q '^sccache-scheduler:' "$tmp/etc/group"; then
+    printf 'sccache-scheduler:x:0:\n' >> "$tmp/etc/group"
+fi
 stage="$tmp/var-lib/sccache-managed-rollout/epoch6-20261125"
 sha=1111111111111111111111111111111111111111
 bundle="$tmp/var-lib/sccache-native-bundles/$sha"
@@ -48,6 +54,11 @@ printf 'old updater\n' > "$tmp/usr-local/libexec/sccache-release-update"
 printf 'old cargo\n' > "$tmp/usr-local/bin/cargo"
 printf 'old client config\n' > "$tmp/etc/sccache/client.conf"
 printf 'old worker config\n' > "$tmp/etc/sccache-dist/server.conf"
+printf 'old scheduler config\n' > "$tmp/etc/sccache-dist/scheduler.conf"
+mkdir -p "$tmp/var-lib/sccache-dashboard/old" "$bundle/pkg"
+printf 'old wasm\n' > "$tmp/var-lib/sccache-dashboard/old/sccache-dashboard_bg.wasm"
+printf 'new wasm\n' > "$bundle/pkg/sccache-dashboard_bg.wasm"
+ln -s /var/lib/sccache-dashboard/old "$tmp/var-lib/sccache-dashboard/current"
 printf '3\n' > "$tmp/var-lib/sccache-autoupdate/dist_protocol"
 printf 'old-sha\n' > "$tmp/var-lib/sccache-autoupdate/source_sha"
 chmod 0750 "$tmp/etc/sccache"
@@ -60,6 +71,28 @@ printf 'role=asus\nuid=0\ngid=0\nplatform=fixture\ncache_url=http://127.0.0.1:10
 printf 'new shared config\n' > "$stage/client-shared.toml"
 printf 'fixture CA\n' > "$stage/cluster-ca.pem"
 printf 'new worker config\n' > "$stage/server.conf"
+printf 'new scheduler config\n' > "$stage/scheduler.conf"
+# The separate host-metadata test covers trusted directory ownership and
+# hashes. Here use a minimal selector in the isolated namespace.
+cat > "$stage/host-native-metadata" <<'MOCK_METADATA'
+#!/bin/bash
+set -euo pipefail
+case "$1" in
+    verify) [[ "$4" == --scheduler-dashboard ]] ;;
+    dashboard-select) ln -s "$2/pkg" "$3.new"; mv -Tf "$3.new" "$3" ;;
+    *) exit 1 ;;
+esac
+MOCK_METADATA
+chmod 0755 "$stage/host-native-metadata"
+# PAM and host account provisioning are outside the transaction fixture.
+cat > "$tmp/bin/runuser" <<'MOCK_RUNUSER'
+#!/bin/bash
+set -euo pipefail
+[[ "$1 $2 $3 $4" == "-u sccache-scheduler -- test" ]]
+shift 3
+exec "$@"
+MOCK_RUNUSER
+chmod 0755 "$tmp/bin/runuser"
 printf 'new router\n' > "$stage/sccache-client"
 printf 'new updater\n' > "$stage/sccache-release-update"
 printf 'new cargo\n' > "$stage/cargo-wrapper"
@@ -80,6 +113,7 @@ bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --unshare-net --die-with-pare
  --bind "$tmp/var-cache" /var/cache \
  --bind "$tmp/var-tmp" /var/tmp \
  --ro-bind "$tmp/bin/systemctl" /usr/bin/systemctl \
+ --ro-bind "$tmp/bin/runuser" /usr/bin/runuser \
  --setenv PATH /usr/bin:/bin \
  /bin/bash -s -- "$sha" <<'INNER'
 set -euo pipefail
@@ -87,7 +121,7 @@ sha=$1
 stage=/var/lib/sccache-managed-rollout/epoch6-20261125
 bundle=/var/lib/sccache-native-bundles/$sha
 cd "$stage"
-sha256sum /etc/sccache/client.conf /etc/sccache-dist/server.conf > originals.sha256
+sha256sum /etc/sccache/client.conf /etc/sccache-dist/server.conf /etc/sccache-dist/scheduler.conf > originals.sha256
 files=(*)
 sha256sum "${files[@]}" > STAGED_SHA256SUMS
 # Published metadata is introduced only after preparation.
@@ -121,6 +155,9 @@ chmod 755 /usr/local/libexec/host-native-metadata
 [[ $(cat /etc/sccache/client-shared.toml) == "new shared config" ]]
 [[ $(cat /etc/sccache/cluster-ca.pem) == "fixture CA" ]]
 [[ $(cat /etc/sccache-dist/server.conf) == "new worker config" ]]
+[[ $(cat /etc/sccache-dist/scheduler.conf) == "new scheduler config" ]]
+[[ $(readlink /var/lib/sccache-dashboard/current) == "$bundle/pkg" ]]
+[[ $(cat /var/lib/sccache-dashboard/current/sccache-dashboard_bg.wasm) == "new wasm" ]]
 [[ $(stat -c %a /etc/sccache) == 750 ]]
 cmp /usr/local/libexec/sccache-bin/sccache "$bundle/sccache"
 cmp /usr/local/bin/sccache-dist "$bundle/sccache-dist"
@@ -148,6 +185,9 @@ systemctl is-enabled --quiet sccache-dist-worker-watchdog.timer
 ! systemctl is-active --quiet sccache-release-update.timer
 
 [[ $(cat /etc/sccache-dist/server.conf) == "old worker config" ]]
+[[ $(cat /etc/sccache-dist/scheduler.conf) == "old scheduler config" ]]
+[[ $(readlink /var/lib/sccache-dashboard/current) == "/var/lib/sccache-dashboard/old" ]]
+[[ $(cat /var/lib/sccache-dashboard/current/sccache-dashboard_bg.wasm) == "old wasm" ]]
 [[ ! -e /etc/sccache/client-shared.toml && ! -e /etc/sccache/cluster-ca.pem && ! -e /dev/shm/sccache-maintenance-drain ]]
 [[ $(stat -c %a /etc/sccache/client.conf) == 640 ]]
 [[ $(stat -c %a /etc/sccache) == 750 ]]

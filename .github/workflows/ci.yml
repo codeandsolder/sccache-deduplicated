@@ -399,6 +399,13 @@ jobs:
           cargo +${{ steps.compiler.outputs.channel }} check --release --locked --no-default-features \
             --features s3,gha,dist-client,dist-server,direct-metrics,vendored-openssl \
             --bin sccache --bin sccache-dist
+      - name: Check exact scheduler release feature profile
+        shell: bash
+        run: |
+          cargo +${{ steps.compiler.outputs.channel }} check --release --locked --no-default-features \
+            --features s3,gha,dist-client,dist-server,direct-metrics,vendored-openssl,scheduler-dashboard \
+            --bin sccache-dist
+
       - name: Finalize mandatory sccache
         if: always()
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main

@@ -77,6 +77,35 @@ rm "$bundle/sccache"
 mv "$bundle/sccache.real" "$bundle/sccache"
 verify
 
+# Scheduler bundle is a separate, explicit role profile. Every asset is
+# checksummed; the ordinary worker verifier must refuse it.
+sed -i 's/^features=.*/&,scheduler-dashboard/' "$bundle/build.txt"
+mkdir "$bundle/pkg"
+for asset in sccache-dashboard.js sccache-dashboard_bg.wasm sccache-dashboard.css; do
+    printf 'fixture %s\n' "$asset" > "$bundle/pkg/$asset"
+done
+refresh_dashboard_hashes() {
+    refresh_hashes
+    (cd "$bundle"; find pkg -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum >> SHA256SUMS)
+}
+verify_dashboard() { "$here/host-native-metadata" verify "$bundle" "$published/build.txt" --scheduler-dashboard; }
+refresh_dashboard_hashes
+reject "scheduler feature profile on ordinary worker"
+verify_dashboard
+"$here/host-native-metadata" dashboard-select "$bundle" "$work/selected/current"
+[[ $(readlink "$work/selected/current") == "$bundle/pkg" ]]
+printf corruption >> "$bundle/pkg/sccache-dashboard_bg.wasm"
+if verify_dashboard >/dev/null 2>&1; then echo 'accepted corrupted dashboard assets' >&2; exit 1; fi
+refresh_dashboard_hashes
+verify_dashboard
+ln -s /etc/passwd "$bundle/pkg/untrusted"
+if verify_dashboard >/dev/null 2>&1; then echo 'accepted dashboard symlink' >&2; exit 1; fi
+rm "$bundle/pkg/untrusted"
+rm -rf "$bundle/pkg"
+cp "$work/valid-build.txt" "$bundle/build.txt"
+refresh_hashes
+verify
+
 # Integration with the actual updater, with no network or service actions.
 cat > "$work/mock-bin/curl" <<'EOF'
 #!/bin/bash

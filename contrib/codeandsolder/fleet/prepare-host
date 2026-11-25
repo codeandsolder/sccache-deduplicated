@@ -168,6 +168,7 @@ ROUTING
 # Use the exact reviewed host tooling from the release checkout.
 install -m 0700 "$repo/sccache-client" "$stage/sccache-client"
 install -m 0700 "$repo/sccache-release-update" "$stage/sccache-release-update"
+install -m 0700 "$repo/host-native-metadata" "$stage/host-native-metadata"
 install -m 0700 "$repo/fleet/activate-host" "$stage/activate-host"
 install -m 0600 "$repo/native-action-report.awk" "$stage/native-action-report.awk"
 if [[ -x /usr/bin/rustup && -f /usr/local/bin/cargo ]]; then
@@ -253,11 +254,15 @@ ExecStart=/usr/local/libexec/sccache-bin/sccache
 UNIT
   scheduler=/etc/sccache-dist/scheduler.conf
   record_source "$scheduler"
-  assert_absent '^\s*\[(job_slack|native_cache)(\.|\])' "$scheduler"
+  assert_absent '^\s*\[(job_slack|native_cache|dashboard)(\.|\])' "$scheduler"
   assert_absent '^\s*cluster_directory\s*=' "$scheduler"
   { printf 'cluster_directory = "/var/lib/sccache-cluster/scheduler"\n'; cat -- "$scheduler"; } > "$stage/scheduler.conf"
-  [[ -z "$(ss -Hln 'sport = :10602')" ]]
+  [[ -z "$(ss -Hln 'sport = :10602')" && -z "$(ss -Hln 'sport = :10604')" ]]
   cat >> "$stage/scheduler.conf" <<EOF
+
+[dashboard]
+bind_address = "127.0.0.1:10604"
+assets = "/var/lib/sccache-dashboard/current"
 
 [job_slack]
 static_jobs = 0

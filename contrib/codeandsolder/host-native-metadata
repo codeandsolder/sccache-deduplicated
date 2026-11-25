@@ -40,22 +40,40 @@ trusted_path() {
     done
 }
 
+# A scheduler generation has the same base release features plus the UI.
+# Check the complete set of paths before reading a checksum manifest; never
+# permit a manifest to name an external file or traverse a symlink.
+bundle_manifest() (
+    local directory="$1" dashboard="$2" file
+    cd "$directory"
+    sha256sum sccache sccache-dist build.txt
+    if (( dashboard )); then
+        for file in sccache-dashboard.js sccache-dashboard_bg.wasm sccache-dashboard.css; do
+            [[ -s "pkg/$file" && -f "pkg/$file" ]] || exit 1
+        done
+        [[ -z "$(find pkg ! -type f ! -type d -print -quit)" ]] || exit 1
+        while IFS= read -r -d '' file; do
+            trusted_path "$directory/$file" || exit 1
+        done < <(find pkg -print0)
+        find pkg -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum
+    else
+        [[ ! -e pkg && ! -L pkg ]] || exit 1
+    fi
+)
+
 verify() {
-    local directory="$1" published="$2" field native official file
+    local directory="$1" published="$2" dashboard="${3:-0}" field native official file expected
     for file in sccache sccache-dist build.txt SHA256SUMS; do
         if ! [[ -f "$directory/$file" ]] || ! trusted_path "$directory/$file"; then
             echo "host-native-metadata: untrusted bundle file $directory/$file" >&2
             return 1
         fi
     done
-
-    # Only accept the exact immutable payloads emitted by the builder.
-    [[ "$(wc -l < "$directory/SHA256SUMS")" == 3 ]]
-    for file in sccache sccache-dist build.txt; do
-        [[ "$(rg -c "^[0-9a-f]{64}  $file\$" "$directory/SHA256SUMS")" == 1 ]]
-    done
-    (cd "$directory" && sha256sum --strict -c SHA256SUMS >&2)
-
+    expected="$(bundle_manifest "$directory" "$dashboard")" || return 1
+    [[ "$expected" == "$(cat "$directory/SHA256SUMS")" ]] || {
+        echo "host-native-metadata: payload checksum manifest differs" >&2
+        return 1
+    }
     [[ "$(manifest_value "$directory/build.txt" build_kind)" == host-native ]]
     [[ "$(manifest_value "$directory/build.txt" rustflags)" == '-C target-cpu=native' ]]
     [[ "$(manifest_value "$directory/build.txt" host_fingerprint)" == "$(fingerprint)" ]] || {
@@ -65,6 +83,7 @@ verify() {
     for field in source_sha rust_toolchain features dist_protocol rollout_epoch openssl_linkage capabilities; do
         native="$(manifest_value "$directory/build.txt" "$field")"
         official="$(manifest_value "$published" "$field")"
+        if [[ "$field" == features && "$dashboard" == 1 ]]; then official+=,scheduler-dashboard; fi
         [[ "$native" == "$official" ]] || {
             echo "host-native-metadata: $field differs from the published source release" >&2
             return 1
@@ -73,9 +92,30 @@ verify() {
     [[ -x "$directory/sccache" && -x "$directory/sccache-dist" ]]
 }
 
+# Atomic generation selection. Call only after verified bundle admission and
+# while the scheduler is stopped. The caller snapshots/restores the link.
+dashboard_select() {
+    local directory="$1" link="$2" parent temporary
+    trusted_path "$directory/pkg" || return 1
+    parent="$(dirname -- "$link")"
+    install -d -m 0755 "$parent"
+    trusted_path "$parent" || return 1
+    [[ ! -e "$link" || -L "$link" ]] || return 1
+    temporary="$(mktemp -d "$parent/.selection.XXXXXX")"
+    ln -s "$directory/pkg" "$temporary/current"
+    mv -Tf "$temporary/current" "$link"
+    rmdir "$temporary"
+}
+
 case "${1:-}" in
     fingerprint) [[ $# == 1 ]]; fingerprint ;;
-    verify) [[ $# == 3 ]]; verify "$2" "$3" ;;
-    *) echo "usage: $0 fingerprint | verify ABSOLUTE_BUNDLE_DIRECTORY PUBLISHED_BUILD_TXT" >&2; exit 2 ;;
+    verify)
+        [[ $# == 3 || ( $# == 4 && $4 == --scheduler-dashboard ) ]]
+        dashboard=0
+        if [[ ${4:-} == --scheduler-dashboard ]]; then dashboard=1; fi
+        verify "$2" "$3" "$dashboard"
+        ;;
+    dashboard-select) [[ $# == 3 ]]; dashboard_select "$2" "$3" ;;
+    *) echo "usage: $0 fingerprint | verify ABSOLUTE_BUNDLE_DIRECTORY PUBLISHED_BUILD_TXT [--scheduler-dashboard] | dashboard-select BUNDLE_DIRECTORY ASSET_LINK" >&2; exit 2 ;;
 esac
 

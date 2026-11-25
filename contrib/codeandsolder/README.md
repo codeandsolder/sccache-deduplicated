@@ -136,10 +136,15 @@ The portable GitHub release is the source-revision and protocol authority.
 Run the checked-out revision's build-host-native as the normal managed
 build user, with the existing sccache wrappers (never as an unmanaged
 root Cargo invocation). This stages both binaries with native Rust and
-C/C++ code generation, the machine/CPU fingerprint and checksums.
+C/C++ code generation, the machine/CPU fingerprint and checksums. On the
+scheduler host invoke `build-host-native ABSENT_OUTPUT_DIRECTORY --scheduler-dashboard`
+instead: that builds the dashboard-enabled scheduler/worker binary and matching
+WASM/JS/CSS package with the exact publisher toolchain. Ordinary worker bundles
+do not build UI dependencies.
 
 After verifying the build, an administrator copies its four regular files
-(sccache, sccache-dist, build.txt, SHA256SUMS) into a root-owned,
+(sccache, sccache-dist, build.txt, SHA256SUMS), and the complete `pkg/` directory
+for a scheduler bundle, into a root-owned,
 non-group/world-writable directory /var/lib/sccache-native-bundles/<full source SHA>.
 Install host-native-metadata beside the managed sccache-release-update.
 Set SCCACHE_AUTOUPDATE_NATIVE_BUNDLE_ROOT=/var/lib/sccache-native-bundles
@@ -148,6 +153,15 @@ The updater waits for a matching native build rather than reverting to
 the portable binary. It checks the local checksum manifest, source SHA,
 protocol, toolchain, feature set, capabilities and machine/CPU identity
 against the published release before using its immediate restart/rollback logic.
+The scheduler bundle must be readable by the scheduler service account; all
+files and directories must be root-owned and non-group/world-writable.
+On the managed fleet, `[dashboard]` uses loopback port 10604 and
+`/var/lib/sccache-dashboard/current`. Activation and automatic update verify
+the role-specific feature set and complete asset manifest, stop the scheduler,
+select that immutable generation atomically alongside the executable, verify
+HTTP/cluster readiness, and restore the old asset symlink and binary on rollback.
+A configured dashboard never falls back to an ordinary portable worker bundle.
+Keep the old selected generation until rollback is no longer needed.
 Build provisioning is separate from the root updater: no automatic root
 compilation and no extra cache daemons.
 
