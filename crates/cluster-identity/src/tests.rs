@@ -1,4 +1,95 @@
 use super::*;
+use openssl::{
+    ssl::{SslAcceptor, SslConnector, SslMethod, SslVerifyMode, SslVersion},
+    x509::{
+        X509Ref,
+        store::{X509Store, X509StoreBuilder},
+    },
+};
+use std::net::{SocketAddr, TcpStream};
+
+fn trust_store(ca: &X509Ref) -> Result<X509Store> {
+    let mut store = X509StoreBuilder::new()?;
+    store.add_cert(ca.to_owned())?;
+    Ok(store.build())
+}
+
+impl TlsCredentials {
+    /// Configure a client with only the cluster CA, not system public roots.
+    ///
+    /// # Errors
+    /// Returns an error if TLS context setup fails.
+    fn connector(&self) -> Result<SslConnector> {
+        let mut connector = SslConnector::builder(SslMethod::tls_client())?;
+        connector.set_cert_store(trust_store(&self.ca)?);
+        connector.set_certificate(&self.certificate)?;
+        connector.set_private_key(self.identity.private_key())?;
+        connector.check_private_key()?;
+        connector.set_min_proto_version(Some(SslVersion::TLS1_2))?;
+        Ok(connector.build())
+    }
+
+    /// Build a server accepting only valid cluster certificates in allowed roles.
+    ///
+    /// # Errors
+    /// Returns an error for invalid role configuration or TLS setup failure.
+    fn acceptor(&self, allowed_roles: &[Role]) -> Result<SslAcceptor> {
+        ensure!(
+            self.role != Role::Client,
+            "client-only credential cannot serve TLS"
+        );
+        ensure!(!allowed_roles.is_empty(), "server must allow a peer role");
+        let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server())?;
+        acceptor.set_cert_store(trust_store(&self.ca)?);
+        acceptor.set_certificate(&self.certificate)?;
+        acceptor.set_private_key(self.identity.private_key())?;
+        acceptor.check_private_key()?;
+        acceptor.set_min_proto_version(Some(SslVersion::TLS1_2))?;
+        let allowed_roles = allowed_roles.to_vec();
+        acceptor.set_verify_callback(
+            SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
+            move |verified, context| {
+                verified
+                    && (context.error_depth() != 0
+                        || context.current_cert().is_some_and(|leaf| {
+                            allowed_roles
+                                .iter()
+                                .any(|role| authenticated_peer(leaf, *role).is_ok())
+                        }))
+            },
+        );
+        Ok(acceptor.build())
+    }
+
+    /// Connect to a candidate address while authenticating the expected peer.
+    ///
+    /// # Errors
+    /// Returns an error for connection, TLS handshake or identity failure.
+    fn connect(
+        &self,
+        address: SocketAddr,
+        expected: PeerId,
+        role: Role,
+        timeout: Duration,
+    ) -> Result<openssl::ssl::SslStream<TcpStream>> {
+        let stream = TcpStream::connect_timeout(&address, timeout)?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+        let stream = self
+            .connector()?
+            .connect(&role.tls_name(expected), stream)?;
+        let certificate = stream
+            .ssl()
+            .peer_certificate()
+            .context("missing peer certificate")?;
+        ensure!(
+            authenticated_peer(&certificate, role)? == expected,
+            "wrong peer identity"
+        );
+        Ok(stream)
+    }
+}
+
 use std::{
     io::{Read, Write},
     net::TcpListener,
@@ -160,8 +251,11 @@ fn refuses_wrong_key_and_wrong_issuer() -> Result<()> {
 #[test]
 fn first_enrollment_and_renewal_bind_roles_and_keys() -> Result<()> {
     let directory = tempfile::tempdir()?;
-    let authority =
-        EnrollmentAuthority::new(ClusterCa::open(&directory.path().join("ca.pem"))?, 7)?;
+    let authority = EnrollmentAuthority::new(
+        ClusterCa::open(&directory.path().join("ca.pem"))?,
+        Registry::open(&directory.path().join("registry.bin"))?,
+        7,
+    )?;
     let worker = identity(&directory, "worker")?;
     let request = EnrollmentRequest::new(&worker)?;
     assert!(authority.enroll(&request, || None).is_err());
@@ -188,5 +282,43 @@ fn first_enrollment_and_renewal_bind_roles_and_keys() -> Result<()> {
     assert_eq!(authenticated_peer(&renewed, role)?, worker.id()?);
     assert_ne!(certificate.to_der()?, renewed.to_der()?);
     TlsCredentials::new(worker, renewed, authority.certificate().clone(), role)?;
+    Ok(())
+}
+
+#[test]
+fn registry_persists_role_and_revocation_and_excludes_other_writers() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("registry.bin");
+    let peer = identity(&directory, "worker")?.id()?;
+    let registry = Registry::open(&path)?;
+    assert!(Registry::open(&path).is_err());
+    registry.register(peer, Role::Worker)?;
+    registry.register(peer, Role::Worker)?;
+    assert!(registry.register(peer, Role::Client).is_err());
+    assert!(registry.is_active(peer, Role::Worker)?);
+    drop(registry);
+    let registry = Registry::open(&path)?;
+    assert!(registry.is_active(peer, Role::Worker)?);
+    registry.revoke(peer)?;
+    drop(registry);
+    let registry = Registry::open(&path)?;
+    assert!(!registry.is_active(peer, Role::Worker)?);
+    assert!(registry.register(peer, Role::Worker).is_err());
+    drop(registry);
+    fs::write(&path, b"corrupt")?;
+    assert!(Registry::open(&path).is_err());
+    assert_eq!(fs::read(path)?, b"corrupt");
+    Ok(())
+}
+
+#[test]
+fn peer_identity_has_a_canonical_config_representation() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let peer = identity(&directory, "peer")?.id()?;
+    let encoded = peer.to_string();
+    assert_eq!(encoded.len(), 64);
+    assert_eq!(encoded.parse::<PeerId>()?, peer);
+    assert!("127.0.0.1:10501".parse::<PeerId>().is_err());
+    assert!("x".repeat(64).parse::<PeerId>().is_err());
     Ok(())
 }

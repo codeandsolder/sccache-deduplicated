@@ -3562,9 +3562,18 @@ name = "sccache-cluster-identity"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "openssl",
+ "reqwest",
+ "rustls",
  "serde",
  "tempfile",
+ "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

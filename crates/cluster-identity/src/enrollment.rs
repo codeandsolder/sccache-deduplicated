@@ -1,6 +1,6 @@
 //! Bounded enrollment and renewal messages, independent of the HTTP transport.
 
-use super::{ClusterCa, Identity, PeerId, Role, key_id, validate_request_key};
+use super::{ClusterCa, Identity, PeerId, Registry, Role, key_id, validate_request_key};
 use anyhow::{Context, Result, ensure};
 use openssl::{
     sha::sha256,
@@ -67,6 +67,7 @@ impl EnrollmentResponse {
 pub struct EnrollmentAuthority {
     ca: ClusterCa,
     validity_days: u32,
+    registry: Registry,
 }
 
 impl EnrollmentAuthority {
@@ -74,12 +75,16 @@ impl EnrollmentAuthority {
     ///
     /// # Errors
     /// Returns an error for an unsupported certificate lifetime.
-    pub fn new(ca: ClusterCa, validity_days: u32) -> Result<Self> {
+    pub fn new(ca: ClusterCa, registry: Registry, validity_days: u32) -> Result<Self> {
         ensure!(
             (1..=30).contains(&validity_days),
             "remote certificate lifetime must be 1–30 days"
         );
-        Ok(Self { ca, validity_days })
+        Ok(Self {
+            ca,
+            validity_days,
+            registry,
+        })
     }
 
     /// The CA certificate to provision in peer trust configuration.
@@ -112,7 +117,11 @@ impl EnrollmentAuthority {
             role != Role::Scheduler,
             "scheduler identity cannot be remotely enrolled"
         );
-        self.issue(&request.parse()?, role)
+        let request = request.parse()?;
+        let response = self.issue(&request, role)?;
+        self.registry
+            .register(key_id(request.public_key()?.as_ref())?, role)?;
+        Ok(response)
     }
 
     /// Renew an authenticated principal without allowing key or role changes.
@@ -139,7 +148,27 @@ impl EnrollmentAuthority {
             key_id(&key)? == authenticated_id,
             "renewal cannot change peer identity"
         );
+        ensure!(
+            self.registry
+                .is_active(authenticated_id, authenticated_role)?,
+            "peer is not enrolled or has been revoked"
+        );
         self.issue(&request, authenticated_role)
+    }
+
+    /// The persistent authorization registry.
+    #[must_use = "the registry is needed to authorize TLS principals"]
+    pub const fn registry(&self) -> &Registry {
+        &self.registry
+    }
+
+    /// Issue or refresh the scheduler own leaf using its persistent key.
+    ///
+    /// # Errors
+    /// Returns an error if local certificate generation fails.
+    pub fn scheduler_certificate(&self, identity: &Identity) -> Result<X509> {
+        self.ca
+            .issue(&identity.request()?, Role::Scheduler, self.validity_days)
     }
 
     fn issue(&self, request: &X509Req, role: Role) -> Result<EnrollmentResponse> {

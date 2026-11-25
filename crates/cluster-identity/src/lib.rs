@@ -32,6 +32,22 @@ impl fmt::Display for PeerId {
     }
 }
 
+impl std::str::FromStr for PeerId {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        ensure!(
+            value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "invalid peer ID"
+        );
+        let mut digest = [0; 32];
+        for (byte, encoded) in digest.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+            *byte = u8::from_str_radix(std::str::from_utf8(encoded)?, 16)?;
+        }
+        Ok(Self(digest))
+    }
+}
+
 /// A role assigned by the enrollment authority, not the requesting peer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Role {
@@ -287,3 +303,12 @@ pub use tls::TlsCredentials;
 
 mod enrollment;
 pub use enrollment::{EnrollmentAuthority, EnrollmentRequest, EnrollmentResponse};
+
+mod registry;
+pub use registry::Registry;
+
+mod http;
+pub use http::{
+    AuthenticatedPeer, ClusterBody, ClusterHttpClient, ClusterListener, EnrollmentClient,
+    SchedulerEnrollment,
+};
