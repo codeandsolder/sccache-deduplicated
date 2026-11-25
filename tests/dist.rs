@@ -12,7 +12,6 @@ use crate::harness::{
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use anyhow::ensure;
 use assert_cmd::prelude::*;
-use sccache::config::HTTPUrl;
 use sccache::dist::{
     AssignJobResult, CompileCommand, InputsReader, JobId, JobState, OutputRequest, RunJobResult,
     ServerIncoming, ServerOutgoing, SubmitToolchainResult, Toolchain, ToolchainReader,
@@ -915,8 +914,7 @@ fn failing_server_process() -> Result<()> {
     )
     .context("custom failing server should initialize")?;
     env_logger::try_init().ok();
-    server.start().context("custom failing server should run")?;
-    Ok(())
+    server.start().context("custom failing server should run").map(|never| match never {})
 }
 
 #[test]

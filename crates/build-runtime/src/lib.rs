@@ -85,8 +85,8 @@ mod mapped;
 mod source;
 #[cfg(all(target_os = "linux", feature = "mapping"))]
 pub use mapped::{
-    InstallationCatalog, InstallationReport, MappedMetadata, MappedTree, PreparedTree,
-    SourceDigestCache,
+    DescriptorDigestProvider, DescriptorMemo, InstallationCatalog, InstallationReport,
+    MappedMetadata, MappedTree, PreparedTree, SourceDigestCache, hash_descriptor,
 };
 
 // Cluster principals are independent of socket endpoints and TLS implementation.

@@ -3502,6 +3502,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rouille",
+ "rustix",
  "sccache-build",
  "sccache-cluster-identity",
  "sccache-peer-identity",

@@ -20,7 +20,7 @@ use crate::compiler::preprocessor_cache::{
 };
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, CompileCommandImpl,
-    CompileTransport, Compiler, CompilerArguments, CompilerHasher, CompilerKind,
+    CompileTransport, Compiler, CompilerArguments, CompilerDiscovery, CompilerHasher, CompilerKind,
     GenerateHashKeyContext, HashResult, Language, SingleCompileCommand,
 };
 use crate::config::PreprocessorCacheModeConfig;
@@ -540,8 +540,9 @@ where
         compiler: I,
         executable: PathBuf,
         pool: &tokio::runtime::Handle,
+        discovery: &CompilerDiscovery,
     ) -> Result<Self> {
-        let digest = Digest::file(executable.clone(), pool).await?;
+        let digest = discovery.hash_toolchain_file(&executable, pool).await?;
 
         Ok(Self {
             executable,

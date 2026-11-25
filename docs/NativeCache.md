@@ -856,7 +856,15 @@ Configure the local client (or the direct-mode daemon) with the catalog:
 native_installation_catalogs = ["/path/to/installation.catalog"]
 ```
 
-The namespace caller reads its own catalog, not a daemon-side substitute.
+The namespace executor reads its own catalog, not a daemon-side substitute.
+The shared supervisor additionally retains a bounded metadata-only digest memo
+across credential-isolated executors. The key is the authenticated UID, GID,
+supplementary groups and mount/root identity plus the actual opened file's
+mature version. The root daemon inspects descriptor metadata without reading
+file content or opening a caller path. A miss is hashed under the caller's
+credentials; publication revalidates the descriptor and version. A conflicting
+digest disables reuse for that version. Public clients cannot use this private
+memo channel.
 Only files whose bytes verified against the expected BLAKE3 digest and whose
 current stat version matches the attestation reuse that digest. The catalog
 is scoped to the current Linux boot; reattest after reboot or installation

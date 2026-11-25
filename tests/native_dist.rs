@@ -311,7 +311,7 @@ impl Fleet {
             .ok())
         })?;
         let (http, status_base) = sccache_cluster_identity::blocking_client(
-            &peer.current()?,
+            peer.current()?.as_ref(),
             scheduler_id,
             sccache_cluster_identity::Role::Scheduler,
             scheduler_address,

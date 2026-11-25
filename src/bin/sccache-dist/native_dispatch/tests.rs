@@ -8,7 +8,11 @@ use sccache::{
 };
 use std::{collections::BTreeMap, num::NonZeroUsize};
 
-fn worker(root: &std::path::Path, url: reqwest::Url) -> Result<NativeWorker> {
+fn worker(
+    root: &std::path::Path,
+    url: reqwest::Url,
+    peer: Arc<sccache_cluster_identity::PeerCredentials>,
+) -> Result<NativeWorker> {
     NativeWorker::new(
         NativeWorkerConfig {
             cache_url: HTTPUrl::from_url(url),
@@ -35,7 +39,7 @@ fn worker(root: &std::path::Path, url: reqwest::Url) -> Result<NativeWorker> {
             package_import: None,
             package_transfer: Default::default(),
         },
-        "test".into(),
+        peer,
     )
 }
 
@@ -115,36 +119,121 @@ fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Res
     let delegation_rx = Mutex::new(delegation_rx);
     // Model a scheduler which holds its admission lock until the worker
     // returns the assignment response. Verification is deliberately blocked.
-    let server = rouille::Server::new("127.0.0.1:0", move |request| match request.url().as_str() {
-        "/api/v5/native/worker/verify" => {
-            let Some(id) = request
-                .header("X-Sccache-Native-Job")
-                .and_then(|job| job.parse::<u64>().ok())
-            else {
-                return rouille::Response::empty_400();
-            };
-            if verification_tx.send(JobId(id)).is_err() {
-                return rouille::Response::empty_404();
+    use http_body_util::{BodyExt, Full};
+    use sccache_cluster_identity::{
+        ClusterCa, ClusterListener, EnrollmentAuthority, Identity, PeerConfig, Registry, Role,
+        SchedulerEnrollment, TlsCredentials,
+    };
+    let cluster = directory.path().join("cluster");
+    std::fs::create_dir_all(&cluster)?;
+    let authority = EnrollmentAuthority::new(
+        ClusterCa::open(&cluster.join("ca-key.pem"))?,
+        Registry::open(&cluster.join("registry.bin"))?,
+        7,
+    )?;
+    let identity = Identity::open(&cluster.join("key.pem"))?;
+    let scheduler_id = identity.id()?;
+    let leaf = authority.scheduler_certificate(&identity)?;
+    let ca_certificate = cluster.join("ca.pem");
+    sccache_cluster_identity::publish_trust_anchor(authority.certificate(), &ca_certificate)?;
+    let credentials = TlsCredentials::new(
+        identity,
+        leaf,
+        authority.certificate().clone(),
+        Role::Scheduler,
+    )?;
+    let tls = Arc::new(ClusterListener::new(&credentials)?);
+    let enrollment = Arc::new(SchedulerEnrollment::new(authority, |role, _, _, token| {
+        role == Role::Worker && token == "test"
+    }));
+    let socket = std::net::TcpListener::bind("127.0.0.1:0")?;
+    socket.set_nonblocking(true)?;
+    let url = reqwest::Url::parse(&format!("https://{}/", socket.local_addr()?))?;
+    let (stop, mut stopped) = tokio::sync::oneshot::channel();
+    let delegation_rx = Arc::new(delegation_rx);
+    let handle = thread::spawn(move || -> Result<()> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        rt.block_on(async move {
+            let socket = tokio::net::TcpListener::from_std(socket)?;
+            loop {
+                let (connection, _) = tokio::select! {
+                    result = socket.accept() => result?,
+                    _ = &mut stopped => return Ok(()),
+                };
+                let tls = Arc::clone(&tls);
+                let enrollment = Arc::clone(&enrollment);
+                let verification_tx = verification_tx.clone();
+                let delegation_rx = Arc::clone(&delegation_rx);
+                tokio::spawn(async move {
+                    let _ = tls
+                        .serve_scheduler(connection, enrollment, move |peer, request| {
+                            let verification_tx = verification_tx.clone();
+                            let delegation_rx = Arc::clone(&delegation_rx);
+                            async move {
+                                let status = if peer.role() != Role::Worker {
+                                    401
+                                } else {
+                                    match request.uri().path() {
+                                        "/api/v5/native/worker/verify" => {
+                                            let id = request
+                                                .headers()
+                                                .get("X-Sccache-Native-Job")
+                                                .and_then(|value| value.to_str().ok())
+                                                .and_then(|job| job.parse::<u64>().ok());
+                                            match id {
+                                                Some(id)
+                                                    if verification_tx.send(JobId(id)).is_ok() =>
+                                                {
+                                                    tokio::task::spawn_blocking(move || {
+                                                        delegation_rx
+                                                            .lock()
+                                                            .unwrap()
+                                                            .recv_timeout(Duration::from_secs(5))
+                                                            .unwrap_or(503)
+                                                    })
+                                                    .await
+                                                    .unwrap_or(503)
+                                                }
+                                                _ => 400,
+                                            }
+                                        }
+                                        "/api/v5/native/worker/renew"
+                                        | "/api/v5/native/worker/fail" => 200,
+                                        _ => 409,
+                                    }
+                                };
+                                let mut response = hyper::Response::new(
+                                    Full::new(bytes::Bytes::new())
+                                        .map_err(|never| match never {})
+                                        .boxed_unsync(),
+                                );
+                                *response.status_mut() =
+                                    hyper::StatusCode::from_u16(status).unwrap();
+                                response
+                            }
+                        })
+                        .await;
+                });
             }
-            let status = delegation_rx
-                .lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap_or(503);
-            rouille::Response::from_data("application/octet-stream", Vec::new())
-                .with_status_code(status)
-        }
-        "/api/v5/native/worker/renew" | "/api/v5/native/worker/fail" => {
-            rouille::Response::from_data("application/octet-stream", Vec::new())
-        }
-        _ => rouille::Response::text("test input unavailable").with_status_code(409),
-    })
-    .map_err(|error| anyhow::anyhow!("{error}"))?;
-    let url = reqwest::Url::parse(&format!("http://{}/", server.server_addr()))?;
-    let (handle, stop) = server.stoppable();
+        })
+    });
+    let peer = sccache::dist::cluster::open_peer(
+        PeerConfig {
+            directory: cluster.join("worker"),
+            ca_certificate,
+            scheduler_id,
+        },
+        &url,
+        Role::Worker,
+        "test",
+    )?;
     let result = (|| -> Result<()> {
         let queue = Arc::new(ExecutionQueue::new(NonZeroUsize::MIN));
-        let dispatcher = NativeDispatcher::new(worker(directory.path(), url)?, Arc::clone(&queue))?;
+        let dispatcher =
+            NativeDispatcher::new(worker(directory.path(), url, peer)?, Arc::clone(&queue))?;
         let (state_tx, states) = mpsc::channel();
         let requester: Arc<dyn ServerOutgoing> = Arc::new(RecordingRequester { states: state_tx });
         let first = JobId(1);
@@ -260,10 +349,10 @@ fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Res
         dispatcher.poll(third, NativeRunRequest::Acknowledge)?;
         Ok(())
     })();
-    stop.send(()).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let _ = stop.send(());
     handle
         .join()
-        .map_err(|_| anyhow::anyhow!("test cache server panicked"))?;
+        .map_err(|_| anyhow::anyhow!("test cache server panicked"))??;
     result
 }
 
