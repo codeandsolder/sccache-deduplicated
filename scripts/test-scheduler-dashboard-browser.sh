@@ -77,6 +77,14 @@ await_js 'return document.body.innerText.includes("NO WORKERS")'
 await_js 'return document.querySelector("#topology svg") !== null && document.querySelector("#topology").innerText.includes("1 identities")'
 js 'const e=document.querySelector("#topology select"); e.selectedIndex=1; e.dispatchEvent(new Event("change",{bubbles:true})); return true' >/dev/null
 await_js 'return document.querySelector("#topology article")?.innerText.includes("Scheduler") === true'
+# Enroll a real authenticated client after hydration; membership must arrive via SSE.
+scheduler_endpoint="$(sed -n 's/.*Scheduler listening for clients on \([^ ]*\).*/\1/p' "$root/scheduler.log" | tail -1)"
+test -n "$scheduler_endpoint"
+scheduler_id="$("$binary" cluster-id --directory "$root/cluster")"
+mkdir -p "$root/client"
+jq -n --arg endpoint "https://$scheduler_endpoint" --arg id "$scheduler_id" --arg root "$root" '{dist:{scheduler_url:$endpoint,auth:{type:"token",token:"test-client"},cluster:{directory:($root+"/client"),ca_certificate:($root+"/cluster/ca.pem"),scheduler_id:$id}}}' > "$root/client.json"
+"$binary" cluster-status --client-config "$root/client.json" >/dev/null
+await_js 'return document.querySelector("#topology").innerText.includes("2 identities") && [...document.querySelectorAll("#topology select option")].some(x => x.textContent.includes("Client"))'
 # The browser sees actual maintenance state changes without page reload.
 touch "$root/drain"
 await_js 'return document.body.innerText.includes("DRAINING")'

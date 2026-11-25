@@ -1,4 +1,4 @@
-//! Fixed PromQL templates and demand-driven, shared historical SSE feeds.
+//! Fixed `PromQL` templates and demand-driven, shared historical SSE feeds.
 use std::{
     collections::BTreeMap,
     convert::Infallible,
