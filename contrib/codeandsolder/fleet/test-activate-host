@@ -6,7 +6,7 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/sccache-fleet-activation-test.XXXXXX")
 trap 'rm -rf -- "$tmp"' EXIT
 mkdir -p "$tmp"/{usr-local/bin,usr-local/libexec/sccache-bin,etc/sccache,etc/sccache-dist,etc/systemd/system,var-lib/sccache-autoupdate,var-cache,var-tmp,shm,run,bin}
 cp /etc/{passwd,group,nsswitch.conf,machine-id} "$tmp/etc/"
-stage="$tmp/var-lib/sccache-managed-rollout/epoch5-20261125"
+stage="$tmp/var-lib/sccache-managed-rollout/epoch6-20261125"
 sha=1111111111111111111111111111111111111111
 bundle="$tmp/var-lib/sccache-native-bundles/$sha"
 mkdir -p "$stage" "$bundle"
@@ -58,6 +58,7 @@ for unit in sccache-local.service sccache-local-root.service sccache-dist-worker
 done
 printf 'role=asus\nuid=0\ngid=0\nplatform=fixture\ncache_url=http://127.0.0.1:10602\n' > "$stage/plan.txt"
 printf 'new shared config\n' > "$stage/client-shared.toml"
+printf 'fixture CA\n' > "$stage/cluster-ca.pem"
 printf 'new worker config\n' > "$stage/server.conf"
 printf 'new router\n' > "$stage/sccache-client"
 printf 'new updater\n' > "$stage/sccache-release-update"
@@ -67,7 +68,7 @@ touch "$tmp/var-lib/mock-systemd/active-random-utils-update.timer" "$tmp/var-lib
 touch "$tmp/var-lib/mock-systemd/enabled-sccache-release-update.timer"
 printf 'new router config\n' > "$stage/wrapper.conf"
 printf '[Service]\nUser=root\n' > "$stage/90-shared-daemon.conf"
-printf '[Service]\nEnvironment=EPOCH=5\n' > "$stage/zz-epoch5.conf"
+printf '[Service]\nEnvironment=EPOCH=6\n' > "$stage/zz-epoch6.conf"
 # The bind roots are all private and writable; the host filesystem is RO.
 bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --unshare-net --die-with-parent \
  --ro-bind / / --proc /proc --dev /dev \
@@ -83,7 +84,7 @@ bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --unshare-net --die-with-pare
  /bin/bash -s -- "$sha" <<'INNER'
 set -euo pipefail
 sha=$1
-stage=/var/lib/sccache-managed-rollout/epoch5-20261125
+stage=/var/lib/sccache-managed-rollout/epoch6-20261125
 bundle=/var/lib/sccache-native-bundles/$sha
 cd "$stage"
 sha256sum /etc/sccache/client.conf /etc/sccache-dist/server.conf > originals.sha256
@@ -92,7 +93,7 @@ sha256sum "${files[@]}" > STAGED_SHA256SUMS
 # Published metadata is introduced only after preparation.
 {
  printf 'source_sha=%s\n' "$sha"
- printf 'dist_protocol=4\nrollout_epoch=5\nrust_toolchain=nightly-2026-11-20\nfeatures=fixture\nopenssl_linkage=vendored-static\ncapabilities=direct-metrics\n'
+ printf 'dist_protocol=5\nrollout_epoch=6\nrust_toolchain=nightly-2026-11-20\nfeatures=fixture\nopenssl_linkage=vendored-static\ncapabilities=direct-metrics\n'
 } > published-build.txt
 {
  cat published-build.txt
@@ -118,6 +119,7 @@ chmod 755 /usr/local/libexec/host-native-metadata
 ./activate-host stop-dist "$sha"
 ./activate-host install "$sha"
 [[ $(cat /etc/sccache/client-shared.toml) == "new shared config" ]]
+[[ $(cat /etc/sccache/cluster-ca.pem) == "fixture CA" ]]
 [[ $(cat /etc/sccache-dist/server.conf) == "new worker config" ]]
 [[ $(stat -c %a /etc/sccache) == 750 ]]
 cmp /usr/local/libexec/sccache-bin/sccache "$bundle/sccache"
@@ -146,7 +148,7 @@ systemctl is-enabled --quiet sccache-dist-worker-watchdog.timer
 ! systemctl is-active --quiet sccache-release-update.timer
 
 [[ $(cat /etc/sccache-dist/server.conf) == "old worker config" ]]
-[[ ! -e /etc/sccache/client-shared.toml && ! -e /dev/shm/sccache-maintenance-drain ]]
+[[ ! -e /etc/sccache/client-shared.toml && ! -e /etc/sccache/cluster-ca.pem && ! -e /dev/shm/sccache-maintenance-drain ]]
 [[ $(stat -c %a /etc/sccache/client.conf) == 640 ]]
 [[ $(stat -c %a /etc/sccache) == 750 ]]
 [[ $(cat /var/lib/sccache-autoupdate/dist_protocol) == 3 ]]

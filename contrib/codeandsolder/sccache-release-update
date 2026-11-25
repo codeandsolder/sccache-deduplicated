@@ -28,7 +28,7 @@ NATIVE_ROOT_PORT="${SCCACHE_AUTOUPDATE_NATIVE_ROOT_PORT:-4237}"
 OPENWRT_ROOT_PORT="${SCCACHE_AUTOUPDATE_OPENWRT_ROOT_PORT:-4238}"
 STRICT_LOCAL_PORT="${SCCACHE_AUTOUPDATE_STRICT_LOCAL_PORT:-4228}"
 CLIENT_SERVICES=("$LOCAL_SERVICE" "$ROOT_LOCAL_SERVICE" "$NATIVE_ROOT_SERVICE" "$OPENWRT_ROOT_SERVICE" "$STRICT_LOCAL_SERVICE")
-SCHEDULER_URL="${SCCACHE_AUTOUPDATE_SCHEDULER_URL:-https://sccache.onhir.eu}"
+SCHEDULER_CONFIG=/etc/sccache/client-shared.toml
 LOCK="${SCCACHE_AUTOUPDATE_LOCK:-/run/lock/sccache-autoupdate.lock}"
 MODE=apply
 NATIVE_BUNDLE_ROOT="${SCCACHE_AUTOUPDATE_NATIVE_BUNDLE_ROOT:-}"
@@ -463,7 +463,7 @@ local_sccache() {
 
 
 scheduler_ready() {
-    curl -fsS --connect-timeout 3 --max-time 5         "$SCHEDULER_URL/api/v1/scheduler/status" >/dev/null 2>&1
+    "$DIST_LIVE" cluster-status --client-config "$SCHEDULER_CONFIG" >/dev/null 2>&1
 }
 local_dist_status_value() {
     local field="$1"
@@ -490,8 +490,7 @@ dist_status_value() {
         return 0
     fi
 
-    curl -fsS --connect-timeout 3 --max-time 5 \
-        -H 'Accept: application/json' "$SCHEDULER_URL/api/v1/scheduler/status" |
+    "$DIST_LIVE" cluster-status --client-config "$SCHEDULER_CONFIG" |
         python3 -c 'import json,sys
 print(json.load(sys.stdin)[sys.argv[1]])' "$field"
 }

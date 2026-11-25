@@ -35,7 +35,7 @@ basedirs = ["/home/user/project"]
 
 [dist]
 # where to find the scheduler
-scheduler_url = "http://1.2.3.4:10600"
+scheduler_url = "https://1.2.3.4:10600"
 # a set of prepackaged toolchains
 toolchains = []
 # the maximum size of the toolchain cache in bytes
@@ -45,6 +45,11 @@ cache_dir = "/home/user/.cache/sccache-dist-client"
 [dist.auth]
 type = "token"
 token = "secrettoken"
+
+[dist.cluster]
+directory = "/home/user/.local/state/sccache-cluster"
+ca_certificate = "/etc/sccache/cluster-ca.pem"
+scheduler_id = "<64-digit scheduler peer ID>"
 
 # Multi-level cache configuration
 # Define cache levels in order (fast to slow).

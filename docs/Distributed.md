@@ -117,10 +117,11 @@ The HTTP implementation of sccache has the following API, where all HTTP body co
    - `POST /api/v1/scheduler/alloc_job`
       - Called by a client to submit a compilation request.
       - Returns information on where the job is allocated it should run.
-   - `GET /api/v1/scheduler/server_certificate`
-      - Called by a client to retrieve the (dynamically created) HTTPS
-        certificate for a server, for use in communication with that server.
-      - Returns a digest and PEM for the temporary server HTTPS certificate.
+   - `GET /api/v1/scheduler/worker_route/{peer_id}`
+      - Returns the configured worker endpoint and bounded alternative interface
+        addresses. All routes must authenticate the same enrolled public key.
+   - `GET /api/v1/scheduler/native_routes`
+      - Returns the native CAS listener's candidate addresses.
    - `POST /api/v4/scheduler/heartbeat_server`
       - Called (repeatedly) by servers to register as available for jobs.
       - Every five seconds, advertises fractional effective CPU capacity from
@@ -178,13 +179,12 @@ To protect against this, servers must be authenticated to the scheduler. You hav
 means for doing this, and the scheduler and all servers must use the same mechanism.
 
 Once a server has registered itself using the selected authentication, the scheduler
-will trust the registered server address and use it for builds.
+will trust the enrolled public-key identity and authenticate each candidate route before use.
 
 #### JWT HS256 (preferred)
 
-This method uses secret key to create a per-IP-and-port token for each server.
-Acquiring a token will only allow participation as a server if the attacker can
-additionally impersonate the IP and port the token was generated for.
+This method creates an enrollment token bound to the worker public-key identity.
+The worker must prove possession of the corresponding private key during enrollment.
 
 You *must* keep the secret key safe.
 
@@ -198,13 +198,12 @@ follows:
 server_auth = { type = "jwt_hs256", secret_key = "YOUR_KEY_HERE" }
 ```
 
-Now generate a token for the server, giving the IP and port the scheduler and clients can
-connect to the server on (address `192.168.1.10:10501` here):
+First initialize the persistent worker key on the worker, as its service account. Then generate an enrollment token for its reported public-key ID:
 
 ```
 sccache-dist auth generate-jwt-hs256-server-token \
     --secret-key YOUR_KEY_HERE \
-    --server 192.168.1.10:10501
+    --server "$WORKER_ID"
 ```
 
 *or:*
@@ -212,7 +211,7 @@ sccache-dist auth generate-jwt-hs256-server-token \
 ```
 sccache-dist auth generate-jwt-hs256-server-token \
     --config /path/to/scheduler-config.toml \
-    --server 192.168.1.10:10501
+    --server "$WORKER_ID"
 ```
 
 This will output a token (you can examine it with https://jwt.io if you're
@@ -378,18 +377,45 @@ If third parties can see traffic to the servers, source code can be leaked. If t
 parties can modify traffic to and from the servers or the scheduler, they can cause
 the client to receive malicious compiled objects.
 
-Securing communication with the scheduler is the responsibility of the sccache cluster
-administrator - it is recommended to put a webserver with a HTTPS certificate in front
-of the scheduler and instruct clients to configure their `scheduler_url` with the
-appropriate `https://` address. The scheduler will verify the server's IP in this
-configuration by inspecting the `X-Real-IP` header's value, if present. The webserver
-used in this case should be configured to set this header to the appropriate value.
+Protocol 5 uses native mutual TLS for scheduler RPCs, worker RPCs and the
+native cache. The scheduler acts as the local CA. Bootstrap tokens authorize
+initial enrollment only; subsequent requests authenticate the role-bound leaf.
+Each peer's persistent P-256 public-key SHA-256 digest is its identity, not its
+address or current leaf. Leaves renew with the same key, and TLS contexts reload
+without stopping in-flight transfers. Job and exact-content capabilities still
+authorize individual operations.
 
-Securing communication with the server is performed automatically - HTTPS certificates
-are generated dynamically on server startup and communicated to the scheduler during
-the heartbeat. If a client does not have the appropriate certificate for communicating
-securely with a server (after receiving a job allocation from the scheduler), the
-certificate will be requested from the scheduler.
+Initialize the scheduler directory as the scheduler service account:
+
+```sh
+sccache-dist cluster-init --directory /var/lib/sccache-cluster/scheduler
+```
+
+Distribute only its generated `ca.pem` and the printed scheduler peer ID using
+an independently authenticated provisioning channel. Never distribute the CA
+private key. Members use separate absolute identity directories and the
+provisioned CA and scheduler ID. For key-bound worker JWT enrollment, create the
+worker identity with `sccache-dist cluster-id --directory /var/lib/sccache-cluster/worker`
+before generating the JWT.
+
+The configured scheduler URL and worker public address are reliable fallback
+endpoints. Workers advertise interface candidates in authenticated heartbeats.
+Native CAS similarly advertises its listener interfaces. Candidates are
+validated by mTLS and ranked by measured request latency; unreachable or stale
+candidates fall back to the configured route. There is no mDNS dependency.
+Explicit bind addresses restrict the listener; by default non-loopback workers
+and native cache listeners bind the configured address family on all interfaces.
+
+For offline administration, `sccache-dist cluster-revoke --directory /var/lib/sccache-cluster/scheduler --peer PEER_ID`
+requires the scheduler to be stopped (exclusive registry lock). The scheduler
+rejects revoked peers and distributes permanent revocations in heartbeats.
+`sccache-dist cluster-status --client-config /path/to/client.toml` provides
+authenticated JSON status for token-configured clients.
+
+Protocol 5 / rollout epoch 6 is incompatible with the previous transport; do
+not mix binaries or use the old HTTP health endpoint. The managed fleet's
+`fleet/prepare-host ROLE CA_PEM SCHEDULER_ID` stages the new trust configuration
+before the coordinated cutover.
 
 ## Configuration
 
@@ -399,9 +425,9 @@ Use the `--config` argument to pass the path to its configuration file to `sccac
 ### scheduler.toml
 
 ```toml
-# The socket address the scheduler will listen on. It's strongly recommended
-# to listen on localhost and put a HTTPS server in front of it.
+# The scheduler terminates TLS directly on this reliable endpoint.
 public_addr = "127.0.0.1:10600"
+cluster_directory = "/var/lib/sccache-cluster/scheduler"
 
 # Optional maintenance admission gate. While this file exists, the scheduler
 # keeps heartbeats and job-state updates working but refuses new allocations.
@@ -437,7 +463,7 @@ draining). When a worker reduces its advertised width, its existing jobs
 are not cancelled. Consequently available slots need not equal the fleet
 limit minus aggregate in-progress jobs.
 
-Upgrade all clients and the scheduler together for protocol 4, adding the
+Upgrade all clients and the scheduler together for protocol 5, adding the
 required configuration before starting the new scheduler. Remove the former
 scheduler slack environment variables; they no longer participate in admission.
 
@@ -506,11 +532,15 @@ cache_dir = "/tmp/toolchains"
 #toolchain_cache_size = 10737418240
 # A public IP address and port that clients will use to connect to this builder.
 public_addr = "192.168.1.1:10501"
-# The socket address the builder will listen on. Falls back to public_addr.
+# The socket address the builder will listen on. Defaults to a wildcard for non-loopback endpoints.
 #bind_address = "0.0.0.0:10501"
-# The URL used to connect to the scheduler (should use https, given an ideal
-# setup of a HTTPS server in front of the scheduler)
-scheduler_url = "https://192.168.1.1"
+# The reliable native HTTPS scheduler endpoint.
+scheduler_url = "https://192.168.1.1:10600"
+
+[cluster]
+directory = "/var/lib/sccache-cluster/worker"
+ca_certificate = "/etc/sccache/cluster-ca.pem"
+scheduler_id = "<64-digit scheduler peer ID>"
 
 [builder]
 type = "overlay"

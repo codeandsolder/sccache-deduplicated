@@ -73,7 +73,7 @@ serves available blobs directly; a missing blob registers a shared backfill
 flight and returns HTTP 202 while a source is selected. A bounded peer-source
 pool first tries workers whose latest residency summary predicts the blob.
 The peer uses a separate expiring HTTPS capability bound to the exact digest
-and length (not a compilation job token), with its registered certificate.
+and length (not a compilation job token), with its enrolled mTLS identity.
 A short discovery window and bounded source-probe deadlines prevent a stale
 hint or a busy peer service from indefinitely delaying the original client.
 If no peer provides the bytes, the scheduler requests them from an active
@@ -182,12 +182,13 @@ other nondeterministic process behavior are not automatically normalized.
 
 ## Configuration
 
-The native scheduler, worker and compiler client are opt-in. Use an authenticated private transport for
-the dedicated HTTP cache listener (e.g. the managed private network);
-the listener does not terminate TLS itself. Worker assignment and status observation use the
-existing HTTPS job service with the scheduler-provided certificate and job
-capability. The cache listener uses the scheduler's existing client and
-worker authentication. Do not expose it as a public cache endpoint.
+The native scheduler, worker and compiler client are opt-in. All distributed
+RPCs and the dedicated native cache listener use native mutual TLS with the
+scheduler-owned cluster CA (see [Distributed.md](Distributed.md)). Bootstrap
+authorization enrolls a persistent public-key identity. Job and exact-content
+capabilities still scope operations. Configured reliable endpoints are retained
+as fallbacks; authenticated alternate interface addresses are probed and
+selected automatically.
 
 Scheduler configuration example (illustrative resource limits):
 
@@ -228,7 +229,7 @@ protocols, sharing its advertised capacity.
 type = "native"
 
 [native_worker]
-cache_url = "http://127.0.0.1:10502"
+cache_url = "https://127.0.0.1:10502"
 directory = "/var/lib/sccache-native/worker"
 scratch = "/var/lib/sccache-native/scratch"
 bubblewrap = "/usr/bin/bwrap"
@@ -374,14 +375,19 @@ select native mode in the normal sccache configuration:
 
 ```toml
 [dist]
-scheduler_url = "http://127.0.0.1:10500"
+scheduler_url = "https://127.0.0.1:10500"
 
 [dist.auth]
 type = "token"
 token = "<scheduler client token>"
 
+[dist.cluster]
+directory = "/home/user/.local/state/sccache-cluster"
+ca_certificate = "/etc/sccache/cluster-ca.pem"
+scheduler_id = "<64-digit scheduler peer ID>"
+
 [dist.native]
-endpoint = "http://127.0.0.1:10502"
+endpoint = "https://127.0.0.1:10502"
 platform_contract = "site-defined-linux-execution-contract-v1"
 request_timeout_secs = 120
 build_timeout_secs = 600
