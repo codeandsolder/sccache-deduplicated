@@ -568,6 +568,20 @@ fn handle_compile_finished(
     }
 
     trace!("handle_compile_finished");
+    if let Some(report) = response.native {
+        use crate::protocol::NativeBuildSource;
+        let source = match report.source {
+            NativeBuildSource::Hit => "hit",
+            NativeBuildSource::Local => "local",
+            NativeBuildSource::Worker(_) => "worker",
+        };
+        let mode = match report.mode {
+            crate::build_runtime::ActionMode::Reuse => "reuse",
+            crate::build_runtime::ActionMode::Refresh => "refresh",
+        };
+        log::info!(target: "sccache::native_action", "native_action {} {source} {mode}",
+            blake3::Hash::from_bytes(report.key.0).to_hex());
+    }
     // It might be nice if the server sent stdout/stderr as the process
     // ran, but then it would have to also save them in the cache as
     // interleaved streams to really make it work.
@@ -807,7 +821,11 @@ where
             let (tx, _rx) = futures::channel::mpsc::channel(1);
             let (_, info) = server::WaitUntilZero::new();
             #[cfg(feature = "dist-client")]
-            let dist_client = storage.dist_client(&config.dist);
+            let dist_client = storage.dist_client(
+                &config.dist,
+                #[cfg(target_os = "linux")]
+                None,
+            );
             #[cfg(not(feature = "dist-client"))]
             let dist_client = server::DistClientContainer::new_disabled();
             let service = server::SccacheService::<C>::new(

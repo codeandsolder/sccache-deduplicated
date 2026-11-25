@@ -11,6 +11,7 @@ use tokio::net::UnixStream;
 pub struct Peer {
     pub(super) credentials: Credentials,
     pub(super) mount: File,
+    pub(super) pid_namespace: File,
     pub(super) root: File,
     pub(super) stdin: OwnedFd,
     pub(super) pidfd: OwnedFd,
@@ -87,21 +88,28 @@ pub(super) fn alive(pidfd: BorrowedFd<'_>) -> io::Result<bool> {
     }
 }
 
-fn stdin_fd(pidfd: BorrowedFd<'_>) -> Result<OwnedFd> {
-    // SAFETY: the pidfd identifies this authenticated peer, and the kernel
-    // duplicates fd 0 only. No requester-supplied descriptor or PID is used.
-    let result = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), 0, 0) };
+fn duplicate_fd(pidfd: BorrowedFd<'_>, fd: libc::c_int) -> io::Result<OwnedFd> {
+    // SAFETY: pidfd identifies a live process, and successful pidfd_getfd
+    // returns a new owned CLOEXEC descriptor for the specified open file.
+    let result = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };
     if result < 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EBADF) {
-            return Ok(File::open("/dev/null")?.into());
-        }
-        return Err(error)
-            .context("cannot duplicate peer stdin; shared daemon requires CAP_SYS_PTRACE");
+        return Err(io::Error::last_os_error());
     }
-    let fd = libc::c_int::try_from(result)?;
-    // SAFETY: a successful pidfd_getfd returns a new owned CLOEXEC descriptor.
+    let fd = libc::c_int::try_from(result).map_err(io::Error::other)?;
+    // SAFETY: the syscall returned an owned descriptor.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn stdin_fd(pidfd: BorrowedFd<'_>) -> Result<OwnedFd> {
+    match duplicate_fd(pidfd, 0) {
+        Ok(fd) => Ok(fd),
+        Err(error) if error.raw_os_error() == Some(libc::EBADF) => {
+            Ok(File::open("/dev/null")?.into())
+        }
+        Err(error) => {
+            Err(error).context("cannot duplicate peer stdin; shared daemon requires CAP_SYS_PTRACE")
+        }
+    }
 }
 
 fn read_umask(proc: &Path) -> Result<u32> {
@@ -148,6 +156,9 @@ impl Peer {
         let mount = File::open(proc.join("ns/mnt"))?;
         let own_mount = File::open("/proc/self/ns/mnt")?;
         let join_mount = !same_identity(&mount, &own_mount)?;
+        let pid_namespace = File::open(proc.join("ns/pid"))?;
+        let own_pid_namespace = File::open("/proc/self/ns/pid")?;
+        let join_pid = !same_identity(&pid_namespace, &own_pid_namespace)?;
         let root = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
@@ -158,6 +169,7 @@ impl Peer {
             groups: peer_groups(socket.as_fd())?,
             umask: read_umask(&proc)?,
             join_mount,
+            join_pid,
             parent_pid: std::process::id(),
         };
         let stdin = stdin_fd(pidfd.as_fd())?;
@@ -170,6 +182,7 @@ impl Peer {
         Ok(Self {
             credentials,
             mount,
+            pid_namespace,
             root,
             stdin,
             pidfd,

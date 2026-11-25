@@ -26,8 +26,8 @@ use crate::{
 use super::{
     LocalExecutor, NativeBuildPolicy, NativeBuildResult, NativeBuildSource, NativeCacheClient,
     client::{
-        InputBlob, InputProvider, LocalInputs, Outcome, failed_output, fetch_result,
-        validate_manifest, verify_destinations,
+        InputBlob, InputProvider, LocalInputs, NativeProgress, Outcome, failed_output,
+        fetch_result, validate_manifest, verify_destinations,
     },
     codec, copy_verified,
 };
@@ -37,6 +37,7 @@ pub use pipe::{DaemonStream, NativeExchange};
 
 #[derive(Serialize, Deserialize)]
 enum Event {
+    Progress(NativeProgress),
     NeedTree(TreeId),
     NeedBlob {
         tree: TreeId,
@@ -112,6 +113,10 @@ struct RemoteInputs<'a> {
 }
 
 impl InputProvider for RemoteInputs<'_> {
+    fn progress(&mut self, progress: NativeProgress) -> Result<()> {
+        send(self.stream, &Event::Progress(progress), self.limit)
+    }
+
     fn manifest(&mut self, tree: TreeId) -> Result<TreeManifest> {
         send(self.stream, &Event::NeedTree(tree), self.limit)?;
         receive(self.stream, self.limit)
@@ -218,40 +223,43 @@ pub async fn run_action(
         spec.platform == policy.platform,
         "native namespace platform mismatch"
     );
+    let activity = crate::server::activity::current();
     connection_task(connection, move |connection| {
-        let inputs = LocalInputs::new(&spec, &inputs)?;
-        let destinations = verify_destinations(&spec, &destinations)?;
-        ensure!(
-            matches!(
-                connection.transfer(TransferRequest::NativeStart)?,
-                TransferReply::Ack
-            ),
-            "unexpected native stream start response"
-        );
-        let result = run_inner(
-            &mut pipe::CallerStream::new(connection, chunk_bytes),
-            &policy,
-            &spec,
-            mode,
-            &inputs,
-            &destinations,
-        );
-        let request = if result.is_ok() {
-            TransferRequest::NativeEnd
-        } else {
-            TransferRequest::Abort
-        };
-        let close = connection.transfer(request);
-        match result {
-            Ok(result) => {
-                ensure!(
-                    matches!(close?, TransferReply::Ack),
-                    "unexpected native stream end response"
-                );
-                Ok(result)
+        crate::server::activity::sync_scope(activity, || {
+            let inputs = LocalInputs::new(&spec, &inputs)?;
+            let destinations = verify_destinations(&spec, &destinations)?;
+            ensure!(
+                matches!(
+                    connection.transfer(TransferRequest::NativeStart)?,
+                    TransferReply::Ack
+                ),
+                "unexpected native stream start response"
+            );
+            let result = run_inner(
+                &mut pipe::CallerStream::new(connection, chunk_bytes),
+                &policy,
+                &spec,
+                mode,
+                &inputs,
+                &destinations,
+            );
+            let request = if result.is_ok() {
+                TransferRequest::NativeEnd
+            } else {
+                TransferRequest::Abort
+            };
+            let close = connection.transfer(request);
+            match result {
+                Ok(result) => {
+                    ensure!(
+                        matches!(close?, TransferReply::Ack),
+                        "unexpected native stream end response"
+                    );
+                    Ok(result)
+                }
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
-        }
+        })
     })
     .await
 }
@@ -270,6 +278,7 @@ fn run_inner(
     let mut buffer = vec![0; stream.chunk_bytes()];
     loop {
         match receive(stream, policy.event_limit()?)? {
+            Event::Progress(progress) => progress.apply(),
             Event::NeedTree(id) => {
                 let manifest = inputs.tree(id)?.manifest();
                 advertised.insert(id, manifest.blobs()?);
@@ -303,6 +312,7 @@ fn run_inner(
                 }
             }
             Event::Ready { source, manifest } => {
+                crate::server::activity::phase(crate::server::activity::Phase::RestoreOutputs);
                 let staged = fetch_result(
                     spec,
                     &manifest,
