@@ -280,7 +280,7 @@ jobs:
     # Single current-Rust Linux lane on every PR and main push.
     permissions:
       contents: read
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@5cfc1a720a1499c3c2cfe733ef235a6953f9ad3e # draft unified CI; repin after upstream acceptance
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@fde2236a3c5b7097797e5fa664a207c3bbaea6e2 # draft unified CI; repin after upstream acceptance
     with:
       isolate-public-sccache-server: true
       # Bubblewrap 0.11+ supplies private writable overlay mounts.
@@ -311,11 +311,10 @@ jobs:
         printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'unset SCCACHE_SERVER_UDS SCCACHE_SERVER_PORT' 'exec "$@"' > "$test_runner"
         chmod +x "$test_runner"
         export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$test_runner"
-        # Integration tests spawn instrumented executables and sometimes strip
-        # their environment or kill a daemon. Keep the normal executable-based
-        # tests until coverage attribution includes those child processes.
+        # The default integration suite still needs explicit Nextest
+        # resource isolation; the privileged credential regression must
+        # retain its original sudo/UID-boundary semantics.
         cargo test --locked --target x86_64-unknown-linux-gnu --test '*'
-        cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-client,dist-server --test native_dist -- --include-ignored --skip shared_daemon_credential_isolation
         cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-client,dist-server --test native_dist -- --ignored --exact shared_daemon_credential_isolation
       test-suites: |
         [
@@ -334,6 +333,12 @@ jobs:
             "name": "scheduler-worker",
             "cargo": ["--locked", "--target", "x86_64-unknown-linux-gnu", "--no-default-features", "--features=dist-server", "--bin", "sccache-dist"],
             "nextest": ["--profile", "ci-isolated"]
+          },
+          {
+            "name": "native-dist",
+            "continuous": true,
+            "cargo": ["--locked", "--target", "x86_64-unknown-linux-gnu", "--no-default-features", "--features=dist-client,dist-server", "--test", "native_dist"],
+            "nextest": ["--profile", "ci-isolated", "--run-ignored", "all", "-E", "not test(=shared_daemon_credential_isolation)"]
           },
           {
             "name": "cpu-target-profile",
