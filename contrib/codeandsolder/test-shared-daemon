@@ -10,6 +10,7 @@ uid=${SUDO_UID:?run this regression with sudo from a non-root account}
 gid=${SUDO_GID:?run this regression with sudo from a non-root account}
 [[ $EUID == 0 && $uid != 0 ]]
 root=$(mktemp -d /run/sccache-shared-test.XXXXXX)
+report_parser=$(dirname -- "${BASH_SOURCE[0]}")/native-action-report.awk
 server_pid=
 cleanup() {
     local status=$?
@@ -19,6 +20,7 @@ cleanup() {
     fi
     if (( status != 0 )); then
         cat "$root/server.log" >&2 || true
+        cat "$root"/root-private/*.log >&2 || true
     fi
     rm -rf -- "$root"
 }
@@ -47,13 +49,15 @@ server_pid=$!
 
 client() {
     env -i PATH=/usr/bin:/bin HOME="$root/user-private" SCCACHE_CONF="$root/client.toml" \
-        SCCACHE_SERVER_UDS="$root/service.sock" SCCACHE_NO_AUTO_START_SERVER=1 \
+        SCCACHE_SERVER_UDS="$root/service.sock" SCCACHE_NO_AUTO_START_SERVER=1 SCCACHE_LOG=sccache::native_action=info \
         "$root/sccache" "$@"
 }
 user_client() {
+    local mode=()
+    if [[ ${SCCACHE_RECACHE:-} == 1 ]]; then mode=(SCCACHE_RECACHE=1); fi
     setpriv --reuid "$uid" --regid "$gid" --groups "$gid" -- \
         env -i PATH=/usr/bin:/bin HOME="$root/user-private" SCCACHE_CONF="$root/client.toml" \
-        SCCACHE_SERVER_UDS="$root/service.sock" SCCACHE_NO_AUTO_START_SERVER=1 \
+        SCCACHE_SERVER_UDS="$root/service.sock" SCCACHE_NO_AUTO_START_SERVER=1 SCCACHE_LOG=sccache::native_action=info "${mode[@]}" \
         "$root/sccache" "$@"
 }
 stats() {
@@ -73,16 +77,25 @@ cd "$root/user-private"
 printf 'int shared_value(void) { return 42; }\n' > probe.c
 chown "$uid:$gid" probe.c
 chmod 600 probe.c
-user_client /usr/bin/gcc -c probe.c -o probe.o
+user_client /usr/bin/gcc -c probe.c -o probe.o 2>"$root/root-private/first.log"
 [[ $(stat -c '%u:%g' probe.o) == "$uid:$gid" ]]
 reference=$(sha256sum probe.o | cut -d' ' -f1)
 rm probe.o
 before=$(stats | jq '.stats.cache_hits.counts | [.[]] | add // 0')
-client /usr/bin/gcc -c probe.c -o probe.o
+client /usr/bin/gcc -c probe.c -o probe.o 2>"$root/root-private/root-hit.log"
 [[ $(stat -c '%u' probe.o) == 0 ]]
 [[ $(sha256sum probe.o | cut -d' ' -f1) == "$reference" ]]
 after=$(stats | jq '.stats.cache_hits.counts | [.[]] | add // 0')
 (( after == before + 1 ))
+if [[ -n $dist ]]; then
+    read -r key source < <(awk -v mode=reuse -v exact_source=1 -f "$report_parser" "$root/root-private/first.log")
+    [[ $source == worker ]]
+    [[ $(awk -v mode=reuse -v exact_source=1 -f "$report_parser" "$root/root-private/root-hit.log") == "$key hit" ]]
+    rm probe.o
+    SCCACHE_RECACHE=1 user_client /usr/bin/gcc -c probe.c -o probe.o 2>"$root/root-private/refresh.log"
+    [[ $(awk -v mode=refresh -v exact_source=1 -f "$report_parser" "$root/root-private/refresh.log") == "$key worker" ]]
+    [[ $(sha256sum probe.o | cut -d' ' -f1) == "$reference" ]]
+fi
 rm probe.o
 user_client /usr/bin/gcc -c probe.c -o probe.o
 [[ $(stat -c '%u:%g' probe.o) == "$uid:$gid" ]]

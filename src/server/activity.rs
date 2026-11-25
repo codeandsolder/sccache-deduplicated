@@ -490,6 +490,37 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(all(target_os = "linux", feature = "dist-client"))]
+    #[tokio::test]
+    async fn native_blocking_assignment_reaches_parent_observer() -> Result<()> {
+        let identity = CompileIdentity {
+            client_pid: 42,
+            exe: "/usr/bin/rustc".into(),
+            cwd: "/build".into(),
+        };
+        let parent = Activity::new("native".into(), &identity, CompileOwner::Daemon);
+        let child = Arc::new(Activity::new(
+            parent.snapshot().id,
+            &identity,
+            CompileOwner::Daemon,
+        ));
+        scope(&child, async {
+            tokio::task::spawn_blocking(inherit_blocking(|| {
+                phase(Phase::AllocateWorker);
+                job(123, "worker-a".into());
+                phase(Phase::StageInputs);
+            }))
+            .await
+        })
+        .await?;
+        parent.observe_executor(child.snapshot())?;
+        let snapshot = parent.snapshot();
+        assert_eq!(snapshot.phase, Phase::StageInputs);
+        assert_eq!(snapshot.distributed_job, Some(123));
+        assert_eq!(snapshot.worker.as_deref(), Some("worker-a"));
+        Ok(())
+    }
+
     #[tokio::test(start_paused = true)]
     async fn caller_observation_cannot_renew_same_phase_and_preserves_transition_age() -> Result<()>
     {

@@ -9,5 +9,5 @@ END {
         actual_mode != mode ||
         (source != "hit" && source != "worker" && source != "local") ||
         (mode == "refresh" && source == "hit")) exit 1
-    print key, (source == "hit" ? "hit" : "miss")
+    print key, (exact_source ? source : (source == "hit" ? "hit" : "miss"))
 }

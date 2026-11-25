@@ -289,19 +289,16 @@ case "$phase" in
     printf 'int sccache_epoch5_%s(void) { return %s; }\n' "$(date +%s)" "$((RANDOM+1))" > smoke.c
     chown "$uid:$gid" smoke.c
     chmod 0644 smoke.c
-    before=$(direct_client --show-stats --stats-format=json | jq '[.stats.dist_compiles[]] | add // 0')
-    runuser -u "$user" -- env -u SCCACHE_SERVER_PORT SCCACHE_SERVER_UDS="$sock" SCCACHE_START_SERVER=0 SCCACHE_NO_AUTO_START_SERVER=1 bash -c 'umask 022; exec "$@"' _ "$live" /usr/bin/gcc -c smoke.c -o smoke.o
+    runuser -u "$user" -- env -u SCCACHE_SERVER_PORT -u SCCACHE_ERROR_LOG -u SCCACHE_RECACHE -u SCCACHE_CLIENT_SIDE SCCACHE_LOG=sccache::native_action=info SCCACHE_SERVER_UDS="$sock" SCCACHE_START_SERVER=0 SCCACHE_NO_AUTO_START_SERVER=1 bash -c 'umask 022; exec "$@"' _ "$live" /usr/bin/gcc -c smoke.c -o smoke.o 2>"$tmp/first.log" || { cat "$tmp/first.log" >&2; exit 1; }
     [[ $(stat -c '%u:%g:%a' smoke.o) == "$uid:$gid:644" ]]
     digest=$(sha256sum smoke.o | cut -d' ' -f1)
-    after=$(direct_client --show-stats --stats-format=json | jq '[.stats.dist_compiles[]] | add // 0')
-    (( after > before ))
+    read -r key source < <(awk -v mode=reuse -v exact_source=1 -f "$stage/native-action-report.awk" "$tmp/first.log")
+    [[ "$source" == worker ]]
     rm smoke.o
-    hits_before=$(direct_client --show-stats --stats-format=json | jq '[.stats.cache_hits.counts[]] | add // 0')
-    (umask 022; direct_client /usr/bin/gcc -c smoke.c -o smoke.o)
+    (umask 022; unset SCCACHE_ERROR_LOG SCCACHE_RECACHE SCCACHE_CLIENT_SIDE; export SCCACHE_LOG=sccache::native_action=info; direct_client /usr/bin/gcc -c smoke.c -o smoke.o) 2>"$tmp/second.log" || { cat "$tmp/second.log" >&2; exit 1; }
     [[ $(stat -c '%u:%a' smoke.o) == 0:644 ]]
     [[ $(sha256sum smoke.o | cut -d' ' -f1) == "$digest" ]]
-    hits_after=$(direct_client --show-stats --stats-format=json | jq '[.stats.cache_hits.counts[]] | add // 0')
-    (( hits_after > hits_before ))
+    [[ $(awk -v mode=reuse -v exact_source=1 -f "$stage/native-action-report.awk" "$tmp/second.log") == "$key hit" ]]
     /usr/local/libexec/sccache-release-update --verify-running-metrics "$(cat "$rollback/metrics-not-before")"
     printf '%s\n' "$sha" > "$rollback/smoke-ok"
     echo "remote compile + cross-UID cache hit verified $role"

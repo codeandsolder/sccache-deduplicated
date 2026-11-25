@@ -150,6 +150,7 @@ ROUTING
 install -m 0700 "$repo/sccache-client" "$stage/sccache-client"
 install -m 0700 "$repo/sccache-release-update" "$stage/sccache-release-update"
 install -m 0700 "$repo/fleet/activate-host" "$stage/activate-host"
+install -m 0600 "$repo/native-action-report.awk" "$stage/native-action-report.awk"
 if [[ -x /usr/local/libexec/cargo-codeandsolder-real && -f /usr/local/bin/cargo ]]; then
   install -m 0700 "$repo/cargo-wrapper" "$stage/cargo-wrapper"
 fi
