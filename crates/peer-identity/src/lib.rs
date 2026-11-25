@@ -8,7 +8,7 @@ use std::fmt;
 pub struct PeerId([u8; 32]);
 
 impl PeerId {
-    /// Construct an identity from a SHA-256 SubjectPublicKeyInfo digest.
+    /// Construct an identity from a SHA-256 `SubjectPublicKeyInfo` digest.
     #[must_use = "the digest identifies the enrolled peer"]
     pub const fn from_digest(digest: [u8; 32]) -> Self {
         Self(digest)
@@ -65,7 +65,7 @@ impl std::str::FromStr for PeerId {
             return Err(ParsePeerIdError);
         }
         let mut digest = [0; 32];
-        for (byte, encoded) in digest.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        for (byte, encoded) in digest.iter_mut().zip(value.as_bytes().as_chunks::<2>().0) {
             *byte = u8::from_str_radix(
                 std::str::from_utf8(encoded).map_err(|_| ParsePeerIdError)?,
                 16,
@@ -127,8 +127,8 @@ impl RouteSet {
 
     /// Accept routable unicast addresses. Scope-local IPv6 addresses cannot
     /// be used on another host without its own interface index.
-    #[must_use]
-    pub fn eligible(address: std::net::SocketAddr) -> bool {
+    #[must_use = "eligibility determines whether an address can be advertised"]
+    pub const fn eligible(address: std::net::SocketAddr) -> bool {
         use std::net::IpAddr;
         address.port() != 0
             && match address.ip() {
@@ -149,7 +149,7 @@ impl RouteSet {
     }
 
     /// Canonicalize discovered addresses; preserve the configured fallback.
-    #[must_use]
+    #[must_use = "the canonical route set must be used"]
     pub fn new(
         primary: std::net::SocketAddr,
         candidates: impl IntoIterator<Item = std::net::SocketAddr>,
@@ -170,7 +170,7 @@ impl RouteSet {
     }
 
     /// Reject malformed or oversized remote advertisements.
-    #[must_use]
+    #[must_use = "remote advertisements must be validated"]
     pub fn valid(&self) -> bool {
         Self::eligible(self.primary)
             && self.alternatives.len() <= Self::MAX_ALTERNATIVES

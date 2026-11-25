@@ -220,7 +220,7 @@ pub struct CachePathRates {
 }
 
 impl CachePathRates {
-    #[must_use]
+    #[must_use = "untrusted rate measurements must be validated"]
     pub fn valid(self) -> bool {
         [self.download, self.upload]
             .into_iter()

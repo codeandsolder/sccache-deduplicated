@@ -198,7 +198,7 @@ impl NativeCacheClient {
 
     /// Report only fresh path measurements; heartbeat generation never
     /// performs network I/O or waits for route discovery.
-    #[must_use]
+    #[must_use = "the snapshot supplies current route costs"]
     pub fn path_rates(&self) -> crate::build_runtime::wire::CachePathRates {
         use sccache_peer_identity::{Role, RouteSet};
         let cached = self.candidates.try_lock().ok();

@@ -322,3 +322,31 @@ fn peer_identity_has_a_canonical_config_representation() -> Result<()> {
     assert!("x".repeat(64).parse::<PeerId>().is_err());
     Ok(())
 }
+
+#[test]
+fn public_anchor_preserves_existing_trust_and_permissions() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let ca = ClusterCa::open(&directory.path().join("ca-key.pem"))?;
+    let anchor = directory.path().join("ca.pem");
+    publish_trust_anchor(ca.certificate(), &anchor)?;
+    #[cfg(unix)]
+    let before = {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(&anchor)?;
+        assert_eq!(metadata.mode() & 0o777, 0o644);
+        metadata.ino()
+    };
+    publish_trust_anchor(ca.certificate(), &anchor)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(std::fs::metadata(&anchor)?.ino(), before);
+    }
+    let other = ClusterCa::open(&directory.path().join("other.pem"))?;
+    assert!(publish_trust_anchor(other.certificate(), &anchor).is_err());
+    assert_eq!(
+        X509::from_pem(&std::fs::read(&anchor)?)?.to_der()?,
+        ca.certificate().to_der()?
+    );
+    Ok(())
+}

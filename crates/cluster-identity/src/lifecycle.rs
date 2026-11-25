@@ -161,17 +161,42 @@ pub fn endpoint(url: &reqwest::Url) -> Result<SocketAddr> {
 /// Publish a scheduler's public trust anchor independently of its private CA.
 ///
 /// # Errors
-/// Returns an error if the file cannot be written durably.
+/// Returns an error if the file cannot be written durably or an existing
+/// trust anchor identifies a different CA.
 pub fn publish_trust_anchor(ca: &X509, path: &Path) -> Result<()> {
     use std::io::Write;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    let matches = |bytes: &[u8]| -> Result<()> {
+        ensure!(
+            X509::from_pem(bytes)?.to_der()? == ca.to_der()?,
+            "existing trust anchor identifies a different CA"
+        );
+        Ok(())
+    };
+    match fs::read(path) {
+        Ok(bytes) => return matches(&bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
     file.write_all(&ca.to_pem()?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o644))?;
+    }
     file.as_file().sync_all()?;
-    file.persist(path).map_err(|error| error.error)?;
+    match file.persist_noclobber(path) {
+        Ok(_) => {}
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return matches(&fs::read(path)?);
+        }
+        Err(error) => return Err(error.error.into()),
+    }
     #[cfg(unix)]
     fs::File::open(parent)?.sync_all()?;
     Ok(())
