@@ -314,7 +314,7 @@ impl<'a> ResultDelivery<'a> {
                     }
                     Ok(None) => {}
                     Err(error) if super::retryable_transport_error(&error) => {
-                        debug!("retrying provisional scheduler delivery after commit: {error:#}")
+                        debug!("retrying provisional scheduler delivery after commit: {error:#}");
                     }
                     Err(error) => return Err(error),
                 }

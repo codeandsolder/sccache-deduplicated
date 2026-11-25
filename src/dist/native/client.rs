@@ -510,6 +510,15 @@ impl NativeCacheClient {
             Ok(std::ops::ControlFlow::Continue(result)) => Ok(result),
             Err(error) => Err(error),
         };
+        self.finish_remote(pin, source, result)
+    }
+
+    fn finish_remote<'a>(
+        &self,
+        pin: Pin<'a>,
+        source: NativeBuildSource,
+        result: Result<NativeRunResult>,
+    ) -> Result<Outcome<'a>> {
         let error = match result {
             Ok(NativeRunResult::Stored) => None,
             Ok(failure @ NativeRunResult::Failed { .. }) => {
