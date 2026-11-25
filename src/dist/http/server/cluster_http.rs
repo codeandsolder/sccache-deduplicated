@@ -164,15 +164,16 @@ async fn blocking_reply(
 pub(super) fn route<S, F>(method: MethodFilter, handler: F) -> MethodRouter<Arc<S>>
 where
     S: Send + Sync + 'static,
-    F: Fn(&S, &Request) -> Response + Clone + Send + Sync + 'static,
+    F: Fn(&S, &Request) -> Response + Send + Sync + 'static,
 {
+    let handler = Arc::new(handler);
     let router = on(
         method,
         move |State(state): State<Arc<S>>,
               Extension(peer): Extension<AuthenticatedPeer>,
               Extension(permit): Extension<Arc<OwnedSemaphorePermit>>,
               request: axum::extract::Request| {
-            let handler = handler.clone();
+            let handler = Arc::clone(&handler);
             let request = Request::new(peer, request);
             async move { blocking_reply(permit, move || handler(&state, &request)).await }
         },
@@ -188,16 +189,17 @@ pub(super) fn path_route<S, P, F>(method: MethodFilter, handler: F) -> MethodRou
 where
     S: Send + Sync + 'static,
     P: serde::de::DeserializeOwned + Send + 'static,
-    F: Fn(&S, &Request, P) -> Response + Clone + Send + Sync + 'static,
+    F: Fn(&S, &Request, P) -> Response + Send + Sync + 'static,
 {
+    let handler = Arc::new(handler);
     let router = on(
         method,
         move |State(state): State<Arc<S>>,
               Extension(peer): Extension<AuthenticatedPeer>,
               Extension(permit): Extension<Arc<OwnedSemaphorePermit>>,
-              path: Result<Path<P>, PathRejection>,
+              path: std::result::Result<Path<P>, PathRejection>,
               request: axum::extract::Request| {
-            let handler = handler.clone();
+            let handler = Arc::clone(&handler);
             let request = Request::new(peer, request);
             async move {
                 match path {
