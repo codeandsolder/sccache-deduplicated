@@ -1378,3 +1378,32 @@ longer useful measurement windows. No extra files are fetched for it.
 The only learning action is a choice among real placements, or a reordering
 of real input fetches. If there is no useful opportunity, the system simply
 uses the fastest predicted placement. New jobs can always proceed normally.
+
+### Build-scoped Cargo intermediate retention
+
+On Linux, the managed Cargo launcher can use `sccache --cargo-final -- <cargo arguments>`.
+It invokes stock rustup-selected Cargo, with a private per-invocation build directory
+mounted through FUSE (requires access to `/dev/fuse` and `fusermount3`).
+The Cargo target directory is unchanged; durable final outputs are installed normally.
+`sccache --cargo-all -- <cargo arguments>` instead uses the regular Cargo build
+directory and retains materialized intermediates.
+
+The scheduler pins exact committed result manifests in a build-wide lease,
+independent of individual compilation tickets. The launcher holds the lease
+through the managed local daemon connection and its inherited scratch lock.
+Only immutable content references and caller-scoped tokens are exposed to the
+mount; the daemon retains remote credentials. A reference is installed on a
+private staging inode only after the result is committed and retained.
+The compiler's input manifest uses the same content ID as a materialized input,
+so a resident artifact does not need to pass through the launcher or compiler
+client. Locally executed build scripts, linkers, proc macros, and other readers
+receive verified bytes on demand. Mutable operations detach from the immutable
+content, preserving hardlinks and ordinary file metadata; truncation need not
+read the old bytes. Multiple local reads share one verified private spool per
+content identity. Spools and namespace data are temporary, not another cache.
+
+An expired or unavailable lease fails the affected operation rather than
+exposing an empty placeholder or inventing a new content identity. Scratch
+reclamation respects inherited process ownership. The full Cargo graph and
+cross-user/namespace acceptance tests must pass before promoting this mode
+to the managed fleet.

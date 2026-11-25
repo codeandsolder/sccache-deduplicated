@@ -149,13 +149,16 @@ impl NativeCompilerClient {
         let Some(reference) = intermediate_reference(file)? else {
             return Ok(None);
         };
-        match &self.endpoint {
+        let provider = match &self.endpoint {
             Endpoint::Direct(endpoint) => {
                 // SAFETY: geteuid only queries process credentials.
-                endpoint
+                let group = endpoint
                     .intermediates
-                    .get(unsafe { libc::geteuid() }, reference.session)?
-                    .authorize(reference.blob)?;
+                    .get(unsafe { libc::geteuid() }, reference.session)?;
+                group.authorize(reference.blob)?;
+                crate::build_runtime::ReferenceBlobProvider::new(move |blob| {
+                    Ok(Box::new(group.read(blob)?))
+                })
             }
             Endpoint::Namespace { connection, .. } => {
                 ensure!(
@@ -170,13 +173,11 @@ impl NativeCompilerClient {
                     ),
                     "unexpected intermediate authorization response"
                 );
+                crate::dist::native::intermediate::source(reference)
             }
-        }
+        };
         log::debug!("using retained CAS input {:?}", reference.blob.id);
-        Ok(Some((
-            reference.blob,
-            crate::dist::native::intermediate::source(reference),
-        )))
+        Ok(Some((reference.blob, provider)))
     }
 
     pub(crate) async fn hash_files(
