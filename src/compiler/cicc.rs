@@ -384,6 +384,7 @@ pub fn generate_compile_commands(
         arguments.extend(dist::osstrings_to_strings(&parsed_args.unhashed_args)?);
         arguments.extend(output_style.dist_args(path_transformer, &parsed_args.input, out_file)?);
         Some(dist::CompileCommand {
+            umask: crate::util::current_umask(),
             executable: path_transformer.as_dist(&executable.canonicalize().ok()?)?,
             arguments,
             env_vars: dist::osstring_tuples_to_strings(env_vars)?,

@@ -181,6 +181,7 @@ mod linux {
             root: ExecutionRoot { id: root, recipe },
             mounts: BTreeMap::new(),
             command: CommandSpec {
+                umask: 0o022,
                 executable: BuildPath::new(b"/bin/clang".to_vec())?,
                 arguments: [
                     b"-cc1".as_slice(),

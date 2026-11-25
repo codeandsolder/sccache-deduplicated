@@ -210,6 +210,15 @@ impl SandboxPlan {
             "bubblewrap launcher must be absolute"
         );
         let mut command = Command::new(bubblewrap);
+        let mask = rustix::fs::Mode::from_bits_truncate(invocation.umask);
+        // SAFETY: umask is an async-signal-safe syscall; the child alone
+        // changes its creation mask before exec, never the worker process.
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut command, move || {
+                rustix::process::umask(mask);
+                Ok(())
+            });
+        }
         command.env_clear().args([
             "--die-with-parent",
             "--new-session",
@@ -274,6 +283,7 @@ fn canonical_source(source: &Path) -> Result<PathBuf> {
 /// the distinction between absence and an empty value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxInvocation {
+    umask: u32,
     executable: OsString,
     arguments: Vec<OsString>,
     cwd: SandboxPath,
@@ -291,6 +301,7 @@ impl SandboxInvocation {
         arguments: Vec<OsString>,
         cwd: &Path,
         environment: impl IntoIterator<Item = (OsString, OsString)>,
+        umask: u32,
     ) -> Result<Self> {
         ensure!(
             !executable.is_empty() && valid_os(&executable),
@@ -300,6 +311,7 @@ impl SandboxInvocation {
             arguments.iter().all(|arg| valid_os(arg)),
             "sandbox argument contains NUL"
         );
+        ensure!(umask <= 0o777, "invalid sandbox umask");
         let mut explicit = BTreeMap::new();
         for (name, value) in environment {
             ensure!(
@@ -313,6 +325,7 @@ impl SandboxInvocation {
             );
         }
         Ok(Self {
+            umask,
             executable,
             arguments,
             cwd: SandboxPath::new(cwd)?,
@@ -339,6 +352,7 @@ impl SandboxInvocation {
                     OsStr::from_bytes(value).to_os_string(),
                 )
             }),
+            spec.umask,
         )
     }
 
@@ -348,6 +362,7 @@ impl SandboxInvocation {
     /// Returns an error for invalid or unencodable process inputs.
     pub fn input_components(&self) -> Result<BTreeMap<String, ContentId>> {
         CommandSpec {
+            umask: self.umask,
             executable: BuildPath::new(self.executable.as_bytes().to_vec())?,
             arguments: self
                 .arguments

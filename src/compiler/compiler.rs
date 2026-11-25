@@ -693,6 +693,16 @@ where
             )
             .await;
         }
+        let key = match crate::util::current_umask() {
+            Some(mask) => {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"sccache-output-umask-v1\0");
+                hasher.update(key.as_bytes());
+                hasher.update(&mask.to_le_bytes());
+                hasher.finalize().to_hex().to_string()
+            }
+            None => key,
+        };
         debug!("[{out_pretty}]: Hash key: {key}");
         // If `ForceRecache` is enabled, we won't check the cache.
         let start = Instant::now();
@@ -3910,6 +3920,7 @@ mod custom_toolchain_override_tests {
 
     fn command(env_vars: Vec<(String, String)>) -> CompileCommand {
         CompileCommand {
+            umask: Some(0o022),
             executable: "/automatic/rustc".to_owned(),
             arguments: Vec::new(),
             env_vars,

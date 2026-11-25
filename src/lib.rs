@@ -79,6 +79,16 @@ pub const LOGGING_ENV: &str = "SCCACHE_LOG";
 
 pub fn main() {
     #[cfg(target_os = "linux")]
+    if let Some(result) = server::shared::run_if_requested() {
+        std::process::exit(match result {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("sccache shared executor: {error:#}");
+                1
+            }
+        });
+    }
+    #[cfg(target_os = "linux")]
     if let Some(result) = rust_link::capture_if_relay() {
         std::process::exit(match result {
             Ok(()) => 0,

@@ -496,6 +496,7 @@ pub fn try_compile_command_to_dist(
         share_jobserver: _,
     } = command;
     Some(CompileCommand {
+        umask: crate::util::current_umask(),
         executable: executable.into_os_string().into_string().ok()?,
         arguments: arguments
             .into_iter()
@@ -709,6 +710,7 @@ impl fmt::Display for JobState {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompileCommand {
+    pub umask: Option<u32>,
     pub executable: String,
     pub arguments: Vec<String>,
     pub env_vars: Vec<(String, String)>,
@@ -719,6 +721,7 @@ impl fmt::Debug for CompileCommand {
         let env_var_names: Vec<_> = self.env_vars.iter().map(|(name, _)| name).collect();
         f.debug_struct("CompileCommand")
             .field("executable", &self.executable)
+            .field("umask", &self.umask)
             .field("argument_count", &self.arguments.len())
             .field("env_var_names", &env_var_names)
             .field("cwd", &self.cwd)

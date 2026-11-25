@@ -1084,6 +1084,14 @@ fn compiler_alias_rejects_relative_paths_and_alias_chains() -> Result<()> {
     Ok(())
 }
 
+/// Authorized host UIDs for a root-owned shared compiler service.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedDaemonConfig {
+    pub socket_gid: u32,
+    pub allowed_uids: std::collections::BTreeSet<u32>,
+}
+
 // TODO: fields only pub for tests
 #[derive(Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(default)]
@@ -1095,6 +1103,7 @@ pub struct FileConfig {
     /// Base directories to strip from paths for cache key computation.
     pub basedirs: Vec<String>,
     pub client_side_mode: bool,
+    pub shared_daemon: Option<SharedDaemonConfig>,
     pub compiler_aliases: CompilerAliases,
     pub compile_limits: crate::server::activity::CompileLimits,
 }
@@ -1759,6 +1768,7 @@ pub struct Config {
     /// Similar to ccache's `CCACHE_BASEDIR`.
     pub basedirs: Vec<Vec<u8>>,
     pub client_side_mode: bool,
+    pub shared_daemon: Option<SharedDaemonConfig>,
     pub compiler_aliases: CompilerAliases,
     pub compile_limits: crate::server::activity::CompileLimits,
 }
@@ -1804,6 +1814,7 @@ impl Config {
             server_startup_timeout_ms,
             basedirs: file_basedirs,
             client_side_mode: file_client_side_mode,
+            shared_daemon,
             compiler_aliases,
             compile_limits,
         } = file_conf;
@@ -1869,6 +1880,19 @@ impl Config {
 
         // Logging must never change the filesystem namespace used to compile.
         let client_side_mode = env_client_side_mode.unwrap_or(file_client_side_mode);
+        if shared_daemon.is_some() {
+            anyhow::ensure!(cfg!(target_os = "linux"), "shared daemon is Linux-only");
+            anyhow::ensure!(
+                !client_side_mode,
+                "shared daemon cannot use caller-owned compilation"
+            );
+            anyhow::ensure!(
+                dist.native
+                    .as_ref()
+                    .is_none_or(|native| native.local_execution.is_none()),
+                "shared daemon cannot run native actions with the daemon's credentials"
+            );
+        }
         if let Some(native) = &dist.native {
             native.validate()?;
             anyhow::ensure!(
@@ -1887,6 +1911,7 @@ impl Config {
             skip_cache_check: false,
             basedirs,
             client_side_mode,
+            shared_daemon,
             compiler_aliases,
             compile_limits,
         })
@@ -2549,6 +2574,7 @@ fn config_overrides() {
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
+        shared_daemon: None,
         compiler_aliases: Default::default(),
         compile_limits: Default::default(),
     };
@@ -2608,6 +2634,7 @@ fn config_overrides() {
             skip_cache_check: false,
             basedirs: vec![],
             client_side_mode: false,
+            shared_daemon: None,
             compiler_aliases: Default::default(),
             compile_limits: Default::default(),
         }
@@ -3757,6 +3784,7 @@ key_prefix = "cosprefix"
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],
             client_side_mode: false,
+            shared_daemon: None,
             compiler_aliases: Default::default(),
             compile_limits: Default::default(),
         }
@@ -3856,6 +3884,7 @@ size = "7g"
             server_startup_timeout_ms: None,
             basedirs: vec![],
             client_side_mode: false,
+            shared_daemon: None,
             compiler_aliases: Default::default(),
             compile_limits: Default::default(),
         }

@@ -102,6 +102,11 @@ pub trait Acceptor {
 
     fn accept(&self) -> impl Future<Output = tokio::io::Result<Self::Socket>> + Send;
     fn local_addr(&self) -> tokio::io::Result<Option<SocketAddr>>;
+
+    #[cfg(target_os = "linux")]
+    fn unix_stream(_socket: &Self::Socket) -> Option<&tokio::net::UnixStream> {
+        None
+    }
 }
 
 impl Acceptor for tokio::net::TcpListener {
@@ -193,6 +198,11 @@ mod unix_imp {
         #[inline]
         fn accept(&self) -> impl Future<Output = tokio::io::Result<Self::Socket>> + Send {
             Self::accept(self).and_then(|(s, _)| futures::future::ok(s))
+        }
+
+        #[cfg(target_os = "linux")]
+        fn unix_stream(socket: &Self::Socket) -> Option<&tokio::net::UnixStream> {
+            Some(socket)
         }
 
         #[inline]

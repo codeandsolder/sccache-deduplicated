@@ -232,7 +232,7 @@ pub struct CompileFinished {
 }
 
 /// The contents of a compile request from a client.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Compile {
     /// Caller PID for correlating a request with local build processes.
     pub client_pid: u32,

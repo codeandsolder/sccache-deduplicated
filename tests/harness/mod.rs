@@ -264,6 +264,7 @@ pub fn sccache_client_cfg(
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
+        shared_daemon: None,
         compiler_aliases: Default::default(),
         compile_limits: Default::default(),
     }

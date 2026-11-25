@@ -23,6 +23,7 @@ fn spec(args: &[&str]) -> anyhow::Result<ExecutionSpec> {
         },
         mounts: BTreeMap::new(),
         command: CommandSpec {
+            umask: 0o022,
             executable: BuildPath::new(b"/toolchain/bin/rustc".to_vec())?,
             arguments: args.iter().map(|arg| arg.as_bytes().to_vec()).collect(),
             cwd: BuildPath::new(b"/src".to_vec())?,
