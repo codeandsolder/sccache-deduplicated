@@ -30,6 +30,8 @@ pub mod errors;
 
 pub use sccache_build as build_runtime;
 pub mod cache;
+#[cfg(target_os = "linux")]
+mod cargo_launcher;
 mod client;
 mod cmdline;
 mod commands;
@@ -100,6 +102,17 @@ pub fn main() {
     }
 
     init_logging();
+
+    #[cfg(target_os = "linux")]
+    if let Some(result) = cargo_launcher::run_if_requested() {
+        std::process::exit(match result {
+            Ok(status) => status,
+            Err(error) => {
+                eprintln!("sccache Cargo launcher: {error:#}");
+                2
+            }
+        });
+    }
 
     let command = match cmdline::try_parse() {
         Ok(cmd) => cmd,

@@ -97,6 +97,8 @@ fn flag_infer_long(name: &'static str) -> Arg {
 }
 
 const ENABLED_FEATURES_HELP: &str = concat!(
+    "Linux Cargo launcher: --cargo-final -- [Cargo arguments] (temporary intermediates)\n",
+    "                      --cargo-all -- [Cargo arguments] (normal Cargo retention)\n\n",
     "Enabled features:\n",
     "    S3:        ",
     cfg!(feature = "s3"),

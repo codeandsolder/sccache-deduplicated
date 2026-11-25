@@ -1502,6 +1502,30 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let hit = client.run_action(&second, &inputs, &destinations, &policy, None)?;
     assert_eq!(hit.source, NativeBuildSource::Hit);
 
+    // Output selection is a delivery policy, not an execution/cache identity.
+    // The complete result includes an already-present input file, but the
+    // first consumer requests only its final compiled object.
+    let mut selective = spec.clone();
+    selective.outputs.insert(
+        "intermediate".into(),
+        OutputSpec {
+            path: BuildPath::new(b"/src/input.s".to_vec())?,
+            required: true,
+            kind: sccache_build::OutputKind::File,
+        },
+    );
+    let intermediate = root.join("delivered-input.s");
+    let first = client.run_action(&selective, &inputs, &destinations, &policy, None)?;
+    assert_eq!(first.source, NativeBuildSource::Worker(worker_address));
+    assert!(first.output.status.success());
+    assert!(!intermediate.exists());
+    let mut all = destinations.clone();
+    all.insert("intermediate".into(), intermediate.clone());
+    let second_result = client.run_action(&selective, &inputs, &all, &policy, None)?;
+    assert_eq!(second_result.source, NativeBuildSource::Hit);
+    assert!(second_result.output.status.success());
+    assert_eq!(fs::read(&intermediate)?, assembly);
+
     // Repeated real executions of the same command family exercise the
     // scheduler's learned service time rather than its worker-wide prior.
     let remote_refresh = NativeBuildPolicy {

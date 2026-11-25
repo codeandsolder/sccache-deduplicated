@@ -121,7 +121,7 @@ sccache_wrapper_main() {
     export SCCACHE_NO_AUTO_START_SERVER=1
     local -a args=("$@")
     if [[ "$mode" == compiler ]]; then
-        if [[ -n "${SCCACHE_CANONICAL_TARGET_ROOT:-}" || -n "${CARGO_TARGET_DIR:-}" || -n "${OUT_DIR:-}" ]]; then
+        if [[ -n "${SCCACHE_CANONICAL_TARGET_ROOT:-}" || -n "${CARGO_TARGET_DIR:-}" || -n "${CARGO_BUILD_BUILD_DIR:-}" || -n "${CARGO_MANIFEST_DIR:-}" || -n "${OUT_DIR:-}" ]]; then
             export SCCACHE_EXPERIMENTAL_CANONICAL_RUST=1
         else
             unset SCCACHE_EXPERIMENTAL_CANONICAL_RUST
