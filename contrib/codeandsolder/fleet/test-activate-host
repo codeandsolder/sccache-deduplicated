@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
+script="$repo/contrib/codeandsolder/fleet/activate-host"
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/sccache-fleet-activation-test.XXXXXX")
+trap 'rm -rf -- "$tmp"' EXIT
+mkdir -p "$tmp"/{usr-local/bin,usr-local/libexec/sccache-bin,etc/sccache,etc/sccache-dist,etc/systemd/system,var-lib/sccache-autoupdate,var-cache,var-tmp,shm,run,bin}
+cp /etc/{passwd,group,nsswitch.conf,machine-id} "$tmp/etc/"
+stage="$tmp/var-lib/sccache-managed-rollout/epoch5-20261125"
+sha=1111111111111111111111111111111111111111
+bundle="$tmp/var-lib/sccache-native-bundles/$sha"
+mkdir -p "$stage" "$bundle"
+cp "$script" "$stage/activate-host"
+cp "$repo/contrib/codeandsolder/host-native-metadata" "$tmp/usr-local/libexec/host-native-metadata"
+cat > "$tmp/bin/systemctl" <<'MOCK'
+#!/bin/bash
+set -eu
+root=/var/lib/mock-systemd
+mkdir -p "$root"
+case "$1" in
+  is-active) [[ -f "$root/active-${!#}" ]] ;;
+  is-enabled) [[ -f "$root/enabled-${!#}" ]] ;;
+  stop) rm -f "$root/active-$2" ;;
+  start) touch "$root/active-$2" ;;
+  enable) touch "$root/enabled-$2" ;;
+  disable) rm -f "$root/enabled-$2" ;;
+  daemon-reload) ;;
+  show)
+    case "$*" in
+      *' User '*) echo root ;;
+      *' LoadState '*) echo loaded ;;
+      *' ActiveState '*) if [[ -f "$root/active-$2" ]]; then echo active; else echo inactive; fi ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  *) echo "unexpected systemctl $*" >&2; exit 1 ;;
+esac
+MOCK
+chmod +x "$tmp/bin/systemctl"
+for name in sccache sccache-dist; do
+ printf '#!/bin/sh\nprintf "fixture new\\n"\n' > "$bundle/$name"; chmod 755 "$bundle/$name"
+done
+printf 'old client\n' > "$tmp/usr-local/libexec/sccache-bin/sccache"
+printf 'old dist\n' > "$tmp/usr-local/bin/sccache-dist"
+printf 'old public\n' > "$tmp/usr-local/bin/sccache"
+printf 'old wrapper\n' > "$tmp/usr-local/libexec/sccache-client"
+printf 'old updater\n' > "$tmp/usr-local/libexec/sccache-release-update"
+printf 'old cargo\n' > "$tmp/usr-local/bin/cargo"
+printf 'old client config\n' > "$tmp/etc/sccache/client.conf"
+printf 'old worker config\n' > "$tmp/etc/sccache-dist/server.conf"
+printf '3\n' > "$tmp/var-lib/sccache-autoupdate/dist_protocol"
+printf 'old-sha\n' > "$tmp/var-lib/sccache-autoupdate/source_sha"
+chmod 0750 "$tmp/etc/sccache"
+chmod 0640 "$tmp/etc/sccache/client.conf"
+mkdir -p "$tmp/var-lib/mock-systemd"
+for unit in sccache-local.service sccache-local-root.service sccache-dist-worker.service; do
+ touch "$tmp/var-lib/mock-systemd/active-$unit" "$tmp/var-lib/mock-systemd/enabled-$unit"
+done
+printf 'role=asus\nuid=0\ngid=0\nplatform=fixture\ncache_url=http://127.0.0.1:10602\n' > "$stage/plan.txt"
+printf 'new shared config\n' > "$stage/client-shared.toml"
+printf 'new worker config\n' > "$stage/server.conf"
+printf 'new router\n' > "$stage/sccache-client"
+printf 'new updater\n' > "$stage/sccache-release-update"
+printf 'new cargo\n' > "$stage/cargo-wrapper"
+touch "$tmp/var-lib/mock-systemd/active-sccache-dist-worker-watchdog.timer" "$tmp/var-lib/mock-systemd/enabled-sccache-dist-worker-watchdog.timer"
+touch "$tmp/var-lib/mock-systemd/active-random-utils-update.timer" "$tmp/var-lib/mock-systemd/enabled-random-utils-update.timer"
+touch "$tmp/var-lib/mock-systemd/enabled-sccache-release-update.timer"
+printf 'new router config\n' > "$stage/wrapper.conf"
+printf '[Service]\nUser=root\n' > "$stage/90-shared-daemon.conf"
+printf '[Service]\nEnvironment=EPOCH=5\n' > "$stage/zz-epoch5.conf"
+# The bind roots are all private and writable; the host filesystem is RO.
+bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --unshare-net --die-with-parent \
+ --ro-bind / / --proc /proc --dev /dev \
+ --bind "$tmp/run" /run \
+ --bind "$tmp/shm" /dev/shm \
+ --bind "$tmp/usr-local" /usr/local \
+ --bind "$tmp/etc" /etc \
+ --bind "$tmp/var-lib" /var/lib \
+ --bind "$tmp/var-cache" /var/cache \
+ --bind "$tmp/var-tmp" /var/tmp \
+ --ro-bind "$tmp/bin/systemctl" /usr/bin/systemctl \
+ --setenv PATH /usr/bin:/bin \
+ /bin/bash -s -- "$sha" <<'INNER'
+set -euo pipefail
+sha=$1
+stage=/var/lib/sccache-managed-rollout/epoch5-20261125
+bundle=/var/lib/sccache-native-bundles/$sha
+cd "$stage"
+sha256sum /etc/sccache/client.conf /etc/sccache-dist/server.conf > originals.sha256
+files=(*)
+sha256sum "${files[@]}" > STAGED_SHA256SUMS
+# Published metadata is introduced only after preparation.
+{
+ printf 'source_sha=%s\n' "$sha"
+ printf 'dist_protocol=4\nrollout_epoch=5\nrust_toolchain=nightly-2026-11-20\nfeatures=fixture\nopenssl_linkage=vendored-static\ncapabilities=direct-metrics\n'
+} > published-build.txt
+{
+ cat published-build.txt
+ printf 'build_kind=host-native\nrustflags=-C target-cpu=native\nhost_fingerprint=%s\n' "$(/usr/local/libexec/host-native-metadata fingerprint)"
+} > "$bundle/build.txt"
+(cd "$bundle"; sha256sum sccache sccache-dist build.txt > SHA256SUMS)
+# The root in a user namespace cannot own the outer mount ancestors, so use
+# a mock attestation verifier for this state-machine test only. The actual
+# metadata helper has its own host-tools CI coverage.
+printf '#!/bin/sh\nexit 0\n' > /usr/local/libexec/host-native-metadata
+chmod 755 /usr/local/libexec/host-native-metadata
+./activate-host verify "$sha"
+./activate-host snapshot "$sha"
+[[ -f "$stage/updaters-paused" && -f /etc/systemd/system/sccache-fleet-rollout-drain ]]
+[[ -f /etc/systemd/system/sccache-release-update.service.d/zz-sccache-fleet-rollout-guard.conf ]]
+! systemctl is-active --quiet random-utils-update.timer
+! systemctl is-active --quiet sccache-release-update.timer
+! systemctl is-active --quiet sccache-dist-worker-watchdog.timer
+[[ -f /etc/systemd/system/sccache-dist-worker-watchdog.service.d/zz-sccache-fleet-rollout-guard.conf ]]
+./activate-host stop-clients "$sha"
+[[ -f /dev/shm/sccache-maintenance-drain ]]
+[[ $(cat /usr/local/bin/sccache) == "new router" ]]
+./activate-host stop-dist "$sha"
+./activate-host install "$sha"
+[[ $(cat /etc/sccache/client-shared.toml) == "new shared config" ]]
+[[ $(cat /etc/sccache-dist/server.conf) == "new worker config" ]]
+[[ $(stat -c %a /etc/sccache) == 750 ]]
+cmp /usr/local/libexec/sccache-bin/sccache "$bundle/sccache"
+cmp /usr/local/bin/sccache-dist "$bundle/sccache-dist"
+[[ $(cat /usr/local/libexec/sccache-release-update) == "new updater" ]]
+[[ $(cat /usr/local/bin/cargo) == "new cargo" ]]
+# A partially committed rollout may already have disabled the watchdog.
+systemctl disable sccache-dist-worker-watchdog.timer
+./activate-host rollback-stop "$sha"
+./activate-host rollback-restore "$sha"
+./activate-host rollback-start-scheduler "$sha"
+./activate-host rollback-start-worker "$sha"
+./activate-host rollback-start-clients "$sha"
+[[ $(cat /usr/local/libexec/sccache-bin/sccache) == "old client" ]]
+[[ $(cat /usr/local/bin/sccache-dist) == "old dist" ]]
+[[ $(cat /usr/local/bin/sccache) == "old public" ]]
+[[ $(cat /usr/local/libexec/sccache-client) == "old wrapper" ]]
+[[ $(cat /usr/local/libexec/sccache-release-update) == "old updater" ]]
+[[ $(cat /usr/local/bin/cargo) == "old cargo" ]]
+[[ ! -e "$stage/updaters-paused" && ! -e /etc/systemd/system/sccache-fleet-rollout-drain ]]
+[[ ! -e /etc/systemd/system/sccache-release-update.service.d/zz-sccache-fleet-rollout-guard.conf ]]
+systemctl is-active --quiet random-utils-update.timer
+systemctl is-active --quiet sccache-dist-worker-watchdog.timer
+systemctl is-enabled --quiet sccache-dist-worker-watchdog.timer
+[[ ! -e /etc/systemd/system/sccache-dist-worker-watchdog.service.d/zz-sccache-fleet-rollout-guard.conf ]]
+! systemctl is-active --quiet sccache-release-update.timer
+
+[[ $(cat /etc/sccache-dist/server.conf) == "old worker config" ]]
+[[ ! -e /etc/sccache/client-shared.toml && ! -e /dev/shm/sccache-maintenance-drain ]]
+[[ $(stat -c %a /etc/sccache/client.conf) == 640 ]]
+[[ $(stat -c %a /etc/sccache) == 750 ]]
+[[ $(cat /var/lib/sccache-autoupdate/dist_protocol) == 3 ]]
+for unit in sccache-local.service sccache-local-root.service sccache-dist-worker.service; do systemctl is-active --quiet "$unit"; done
+echo isolated-activation-rollback-pass
+INNER

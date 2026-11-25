@@ -612,9 +612,13 @@ fn bind_server(
     client: &Client,
     dist_client: DistClientContainer,
     storage: Arc<dyn Storage>,
-    compiler_aliases: CompilerAliases,
-    compile_limits: CompileLimits,
+    config: &Config,
 ) -> io::Result<(crate::net::SocketAddr, StartupRunner)> {
+    let compiler_aliases = config.compiler_aliases.clone();
+    let compile_limits = config.compile_limits;
+    #[cfg(target_os = "linux")]
+    let shared = shared::for_listener(config, client, addr)?;
+
     match addr {
         crate::net::SocketAddr::Net(addr) => {
             trace!("binding TCP {addr}");
@@ -639,6 +643,13 @@ fn bind_server(
         #[cfg(unix)]
         crate::net::SocketAddr::Unix(path) => {
             trace!("binding unix socket {}", path.display());
+            #[cfg(target_os = "linux")]
+            if shared.is_some() {
+                shared::prepare_listener(path).map_err(io::Error::other)?;
+            } else {
+                let _ = std::fs::remove_file(path);
+            }
+            #[cfg(not(target_os = "linux"))]
             let _ = std::fs::remove_file(path);
             let listener = {
                 let _guard = runtime.enter();
@@ -653,6 +664,15 @@ fn bind_server(
                 compiler_aliases,
                 compile_limits,
             );
+            #[cfg(target_os = "linux")]
+            let server = {
+                let mut server = server;
+                if let Some(executor) = shared {
+                    shared::secure_listener(path, &executor.policy)?;
+                    server.shared = Some(executor);
+                }
+                server
+            };
             let bound_addr = server.try_local_addr()?.ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::AddrNotAvailable,
@@ -737,15 +757,7 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
     let notify = env::var_os("SCCACHE_STARTUP_NOTIFY");
     let storage = initialize_server_storage(config, &pool, &runtime, notify.as_ref())?;
 
-    match bind_server(
-        addr,
-        runtime,
-        &client,
-        dist_client,
-        storage,
-        config.compiler_aliases.clone(),
-        config.compile_limits,
-    ) {
+    match bind_server(addr, runtime, &client, dist_client, storage, config) {
         Ok((bound_addr, run)) => {
             info!("server started, listening on {bound_addr}");
             notify_server_startup(
@@ -772,6 +784,8 @@ pub struct SccacheServer<A: crate::net::Acceptor, C: CommandCreatorSync = Proces
     timeout: Duration,
     service: SccacheService<C>,
     wait: WaitUntilZero,
+    #[cfg(target_os = "linux")]
+    shared: Option<Arc<shared::SharedExecutor>>,
 }
 
 impl<C: CommandCreatorSync> SccacheServer<tokio::net::TcpListener, C> {
@@ -841,6 +855,8 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
             service,
             timeout: Duration::from_secs(get_idle_timeout()),
             wait,
+            #[cfg(target_os = "linux")]
+            shared: None,
         }
     }
 
@@ -900,6 +916,8 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
             service,
             timeout,
             wait,
+            #[cfg(target_os = "linux")]
+            shared,
         } = self;
         let storage = Arc::clone(&service.storage);
         #[cfg(feature = "direct-metrics")]
@@ -911,8 +929,29 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
             loop {
                 let socket = listener.accept().await?;
                 trace!("incoming connection");
-                let conn = service.clone().bind(socket).map_err(|res| {
-                    error!("Failed to bind socket: {res}");
+                let service = service.clone();
+                #[cfg(target_os = "linux")]
+                let shared = shared.clone();
+                let conn = async move {
+                    #[cfg(target_os = "linux")]
+                    if let Some(executor) = shared {
+                        let unix = A::unix_stream(&socket)
+                            .context("shared compiler service requires a Unix socket")?;
+                        let peer = shared::Peer::capture(unix, &executor.policy.allowed_uids)?;
+                        return service
+                            .bind_with_role(
+                                socket,
+                                ConnectionRole::SharedPublic {
+                                    executor,
+                                    peer: Arc::new(peer),
+                                },
+                            )
+                            .await;
+                    }
+                    service.bind(socket).await
+                }
+                .map_err(|res| {
+                    error!("Failed to bind socket: {res:#}");
                 });
 
                 // We're not interested if the task panicked; immediately process
@@ -1101,6 +1140,52 @@ pub mod activity;
 use activity::{CompileLimits, Phase};
 mod namespace;
 use namespace::TransferSession;
+#[cfg(target_os = "linux")]
+pub(crate) mod shared;
+
+enum ConnectionRole {
+    Ordinary,
+    #[cfg(target_os = "linux")]
+    SharedPublic {
+        executor: Arc<shared::SharedExecutor>,
+        peer: Arc<shared::Peer>,
+    },
+    #[cfg(target_os = "linux")]
+    PrivateExecutor,
+}
+
+impl ConnectionRole {
+    fn permits(&self, request: &Request) -> bool {
+        match self {
+            Self::Ordinary => true,
+            #[cfg(target_os = "linux")]
+            Self::SharedPublic { peer, .. } => match request {
+                Request::Compile(_) | Request::GetStats | Request::DistStatus => true,
+                Request::ZeroStats
+                | Request::Shutdown
+                | Request::ActiveCompiles
+                | Request::CancelCompile(_) => peer.uid() == 0,
+                _ => false,
+            },
+            #[cfg(target_os = "linux")]
+            Self::PrivateExecutor => matches!(
+                request,
+                Request::StorageHandshake
+                    | Request::Transfer(_)
+                    | Request::RecordStats(_)
+                    | Request::DistStatus
+            ),
+        }
+    }
+
+    fn authenticate_compile(&self, compile: &mut Compile) {
+        #[cfg(target_os = "linux")]
+        if let Self::SharedPublic { peer, .. } = self {
+            compile.client_pid = peer.pid();
+        }
+        let _ = compile;
+    }
+}
 
 impl<C> SccacheService<C>
 where
@@ -1292,7 +1377,32 @@ where
         }
     }
 
+    async fn dispatch_connection(
+        &self,
+        req: SccacheRequest,
+        transfers: &mut TransferSession,
+        role: &ConnectionRole,
+    ) -> Result<SccacheResponse> {
+        #[cfg(target_os = "linux")]
+        if let ConnectionRole::SharedPublic { executor, peer } = role
+            && let Message::WithoutBody(Request::Compile(compile)) = req
+        {
+            drop(self.tx.clone().start_send(ServerMessage::Request));
+            self.stats.lock().await.compile_requests += 1;
+            return Ok(Arc::clone(executor).response(self.clone(), Arc::clone(peer), compile));
+        }
+        let _ = role;
+        self.dispatch(req, transfers).await
+    }
+
     async fn bind<T>(self, socket: T) -> Result<()>
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        self.bind_with_role(socket, ConnectionRole::Ordinary).await
+    }
+
+    async fn bind_with_role<T>(self, socket: T, role: ConnectionRole) -> Result<()>
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -1326,7 +1436,9 @@ where
         // and all of its pending compiler futures.
         let mut handler = util::spawn(async move {
             let mut next = match reqs_rx.recv().await {
-                Some(Message::WithoutBody(Request::ObserveCompile(identity))) => {
+                Some(Message::WithoutBody(Request::ObserveCompile(identity)))
+                    if matches!(role, ConnectionRole::Ordinary) =>
+                {
                     return me.serve_observer(identity, &mut reqs_rx, &mut sink).await;
                 }
                 first => first,
@@ -1336,16 +1448,28 @@ where
                 #[cfg(feature = "dist-client")]
                 Arc::clone(&me.namespace_reservations),
             );
-            while let Some(req) = next {
-                if let Message::WithoutBody(Request::Compile(compile)) = &req {
+            while let Some(mut req) = next {
+                let Message::WithoutBody(request) = &mut req else {
+                    bail!("unexpected body in request");
+                };
+                anyhow::ensure!(
+                    role.permits(request),
+                    "request forbidden on shared daemon connection"
+                );
+                if let Request::Compile(compile) = request {
+                    role.authenticate_compile(compile);
                     let registration = me.activities.begin(compile);
-                    me.serve_compile(&registration.activity, req, &mut transfers, &mut sink)
+                    let work = me.dispatch_connection(req, &mut transfers, &role);
+                    me.serve_compile(&registration.activity, work, &mut sink)
                         .await?;
                 } else {
                     let budget = transfers.request_budget(&req, me.compile_limits);
-                    let Message::WithoutBody(message) =
-                        Self::monitor_control(&mut sink, me.dispatch(req, &mut transfers), budget)
-                            .await?
+                    let Message::WithoutBody(message) = Self::monitor_control(
+                        &mut sink,
+                        me.dispatch_connection(req, &mut transfers, &role),
+                        budget,
+                    )
+                    .await?
                     else {
                         bail!("unexpected compiler body outside a compile request");
                     };
@@ -1427,8 +1551,7 @@ where
     async fn serve_compile<S>(
         &self,
         activity: &Arc<activity::Activity>,
-        req: SccacheRequest,
-        transfers: &mut TransferSession,
+        work: impl Future<Output = Result<SccacheResponse>> + Send,
         sink: &mut S,
     ) -> Result<()>
     where
@@ -1436,11 +1559,7 @@ where
     {
         let result = async {
             match self
-                .monitor_compile(
-                    activity,
-                    sink,
-                    activity::scope(activity, self.dispatch(req, transfers)),
-                )
+                .monitor_compile(activity, sink, activity::scope(activity, work))
                 .await?
             {
                 Message::WithoutBody(message) => {
@@ -1969,15 +2088,24 @@ where
                             debug!("stats after compile result: {stats:?}");
                             cache_write = Some(future);
                         }
-                        CompileResult::NativeMiss(miss_type, dt, duration) => {
-                            if miss_type == MissType::ForcedRecache {
-                                stats.forced_recaches += 1;
+                        CompileResult::Native(report, duration) => {
+                            use crate::protocol::NativeBuildSource;
+                            res.native = Some(report);
+                            if report.source == NativeBuildSource::Hit {
+                                stats.cache_hits.increment(&kind, lang);
+                                stats.cache_read_hit_duration += duration;
+                            } else {
+                                if report.mode == crate::build_runtime::ActionMode::Refresh {
+                                    stats.forced_recaches += 1;
+                                }
+                                if let NativeBuildSource::Worker(addr) = report.source {
+                                    dist_type = DistType::Ok(addr.to_string());
+                                }
+                                stats.compilations += 1;
+                                stats.cache_misses.increment(&kind, lang);
+                                stats.compiler_write_duration += duration;
+                                stats.cache_writes += 1;
                             }
-                            dist_type = dt;
-                            stats.compilations += 1;
-                            stats.cache_misses.increment(&kind, lang);
-                            stats.compiler_write_duration += duration;
-                            stats.cache_writes += 1;
                         }
                         CompileResult::NotCached(dt, duration) => {
                             debug!("[{out_pretty}]: compile result: not cached");

@@ -216,6 +216,21 @@ pub enum CompileResponse {
     UnsupportedCompiler(OsString),
 }
 
+/// A successful native action, reported only after verified output delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeCompileReport {
+    pub key: crate::build_runtime::ActionKey,
+    pub mode: crate::build_runtime::ActionMode,
+    pub source: NativeBuildSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeBuildSource {
+    Hit,
+    Local,
+    Worker(std::net::SocketAddr),
+}
+
 /// Information about a finished compile, either from cache or executed locally.
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct CompileFinished {
@@ -229,10 +244,12 @@ pub struct CompileFinished {
     pub stderr: Vec<u8>,
     /// The state of any compiler options passed to control color output.
     pub color_mode: ColorMode,
+    /// Exact native action identity and outcome, absent for uncached work.
+    pub native: Option<NativeCompileReport>,
 }
 
 /// The contents of a compile request from a client.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Compile {
     /// Caller PID for correlating a request with local build processes.
     pub client_pid: u32,

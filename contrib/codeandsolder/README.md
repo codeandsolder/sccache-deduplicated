@@ -73,6 +73,64 @@ the disposable `client/toolchain_tmp` directory documented by
 `test-dist-client-preflight` for the filesystem contract. Do not invoke
 the preflight against a running daemon.
 
+## Shared multi-UID daemon (Linux)
+
+The opt-in shared daemon serves normal compiler requests from multiple local
+UIDs using one cache and one distributed-client connection authority. The
+public client never executes the compiler: the daemon launches a private
+executor, reproduces the caller's mount view, root, supplementary groups and
+umask, and drops to the kernel-authenticated caller credentials before
+compiler detection, preprocessing, local compilation or materialization.
+The executor uses a private IPC channel for cache and scheduler operations.
+The creation mask is part of both legacy and native Linux cache identity,
+and is carried to isolated remote execution. Cache hits do not reuse
+outputs captured with a different creation mask.
+
+The server requires Linux 6.5+ (SO_PEERPIDFD), a root-owned non-setuid binary,
+a pathname Unix socket under canonical root-owned non-writable directories,
+and a service with the namespace/credential/ptrace capabilities required
+for its authorized users. Initial support is restricted to the daemon's user
+namespace; a separate mount namespace is supported. Remapped user namespaces
+fail closed. Do not enable native local execution in the root daemon: local
+fallback must execute in the credential-isolated helper instead.
+
+Example service configuration (replace both numbers with the actual local
+authorized UID and socket-access group):
+
+```toml
+[shared_daemon]
+socket_gid = 1000
+allowed_uids = [1000]
+```
+
+Run the managed server as root with a root-owned runtime directory such as
+`/run/sccache-shared` (mode 0755), and its existing cache/distribution
+configuration and service startup policy. The socket is created root:group
+with mode 0660. Root is implicitly authorized; other users must pass both
+filesystem access and the explicit UID allowlist. Only root can reset
+statistics, cancel arbitrary jobs, enumerate active compile details or shut
+down the daemon. Neither root nor ordinary public clients can use the raw
+cache broker or caller-owned compilation mode.
+
+Configure both routes in the host-specific wrapper configuration:
+
+```ini
+user_endpoint=unix:/run/sccache-shared/sccache.sock
+root_endpoint=unix:/run/sccache-shared/sccache.sock
+user_service=sccache-local.service
+root_service=sccache-local.service
+readiness_seconds=300
+```
+
+Retain verified compiler aliases for installed strict compiler launchers;
+they are resolved within the requester's filesystem and apply to uncached
+fallback too. The old per-root service must be stopped/disabled as part of
+the coordinated migration; do not start another persistent daemon. Verify
+cross-UID cache reuse, ownership, local fallback and distributed execution
+before removing its previous configuration or restoring automatic updates.
+The isolated root regression in `tests/native_dist.rs` is for disposable CI
+only, not for starting test daemons in the managed fleet.
+
 ## Host-native release policy
 
 The portable GitHub release is the source-revision and protocol authority.

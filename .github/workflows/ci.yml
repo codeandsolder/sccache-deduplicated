@@ -101,7 +101,7 @@ jobs:
       - name: Install host validation dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends ripgrep socat
+          sudo apt-get install -y --no-install-recommends ripgrep socat bubblewrap
 
       - name: Validate managed host scripts
         run: |
@@ -114,6 +114,9 @@ jobs:
           contrib/codeandsolder/test-wrappers
           contrib/codeandsolder/test-sccache-router
           sudo contrib/codeandsolder/test-host-native-metadata
+          shellcheck -x contrib/codeandsolder/fleet/* contrib/codeandsolder/test-native-cache-reuse
+          contrib/codeandsolder/test-native-cache-reuse --self-test
+          sudo contrib/codeandsolder/fleet/test-activate-host
 
   toml_format:
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
@@ -284,7 +287,7 @@ jobs:
       runner: ubuntu-26.04
       command: |
         sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends gcc clang bubblewrap
+        sudo apt-get install -y --no-install-recommends gcc clang bubblewrap ripgrep
         # Canonical Rust integration tests execute the bundled compiler through
         # bwrap, just like the managed Linux hosts.
         command -v bwrap
@@ -310,7 +313,8 @@ jobs:
         export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$test_runner"
         cargo test --locked --target x86_64-unknown-linux-gnu --lib --bins --tests
         cargo test --locked --target x86_64-unknown-linux-gnu -p sccache-build -- --include-ignored --skip benchmark_native_zfs_clones_against_reuse --skip benchmark_native_zfs_clones_against_fuse_views
-        cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-client,dist-server --test native_dist -- --include-ignored
+        cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-client,dist-server --test native_dist -- --include-ignored --skip shared_daemon_credential_isolation
+        cargo test --locked --target x86_64-unknown-linux-gnu --no-default-features --features=dist-client,dist-server --test native_dist -- --ignored --exact shared_daemon_credential_isolation
         # The default feature set omits dist-server: explicitly run all
         # scheduler/worker binary tests, including job resource telemetry.
         cargo test --locked --target x86_64-unknown-linux-gnu \

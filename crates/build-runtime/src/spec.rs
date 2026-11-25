@@ -54,6 +54,7 @@ impl BuildPath {
 /// fingerprint but not persisted in the scheduler's action index.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandSpec {
+    pub umask: u32,
     pub executable: BuildPath,
     pub arguments: Vec<Vec<u8>>,
     pub cwd: BuildPath,
@@ -66,6 +67,7 @@ impl CommandSpec {
     /// # Errors
     /// Returns an error if paths, arguments or environment are invalid.
     pub fn validate(&self) -> Result<()> {
+        ensure!(self.umask <= 0o777, "invalid command umask");
         self.executable.validate()?;
         self.cwd.validate()?;
         ensure!(self.executable.0 != b"/", "root is not an executable");
@@ -99,6 +101,10 @@ impl CommandSpec {
                 ContentId(typed_digest(b"sccache-sandbox-argv-v1\0", &self.arguments)?),
             ),
             ("command/cwd".into(), ContentId::of(self.cwd.as_bytes())),
+            (
+                "command/umask".into(),
+                ContentId::of(&self.umask.to_le_bytes()),
+            ),
         ]);
         for (name, value) in &self.environment {
             components.insert(
@@ -293,6 +299,7 @@ mod tests {
             },
             mounts: BTreeMap::from([(BuildPath::new(b"/src".to_vec())?, TreeId([2; 32]))]),
             command: CommandSpec {
+                umask: 0o022,
                 executable: BuildPath::new(b"/bin/tool".to_vec())?,
                 arguments: vec![b"-c".to_vec(), vec![255]],
                 cwd: BuildPath::new(b"/src".to_vec())?,
@@ -315,6 +322,11 @@ mod tests {
         let key = |spec: &ExecutionSpec| spec.action_request()?.action_fingerprint()?.key();
         let first = key(&original)?;
         let mut changed = original.clone();
+        changed.command.umask = 0o077;
+        assert_ne!(first, key(&changed)?);
+        changed.command.umask = 0o1000;
+        assert!(changed.validate().is_err());
+        changed = original.clone();
         changed.command.environment.clear();
         assert_ne!(first, key(&changed)?);
         changed = original.clone();

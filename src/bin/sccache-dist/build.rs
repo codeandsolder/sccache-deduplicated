@@ -464,6 +464,7 @@ impl OverlayBuilder {
                         .context("Failed to unpack inputs to overlay")?;
 
                     let CompileCommand {
+                        umask,
                         executable,
                         arguments,
                         env_vars,
@@ -504,6 +505,17 @@ impl OverlayBuilder {
                     // - The order of bind vs proc + dev is important - the new root must be put in place
                     //   first, otherwise proc and dev get hidden
                     let mut cmd = Command::new(bubblewrap);
+                    if let Some(mask) = umask {
+                        anyhow::ensure!(mask <= 0o777, "invalid command umask");
+                        // SAFETY: umask is async-signal-safe and only changes
+                        // the child before executing the sandbox launcher.
+                        unsafe {
+                            std::os::unix::process::CommandExt::pre_exec(&mut cmd, move || {
+                                libc::umask(mask);
+                                Ok(())
+                            });
+                        }
+                    }
                     cmd.arg("--die-with-parent")
                         .args(["--cap-drop", "ALL"])
                         .args([
@@ -972,6 +984,7 @@ impl DockerBuilder {
         drop(inputs_rdr);
 
         let CompileCommand {
+            umask,
             executable,
             arguments,
             env_vars,
@@ -1000,9 +1013,20 @@ impl DockerBuilder {
         trace!("performing compile");
         // TODO: likely shouldn't perform the compile as root in the container
         let mut cmd = Command::new("docker");
-        cmd.args(["exec", "--workdir"])
-            .arg(cwd)
-            .args([cid, "/busybox", "env", "-i", "--"]);
+        cmd.args(["exec", "--workdir"]).arg(cwd).arg(cid);
+        if let Some(mask) = umask {
+            anyhow::ensure!(mask <= 0o777, "invalid command umask");
+            cmd.args([
+                "/busybox",
+                "sh",
+                "-c",
+                "umask \"$1\" && shift && exec /busybox env -i -- \"$@\"",
+                "sccache-umask",
+            ])
+            .arg(format!("{mask:o}"));
+        } else {
+            cmd.args(["/busybox", "env", "-i", "--"]);
+        }
         let compile_output =
             run_with_environment(job_id, &mut cmd, env_vars, executable, arguments)?;
         trace!("compile_output: {:?}", compile_output);

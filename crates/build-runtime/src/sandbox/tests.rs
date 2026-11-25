@@ -6,7 +6,13 @@ use std::{
 use super::*;
 
 fn invocation(env: Vec<(OsString, OsString)>) -> Result<SandboxInvocation> {
-    SandboxInvocation::new("/usr/bin/env".into(), Vec::new(), Path::new("/"), env)
+    SandboxInvocation::new(
+        "/usr/bin/env".into(),
+        Vec::new(),
+        Path::new("/"),
+        env,
+        0o022,
+    )
 }
 
 #[test]
@@ -107,6 +113,7 @@ fn executes_isolated_process_with_readonly_inputs_and_private_outputs() -> Resul
         vec!["-c".into(), "test \"$PRESENT\" = value && test \"${EMPTY+x}\" = x && test -z \"${HOST_SENTINEL+x}\" && test \"$(/usr/bin/id -u)\" = 1000 && test \"$(/usr/bin/hostname)\" = sccache-build && ! (echo bad > /workspace/input) && /usr/bin/cat /workspace/input > /out/result && echo tmp > /tmp/scratch".into()],
         Path::new("/workspace"),
         [("PRESENT".into(), "value".into()), ("EMPTY".into(), "".into())],
+        0o077,
     )?;
     let result = plan
         .command(Path::new("/usr/bin/bwrap"), &invocation)?
@@ -118,6 +125,14 @@ fn executes_isolated_process_with_readonly_inputs_and_private_outputs() -> Resul
         String::from_utf8_lossy(&result.stderr)
     );
     assert_eq!(fs::read(output.path().join("result"))?, b"original");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        fs::metadata(output.path().join("result"))?
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
     assert_eq!(fs::read(root.path().join("workspace/input"))?, b"original");
     assert!(!root.path().join("tmp/scratch").exists());
     Ok(())
