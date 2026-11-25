@@ -205,7 +205,7 @@ fn mountinfo_path_preserves_all_linux_escape_sequences() -> Result<()> {
 #[cfg(target_os = "linux")]
 #[test]
 fn reopening_store_detaches_owned_readonly_fuse_mounts() -> Result<()> {
-    use fuser::{Filesystem, MountOption, Session};
+    use fuser::{Config, Filesystem, MountOption, Session};
 
     struct EmptyFilesystem;
     impl Filesystem for EmptyFilesystem {}
@@ -216,11 +216,9 @@ fn reopening_store_detaches_owned_readonly_fuse_mounts() -> Result<()> {
     let parent = tmp.path().join("mounts").join("build-fuse-abandoned-test");
     let mountpoint = parent.join("root");
     fs::create_dir_all(&mountpoint)?;
-    let mut session = Session::new(
-        EmptyFilesystem,
-        &mountpoint,
-        &[MountOption::RO, MountOption::DefaultPermissions],
-    )?;
+    let mut config = Config::default();
+    config.mount_options = vec![MountOption::RO, MountOption::DefaultPermissions];
+    let session = Session::new(EmptyFilesystem, &mountpoint, &config)?;
     let service = thread::spawn(move || session.run());
     // The FUSE mount is intentionally still live while reopening the store.
     // It simulates the same persisted mountpoint as a killed worker; the Redb
