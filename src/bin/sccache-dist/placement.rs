@@ -16,8 +16,9 @@ pub(super) use exploration::{Exploration, choose_worker};
 pub(super) use retained::RecentResidency;
 use sccache::{
     build_runtime::{
-        DirectionSnapshot, NetworkSnapshot, PackageCatalog, Peer, ResultTransferEstimate,
-        TransferDemand, transfer_seconds,
+        Direction, DirectionSnapshot, NetworkSnapshot, PackageCatalog, Peer,
+        ResultTransferEstimate, TransferDemand, transfer_seconds,
+        wire::{CachePathRate, CachePathRates},
     },
     dist::{self, ServerId},
 };
@@ -74,7 +75,27 @@ pub(super) struct NativeTransferPlan<'a> {
     send_demands: BTreeMap<Peer, TransferDemand>,
     send_baseline: BTreeMap<Peer, f64>,
     receive_demands: BTreeMap<Peer, TransferDemand>,
-    path_rates: BTreeMap<Peer, sccache::build_runtime::wire::CachePathRates>,
+    path_rates: BTreeMap<Peer, CachePathRates>,
+}
+
+const fn directional_rate(rates: CachePathRates, direction: Direction) -> Option<CachePathRate> {
+    match direction {
+        Direction::Send => rates.download,
+        Direction::Receive => rates.upload,
+    }
+}
+
+fn predicted_peer(peer: Peer, rate: Option<CachePathRate>) -> Peer {
+    rate.map_or(peer, |rate| peer.on_path(rate.path))
+}
+
+fn active_on_other_paths(network: &DirectionSnapshot, peer: Peer) -> u128 {
+    network
+        .peers
+        .iter()
+        .filter(|(other, _)| **other != peer && other.principal() == peer.principal())
+        .map(|(_, capacity)| u128::from(capacity.active_remaining_bytes))
+        .sum()
 }
 
 fn active_demands(network: &DirectionSnapshot) -> BTreeMap<Peer, TransferDemand> {
@@ -104,19 +125,34 @@ fn marginal_completion(
     baseline: &BTreeMap<Peer, f64>,
     peer: Peer,
     demand: TransferDemand,
+    direction: Direction,
 ) -> (f64, f64) {
+    let relevant = |other: Peer| {
+        other == peer || (direction == Direction::Send && other.principal() == peer.principal())
+    };
     if network.shared.is_empty() {
-        return (transfer_seconds(demand.bytes, demand.bytes_per_second), 0.0);
+        let completion = transfer_seconds(demand.bytes, demand.bytes_per_second);
+        let other_completion = demands
+            .iter()
+            .filter(|(other, _)| **other != peer && relevant(**other))
+            .map(|(_, other)| transfer_seconds(other.bytes, other.bytes_per_second))
+            .fold(0.0, f64::max);
+        return (completion.max(other_completion), 0.0);
     }
     let mut updated = demands.clone();
     updated.insert(peer, demand);
     let after = network.finish_times(&updated);
     let externality = baseline
         .iter()
-        .filter(|(other, _)| **other != peer)
+        .filter(|(other, _)| other.principal() != peer.principal())
         .map(|(other, before)| (after.get(other).copied().unwrap_or(*before) - before).max(0.0))
         .sum();
-    (after.get(&peer).copied().unwrap_or(0.0), externality)
+    let completion = after
+        .iter()
+        .filter(|(other, _)| relevant(**other))
+        .map(|(_, &seconds)| seconds)
+        .fold(0.0, f64::max);
+    (completion, externality)
 }
 
 impl<'a> NativeTransferPlan<'a> {
@@ -139,11 +175,15 @@ impl<'a> NativeTransferPlan<'a> {
         let mut send_demands = active_demands(&network.send);
         let mut receive_demands = active_demands(&network.receive);
         for (peer, rates) in &path_rates {
-            if let Some((demand, rate)) = send_demands.get_mut(peer).zip(rates.download) {
-                demand.bytes_per_second = rate;
+            if let Some(rate) = rates.download
+                && let Some(demand) = send_demands.get_mut(&peer.on_path(rate.path))
+            {
+                demand.bytes_per_second = rate.bytes_per_second;
             }
-            if let Some((demand, rate)) = receive_demands.get_mut(peer).zip(rates.upload) {
-                demand.bytes_per_second = rate;
+            if let Some(rate) = rates.upload
+                && let Some(demand) = receive_demands.get_mut(&peer.on_path(rate.path))
+            {
+                demand.bytes_per_second = rate.bytes_per_second;
             }
         }
         // Other workers' predicted input closures are only needed if they can
@@ -151,7 +191,8 @@ impl<'a> NativeTransferPlan<'a> {
         if !network.send.shared.is_empty() {
             for (&id, details) in servers {
                 if let Some(placement) = &details.capabilities.native_placement {
-                    let peer = Peer::Worker(id);
+                    let rate = placement.cache_path_rates.download;
+                    let peer = predicted_peer(Peer::Worker(id), rate);
                     let Some(forecast) = WorkerForecast::new(details, None) else {
                         continue;
                     };
@@ -159,7 +200,7 @@ impl<'a> NativeTransferPlan<'a> {
                         &network.send,
                         peer,
                         placement.timing.transfer,
-                        placement.cache_path_rates.download,
+                        rate.map(|rate| rate.bytes_per_second),
                     );
                     let traffic = pipeline::publication_forecast(
                         forecast,
@@ -173,7 +214,7 @@ impl<'a> NativeTransferPlan<'a> {
                             &network.send,
                             peer,
                             traffic,
-                            placement.cache_path_rates.download,
+                            rate.map(|rate| rate.bytes_per_second),
                         );
                         send_demands.insert(peer, demand);
                     }
@@ -198,7 +239,9 @@ impl<'a> NativeTransferPlan<'a> {
         traffic: InputTraffic,
         current_wire_rate: Option<u64>,
     ) -> TransferDemand {
-        let bytes = traffic.wire_bytes;
+        let bytes = traffic
+            .wire_bytes
+            .saturating_sub(active_on_other_paths(network, peer));
         let active = network
             .peers
             .get(&peer)
@@ -211,22 +254,36 @@ impl<'a> NativeTransferPlan<'a> {
         }
     }
 
+    fn path_rate(&self, peer: Peer, direction: Direction) -> Option<CachePathRate> {
+        self.path_rates
+            .get(&peer.principal())
+            .and_then(|rates| directional_rate(*rates, direction))
+    }
+
+    fn path_peer(&self, peer: Peer, direction: Direction) -> Peer {
+        predicted_peer(peer, self.path_rate(peer, direction))
+    }
+
     fn input_completion(&self, peer: Peer, traffic: InputTraffic) -> (f64, f64) {
         if traffic.wire_bytes == 0 {
             return (0.0, 0.0);
         }
+        let rate = self.path_rate(peer, Direction::Send);
+        let peer = predicted_peer(peer, rate);
         let demand = Self::input_demand(
             self.send,
             peer,
             traffic,
-            self.path_rates.get(&peer).and_then(|rates| rates.download),
+            rate.map(|rate| rate.bytes_per_second),
         );
+        // All paths already carrying this input union remain in the model.
         marginal_completion(
             self.send,
             &self.send_demands,
             &self.send_baseline,
             peer,
             demand,
+            Direction::Send,
         )
     }
 
@@ -245,16 +302,24 @@ impl<'a> NativeTransferPlan<'a> {
             .receive
             .remaining_after(&self.receive_demands, ready_at);
         let baseline = self.receive.finish_times(&remaining);
+        let rate = self.path_rate(peer, Direction::Receive);
+        let peer = predicted_peer(peer, rate);
         let already_pending = remaining.get(&peer).map_or(0, |demand| demand.bytes);
         let demand = TransferDemand {
             bytes: already_pending.saturating_add(u128::from(result.expected_bytes)),
-            bytes_per_second: self
-                .path_rates
-                .get(&peer)
-                .and_then(|rates| rates.upload)
-                .unwrap_or_else(|| self.receive.rate(peer, result.bytes_per_second)),
+            bytes_per_second: rate.map_or_else(
+                || self.receive.rate(peer, result.bytes_per_second),
+                |rate| rate.bytes_per_second,
+            ),
         };
-        marginal_completion(self.receive, &remaining, &baseline, peer, demand)
+        marginal_completion(
+            self.receive,
+            &remaining,
+            &baseline,
+            peer,
+            demand,
+            Direction::Receive,
+        )
     }
 }
 
@@ -312,9 +377,12 @@ pub(super) fn native_estimate(
     let (bytes, _) = native_missing_inputs(assigned, placement, recent, Some(requested));
     let mut rates = DeliveryRates::new(
         plan.send,
-        peer,
+        plan.path_peer(peer, Direction::Send),
         placement.timing.transfer,
-        placement.cache_path_rates.download,
+        placement
+            .cache_path_rates
+            .download
+            .map(|rate| rate.bytes_per_second),
     );
     let initial = pipeline::publication_forecast(forecast, requested, plan.packages, rates);
     let (network, externality) = plan.input_completion(peer, initial.traffic);
@@ -453,5 +521,60 @@ mod tests {
         assert_eq!(plan.result_completion(b, 0.0, result), (2.0, 1.0));
         assert_eq!(plan.result_completion(b, 0.5, result), (1.5, 0.5));
         assert_eq!(plan.result_completion(b, 2.0, result), (1.0, 0.0));
+    }
+    #[test]
+    fn changing_route_does_not_inherit_old_path_contention() -> anyhow::Result<()> {
+        let a = worker(1);
+        let b = worker(2);
+        let overlay = "100.64.0.1,100.64.0.2".parse()?;
+        let ethernet = "192.168.76.2,192.168.76.1".parse()?;
+        let other_overlay = "100.64.0.1,100.64.0.3".parse()?;
+        let network = NetworkSnapshot {
+            send: constrained(a.on_path(overlay), b.on_path(other_overlay)),
+            receive: DirectionSnapshot::default(),
+        };
+        let mut plan = NativeTransferPlan::new(&network, &HashMap::new(), None);
+        let traffic = InputTraffic {
+            wire_bytes: 100_000_000,
+            archive_bytes: 0,
+            wire_time: Duration::from_secs(1),
+        };
+        let rate = |path| CachePathRate {
+            path,
+            bytes_per_second: 100_000_000,
+        };
+        plan.path_rates.insert(
+            b,
+            CachePathRates {
+                download: Some(rate(other_overlay)),
+                upload: None,
+            },
+        );
+        assert_eq!(plan.input_completion(b, traffic), (2.0, 1.0));
+        plan.path_rates.insert(
+            b,
+            CachePathRates {
+                download: Some(rate(ethernet)),
+                upload: None,
+            },
+        );
+        assert_eq!(plan.input_completion(b, traffic), (1.0, 0.0));
+
+        plan.path_rates.insert(
+            a,
+            CachePathRates {
+                download: Some(rate(ethernet)),
+                upload: None,
+            },
+        );
+        assert_eq!(plan.input_completion(a, traffic), (1.0, 0.0));
+        // 100 MB are already arriving over the overlay. Only the extra
+        // 100 MB belongs to the newly selected route, not all 200 MB.
+        let extra = InputTraffic {
+            wire_bytes: 200_000_000,
+            ..traffic
+        };
+        assert_eq!(plan.input_completion(a, extra), (1.0, 0.0));
+        Ok(())
     }
 }

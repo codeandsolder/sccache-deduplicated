@@ -1,6 +1,7 @@
 //! Short-lived, authenticated path measurements. A peer's identity remains
 //! independent of the currently preferred interface.
-use sccache_peer_identity::{PeerId, Role, RouteSet};
+use crate::build_runtime::wire::CachePathRate;
+use sccache_peer_identity::{NetworkPath, PeerId, Role, RouteSet};
 use std::{
     collections::HashMap,
     io::{self, Read},
@@ -75,6 +76,7 @@ impl Transfer {
 
 #[derive(Clone, Copy)]
 struct Rate {
+    path: Option<NetworkPath>,
     bytes_per_second: u64,
     expires: Instant,
 }
@@ -149,6 +151,17 @@ impl RouteBook {
         address: SocketAddr,
         elapsed: Option<Duration>,
     ) {
+        self.observe_path(peer, role, address, elapsed, None);
+    }
+
+    pub fn observe_path(
+        &self,
+        peer: PeerId,
+        role: Role,
+        address: SocketAddr,
+        elapsed: Option<Duration>,
+        path: Option<NetworkPath>,
+    ) {
         let mut samples = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
         let key = Key {
             peer,
@@ -161,6 +174,15 @@ impl RouteBook {
                 expires: Instant::now(),
                 rates: [None; 2],
             });
+            // The probe uses the same blocking pool as downloads. It cannot
+            // invalidate the upload sample: the separate async upload pool
+            // may still be connected through a different source interface.
+            if let Some(path) = path
+                && sample.rates[Transfer::Download(0).index()]
+                    .is_some_and(|rate| rate.path != Some(path))
+            {
+                sample.rates[Transfer::Download(0).index()] = None;
+            }
             sample.measured = elapsed;
             sample.expires = Instant::now()
                 + if elapsed.is_some() {
@@ -181,6 +203,7 @@ impl RouteBook {
         address: SocketAddr,
         transfer: Transfer,
         elapsed: Duration,
+        path: Option<NetworkPath>,
     ) {
         if transfer.bytes() < MIN_SAMPLE_BYTES || elapsed < Duration::from_millis(2) {
             return;
@@ -207,11 +230,12 @@ impl RouteBook {
         )
         .unwrap_or(1_000_000_000_000);
         let rate = slot
-            .filter(|rate| rate.expires > now)
+            .filter(|rate| rate.expires > now && rate.path == path)
             .map_or(observed, |rate| {
                 (rate.bytes_per_second + observed).div_ceil(2)
             });
         *slot = Some(Rate {
+            path,
             bytes_per_second: rate,
             expires: now + RATE_TTL,
         });
@@ -224,7 +248,7 @@ impl RouteBook {
         role: Role,
         routes: &RouteSet,
         transfer: Transfer,
-    ) -> Option<u64> {
+    ) -> Option<CachePathRate> {
         let now = Instant::now();
         let samples = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
         routes
@@ -248,9 +272,14 @@ impl RouteBook {
                 }
                 sample.rates[transfer.index()]
                     .filter(|rate| rate.expires > now)
-                    .map(|rate| rate.bytes_per_second)
+                    .and_then(|rate| {
+                        Some(CachePathRate {
+                            path: rate.path?,
+                            bytes_per_second: rate.bytes_per_second,
+                        })
+                    })
             })
-            .max()
+            .max_by_key(|rate| rate.bytes_per_second)
     }
 
     /// Rank by authenticated RTT for control messages, or estimated
@@ -327,6 +356,15 @@ impl RouteBook {
     }
 }
 
+pub(super) fn reported_path(headers: &reqwest::header::HeaderMap) -> Option<NetworkPath> {
+    headers
+        .get(sccache_cluster_identity::PATH_HEADER)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
+}
+
 /// Measure completed wire bodies, never truncated or abandoned ones.
 pub struct MeasuredReader<R> {
     reader: R,
@@ -336,6 +374,7 @@ pub struct MeasuredReader<R> {
     bytes: u64,
     start: Instant,
     finished: bool,
+    path: Option<NetworkPath>,
 }
 
 impl<R> MeasuredReader<R> {
@@ -346,6 +385,7 @@ impl<R> MeasuredReader<R> {
         role: Role,
         address: SocketAddr,
         length: Option<u64>,
+        path: Option<NetworkPath>,
     ) -> Self {
         Self {
             reader,
@@ -359,6 +399,7 @@ impl<R> MeasuredReader<R> {
             bytes: 0,
             start: Instant::now(),
             finished: false,
+            path,
         }
     }
 
@@ -396,6 +437,7 @@ impl<R: Read> Read for MeasuredReader<R> {
                 self.key.address,
                 Transfer::Download(self.bytes),
                 self.start.elapsed(),
+                self.path,
             );
         }
         Ok(count)
@@ -496,6 +538,7 @@ mod tests {
                 address,
                 Transfer::Upload(upload << 20),
                 Duration::from_secs(1),
+                None,
             );
             book.transferred(
                 peer,
@@ -503,6 +546,7 @@ mod tests {
                 address,
                 Transfer::Download(download << 20),
                 Duration::from_secs(1),
+                None,
             );
         }
         assert_eq!(
@@ -526,6 +570,71 @@ mod tests {
                 Some(Transfer::Download(100 << 20))
             ),
             [primary, lan]
+        );
+        Ok(())
+    }
+    #[test]
+    fn changed_source_does_not_reuse_rate_or_invalidate_other_pool() -> anyhow::Result<()> {
+        let primary = "100.64.0.1:10501".parse()?;
+        let peer = PeerId::from_digest([1; 32]);
+        let routes = RouteSet::new(primary, []);
+        let book = RouteBook::default();
+        let first = "100.64.0.1,100.64.0.2".parse()?;
+        let second = "100.64.0.1,100.64.0.3".parse()?;
+        book.observe_path(
+            peer,
+            Role::Scheduler,
+            primary,
+            Some(Duration::from_millis(1)),
+            Some(first),
+        );
+        for transfer in [Transfer::Upload(32 << 20), Transfer::Download(32 << 20)] {
+            book.transferred(
+                peer,
+                Role::Scheduler,
+                primary,
+                transfer,
+                Duration::from_secs(1),
+                Some(first),
+            );
+        }
+        assert_eq!(
+            book.best_rate(peer, Role::Scheduler, &routes, Transfer::Download(0))
+                .map(|rate| rate.path),
+            Some(first)
+        );
+        book.observe_path(
+            peer,
+            Role::Scheduler,
+            primary,
+            Some(Duration::from_millis(1)),
+            Some(second),
+        );
+        assert!(
+            book.best_rate(peer, Role::Scheduler, &routes, Transfer::Download(0))
+                .is_none()
+        );
+        assert_eq!(
+            book.best_rate(peer, Role::Scheduler, &routes, Transfer::Upload(0)),
+            Some(CachePathRate {
+                path: first,
+                bytes_per_second: 32 << 20
+            })
+        );
+        book.transferred(
+            peer,
+            Role::Scheduler,
+            primary,
+            Transfer::Upload(4 << 20),
+            Duration::from_secs(1),
+            Some(second),
+        );
+        assert_eq!(
+            book.best_rate(peer, Role::Scheduler, &routes, Transfer::Upload(0)),
+            Some(CachePathRate {
+                path: second,
+                bytes_per_second: 4 << 20
+            })
         );
         Ok(())
     }

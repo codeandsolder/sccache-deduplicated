@@ -106,13 +106,8 @@ impl PackageService {
                     "upstream package length violates expectation"
                 );
                 let size = response.content_length().or(locator.expected_size);
-                Ok(network.meter(
-                    Direction::Receive,
-                    Peer::Upstream,
-                    response,
-                    size.unwrap_or(0),
-                    size,
-                ))
+                let peer = observed_response_peer(&response, Peer::Upstream);
+                Ok(network.meter(Direction::Receive, peer, response, size.unwrap_or(0), size))
             },
         )
     }
@@ -213,7 +208,7 @@ pub(super) fn spawn(
     let packages = PackageService::new(config)?;
     network::start(
         &network,
-        config.directory.join("network-timing.json"),
+        config.directory.join("network-path-timing.json"),
         config.public_addr,
     )?;
     let server = Listener::from_socket(
@@ -281,6 +276,18 @@ pub(super) fn physical_blob_response(mut file: File, encoding: BlobEncoding) -> 
         .with_additional_header("X-Sccache-CAS-Encoding", encoding.http_value()))
 }
 
+fn observed_response_peer(response: &reqwest::blocking::Response, peer: Peer) -> Peer {
+    response
+        .extensions()
+        .get::<hyper_util::client::legacy::connect::HttpInfo>()
+        .map_or(peer, |info| {
+            peer.on_path(crate::build_runtime::NetworkPath::new(
+                info.local_addr().ip(),
+                info.remote_addr().ip(),
+            ))
+        })
+}
+
 /// Retrieve a blob from a specific authenticated worker using its exact-content capability.
 pub(super) fn fetch_peer(
     routes: &SchedulerRequester,
@@ -331,19 +338,14 @@ pub(super) fn fetch_peer(
             .to_str()?,
     )?;
     let size = response.content_length();
+    let peer = observed_response_peer(&response, Peer::Worker(source.server));
     let response = routes.routes.measure_response(
         source.server,
         sccache_cluster_identity::Role::Worker,
         address,
         response,
     );
-    let response = network.meter(
-        Direction::Receive,
-        Peer::Worker(source.server),
-        response,
-        blob.size,
-        size,
-    );
+    let response = network.meter(Direction::Receive, peer, response, blob.size, size);
     Ok(Some((response, encoding)))
 }
 
@@ -433,7 +435,8 @@ fn dispatch(
     let peer = match publisher {
         Publisher::Client => Peer::Client(request.id()),
         Publisher::Worker { peer, .. } => Peer::Worker(peer),
-    };
+    }
+    .on_path(request.path());
     match operation {
         "package_lookup" | "rust_package_lookup"
             if publisher == Publisher::Client && packages.is_some() =>

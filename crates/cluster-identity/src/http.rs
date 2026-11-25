@@ -26,13 +26,15 @@ use tokio::{net::TcpStream, time::timeout};
 use tokio_rustls::TlsAcceptor;
 
 use super::{
-    EnrollmentAuthority, EnrollmentRequest, EnrollmentResponse, PeerId, Role, TlsCredentials,
-    authenticated_peer,
+    EnrollmentAuthority, EnrollmentRequest, EnrollmentResponse, NetworkPath, PeerId, Role,
+    TlsCredentials, authenticated_peer,
 };
 
 mod client;
 mod idle_write;
 pub use client::{ClusterHttpClient, EnrollmentClient, blocking_client};
+
+pub const PATH_HEADER: &str = "x-sccache-network-path";
 
 const CONTROL_LIMIT: usize = 64 * 1024;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -54,6 +56,7 @@ pub struct AuthenticatedPeer {
     role: Role,
     expires: SystemTime,
     remote_addr: SocketAddr,
+    path: NetworkPath,
 }
 
 impl AuthenticatedPeer {
@@ -75,7 +78,13 @@ impl AuthenticatedPeer {
         self.remote_addr
     }
 
-    fn from_verified_leaf(der: &[u8], remote_addr: SocketAddr) -> Result<Self> {
+    /// Actual local and remote IP addresses of this authenticated connection.
+    #[must_use = "the path identifies the observed transport endpoints"]
+    pub const fn path(self) -> NetworkPath {
+        self.path
+    }
+
+    fn from_verified_leaf(der: &[u8], remote_addr: SocketAddr, path: NetworkPath) -> Result<Self> {
         let leaf = X509::from_der(der)?;
         let (id, role) = [Role::Scheduler, Role::Worker, Role::Client]
             .into_iter()
@@ -93,6 +102,7 @@ impl AuthenticatedPeer {
             role,
             expires,
             remote_addr,
+            path,
         })
     }
 
@@ -289,6 +299,8 @@ impl ClusterListener {
             ),
             address => address,
         };
+        let path = NetworkPath::new(socket.local_addr()?.ip(), address.ip());
+        let path_header = hyper::header::HeaderValue::from_str(&path.to_string())?;
         let config = self
             .config
             .read()
@@ -300,11 +312,18 @@ impl ClusterListener {
             .1
             .peer_certificates()
             .and_then(|chain| chain.first())
-            .map(|leaf| AuthenticatedPeer::from_verified_leaf(leaf.as_ref(), address))
+            .map(|leaf| AuthenticatedPeer::from_verified_leaf(leaf.as_ref(), address, path))
             .transpose()?;
         let service = service_fn(move |request| {
             let future = handler(peer, address, request);
-            async move { Ok::<_, Infallible>(future.await) }
+            let path_header = path_header.clone();
+            async move {
+                let mut response = future.await;
+                if peer.is_some() {
+                    response.headers_mut().insert(PATH_HEADER, path_header);
+                }
+                Ok::<_, Infallible>(response)
+            }
         });
         http1::Builder::new()
             .timer(TokioTimer::new())

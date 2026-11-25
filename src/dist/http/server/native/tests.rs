@@ -402,8 +402,10 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
         assert_eq!(downloaded, bytes);
         verify_compressed_download(url, ticket, blob, &bytes)?;
         let measured = network.snapshot();
-        let worker = Peer::Worker(url.worker.current()?.id()?);
-        let client_peer = Peer::Client(url.client.current()?.id()?);
+        let ip = std::net::Ipv4Addr::LOCALHOST.into();
+        let path = crate::build_runtime::NetworkPath::new(ip, ip);
+        let worker = Peer::Worker(url.worker.current()?.id()?).on_path(path);
+        let client_peer = Peer::Client(url.client.current()?.id()?).on_path(path);
         assert!(measured.receive.peers[&worker].body_bytes > 0);
         assert_eq!(measured.receive.peers[&worker].active_remaining_bytes, 0);
         assert!(measured.send.peers[&client_peer].body_bytes > 0);

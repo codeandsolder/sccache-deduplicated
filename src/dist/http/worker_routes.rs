@@ -125,18 +125,18 @@ impl WorkerRoutes {
                 .timeout(PROBE_TIMEOUT)
                 .send()
                 .await?;
-            Ok::<_, anyhow::Error>(response.status() == reqwest::StatusCode::NO_CONTENT)
+            Ok::<_, anyhow::Error>((
+                response.status() == reqwest::StatusCode::NO_CONTENT,
+                crate::dist::cluster_routes::reported_path(response.headers()),
+            ))
         }
         .await;
-        self.book.observe(
-            server,
-            Role::Worker,
-            address,
-            result
-                .ok()
-                .filter(|success| *success)
-                .map(|_| start.elapsed()),
-        );
+        let (elapsed, path) = result
+            .ok()
+            .filter(|(success, _)| *success)
+            .map_or((None, None), |(_, path)| (Some(start.elapsed()), path));
+        self.book
+            .observe_path(server, Role::Worker, address, elapsed, path);
         drop(probe);
     }
 

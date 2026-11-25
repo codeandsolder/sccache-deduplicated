@@ -113,6 +113,68 @@ pub struct PeerConfig {
     pub scheduler_id: PeerId,
 }
 
+/// An observed IP endpoint pair, in scheduler-relative order. Ephemeral
+/// TCP source ports are deliberately excluded from the capacity identity.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct NetworkPath {
+    pub local: std::net::IpAddr,
+    pub remote: std::net::IpAddr,
+}
+
+impl NetworkPath {
+    #[must_use = "capacity observations are scoped to the connection endpoints"]
+    pub const fn new(local: std::net::IpAddr, remote: std::net::IpAddr) -> Self {
+        Self {
+            local: local.to_canonical(),
+            remote: remote.to_canonical(),
+        }
+    }
+
+    #[must_use = "untrusted reported path endpoints must be validated"]
+    pub const fn valid(self) -> bool {
+        use std::net::{IpAddr, SocketAddr};
+        matches!(
+            (self.local, self.remote),
+            (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+        ) && RouteSet::eligible(SocketAddr::new(self.local, 1))
+            && RouteSet::eligible(SocketAddr::new(self.remote, 1))
+    }
+}
+
+impl fmt::Display for NetworkPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{},{}", self.local, self.remote)
+    }
+}
+
+impl std::str::FromStr for NetworkPath {
+    type Err = ParseNetworkPathError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (local, remote) = value.split_once(',').ok_or(ParseNetworkPathError)?;
+        let path = Self::new(
+            local.parse().map_err(|_| ParseNetworkPathError)?,
+            remote.parse().map_err(|_| ParseNetworkPathError)?,
+        );
+        if path.valid() {
+            Ok(path)
+        } else {
+            Err(ParseNetworkPathError)
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ParseNetworkPathError;
+
+impl fmt::Display for ParseNetworkPathError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("expected a routable IP endpoint pair")
+    }
+}
+
+impl std::error::Error for ParseNetworkPathError {}
+
 /// The configured reliable endpoint and bounded alternate interface addresses.
 /// Addresses are routing hints, not authentication credentials.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

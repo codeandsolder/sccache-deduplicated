@@ -65,7 +65,10 @@ fn question(
         return None;
     }
     let remaining = network.remaining_after(&super::active_demands(network), delay);
-    if remaining.contains_key(&peer) {
+    if remaining
+        .keys()
+        .any(|other| other.principal() == peer.principal())
+    {
         // This worker is already contributing to the measured active set.
         return None;
     }
@@ -150,9 +153,10 @@ impl<'a> Opportunity<'a> {
         plan: &NativeTransferPlan<'_>,
     ) -> Self {
         let inputs = additional_inputs(details, requested);
-        let encoded = plan
-            .send
-            .wire_bytes(Peer::Worker(server), logical_size(&inputs));
+        let encoded = plan.send.wire_bytes(
+            plan.path_peer(Peer::Worker(server), Direction::Send),
+            logical_size(&inputs),
+        );
         Self {
             server,
             inputs,
@@ -172,7 +176,7 @@ impl<'a> Opportunity<'a> {
         if let Some(question) = question(
             plan.send,
             Direction::Send,
-            peer,
+            plan.path_peer(peer, Direction::Send),
             self.encoded,
             ASSIGNMENT_MARGIN,
         ) && history.available(&question, now)
@@ -187,7 +191,7 @@ impl<'a> Opportunity<'a> {
         question(
             plan.receive,
             Direction::Receive,
-            peer,
+            plan.path_peer(peer, Direction::Receive),
             u128::from(forecast.cost.output_bytes),
             estimate.negotiation_at,
         )

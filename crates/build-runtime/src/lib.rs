@@ -11,8 +11,8 @@ mod installation;
 mod network;
 pub use network::{
     ConcurrentCapacity, Direction, DirectionSnapshot, MeteredReader, NetworkCheckpoint,
-    NetworkMeter, NetworkSnapshot, Peer, PeerCapacity, ResultTransferEstimate, SharedCapacity,
-    TransferDemand, transfer_seconds,
+    NetworkMeter, NetworkPath, NetworkSnapshot, Peer, PeerCapacity, ResultTransferEstimate,
+    SharedCapacity, TransferDemand, transfer_seconds,
 };
 mod package;
 pub use installation::{InstallationManifest, InstallationRecipe, InstalledComponent};

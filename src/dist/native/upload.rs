@@ -13,13 +13,18 @@ static RUNTIME: OnceLock<io::Result<Runtime>> = OnceLock::new();
 
 enum Event {
     Read(oneshot::Sender<io::Result<Option<Bytes>>>),
-    Complete(Result<Vec<u8>>),
+    Complete(Result<Reply>),
 }
 
 pub(super) struct Attempt {
-    pub result: Result<Vec<u8>>,
+    pub result: Result<Reply>,
     /// Bytes actually read from the caller's source, including the metadata.
     pub consumed: u64,
+}
+
+pub(super) struct Reply {
+    pub bytes: Vec<u8>,
+    pub path: Option<sccache_peer_identity::NetworkPath>,
 }
 
 async fn reply(
@@ -27,7 +32,7 @@ async fn reply(
     length: u64,
     limit: u64,
     demand: mpsc::Sender<Event>,
-) -> Result<Vec<u8>> {
+) -> Result<Reply> {
     let stream = futures::stream::unfold(Some(demand), |state| async move {
         let demand = state?;
         let (send, receive) = oneshot::channel();
@@ -44,6 +49,7 @@ async fn reply(
         .send()
         .await?
         .error_for_status()?;
+    let path = super::super::cluster_routes::reported_path(response.headers());
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {
         ensure!(
@@ -52,7 +58,7 @@ async fn reply(
         );
         bytes.extend_from_slice(&chunk);
     }
-    Ok(bytes)
+    Ok(Reply { bytes, path })
 }
 
 /// Only the calling thread reads the source, and only when the HTTP body is

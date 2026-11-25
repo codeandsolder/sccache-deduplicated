@@ -325,6 +325,14 @@ mod tests {
             .send()
             .await?;
         assert_eq!(probe.status(), StatusCode::NO_CONTENT);
+        let ip = server.address.ip();
+        assert_eq!(
+            probe
+                .headers()
+                .get(crate::PATH_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(crate::NetworkPath::new(ip, ip).to_string().as_str())
+        );
         let enrolled =
             EnrollmentClient::new(&server.ca, server.id, server.address, Some(&credentials))?;
         assert!(

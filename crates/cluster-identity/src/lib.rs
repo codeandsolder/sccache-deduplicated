@@ -18,7 +18,7 @@ use openssl::{
     },
 };
 
-pub use sccache_peer_identity::{PeerConfig, PeerId, Role};
+pub use sccache_peer_identity::{NetworkPath, PeerConfig, PeerId, Role};
 
 fn key_id<T: openssl::pkey::HasPublic>(key: &PKeyRef<T>) -> Result<PeerId> {
     Ok(PeerId::from_digest(sha256(&key.public_key_to_der()?)))
@@ -256,7 +256,7 @@ pub use registry::Registry;
 mod http;
 pub use http::{
     AuthenticatedPeer, ClusterBody, ClusterHttpClient, ClusterListener, EnrollmentClient,
-    SchedulerEnrollment, blocking_client,
+    PATH_HEADER, SchedulerEnrollment, blocking_client,
 };
 
 mod lifecycle;

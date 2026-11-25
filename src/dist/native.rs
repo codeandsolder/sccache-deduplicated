@@ -986,9 +986,10 @@ impl NativeCacheClient {
                             address,
                             Transfer::Upload(length),
                             started.elapsed(),
+                            response.path,
                         );
                     }
-                    return Ok(response);
+                    return Ok(response.bytes);
                 }
                 Err(error) => {
                     let transport = error.downcast_ref::<reqwest::Error>();

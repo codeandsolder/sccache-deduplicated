@@ -19,6 +19,38 @@ pub enum Peer {
     Client(crate::PeerId),
     Upstream,
     Other,
+    WorkerPath(crate::PeerId, NetworkPath),
+    ClientPath(crate::PeerId, NetworkPath),
+    UpstreamPath(NetworkPath),
+}
+
+pub use sccache_peer_identity::NetworkPath;
+
+impl Peer {
+    /// The stable principal; path changes must not change job ownership.
+    #[must_use = "principal identity groups the same member's outstanding demand"]
+    pub const fn principal(self) -> Self {
+        match self {
+            Self::WorkerPath(id, _) => Self::Worker(id),
+            Self::ClientPath(id, _) => Self::Client(id),
+            Self::UpstreamPath(_) => Self::Upstream,
+            peer => peer,
+        }
+    }
+
+    /// Attribute one observation to a concrete scheduler-relative route.
+    #[must_use = "the route-specific peer keys capacity evidence"]
+    pub const fn on_path(self, path: NetworkPath) -> Self {
+        if !path.valid() {
+            return self.principal();
+        }
+        match self.principal() {
+            Self::Worker(id) => Self::WorkerPath(id, path),
+            Self::Client(id) => Self::ClientPath(id, path),
+            Self::Upstream => Self::UpstreamPath(path),
+            peer => peer,
+        }
+    }
 }
 
 #[derive(

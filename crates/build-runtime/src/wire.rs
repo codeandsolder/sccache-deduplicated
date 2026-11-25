@@ -211,12 +211,19 @@ pub enum ScheduleReply {
     Unavailable { message: String },
 }
 
+/// Encoded body goodput measured on a concrete scheduler-relative route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachePathRate {
+    pub path: crate::NetworkPath,
+    pub bytes_per_second: u64,
+}
+
 /// Fresh, authenticated cache-route body goodput, in worker-relative
-/// directions and encoded bytes per second. Absence is not a zero-rate link.
+/// directions. Absence is not a zero-rate link.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CachePathRates {
-    pub download: Option<u64>,
-    pub upload: Option<u64>,
+    pub download: Option<CachePathRate>,
+    pub upload: Option<CachePathRate>,
 }
 
 impl CachePathRates {
@@ -225,7 +232,10 @@ impl CachePathRates {
         [self.download, self.upload]
             .into_iter()
             .flatten()
-            .all(|rate| (64 * 1024..=1_000_000_000_000).contains(&rate))
+            .all(|rate| {
+                rate.path.valid()
+                    && (64 * 1024..=1_000_000_000_000).contains(&rate.bytes_per_second)
+            })
     }
 }
 

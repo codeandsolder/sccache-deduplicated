@@ -31,6 +31,7 @@ pub(super) struct Request {
     id: PeerId,
     role: Role,
     remote_addr: SocketAddr,
+    path: sccache_cluster_identity::NetworkPath,
     body: RefCell<Option<Box<dyn Read + Send>>>,
 }
 
@@ -58,6 +59,7 @@ impl Request {
             id: peer.id(),
             role: peer.role(),
             remote_addr: peer.remote_addr(),
+            path: peer.path(),
             body: RefCell::new(Some(Box::new(reader))),
         }
     }
@@ -89,6 +91,9 @@ impl Request {
     pub(super) const fn remote_addr(&self) -> SocketAddr {
         self.remote_addr
     }
+    pub(super) const fn path(&self) -> sccache_cluster_identity::NetworkPath {
+        self.path
+    }
     #[cfg(test)]
     pub(super) fn fake_http_from(
         address: SocketAddr,
@@ -107,6 +112,7 @@ impl Request {
             id: PeerId::from_digest([1; 32]),
             role: Role::Client,
             remote_addr: address,
+            path: sccache_cluster_identity::NetworkPath::new(address.ip(), address.ip()),
             body: RefCell::new(Some(Box::new(io::Cursor::new(body)))),
         }
     }

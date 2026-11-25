@@ -1165,26 +1165,32 @@ Catalogs and forecasts are advisory; no change to content identity.
 
 The native cache listener meters encoded HTTP payload bytes before delivery
 to the transport or after reception from it; logical lengths are tracked
-separately. Authenticated worker addresses, client source IPs, and upstream
-package traffic have separate counters in each direction. A dedicated
+separately. Authenticated worker and client principals, their actual IP endpoint pairs,
+and upstream package routes have separate counters in each direction. A dedicated
 250 ms sampler aggregates overlapping streams without a global lock in
 the body read path. Long observations include transport backpressure and
 may also reflect endpoint processing or storage limitations: these are
 effective service-rate estimates, not physical interface line rates.
 
-Sustained per-peer observations provide lower bounds on available bandwidth.
+Sustained per-path observations provide lower bounds on available bandwidth.
 A group becomes a shared effective constraint after at least three aligned
 windows in which all members remain active, every member runs below its
 previous sustained rate, and the group total remains near a plateau.
 Unsaturated or nonoverlapping windows do not establish a ceiling. A higher
 subsequent observed group total invalidates the constraint. Peer and group
 evidence expires after 30 minutes; the scheduler atomically checkpoints
-fresh measurements to `network-timing.json` each minute, scoped to the native
+fresh measurements to `network-path-timing.json` each minute, scoped to the native
 listener address. Active requests and their remaining bytes are not restored
-after restart.
+after restart. The directional capacity model attributes sustained
+transfer observations to the actual scheduler/member IP endpoint pair (excluding
+ephemeral ports), not just the member identity. Shared and independent capacity
+cohorts therefore remain specific to the measured routes. Worker heartbeats
+carry the current measured download/upload path and rate; existing demand on
+other paths stays on those paths in forecasts. An unknown path is not assigned
+a historical contention ceiling from a different route.
 
 Native placement converts predicted missing logical bytes to encoded demand
-using measured per-peer compression ratios and uses sustained aggregate
+using measured per-path compression ratios and uses sustained aggregate
 goodput in addition to the worker's per-request estimates. Outstanding
 worker input closures are deduplicated before estimating demand; currently
 active client downloads participate in the same model. Progressive max-min

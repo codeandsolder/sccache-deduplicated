@@ -90,23 +90,22 @@ impl BlockingRoutes {
     fn probe(&self, peer: PeerId, role: Role, probe: Probe) {
         let address = probe.address;
         let start = Instant::now();
-        let result = (|| -> Result<bool> {
+        let result = (|| -> Result<(bool, Option<sccache_peer_identity::NetworkPath>)> {
             let (client, base) = self.endpoint(peer, role, address)?;
             let response = client
                 .get(base.join(PROBE_PATH)?)
                 .timeout(PROBE_TIMEOUT)
                 .send()?;
-            Ok(response.status() == reqwest::StatusCode::NO_CONTENT)
+            Ok((
+                response.status() == reqwest::StatusCode::NO_CONTENT,
+                super::cluster_routes::reported_path(response.headers()),
+            ))
         })();
-        self.book.observe(
-            peer,
-            role,
-            address,
-            result
-                .ok()
-                .filter(|success| *success)
-                .map(|_| start.elapsed()),
-        );
+        let (elapsed, path) = result
+            .ok()
+            .filter(|(success, _)| *success)
+            .map_or((None, None), |(_, path)| (Some(start.elapsed()), path));
+        self.book.observe_path(peer, role, address, elapsed, path);
         drop(probe);
     }
 
@@ -152,7 +151,7 @@ impl BlockingRoutes {
         role: Role,
         routes: &RouteSet,
         transfer: Transfer,
-    ) -> Option<u64> {
+    ) -> Option<crate::build_runtime::wire::CachePathRate> {
         self.book.best_rate(peer, role, routes, transfer)
     }
 
@@ -163,9 +162,10 @@ impl BlockingRoutes {
         address: SocketAddr,
         transfer: Transfer,
         elapsed: Duration,
+        path: Option<sccache_peer_identity::NetworkPath>,
     ) {
         self.book
-            .transferred(peer, role, address, transfer, elapsed);
+            .transferred(peer, role, address, transfer, elapsed, path);
     }
 
     pub(super) fn measure_response(
@@ -176,6 +176,7 @@ impl BlockingRoutes {
         response: reqwest::blocking::Response,
     ) -> MeasuredReader<reqwest::blocking::Response> {
         let length = response.content_length();
+        let path = super::cluster_routes::reported_path(response.headers());
         MeasuredReader::new(
             response,
             Arc::clone(&self.book),
@@ -183,6 +184,7 @@ impl BlockingRoutes {
             role,
             address,
             length,
+            path,
         )
     }
 
