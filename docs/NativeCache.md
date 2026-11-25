@@ -1252,7 +1252,18 @@ demand when concurrent scheduler publication and direct client delivery
 share the worker's same known sender interface. Separate interface addresses
 on one device are grouped. Distinct devices are not proof of independent
 end-to-end paths; shared router, switch and Wi-Fi airtime constraints beyond
-the endpoint still require synchronized overlap observations.
+the endpoint are learned from synchronized real body windows at an
+endpoint. A directed path is indexed by its local and remote IP pair plus
+send/receive direction. The learner observes aligned local-monotonic windows,
+requires isolated baselines for both paths and three consistent uncontaminated
+overlap windows, and reports bounded effective aggregate service for that
+exact pair. It expires evidence after ten minutes and invalidates a
+contradicted ceiling. Local route scoring uses it only when the matching
+competing flow is active; the scheduler includes learned sender-side
+publication/direct result overlap even across different interfaces. The
+observation is effective transport service, not a proof of physical topology.
+Unbound outgoing uploads without a known actual source are not used for
+overlap learning. No extra bulk traffic is generated.
 
 The receiver compares authenticated route latency and directional effective
 goodput, using the scheduler as the durable fallback for committed results.

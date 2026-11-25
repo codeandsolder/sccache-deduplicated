@@ -1,6 +1,11 @@
 //! Linux interface counters include traffic from every process. Local address
 //! ownership is refreshed on demand; ambiguous addresses supply no evidence.
+mod overlap;
 use super::{Evidence, Quality, SAMPLE_INTERVAL, Transfer};
+use crate::build_runtime::{
+    Direction, NetworkPath,
+    wire::{EndpointFlow, EndpointOverlap},
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -21,6 +26,8 @@ const SCALE: u64 = 1000;
 struct Counters {
     active: AtomicU64,
     generation: AtomicU64,
+    unattributed: AtomicU64,
+    unknown_epoch: AtomicU64,
     managed: AtomicU64,
 }
 struct Sample {
@@ -30,6 +37,8 @@ struct Sample {
     external: u64,
     peak: u64,
     peak_at: Instant,
+    aligned: bool,
+    unknown_epoch: u64,
     counters: Arc<Counters>,
 }
 
@@ -42,18 +51,25 @@ impl Sample {
             external: 0,
             peak: 0,
             peak_at: now,
+            aligned: false,
+            unknown_epoch: 0,
             counters: Arc::default(),
         }
     }
 
     fn update(&mut self, total: u64, now: Instant, elapsed: Duration) {
         let managed = self.counters.managed.load(Ordering::Relaxed);
+        let unknown_epoch = self.counters.unknown_epoch.load(Ordering::Relaxed);
         // Link replacement, counter reset or suspended sampling invalidates
         // this window rather than introducing a huge unsigned delta.
         if let Some(bytes) = total.checked_sub(self.total).filter(|_| elapsed <= TTL) {
             let own = managed.wrapping_sub(self.managed);
             self.rate = per_second(bytes, elapsed);
             self.external = per_second(bytes.saturating_sub(own), elapsed);
+            self.aligned = bytes >= own.saturating_mul(9) / 10
+                && bytes.saturating_sub(own) <= own / 8 + (64 << 10)
+                && self.counters.unattributed.load(Ordering::Relaxed) == 0
+                && unknown_epoch == self.unknown_epoch;
             if now.duration_since(self.peak_at) >= TTL || self.rate >= self.peak {
                 self.peak = self.rate;
                 self.peak_at = now;
@@ -62,10 +78,12 @@ impl Sample {
             self.rate = 0;
             self.external = 0;
             self.peak = 0;
+            self.aligned = false;
             self.peak_at = now;
         }
         self.total = total;
         self.managed = managed;
+        self.unknown_epoch = unknown_epoch;
     }
 }
 
@@ -86,6 +104,7 @@ struct Book {
     updated: Option<Instant>,
     addresses: BTreeMap<IpAddr, LocalAddress>,
     links: BTreeMap<String, Link>,
+    overlap: overlap::Learner,
 }
 
 static BOOK: LazyLock<Mutex<Book>> = LazyLock::new(|| {
@@ -93,6 +112,7 @@ static BOOK: LazyLock<Mutex<Book>> = LazyLock::new(|| {
         updated: None,
         addresses: BTreeMap::new(),
         links: BTreeMap::new(),
+        overlap: overlap::Learner::default(),
     })
 });
 
@@ -213,6 +233,7 @@ impl Book {
             self.links.clear();
             self.addresses.clear();
             self.updated = None;
+            self.overlap = overlap::Learner::default();
             return;
         };
         let mut seen = BTreeSet::new();
@@ -242,6 +263,20 @@ impl Book {
         }
         self.links.retain(|name, _| seen.contains(name.as_str()));
         self.addresses = interface_addresses();
+        if !elapsed.is_zero() {
+            let addresses = &self.addresses;
+            let links = &self.links;
+            self.overlap.sample(now, elapsed, |flow| {
+                let index = match flow.direction {
+                    Direction::Send => 0,
+                    Direction::Receive => 1,
+                };
+                addresses
+                    .get(&flow.path.local)
+                    .and_then(|address| links.get(&address.name))
+                    .is_some_and(|link| link.directions[index].aligned)
+            });
+        }
         self.updated = Some(now);
     }
 }
@@ -256,6 +291,8 @@ pub(in crate::dist) struct Activity {
     generation: u64,
     bytes: u64,
     evidence: Evidence,
+    flow: Option<Arc<overlap::Counters>>,
+    next_sample: Instant,
 }
 
 fn classify(start: Option<u64>, end: Option<u64>, bytes: u64, overlapped: bool) -> Quality {
@@ -285,6 +322,16 @@ impl Activity {
     pub(in crate::dist) fn bytes(&mut self, bytes: u64) {
         self.bytes = self.bytes.saturating_add(bytes);
         self.counters.managed.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(flow) = &self.flow {
+            flow.bytes(bytes);
+        }
+        let now = Instant::now();
+        if now >= self.next_sample {
+            self.next_sample = now + SAMPLE_INTERVAL;
+            if let Ok(mut book) = BOOK.try_lock() {
+                book.refresh(now);
+            }
+        }
     }
 
     pub(in crate::dist) fn evidence(&self) -> Evidence {
@@ -302,20 +349,30 @@ impl Drop for Activity {
             self.bytes,
             overlapped,
         ));
-        self.counters.active.fetch_sub(1, Ordering::Relaxed);
-        if let Ok(mut book) = BOOK.lock() {
-            book.refresh(Instant::now());
+        // Synchronize lifecycle transitions with the aligned window sampler.
+        let mut book = BOOK.lock().unwrap_or_else(PoisonError::into_inner);
+        book.refresh(Instant::now());
+        if let Some(flow) = &self.flow {
+            flow.finish();
+        } else {
+            self.counters.unattributed.fetch_sub(1, Ordering::Relaxed);
         }
+        self.counters.active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-pub(in crate::dist) fn activity(local: Option<IpAddr>, transfer: Transfer) -> Option<Activity> {
+pub(in crate::dist) fn activity(
+    local: Option<IpAddr>,
+    transfer: Transfer,
+    path: Option<NetworkPath>,
+) -> Option<Activity> {
     let local = local?;
     if transfer.bytes() < 256 * 1024 {
         return None;
     }
     let mut book = BOOK.lock().unwrap_or_else(PoisonError::into_inner);
-    book.refresh(Instant::now());
+    let now = Instant::now();
+    book.refresh(now);
     let name = &book.addresses.get(&local)?.name;
     let link = book.links.get(name)?;
     let counters = Arc::clone(&link.directions[transfer.index()].counters);
@@ -332,6 +389,22 @@ pub(in crate::dist) fn activity(local: Option<IpAddr>, transfer: Transfer) -> Op
         .generation
         .fetch_add(1, Ordering::Relaxed)
         .wrapping_add(1);
+    let direction = match transfer {
+        Transfer::Upload(_) => Direction::Send,
+        Transfer::Download(_) => Direction::Receive,
+    };
+    let flow = path
+        .filter(|path| {
+            path.local == local
+                && path.valid()
+                && !path.local.is_loopback()
+                && !path.remote.is_loopback()
+        })
+        .and_then(|path| book.overlap.start(EndpointFlow { path, direction }, now));
+    if flow.is_none() {
+        counters.unattributed.fetch_add(1, Ordering::Relaxed);
+        counters.unknown_epoch.fetch_add(1, Ordering::Relaxed);
+    }
     drop(book);
     Some(Activity {
         counters,
@@ -341,6 +414,8 @@ pub(in crate::dist) fn activity(local: Option<IpAddr>, transfer: Transfer) -> Op
         generation,
         bytes: 0,
         evidence: Evidence::default(),
+        flow,
+        next_sample: now + SAMPLE_INTERVAL,
     })
 }
 
@@ -356,6 +431,8 @@ struct Load {
 /// A single coherent local snapshot is reused for every competing route.
 pub(in crate::dist) struct Snapshot {
     addresses: BTreeMap<IpAddr, [Load; 2]>,
+    active: BTreeMap<EndpointFlow, u64>,
+    overlaps: Vec<EndpointOverlap>,
 }
 
 impl Load {
@@ -399,6 +476,43 @@ impl Snapshot {
                 load[transfer.index()].cost(clean_wire_rate, predicted)
             })
     }
+
+    /// A learned cross-interface bottleneck is charged only while its
+    /// actual peer flow is active. It is an additional lower bound, not
+    /// an additive penalty on the already-accounted local interface.
+    pub(in crate::dist) fn overlap_cost(
+        &self,
+        path: Option<NetworkPath>,
+        transfer: Transfer,
+        wire_bytes: u64,
+        predicted: u128,
+    ) -> u128 {
+        let Some(path) = path else {
+            return predicted;
+        };
+        let direction = match transfer {
+            Transfer::Upload(_) => Direction::Send,
+            Transfer::Download(_) => Direction::Receive,
+        };
+        let flow = EndpointFlow { path, direction };
+        let own = self.active.get(&flow).copied().unwrap_or(0);
+        self.overlaps
+            .iter()
+            .filter_map(|overlap| {
+                let other = overlap
+                    .flows
+                    .iter()
+                    .copied()
+                    .find(|&key| key != flow && overlap.flows.contains(&flow))?;
+                let active = self.active.get(&other).copied()?;
+                let participants = own.saturating_add(active).saturating_add(1);
+                Some(
+                    (u128::from(wire_bytes) * 1_000_000_000 * u128::from(participants))
+                        .div_ceil(u128::from(overlap.bytes_per_second)),
+                )
+            })
+            .fold(predicted, u128::max)
+    }
 }
 
 pub(in crate::dist) fn snapshot() -> Snapshot {
@@ -421,8 +535,14 @@ pub(in crate::dist) fn snapshot() -> Snapshot {
             ))
         })
         .collect();
+    let active = book.overlap.active();
+    let overlaps = book.overlap.report(Instant::now());
     drop(book);
-    Snapshot { addresses }
+    Snapshot {
+        addresses,
+        active,
+        overlaps,
+    }
 }
 
 pub(in crate::dist) fn report() -> crate::build_runtime::wire::InterfaceReport {
@@ -458,9 +578,20 @@ pub(in crate::dist) fn report() -> crate::build_runtime::wire::InterfaceReport {
             })
         })
         .collect::<Vec<_>>();
+    let mut overlaps = book.overlap.report(Instant::now());
     drop(book);
     interfaces.sort_unstable_by_key(|interface| interface.index);
-    InterfaceReport { interfaces }
+    overlaps.retain(|overlap| {
+        overlap.flows.iter().all(|flow| {
+            interfaces
+                .iter()
+                .any(|interface| interface.addresses.binary_search(&flow.path.local).is_ok())
+        })
+    });
+    InterfaceReport {
+        interfaces,
+        overlaps,
+    }
 }
 
 pub(in crate::dist) fn binding(ip: IpAddr) -> Option<String> {
@@ -579,6 +710,40 @@ mod tests {
         sample.update(1, now + Duration::from_secs(2), Duration::from_secs(1));
         assert_eq!(sample.rate, 0);
         assert_eq!(sample.external, 0);
+    }
+
+    #[test]
+    fn learned_overlap_only_penalizes_active_matching_pair() -> anyhow::Result<()> {
+        let a = EndpointFlow {
+            path: "192.0.2.1,192.0.2.2".parse()?,
+            direction: Direction::Send,
+        };
+        let b = EndpointFlow {
+            path: "198.51.100.1,198.51.100.2".parse()?,
+            direction: Direction::Receive,
+        };
+        let mut snapshot = Snapshot {
+            addresses: BTreeMap::new(),
+            active: BTreeMap::from([(b, 1)]),
+            overlaps: vec![EndpointOverlap {
+                flows: [a, b],
+                bytes_per_second: 100 << 20,
+            }],
+        };
+        assert_eq!(
+            snapshot.overlap_cost(Some(a.path), Transfer::Upload(100 << 20), 100 << 20, 1),
+            2_000_000_000
+        );
+        assert_eq!(
+            snapshot.overlap_cost(Some(a.path), Transfer::Download(100 << 20), 100 << 20, 1),
+            1
+        );
+        snapshot.active.clear();
+        assert_eq!(
+            snapshot.overlap_cost(Some(a.path), Transfer::Upload(100 << 20), 100 << 20, 1),
+            1
+        );
+        Ok(())
     }
 
     #[test]

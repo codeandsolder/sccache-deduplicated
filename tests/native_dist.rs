@@ -1805,9 +1805,11 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
             "worker retained redundant archive"
         );
     }
-    assert_eq!(worker_stats.actions, 4);
-    assert_eq!(scheduler_stats.actions, 5);
-    assert_eq!(scheduler_stats.results, 3);
+    // The selected-output compilation is a distinct action with a
+    // complete result containing both the object and generated listing.
+    assert_eq!(worker_stats.actions, 5);
+    assert_eq!(scheduler_stats.actions, 6);
+    assert_eq!(scheduler_stats.results, 4);
     assert!(worker_stats.trees >= 4);
     assert_eq!(scheduler_stats.trees, 4);
     Ok(())

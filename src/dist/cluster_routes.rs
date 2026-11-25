@@ -442,8 +442,14 @@ impl RouteBook {
             let clean_wire = sample.rates[Transfer::Download(0).index()]
                 .filter(|rate| rate.expires > now && rate.quality == interface::Quality::Clean)
                 .map(|rate| rate.bytes_per_second);
+            let transfer = Transfer::Download(4 << 20);
+            let wire = (4_u64 << 20)
+                .saturating_mul(rate.wire_per_mille)
+                .div_ceil(1000);
+            let load = interfaces.cost(rate.local, transfer, clean_wire, nominal);
+            let endpoint = rate.local.map(|local| NetworkPath::new(local, path.local));
             let cost = sample.measured.map_or(0, |rtt| rtt.as_nanos())
-                + interfaces.cost(rate.local, Transfer::Download(4 << 20), clean_wire, nominal);
+                + interfaces.overlap_cost(endpoint, transfer, wire, load);
             best.entry(key.peer)
                 .and_modify(|current| {
                     if (cost, observed.path) < (current.0, current.1.path) {
@@ -623,7 +629,29 @@ impl RouteBook {
                                 rate.expires > now && rate.quality == interface::Quality::Clean
                             })
                             .map(|rate| rate.bytes_per_second);
-                        interfaces.cost(local, transfer, clean_wire, nominal)
+                        let encoded =
+                            if role == Role::Worker && matches!(transfer, Transfer::Download(_)) {
+                                sample.verified.filter(|rate| rate.expires > now).map_or(
+                                    transfer.bytes(),
+                                    |rate| {
+                                        transfer
+                                            .bytes()
+                                            .saturating_mul(rate.wire_per_mille)
+                                            .div_ceil(1000)
+                                    },
+                                )
+                            } else {
+                                transfer.bytes()
+                            };
+                        let endpoint = local.map(|local| {
+                            let remote = sample.rates[transfer.index()]
+                                .filter(|rate| rate.expires > now)
+                                .and_then(|rate| rate.path)
+                                .map_or(address.address.ip(), |path| path.local);
+                            NetworkPath::new(local, remote)
+                        });
+                        let load = interfaces.cost(local, transfer, clean_wire, nominal);
+                        interfaces.overlap_cost(endpoint, transfer, encoded, load)
                     });
                 Some((
                     !explore || known.is_some(),
@@ -692,6 +720,10 @@ impl<R> MeasuredReader<R> {
             interface: interface::activity(
                 connection.local,
                 Transfer::Download(length.unwrap_or(0)),
+                connection
+                    .local
+                    .zip(connection.reported)
+                    .map(|(local, path)| NetworkPath::new(local, path.local)),
             ),
         }
     }

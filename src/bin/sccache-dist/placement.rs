@@ -19,7 +19,8 @@ use sccache::{
         Direction, DirectionSnapshot, NetworkSnapshot, PackageCatalog, Peer,
         ResultTransferEstimate, TransferDemand, transfer_seconds,
         wire::{
-            CachePathRate, CachePathRates, ClientDeliveryRates, InterfaceReport, PeerDownloadRate,
+            CachePathRate, CachePathRates, ClientDeliveryRates, EndpointFlow, InterfaceReport,
+            PeerDownloadRate,
         },
     },
     dist::{self, ServerId},
@@ -497,13 +498,23 @@ impl<'a> NativeTransferPlan<'a> {
         let Some(publication) = self.path_rate(worker, Direction::Receive) else {
             return 0.0;
         };
-        let Some(interface) = report.at(route.path.local) else {
-            return 0.0;
+        let outbound = EndpointFlow {
+            path: route.path,
+            direction: Direction::Send,
         };
-        if !interface.addresses.contains(&publication.path.remote) {
-            return 0.0;
-        }
-        let Some(capacity) = interface.available(Direction::Send) else {
+        let publish = EndpointFlow {
+            path: sccache::build_runtime::NetworkPath::new(
+                publication.path.remote,
+                publication.path.local,
+            ),
+            direction: Direction::Send,
+        };
+        let physical = report
+            .at(route.path.local)
+            .filter(|interface| interface.addresses.contains(&publication.path.remote))
+            .and_then(|interface| interface.available(Direction::Send));
+        let learned = report.shared_rate(outbound, publish);
+        let Some(capacity) = physical.into_iter().chain(learned).min() else {
             return 0.0;
         };
         let direct_wire = direct_bytes
@@ -1004,6 +1015,7 @@ mod tests {
             worker,
             InterfaceReport {
                 interfaces: vec![interface],
+                overlaps: Vec::new(),
             },
         );
         assert_eq!(
@@ -1040,6 +1052,32 @@ mod tests {
         assert_eq!(
             plan.shared_publication_time(worker, direct, 100 << 20, 100 << 20),
             0.0
+        );
+        let mut flows = [
+            EndpointFlow {
+                path: separate.path,
+                direction: Direction::Send,
+            },
+            EndpointFlow {
+                path: sccache::build_runtime::NetworkPath::new(
+                    publication.remote,
+                    publication.local,
+                ),
+                direction: Direction::Send,
+            },
+        ];
+        flows.sort_unstable();
+        plan.worker_interfaces
+            .get_mut(&worker)
+            .unwrap()
+            .overlaps
+            .push(sccache::build_runtime::wire::EndpointOverlap {
+                flows,
+                bytes_per_second: 80 << 20,
+            });
+        assert_eq!(
+            plan.shared_publication_time(worker, separate, 100 << 20, 100 << 20),
+            2.5
         );
         Ok(())
     }

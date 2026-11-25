@@ -1086,6 +1086,9 @@ impl NativeCacheClient {
                 Cursor::new(&header).chain(&mut reader),
                 local,
                 Transfer::Upload(length),
+                address.source.map(|local| {
+                    sccache_peer_identity::NetworkPath::new(local, address.address.ip())
+                }),
             );
             let evidence = tracked.evidence();
             let attempt = upload::send(request, length, self.metadata_limit, tracked)?;

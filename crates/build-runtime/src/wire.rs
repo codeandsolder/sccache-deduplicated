@@ -319,7 +319,7 @@ pub struct InterfaceDirection {
 }
 
 impl InterfaceDirection {
-    fn valid(self) -> bool {
+    const fn valid(self) -> bool {
         self.external_bytes_per_second <= self.total_bytes_per_second
             && self.total_bytes_per_second <= 1_000_000_000_000
             && self.active_streams <= 4096
@@ -335,9 +335,40 @@ pub struct InterfaceTraffic {
     pub receive: InterfaceDirection,
 }
 
+/// An endpoint-local directional path. The local address belongs to the
+/// reporting host; remote is the authenticated connection's other endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct EndpointFlow {
+    pub path: crate::NetworkPath,
+    pub direction: crate::Direction,
+}
+
+impl EndpointFlow {
+    const fn valid(self) -> bool {
+        self.path.valid() && !self.path.local.is_loopback() && !self.path.remote.is_loopback()
+    }
+}
+
+/// Observed effective aggregate service under simultaneous real task traffic.
+/// This is not a physical topology assertion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointOverlap {
+    pub flows: [EndpointFlow; 2],
+    pub bytes_per_second: u64,
+}
+
+impl EndpointOverlap {
+    fn valid(self) -> bool {
+        self.flows[0] < self.flows[1]
+            && self.flows.iter().all(|flow| flow.valid())
+            && (128 * 1024..=2_000_000_000_000).contains(&self.bytes_per_second)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterfaceReport {
     pub interfaces: Vec<InterfaceTraffic>,
+    pub overlaps: Vec<EndpointOverlap>,
 }
 
 impl InterfaceReport {
@@ -365,6 +396,29 @@ impl InterfaceReport {
                     && interface.send.valid()
                     && interface.receive.valid()
             })
+            && self.overlaps.len() <= 64
+            && self
+                .overlaps
+                .windows(2)
+                .all(|pair| pair[0].flows < pair[1].flows)
+            && self.overlaps.iter().all(|overlap| {
+                overlap.valid()
+                    && overlap
+                        .flows
+                        .iter()
+                        .all(|flow| self.at(flow.path.local).is_some())
+            })
+    }
+
+    /// Effective aggregate service learned for exactly this pair of flows.
+    #[must_use = "the observed constraint is scoped to the reported endpoint"]
+    pub fn shared_rate(&self, a: EndpointFlow, b: EndpointFlow) -> Option<u64> {
+        let mut flows = [a, b];
+        flows.sort_unstable();
+        self.overlaps
+            .binary_search_by_key(&flows, |overlap| overlap.flows)
+            .ok()
+            .map(|index| self.overlaps[index].bytes_per_second)
     }
 
     #[must_use = "the interface is used for endpoint capacity estimates"]
@@ -579,4 +633,57 @@ pub enum NativeRunResult {
         stderr: Vec<u8>,
     },
     JobNotFound,
+}
+
+#[cfg(test)]
+mod endpoint_report_tests {
+    use super::*;
+    use crate::Direction;
+
+    #[test]
+    fn endpoint_report_is_bounded_and_scopes_overlap_to_exact_paths() -> Result<()> {
+        let first = EndpointFlow {
+            path: "192.0.2.1,192.0.2.2".parse()?,
+            direction: Direction::Send,
+        };
+        let second = EndpointFlow {
+            path: "198.51.100.1,198.51.100.2".parse()?,
+            direction: Direction::Receive,
+        };
+        let interface = |index, address| InterfaceTraffic {
+            index,
+            addresses: vec![address],
+            nominal_capacity: None,
+            send: InterfaceDirection::default(),
+            receive: InterfaceDirection::default(),
+        };
+        let mut report = InterfaceReport {
+            interfaces: vec![
+                interface(1, first.path.local),
+                interface(2, second.path.local),
+            ],
+            overlaps: vec![EndpointOverlap {
+                flows: [first, second],
+                bytes_per_second: 100 << 20,
+            }],
+        };
+        assert!(report.valid());
+        assert_eq!(report.shared_rate(second, first), Some(100 << 20));
+        assert_eq!(
+            report.shared_rate(
+                first,
+                EndpointFlow {
+                    direction: Direction::Send,
+                    ..second
+                }
+            ),
+            None
+        );
+        report.overlaps[0].flows.reverse();
+        assert!(!report.valid());
+        report.overlaps[0].flows.reverse();
+        report.interfaces.pop();
+        assert!(!report.valid());
+        Ok(())
+    }
 }

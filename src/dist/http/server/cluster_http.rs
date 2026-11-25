@@ -63,8 +63,12 @@ impl Request {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
-        let reader =
-            TrackedReader::new(reader, Some(peer.path().local), Transfer::Download(length));
+        let reader = TrackedReader::new(
+            reader,
+            Some(peer.path().local),
+            Transfer::Download(length),
+            Some(peer.path()),
+        );
         Self {
             parts,
             id: peer.id(),
@@ -169,6 +173,7 @@ async fn dispatch(
                     .and_then(|length| u64::try_from(length).ok())
                     .unwrap_or(0),
             ),
+            Some(request.path()),
         );
         let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(2);
         let stream = stream::unfold(rx, |mut rx| async move {

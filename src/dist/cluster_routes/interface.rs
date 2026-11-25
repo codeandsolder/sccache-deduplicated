@@ -1,6 +1,7 @@
 //! Host-wide traffic samples from actual task transfers. Interface counters
 //! are observations, not capacity claims. No packets are generated here.
 use super::Transfer;
+use sccache_peer_identity::NetworkPath;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 use std::{
@@ -66,13 +67,26 @@ impl Snapshot {
     ) -> u128 {
         predicted
     }
+    pub(in crate::dist) const fn overlap_cost(
+        &self,
+        _: Option<NetworkPath>,
+        _: Transfer,
+        _: u64,
+        predicted: u128,
+    ) -> u128 {
+        predicted
+    }
 }
 #[cfg(not(target_os = "linux"))]
 pub(in crate::dist) const fn snapshot() -> Snapshot {
     Snapshot
 }
 #[cfg(not(target_os = "linux"))]
-pub(in crate::dist) const fn activity(_: Option<IpAddr>, _: Transfer) -> Option<Activity> {
+pub(in crate::dist) const fn activity(
+    _: Option<IpAddr>,
+    _: Transfer,
+    _: Option<NetworkPath>,
+) -> Option<Activity> {
     None
 }
 
@@ -99,10 +113,15 @@ impl<R> TrackedReader<R> {
     pub(in crate::dist) fn evidence(&self) -> Option<Evidence> {
         self.activity.as_ref().map(Activity::evidence)
     }
-    pub(in crate::dist) fn new(reader: R, local: Option<IpAddr>, transfer: Transfer) -> Self {
+    pub(in crate::dist) fn new(
+        reader: R,
+        local: Option<IpAddr>,
+        transfer: Transfer,
+        path: Option<NetworkPath>,
+    ) -> Self {
         Self {
             reader,
-            activity: activity(local, transfer),
+            activity: activity(local, transfer, path),
         }
     }
 }
