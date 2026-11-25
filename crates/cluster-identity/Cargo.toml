@@ -20,9 +20,12 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
+
+[features]
+vendored-openssl = ["openssl/vendored"]
 
 [lints]
 workspace = true

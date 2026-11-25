@@ -66,7 +66,7 @@ hyper-util = { version = "0.1.3", optional = true, features = [
 ] }
 itertools = "0.15"
 jobserver = "0.1"
-jwt = { package = "jsonwebtoken", version = "12", optional = true, features = [
+jwt = { package = "jsonwebtoken", version = "12", optional = true, default-features = false, features = [
   "aws_lc_rs",
 ] }
 libc = "0.2.153"
@@ -75,11 +75,10 @@ log = "0.4"
 lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "68a4a057a9b32e4a45fe7530a2fbd0fdf2566f43", optional = true }
 memchr = "2"
 mime = "0.3"
-object = "0.41"
+object = { version = "0.41", default-features = false, features = ["read", "std"] }
 opendal = { version = "0.59.0", optional = true, default-features = false }
 opendal-http-transport-reqwest = { version = "0.59.0", optional = true }
 opendal-layer-logging = { version = "0.59.0", optional = true }
-openssl = { version = "0.10.75", optional = true }
 rand = "0.10.0"
 regex = "1.10.3"
 percent-encoding = "2.3"
@@ -127,7 +126,6 @@ zlib-rs-fast = { package = "zlib-rs", git = "https://github.com/codeandsolder/zl
 # dist-server only
 socket2 = { version = "0.6", optional = true }
 syslog = { version = "7", optional = true }
-version-compare = { version = "0.2.0", optional = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
@@ -156,10 +154,6 @@ nix = { version = "0.32.0", optional = true, features = [
   "process",
 ] }
 daemonix = "0.1"
-
-[target.'cfg(not(target_os = "freebsd"))'.dependencies.libmount]
-optional = true
-version = "0.1.15"
 
 [target.'cfg(windows)'.dependencies.windows-sys]
 features = [
@@ -213,7 +207,6 @@ gha = [
   "reqwest",
 ]
 memcached = ["opendal/services-memcached", "opendal-layer-logging"]
-native-zlib = []
 native-store = ["sccache-build/store"]
 oss = [
   "opendal/services-oss",
@@ -238,7 +231,7 @@ webdav = [
 # Enable features that will build a vendored version of openssl and
 # statically linked with it, instead of linking against the system-wide openssl
 # dynamically or statically.
-vendored-openssl = ["openssl?/vendored", "reqwest?/native-tls-vendored"]
+vendored-openssl = ["sccache-cluster-identity?/vendored-openssl"]
 # Enable features that require unstable features of Nightly Rust.
 unstable = []
 # Enables distributed support in the sccache client
@@ -262,17 +255,13 @@ dist-server = [
   "hyper-util",
   "tokio-util/io-util",
   "native-store",
-  "sha2",
   "url/serde",
   "jwt",
   "zlib-rs-fast",
-  "libmount",
   "dep:nix",
-  "openssl",
   "reqwest",
   "axum",
   "syslog",
-  "version-compare",
   "dep:hostname",
 ]
 # Opt-in local status UI; worker-only builds do not need the web stack.

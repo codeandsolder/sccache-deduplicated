@@ -180,7 +180,7 @@ fn server_config(credentials: &TlsCredentials, allow_enrollment: bool) -> Result
     );
     let mut roots = RootCertStore::empty();
     roots.add(CertificateDer::from(credentials.ca.to_der()?))?;
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let verifier =
         WebPkiClientVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&provider));
     let verifier = if allow_enrollment {

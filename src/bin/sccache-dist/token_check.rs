@@ -1,8 +1,6 @@
 use anyhow::{Context, Result, bail};
-use base64::Engine;
 use sccache::dist::http::{ClientAuthCheck, ClientVisibleMsg};
 use sccache::http_client::{self, new_reqwest_blocking_client};
-use sccache::util::BASE64_URL_SAFE_ENGINE;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::result::Result as StdResult;
@@ -24,29 +22,12 @@ pub struct Jwk {
 }
 
 impl Jwk {
-    // https://github.com/lawliet89/biscuit/issues/96#issuecomment-399149872
-    pub fn to_der_pkcs1(&self) -> Result<Vec<u8>> {
+    fn decoding_key(&self) -> Result<jwt::DecodingKey> {
         if self.kty != "RSA" {
-            bail!("Cannot handle non-RSA JWK")
+            bail!("Cannot handle non-RSA JWK");
         }
-
-        // JWK is big-endian, openssl bignum from_slice is big-endian
-        let n = BASE64_URL_SAFE_ENGINE
-            .decode(&self.n)
-            .context("Failed to base64 decode n")?;
-        let e = BASE64_URL_SAFE_ENGINE
-            .decode(&self.e)
-            .context("Failed to base64 decode e")?;
-        let n_bn = openssl::bn::BigNum::from_slice(&n)
-            .context("Failed to create openssl bignum from n")?;
-        let e_bn = openssl::bn::BigNum::from_slice(&e)
-            .context("Failed to create openssl bignum from e")?;
-        let pubkey = openssl::rsa::Rsa::from_public_components(n_bn, e_bn)
-            .context("Failed to create pubkey from n and e")?;
-        let der: Vec<u8> = pubkey
-            .public_key_to_der_pkcs1()
-            .context("Failed to convert public key to der pkcs1")?;
-        Ok(der)
+        jwt::DecodingKey::from_rsa_components(&self.n, &self.e)
+            .context("Failed to decode RSA JWK components")
     }
 }
 
@@ -182,7 +163,7 @@ impl ProxyTokenCheck {
 pub struct ValidJWTCheck {
     audience: String,
     issuer: String,
-    kid_to_pkcs1: HashMap<String, Vec<u8>>,
+    keys: HashMap<String, jwt::DecodingKey>,
 }
 
 impl ClientAuthCheck for ValidJWTCheck {
@@ -212,16 +193,16 @@ impl ValidJWTCheck {
         }
         let jwks: Jwks = http_client::read_bounded_json(res, http_client::JWKS_LIMIT)
             .context("Failed to parse JWKs json")?;
-        let kid_to_pkcs1 = jwks
+        let keys = jwks
             .keys
             .into_iter()
-            .map(|k| k.to_der_pkcs1().map(|pkcs1| (k.kid, pkcs1)))
+            .map(|k| k.decoding_key().map(|key| (k.kid, key)))
             .collect::<Result<_>>()
-            .context("Failed to convert JWKs into pkcs1")?;
+            .context("Failed to decode JWKs")?;
         Ok(Self {
             audience,
             issuer,
-            kid_to_pkcs1,
+            keys,
         })
     }
 
@@ -232,16 +213,12 @@ impl ValidJWTCheck {
         trace!("Validating JWT in scheduler");
         // Prepare validation
         let kid = header.kid.context("No kid found")?;
-        let pkcs1 = jwt::DecodingKey::from_rsa_der(
-            self.kid_to_pkcs1
-                .get(&kid)
-                .context("kid not found in jwks")?,
-        );
+        let key = self.keys.get(&kid).context("kid not found in jwks")?;
         let mut validation = jwt::Validation::new(header.alg);
         validation.set_audience(&[&self.audience]);
         validation.set_issuer(&[&self.issuer]);
         // Decode the JWT, discarding any claims - we just care about validity
-        let _tokendata = jwt::decode::<Claims>(token, &pkcs1, &validation)
+        let _tokendata = jwt::decode::<Claims>(token, key, &validation)
             .context("Unable to validate and decode jwt")?;
         Ok(())
     }

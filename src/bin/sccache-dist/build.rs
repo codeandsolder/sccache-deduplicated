@@ -16,7 +16,6 @@ use super::command_helpers::{CommandExt, run_with_environment};
 use crate::job_telemetry;
 use anyhow::{Context, Error, Result, anyhow, bail};
 use fs_err as fs;
-use libmount::Overlay;
 use nix::errno::Errno;
 use nix::fcntl::OFlag;
 use nix::sys::stat::{Mode, mkdirat};
@@ -28,15 +27,35 @@ use sccache::dist::{
     ProcessOutput, TcCache, Toolchain,
 };
 use sccache::lru_disk_cache::Error as LruError;
+use semver::Version;
 use std::collections::{HashMap, HashSet, hash_map};
 use std::io;
-use std::iter;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use version_compare::Version;
+
+// Preserve the mount(2) overlay option escaping previously provided by
+// libmount; use byte paths rather than lossy UTF-8 conversion.
+fn writable_overlay_options(lower: &Path, upper: &Path, work: &Path) -> Vec<u8> {
+    let mut options = Vec::new();
+    for (key, path) in [
+        (b"lowerdir=".as_slice(), lower),
+        (b",upperdir=", upper),
+        (b",workdir=", work),
+    ] {
+        options.extend_from_slice(key);
+        for &byte in path.as_os_str().as_bytes() {
+            if matches!(byte, b'\\' | b':' | b',') {
+                options.push(b'\\');
+            }
+            options.push(byte);
+        }
+    }
+    options
+}
 
 /// Host-side filesystem operations on a build's temporary root must obey
 /// the same root boundary as the compiler running under bubblewrap. In
@@ -190,29 +209,21 @@ impl OverlayBuilder {
             .arg("--version")
             .check_stdout_trim()
             .context("Failed to execute bwrap for version check")?;
-        if let Some(s) = out.split_whitespace().nth(1) {
-            match (Version::from("0.3.0"), Version::from(s)) {
-                (Some(min), Some(seen)) => {
-                    if seen < min {
-                        bail!(
-                            "bubblewrap 0.3.0 or later is required, got {out:?} for {}",
-                            bubblewrap.display()
-                        );
-                    }
-                }
-                (_, _) => {
-                    bail!(
-                        "Unexpected version format running {}: got {out:?}, expected \"bubblewrap x.x.x\"",
-                        bubblewrap.display()
-                    );
-                }
-            }
-        } else {
-            bail!(
-                "Unexpected version format running {}: got {out:?}, expected \"bubblewrap x.x.x\"",
-                bubblewrap.display()
-            );
-        }
+        let seen = out
+            .split_whitespace()
+            .nth(1)
+            .and_then(|version| Version::parse(version).ok())
+            .with_context(|| {
+                format!(
+                    "Unexpected version format running {}: got {out:?}, expected bubblewrap x.y.z",
+                    bubblewrap.display()
+                )
+            })?;
+        anyhow::ensure!(
+            seen >= Version::new(0, 3, 0),
+            "bubblewrap 0.3.0 or later is required, got {out:?} for {}",
+            bubblewrap.display()
+        );
 
         // TODO: pidfile
         let ret = Self {
@@ -433,15 +444,15 @@ impl OverlayBuilder {
         fs::create_dir(&upper_dir).context("Failed to create overlay upper directory")?;
         fs::create_dir(&target_dir).context("Failed to create overlay target directory")?;
 
-        let () = Overlay::writable(
-            iter::once(overlay.toolchain_dir.as_path()),
-            upper_dir,
-            work_dir,
+        let options = writable_overlay_options(&overlay.toolchain_dir, &upper_dir, &work_dir);
+        nix::mount::mount(
+            Some("overlay"),
             &target_dir,
-            // This error is unfortunately not Send+Sync
+            Some("overlay"),
+            nix::mount::MsFlags::empty(),
+            Some(options.as_slice()),
         )
-        .mount()
-        .map_err(|e| anyhow!("Failed to mount overlay FS: {e}"))?;
+        .with_context(|| format!("Failed to mount overlay FS at {}", target_dir.display()))?;
 
         Ok(target_dir)
     }
@@ -1400,5 +1411,22 @@ mod docker_listing_tests {
                 "incorrectly accepted malformed listing {listing:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod dependency_normalization_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn overlay_options_preserve_non_utf8_and_delimiters() {
+        let lower = Path::new(OsStr::from_bytes(b"/a:\xff"));
+        let upper = Path::new(OsStr::from_bytes(b"/b,c"));
+        let work = Path::new(OsStr::from_bytes(b"/d\\e"));
+        assert_eq!(
+            writable_overlay_options(lower, upper, work),
+            b"lowerdir=/a\\:\xff,upperdir=/b\\,c,workdir=/d\\\\e"
+        );
     }
 }
