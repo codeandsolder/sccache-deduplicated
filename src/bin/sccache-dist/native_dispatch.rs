@@ -427,7 +427,7 @@ impl NativeDispatcher {
                 requester,
                 cancelled,
             },
-            assignment: Box::new(Assignment { spec, pins: pins }),
+            assignment: Box::new(Assignment { spec, pins }),
         };
         // No authorization RPC on this request thread: schedule still holds
         // its session lock while awaiting our assignment acknowledgement.

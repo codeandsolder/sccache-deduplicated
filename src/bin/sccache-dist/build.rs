@@ -406,6 +406,46 @@ impl OverlayBuilder {
         })
     }
 
+    fn mount_build_overlay(overlay: &OverlaySpec) -> Result<PathBuf> {
+        // Now mounted filesystems will be automatically unmounted when this thread dies
+        // (and tmpfs filesystems will be completely destroyed)
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)
+            .context("Failed to enter a new Linux namespace")?;
+        // Make sure that all future mount changes are private to this namespace
+        // TODO: shouldn't need to add these annotations
+        let source: Option<&str> = None;
+        let fstype: Option<&str> = None;
+        let data: Option<&str> = None;
+        // Turn / into a 'slave', so it receives mounts from real root, but doesn't propagate back
+        nix::mount::mount(
+            source,
+            "/",
+            fstype,
+            nix::mount::MsFlags::MS_REC | nix::mount::MsFlags::MS_PRIVATE,
+            data,
+        )
+        .context("Failed to turn / into a slave")?;
+
+        let work_dir = overlay.build_dir.join("work");
+        let upper_dir = overlay.build_dir.join("upper");
+        let target_dir = overlay.build_dir.join("target");
+        fs::create_dir(&work_dir).context("Failed to create overlay work directory")?;
+        fs::create_dir(&upper_dir).context("Failed to create overlay upper directory")?;
+        fs::create_dir(&target_dir).context("Failed to create overlay target directory")?;
+
+        let () = Overlay::writable(
+            iter::once(overlay.toolchain_dir.as_path()),
+            upper_dir,
+            work_dir,
+            &target_dir,
+            // This error is unfortunately not Send+Sync
+        )
+        .mount()
+        .map_err(|e| anyhow!("Failed to mount overlay FS: {e}"))?;
+
+        Ok(target_dir)
+    }
+
     fn perform_build(
         job_id: JobId,
         bubblewrap: &Path,
@@ -423,44 +463,7 @@ impl OverlayBuilder {
         std::thread::scope(|scope| {
             scope
                 .spawn(|| {
-                    // Now mounted filesystems will be automatically unmounted when this thread dies
-                    // (and tmpfs filesystems will be completely destroyed)
-                    nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)
-                        .context("Failed to enter a new Linux namespace")?;
-                    // Make sure that all future mount changes are private to this namespace
-                    // TODO: shouldn't need to add these annotations
-                    let source: Option<&str> = None;
-                    let fstype: Option<&str> = None;
-                    let data: Option<&str> = None;
-                    // Turn / into a 'slave', so it receives mounts from real root, but doesn't propagate back
-                    nix::mount::mount(
-                        source,
-                        "/",
-                        fstype,
-                        nix::mount::MsFlags::MS_REC | nix::mount::MsFlags::MS_PRIVATE,
-                        data,
-                    )
-                    .context("Failed to turn / into a slave")?;
-
-                    let work_dir = overlay.build_dir.join("work");
-                    let upper_dir = overlay.build_dir.join("upper");
-                    let target_dir = overlay.build_dir.join("target");
-                    fs::create_dir(&work_dir).context("Failed to create overlay work directory")?;
-                    fs::create_dir(&upper_dir)
-                        .context("Failed to create overlay upper directory")?;
-                    fs::create_dir(&target_dir)
-                        .context("Failed to create overlay target directory")?;
-
-                    let () = Overlay::writable(
-                        iter::once(overlay.toolchain_dir.as_path()),
-                        upper_dir,
-                        work_dir,
-                        &target_dir,
-                        // This error is unfortunately not Send+Sync
-                    )
-                    .mount()
-                    .map_err(|e| anyhow!("Failed to mount overlay FS: {e}"))?;
-
+                    let target_dir = Self::mount_build_overlay(overlay)?;
                     trace!("copying in inputs");
                     // Note that we don't unpack directly into the upperdir since there overlayfs has some
                     // special marker files that we don't want to create by accident (or malicious intent)
@@ -847,16 +850,19 @@ impl DockerBuilder {
 
         // Good as new, add it back to the container list. If the bookkeeping lock is poisoned,
         // discard the container rather than turning cleanup into a process-wide panic.
-        let reclaimed = if let Ok(mut containers) = self.container_lists.lock() {
-            containers.get_mut(tc).is_some_and(|entry| {
-                debug!("Reclaimed container {cid}");
-                entry.push(cid.to_owned());
-                true
-            })
-        } else {
-            warn!("Container list mutex poisoned while reclaiming {cid}");
-            false
-        };
+        let reclaimed = self.container_lists.lock().map_or_else(
+            |_| {
+                warn!("Container list mutex poisoned while reclaiming {cid}");
+                false
+            },
+            |mut containers| {
+                containers.get_mut(tc).is_some_and(|entry| {
+                    debug!("Reclaimed container {cid}");
+                    entry.push(cid.to_owned());
+                    true
+                })
+            },
+        );
         if !reclaimed {
             warn!(
                 "Could not reclaim container {cid} for toolchain {}; removing it",
@@ -895,7 +901,7 @@ impl DockerBuilder {
 
         // Once a temporary container exists, remove it even when copying or
         // committing the image fails. Keep the original failure as the result.
-        let imagename = format!("sccache-builder-{}", &tc.archive_id);
+        let imagename = format!("sccache-builder-{}", tc.archive_id);
         let image_result = (|| -> Result<()> {
             trace!("Copying in toolchain");
             Command::new("docker")

@@ -135,7 +135,7 @@ impl NativeWorker {
         }
         Ok(super::NativeInputPins {
             _trees: trees,
-            blobs: blobs,
+            blobs,
         })
     }
 
