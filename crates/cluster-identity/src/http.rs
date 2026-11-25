@@ -9,12 +9,19 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+use axum::{
+    Router,
+    body::Body,
+    extract::{Extension, Request},
+    http::{Method, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{MethodRouter, any, get},
+};
 use bincode::Options;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited, combinators::UnsyncBoxBody};
-use hyper::{
-    Method, Request, Response, StatusCode, body::Incoming, server::conn::http1, service::service_fn,
-};
+use http_body_util::{BodyExt, Limited};
+use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use openssl::{asn1::Asn1Time, x509::X509};
 use rustls::{
@@ -24,6 +31,7 @@ use rustls::{
 };
 use tokio::{net::TcpStream, time::timeout};
 use tokio_rustls::TlsAcceptor;
+use tower::ServiceExt as _;
 
 use super::{
     EnrollmentAuthority, EnrollmentRequest, EnrollmentResponse, NetworkPath, PeerId, Role,
@@ -37,10 +45,12 @@ pub use client::{ClusterHttpClient, EnrollmentClient, blocking_client, blocking_
 pub const PATH_HEADER: &str = "x-sccache-network-path";
 
 const CONTROL_LIMIT: usize = 64 * 1024;
+const HTTP_HEADER_LIMIT: usize = 64 * 1024;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 const ENROLL_WORKER: &str = "/api/v1/cluster/enroll/worker";
 const ENROLL_CLIENT: &str = "/api/v1/cluster/enroll/client";
 const RENEW: &str = "/api/v1/cluster/renew";
+const PROBE: &str = "/api/v1/cluster/probe";
 
 fn codec() -> impl Options {
     bincode::DefaultOptions::new()
@@ -111,18 +121,55 @@ impl AuthenticatedPeer {
     }
 }
 
-/// Streaming HTTP response body. Enrollment uses small fixed bodies, while
-/// normal request handlers may supply streaming CAS responses.
-pub type ClusterBody = UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+fn response(status: StatusCode, body: impl Into<Bytes>) -> Response {
+    (status, Body::from(body.into())).into_response()
+}
 
-fn response(status: StatusCode, body: impl Into<Bytes>) -> Response<ClusterBody> {
-    let mut response = Response::new(
-        Full::new(body.into())
-            .map_err(|never| match never {})
-            .boxed_unsync(),
-    );
-    *response.status_mut() = status;
-    response
+#[derive(Clone, Copy)]
+struct ConnectionInfo {
+    peer: Option<AuthenticatedPeer>,
+    address: SocketAddr,
+}
+
+/// A routing tree bound to one TLS listener identity and enrollment policy.
+/// Only the listener can construct it, so an application cannot bypass
+/// transport-derived peer authorization by serving a bare Axum router.
+#[derive(Clone)]
+pub struct ClusterRouter {
+    router: Router,
+    id: PeerId,
+    role: Role,
+    allow_enrollment: bool,
+}
+
+fn authenticated(
+    router: Router,
+    authorize: impl Fn(AuthenticatedPeer) -> bool + Clone + Send + Sync + 'static,
+) -> Router {
+    router.layer(middleware::from_fn(
+        move |Extension(connection): Extension<ConnectionInfo>,
+              mut request: Request,
+              next: Next| {
+            let peer = connection
+                .peer
+                .filter(|peer| peer.valid() && authorize(*peer));
+            async move {
+                match peer {
+                    Some(peer) => {
+                        request.extensions_mut().insert(peer);
+                        next.run(request).await
+                    }
+                    None => response(StatusCode::UNAUTHORIZED, "cluster authentication required"),
+                }
+            }
+        },
+    ))
+}
+
+fn probe() -> MethodRouter {
+    get(|| std::future::ready(StatusCode::NO_CONTENT))
+        .head(|| std::future::ready(StatusCode::NOT_FOUND))
+        .fallback(|| std::future::ready(StatusCode::NOT_FOUND))
 }
 
 fn server_config(credentials: &TlsCredentials, allow_enrollment: bool) -> Result<ServerConfig> {
@@ -216,82 +263,95 @@ impl ClusterListener {
         Ok(())
     }
 
-    /// Serve a scheduler connection with initial enrollment and mTLS dispatch.
-    ///
+    /// Prepare the scheduler's enrollment, renewal and authenticated application routes.
     /// # Errors
-    /// Returns an error for wrong listener role, failed TLS or HTTP failure.
-    pub async fn serve_scheduler<H, F>(
+    /// Returns an error if called for a non-scheduler listener.
+    pub fn scheduler_router(
         &self,
-        socket: TcpStream,
         enrollment: Arc<SchedulerEnrollment>,
-        handler: H,
-    ) -> Result<()>
-    where
-        H: Fn(AuthenticatedPeer, Request<Incoming>) -> F + Send + Sync + 'static,
-        F: Future<Output = Response<ClusterBody>> + Send,
-    {
+        data: Router,
+    ) -> Result<ClusterRouter> {
         ensure!(self.role == Role::Scheduler, "not a scheduler listener");
-        let handler = Arc::new(handler);
         let allow_enrollment = self.allow_enrollment;
-        self.serve_connection(socket, move |peer, address, request| {
-            let enrollment = Arc::clone(&enrollment);
-            let handler = Arc::clone(&handler);
-            async move {
-                enrollment
-                    .dispatch(peer, address, request, handler.as_ref(), allow_enrollment)
-                    .await
-            }
-        })
-        .await
+        let authorization = Arc::clone(&enrollment);
+        let renewal = Arc::clone(&enrollment);
+        let protected = authenticated(
+            Router::new()
+                .route(PROBE, probe())
+                .route(
+                    RENEW,
+                    any(
+                        move |Extension(peer): Extension<AuthenticatedPeer>, request: Request| {
+                            let renewal = Arc::clone(&renewal);
+                            async move {
+                                if allow_enrollment {
+                                    renewal.renew(peer, request).await
+                                } else {
+                                    StatusCode::NOT_FOUND.into_response()
+                                }
+                            }
+                        },
+                    ),
+                )
+                .fallback_service(data),
+            move |peer| {
+                authorization
+                    .authority
+                    .registry()
+                    .is_active(peer.id, peer.role)
+                    .unwrap_or(false)
+            },
+        );
+        let router = Router::new()
+            .route(
+                ENROLL_WORKER,
+                enrollment_route(Arc::clone(&enrollment), Role::Worker, allow_enrollment),
+            )
+            .route(
+                ENROLL_CLIENT,
+                enrollment_route(enrollment, Role::Client, allow_enrollment),
+            )
+            .fallback_service(protected);
+        Ok(self.bind_router(router))
     }
 
-    /// Serve a worker connection. All requests require mTLS and an authorized
-    /// principal; no worker-side bootstrap path exists.
-    ///
+    /// Prepare worker application routes. All requests require an authorized
+    /// mTLS principal; no worker-side bootstrap path exists.
     /// # Errors
-    /// Returns an error for wrong listener role, failed TLS or HTTP failure.
-    pub async fn serve_worker<A, H, F>(
+    /// Returns an error if called for a non-worker listener.
+    pub fn worker_router(
         &self,
-        socket: TcpStream,
-        authorize: A,
-        handler: H,
-    ) -> Result<()>
-    where
-        A: Fn(AuthenticatedPeer) -> bool + Send + Sync + 'static,
-        H: Fn(AuthenticatedPeer, Request<Incoming>) -> F + Send + Sync + 'static,
-        F: Future<Output = Response<ClusterBody>> + Send,
-    {
+        authorize: impl Fn(AuthenticatedPeer) -> bool + Clone + Send + Sync + 'static,
+        data: Router,
+    ) -> Result<ClusterRouter> {
         ensure!(self.role == Role::Worker, "not a worker listener");
-        let handler = Arc::new(handler);
-        let authorize = Arc::new(authorize);
-        self.serve_connection(socket, move |peer, _, request| {
-            let handler = Arc::clone(&handler);
-            let authorize = Arc::clone(&authorize);
-            async move {
-                match peer.filter(|peer| peer.valid() && authorize(*peer)) {
-                    Some(peer) => {
-                        if request.method() == Method::GET
-                            && request.uri().path() == "/api/v1/cluster/probe"
-                        {
-                            response(StatusCode::NO_CONTENT, Bytes::new())
-                        } else {
-                            handler(peer, request).await
-                        }
-                    }
-                    None => response(StatusCode::UNAUTHORIZED, "cluster authentication required"),
-                }
-            }
-        })
-        .await
+        Ok(self.bind_router(authenticated(
+            Router::new().route(PROBE, probe()).fallback_service(data),
+            authorize,
+        )))
     }
 
-    // The caller owns connection admission and listener lifecycle. Peer metadata
-    // is exclusively derived from rustls, never from HTTP request headers.
-    async fn serve_connection<H, F>(&self, socket: TcpStream, handler: H) -> Result<()>
-    where
-        H: Fn(Option<AuthenticatedPeer>, SocketAddr, Request<Incoming>) -> F + Send + Sync,
-        F: Future<Output = Response<ClusterBody>> + Send,
-    {
+    fn bind_router(&self, router: Router) -> ClusterRouter {
+        ClusterRouter {
+            router,
+            id: self.id,
+            role: self.role,
+            allow_enrollment: self.allow_enrollment,
+        }
+    }
+
+    /// Serve one socket with a router prepared for this listener. The caller
+    /// owns connection admission and listener lifecycle.
+    /// # Errors
+    /// Returns an error if the router belongs to another listener or if
+    /// TLS or HTTP transport fails.
+    pub async fn serve(&self, socket: TcpStream, router: ClusterRouter) -> Result<()> {
+        ensure!(
+            router.id == self.id
+                && router.role == self.role
+                && router.allow_enrollment == self.allow_enrollment,
+            "cluster router belongs to a different listener"
+        );
         let address = match socket.peer_addr()? {
             SocketAddr::V6(address) if address.ip().to_ipv4_mapped().is_some() => SocketAddr::new(
                 std::net::IpAddr::V6(*address.ip()).to_canonical(),
@@ -314,11 +374,18 @@ impl ClusterListener {
             .and_then(|chain| chain.first())
             .map(|leaf| AuthenticatedPeer::from_verified_leaf(leaf.as_ref(), address, path))
             .transpose()?;
-        let service = service_fn(move |request| {
-            let future = handler(peer, address, request);
+        let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+            let mut request = request.map(Body::new);
+            request
+                .extensions_mut()
+                .insert(ConnectionInfo { peer, address });
+            let future = router.router.clone().oneshot(request);
             let path_header = path_header.clone();
             async move {
-                let mut response = future.await;
+                let mut response = match future.await {
+                    Ok(response) => response,
+                    Err(never) => match never {},
+                };
                 if peer.is_some() {
                     response.headers_mut().insert(PATH_HEADER, path_header);
                 }
@@ -328,6 +395,7 @@ impl ClusterListener {
         http1::Builder::new()
             .timer(TokioTimer::new())
             .header_read_timeout(CONTROL_TIMEOUT)
+            .max_buf_size(HTTP_HEADER_LIMIT)
             .serve_connection(
                 TokioIo::new(idle_write::IdleWrite::new(stream, Duration::from_secs(90))),
                 service,
@@ -364,60 +432,12 @@ impl SchedulerEnrollment {
         &self.authority
     }
 
-    async fn dispatch<H, F>(
-        self: &Arc<Self>,
-        peer: Option<AuthenticatedPeer>,
-        address: SocketAddr,
-        request: Request<Incoming>,
-        handler: &H,
-        allow_enrollment: bool,
-    ) -> Response<ClusterBody>
-    where
-        H: Fn(AuthenticatedPeer, Request<Incoming>) -> F + Sync,
-        F: Future<Output = Response<ClusterBody>>,
-    {
-        let role = match request.uri().path() {
-            ENROLL_WORKER => Some(Role::Worker),
-            ENROLL_CLIENT => Some(Role::Client),
-            _ => None,
-        };
-        if let Some(role) = role {
-            if !allow_enrollment {
-                return response(StatusCode::NOT_FOUND, Bytes::new());
-            }
-            if peer.is_some() {
-                return response(StatusCode::FORBIDDEN, "use authenticated renewal");
-            }
-            return self.enroll(address, role, request).await;
-        }
-        let Some(peer) = peer.filter(|peer| {
-            peer.valid()
-                && self
-                    .authority
-                    .registry()
-                    .is_active(peer.id, peer.role)
-                    .unwrap_or(false)
-        }) else {
-            return response(StatusCode::UNAUTHORIZED, "cluster authentication required");
-        };
-        if request.method() == Method::GET && request.uri().path() == "/api/v1/cluster/probe" {
-            return response(StatusCode::NO_CONTENT, Bytes::new());
-        }
-        if request.uri().path() == RENEW {
-            if !allow_enrollment {
-                return response(StatusCode::NOT_FOUND, Bytes::new());
-            }
-            return self.renew(peer, request).await;
-        }
-        handler(peer, request).await
-    }
-
     async fn enroll(
         self: &Arc<Self>,
         address: SocketAddr,
         role: Role,
-        request: Request<Incoming>,
-    ) -> Response<ClusterBody> {
+        request: Request,
+    ) -> Response {
         let Some(token) = request
             .headers()
             .get(hyper::header::AUTHORIZATION)
@@ -446,11 +466,7 @@ impl SchedulerEnrollment {
         )
     }
 
-    async fn renew(
-        self: &Arc<Self>,
-        peer: AuthenticatedPeer,
-        request: Request<Incoming>,
-    ) -> Response<ClusterBody> {
+    async fn renew(self: &Arc<Self>, peer: AuthenticatedPeer, request: Request) -> Response {
         let csr = match decode(request).await {
             Ok(csr) => csr,
             Err((status, message)) => return response(status, message),
@@ -465,8 +481,29 @@ impl SchedulerEnrollment {
     }
 }
 
+fn enrollment_route(
+    enrollment: Arc<SchedulerEnrollment>,
+    role: Role,
+    enabled: bool,
+) -> MethodRouter {
+    any(
+        move |Extension(connection): Extension<ConnectionInfo>, request: Request| {
+            let enrollment = Arc::clone(&enrollment);
+            async move {
+                if !enabled {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                if connection.peer.is_some() {
+                    return response(StatusCode::FORBIDDEN, "use authenticated renewal");
+                }
+                enrollment.enroll(connection.address, role, request).await
+            }
+        },
+    )
+}
+
 async fn decode(
-    request: Request<Incoming>,
+    request: Request,
 ) -> std::result::Result<EnrollmentRequest, (StatusCode, &'static str)> {
     if request.method() != Method::POST
         || request.uri().query().is_some()
@@ -493,7 +530,7 @@ async fn decode(
 
 fn issue_result(
     result: std::result::Result<Result<EnrollmentResponse>, tokio::task::JoinError>,
-) -> Response<ClusterBody> {
+) -> Response {
     match result {
         Ok(Ok(issued)) => codec().serialize(&issued).map_or_else(
             |_| {

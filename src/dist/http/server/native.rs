@@ -10,10 +10,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::cluster_http::{Listener, ListenerRole, Request};
+use super::cluster_http::{Listener, ListenerRole, Request, binary, file_body, path_route, routes};
 use anyhow::{Context, Result, ensure};
+use axum::{
+    Router,
+    response::{IntoResponse, Response},
+    routing::MethodFilter,
+};
 use bincode::Options;
-use rouille::{Response, ResponseBody};
+use http::StatusCode;
 use sccache_cluster_identity::{ClusterListener, SchedulerEnrollment};
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -239,9 +244,11 @@ pub(super) fn spawn(
         tls,
         ListenerRole::Scheduler(enrollment),
         config.http_threads,
-        move |request| {
+        native_router(move |request, role, operation| {
             respond(
                 request,
+                role,
+                operation,
                 NativeServices {
                     sessions: &sessions,
                     packages: packages.as_ref(),
@@ -252,7 +259,7 @@ pub(super) fn spawn(
                 &allocate,
                 metadata_limit,
             )
-        },
+        }),
     )?;
     info!("Native cache listening on {bound}");
     thread::Builder::new()
@@ -285,7 +292,23 @@ pub(super) fn spawn(
     Ok((bound, retained_sessions))
 }
 
-const PREFIX: &str = "/api/v5/native/";
+fn native_router<F>(handler: F) -> Router
+where
+    F: Fn(&Request, &str, &str) -> Response + Send + Sync + 'static,
+{
+    routes(
+        Router::new().route(
+            "/api/v5/native/{role}/{operation}",
+            path_route(
+                MethodFilter::POST,
+                |handler: &F, request, (role, operation): (String, String)| {
+                    handler(request, &role, &operation)
+                },
+            ),
+        ),
+        handler,
+    )
+}
 
 /// The single peer-content endpoint serves scheduler recovery, worker inputs,
 /// and client results. Only an exact, recipient-bound capability grants access.
@@ -301,16 +324,16 @@ pub(super) fn serve_peer_blob(
         Role::Worker => BlobRecipient::Worker(request.id()),
     };
     let Ok(blob) = metadata::<BlobRef>(request, 40) else {
-        return Ok(Response::empty_400());
+        return Ok(StatusCode::BAD_REQUEST.into_response());
     };
     let permitted = super::bearer_http_auth(request)
         .is_some_and(|token| authorizer.verify_blob_token(blob, recipient, token).is_ok());
     if !permitted {
-        return Ok(Response::text("invalid peer capability").with_status_code(401));
+        return Ok((StatusCode::UNAUTHORIZED, "invalid peer capability").into_response());
     }
     match open(blob)? {
         Some((file, encoding)) => physical_blob_response(file, encoding),
-        None => Ok(Response::empty_404()),
+        None => Ok(StatusCode::NOT_FOUND.into_response()),
     }
 }
 
@@ -323,8 +346,13 @@ pub(super) fn physical_blob_response(mut file: File, encoding: BlobEncoding) -> 
     } else {
         (file, encoding)
     };
-    Ok(Response::from_file("application/octet-stream", file)
-        .with_additional_header("X-Sccache-CAS-Encoding", encoding.http_value()))
+    let length = file.metadata()?.len();
+    let mut response = file_body(file, length);
+    response.headers_mut().insert(
+        "x-sccache-cas-encoding",
+        http::HeaderValue::from_static(encoding.http_value()),
+    );
+    Ok(response)
 }
 
 fn observed_response_peer(response: &reqwest::blocking::Response, peer: Peer) -> Peer {
@@ -411,22 +439,14 @@ struct NativeServices<'a> {
 
 fn respond(
     request: &Request,
+    role: &str,
+    operation: &str,
     services: NativeServices<'_>,
     allocate: &Allocator,
     limit: usize,
 ) -> Response {
-    if request.method() != "POST" {
-        return Response::empty_404();
-    }
-    let url = request.url();
-    let Some(path) = url.strip_prefix(PREFIX) else {
-        return Response::empty_404();
-    };
-    let Some((role, operation)) = path.split_once('/') else {
-        return Response::empty_404();
-    };
     if request.header("Content-Type") != Some("application/octet-stream") {
-        return Response::empty_400();
+        return StatusCode::BAD_REQUEST.into_response();
     }
     let publisher = match role {
         "client" => {
@@ -444,28 +464,30 @@ fn respond(
                 .header("X-Sccache-Native-Job")
                 .and_then(|job| job.parse::<u64>().ok())
             else {
-                return Response::empty_400();
+                return StatusCode::BAD_REQUEST.into_response();
             };
             Publisher::Worker { peer: server, job }
         }
-        _ => return Response::empty_404(),
+        _ => return StatusCode::NOT_FOUND.into_response(),
     };
     match dispatch(request, services, allocate, publisher, operation, limit) {
         Ok(response) => response,
         Err(error) if error.is::<NativeContentPending>() => {
-            Response::text("native input pending").with_status_code(202)
+            (StatusCode::ACCEPTED, "native input pending").into_response()
         }
-        Err(error) if error.is::<NativeInputRejected>() => {
-            Response::text("native input bytes rejected").with_status_code(422)
-        }
+        Err(error) if error.is::<NativeInputRejected>() => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "native input bytes rejected",
+        )
+            .into_response(),
         Err(error) if error.is::<NativeServiceBusy>() => {
-            Response::text("native service busy").with_status_code(503)
+            (StatusCode::SERVICE_UNAVAILABLE, "native service busy").into_response()
         }
         Err(error) => {
             // Do not return host paths, auth tokens or raw internal metadata
             // to callers. The service log carries diagnostic context.
             warn!("Native cache {operation} rejected: {error:#}");
-            Response::text("native cache operation rejected").with_status_code(409)
+            (StatusCode::CONFLICT, "native cache operation rejected").into_response()
         }
     }
 }
@@ -740,20 +762,13 @@ fn dispatch(
             let (file, encoding) = sessions.download(ticket, publisher, id)?;
             let logical =
                 crate::build_runtime::BlobReader::open(file.try_clone()?, encoding)?.len();
-            let mut response = Response::from_file("application/octet-stream", file)
-                .with_additional_header("X-Sccache-CAS-Encoding", encoding.http_value());
-            let (reader, size) = response.data.into_reader_and_size();
-            let reader = network.meter(
-                Direction::Send,
-                peer,
-                reader,
-                logical,
-                size.map(|size| size as u64),
+            let size = file.metadata()?.len();
+            let reader = network.meter(Direction::Send, peer, file, logical, Some(size));
+            let mut response = file_body(reader, size);
+            response.headers_mut().insert(
+                "x-sccache-cas-encoding",
+                http::HeaderValue::from_static(encoding.http_value()),
             );
-            response.data = match size {
-                Some(size) => ResponseBody::from_reader_and_size(reader, size),
-                None => ResponseBody::from_reader(reader),
-            };
             Ok(response)
         }
         "tree_offer" if publisher == Publisher::Client => {
@@ -837,7 +852,7 @@ fn dispatch(
             sessions.fail(metadata(request, limit)?, publisher)?;
             encode(&(), limit)
         }
-        _ => Ok(Response::empty_404()),
+        _ => Ok(StatusCode::NOT_FOUND.into_response()),
     }
 }
 
@@ -861,7 +876,7 @@ pub(super) fn metadata<T: DeserializeOwned>(request: &Request, limit: usize) -> 
 
 fn encode<T: Serialize>(value: &T, limit: usize) -> Result<Response> {
     let data = codec().with_limit(u64::try_from(limit)?).serialize(value)?;
-    Ok(Response::from_data("application/octet-stream", data))
+    Ok(binary(data))
 }
 
 #[cfg(test)]

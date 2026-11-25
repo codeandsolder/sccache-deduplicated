@@ -9,6 +9,8 @@ description = "Persistent machine identities and cluster certificate issuance fo
 [dependencies]
 sccache-peer-identity = { path = "../peer-identity" }
 anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tower = { version = "0.5", features = ["util"] }
 openssl = "0.10.75"
 tempfile = "3"
 serde = { version = "1", features = ["derive"] }

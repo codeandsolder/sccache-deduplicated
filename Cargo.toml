@@ -42,6 +42,7 @@ strip = true
 anyhow = { version = "1.0", features = ["backtrace"] }
 ar = "0.9"
 async-trait = "0.1"
+axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "tokio", "json"] }
 backon = { version = "1", default-features = false, features = [
   "std-blocking-sleep",
 ] }
@@ -58,8 +59,6 @@ fs-err = "3"
 futures = "0.3"
 hostname = { version = "0.4", optional = true }
 http = "1.0"
-http-body-util = { version = "0.1", optional = true }
-hyper = { version = "1.1", optional = true, features = ["server", "http1"] }
 hyper-util = { version = "0.1.3", optional = true, features = [
   "tokio",
   "server",
@@ -127,13 +126,11 @@ zlib-rs-fast = { package = "zlib-rs", git = "https://github.com/codeandsolder/zl
 
 # dist-server only
 socket2 = { version = "0.6", optional = true }
-rouille = { version = "3.6", optional = true, default-features = false, features = [
-  "ssl",
-] }
 syslog = { version = "7", optional = true }
 version-compare = { version = "0.2.0", optional = true }
 
 [dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["test-util"] }
 assert_cmd = "2.0.13"
 cc = "1.0"
@@ -252,8 +249,7 @@ dist-client = [
   "native-store",
   "zlib-rs-fast",
   "zlib-rs-fast/parallel",
-  "hyper",
-  "http-body-util",
+  "axum",
   "hyper-util",
   "reqwest",
   "url",
@@ -263,8 +259,6 @@ dist-client = [
 dist-server = [
   "dep:socket2",
   "dep:sccache-cluster-identity",
-  "hyper",
-  "http-body-util",
   "hyper-util",
   "tokio-util/io-util",
   "native-store",
@@ -276,7 +270,7 @@ dist-server = [
   "dep:nix",
   "openssl",
   "reqwest",
-  "rouille",
+  "axum",
   "syslog",
   "version-compare",
   "dep:hostname",
@@ -287,7 +281,7 @@ scheduler-dashboard = ["dist-server", "dep:sccache-dashboard"]
 dist-tests = ["dist-client", "dist-server"]
 
 [workspace]
-exclude = ["tests/test-crate", "vendor/tiny_http"]
+exclude = ["tests/test-crate"]
 members = ["crates/build-runtime", "crates/cluster-identity", "crates/peer-identity", "crates/scheduler-dashboard", "tests/integration/randomize_readdir"]
 
 [[bench]]
@@ -313,6 +307,3 @@ ptr_as_ptr = "warn"
 ref_option = "warn"
 semicolon_if_nothing_returned = "warn"
 unnecessary_semicolon = "warn"
-
-[patch.crates-io]
-tiny_http = { path = "vendor/tiny_http" }

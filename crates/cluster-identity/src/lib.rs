@@ -279,7 +279,7 @@ pub fn scheduler_registry(directory: &Path) -> Result<Registry> {
 
 mod http;
 pub use http::{
-    AuthenticatedPeer, ClusterBody, ClusterHttpClient, ClusterListener, EnrollmentClient,
+    AuthenticatedPeer, ClusterHttpClient, ClusterListener, ClusterRouter, EnrollmentClient,
     PATH_HEADER, SchedulerEnrollment, blocking_client, blocking_client_bound,
 };
 

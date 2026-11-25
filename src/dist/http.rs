@@ -273,11 +273,17 @@ pub mod urls {
 
 #[cfg(feature = "dist-server")]
 mod server {
-    use self::cluster_http::{Listener, ListenerRole, Request};
+    use self::cluster_http::{Listener, ListenerRole, Request, binary, path_route, route, routes};
     use crate::dist::cluster::{BlockingRoutes, refresh_blocking};
     use crate::util::num_cpus;
+    use axum::{
+        Json, Router,
+        body::Body,
+        response::{IntoResponse, Response},
+        routing::MethodFilter,
+    };
     use byteorder::{BigEndian, ReadBytesExt};
-    use rouille::accept;
+    use http::{StatusCode, header};
     use sccache_cluster_identity::{
         ClusterCa, ClusterListener, EnrollmentAuthority, Identity, PeerCredentials, Role,
         SchedulerEnrollment, TlsCredentials,
@@ -608,21 +614,20 @@ mod server {
         validation
     });
 
-    // Based on rouille::input::json::json_input
     #[derive(Debug)]
-    pub enum RouilleBincodeError {
+    pub enum BincodeInputError {
         BodyAlreadyExtracted,
         WrongContentType,
         BodyTooLarge,
         BodyReadError(std::io::Error),
         ParseError(bincode::Error),
     }
-    impl From<bincode::Error> for RouilleBincodeError {
+    impl From<bincode::Error> for BincodeInputError {
         fn from(err: bincode::Error) -> Self {
             Self::ParseError(err)
         }
     }
-    impl std::error::Error for RouilleBincodeError {
+    impl std::error::Error for BincodeInputError {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             match *self {
                 Self::ParseError(ref e) => Some(e),
@@ -631,7 +636,7 @@ mod server {
             }
         }
     }
-    impl std::fmt::Display for RouilleBincodeError {
+    impl std::fmt::Display for BincodeInputError {
         fn fmt(
             &self,
             fmt: &mut std::fmt::Formatter<'_>,
@@ -653,31 +658,30 @@ mod server {
             )
         }
     }
-    fn bincode_input<O>(request: &Request) -> std::result::Result<O, RouilleBincodeError>
+    fn bincode_input<O>(request: &Request) -> std::result::Result<O, BincodeInputError>
     where
         O: serde::de::DeserializeOwned,
     {
         if let Some(header) = request.header("Content-Type") {
             if !header.starts_with("application/octet-stream") {
-                return Err(RouilleBincodeError::WrongContentType);
+                return Err(BincodeInputError::WrongContentType);
             }
         } else {
-            return Err(RouilleBincodeError::WrongContentType);
+            return Err(BincodeInputError::WrongContentType);
         }
 
         let mut body = request
             .data()
-            .ok_or(RouilleBincodeError::BodyAlreadyExtracted)?;
+            .ok_or(BincodeInputError::BodyAlreadyExtracted)?;
         let bytes = transport::read_bounded(&mut body, transport::CONTROL_REQUEST_LIMIT).map_err(
             |error| match error {
-                transport::BoundedReadError::TooLarge => RouilleBincodeError::BodyTooLarge,
-                transport::BoundedReadError::Io(error) => RouilleBincodeError::BodyReadError(error),
+                transport::BoundedReadError::TooLarge => BincodeInputError::BodyTooLarge,
+                transport::BoundedReadError::Io(error) => BincodeInputError::BodyReadError(error),
             },
         )?;
         transport::decode_bincode(&bytes).map_err(From::from)
     }
 
-    // Based on try_or_400 in rouille, but with logging
     #[derive(Serialize)]
     pub struct ErrJson {
         description: String,
@@ -717,14 +721,14 @@ mod server {
 
                     warn!("Res {} error: {}", $reqid, err_msg);
                     let json = ErrJson::from_err(&*err);
-                    return rouille::Response::json(&json).with_status_code($code);
+                    return ($code, Json(json)).into_response();
                 }
             }
         };
     }
     macro_rules! try_or_400_log {
         ($reqid:expr, $result:expr) => {
-            try_or_err_and_log!($reqid, 400, $result)
+            try_or_err_and_log!($reqid, StatusCode::BAD_REQUEST, $result)
         };
     }
     macro_rules! try_bincode_input {
@@ -732,14 +736,13 @@ mod server {
             match bincode_input($request) {
                 Ok(value) => value,
                 Err(error) => {
-                    let status = if matches!(error, RouilleBincodeError::BodyTooLarge) {
-                        413
+                    let status = if matches!(error, BincodeInputError::BodyTooLarge) {
+                        StatusCode::PAYLOAD_TOO_LARGE
                     } else {
-                        400
+                        StatusCode::BAD_REQUEST
                     };
                     warn!("Res {} error: {}", $reqid, error);
-                    return rouille::Response::json(&ErrJson::from_err(&error))
-                        .with_status_code(status);
+                    return (status, Json(ErrJson::from_err(&error))).into_response();
                 }
             }
         }};
@@ -747,21 +750,21 @@ mod server {
 
     macro_rules! try_or_500_log {
         ($reqid:expr, $result:expr) => {
-            try_or_err_and_log!($reqid, 500, $result)
+            try_or_err_and_log!($reqid, StatusCode::INTERNAL_SERVER_ERROR, $result)
         };
     }
-    fn make_401_with_body(short_err: &str, body: ClientVisibleMsg) -> rouille::Response {
-        rouille::Response {
-            status_code: 401,
-            headers: vec![(
-                "WWW-Authenticate".into(),
-                format!("Bearer error=\"{short_err}\"").into(),
+    fn make_401_with_body(short_err: &str, body: ClientVisibleMsg) -> Response {
+        (
+            StatusCode::UNAUTHORIZED,
+            [(
+                header::WWW_AUTHENTICATE,
+                format!("Bearer error=\"{short_err}\""),
             )],
-            data: rouille::ResponseBody::from_data(body.0),
-            upgrade: None,
-        }
+            Body::from(body.0),
+        )
+            .into_response()
     }
-    fn make_401(short_err: &str) -> rouille::Response {
+    fn make_401(short_err: &str) -> Response {
         make_401_with_body(short_err, ClientVisibleMsg(String::new()))
     }
     fn bearer_http_auth(request: &Request) -> Option<&str> {
@@ -777,14 +780,14 @@ mod server {
         split.next()
     }
 
-    fn authenticate_client(request: &Request) -> StdResult<(), rouille::Response> {
+    fn authenticate_client(request: &Request) -> StdResult<(), Response> {
         if request.role() != Role::Client {
             return Err(make_401("client_role_required"));
         }
         Ok(())
     }
 
-    fn authenticate_server(request: &Request) -> StdResult<ServerId, rouille::Response> {
+    fn authenticate_server(request: &Request) -> StdResult<ServerId, Response> {
         if request.role() != Role::Worker {
             return Err(make_401("worker_role_required"));
         }
@@ -792,34 +795,72 @@ mod server {
     }
 
     /// Return `content` as a bincode-encoded `Response`.
-    pub fn bincode_response<T>(content: &T) -> rouille::Response
+    pub fn bincode_response<T>(content: &T) -> Response
     where
         T: serde::Serialize,
     {
         let data = bincode::serialize(content).context("Failed to serialize response body");
         let data = try_or_500_log!("bincode body serialization", data);
 
-        rouille::Response {
-            status_code: 200,
-            headers: vec![
-                ("Content-Type".into(), "application/octet-stream".into()),
-                ("Content-Length".into(), data.len().to_string().into()),
-            ],
-            data: rouille::ResponseBody::from_data(data),
-            upgrade: None,
-        }
+        binary(data)
     }
 
-    /// Return `content` as either a bincode or json encoded `Response`
-    /// depending on the Accept header in `request`.
-    fn prepare_response<T>(request: &Request, content: &T) -> rouille::Response
-    where
-        T: serde::Serialize,
-    {
-        accept!(request,
-        "application/octet-stream" => bincode_response(content),
-        "application/json" => rouille::Response::json(content),
-        )
+    // Negotiate the two control-plane representations, preferring binary on
+    // ties. An explicit media range takes precedence over a wildcard.
+    fn accept_quality(accept: &str, subtype: &str) -> u16 {
+        accept
+            .split(',')
+            .filter_map(|range| {
+                let media = range.trim().parse::<mime::Mime>().ok()?;
+                if media.suffix().is_some() {
+                    return None;
+                }
+                let specificity = if media.type_() == mime::STAR && media.subtype() == mime::STAR {
+                    0
+                } else if media.type_() == mime::APPLICATION && media.subtype() == mime::STAR {
+                    1
+                } else if media.type_() == mime::APPLICATION && media.subtype().as_str() == subtype
+                {
+                    2
+                } else {
+                    return None;
+                };
+                let quality = match media.get_param("q") {
+                    Some(q) => {
+                        let (whole, fraction) =
+                            q.as_str().split_once('.').unwrap_or((q.as_str(), ""));
+                        if fraction.len() > 3 || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+                        {
+                            return None;
+                        }
+                        let fraction = if fraction.is_empty() {
+                            0
+                        } else {
+                            fraction.parse::<u16>().ok()?
+                                * 10_u16.pow(3 - u32::try_from(fraction.len()).ok()?)
+                        };
+                        match whole {
+                            "0" => fraction,
+                            "1" if fraction == 0 => 1000,
+                            _ => return None,
+                        }
+                    }
+                    None => 1000,
+                };
+                Some((specificity, quality))
+            })
+            .max()
+            .map_or(0, |(_, quality)| quality)
+    }
+
+    /// Return binary or JSON based on the request's Accept media ranges.
+    fn prepare_response<T: serde::Serialize>(request: &Request, content: &T) -> Response {
+        let accept = request.header("Accept").unwrap_or("*/*");
+        if accept_quality(accept, "json") > accept_quality(accept, "octet-stream") {
+            Json(content).into_response()
+        } else {
+            bincode_response(content)
+        }
     }
 
     // Verification of job auth in a request
@@ -1032,6 +1073,368 @@ mod server {
         assert!(ja2.verify_token(job_id, &token).is_err());
         assert!(ja2.verify_token(job_id2, &token2).is_err());
         Ok(())
+    }
+
+    struct SchedulerHttp<S> {
+        handler: Arc<S>,
+        requester: Arc<SchedulerRequester>,
+        registry: Arc<SchedulerEnrollment>,
+        native_endpoint: Option<(SocketAddr, SocketAddr)>,
+        request_count: atomic::AtomicUsize,
+    }
+
+    struct WorkerHttp<S> {
+        handler: Arc<S>,
+        requester: Arc<ServerRequester>,
+        job_authorizer: Box<JWTJobAuthorizer>,
+        running_jobs: Arc<Mutex<HashSet<JobId>>>,
+        upload_activity: UploadActivity,
+        request_count: atomic::AtomicUsize,
+    }
+
+    fn logged(
+        count: &atomic::AtomicUsize,
+        request: &Request,
+        operation: impl FnOnce(usize) -> Response,
+    ) -> Response {
+        let req_id = count.fetch_add(1, atomic::Ordering::Relaxed);
+        trace!(target: "sccache_http", "Req {req_id}: {:?}", SafeRequest(request));
+        let response = operation(req_id);
+        trace!(target: "sccache_http", "Res {req_id}: {}", response.status());
+        response
+    }
+
+    fn scheduler_routes<S: dist::SchedulerIncoming + 'static>(state: SchedulerHttp<S>) -> Router {
+        let router = Router::new()
+            .route("/api/v1/scheduler/alloc_job", route(MethodFilter::POST, |state: &SchedulerHttp<S>, request| {
+                let handler = &state.handler;
+                let requester = &state.requester;
+                logged(&state.request_count, request, |req_id| {
+                    if let Err(response) = authenticate_client(request) {
+                        return response;
+                    }
+                    let toolchain = try_bincode_input!(req_id, request);
+                    trace!("Req {req_id}: alloc_job: {toolchain:?}");
+
+                    let alloc_job_res: AllocJobResult = try_or_500_log!(req_id, handler.handle_alloc_job(requester.as_ref(), toolchain));
+                    let res = match alloc_job_res {
+                        AllocJobResult::Success { job_alloc, need_toolchain } => {
+                            let routes = try_or_500_log!(req_id, requester.addresses(job_alloc.server_id));
+                            AllocJobHttpResponse::Success { job_alloc, need_toolchain, routes }
+                        }
+                        AllocJobResult::Fail { msg } => AllocJobHttpResponse::Fail { msg }
+                    };
+                    prepare_response(request, &res)
+                })
+            }))
+            .route("/api/v1/scheduler/native_routes", route(MethodFilter::GET, |state: &SchedulerHttp<S>, request| {
+                let native_endpoint = &state.native_endpoint;
+                logged(&state.request_count, request, |_req_id| {
+                    if let Some((primary, bind)) = *native_endpoint {
+                        let routes = crate::dist::cluster_routes::discover(primary, bind);
+                        prepare_response(request, &WorkerRouteHttpResponse { routes })
+                    } else {
+                        StatusCode::NOT_FOUND.into_response()
+                    }
+                })
+            }))
+            .route("/api/v1/scheduler/worker_route/{server_id}", path_route(MethodFilter::GET, |state: &SchedulerHttp<S>, request, server_id: ServerId| {
+                let requester = &state.requester;
+                logged(&state.request_count, request, |req_id| {
+                    if let Err(response) = authenticate_client(request) { return response; }
+                    let routes = try_or_500_log!(req_id, requester.addresses(server_id));
+                    prepare_response(request, &WorkerRouteHttpResponse { routes })
+                })
+            }))
+            .route("/api/v1/scheduler/worker_name/{server_id}", path_route(MethodFilter::GET, |state: &SchedulerHttp<S>, request, server_id: ServerId| {
+                let handler = &state.handler;
+                logged(&state.request_count, request, |req_id| {
+                    if let Err(response) = authenticate_client(request) {
+                        return response;
+                    }
+                    let worker_name = try_or_500_log!(
+                        req_id,
+                        handler.handle_get_worker_name(server_id)
+                    );
+                    prepare_response(request, &WorkerNameHttpResponse { worker_name })
+                })
+            }))
+            .route("/api/v4/scheduler/heartbeat_server", route(MethodFilter::POST, |state: &SchedulerHttp<S>, request| {
+                let handler = &state.handler;
+                let requester = &state.requester;
+                let registry = &state.registry;
+                logged(&state.request_count, request, |req_id| {
+                    let server_id = match authenticate_server(request) { Ok(id) => id, Err(response) => return response };
+                    let worker_name = request
+                        .header("X-Sccache-Worker-Name")
+                        .map(ToOwned::to_owned);
+                    let native_platform = try_or_400_log!(req_id, request.header("X-Sccache-Native-Platform").map(|value| -> Result<ContentId> {
+                        let bytes = BASE64_URL_SAFE_ENGINE.decode(value)?;
+                        Ok(ContentId(bytes.try_into().map_err(|_| anyhow!("invalid native platform digest"))?))
+                    }).transpose());
+                    let archive = match request.header("X-Sccache-Archive-Worker") {
+                        None | Some("true") => true,
+                        Some("false") => false,
+                        _ => return StatusCode::BAD_REQUEST.into_response(),
+                    };
+                    let heartbeat_server = try_bincode_input!(req_id, request);
+
+                    trace!(target: "sccache_heartbeat", "Req {req_id}: heartbeat_server: {heartbeat_server:?}");
+
+                    let HeartbeatServerHttpRequest {
+                        cpu_capacity, active_job_ids, native_placement, jwt_key,
+                        server_nonce, routes,
+                    } = heartbeat_server;
+                    let job_authorizer = try_or_400_log!(req_id, JWTJobAuthorizer::boxed(&jwt_key));
+                    try_or_400_log!(req_id, requester.register(server_id, &routes));
+                    let worker_name_nonce = server_nonce.clone();
+                    let res: HeartbeatServerResult = try_or_500_log!(req_id, handler.handle_heartbeat_server(
+                        server_id, server_nonce,
+                        cpu_capacity, &active_job_ids,
+                        job_authorizer, dist::WorkerCapabilities {
+                            archive, native_platform, native_placement,
+                        }
+                    ));
+                    if let Some(worker_name) = worker_name
+                        && let Err(error) = handler.handle_update_worker_name(
+                            server_id,
+                            worker_name_nonce,
+                            worker_name,
+                        )
+                    {
+                        // Display metadata must never take a healthy worker offline.
+                        warn!("Could not register display name for {server_id:?}: {error:#}");
+                    }
+                    let revoked = try_or_500_log!(req_id, registry.authority().registry().revoked());
+                    prepare_response(request, &HeartbeatReply { result: res, revoked })
+                })
+            }))
+            .route("/api/v1/scheduler/job_state/{job_id}", path_route(MethodFilter::POST, |state: &SchedulerHttp<S>, request, job_id: JobId| {
+                let handler = &state.handler;
+                logged(&state.request_count, request, |req_id| {
+                    let server_id = match authenticate_server(request) { Ok(id) => id, Err(response) => return response };
+                    let job_state = try_bincode_input!(req_id, request);
+                    trace!("Req {req_id}: job state: {job_state:?}");
+
+                    let res: UpdateJobStateResult = try_or_500_log!(req_id, handler.handle_update_job_state(
+                        job_id, server_id, job_state
+                    ));
+                    prepare_response(request, &res)
+                })
+            }))
+            .route("/api/v1/scheduler/status", route(MethodFilter::GET, |state: &SchedulerHttp<S>, request| {
+                let handler = &state.handler;
+                logged(&state.request_count, request, |req_id| {
+                    let res: SchedulerStatusResult = try_or_500_log!(req_id, handler.handle_status());
+                    prepare_response(request, &res)
+                })
+            }))
+            .route("/api/v1/scheduler/drain_status", route(MethodFilter::GET, |state: &SchedulerHttp<S>, request| {
+                let handler = &state.handler;
+                logged(&state.request_count, request, |_req_id| {
+                    let draining = u8::from(handler.handle_is_draining());
+                    format!("{draining}\n").into_response()
+                })
+            }));
+        routes(router, state)
+    }
+
+    fn worker_routes<S: dist::ServerIncoming + 'static>(state: WorkerHttp<S>) -> Router {
+        let router = Router::new()
+            .route(
+                "/api/v1/distserver/assign_job/{job_id}",
+                path_route(
+                    MethodFilter::POST,
+                    |state: &WorkerHttp<S>, request, job_id: JobId| {
+                        let handler = &state.handler;
+                        let job_authorizer = &state.job_authorizer;
+                        logged(&state.request_count, request, |req_id| {
+                            if request.role() != Role::Scheduler {
+                                return make_401("scheduler_role_required");
+                            }
+                            job_auth_or_401!(request, job_authorizer, job_id);
+                            let toolchain = try_bincode_input!(req_id, request);
+                            trace!("Req {req_id}: assign_job({job_id}): {toolchain:?}");
+
+                            let res: AssignJobResult = try_or_500_log!(
+                                req_id,
+                                handler.handle_assign_job(job_id, toolchain)
+                            );
+                            prepare_response(request, &res)
+                        })
+                    },
+                ),
+            )
+            .route(
+                "/api/v5/distserver/assign_native_job/{job_id}",
+                path_route(
+                    MethodFilter::POST,
+                    |state: &WorkerHttp<S>, request, job_id: JobId| {
+                        let handler = &state.handler;
+                        let requester = &state.requester;
+                        let job_authorizer = &state.job_authorizer;
+                        logged(&state.request_count, request, |req_id| {
+                            if request.role() != Role::Scheduler {
+                                return make_401("scheduler_role_required");
+                            }
+                            job_auth_or_401!(request, job_authorizer, job_id);
+                            let limit = try_or_400_log!(
+                                req_id,
+                                handler
+                                    .native_metadata_limit()
+                                    .context("native worker disabled")
+                            );
+                            let assignment: NativeAssignment =
+                                try_or_400_log!(req_id, native::metadata(request, limit));
+                            let res = try_or_500_log!(
+                                req_id,
+                                handler.handle_assign_native_job(
+                                    Arc::clone(requester),
+                                    job_id,
+                                    assignment
+                                )
+                            );
+                            prepare_response(request, &res)
+                        })
+                    },
+                ),
+            )
+            .route(
+                "/api/v3/distserver/native_blob",
+                route(MethodFilter::POST, |state: &WorkerHttp<S>, request| {
+                    let handler = &state.handler;
+                    let job_authorizer = &state.job_authorizer;
+                    logged(&state.request_count, request, |req_id| {
+                        try_or_500_log!(
+                            req_id,
+                            native::serve_peer_blob(request, job_authorizer.as_ref(), |blob| {
+                                handler.handle_native_blob(blob)
+                            })
+                        )
+                    })
+                }),
+            )
+            .route(
+                "/api/v5/distserver/run_native_job/{job_id}",
+                path_route(
+                    MethodFilter::POST,
+                    |state: &WorkerHttp<S>, request, job_id: JobId| {
+                        let handler = &state.handler;
+                        let job_authorizer = &state.job_authorizer;
+                        logged(&state.request_count, request, |req_id| {
+                            if request.role() != Role::Client {
+                                return make_401("client_role_required");
+                            }
+                            job_auth_or_401!(request, job_authorizer, job_id);
+                            let operation: crate::build_runtime::wire::NativeRunRequest =
+                                try_or_400_log!(req_id, native::metadata(request, 16));
+                            let res = try_or_500_log!(
+                                req_id,
+                                handler.handle_run_native_job(job_id, operation)
+                            );
+                            let data = try_or_500_log!(
+                                req_id,
+                                crate::dist::native::codec().serialize(&res)
+                            );
+                            binary(data)
+                        })
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/distserver/submit_toolchain/{job_id}",
+                path_route(
+                    MethodFilter::POST,
+                    |state: &WorkerHttp<S>, request, job_id: JobId| {
+                        let handler = &state.handler;
+                        let requester = &state.requester;
+                        let job_authorizer = &state.job_authorizer;
+                        let upload_activity = &state.upload_activity;
+                        logged(&state.request_count, request, |req_id| {
+                            if request.role() != Role::Client {
+                                return make_401("client_role_required");
+                            }
+                            job_auth_or_401!(request, job_authorizer, job_id);
+                            trace!("Req {req_id}: submit_toolchain({job_id})");
+
+                            let body = try_or_400_log!(
+                                req_id,
+                                request
+                                    .data()
+                                    .context("missing submit_toolchain request body")
+                            );
+                            let progress = try_or_500_log!(
+                                req_id,
+                                ProgressReader::new(body, upload_activity, job_id)
+                            );
+                            let toolchain_rdr = ToolchainReader(Box::new(progress));
+                            let res: SubmitToolchainResult = try_or_500_log!(
+                                req_id,
+                                handler.handle_submit_toolchain(
+                                    requester.as_ref(),
+                                    job_id,
+                                    toolchain_rdr
+                                )
+                            );
+                            prepare_response(request, &res)
+                        })
+                    },
+                ),
+            )
+            .route(
+                "/api/v2/distserver/run_job/{job_id}",
+                path_route(
+                    MethodFilter::POST,
+                    |state: &WorkerHttp<S>, request, job_id: JobId| {
+                        let handler = &state.handler;
+                        let requester = &state.requester;
+                        let job_authorizer = &state.job_authorizer;
+                        let running_jobs = &state.running_jobs;
+                        logged(&state.request_count, request, |req_id| {
+                            if request.role() != Role::Client {
+                                return make_401("client_role_required");
+                            }
+                            job_auth_or_401!(request, job_authorizer, job_id);
+
+                            let mut body = try_or_400_log!(
+                                req_id,
+                                request.data().context("missing run_job request body")
+                            );
+                            let bincode_length = u64::from(try_or_500_log!(
+                                req_id,
+                                body.read_u32::<BigEndian>()
+                                    .context("failed to read run job input length")
+                            ));
+
+                            let mut bincode_reader = body.take(bincode_length);
+                            let runjob = try_or_500_log!(
+                                req_id,
+                                bincode::deserialize_from(&mut bincode_reader)
+                                    .context("failed to deserialize run job request")
+                            );
+                            trace!("Req {req_id}: run_job({job_id}): {runjob:?}");
+                            let RunJobHttpRequest { command, outputs } = runjob;
+                            let body = bincode_reader.into_inner();
+                            let inputs_rdr = InputsReader::new(Box::new(body));
+
+                            let _running_job =
+                                try_or_500_log!(req_id, RunningJobGuard::new(running_jobs, job_id));
+                            let res: RunJobResult = try_or_500_log!(
+                                req_id,
+                                handler.handle_run_job(
+                                    requester.as_ref(),
+                                    job_id,
+                                    command,
+                                    outputs,
+                                    inputs_rdr
+                                )
+                            );
+                            prepare_response(request, &res)
+                        })
+                    },
+                ),
+            );
+        routes(router, state)
     }
 
     pub struct Scheduler<S> {
@@ -1326,140 +1729,19 @@ mod server {
                 "scheduler-dashboard feature is disabled"
             );
 
-            macro_rules! check_server_auth_or_err {
-                ($request:ident) => {{
-                    match authenticate_server($request) {
-                        Ok(server_id) => server_id,
-                        Err(response) => return response,
-                    }
-                }};
-            }
-
-            let request_count = atomic::AtomicUsize::new(0);
-
             let registry = Arc::clone(&enrollment);
             let server = Listener::bind(
                 public_addr,
                 tls,
                 ListenerRole::Scheduler(enrollment),
                 num_cpus() * 8,
-                move |request| {
-                    let req_id = request_count.fetch_add(1, atomic::Ordering::Relaxed);
-                    trace!(target: "sccache_http", "Req {req_id}: {:?}", SafeRequest(request));
-                    let response = (|| {
-                        router!(request,
-                            (POST) (/api/v1/scheduler/alloc_job) => {
-                                if let Err(response) = authenticate_client(request) {
-                                    return response;
-                                }
-                                let toolchain = try_bincode_input!(req_id, request);
-                                trace!("Req {req_id}: alloc_job: {toolchain:?}");
-
-                                let alloc_job_res: AllocJobResult = try_or_500_log!(req_id, handler.handle_alloc_job(&*requester, toolchain));
-                                let res = match alloc_job_res {
-                                    AllocJobResult::Success { job_alloc, need_toolchain } => {
-                                        let routes = try_or_500_log!(req_id, requester.addresses(job_alloc.server_id));
-                                        AllocJobHttpResponse::Success { job_alloc, need_toolchain, routes }
-                                    }
-                                    AllocJobResult::Fail { msg } => AllocJobHttpResponse::Fail { msg }
-                                };
-                                prepare_response(request, &res)
-                            },
-                            (GET) (/api/v1/scheduler/native_routes) => {
-                                if let Some((primary, bind)) = native_endpoint {
-                                    let routes = crate::dist::cluster_routes::discover(primary, bind);
-                                    prepare_response(request, &WorkerRouteHttpResponse { routes })
-                                } else {
-                                    rouille::Response::empty_404()
-                                }
-                            },
-                            (GET) (/api/v1/scheduler/worker_route/{server_id: ServerId}) => {
-                                if let Err(response) = authenticate_client(request) { return response; }
-                                let routes = try_or_500_log!(req_id, requester.addresses(server_id));
-                                prepare_response(request, &WorkerRouteHttpResponse { routes })
-                            },
-                            (GET) (/api/v1/scheduler/worker_name/{server_id: ServerId}) => {
-                                if let Err(response) = authenticate_client(request) {
-                                    return response;
-                                }
-                                let worker_name = try_or_500_log!(
-                                    req_id,
-                                    handler.handle_get_worker_name(server_id)
-                                );
-                                prepare_response(request, &WorkerNameHttpResponse { worker_name })
-                            },
-                            (POST) (/api/v4/scheduler/heartbeat_server) => {
-                                let server_id = check_server_auth_or_err!(request);
-                                let worker_name = request
-                                    .header("X-Sccache-Worker-Name")
-                                    .map(ToOwned::to_owned);
-                                let native_platform = try_or_400_log!(req_id, request.header("X-Sccache-Native-Platform").map(|value| -> Result<ContentId> {
-                                    let bytes = BASE64_URL_SAFE_ENGINE.decode(value)?;
-                                    Ok(ContentId(bytes.try_into().map_err(|_| anyhow!("invalid native platform digest"))?))
-                                }).transpose());
-                                let archive = match request.header("X-Sccache-Archive-Worker") {
-                                    None | Some("true") => true,
-                                    Some("false") => false,
-                                    _ => return rouille::Response::empty_400(),
-                                };
-                                let heartbeat_server = try_bincode_input!(req_id, request);
-
-                                trace!(target: "sccache_heartbeat", "Req {req_id}: heartbeat_server: {heartbeat_server:?}");
-
-                                let HeartbeatServerHttpRequest {
-                                    cpu_capacity, active_job_ids, native_placement, jwt_key,
-                                    server_nonce, routes,
-                                } = heartbeat_server;
-                                let job_authorizer = try_or_400_log!(req_id, JWTJobAuthorizer::boxed(&jwt_key));
-                                try_or_400_log!(req_id, requester.register(server_id, &routes));
-                                let worker_name_nonce = server_nonce.clone();
-                                let res: HeartbeatServerResult = try_or_500_log!(req_id, handler.handle_heartbeat_server(
-                                    server_id, server_nonce,
-                                    cpu_capacity, &active_job_ids,
-                                    job_authorizer, dist::WorkerCapabilities {
-                                        archive, native_platform, native_placement,
-                                    }
-                                ));
-                                if let Some(worker_name) = worker_name
-                                    && let Err(error) = handler.handle_update_worker_name(
-                                        server_id,
-                                        worker_name_nonce,
-                                        worker_name,
-                                    )
-                                {
-                                    // Display metadata must never take a healthy worker offline.
-                                    warn!("Could not register display name for {server_id:?}: {error:#}");
-                                }
-                                let revoked = try_or_500_log!(req_id, registry.authority().registry().revoked());
-                                prepare_response(request, &HeartbeatReply { result: res, revoked })
-                            },
-                            (POST) (/api/v1/scheduler/job_state/{job_id: JobId}) => {
-                                let server_id = check_server_auth_or_err!(request);
-                                let job_state = try_bincode_input!(req_id, request);
-                                trace!("Req {req_id}: job state: {job_state:?}");
-
-                                let res: UpdateJobStateResult = try_or_500_log!(req_id, handler.handle_update_job_state(
-                                    job_id, server_id, job_state
-                                ));
-                                prepare_response(request, &res)
-                            },
-                            (GET) (/api/v1/scheduler/status) => {
-                                let res: SchedulerStatusResult = try_or_500_log!(req_id, handler.handle_status());
-                                prepare_response(request, &res)
-                            },
-                            (GET) (/api/v1/scheduler/drain_status) => {
-                                let draining = u8::from(handler.handle_is_draining());
-                                rouille::Response::text(format!("{draining}\n"))
-                            },
-                            _ => {
-                                warn!("Unknown request {:?}", SafeRequest(request));
-                                rouille::Response::empty_404()
-                            },
-                        )
-                    })();
-                    trace!(target: "sccache_http", "Res {req_id}: {response:?}");
-                    response
-                },
+                scheduler_routes(SchedulerHttp {
+                    handler,
+                    requester,
+                    registry,
+                    native_endpoint,
+                    request_count: atomic::AtomicUsize::new(0),
+                }),
             )?;
             info!(
                 "Scheduler listening for clients on {}",
@@ -1771,8 +2053,6 @@ mod server {
             });
 
             info!("Server listening for clients on {bind_address}");
-            let request_count = atomic::AtomicUsize::new(0);
-
             let server = Listener::from_socket(
                 socket,
                 tls,
@@ -1781,87 +2061,14 @@ mod server {
                     revocations,
                 },
                 num_cpus() * 8,
-                move |request| {
-                    let req_id = request_count.fetch_add(1, atomic::Ordering::Relaxed);
-                    trace!("Req {req_id}: {:?}", SafeRequest(request));
-                    let response = (|| {
-                        router!(request,
-                            (POST) (/api/v1/distserver/assign_job/{job_id: JobId}) => {
-                                if request.role() != Role::Scheduler { return make_401("scheduler_role_required"); }
-                                job_auth_or_401!(request, &job_authorizer, job_id);
-                                let toolchain = try_bincode_input!(req_id, request);
-                                trace!("Req {req_id}: assign_job({job_id}): {toolchain:?}");
-
-                                let res: AssignJobResult = try_or_500_log!(req_id, handler.handle_assign_job(job_id, toolchain));
-                                prepare_response(request, &res)
-                            },
-                            (POST) (/api/v5/distserver/assign_native_job/{job_id: JobId}) => {
-                                if request.role() != Role::Scheduler { return make_401("scheduler_role_required"); }
-                                job_auth_or_401!(request, &job_authorizer, job_id);
-                                let limit = try_or_400_log!(req_id, handler.native_metadata_limit().context("native worker disabled"));
-                                let assignment: NativeAssignment = try_or_400_log!(req_id, native::metadata(request, limit));
-                                let res = try_or_500_log!(req_id, handler.handle_assign_native_job(requester.clone(), job_id, assignment));
-                                prepare_response(request, &res)
-                            },
-                            (POST) (/api/v3/distserver/native_blob) => {
-                                try_or_500_log!(req_id, native::serve_peer_blob(request, &*job_authorizer, |blob| handler.handle_native_blob(blob)))
-                            },
-                            (POST) (/api/v5/distserver/run_native_job/{job_id: JobId}) => {
-                                if request.role() != Role::Client { return make_401("client_role_required"); }
-                                job_auth_or_401!(request, &job_authorizer, job_id);
-                                let operation: crate::build_runtime::wire::NativeRunRequest = try_or_400_log!(req_id, native::metadata(request, 16));
-                                let res = try_or_500_log!(req_id, handler.handle_run_native_job(job_id, operation));
-                                let data = try_or_500_log!(req_id, crate::dist::native::codec().serialize(&res));
-                                rouille::Response::from_data("application/octet-stream", data)
-                            },
-                            (POST) (/api/v1/distserver/submit_toolchain/{job_id: JobId}) => {
-                                if request.role() != Role::Client { return make_401("client_role_required"); }
-                                job_auth_or_401!(request, &job_authorizer, job_id);
-                                trace!("Req {req_id}: submit_toolchain({job_id})");
-
-                                let body = try_or_400_log!(
-                                    req_id,
-                                    request
-                                        .data()
-                                        .context("missing submit_toolchain request body")
-                                );
-                                let progress = try_or_500_log!(req_id, ProgressReader::new(body, &upload_activity, job_id));
-                                let toolchain_rdr = ToolchainReader(Box::new(progress));
-                                let res: SubmitToolchainResult = try_or_500_log!(req_id, handler.handle_submit_toolchain(requester.as_ref(), job_id, toolchain_rdr));
-                                prepare_response(request, &res)
-                            },
-                            (POST) (/api/v2/distserver/run_job/{job_id: JobId}) => {
-                                if request.role() != Role::Client { return make_401("client_role_required"); }
-                                job_auth_or_401!(request, &job_authorizer, job_id);
-
-                                let mut body = try_or_400_log!(
-                                    req_id,
-                                    request.data().context("missing run_job request body")
-                                );
-                                let bincode_length = u64::from(try_or_500_log!(req_id, body.read_u32::<BigEndian>()
-                                    .context("failed to read run job input length")));
-
-                                let mut bincode_reader = body.take(bincode_length);
-                                let runjob = try_or_500_log!(req_id, bincode::deserialize_from(&mut bincode_reader)
-                                    .context("failed to deserialize run job request"));
-                                trace!("Req {req_id}: run_job({job_id}): {runjob:?}");
-                                let RunJobHttpRequest { command, outputs } = runjob;
-                                let body = bincode_reader.into_inner();
-                                let inputs_rdr = InputsReader::new(Box::new(body));
-
-                                let _running_job = try_or_500_log!(req_id, RunningJobGuard::new(&running_jobs, job_id));
-                                let res: RunJobResult = try_or_500_log!(req_id, handler.handle_run_job(requester.as_ref(), job_id, command, outputs, inputs_rdr));
-                                prepare_response(request, &res)
-                            },
-                            _ => {
-                                warn!("Unknown request {:?}", SafeRequest(request));
-                                rouille::Response::empty_404()
-                            },
-                        )
-                    })();
-                    trace!("Res {req_id}: {response:?}");
-                    response
-                },
+                worker_routes(WorkerHttp {
+                    handler,
+                    requester,
+                    job_authorizer,
+                    running_jobs,
+                    upload_activity,
+                    request_count: atomic::AtomicUsize::new(0),
+                }),
             )?;
             server.run()?;
             Err(anyhow!("worker HTTPS listener terminated"))
@@ -1928,6 +2135,22 @@ mod server {
         }
 
         #[test]
+        fn accept_negotiation_respects_specificity_and_quality() {
+            assert_eq!(accept_quality("*/*", "json"), 1000);
+            assert_eq!(
+                accept_quality("application/*;q=0.5,application/json;q=0", "json"),
+                0
+            );
+            assert_eq!(
+                accept_quality("application/*;q=0.5,application/json;q=0", "octet-stream"),
+                500
+            );
+            assert_eq!(accept_quality("application/json;q=0.123", "json"), 123);
+            assert_eq!(accept_quality("application/json+other", "json"), 0);
+            assert_eq!(accept_quality("application/json;q=1.001", "json"), 0);
+        }
+
+        #[test]
         fn inbound_control_bincode_is_bounded() {
             let headers = vec![(
                 "Content-Type".to_owned(),
@@ -1951,7 +2174,7 @@ mod server {
             );
             assert!(matches!(
                 bincode_input::<u64>(&oversized),
-                Err(RouilleBincodeError::BodyTooLarge)
+                Err(BincodeInputError::BodyTooLarge)
             ));
         }
 

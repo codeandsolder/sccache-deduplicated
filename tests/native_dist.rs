@@ -521,7 +521,7 @@ struct OriginalUpstream {
     origin: reqwest::Url,
     requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    stop: std::sync::mpsc::Sender<()>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -540,34 +540,67 @@ impl OriginalUpstream {
         let peak = Arc::new(AtomicUsize::new(0));
         let maximum = Arc::clone(&peak);
         let active = AtomicUsize::new(0);
-        let server = rouille::Server::new("127.0.0.1:0", move |request| {
-            if request.method() != "GET" || request.header("Authorization").is_some() {
-                return rouille::Response::empty_404();
+        use axum::{Router, body::Body, response::IntoResponse};
+        use http::{Method, StatusCode, header};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let origin = reqwest::Url::parse(&format!("http://{}/", listener.local_addr()?))?;
+        let (stop, shutdown) = tokio::sync::oneshot::channel();
+        let archives = Arc::new(archives);
+        let active = Arc::new(active);
+        let admission = Arc::new(tokio::sync::Semaphore::new(2));
+        let router = Router::new().fallback(move |request: axum::extract::Request| {
+            let archives = Arc::clone(&archives);
+            let count = Arc::clone(&count);
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            let admission = Arc::clone(&admission);
+            async move {
+                if request.method() != Method::GET
+                    || request.headers().contains_key(header::AUTHORIZATION)
+                {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                let Some(bytes) = archives.get(request.uri().path()).cloned() else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
+                let Ok(_permit) = admission.acquire().await else {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                };
+                count.fetch_add(1, Ordering::Relaxed);
+                let concurrent = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(concurrent, Ordering::SeqCst);
+                // Allow independent acquisitions to overlap.
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                // An unknown-size stream intentionally omits Content-Length.
+                let body = Body::from_stream(futures::stream::once(async move {
+                    Ok::<_, std::convert::Infallible>(bytes::Bytes::from_owner(bytes))
+                }));
+                ([(header::CONTENT_TYPE, "application/octet-stream")], body).into_response()
             }
-            let Some(bytes) = archives.get(&request.url()) else {
-                return rouille::Response::empty_404();
-            };
-            count.fetch_add(1, Ordering::Relaxed);
-            let concurrent = active.fetch_add(1, Ordering::SeqCst) + 1;
-            maximum.fetch_max(concurrent, Ordering::SeqCst);
-            // Allow independent acquisitions to overlap.
-            thread::sleep(Duration::from_millis(800));
-            active.fetch_sub(1, Ordering::SeqCst);
-            let mut response = rouille::Response::from_data("application/octet-stream", Vec::new());
-            // Intentionally omit Content-Length.
-            response.data =
-                rouille::ResponseBody::from_reader(std::io::Cursor::new(Arc::clone(bytes)));
-            response
-        })
-        .map_err(|error| anyhow::anyhow!("{error}"))?
-        .pool_size(2);
-        let origin = reqwest::Url::parse(&format!("http://{}/", server.server_addr()))?;
-        let (worker, stop) = server.stoppable();
+        });
+        let worker = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("fixture runtime");
+            runtime.block_on(async {
+                let listener =
+                    tokio::net::TcpListener::from_std(listener).expect("fixture listener");
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(async {
+                        let _ = shutdown.await;
+                    })
+                    .await
+                    .expect("fixture HTTP server");
+            });
+        });
         Ok(Self {
             origin,
             requests,
             peak,
-            stop,
+            stop: Some(stop),
             thread: Some(worker),
         })
     }
@@ -579,7 +612,9 @@ impl OriginalUpstream {
 
 impl Drop for OriginalUpstream {
     fn drop(&mut self) {
-        let _ = self.stop.send(());
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }

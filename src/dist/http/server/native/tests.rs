@@ -179,9 +179,11 @@ fn with_native_service(
             let network = Arc::clone(&network);
             let observations = Arc::clone(&observations);
             let sources = Arc::clone(&sources);
-            move |request| {
+            native_router(move |request, role, operation| {
                 respond(
                     request,
+                    role,
+                    operation,
                     NativeServices {
                         sessions: &sessions,
                         packages: None,
@@ -225,7 +227,7 @@ fn with_native_service(
                     },
                     1024 * 1024,
                 )
-            }
+            })
         },
     )?;
     let url = reqwest::Url::parse(&format!("https://{}/", server.local_addr()?))?;
@@ -330,24 +332,37 @@ fn verify_peer_delivery(
         {
             let bytes = bytes.to_vec();
             let bad = Arc::clone(&bad);
-            move |request| {
-                serve_peer_blob(request, &*authorizer, |requested| {
-                    if requested != blob {
-                        return Ok(None);
-                    }
-                    let mut file = tempfile::tempfile()?;
-                    if bad.load(Ordering::Relaxed) {
-                        file.write_all(b"corrupt")?;
-                    } else {
-                        file.write_all(&bytes)?;
-                    }
-                    file.rewind()?;
-                    Ok(Some((file, BlobEncoding::Raw)))
-                })
-                .unwrap_or_else(|_| {
-                    Response::text("test peer response failed").with_status_code(500)
-                })
-            }
+            routes(
+                Router::new().route(
+                    "/api/v3/distserver/native_blob",
+                    super::super::cluster_http::route(
+                        MethodFilter::POST,
+                        move |_: &(), request| {
+                            serve_peer_blob(request, &*authorizer, |requested| {
+                                if requested != blob {
+                                    return Ok(None);
+                                }
+                                let mut file = tempfile::tempfile()?;
+                                if bad.load(Ordering::Relaxed) {
+                                    file.write_all(b"corrupt")?;
+                                } else {
+                                    file.write_all(&bytes)?;
+                                }
+                                file.rewind()?;
+                                Ok(Some((file, BlobEncoding::Raw)))
+                            })
+                            .unwrap_or_else(|_| {
+                                (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "test peer response failed",
+                                )
+                                    .into_response()
+                            })
+                        },
+                    ),
+                ),
+                (),
+            )
         },
     )?;
     let address = server.local_addr()?;
@@ -912,8 +927,8 @@ fn native_action_transfers_inputs_executes_and_retains_worker_result() -> Result
     })
 }
 
-#[test]
-fn physical_blob_response_preserves_content_and_reuses_encoded_files() -> Result<()> {
+#[tokio::test]
+async fn physical_blob_response_preserves_content_and_reuses_encoded_files() -> Result<()> {
     use std::io::{Seek as _, Write as _};
     let compressible = vec![b'Z'; 256 * 1024];
     let noise: Vec<u8> = (0..8192_u64)
@@ -928,13 +943,13 @@ fn physical_blob_response_preserves_content_and_reuses_encoded_files() -> Result
         raw.write_all(&original)?;
         raw.rewind()?;
         let response = physical_blob_response(raw, BlobEncoding::Raw)?;
-        assert!(
-            response
-                .headers
-                .iter()
-                .any(|(name, value)| name == "X-Sccache-CAS-Encoding" && value == "zstd-chunks")
-        );
-        let (stream, size) = response.data.into_reader_and_size();
+        assert_eq!(response.headers()["X-Sccache-CAS-Encoding"], "zstd-chunks");
+        let size = response.headers()[http::header::CONTENT_LENGTH]
+            .to_str()?
+            .parse::<u64>()?;
+        let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024).await?;
+        assert_eq!(u64::try_from(bytes.len())?, size);
+        let stream = std::io::Cursor::new(bytes);
         let mut encoded = tempfile::tempfile()?;
         let mut decoded = Vec::new();
         crate::build_runtime::transfer_native_blob(
@@ -946,10 +961,14 @@ fn physical_blob_response_preserves_content_and_reuses_encoded_files() -> Result
         )?;
         assert_eq!(decoded, original);
         encoded.rewind()?;
-        let (stream, reused_size) = physical_blob_response(encoded, BlobEncoding::ZstdChunks)?
-            .data
-            .into_reader_and_size();
+        let response = physical_blob_response(encoded, BlobEncoding::ZstdChunks)?;
+        let reused_size = response.headers()[http::header::CONTENT_LENGTH]
+            .to_str()?
+            .parse::<u64>()?;
         assert_eq!(size, reused_size);
+        let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024).await?;
+        assert_eq!(u64::try_from(bytes.len())?, reused_size);
+        let stream = std::io::Cursor::new(bytes);
         let mut decoded = Vec::new();
         crate::build_runtime::transfer_native_blob(
             stream,

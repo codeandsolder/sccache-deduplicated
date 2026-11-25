@@ -121,10 +121,15 @@ fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Res
     let delegation_rx = Mutex::new(delegation_rx);
     // Model a scheduler which holds its admission lock until the worker
     // returns the assignment response. Verification is deliberately blocked.
-    use http_body_util::{BodyExt, Full};
+    use axum::{
+        Router,
+        extract::Extension,
+        http::{HeaderMap, StatusCode},
+        routing::post,
+    };
     use sccache_cluster_identity::{
-        ClusterCa, ClusterListener, EnrollmentAuthority, Identity, PeerConfig, Registry, Role,
-        SchedulerEnrollment, TlsCredentials,
+        AuthenticatedPeer, ClusterCa, ClusterListener, EnrollmentAuthority, Identity, PeerConfig,
+        Registry, Role, SchedulerEnrollment, TlsCredentials,
     };
     let cluster = directory.path().join("cluster");
     std::fs::create_dir_all(&cluster)?;
@@ -153,6 +158,52 @@ fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Res
     let url = reqwest::Url::parse(&format!("https://{}/", socket.local_addr()?))?;
     let (stop, mut stopped) = tokio::sync::oneshot::channel();
     let delegation_rx = Arc::new(delegation_rx);
+    let worker_status = |Extension(peer): Extension<AuthenticatedPeer>| async move {
+        if peer.role() == Role::Worker {
+            StatusCode::OK
+        } else {
+            StatusCode::UNAUTHORIZED
+        }
+    };
+    let router = Router::new()
+        .route(
+            "/api/v5/native/worker/verify",
+            post(
+                move |Extension(peer): Extension<AuthenticatedPeer>, headers: HeaderMap| {
+                    let verification_tx = verification_tx.clone();
+                    let delegation_rx = Arc::clone(&delegation_rx);
+                    async move {
+                        if peer.role() != Role::Worker {
+                            return StatusCode::UNAUTHORIZED;
+                        }
+                        let Some(id) = headers
+                            .get("x-sccache-native-job")
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(|job| job.parse::<u64>().ok())
+                        else {
+                            return StatusCode::BAD_REQUEST;
+                        };
+                        if verification_tx.send(JobId(id)).is_err() {
+                            return StatusCode::BAD_REQUEST;
+                        }
+                        let status = tokio::task::spawn_blocking(move || {
+                            delegation_rx
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(5))
+                                .unwrap_or(503)
+                        })
+                        .await
+                        .unwrap_or(503);
+                        StatusCode::from_u16(status).unwrap()
+                    }
+                },
+            ),
+        )
+        .route("/api/v5/native/worker/renew", post(worker_status))
+        .route("/api/v5/native/worker/fail", post(worker_status))
+        .fallback(|| async { StatusCode::CONFLICT });
+    let router = tls.scheduler_router(enrollment, router)?;
     let handle = thread::spawn(move || -> Result<()> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -166,58 +217,9 @@ fn native_dispatcher_assignment_starts_before_poll_but_after_delegation() -> Res
                     _ = &mut stopped => return Ok(()),
                 };
                 let tls = Arc::clone(&tls);
-                let enrollment = Arc::clone(&enrollment);
-                let verification_tx = verification_tx.clone();
-                let delegation_rx = Arc::clone(&delegation_rx);
+                let router = router.clone();
                 tokio::spawn(async move {
-                    let _ = tls
-                        .serve_scheduler(connection, enrollment, move |peer, request| {
-                            let verification_tx = verification_tx.clone();
-                            let delegation_rx = Arc::clone(&delegation_rx);
-                            async move {
-                                let status = if peer.role() != Role::Worker {
-                                    401
-                                } else {
-                                    match request.uri().path() {
-                                        "/api/v5/native/worker/verify" => {
-                                            let id = request
-                                                .headers()
-                                                .get("X-Sccache-Native-Job")
-                                                .and_then(|value| value.to_str().ok())
-                                                .and_then(|job| job.parse::<u64>().ok());
-                                            match id {
-                                                Some(id)
-                                                    if verification_tx.send(JobId(id)).is_ok() =>
-                                                {
-                                                    tokio::task::spawn_blocking(move || {
-                                                        delegation_rx
-                                                            .lock()
-                                                            .unwrap()
-                                                            .recv_timeout(Duration::from_secs(5))
-                                                            .unwrap_or(503)
-                                                    })
-                                                    .await
-                                                    .unwrap_or(503)
-                                                }
-                                                _ => 400,
-                                            }
-                                        }
-                                        "/api/v5/native/worker/renew"
-                                        | "/api/v5/native/worker/fail" => 200,
-                                        _ => 409,
-                                    }
-                                };
-                                let mut response = hyper::Response::new(
-                                    Full::new(bytes::Bytes::new())
-                                        .map_err(|never| match never {})
-                                        .boxed_unsync(),
-                                );
-                                *response.status_mut() =
-                                    hyper::StatusCode::from_u16(status).unwrap();
-                                response
-                            }
-                        })
-                        .await;
+                    let _ = tls.serve(connection, router).await;
                 });
             }
         })

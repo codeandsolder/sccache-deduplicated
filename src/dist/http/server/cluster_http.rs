@@ -10,21 +10,29 @@ use std::{
     time::{Duration, Instant},
 };
 
+use axum::{
+    Router,
+    body::{Body, HttpBody as _},
+    extract::rejection::PathRejection,
+    extract::{Extension, Path, State},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{MethodFilter, MethodRouter, on},
+};
 use bytes::Bytes;
 use futures::{StreamExt, stream};
-use http_body_util::{BodyExt, Full, StreamBody};
-use hyper::{
-    Response, StatusCode,
-    body::{Frame, Incoming},
-};
+use http::StatusCode;
 use sccache_cluster_identity::{
-    AuthenticatedPeer, ClusterBody, ClusterListener, PeerId, Role, SchedulerEnrollment,
+    AuthenticatedPeer, ClusterListener, PeerId, Role, SchedulerEnrollment,
 };
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::io::{StreamReader, SyncIoBridge};
 
 use crate::{
-    dist::cluster_routes::{Transfer, interface::TrackedReader},
+    dist::cluster_routes::{
+        Transfer,
+        interface::{self, TrackedReader},
+    },
     errors::{Context, Result},
 };
 
@@ -39,7 +47,7 @@ pub(super) struct Request {
 }
 
 impl Request {
-    fn new(peer: AuthenticatedPeer, request: hyper::Request<Incoming>) -> Self {
+    fn new(peer: AuthenticatedPeer, request: axum::extract::Request) -> Self {
         let (parts, body) = request.into_parts();
         let stream = stream::unfold(Some(body.into_data_stream()), |state| async move {
             let mut data = state?;
@@ -82,12 +90,6 @@ impl Request {
     pub(super) fn method(&self) -> &str {
         self.parts.method.as_str()
     }
-    pub(super) fn raw_url(&self) -> &str {
-        self.parts
-            .uri
-            .path_and_query()
-            .map_or("/", http::uri::PathAndQuery::as_str)
-    }
     pub(super) fn url(&self) -> &str {
         self.parts.uri.path()
     }
@@ -117,7 +119,7 @@ impl Request {
         headers: Vec<(String, String)>,
         body: Vec<u8>,
     ) -> Self {
-        let mut builder = hyper::Request::builder().method(method).uri(url);
+        let mut builder = http::Request::builder().method(method).uri(url);
         for (name, value) in headers {
             builder = builder.header(name, value);
         }
@@ -133,84 +135,100 @@ impl Request {
     }
 }
 
-fn error_response(status: StatusCode, message: &'static str) -> Response<ClusterBody> {
-    let mut reply = Response::new(
-        Full::new(Bytes::from_static(message.as_bytes()))
-            .map_err(|never| match never {})
-            .boxed_unsync(),
-    );
-    *reply.status_mut() = status;
-    reply
-}
-
 const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
-type Handler = dyn Fn(&Request) -> rouille::Response + Send + Sync;
-
-async fn dispatch(
-    peer: AuthenticatedPeer,
-    request: hyper::Request<Incoming>,
-    handler: Arc<Handler>,
-    admission: Arc<Semaphore>,
-) -> Response<ClusterBody> {
-    let Ok(permit) = admission.try_acquire_owned() else {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "distributed HTTP pool busy",
-        );
-    };
-    let request = Request::new(peer, request);
-    let (send, receive) = oneshot::channel();
-    tokio::task::spawn_blocking(move || {
+// Blocking filesystem/compilation operations retain admission even if the HTTP
+// caller cancels. TLS and HTTP parsing stay on the asynchronous runtime.
+async fn blocking_reply(
+    permit: Arc<OwnedSemaphorePermit>,
+    operation: impl FnOnce() -> Response + Send + 'static,
+) -> Response {
+    match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let response = handler(&request);
-        let (reader, length) = response.data.into_reader_and_size();
-        let mut reader = TrackedReader::new(
-            reader,
-            Some(request.path().local),
-            Transfer::Upload(
-                length
-                    .and_then(|length| u64::try_from(length).ok())
-                    .unwrap_or(0),
-            ),
-            Some(request.path()),
-        );
-        let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(2);
-        let stream = stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|chunk| {
-                (
-                    chunk.map(Frame::data).map_err(|error| {
-                        Box::new(error) as Box<dyn std::error::Error + Send + Sync>
-                    }),
-                    rx,
-                )
-            })
-        });
-        let mut builder = Response::builder().status(response.status_code);
-        for (name, value) in response.headers {
-            // Hyper owns HTTP framing and connection management.
-            if !name.eq_ignore_ascii_case("content-length")
-                && !name.eq_ignore_ascii_case("transfer-encoding")
-                && !name.eq_ignore_ascii_case("connection")
-            {
-                builder = builder.header(name.as_ref(), value.as_ref());
+        operation()
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            warn!("distributed HTTP handler terminated: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "distributed HTTP handler terminated",
+            )
+                .into_response()
+        }
+    }
+}
+
+pub(super) fn route<S, F>(method: MethodFilter, handler: F) -> MethodRouter<Arc<S>>
+where
+    S: Send + Sync + 'static,
+    F: Fn(&S, &Request) -> Response + Clone + Send + Sync + 'static,
+{
+    let router = on(
+        method,
+        move |State(state): State<Arc<S>>,
+              Extension(peer): Extension<AuthenticatedPeer>,
+              Extension(permit): Extension<Arc<OwnedSemaphorePermit>>,
+              request: axum::extract::Request| {
+            let handler = handler.clone();
+            let request = Request::new(peer, request);
+            async move { blocking_reply(permit, move || handler(&state, &request)).await }
+        },
+    );
+    if method == MethodFilter::GET {
+        router.head(|| std::future::ready(StatusCode::NOT_FOUND))
+    } else {
+        router
+    }
+}
+
+pub(super) fn path_route<S, P, F>(method: MethodFilter, handler: F) -> MethodRouter<Arc<S>>
+where
+    S: Send + Sync + 'static,
+    P: serde::de::DeserializeOwned + Send + 'static,
+    F: Fn(&S, &Request, P) -> Response + Clone + Send + Sync + 'static,
+{
+    let router = on(
+        method,
+        move |State(state): State<Arc<S>>,
+              Extension(peer): Extension<AuthenticatedPeer>,
+              Extension(permit): Extension<Arc<OwnedSemaphorePermit>>,
+              path: Result<Path<P>, PathRejection>,
+              request: axum::extract::Request| {
+            let handler = handler.clone();
+            let request = Request::new(peer, request);
+            async move {
+                match path {
+                    Ok(Path(path)) => {
+                        blocking_reply(permit, move || handler(&state, &request, path)).await
+                    }
+                    Err(_) => StatusCode::NOT_FOUND.into_response(),
+                }
             }
-        }
-        if let Some(length) = length {
-            builder = builder.header(http::header::CONTENT_LENGTH, length);
-        }
-        let response = builder
-            .body(StreamBody::new(stream).boxed_unsync())
-            .unwrap_or_else(|_| {
-                error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "invalid response metadata",
-                )
-            });
-        if send.send(response).is_err() {
-            return;
-        }
-        loop {
+        },
+    );
+    if method == MethodFilter::GET {
+        router.head(|| std::future::ready(StatusCode::NOT_FOUND))
+    } else {
+        router
+    }
+}
+
+pub(super) fn routes<S: Send + Sync + 'static>(router: Router<Arc<S>>, state: S) -> Router {
+    router
+        .method_not_allowed_fallback(|| std::future::ready(StatusCode::NOT_FOUND))
+        .with_state(Arc::new(state))
+}
+
+/// Stream a blocking file/codec reader with a two-chunk bounded queue. Closing
+/// the response closes the receiver and stops the producer without buffering
+/// the entire artifact.
+pub(super) fn reader_body(mut reader: impl Read + Send + 'static) -> Body {
+    let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(2);
+    tokio::task::spawn_blocking(move || {
+        while !tx.is_closed() {
             let mut buffer = vec![0; 128 * 1024];
             match reader.read(&mut buffer) {
                 Ok(0) => break,
@@ -228,12 +246,85 @@ async fn dispatch(
             }
         }
     });
-    receive.await.unwrap_or_else(|_| {
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "distributed HTTP handler terminated",
+    Body::from_stream(stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|chunk| (chunk, rx))
+    }))
+}
+
+pub(super) fn binary(data: Vec<u8>) -> Response {
+    (
+        [(http::header::CONTENT_TYPE, "application/octet-stream")],
+        data,
+    )
+        .into_response()
+}
+
+pub(super) fn file_body(reader: impl Read + Send + 'static, length: u64) -> Response {
+    (
+        [
+            (
+                http::header::CONTENT_TYPE,
+                "application/octet-stream".to_owned(),
+            ),
+            (http::header::CONTENT_LENGTH, length.to_string()),
+        ],
+        reader_body(reader),
+    )
+        .into_response()
+}
+
+async fn admit(
+    State(admission): State<Arc<Semaphore>>,
+    Extension(peer): Extension<AuthenticatedPeer>,
+    mut request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let Ok(permit) = admission.try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "distributed HTTP pool busy",
         )
-    })
+            .into_response();
+    };
+    let permit = Arc::new(permit);
+    request.extensions_mut().insert(Arc::clone(&permit));
+    let response = next.run(request).await;
+    let (mut parts, body) = response.into_parts();
+    let length = parts
+        .headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(|| body.size_hint().exact());
+    if let Some(length) = length
+        && !parts.status.is_informational()
+        && parts.status != StatusCode::NO_CONTENT
+        && parts.status != StatusCode::NOT_MODIFIED
+        && !parts.headers.contains_key(http::header::CONTENT_LENGTH)
+        && let Ok(value) = http::HeaderValue::from_str(&length.to_string())
+    {
+        parts.headers.insert(http::header::CONTENT_LENGTH, value);
+    }
+    let activity = interface::activity(
+        Some(peer.path().local),
+        Transfer::Upload(length.unwrap_or(0)),
+        Some(peer.path()),
+    );
+    // Keep the request slot until the response is drained or cancelled.
+    let stream = stream::unfold(
+        (body.into_data_stream(), activity, permit),
+        |(mut body, mut activity, permit)| async move {
+            body.next().await.map(|chunk| {
+                if let Ok(bytes) = &chunk
+                    && let Some(activity) = &mut activity
+                {
+                    activity.bytes(bytes.len() as u64);
+                }
+                (chunk, (body, activity, permit))
+            })
+        },
+    );
+    Response::from_parts(parts, Body::from_stream(stream))
 }
 
 /// Until the initial authenticated snapshot arrives, no remote member except
@@ -320,7 +411,7 @@ pub(super) struct Listener {
     tls: Arc<ClusterListener>,
     role: ListenerRole,
     threads: usize,
-    handler: Arc<Handler>,
+    router: Router,
 }
 
 impl Listener {
@@ -329,9 +420,9 @@ impl Listener {
         tls: Arc<ClusterListener>,
         role: ListenerRole,
         threads: usize,
-        handler: impl Fn(&Request) -> rouille::Response + Send + Sync + 'static,
+        router: Router,
     ) -> Result<Self> {
-        Self::from_socket(bind_socket(address)?, tls, role, threads, handler)
+        Self::from_socket(bind_socket(address)?, tls, role, threads, router)
     }
 
     pub(super) fn from_socket(
@@ -339,7 +430,7 @@ impl Listener {
         tls: Arc<ClusterListener>,
         role: ListenerRole,
         threads: usize,
-        handler: impl Fn(&Request) -> rouille::Response + Send + Sync + 'static,
+        router: Router,
     ) -> Result<Self> {
         anyhow::ensure!(threads > 0, "HTTP handler pool must not be empty");
         Ok(Self {
@@ -347,7 +438,7 @@ impl Listener {
             tls,
             role,
             threads,
-            handler: Arc::new(handler),
+            router,
         })
     }
 
@@ -359,6 +450,7 @@ impl Listener {
     pub(super) fn run_until(self, stop: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
+            .max_blocking_threads(self.threads.saturating_mul(2).max(8))
             .enable_all()
             .build()?;
         runtime.block_on(async {
@@ -372,6 +464,7 @@ impl Listener {
     pub(super) fn run(self) -> Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
+            .max_blocking_threads(self.threads.saturating_mul(2).max(8))
             .enable_all()
             .build()?;
         runtime.block_on(self.run_async())
@@ -383,44 +476,37 @@ impl Listener {
             tls,
             role,
             threads,
-            handler,
+            router,
         } = self;
         let socket = tokio::net::TcpListener::from_std(socket)?;
         let connections = Arc::new(Semaphore::new(threads.saturating_mul(4)));
-        let requests = Arc::new(Semaphore::new(threads));
+        let router = router.layer(middleware::from_fn_with_state(
+            Arc::new(Semaphore::new(threads)),
+            admit,
+        ));
+        let router = match role {
+            ListenerRole::Scheduler(enrollment) => tls.scheduler_router(enrollment, router)?,
+            ListenerRole::Worker {
+                scheduler,
+                revocations,
+            } => tls.worker_router(
+                move |peer| match peer.role() {
+                    Role::Scheduler => peer.id() == scheduler,
+                    Role::Client | Role::Worker => revocations.permits(peer.id()),
+                },
+                router,
+            )?,
+        };
         loop {
             let (socket, _) = socket.accept().await?;
             let Ok(connection) = Arc::clone(&connections).try_acquire_owned() else {
                 continue;
             };
             let tls = Arc::clone(&tls);
-            let role = role.clone();
-            let handler = Arc::clone(&handler);
-            let requests = Arc::clone(&requests);
+            let router = router.clone();
             tokio::spawn(async move {
                 let _connection = connection;
-                let dispatch = move |peer, request| {
-                    dispatch(peer, request, Arc::clone(&handler), Arc::clone(&requests))
-                };
-                let result = match role {
-                    ListenerRole::Scheduler(enrollment) => {
-                        tls.serve_scheduler(socket, enrollment, dispatch).await
-                    }
-                    ListenerRole::Worker {
-                        scheduler,
-                        revocations,
-                    } => {
-                        tls.serve_worker(
-                            socket,
-                            move |peer| match peer.role() {
-                                Role::Scheduler => peer.id() == scheduler,
-                                Role::Client | Role::Worker => revocations.permits(peer.id()),
-                            },
-                            dispatch,
-                        )
-                        .await
-                    }
-                };
+                let result = tls.serve(socket, router).await;
                 if let Err(error) = result {
                     debug!("distributed HTTPS connection ended: {error:#}");
                 }

@@ -348,7 +348,16 @@ mod tests {
         }));
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        let route_enrollment = Arc::clone(&enrollment);
+        let router = tls.scheduler_router(
+            Arc::clone(&enrollment),
+            axum::Router::new().fallback(
+                |axum::extract::Extension(peer): axum::extract::Extension<
+                    super::super::AuthenticatedPeer,
+                >| {
+                    std::future::ready(format!("{}:{:?}", peer.id(), peer.role()))
+                },
+            ),
+        )?;
         let task = tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
             loop {
@@ -356,12 +365,8 @@ mod tests {
                     accepted = listener.accept() => {
                         let (socket, _) = accepted?;
                         let tls = Arc::clone(&tls);
-                        let enrollment = Arc::clone(&route_enrollment);
-                        connections.spawn(async move {
-                            tls.serve_scheduler(socket, enrollment, |peer, _| async move {
-                                super::super::response(StatusCode::OK, format!("{}:{:?}", peer.id(), peer.role()))
-                            }).await
-                        });
+                        let router = router.clone();
+                        connections.spawn(async move { tls.serve(socket, router).await });
                     },
                     Some(_) = connections.join_next(), if !connections.is_empty() => {},
                 }
@@ -600,19 +605,22 @@ mod worker_tests {
         authorized: PeerId,
     ) -> JoinHandle<Result<()>> {
         tokio::spawn(async move {
+            let router = tls.worker_router(
+                move |peer| peer.id() == authorized && peer.role() == Role::Scheduler,
+                axum::Router::new().fallback(
+                    |axum::extract::Extension(peer): axum::extract::Extension<
+                        super::super::AuthenticatedPeer,
+                    >| { std::future::ready(peer.id().to_string()) },
+                ),
+            )?;
             let mut connections = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     accepted = listener.accept() => {
                         let (socket, _) = accepted?;
                         let tls = Arc::clone(&tls);
-                        connections.spawn(async move {
-                            tls.serve_worker(socket, move |peer| {
-                                peer.id() == authorized && peer.role() == Role::Scheduler
-                            }, |peer, _| async move {
-                                super::super::response(StatusCode::OK, peer.id().to_string())
-                            }).await
-                        });
+                        let router = router.clone();
+                        connections.spawn(async move { tls.serve(socket, router).await });
                     },
                     Some(_) = connections.join_next(), if !connections.is_empty() => {},
                 }
