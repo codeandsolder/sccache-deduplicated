@@ -72,7 +72,7 @@ impl PeerCredentials {
         let credential = if let Some(certificate) = &persisted
             && !certificate
                 .not_after()
-                .compare(&Asn1Time::days_from_now(0)?)?
+                .compare(Asn1Time::days_from_now(0)?.as_ref())?
                 .is_lt()
         {
             TlsCredentials::new(identity, certificate.clone(), ca.clone(), role).context(
