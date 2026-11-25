@@ -2134,8 +2134,11 @@ pub mod scheduler {
         #[must_use = "the computed admission capacity limits worker reservations"]
         #[expect(
             clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
             reason = "validated nonnegative capacity is intentionally rounded to whole job slots using saturating float-to-integer casts"
+        )]
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "CPU capacity and proportional slack have been validated as nonnegative"
         )]
         pub fn max_jobs(self, cpu_capacity: f64) -> usize {
             if !cpu_capacity.is_finite() || cpu_capacity < 0.0 {
