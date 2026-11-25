@@ -691,7 +691,7 @@ rollback() {
 
     if (( dashboard_required && dist_update_required )); then
         if [[ -L "$backup_dir/dashboard-current" ]]; then
-            cp -a --remove-destination "$backup_dir/dashboard-current" "$DASHBOARD_LINK"
+            cp -aT --remove-destination "$backup_dir/dashboard-current" "$DASHBOARD_LINK"
         else
             rm -f "$DASHBOARD_LINK"
         fi

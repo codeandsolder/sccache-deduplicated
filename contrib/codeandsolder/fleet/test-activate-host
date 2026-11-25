@@ -6,12 +6,11 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/sccache-fleet-activation-test.XXXXXX")
 trap 'rm -rf -- "$tmp"' EXIT
 mkdir -p "$tmp"/{usr-local/bin,usr-local/libexec/sccache-bin,etc/sccache,etc/sccache-dist,etc/systemd/system,var-lib/sccache-autoupdate,var-cache,var-tmp,shm,run,bin}
 cp /etc/{passwd,group,nsswitch.conf,machine-id} "$tmp/etc/"
-if ! rg -q '^sccache-scheduler:' "$tmp/etc/passwd"; then
-    printf 'sccache-scheduler:x:0:0:Fixture scheduler:/var/lib:/bin/sh\n' >> "$tmp/etc/passwd"
-fi
-if ! rg -q '^sccache-scheduler:' "$tmp/etc/group"; then
-    printf 'sccache-scheduler:x:0:\n' >> "$tmp/etc/group"
-fi
+# Namespace root is the only mapped identity, including on development hosts
+# that already have a real scheduler account.
+sed -i '/^sccache-scheduler:/d' "$tmp/etc/passwd" "$tmp/etc/group"
+printf 'sccache-scheduler:x:0:0:Fixture scheduler:/var/lib:/bin/sh\n' >> "$tmp/etc/passwd"
+printf 'sccache-scheduler:x:0:\n' >> "$tmp/etc/group"
 stage="$tmp/var-lib/sccache-managed-rollout/epoch6-20261125"
 sha=1111111111111111111111111111111111111111
 bundle="$tmp/var-lib/sccache-native-bundles/$sha"
@@ -116,6 +115,7 @@ bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --unshare-net --die-with-pare
  --setenv PATH /run/test-bin:/usr/bin:/bin \
  /bin/bash -s -- "$sha" <<'INNER'
 set -euo pipefail
+trap 'echo "activation fixture assertion failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 sha=$1
 stage=/var/lib/sccache-managed-rollout/epoch6-20261125
 bundle=/var/lib/sccache-native-bundles/$sha
@@ -130,7 +130,7 @@ sha256sum "${files[@]}" > STAGED_SHA256SUMS
 } > published-build.txt
 {
  cat published-build.txt
- printf 'build_kind=host-native\nrustflags=-C target-cpu=native\nhost_fingerprint=%s\n' "$(/usr/local/libexec/host-native-metadata fingerprint)"
+ printf 'build_kind=host-native\nrustflags=-C target-cpu=native\nhost_fingerprint=%s\n' "fixture"
 } > "$bundle/build.txt"
 (cd "$bundle"; sha256sum sccache sccache-dist build.txt > SHA256SUMS)
 # The root in a user namespace cannot own the outer mount ancestors, so use

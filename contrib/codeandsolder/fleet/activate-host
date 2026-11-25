@@ -383,7 +383,7 @@ case "$phase" in
     while IFS= read -r f; do
       if [[ -e "$rollback/files$f" || -L "$rollback/files$f" ]]; then
         [[ -d "$(dirname -- "$f")" ]] || install -d -m 0755 "$(dirname -- "$f")"
-        cp -a --remove-destination -- "$rollback/files$f" "$f"
+        cp -aT --remove-destination -- "$rollback/files$f" "$f"
       else
         rm -f -- "$f"
       fi
