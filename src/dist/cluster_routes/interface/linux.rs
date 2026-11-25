@@ -1,11 +1,15 @@
 //! Linux interface counters include traffic from every process. Local address
 //! ownership is refreshed on demand; ambiguous addresses supply no evidence.
+#[cfg(feature = "dist-server")]
+mod meter_window;
 mod overlap;
 use super::{Evidence, Quality, SAMPLE_INTERVAL, Transfer};
 use crate::build_runtime::{
     Direction, NetworkPath,
     wire::{EndpointFlow, EndpointOverlap},
 };
+#[cfg(feature = "dist-server")]
+pub(in crate::dist) use meter_window::MeterSampler;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -358,6 +362,7 @@ impl Drop for Activity {
             self.counters.unattributed.fetch_sub(1, Ordering::Relaxed);
         }
         self.counters.active.fetch_sub(1, Ordering::Relaxed);
+        drop(book);
     }
 }
 

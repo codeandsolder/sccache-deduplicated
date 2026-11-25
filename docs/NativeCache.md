@@ -1263,7 +1263,14 @@ competing flow is active; the scheduler includes learned sender-side
 publication/direct result overlap even across different interfaces. The
 observation is effective transport service, not a proof of physical topology.
 Unbound outgoing uploads without a known actual source are not used for
-overlap learning. No extra bulk traffic is generated.
+overlap learning. No extra bulk traffic is generated. The scheduler's existing directional
+meter also compares its aggregate body deltas by local interface against
+independently aligned total interface counter deltas. Contaminated windows
+cannot establish isolated service, shared ceilings or independence. Fresh
+scheduler interface capacity and learned same-direction path constraints
+are injected into the placement simulator for both active and predicted
+candidate routes, including the requesting client. Both endpoints cap
+scheduler-path service when known wired headroom is available.
 
 The receiver compares authenticated route latency and directional effective
 goodput, using the scheduler as the durable fallback for committed results.

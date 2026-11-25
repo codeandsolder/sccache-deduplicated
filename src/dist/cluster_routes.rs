@@ -212,6 +212,50 @@ struct Sample {
     verified: Option<Rate>,
 }
 
+impl Sample {
+    fn loaded_cost(
+        &self,
+        interfaces: &interface::Snapshot,
+        address: Route,
+        role: Role,
+        transfer: Transfer,
+        nominal: u128,
+        now: Instant,
+    ) -> u128 {
+        let local = address.source.or_else(|| {
+            self.rates[transfer.index()]
+                .filter(|rate| rate.expires > now)
+                .and_then(|rate| rate.local)
+                .or(self.local)
+        });
+        let clean_wire = self.rates[transfer.index()]
+            .filter(|rate| rate.expires > now && rate.quality == interface::Quality::Clean)
+            .map(|rate| rate.bytes_per_second);
+        let encoded = if role == Role::Worker && matches!(transfer, Transfer::Download(_)) {
+            self.verified.filter(|rate| rate.expires > now).map_or_else(
+                || transfer.bytes(),
+                |rate| {
+                    transfer
+                        .bytes()
+                        .saturating_mul(rate.wire_per_mille)
+                        .div_ceil(1000)
+                },
+            )
+        } else {
+            transfer.bytes()
+        };
+        let endpoint = local.map(|local| {
+            let remote = self.rates[transfer.index()]
+                .filter(|rate| rate.expires > now)
+                .and_then(|rate| rate.path)
+                .map_or_else(|| address.address.ip(), |path| path.local);
+            NetworkPath::new(local, remote)
+        });
+        let load = interfaces.cost(local, transfer, clean_wire, nominal);
+        interfaces.overlap_cost(endpoint, transfer, encoded, load)
+    }
+}
+
 #[derive(Default)]
 pub struct RouteBook {
     samples: Mutex<HashMap<Key, Sample>>,
@@ -618,40 +662,7 @@ impl RouteBook {
                         });
                         let nominal = (u128::from(transfer.bytes()) * 1_000_000_000)
                             .div_ceil(u128::from(rate));
-                        let local = address.source.or_else(|| {
-                            sample.rates[transfer.index()]
-                                .filter(|rate| rate.expires > now)
-                                .and_then(|rate| rate.local)
-                                .or(sample.local)
-                        });
-                        let clean_wire = sample.rates[transfer.index()]
-                            .filter(|rate| {
-                                rate.expires > now && rate.quality == interface::Quality::Clean
-                            })
-                            .map(|rate| rate.bytes_per_second);
-                        let encoded =
-                            if role == Role::Worker && matches!(transfer, Transfer::Download(_)) {
-                                sample.verified.filter(|rate| rate.expires > now).map_or(
-                                    transfer.bytes(),
-                                    |rate| {
-                                        transfer
-                                            .bytes()
-                                            .saturating_mul(rate.wire_per_mille)
-                                            .div_ceil(1000)
-                                    },
-                                )
-                            } else {
-                                transfer.bytes()
-                            };
-                        let endpoint = local.map(|local| {
-                            let remote = sample.rates[transfer.index()]
-                                .filter(|rate| rate.expires > now)
-                                .and_then(|rate| rate.path)
-                                .map_or(address.address.ip(), |path| path.local);
-                            NetworkPath::new(local, remote)
-                        });
-                        let load = interfaces.cost(local, transfer, clean_wire, nominal);
-                        interfaces.overlap_cost(endpoint, transfer, encoded, load)
+                        sample.loaded_cost(&interfaces, address, role, transfer, nominal, now)
                     });
                 Some((
                     !explore || known.is_some(),

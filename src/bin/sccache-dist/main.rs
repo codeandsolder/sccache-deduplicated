@@ -1172,17 +1172,22 @@ impl Scheduler {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let transfer_plan = native_inputs.as_ref().map(|inputs| {
-                NativeTransferPlan::new(network, &servers, Some(&packages), Some(inputs))
-                    .with_receiver(native.and_then(|assignment| assignment.receiver.as_ref()))
-                    .with_remote_fraction(
-                        native
-                            .and_then(|assignment| {
-                                let (requester, _) = assignment.receiver.as_ref()?;
-                                let profile = assignment.delivery_profile?;
-                                Some(cost_book.delivery_fraction(*requester, profile, assigned_at))
-                            })
-                            .unwrap_or(1_000_000),
-                    )
+                NativeTransferPlan::new(
+                    network,
+                    &servers,
+                    Some(&packages),
+                    Some(inputs),
+                    native.and_then(|assignment| assignment.receiver.as_ref()),
+                )
+                .with_remote_fraction(
+                    native
+                        .and_then(|assignment| {
+                            let (requester, _) = assignment.receiver.as_ref()?;
+                            let profile = assignment.delivery_profile?;
+                            Some(cost_book.delivery_fraction(*requester, profile, assigned_at))
+                        })
+                        .unwrap_or(1_000_000),
+                )
             });
             let res = {
                 let mut healthy = Vec::new();
@@ -2652,7 +2657,7 @@ mod scheduler_tests {
         let inputs = BTreeMap::from([(a, 100_000_000), (b, 1_000_000)]);
         let empty = HashMap::new();
         let network = NetworkSnapshot::default();
-        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None);
+        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None, None);
         let peer = Peer::Worker(ServerId::from_digest([1; 32]));
         let eta = |capacity, assigned: &HashMap<_, _>, placement: &dist::NativePlacement| {
             native_estimate(

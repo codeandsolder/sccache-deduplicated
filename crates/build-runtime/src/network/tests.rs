@@ -21,7 +21,7 @@ fn feed(meter: &mut DirectionMeter, now: Instant, rates: &[(Peer, u64)]) {
             activity.idle_epoch += 1;
         }
     }
-    meter.sample(now, Duration::from_secs(1));
+    meter.sample(now, Duration::from_secs(1), |_| true);
 }
 
 #[test]
@@ -321,4 +321,49 @@ fn route_specific_windows_and_checkpoint_keep_old_cohorts_separate() -> anyhow::
     );
     assert_eq!(snapshot.send.peers[&b_lan].active_remaining_bytes, 0);
     Ok(())
+}
+
+#[test]
+fn contaminated_meter_windows_do_not_learn_contention() {
+    let a = worker(1);
+    let b = worker(2);
+    let now = Instant::now();
+    let mut meter = DirectionMeter::default();
+    meter.record(a, now);
+    meter.record(b, now);
+    for second in 1..=3 {
+        feed(
+            &mut meter,
+            now + Duration::from_secs(second),
+            &[(a, 100_000_000)],
+        );
+    }
+    for second in 4..=6 {
+        feed(
+            &mut meter,
+            now + Duration::from_secs(second),
+            &[(b, 100_000_000)],
+        );
+    }
+    for second in 7..=11 {
+        for peer in [a, b] {
+            let counters = &meter.peers[&peer].counters;
+            counters.activity.lock().unwrap().active = 1;
+            counters.bytes.fetch_add(50_000_000, Ordering::Relaxed);
+        }
+        meter.sample(
+            now + Duration::from_secs(second),
+            Duration::from_secs(1),
+            |_| false,
+        );
+    }
+    assert!(meter.snapshot().shared.is_empty());
+    for second in 12..=14 {
+        feed(
+            &mut meter,
+            now + Duration::from_secs(second),
+            &[(a, 50_000_000), (b, 50_000_000)],
+        );
+    }
+    assert_eq!(meter.snapshot().shared.len(), 1);
 }

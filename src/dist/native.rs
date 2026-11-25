@@ -261,12 +261,6 @@ impl NativeCacheClient {
         self.routes.peer_download_rates()
     }
 
-    /// Total interface traffic and currently known local interface bindings.
-    #[must_use = "the report supplies endpoint network forecasts"]
-    pub fn interface_report(&self) -> crate::build_runtime::wire::InterfaceReport {
-        crate::dist::cluster_routes::interface::report()
-    }
-
     fn operation_path(&self, operation: &str) -> (String, Option<JobId>) {
         let (role, job) = match self.role {
             Role::Client => ("client", None),
@@ -580,7 +574,7 @@ impl NativeCacheClient {
     ) -> Result<ScheduleReply> {
         let receiver = crate::build_runtime::wire::ClientDeliveryRates {
             scheduler: self.path_rates().download,
-            interfaces: self.interface_report(),
+            interfaces: crate::dist::cluster::interface_report(),
             #[cfg(all(target_os = "linux", feature = "native-store"))]
             peers: self.peer_download_rates(),
             #[cfg(not(all(target_os = "linux", feature = "native-store")))]

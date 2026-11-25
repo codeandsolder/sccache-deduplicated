@@ -40,10 +40,12 @@ impl Evidence {
 
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(all(target_os = "linux", feature = "dist-server"))]
-pub(in crate::dist) use linux::advertised_addresses;
 #[cfg(target_os = "linux")]
-pub(in crate::dist) use linux::{Activity, activity, binding, direct_sources, report, snapshot};
+pub(in crate::dist) use linux::{
+    Activity, Snapshot, activity, binding, direct_sources, report, snapshot,
+};
+#[cfg(all(target_os = "linux", feature = "dist-server"))]
+pub(in crate::dist) use linux::{MeterSampler, advertised_addresses};
 
 #[cfg(not(target_os = "linux"))]
 pub(in crate::dist) struct Activity;
@@ -142,4 +144,20 @@ impl<R: std::io::Read> std::io::Read for TrackedReader<R> {
 #[cfg(not(target_os = "linux"))]
 pub(in crate::dist) fn report() -> crate::build_runtime::wire::InterfaceReport {
     crate::build_runtime::wire::InterfaceReport::default()
+}
+
+#[cfg(all(feature = "dist-server", not(target_os = "linux")))]
+#[derive(Default)]
+pub(in crate::dist) struct MeterSampler;
+
+#[cfg(all(feature = "dist-server", not(target_os = "linux")))]
+impl MeterSampler {
+    pub(in crate::dist) fn sample(
+        &mut self,
+    ) -> impl Fn(
+        crate::build_runtime::Direction,
+        &std::collections::BTreeMap<crate::build_runtime::Peer, u64>,
+    ) -> bool {
+        |_, _| true
+    }
 }

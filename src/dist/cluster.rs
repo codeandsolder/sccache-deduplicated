@@ -21,6 +21,12 @@ use sccache_peer_identity::RouteSet;
 
 type Current = dyn Fn() -> Result<Arc<TlsCredentials>> + Send + Sync;
 
+/// Total interface traffic and learned directional path overlap on this host.
+#[must_use = "the report supplies endpoint network forecasts"]
+pub fn interface_report() -> crate::build_runtime::wire::InterfaceReport {
+    super::cluster_routes::interface::report()
+}
+
 /// A default data listener is dual-stack, including when its configured
 /// reliable route is IPv4. Loopback-only endpoints remain loopback-only.
 #[cfg(feature = "dist-server")]

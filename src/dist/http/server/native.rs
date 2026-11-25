@@ -652,7 +652,8 @@ fn dispatch(
                                     crate::build_runtime::PackageCatalog::default()
                                 });
                         packages.restrict_to_trees(trees);
-                        let snapshot = network.snapshot();
+                        let mut snapshot = network.snapshot();
+                        snapshot.interfaces = crate::dist::cluster::interface_report();
                         allocate(
                             crate::dist::NativeAssignment {
                                 ticket,

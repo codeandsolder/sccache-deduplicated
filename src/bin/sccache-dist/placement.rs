@@ -17,7 +17,7 @@ pub(super) use retained::RecentResidency;
 use sccache::{
     build_runtime::{
         Direction, DirectionSnapshot, NetworkSnapshot, PackageCatalog, Peer,
-        ResultTransferEstimate, TransferDemand, transfer_seconds,
+        ResultTransferEstimate, SharedCapacity, TransferDemand, transfer_seconds,
         wire::{
             CachePathRate, CachePathRates, ClientDeliveryRates, EndpointFlow, InterfaceReport,
             PeerDownloadRate,
@@ -26,7 +26,7 @@ use sccache::{
     dist::{self, ServerId},
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     time::Duration,
 };
 
@@ -73,8 +73,9 @@ fn native_missing_inputs(
 
 pub(super) struct NativeTransferPlan<'a> {
     packages: Option<&'a PackageCatalog>,
-    send: &'a DirectionSnapshot,
-    receive: &'a DirectionSnapshot,
+    send: DirectionSnapshot,
+    receive: DirectionSnapshot,
+    scheduler_interfaces: &'a InterfaceReport,
     send_demands: BTreeMap<Peer, TransferDemand>,
     send_baseline: BTreeMap<Peer, f64>,
     receive_demands: BTreeMap<Peer, TransferDemand>,
@@ -163,6 +164,70 @@ fn marginal_completion(
         .map(|(_, &seconds)| seconds)
         .fold(0.0, f64::max);
     (completion, externality)
+}
+
+/// Turn known physical interface capacity and observed local path cohorts
+/// into the same simultaneous resource constraints as the existing meter.
+fn scheduler_constraints(
+    snapshot: &mut DirectionSnapshot,
+    report: &InterfaceReport,
+    direction: Direction,
+    candidates: impl Iterator<Item = Peer>,
+) {
+    let peers = snapshot
+        .peers
+        .keys()
+        .copied()
+        .chain(candidates)
+        .filter(|peer| peer.path().is_some())
+        .collect::<BTreeSet<_>>();
+    let mut add = |members: BTreeSet<Peer>, capacity: u64| {
+        if members.len() < 2 {
+            return;
+        }
+        if let Some(group) = snapshot
+            .shared
+            .iter_mut()
+            .find(|group| group.members == members)
+        {
+            group.bytes_per_second = group.bytes_per_second.min(capacity);
+        } else {
+            snapshot.shared.push(SharedCapacity {
+                members,
+                bytes_per_second: capacity,
+            });
+        }
+    };
+    for interface in &report.interfaces {
+        if let Some(capacity) = interface.available(direction) {
+            add(
+                peers
+                    .iter()
+                    .copied()
+                    .filter(|peer| {
+                        peer.path()
+                            .is_some_and(|path| interface.addresses.contains(&path.local))
+                    })
+                    .collect(),
+                capacity,
+            );
+        }
+    }
+    for overlap in &report.overlaps {
+        if overlap.flows.iter().all(|flow| flow.direction == direction) {
+            add(
+                peers
+                    .iter()
+                    .copied()
+                    .filter(|peer| {
+                        peer.path()
+                            .is_some_and(|path| overlap.flows.iter().any(|flow| flow.path == path))
+                    })
+                    .collect(),
+                overlap.bytes_per_second,
+            );
+        }
+    }
 }
 
 fn interface_rate(
@@ -265,12 +330,71 @@ fn direct_input_forecasts(
     forecasts
 }
 
+fn path_rates(
+    servers: &HashMap<ServerId, ServerDetails>,
+    worker_interfaces: &BTreeMap<Peer, InterfaceReport>,
+    scheduler: &InterfaceReport,
+) -> BTreeMap<Peer, CachePathRates> {
+    servers
+        .iter()
+        .filter_map(|(&id, details)| {
+            let mut rates = details
+                .capabilities
+                .native_placement
+                .as_ref()?
+                .cache_path_rates;
+            if !rates.valid() {
+                return None;
+            }
+            let peer = Peer::Worker(id);
+            if let Some(report) = worker_interfaces.get(&peer) {
+                if let Some(rate) = &mut rates.download {
+                    rate.bytes_per_second = interface_rate(
+                        report,
+                        rate.path.remote,
+                        Direction::Receive,
+                        rate.bytes_per_second,
+                    );
+                }
+                if let Some(rate) = &mut rates.upload {
+                    rate.bytes_per_second = interface_rate(
+                        report,
+                        rate.path.remote,
+                        Direction::Send,
+                        rate.bytes_per_second,
+                    );
+                }
+            }
+            if let Some(rate) = &mut rates.download {
+                rate.bytes_per_second = interface_rate(
+                    scheduler,
+                    rate.path.local,
+                    Direction::Send,
+                    rate.bytes_per_second,
+                );
+            }
+            if let Some(rate) = &mut rates.upload {
+                rate.bytes_per_second = interface_rate(
+                    scheduler,
+                    rate.path.local,
+                    Direction::Receive,
+                    rate.bytes_per_second,
+                );
+            }
+            // Original telemetry was validated at admission; the capped
+            // rates may be smaller than the minimum measurement size.
+            Some((peer, rates))
+        })
+        .collect()
+}
+
 impl<'a> NativeTransferPlan<'a> {
     pub(super) fn new(
         network: &'a NetworkSnapshot,
         servers: &HashMap<ServerId, ServerDetails>,
         packages: Option<&'a PackageCatalog>,
         requested: Option<&dist::NativeInputBlobs>,
+        receiver: Option<&'a (ServerId, ClientDeliveryRates)>,
     ) -> Self {
         let worker_interfaces = servers
             .iter()
@@ -280,44 +404,49 @@ impl<'a> NativeTransferPlan<'a> {
                     .then(|| (Peer::Worker(id), placement.interfaces.clone()))
             })
             .collect::<BTreeMap<_, _>>();
-        let path_rates: BTreeMap<_, _> = servers
-            .iter()
-            .filter_map(|(&id, details)| {
-                let mut rates = details
-                    .capabilities
-                    .native_placement
-                    .as_ref()?
-                    .cache_path_rates;
-                if !rates.valid() {
-                    return None;
-                }
-                let peer = Peer::Worker(id);
-                if let Some(report) = worker_interfaces.get(&peer) {
-                    if let Some(rate) = &mut rates.download {
-                        rate.bytes_per_second = interface_rate(
-                            report,
-                            rate.path.remote,
-                            Direction::Receive,
-                            rate.bytes_per_second,
-                        );
-                    }
-                    if let Some(rate) = &mut rates.upload {
-                        rate.bytes_per_second = interface_rate(
-                            report,
-                            rate.path.remote,
-                            Direction::Send,
-                            rate.bytes_per_second,
-                        );
-                    }
-                }
-                // Original telemetry was validated at admission; the capped
-                // rates may be smaller than the minimum measurement size.
-                Some((peer, rates))
-            })
-            .collect();
+        let path_rates = path_rates(servers, &worker_interfaces, &network.interfaces);
         let direct_inputs = direct_input_forecasts(servers, requested);
-        let mut send_demands = active_demands(&network.send);
-        let mut receive_demands = active_demands(&network.receive);
+        let mut send = network.send.clone();
+        let mut receive = network.receive.clone();
+        for (snapshot, direction) in [
+            (&mut send, Direction::Send),
+            (&mut receive, Direction::Receive),
+        ] {
+            let client = receiver.and_then(|(id, rates)| {
+                (direction == Direction::Send)
+                    .then_some(rates.scheduler)
+                    .flatten()
+                    .map(|rate| Peer::Client(*id).on_path(rate.path))
+            });
+            scheduler_constraints(
+                snapshot,
+                &network.interfaces,
+                direction,
+                path_rates
+                    .iter()
+                    .filter_map(|(&peer, rates)| {
+                        directional_rate(*rates, direction).map(|rate| peer.on_path(rate.path))
+                    })
+                    .chain(client),
+            );
+        }
+        let mut send_demands = active_demands(&send);
+        let mut receive_demands = active_demands(&receive);
+        for (demands, direction) in [
+            (&mut send_demands, Direction::Send),
+            (&mut receive_demands, Direction::Receive),
+        ] {
+            for (&peer, demand) in demands {
+                if let Some(path) = peer.path() {
+                    demand.bytes_per_second = interface_rate(
+                        &network.interfaces,
+                        path.local,
+                        direction,
+                        demand.bytes_per_second,
+                    );
+                }
+            }
+        }
         for (peer, rates) in &path_rates {
             if let Some(rate) = rates.download
                 && let Some(demand) = send_demands.get_mut(&peer.on_path(rate.path))
@@ -332,7 +461,7 @@ impl<'a> NativeTransferPlan<'a> {
         }
         // Other workers' predicted input closures are only needed if they can
         // contend for a known shared resource. Avoid scanning them otherwise.
-        if !network.send.shared.is_empty() {
+        if !send.shared.is_empty() {
             for (&id, details) in servers {
                 if let Some(placement) = &details.capabilities.native_placement {
                     let rate = path_rates
@@ -343,7 +472,7 @@ impl<'a> NativeTransferPlan<'a> {
                         continue;
                     };
                     let rates = DeliveryRates::new(
-                        &network.send,
+                        &send,
                         peer,
                         placement.timing.transfer,
                         rate.map(|rate| rate.bytes_per_second),
@@ -358,7 +487,7 @@ impl<'a> NativeTransferPlan<'a> {
                     .traffic;
                     if traffic.wire_bytes > 0 {
                         let demand = Self::input_demand(
-                            &network.send,
+                            &send,
                             peer,
                             traffic,
                             rate.map(|rate| rate.bytes_per_second),
@@ -368,28 +497,21 @@ impl<'a> NativeTransferPlan<'a> {
                 }
             }
         }
-        let send_baseline = network.send.finish_times(&send_demands);
+        let send_baseline = send.finish_times(&send_demands);
         Self {
             packages,
-            send: &network.send,
-            receive: &network.receive,
+            send,
+            receive,
+            scheduler_interfaces: &network.interfaces,
             send_demands,
             send_baseline,
             receive_demands,
             path_rates,
             direct_inputs,
             worker_interfaces,
-            receiver: None,
+            receiver,
             remote_fraction: 1_000_000,
         }
-    }
-
-    pub(super) const fn with_receiver(
-        mut self,
-        receiver: Option<&'a (ServerId, ClientDeliveryRates)>,
-    ) -> Self {
-        self.receiver = receiver;
-        self
     }
 
     pub(super) const fn with_remote_fraction(mut self, fraction: u64) -> Self {
@@ -413,11 +535,17 @@ impl<'a> NativeTransferPlan<'a> {
         let wire_rate = rates.scheduler.map_or_else(
             || self.send.rate(client, 16 << 20),
             |rate| {
+                let sender = interface_rate(
+                    self.scheduler_interfaces,
+                    rate.path.local,
+                    Direction::Send,
+                    rate.bytes_per_second,
+                );
                 interface_rate(
                     &rates.interfaces,
                     rate.path.remote,
                     Direction::Receive,
-                    rate.bytes_per_second,
+                    sender,
                 )
             },
         );
@@ -544,7 +672,7 @@ impl<'a> NativeTransferPlan<'a> {
             bytes_per_second: wire_rate,
         };
         marginal_completion(
-            self.send,
+            &self.send,
             &remaining,
             &baseline,
             peer,
@@ -591,14 +719,14 @@ impl<'a> NativeTransferPlan<'a> {
         let rate = self.path_rate(peer, Direction::Send);
         let peer = predicted_peer(peer, rate);
         let demand = Self::input_demand(
-            self.send,
+            &self.send,
             peer,
             traffic,
             rate.map(|rate| rate.bytes_per_second),
         );
         // All paths already carrying this input union remain in the model.
         marginal_completion(
-            self.send,
+            &self.send,
             &self.send_demands,
             &self.send_baseline,
             peer,
@@ -636,7 +764,7 @@ impl<'a> NativeTransferPlan<'a> {
             ),
         };
         marginal_completion(
-            self.receive,
+            &self.receive,
             &remaining,
             &baseline,
             peer,
@@ -702,7 +830,7 @@ pub(super) fn native_estimate(
     } = forecast;
     let (bytes, _) = native_missing_inputs(assigned, placement, recent, Some(requested));
     let mut rates = DeliveryRates::new(
-        plan.send,
+        &plan.send,
         plan.path_peer(peer, Direction::Send),
         placement.timing.transfer,
         placement
@@ -759,7 +887,7 @@ pub(super) fn native_estimate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sccache::build_runtime::{PeerCapacity, SharedCapacity};
+    use sccache::build_runtime::PeerCapacity;
 
     fn worker(port: u16) -> Peer {
         Peer::Worker(ServerId::from_digest(std::array::from_fn(|index| {
@@ -795,8 +923,9 @@ mod tests {
         let network = NetworkSnapshot {
             send: constrained(a, b),
             receive: DirectionSnapshot::default(),
+            interfaces: InterfaceReport::default(),
         };
-        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None);
+        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None, None);
         assert_eq!(
             plan.input_completion(
                 a,
@@ -846,8 +975,9 @@ mod tests {
         let network = NetworkSnapshot {
             send: DirectionSnapshot::default(),
             receive: constrained(a, b),
+            interfaces: InterfaceReport::default(),
         };
-        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None);
+        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None, None);
         let result = ResultTransferEstimate {
             expected_bytes: 100_000_000,
             bytes_per_second: 100_000_000,
@@ -867,8 +997,9 @@ mod tests {
         let network = NetworkSnapshot {
             send: constrained(a.on_path(overlay), b.on_path(other_overlay)),
             receive: DirectionSnapshot::default(),
+            interfaces: InterfaceReport::default(),
         };
-        let mut plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None);
+        let mut plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None, None);
         let traffic = InputTraffic {
             wire_bytes: 100_000_000,
             archive_bytes: 0,
@@ -937,8 +1068,7 @@ mod tests {
             output_requests: 0,
         };
         let receiver = (requester, rates.clone());
-        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None)
-            .with_receiver(Some(&receiver));
+        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None, Some(&receiver));
         assert_eq!(
             plan.client_completion(worker(1), 0.0, 0.0, cost),
             (10.0, 0.0)
@@ -958,8 +1088,7 @@ mod tests {
             wire_per_mille: 1000,
         });
         let receiver = (requester, rates);
-        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None)
-            .with_receiver(Some(&receiver));
+        let plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None, Some(&receiver));
         assert_eq!(
             plan.client_completion(worker(1), 0.0, 0.0, cost),
             (1.0, 0.0)
@@ -983,7 +1112,7 @@ mod tests {
     fn publication_and_direct_delivery_share_only_known_sender_interface() -> anyhow::Result<()> {
         use sccache::build_runtime::wire::{InterfaceDirection, InterfaceTraffic};
         let network = NetworkSnapshot::default();
-        let mut plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None);
+        let mut plan = NativeTransferPlan::new(&network, &HashMap::new(), None, None, None);
         let worker = worker(1);
         let source =
             ServerId::from_digest(std::array::from_fn(|index| 1_u16.to_le_bytes()[index % 2]));
@@ -1079,6 +1208,70 @@ mod tests {
             plan.shared_publication_time(worker, separate, 100 << 20, 100 << 20),
             2.5
         );
+        Ok(())
+    }
+    #[test]
+    fn scheduler_constraints_include_candidate_paths_and_interface_aliases() -> anyhow::Result<()> {
+        use sccache::build_runtime::wire::{EndpointOverlap, InterfaceDirection, InterfaceTraffic};
+        let a = worker(1).on_path("192.0.2.1,192.0.2.2".parse()?);
+        let b = worker(2).on_path("192.0.2.3,192.0.2.4".parse()?);
+        let c = worker(3).on_path("198.51.100.1,198.51.100.2".parse()?);
+        let interface = InterfaceTraffic {
+            index: 1,
+            addresses: vec!["192.0.2.1".parse()?, "192.0.2.3".parse()?],
+            nominal_capacity: Some(100_000_000),
+            send: InterfaceDirection {
+                total_bytes_per_second: 20_000_000,
+                external_bytes_per_second: 20_000_000,
+                active_streams: 0,
+            },
+            receive: InterfaceDirection::default(),
+        };
+        let other = InterfaceTraffic {
+            index: 2,
+            addresses: vec!["198.51.100.1".parse()?],
+            nominal_capacity: None,
+            send: InterfaceDirection::default(),
+            receive: InterfaceDirection::default(),
+        };
+        let flows = [
+            EndpointFlow {
+                path: a.path().unwrap(),
+                direction: Direction::Send,
+            },
+            EndpointFlow {
+                path: c.path().unwrap(),
+                direction: Direction::Send,
+            },
+        ];
+        let report = InterfaceReport {
+            interfaces: vec![interface, other],
+            overlaps: vec![EndpointOverlap {
+                flows,
+                bytes_per_second: 120_000_000,
+            }],
+        };
+        assert!(report.valid());
+        let mut snapshot = DirectionSnapshot::default();
+        scheduler_constraints(
+            &mut snapshot,
+            &report,
+            Direction::Send,
+            [a, b, c].into_iter(),
+        );
+        assert_eq!(snapshot.shared.len(), 2);
+        assert_eq!(snapshot.shared[0].members, BTreeSet::from([a, b]));
+        assert_eq!(snapshot.shared[0].bytes_per_second, 80_000_000);
+        assert_eq!(snapshot.shared[1].members, BTreeSet::from([a, c]));
+        let mut receiving = DirectionSnapshot::default();
+        scheduler_constraints(
+            &mut receiving,
+            &report,
+            Direction::Receive,
+            [a, b, c].into_iter(),
+        );
+        assert_eq!(receiving.shared.len(), 1);
+        assert_eq!(receiving.shared[0].bytes_per_second, 100_000_000);
         Ok(())
     }
 }

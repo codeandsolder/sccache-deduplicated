@@ -183,7 +183,7 @@ impl<'a> Opportunity<'a> {
     ) -> Option<Question> {
         let peer = Peer::Worker(self.server);
         if let Some(question) = question(
-            plan.send,
+            &plan.send,
             Direction::Send,
             plan.path_peer(peer, Direction::Send),
             self.encoded,
@@ -198,7 +198,7 @@ impl<'a> Opportunity<'a> {
         }
         let estimate = native_estimate(forecast, requested, peer, plan);
         question(
-            plan.receive,
+            &plan.receive,
             Direction::Receive,
             plan.path_peer(peer, Direction::Receive),
             u128::from(forecast.cost.output_bytes),
