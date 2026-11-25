@@ -46,6 +46,26 @@ impl State {
 }
 
 impl RecoveryQueue {
+    pub(super) fn telemetry(&self) -> Result<Option<super::RecoveryStatus>> {
+        Ok(super::telemetry::observe(&self.state)?.map(|state| {
+            let now = Instant::now();
+            super::RecoveryStatus {
+                queued: state.jobs.len(),
+                queued_bytes: state.queued_bytes,
+                ready: state
+                    .ready
+                    .values()
+                    .filter(|(_, expires)| *expires > now)
+                    .count(),
+                cooldown: state
+                    .failed
+                    .values()
+                    .filter(|expires| **expires > now)
+                    .count(),
+            }
+        }))
+    }
+
     pub(super) fn offer(
         &self,
         permit: CompilePermit,

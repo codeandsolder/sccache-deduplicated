@@ -156,7 +156,7 @@ pub(super) fn spawn(
     tls: Arc<ClusterListener>,
     enrollment: Arc<SchedulerEnrollment>,
     network: Arc<NetworkMeter>,
-) -> Result<std::net::SocketAddr> {
+) -> Result<(std::net::SocketAddr, Arc<NativeSessions>)> {
     let PublicationCallbacks {
         source_plan,
         observe_result,
@@ -229,6 +229,7 @@ pub(super) fn spawn(
         config.directory.join("network-path-timing.json"),
         config.public_addr,
     )?;
+    let retained_sessions = Arc::clone(&sessions);
     let server = Listener::from_socket(
         socket,
         tls,
@@ -277,7 +278,7 @@ pub(super) fn spawn(
                 error!("native cache HTTPS listener terminated: {error:#}");
             }
         })?;
-    Ok(bound)
+    Ok((bound, retained_sessions))
 }
 
 const PREFIX: &str = "/api/v5/native/";

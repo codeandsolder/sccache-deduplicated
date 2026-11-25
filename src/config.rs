@@ -2220,8 +2220,18 @@ pub mod scheduler {
 
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
+    pub struct DashboardConfig {
+        pub bind_address: SocketAddr,
+        pub assets: PathBuf,
+        pub metrics_url: Option<String>,
+        pub metrics_ingress_host: Option<String>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct Config {
         pub cluster_directory: PathBuf,
+        pub dashboard: Option<DashboardConfig>,
         pub public_addr: SocketAddr,
         pub client_auth: ClientAuth,
         pub server_auth: ServerAuth,
@@ -2236,6 +2246,22 @@ pub mod scheduler {
             .context("Failed to load scheduler config file")?;
         if let Some(config) = &config {
             config.job_slack.validate()?;
+            if let Some(dashboard) = &config.dashboard {
+                if !cfg!(feature = "scheduler-dashboard") {
+                    bail!("dashboard requires the scheduler-dashboard build feature");
+                }
+                if !dashboard.bind_address.ip().is_loopback() || !dashboard.assets.is_absolute() {
+                    bail!("dashboard requires a loopback bind address and absolute assets path");
+                }
+                if dashboard.bind_address == config.public_addr
+                    || config
+                        .native_cache
+                        .as_ref()
+                        .is_some_and(|native| native.public_addr == dashboard.bind_address)
+                {
+                    bail!("dashboard requires a separate listener address");
+                }
+            }
             if let Some(native) = &config.native_cache {
                 native.session_limits()?;
                 if native.public_addr == config.public_addr {

@@ -32,6 +32,8 @@ mod build;
 
 mod cmdline;
 mod command_helpers;
+#[cfg(feature = "scheduler-dashboard")]
+mod dashboard;
 mod job_telemetry;
 mod placement;
 use placement::{Exploration, NativeTransferPlan, choose_worker, native_estimate};
@@ -570,6 +572,7 @@ fn run(command: Command) -> Result<i32> {
 
         Command::Scheduler(scheduler_config::Config {
             cluster_directory,
+            dashboard,
             public_addr,
             client_auth,
             server_auth,
@@ -656,6 +659,7 @@ fn run(command: Command) -> Result<i32> {
                 check_client_auth,
                 check_server_auth,
                 native_cache,
+                dashboard,
             );
             // A running server never exits successfully (Result<Infallible>).
             match http_scheduler.start()? {}
@@ -912,6 +916,11 @@ pub struct Scheduler {
     // scheduler must not begin again at JobId(0).
     job_id_base: u64,
     job_count: AtomicUsize,
+    #[cfg(feature = "scheduler-dashboard")]
+    dashboard_waker: std::sync::OnceLock<std::sync::mpsc::SyncSender<()>>,
+    #[cfg(feature = "scheduler-dashboard")]
+    dashboard_clients:
+        Mutex<BTreeMap<ServerId, (Instant, sccache::build_runtime::wire::ClientDeliveryRates)>>,
     job_slack: JobSlackConfig,
     maintenance_drain_file: Option<PathBuf>,
 
@@ -921,6 +930,16 @@ pub struct Scheduler {
     completed_acks: Mutex<CompletedJobAcks>,
     exploration: Mutex<Exploration>,
     cost_book: std::sync::Arc<Mutex<placement::CostBook>>,
+}
+
+#[cfg(feature = "scheduler-dashboard")]
+struct DashboardChange<'a>(&'a Scheduler);
+
+#[cfg(feature = "scheduler-dashboard")]
+impl Drop for DashboardChange<'_> {
+    fn drop(&mut self) {
+        self.0.dashboard_changed();
+    }
 }
 
 struct ServerDetails {
@@ -977,10 +996,13 @@ impl ServerDetails {
         )
     }
 
+    fn admission_slots(&self, job_slack: JobSlackConfig) -> usize {
+        job_slack
+            .max_jobs(self.cpu_capacity)
+            .saturating_sub(self.compiler_demand())
+    }
+
     fn native_headroom(&self) -> usize {
-        if self.capabilities.archive {
-            return usize::MAX;
-        }
         self.capabilities
             .native_placement
             .as_ref()
@@ -995,6 +1017,13 @@ impl ServerDetails {
 }
 
 impl Scheduler {
+    #[cfg(feature = "scheduler-dashboard")]
+    fn dashboard_changed(&self) {
+        if let Some(sender) = self.dashboard_waker.get() {
+            let _ = sender.try_send(());
+        }
+    }
+
     pub fn new() -> Self {
         Self::new_with_job_slack(JobSlackConfig::default())
     }
@@ -1034,6 +1063,10 @@ impl Scheduler {
         Scheduler {
             job_id_base,
             job_count: AtomicUsize::new(0),
+            #[cfg(feature = "scheduler-dashboard")]
+            dashboard_waker: std::sync::OnceLock::new(),
+            #[cfg(feature = "scheduler-dashboard")]
+            dashboard_clients: Mutex::default(),
             job_slack,
             maintenance_drain_file,
             jobs: Mutex::new(BTreeMap::new()),
@@ -1145,6 +1178,8 @@ impl Scheduler {
         network: &NetworkSnapshot,
         packages: std::sync::Arc<sccache::build_runtime::PackageCatalog>,
     ) -> Result<AllocJobResult> {
+        #[cfg(feature = "scheduler-dashboard")]
+        let _dashboard_change = DashboardChange(self);
         if self.is_draining() {
             return Ok(AllocJobResult::Fail {
                 msg: "scheduler is draining for maintenance".to_owned(),
@@ -1345,6 +1380,8 @@ impl Scheduler {
                 return Ok(AllocJobResult::Fail { msg });
             }
         };
+        #[cfg(feature = "scheduler-dashboard")]
+        self.dashboard_changed();
         if let JobAssignment::Native(native) = &mut assignment {
             native.estimated_result_bytes = estimated_result_bytes;
         }
@@ -1454,6 +1491,21 @@ impl SchedulerIncoming for Scheduler {
         network: &NetworkSnapshot,
         packages: std::sync::Arc<sccache::build_runtime::PackageCatalog>,
     ) -> Result<AllocJobResult> {
+        #[cfg(feature = "scheduler-dashboard")]
+        if let Some((id, rates)) = &assignment.receiver {
+            let mut clients = self
+                .dashboard_clients
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = Instant::now();
+            clients.retain(|_, (seen, _)| {
+                now.saturating_duration_since(*seen) <= dist::http::HEARTBEAT_TIMEOUT
+            });
+            clients.insert(*id, (now, rates.clone()));
+            drop(clients);
+            self.dashboard_changed();
+        }
+
         assignment.spec.validate()?;
         self.allocate_job(
             requester,
@@ -1469,6 +1521,8 @@ impl SchedulerIncoming for Scheduler {
         job: JobId,
         event: dist::NativeLifecycleEvent<'_>,
     ) {
+        #[cfg(feature = "scheduler-dashboard")]
+        let _dashboard_change = DashboardChange(self);
         let now = Instant::now();
         // Delivery receipts outlive the worker's job record. The session
         // authenticated the original requester and validated the exact closure.
@@ -1697,6 +1751,8 @@ impl SchedulerIncoming for Scheduler {
         job_authorizer: Box<dyn JobAuthorizer>,
         mut capabilities: dist::WorkerCapabilities,
     ) -> Result<HeartbeatServerResult> {
+        #[cfg(feature = "scheduler-dashboard")]
+        let _dashboard_change = DashboardChange(self);
         // LOCKS
         let mut jobs = self
             .jobs
@@ -1877,6 +1933,8 @@ impl SchedulerIncoming for Scheduler {
         server_nonce: ServerNonce,
         worker_name: String,
     ) -> Result<()> {
+        #[cfg(feature = "scheduler-dashboard")]
+        let _dashboard_change = DashboardChange(self);
         let worker_name = validate_worker_name(worker_name)?;
         // Match heartbeat lock ordering so a stale named worker cannot reserve
         // a display name after it has stopped heartbeating.
@@ -1940,6 +1998,8 @@ impl SchedulerIncoming for Scheduler {
         server_id: ServerId,
         job_state: JobState,
     ) -> Result<UpdateJobStateResult> {
+        #[cfg(feature = "scheduler-dashboard")]
+        let _dashboard_change = DashboardChange(self);
         // LOCKS
         let mut jobs = self
             .jobs
@@ -2027,7 +2087,21 @@ impl SchedulerIncoming for Scheduler {
         self.is_draining()
     }
 
+    #[cfg(feature = "scheduler-dashboard")]
+    fn install_dashboard_waker(&self, sender: std::sync::mpsc::SyncSender<()>) -> Result<()> {
+        self.dashboard_waker
+            .set(sender)
+            .map_err(|_| anyhow::anyhow!("dashboard waker already installed"))
+    }
+
+    #[cfg(feature = "scheduler-dashboard")]
+    fn handle_dashboard_snapshot(&self) -> Result<sccache_dashboard::Snapshot> {
+        dashboard::snapshot(self)
+    }
+
     fn handle_status(&self) -> Result<SchedulerStatusResult> {
+        #[cfg(feature = "scheduler-dashboard")]
+        let _dashboard_change = DashboardChange(self);
         // LOCKS
         let mut jobs = self
             .jobs
@@ -2059,10 +2133,12 @@ impl SchedulerIncoming for Scheduler {
                 servers
                     .values()
                     .map(|v| {
-                        self.job_slack
-                            .max_jobs(v.cpu_capacity)
-                            .saturating_sub(v.compiler_demand())
-                            .min(v.native_headroom())
+                        let slots = v.admission_slots(self.job_slack);
+                        if v.capabilities.archive {
+                            slots
+                        } else {
+                            slots.min(v.native_headroom())
+                        }
                     })
                     .fold(0, usize::saturating_add)
             },
@@ -3284,6 +3360,15 @@ mod scheduler_tests {
             (status.num_cpus, status.max_jobs, status.available_jobs),
             (4, 13, 13)
         );
+        #[cfg(feature = "scheduler-dashboard")]
+        {
+            let snapshot = scheduler.handle_dashboard_snapshot().unwrap();
+            assert_eq!(snapshot.totals.workers, 3);
+            assert_eq!(snapshot.totals.available, status.available_jobs);
+            assert_eq!(snapshot.totals.max_jobs, status.max_jobs);
+            assert_eq!(snapshot.totals.cpu_capacity, 4.0);
+            assert_eq!(snapshot.workers.len(), 3);
+        }
         for _ in 0..13 {
             assert!(matches!(
                 scheduler
@@ -3338,14 +3423,24 @@ mod scheduler_tests {
         fn do_assign_job(
             &self,
             _server_id: ServerId,
-            _job_id: JobId,
+            job_id: JobId,
             _assignment: JobAssignment,
             _auth: String,
         ) -> Result<AssignJobResult> {
+            let _ = job_id;
             // Status must include reservations even before a JobDetail exists.
             let status = self.0.handle_status()?;
             assert_eq!(status.in_progress, 1);
             assert_eq!(status.available_jobs, status.max_jobs - 1);
+            #[cfg(feature = "scheduler-dashboard")]
+            {
+                let snapshot = self.0.handle_dashboard_snapshot()?;
+                assert_eq!(snapshot.totals.assigned, 1);
+                assert_eq!(snapshot.totals.assigning, 1);
+                assert_eq!(snapshot.jobs.len(), 1);
+                assert_eq!(snapshot.jobs[0].id, job_id.to_string());
+                assert_eq!(snapshot.jobs[0].state, "Assigning");
+            }
             Ok(AssignJobResult {
                 state: JobState::Pending,
                 need_toolchain: false,

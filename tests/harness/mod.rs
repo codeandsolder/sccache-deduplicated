@@ -277,6 +277,7 @@ fn sccache_scheduler_cfg(address: SocketAddr) -> sccache::config::scheduler::Con
     sccache::config::scheduler::Config {
         cluster_directory: Path::new(CONFIGS_CONTAINER_PATH).join("cluster"),
         maintenance_drain_file: None,
+        dashboard: None,
         native_cache: None,
         job_slack: Default::default(),
         public_addr: address,

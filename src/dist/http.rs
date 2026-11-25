@@ -315,6 +315,8 @@ mod server {
     use bincode::Options;
 
     mod cluster_http;
+    #[cfg(feature = "scheduler-dashboard")]
+    mod dashboard;
     mod native;
 
     const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -1028,6 +1030,7 @@ mod server {
         // Do we believe the server is who they appear to be?
         check_server_auth: ServerAuthCheck,
         native_cache: Option<crate::config::scheduler::NativeCacheConfig>,
+        dashboard: Option<crate::config::scheduler::DashboardConfig>,
     }
 
     impl<S: dist::SchedulerIncoming + 'static> Scheduler<S> {
@@ -1038,6 +1041,7 @@ mod server {
             check_client_auth: Box<dyn ClientAuthCheck>,
             check_server_auth: ServerAuthCheck,
             native_cache: Option<crate::config::scheduler::NativeCacheConfig>,
+            dashboard: Option<crate::config::scheduler::DashboardConfig>,
         ) -> Self {
             Self {
                 cluster_directory,
@@ -1046,6 +1050,7 @@ mod server {
                 check_client_auth,
                 check_server_auth,
                 native_cache,
+                dashboard,
             }
         }
 
@@ -1057,6 +1062,7 @@ mod server {
                 check_client_auth,
                 check_server_auth,
                 native_cache,
+                dashboard,
             } = self;
             anyhow::ensure!(
                 cluster_directory.is_absolute(),
@@ -1146,6 +1152,8 @@ mod server {
                         }
                     }
                 })?;
+            #[cfg(feature = "scheduler-dashboard")]
+            let mut dashboard_native = None;
             let native_endpoint = if let Some(config) = native_cache {
                 let handler = Arc::clone(&handler);
                 let requester = Arc::clone(&requester);
@@ -1157,7 +1165,7 @@ mod server {
                 let peer_routes = Arc::clone(&requester);
                 let network = Arc::new(crate::build_runtime::NetworkMeter::default());
                 let peer_network = Arc::clone(&network);
-                let bound = native::spawn(
+                let (bound, sessions) = native::spawn(
                     &config,
                     move |assignment, snapshot, packages| match handler.handle_alloc_native_job(
                         &*requester,
@@ -1239,12 +1247,58 @@ mod server {
                     },
                     native_tls.context("missing native data TLS listener")?,
                     Arc::clone(&enrollment),
-                    network,
+                    Arc::clone(&network),
                 )?;
+                #[cfg(feature = "scheduler-dashboard")]
+                {
+                    dashboard_native = Some((sessions, network));
+                }
+                #[cfg(not(feature = "scheduler-dashboard"))]
+                drop(sessions);
                 Some((config.public_addr, bound))
             } else {
                 None
             };
+            #[cfg(feature = "scheduler-dashboard")]
+            if let Some(config) = dashboard {
+                let handler = Arc::clone(&handler);
+                let topology_enrollment = Arc::clone(&enrollment);
+                let topology_requester = Arc::clone(&requester);
+                let topology_network = dashboard_native
+                    .as_ref()
+                    .map(|(_, network)| Arc::clone(network));
+                let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+                handler.install_dashboard_waker(sender)?;
+                sccache_dashboard::server::spawn(
+                    config.bind_address,
+                    &config.assets,
+                    config.metrics_url.as_deref(),
+                    config.metrics_ingress_host.as_deref(),
+                    move || {
+                        let mut snapshot = handler.handle_dashboard_snapshot()?;
+                        dashboard::enrich(
+                            &mut snapshot,
+                            scheduler_id,
+                            public_addr,
+                            &topology_enrollment,
+                            &topology_requester,
+                            topology_network.as_deref(),
+                        )?;
+                        Ok(snapshot)
+                    },
+                    move || {
+                        dashboard_native
+                            .as_ref()
+                            .map(|(sessions, network)| dashboard::snapshot(sessions, network))
+                    },
+                    receiver,
+                )?;
+            }
+            #[cfg(not(feature = "scheduler-dashboard"))]
+            anyhow::ensure!(
+                dashboard.is_none(),
+                "scheduler-dashboard feature is disabled"
+            );
 
             macro_rules! check_server_auth_or_err {
                 ($request:ident) => {{

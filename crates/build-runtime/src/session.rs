@@ -2082,6 +2082,8 @@ impl Drop for UploadSlot {
 }
 
 mod recovery;
+mod telemetry;
+pub use telemetry::{ManifestStatus, RecoveryStatus, SessionStatus, TicketStatus};
 
 #[cfg(test)]
 mod tests;

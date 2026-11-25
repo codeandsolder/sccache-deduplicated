@@ -1219,6 +1219,13 @@ pub trait SchedulerIncoming: Send + Sync {
     ) -> ExtResult<UpdateJobStateResult, Error>;
     // From anyone
     fn handle_status(&self) -> ExtResult<SchedulerStatusResult, Error>;
+    #[cfg(feature = "scheduler-dashboard")]
+    fn handle_dashboard_snapshot(&self) -> ExtResult<sccache_dashboard::Snapshot, Error>;
+    #[cfg(feature = "scheduler-dashboard")]
+    fn install_dashboard_waker(
+        &self,
+        sender: std::sync::mpsc::SyncSender<()>,
+    ) -> ExtResult<(), Error>;
     // Additive maintenance metadata. Existing scheduler implementations remain
     // non-draining unless they explicitly opt into a drain source.
     fn handle_is_draining(&self) -> bool {

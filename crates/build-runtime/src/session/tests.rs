@@ -1610,3 +1610,36 @@ fn peer_recovery_cannot_consume_last_direct_upload_slot() -> Result<()> {
 fn test_peer(value: u8) -> crate::PeerId {
     crate::PeerId::from_digest([value; 32])
 }
+
+#[test]
+fn session_telemetry_reports_contended_tickets_without_waiting() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let service = service(temp.path())?;
+    let ticket = service.register(Kind::Action, Publisher::Client, Phase::Failed)?;
+    let shared = service.get(ticket)?;
+    let state = NativeSessions::lock(&shared)?;
+    let original_expiry = state.expires;
+    let busy = service
+        .telemetry()?
+        .tickets
+        .context("tickets unavailable")?;
+    assert_eq!((busy.registered, busy.busy, busy.failed), (1, 1, 0));
+    drop(state);
+    let status = service.telemetry()?;
+    assert_eq!(status.max_sessions, 8);
+    assert_eq!(status.max_uploads, 4);
+    let tickets = status.tickets.context("tickets unavailable")?;
+    assert_eq!(
+        (
+            tickets.registered,
+            tickets.action,
+            tickets.failed,
+            tickets.busy
+        ),
+        (1, 1, 1, 0)
+    );
+    assert_eq!(NativeSessions::lock(&shared)?.expires, original_expiry);
+    let _map = service.sessions()?;
+    assert!(service.telemetry()?.tickets.is_none());
+    Ok(())
+}

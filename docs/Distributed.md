@@ -616,3 +616,129 @@ Until these binaries [are included in releases](https://github.com/mozilla/sccac
 ```
 docker run -ti --rm -v $PWD:/sccache luser/sccache-musl-build:0.1 /bin/bash -c "cd /sccache; cargo build --release --target x86_64-unknown-linux-musl --features=dist-server && strip target/x86_64-unknown-linux-musl/release/sccache-dist && cd target/x86_64-unknown-linux-musl/release/ && tar czf sccache-dist.tar.gz sccache-dist"
 ```
+
+## Local scheduler status dashboard
+
+### Live network topology
+
+The dashboard's **Topology** view projects authenticated scheduler, worker,
+client, and observed upstream identities. Enrolled but idle or revoked
+identities remain visible, while candidate routes, verified measured routes,
+and active scheduler transfers have distinct evidence states. The selectable
+host detail exposes all reported interface addresses, nominal wired capacity,
+and total/external RX and TX rates. Directional path rows distinguish encoded
+wire service from verified logical peer delivery. Several addresses belonging
+to one authenticated member do not create several host nodes. Separate
+client and worker identities on one physical machine are not merged without
+evidence. The graph is a logical directed transport graph, not a physical
+traceroute reconstruction.
+
+Host and link upserts/removals share the native revisioned SSE stream with
+workers and jobs; reconnect resets reconstruct the complete topology. The
+WASM graph has deterministic keyed SVG nodes and edges, so traffic changes
+do not recreate the layout. No browser polling or graph-specific HTTP endpoint
+is used. The dashboard remains scheduler-local and read-only.
+
+The optional `scheduler-dashboard` feature adds a read-only Axum listener
+inside the scheduler process. The UI follows rust-web-fullstack: Leptos 0.8
+SSR/WASM hydration, typed Rust server functions, scoped Stylance styles and
+Server-Sent Events. Model-only workspace builds and ordinary worker builds
+do not require the UI dependencies. The distributed wire protocol is unchanged.
+
+Build the native scheduler and matching browser assets from the same revision:
+
+```sh
+rustup target add wasm32-unknown-unknown
+# Linux x86-64: exact lockfile tool versions with upstream checksums.
+scripts/install-scheduler-dashboard-tools.sh target/dashboard-tools
+scripts/build-scheduler-dashboard.sh target/dashboard-tools/wasm-bindgen target/dashboard-tools/stylance
+cargo build --locked --release --no-default-features --features scheduler-dashboard --bin sccache-dist
+```
+
+On other platforms install the versions of wasm-bindgen-cli and stylance-cli
+specified by Cargo.lock and call the build script with their executable paths
+(or put the matching tools on PATH). The generated package is under the Cargo
+target directory at `scheduler-dashboard/pkg`; install the complete directory
+alongside the corresponding scheduler release. Configure its absolute path:
+
+```toml
+[dashboard]
+bind_address = "127.0.0.1:10604"
+assets = "/opt/sccache/dashboard/pkg"
+# Optional Prometheus-compatible data source, e.g. Liberta:
+# metrics_url = "http://127.0.0.1:8428"
+# Exact Certifex virtual host for the ingress panels:
+# metrics_ingress_host = "sccache.example.org"
+```
+
+The dashboard is read-only and loopback-only. Access it locally or through an
+SSH port forward. Do not publish it through an unauthenticated reverse proxy.
+A configured dashboard fails startup for missing assets, invalid addresses or
+invalid metrics URLs. Builds without the feature reject dashboard configuration.
+
+### Live scheduler data
+
+The initial typed SSR snapshot hydrates once. `GET /api/events` then streams
+a full reset followed by ordered deltas. Worker and job rows are keyed by
+identity; unchanged rows are not retransmitted just to update their age.
+Scheduler mutations wake the sampler, coalesced to at most ten projections
+per second. The periodic two-second sample covers time-based state changes
+and CAS/network observations and appends one history point (900 retained).
+History resets with the scheduler. Reconnection and broadcast lag both
+produce a fresh reset; revision gaps cannot be silently ignored.
+
+The UI includes worker heartbeat age, capacity, errors, reservations and
+native phases, job state, input backlog and assignment-time predictions,
+CAS logical accounting, garbage collection and directional network estimates, including shared bottleneck and observed
+concurrent-capacity groups. CAS/network samples have their own cadence and
+are not recomputed in response to scheduler mutations.
+All scheduler-owned reservations, including assignment RPCs in flight, are
+available through a searchable, paginated table. Archive and native admission
+headroom are shown separately; they share compiler capacity and must not be added.
+No thousand-job truncation. Expired workers are excluded without
+mutating scheduling state. Native compiler slots are not legacy allocations;
+logical CAS bytes are not physical filesystem usage; measured transport
+goodput is not physical link capacity.
+
+### Fleet history
+
+If configured, Liberta supplies the existing Grafana dashboard's 33 query
+panels. Select an exact client or all clients and a range from 15 minutes
+to seven days. Requests use fixed server-side PromQL templates; user labels
+are escaped as literal regular expressions. Linux host-wide panels include monitored Linux hosts rather than claiming all
+are workers. Ingress panels require an explicit Certifex virtual host. Range-dependent resolution is 5–1800 seconds;
+rates span at least five minutes.
+
+`GET /api/metrics/events` has one shared producer for each selected view.
+At most eight active distinct views and four concurrent queries globally
+bound backend load. Inactive views stop querying. Normal queries refresh the trailing five minutes or four buckets, whichever
+is longer; a full reconciliation runs every ten minutes or four buckets,
+whichever is longer. Failed panels retain previous samples inside the range
+and retry a full range at the next grid. Rolling changes and corrections are
+delivered as point-level patches. Stat, time-series, distribution gauge and
+version table presentation are preserved. Both streams expose errors and resynchronize
+after connection loss. Native telemetry works independently of Liberta.
+Liberta's existing retention and data producers are unchanged.
+
+### Native service and CAS pressure
+
+The dashboard reports ticket populations (including unobserved/contended tickets),
+upload slots, manifest-cache usage and result-recovery queue occupancy. Session
+telemetry never renews leases or takes service slots. A contended session or
+resource is explicitly unavailable in that sample; observations do not wait
+behind long-running I/O or trigger eviction. The CAS view shows physical free
+space separately from logical resident bytes, staging reservations and both
+physical and logical budget watermarks. Headroom estimates exclude prospective
+reclamation and are advisory, not admission guarantees.
+
+### Portable release package
+
+The CI release workflow additionally publishes
+`sccache-scheduler-dashboard-linux-x86_64-v2.tar.gz` and its SHA-256 file.
+The archive contains the dashboard-enabled scheduler executable, matching
+`pkg/` assets, build revision/protocol metadata and internal SHA-256 checksums.
+It is built from the same revision as the ordinary fleet binaries and subject
+to the same native ABI checks. Worker/client bundles and the existing automatic
+fleet updater continue to use the ordinary binaries; installing the separate
+scheduler package and switching the scheduler service are explicit deployment
+operations, not an automatic protocol rollout.

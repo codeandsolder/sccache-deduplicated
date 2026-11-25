@@ -136,6 +136,23 @@ impl Registry {
             .is_some_and(|record| !record.revoked && record.role == role))
     }
 
+    /// Snapshot enrolled identities, including revoked and currently idle peers.
+    ///
+    /// # Errors
+    /// Returns an error if the registry is unavailable.
+    pub fn members(&self) -> Result<Vec<(PeerId, Role, bool)>> {
+        let records = self
+            .records
+            .lock()
+            .map_err(|_| anyhow::anyhow!("enrollment registry poisoned"))?;
+        let members = records
+            .iter()
+            .map(|(&id, record)| (id, record.role, record.revoked))
+            .collect();
+        drop(records);
+        Ok(members)
+    }
+
     /// Snapshot permanent revocations for authenticated worker distribution.
     ///
     /// # Errors

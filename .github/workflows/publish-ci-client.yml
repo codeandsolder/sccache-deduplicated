@@ -132,6 +132,22 @@ jobs:
             echo "capabilities=$(target/release/sccache --capabilities | paste -sd, -)"
           } > dist/build.txt
 
+      - name: Build matching dashboard scheduler and browser package
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add --toolchain "${{ steps.protocol.outputs.rust_toolchain }}" wasm32-unknown-unknown
+          scripts/install-scheduler-dashboard-tools.sh target/dashboard-tools
+          env -u RUSTFLAGS scripts/build-scheduler-dashboard.sh target/dashboard-tools/wasm-bindgen target/dashboard-tools/stylance
+          cargo +${{ steps.protocol.outputs.rust_toolchain }} build --release --locked \
+            --no-default-features \
+            --features s3,gha,dist-client,dist-server,direct-metrics,vendored-openssl,scheduler-dashboard \
+            --bin sccache-dist
+          install -D -m 0755 target/release/sccache-dist dist/sccache-scheduler-dashboard-linux-x86_64-v2
+          scripts/package-scheduler-dashboard.sh \
+            dist/sccache-scheduler-dashboard-linux-x86_64-v2 target/scheduler-dashboard/pkg \
+            dist/sccache-scheduler-dashboard-linux-x86_64-v2.tar.gz
+
       - name: Install native release validation tools
         shell: bash
         run: |
@@ -146,7 +162,7 @@ jobs:
         run: |
           set -euo pipefail
           max_supported="GLIBC_${{ steps.protocol.outputs.glibc_abi_max }}"
-          for binary in dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2; do
+          for binary in dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2 dist/sccache-scheduler-dashboard-linux-x86_64-v2; do
             abi_report="$RUNNER_TEMP/$(basename "$binary").glibc-versions"
             readelf -W --version-info "$binary" > "$abi_report"
             # rg exit 1 means no matches (valid for a fully static binary);
@@ -171,7 +187,7 @@ jobs:
         shell: bash
         run: >-
           bash contrib/codeandsolder/verify-release-native-abi.sh
-          dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2
+          dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2 dist/sccache-scheduler-dashboard-linux-x86_64-v2
 
       - name: Finalize mandatory sccache before publishing binaries
         if: always()
@@ -198,4 +214,5 @@ jobs:
             --target "${{ steps.rev.outputs.sha }}" \
             --title "CI sccache bundle ${{ steps.rev.outputs.sha }}" \
             --notes "Pinned Linux x86-64-v2 sccache client + direct sccache-dist worker bundle for centrally managed CI." \
-            dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2 dist/SHA256SUMS dist/build.txt
+            dist/sccache-linux-x86_64-v2 dist/sccache-dist-linux-x86_64-v2 dist/SHA256SUMS dist/build.txt \
+            dist/sccache-scheduler-dashboard-linux-x86_64-v2.tar.gz dist/sccache-scheduler-dashboard-linux-x86_64-v2.tar.gz.sha256

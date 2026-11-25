@@ -94,6 +94,7 @@ semver = "1.0"
 sccache-peer-identity = { path = "crates/peer-identity" }
 sccache-cluster-identity = { path = "crates/cluster-identity", optional = true }
 sccache-build = { path = "crates/build-runtime", default-features = false }
+sccache-dashboard = { path = "crates/scheduler-dashboard", optional = true, features = ["ssr"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11.19"
 serde_json = ">=1.0, <1.0.155" # zmij (used in 1.0.147+) requires Rust 1.84+
@@ -280,12 +281,14 @@ dist-server = [
   "version-compare",
   "dep:hostname",
 ]
+# Opt-in local status UI; worker-only builds do not need the web stack.
+scheduler-dashboard = ["dist-server", "dep:sccache-dashboard"]
 # Enables dist tests with external requirements
 dist-tests = ["dist-client", "dist-server"]
 
 [workspace]
 exclude = ["tests/test-crate", "vendor/tiny_http"]
-members = ["crates/build-runtime", "crates/cluster-identity", "crates/peer-identity", "tests/integration/randomize_readdir"]
+members = ["crates/build-runtime", "crates/cluster-identity", "crates/peer-identity", "crates/scheduler-dashboard", "tests/integration/randomize_readdir"]
 
 [[bench]]
 harness = false

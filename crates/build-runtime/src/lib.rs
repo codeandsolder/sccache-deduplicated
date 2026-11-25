@@ -51,8 +51,8 @@ mod coordinator;
 mod session;
 #[cfg(all(unix, feature = "store"))]
 pub use session::{
-    DeliveryReceipt, NativeContentPending, NativeInputRejected, NativeServiceBusy, NativeSessions,
-    PeerInputClaim, SessionLimits,
+    DeliveryReceipt, ManifestStatus, NativeContentPending, NativeInputRejected, NativeServiceBusy,
+    NativeSessions, PeerInputClaim, RecoveryStatus, SessionLimits, SessionStatus, TicketStatus,
 };
 #[cfg(all(unix, feature = "store"))]
 mod store;
@@ -62,8 +62,8 @@ pub use coordinator::{Admission, BuildCoordinator, CompilePermit};
 pub use store::{
     CacheStats, ComponentAudit, Eviction, GarbageCollected, NativeIndexAudit, NativeStore,
     PackageArchiveLease, PackageDecoder, PackageImportLimits, PackagePolicy, PackageSlot,
-    Published, ResultLease, SchemaInventory, SpaceReport, StageBudget, StagedBlob, TreeLease,
-    UploadReservation, VerifiedPackage, decode_package_process,
+    Published, ResultLease, SchemaInventory, SpaceReport, SpaceStatus, StageBudget, StagedBlob,
+    TreeLease, UploadReservation, VerifiedPackage, decode_package_process,
 };
 
 #[cfg(all(target_os = "linux", feature = "store"))]
