@@ -130,7 +130,7 @@ impl<'a> NativeTransferPlan<'a> {
         if !network.send.shared.is_empty() {
             for (&id, details) in servers {
                 if let Some(placement) = &details.capabilities.native_placement {
-                    let peer = Peer::Worker(id.addr());
+                    let peer = Peer::Worker(id);
                     let Some(forecast) = WorkerForecast::new(details, None) else {
                         continue;
                     };
@@ -315,7 +315,9 @@ mod tests {
     use sccache::build_runtime::{PeerCapacity, SharedCapacity};
 
     fn worker(port: u16) -> Peer {
-        Peer::Worker(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+        Peer::Worker(ServerId::from_digest(std::array::from_fn(|index| {
+            port.to_le_bytes()[index % 2]
+        })))
     }
 
     fn constrained(a: Peer, b: Peer) -> DirectionSnapshot {

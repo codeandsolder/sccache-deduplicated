@@ -28,7 +28,7 @@ impl std::fmt::Debug for Ticket {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Publisher {
     Client,
-    Worker { address: SocketAddr, job: u64 },
+    Worker { peer: crate::PeerId, job: u64 },
 }
 
 /// A client request for a complete *native* action, not a legacy cache key.
@@ -192,15 +192,16 @@ pub struct TreeRead {
 /// worker's existing authenticated HTTPS service.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerAllocation {
-    pub address: std::net::SocketAddr,
+    pub peer: crate::PeerId,
+    pub address: SocketAddr,
     pub job: u64,
     pub auth: String,
-    pub certificate: Vec<u8>,
 }
 
 impl std::fmt::Debug for WorkerAllocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkerAllocation")
+            .field("peer", &self.peer)
             .field("address", &self.address)
             .field("job", &self.job)
             .finish_non_exhaustive()

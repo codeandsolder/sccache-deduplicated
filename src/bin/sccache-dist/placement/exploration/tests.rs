@@ -8,11 +8,11 @@ use sccache::{
 };
 
 fn id(port: u16) -> ServerId {
-    ServerId::new(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+    ServerId::from_digest(std::array::from_fn(|index| port.to_le_bytes()[index % 2]))
 }
 
 fn peer(port: u16) -> Peer {
-    Peer::Worker(id(port).addr())
+    Peer::Worker(id(port))
 }
 
 fn capacity(remaining: u64) -> PeerCapacity {

@@ -89,9 +89,9 @@ enum Role {
 /// to its scheduler-assigned job and the delegated ticket.
 #[derive(Clone)]
 pub struct NativeCacheClient {
-    http: reqwest::blocking::Client,
-    base: reqwest::Url,
-    auth: String,
+    routes: std::sync::Arc<crate::dist::cluster::BlockingRoutes>,
+    peer: std::sync::Arc<sccache_cluster_identity::PeerCredentials>,
+    address: std::net::SocketAddr,
     role: Role,
     metadata_limit: u64,
     timeout: Duration,
@@ -104,32 +104,21 @@ impl NativeCacheClient {
     /// Returns an error for invalid endpoint configuration or HTTP setup.
     pub fn new(
         base: reqwest::Url,
-        auth: String,
+        peer: std::sync::Arc<sccache_cluster_identity::PeerCredentials>,
         timeout: Duration,
         metadata_limit: u64,
     ) -> Result<Self> {
-        ensure!(
-            matches!(base.scheme(), "http" | "https")
-                && base.query().is_none()
-                && base.fragment().is_none()
-                && base.username().is_empty()
-                && base.password().is_none(),
-            "invalid native cache endpoint"
-        );
+        let address = sccache_cluster_identity::endpoint(&base)?;
         ensure!(
             metadata_limit > 0 && metadata_limit < u64::MAX && !timeout.is_zero(),
             "invalid native client bounds"
         );
-        let http = crate::http_client::new_reqwest_blocking_builder()?
-            .timeout(timeout)
-            .connect_timeout(Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .pool_max_idle_per_host(0)
-            .build()?;
         Ok(Self {
-            http,
-            base,
-            auth,
+            routes: std::sync::Arc::new(crate::dist::cluster::BlockingRoutes::for_peer(
+                std::sync::Arc::clone(&peer),
+            )),
+            peer,
+            address,
             role: Role::Client,
             metadata_limit,
             timeout,
@@ -148,15 +137,16 @@ impl NativeCacheClient {
             Role::Client => ("client", None),
             Role::Worker(job) => ("worker", Some(job)),
         };
-        let url = self
-            .base
-            .join(&format!("/api/v5/native/{role}/{operation}"))?;
-        let mut request = self
-            .http
+        let (http, base) = self.routes.endpoint(
+            self.peer.scheduler_id(),
+            sccache_cluster_identity::Role::Scheduler,
+            self.address,
+        )?;
+        let url = base.join(&format!("/api/v5/native/{role}/{operation}"))?;
+        let mut request = http
             .post(url)
-            .bearer_auth(&self.auth)
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .header(reqwest::header::CONNECTION, "close");
+            .timeout(self.timeout)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
         if let Some(job) = job {
             request = request.header("X-Sccache-Native-Job", job.to_string());
         }
@@ -387,6 +377,7 @@ impl NativeCacheClient {
     /// Returns an error for a rejected job, invalid certificate or transport
     /// failure, or an oversized failure response.
     pub fn run_worker(
+        &self,
         allocation: &WorkerAllocation,
         timeout: Duration,
         max_response_bytes: u64,
@@ -395,17 +386,12 @@ impl NativeCacheClient {
             !timeout.is_zero() && max_response_bytes > 0 && max_response_bytes < u64::MAX,
             "invalid native run limits"
         );
-        let certificate = reqwest::Certificate::from_pem(&allocation.certificate)?;
-        let http = reqwest::blocking::Client::builder()
-            .tls_certs_only([certificate])
-            .timeout(timeout)
-            .connect_timeout(Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
-        let url = crate::dist::http::urls::server_run_native_job(
-            crate::dist::ServerId::new(allocation.address),
-            JobId(allocation.job),
+        let (http, base) = self.routes.endpoint(
+            allocation.peer,
+            sccache_cluster_identity::Role::Worker,
+            allocation.address,
         )?;
+        let url = crate::dist::http::urls::server_run_native_job(&base, JobId(allocation.job))?;
         let max_response_bytes = max_response_bytes
             .checked_add(64)
             .context("native response limit overflow")?;

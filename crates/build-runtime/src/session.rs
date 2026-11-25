@@ -4,7 +4,6 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs::File,
     io::{Read, Seek},
-    net::SocketAddr,
     path::Path,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, Weak,
@@ -292,7 +291,7 @@ impl TreeDelivery {
 /// Only the claimed origin uploads; the verified retention lease is shared.
 struct Backfill {
     blob: BlobRef,
-    requester: SocketAddr,
+    requester: crate::PeerId,
     state: Mutex<BackfillState>,
 }
 
@@ -353,7 +352,7 @@ impl PeerInputClaim {
     }
 
     #[must_use = "identifies the worker awaiting recovered content"]
-    pub fn requester(&self) -> SocketAddr {
+    pub fn requester(&self) -> crate::PeerId {
         self.0.flight.requester
     }
 }
@@ -869,7 +868,7 @@ impl NativeSessions {
                 worker: allocation.clone(),
             });
             state.publisher = Publisher::Worker {
-                address: allocation.address,
+                peer: allocation.peer,
                 job: allocation.job,
             };
         }
@@ -1374,7 +1373,7 @@ impl NativeSessions {
         );
         let input = action.inputs.get(&tree).context("undeclared input tree")?;
         let Publisher::Worker {
-            address: requester, ..
+            peer: requester, ..
         } = reader
         else {
             bail!("backfill requires a worker");

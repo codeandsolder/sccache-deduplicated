@@ -110,17 +110,20 @@ impl EnrollmentAuthority {
     pub fn enroll(
         &self,
         request: &EnrollmentRequest,
-        authorize: impl FnOnce() -> Option<Role>,
+        authorize: impl FnOnce(PeerId) -> Option<Role>,
     ) -> Result<EnrollmentResponse> {
-        let role = authorize().context("enrollment authorization denied")?;
+        let request = request.parse()?;
+        let key = request.public_key()?;
+        validate_request_key(&key)?;
+        ensure!(request.verify(&key)?, "invalid CSR signature");
+        let id = key_id(&key)?;
+        let role = authorize(id).context("enrollment authorization denied")?;
         ensure!(
             role != Role::Scheduler,
             "scheduler identity cannot be remotely enrolled"
         );
-        let request = request.parse()?;
         let response = self.issue(&request, role)?;
-        self.registry
-            .register(key_id(request.public_key()?.as_ref())?, role)?;
+        self.registry.register(id, role)?;
         Ok(response)
     }
 

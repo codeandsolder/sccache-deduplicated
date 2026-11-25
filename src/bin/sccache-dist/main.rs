@@ -145,13 +145,13 @@ fn main() {
 }
 
 fn create_server_token(server_id: ServerId, auth_token: &str) -> String {
-    format!("{} {}", server_id.addr(), auth_token)
+    format!("{} {}", server_id, auth_token)
 }
 fn check_server_token(server_token: &str, auth_token: &str) -> Option<ServerId> {
     let mut split = server_token.splitn(2, ' ');
-    let server_addr = split.next().and_then(|addr| addr.parse().ok())?;
+    let server_id = split.next().and_then(|id| id.parse().ok())?;
     match split.next() {
-        Some(t) if t == auth_token => Some(ServerId::new(server_addr)),
+        Some(t) if t == auth_token => Some(server_id),
         Some(_) | None => None,
     }
 }
@@ -217,9 +217,22 @@ fn package_client(client_config: &Path) -> Result<sccache::dist::native::NativeC
     let DistAuth::Token { token } = config.dist.auth else {
         bail!("original-package provisioning requires token authentication");
     };
+    let peer = dist::cluster::open_peer(
+        config
+            .dist
+            .cluster
+            .context("cluster trust configuration required")?,
+        &config
+            .dist
+            .scheduler_url
+            .context("scheduler endpoint required")?
+            .to_url(),
+        sccache_cluster_identity::Role::Client,
+        &token,
+    )?;
     NativeCacheClient::new(
         native.endpoint.to_url(),
-        token,
+        peer,
         Duration::from_secs(native.request_timeout_secs),
         native.max_metadata_bytes,
     )
@@ -487,6 +500,7 @@ fn run(command: Command) -> Result<i32> {
         }
 
         Command::Scheduler(scheduler_config::Config {
+            cluster_directory,
             public_addr,
             client_auth,
             server_auth,
@@ -567,6 +581,7 @@ fn run(command: Command) -> Result<i32> {
                 )?;
             }
             let http_scheduler = dist::http::Scheduler::new(
+                cluster_directory,
                 public_addr,
                 scheduler,
                 check_client_auth,
@@ -578,6 +593,7 @@ fn run(command: Command) -> Result<i32> {
         }
 
         Command::Server(server_config::Config {
+            cluster,
             builder,
             cache_dir,
             public_addr,
@@ -642,7 +658,7 @@ fn run(command: Command) -> Result<i32> {
                 })
                 .transpose()?;
 
-            let server_id = ServerId::new(public_addr);
+            let server_id = sccache_cluster_identity::open_identity(&cluster)?.id()?;
             let scheduler_auth = match scheduler_auth {
                 server_config::SchedulerAuth::Insecure => {
                     warn!("Server starting with DANGEROUSLY_INSECURE scheduler authentication");
@@ -666,9 +682,15 @@ fn run(command: Command) -> Result<i32> {
                 }
             };
 
+            let peer = dist::cluster::open_peer(
+                cluster,
+                &scheduler_url.to_url(),
+                sccache_cluster_identity::Role::Worker,
+                &scheduler_auth,
+            )?;
             #[cfg(target_os = "linux")]
             let native_worker = native_worker
-                .map(|config| NativeWorker::new(config, scheduler_auth.clone()))
+                .map(|config| NativeWorker::new(config, std::sync::Arc::clone(&peer)))
                 .transpose()?;
             #[cfg(not(target_os = "linux"))]
             if native_worker.is_some() {
@@ -688,15 +710,9 @@ fn run(command: Command) -> Result<i32> {
                 ..server
             };
             let worker_name = dist_worker_name()?;
-            let http_server = dist::http::Server::new_with_worker_name(
-                public_addr,
-                bind_address,
-                scheduler_url.to_url(),
-                scheduler_auth,
-                worker_name,
-                server,
-            )
-            .context("Failed to create sccache HTTP server instance")?;
+            let http_server =
+                dist::http::Server::new(public_addr, bind_address, peer, Some(worker_name), server)
+                    .context("Failed to create sccache HTTP server instance")?;
             // A running server never exits successfully (Result<Infallible>).
             match http_server.start()? {}
         }
@@ -998,7 +1014,7 @@ impl Scheduler {
         for server_id in dead_servers {
             warn!(
                 "Server {} appears to be dead, pruning it in the scheduler",
-                server_id.addr()
+                server_id
             );
             let Some(server_details) = servers.remove(&server_id) else {
                 error!("server {server_id:?} disappeared while pruning");
@@ -1007,7 +1023,7 @@ impl Scheduler {
             for job_id in server_details.jobs_assigned.into_keys() {
                 warn!(
                     "dist_job_lost job_id={job_id} worker={} reason=heartbeat_timeout previous_state={:?}",
-                    server_id.addr(),
+                    server_id,
                     jobs.get(&job_id).map(|detail| detail.state)
                 );
                 // A job may be missing here if it failed to allocate
@@ -1126,7 +1142,7 @@ impl Scheduler {
                         let learned = class.zip(native_platform).map(|(class, platform)| {
                             cost_book.predict(
                                 placement::WorkerScope {
-                                    address: server_id.addr(),
+                                    peer: server_id,
                                     platform,
                                 },
                                 class,
@@ -1139,8 +1155,8 @@ impl Scheduler {
                             continue;
                         };
                         let estimate =
-                            native_estimate(forecast, inputs, Peer::Worker(server_id.addr()), plan);
-                        predictions.insert(server_id.addr(), estimate);
+                            native_estimate(forecast, inputs, Peer::Worker(server_id), plan);
+                        predictions.insert(server_id, estimate);
                         estimate.seconds
                     } else {
                         weight
@@ -1195,23 +1211,21 @@ impl Scheduler {
                         .job_authorizer
                         .generate_token(job_id)
                         .context("Could not create an auth token for this job")?;
-                    let prediction = predictions.get(&server_id.addr()).copied();
+                    let prediction = predictions.get(&server_id).copied();
                     if let Some(class) = class {
                         trace!(target: "native_placement_replay", "{}", serde_json::json!({
-                            "kind": "assigned", "job": job_id.0, "worker": server_id.addr(), "class": class,
+                            "kind": "assigned", "job": job_id.0, "worker": server_id, "class": class,
                             "candidates": predictions,
                             "estimated_result_bytes": estimated_result_bytes,
                             "host_prior": server_details.capabilities.native_placement.as_ref().map(placement::ActionCost::baseline),
-                            "healthy": healthy.iter().map(|(id, _)| id.addr()).collect::<Vec<_>>(),
+                            "healthy": healthy.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
                         }));
                     }
                     let assigned = native_inputs.map(|inputs| placement::AssignedNative {
                         packages: std::sync::Arc::clone(&packages),
                         inputs: inputs.clone(),
                         class,
-                        cost: predictions
-                            .get(&server_id.addr())
-                            .map(|estimate| estimate.cost),
+                        cost: predictions.get(&server_id).map(|estimate| estimate.cost),
                         milestone: None,
                     });
                     assert!(
@@ -1451,7 +1465,7 @@ impl SchedulerIncoming for Scheduler {
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .observe(
                                     placement::WorkerScope {
-                                        address: server_id.addr(),
+                                        peer: server_id,
                                         platform,
                                     },
                                     class,
@@ -1463,7 +1477,7 @@ impl SchedulerIncoming for Scheduler {
                                 );
                         }
                         trace!(target: "native_placement_replay", "{}", serde_json::json!({
-                            "kind": "completed", "job": job.0, "worker": server_id.addr(),
+                            "kind": "completed", "job": job.0, "worker": server_id,
                             "class": class, "predicted_seconds": detail.prediction.map(|prediction| prediction.completion_seconds),
                             "actual_inputs_ready_seconds": detail.inputs_staged_at.map(|staged| staged.saturating_duration_since(detail.assigned_at).as_secs_f64()),
                             "actual_result_negotiation_seconds": detail.publication_began_at.map(|began| began.saturating_duration_since(detail.assigned_at).as_secs_f64()),
@@ -1488,7 +1502,7 @@ impl SchedulerIncoming for Scheduler {
     fn native_blob_sources(
         &self,
         blob: sccache::build_runtime::BlobRef,
-        requester: Option<std::net::SocketAddr>,
+        requester: Option<ServerId>,
     ) -> Result<Vec<dist::NativeBlobSource>> {
         let servers = self
             .servers
@@ -1525,7 +1539,7 @@ impl SchedulerIncoming for Scheduler {
                                 .is_some_and(|residency| residency.may_contain(blob.id)),
                         )
                     };
-                (Some(id.addr()) != requester
+                (Some(*id) != requester
                     && details.last_seen.elapsed() < Duration::from_secs(20)
                     && details.last_error.is_none()
                     && (requester.is_none() || locality > 0))
@@ -1536,7 +1550,7 @@ impl SchedulerIncoming for Scheduler {
             right_predicted
                 .cmp(left_predicted)
                 .then_with(|| right.last_seen.cmp(&left.last_seen))
-                .then_with(|| a.addr().cmp(&b.addr()))
+                .then_with(|| a.cmp(b))
         });
         candidates
             .into_iter()
@@ -1663,14 +1677,13 @@ impl SchedulerIncoming for Scheduler {
                     for job_id in stale_jobs {
                         warn!(
                             "dist_job_lost job_id={job_id} worker={} reason=stale_assignment previous_state={:?}",
-                            server_id.addr(),
+                            server_id,
                             jobs.get(&job_id).map(|detail| detail.state)
                         );
                         if details.jobs_assigned.remove(&job_id).is_none() {
                             warn!(
                                 "Stale job for server {} not assigned: {}",
-                                server_id.addr(),
-                                job_id
+                                server_id, job_id
                             );
                         }
                         details.jobs_assigning.remove(&job_id);
@@ -1689,14 +1702,13 @@ impl SchedulerIncoming for Scheduler {
                 for job_id in details.jobs_assigned.keys() {
                     warn!(
                         "dist_job_lost job_id={job_id} worker={} reason=worker_restarted previous_state={:?}",
-                        server_id.addr(),
+                        server_id,
                         jobs.get(job_id).map(|detail| detail.state)
                     );
                     if jobs.remove(job_id).is_none() {
                         warn!(
                             "Unknown job found when replacing server {}: {}",
-                            server_id.addr(),
-                            job_id
+                            server_id, job_id
                         );
                     }
                 }
@@ -1745,16 +1757,10 @@ impl SchedulerIncoming for Scheduler {
         self.prune_servers(&mut servers, &mut jobs);
         drop(jobs);
         let details = servers.get(&server_id).ok_or_else(|| {
-            anyhow::anyhow!(
-                "worker name update from unknown server {}",
-                server_id.addr()
-            )
+            anyhow::anyhow!("worker name update from unknown server {}", server_id)
         })?;
         if details.server_nonce != server_nonce {
-            bail!(
-                "worker name update from stale server epoch {}",
-                server_id.addr()
-            )
+            bail!("worker name update from stale server epoch {}", server_id)
         }
         if let Some(existing) = details.worker_name.as_ref() {
             if existing == &worker_name {
@@ -1762,7 +1768,7 @@ impl SchedulerIncoming for Scheduler {
             }
             bail!(
                 "distributed worker {} changed name from {:?} to {:?} without restarting",
-                server_id.addr(),
+                server_id,
                 existing,
                 worker_name
             )
@@ -2426,9 +2432,9 @@ mod scheduler_tests {
         assert_eq!(admission_weight(0, 0.0, slack), Some(0.5));
         assert!(admission_weight(1, 0.0, slack).is_none());
         assert!(admission_weight(0, f64::NAN, slack).is_none());
-        let a: ServerId = "127.0.0.1:10501".parse().unwrap();
-        let b: ServerId = "127.0.0.2:10501".parse().unwrap();
-        let c: ServerId = "127.0.0.3:10501".parse().unwrap();
+        let a: ServerId = ServerId::from_digest([1; 32]);
+        let b: ServerId = ServerId::from_digest([2; 32]);
+        let c: ServerId = ServerId::from_digest([3; 32]);
         let choices = [(a, 1.5), (b, 3.5), (c, 0.5)];
         assert_eq!(weighted_server(&choices, 0.0), Some(a));
         assert_eq!(weighted_server(&choices, 0.27), Some(a));
@@ -2513,7 +2519,7 @@ mod scheduler_tests {
         let empty = HashMap::new();
         let network = NetworkSnapshot::default();
         let plan = NativeTransferPlan::new(&network, &HashMap::new(), None);
-        let peer = Peer::Worker("127.0.0.1:10501".parse().unwrap());
+        let peer = Peer::Worker(ServerId::from_digest([1; 32]));
         let eta = |capacity, assigned: &HashMap<_, _>, placement: &dist::NativePlacement| {
             native_estimate(
                 placement::WorkerForecast {
@@ -2564,9 +2570,9 @@ mod scheduler_tests {
     fn peer_blob_sources_exclude_requester_and_do_not_reserve_jobs() -> Result<()> {
         use sccache::build_runtime::{BlobRef, BlobResidency, ContentId};
         let scheduler = Scheduler::new();
-        let requester: ServerId = "127.0.0.1:10501".parse()?;
-        let peer: ServerId = "127.0.0.2:10501".parse()?;
-        let empty: ServerId = "127.0.0.3:10501".parse()?;
+        let requester: ServerId = ServerId::from_digest([1; 32]);
+        let peer: ServerId = ServerId::from_digest([2; 32]);
+        let empty: ServerId = ServerId::from_digest([3; 32]);
         let blob = BlobRef {
             id: ContentId::of(b"shared"),
             size: 6,
@@ -2588,12 +2594,12 @@ mod scheduler_tests {
                 Box::new(TestJobAuthorizer),
                 dist::WorkerCapabilities {
                     archive: false,
-                    native_platform: Some(ContentId::of(server.addr().to_string().as_bytes())),
+                    native_platform: Some(ContentId::of(server.to_string().as_bytes())),
                     native_placement: Some(placement),
                 },
             )?;
         }
-        let sources = scheduler.native_blob_sources(blob, Some(requester.addr()))?;
+        let sources = scheduler.native_blob_sources(blob, Some(requester))?;
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].server, peer);
         let recovery = scheduler.native_blob_sources(blob, None)?;
@@ -2649,8 +2655,8 @@ mod scheduler_tests {
     fn native_staged_closure_survives_stale_heartbeat_and_failed_compilation() -> Result<()> {
         use sccache::build_runtime::{BlobRef, ContentId, wire::NativeJobPhase};
         let scheduler = Scheduler::new();
-        let worker: ServerId = "127.0.0.1:10501".parse()?;
-        let peer: ServerId = "127.0.0.2:10501".parse()?;
+        let worker: ServerId = ServerId::from_digest([1; 32]);
+        let peer: ServerId = ServerId::from_digest([2; 32]);
         let platform = ContentId::of(b"native-staging-test");
         let nonce = ServerNonce::new();
         let capabilities = dist::WorkerCapabilities {
@@ -2683,25 +2689,12 @@ mod scheduler_tests {
             bail!("worker unavailable");
         };
         let id = job_alloc.job_id;
-        assert!(
-            scheduler
-                .native_blob_sources(blob, Some(peer.addr()))?
-                .is_empty()
-        );
+        assert!(scheduler.native_blob_sources(blob, Some(peer))?.is_empty());
         scheduler.observe_native_lifecycle(peer, id, dist::NativeLifecycleEvent::InputsStaged);
-        assert!(
-            scheduler
-                .native_blob_sources(blob, Some(peer.addr()))?
-                .is_empty()
-        );
+        assert!(scheduler.native_blob_sources(blob, Some(peer))?.is_empty());
         scheduler.observe_native_lifecycle(worker, id, dist::NativeLifecycleEvent::InputsStaged);
         heartbeat(&[id])?;
-        assert_eq!(
-            scheduler
-                .native_blob_sources(blob, Some(peer.addr()))?
-                .len(),
-            1
-        );
+        assert_eq!(scheduler.native_blob_sources(blob, Some(peer))?.len(), 1);
         {
             let servers = scheduler.servers.lock().unwrap();
             let queue = &servers[&worker]
@@ -2715,12 +2708,7 @@ mod scheduler_tests {
             assert_eq!(servers[&worker].compiler_demand(), 1);
         }
         scheduler.handle_update_job_state(id, worker, JobState::Complete)?;
-        assert_eq!(
-            scheduler
-                .native_blob_sources(blob, Some(peer.addr()))?
-                .len(),
-            1
-        );
+        assert_eq!(scheduler.native_blob_sources(blob, Some(peer))?.len(), 1);
         assert_eq!(
             scheduler.servers.lock().unwrap()[&worker].compiler_demand(),
             0
@@ -2778,7 +2766,7 @@ mod scheduler_tests {
             wire::{ActionObservation, WorkerTiming},
         };
         let scheduler = Scheduler::new();
-        let worker: ServerId = "127.0.0.1:10501".parse()?;
+        let worker: ServerId = ServerId::from_digest([1; 32]);
         let platform = ContentId::of(b"timing-platform");
         let nonce = ServerNonce::new();
         let capabilities = dist::WorkerCapabilities {
@@ -2869,8 +2857,8 @@ mod scheduler_tests {
     fn native_producer_receipt_places_consumer_before_next_heartbeat() -> Result<()> {
         use sccache::build_runtime::{Artifact, BlobRef, ContentId, ResultManifest};
         let scheduler = Scheduler::new();
-        let producer: ServerId = "127.0.0.1:10501".parse()?;
-        let other: ServerId = "127.0.0.2:10501".parse()?;
+        let producer: ServerId = ServerId::from_digest([1; 32]);
+        let other: ServerId = ServerId::from_digest([2; 32]);
         let platform = ContentId::of(b"test");
         let register = |id, execution_nanoseconds| {
             scheduler.handle_heartbeat_server(
@@ -2921,20 +2909,12 @@ mod scheduler_tests {
         };
         register(other, 1_000_000_000)?;
         scheduler.observe_native_lifecycle(producer, job, committed());
-        assert!(
-            scheduler
-                .native_blob_sources(blob, Some(other.addr()))?
-                .is_empty()
-        );
+        assert!(scheduler.native_blob_sources(blob, Some(other))?.is_empty());
         scheduler.observe_native_lifecycle(producer, job, dist::NativeLifecycleEvent::Negotiated);
         scheduler.observe_native_lifecycle(other, job, committed());
-        assert!(
-            scheduler
-                .native_blob_sources(blob, Some(other.addr()))?
-                .is_empty()
-        );
+        assert!(scheduler.native_blob_sources(blob, Some(other))?.is_empty());
         scheduler.observe_native_lifecycle(producer, job, committed());
-        let sources = scheduler.native_blob_sources(blob, Some(other.addr()))?;
+        let sources = scheduler.native_blob_sources(blob, Some(other))?;
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].server, producer);
         scheduler.handle_update_job_state(job, producer, JobState::Complete)?;
@@ -2953,11 +2933,7 @@ mod scheduler_tests {
         register(producer, 2_000_000_000)?;
         scheduler.observe_native_lifecycle(producer, job, dist::NativeLifecycleEvent::Negotiated);
         scheduler.observe_native_lifecycle(producer, job, committed());
-        assert!(
-            scheduler
-                .native_blob_sources(blob, Some(other.addr()))?
-                .is_empty()
-        );
+        assert!(scheduler.native_blob_sources(blob, Some(other))?.is_empty());
         let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_native_job(
             &AcceptAssign,
             native_test_assignment(platform, BTreeMap::from([(blob.id, blob.size)]))?,
@@ -2978,8 +2954,8 @@ mod scheduler_tests {
             static_jobs: 0,
             percent: 0.0,
         });
-        let a: ServerId = "127.0.0.1:10501".parse()?;
-        let b: ServerId = "127.0.0.2:10501".parse()?;
+        let a: ServerId = ServerId::from_digest([1; 32]);
+        let b: ServerId = ServerId::from_digest([2; 32]);
         let nonce_a = ServerNonce::new();
         let nonce_b = ServerNonce::new();
         let platform = ContentId::of(b"native-test");
@@ -3050,9 +3026,9 @@ mod scheduler_tests {
             percent: 200.0,
         });
         let ids: [ServerId; 3] = [
-            "127.0.0.1:10501".parse().unwrap(),
-            "127.0.0.1:10502".parse().unwrap(),
-            "127.0.0.1:10503".parse().unwrap(),
+            ServerId::from_digest([1; 32]),
+            ServerId::from_digest([2; 32]),
+            ServerId::from_digest([3; 32]),
         ];
         let nonce = ServerNonce::new();
         for (id, cpus) in ids.into_iter().zip([1.0, 3.0, 0.0]) {
@@ -3173,7 +3149,7 @@ mod scheduler_tests {
     #[test]
     fn heartbeat_reports_inflight_and_accepted_assignments() -> Result<()> {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse()?;
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
         let AllocJobResult::Success { job_alloc, .. } = scheduler.handle_alloc_job(
@@ -3213,7 +3189,7 @@ mod scheduler_tests {
     #[test]
     fn status_counts_assignment_rpc_reservations() {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         register_test_server(&scheduler, server_id, ServerNonce::new());
         let AllocJobResult::Success { job_alloc, .. } = scheduler
             .handle_alloc_job(&StatusDuringAssign(&scheduler), test_toolchain('c'))
@@ -3233,9 +3209,9 @@ mod scheduler_tests {
     #[test]
     fn idle_workers_receive_jobs_proportional_to_cpu_capacity() {
         let scheduler = Scheduler::new();
-        let ids: Vec<ServerId> = ["127.0.0.1:10501", "127.0.0.2:10501", "127.0.0.3:10501"]
+        let ids: Vec<ServerId> = [1, 2, 3]
             .into_iter()
-            .map(|s| s.parse().unwrap())
+            .map(|i| ServerId::from_digest([i; 32]))
             .collect();
 
         for (&id, capacity) in ids.iter().zip([1.0, 3.0, 0.0]) {
@@ -3291,7 +3267,7 @@ mod scheduler_tests {
         let drain = dir.path().join("scheduler-drain");
         let scheduler =
             Scheduler::new_with_job_slack_and_drain(JobSlackConfig::default(), Some(drain.clone()));
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         register_test_server(&scheduler, server_id, ServerNonce::new());
 
         std::fs::write(&drain, b"drain").unwrap();
@@ -3368,7 +3344,7 @@ mod scheduler_tests {
     #[test]
     fn ready_transition_starts_its_own_unclaimed_timeout() {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
 
@@ -3425,7 +3401,7 @@ mod scheduler_tests {
     #[test]
     fn progressing_pending_upload_renews_lease_but_inactive_upload_expires() -> Result<()> {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse()?;
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
         let AllocJobResult::Success { job_alloc, .. } =
@@ -3480,7 +3456,7 @@ mod scheduler_tests {
     #[test]
     fn pending_jobs_expire_but_started_jobs_remain_owned_by_execution() {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
 
@@ -3578,7 +3554,7 @@ mod scheduler_tests {
     #[test]
     fn failed_token_generation_never_reserves_capacity() {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         scheduler
             .handle_heartbeat_server(
                 server_id,
@@ -3600,7 +3576,7 @@ mod scheduler_tests {
     #[test]
     fn completion_without_assignment_does_not_discard_job() {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         register_test_server(&scheduler, server_id, ServerNonce::new());
         let AllocJobResult::Success { job_alloc, .. } = scheduler
             .handle_alloc_job(&AcceptAssign, test_toolchain('c'))
@@ -3653,7 +3629,7 @@ mod scheduler_tests {
     #[test]
     fn started_jobs_reconcile_against_worker_running_inventory() {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
         let AllocJobResult::Success { job_alloc, .. } = scheduler
@@ -3730,8 +3706,8 @@ mod scheduler_tests {
     #[test]
     fn only_the_completing_worker_can_retry_a_known_completion() -> Result<()> {
         let scheduler = Scheduler::new();
-        let owner: ServerId = "127.0.0.1:10501".parse()?;
-        let other: ServerId = "127.0.0.1:10502".parse()?;
+        let owner: ServerId = ServerId::from_digest([1; 32]);
+        let other: ServerId = ServerId::from_digest([2; 32]);
         register_test_server(&scheduler, owner, ServerNonce::new());
         let AllocJobResult::Success { job_alloc, .. } =
             scheduler.handle_alloc_job(&AcceptAssign, test_toolchain('f'))?
@@ -3769,7 +3745,7 @@ mod scheduler_tests {
     #[test]
     fn recent_completion_acknowledgments_expire_and_are_bounded() -> Result<()> {
         let now = Instant::now();
-        let owner: ServerId = "127.0.0.1:10501".parse()?;
+        let owner: ServerId = ServerId::from_digest([1; 32]);
         let mut acks = CompletedJobAcks::default();
         for id in 0..MAX_COMPLETION_ACKS as u64 {
             acks.record(JobId(id), owner, now);
@@ -3789,7 +3765,7 @@ mod scheduler_tests {
     #[test]
     fn returned_running_job_resets_missing_heartbeat_grace() {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         register_test_server(&scheduler, server_id, nonce.clone());
         let AllocJobResult::Success { job_alloc, .. } = scheduler
@@ -3864,7 +3840,7 @@ mod scheduler_tests {
     #[test]
     fn state_acknowledgments_are_idempotent() {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         register_test_server(&scheduler, server_id, ServerNonce::new());
         let AllocJobResult::Success { job_alloc, .. } = scheduler
             .handle_alloc_job(&AcceptAssign, test_toolchain('d'))
@@ -3893,7 +3869,7 @@ mod scheduler_tests {
     #[test]
     fn worker_name_side_channel_is_optional_and_epoch_bound() {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         scheduler
             .handle_heartbeat_server(
@@ -3939,8 +3915,8 @@ mod scheduler_tests {
     #[test]
     fn duplicate_active_worker_names_are_rejected() {
         let scheduler = Scheduler::new();
-        let first: ServerId = "127.0.0.1:10501".parse().unwrap();
-        let second: ServerId = "127.0.0.2:10501".parse().unwrap();
+        let first: ServerId = ServerId::from_digest([1; 32]);
+        let second: ServerId = ServerId::from_digest([2; 32]);
         let first_nonce = ServerNonce::new();
         let second_nonce = ServerNonce::new();
         for (server_id, nonce) in [(first, first_nonce.clone()), (second, second_nonce.clone())] {
@@ -3967,7 +3943,7 @@ mod scheduler_tests {
     #[test]
     fn worker_name_is_stable_within_server_epoch() {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         let nonce = ServerNonce::new();
         scheduler
             .handle_heartbeat_server(
@@ -3991,7 +3967,7 @@ mod scheduler_tests {
     #[test]
     fn allocation_fails_if_assignment_is_cleaned_up() {
         let scheduler = Scheduler::new();
-        let server_id: ServerId = "127.0.0.1:10501".parse().unwrap();
+        let server_id: ServerId = ServerId::from_digest([1; 32]);
         let server_nonce = ServerNonce::new();
 
         register_test_server(&scheduler, server_id, server_nonce.clone());

@@ -112,11 +112,11 @@ fn worker_publication_and_client_download_are_bound_to_ticket() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let service = service(dir.path())?;
     let worker = Publisher::Worker {
-        address: "127.0.0.1:10501".parse()?,
+        peer: test_peer(1),
         job: 42,
     };
     let other_worker = Publisher::Worker {
-        address: "127.0.0.1:10502".parse()?,
+        peer: test_peer(2),
         job: 42,
     };
     let NativeAdmission::Compile { ticket } = service.admit(
@@ -282,12 +282,12 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     else {
         bail!("expected compilation");
     };
-    let worker = "127.0.0.1:10501".parse()?;
+    let worker = test_peer(1);
     let allocation = WorkerAllocation {
-        address: worker,
+        peer: worker,
+        address: "127.0.0.1:10501".parse()?,
         job: 42,
         auth: "proof".into(),
-        certificate: vec![1],
     };
     let expected = ScheduleReply::Assigned(allocation);
     assert_eq!(
@@ -311,7 +311,7 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     service.renew(
         ticket,
         Publisher::Worker {
-            address: worker,
+            peer: worker,
             job: 42,
         },
     )?;
@@ -320,7 +320,7 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     assert_eq!(service.status(ticket)?, NativeStatus::Compiling);
     assert_eq!(NativeSessions::lock(&session)?.expires, expiry);
     let publisher = Publisher::Worker {
-        address: worker,
+        peer: worker,
         job: 42,
     };
     let result = manifest(b"object");
@@ -403,13 +403,13 @@ fn delegation_blocks_early_worker_verification_until_assignment_returns() -> Res
             bail!("expected compilation");
         };
         let worker = WorkerAllocation {
+            peer: test_peer(1),
             address: "127.0.0.1:10501".parse()?,
             job: u64::from(accepted),
             auth: "proof".into(),
-            certificate: vec![1],
         };
         let publisher = Publisher::Worker {
-            address: worker.address,
+            peer: worker.peer,
             job: worker.job,
         };
         let expected = if accepted {
@@ -555,7 +555,7 @@ fn input_manifest_survives_scheduler_eviction_and_worker_fetch_is_scoped() -> Re
     };
     request.input_trees = BTreeSet::from([id]);
     let worker = Publisher::Worker {
-        address: "127.0.0.1:10501".parse()?,
+        peer: test_peer(1),
         job: 42,
     };
     let NativeAdmission::Compile { ticket } = service.admit(
@@ -913,11 +913,11 @@ fn lazy_manifest_admission_and_cross_action_backfill_are_single_flight() -> Resu
         .components
         .insert("second".into(), ContentId::of(b"second"));
     let worker1 = Publisher::Worker {
-        address: "127.0.0.1:10501".parse()?,
+        peer: test_peer(1),
         job: 1,
     };
     let worker2 = Publisher::Worker {
-        address: "127.0.0.1:10502".parse()?,
+        peer: test_peer(2),
         job: 2,
     };
     assert_eq!(
@@ -1049,7 +1049,7 @@ fn exercise_source_release(staged: bool) -> Result<()> {
     };
     spec.input_trees = BTreeSet::from([id]);
     let worker = Publisher::Worker {
-        address: "127.0.0.1:10501".parse()?,
+        peer: test_peer(1),
         job: 1,
     };
     let NativeAdmission::Compile { ticket: a } = service.admit(
@@ -1158,8 +1158,8 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
         recipe: TreeRecipe::union(root, [id]),
     };
     spec.input_trees = BTreeSet::from([id]);
-    let address = "127.0.0.1:10501".parse()?;
-    let worker = Publisher::Worker { address, job: 1 };
+    let peer = test_peer(1);
+    let worker = Publisher::Worker { peer, job: 1 };
     let NativeAdmission::Compile { ticket } = service.admit(
         spec,
         worker,
@@ -1176,7 +1176,7 @@ fn peer_backfill_uses_same_flight_and_falls_back_to_origin() -> Result<()> {
         .claim_peer_input(Duration::ZERO)?
         .context("peer claim missing")?;
     assert_eq!(claim.blob(), first);
-    assert_eq!(claim.requester(), address);
+    assert_eq!(claim.requester(), peer);
     assert_eq!(service.poll_input(ticket)?, InputPoll::Waiting);
     assert!(service.claim_peer_input(Duration::ZERO)?.is_none());
     service.recover_peer_input(
@@ -1426,4 +1426,8 @@ fn peer_recovery_cannot_consume_last_direct_upload_slot() -> Result<()> {
     drop(peer);
     assert_eq!(service.active_uploads.load(Ordering::Acquire), 0);
     Ok(())
+}
+
+fn test_peer(value: u8) -> crate::PeerId {
+    crate::PeerId::from_digest([value; 32])
 }

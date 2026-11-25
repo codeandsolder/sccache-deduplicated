@@ -19,7 +19,6 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Read};
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::str::FromStr;
@@ -38,6 +37,8 @@ pub(crate) mod broker;
 mod cache;
 #[cfg(feature = "dist-client")]
 pub mod client_auth;
+#[cfg(any(feature = "dist-client", feature = "dist-server"))]
+pub mod cluster;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
 pub mod execution_queue;
 #[cfg(any(feature = "dist-client", feature = "dist-server"))]
@@ -652,25 +653,7 @@ impl FromStr for JobId {
         u64::from_str(s).map(JobId)
     }
 }
-#[derive(Hash, Eq, PartialEq, Clone, Copy, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ServerId(SocketAddr);
-impl ServerId {
-    #[must_use = "the returned server identifier contains the selected address"]
-    pub const fn new(addr: SocketAddr) -> Self {
-        Self(addr)
-    }
-    #[must_use = "the address is returned without changing the server identity"]
-    pub const fn addr(&self) -> SocketAddr {
-        self.0
-    }
-}
-impl FromStr for ServerId {
-    type Err = <SocketAddr as FromStr>::Err;
-    fn from_str(s: &str) -> ::std::result::Result<Self, Self::Err> {
-        SocketAddr::from_str(s).map(ServerId)
-    }
-}
+pub use sccache_peer_identity::PeerId as ServerId;
 #[derive(Eq, PartialEq, Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerNonce(u64);
@@ -1173,7 +1156,7 @@ pub trait SchedulerIncoming: Send + Sync {
     fn native_blob_sources(
         &self,
         blob: crate::build_runtime::BlobRef,
-        requester: Option<std::net::SocketAddr>,
+        requester: Option<ServerId>,
     ) -> ExtResult<Vec<NativeBlobSource>, Error>;
     /// Record advisory producer residency for the current worker epoch.
     fn observe_native_lifecycle(
@@ -1314,7 +1297,7 @@ pub trait Client: Send + Sync {
         inputs_packager: Box<dyn pkg::InputsPackager>,
     ) -> Result<RunJobResult>;
     async fn worker_label(&self, server_id: ServerId) -> String {
-        server_id.addr().to_string()
+        server_id.to_string()
     }
     async fn put_toolchain(
         &self,

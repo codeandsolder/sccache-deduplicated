@@ -3503,6 +3503,8 @@ dependencies = [
  "reqwest",
  "rouille",
  "sccache-build",
+ "sccache-cluster-identity",
+ "sccache-peer-identity",
  "semver",
  "serde",
  "serde_bytes",
@@ -3549,6 +3551,7 @@ dependencies = [
  "rand 0.10.4",
  "redb",
  "rustix",
+ "sccache-peer-identity",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -3570,10 +3573,18 @@ dependencies = [
  "openssl",
  "reqwest",
  "rustls",
+ "sccache-peer-identity",
  "serde",
  "tempfile",
  "tokio",
  "tokio-rustls",
+]
+
+[[package]]
+name = "sccache-peer-identity"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

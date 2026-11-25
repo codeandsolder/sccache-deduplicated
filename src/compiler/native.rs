@@ -40,6 +40,8 @@ use super::{
 struct DirectEndpoint {
     config: NativeClientConfig,
     scheduler: Option<HTTPUrl>,
+    cluster: Option<sccache_peer_identity::PeerConfig>,
+    peer: std::sync::Mutex<Option<Arc<sccache_cluster_identity::PeerCredentials>>>,
     auth: DistAuth,
     local: Option<LocalExecutor>,
 }
@@ -76,6 +78,7 @@ impl NativeCompilerClient {
     pub fn new(
         config: NativeClientConfig,
         scheduler: Option<HTTPUrl>,
+        cluster: Option<sccache_peer_identity::PeerConfig>,
         auth: DistAuth,
         toolchains: Vec<DistToolchainConfig>,
         catalogs: &[PathBuf],
@@ -95,6 +98,8 @@ impl NativeCompilerClient {
             endpoint: Endpoint::Direct(Box::new(DirectEndpoint {
                 config,
                 scheduler,
+                cluster,
+                peer: std::sync::Mutex::new(None),
                 auth,
                 local,
             })),
@@ -204,9 +209,38 @@ impl NativeCompilerClient {
                 DistClientContainer::get_cached_config_auth_token(auth_url)?
             }
         };
+        let peer = {
+            let mut saved = endpoint
+                .peer
+                .lock()
+                .map_err(|_| anyhow::anyhow!("native peer credentials poisoned"))?;
+            if saved.is_none() {
+                let cluster = endpoint
+                    .cluster
+                    .clone()
+                    .context("native client cluster trust required")?;
+                let scheduler = endpoint
+                    .scheduler
+                    .as_ref()
+                    .context("native client scheduler endpoint required")?;
+                *saved = Some(crate::dist::cluster::open_peer(
+                    cluster,
+                    &scheduler.to_url(),
+                    sccache_cluster_identity::Role::Client,
+                    &token,
+                )?);
+            }
+            saved
+                .as_ref()
+                .context("missing native peer credentials")?
+                .clone()
+        };
+        if let Err(error) = crate::dist::cluster::refresh_blocking(&peer) {
+            warn!("Native client certificate renewal will be retried: {error:#}");
+        }
         NativeCacheClient::new(
             config.endpoint.to_url(),
-            token,
+            peer,
             Duration::from_secs(config.request_timeout_secs),
             config.max_metadata_bytes,
         )

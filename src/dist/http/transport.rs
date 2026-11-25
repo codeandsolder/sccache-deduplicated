@@ -13,7 +13,6 @@ use std::time::Duration;
 const CONTROL_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
 const ERROR_RESPONSE_LIMIT: usize = 64 * 1024;
 #[cfg(feature = "dist-client")]
-const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 #[cfg(feature = "dist-client")]
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_mins(20);
 
@@ -104,79 +103,6 @@ fn check_advertised_length(length: Option<u64>, limit: usize) -> Result<()> {
         anyhow::bail!("distributed HTTP response exceeds {limit} bytes");
     }
     Ok(())
-}
-
-/// Decode exactly one certificate and authenticate its SHA-256 DER identity.
-/// The endpoint's IP SAN is independently checked by the TLS handshake.
-fn certificate_der(pem: &[u8]) -> Result<Vec<u8>> {
-    use base64::Engine as _;
-    let text = std::str::from_utf8(pem)?.trim();
-    let encoded = text
-        .strip_prefix("-----BEGIN CERTIFICATE-----")
-        .and_then(|text| text.strip_suffix("-----END CERTIFICATE-----"))
-        .context("invalid worker certificate PEM")?;
-    let encoded: Vec<_> = encoded
-        .bytes()
-        .filter(|byte| !byte.is_ascii_whitespace())
-        .collect();
-    Ok(base64::engine::general_purpose::STANDARD.decode(encoded)?)
-}
-
-pub(super) fn verified_worker_certificate(
-    digest: &[u8],
-    pem: &[u8],
-) -> Result<reqwest::Certificate> {
-    use sha2::{Digest as _, Sha256};
-    let der = certificate_der(pem)?;
-    let actual: [u8; 32] = Sha256::digest(&der).into();
-    anyhow::ensure!(digest == actual, "worker certificate digest mismatch");
-    Ok(reqwest::Certificate::from_der(&der)?)
-}
-
-#[cfg(feature = "dist-client")]
-pub(super) fn pinned_async_client(certificate: reqwest::Certificate) -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .tls_certs_only([certificate])
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(HTTP_REQUEST_TIMEOUT)
-        .connect_timeout(HTTP_CONNECT_TIMEOUT)
-        .pool_max_idle_per_host(0)
-        .build()
-        .context("create pinned worker HTTP client")
-}
-
-#[cfg(feature = "dist-server")]
-pub(super) fn pinned_blocking_client(
-    certificate: reqwest::Certificate,
-) -> Result<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
-        .tls_certs_only([certificate])
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(90))
-        .pool_max_idle_per_host(0)
-        .build()
-        .context("create pinned scheduler-to-worker HTTP client")
-}
-
-#[cfg(feature = "dist-client")]
-pub(super) fn async_client() -> Result<reqwest::Client> {
-    crate::http_client::new_reqwest_client_builder()?
-        .timeout(HTTP_REQUEST_TIMEOUT)
-        .connect_timeout(HTTP_CONNECT_TIMEOUT)
-        .pool_max_idle_per_host(0)
-        .build()
-        .context("failed to create distributed async HTTP client")
-}
-
-#[cfg(feature = "dist-server")]
-pub(super) fn blocking_client() -> Result<reqwest::blocking::Client> {
-    crate::http_client::new_reqwest_blocking_builder()?
-        .pool_max_idle_per_host(0)
-        .build()
-        .context("failed to create distributed blocking HTTP client")
 }
 
 #[cfg(feature = "dist-client")]

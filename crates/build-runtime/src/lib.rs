@@ -88,3 +88,6 @@ pub use mapped::{
     InstallationCatalog, InstallationReport, MappedMetadata, MappedTree, PreparedTree,
     SourceDigestCache,
 };
+
+// Cluster principals are independent of socket endpoints and TLS implementation.
+pub use sccache_peer_identity::PeerId;

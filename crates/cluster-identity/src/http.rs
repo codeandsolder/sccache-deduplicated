@@ -31,7 +31,7 @@ use super::{
 };
 
 mod client;
-pub use client::{ClusterHttpClient, EnrollmentClient};
+pub use client::{ClusterHttpClient, EnrollmentClient, blocking_client};
 
 const CONTROL_LIMIT: usize = 64 * 1024;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -280,7 +280,7 @@ impl ClusterListener {
     }
 }
 
-type Authorize = dyn Fn(Role, SocketAddr, &str) -> bool + Send + Sync;
+type Authorize = dyn Fn(Role, PeerId, SocketAddr, &str) -> bool + Send + Sync;
 
 /// Scheduler-local enrollment routing and authorization. Unknown or revoked
 /// principals never reach application handlers.
@@ -293,7 +293,7 @@ impl SchedulerEnrollment {
     /// Install the existing scheduler's role-bound initial authorization policy.
     pub fn new(
         authority: EnrollmentAuthority,
-        authorize: impl Fn(Role, SocketAddr, &str) -> bool + Send + Sync + 'static,
+        authorize: impl Fn(Role, PeerId, SocketAddr, &str) -> bool + Send + Sync + 'static,
     ) -> Self {
         Self {
             authority,
@@ -371,8 +371,8 @@ impl SchedulerEnrollment {
         let enrollment = Arc::clone(self);
         issue_result(
             tokio::task::spawn_blocking(move || {
-                enrollment.authority.enroll(&csr, || {
-                    (enrollment.authorize)(role, address, &token).then_some(role)
+                enrollment.authority.enroll(&csr, |id| {
+                    (enrollment.authorize)(role, id, address, &token).then_some(role)
                 })
             })
             .await,

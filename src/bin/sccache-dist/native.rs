@@ -37,7 +37,10 @@ pub(super) struct NativeWorker {
 }
 
 impl NativeWorker {
-    pub(super) fn new(config: NativeWorkerConfig, auth: String) -> Result<Self> {
+    pub(super) fn new(
+        config: NativeWorkerConfig,
+        peer: std::sync::Arc<sccache_cluster_identity::PeerCredentials>,
+    ) -> Result<Self> {
         ensure!(
             config.directory.is_absolute()
                 && config.scratch.is_absolute()
@@ -91,7 +94,7 @@ impl NativeWorker {
         let _ = store.can_clone_into(&config.scratch)?;
         let client = NativeCacheClient::new(
             config.cache_url.to_url(),
-            auth,
+            peer,
             Duration::from_secs(config.request_timeout_secs),
             config.max_metadata_bytes,
         )?;

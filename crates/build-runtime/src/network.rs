@@ -4,7 +4,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{self, Read},
-    net::{IpAddr, SocketAddr},
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicU64, Ordering},
@@ -16,8 +15,8 @@ use std::{
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 pub enum Peer {
-    Worker(SocketAddr),
-    Client(IpAddr),
+    Worker(crate::PeerId),
+    Client(crate::PeerId),
     Upstream,
     Other,
 }

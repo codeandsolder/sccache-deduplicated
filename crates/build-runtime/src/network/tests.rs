@@ -1,7 +1,9 @@
 use super::*;
 
 fn worker(port: u16) -> Peer {
-    Peer::Worker(SocketAddr::from(([127, 0, 0, 1], port)))
+    Peer::Worker(crate::PeerId::from_digest(std::array::from_fn(|index| {
+        port.to_le_bytes()[index % 2]
+    })))
 }
 
 fn feed(meter: &mut DirectionMeter, now: Instant, rates: &[(Peer, u64)]) {

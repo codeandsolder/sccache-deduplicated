@@ -2,23 +2,25 @@
 //! ownership without running filesystem I/O on the scheduling request pool.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     fs::File,
     io::{Read, Seek},
-    sync::{Arc, Mutex},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow, ensure};
+use super::cluster_http::{Listener, ListenerRole, Request};
+use anyhow::{Context, Result, ensure};
 use bincode::Options;
-use rouille::{Request, Response, ResponseBody};
+use rouille::{Response, ResponseBody};
+use sccache_cluster_identity::{ClusterListener, SchedulerEnrollment};
 use serde::{Serialize, de::DeserializeOwned};
 
-use super::{ClientAuthCheck, ServerAuthenticator, authenticate_client, authenticate_server};
+use super::{SchedulerRequester, authenticate_client, authenticate_server};
 use crate::{
     build_runtime::{
-        ActionMode, ArchiveLength, BlobEncoding, BlobRef, ContentId, Direction, ExecutionSpec,
+        ActionMode, ArchiveLength, BlobEncoding, BlobRef, Direction, ExecutionSpec,
         NativeContentPending, NativeInputRejected, NativeServiceBusy, NativeSessions, NativeStore,
         NetworkMeter, PackageIdentity, PackageImportLimits, PackageSource, Peer, StagedBlob,
         TreeId, TreeManifest, VerifiedPackage,
@@ -128,7 +130,7 @@ pub(super) fn spawn(
     + 'static,
     fetch_peer: impl Fn(
         BlobRef,
-        Option<std::net::SocketAddr>,
+        Option<crate::dist::ServerId>,
         &NativeStore,
         Instant,
     ) -> Result<Option<StagedBlob>>
@@ -142,8 +144,8 @@ pub(super) fn spawn(
     ) + Send
     + Sync
     + 'static,
-    client_auth: Arc<dyn ClientAuthCheck>,
-    server_auth: Arc<ServerAuthenticator>,
+    tls: Arc<ClusterListener>,
+    enrollment: Arc<SchedulerEnrollment>,
     network: Arc<NetworkMeter>,
 ) -> Result<()> {
     let limits = config.session_limits()?;
@@ -212,23 +214,25 @@ pub(super) fn spawn(
         config.directory.join("network-timing.json"),
         config.public_addr,
     )?;
-    let server = rouille::Server::new(config.public_addr, move |request| {
-        respond(
-            request,
-            NativeServices {
-                sessions: &sessions,
-                packages: packages.as_ref(),
-                network: &network,
-                observe_result: &observe_result,
-            },
-            &allocate,
-            &*client_auth,
-            &*server_auth,
-            metadata_limit,
-        )
-    })
-    .map_err(|error| anyhow!("could not bind native cache listener: {error}"))?
-    .pool_size(config.http_threads);
+    let server = Listener::bind(
+        config.public_addr,
+        tls,
+        ListenerRole::Scheduler(enrollment),
+        config.http_threads,
+        move |request| {
+            respond(
+                request,
+                NativeServices {
+                    sessions: &sessions,
+                    packages: packages.as_ref(),
+                    network: &network,
+                    observe_result: &observe_result,
+                },
+                &allocate,
+                metadata_limit,
+            )
+        },
+    )?;
     info!("Native cache listening on {}", config.public_addr);
     thread::Builder::new()
         .name("native-cache-maintenance".into())
@@ -253,8 +257,9 @@ pub(super) fn spawn(
     thread::Builder::new()
         .name("native-cache-http".into())
         .spawn(move || {
-            server.run();
-            error!("native cache HTTP listener terminated");
+            if let Err(error) = server.run() {
+                error!("native cache HTTPS listener terminated: {error:#}");
+            }
         })?;
     Ok(())
 }
@@ -274,90 +279,47 @@ pub(super) fn physical_blob_response(mut file: File, encoding: BlobEncoding) -> 
         .with_additional_header("X-Sccache-CAS-Encoding", encoding.http_value()))
 }
 
-/// Reuse TLS connections without broadening each peer's pinned trust root.
-#[derive(Default)]
-pub(super) struct PeerHttp {
-    clients: Mutex<HashMap<crate::dist::ServerId, (ContentId, reqwest::blocking::Client)>>,
-}
-
-impl PeerHttp {
-    fn client(
-        &self,
-        server: crate::dist::ServerId,
-        certificate: &[u8],
-    ) -> Result<reqwest::blocking::Client> {
-        let digest = ContentId::of(certificate);
-        let mut clients = self
-            .clients
-            .lock()
-            .map_err(|_| anyhow!("native peer HTTP cache poisoned"))?;
-        if let Some((saved, client)) = clients.get(&server)
-            && *saved == digest
-        {
-            return Ok(client.clone());
-        }
-        let certificate = reqwest::Certificate::from_pem(certificate)?;
-        let client = reqwest::blocking::Client::builder()
-            .tls_certs_only([certificate])
-            .connect_timeout(Duration::from_secs(1))
-            .redirect(reqwest::redirect::Policy::none())
-            .pool_max_idle_per_host(2)
-            .no_proxy()
-            .build()?;
-        // Bound stale worker connections across fleet churn. Current requests
-        // retain their own cloned clients and are unaffected.
-        if clients.len() >= 64 {
-            clients.clear();
-        }
-        clients.insert(server, (digest, client.clone()));
-        Ok(client)
+/// Retrieve a blob from a specific authenticated worker using its exact-content capability.
+pub(super) fn fetch_peer(
+    routes: &SchedulerRequester,
+    source: crate::dist::NativeBlobSource,
+    blob: BlobRef,
+    network: &NetworkMeter,
+    deadline: Instant,
+) -> Result<Option<(impl Read + Send + use<>, BlobEncoding)>> {
+    // Bounded source probe: allow roughly 4 MiB/s plus setup time,
+    // with an absolute ceiling; a slow peer falls back to the origin.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    ensure!(!remaining.is_zero(), "native peer deadline expired");
+    let timeout = Duration::from_secs((5 + blob.size.div_ceil(1024 * 1024)).min(60)).min(remaining);
+    let (client, base) = routes.endpoint(source.server)?;
+    let response = client
+        .post(super::super::urls::server_native_blob(&base)?)
+        .timeout(timeout)
+        .bearer_auth(source.token)
+        .header("Content-Type", "application/octet-stream")
+        .body(codec().serialize(&blob)?)
+        .send()?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
     }
-
-    /// Retrieve a blob from a specific worker using its exact-content
-    /// capability. A stale inventory hint is an ordinary miss.
-    pub(super) fn fetch(
-        &self,
-        source: crate::dist::NativeBlobSource,
-        blob: BlobRef,
-        certificate: &[u8],
-        network: &NetworkMeter,
-        deadline: Instant,
-    ) -> Result<Option<(impl Read + Send + use<>, BlobEncoding)>> {
-        // Bounded source probe: allow roughly 4 MiB/s plus setup time,
-        // with an absolute ceiling; a slow peer falls back to the origin.
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        ensure!(!remaining.is_zero(), "native peer deadline expired");
-        let timeout =
-            Duration::from_secs((5 + blob.size.div_ceil(1024 * 1024)).min(60)).min(remaining);
-        let response = self
-            .client(source.server, certificate)?
-            .post(super::super::urls::server_native_blob(source.server)?)
-            .timeout(timeout)
-            .bearer_auth(source.token)
-            .header("Content-Type", "application/octet-stream")
-            .body(codec().serialize(&blob)?)
-            .send()?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        let response = response.error_for_status()?;
-        let encoding = BlobEncoding::from_http_value(
-            response
-                .headers()
-                .get("x-sccache-cas-encoding")
-                .context("missing peer encoding")?
-                .to_str()?,
-        )?;
-        let size = response.content_length();
-        let response = network.meter(
-            Direction::Receive,
-            Peer::Worker(source.server.addr()),
-            response,
-            blob.size,
-            size,
-        );
-        Ok(Some((response, encoding)))
-    }
+    let response = response.error_for_status()?;
+    let encoding = BlobEncoding::from_http_value(
+        response
+            .headers()
+            .get("x-sccache-cas-encoding")
+            .context("missing peer encoding")?
+            .to_str()?,
+    )?;
+    let size = response.content_length();
+    let response = network.meter(
+        Direction::Receive,
+        Peer::Worker(source.server),
+        response,
+        blob.size,
+        size,
+    );
+    Ok(Some((response, encoding)))
 }
 
 #[derive(Clone, Copy)]
@@ -372,8 +334,6 @@ fn respond(
     request: &Request,
     services: NativeServices<'_>,
     allocate: &Allocator,
-    client_auth: &dyn ClientAuthCheck,
-    server_auth: &ServerAuthenticator,
     limit: usize,
 ) -> Response {
     if request.method() != "POST" {
@@ -391,13 +351,13 @@ fn respond(
     }
     let publisher = match role {
         "client" => {
-            if let Err(response) = authenticate_client(request, client_auth) {
+            if let Err(response) = authenticate_client(request) {
                 return response;
             }
             Publisher::Client
         }
         "worker" => {
-            let server = match authenticate_server(request, server_auth) {
+            let server = match authenticate_server(request) {
                 Ok(server) => server,
                 Err(response) => return response,
             };
@@ -407,10 +367,7 @@ fn respond(
             else {
                 return Response::empty_400();
             };
-            Publisher::Worker {
-                address: server.addr(),
-                job,
-            }
+            Publisher::Worker { peer: server, job }
         }
         _ => return Response::empty_404(),
     };
@@ -449,8 +406,8 @@ fn dispatch(
         observe_result,
     } = services;
     let peer = match publisher {
-        Publisher::Client => Peer::Client(request.remote_addr().ip()),
-        Publisher::Worker { address, .. } => Peer::Worker(address),
+        Publisher::Client => Peer::Client(request.id()),
+        Publisher::Worker { peer, .. } => Peer::Worker(peer),
     };
     match operation {
         "package_lookup" | "rust_package_lookup"
@@ -560,9 +517,9 @@ fn dispatch(
         }
         "inputs_staged" => {
             sessions.inputs_staged(metadata(request, limit)?, publisher)?;
-            if let Publisher::Worker { address, job } = publisher {
+            if let Publisher::Worker { peer, job } = publisher {
                 observe_result(
-                    crate::dist::ServerId::new(address),
+                    peer,
                     crate::dist::JobId(job),
                     crate::dist::NativeLifecycleEvent::InputsStaged,
                 );
@@ -676,9 +633,9 @@ fn dispatch(
         "begin" => {
             let ManifestRequest { ticket, manifest } = metadata(request, limit)?;
             let reply = sessions.begin(ticket, publisher, manifest)?;
-            if let Publisher::Worker { address, job } = publisher {
+            if let Publisher::Worker { peer, job } = publisher {
                 observe_result(
-                    crate::dist::ServerId::new(address),
+                    peer,
                     crate::dist::JobId(job),
                     crate::dist::NativeLifecycleEvent::Negotiated,
                 );
@@ -706,9 +663,9 @@ fn dispatch(
                 observation,
             } = metadata(request, limit)?;
             let manifest = sessions.commit(ticket, publisher)?;
-            if let Publisher::Worker { address, job } = publisher {
+            if let Publisher::Worker { peer, job } = publisher {
                 observe_result(
-                    crate::dist::ServerId::new(address),
+                    peer,
                     crate::dist::JobId(job),
                     crate::dist::NativeLifecycleEvent::Committed {
                         manifest: &manifest,

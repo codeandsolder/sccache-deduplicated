@@ -258,14 +258,14 @@ fn first_enrollment_and_renewal_bind_roles_and_keys() -> Result<()> {
     )?;
     let worker = identity(&directory, "worker")?;
     let request = EnrollmentRequest::new(&worker)?;
-    assert!(authority.enroll(&request, || None).is_err());
+    assert!(authority.enroll(&request, |_| None).is_err());
     assert!(
         authority
-            .enroll(&request, || Some(Role::Scheduler))
+            .enroll(&request, |_| Some(Role::Scheduler))
             .is_err()
     );
     let (certificate, role) = authority
-        .enroll(&request, || Some(Role::Worker))?
+        .enroll(&request, |_| Some(Role::Worker))?
         .into_certificate()?;
     assert_eq!(role, Role::Worker);
     assert_eq!(authenticated_peer(&certificate, role)?, worker.id()?);

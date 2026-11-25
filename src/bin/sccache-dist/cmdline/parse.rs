@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{env, ffi::OsString, fmt, net::SocketAddr, path::PathBuf, str::FromStr};
+use std::{env, ffi::OsString, fmt, path::PathBuf, str::FromStr};
 
 use anyhow::{Context, anyhow, bail};
 use clap::{Arg, ArgGroup, Command as ClapCommand, ValueEnum};
@@ -152,8 +152,8 @@ fn get_clap_command() -> ClapCommand {
                         .args(&[
                             flag_infer_long("server")
                                 .help("Generate a key for the specified server")
-                                .value_name("SERVER_ADDR")
-                                .value_parser(clap::value_parser!(SocketAddr))
+                                .value_name("PEER_ID")
+                                .value_parser(clap::value_parser!(ServerId))
                                 .required(true),
                             flag_infer_long("secret-key")
                                 .help("Use specified key to create the token")
@@ -248,10 +248,9 @@ pub fn try_parse_from(
             // Size based on https://briansmith.org/rustdoc/ring/hmac/fn.recommended_key_len.html
             Some(("generate-jwt-hs256-key", _)) => AuthSubcommand::Base64 { num_bytes: 256 / 8 },
             Some(("generate-jwt-hs256-server-token", matches)) => {
-                let server_addr = matches
+                let server_id = *matches
                     .get_one("server")
                     .context("clap did not provide required `server` value")?;
-                let server_id = ServerId::new(*server_addr);
 
                 let secret_key = if matches.contains_id("config") {
                     let config_path = matches
@@ -512,7 +511,10 @@ mod tests {
 
     #[test]
     fn auth_generate_server_token_needs_key_source() {
-        let server_args = &["--server", "127.0.0.1:4321"];
+        let server_args = &[
+            "--server",
+            "0101010101010101010101010101010101010101010101010101010101010101",
+        ];
 
         let no_key = auth_generate_jwt_hs256_server_token(server_args);
         assert!(try_parse_from(no_key).is_err());
@@ -540,9 +542,9 @@ mod tests {
 
     #[test]
     fn auth_generate_jwt_hs256_server_token_good() {
-        let base = auth_generate_jwt_hs256_server_token(&["--server", "127.0.0.1:4321"]);
-        let server_socket: SocketAddr = "127.0.0.1:4321".parse().unwrap();
-        let server_id = ServerId::new(server_socket);
+        let peer = "0101010101010101010101010101010101010101010101010101010101010101";
+        let base = auth_generate_jwt_hs256_server_token(&["--server", peer]);
+        let server_id: ServerId = peer.parse().unwrap();
 
         let mut secret_key = base.clone();
         secret_key.extend_from_slice(&["--secret-key", "very secret"]);

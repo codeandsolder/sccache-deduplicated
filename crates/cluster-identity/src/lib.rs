@@ -1,7 +1,7 @@
 //! Cluster-local credentials. Enrollment authorization belongs to the scheduler;
 //! this crate never derives a role from an untrusted CSR.
 
-use std::{fmt, fs, io::Write, path::Path};
+use std::{fs, io::Write, path::Path};
 
 use anyhow::{Context, Result, ensure};
 use openssl::{
@@ -17,65 +17,11 @@ use openssl::{
         extension::{BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName},
     },
 };
-use serde::{Deserialize, Serialize};
 
-/// Immutable identity of an enrolled public key, independent of the leaf certificate.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct PeerId([u8; 32]);
-
-impl fmt::Display for PeerId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
-    }
-}
-
-impl std::str::FromStr for PeerId {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        ensure!(
-            value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
-            "invalid peer ID"
-        );
-        let mut digest = [0; 32];
-        for (byte, encoded) in digest.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
-            *byte = u8::from_str_radix(std::str::from_utf8(encoded)?, 16)?;
-        }
-        Ok(Self(digest))
-    }
-}
-
-/// A role assigned by the enrollment authority, not the requesting peer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum Role {
-    Scheduler,
-    Worker,
-    Client,
-}
-
-impl Role {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Scheduler => "scheduler",
-            Self::Worker => "worker",
-            Self::Client => "client",
-        }
-    }
-
-    /// Stable DNS-shaped TLS name. No DNS lookup is required.
-    #[must_use = "the returned value is required for TLS identity verification"]
-    pub fn tls_name(self, peer: PeerId) -> String {
-        let hex = peer.to_string();
-        let (left, right) = hex.split_at(32);
-        format!("{left}.{right}.{}.sccache.invalid", self.label())
-    }
-}
+pub use sccache_peer_identity::{PeerConfig, PeerId, Role};
 
 fn key_id<T: openssl::pkey::HasPublic>(key: &PKeyRef<T>) -> Result<PeerId> {
-    Ok(PeerId(sha256(&key.public_key_to_der()?)))
+    Ok(PeerId::from_digest(sha256(&key.public_key_to_der()?)))
 }
 
 fn generate_key() -> Result<PKey<Private>> {
@@ -310,5 +256,8 @@ pub use registry::Registry;
 mod http;
 pub use http::{
     AuthenticatedPeer, ClusterBody, ClusterHttpClient, ClusterListener, EnrollmentClient,
-    SchedulerEnrollment,
+    SchedulerEnrollment, blocking_client,
 };
+
+mod lifecycle;
+pub use lifecycle::{PeerCredentials, endpoint, open_identity, publish_trust_anchor};

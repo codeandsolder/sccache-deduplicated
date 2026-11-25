@@ -7,6 +7,7 @@ license = "Apache-2.0"
 description = "Persistent machine identities and cluster certificate issuance for sccache"
 
 [dependencies]
+sccache-peer-identity = { path = "../peer-identity" }
 anyhow = "1"
 openssl = "0.10.75"
 tempfile = "3"
@@ -16,7 +17,7 @@ bytes = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

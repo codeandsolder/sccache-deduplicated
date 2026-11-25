@@ -5,7 +5,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, Read, Take, Write},
-    net::SocketAddr,
     os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::{ExitStatus, Output},
@@ -40,7 +39,7 @@ pub struct NativeBuildPolicy {
 pub enum NativeBuildSource {
     Hit,
     Local,
-    Worker(SocketAddr),
+    Worker(crate::dist::ServerId),
 }
 
 /// Native compiler response after all declared results have been delivered.
@@ -373,7 +372,7 @@ impl NativeCacheClient {
                 bail!("native worker unavailable: {message}");
             }
         };
-        let source = NativeBuildSource::Worker(allocation.address);
+        let source = NativeBuildSource::Worker(allocation.peer);
         let request = spec.action_request()?;
         let remaining = policy.timeout.saturating_sub(start.elapsed());
         // Keep the origin connection live while the worker acquires inputs.
@@ -381,7 +380,7 @@ impl NativeCacheClient {
         // (including the namespace stream) remains owned by this thread.
         let result = thread::scope(|scope| {
             let worker =
-                scope.spawn(|| Self::run_worker(&allocation, remaining, policy.max_result_bytes));
+                scope.spawn(|| self.run_worker(&allocation, remaining, policy.max_result_bytes));
             let supply = (|| -> Result<()> {
                 let mut idle = Duration::from_millis(10);
                 while !worker.is_finished() {

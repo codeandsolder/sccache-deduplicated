@@ -1,0 +1,280 @@
+//! Native mTLS adapter for the synchronous compiler/CAS handlers. Request
+//! bodies remain streaming; TLS-authenticated identity is not an HTTP header.
+
+use std::{
+    cell::RefCell,
+    io::{self, Read},
+    net::{SocketAddr, TcpListener},
+    sync::Arc,
+};
+
+use bytes::Bytes;
+use futures::{TryStreamExt, stream};
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::{
+    Response, StatusCode,
+    body::{Frame, Incoming},
+};
+use sccache_cluster_identity::{
+    AuthenticatedPeer, ClusterBody, ClusterListener, PeerId, Role, SchedulerEnrollment,
+};
+use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio_util::io::{StreamReader, SyncIoBridge};
+
+use crate::errors::{Context, Result};
+
+/// The single request abstraction used by all synchronous dist handlers.
+pub(super) struct Request {
+    parts: http::request::Parts,
+    id: PeerId,
+    role: Role,
+    remote_addr: SocketAddr,
+    body: RefCell<Option<Box<dyn Read + Send>>>,
+}
+
+impl Request {
+    fn new(peer: AuthenticatedPeer, request: hyper::Request<Incoming>) -> Self {
+        let (parts, body) = request.into_parts();
+        let stream = body.into_data_stream().map_err(io::Error::other);
+        let reader = SyncIoBridge::new(StreamReader::new(stream));
+        Self {
+            parts,
+            id: peer.id(),
+            role: peer.role(),
+            remote_addr: peer.remote_addr(),
+            body: RefCell::new(Some(Box::new(reader))),
+        }
+    }
+
+    pub(super) fn method(&self) -> &str {
+        self.parts.method.as_str()
+    }
+    pub(super) fn raw_url(&self) -> &str {
+        self.parts
+            .uri
+            .path_and_query()
+            .map_or("/", http::uri::PathAndQuery::as_str)
+    }
+    pub(super) fn url(&self) -> &str {
+        self.parts.uri.path()
+    }
+    pub(super) fn header(&self, name: &str) -> Option<&str> {
+        self.parts.headers.get(name)?.to_str().ok()
+    }
+    pub(super) fn data(&self) -> Option<Box<dyn Read + Send>> {
+        self.body.borrow_mut().take()
+    }
+    pub(super) const fn id(&self) -> PeerId {
+        self.id
+    }
+    pub(super) const fn role(&self) -> Role {
+        self.role
+    }
+    pub(super) const fn remote_addr(&self) -> SocketAddr {
+        self.remote_addr
+    }
+    #[cfg(test)]
+    pub(super) fn fake_http_from(
+        address: SocketAddr,
+        method: &str,
+        url: &str,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> Self {
+        let mut builder = hyper::Request::builder().method(method).uri(url);
+        for (name, value) in headers {
+            builder = builder.header(name, value);
+        }
+        let (parts, ()) = builder.body(()).expect("test HTTP request").into_parts();
+        Self {
+            parts,
+            id: PeerId::from_digest([1; 32]),
+            role: Role::Client,
+            remote_addr: address,
+            body: RefCell::new(Some(Box::new(io::Cursor::new(body)))),
+        }
+    }
+}
+
+fn error_response(status: StatusCode, message: &'static str) -> Response<ClusterBody> {
+    let mut reply = Response::new(
+        Full::new(Bytes::from_static(message.as_bytes()))
+            .map_err(|never| match never {})
+            .boxed_unsync(),
+    );
+    *reply.status_mut() = status;
+    reply
+}
+
+type Handler = dyn Fn(&Request) -> rouille::Response + Send + Sync;
+
+async fn dispatch(
+    peer: AuthenticatedPeer,
+    request: hyper::Request<Incoming>,
+    handler: Arc<Handler>,
+    admission: Arc<Semaphore>,
+) -> Response<ClusterBody> {
+    let Ok(permit) = admission.try_acquire_owned() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "distributed HTTP pool busy",
+        );
+    };
+    let request = Request::new(peer, request);
+    let (send, receive) = oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let response = handler(&request);
+        let (mut reader, length) = response.data.into_reader_and_size();
+        let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(2);
+        let stream = stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|chunk| {
+                (
+                    chunk.map(Frame::data).map_err(|error| {
+                        Box::new(error) as Box<dyn std::error::Error + Send + Sync>
+                    }),
+                    rx,
+                )
+            })
+        });
+        let mut builder = Response::builder().status(response.status_code);
+        for (name, value) in response.headers {
+            // Hyper owns HTTP framing and connection management.
+            if !name.eq_ignore_ascii_case("content-length")
+                && !name.eq_ignore_ascii_case("transfer-encoding")
+                && !name.eq_ignore_ascii_case("connection")
+            {
+                builder = builder.header(name.as_ref(), value.as_ref());
+            }
+        }
+        if let Some(length) = length {
+            builder = builder.header(http::header::CONTENT_LENGTH, length);
+        }
+        let response = builder
+            .body(StreamBody::new(stream).boxed_unsync())
+            .unwrap_or_else(|_| {
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "invalid response metadata",
+                )
+            });
+        if send.send(response).is_err() {
+            return;
+        }
+        loop {
+            let mut buffer = vec![0; 128 * 1024];
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(size) => {
+                    buffer.truncate(size);
+                    if tx.blocking_send(Ok(Bytes::from(buffer))).is_err() {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    let _ = tx.blocking_send(Err(error));
+                    break;
+                }
+            }
+        }
+    });
+    receive.await.unwrap_or_else(|_| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "distributed HTTP handler terminated",
+        )
+    })
+}
+
+#[derive(Clone)]
+pub(super) enum ListenerRole {
+    Scheduler(Arc<SchedulerEnrollment>),
+    Worker { scheduler: PeerId },
+}
+
+/// Bind the listener before starting any dependent background services.
+pub(super) struct Listener {
+    socket: TcpListener,
+    tls: Arc<ClusterListener>,
+    role: ListenerRole,
+    threads: usize,
+    handler: Arc<Handler>,
+}
+
+impl Listener {
+    pub(super) fn bind(
+        address: SocketAddr,
+        tls: Arc<ClusterListener>,
+        role: ListenerRole,
+        threads: usize,
+        handler: impl Fn(&Request) -> rouille::Response + Send + Sync + 'static,
+    ) -> Result<Self> {
+        anyhow::ensure!(threads > 0, "HTTP handler pool must not be empty");
+        let socket = TcpListener::bind(address).context("bind distributed HTTPS listener")?;
+        socket.set_nonblocking(true)?;
+        Ok(Self {
+            socket,
+            tls,
+            role,
+            threads,
+            handler: Arc::new(handler),
+        })
+    }
+
+    pub(super) fn run(self) -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        runtime.block_on(self.run_async())
+    }
+
+    async fn run_async(self) -> Result<()> {
+        let Self {
+            socket,
+            tls,
+            role,
+            threads,
+            handler,
+        } = self;
+        let socket = tokio::net::TcpListener::from_std(socket)?;
+        let connections = Arc::new(Semaphore::new(threads.saturating_mul(4)));
+        let requests = Arc::new(Semaphore::new(threads));
+        loop {
+            let (socket, _) = socket.accept().await?;
+            let Ok(connection) = Arc::clone(&connections).try_acquire_owned() else {
+                continue;
+            };
+            let tls = Arc::clone(&tls);
+            let role = role.clone();
+            let handler = Arc::clone(&handler);
+            let requests = Arc::clone(&requests);
+            tokio::spawn(async move {
+                let _connection = connection;
+                let dispatch = move |peer, request| {
+                    dispatch(peer, request, Arc::clone(&handler), Arc::clone(&requests))
+                };
+                let result = match role {
+                    ListenerRole::Scheduler(enrollment) => {
+                        tls.serve_scheduler(socket, enrollment, dispatch).await
+                    }
+                    ListenerRole::Worker { scheduler } => {
+                        tls.serve_worker(
+                            socket,
+                            move |peer| match peer.role() {
+                                Role::Scheduler => peer.id() == scheduler,
+                                Role::Client | Role::Worker => true,
+                            },
+                            dispatch,
+                        )
+                        .await
+                    }
+                };
+                if let Err(error) = result {
+                    debug!("distributed HTTPS connection ended: {error:#}");
+                }
+            });
+        }
+    }
+}

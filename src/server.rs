@@ -249,6 +249,7 @@ pub struct DistClientConfig {
 
     // From the static dist configuration
     scheduler_url: Option<config::HTTPUrl>,
+    cluster: Option<sccache_peer_identity::PeerConfig>,
     auth: config::DistAuth,
     cache_dir: PathBuf,
     toolchain_cache_size: u64,
@@ -308,6 +309,7 @@ impl DistClientContainer {
             return Self::new_native(crate::compiler::NativeCompilerClient::new(
                 native.clone(),
                 config.dist.scheduler_url.clone(),
+                config.dist.cluster.clone(),
                 config.dist.auth.clone(),
                 config.dist.toolchains.clone(),
                 &config.dist.native_installation_catalogs,
@@ -317,6 +319,7 @@ impl DistClientContainer {
         let config = DistClientConfig {
             pool: pool.clone(),
             scheduler_url: config.dist.scheduler_url.clone(),
+            cluster: config.dist.cluster.clone(),
             auth: config.dist.auth.clone(),
             cache_dir: config.dist.cache_dir.clone(),
             toolchain_cache_size: config.dist.toolchain_cache_size,
@@ -505,15 +508,23 @@ impl DistClientContainer {
             let auth_token = try_or_fail_with_message!(
                 auth_token.context("could not load client auth token, run |sccache --dist-auth|")
             );
+            let cluster = try_or_fail_with_message!(
+                config
+                    .cluster
+                    .clone()
+                    .context("distributed cluster trust configuration required")
+            );
             let dist_client = dist::http::Client::new(
                 &config.pool,
                 url,
+                cluster,
                 &config.cache_dir.join("client"),
                 config.toolchain_cache_size,
                 &config.toolchains,
                 auth_token,
                 config.rewrite_includes_only,
-            );
+            )
+            .await;
             let dist_client =
                 try_or_retry_later!(dist_client.context("failure during dist client creation"));
             if let Ok(res) = dist_client.do_get_status().await {
@@ -1354,6 +1365,7 @@ where
                 Box::new(DistClientConfig {
                     pool: rt.clone(),
                     scheduler_url: None,
+                    cluster: None,
                     auth: config::DistAuth::Token {
                         token: String::new(),
                     },

@@ -4,9 +4,9 @@
 use super::{ActionClass, ActionCost, ActionCosts, MAX_AGE};
 use sccache::{
     build_runtime::{ContentId, wire::ActionObservation},
-    dist::NativePlacement,
+    dist::{NativePlacement, ServerId},
 };
-use std::{collections::BTreeMap, net::SocketAddr, time::Instant};
+use std::{collections::BTreeMap, time::Instant};
 
 pub(super) const MAX_WORKERS: usize = 32;
 const RATIO_SCALE: u128 = 1_000_000;
@@ -16,7 +16,7 @@ const MAX_CALIBRATION_CLASSES: usize = 32;
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 pub(crate) struct WorkerScope {
-    pub address: SocketAddr,
+    pub peer: ServerId,
     pub platform: ContentId,
 }
 
@@ -203,7 +203,7 @@ mod tests {
 
     fn scope(port: u16) -> WorkerScope {
         WorkerScope {
-            address: SocketAddr::from(([127, 0, 0, 1], port)),
+            peer: ServerId::from_digest(std::array::from_fn(|index| port.to_le_bytes()[index % 2])),
             platform: ContentId::of(b"platform"),
         }
     }

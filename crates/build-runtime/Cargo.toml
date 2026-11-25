@@ -7,6 +7,7 @@ license = "Apache-2.0"
 description = "Content-addressed storage and execution environments for build infrastructure"
 
 [dependencies]
+sccache-peer-identity = { path = "../peer-identity" }
 anyhow = "1"
 bincode = "1"
 blake3 = "1"

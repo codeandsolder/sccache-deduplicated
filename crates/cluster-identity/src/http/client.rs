@@ -13,6 +13,31 @@ use rustls::{
 use super::{CONTROL_LIMIT, CONTROL_TIMEOUT, ENROLL_CLIENT, ENROLL_WORKER, RENEW, codec};
 use crate::{EnrollmentRequest, EnrollmentResponse, Identity, PeerId, Role, TlsCredentials};
 
+fn client_config(ca: &X509, credentials: Option<&TlsCredentials>) -> Result<ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    roots.add(CertificateDer::from(ca.to_der()?))?;
+    let config =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_root_certificates(roots);
+    let config = match credentials {
+        Some(credentials) => {
+            ensure!(
+                credentials.ca.to_der()? == ca.to_der()?,
+                "credential belongs to another cluster"
+            );
+            config.with_client_auth_cert(
+                vec![CertificateDer::from(credentials.certificate.to_der()?)],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                    credentials.identity.private_key().private_key_to_pkcs8()?,
+                )),
+            )?
+        }
+        None => config.with_no_client_auth(),
+    };
+    Ok(config)
+}
+
 /// A pooled HTTPS connection path to one specific cluster service.
 pub struct ClusterHttpClient {
     client: reqwest::Client,
@@ -40,31 +65,11 @@ impl ClusterHttpClient {
         address: SocketAddr,
         credentials: Option<&TlsCredentials>,
     ) -> Result<Self> {
+        let config = client_config(ca, credentials)?;
         ensure!(
             role != Role::Client,
             "client-only identity has no TLS service"
         );
-        let mut roots = RootCertStore::empty();
-        roots.add(CertificateDer::from(ca.to_der()?))?;
-        let config =
-            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_protocol_versions(&[&rustls::version::TLS13])?
-                .with_root_certificates(roots);
-        let config = match credentials {
-            Some(credentials) => {
-                ensure!(
-                    credentials.ca.to_der()? == ca.to_der()?,
-                    "credential belongs to another cluster"
-                );
-                config.with_client_auth_cert(
-                    vec![CertificateDer::from(credentials.certificate.to_der()?)],
-                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                        credentials.identity.private_key().private_key_to_pkcs8()?,
-                    )),
-                )?
-            }
-            None => config.with_no_client_auth(),
-        };
         let name = role.tls_name(expected);
         let base = reqwest::Url::parse(&format!("https://{name}:{}/", address.port()))?;
         let client = reqwest::Client::builder()
@@ -76,6 +81,18 @@ impl ClusterHttpClient {
             .read_timeout(std::time::Duration::from_secs(90))
             .build()?;
         Ok(Self { client, base })
+    }
+
+    /// The pinned service origin, independent of its candidate socket address.
+    #[must_use = "requests must target the logical TLS authority"]
+    pub const fn base(&self) -> &reqwest::Url {
+        &self.base
+    }
+
+    /// Clone the pooled HTTP client for integration with existing RPC builders.
+    #[must_use = "use the client only for its pinned logical service origin"]
+    pub fn client(&self) -> reqwest::Client {
+        self.client.clone()
     }
 
     /// Build a request to this authenticated service, rejecting foreign URLs.
@@ -92,6 +109,34 @@ impl ClusterHttpClient {
         );
         Ok(self.client.request(method, url))
     }
+}
+
+/// Blocking HTTP client bound to the expected principal and candidate endpoint.
+///
+/// # Errors
+/// Returns an error if trust, identity or HTTP configuration is invalid.
+pub fn blocking_client(
+    credentials: &TlsCredentials,
+    expected: PeerId,
+    role: Role,
+    address: SocketAddr,
+    timeout: std::time::Duration,
+) -> Result<(reqwest::blocking::Client, reqwest::Url)> {
+    ensure!(
+        role != Role::Client,
+        "client-only identity has no TLS service"
+    );
+    let name = role.tls_name(expected);
+    let base = reqwest::Url::parse(&format!("https://{name}:{}/", address.port()))?;
+    let client = reqwest::blocking::Client::builder()
+        .tls_backend_preconfigured(client_config(&credentials.ca, Some(credentials))?)
+        .resolve(&name, address)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CONTROL_TIMEOUT)
+        .timeout(timeout)
+        .build()?;
+    Ok((client, base))
 }
 
 /// A client pinned to the cluster CA and expected scheduler public key.
@@ -220,7 +265,7 @@ mod tests {
             ca.clone(),
             Role::Scheduler,
         )?)?);
-        let enrollment = Arc::new(SchedulerEnrollment::new(authority, |role, _, token| {
+        let enrollment = Arc::new(SchedulerEnrollment::new(authority, |role, _, _, token| {
             matches!(
                 (role, token),
                 (Role::Worker, "worker-token") | (Role::Client, "client-token")
@@ -408,7 +453,7 @@ mod worker_tests {
         let worker_id = worker.id()?;
         let worker_request = EnrollmentRequest::new(&worker)?;
         let (leaf, role) = authority
-            .enroll(&worker_request, || Some(Role::Worker))?
+            .enroll(&worker_request, |_| Some(Role::Worker))?
             .into_certificate()?;
         let worker = TlsCredentials::new(worker, leaf, ca.clone(), role)?;
         let scheduler = Identity::open(&directory.path().join("scheduler.pem"))?;

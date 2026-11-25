@@ -90,6 +90,8 @@ reqwest = { version = "0.13", features = [
   "rustls",
 ], optional = true }
 semver = "1.0"
+sccache-peer-identity = { path = "crates/peer-identity" }
+sccache-cluster-identity = { path = "crates/cluster-identity", optional = true }
 sccache-build = { path = "crates/build-runtime", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11.19"
@@ -237,6 +239,7 @@ vendored-openssl = ["openssl?/vendored", "reqwest?/native-tls-vendored"]
 unstable = []
 # Enables distributed support in the sccache client
 dist-client = [
+  "dep:sccache-cluster-identity",
   "native-store",
   "zlib-rs-fast",
   "zlib-rs-fast/parallel",
@@ -249,6 +252,11 @@ dist-client = [
 ]
 # Enables the sccache-dist binary
 dist-server = [
+  "dep:sccache-cluster-identity",
+  "hyper",
+  "http-body-util",
+  "hyper-util",
+  "tokio-util/io-util",
   "native-store",
   "sha2",
   "url/serde",
@@ -268,7 +276,7 @@ dist-tests = ["dist-client", "dist-server"]
 
 [workspace]
 exclude = ["tests/test-crate", "vendor/tiny_http"]
-members = ["crates/build-runtime", "crates/cluster-identity", "tests/integration/randomize_readdir"]
+members = ["crates/build-runtime", "crates/cluster-identity", "crates/peer-identity", "tests/integration/randomize_readdir"]
 
 [[bench]]
 harness = false

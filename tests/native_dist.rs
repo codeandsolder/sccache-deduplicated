@@ -161,6 +161,7 @@ fn fetch_status(
 
 fn native_worker_config(
     root: &Path,
+    cluster: sccache_peer_identity::PeerConfig,
     worker_address: SocketAddr,
     scheduler_url: reqwest::Url,
     cache_url: reqwest::Url,
@@ -168,6 +169,7 @@ fn native_worker_config(
     transfer: sccache::build_runtime::PackageTransferCost,
 ) -> server::Config {
     server::Config {
+        cluster,
         builder: server::BuilderType::Native,
         cache_dir: None,
         public_addr: worker_address,
@@ -205,6 +207,11 @@ struct Fleet {
     worker_directory: PathBuf,
     scheduler_directory: PathBuf,
     worker_address: SocketAddr,
+    worker_id: sccache_peer_identity::PeerId,
+    cluster: sccache_peer_identity::PeerConfig,
+    worker_cluster: sccache_peer_identity::PeerConfig,
+    peer: std::sync::Arc<sccache_cluster_identity::PeerCredentials>,
+    status_base: reqwest::Url,
     cache_url: reqwest::Url,
     scheduler_url: reqwest::Url,
     http: reqwest::blocking::Client,
@@ -236,14 +243,32 @@ impl Fleet {
         transfer: sccache::build_runtime::PackageTransferCost,
     ) -> Result<Self> {
         let [scheduler_address, cache_address, worker_address] = addresses()?;
-        let scheduler_url = reqwest::Url::parse(&format!("http://{scheduler_address}/"))?;
-        let cache_url = reqwest::Url::parse(&format!("http://{cache_address}/"))?;
+        let scheduler_url = reqwest::Url::parse(&format!("https://{scheduler_address}/"))?;
+        let cache_url = reqwest::Url::parse(&format!("https://{cache_address}/"))?;
         let scheduler_directory = root.join("scheduler-store");
         let worker_directory = root.join("worker-store");
+        let cluster_directory = root.join("cluster");
+        fs::create_dir_all(&cluster_directory)?;
+        let ca = sccache_cluster_identity::ClusterCa::open(&cluster_directory.join("ca-key.pem"))?;
+        let scheduler_id =
+            sccache_cluster_identity::Identity::open(&cluster_directory.join("key.pem"))?.id()?;
+        let ca_certificate = cluster_directory.join("ca.pem");
+        sccache_cluster_identity::publish_trust_anchor(ca.certificate(), &ca_certificate)?;
+        let cluster = sccache_peer_identity::PeerConfig {
+            directory: root.join("client-identity"),
+            ca_certificate,
+            scheduler_id,
+        };
+        let worker_cluster = sccache_peer_identity::PeerConfig {
+            directory: root.join("worker-identity"),
+            ..cluster.clone()
+        };
+        let worker_id = sccache_cluster_identity::open_identity(&worker_cluster)?.id()?;
         let mut scheduler_process = Process::start(
             root,
             "scheduler",
             &scheduler::Config {
+                cluster_directory,
                 public_addr: scheduler_address,
                 client_auth: scheduler::ClientAuth::Token {
                     token: CLIENT_TOKEN.into(),
@@ -275,19 +300,30 @@ impl Fleet {
                 }),
             },
         )?;
-        let http = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()?;
-        let status = || fetch_status(&http, &scheduler_url);
-        wait_for(|| {
+        let peer = wait_for(|| {
             scheduler_process.check()?;
-            Ok(status().ok())
+            Ok(sccache::dist::cluster::open_peer(
+                cluster.clone(),
+                &scheduler_url,
+                sccache_cluster_identity::Role::Client,
+                CLIENT_TOKEN,
+            )
+            .ok())
         })?;
+        let (http, status_base) = sccache_cluster_identity::blocking_client(
+            &peer.current()?,
+            scheduler_id,
+            sccache_cluster_identity::Role::Scheduler,
+            scheduler_address,
+            Duration::from_secs(2),
+        )?;
+        let status = || fetch_status(&http, &status_base);
         let mut worker_process = Process::start(
             root,
             "server",
             &native_worker_config(
                 root,
+                worker_cluster.clone(),
                 worker_address,
                 scheduler_url.clone(),
                 cache_url.clone(),
@@ -308,6 +344,11 @@ impl Fleet {
             worker_directory,
             scheduler_directory,
             worker_address,
+            worker_id,
+            cluster,
+            worker_cluster,
+            peer,
+            status_base,
             cache_url,
             scheduler_url,
             http,
@@ -321,6 +362,10 @@ impl Fleet {
             "server",
             &native_worker_config(
                 root,
+                sccache_peer_identity::PeerConfig {
+                    directory: root.join("worker-identity"),
+                    ..self.cluster.clone()
+                },
                 address,
                 self.scheduler_url.clone(),
                 self.cache_url.clone(),
@@ -336,7 +381,7 @@ impl Fleet {
     }
 
     fn status(&self) -> Result<SchedulerStatusResult> {
-        fetch_status(&self.http, &self.scheduler_url)
+        fetch_status(&self.http, &self.status_base)
     }
 
     fn finish(
@@ -381,6 +426,7 @@ fn shared_daemon_credential_isolation() -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let fleet = Fleet::start(temporary.path(), BTreeMap::new())?;
     let config = sccache::config::DistConfig {
+        cluster: Some(fleet.cluster.clone()),
         scheduler_url: Some(HTTPUrl::from_url(fleet.scheduler_url.clone())),
         auth: DistAuth::Token {
             token: CLIENT_TOKEN.into(),
@@ -439,14 +485,16 @@ fn rust_installer_fixture(component: &str, file: &str, contents: &[u8]) -> Resul
     Ok(archive.into_inner()?)
 }
 
-fn provisioning_config(root: &Path, endpoint: &reqwest::Url) -> Result<PathBuf> {
+fn provisioning_config(root: &Path, fleet: &Fleet) -> Result<PathBuf> {
     let config = sccache::config::FileConfig {
         dist: sccache::config::DistConfig {
+            cluster: Some(fleet.cluster.clone()),
+            scheduler_url: Some(HTTPUrl::from_url(fleet.scheduler_url.clone())),
             auth: DistAuth::Token {
                 token: CLIENT_TOKEN.into(),
             },
             native: Some(NativeClientConfig {
-                endpoint: HTTPUrl::from_url(endpoint.clone()),
+                endpoint: HTTPUrl::from_url(fleet.cache_url.clone()),
                 platform_contract: PLATFORM.into(),
                 request_timeout_secs: 30,
                 build_timeout_secs: 30,
@@ -623,7 +671,7 @@ fn rustup_sync_acquires_once_and_reuses_portable_recipe_and_catalog() -> Result<
     // Installed files must be older than the source digest race window before
     // metadata-only attestation can safely remember them.
     std::thread::sleep(Duration::from_secs(3));
-    let config = provisioning_config(root, &fleet.cache_url)?;
+    let config = provisioning_config(root, &fleet)?;
     let catalog = root.join("installation.catalog");
     let recipe = root.join("installation.recipe");
     let catalog2 = root.join("installation-second.catalog");
@@ -715,7 +763,7 @@ fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
     };
     let client = NativeCacheClient::new(
         fleet.cache_url.clone(),
-        CLIENT_TOKEN.into(),
+        std::sync::Arc::clone(&fleet.peer),
         Duration::from_secs(30),
         1024 * 1024,
     )?;
@@ -730,13 +778,18 @@ fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
     assert!(client.lookup_rust_package(wrong.identity)?.is_none());
     let worker = NativeCacheClient::new(
         fleet.cache_url.clone(),
-        WORKER_TOKEN.into(),
+        sccache::dist::cluster::open_peer(
+            fleet.worker_cluster.clone(),
+            &fleet.scheduler_url,
+            sccache_cluster_identity::Role::Worker,
+            &format!("{} {}", fleet.worker_id, WORKER_TOKEN),
+        )?,
         Duration::from_secs(5),
         1024 * 1024,
     )?
     .for_worker(sccache::dist::JobId(123));
     assert!(worker.lookup_rust_package(source.identity).is_err());
-    let config_path = provisioning_config(root, &fleet.cache_url)?;
+    let config_path = provisioning_config(root, &fleet)?;
     let manifest_path = root.join("package.manifest");
     let sha256 = source.identity.checksum_hex();
     let command = || {
@@ -839,7 +892,7 @@ fn named_system_upstream_provisions_original_without_client_upload() -> Result<(
     )?;
     let client = NativeCacheClient::new(
         fleet.cache_url.clone(),
-        CLIENT_TOKEN.into(),
+        std::sync::Arc::clone(&fleet.peer),
         Duration::from_secs(30),
         1024 * 1024,
     )?;
@@ -866,7 +919,7 @@ fn named_system_upstream_provisions_original_without_client_upload() -> Result<(
             .is_err()
     );
     assert!(client.lookup_package(identity)?.is_none());
-    let config = provisioning_config(root, &fleet.cache_url)?;
+    let config = provisioning_config(root, &fleet)?;
     let command = || {
         let mut command = Command::new(env!("CARGO_BIN_EXE_sccache-dist"));
         command
@@ -962,7 +1015,7 @@ fn pacman_discovery_seeds_real_gcc_and_compiles_with_exact_results() -> Result<(
         sccache::build_runtime::PackageTransferCost::default(),
     )?;
     let worker_store = fleet.worker_directory.clone();
-    let config = provisioning_config(root, &fleet.cache_url)?;
+    let config = provisioning_config(root, &fleet)?;
     let discover = || {
         Command::new(env!("CARGO_BIN_EXE_sccache-dist"))
             .args(["native-sync-system", "--client-config"])
@@ -996,7 +1049,7 @@ fn pacman_discovery_seeds_real_gcc_and_compiles_with_exact_results() -> Result<(
     assert_eq!(warm["provisioned"][0]["transfer"], "existing");
     let client = NativeCacheClient::new(
         fleet.cache_url.clone(),
-        CLIENT_TOKEN.into(),
+        std::sync::Arc::clone(&fleet.peer),
         Duration::from_secs(60),
         1024 * 1024,
     )?;
@@ -1267,7 +1320,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let cache_url = fleet.cache_url.clone();
     let client = NativeCacheClient::new(
         cache_url,
-        CLIENT_TOKEN.into(),
+        std::sync::Arc::clone(&fleet.peer),
         Duration::from_secs(10),
         1024 * 1024,
     )?;
@@ -1401,7 +1454,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
         ScheduleReply::Assigned(allocation.clone())
     );
     assert_eq!(
-        NativeCacheClient::run_worker(&allocation, Duration::from_secs(30), 1024 * 1024)?,
+        client.run_worker(&allocation, Duration::from_secs(30), 1024 * 1024)?,
         NativeRunResult::Stored
     );
     let NativeStatus::Ready(manifest) = client.status(ticket)? else {
@@ -1496,7 +1549,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     second.command.arguments.insert(0, b"--64".to_vec());
     fs::remove_file(&delivered)?;
     let miss = client.run_action(&second, &inputs, &destinations, &policy, None)?;
-    assert_eq!(miss.source, NativeBuildSource::Worker(worker_address));
+    assert_eq!(miss.source, NativeBuildSource::Worker(fleet.worker_id));
     assert!(miss.output.status.success());
     assert_eq!(fs::read(&delivered)?, fs::read(&reference)?);
     let hit = client.run_action(&second, &inputs, &destinations, &policy, None)?;
@@ -1510,7 +1563,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     };
     for _ in 0..4 {
         let result = client.run_action(&second, &inputs, &destinations, &remote_refresh, None)?;
-        assert_eq!(result.source, NativeBuildSource::Worker(worker_address));
+        assert_eq!(result.source, NativeBuildSource::Worker(fleet.worker_id));
         assert!(result.output.status.success());
         assert_eq!(fs::read(&delivered)?, fs::read(&reference)?);
     }
@@ -1530,7 +1583,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let generated = root.join("generated-codegen");
     let tree_destinations = BTreeMap::from([("codegen".into(), generated.clone())]);
     let result = client.run_action(&directory, &inputs, &tree_destinations, &policy, None)?;
-    assert_eq!(result.source, NativeBuildSource::Worker(worker_address));
+    assert_eq!(result.source, NativeBuildSource::Worker(fleet.worker_id));
     assert!(result.output.status.success());
     assert_eq!(fs::read(generated.join("object.o"))?, fs::read(&reference)?);
     let source_bytes = fs::read(generated.join("input.s"))?;
@@ -1549,7 +1602,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
         sccache_build::OutputKind::GeneratedTree;
     fs::remove_dir_all(&generated)?;
     let result = client.run_action(&directory, &inputs, &tree_destinations, &policy, None)?;
-    assert_eq!(result.source, NativeBuildSource::Worker(worker_address));
+    assert_eq!(result.source, NativeBuildSource::Worker(fleet.worker_id));
     assert_eq!(fs::read(generated.join("object.o"))?, fs::read(&reference)?);
     assert!(!generated.join("input.s").exists());
     fs::remove_dir_all(&generated)?;
@@ -1621,7 +1674,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
         anyhow::bail!("worker unavailable");
     };
     let NativeRunResult::Failed { code, stderr, .. } =
-        NativeCacheClient::run_worker(&allocation, Duration::from_secs(30), 1024 * 1024)?
+        client.run_worker(&allocation, Duration::from_secs(30), 1024 * 1024)?
     else {
         anyhow::bail!("expected compiler failure");
     };
@@ -1630,7 +1683,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     assert_eq!(client.status(ticket)?, NativeStatus::Failed);
     client.close(ticket)?;
     let failed = client.run_action(&invalid, &inputs, &destinations, &policy, None)?;
-    assert_eq!(failed.source, NativeBuildSource::Worker(worker_address));
+    assert_eq!(failed.source, NativeBuildSource::Worker(fleet.worker_id));
     assert!(!failed.output.status.success());
     assert!(!failed.output.stderr.is_empty());
     let worker_directory = fleet.worker_directory.clone();
@@ -1842,7 +1895,7 @@ fn run_worker_only_inputs(peer_source: bool) -> Result<()> {
         };
         let client = NativeCacheClient::new(
             fleet.cache_url.clone(),
-            CLIENT_TOKEN.into(),
+            std::sync::Arc::clone(&fleet.peer),
             Duration::from_secs(10),
             1024 * 1024,
         )?;
@@ -1852,7 +1905,7 @@ fn run_worker_only_inputs(peer_source: bool) -> Result<()> {
             if pass == 2 {
                 NativeBuildSource::Hit
             } else {
-                NativeBuildSource::Worker(fleet.worker_address)
+                NativeBuildSource::Worker(fleet.worker_id)
             },
         );
         assert!(result.output.status.success());
@@ -1932,6 +1985,7 @@ impl LocalService {
         let cached_config = root.join("caller-cached.toml");
         fs::write(&caller_config, "client_side_mode = true\n")?;
         let mut config = Config::default();
+        config.dist.cluster = Some(fleet.cluster.clone());
         config.dist.scheduler_url = Some(HTTPUrl::from_url(fleet.scheduler_url.clone()));
         config.dist.auth = DistAuth::Token {
             token: CLIENT_TOKEN.into(),

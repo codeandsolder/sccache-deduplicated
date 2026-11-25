@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const LIMIT: u64 = 16 << 20;
 const INTERVAL: Duration = Duration::from_secs(60);
 
@@ -301,7 +301,7 @@ mod tests {
         let path = dir.path().join("action-costs.bin");
         let listener = SocketAddr::from(([127, 0, 0, 1], 1001));
         let scope = WorkerScope {
-            address: SocketAddr::from(([127, 0, 0, 1], 1002)),
+            peer: sccache::dist::ServerId::from_digest([2; 32]),
             platform: ContentId::of(b"platform"),
         };
         let class = ActionClass(ContentId::of(b"command"));
@@ -355,7 +355,7 @@ mod tests {
                 .is_empty()
         );
         assert!(load(&path, listener, now, wall - 1)?.workers.is_empty());
-        assert!(load(&path, scope.address, now, wall).is_err());
+        assert!(load(&path, SocketAddr::from(([127, 0, 0, 1], 1002)), now, wall).is_err());
         fs::write(&path, b"invalid data")?;
         assert!(load(&path, listener, now, wall).is_err());
         Ok(())
