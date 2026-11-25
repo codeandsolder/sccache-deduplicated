@@ -253,7 +253,7 @@ mod tests {
         }
     }
 
-    async fn server(directory: &std::path::Path) -> Result<Server> {
+    async fn server(directory: &std::path::Path, data_only: bool) -> Result<Server> {
         let authority = EnrollmentAuthority::new(
             ClusterCa::open(&directory.join("ca.pem"))?,
             Registry::open(&directory.join("registry.bin"))?,
@@ -263,12 +263,12 @@ mod tests {
         let id = scheduler.id()?;
         let ca = authority.certificate().clone();
         let leaf = authority.scheduler_certificate(&scheduler)?;
-        let tls = Arc::new(ClusterListener::new(&TlsCredentials::new(
-            scheduler,
-            leaf,
-            ca.clone(),
-            Role::Scheduler,
-        )?)?);
+        let credentials = TlsCredentials::new(scheduler, leaf, ca.clone(), Role::Scheduler)?;
+        let tls = Arc::new(if data_only {
+            ClusterListener::new_data(&credentials)?
+        } else {
+            ClusterListener::new(&credentials)?
+        });
         let enrollment = Arc::new(SchedulerEnrollment::new(authority, |role, _, _, token| {
             matches!(
                 (role, token),
@@ -306,9 +306,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn data_listener_requires_mutual_tls() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let server = server(directory.path(), true).await?;
+        let key_path = directory.path().join("worker.pem");
+        let identity = Identity::open(&key_path)?;
+        let request = EnrollmentRequest::new(&identity)?;
+        let (leaf, role) = server
+            .enrollment
+            .authority()
+            .enroll(&request, |_| Some(Role::Worker))?
+            .into_certificate()?;
+        let credentials = TlsCredentials::new(identity, leaf, server.ca.clone(), role)?;
+        let data =
+            ClusterHttpClient::new(&credentials, server.id, Role::Scheduler, server.address)?;
+        let probe = data
+            .request(reqwest::Method::GET, "/api/v1/cluster/probe")?
+            .send()
+            .await?;
+        assert_eq!(probe.status(), StatusCode::NO_CONTENT);
+        let enrolled =
+            EnrollmentClient::new(&server.ca, server.id, server.address, Some(&credentials))?;
+        assert!(
+            enrolled
+                .renew(Identity::open(&key_path)?, Role::Worker)
+                .await
+                .is_err()
+        );
+        let without_certificate =
+            EnrollmentClient::new(&server.ca, server.id, server.address, None)?;
+        let probe = without_certificate
+            .transport
+            .request(reqwest::Method::GET, "/api/v1/cluster/probe")?
+            .send()
+            .await;
+        assert!(probe.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn bootstrap_renewal_and_revocation_on_real_https() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let server = server(directory.path()).await?;
+        let server = server(directory.path(), false).await?;
         let key_path = directory.path().join("worker.pem");
         let leaf_path = directory.path().join("worker.der");
         let bootstrap = EnrollmentClient::new(&server.ca, server.id, server.address, None)?;
