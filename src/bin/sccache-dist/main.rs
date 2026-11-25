@@ -480,6 +480,75 @@ fn run(command: Command) -> Result<i32> {
             }
             Ok(0)
         }
+        Command::ClusterInit { directory } => {
+            anyhow::ensure!(
+                directory.is_absolute(),
+                "cluster directory must be absolute"
+            );
+            std::fs::create_dir_all(&directory)?;
+            let ca = sccache_cluster_identity::ClusterCa::open(&directory.join("ca-key.pem"))?;
+            let identity = sccache_cluster_identity::Identity::open(&directory.join("key.pem"))?;
+            sccache_cluster_identity::publish_trust_anchor(
+                ca.certificate(),
+                &directory.join("ca.pem"),
+            )?;
+            println!("{}", identity.id()?);
+            Ok(0)
+        }
+        Command::ClusterId { directory } => {
+            anyhow::ensure!(directory.is_absolute(), "member directory must be absolute");
+            std::fs::create_dir_all(&directory)?;
+            println!(
+                "{}",
+                sccache_cluster_identity::Identity::open(&directory.join("key.pem"))?.id()?
+            );
+            Ok(0)
+        }
+        Command::ClusterRevoke { directory, peer } => {
+            anyhow::ensure!(
+                directory.is_absolute(),
+                "cluster directory must be absolute"
+            );
+            let registry =
+                sccache_cluster_identity::Registry::open(&directory.join("registry.bin"))?;
+            registry.revoke(peer)?;
+            Ok(0)
+        }
+        Command::ClusterStatus { client_config } => {
+            use sccache::config::{DistAuth, FileConfig, try_read_config_file};
+            use sccache_cluster_identity::Role;
+            let config: FileConfig = try_read_config_file(&client_config)?
+                .context("client configuration unavailable")?;
+            let DistAuth::Token { token } = config.dist.auth else {
+                bail!("cluster status requires token authentication")
+            };
+            let peer = dist::cluster::open_peer(
+                config.dist.cluster.context("cluster trust required")?,
+                &config
+                    .dist
+                    .scheduler_url
+                    .context("scheduler endpoint required")?
+                    .to_url(),
+                Role::Client,
+                &token,
+            )?;
+            let routes = dist::cluster::BlockingRoutes::for_peer(std::sync::Arc::clone(&peer));
+            let (http, base) = routes.endpoint(
+                peer.scheduler_id(),
+                Role::Scheduler,
+                peer.scheduler_address(),
+            )?;
+            let status: dist::SchedulerStatusResult = http
+                .get(dist::http::urls::scheduler_status(&base)?)
+                .header("Accept", "application/json")
+                .timeout(Duration::from_secs(5))
+                .send()?
+                .error_for_status()?
+                .json()?;
+            println!("{}", serde_json::to_string(&status)?);
+            Ok(0)
+        }
+
         Command::Auth(AuthSubcommand::Base64 { num_bytes }) => {
             let mut bytes = vec![0; num_bytes];
             rand::fill(&mut bytes);

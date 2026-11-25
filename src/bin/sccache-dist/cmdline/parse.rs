@@ -143,6 +143,27 @@ fn get_clap_command() -> ClapCommand {
         .version(env!("CARGO_PKG_VERSION"))
         .subcommand_required(true)
         .subcommand(
+            ClapCommand::new("cluster-init")
+                .about("Initialize persistent scheduler CA and identity; print the scheduler peer ID")
+                .arg(flag_infer_long("directory").value_parser(clap::value_parser!(PathBuf)).required(true))
+        )
+        .subcommand(
+            ClapCommand::new("cluster-id")
+                .about("Initialize a member key and print its stable peer ID")
+                .arg(flag_infer_long("directory").value_parser(clap::value_parser!(PathBuf)).required(true))
+        )
+        .subcommand(
+            ClapCommand::new("cluster-revoke")
+                .about("Permanently revoke a peer in the offline scheduler registry")
+                .arg(flag_infer_long("directory").value_parser(clap::value_parser!(PathBuf)).required(true))
+                .arg(flag_infer_long("peer").value_parser(clap::value_parser!(ServerId)).required(true))
+        )
+        .subcommand(
+            ClapCommand::new("cluster-status")
+                .about("Read scheduler status through authenticated cluster HTTPS")
+                .arg(flag_infer_long("client-config").value_parser(clap::value_parser!(PathBuf)).required(true))
+        )
+        .subcommand(
             ClapCommand::new("auth")
                 .about("Helper commands to generate authentication tokens")
                 .subcommand_required(true)
@@ -244,6 +265,33 @@ pub fn try_parse_from(
     let matches = get_clap_command().try_get_matches_from(args)?;
 
     Ok(match matches.subcommand() {
+        Some(("cluster-init", matches)) => Command::ClusterInit {
+            directory: matches
+                .get_one::<PathBuf>("directory")
+                .context("missing cluster directory")?
+                .clone(),
+        },
+        Some(("cluster-id", matches)) => Command::ClusterId {
+            directory: matches
+                .get_one::<PathBuf>("directory")
+                .context("missing member directory")?
+                .clone(),
+        },
+        Some(("cluster-revoke", matches)) => Command::ClusterRevoke {
+            directory: matches
+                .get_one::<PathBuf>("directory")
+                .context("missing cluster directory")?
+                .clone(),
+            peer: *matches
+                .get_one::<ServerId>("peer")
+                .context("missing peer ID")?,
+        },
+        Some(("cluster-status", matches)) => Command::ClusterStatus {
+            client_config: matches
+                .get_one::<PathBuf>("client-config")
+                .context("missing client config")?
+                .clone(),
+        },
         Some(("auth", matches)) => Command::Auth(match matches.subcommand() {
             // Size based on https://briansmith.org/rustdoc/ring/hmac/fn.recommended_key_len.html
             Some(("generate-jwt-hs256-key", _)) => AuthSubcommand::Base64 { num_bytes: 256 / 8 },
