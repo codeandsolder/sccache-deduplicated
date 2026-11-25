@@ -1742,7 +1742,7 @@ fn native_worker_only_inputs_survive_scheduler_eviction_and_restart() -> Result<
 
 #[test]
 #[ignore = "requires Linux Bubblewrap, GNU assembler and isolated scheduler/worker processes"]
-fn native_peer_only_input_is_recovered_without_origin_upload() -> Result<()> {
+fn native_peer_only_input_is_delivered_without_scheduler_or_origin_upload() -> Result<()> {
     run_worker_only_inputs(true)
 }
 
@@ -1922,7 +1922,7 @@ fn run_worker_only_inputs(peer_source: bool) -> Result<()> {
                 "worker-resident input was unnecessarily uploaded"
             );
         }
-        if pass == 0 {
+        if pass == 0 && !peer_source {
             assert!(scheduler.open_available_blob(missing)?.is_some());
             let retention = NativeStore::blob_retention_manifest(missing)?.id()?;
             assert!(matches!(
@@ -1931,7 +1931,10 @@ fn run_worker_only_inputs(peer_source: bool) -> Result<()> {
             ));
             scheduler.collect_garbage(128)?;
         }
-        assert!(scheduler.open_available_blob(missing)?.is_none());
+        assert!(
+            scheduler.open_available_blob(missing)?.is_none(),
+            "direct peer input must not populate scheduler solely for relay"
+        );
         let worker = NativeStore::open(&root.join("worker-store"))?;
         assert!(worker.lookup_tree(inputs[1].id())?.is_some());
         assert!(worker.open_available_blob(object)?.is_some());
