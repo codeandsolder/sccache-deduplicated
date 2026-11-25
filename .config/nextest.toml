@@ -1,0 +1,10 @@
+# These legacy integration suites intentionally start/stop the same default
+# test daemon. serial_test's in-process lock cannot serialize nextest's
+# separate test executables. Declare the shared resource at the runner.
+# Distributed/native fixtures with private endpoints remain parallel.
+[test-groups.legacy-default-daemon]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = "binary(cache_hit_rate) | binary(sccache_args) | binary(sccache_cargo) | binary(sccache_rustc) | binary(system) | binary(logging)"
+test-group = "legacy-default-daemon"
