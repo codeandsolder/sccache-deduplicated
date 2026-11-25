@@ -1,32 +1,23 @@
 //! The single-threaded trusted entry point drops privileges before decoding
 //! the user's compile request or running any compiler-related code.
 use super::{
-    BROKER_FD, Credentials, Job, MAX_FRAME, MOUNT_FD, ROOT_FD, STDIN_FD, decode_frame, frame,
+    BROKER_FD, Credentials, ExecutorEvent, Job, MOUNT_FD, PIDNS_FD, ROOT_FD, STDIN_FD, frame,
+    read_sync_frame,
 };
 use crate::cache::IpcStorage;
 use crate::client::{ServerConnection, connection_task};
 use crate::config::DistConfig;
 use crate::jobserver::Client;
 use crate::mock_command::ProcessCommandCreator;
-use crate::protocol::{CompileFinished, CompileResponse, Request};
-use crate::server::{SccacheService, WaitUntilZero};
+use crate::protocol::{CompileFinished, CompileIdentity, CompileResponse, Request};
+use crate::server::{SccacheService, WaitUntilZero, activity};
 use anyhow::{Context, Result, bail, ensure};
-use serde::de::DeserializeOwned;
-use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::io::{self, Write};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::sync::Arc;
-
-fn read_frame<T: DeserializeOwned>(input: &mut impl Read) -> Result<T> {
-    let mut length = [0_u8; 4];
-    input.read_exact(&mut length)?;
-    let len = u32::from_be_bytes(length) as usize;
-    ensure!(len <= MAX_FRAME, "shared executor input exceeds limit");
-    let mut data = vec![0; len];
-    input.read_exact(&mut data)?;
-    decode_frame(&data)
-}
+use std::time::Duration;
 
 fn checked(result: libc::c_int) -> io::Result<()> {
     if result == -1 {
@@ -44,7 +35,75 @@ fn inherited(fd: RawFd) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-fn assume(credentials: &Credentials, mount: &OwnedFd, root: &OwnedFd) -> Result<()> {
+fn open_pidfd(pid: libc::pid_t) -> Result<OwnedFd> {
+    // SAFETY: pid identifies the current process or its verified parent.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error()).context("open supervisor pidfd");
+    }
+    // SAFETY: pidfd_open returned a new owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(libc::c_int::try_from(fd)?) })
+}
+
+// The private launcher is still single-threaded. setns(CLONE_NEWPID)
+// changes only the namespace of subsequently created children.
+fn enter_pid_namespace(credentials: &Credentials, namespace: &OwnedFd) -> Result<OwnedFd> {
+    let daemon_pid = i32::try_from(credentials.parent_pid)?;
+    // SAFETY: only process-local queries and parent-death signal setup.
+    unsafe {
+        checked(libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0))?;
+        ensure!(libc::getppid() == daemon_pid, "shared daemon disappeared");
+    }
+    if !credentials.join_pid {
+        return open_pidfd(daemon_pid);
+    }
+    // SAFETY: this is the current process, prior to fork.
+    let supervisor = open_pidfd(unsafe { libc::getpid() })?;
+    // SAFETY: a verified peer PID namespace, before any threads or runtime.
+    let child = unsafe {
+        checked(libc::setns(namespace.as_raw_fd(), libc::CLONE_NEWPID))
+            .context("enter requester PID namespace")?;
+        libc::fork()
+    };
+    if child < 0 {
+        return Err(io::Error::last_os_error()).context("fork namespace executor");
+    }
+    if child > 0 {
+        supervise_child(child);
+    }
+    Ok(supervisor)
+}
+
+fn supervise_child(child: libc::pid_t) -> ! {
+    // SAFETY: the single-threaded supervisor owns this child. Close every
+    // inherited pipe/socket copy so only the executor can hold them open.
+    // No Rust destructors or stdio operations run in this supervisor.
+    unsafe {
+        if libc::syscall(libc::SYS_close_range, 0_u32, u32::MAX, 0_u32) < 0 {
+            libc::_exit(1);
+        }
+        let mut status = 0;
+        loop {
+            if libc::waitpid(child, &raw mut status, 0) == child {
+                libc::_exit(if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    128 + libc::WTERMSIG(status)
+                });
+            }
+            if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                libc::_exit(1);
+            }
+        }
+    }
+}
+
+fn assume(
+    credentials: &Credentials,
+    mount: &OwnedFd,
+    root: &OwnedFd,
+    supervisor: &OwnedFd,
+) -> Result<()> {
     // SAFETY: this entry point executes before constructing runtimes or
     // spawning threads. Both namespace descriptors come from the authenticated
     // peer, opened by the root daemon, not from user-controlled pathname data.
@@ -95,15 +154,20 @@ fn assume(credentials: &Credentials, mount: &OwnedFd, root: &OwnedFd) -> Result<
         // Credential changes clear PDEATHSIG; arm it after dropping them.
         checked(libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0))?;
         ensure!(
-            libc::getppid() == i32::try_from(credentials.parent_pid)?,
-            "shared daemon disappeared"
+            super::peer::alive(supervisor.as_fd())?,
+            "shared executor supervisor disappeared"
         );
     }
     Ok(())
 }
 
-async fn compile(job: Job, broker: UnixStream) -> Result<CompileFinished> {
+async fn compile(
+    job: Job,
+    broker: UnixStream,
+    #[cfg(feature = "dist-client")] digest_provider: crate::build_runtime::DescriptorDigestProvider,
+) -> Result<CompileFinished> {
     let Job {
+        activity_id: _,
         mut compile,
         aliases,
         toolchains,
@@ -120,7 +184,7 @@ async fn compile(job: Job, broker: UnixStream) -> Result<CompileFinished> {
         ..DistConfig::default()
     };
     #[cfg(feature = "dist-client")]
-    let dist_client = storage.dist_client(&config);
+    let dist_client = storage.dist_client(&config, Some(digest_provider));
     #[cfg(not(feature = "dist-client"))]
     let dist_client = {
         drop(config);
@@ -148,6 +212,7 @@ async fn compile(job: Job, broker: UnixStream) -> Result<CompileFinished> {
         CompileResponse::UnhandledCompile => {
             // The client must never execute this fallback. It runs here, in
             // the exact same credential and filesystem context as cache hits.
+            activity::phase(activity::Phase::LocalCompile);
             let output = tokio::process::Command::new(&compile.exe)
                 .args(&compile.args)
                 .env_clear()
@@ -185,15 +250,21 @@ pub(super) fn run() -> Result<()> {
     let broker = inherited(BROKER_FD)?;
     let mount = inherited(MOUNT_FD)?;
     let root = inherited(ROOT_FD)?;
+    let pid_namespace = inherited(PIDNS_FD)?;
     let stdin = inherited(STDIN_FD)?;
+    #[cfg(feature = "dist-client")]
+    let digest = inherited(super::DIGEST_FD)?;
     let mut input = io::stdin().lock();
-    let credentials: Credentials = read_frame(&mut input)?;
-    assume(&credentials, &mount, &root)?;
+    let credentials: Credentials = read_sync_frame(&mut input)?;
+    let supervisor = enter_pid_namespace(&credentials, &pid_namespace)?;
+    drop(pid_namespace);
+    assume(&credentials, &mount, &root, &supervisor)?;
+    drop(supervisor);
     crate::util::initialize_shared_umask(credentials.umask)?;
     drop(mount);
     drop(root);
     // Only now is the user-provided compiler request decoded.
-    let job: Job = read_frame(&mut input)?;
+    let job: Job = read_sync_frame(&mut input)?;
     drop(input);
     // SAFETY: stdin is a live descriptor duplicated from the authenticated peer.
     checked(unsafe { libc::dup2(stdin.as_raw_fd(), libc::STDIN_FILENO) })?;
@@ -206,9 +277,53 @@ pub(super) fn run() -> Result<()> {
         unsafe { std::env::set_var(key, value) };
     }
     let runtime = crate::util::new_client_runtime()?;
-    let result = runtime
-        .block_on(compile(job, UnixStream::from(broker)))
-        .map_err(|error| format!("{error:#}"));
-    io::stdout().lock().write_all(&frame(&result)?)?;
-    Ok(())
+    runtime.block_on(report_compile(
+        job,
+        UnixStream::from(broker),
+        &mut io::stdout().lock(),
+        #[cfg(feature = "dist-client")]
+        super::digests::provider(UnixStream::from(digest)),
+    ))
+}
+
+async fn report_compile(
+    job: Job,
+    broker: UnixStream,
+    output: &mut impl Write,
+    #[cfg(feature = "dist-client")] digest_provider: crate::build_runtime::DescriptorDigestProvider,
+) -> Result<()> {
+    let activity = Arc::new(activity::Activity::new(
+        job.activity_id.clone(),
+        &CompileIdentity::from(&job.compile),
+        activity::CompileOwner::Daemon,
+    ));
+    let work = activity::scope(
+        &activity,
+        compile(
+            job,
+            broker,
+            #[cfg(feature = "dist-client")]
+            digest_provider,
+        ),
+    );
+    tokio::pin!(work);
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut work => {
+                output.write_all(&frame(&ExecutorEvent::Progress(activity.snapshot()))?)?;
+                output.write_all(&frame(&ExecutorEvent::Finished(
+                    result.map_err(|error| format!("{error:#}")),
+                ))?)?;
+                output.flush()?;
+                return Ok(());
+            }
+            _ = ticker.tick() => {
+                output.write_all(&frame(&ExecutorEvent::Progress(activity.snapshot()))?)?;
+                output.flush()?;
+            }
+        }
+    }
 }

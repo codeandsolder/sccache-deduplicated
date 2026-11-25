@@ -1468,32 +1468,20 @@ impl Rust {
             env_vars,
             discovery.dist_archive.clone(),
         );
-        #[cfg(feature = "dist-client")]
-        let ((sysroot, libs), rlib_dep_reader) = {
-            use futures::TryFutureExt;
-            let rlib_dep_reader = {
-                let executable = executable.clone();
-                let env_vars = env_vars.to_owned();
-                pool.spawn_blocking(move || RlibDepReader::new_with_check(executable, &env_vars))
-                    .map_err(anyhow::Error::from)
-            };
-
-            let ((sysroot, libs), rlib_dep_reader) =
-                futures::future::try_join(sysroot_and_libs, rlib_dep_reader).await?;
-
-            let rlib_dep_reader = match rlib_dep_reader {
-                Ok(r) => Some(Arc::new(r)),
-                Err(e) => {
-                    warn!(
-                        "Failed to initialise RlibDepDecoder, distributed compiles will be inefficient: {e}"
-                    );
-                    None
-                }
-            };
-            ((sysroot, libs), rlib_dep_reader)
-        };
-        #[cfg(not(feature = "dist-client"))]
         let (sysroot, libs) = sysroot_and_libs.await?;
+        #[cfg(feature = "dist-client")]
+        let rlib_dep_reader = match RlibDepReader::from_version(
+            executable.clone(),
+            rustc_verbose_version,
+        ) {
+            Ok(reader) => Some(Arc::new(reader)),
+            Err(error) => {
+                warn!(
+                    "Rust dependency inspection unavailable: {error:#}; including complete search paths"
+                );
+                None
+            }
+        };
         let digests = discovery.hash_toolchain_files(&libs, &pool).await?;
         Ok(Self {
             executable,
@@ -4893,116 +4881,27 @@ struct RlibDepReader {
 
 #[cfg(feature = "dist-client")]
 impl RlibDepReader {
-    fn new_with_check(executable: PathBuf, env_vars: &[(OsString, OsString)]) -> Result<Self> {
+    fn from_version(executable: PathBuf, rustc_verbose_version: &str) -> Result<Self> {
         const CACHE_SIZE: u64 = 3 * 1024 * 1024;
-
-        let temp_dir = tempfile::Builder::new()
-            .prefix("sccache-rlibreader")
-            .tempdir()
-            .context("Could not create temporary directory for rlib output")?;
-        let temp_rlib = temp_dir.path().join("x.rlib");
-
-        let mut cmd = process::Command::new(&executable);
-        cmd.arg("--crate-type=rlib")
-            .arg("-o")
-            .arg(&temp_rlib)
-            .arg("-")
-            .env_clear()
-            .envs(env_vars.to_vec());
-
-        let process::Output {
-            status,
-            stdout,
-            stderr,
-        } = cmd
-            .stdin(process::Stdio::piped())
-            .output()
-            .context("could not execute Rust dependency probe")?;
-
-        if !stdout.is_empty() {
-            bail!(
-                "rustc stdout non-empty when compiling a minimal rlib: {:?}",
-                String::from_utf8_lossy(&stdout)
-            )
-        }
-        if !stderr.is_empty() {
-            bail!(
-                "rustc stderr non-empty when compiling a minimal rlib: {:?}",
-                String::from_utf8_lossy(&stderr)
-            )
-        }
-        if !status.success() {
-            bail!(
-                "Failed to compile a minimal rlib with {}",
-                executable.display()
-            )
-        }
-
-        // The goal of this cache is to avoid repeated lookups when building a single project. Let's budget 3MB.
-        // Allowing for a 100 byte path, 50 dependencies per rlib and 20 characters per crate name, this roughly
-        // approximates to `path_size + path + vec_size + num_deps * (systemtime_size + string_size + crate_name_len)`
-        //                 `   3*8    +  100 +   3*8    +    50    * (      8         +     3*8     +       20      )`
-        //                 `2748` bytes per crate
-        // Allowing for possible overhead of up to double (for unused space in allocated memory), this means we
-        // can cache information from about 570 rlibs - easily enough for a single project.
-        let cache = LruCache::with_meter(CACHE_SIZE, DepsSize);
-        let rustc_version = Self::get_rustc_version(&executable, env_vars)?;
-
-        let rlib_dep_reader = Self {
-            cache: Mutex::new(cache),
+        // Compiler discovery already obtained the verbose version. Dependency
+        // inspection is optional and falls back to the complete search set
+        // on any real input failure; compiling a dummy crate for each fresh
+        // executor cannot establish anything about the actual input metadata.
+        let version = Self::parse_rustc_version(rustc_verbose_version.as_bytes())?;
+        Ok(Self {
+            cache: Mutex::new(LruCache::with_meter(CACHE_SIZE, DepsSize)),
             executable,
-            ls_arg: Self::get_correct_ls_arg(&rustc_version),
-        };
-        if let Err(e) = rlib_dep_reader.discover_rlib_deps(env_vars, &temp_rlib) {
-            bail!("Failed to read deps from minimal rlib: {e}")
-        }
-
-        Ok(rlib_dep_reader)
-    }
-
-    fn get_rustc_version(
-        executable: &PathBuf,
-        env_vars: &[(OsString, OsString)],
-    ) -> Result<Version> {
-        let mut cmd = process::Command::new(executable);
-        cmd.arg("--version").env_clear().envs(env_vars.to_vec());
-
-        let process::Output {
-            status,
-            stdout,
-            stderr,
-        } = cmd
-            .stdin(process::Stdio::piped())
-            .output()
-            .context("could not execute Rust dependency probe")?;
-
-        if !status.success() {
-            bail!("Failed to get rustc version with {}", executable.display())
-        }
-        if stdout.is_empty() {
-            bail!("rustc stdout empty when parsing version")
-        }
-        if !stderr.is_empty() {
-            bail!(
-                "rustc stderr non-empty when parsing version: {:?}",
-                String::from_utf8_lossy(&stderr)
-            )
-        }
-
-        Self::parse_rustc_version(&stdout)
+            ls_arg: Self::get_correct_ls_arg(&version),
+        })
     }
 
     fn parse_rustc_version(stdout: &[u8]) -> Result<Version> {
-        let stdout_string = String::from_utf8_lossy(stdout);
-        let rustc_version: Vec<&str> = stdout_string.split_whitespace().collect();
-        if rustc_version[0] != "rustc" {
-            bail!(
-                "Expected rustc string in rustc version with {:?}",
-                String::from_utf8_lossy(stdout)
-            )
-        }
-
-        Ok(Version::parse(rustc_version[1])?)
+        let stdout = std::str::from_utf8(stdout)?;
+        let mut fields = stdout.split_whitespace();
+        anyhow::ensure!(fields.next() == Some("rustc"), "expected rustc version");
+        Ok(Version::parse(
+            fields.next().context("missing rustc version")?,
+        )?)
     }
 
     fn get_correct_ls_arg(version: &Version) -> String {
@@ -6489,8 +6388,37 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         .collect();
         env_vars.push(("RUSTUP_AUTO_INSTALL".into(), "0".into()));
 
-        let rlib_dep_reader = RlibDepReader::new_with_check(rustc_path, &env_vars);
-        rlib_dep_reader.expect("selected rustc must support rlib dependency reading");
+        let version = process::Command::new(&rustc_path)
+            .arg("-vV")
+            .env_clear()
+            .envs(env_vars.clone())
+            .output()
+            .expect("query selected rustc version");
+        assert!(version.status.success());
+        let reader = RlibDepReader::from_version(
+            rustc_path.clone(),
+            std::str::from_utf8(&version.stdout).expect("rustc version is UTF-8"),
+        )
+        .expect("initialize Rust dependency reader without a compilation");
+        let temp = tempfile::tempdir().expect("temporary dependency fixture");
+        let source = temp.path().join("fixture.rs");
+        let artifact = temp.path().join("fixture.rlib");
+        fs::write(&source, "pub fn fixture() {}").expect("write dependency fixture");
+        assert!(
+            process::Command::new(&rustc_path)
+                .args(["--crate-type=rlib", "--crate-name=fixture"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&artifact)
+                .env_clear()
+                .envs(env_vars.clone())
+                .status()
+                .expect("compile real dependency fixture")
+                .success()
+        );
+        reader
+            .discover_rlib_deps(&env_vars, &artifact)
+            .expect("selected rustc must support rlib dependency reading");
     }
 
     #[cfg(feature = "dist-client")]
@@ -6505,6 +6433,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
 
         assert!(RlibDepReader::parse_rustc_version(b"rutc 1.2.3 aaaa").is_err());
         assert!(RlibDepReader::parse_rustc_version(b"1.2.3").is_err());
+        assert!(RlibDepReader::parse_rustc_version(b"").is_err());
+        assert!(RlibDepReader::parse_rustc_version(b"rustc").is_err());
     }
 
     #[cfg(feature = "dist-client")]

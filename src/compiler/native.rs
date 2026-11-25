@@ -16,15 +16,16 @@ use anyhow::{Context, Result, ensure};
 
 use crate::{
     build_runtime::{
-        ActionMode, BuildPath, CommandSpec, ContentId, ExecutionRoot, ExecutionSpec, OutputKind,
-        OutputSpec, PreparedTree, SourceDigestCache, TreeRecipe,
+        ActionKey, ActionMode, BuildPath, CommandSpec, ContentId, DescriptorDigestProvider,
+        ExecutionRoot, ExecutionSpec, OutputKind, OutputSpec, PreparedTree, SourceDigestCache,
+        TreeRecipe,
     },
     cache::FileObjectSource,
     client::{SharedConnection, connection_task},
     config::{DistAuth, DistToolchainConfig, HTTPUrl, NativeClientConfig},
     dist::{
         self,
-        native::{LocalExecutor, NativeBuildResult, NativeBuildSource, NativeCacheClient, broker},
+        native::{LocalExecutor, NativeBuildResult, NativeCacheClient, broker},
         pkg,
     },
     mock_command::CommandCreatorSync,
@@ -34,7 +35,6 @@ use crate::{
 
 use super::{
     CacheControl, Cacheable, Compilation, CompileResult, CompileTransport, DistPackagers, DistType,
-    MissType,
 };
 
 struct DirectEndpoint {
@@ -59,8 +59,11 @@ pub struct NativeCompilerClient {
     toolchain_digests: Arc<SourceDigestCache>,
 }
 
-fn installed_digest_cache(catalogs: &[PathBuf]) -> Arc<SourceDigestCache> {
-    let mut cache = SourceDigestCache::default();
+fn installed_digest_cache(
+    catalogs: &[PathBuf],
+    provider: Option<DescriptorDigestProvider>,
+) -> Arc<SourceDigestCache> {
+    let mut cache = SourceDigestCache::default().with_descriptor_provider(provider);
     for path in catalogs {
         if let Err(error) = cache.load_catalog(path) {
             warn!(
@@ -100,7 +103,7 @@ impl NativeCompilerClient {
             })),
             policy,
             toolchains,
-            toolchain_digests: installed_digest_cache(catalogs),
+            toolchain_digests: installed_digest_cache(catalogs, None),
         }
     }
 
@@ -110,6 +113,7 @@ impl NativeCompilerClient {
         policy: NativeNamespacePolicy,
         toolchains: Vec<DistToolchainConfig>,
         catalogs: &[PathBuf],
+        provider: Option<DescriptorDigestProvider>,
     ) -> Self {
         Self {
             endpoint: Endpoint::Namespace {
@@ -118,7 +122,7 @@ impl NativeCompilerClient {
             },
             policy,
             toolchains,
-            toolchain_digests: installed_digest_cache(catalogs),
+            toolchain_digests: installed_digest_cache(catalogs, provider),
         }
     }
 
@@ -217,10 +221,11 @@ impl NativeCompilerClient {
         plan: CompilerPlan,
         mode: ActionMode,
         pool: &tokio::runtime::Handle,
-    ) -> Result<NativeBuildResult> {
-        match &self.endpoint {
+    ) -> Result<(NativeBuildResult, crate::build_runtime::ActionKey)> {
+        let key = plan.spec.action_request()?.action_fingerprint()?.key()?;
+        let result = match &self.endpoint {
             Endpoint::Direct(_) => {
-                pool.spawn_blocking(move || {
+                pool.spawn_blocking(crate::server::activity::inherit_blocking(move || {
                     let Endpoint::Direct(endpoint) = &self.endpoint else {
                         unreachable!()
                     };
@@ -231,7 +236,7 @@ impl NativeCompilerClient {
                         &self.policy.build_policy(mode),
                         endpoint.local.as_ref(),
                     )
-                })
+                }))
                 .await?
             }
             Endpoint::Namespace {
@@ -249,7 +254,8 @@ impl NativeCompilerClient {
                 )
                 .await
             }
-        }
+        }?;
+        Ok((result, key))
     }
 }
 
@@ -596,22 +602,18 @@ fn prepare_dispatch(
     Ok((outputs, layout, packagers))
 }
 
-fn classify_source(
-    source: NativeBuildSource,
-    mode: ActionMode,
-    elapsed: Duration,
-) -> CompileResult {
-    let miss = if mode == ActionMode::Refresh {
-        MissType::ForcedRecache
-    } else {
-        MissType::Normal
-    };
-    match source {
-        NativeBuildSource::Hit => CompileResult::CacheHit(elapsed),
-        NativeBuildSource::Local => CompileResult::NativeMiss(miss, DistType::NoDist, elapsed),
-        NativeBuildSource::Worker(addr) => {
-            CompileResult::NativeMiss(miss, DistType::Ok(addr.to_string()), elapsed)
+async fn finish_link<T: CommandCreatorSync>(
+    result: Result<(NativeBuildResult, ActionKey)>,
+    split: Option<&NativeLink>,
+    creator: &T,
+) -> Result<(NativeBuildResult, ActionKey)> {
+    match (result, split) {
+        (Ok((mut result, key)), Some(link)) if result.output.status.success() => {
+            crate::server::activity::phase(crate::server::activity::Phase::LocalCompile);
+            result.output = link.finish(creator, result.output).await?;
+            Ok((result, key))
         }
+        (result, _) => result,
     }
 }
 
@@ -625,6 +627,7 @@ pub(super) async fn compile<T: CommandCreatorSync>(
     pool: &tokio::runtime::Handle,
 ) -> Result<(CompileResult, process::Output)> {
     let start = Instant::now();
+    crate::server::activity::phase(crate::server::activity::Phase::PlanCompile);
     let mut transformer = dist::PathTransformer::new();
     let (local, remote, cacheable) =
         compilation.generate_compile_commands(&mut transformer, CompileTransport::Native)?;
@@ -669,33 +672,31 @@ pub(super) async fn compile<T: CommandCreatorSync>(
         })();
         let result = match result {
             Ok(task) => match task.await? {
-                Ok(plan) => client.execute(plan, mode, pool).await,
+                Ok(plan) => {
+                    crate::server::activity::phase(crate::server::activity::Phase::RunDistributed);
+                    client.execute(plan, mode, pool).await
+                }
                 Err(error) => Err(error),
             },
             Err(error) => Err(error),
         };
-        let result = match (result, split.as_ref()) {
-            (Ok(mut result), Some(link)) if result.output.status.success() => {
-                match link.finish(&creator, result.output).await {
-                    Ok(output) => {
-                        result.output = output;
-                        Ok(result)
-                    }
-                    Err(error) => Err(error),
-                }
-            }
-            (result, _) => result,
-        };
+        let result = finish_link(result, split.as_ref(), &creator).await;
         // Explicit drop order: the workspace's TempDirs reference scratch.
         drop(split);
         drop(scratch);
         match result {
-            Ok(result) if result.output.status.success() => {
-                let elapsed = start.elapsed();
-                let classification = classify_source(result.source, mode, elapsed);
-                return Ok((classification, result.output));
+            Ok((result, key)) if result.output.status.success() => {
+                let report = crate::protocol::NativeCompileReport {
+                    key,
+                    mode,
+                    source: result.source,
+                };
+                return Ok((
+                    CompileResult::Native(report, start.elapsed()),
+                    result.output,
+                ));
             }
-            Ok(result) => {
+            Ok((result, _)) => {
                 // Incomplete compiler environment discovery can also produce
                 // an ordinary nonzero exit. Preserve caller semantics by
                 // rerunning locally without writing an archive cache.
@@ -712,6 +713,7 @@ pub(super) async fn compile<T: CommandCreatorSync>(
             }
         }
     }
+    crate::server::activity::phase(crate::server::activity::Phase::LocalCompile);
     let output = local.execute(service, &creator).await?;
     let result = if output.status.success() {
         CompileResult::NotCached(fallback, start.elapsed())

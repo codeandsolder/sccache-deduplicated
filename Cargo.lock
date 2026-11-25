@@ -4292,6 +4292,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rouille",
+ "rustix",
  "sccache-build",
  "sccache-dashboard",
  "semver",

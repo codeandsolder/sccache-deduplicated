@@ -32,7 +32,7 @@ pub fn metadata(stat: &Stat) -> Result<TreeMetadata> {
 
 // Linux stat layouts differ by architecture. Normalize all fields without
 // narrowing, including the metadata needed to detect replacement and mutation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FileVersion([i128; 10]);
 
 impl From<&Stat> for FileVersion {

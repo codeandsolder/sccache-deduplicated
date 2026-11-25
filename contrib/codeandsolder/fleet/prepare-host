@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+# Stage only: all output goes into a private rollout directory. No service
+# restart, live config write, cache relocation, or release promotion.
+set -euo pipefail
+umask 077
+[[ $EUID == 0 ]]
+role=${1:?acer, asus, cold-storage, or wsl}
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+case "$role" in
+  acer) user=jan; source=/etc/sccache/client.conf; worker_gib=32; worker_target=24; minimum=16; target=24 ;;
+  asus) user=jan; source=/etc/sccache/client.conf; worker_gib=48; worker_target=36; minimum=32; target=48 ;;
+  cold-storage) user=sentinelx; source=/etc/sccache/client.conf; worker_gib=0 ;;
+  wsl) user=jan; source=/etc/sccache/config; worker_gib=48; worker_target=36; minimum=32; target=48 ;;
+  *) exit 2 ;;
+esac
+[[ "$(systemctl show sccache-local.service -p User --value)" == "$user" ]]
+uid=$(id -u "$user")
+gid=$(id -g "$user")
+stage=/var/lib/sccache-managed-rollout/epoch5-20261125
+[[ ! -e "$stage" ]] || { echo "stage already exists: $stage"; exit 1; }
+install -d -m 0700 "$stage"
+trap 'rc=$?; if (( rc != 0 )); then rm -rf -- "$stage"; fi' EXIT
+gib=1073741824
+cache_url=http://100.73.74.69:10602
+platform=linux-x86_64-zen2-explicit-codegen-bwrap-v1
+record_source() { sha256sum -- "$1" >> "$stage/originals.sha256"; }
+assert_absent() {
+  local pattern=$1 file=$2 rc=0
+  rg -q "$pattern" "$file" || rc=$?
+  [[ $rc == 1 ]] || { echo "existing section or unreadable source: $file"; exit 1; }
+}
+record_source "$source"
+assert_absent '^\s*\[(shared_daemon|dist\.native|compiler_aliases)(\.|\])' "$source"
+cp -- "$source" "$stage/client-shared.toml"
+cat >> "$stage/client-shared.toml" <<EOF
+
+[shared_daemon]
+socket_gid = $gid
+allowed_uids = [$uid]
+
+[dist.native]
+endpoint = "$cache_url"
+platform_contract = "$platform"
+request_timeout_secs = 120
+build_timeout_secs = 1800
+renewal_interval_secs = 15
+max_metadata_bytes = 67108864
+max_result_bytes = 1073741824
+EOF
+case "$role" in
+  acer) cat >> "$stage/client-shared.toml" <<'ALIAS_ACER'
+
+# Candidate only; verify wrapper bytes again at activation.
+
+[compiler_aliases."/usr/local/libexec/sccache-strict-wrappers/c++"]
+compiler = "/usr/bin/c++"
+blake3 = "95c1fdea1ebb7afc5c1ef3b101b7013307536f29a4316ed5bb626b347c93a365"
+
+[compiler_aliases."/usr/local/libexec/sccache-strict-wrappers/cc"]
+compiler = "/usr/bin/cc"
+blake3 = "ca2ea427ceffe138d4e8de8b7f719e705644eb321ca04fb54511d4ab3a262928"
+
+[compiler_aliases."/usr/local/libexec/sccache-strict-wrappers/clang"]
+compiler = "/usr/bin/clang"
+blake3 = "3fb8ec4fd363dc7376a35eb274d6f4f08419df823ce1a80a586f839a193819fb"
+
+[compiler_aliases."/usr/local/libexec/sccache-strict-wrappers/clang++"]
+compiler = "/usr/bin/clang++"
+blake3 = "753e10bf8afe1ca33057f8889d4633e31a1be06c81cf40eb9eb1f3b5d9794c37"
+
+[compiler_aliases."/usr/local/libexec/sccache-strict-wrappers/clang-cl"]
+compiler = "/usr/bin/clang-cl"
+blake3 = "331b3a0d58fe4da0e0d958761577825bd2218241ab8f554a7a9ab1a5a6cc20a4"
+
+[compiler_aliases."/usr/local/libexec/sccache-strict-wrappers/g++"]
+compiler = "/usr/bin/g++"
+blake3 = "54c137db24dde0b02447856b144aeafc47737ce05193e1636e067ed3b4eac02a"
+
+[compiler_aliases."/usr/local/libexec/sccache-strict-wrappers/gcc"]
+compiler = "/usr/bin/gcc"
+blake3 = "66bed3c4b1899338804c28a49b88136d8644f03e6066b3e66fa036203de81d36"
+ALIAS_ACER
+  ;;
+  asus) cat >> "$stage/client-shared.toml" <<'ALIAS_ASUS'
+
+# Candidate only; verify wrapper bytes again at activation.
+
+[compiler_aliases."/usr/local/libexec/sccache-strict-wrappers/c++"]
+compiler = "/usr/bin/c++"
+blake3 = "95c1fdea1ebb7afc5c1ef3b101b7013307536f29a4316ed5bb626b347c93a365"
+
+[compiler_aliases."/usr/local/libexec/sccache-strict-wrappers/cc"]
+compiler = "/usr/bin/cc"
+blake3 = "ca2ea427ceffe138d4e8de8b7f719e705644eb321ca04fb54511d4ab3a262928"
+
+[compiler_aliases."/usr/local/libexec/sccache-strict-wrappers/clang"]
+compiler = "/usr/bin/clang"
+blake3 = "3fb8ec4fd363dc7376a35eb274d6f4f08419df823ce1a80a586f839a193819fb"
+
+[compiler_aliases."/usr/local/libexec/sccache-strict-wrappers/clang++"]
+compiler = "/usr/bin/clang++"
+blake3 = "753e10bf8afe1ca33057f8889d4633e31a1be06c81cf40eb9eb1f3b5d9794c37"
+
+[compiler_aliases."/usr/local/libexec/sccache-strict-wrappers/clang-cl"]
+compiler = "/usr/bin/clang-cl"
+blake3 = "331b3a0d58fe4da0e0d958761577825bd2218241ab8f554a7a9ab1a5a6cc20a4"
+
+[compiler_aliases."/usr/local/libexec/sccache-strict-wrappers/g++"]
+compiler = "/usr/bin/g++"
+blake3 = "54c137db24dde0b02447856b144aeafc47737ce05193e1636e067ed3b4eac02a"
+
+[compiler_aliases."/usr/local/libexec/sccache-strict-wrappers/gcc"]
+compiler = "/usr/bin/gcc"
+blake3 = "66bed3c4b1899338804c28a49b88136d8644f03e6066b3e66fa036203de81d36"
+
+[compiler_aliases."/usr/local/libexec/sccache-strict-wrappers/nvcc"]
+compiler = "/opt/cuda/bin/nvcc"
+blake3 = "a0849c05a435841e8e1092ec08913e82d53e45c60d4989e78307ea5d194ee3d4"
+ALIAS_ASUS
+  ;;
+esac
+cat > "$stage/90-shared-daemon.conf" <<'UNIT'
+[Service]
+User=root
+Group=root
+ExecStart=
+ExecStart=/usr/local/libexec/sccache-bin/sccache
+ExecStartPre=
+RuntimeDirectory=
+RuntimeDirectory=sccache-shared
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+CacheDirectory=
+StateDirectory=
+Environment=HOME=/root
+Environment=SCCACHE_CONF=/etc/sccache/client-shared.toml
+Environment=SCCACHE_SERVER_UDS=/run/sccache-shared/sccache.sock
+Environment=SCCACHE_START_SERVER=1
+Environment=SCCACHE_NO_DAEMON=1
+UnsetEnvironment=SCCACHE_SERVER_PORT SCCACHE_CLIENT_SIDE SCCACHE_DIST_CLIENT_CACHE_DIR
+UNIT
+cat > "$stage/wrapper.conf" <<'ROUTING'
+user_endpoint=unix:/run/sccache-shared/sccache.sock
+root_endpoint=unix:/run/sccache-shared/sccache.sock
+user_service=sccache-local.service
+root_service=sccache-local.service
+readiness_seconds=300
+ROUTING
+# Use the exact reviewed host tooling from the release checkout.
+install -m 0700 "$repo/sccache-client" "$stage/sccache-client"
+install -m 0700 "$repo/sccache-release-update" "$stage/sccache-release-update"
+install -m 0700 "$repo/fleet/activate-host" "$stage/activate-host"
+install -m 0600 "$repo/native-action-report.awk" "$stage/native-action-report.awk"
+if [[ -x /usr/local/libexec/cargo-codeandsolder-real && -f /usr/local/bin/cargo ]]; then
+  install -m 0700 "$repo/cargo-wrapper" "$stage/cargo-wrapper"
+fi
+for helper in sccache-cmake-launcher sccache-dist-client-preflight; do
+  if [[ -f "/usr/local/libexec/$helper" ]]; then
+    install -m 0700 "$repo/$helper" "$stage/$helper"
+  fi
+done
+case "$role" in
+  wsl) sed -i 's| /usr/bin/rustup | /home/jan/.cargo/bin/rustup |' "$stage/sccache-client" ;;
+  cold-storage) sed -i 's| /usr/bin/rustup | /var/lib/sccache-native-builder/cargo/bin/rustup |' "$stage/sccache-client" ;;
+esac
+chmod 0700 "$stage/sccache-client"
+bash -n "$stage/sccache-client"
+cat > "$stage/zz-epoch5.conf" <<'UPDATER'
+[Service]
+Environment=SCCACHE_AUTOUPDATE_EXPECTED_ROLLOUT_EPOCH=5
+Environment=SCCACHE_AUTOUPDATE_EXPECTED_RUST_TOOLCHAIN=nightly-2026-11-20
+Environment=SCCACHE_AUTOUPDATE_NATIVE_BUNDLE_ROOT=/var/lib/sccache-native-bundles
+Environment=SCCACHE_AUTOUPDATE_LIVE=/usr/local/libexec/sccache-bin/sccache
+Environment=SCCACHE_AUTOUPDATE_CLIENT_UDS=/run/sccache-shared/sccache.sock
+UnsetEnvironment=SCCACHE_AUTOUPDATE_CLIENT_PORT
+UPDATER
+if (( worker_gib > 0 )); then
+  worker=/etc/sccache-dist/server.conf
+  record_source "$worker"
+  assert_absent '^\s*\[native_worker(\.|\])' "$worker"
+  cp -- "$worker" "$stage/server.conf"
+  cat >> "$stage/server.conf" <<EOF
+
+[native_worker]
+cache_url = "$cache_url"
+directory = "/var/cache/sccache-native/worker"
+scratch = "/var/cache/sccache-native/scratch"
+bubblewrap = "/usr/bin/bwrap"
+platform_contract = "$platform"
+renewal_interval_secs = 15
+request_timeout_secs = 120
+execution_timeout_secs = 1200
+max_result_bytes = 1073741824
+max_metadata_bytes = 67108864
+artifact_grace_secs = 300
+
+[native_worker.space]
+min_available_bytes = $((minimum*gib))
+target_available_bytes = $((target*gib))
+max_resident_bytes = $((worker_gib*gib))
+target_resident_bytes = $((worker_target*gib))
+max_evictions_per_pass = 128
+gc_batch = 1024
+
+[native_worker.package_import]
+retain_original = false
+max_concurrent_imports = 2
+max_archive_bytes = 1073741824
+max_entries = 100000
+max_expanded_bytes = 8589934592
+max_tar_bytes = 9663676416
+max_metadata_bytes = 67108864
+decoder_memory_bytes = 536870912
+decoder_timeout_secs = 600
+EOF
+  test -x /usr/bin/bwrap
+  if [[ $(findmnt -n -o FSTYPE -T /var/cache) != zfs ]]; then
+    test -c /dev/fuse
+    command -v fusermount3 >/dev/null
+  fi
+fi
+if [[ "$role" == asus ]]; then
+  cat > "$stage/90-real-binary.conf" <<'UNIT'
+[Service]
+ExecStart=
+ExecStart=/usr/local/libexec/sccache-bin/sccache
+UNIT
+  scheduler=/etc/sccache-dist/scheduler.conf
+  record_source "$scheduler"
+  assert_absent '^\s*\[(job_slack|native_cache)(\.|\])' "$scheduler"
+  cp -- "$scheduler" "$stage/scheduler.conf"
+  [[ -z "$(ss -Hln 'sport = :10602')" ]]
+  cat >> "$stage/scheduler.conf" <<EOF
+
+[job_slack]
+static_jobs = 0
+percent = 200.0
+
+[native_cache]
+public_addr = "100.73.74.69:10602"
+directory = "/var/cache/sccache-native/scheduler"
+idle_timeout_secs = 120
+max_sessions = 256
+max_result_bytes = 1073741824
+max_result_blobs = 4096
+max_tree_bytes = 21474836480
+max_tree_blobs = 200000
+max_concurrent_uploads = 4
+max_total_uploads = 16
+http_threads = 64
+max_metadata_bytes = 67108864
+
+[native_cache.space]
+min_available_bytes = $((32*gib))
+target_available_bytes = $((48*gib))
+max_resident_bytes = $((64*gib))
+target_resident_bytes = $((48*gib))
+max_evictions_per_pass = 128
+gc_batch = 1024
+
+[native_cache.package_import]
+retain_original = true
+max_concurrent_imports = 2
+max_archive_bytes = 1073741824
+max_entries = 100000
+max_expanded_bytes = 8589934592
+max_tar_bytes = 9663676416
+max_metadata_bytes = 67108864
+decoder_memory_bytes = 536870912
+decoder_timeout_secs = 600
+
+[native_cache.package_upstreams.rust]
+origin = "https://static.rust-lang.org/"
+timeout_secs = 180
+EOF
+fi
+# Provision only the exact release/CI toolchains and stable smoke toolchain
+# that actually exist on this host. All other toolchains use descriptor memo.
+catalog_dir=/var/lib/sccache-installations/epoch5
+: > "$stage/rust-installations.tsv"
+home=$(getent passwd "$user" | cut -d: -f6)
+for base in "$home/.rustup/toolchains" /root/.rustup/toolchains /opt/toolchains/rustup/toolchains /var/lib/sccache-native-builder/rustup/toolchains; do
+  for channel in nightly-2026-11-20 nightly-2026-11-22 1.99.0; do
+    root="$base/$channel-x86_64-unknown-linux-gnu"
+    [[ -f "$root/lib/rustlib/multirust-config.toml" ]] || continue
+    root=$(realpath -e "$root")
+    id=$(printf '%s' "$root" | sha256sum | cut -c1-24)
+    printf '%s\t%s\n' "$root" "$catalog_dir/$id.catalog" >> "$stage/rust-installations.tsv"
+  done
+done
+sort -u -o "$stage/rust-installations.tsv" "$stage/rust-installations.tsv"
+catalogs=$(cut -f2 "$stage/rust-installations.tsv" | jq -Rnc '[inputs]')
+# Insert into the existing [dist] table, not a duplicate table.
+[[ $(rg -c '^\s*\[dist\]\s*$' "$stage/client-shared.toml") == 1 ]]
+assert_absent '^\s*native_installation_catalogs\s*=' "$stage/client-shared.toml"
+sed -i "/^\s*\[dist\]\s*$/a native_installation_catalogs = $catalogs" "$stage/client-shared.toml"
+# The live files are unchanged and must remain so until coordinated cutover.
+sha256sum --check --status "$stage/originals.sha256"
+printf 'role=%s\nuid=%s\ngid=%s\nplatform=%s\ncache_url=%s\n' "$role" "$uid" "$gid" "$platform" "$cache_url" > "$stage/plan.txt"
+(
+ cd "$stage"
+ files=(*); sha256sum -- "${files[@]}" > STAGED_SHA256SUMS
+ sha256sum --check --status STAGED_SHA256SUMS
+)
+printf 'STAGED %s uid=%s gid=%s in %s\n' "$role" "$uid" "$gid" "$stage"
