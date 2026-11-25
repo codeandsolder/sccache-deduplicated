@@ -132,6 +132,7 @@ impl Destinations {
                 continue;
             };
             let parent = path.parent().context("intermediate output has no parent")?;
+            log::debug!("publishing leased intermediate {}", path.display());
             match artifact {
                 Artifact::File { blob, mode } => {
                     let file = tempfile::NamedTempFile::new_in(parent)?;

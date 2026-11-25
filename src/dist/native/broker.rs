@@ -137,7 +137,7 @@ impl InputProvider for RemoteInputs<'_> {
 
 /// Complete one action in the daemon. Only declared input trees/blobs are
 /// requested. The caller reads verified outputs through the active result pin.
-pub fn serve_action(
+pub(crate) fn serve_action(
     client: &NativeCacheClient,
     policy: &NativeNamespacePolicy,
     mut stream: DaemonStream,

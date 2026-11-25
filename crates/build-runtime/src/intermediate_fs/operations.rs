@@ -232,7 +232,13 @@ impl Filesystem for IntermediateFs {
                     name,
                     Mode::from_bits_truncate(mode & !umask),
                 )?;
-                self.lookup_attr(parent, name)
+                let (ino, node) = self.child(parent, name)?;
+                let inherited = node.fd.metadata()?.mode() & libc::S_ISGID;
+                fs::set_permissions(
+                    node.path(),
+                    fs::Permissions::from_mode((mode & !umask & 0o7777) | inherited),
+                )?;
+                node.attr(ino)
             })(),
         );
     }
@@ -254,12 +260,14 @@ impl Filesystem for IntermediateFs {
         reply_entry(
             reply,
             (|| {
-                rfs::openat(
+                let permissions = Mode::from_bits_truncate(mode & !umask);
+                let file = rfs::openat(
                     &self.node(parent)?.fd,
                     name,
                     OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::CLOEXEC,
-                    Mode::from_bits_truncate(mode & !umask),
+                    permissions,
                 )?;
+                rfs::fchmod(&file, permissions)?;
                 self.lookup_attr(parent, name)
             })(),
         );
@@ -361,16 +369,30 @@ impl Filesystem for IntermediateFs {
         reply: ReplyCreate,
     ) {
         let result = (|| {
-            let file = rfs::openat(
-                &self.node(parent)?.fd,
-                name,
-                OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::CLOEXEC,
-                Mode::from_bits_truncate(mode & !umask),
-            )?;
-            drop(file);
+            let permissions = Mode::from_bits_truncate(mode & !umask);
+            let open_flags = OFlags::from_bits_truncate((flags & !libc::O_APPEND) as u32)
+                | OFlags::CREATE
+                | OFlags::EXCL
+                | OFlags::CLOEXEC;
+            let file = match rfs::openat(&self.node(parent)?.fd, name, open_flags, permissions) {
+                Ok(file) => file,
+                Err(rustix::io::Errno::EXIST) if flags & libc::O_EXCL == 0 => {
+                    let (ino, node) = self.child(parent, name)?;
+                    let fh = self.open_file(ino, flags)?;
+                    return Ok((node.attr(ino)?, fh));
+                }
+                Err(error) => return Err(error.into()),
+            };
+            rfs::fchmod(&file, permissions)?;
             let (ino, node) = self.child(parent, name)?;
             let attr = node.attr(ino)?;
-            let fh = self.open_file(ino, flags)?;
+            let fh = lock(&self.namespace)?.handle(
+                ino,
+                Handle::File {
+                    ino,
+                    file: Arc::new(file.into()),
+                },
+            )?;
             Ok((attr, fh))
         })();
         match result {

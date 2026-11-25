@@ -172,6 +172,7 @@ impl NativeCompilerClient {
                 );
             }
         }
+        log::debug!("using retained CAS input {:?}", reference.blob.id);
         Ok(Some((
             reference.blob,
             crate::dist::native::intermediate::source(reference),

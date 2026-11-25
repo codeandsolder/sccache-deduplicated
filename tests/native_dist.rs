@@ -2621,3 +2621,81 @@ fn native_local_execution_in_networkless_namespace_shares_remote_actions() -> Re
     assert_eq!(worker.actions, 2);
     Ok(())
 }
+
+/// Exercise the actual launcher, Cargo fingerprints, an intermediate Rust
+/// library, the broker, a scheduler cache hit and final executable delivery.
+#[test]
+#[ignore = "requires a real FUSE mount, stock Cargo and native distributed test fleet"]
+fn cargo_leased_intermediates_deliver_a_working_binary() -> Result<()> {
+    let temp = tempfile::Builder::new()
+        .prefix("native-cargo-")
+        .tempdir_in("/tmp")?;
+    let root = temp.path().canonicalize()?;
+    let fleet = Fleet::start(&root, BTreeMap::new())?;
+    let mut service = LocalService::start(&root, &fleet, None)?;
+    let workspace = root.join("workspace");
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::create_dir_all(workspace.join("dep/src"))?;
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname = \"leased-app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nleased-dep = { path = \"dep\" }\n",
+    )?;
+    fs::write(
+        workspace.join("dep/Cargo.toml"),
+        "[package]\nname = \"leased-dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )?;
+    fs::write(
+        workspace.join("dep/src/lib.rs"),
+        "pub fn answer() -> u32 { 42 }\n",
+    )?;
+    fs::write(
+        workspace.join("src/main.rs"),
+        "fn main() { println!(\"{}\", leased_dep::answer()); }\n",
+    )?;
+    let binary = workspace.join("target/debug/leased-app");
+    let direct_config = root.join("direct.toml");
+    fs::write(&direct_config, "client_side_mode = false\n")?;
+    for round in 0..2 {
+        let mut command = service.command(env!("CARGO_BIN_EXE_sccache"));
+        command
+            .current_dir(&workspace)
+            .args(["--cargo-final", "--", "build", "--offline", "-j", "2"])
+            .env("SCCACHE_CONF", &direct_config)
+            .env("SCCACHE_EXPERIMENTAL_CANONICAL_RUST", "1")
+            .env("RUSTC_WRAPPER", env!("CARGO_BIN_EXE_sccache"))
+            .env("CARGO_TARGET_DIR", workspace.join("target"))
+            .env("TMPDIR", &root);
+        // CI installs the pinned toolchain using rustup. Preserve only the
+        // toolchain discovery environment, never its compiler-cache socket.
+        for key in [
+            "PATH",
+            "HOME",
+            "RUSTUP_HOME",
+            "CARGO_HOME",
+            "RUSTUP_TOOLCHAIN",
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        let output = command.output()?;
+        ensure!(
+            output.status.success(),
+            "Cargo leased build {round} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result = Command::new(&binary).output()?;
+        assert!(result.status.success());
+        assert_eq!(result.stdout, b"42\n");
+        // Force Cargo to consult the action cache again with a fresh
+        // intermediate tree, keeping the workspace and compiler inputs.
+        fs::remove_dir_all(workspace.join("target"))?;
+    }
+    let stats = service.stats()?;
+    assert_eq!(stats.dist_errors, 0);
+    assert!(stats.dist_compiles.values().sum::<usize>() >= 2);
+    assert!(stats.cache_hits.all() >= 2);
+    service.stop()?;
+    fleet.finish()?;
+    Ok(())
+}
