@@ -590,6 +590,29 @@ fn input_manifest_survives_scheduler_eviction_and_worker_fetch_is_scoped() -> Re
     assert!(service.open_tree(id, Publisher::Client, ticket).is_err());
     let read = service.open_tree(id, worker, ticket)?;
     verify_package_plan_authorization(&service, read.ticket, worker, blob)?;
+    assert_eq!(
+        service.authorize_blob_sources(read.ticket, worker, &[blob])?,
+        (None, vec![false])
+    );
+    assert!(
+        service
+            .authorize_blob_sources(read.ticket, Publisher::Client, &[blob])
+            .is_err()
+    );
+    assert!(
+        service
+            .authorize_blob_sources(
+                read.ticket,
+                worker,
+                &[BlobRef {
+                    size: blob.size + 1,
+                    ..blob
+                }]
+            )
+            .is_err()
+    );
+    // Merely discovering a direct source must not trigger origin backfill.
+    assert_eq!(service.poll_input(ticket)?, InputPoll::Waiting);
     assert!(
         service
             .download(read.ticket, Publisher::Client, blob.id)
@@ -606,6 +629,10 @@ fn input_manifest_survives_scheduler_eviction_and_worker_fetch_is_scoped() -> Re
         InputPoll::Demand(InputDemand { tree: id, blob })
     );
     service.backfill_input(ticket, blob, &b"tree data"[..])?;
+    assert_eq!(
+        service.authorize_blob_sources(read.ticket, worker, &[blob])?,
+        (None, vec![true])
+    );
     let mut contents = Vec::new();
     decoded_download(&service, read.ticket, worker, blob.id)?.read_to_end(&mut contents)?;
     assert_eq!(contents, b"tree data");

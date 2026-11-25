@@ -26,8 +26,8 @@ use crate::dist::{
 };
 
 mod package;
-#[cfg(all(target_os = "linux", feature = "dist-client"))]
-mod result_delivery;
+#[cfg(all(target_os = "linux", feature = "native-store"))]
+mod peer_delivery;
 mod upload;
 pub use package::{
     PackageAcquisition, PackageLocator, map_packages, validate_upstream_base,
@@ -63,7 +63,7 @@ pub(super) struct DownloadRequest {
 }
 
 #[derive(Serialize, Deserialize)]
-pub(super) struct ResultSourceRequest {
+pub(super) struct BlobSourceRequest {
     pub ticket: Ticket,
     pub blobs: Vec<BlobRef>,
 }
@@ -785,12 +785,19 @@ impl NativeCacheClient {
             // The origin can stream subsequent misses while these are consumed.
             let lookahead = transport.parallelism().get().saturating_mul(8).min(256);
             for chunk in raw_missing.chunks(lookahead) {
-                self.control::<_, ()>("input_prefetch", &InputPrefetchRequest {
-                    ticket: read.ticket,
-                    missing: chunk.to_vec(),
-                })?;
+                let plans = self.source_plans(read.ticket, chunk);
+                self.probe_sources(plans.values());
+                let prefetch = chunk.iter().copied().filter(|blob| {
+                    plans.get(&blob.id).is_none_or(|plan| !self.has_direct_source(plan))
+                }).collect::<Vec<_>>();
+                if !prefetch.is_empty() {
+                    self.control::<_, ()>("input_prefetch", &InputPrefetchRequest {
+                        ticket: read.ticket,
+                        missing: prefetch,
+                    })?;
+                }
                 let leases = map_packages(chunk, transport.parallelism(), |blob| {
-                    self.fetch_input_blob(read.ticket, *blob, store, transport, check)
+                    self.fetch_input_blob(read.ticket, *blob, plans.get(&blob.id), store, transport, check)
                 })?;
                 for lease in &leases {
                     on_tree(lease);
@@ -828,6 +835,7 @@ impl NativeCacheClient {
         &self,
         ticket: Ticket,
         blob: BlobRef,
+        plan: Option<&crate::build_runtime::wire::BlobSourcePlan>,
         store: &crate::build_runtime::NativeStore,
         transport: &worker::PackageTransportTracker,
         check: &LeaseCheck<'_>,
@@ -839,6 +847,16 @@ impl NativeCacheClient {
             let staged = if reservation.missing().is_empty() {
                 Vec::new()
             } else {
+                if let Some(plan) = plan.filter(|plan| self.has_direct_source(plan)) {
+                    let slot = transport.raw_slot(check)?;
+                    let started = Instant::now();
+                    let staged = self.try_peer_blob(plan, |reader, encoding| store.stage_expected_physical(blob, encoding, reader));
+                    drop(slot);
+                    if let Some(staged) = staged {
+                        transport.observe_raw(blob.size, started.elapsed());
+                        return store.publish_tree_pinned(&manifest, vec![staged]);
+                    }
+                }
                 let start = Instant::now();
                 let mut delay = Duration::from_millis(10);
                 loop {

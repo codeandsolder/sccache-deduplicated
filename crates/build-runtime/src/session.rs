@@ -1248,39 +1248,67 @@ impl NativeSessions {
         })
     }
 
-    /// Authorize a bounded batch of exact result blobs before issuing peer
-    /// source grants. A ready durable result is the authority, not residency.
+    /// Authorize exact content delivery under a live result or input-tree
+    /// lease. Return the known producer and current scheduler residency.
     ///
     /// # Errors
-    /// Returns an error for an expired ticket, uncommitted result or undeclared content.
-    pub fn result_sources(
+    /// Returns an error for expired tickets, invalid leases or undeclared content.
+    pub fn authorize_blob_sources(
         &self,
         ticket: Ticket,
+        reader: Publisher,
         blobs: &[BlobRef],
-    ) -> Result<Option<crate::PeerId>> {
+    ) -> Result<(Option<crate::PeerId>, Vec<bool>)> {
         ensure!(
             !blobs.is_empty() && blobs.len() <= crate::wire::MAX_SOURCE_BATCH,
-            "invalid result source batch"
+            "invalid content source batch"
         );
         let session = self.get(ticket)?;
         let mut state = Self::lock(&session)?;
-        self.authorize_reader(&mut state, Publisher::Client)?;
-        let Phase::Ready(Ready::Result(lease)) = &state.phase else {
-            bail!("native result not committed");
+        self.authorize_reader(&mut state, reader)?;
+        let Phase::Ready(lease) = &state.phase else {
+            bail!("native delivery not ready");
         };
-        let declared = lease.manifest().blobs()?;
-        ensure!(
+        let declared = |manifest: &BTreeMap<ContentId, u64>| {
             blobs
                 .iter()
-                .all(|blob| declared.get(&blob.id) == Some(&blob.size)),
-            "undeclared result source"
-        );
-        let producer = state
-            .allocation
-            .as_ref()
-            .map(|allocation| allocation.worker.peer);
+                .all(|blob| manifest.get(&blob.id) == Some(&blob.size))
+        };
+        let (producer, pinned) = match lease {
+            Ready::Result(lease) => {
+                ensure!(
+                    declared(&lease.manifest().blobs()?),
+                    "undeclared result source"
+                );
+                (
+                    state
+                        .allocation
+                        .as_ref()
+                        .map(|allocation| allocation.worker.peer),
+                    true,
+                )
+            }
+            Ready::Tree(delivery) => match &delivery.source {
+                TreeSource::Stored(tree) => {
+                    ensure!(declared(tree.blobs()), "undeclared tree source");
+                    (None, true)
+                }
+                TreeSource::Action { input, .. } => {
+                    ensure!(declared(&input.blobs), "undeclared input source");
+                    (None, false)
+                }
+            },
+        };
         drop(state);
-        Ok(producer)
+        let availability = if pinned {
+            vec![true; blobs.len()]
+        } else {
+            blobs
+                .iter()
+                .map(|&blob| Ok(self.store().open_available_physical(blob)?.is_some()))
+                .collect::<Result<Vec<_>>>()?
+        };
+        Ok((producer, availability))
     }
 
     /// Open declared content for transport. Generated raw ZFS files are

@@ -1163,6 +1163,37 @@ Catalogs and forecasts are advisory; no change to content identity.
 
 ### Directional shared-network estimation
 
+### Receiver-directed content transfer
+
+The scheduler authorizes content delivery, but it does not need to relay all
+payloads. Workers and clients negotiate bounded batches of exact digest/length
+pairs against their live input-tree or committed-result lease. The scheduler
+reports whether each blob is already present and advertises likely resident
+workers, their current authenticated routes, and short-lived source capabilities
+bound to the receiving principal and exact content. The same worker CAS
+endpoint serves scheduler recovery, worker-to-worker inputs, and client result
+delivery. Bloom-filter residency is advisory; an opened immutable descriptor
+and successful content verification are what establish a usable source.
+
+The receiver compares authenticated route latency and directional effective
+goodput, using the scheduler as the durable fallback for committed results.
+An absent scheduler input can be obtained from a reachable worker without
+requesting origin backfill or populating the scheduler solely to relay it.
+Worker-side tree acquisition still verifies and pins all required content
+before compilation. A failed peer attempt falls back to the ordinary scheduler
+download/backfill path. Receivers stage and verify each attempted payload
+before publishing it; partial, corrupt or expired peer responses cannot
+contaminate a subsequent delivery. Loopback candidates are advertised only
+when bound and authenticated just like all other routes.
+
+Result publication retains the existing manifest and unique missing-content
+negotiation: the producing worker only uploads blobs absent from the scheduler
+CAS, then commits the durable result. Direct client result delivery follows
+that commit, and can also use other resident workers for cache hits. It does
+not weaken the durable publication guarantee or require rerunning compilation
+when a peer disappears. Selective output materialization is orthogonal to source
+selection; receivers request only the selected exact content.
+
 The native cache listener meters encoded HTTP payload bytes before delivery
 to the transport or after reception from it; logical lengths are tracked
 separately. Authenticated worker and client principals, their actual IP endpoint pairs,

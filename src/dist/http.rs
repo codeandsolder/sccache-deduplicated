@@ -1212,8 +1212,14 @@ mod server {
                     },
                     native::PublicationCallbacks {
                         source_plan: move |blob, recipient, producer| {
+                            let requester = match recipient {
+                                crate::build_runtime::wire::BlobRecipient::Worker(peer) => {
+                                    Some(peer)
+                                }
+                                _ => None,
+                            };
                             let sources = source_handler
-                                .native_blob_sources(blob, None, recipient, producer)?;
+                                .native_blob_sources(blob, requester, recipient, producer)?;
                             Ok(sources
                                 .into_iter()
                                 .filter_map(|source| {
@@ -1226,9 +1232,10 @@ mod server {
                                 })
                                 .collect())
                         },
-                        observe_result: move |server, job, event| {
-                            result_handler.observe_native_lifecycle(server, job, event)
-                        },
+                        observe_result:
+                            move |server, job, event: crate::dist::NativeLifecycleEvent<'_>| {
+                                result_handler.observe_native_lifecycle(server, job, event)
+                            },
                     },
                     native_tls.context("missing native data TLS listener")?,
                     Arc::clone(&enrollment),
@@ -1700,24 +1707,7 @@ mod server {
                                 prepare_response(request, &res)
                             },
                             (POST) (/api/v3/distserver/native_blob) => {
-                                use crate::build_runtime::wire::BlobRecipient;
-                                let recipient = match request.role() {
-                                    Role::Scheduler => BlobRecipient::Scheduler,
-                                    Role::Client => BlobRecipient::Client(request.id()),
-                                    Role::Worker => BlobRecipient::Worker(request.id()),
-                                };
-                                let blob: BlobRef = try_or_400_log!(req_id, native::metadata(request, 40));
-                                let Some(token) = bearer_http_auth(request) else {
-                                    return rouille::Response::text("invalid peer capability").with_status_code(401);
-                                };
-                                if job_authorizer.verify_blob_token(blob, recipient, token).is_err() {
-                                    return rouille::Response::text("invalid peer capability").with_status_code(401);
-                                }
-                                let file = try_or_500_log!(req_id, handler.handle_native_blob(blob));
-                                match file {
-                                    Some((file, encoding)) => try_or_500_log!(req_id, native::physical_blob_response(file, encoding)),
-                                    None => rouille::Response::empty_404(),
-                                }
+                                try_or_500_log!(req_id, native::serve_peer_blob(request, &*job_authorizer, |blob| handler.handle_native_blob(blob)))
                             },
                             (POST) (/api/v5/distserver/run_native_job/{job_id: JobId}) => {
                                 if request.role() != Role::Client { return make_401("client_role_required"); }

@@ -187,6 +187,15 @@ impl std::fmt::Debug for BlobSource {
     }
 }
 
+/// A receiver-specific offer. Scheduler residency is an observation, not
+/// permission to assume a subsequent transfer will succeed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobSourcePlan {
+    pub blob: BlobRef,
+    pub scheduler_present: bool,
+    pub sources: Vec<BlobSource>,
+}
+
 pub const MAX_SOURCE_BATCH: usize = 32;
 pub const MAX_BLOB_SOURCES: usize = 4;
 

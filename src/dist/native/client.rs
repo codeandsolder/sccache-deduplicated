@@ -223,7 +223,7 @@ impl Delivery<'_> {
             Self::Scheduler(pin) => {
                 pin.client
                     .with_renewal(pin.ticket, renewal_interval, |check| {
-                        let mut delivery = super::result_delivery::ResultDelivery::new(
+                        let mut delivery = super::peer_delivery::ResultDelivery::new(
                             pin.client, pin.ticket, declared,
                         );
                         let result = operation(&mut |blob, output| {

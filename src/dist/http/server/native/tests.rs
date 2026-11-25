@@ -72,6 +72,7 @@ struct TestEndpoint {
     client: Arc<PeerCredentials>,
     rejected_config: PeerConfig,
     worker: Arc<PeerCredentials>,
+    sources: Arc<Mutex<BTreeMap<ContentId, Vec<BlobSource>>>>,
 }
 fn make_client(endpoint: &TestEndpoint, token: &str) -> Result<NativeCacheClient> {
     let peer = match token {
@@ -166,6 +167,7 @@ fn with_native_service(
     ));
     let network = Arc::new(NetworkMeter::default());
     let observations = Arc::new(Observations::default());
+    let sources = Arc::new(Mutex::new(BTreeMap::<ContentId, Vec<BlobSource>>::new()));
     let server = Listener::bind(
         "127.0.0.1:0".parse()?,
         tls,
@@ -175,6 +177,7 @@ fn with_native_service(
             let sessions = Arc::clone(&sessions);
             let network = Arc::clone(&network);
             let observations = Arc::clone(&observations);
+            let sources = Arc::clone(&sources);
             move |request| {
                 respond(
                     request,
@@ -182,7 +185,14 @@ fn with_native_service(
                         sessions: &sessions,
                         packages: None,
                         network: &network,
-                        source_plan: &|_, _, _| Ok(Vec::new()),
+                        source_plan: &|blob, _, _| {
+                            Ok(sources
+                                .lock()
+                                .unwrap()
+                                .get(&blob.id)
+                                .cloned()
+                                .unwrap_or_default())
+                        },
                         observe_result: &|server, job, event| {
                             let result = match event {
                                 crate::dist::NativeLifecycleEvent::InputsStaged => {
@@ -234,6 +244,7 @@ fn with_native_service(
             client,
             rejected_config,
             worker,
+            sources,
         };
         operation(&endpoint, &sessions, &network, &observations)
     })();
@@ -280,6 +291,134 @@ fn verify_compressed_download(
     )?;
     assert_eq!(decoded, bytes);
     Ok(())
+}
+
+fn verify_peer_delivery(
+    endpoint: &TestEndpoint,
+    client: &NativeCacheClient,
+    ticket: crate::build_runtime::wire::Ticket,
+    blob: BlobRef,
+    bytes: &[u8],
+    network: &NetworkMeter,
+) -> Result<()> {
+    use crate::dist::JobAuthorizer;
+    use std::{
+        io::Write,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+    let worker = endpoint.worker.current()?;
+    let worker_id = worker.id()?;
+    let authorizer = super::super::JWTJobAuthorizer::boxed(&[7; super::super::JWT_KEY_LENGTH])?;
+    let recipient = BlobRecipient::Client(endpoint.client.current()?.id()?);
+    let token = authorizer.generate_blob_token(blob, recipient)?;
+    let revocations = Arc::new(super::super::cluster_http::Revocations::default());
+    revocations.update(Vec::new());
+    let bad = Arc::new(AtomicBool::new(false));
+    let server = Listener::bind(
+        "127.0.0.1:0".parse()?,
+        Arc::new(ClusterListener::new(&worker)?),
+        ListenerRole::Worker {
+            scheduler: endpoint.scheduler,
+            revocations,
+        },
+        2,
+        {
+            let bytes = bytes.to_vec();
+            let bad = Arc::clone(&bad);
+            move |request| {
+                serve_peer_blob(request, &*authorizer, |requested| {
+                    if requested != blob {
+                        return Ok(None);
+                    }
+                    let mut file = tempfile::tempfile()?;
+                    if bad.load(Ordering::Relaxed) {
+                        file.write_all(b"corrupt")?;
+                    } else {
+                        file.write_all(&bytes)?;
+                    }
+                    file.rewind()?;
+                    Ok(Some((file, BlobEncoding::Raw)))
+                })
+                .unwrap_or_else(|_| {
+                    Response::text("test peer response failed").with_status_code(500)
+                })
+            }
+        },
+    )?;
+    let address = server.local_addr()?;
+    endpoint.sources.lock().unwrap().insert(
+        blob.id,
+        vec![BlobSource {
+            peer: worker_id,
+            routes: sccache_peer_identity::RouteSet::new(address, []),
+            token,
+        }],
+    );
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let handle = thread::spawn(move || server.run_until(stopped));
+    let outcome = (|| {
+        let plans = client.source_plans(ticket, &[blob]);
+        let plan = plans
+            .get(&blob.id)
+            .context("missing authorized result source")?;
+        assert!(plan.scheduler_present);
+        assert_eq!(plan.sources.len(), 1);
+        // The source grant comes from the live scheduler, but the configured
+        // data fallback is deliberately unavailable. The worker must supply
+        // the bytes directly without contacting that data listener.
+        let unavailable = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let base = reqwest::Url::parse(&format!("https://{}/", unavailable.local_addr()?))?;
+        let direct = NativeCacheClient::new(
+            &base,
+            Arc::clone(&endpoint.client),
+            Duration::from_secs(10),
+            1024 * 1024,
+        )?;
+        let before = network
+            .snapshot()
+            .send
+            .peers
+            .values()
+            .map(|peer| peer.body_bytes)
+            .sum::<u64>();
+        let receive = |reader, encoding| {
+            let mut output = Vec::new();
+            crate::build_runtime::transfer_native_blob(
+                reader,
+                std::io::sink(),
+                &mut output,
+                blob,
+                encoding,
+            )?;
+            Ok(output)
+        };
+        assert_eq!(
+            direct
+                .try_peer_blob(plan, receive)
+                .context("direct worker delivery failed")?,
+            bytes
+        );
+        let after = network
+            .snapshot()
+            .send
+            .peers
+            .values()
+            .map(|peer| peer.body_bytes)
+            .sum::<u64>();
+        assert_eq!(before, after);
+        bad.store(true, Ordering::Relaxed);
+        assert!(direct.try_peer_blob(plan, receive).is_none());
+        // The durable scheduler copy still restores the result, without a rerun.
+        let mut fallback = Vec::new();
+        client.download(ticket, blob, &mut fallback)?;
+        assert_eq!(fallback, bytes);
+        Ok(())
+    })();
+    let _ = stop.send(());
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("peer delivery test listener panicked"))??;
+    outcome
 }
 
 #[test]
@@ -358,7 +497,11 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
             worker_client.begin(ticket, output.clone())?.missing,
             vec![blob]
         );
-        assert!(sessions.result_sources(ticket, &[blob]).is_err());
+        assert!(
+            sessions
+                .authorize_blob_sources(ticket, Publisher::Client, &[blob])
+                .is_err()
+        );
         assert!(
             worker_client
                 .commit(ticket, Duration::from_secs(300), None)
@@ -387,11 +530,15 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
         worker_client.upload(ticket, blob, Cursor::new(bytes.clone()))?;
         let retention = Duration::from_millis(299_123);
         assert_eq!(worker_client.commit(ticket, retention, None)?, output);
-        assert_eq!(sessions.result_sources(ticket, &[blob])?, Some(owner));
+        assert_eq!(
+            sessions.authorize_blob_sources(ticket, Publisher::Client, &[blob])?,
+            (Some(owner), vec![true])
+        );
         assert!(
             sessions
-                .result_sources(
+                .authorize_blob_sources(
                     ticket,
+                    Publisher::Client,
                     &[BlobRef {
                         size: blob.size + 1,
                         ..blob
@@ -399,13 +546,17 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
                 )
                 .is_err()
         );
-        assert!(sessions.result_sources(ticket, &[]).is_err());
+        assert!(
+            sessions
+                .authorize_blob_sources(ticket, Publisher::Client, &[])
+                .is_err()
+        );
         let (http, base) = url.raw(&url.client)?;
         let source_request = |blobs: Vec<BlobRef>| -> Result<reqwest::blocking::Response> {
             Ok(http
-                .post(base.join("/api/v5/native/client/result_sources")?)
+                .post(base.join("/api/v5/native/client/blob_sources")?)
                 .header("Content-Type", "application/octet-stream")
-                .body(codec().serialize(&ResultSourceRequest { ticket, blobs })?)
+                .body(codec().serialize(&BlobSourceRequest { ticket, blobs })?)
                 .send()?)
         };
         assert_eq!(
@@ -432,6 +583,7 @@ fn direct_worker_upload_and_verified_client_hit_over_http() -> Result<()> {
             ]
         );
         assert_eq!(client.status(ticket)?, NativeStatus::Ready(output.clone()));
+        verify_peer_delivery(url, &client, ticket, blob, &bytes, network)?;
         let mut downloaded = Vec::new();
         client.download(ticket, blob, &mut downloaded)?;
         assert_eq!(downloaded, bytes);

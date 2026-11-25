@@ -24,13 +24,13 @@ use crate::{
         NativeContentPending, NativeInputRejected, NativeServiceBusy, NativeSessions, NativeStore,
         NetworkMeter, PackageIdentity, PackageImportLimits, PackageSource, Peer, StagedBlob,
         TreeId, TreeManifest, VerifiedPackage,
-        wire::{BlobRecipient, BlobSource, Publisher, ScheduleReply, UploadHeader},
+        wire::{BlobRecipient, BlobSource, BlobSourcePlan, Publisher, ScheduleReply, UploadHeader},
     },
     config::scheduler::NativeCacheConfig,
     dist::native::{
-        CommitRequest, DownloadRequest, ExecutionRequest, InputPrefetchRequest, ManifestRequest,
-        OpenTreeRequest, PackageAcquisition, PackageLocator, PackagePlanRequest,
-        ResultSourceRequest, codec,
+        BlobSourceRequest, CommitRequest, DownloadRequest, ExecutionRequest, InputPrefetchRequest,
+        ManifestRequest, OpenTreeRequest, PackageAcquisition, PackageLocator, PackagePlanRequest,
+        codec,
     },
 };
 
@@ -281,6 +281,33 @@ pub(super) fn spawn(
 }
 
 const PREFIX: &str = "/api/v5/native/";
+
+/// The single peer-content endpoint serves scheduler recovery, worker inputs,
+/// and client results. Only an exact, recipient-bound capability grants access.
+pub(super) fn serve_peer_blob(
+    request: &Request,
+    authorizer: &dyn crate::dist::JobAuthorizer,
+    open: impl FnOnce(BlobRef) -> Result<Option<(File, BlobEncoding)>>,
+) -> Result<Response> {
+    use sccache_cluster_identity::Role;
+    let recipient = match request.role() {
+        Role::Scheduler => BlobRecipient::Scheduler,
+        Role::Client => BlobRecipient::Client(request.id()),
+        Role::Worker => BlobRecipient::Worker(request.id()),
+    };
+    let Ok(blob) = metadata::<BlobRef>(request, 40) else {
+        return Ok(Response::empty_400());
+    };
+    let authorized = super::bearer_http_auth(request)
+        .is_some_and(|token| authorizer.verify_blob_token(blob, recipient, token).is_ok());
+    if !authorized {
+        return Ok(Response::text("invalid peer capability").with_status_code(401));
+    }
+    match open(blob)? {
+        Some((file, encoding)) => physical_blob_response(file, encoding),
+        None => Ok(Response::empty_404()),
+    }
+}
 
 pub(super) fn physical_blob_response(mut file: File, encoding: BlobEncoding) -> Result<Response> {
     let (file, encoding) = if encoding == BlobEncoding::Raw {
@@ -631,15 +658,26 @@ fn dispatch(
             sessions.close(metadata(request, limit)?, publisher)?;
             encode(&(), limit)
         }
-        "result_sources" if publisher == Publisher::Client => {
-            let ResultSourceRequest { ticket, blobs } = metadata(request, limit)?;
-            let producer = sessions.result_sources(ticket, &blobs)?;
-            let recipient = BlobRecipient::Client(request.id());
-            let sources = blobs
+        "blob_sources" => {
+            let BlobSourceRequest { ticket, blobs } = metadata(request, limit)?;
+            let (producer, availability) =
+                sessions.authorize_blob_sources(ticket, publisher, &blobs)?;
+            let recipient = match publisher {
+                Publisher::Client => BlobRecipient::Client(request.id()),
+                Publisher::Worker { peer, .. } => BlobRecipient::Worker(peer),
+            };
+            let plans = blobs
                 .into_iter()
-                .map(|blob| Ok((blob, source_plan(blob, recipient, producer)?)))
+                .zip(availability)
+                .map(|(blob, scheduler_present)| {
+                    Ok(BlobSourcePlan {
+                        blob,
+                        scheduler_present,
+                        sources: source_plan(blob, recipient, producer)?,
+                    })
+                })
                 .collect::<Result<Vec<_>>>()?;
-            encode(&sources, limit)
+            encode(&plans, limit)
         }
         "download" => {
             let DownloadRequest { ticket, id } = metadata(request, limit)?;
