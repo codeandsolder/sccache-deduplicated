@@ -24,7 +24,7 @@ use crate::{
     config::{DistAuth, DistToolchainConfig, HTTPUrl, NativeClientConfig},
     dist::{
         self,
-        native::{LocalExecutor, NativeBuildResult, NativeBuildSource, NativeCacheClient, broker},
+        native::{LocalExecutor, NativeBuildResult, NativeCacheClient, broker},
         pkg,
     },
     mock_command::CommandCreatorSync,
@@ -34,7 +34,6 @@ use crate::{
 
 use super::{
     CacheControl, Cacheable, Compilation, CompileResult, CompileTransport, DistPackagers, DistType,
-    MissType,
 };
 
 struct DirectEndpoint {
@@ -221,10 +220,11 @@ impl NativeCompilerClient {
         plan: CompilerPlan,
         mode: ActionMode,
         pool: &tokio::runtime::Handle,
-    ) -> Result<NativeBuildResult> {
-        match &self.endpoint {
+    ) -> Result<(NativeBuildResult, crate::build_runtime::ActionKey)> {
+        let key = plan.spec.action_request()?.action_fingerprint()?.key()?;
+        let result = match &self.endpoint {
             Endpoint::Direct(_) => {
-                pool.spawn_blocking(move || {
+                pool.spawn_blocking(crate::server::activity::inherit_blocking(move || {
                     let Endpoint::Direct(endpoint) = &self.endpoint else {
                         unreachable!()
                     };
@@ -235,7 +235,7 @@ impl NativeCompilerClient {
                         &self.policy.build_policy(mode),
                         endpoint.local.as_ref(),
                     )
-                })
+                }))
                 .await?
             }
             Endpoint::Namespace {
@@ -253,7 +253,8 @@ impl NativeCompilerClient {
                 )
                 .await
             }
-        }
+        }?;
+        Ok((result, key))
     }
 }
 
@@ -600,25 +601,6 @@ fn prepare_dispatch(
     Ok((outputs, layout, packagers))
 }
 
-fn classify_source(
-    source: NativeBuildSource,
-    mode: ActionMode,
-    elapsed: Duration,
-) -> CompileResult {
-    let miss = if mode == ActionMode::Refresh {
-        MissType::ForcedRecache
-    } else {
-        MissType::Normal
-    };
-    match source {
-        NativeBuildSource::Hit => CompileResult::CacheHit(elapsed),
-        NativeBuildSource::Local => CompileResult::NativeMiss(miss, DistType::NoDist, elapsed),
-        NativeBuildSource::Worker(addr) => {
-            CompileResult::NativeMiss(miss, DistType::Ok(addr.to_string()), elapsed)
-        }
-    }
-}
-
 pub(super) async fn compile<T: CommandCreatorSync>(
     client: Arc<NativeCompilerClient>,
     service: &SccacheService<T>,
@@ -683,12 +665,12 @@ pub(super) async fn compile<T: CommandCreatorSync>(
             Err(error) => Err(error),
         };
         let result = match (result, split.as_ref()) {
-            (Ok(mut result), Some(link)) if result.output.status.success() => {
+            (Ok((mut result, key)), Some(link)) if result.output.status.success() => {
                 crate::server::activity::phase(crate::server::activity::Phase::LocalCompile);
                 match link.finish(&creator, result.output).await {
                     Ok(output) => {
                         result.output = output;
-                        Ok(result)
+                        Ok((result, key))
                     }
                     Err(error) => Err(error),
                 }
@@ -699,12 +681,18 @@ pub(super) async fn compile<T: CommandCreatorSync>(
         drop(split);
         drop(scratch);
         match result {
-            Ok(result) if result.output.status.success() => {
-                let elapsed = start.elapsed();
-                let classification = classify_source(result.source, mode, elapsed);
-                return Ok((classification, result.output));
+            Ok((result, key)) if result.output.status.success() => {
+                let report = crate::protocol::NativeCompileReport {
+                    key,
+                    mode,
+                    source: result.source,
+                };
+                return Ok((
+                    CompileResult::Native(report, start.elapsed()),
+                    result.output,
+                ));
             }
-            Ok(result) => {
+            Ok((result, _)) => {
                 // Incomplete compiler environment discovery can also produce
                 // an ordinary nonzero exit. Preserve caller semantics by
                 // rerunning locally without writing an archive cache.

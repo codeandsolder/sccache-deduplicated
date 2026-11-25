@@ -33,6 +33,7 @@ sccache_wrapper_main() {
     local root_service='sccache-local-root.service'
     local readiness_seconds=300
     local drain='/dev/shm/sccache-maintenance-drain'
+    local fleet_guard='/etc/systemd/system/sccache-fleet-rollout-drain'
     local drain_mtime now
 
     if [[ "$mode" == compiler ]]; then
@@ -65,7 +66,16 @@ sccache_wrapper_main() {
     readiness_seconds=$((10#$readiness_seconds))
 
     if [[ "$mode" == compiler || (${1:-} != -* && $# -gt 0) ]]; then
-        while [[ -e "$drain" ]]; do
+        local deadline=$((SECONDS + readiness_seconds))
+        while [[ -e "$drain" || -e "$fleet_guard" ]]; do
+            if [[ -e "$fleet_guard" ]]; then
+                if (( SECONDS >= deadline )); then
+                    printf 'sccache: coordinated fleet rollout in progress\n' >&2
+                    return 75
+                fi
+                sleep 0.1
+                continue
+            fi
             drain_mtime="$(stat -c %Y "$drain" 2>/dev/null || printf '0')"
             now="$(date +%s)"
             if (( drain_mtime <= 0 || now - drain_mtime >= 900 )); then

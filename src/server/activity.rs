@@ -365,8 +365,19 @@ pub(crate) fn scope<F: Future>(
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn current() -> Option<Arc<Activity>> {
+pub(crate) fn current() -> Option<Arc<Activity>> {
     CURRENT.try_with(Clone::clone).ok().flatten()
+}
+
+#[cfg(all(target_os = "linux", feature = "dist-client"))]
+pub(crate) fn inherit_blocking<F: FnOnce() -> R, R>(work: F) -> impl FnOnce() -> R {
+    let activity = current();
+    move || CURRENT.sync_scope(activity, work)
+}
+
+#[cfg(all(target_os = "linux", feature = "dist-client"))]
+pub(crate) fn sync_scope<F: FnOnce() -> R, R>(activity: Option<Arc<Activity>>, work: F) -> R {
+    CURRENT.sync_scope(activity, work)
 }
 
 pub fn phase(phase: Phase) {

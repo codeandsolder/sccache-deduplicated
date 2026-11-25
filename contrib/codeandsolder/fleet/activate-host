@@ -1,0 +1,378 @@
+#!/usr/bin/env bash
+# Coordinated protocol 3 -> 4 / rollout epoch 4 -> 5 cutover.
+# Call phases on every host in order; NEVER complete one host's entire
+# migration while another host still serves protocol 3.
+set -euo pipefail
+umask 077
+[[ $EUID == 0 ]]
+stage=/var/lib/sccache-managed-rollout/epoch5-20261125
+cd "$stage"
+phase=${1:?phase required}
+sha=${2:?exact published source SHA required}
+[[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+bundle=/var/lib/sccache-native-bundles/$sha
+state=/var/lib/sccache-autoupdate
+live=/usr/local/libexec/sccache-bin/sccache
+dist=/usr/local/bin/sccache-dist
+rollback="$stage/rollback"
+drain=/dev/shm/sccache-maintenance-drain
+sched_drain=/run/sccache-scheduler-maintenance-drain
+sock=/run/sccache-shared/sccache.sock
+role=$(sed -n 's/^role=//p' plan.txt)
+uid=$(sed -n 's/^uid=//p' plan.txt)
+gid=$(sed -n 's/^gid=//p' plan.txt)
+user=$(getent passwd "$uid" | cut -d: -f1)
+[[ -n "$user" && "$(id -g "$user")" == "$gid" ]]
+clients=(sccache-local.service sccache-local-root.service sccache-native-root.service sccache-openwrt-root.service sccache-strict-local.service)
+workers=(sccache-dist-worker.service)
+scheduler=(sccache-dist-scheduler.service sccache-scheduler-loopback.socket sccache-scheduler-loopback.service)
+timers=(sccache-release-update.timer random-utils-update.timer)
+updaters=(sccache-release-update.service random-utils-update.service)
+guard="$stage/updaters-paused"
+client_guard=/etc/systemd/system/sccache-fleet-rollout-drain
+guard_name=zz-sccache-fleet-rollout-guard.conf
+units=("${clients[@]}" "${workers[@]}" "${scheduler[@]}" "${timers[@]}")
+exec 9>"$stage/activation.lock"
+flock -x 9
+active_before() { rg -xq -- "$1" "$rollback/active-units"; }
+stop_if_active() {
+  local state
+  state=$(systemctl show "$1" -p ActiveState --value)
+  case "$state" in inactive|failed) ;; *) systemctl stop "$1" ;; esac
+}
+start_if_previous() {
+  if active_before "$1"; then systemctl start "$1"; fi
+}
+updater_guard() {
+  local u dir
+  touch "$guard" "$client_guard"
+  for u in "${updaters[@]}"; do
+    dir="/etc/systemd/system/$u.d"
+    install -d -m 0755 "$dir"
+    printf '[Unit]\nConditionPathExists=!%s\n' "$guard" > "$dir/$guard_name"
+  done
+  systemctl daemon-reload
+  for u in "${timers[@]}"; do stop_if_active "$u"; done
+  # Do not kill an update midway through installing binaries. Wait for the
+  # in-flight transaction to finish, including activating/deactivating units.
+  local deadline=$((SECONDS+1200)) state
+  for u in "${updaters[@]}"; do
+    while :; do
+      state=$(systemctl show "$u" -p ActiveState --value)
+      case "$state" in inactive|failed) break ;; esac
+      (( SECONDS < deadline )) || { echo "updater did not quiesce: $u ($state)" >&2; return 1; }
+      sleep 1
+    done
+  done
+}
+resume_updaters() {
+  local u
+  for u in "${updaters[@]}"; do
+    rm -f -- "/etc/systemd/system/$u.d/$guard_name"
+  done
+  rm -f -- "$guard" "$client_guard"
+  systemctl daemon-reload
+  for u in "${timers[@]}"; do start_if_previous "$u"; done
+}
+assert_updaters_paused() {
+  [[ -f "$guard" && -f "$client_guard" ]]
+  local u state
+  for u in "${updaters[@]}" "${timers[@]}"; do
+    state=$(systemctl show "$u" -p ActiveState --value)
+    [[ "$state" == inactive || "$state" == failed ]] || { echo "update unit not quiescent: $u ($state)" >&2; return 1; }
+  done
+}
+field() { sed -n "s/^$1=//p" "$2"; }
+assert_bundle() {
+  [[ $(field source_sha "$stage/published-build.txt") == "$sha" ]]
+  [[ $(field dist_protocol "$stage/published-build.txt") == 4 ]]
+  [[ $(field rollout_epoch "$stage/published-build.txt") == 5 ]]
+  /usr/local/libexec/host-native-metadata verify "$bundle" "$stage/published-build.txt"
+}
+assert_prepared() {
+  sha256sum --check --status STAGED_SHA256SUMS
+  sha256sum --check --status originals.sha256
+  assert_bundle
+}
+snapshot_file() {
+  local f="$1"
+  printf '%s\n' "$f" >> "$rollback/paths"
+  if [[ -e "$f" || -L "$f" ]]; then
+    mkdir -p -- "$rollback/files$(dirname -- "$f")"
+    cp -a -- "$f" "$rollback/files$f"
+  fi
+}
+install_atomic() {
+  local from="$1" to="$2" mode="$3" owner="${4:-root}" group="${5:-root}"
+  [[ -d "$(dirname -- "$to")" ]] || install -d -m 0755 "$(dirname -- "$to")"
+  local tmp
+  tmp=$(mktemp "$(dirname -- "$to")/.epoch5.XXXXXX")
+  install -o "$owner" -g "$group" -m "$mode" "$from" "$tmp"
+  mv -Tf -- "$tmp" "$to"
+}
+assert_stopped() {
+  local u state
+  for u in "${clients[@]}" "${workers[@]}" "${scheduler[@]}"; do
+    state=$(systemctl show "$u" -p ActiveState --value)
+    case "$state" in inactive|failed) ;; *) echo "not stopped: $u ($state)" >&2; exit 1 ;; esac
+  done
+}
+direct_client() {
+  env -u SCCACHE_SERVER_PORT SCCACHE_SERVER_UDS="$sock" SCCACHE_START_SERVER=0 SCCACHE_NO_AUTO_START_SERVER=1 "$live" "$@"
+}
+wait_shared() {
+  local i
+  for ((i=0;i<200;i++)); do
+    if [[ -S "$sock" ]] && direct_client --show-stats >/dev/null 2>&1; then break; fi
+    sleep .1
+  done
+  [[ $(stat -c '%u:%g:%a' "$sock") == "0:$gid:660" ]]
+  systemctl is-active --quiet sccache-local.service
+  [[ $(systemctl show sccache-local.service -p User --value) == root ]]
+  direct_client --show-stats >/dev/null
+}
+verify_running() {
+  local u="$1" expected="$2" pid
+  systemctl is-active --quiet "$u"
+  pid=$(systemctl show "$u" -p MainPID --value)
+  [[ $pid =~ ^[1-9][0-9]*$ ]]
+  [[ $(sha256sum "/proc/$pid/exe" | cut -d' ' -f1) == "$expected" ]]
+}
+state_files=(binary_sha256 build.txt client_release_tag client_sha256 client_source_sha client_updated_at dist_binary_sha256 dist_protocol dist_release_tag dist_sha256 dist_source_sha dist_updated_at published_at release_tag SHA256SUMS source_sha updated_at)
+case "$phase" in
+  verify)
+    assert_prepared
+    [[ ! -e "$rollback" && ! -e "$drain" && ! -e "$guard" && ! -e "$client_guard" ]]
+    if systemctl is-active --quiet sccache-release-update.service; then
+      echo "release updater is active" >&2; exit 1
+    fi
+    if [[ "$role" == asus ]]; then [[ ! -e "$sched_drain" ]]; fi
+    [[ $(cat "$state/dist_protocol") == 3 ]]
+    echo "verified $role $sha"
+    ;;
+  snapshot)
+    assert_prepared
+    [[ ! -e "$rollback" && ! -e "$drain" && ! -e "$guard" && ! -e "$client_guard" ]]
+    install -d -m 0700 "$rollback/files"
+    : > "$rollback/active-units"
+    : > "$rollback/enabled-units"
+    : > "$rollback/paths"
+    for u in "${units[@]}"; do
+      if systemctl is-active --quiet "$u"; then printf '%s\n' "$u" >> "$rollback/active-units"; fi
+      if systemctl is-enabled --quiet "$u" 2>/dev/null; then printf '%s\n' "$u" >> "$rollback/enabled-units"; fi
+    done
+    # Record timer state before stopping them. If snapshot preparation fails,
+    # restore the updater state; no live files have yet been replaced.
+    trap 'rc=$?; if (( rc != 0 )); then resume_updaters; rm -rf -- "$rollback"; fi' EXIT
+    updater_guard
+    assert_updaters_paused
+    assert_prepared
+    files=("$live" "$dist" /usr/local/bin/sccache /usr/local/libexec/sccache-client /usr/local/libexec/sccache-release-update /etc/sccache/client-shared.toml /etc/sccache/wrapper.conf /etc/systemd/system/sccache-local.service.d/90-shared-daemon.conf /etc/systemd/system/sccache-release-update.service.d/zz-epoch5.conf)
+    [[ ! -f server.conf ]] || files+=(/etc/sccache-dist/server.conf)
+    [[ ! -f scheduler.conf ]] || files+=(/etc/sccache-dist/scheduler.conf)
+    [[ ! -f 90-real-binary.conf ]] || files+=(/etc/systemd/system/sccache-strict-local.service.d/90-real-binary.conf)
+    [[ ! -f cargo-wrapper ]] || files+=(/usr/local/bin/cargo)
+    [[ ! -f sccache-cmake-launcher ]] || files+=(/usr/local/libexec/sccache-cmake-launcher)
+    [[ ! -f sccache-dist-client-preflight ]] || files+=(/usr/local/libexec/sccache-dist-client-preflight)
+    for f in "${state_files[@]}"; do files+=("$state/$f"); done
+    for f in "${files[@]}"; do snapshot_file "$f"; done
+    printf '%s\n' "$sha" > "$rollback/release-sha"
+    trap - EXIT
+    echo "snapshot complete $role"
+    ;;
+  stop-clients)
+    [[ $(cat "$rollback/release-sha") == "$sha" ]]
+    [[ ! -e "$drain" ]]
+    assert_updaters_paused
+    touch "$drain"
+    # All entrypoints now observe the maintenance gate, including hosts
+    # previously using a direct public binary. Atomic replacement leaves
+    # the still-running daemon inode intact.
+    install_atomic sccache-client /usr/local/bin/sccache 0755
+    install_atomic sccache-client /usr/local/libexec/sccache-client 0755
+    # Stop the active clients only; the old root unit is disabled at commit.
+    for u in "${clients[@]}"; do stop_if_active "$u"; done
+    echo "clients stopped $role"
+    ;;
+  stop-dist)
+    [[ $(cat "$rollback/release-sha") == "$sha" && -e "$drain" ]]
+    for u in "${workers[@]}"; do stop_if_active "$u"; done
+    if [[ "$role" == asus ]]; then
+      touch "$sched_drain"
+      stop_if_active sccache-scheduler-loopback.socket
+      stop_if_active sccache-scheduler-loopback.service
+      stop_if_active sccache-dist-scheduler.service
+    fi
+    echo "distributed services stopped $role"
+    ;;
+  install)
+    [[ $(cat "$rollback/release-sha") == "$sha" && -e "$drain" ]]
+    assert_prepared
+    assert_stopped
+    assert_updaters_paused
+    install_atomic "$bundle/sccache" "$live" 0755
+    install_atomic "$bundle/sccache-dist" "$dist" 0755
+    install_atomic sccache-client /usr/local/bin/sccache 0755
+    install_atomic sccache-client /usr/local/libexec/sccache-client 0755
+    install_atomic sccache-release-update /usr/local/libexec/sccache-release-update 0755
+    if [[ -f cargo-wrapper ]]; then install_atomic cargo-wrapper /usr/local/bin/cargo 0755; fi
+    if [[ -f sccache-cmake-launcher ]]; then install_atomic sccache-cmake-launcher /usr/local/libexec/sccache-cmake-launcher 0755; fi
+    if [[ -f sccache-dist-client-preflight ]]; then install_atomic sccache-dist-client-preflight /usr/local/libexec/sccache-dist-client-preflight 0755; fi
+    install_atomic client-shared.toml /etc/sccache/client-shared.toml 0600
+    install_atomic wrapper.conf /etc/sccache/wrapper.conf 0644
+    install_atomic 90-shared-daemon.conf /etc/systemd/system/sccache-local.service.d/90-shared-daemon.conf 0644
+    install_atomic zz-epoch5.conf /etc/systemd/system/sccache-release-update.service.d/zz-epoch5.conf 0644
+    if [[ -f 90-real-binary.conf ]]; then
+      install_atomic 90-real-binary.conf /etc/systemd/system/sccache-strict-local.service.d/90-real-binary.conf 0644
+    fi
+    if [[ -f server.conf ]]; then
+      install_atomic server.conf /etc/sccache-dist/server.conf 0600
+      install -d -m 0755 /var/cache/sccache-native
+      install -d -m 0700 /var/cache/sccache-native/worker /var/cache/sccache-native/scratch
+      [[ $(stat -c %d /var/cache/sccache-native/worker) == $(stat -c %d /var/cache/sccache-native/scratch) ]]
+    fi
+    if [[ -f scheduler.conf ]]; then
+      install_atomic scheduler.conf /etc/sccache-dist/scheduler.conf 0640 root sccache-scheduler
+      install -d -o sccache-scheduler -g sccache-scheduler -m 0700 /var/cache/sccache-native/scheduler
+    fi
+    systemctl daemon-reload
+    [[ $(systemctl show sccache-local.service -p User --value) == root ]]
+    echo "installed $role $sha"
+    ;;
+  start-scheduler)
+    if [[ "$role" == asus ]]; then
+      systemctl start sccache-dist-scheduler.service
+      rm -f "$sched_drain"
+      start_if_previous sccache-scheduler-loopback.socket
+      start_if_previous sccache-scheduler-loopback.service
+      systemctl is-active --quiet sccache-dist-scheduler.service
+      for ((i=0;i<60;i++)); do
+        if curl -fsS --max-time 2 -H 'Accept: application/json' http://100.73.74.69:10600/api/v1/scheduler/status; then exit 0; fi
+        sleep 1
+      done
+      echo "scheduler did not become ready" >&2; exit 1
+    fi
+    ;;
+  start-worker)
+    start_if_previous sccache-dist-worker.service
+    if active_before sccache-dist-worker.service; then verify_running sccache-dist-worker.service "$(sha256sum "$dist" | cut -d' ' -f1)"; fi
+    ;;
+  provision-rust)
+    assert_updaters_paused
+    [[ -e "$drain" ]]
+    install -d -m 0755 /var/lib/sccache-installations/epoch5
+    while IFS=$'\t' read -r root catalog; do
+      [[ "$catalog" =~ ^/var/lib/sccache-installations/epoch5/[0-9a-f]{24}\.catalog$ ]]
+      "$dist" native-sync-rust --root "$root" --client-config /etc/sccache/client-shared.toml \
+        --output "$catalog" --recipe-output "${catalog%.catalog}.recipe" --jobs 2
+      chmod 0644 "$catalog" "${catalog%.catalog}.recipe"
+    done < rust-installations.tsv
+    ;;
+  start-clients)
+    # Root clients now share the ordinary daemon. Preserve distinct-purpose
+    # services but never restart the redundant ordinary root endpoint.
+    date +%s > "$rollback/metrics-not-before"
+    systemctl start sccache-local.service
+    for u in sccache-native-root.service sccache-openwrt-root.service sccache-strict-local.service; do start_if_previous "$u"; done
+    wait_shared
+    verify_running sccache-local.service "$(sha256sum "$live" | cut -d' ' -f1)"
+    ;;
+  smoke)
+    wait_shared
+    # Run directly against the managed shared endpoint while wrappers remain
+    # gated. This is a correctness check, not a benchmark.
+    tmp=$(mktemp -d /var/tmp/sccache-epoch5-smoke.XXXXXX)
+    trap 'rm -rf -- "$tmp"' EXIT
+    chmod 0755 "$tmp"
+    install -d -o "$uid" -g "$gid" -m 0700 "$tmp/build"
+    cd "$tmp/build"
+    printf 'int sccache_epoch5_%s(void) { return %s; }\n' "$(date +%s)" "$((RANDOM+1))" > smoke.c
+    chown "$uid:$gid" smoke.c
+    chmod 0644 smoke.c
+    before=$(direct_client --show-stats --stats-format=json | jq '[.stats.dist_compiles[]] | add // 0')
+    runuser -u "$user" -- env -u SCCACHE_SERVER_PORT SCCACHE_SERVER_UDS="$sock" SCCACHE_START_SERVER=0 SCCACHE_NO_AUTO_START_SERVER=1 bash -c 'umask 022; exec "$@"' _ "$live" /usr/bin/gcc -c smoke.c -o smoke.o
+    [[ $(stat -c '%u:%g:%a' smoke.o) == "$uid:$gid:644" ]]
+    digest=$(sha256sum smoke.o | cut -d' ' -f1)
+    after=$(direct_client --show-stats --stats-format=json | jq '[.stats.dist_compiles[]] | add // 0')
+    (( after > before ))
+    rm smoke.o
+    hits_before=$(direct_client --show-stats --stats-format=json | jq '[.stats.cache_hits.counts[]] | add // 0')
+    (umask 022; direct_client /usr/bin/gcc -c smoke.c -o smoke.o)
+    [[ $(stat -c '%u:%a' smoke.o) == 0:644 ]]
+    [[ $(sha256sum smoke.o | cut -d' ' -f1) == "$digest" ]]
+    hits_after=$(direct_client --show-stats --stats-format=json | jq '[.stats.cache_hits.counts[]] | add // 0')
+    (( hits_after > hits_before ))
+    /usr/local/libexec/sccache-release-update --verify-running-metrics "$(cat "$rollback/metrics-not-before")"
+    printf '%s\n' "$sha" > "$rollback/smoke-ok"
+    echo "remote compile + cross-UID cache hit verified $role"
+    ;;
+  commit)
+    [[ $(cat "$rollback/smoke-ok") == "$sha" ]]
+    wait_shared
+    assert_bundle
+    local_hash=$(sha256sum "$live" | cut -d' ' -f1)
+    dist_hash=$(sha256sum "$dist" | cut -d' ' -f1)
+    [[ "$local_hash" == "$(sha256sum "$bundle/sccache" | cut -d' ' -f1)" ]]
+    [[ "$dist_hash" == "$(sha256sum "$bundle/sccache-dist" | cut -d' ' -f1)" ]]
+    for u in "${clients[@]}"; do
+      [[ "$u" == sccache-local-root.service ]] && continue
+      if active_before "$u"; then verify_running "$u" "$local_hash"; fi
+    done
+    if active_before sccache-dist-worker.service; then verify_running sccache-dist-worker.service "$dist_hash"; fi
+    if active_before sccache-dist-scheduler.service; then verify_running sccache-dist-scheduler.service "$dist_hash"; fi
+    if [[ $(systemctl show sccache-local-root.service -p LoadState --value) == loaded ]]; then
+      systemctl disable sccache-local-root.service
+    fi
+    tag=sccache-ci-$sha
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    for f in client_release_tag dist_release_tag release_tag; do printf '%s\n' "$tag" > "$state/$f"; done
+    for f in client_source_sha dist_source_sha source_sha; do printf '%s\n' "$sha" > "$state/$f"; done
+    for f in binary_sha256 client_sha256; do printf '%s\n' "$local_hash" > "$state/$f"; done
+    for f in dist_binary_sha256 dist_sha256; do printf '%s\n' "$dist_hash" > "$state/$f"; done
+    for f in client_updated_at dist_updated_at updated_at; do printf '%s\n' "$now" > "$state/$f"; done
+    printf '4\n' > "$state/dist_protocol"
+    cp "$stage/published-at.txt" "$state/published_at"
+    cp "$bundle/build.txt" "$bundle/SHA256SUMS" "$state/"
+    echo "committed $role $sha"
+    ;;
+  resume-updates)
+    [[ $(cat "$state/source_sha") == "$sha" && $(cat "$state/dist_protocol") == 4 ]]
+    rm -f "$drain"
+    resume_updaters
+    ;;
+  rollback-stop)
+    updater_guard
+    assert_updaters_paused
+    touch "$drain"
+    for u in "${clients[@]}" "${workers[@]}"; do stop_if_active "$u"; done
+    stop_if_active sccache-scheduler-loopback.socket
+    stop_if_active sccache-scheduler-loopback.service
+    stop_if_active sccache-dist-scheduler.service
+    ;;
+  rollback-restore)
+    assert_stopped
+    while IFS= read -r f; do
+      if [[ -e "$rollback/files$f" || -L "$rollback/files$f" ]]; then
+        [[ -d "$(dirname -- "$f")" ]] || install -d -m 0755 "$(dirname -- "$f")"
+        cp -a --remove-destination -- "$rollback/files$f" "$f"
+      else
+        rm -f -- "$f"
+      fi
+    done < "$rollback/paths"
+    systemctl daemon-reload
+    if rg -xq sccache-local-root.service "$rollback/enabled-units"; then systemctl enable sccache-local-root.service; fi
+    ;;
+  rollback-start-scheduler)
+    start_if_previous sccache-dist-scheduler.service
+    start_if_previous sccache-scheduler-loopback.socket
+    start_if_previous sccache-scheduler-loopback.service
+    [[ "$role" != asus ]] || rm -f "$sched_drain"
+    ;;
+  rollback-start-worker) start_if_previous sccache-dist-worker.service ;;
+  rollback-start-clients)
+    for u in "${clients[@]}"; do start_if_previous "$u"; done
+    rm -f "$drain"
+    resume_updaters
+    ;;
+  *) echo "unknown phase: $phase" >&2; exit 2 ;;
+esac

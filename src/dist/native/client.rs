@@ -35,13 +35,8 @@ pub struct NativeBuildPolicy {
     pub max_result_bytes: u64,
 }
 
-/// Distinguish a result reuse from a new worker execution.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum NativeBuildSource {
-    Hit,
-    Local,
-    Worker(SocketAddr),
-}
+use crate::protocol::NativeBuildSource;
+use crate::server::activity::{self, Phase};
 
 /// Native compiler response after all declared results have been delivered.
 pub struct NativeBuildResult {
@@ -88,7 +83,29 @@ impl Read for InputBlob {
     }
 }
 
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub(super) enum NativeProgress {
+    Phase(Phase),
+    Assigned { job: u64, worker: SocketAddr },
+}
+
+impl NativeProgress {
+    pub(super) fn apply(self) {
+        match self {
+            Self::Phase(phase) => activity::phase(phase),
+            Self::Assigned { job, worker } => {
+                activity::job(job, worker.to_string());
+                activity::phase(Phase::StageInputs);
+            }
+        }
+    }
+}
+
 pub(super) trait InputProvider {
+    fn progress(&mut self, progress: NativeProgress) -> Result<()> {
+        progress.apply();
+        Ok(())
+    }
     fn manifest(&mut self, tree: TreeId) -> Result<TreeManifest>;
     fn open_blob(&mut self, tree: TreeId, blob: BlobRef) -> Result<Option<InputBlob>>;
 }
@@ -243,6 +260,7 @@ impl NativeCacheClient {
                 source,
                 manifest,
             } => {
+                inputs.progress(NativeProgress::Phase(Phase::RestoreOutputs))?;
                 let staged = delivery.with_download(policy.renewal_interval, |download| {
                     fetch_result(
                         spec,
@@ -271,6 +289,7 @@ impl NativeCacheClient {
     ) -> Result<Outcome<'_>> {
         validate_policy(policy)?;
         let request = spec.action_request()?;
+        inputs.progress(NativeProgress::Phase(Phase::CacheLookup))?;
         let start = Instant::now();
         let mut declared = BTreeMap::new();
 
@@ -363,6 +382,7 @@ impl NativeCacheClient {
         if let Some(local) = local.filter(|executor| executor.prefers_local()) {
             return self.run_local(pin, spec, inputs, policy, start, local);
         }
+        inputs.progress(NativeProgress::Phase(Phase::AllocateWorker))?;
         let reply = self.schedule_with_retry(pin.ticket, spec, start, policy.timeout)?;
         let allocation = match reply {
             ScheduleReply::Assigned(allocation) => allocation,
@@ -373,6 +393,10 @@ impl NativeCacheClient {
                 bail!("native worker unavailable: {message}");
             }
         };
+        inputs.progress(NativeProgress::Assigned {
+            job: allocation.job,
+            worker: allocation.address,
+        })?;
         let source = NativeBuildSource::Worker(allocation.address);
         let request = spec.action_request()?;
         let remaining = policy.timeout.saturating_sub(start.elapsed());
@@ -400,7 +424,10 @@ impl NativeCacheClient {
                         Err(error) => return Err(error),
                     };
                     match poll {
-                        InputPoll::Complete => break,
+                        InputPoll::Complete => {
+                            inputs.progress(NativeProgress::Phase(Phase::RunDistributed))?;
+                            break;
+                        }
                         InputPoll::Waiting => {
                             thread::sleep(idle);
                             idle = (idle * 2).min(Duration::from_millis(200));
@@ -523,6 +550,7 @@ impl NativeCacheClient {
         start: Instant,
         local: &LocalExecutor,
     ) -> Result<Outcome<'a>> {
+        inputs.progress(NativeProgress::Phase(Phase::LocalCompile))?;
         let captured = local.execute(self, pin.ticket, spec, inputs, policy, start)?;
         drop(pin);
         let source = NativeBuildSource::Local;
