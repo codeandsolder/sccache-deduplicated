@@ -84,7 +84,7 @@ impl EnrollmentAuthority {
 
     /// The CA certificate to provision in peer trust configuration.
     #[must_use = "peers must authenticate the cluster CA before enrollment"]
-    pub fn certificate(&self) -> &X509 {
+    pub const fn certificate(&self) -> &X509 {
         self.ca.certificate()
     }
 
