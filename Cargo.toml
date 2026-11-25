@@ -64,7 +64,7 @@ jobserver = "0.1"
 jwt = { package = "jsonwebtoken", version = "12", optional = true, default-features = false }
 jsonwebtoken-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "0fddfc535515622963dfb4cb658ab63dcfa5307d", optional = true }
 libc = "0.2.153"
-linked-hash-map = "0.5"
+lru = "0.19"
 log = "0.4"
 lurkmoar = { git = "https://github.com/codeandsolder/lurkmoar-rs", rev = "e58a7abdb5a0f47a969771fc0b6837c5103863ee", optional = true }
 memchr = "2"

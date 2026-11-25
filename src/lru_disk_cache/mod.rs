@@ -2,20 +2,17 @@ pub mod lru_cache;
 
 use fs::File;
 use fs_err as fs;
-use std::borrow::Borrow;
 use std::boxed::Box;
-use std::collections::hash_map::RandomState;
 use std::error::Error as StdError;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::hash::BuildHasher;
 use std::io;
 use std::io::prelude::*;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub use lru_cache::{LruCache, Meter};
+pub use lru_cache::{Meter, WeightedLru};
 use std::fs::FileTimes;
 use std::time::SystemTime;
 use tempfile::NamedTempFile;
@@ -79,12 +76,7 @@ struct FileSize;
 
 /// Given a tuple of (path, filesize), use the filesize for measurement.
 impl<K> Meter<K, u64> for FileSize {
-    type Measure = u64;
-
-    fn measure<Q: ?Sized>(&self, _: &Q, v: &u64) -> u64
-    where
-        K: Borrow<Q>,
-    {
+    fn measure(&self, _: &K, v: &u64) -> u64 {
         *v
     }
 }
@@ -116,8 +108,8 @@ fn get_all_files<P: AsRef<Path>>(path: P) -> Box<dyn Iterator<Item = (PathBuf, u
 }
 
 /// An LRU cache of files on disk.
-pub struct LruDiskCache<S: BuildHasher = RandomState> {
-    lru: LruCache<OsString, u64, S, FileSize>,
+pub struct LruDiskCache {
+    lru: WeightedLru<OsString, u64, FileSize>,
     root: PathBuf,
     pending_size: Arc<AtomicU64>,
 }
@@ -244,7 +236,7 @@ impl LruDiskCache {
         PathBuf: From<T>,
     {
         Self {
-            lru: LruCache::with_meter(size, FileSize),
+            lru: WeightedLru::new(size, FileSize),
             root: PathBuf::from(path),
             pending_size: Arc::new(AtomicU64::new(0)),
         }
@@ -267,7 +259,7 @@ impl LruDiskCache {
 
     #[must_use = "the result describes whether the cache contains any entries"]
     pub fn is_empty(&self) -> bool {
-        self.lru.len() == 0
+        self.lru.is_empty()
     }
 
     /// Return the maximum size of the cache.

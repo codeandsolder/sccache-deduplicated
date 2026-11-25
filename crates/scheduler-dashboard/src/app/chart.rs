@@ -105,15 +105,16 @@ fn axis_time(time: f64, range: f64) -> String {
     Duration::try_from_secs_f64(time)
         .ok()
         .and_then(|duration| {
-            chrono::DateTime::from_timestamp(
+            jiff::Timestamp::new(
                 i64::try_from(duration.as_secs()).ok()?,
-                duration.subsec_nanos(),
+                i32::try_from(duration.subsec_nanos()).ok()?,
             )
+            .ok()
         })
         .map_or_else(
             || "—".into(),
             |date| {
-                date.format(if range >= 86400.0 {
+                date.strftime(if range >= 86400.0 {
                     "%m-%d %H:%M"
                 } else {
                     "%H:%M:%S"
@@ -147,6 +148,15 @@ pub(super) fn graph(series: Vec<MetricSeries>, unit: &str, step: u64) -> impl In
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn chart_axis_uses_utc_and_handles_invalid_time() {
+        assert_eq!(axis_time(0.0, 60.0), "00:00:00");
+        assert_eq!(axis_time(86_401.5, 86_400.0), "01-02 00:00");
+        assert_eq!(axis_time(f64::NAN, 60.0), "—");
+        assert_eq!(axis_time(-1.0, 60.0), "—");
+        assert_eq!(axis_time(f64::MAX, 60.0), "—");
+    }
+
     #[test]
     fn chart_does_not_bridge_missing_samples_or_time_gaps() {
         let bounds = Bounds {

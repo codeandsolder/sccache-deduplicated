@@ -31,7 +31,7 @@ use crate::compiler::{
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
 #[cfg(feature = "dist-client")]
-use crate::lru_disk_cache::{LruCache, Meter};
+use crate::lru_disk_cache::{Meter, WeightedLru};
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::{Digest, fmt_duration_as_secs, hash_all, hash_all_archives, run_input_output};
 use crate::util::{HashToDigest, OsStrExt};
@@ -43,10 +43,7 @@ use log::Level::Trace;
 use semver::Version;
 use serde::Serialize;
 #[cfg(feature = "dist-client")]
-use std::borrow::Borrow;
 use std::borrow::Cow;
-#[cfg(feature = "dist-client")]
-use std::collections::hash_map::RandomState;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env::consts::DLL_EXTENSION;
 #[cfg(feature = "dist-client")]
@@ -4412,7 +4409,7 @@ fn test_dist_dependency_inspection_failure_keeps_all_candidates() -> Result<()> 
     // Metadata reader unavailable for this individual input, even though
     // discovery was enabled when the server initialized the compiler.
     let reader = Arc::new(RlibDepReader {
-        cache: Mutex::new(LruCache::with_meter(1024, DepsSize)),
+        cache: Mutex::new(WeightedLru::new(1024, DepsSize)),
         executable: tmp.path().join("missing-rustc"),
         ls_arg: "ls=root".into(),
     });
@@ -4851,31 +4848,20 @@ struct RlibDepsDetail {
 struct DepsSize;
 #[cfg(feature = "dist-client")]
 impl Meter<PathBuf, RlibDepsDetail> for DepsSize {
-    type Measure = usize;
-    fn measure<Q: ?Sized>(&self, _k: &Q, v: &RlibDepsDetail) -> usize
-    where
-        PathBuf: Borrow<Q>,
-    {
-        use std::mem;
-
-        // TODO: unfortunately there is exactly nothing you can do with the k given the
-        // current trait bounds. Just use some kind of sane value;
-        //let k_size = mem::size_of::<PathBuf>() + k.capacity();
-        let k_size = 3 * 8 + 100;
-
-        let crate_names_size: usize = v.deps.iter().map(std::string::String::capacity).sum();
-        let v_size: usize = mem::size_of::<RlibDepsDetail>() + // Systemtime and vec itself
-            v.deps.capacity() * mem::size_of::<String>() + // Each string in the vec
-            crate_names_size; // Contents of all strings
-
-        k_size + v_size
+    fn measure(&self, key: &PathBuf, value: &RlibDepsDetail) -> u64 {
+        use std::mem::size_of;
+        let key_size = size_of::<PathBuf>() + key.capacity();
+        let names_size = value.deps.iter().map(String::capacity).sum::<usize>();
+        let value_size =
+            size_of::<RlibDepsDetail>() + value.deps.capacity() * size_of::<String>() + names_size;
+        u64::try_from(key_size + value_size).unwrap_or(u64::MAX)
     }
 }
 
 #[cfg(feature = "dist-client")]
 #[derive(Debug)]
 struct RlibDepReader {
-    cache: Mutex<LruCache<PathBuf, RlibDepsDetail, RandomState, DepsSize>>,
+    cache: Mutex<WeightedLru<PathBuf, RlibDepsDetail, DepsSize>>,
     executable: PathBuf,
     ls_arg: String,
 }
@@ -4890,7 +4876,7 @@ impl RlibDepReader {
         // executor cannot establish anything about the actual input metadata.
         let version = Self::parse_rustc_version(rustc_verbose_version.as_bytes())?;
         Ok(Self {
-            cache: Mutex::new(LruCache::with_meter(CACHE_SIZE, DepsSize)),
+            cache: Mutex::new(WeightedLru::new(CACHE_SIZE, DepsSize)),
             executable,
             ls_arg: Self::get_correct_ls_arg(&version),
         })

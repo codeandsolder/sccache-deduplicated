@@ -292,14 +292,23 @@ fn age_since(sampled_at: Option<u64>, then_ms: u64) -> String {
 fn timestamp(value: Option<u64>) -> String {
     value
         .and_then(|value| i64::try_from(value).ok())
-        .and_then(|value| chrono::DateTime::from_timestamp(value, 0))
+        .and_then(|value| jiff::Timestamp::from_second(value).ok())
         .map_or_else(
             || "Not yet sampled".into(),
-            |value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+            |value| value.strftime("%Y-%m-%d %H:%M:%S UTC").to_string(),
         )
 }
 
 #[component]
 fn Stat(label: &'static str, value: String) -> impl IntoView {
     view! { <div class=styles::stat><small>{label}</small><strong>{value}</strong></div> }
+}
+
+#[cfg(test)]
+#[test]
+fn timestamp_formats_utc_without_local_timezone() {
+    assert_eq!(timestamp(Some(0)), "1970-01-01 00:00:00 UTC");
+    assert_eq!(timestamp(Some(1_704_067_200)), "2024-01-01 00:00:00 UTC");
+    assert_eq!(timestamp(None), "Not yet sampled");
+    assert_eq!(timestamp(Some(u64::MAX)), "Not yet sampled");
 }
