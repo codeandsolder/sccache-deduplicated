@@ -28,10 +28,15 @@ workers=(sccache-dist-worker.service)
 scheduler=(sccache-dist-scheduler.service sccache-scheduler-loopback.socket sccache-scheduler-loopback.service)
 timers=(sccache-release-update.timer random-utils-update.timer)
 updaters=(sccache-release-update.service random-utils-update.service)
+watchdog_timer=sccache-dist-worker-watchdog.timer
+watchdog_service=sccache-dist-worker-watchdog.service
+if [[ "$role" == asus ]]; then
+  updaters+=("$watchdog_service")
+fi
 guard="$stage/updaters-paused"
 client_guard=/etc/systemd/system/sccache-fleet-rollout-drain
 guard_name=zz-sccache-fleet-rollout-guard.conf
-units=("${clients[@]}" "${workers[@]}" "${scheduler[@]}" "${timers[@]}")
+units=("${clients[@]}" "${workers[@]}" "${scheduler[@]}" "${timers[@]}" "$watchdog_timer")
 exec 9>"$stage/activation.lock"
 flock -x 9
 active_before() { rg -xq -- "$1" "$rollback/active-units"; }
@@ -53,6 +58,7 @@ updater_guard() {
   done
   systemctl daemon-reload
   for u in "${timers[@]}"; do stop_if_active "$u"; done
+  if [[ "$role" == asus ]]; then stop_if_active "$watchdog_timer"; fi
   # Do not kill an update midway through installing binaries. Wait for the
   # in-flight transaction to finish, including activating/deactivating units.
   local deadline=$((SECONDS+1200)) state
@@ -74,9 +80,18 @@ resume_updaters() {
   systemctl daemon-reload
   for u in "${timers[@]}"; do start_if_previous "$u"; done
 }
+restore_watchdog() {
+  if [[ "$role" == asus ]]; then
+    if rg -xq "$watchdog_timer" "$rollback/enabled-units"; then systemctl enable "$watchdog_timer"; fi
+    start_if_previous "$watchdog_timer"
+  fi
+}
 assert_updaters_paused() {
   [[ -f "$guard" && -f "$client_guard" ]]
   local u state
+  if [[ "$role" == asus ]]; then
+    [[ $(systemctl show "$watchdog_timer" -p ActiveState --value) == inactive ]]
+  fi
   for u in "${updaters[@]}" "${timers[@]}"; do
     state=$(systemctl show "$u" -p ActiveState --value)
     [[ "$state" == inactive || "$state" == failed ]] || { echo "update unit not quiescent: $u ($state)" >&2; return 1; }
@@ -163,7 +178,7 @@ case "$phase" in
     done
     # Record timer state before stopping them. If snapshot preparation fails,
     # restore the updater state; no live files have yet been replaced.
-    trap 'rc=$?; if (( rc != 0 )); then resume_updaters; rm -rf -- "$rollback"; fi' EXIT
+    trap 'rc=$?; if (( rc != 0 )); then resume_updaters; restore_watchdog; rm -rf -- "$rollback"; fi' EXIT
     updater_guard
     assert_updaters_paused
     assert_prepared
@@ -320,6 +335,10 @@ case "$phase" in
     if [[ $(systemctl show sccache-local-root.service -p LoadState --value) == loaded ]]; then
       systemctl disable sccache-local-root.service
     fi
+    if [[ "$role" == asus && $(systemctl show "$watchdog_timer" -p LoadState --value) == loaded ]]; then
+      assert_updaters_paused
+      systemctl disable "$watchdog_timer"
+    fi
     tag=sccache-ci-$sha
     now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     for f in client_release_tag dist_release_tag release_tag; do printf '%s\n' "$tag" > "$state/$f"; done
@@ -370,6 +389,7 @@ case "$phase" in
     for u in "${clients[@]}"; do start_if_previous "$u"; done
     rm -f "$drain"
     resume_updaters
+    restore_watchdog
     ;;
   *) echo "unknown phase: $phase" >&2; exit 2 ;;
 esac
