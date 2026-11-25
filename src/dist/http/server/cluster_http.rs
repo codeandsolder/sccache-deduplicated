@@ -270,7 +270,7 @@ pub(super) enum ListenerRole {
 }
 
 /// Explicitly configure the address-family behavior; do not depend on
-/// the host's IPV6_V6ONLY default. An IPv4-only kernel can still serve
+/// the host's `IPV6_V6ONLY` default. An IPv4-only kernel can still serve
 /// the configured reliable IPv4 endpoint when no explicit bind is set.
 pub(super) fn bind_socket(address: SocketAddr) -> io::Result<TcpListener> {
     let socket = socket2::Socket::new(

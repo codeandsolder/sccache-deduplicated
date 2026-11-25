@@ -350,6 +350,10 @@ mod server {
         }
     }
 
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the ratio is an advisory CPU load estimate over the delta between consecutive samples"
+    )]
     fn idle_fraction(previous: (u64, u64), current: (u64, u64)) -> Option<f64> {
         let total = current.0.checked_sub(previous.0)?;
         let idle = current.1.checked_sub(previous.1)?;
@@ -359,7 +363,9 @@ mod server {
     fn effective_cpu_capacity(cpus: usize, idle_fraction: f64, running_jobs: usize) -> f64 {
         // The measured idle CPUs exclude our own executing jobs. Restore those
         // before the scheduler subtracts all of its outstanding reservations.
-        (cpus as f64 * idle_fraction + running_jobs as f64).min(cpus as f64)
+        let cpus = f64::from(u32::try_from(cpus).unwrap_or(u32::MAX));
+        let running = f64::from(u32::try_from(running_jobs).unwrap_or(u32::MAX));
+        cpus.mul_add(idle_fraction, running).min(cpus)
     }
 
     #[cfg(target_os = "linux")]
@@ -441,7 +447,10 @@ mod server {
     impl Drop for RunningJobGuard {
         fn drop(&mut self) {
             // Never leak a running entry if a different thread poisoned the lock.
-            let mut jobs = self.jobs.lock().unwrap_or_else(|error| error.into_inner());
+            let mut jobs = self
+                .jobs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             jobs.remove(&self.job_id);
         }
     }
@@ -503,7 +512,7 @@ mod server {
                 let mut uploads = self
                     .activity
                     .lock()
-                    .unwrap_or_else(|error| error.into_inner());
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(last_progress) = uploads.get_mut(&self.job_id) {
                     *last_progress = Instant::now();
                 }
@@ -516,13 +525,15 @@ mod server {
         fn drop(&mut self) {
             self.activity
                 .lock()
-                .unwrap_or_else(|error| error.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&self.job_id);
         }
     }
 
     fn recently_progressing_uploads(activity: &UploadActivity, now: Instant) -> Vec<JobId> {
-        let uploads = activity.lock().unwrap_or_else(|error| error.into_inner());
+        let uploads = activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         uploads
             .iter()
             .filter_map(|(&job, &progress)| {
@@ -572,12 +583,15 @@ mod server {
     #[derive(Debug)]
     pub struct ClientVisibleMsg(String);
     impl ClientVisibleMsg {
-        pub fn from_nonsensitive(s: String) -> Self {
-            ClientVisibleMsg(s)
+        #[must_use = "the message is intended for a client-visible response"]
+        pub const fn from_nonsensitive(s: String) -> Self {
+            Self(s)
         }
     }
 
     pub trait ClientAuthCheck: Send + Sync {
+        /// # Errors
+        /// Rejects invalid or unauthorized client bootstrap credentials.
         fn check(&self, token: &str) -> StdResult<(), ClientVisibleMsg>;
     }
     type ServerAuthenticator = dyn Fn(&str) -> Option<ServerId> + Send + Sync;
@@ -604,15 +618,15 @@ mod server {
         ParseError(bincode::Error),
     }
     impl From<bincode::Error> for RouilleBincodeError {
-        fn from(err: bincode::Error) -> RouilleBincodeError {
-            RouilleBincodeError::ParseError(err)
+        fn from(err: bincode::Error) -> Self {
+            Self::ParseError(err)
         }
     }
     impl std::error::Error for RouilleBincodeError {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             match *self {
-                RouilleBincodeError::ParseError(ref e) => Some(e),
-                RouilleBincodeError::BodyReadError(ref e) => Some(e),
+                Self::ParseError(ref e) => Some(e),
+                Self::BodyReadError(ref e) => Some(e),
                 _ => None,
             }
         }
@@ -626,16 +640,15 @@ mod server {
                 fmt,
                 "{}",
                 match *self {
-                    RouilleBincodeError::BodyAlreadyExtracted => {
+                    Self::BodyAlreadyExtracted => {
                         "the body of the request was already extracted"
                     }
-                    RouilleBincodeError::WrongContentType => {
+                    Self::WrongContentType => {
                         "the request didn't have a binary content type"
                     }
-                    RouilleBincodeError::BodyTooLarge => "control-plane request body exceeds limit",
-                    RouilleBincodeError::BodyReadError(_) =>
-                        "error reading control-plane request body",
-                    RouilleBincodeError::ParseError(_) => "error while parsing the bincode body",
+                    Self::BodyTooLarge => "control-plane request body exceeds limit",
+                    Self::BodyReadError(_) => "error reading control-plane request body",
+                    Self::ParseError(_) => "error while parsing the bincode body",
                 }
             )
         }
@@ -672,9 +685,9 @@ mod server {
     }
 
     impl ErrJson {
-        fn from_err<E: ?Sized + std::error::Error>(err: &E) -> ErrJson {
-            let cause = err.source().map(ErrJson::from_err).map(Box::new);
-            ErrJson {
+        fn from_err<E: ?Sized + std::error::Error>(err: &E) -> Self {
+            let cause = err.source().map(Self::from_err).map(Box::new);
+            Self {
                 description: err.to_string(),
                 cause,
             }
@@ -742,7 +755,7 @@ mod server {
             status_code: 401,
             headers: vec![(
                 "WWW-Authenticate".into(),
-                format!("Bearer error=\"{}\"", short_err).into(),
+                format!("Bearer error=\"{short_err}\"").into(),
             )],
             data: rouille::ResponseBody::from_data(body.0),
             upgrade: None,
@@ -873,14 +886,14 @@ mod server {
         fn generate_token(&self, job_id: JobId) -> Result<String> {
             let claims = JobJwt { exp: 0, job_id };
             jwt::encode(&JWT_HEADER, &claims, &self.encoding_key)
-                .map_err(|e| anyhow!("Failed to create JWT for job: {}", e))
+                .map_err(|e| anyhow!("Failed to create JWT for job: {e}"))
         }
         fn verify_token(&self, job_id: JobId, token: &str) -> Result<()> {
             let valid_claims = JobJwt { exp: 0, job_id };
             jwt::decode(token, &self.decoding_key, &JWT_VALIDATION)
-                .map_err(|e| anyhow!("JWT decode failed: {}", e))
+                .map_err(|e| anyhow!("JWT decode failed: {e}"))
                 .and_then(|res| {
-                    fn identical_t<T>(_: &T, _: &T) {}
+                    const fn identical_t<T>(_: &T, _: &T) {}
                     identical_t(&res.claims, &valid_claims);
                     if res.claims == valid_claims {
                         Ok(())
@@ -1054,6 +1067,14 @@ mod server {
             }
         }
 
+        /// Start the authenticated scheduler and its optional native services.
+        ///
+        /// # Errors
+        /// Returns an error when persistent identity, listener or service initialization fails.
+        #[expect(
+            clippy::too_many_lines,
+            reason = "scheduler startup ties the enrollment, native publication, dashboard and control RPC listeners to a single handler lifetime"
+        )]
         pub fn start(self) -> Result<Infallible> {
             let Self {
                 cluster_directory,
@@ -1146,6 +1167,7 @@ mod server {
                                 }
                                 *active = next;
                             }
+                            drop(active);
                             Ok(())
                         };
                         if let Err(error) = renew() {
@@ -1205,7 +1227,7 @@ mod server {
                             }
                             match native::fetch_peer(
                                 &peer_routes,
-                                source,
+                                &source,
                                 blob,
                                 &peer_network,
                                 deadline,
@@ -1246,7 +1268,7 @@ mod server {
                         },
                         observe_result:
                             move |server, job, event: crate::dist::NativeLifecycleEvent<'_>| {
-                                result_handler.observe_native_lifecycle(server, job, event)
+                                result_handler.observe_native_lifecycle(server, job, event);
                             },
                     },
                     native_tls.context("missing native data TLS listener")?,
@@ -1331,7 +1353,7 @@ mod server {
                                     return response;
                                 }
                                 let toolchain = try_bincode_input!(req_id, request);
-                                trace!("Req {}: alloc_job: {:?}", req_id, toolchain);
+                                trace!("Req {req_id}: alloc_job: {toolchain:?}");
 
                                 let alloc_job_res: AllocJobResult = try_or_500_log!(req_id, handler.handle_alloc_job(&*requester, toolchain));
                                 let res = match alloc_job_res {
@@ -1382,14 +1404,14 @@ mod server {
                                 };
                                 let heartbeat_server = try_bincode_input!(req_id, request);
 
-                                trace!(target: "sccache_heartbeat", "Req {}: heartbeat_server: {:?}", req_id, heartbeat_server);
+                                trace!(target: "sccache_heartbeat", "Req {req_id}: heartbeat_server: {heartbeat_server:?}");
 
                                 let HeartbeatServerHttpRequest {
                                     cpu_capacity, active_job_ids, native_placement, jwt_key,
                                     server_nonce, routes,
                                 } = heartbeat_server;
                                 let job_authorizer = try_or_400_log!(req_id, JWTJobAuthorizer::boxed(&jwt_key));
-                                try_or_400_log!(req_id, requester.register(server_id, routes));
+                                try_or_400_log!(req_id, requester.register(server_id, &routes));
                                 let worker_name_nonce = server_nonce.clone();
                                 let res: HeartbeatServerResult = try_or_500_log!(req_id, handler.handle_heartbeat_server(
                                     server_id, server_nonce,
@@ -1414,7 +1436,7 @@ mod server {
                             (POST) (/api/v1/scheduler/job_state/{job_id: JobId}) => {
                                 let server_id = check_server_auth_or_err!(request);
                                 let job_state = try_bincode_input!(req_id, request);
-                                trace!("Req {}: job state: {:?}", req_id, job_state);
+                                trace!("Req {req_id}: job state: {job_state:?}");
 
                                 let res: UpdateJobStateResult = try_or_500_log!(req_id, handler.handle_update_job_state(
                                     job_id, server_id, job_state
@@ -1435,7 +1457,7 @@ mod server {
                             },
                         )
                     })();
-                    trace!(target: "sccache_http", "Res {}: {:?}", req_id, response);
+                    trace!(target: "sccache_http", "Res {req_id}: {response:?}");
                     response
                 },
             )?;
@@ -1454,7 +1476,7 @@ mod server {
     }
 
     impl SchedulerRequester {
-        fn register(&self, id: ServerId, routes: sccache_peer_identity::RouteSet) -> Result<()> {
+        fn register(&self, id: ServerId, routes: &sccache_peer_identity::RouteSet) -> Result<()> {
             anyhow::ensure!(routes.valid(), "invalid worker endpoints");
             let mut addresses = self
                 .addresses
@@ -1463,7 +1485,7 @@ mod server {
             addresses.retain(|_, (_, updated)| updated.elapsed() < HEARTBEAT_TIMEOUT);
             addresses.insert(id, (routes.clone(), Instant::now()));
             drop(addresses);
-            self.routes.prime(id, Role::Worker, &routes);
+            self.routes.prime(id, Role::Worker, routes);
             Ok(())
         }
 
@@ -1553,12 +1575,16 @@ mod server {
         bind_address: Option<SocketAddr>,
         peer: Arc<PeerCredentials>,
         jwt_key: Vec<u8>,
-        server_nonce: ServerNonce,
+        nonce: ServerNonce,
         worker_name: Option<String>,
         handler: S,
     }
 
     impl<S: dist::ServerIncoming + 'static> Server<S> {
+        /// Construct a worker with its persistent cluster identity.
+        ///
+        /// # Errors
+        /// Returns an error if the worker name cannot be represented in an HTTP header.
         pub fn new(
             public_addr: SocketAddr,
             bind_address: Option<SocketAddr>,
@@ -1578,19 +1604,27 @@ mod server {
                 bind_address,
                 peer,
                 jwt_key,
-                server_nonce,
+                nonce: server_nonce,
                 worker_name,
                 handler,
             })
         }
 
+        /// Start worker heartbeats and the authenticated execution listener.
+        ///
+        /// # Errors
+        /// Returns an error for invalid credentials, listener setup or server termination.
+        #[expect(
+            clippy::too_many_lines,
+            reason = "worker startup captures the same job reservations and authentication state in the heartbeat and execution loops"
+        )]
         pub fn start(self) -> Result<Infallible> {
             let Self {
                 public_addr,
                 bind_address,
                 peer,
                 jwt_key,
-                server_nonce,
+                nonce: server_nonce,
                 worker_name,
                 handler,
             } = self;
@@ -1625,9 +1659,9 @@ mod server {
                     // before its response. Never prune that assignment.
                     let heartbeat_started_at = Instant::now();
                     trace!(target: "sccache_heartbeat", "Performing heartbeat");
-                    let running_job_ids: Vec<_> = heartbeat_running_jobs
+                    let mut active_job_ids: HashSet<_> = heartbeat_running_jobs
                         .lock()
-                        .unwrap_or_else(|error| error.into_inner())
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .iter()
                         .copied()
                         .collect();
@@ -1636,24 +1670,22 @@ mod server {
                     let capabilities = heartbeat_handler.capabilities();
                     // Transfers keep their assignment alive, but do not count as
                     // executing compiler processes for CPU-capacity restoration.
-                    let active_job_ids =
-                        running_job_ids
-                            .into_iter()
-                            .chain(capabilities.native_placement.iter().flat_map(|placement| {
-                                placement.queue.jobs.iter().filter_map(|(&id, progress)| {
-                                    progress.phase.active().then_some(id)
-                                })
-                            }))
-                            .chain(recently_progressing_uploads(
-                                &heartbeat_upload_activity,
-                                Instant::now(),
-                            ))
-                            .collect::<HashSet<_>>()
-                            .into_iter()
-                            .collect();
+                    active_job_ids.extend(capabilities.native_placement.iter().flat_map(
+                        |placement| {
+                            placement
+                                .queue
+                                .jobs
+                                .iter()
+                                .filter_map(|(&id, progress)| progress.phase.active().then_some(id))
+                        },
+                    ));
+                    active_job_ids.extend(recently_progressing_uploads(
+                        &heartbeat_upload_activity,
+                        Instant::now(),
+                    ));
                     let heartbeat_req = HeartbeatServerHttpRequest {
                         cpu_capacity: advertised_cpus,
-                        active_job_ids,
+                        active_job_ids: active_job_ids.into_iter().collect(),
                         native_placement: capabilities.native_placement,
                         jwt_key: heartbeat_jwt_key.clone(),
                         server_nonce: server_nonce.clone(),
@@ -1711,7 +1743,7 @@ mod server {
                             revoked,
                         }) => {
                             heartbeat_revocations.update(revoked);
-                            trace!(target: "sccache_heartbeat", "Heartbeat success is_new={}", is_new);
+                            trace!(target: "sccache_heartbeat", "Heartbeat success is_new={is_new}");
                             match heartbeat_handler.handle_reconcile_assignments(
                                 &assigned_job_ids,
                                 heartbeat_started_at,
@@ -1731,14 +1763,14 @@ mod server {
                             thread::sleep(HEARTBEAT_INTERVAL);
                         }
                         Err(e) => {
-                            error!(target: "sccache_heartbeat", "Failed to send heartbeat to server: {}", e);
+                            error!(target: "sccache_heartbeat", "Failed to send heartbeat to server: {e}");
                             thread::sleep(HEARTBEAT_ERROR_INTERVAL);
                         }
                     }
                 }
             });
 
-            info!("Server listening for clients on {}", bind_address);
+            info!("Server listening for clients on {bind_address}");
             let request_count = atomic::AtomicUsize::new(0);
 
             let server = Listener::from_socket(
@@ -1758,7 +1790,7 @@ mod server {
                                 if request.role() != Role::Scheduler { return make_401("scheduler_role_required"); }
                                 job_auth_or_401!(request, &job_authorizer, job_id);
                                 let toolchain = try_bincode_input!(req_id, request);
-                                trace!("Req {}: assign_job({}): {:?}", req_id, job_id, toolchain);
+                                trace!("Req {req_id}: assign_job({job_id}): {toolchain:?}");
 
                                 let res: AssignJobResult = try_or_500_log!(req_id, handler.handle_assign_job(job_id, toolchain));
                                 prepare_response(request, &res)
@@ -1785,7 +1817,7 @@ mod server {
                             (POST) (/api/v1/distserver/submit_toolchain/{job_id: JobId}) => {
                                 if request.role() != Role::Client { return make_401("client_role_required"); }
                                 job_auth_or_401!(request, &job_authorizer, job_id);
-                                trace!("Req {}: submit_toolchain({})", req_id, job_id);
+                                trace!("Req {req_id}: submit_toolchain({job_id})");
 
                                 let body = try_or_400_log!(
                                     req_id,
@@ -1806,13 +1838,13 @@ mod server {
                                     req_id,
                                     request.data().context("missing run_job request body")
                                 );
-                                let bincode_length = try_or_500_log!(req_id, body.read_u32::<BigEndian>()
-                                    .context("failed to read run job input length")) as u64;
+                                let bincode_length = u64::from(try_or_500_log!(req_id, body.read_u32::<BigEndian>()
+                                    .context("failed to read run job input length")));
 
                                 let mut bincode_reader = body.take(bincode_length);
                                 let runjob = try_or_500_log!(req_id, bincode::deserialize_from(&mut bincode_reader)
                                     .context("failed to deserialize run job request"));
-                                trace!("Req {}: run_job({}): {:?}", req_id, job_id, runjob);
+                                trace!("Req {req_id}: run_job({job_id}): {runjob:?}");
                                 let RunJobHttpRequest { command, outputs } = runjob;
                                 let body = bincode_reader.into_inner();
                                 let inputs_rdr = InputsReader::new(Box::new(body));
@@ -1827,7 +1859,7 @@ mod server {
                             },
                         )
                     })();
-                    trace!("Res {}: {:?}", req_id, response);
+                    trace!("Res {req_id}: {response:?}");
                     response
                 },
             )?;

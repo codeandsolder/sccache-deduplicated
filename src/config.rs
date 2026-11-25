@@ -2068,7 +2068,7 @@ pub mod scheduler {
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
 
-    use crate::errors::*;
+    use crate::errors::{Context, Result, bail};
 
     use serde::{Deserialize, Serialize};
 
@@ -2122,6 +2122,8 @@ pub mod scheduler {
     }
 
     impl JobSlackConfig {
+        /// # Errors
+        /// Rejects a negative or nonfinite proportional slack setting.
         pub fn validate(self) -> Result<()> {
             if !self.percent.is_finite() || self.percent < 0.0 {
                 bail!("scheduler job_slack.percent must be finite and non-negative");
@@ -2129,6 +2131,12 @@ pub mod scheduler {
             Ok(())
         }
 
+        #[must_use = "the computed admission capacity limits worker reservations"]
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "validated nonnegative capacity is intentionally rounded to whole job slots using saturating float-to-integer casts"
+        )]
         pub fn max_jobs(self, cpu_capacity: f64) -> usize {
             if !cpu_capacity.is_finite() || cpu_capacity < 0.0 {
                 return 0;
@@ -2241,6 +2249,10 @@ pub mod scheduler {
         pub native_cache: Option<NativeCacheConfig>,
     }
 
+    /// Load and validate scheduler configuration.
+    ///
+    /// # Errors
+    /// Returns an error for unreadable, malformed or incompatible configuration.
     pub fn from_path(conf_path: &Path) -> Result<Option<Config>> {
         let config: Option<Config> = super::try_read_config_file(conf_path)
             .context("Failed to load scheduler config file")?;
@@ -2314,10 +2326,10 @@ pub mod server {
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
 
-    use crate::errors::*;
+    use crate::errors::{Context, Result};
 
     const TEN_GIGS: u64 = 10 * 1024 * 1024 * 1024;
-    fn default_toolchain_cache_size() -> u64 {
+    const fn default_toolchain_cache_size() -> u64 {
         TEN_GIGS
     }
 
@@ -2345,11 +2357,11 @@ pub mod server {
     fn default_pot_clone_args() -> Vec<String> {
         DEFAULT_POT_CLONE_ARGS
             .iter()
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .collect()
     }
 
-    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(tag = "type")]
     #[serde(deny_unknown_fields)]
     pub enum BuilderType {
@@ -2377,7 +2389,7 @@ pub mod server {
         },
     }
 
-    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(tag = "type")]
     #[serde(deny_unknown_fields)]
     pub enum SchedulerAuth {
@@ -2417,7 +2429,7 @@ pub mod server {
         pub package_transfer: crate::build_runtime::PackageTransferCost,
     }
 
-    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     pub struct Config {
         pub cluster: sccache_peer_identity::PeerConfig,
@@ -2435,6 +2447,10 @@ pub mod server {
         pub native_worker: Option<NativeWorkerConfig>,
     }
 
+    /// Load worker configuration.
+    ///
+    /// # Errors
+    /// Returns an error for unreadable or malformed configuration.
     pub fn from_path(conf_path: &Path) -> Result<Option<Config>> {
         super::try_read_config_file(conf_path).context("Failed to load server config file")
     }

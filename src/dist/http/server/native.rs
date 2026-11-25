@@ -124,6 +124,10 @@ pub(super) struct PublicationCallbacks<S, O> {
     pub observe_result: O,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "native listener startup owns the shared session lifetime and starts its coordinated acquisition and maintenance workers"
+)]
 pub(super) fn spawn(
     config: &NativeCacheConfig,
     allocate: impl Fn(
@@ -172,7 +176,7 @@ pub(super) fn spawn(
     let fetch_peer = Arc::new(fetch_peer);
     // Keep source acquisition bounded separately from compiler execution
     // and leave capacity for originating-client uploads.
-    let peer_threads = config.max_total_uploads.saturating_sub(1).min(4).max(1);
+    let peer_threads = config.max_total_uploads.saturating_sub(1).clamp(1, 4);
     for index in 0..peer_threads {
         let sessions = Arc::downgrade(&sessions);
         let fetch_peer = Arc::clone(&fetch_peer);
@@ -338,7 +342,7 @@ fn observed_response_peer(response: &reqwest::blocking::Response, peer: Peer) ->
 /// Retrieve a blob from a specific authenticated worker using its exact-content capability.
 pub(super) fn fetch_peer(
     routes: &SchedulerRequester,
-    source: crate::dist::NativeBlobSource,
+    source: &crate::dist::NativeBlobSource,
     blob: BlobRef,
     network: &NetworkMeter,
     deadline: Instant,
@@ -466,6 +470,10 @@ fn respond(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "single exhaustive protocol dispatch preserves the operation-level authorization checks alongside each wire decoder"
+)]
 fn dispatch(
     request: &Request,
     services: NativeServices<'_>,
@@ -697,7 +705,7 @@ fn dispatch(
                             "direct_bytes": receipt.observation.direct_bytes,
                             "scheduler_bytes": receipt.observation.scheduler_bytes,
                             "unique_blobs": receipt.observation.unique_blobs,
-                        }))
+                        }));
                     }
                     Ok(None) => {}
                     Err(error) => debug!("native delivery observation rejected: {error:#}"),

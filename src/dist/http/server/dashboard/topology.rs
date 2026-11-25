@@ -24,7 +24,7 @@ fn host(id: String, name: String, role: HostRole, status: &str) -> NetworkHost {
     }
 }
 
-fn member_role(role: Role) -> HostRole {
+const fn member_role(role: Role) -> HostRole {
     match role {
         Role::Scheduler => HostRole::Scheduler,
         Role::Worker => HostRole::Worker,
@@ -32,7 +32,7 @@ fn member_role(role: Role) -> HostRole {
     }
 }
 
-fn role_name(role: HostRole) -> &'static str {
+const fn role_name(role: HostRole) -> &'static str {
     match role {
         HostRole::Scheduler => "Scheduler",
         HostRole::Worker => "Worker",

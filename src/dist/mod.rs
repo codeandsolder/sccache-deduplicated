@@ -985,6 +985,8 @@ pub enum JobAssignment {
 #[cfg(feature = "dist-server")]
 pub trait SchedulerOutgoing {
     // To Server
+    /// # Errors
+    /// The worker could not be contacted or rejected the assignment.
     fn do_assign_job(
         &self,
         server_id: ServerId,
@@ -997,19 +999,29 @@ pub trait SchedulerOutgoing {
 #[cfg(feature = "dist-server")]
 pub trait ServerOutgoing: Send + Sync {
     // To Scheduler
+    /// # Errors
+    /// The scheduler could not accept or acknowledge the state update.
     fn do_update_job_state(&self, job_id: JobId, state: JobState) -> Result<UpdateJobStateResult>;
 }
 
 // Trait to handle the creation and verification of job authorization tokens
 #[cfg(feature = "dist-server")]
 pub trait JobAuthorizer: Send {
+    /// # Errors
+    /// The job capability could not be signed.
     fn generate_token(&self, job_id: JobId) -> Result<String>;
+    /// # Errors
+    /// The supplied capability is invalid for the job.
     fn verify_token(&self, job_id: JobId, token: &str) -> Result<()>;
+    /// # Errors
+    /// The exact-content capability could not be signed.
     fn generate_blob_token(
         &self,
         blob: crate::build_runtime::BlobRef,
         recipient: crate::build_runtime::wire::BlobRecipient,
     ) -> Result<String>;
+    /// # Errors
+    /// The supplied capability is invalid for the requested content and recipient.
     fn verify_blob_token(
         &self,
         blob: crate::build_runtime::BlobRef,
@@ -1158,6 +1170,8 @@ impl WorkerCapabilities {
 #[cfg(feature = "dist-server")]
 pub trait SchedulerIncoming: Send + Sync {
     // From Client
+    /// # Errors
+    /// Worker selection or assignment failed.
     fn handle_alloc_job(
         &self,
         requester: &dyn SchedulerOutgoing,
@@ -1175,6 +1189,8 @@ pub trait SchedulerIncoming: Send + Sync {
         packages: std::sync::Arc<crate::build_runtime::PackageCatalog>,
     ) -> ExtResult<AllocJobResult, Error>;
     /// Select likely sources for a missing exact blob without allocating a job.
+    /// # Errors
+    /// The scheduler could not access worker state or sign a source capability.
     fn native_blob_sources(
         &self,
         blob: crate::build_runtime::BlobRef,
@@ -1191,6 +1207,8 @@ pub trait SchedulerIncoming: Send + Sync {
         event: NativeLifecycleEvent<'_>,
     );
     // From Server
+    /// # Errors
+    /// Worker state could not be validated or updated.
     fn handle_heartbeat_server(
         &self,
         server_id: ServerId,
@@ -1201,6 +1219,8 @@ pub trait SchedulerIncoming: Send + Sync {
         capabilities: WorkerCapabilities,
     ) -> ExtResult<HeartbeatServerResult, Error>;
     // From Server, best-effort observability metadata.
+    /// # Errors
+    /// Worker metadata could not be updated.
     fn handle_update_worker_name(
         &self,
         _server_id: ServerId,
@@ -1210,10 +1230,14 @@ pub trait SchedulerIncoming: Send + Sync {
         Ok(())
     }
     // From Client, best-effort observability metadata.
+    /// # Errors
+    /// Worker metadata could not be read.
     fn handle_get_worker_name(&self, _server_id: ServerId) -> ExtResult<Option<String>, Error> {
         Ok(None)
     }
     // From Server
+    /// # Errors
+    /// The job is unknown or its state transition is invalid.
     fn handle_update_job_state(
         &self,
         job_id: JobId,
@@ -1221,10 +1245,16 @@ pub trait SchedulerIncoming: Send + Sync {
         job_state: JobState,
     ) -> ExtResult<UpdateJobStateResult, Error>;
     // From anyone
+    /// # Errors
+    /// Scheduler state could not be read.
     fn handle_status(&self) -> ExtResult<SchedulerStatusResult, Error>;
     #[cfg(feature = "scheduler-dashboard")]
+    /// # Errors
+    /// Scheduler status could not be collected.
     fn handle_dashboard_snapshot(&self) -> ExtResult<sccache_dashboard::Snapshot, Error>;
     #[cfg(feature = "scheduler-dashboard")]
+    /// # Errors
+    /// The dashboard wake channel could not be registered.
     fn install_dashboard_waker(
         &self,
         sender: std::sync::mpsc::SyncSender<()>,
@@ -1241,10 +1271,14 @@ pub trait ServerIncoming: Send + Sync {
     /// Compiler slots in use, excluding jobs waiting for input or a slot.
     fn executing_jobs(&self) -> usize;
     // From Scheduler
+    /// # Errors
+    /// The worker could not reserve the assignment.
     fn handle_assign_job(&self, job_id: JobId, tc: Toolchain) -> ExtResult<AssignJobResult, Error>;
     fn capabilities(&self) -> WorkerCapabilities;
     fn native_metadata_limit(&self) -> Option<usize>;
     /// Open an exact local CAS blob for an authenticated scheduler request.
+    /// # Errors
+    /// The local content store could not read the exact blob.
     fn handle_native_blob(
         &self,
         blob: crate::build_runtime::BlobRef,
@@ -1270,12 +1304,16 @@ pub trait ServerIncoming: Send + Sync {
     ) -> ExtResult<crate::build_runtime::wire::NativeRunResult, Error>;
     // Reconcile scheduler-side reservations against local unclaimed jobs.
     // The cutoff predates the heartbeat request; later assignments must survive.
+    /// # Errors
+    /// Worker reservations could not be reconciled.
     fn handle_reconcile_assignments(
         &self,
         assigned_job_ids: &[JobId],
         heartbeat_started_at: std::time::Instant,
     ) -> ExtResult<usize, Error>;
     // From Client
+    /// # Errors
+    /// The uploaded toolchain could not be validated or installed.
     fn handle_submit_toolchain(
         &self,
         requester: &dyn ServerOutgoing,
@@ -1283,6 +1321,8 @@ pub trait ServerIncoming: Send + Sync {
         tc_rdr: ToolchainReader<'_>,
     ) -> ExtResult<SubmitToolchainResult, Error>;
     // From Client
+    /// # Errors
+    /// The worker could not execute or report the assigned build.
     fn handle_run_job(
         &self,
         requester: &dyn ServerOutgoing,
@@ -1296,6 +1336,8 @@ pub trait ServerIncoming: Send + Sync {
 #[cfg(feature = "dist-server")]
 pub trait BuilderIncoming: Send + Sync {
     // From Server
+    /// # Errors
+    /// The builder could not prepare or execute the compilation.
     fn run_build(
         &self,
         job_id: JobId,

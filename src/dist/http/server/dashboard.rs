@@ -57,7 +57,7 @@ pub(super) fn snapshot(sessions: &NativeSessions, network: &NetworkMeter) -> Nat
                 logical_bytes: stats.logical_bytes,
                 pending_gc_blobs: stats.pending_gc_blobs,
                 pending_gc_bytes: stats.pending_gc_bytes,
-            })
+            });
         }
         Err(error) => {
             warn!("dashboard CAS stats unavailable: {error:#}");

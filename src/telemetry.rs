@@ -19,7 +19,7 @@ use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
-pub(crate) const CAPABILITY: &str = "direct-metrics";
+pub const CAPABILITY: &str = "direct-metrics";
 
 const URL_ENV: &str = "SCCACHE_METRICS_URL";
 const INSTANCE_ENV: &str = "SCCACHE_METRICS_INSTANCE";
