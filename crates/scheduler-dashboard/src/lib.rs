@@ -40,11 +40,12 @@ pub struct Worker {
     pub compiler_demand: usize,
     pub max_jobs: usize,
     pub available: usize,
-    pub archive: bool,
+    pub archive_available: Option<usize>,
+    pub native_available: Option<usize>,
     pub native: Option<NativeWorker>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeWorker {
     pub reservations: usize,
     pub capacity: u32,
@@ -66,16 +67,18 @@ pub struct NativeWorker {
 pub struct Job {
     pub id: String,
     pub worker: String,
+    pub worker_address: String,
     pub state: String,
     pub native_phase: Option<String>,
-    pub assigned_at_ms: u64,
-    pub state_since_ms: u64,
+    pub native_phase_observed_ns: Option<u64>,
+    pub assigned_at_ms: Option<u64>,
+    pub state_since_ms: Option<u64>,
     pub remaining_input_bytes: Option<u64>,
     pub remaining_input_blobs: Option<u64>,
     pub predicted_completion_secs: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkPeer {
     pub peer: String,
     pub direction: String,
@@ -86,14 +89,20 @@ pub struct NetworkPeer {
     pub body_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkGroup {
     pub direction: String,
     pub peers: String,
     pub bytes_per_second: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConcurrentGroup {
+    pub direction: String,
+    pub rates: Vec<(String, u64)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cache {
     pub actions: u64,
     pub results: u64,
@@ -109,11 +118,17 @@ pub struct Snapshot {
     pub totals: Totals,
     pub workers: Vec<Worker>,
     pub jobs: Vec<Job>,
-    pub jobs_total: usize,
+}
+
+/// Independent, periodically collected CAS and network observations.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct NativeTelemetry {
+    pub sampled_at: u64,
     pub cache: Option<Cache>,
     pub cache_error: Option<String>,
     pub network: Vec<NetworkPeer>,
     pub shared_capacity: Vec<NetworkGroup>,
+    pub independent_capacity: Vec<ConcurrentGroup>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -127,6 +142,7 @@ pub struct DashboardData {
     pub revision: u64,
     pub sampled_at: Option<u64>,
     pub snapshot: Option<Snapshot>,
+    pub telemetry: Option<NativeTelemetry>,
     pub history: Vec<Sample>,
     pub error: Option<String>,
 }
@@ -182,16 +198,18 @@ impl TimeRange {
         Self::SevenDays,
     ];
 
+    #[must_use = "the range determines the historical query interval"]
     pub const fn seconds(self) -> u64 {
         match self {
             Self::FifteenMinutes => 900,
             Self::OneHour => 3600,
             Self::SixHours => 21600,
             Self::OneDay => 86400,
-            Self::SevenDays => 604800,
+            Self::SevenDays => 604_800,
         }
     }
 
+    #[must_use = "the resolution determines the sampling grid"]
     pub const fn step(self) -> u64 {
         match self {
             Self::FifteenMinutes => 5,
@@ -202,6 +220,7 @@ impl TimeRange {
         }
     }
 
+    #[must_use = "the value identifies a selected range"]
     pub const fn value(self) -> &'static str {
         match self {
             Self::FifteenMinutes => "fifteen_minutes",
@@ -212,6 +231,7 @@ impl TimeRange {
         }
     }
 
+    #[must_use = "the label describes the selected range"]
     pub const fn label(self) -> &'static str {
         match self {
             Self::FifteenMinutes => "15 minutes",
@@ -233,11 +253,11 @@ pub struct MetricsView {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NativeEvent {
-    Reset(DashboardData),
+    Reset(Box<DashboardData>),
     Patch(Box<NativePatch>),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rows<T> {
     pub upsert: Vec<T>,
     pub remove: Vec<String>,
@@ -252,12 +272,6 @@ impl<T> Default for Rows<T> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CacheUpdate {
-    pub stats: Option<Cache>,
-    pub error: Option<String>,
-}
-
 /// A patch always belongs to exactly one previous revision. Reset messages
 /// replace the whole state after connecting or falling behind the broadcast.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -269,10 +283,7 @@ pub struct NativePatch {
     pub totals: Option<Totals>,
     pub workers: Rows<Worker>,
     pub jobs: Rows<Job>,
-    pub jobs_total: Option<usize>,
-    pub cache: Option<CacheUpdate>,
-    pub network: Option<Vec<NetworkPeer>>,
-    pub shared_capacity: Option<Vec<NetworkGroup>>,
+    pub telemetry: Option<NativeTelemetry>,
 }
 
 mod protocol;

@@ -908,10 +908,13 @@ impl ServerDetails {
         )
     }
 
+    fn admission_slots(&self, job_slack: JobSlackConfig) -> usize {
+        job_slack
+            .max_jobs(self.cpu_capacity)
+            .saturating_sub(self.compiler_demand())
+    }
+
     fn native_headroom(&self) -> usize {
-        if self.capabilities.archive {
-            return usize::MAX;
-        }
         self.capabilities
             .native_placement
             .as_ref()
@@ -1970,10 +1973,12 @@ impl SchedulerIncoming for Scheduler {
                 servers
                     .values()
                     .map(|v| {
-                        self.job_slack
-                            .max_jobs(v.cpu_capacity)
-                            .saturating_sub(v.compiler_demand())
-                            .min(v.native_headroom())
+                        let slots = v.admission_slots(self.job_slack);
+                        if v.capabilities.archive {
+                            slots
+                        } else {
+                            slots.min(v.native_headroom())
+                        }
                     })
                     .fold(0, usize::saturating_add)
             },
@@ -3186,14 +3191,24 @@ mod scheduler_tests {
         fn do_assign_job(
             &self,
             _server_id: ServerId,
-            _job_id: JobId,
+            job_id: JobId,
             _assignment: JobAssignment,
             _auth: String,
         ) -> Result<AssignJobResult> {
+            let _ = job_id;
             // Status must include reservations even before a JobDetail exists.
             let status = self.0.handle_status()?;
             assert_eq!(status.in_progress, 1);
             assert_eq!(status.available_jobs, status.max_jobs - 1);
+            #[cfg(feature = "scheduler-dashboard")]
+            {
+                let snapshot = self.0.handle_dashboard_snapshot()?;
+                assert_eq!(snapshot.totals.assigned, 1);
+                assert_eq!(snapshot.totals.assigning, 1);
+                assert_eq!(snapshot.jobs.len(), 1);
+                assert_eq!(snapshot.jobs[0].id, job_id.to_string());
+                assert_eq!(snapshot.jobs[0].state, "Assigning");
+            }
             Ok(AssignJobResult {
                 state: JobState::Pending,
                 need_toolchain: false,

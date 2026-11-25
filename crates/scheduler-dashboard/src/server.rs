@@ -1,9 +1,8 @@
 //! Scheduler-local HTTP listener, independent sampler and SSE broadcast.
 use std::{
-    convert::Infallible,
     net::{SocketAddr, TcpListener},
     path::Path,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -14,89 +13,88 @@ use axum::{
     http::header,
     response::{
         IntoResponse,
-        sse::{Event, KeepAlive, Sse},
+        sse::{KeepAlive, Sse},
     },
     routing::{get, post},
 };
-use futures::{Stream, stream};
 use leptos::prelude::*;
-use tokio::sync::broadcast;
 use tower_http::{services::ServeDir, set_header::SetResponseHeaderLayer};
 
-use crate::{DashboardData, MetricsView, NativeEvent, Sample, Snapshot, apply_event, make_patch};
+use crate::{
+    DashboardData, MetricsView, NativeEvent, NativeTelemetry, Sample, Snapshot, apply_event,
+    make_patch,
+};
 
+mod broadcast;
 mod metrics;
 
 #[derive(Clone)]
 pub(crate) struct DashboardState {
-    data: Arc<Mutex<DashboardData>>,
-    changes: broadcast::Sender<Arc<str>>,
+    feed: Arc<broadcast::Feed<DashboardData>>,
 }
 
 impl Default for DashboardState {
     fn default() -> Self {
-        let (changes, _) = broadcast::channel(32);
         Self {
-            data: Arc::default(),
-            changes,
+            feed: Arc::new(broadcast::Feed::new(DashboardData::default(), 32)),
         }
     }
 }
 
 impl DashboardState {
-    fn lock(&self) -> MutexGuard<'_, DashboardData> {
-        self.data
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     pub(crate) fn snapshot(&self) -> DashboardData {
-        self.lock().clone()
+        self.feed.inspect(Clone::clone)
     }
 
-    fn publish(&self, result: Result<Snapshot>, history: bool) -> Result<()> {
-        let mut state = self.lock();
-        let patch = match result {
-            Ok(snapshot) => {
-                if !history && state.snapshot.as_ref() == Some(&snapshot) && state.error.is_none() {
-                    return Ok(());
+    fn publish(
+        &self,
+        result: Result<Snapshot>,
+        history: bool,
+        telemetry: Option<NativeTelemetry>,
+    ) -> Result<()> {
+        self.feed.publish(|state| {
+            let mut patch = match result {
+                Ok(snapshot) => {
+                    if !history
+                        && state.snapshot.as_ref() == Some(&snapshot)
+                        && state.error.is_none()
+                    {
+                        return Ok(None);
+                    }
+                    let timestamp = now();
+                    let sample = history.then(|| Sample {
+                        unix_secs: timestamp,
+                        totals: snapshot.totals.clone(),
+                    });
+                    make_patch(state, Some(&snapshot), Some(timestamp), sample, None)
                 }
-                let timestamp = now();
-                let sample = history.then(|| Sample {
-                    unix_secs: timestamp,
-                    totals: snapshot.totals.clone(),
-                });
-                let mut patch = make_patch(&state, Some(&snapshot), sample, None);
-                patch.sampled_at = Some(timestamp);
-                patch
+                Err(error) => {
+                    let message = "Scheduler snapshot unavailable; showing last successful sample";
+                    if state.error.as_deref() == Some(message) && telemetry.is_none() {
+                        return Ok(None);
+                    }
+                    log::warn!("dashboard sample failed: {error:#}");
+                    make_patch(state, None, None, None, Some(message.into()))
+                }
+            };
+            if let Some(mut telemetry) = telemetry {
+                telemetry.sampled_at = now();
+                if telemetry.cache_error.is_some() && telemetry.cache.is_none() {
+                    telemetry.cache = state
+                        .telemetry
+                        .as_ref()
+                        .and_then(|previous| previous.cache.clone());
+                }
+                patch.telemetry = Some(telemetry);
             }
-            Err(error) => {
-                log::warn!("dashboard sample failed: {error:#}");
-                make_patch(
-                    &state,
-                    None,
-                    None,
-                    Some("Scheduler snapshot unavailable; showing last successful sample".into()),
-                )
-            }
-        };
-        let event = NativeEvent::Patch(Box::new(patch));
-        let payload: Arc<str> = serde_json::to_string(&event)?.into();
-        ensure!(
-            apply_event(&mut state, event),
-            "internal dashboard revision mismatch"
-        );
-        // Serialize once per producer update, not once per connected browser.
-        // Subscription/reset also takes this lock, eliminating the initial-state race.
-        let _ = self.changes.send(payload);
-        Ok(())
-    }
-
-    fn subscribe(&self) -> Result<(String, broadcast::Receiver<Arc<str>>)> {
-        let state = self.lock();
-        let rx = self.changes.subscribe();
-        let reset = serde_json::to_string(&NativeEvent::Reset(state.clone()))?;
-        Ok((reset, rx))
+            let event = NativeEvent::Patch(Box::new(patch));
+            let payload: Arc<str> = serde_json::to_string(&event)?.into();
+            ensure!(
+                apply_event(state, event),
+                "internal dashboard revision mismatch"
+            );
+            Ok(Some(payload))
+        })
     }
 }
 
@@ -105,29 +103,6 @@ pub(super) fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn event(data: impl AsRef<str>) -> Event {
-    Event::default().data(data.as_ref())
-}
-
-fn native_stream(state: DashboardState) -> impl Stream<Item = Result<Event, Infallible>> {
-    stream::unfold(
-        (state, None),
-        |(state, rx): (DashboardState, Option<broadcast::Receiver<Arc<str>>>)| async move {
-            let next = match rx {
-                Some(mut rx) => match rx.recv().await {
-                    Ok(payload) => Some((event(payload), rx)),
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        state.subscribe().ok().map(|(reset, rx)| (event(reset), rx))
-                    }
-                    Err(broadcast::error::RecvError::Closed) => None,
-                },
-                None => state.subscribe().ok().map(|(reset, rx)| (event(reset), rx)),
-            };
-            next.map(|(event, rx)| (Ok(event), (state, Some(rx))))
-        },
-    )
 }
 
 /// Bind only a loopback listener. Assets and the metrics endpoint are explicit
@@ -140,6 +115,7 @@ pub fn spawn(
     assets: &Path,
     metrics_url: Option<&str>,
     snapshot: impl Fn() -> Result<Snapshot> + Send + 'static,
+    telemetry: impl Fn() -> Option<NativeTelemetry> + Send + 'static,
     wake: std::sync::mpsc::Receiver<()>,
 ) -> Result<SocketAddr> {
     ensure!(
@@ -172,7 +148,7 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("scheduler-dashboard-sampler".into())
         .spawn(move || {
-            sample_loop(status_state, snapshot, wake);
+            sample_loop(status_state, snapshot, telemetry, wake);
         })?;
     let router = router(state, metrics, assets);
     std::thread::Builder::new()
@@ -196,6 +172,7 @@ pub fn spawn(
 fn sample_loop(
     state: DashboardState,
     snapshot: impl Fn() -> Result<Snapshot>,
+    telemetry: impl Fn() -> Option<NativeTelemetry>,
     wake: std::sync::mpsc::Receiver<()>,
 ) {
     use std::time::Instant;
@@ -208,7 +185,11 @@ fn sample_loop(
         if history {
             next_history = now + HISTORY_INTERVAL;
         }
-        if let Err(error) = state.publish(snapshot(), history) {
+        if let Err(error) = state.publish(
+            snapshot(),
+            history,
+            if history { telemetry() } else { None },
+        ) {
             log::error!("dashboard publish failed: {error:#}");
         }
         let next_change = Instant::now() + MIN_CHANGE_INTERVAL;
@@ -254,7 +235,9 @@ fn router(state: DashboardState, metrics: metrics::MetricsService, assets: &Path
             "/api/events",
             get(move || {
                 let state = state.clone();
-                async move { Sse::new(native_stream(state)).keep_alive(KeepAlive::default()) }
+                async move {
+                    Sse::new(broadcast::events(state.feed, ())).keep_alive(KeepAlive::default())
+                }
             }),
         )
         .route(
@@ -288,9 +271,9 @@ mod tests {
     fn failed_samples_preserve_last_good_data_and_history_is_bounded() -> Result<()> {
         let state = DashboardState::default();
         for _ in 0..=HISTORY_CAPACITY {
-            state.publish(Ok(Snapshot::default()), true)?;
+            state.publish(Ok(Snapshot::default()), true, None)?;
         }
-        state.publish(Err(anyhow::anyhow!("failure")), true)?;
+        state.publish(Err(anyhow::anyhow!("failure")), true, None)?;
         let status = state.snapshot();
         assert_eq!(status.history.len(), HISTORY_CAPACITY);
         assert!(status.snapshot.is_some());
@@ -301,22 +284,22 @@ mod tests {
     #[tokio::test]
     async fn subscription_reset_has_no_gap_and_lag_is_resynchronizable() -> Result<()> {
         let state = DashboardState::default();
-        state.publish(Ok(Snapshot::default()), true)?;
-        let (reset, mut rx) = state.subscribe()?;
+        state.publish(Ok(Snapshot::default()), true, None)?;
+        let (reset, mut rx) = state.feed.subscribe()?;
         let mut client = DashboardData::default();
         assert!(apply_event(&mut client, serde_json::from_str(&reset)?));
-        state.publish(Ok(Snapshot::default()), true)?;
+        state.publish(Ok(Snapshot::default()), true, None)?;
         let event = rx.recv().await?;
         assert!(apply_event(&mut client, serde_json::from_str(&event)?));
         assert_eq!(client, state.snapshot());
         for _ in 0..40 {
-            state.publish(Ok(Snapshot::default()), true)?;
+            state.publish(Ok(Snapshot::default()), true, None)?;
         }
         assert!(matches!(
             rx.recv().await,
-            Err(broadcast::error::RecvError::Lagged(_))
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
         ));
-        let (reset, _) = state.subscribe()?;
+        let (reset, _) = state.feed.subscribe()?;
         assert!(apply_event(&mut client, serde_json::from_str(&reset)?));
         assert_eq!(client, state.snapshot());
         Ok(())
@@ -325,13 +308,13 @@ mod tests {
     #[tokio::test]
     async fn change_notification_does_not_grow_history() -> Result<()> {
         let state = DashboardState::default();
-        state.publish(Ok(Snapshot::default()), true)?;
-        let (reset, mut rx) = state.subscribe()?;
+        state.publish(Ok(Snapshot::default()), true, None)?;
+        let (reset, mut rx) = state.feed.subscribe()?;
         let mut client = DashboardData::default();
         assert!(apply_event(&mut client, serde_json::from_str(&reset)?));
         let mut snapshot = Snapshot::default();
         snapshot.totals.workers = 2;
-        state.publish(Ok(snapshot), false)?;
+        state.publish(Ok(snapshot), false, None)?;
         let event = rx.recv().await?;
         assert!(apply_event(&mut client, serde_json::from_str(&event)?));
         assert_eq!(client.history.len(), 1);
@@ -368,7 +351,7 @@ mod tests {
     #[tokio::test]
     async fn http_stream_reconnects_with_current_snapshot() -> Result<()> {
         let state = DashboardState::default();
-        state.publish(Ok(Snapshot::default()), true)?;
+        state.publish(Ok(Snapshot::default()), true, None)?;
         let metrics = metrics::MetricsService::new(None)?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let base = format!("http://{}", listener.local_addr()?);
@@ -396,7 +379,7 @@ mod tests {
         drop(response);
         let mut changed = Snapshot::default();
         changed.totals.workers = 7;
-        state.publish(Ok(changed), false)?;
+        state.publish(Ok(changed), false, None)?;
         let mut response = client
             .get(format!("{base}/api/events"))
             .send()

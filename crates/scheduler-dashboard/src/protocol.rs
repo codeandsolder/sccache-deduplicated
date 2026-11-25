@@ -2,9 +2,7 @@
 //! consumer can silently continue with a missing revision.
 use std::collections::BTreeMap;
 
-use crate::{
-    CacheUpdate, DashboardData, HISTORY_CAPACITY, NativeEvent, NativePatch, Rows, Sample, Snapshot,
-};
+use crate::{DashboardData, HISTORY_CAPACITY, NativeEvent, NativePatch, Rows, Sample, Snapshot};
 
 fn diff_rows<T: Clone + PartialEq>(old: &[T], new: &[T], key: impl Fn(&T) -> &str) -> Rows<T> {
     let mut previous: BTreeMap<_, _> = old.iter().map(|row| (key(row), row)).collect();
@@ -34,15 +32,17 @@ fn apply_rows<T>(rows: &mut Vec<T>, delta: Rows<T>, key: impl Fn(&T) -> &str) {
     rows.extend(indexed.into_values());
 }
 
+#[must_use = "the patch advances the native feed revision"]
 pub fn make_patch(
     previous: &DashboardData,
     snapshot: Option<&Snapshot>,
+    sampled_at: Option<u64>,
     sample: Option<Sample>,
     error: Option<String>,
 ) -> NativePatch {
     let mut patch = NativePatch {
         revision: previous.revision.saturating_add(1),
-        sampled_at: sample.as_ref().map(|sample| sample.unix_secs),
+        sampled_at,
         sample,
         error,
         ..Default::default()
@@ -54,15 +54,6 @@ pub fn make_patch(
             (previous.snapshot.is_none() || old.totals != new.totals).then(|| new.totals.clone());
         patch.workers = diff_rows(&old.workers, &new.workers, |row| &row.address);
         patch.jobs = diff_rows(&old.jobs, &new.jobs, |row| &row.id);
-        patch.jobs_total = (old.jobs_total != new.jobs_total).then_some(new.jobs_total);
-        patch.cache =
-            (old.cache != new.cache || old.cache_error != new.cache_error).then(|| CacheUpdate {
-                stats: new.cache.clone(),
-                error: new.cache_error.clone(),
-            });
-        patch.network = (old.network != new.network).then(|| new.network.clone());
-        patch.shared_capacity =
-            (old.shared_capacity != new.shared_capacity).then(|| new.shared_capacity.clone());
     }
     patch
 }
@@ -71,7 +62,7 @@ pub fn make_patch(
 pub fn apply_event(state: &mut DashboardData, event: NativeEvent) -> bool {
     let patch = match event {
         NativeEvent::Reset(reset) => {
-            *state = reset;
+            *state = *reset;
             return true;
         }
         NativeEvent::Patch(patch) => *patch,
@@ -94,23 +85,15 @@ pub fn apply_event(state: &mut DashboardData, event: NativeEvent) -> bool {
             snapshot.totals = totals;
         }
         apply_rows(&mut snapshot.workers, patch.workers, |row| &row.address);
-        apply_rows(&mut snapshot.jobs, patch.jobs, |row| &row.id);
-        snapshot
-            .jobs
-            .sort_unstable_by(|a, b| (a.assigned_at_ms, &a.id).cmp(&(b.assigned_at_ms, &b.id)));
-        if let Some(total) = patch.jobs_total {
-            snapshot.jobs_total = total;
+        if !patch.jobs.upsert.is_empty() || !patch.jobs.remove.is_empty() {
+            apply_rows(&mut snapshot.jobs, patch.jobs, |row| &row.id);
+            snapshot
+                .jobs
+                .sort_unstable_by(|a, b| (a.assigned_at_ms, &a.id).cmp(&(b.assigned_at_ms, &b.id)));
         }
-        if let Some(cache) = patch.cache {
-            snapshot.cache = cache.stats;
-            snapshot.cache_error = cache.error;
-        }
-        if let Some(network) = patch.network {
-            snapshot.network = network;
-        }
-        if let Some(groups) = patch.shared_capacity {
-            snapshot.shared_capacity = groups;
-        }
+    }
+    if let Some(telemetry) = patch.telemetry {
+        state.telemetry = Some(telemetry);
     }
     true
 }
@@ -124,10 +107,12 @@ mod tests {
         Job {
             id: id.into(),
             worker: "worker".into(),
+            worker_address: "127.0.0.1:1".into(),
             state: "ready".into(),
             native_phase: None,
-            assigned_at_ms: 100,
-            state_since_ms: 100,
+            native_phase_observed_ns: None,
+            assigned_at_ms: Some(100),
+            state_since_ms: Some(100),
             remaining_input_bytes: None,
             remaining_input_blobs: None,
             predicted_completion_secs: None,
@@ -139,20 +124,30 @@ mod tests {
         let mut state = DashboardData::default();
         let mut snapshot = Snapshot {
             jobs: vec![job("1"), job("2")],
-            jobs_total: 2,
             ..Default::default()
         };
         let sample = Sample {
             unix_secs: 1,
             totals: Totals::default(),
         };
-        let patch = make_patch(&state, Some(&snapshot), Some(sample.clone()), None);
+        let patch = make_patch(
+            &state,
+            Some(&snapshot),
+            Some(sample.unix_secs),
+            Some(sample.clone()),
+            None,
+        );
         assert!(apply_event(&mut state, NativeEvent::Patch(Box::new(patch))));
         assert_eq!(state.snapshot.as_ref(), Some(&snapshot));
         snapshot.jobs.remove(0);
         snapshot.jobs[0].state = "started".into();
-        snapshot.jobs_total = 1;
-        let patch = make_patch(&state, Some(&snapshot), Some(sample), None);
+        let patch = make_patch(
+            &state,
+            Some(&snapshot),
+            Some(sample.unix_secs),
+            Some(sample),
+            None,
+        );
         assert_eq!(patch.jobs.remove, vec!["1"]);
         assert_eq!(patch.jobs.upsert.len(), 1);
         let wire = serde_json::to_string(&NativeEvent::Patch(Box::new(patch))).unwrap();
@@ -177,6 +172,7 @@ mod tests {
         let patch = make_patch(
             &state,
             Some(&snapshot),
+            Some(1),
             Some(Sample {
                 unix_secs: 1,
                 totals: Totals::default(),
@@ -186,7 +182,7 @@ mod tests {
         assert!(patch.workers.upsert.is_empty());
         assert!(patch.jobs.upsert.is_empty());
         assert!(patch.totals.is_none());
-        assert!(patch.network.is_none());
+        assert!(patch.telemetry.is_none());
     }
 }
 
@@ -277,6 +273,7 @@ fn panel_patch(old: &MetricPanel, new: &MetricPanel) -> Option<PanelPatch> {
     }
 }
 
+#[must_use = "the patch advances the metrics feed revision"]
 pub fn make_metrics_patch(old: &MetricsData, new: &MetricsData) -> MetricsPatch {
     let previous: BTreeMap<_, _> = old.panels.iter().map(|panel| (panel.key, panel)).collect();
     MetricsPatch {

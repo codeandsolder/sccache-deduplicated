@@ -33,18 +33,24 @@ pub(super) fn NativeStatus(data: Memo<Option<DashboardData>>) -> impl IntoView {
                 .map_or_else(Vec::new, |snapshot| snapshot.jobs.clone())
         })
     });
+    let telemetry =
+        Memo::new(move |_| data.with(|data| data.as_ref().and_then(|data| data.telemetry.clone())));
     let cache = Memo::new(move |_| {
-        snapshot.with(|snapshot| {
-            snapshot
+        telemetry.with(|telemetry| {
+            telemetry
                 .as_ref()
-                .map(|snapshot| (snapshot.cache.clone(), snapshot.cache_error.clone()))
+                .map(|telemetry| (telemetry.cache.clone(), telemetry.cache_error.clone()))
         })
     });
     let network = Memo::new(move |_| {
-        snapshot.with(|snapshot| {
-            snapshot
-                .as_ref()
-                .map(|snapshot| (snapshot.network.clone(), snapshot.shared_capacity.clone()))
+        telemetry.with(|telemetry| {
+            telemetry.as_ref().map(|telemetry| {
+                (
+                    telemetry.network.clone(),
+                    telemetry.shared_capacity.clone(),
+                    telemetry.independent_capacity.clone(),
+                )
+            })
         })
     });
     view! {
@@ -83,6 +89,7 @@ pub(super) fn NativeStatus(data: Memo<Option<DashboardData>>) -> impl IntoView {
         <WorkerTable workers=workers sampled_at=sampled_at/>
         <JobTable jobs=jobs sampled_at=sampled_at/>
         <section id="cas"><h2>"Scheduler CAS"</h2>
+            <p class=styles::muted>{move || telemetry.with(|value| value.as_ref().map_or_else(|| "No native telemetry yet".into(), |value| timestamp(Some(value.sampled_at))))}</p>
             {move || cache.get().map(|(cache,error)| view! {
                 {error.map(|error| view!{<p class=styles::warning>{error}</p>})}
                 {cache.map_or_else(|| view!{<p class=styles::muted>"No CAS snapshot available."</p>}.into_any(), |cache| view!{
@@ -94,7 +101,7 @@ pub(super) fn NativeStatus(data: Memo<Option<DashboardData>>) -> impl IntoView {
         </section>
         <section id="network"><h2>"Native transport"</h2>
             <p class=styles::muted>"Effective HTTP-body throughput estimates, not physical link rates."</p>
-            {move || network.get().map(|(peers,groups)| view!{
+            {move || network.get().map(|(peers,groups,independent)| view!{
                 <div class=styles::tablewrap><table><thead><tr><th>"Peer"</th><th>"Direction"</th><th>"Observed"</th><th>"Isolated"</th><th>"Wire / logical"</th><th>"Remaining"</th><th>"Body bytes"</th></tr></thead><tbody>
                     {peers.into_iter().map(|peer| view!{
                         <tr><td>{peer.peer}</td><td>{peer.direction}</td><td>{rate(peer.observed_bytes_per_second)}</td><td>{rate(peer.isolated_bytes_per_second)}</td><td>{format!("{:.1}%", peer.wire_per_mille as f64 / 10.0)}</td><td>{bytes(peer.remaining_bytes)}</td><td>{bytes(peer.body_bytes)}</td></tr>
@@ -103,6 +110,11 @@ pub(super) fn NativeStatus(data: Memo<Option<DashboardData>>) -> impl IntoView {
                 <h3>"Shared capacity observations"</h3>
                 <div class=styles::tablewrap><table><thead><tr><th>"Direction"</th><th>"Peers"</th><th>"Effective capacity"</th></tr></thead><tbody>
                     {groups.into_iter().map(|group| view!{<tr><td>{group.direction}</td><td>{group.peers}</td><td>{rate(group.bytes_per_second)}</td></tr>}).collect_view()}
+                </tbody></table></div>
+                <h3>"Concurrent capacity observations"</h3>
+                <p class=styles::muted>"Peers that sustained their isolated rates together at the observed load."</p>
+                <div class=styles::tablewrap><table><thead><tr><th>"Direction"</th><th>"Concurrent peer rates"</th></tr></thead><tbody>
+                    {independent.into_iter().map(|group| view!{<tr><td>{group.direction}</td><td>{group.rates.into_iter().map(|(peer,value)| format!("{peer}: {}",rate(value))).collect::<Vec<_>>().join(" · ")}</td></tr>}).collect_view()}
                 </tbody></table></div>
             })}
         </section>
@@ -152,7 +164,7 @@ fn WorkerCells(worker: Worker, sampled_at: Memo<Option<u64>>) -> impl IntoView {
                 if native.residency_reported {"reported"} else {"unknown"}),
         ));
     view! {
-        <td><b>{worker.name}</b><small>{worker.address}</small><small>{if worker.archive {"Archive enabled"} else {"Native only"}}</small></td>
+        <td><b>{worker.name}</b><small>{worker.address}</small><small>{if worker.archive_available.is_some() {"Archive enabled"} else {"Native only"}}</small></td>
         <td>
             <span class=move || if sampled_at.get().is_some_and(|now| now.saturating_mul(1000).saturating_sub(worker.heartbeat_at_ms)>15_000) {styles::warning} else {styles::healthy}>
                 {move || age_since(sampled_at.get(), worker.heartbeat_at_ms)}
@@ -160,7 +172,7 @@ fn WorkerCells(worker: Worker, sampled_at: Memo<Option<u64>>) -> impl IntoView {
             {worker.last_error_at_ms.map(|error| view!{<small class=styles::warning>"Last error: "{move || age_since(sampled_at.get(), error)}" ago"</small>})}
         </td>
         <td>{format!("{:.1}",worker.cpu_capacity)}</td><td>{worker.assigned}" ("{worker.assigning}" assigning)"</td>
-        <td>{worker.compiler_demand}" / "{worker.max_jobs}</td><td>{worker.available}</td>
+        <td>{worker.compiler_demand}" / "{worker.max_jobs}</td><td>{worker.available}<small>{format!("Archive: {} · Native: {}",worker.archive_available.map_or_else(||"—".into(),|value|value.to_string()),worker.native_available.map_or_else(||"—".into(),|value|value.to_string()))}</small></td>
         <td>{execution}</td><td>{queue}</td><td>{phases}</td><td>{remaining}</td><td>{timing}</td>
     }
 }
@@ -184,7 +196,7 @@ fn JobTable(jobs: Memo<Vec<Job>>, sampled_at: Memo<Option<u64>>) -> impl IntoVie
             jobs.iter()
                 .filter(|job| {
                     filter.is_empty()
-                        || [&job.id, &job.worker, &job.state]
+                        || [&job.id, &job.worker, &job.worker_address, &job.state]
                             .iter()
                             .any(|value| value.to_lowercase().contains(&filter))
                         || job
@@ -215,7 +227,7 @@ fn JobTable(jobs: Memo<Vec<Job>>, sampled_at: Memo<Option<u64>>) -> impl IntoVie
                 <button disabled=move || current.get()+1 >= pages.get() on:click=move |_| page.set(current.get()+1)>"Next"</button>
                 <span>{move || format!("Page {} / {} · {} matching / {} jobs",current.get()+1,pages.get(),matching.with(Vec::len),jobs.with(Vec::len))}</span>
             </div>
-            <div class=styles::tablewrap><table><thead><tr><th>"Job"</th><th>"Worker"</th><th>"State"</th><th>"Native phase"</th><th>"Age"</th><th>"Phase age"</th><th>"Input remaining"</th><th>"Predicted completion (at assignment)"</th></tr></thead><tbody>
+            <div class=styles::tablewrap><table><thead><tr><th>"Job"</th><th>"Worker"</th><th>"State"</th><th>"Native phase"</th><th>"Age"</th><th>"Scheduler state age"</th><th>"Input remaining"</th><th>"Predicted completion (at assignment)"</th></tr></thead><tbody>
                 <For each=move || visible.get() key=Clone::clone children=move |key| {
                     let job = Memo::new(move |_| indexed.with(|jobs| jobs.get(&key).cloned()));
                     view!{<tr>{move || job.get().map(|job| view!{<JobCells job=job sampled_at=sampled_at/>})}</tr>}
@@ -228,8 +240,8 @@ fn JobTable(jobs: Memo<Vec<Job>>, sampled_at: Memo<Option<u64>>) -> impl IntoVie
 #[component]
 fn JobCells(job: Job, sampled_at: Memo<Option<u64>>) -> impl IntoView {
     view! {
-        <td>{job.id}</td><td>{job.worker}</td><td>{job.state}</td><td>{job.native_phase.unwrap_or_else(|| "—".into())}</td>
-        <td>{move || age_since(sampled_at.get(),job.assigned_at_ms)}</td><td>{move || age_since(sampled_at.get(),job.state_since_ms)}</td>
+        <td>{job.id}</td><td>{job.worker}<small>{job.worker_address}</small></td><td>{job.state}</td><td>{job.native_phase.unwrap_or_else(|| "—".into())}{job.native_phase_observed_ns.map(|ns|view!{<small>{age(ns as f64 / 1e9)}" at observation"</small>})}</td>
+        <td>{move || job.assigned_at_ms.map_or_else(|| "—".into(), |then| age_since(sampled_at.get(),then))}</td><td>{move || job.state_since_ms.map_or_else(|| "—".into(), |then| age_since(sampled_at.get(),then))}</td>
         <td>{job.remaining_input_bytes.map_or_else(|| "—".into(), bytes)}{job.remaining_input_blobs.map(|blobs| format!(" / {blobs} blobs"))}</td>
         <td>{job.predicted_completion_secs.map_or_else(|| "—".into(), age)}</td>
     }

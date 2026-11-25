@@ -11,12 +11,12 @@ use axum::{
     http::StatusCode,
     response::{
         IntoResponse, Response,
-        sse::{Event, KeepAlive, Sse},
+        sse::{KeepAlive, Sse},
     },
 };
-use futures::{Stream, StreamExt, stream};
+use futures::{StreamExt, stream};
 use serde::Deserialize;
-use tokio::sync::{Semaphore, broadcast, watch};
+use tokio::sync::{Semaphore, watch};
 
 use crate::{
     MetricPanel, MetricSeries, MetricsData, MetricsEvent, MetricsView, make_metrics_patch,
@@ -71,8 +71,7 @@ pub(super) struct MetricsService {
 }
 
 struct Feed {
-    data: Mutex<MetricsData>,
-    changes: broadcast::Sender<Arc<str>>,
+    data: Arc<super::broadcast::Feed<MetricsData>>,
     // Once the last lease is dropped this feed cannot be resurrected.
     subscribers: Mutex<usize>,
     stopped: watch::Sender<bool>,
@@ -80,15 +79,16 @@ struct Feed {
 
 impl Feed {
     fn new(view: MetricsView) -> Self {
-        let (changes, _) = broadcast::channel(4);
         let (stopped, _) = watch::channel(false);
         Self {
-            data: Mutex::new(MetricsData {
-                configured: true,
-                view,
-                ..Default::default()
-            }),
-            changes,
+            data: Arc::new(super::broadcast::Feed::new(
+                MetricsData {
+                    configured: true,
+                    view,
+                    ..Default::default()
+                },
+                4,
+            )),
             subscribers: Mutex::new(1),
             stopped,
         }
@@ -110,29 +110,14 @@ impl Feed {
         !*self.stopped.borrow()
     }
 
-    fn subscribe(&self) -> Result<(String, broadcast::Receiver<Arc<str>>)> {
-        let data = self
-            .data
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let receiver = self.changes.subscribe();
-        Ok((
-            serde_json::to_string(&MetricsEvent::Reset(data.clone()))?,
-            receiver,
-        ))
-    }
-
     fn publish(&self, mut data: MetricsData) -> Result<()> {
-        let mut previous = self
-            .data
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let patch = make_metrics_patch(&previous, &data);
-        data.revision = patch.revision;
-        let payload: Arc<str> = serde_json::to_string(&MetricsEvent::Patch(patch))?.into();
-        *previous = data;
-        let _ = self.changes.send(payload);
-        Ok(())
+        self.data.publish(|previous| {
+            let patch = make_metrics_patch(previous, &data);
+            data.revision = patch.revision;
+            let payload = serde_json::to_string(&MetricsEvent::Patch(patch))?.into();
+            *previous = data;
+            Ok(Some(payload))
+        })
     }
 }
 
@@ -150,32 +135,6 @@ impl Drop for Lease {
             self.0.stopped.send_replace(true);
         }
     }
-}
-
-fn feed_stream(
-    feed: Arc<Feed>,
-    subscription: Lease,
-) -> impl Stream<Item = Result<Event, Infallible>> {
-    stream::unfold(
-        (feed, subscription, None),
-        |(feed, subscription, receiver): (_, _, Option<broadcast::Receiver<Arc<str>>>)| async move {
-            let next = match receiver {
-                Some(mut receiver) => match receiver.recv().await {
-                    Ok(payload) => Some((super::event(payload), receiver)),
-                    Err(broadcast::error::RecvError::Lagged(_)) => feed
-                        .subscribe()
-                        .ok()
-                        .map(|(reset, receiver)| (super::event(reset), receiver)),
-                    Err(broadcast::error::RecvError::Closed) => None,
-                },
-                None => feed
-                    .subscribe()
-                    .ok()
-                    .map(|(reset, receiver)| (super::event(reset), receiver)),
-            };
-            next.map(|(event, receiver)| (Ok(event), (feed, subscription, Some(receiver))))
-        },
-    )
 }
 
 impl MetricsService {
@@ -224,8 +183,10 @@ impl MetricsService {
             };
             return match serde_json::to_string(&MetricsEvent::Reset(data)) {
                 Ok(payload) => Sse::new(
-                    stream::once(async move { Ok::<_, Infallible>(super::event(payload)) })
-                        .chain(stream::pending()),
+                    stream::once(
+                        async move { Ok::<_, Infallible>(super::broadcast::event(payload)) },
+                    )
+                    .chain(stream::pending()),
                 )
                 .keep_alive(KeepAlive::default())
                 .into_response(),
@@ -268,7 +229,7 @@ impl MetricsService {
                 (feed, subscription)
             }
         };
-        Sse::new(feed_stream(feed, subscriber))
+        Sse::new(super::broadcast::events(Arc::clone(&feed.data), subscriber))
             .keep_alive(KeepAlive::default())
             .into_response()
     }
@@ -346,17 +307,14 @@ async fn query(
     source: &Source,
     definition: &QueryDefinition,
     view: &MetricsView,
-    end: u64,
+    window: QueryWindow,
     index: usize,
 ) -> Result<Vec<MetricSeries>> {
     let mut url = source.base.join("api/v1/query_range")?;
     url.query_pairs_mut()
         .append_pair("query", &expression(definition, view))
-        .append_pair(
-            "start",
-            &end.saturating_sub(view.range.seconds()).to_string(),
-        )
-        .append_pair("end", &end.to_string())
+        .append_pair("start", &window.start.to_string())
+        .append_pair("end", &window.end.to_string())
         .append_pair("step", &view.range.step().to_string());
     let data: QueryData = get_json(source, url).await?;
     ensure!(data.result.len() <= MAX_SERIES, "too many metric series");
@@ -389,12 +347,69 @@ async fn query(
         .collect()
 }
 
+#[derive(Clone, Copy)]
+struct QueryWindow {
+    start: u64,
+    end: u64,
+    retain_from: u64,
+}
+
+impl QueryWindow {
+    fn new(view: &MetricsView, end: u64, previous_end: Option<u64>, full: bool) -> Self {
+        let retain_from = end.saturating_sub(view.range.seconds());
+        let step = view.range.step();
+        // Re-query the trailing five minutes or four buckets, whichever is
+        // longer. Periodic full reconciliation handles arbitrarily late
+        // corrections and changed historical label sets.
+        let overlap = 300_u64.div_ceil(step).max(4) * step;
+        let start = if full {
+            retain_from
+        } else {
+            previous_end.map_or(retain_from, |previous| {
+                previous.min(end).saturating_sub(overlap).max(retain_from)
+            })
+        };
+        Self {
+            start,
+            end,
+            retain_from,
+        }
+    }
+}
+
+fn merge_window(
+    previous: Vec<MetricSeries>,
+    incoming: Vec<MetricSeries>,
+    window: QueryWindow,
+) -> Vec<MetricSeries> {
+    let mut merged = BTreeMap::new();
+    for mut series in previous {
+        // A successful query is authoritative for its entire interval,
+        // including absent points and disappeared series.
+        series
+            .points
+            .retain(|(time, _)| *time >= window.retain_from as f64 && *time < window.start as f64);
+        if !series.points.is_empty() {
+            merged.insert(series.key.clone(), series);
+        }
+    }
+    for mut series in incoming {
+        if let Some(mut prior) = merged.remove(&series.key) {
+            prior.points.append(&mut series.points);
+            series.points = prior.points;
+        }
+        merged.insert(series.key.clone(), series);
+    }
+    merged.into_values().collect()
+}
+
 async fn read_panel(
     source: Arc<Source>,
     key: usize,
     definition: PanelDefinition,
     view: MetricsView,
-    end: u64,
+    window: QueryWindow,
+    previous: Option<MetricPanel>,
 ) -> MetricPanel {
     let mut panel = MetricPanel {
         key,
@@ -403,14 +418,44 @@ async fn read_panel(
         series: Vec::new(),
         error: None,
     };
-    for (index, definition) in definition.queries.iter().enumerate() {
-        match query(&source, definition, &view, end, index).await {
-            Ok(series) => panel.series.extend(series),
-            Err(error) => {
-                log::warn!("dashboard metrics panel {}: {error:#}", panel.title);
-                panel.error = Some("One or more queries failed".into());
+    let mut previous_by_query: BTreeMap<usize, Vec<MetricSeries>> = BTreeMap::new();
+    if let Some(previous) = previous {
+        for series in previous.series {
+            if let Some(index) = series
+                .key
+                .split_once(':')
+                .and_then(|(index, _)| index.parse::<usize>().ok())
+            {
+                previous_by_query.entry(index).or_default().push(series);
             }
         }
+    }
+    let mut failed = 0;
+    let count = definition.queries.len();
+    for (index, definition) in definition.queries.iter().enumerate() {
+        let previous = previous_by_query.remove(&index).unwrap_or_default();
+        match query(&source, definition, &view, window, index).await {
+            Ok(series) => panel.series.extend(merge_window(previous, series, window)),
+            Err(error) => {
+                log::warn!("dashboard metrics panel {}: {error:#}", panel.title);
+                failed += 1;
+                // Keep the last successful data within the selected range.
+                // The failure message makes the stale part explicit.
+                panel
+                    .series
+                    .extend(previous.into_iter().filter_map(|mut series| {
+                        series.points.retain(|(time, _)| {
+                            *time >= window.retain_from as f64 && *time <= window.end as f64
+                        });
+                        (!series.points.is_empty()).then_some(series)
+                    }));
+            }
+        }
+    }
+    if failed != 0 {
+        panel.error = Some(format!(
+            "{failed}/{count} queries failed; retained available previous samples"
+        ));
     }
     panel.series.sort_unstable_by(|a, b| a.key.cmp(&b.key));
     panel
@@ -433,11 +478,25 @@ async fn clients(source: &Source, end: u64, view: &MetricsView) -> Result<Vec<St
 }
 
 async fn refresh(source: Arc<Source>, feed: &Feed, view: MetricsView) {
+    let mut last_full = None;
     loop {
-        // Fixed time grid makes consecutive queries comparable, including late
-        // data arrivals. Account for the backend ingestion latency.
         let step = view.range.step();
         let end = super::now().saturating_sub(3) / step * step;
+        let previous = feed.data.inspect(Clone::clone);
+        // Do not query the same grid point repeatedly after a short cycle.
+        // Failed panels are retried on the following grid.
+        if previous.sampled_at == Some(end) {
+            tokio::time::sleep(Duration::from_secs(step.min(15))).await;
+            continue;
+        }
+        let full = last_full.is_none_or(|last| end.saturating_sub(last) >= (step * 4).max(600))
+            || previous.sampled_at.is_some_and(|last| end < last);
+        let previous_end = previous.sampled_at;
+        let mut old_panels: BTreeMap<_, _> = previous
+            .panels
+            .into_iter()
+            .map(|panel| (panel.key, panel))
+            .collect();
         let client_list = clients(&source, end, &view).await;
         let queries = source
             .definitions
@@ -445,20 +504,29 @@ async fn refresh(source: Arc<Source>, feed: &Feed, view: MetricsView) {
             .into_iter()
             .enumerate()
             .map(|(key, definition)| {
-                read_panel(Arc::clone(&source), key, definition, view.clone(), end)
+                let old = old_panels.remove(&key);
+                let full = full || old.as_ref().is_none_or(|panel| panel.error.is_some());
+                let window = QueryWindow::new(&view, end, previous_end, full);
+                read_panel(
+                    Arc::clone(&source),
+                    key,
+                    definition,
+                    view.clone(),
+                    window,
+                    old,
+                )
             })
             .collect::<Vec<_>>();
         let panels = stream::iter(queries).buffered(4).collect::<Vec<_>>().await;
+        if full {
+            last_full = Some(end);
+        }
         let (clients, error) = match client_list {
             Ok(clients) => (clients, None),
             Err(error) => {
                 log::warn!("dashboard client labels unavailable: {error:#}");
                 (
-                    feed.data
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clients
-                        .clone(),
+                    previous.clients,
                     Some("Client discovery unavailable".into()),
                 )
             }
@@ -475,13 +543,83 @@ async fn refresh(source: Arc<Source>, feed: &Feed, view: MetricsView) {
         if let Err(error) = feed.publish(data) {
             log::error!("dashboard metric publish failed: {error:#}");
         }
-        tokio::time::sleep(Duration::from_secs(step.max(15))).await;
+        // Align the next query with the time grid, but avoid hammering the
+        // store when the queries themselves take longer than one bucket.
+        let delay = end
+            .saturating_add(step)
+            .saturating_add(3)
+            .saturating_sub(super::now())
+            .max(15);
+        tokio::time::sleep(Duration::from_secs(delay)).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn series(key: &str, points: &[(f64, Option<f64>)]) -> MetricSeries {
+        MetricSeries {
+            key: key.into(),
+            label: key.into(),
+            points: points.to_vec(),
+        }
+    }
+
+    #[test]
+    fn successful_overlap_replaces_missing_and_corrected_points() {
+        let window = QueryWindow {
+            retain_from: 2,
+            start: 4,
+            end: 7,
+        };
+        let previous = vec![
+            series(
+                "a",
+                &[
+                    (1.0, Some(1.0)),
+                    (2.0, Some(2.0)),
+                    (3.0, Some(3.0)),
+                    (4.0, Some(4.0)),
+                    (5.0, Some(5.0)),
+                ],
+            ),
+            series("b", &[(4.0, Some(4.0))]),
+            series("c", &[(3.0, Some(3.0)), (4.0, Some(4.0))]),
+        ];
+        let incoming = vec![
+            series("a", &[(4.0, Some(40.0)), (6.0, None), (7.0, Some(7.0))]),
+            series("d", &[(7.0, Some(1.0))]),
+        ];
+        let merged = merge_window(previous, incoming, window);
+        assert_eq!(
+            merged,
+            vec![
+                series(
+                    "a",
+                    &[
+                        (2.0, Some(2.0)),
+                        (3.0, Some(3.0)),
+                        (4.0, Some(40.0)),
+                        (6.0, None),
+                        (7.0, Some(7.0))
+                    ]
+                ),
+                series("c", &[(3.0, Some(3.0))]),
+                series("d", &[(7.0, Some(1.0))]),
+            ]
+        );
+    }
+
+    #[test]
+    fn incremental_grid_does_not_skip_after_long_gap() {
+        let view = MetricsView::default();
+        let window = QueryWindow::new(&view, 7200, Some(3600), false);
+        assert_eq!(window.start, 3600);
+        let window = QueryWindow::new(&view, 7200, Some(7185), false);
+        assert_eq!(window.start, 6885);
+        assert_eq!(window.start % view.range.step(), 0);
+    }
+
     #[test]
     fn final_lease_cannot_be_resurrected() {
         let feed = Arc::new(Feed::new(MetricsView::default()));
