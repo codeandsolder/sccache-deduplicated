@@ -126,7 +126,7 @@ sha256sum "${files[@]}" > STAGED_SHA256SUMS
 # Published metadata is introduced only after preparation.
 {
  printf 'source_sha=%s\n' "$sha"
- printf 'dist_protocol=5\nrollout_epoch=6\nrust_toolchain=nightly-2026-11-20\nfeatures=fixture\nopenssl_linkage=vendored-static\ncapabilities=direct-metrics\n'
+ printf 'dist_protocol=5\nrollout_epoch=6\nrust_toolchain=nightly-2026-11-20\nfeatures=fixture\ntls_backend=boringssl-static\ncapabilities=direct-metrics\n'
 } > published-build.txt
 {
  cat published-build.txt

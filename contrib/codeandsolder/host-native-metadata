@@ -103,7 +103,7 @@ verify() {
         echo "host-native-metadata: bundle was built for a different machine/CPU" >&2
         return 1
     }
-    for field in source_sha rust_toolchain features dist_protocol rollout_epoch openssl_linkage capabilities; do
+    for field in source_sha rust_toolchain features dist_protocol rollout_epoch tls_backend capabilities; do
         native="$(manifest_value "$directory/build.txt" "$field")"
         official="$(manifest_value "$published" "$field")"
         if [[ "$field" == features && "$dashboard" == 1 ]]; then official+=,scheduler-dashboard; fi

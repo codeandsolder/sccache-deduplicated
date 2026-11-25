@@ -244,8 +244,6 @@ webdav = [
   "dep:url",
   "http-client",
 ]
-## BoringSSL is statically linked by btls-sys; remove this release flag with the publisher update.
-vendored-openssl = []
 # Enable features that require unstable features of Nightly Rust.
 unstable = []
 # Enables distributed support in the sccache client
