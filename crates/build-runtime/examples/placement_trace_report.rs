@@ -60,6 +60,7 @@ struct Delivered {
     worker: PeerId,
     actual_client_completion_seconds: f64,
     staging_nanoseconds: u64,
+    selected_bytes: u64,
     direct_bytes: u64,
     scheduler_bytes: u64,
     unique_blobs: u64,
@@ -180,6 +181,8 @@ impl Errors {
 struct Metrics {
     publication_seconds: Errors,
     client_completion_seconds: Errors,
+    selected_delivery_bytes: u128,
+    local_reuse_bytes: u128,
     direct_delivery_bytes: u128,
     scheduler_delivery_bytes: u128,
     delivered_unique_blobs: u128,
@@ -201,6 +204,8 @@ struct Metrics {
 struct MetricSummary {
     publication_seconds: ErrorSummary,
     client_completion_seconds: ErrorSummary,
+    selected_delivery_bytes: u128,
+    local_reuse_bytes: u128,
     direct_delivery_bytes: u128,
     scheduler_delivery_bytes: u128,
     delivered_unique_blobs: u128,
@@ -302,6 +307,16 @@ impl Metrics {
             selected.completion_seconds,
             delivery.actual_client_completion_seconds,
         )?;
+        let remote = delivery
+            .direct_bytes
+            .checked_add(delivery.scheduler_bytes)
+            .context("delivery byte count overflow")?;
+        let local = delivery
+            .selected_bytes
+            .checked_sub(remote)
+            .context("delivery exceeds selected closure")?;
+        self.selected_delivery_bytes += u128::from(delivery.selected_bytes);
+        self.local_reuse_bytes += u128::from(local);
         self.direct_delivery_bytes += u128::from(delivery.direct_bytes);
         self.scheduler_delivery_bytes += u128::from(delivery.scheduler_bytes);
         self.delivered_unique_blobs += u128::from(delivery.unique_blobs);
@@ -313,6 +328,8 @@ impl Metrics {
         MetricSummary {
             publication_seconds: self.publication_seconds.summarize(),
             client_completion_seconds: self.client_completion_seconds.summarize(),
+            selected_delivery_bytes: self.selected_delivery_bytes,
+            local_reuse_bytes: self.local_reuse_bytes,
             direct_delivery_bytes: self.direct_delivery_bytes,
             scheduler_delivery_bytes: self.scheduler_delivery_bytes,
             delivered_unique_blobs: self.delivered_unique_blobs,
@@ -421,7 +438,7 @@ mod tests {
         });
         let delivered = serde_json::json!({
             "kind": "delivered", "job": 1, "worker": worker, "actual_client_completion_seconds": 2.25,
-            "staging_nanoseconds": 750_000_000, "direct_bytes": 900, "scheduler_bytes": 100, "unique_blobs": 2,
+            "staging_nanoseconds": 750_000_000, "selected_bytes": 1000, "direct_bytes": 800, "scheduler_bytes": 100, "unique_blobs": 2,
         });
         let mut unmatched = assigned.clone();
         unmatched["job"] = serde_json::json!(2);
@@ -435,7 +452,9 @@ mod tests {
             report.total.client_completion_seconds.mean_absolute_error,
             Some(0.25)
         );
-        assert_eq!(report.total.direct_delivery_bytes, 900);
+        assert_eq!(report.total.selected_delivery_bytes, 1000);
+        assert_eq!(report.total.local_reuse_bytes, 100);
+        assert_eq!(report.total.direct_delivery_bytes, 800);
         assert_eq!(report.total.scheduler_delivery_bytes, 100);
         assert_eq!(report.total.delivered_unique_blobs, 2);
         assert_eq!(

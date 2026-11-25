@@ -189,6 +189,29 @@ impl ResultManifest {
     /// # Errors
     /// Returns an error if the same digest has conflicting declared lengths.
     pub fn blobs(&self) -> Result<BTreeMap<ContentId, u64>> {
+        self.collect_blobs(self.outputs.values())
+    }
+
+    /// Unique content closure of the selected output keys, including diagnostics.
+    /// The complete manifest remains the authority for result identity. Callers
+    /// validate selection against the action declaration; absent optional outputs
+    /// contribute no content.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid artifact or inconsistent content length.
+    pub fn selected_blobs(&self, selected: &BTreeSet<String>) -> Result<BTreeMap<ContentId, u64>> {
+        self.collect_blobs(
+            self.outputs
+                .iter()
+                .filter(|(name, _)| selected.contains(*name))
+                .map(|(_, artifact)| artifact),
+        )
+    }
+
+    fn collect_blobs<'a>(
+        &self,
+        outputs: impl Iterator<Item = &'a Artifact>,
+    ) -> Result<BTreeMap<ContentId, u64>> {
         let mut blobs = BTreeMap::new();
         let mut insert = |id, size| -> Result<()> {
             if let Some(previous) = blobs.insert(id, size) {
@@ -196,7 +219,7 @@ impl ResultManifest {
             }
             Ok(())
         };
-        for artifact in self.outputs.values() {
+        for artifact in outputs {
             artifact.validate()?;
             match artifact {
                 Artifact::File { blob, .. } => insert(blob.id, blob.size)?,
@@ -279,7 +302,21 @@ mod tests {
         result.stderr = Some(blob);
         assert_ne!(first, result.id()?);
         assert_eq!(result.blobs()?.len(), 1);
+        assert_eq!(
+            result.selected_blobs(&BTreeSet::new())?,
+            BTreeMap::from([(blob.id, blob.size)])
+        );
         result.stderr = None;
+        assert!(result.selected_blobs(&BTreeSet::new())?.is_empty());
+        assert_eq!(
+            result.selected_blobs(&BTreeSet::from(["obj".into()]))?,
+            result.blobs()?
+        );
+        assert!(
+            result
+                .selected_blobs(&BTreeSet::from(["optional".into()]))?
+                .is_empty()
+        );
         if let Some(Artifact::File { mode, .. }) = result.outputs.get_mut("obj") {
             *mode = Some(0o755);
         }

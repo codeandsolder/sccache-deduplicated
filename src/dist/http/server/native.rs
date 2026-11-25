@@ -674,7 +674,8 @@ fn dispatch(
                             "requester": receipt.requester,
                             "actual_client_completion_seconds": receipt.elapsed.as_secs_f64(),
                             "staging_nanoseconds": receipt.observation.staging_nanoseconds,
-                            "direct_bytes": receipt.observation.direct_bytes,
+                            "selected_bytes": receipt.observation.selected_bytes,
+                        "direct_bytes": receipt.observation.direct_bytes,
                             "scheduler_bytes": receipt.observation.scheduler_bytes,
                             "unique_blobs": receipt.observation.unique_blobs,
                         }))

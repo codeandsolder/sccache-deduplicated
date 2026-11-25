@@ -375,6 +375,7 @@ fn delegation_and_publisher_renewal_are_exclusive() -> Result<()> {
     )?;
     assert_eq!(service.commit(ticket, publisher)?, result);
     let delivered = ClientDeliveryObservation {
+        selected_bytes: 6,
         direct_bytes: 6,
         scheduler_bytes: 0,
         unique_blobs: 1,

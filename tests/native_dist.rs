@@ -1183,7 +1183,7 @@ fn verify_learned_placement_trace(log: &Path, expected_archive_bytes: u64) -> Re
             _ => (),
         }
     }
-    assert_eq!(completed.len(), 8);
+    assert_eq!(completed.len(), 9);
     let cold = completed.first().context("missing cold completion")?;
     assert!(cold["warm_staging_nanoseconds"].is_null());
     let id = cold["job"].as_u64().context("missing cold job")?;
@@ -1327,8 +1327,12 @@ fn verify_learned_placement_trace(log: &Path, expected_archive_bytes: u64) -> Re
                     .context("missing scheduler bytes")?,
             )
             .context("delivery overflow")?;
+        let selected = receipt["selected_bytes"]
+            .as_u64()
+            .context("missing selected bytes")?;
+        assert!(bytes <= selected);
         assert!(
-            bytes
+            selected
                 <= publication["result_bytes"]
                     .as_u64()
                     .context("missing result bytes")?
@@ -1609,7 +1613,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     );
     let intermediate = root.join("delivered-input.s");
     let first = client.run_action(&selective, &inputs, &destinations, &policy, None)?;
-    assert_eq!(first.source, NativeBuildSource::Worker(worker_address));
+    assert_eq!(first.source, NativeBuildSource::Worker(fleet.worker_id));
     assert!(first.output.status.success());
     assert!(!intermediate.exists());
     let mut all = destinations.clone();

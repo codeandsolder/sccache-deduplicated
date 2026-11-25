@@ -4,7 +4,7 @@
 //! scheduler tickets, worker capabilities, or daemon filesystem paths.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{BufWriter, Read, Write},
     path::PathBuf,
     time::Duration,
@@ -152,7 +152,12 @@ fn serve_inner(
     stream: &mut DaemonStream,
     local: Option<&LocalExecutor>,
 ) -> Result<()> {
-    let (spec, mode): (ExecutionSpec, ActionMode) = receive(stream, policy.max_metadata_bytes)?;
+    let (spec, mode, selected): (ExecutionSpec, ActionMode, BTreeSet<String>) =
+        receive(stream, policy.max_metadata_bytes)?;
+    ensure!(
+        selected.iter().all(|name| spec.outputs.contains_key(name)),
+        "undeclared selected result output"
+    );
     ensure!(
         spec.platform == policy.platform,
         "native namespace platform mismatch"
@@ -176,7 +181,7 @@ fn serve_inner(
             manifest,
         } => {
             validate_manifest(&spec, &manifest, policy.max_result_bytes)?;
-            let blobs = manifest.blobs()?;
+            let blobs = manifest.selected_blobs(&selected)?;
             delivery.with_download(build_policy.renewal_interval, &blobs, |download| {
                 send(
                     stream,
@@ -273,7 +278,8 @@ fn run_inner(
     destinations: &BTreeMap<String, PathBuf>,
 ) -> Result<NativeBuildResult> {
     let limit = policy.max_metadata_bytes;
-    send(stream, &(spec, mode), limit)?;
+    let selected = destinations.keys().cloned().collect::<BTreeSet<_>>();
+    send(stream, &(spec, mode, selected), limit)?;
     let mut advertised = BTreeMap::<TreeId, BTreeMap<ContentId, u64>>::new();
     let mut buffer = vec![0; stream.chunk_bytes()];
     loop {

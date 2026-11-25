@@ -330,6 +330,8 @@ impl ClientDeliveryRates {
 /// Counts exclude failed attempts and repeated reads of the same content.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientDeliveryObservation {
+    /// Unique logical closure selected by the receiver, including local reuse.
+    pub selected_bytes: u64,
     pub direct_bytes: u64,
     pub scheduler_bytes: u64,
     pub unique_blobs: u64,

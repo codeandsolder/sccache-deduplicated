@@ -1956,7 +1956,8 @@ impl NativeSessions {
             .checked_add(observation.scheduler_bytes)
             .context("delivery size overflow")?;
         ensure!(
-            bytes <= size
+            bytes <= observation.selected_bytes
+                && observation.selected_bytes <= size
                 && observation.unique_blobs <= u64::try_from(declared.len())?
                 && (observation.unique_blobs != 0 || bytes == 0),
             "delivery exceeds result manifest"

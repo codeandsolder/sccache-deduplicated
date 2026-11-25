@@ -325,10 +325,11 @@ impl NativeCacheClient {
                 manifest,
             } => {
                 inputs.progress(NativeProgress::Phase(Phase::RestoreOutputs))?;
-                let staged = delivery.with_download(
-                    policy.renewal_interval,
-                    &manifest.blobs()?,
-                    |download| {
+                validate_manifest(spec, &manifest, policy.max_result_bytes)?;
+                let selected = destinations.keys().cloned().collect();
+                let declared = manifest.selected_blobs(&selected)?;
+                let staged =
+                    delivery.with_download(policy.renewal_interval, &declared, |download| {
                         fetch_result(
                             spec,
                             &manifest,
@@ -337,8 +338,7 @@ impl NativeCacheClient {
                             policy.max_result_bytes,
                             download,
                         )
-                    },
-                )?;
+                    })?;
                 let output = staged.install()?;
                 Ok(NativeBuildResult { source, output })
             }

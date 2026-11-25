@@ -293,6 +293,7 @@ impl<'a> ResultDelivery<'a> {
         elapsed: Duration,
     ) -> crate::build_runtime::wire::ClientDeliveryObservation {
         crate::build_runtime::wire::ClientDeliveryObservation {
+            selected_bytes: self.declared.values().copied().sum(),
             staging_nanoseconds: u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
             ..self.observation
         }

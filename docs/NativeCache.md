@@ -1091,7 +1091,11 @@ existing result-lease close. The scheduler validates the original authenticated
 requester, committed manifest bounds, and one receipt per allocation. It logs
 elapsed scheduler-monotonic time from allocation start to receipt (including
 allocation overhead, delivery and the close RPC), staging time, and unique
-logical content bytes split by successful direct or scheduler source. Local
+logical content bytes split by successful direct or scheduler source. The
+selected unique result closure includes diagnostics; its difference from
+received unique bytes measures local reuse, and its difference from the full
+manifest measures omitted outputs. Source plans are restricted to the selected
+closure in both direct and namespace clients. Local
 installation after the broker's Done frame is outside this measurement. The
 replay separately evaluates end-to-end delivery forecasts using these receipts;
 missing receipts are not interpreted as zero-duration delivery. Join by job ID within
