@@ -93,7 +93,7 @@ impl NativeWorker {
         let package_transfer = PackageTransportTracker::new(timing)?;
         let _ = store.can_clone_into(&config.scratch)?;
         let client = NativeCacheClient::new(
-            config.cache_url.to_url(),
+            &config.cache_url.to_url(),
             peer,
             Duration::from_secs(config.request_timeout_secs),
             config.max_metadata_bytes,

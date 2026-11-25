@@ -763,7 +763,7 @@ fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
         size: u64::try_from(bytes.len())?,
     };
     let client = NativeCacheClient::new(
-        fleet.cache_url.clone(),
+        &fleet.cache_url,
         std::sync::Arc::clone(&fleet.peer),
         Duration::from_secs(30),
         1024 * 1024,
@@ -778,7 +778,7 @@ fn live_original_package_provisioning_reuses_verified_content() -> Result<()> {
     );
     assert!(client.lookup_rust_package(wrong.identity)?.is_none());
     let worker = NativeCacheClient::new(
-        fleet.cache_url.clone(),
+        &fleet.cache_url,
         sccache::dist::cluster::open_peer(
             fleet.worker_cluster.clone(),
             &fleet.scheduler_url,
@@ -892,7 +892,7 @@ fn named_system_upstream_provisions_original_without_client_upload() -> Result<(
         )]),
     )?;
     let client = NativeCacheClient::new(
-        fleet.cache_url.clone(),
+        &fleet.cache_url,
         std::sync::Arc::clone(&fleet.peer),
         Duration::from_secs(30),
         1024 * 1024,
@@ -1049,7 +1049,7 @@ fn pacman_discovery_seeds_real_gcc_and_compiles_with_exact_results() -> Result<(
     assert_eq!(warm["provisioned"][0]["reused"], true);
     assert_eq!(warm["provisioned"][0]["transfer"], "existing");
     let client = NativeCacheClient::new(
-        fleet.cache_url.clone(),
+        &fleet.cache_url,
         std::sync::Arc::clone(&fleet.peer),
         Duration::from_secs(60),
         1024 * 1024,
@@ -1320,7 +1320,7 @@ fn native_worker_https_executes_real_assembler_and_reuses_result() -> Result<()>
     let worker_address = fleet.worker_address;
     let cache_url = fleet.cache_url.clone();
     let client = NativeCacheClient::new(
-        cache_url,
+        &cache_url,
         std::sync::Arc::clone(&fleet.peer),
         Duration::from_secs(10),
         1024 * 1024,
@@ -1895,7 +1895,7 @@ fn run_worker_only_inputs(peer_source: bool) -> Result<()> {
             None
         };
         let client = NativeCacheClient::new(
-            fleet.cache_url.clone(),
+            &fleet.cache_url,
             std::sync::Arc::clone(&fleet.peer),
             Duration::from_secs(10),
             1024 * 1024,

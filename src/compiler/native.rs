@@ -217,9 +217,10 @@ impl NativeCompilerClient {
             .client
             .lock()
             .map_err(|_| anyhow::anyhow!("native client credentials poisoned"))?;
-        if let Some(client) = saved.as_ref() {
+        if let Some(client) = saved.as_ref().cloned() {
+            drop(saved);
             client.refresh_credentials();
-            return Ok(client.clone());
+            return Ok(client);
         }
         let cluster = endpoint
             .cluster
@@ -236,12 +237,13 @@ impl NativeCompilerClient {
             &token,
         )?;
         let client = NativeCacheClient::new(
-            config.endpoint.to_url(),
+            &config.endpoint.to_url(),
             peer,
             Duration::from_secs(config.request_timeout_secs),
             config.max_metadata_bytes,
         )?;
         *saved = Some(client.clone());
+        drop(saved);
         Ok(client)
     }
 

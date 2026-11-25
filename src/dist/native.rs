@@ -26,6 +26,7 @@ use crate::dist::{
 };
 
 mod package;
+mod upload;
 pub use package::{
     PackageAcquisition, PackageLocator, map_packages, validate_upstream_base,
     validate_upstream_name,
@@ -109,12 +110,12 @@ impl NativeCacheClient {
     /// # Errors
     /// Returns an error for invalid endpoint configuration or HTTP setup.
     pub fn new(
-        base: reqwest::Url,
+        base: &reqwest::Url,
         peer: std::sync::Arc<sccache_cluster_identity::PeerCredentials>,
         timeout: Duration,
         metadata_limit: u64,
     ) -> Result<Self> {
-        let address = sccache_cluster_identity::endpoint(&base)?;
+        let address = sccache_cluster_identity::endpoint(base)?;
         ensure!(
             metadata_limit > 0 && metadata_limit < u64::MAX && !timeout.is_zero(),
             "invalid native client bounds"
@@ -148,6 +149,10 @@ impl NativeCacheClient {
 
     fn cache_routes(&self) -> sccache_peer_identity::RouteSet {
         use sccache_peer_identity::{Role, RouteSet};
+        #[derive(serde::Deserialize)]
+        struct Reply {
+            routes: RouteSet,
+        }
         let fallback = || RouteSet::new(self.address, []);
         let Ok(mut cached) = self.candidates.lock() else {
             return fallback();
@@ -169,10 +174,6 @@ impl NativeCacheClient {
                 .timeout(Duration::from_millis(500))
                 .send()?
                 .error_for_status()?;
-            #[derive(serde::Deserialize)]
-            struct Reply {
-                routes: RouteSet,
-            }
             let reply: Reply = decode_response(response, 4096)?;
             ensure!(reply.routes.valid(), "invalid scheduler routes");
             // The local configured endpoint is always the fallback even if the
@@ -186,13 +187,16 @@ impl NativeCacheClient {
                 cached
                     .as_ref()
                     .filter(|(_, updated, _)| updated.elapsed() < Duration::from_secs(90))
-                    .map(|(routes, updated, _)| (routes.clone(), *updated))
-                    .unwrap_or_else(|| (fallback(), Instant::now()))
+                    .map_or_else(
+                        || (fallback(), Instant::now()),
+                        |(routes, updated, _)| (routes.clone(), *updated),
+                    )
             }
         };
         self.routes
             .prime(self.peer.scheduler_id(), Role::Scheduler, &routes);
         *cached = Some((routes.clone(), updated, Instant::now()));
+        drop(cached);
         routes
     }
 
@@ -209,14 +213,24 @@ impl NativeCacheClient {
             .filter(|(_, updated, _)| updated.elapsed() < Duration::from_secs(90))
             .map_or(&fallback, |(routes, _, _)| routes);
         let peer = self.peer.scheduler_id();
-        crate::build_runtime::wire::CachePathRates {
+        let rates = crate::build_runtime::wire::CachePathRates {
             download: self
                 .routes
                 .best_rate(peer, Role::Scheduler, routes, Transfer::Download(0)),
             upload: self
                 .routes
                 .best_rate(peer, Role::Scheduler, routes, Transfer::Upload(0)),
-        }
+        };
+        drop(cached);
+        rates
+    }
+
+    fn operation_path(&self, operation: &str) -> (String, Option<JobId>) {
+        let (role, job) = match self.role {
+            Role::Client => ("client", None),
+            Role::Worker(job) => ("worker", Some(job)),
+        };
+        (format!("/api/v5/native/{role}/{operation}"), job)
     }
 
     fn request_at(
@@ -224,16 +238,13 @@ impl NativeCacheClient {
         operation: &str,
         address: std::net::SocketAddr,
     ) -> Result<reqwest::blocking::RequestBuilder> {
-        let (role, job) = match self.role {
-            Role::Client => ("client", None),
-            Role::Worker(job) => ("worker", Some(job)),
-        };
+        let (path, job) = self.operation_path(operation);
         let (http, base) = self.routes.endpoint(
             self.peer.scheduler_id(),
             sccache_cluster_identity::Role::Scheduler,
             address,
         )?;
-        let url = base.join(&format!("/api/v5/native/{role}/{operation}"))?;
+        let url = base.join(&path)?;
         let mut request = http
             .post(url)
             .timeout(self.timeout)
@@ -248,10 +259,10 @@ impl NativeCacheClient {
         let routes = self.cache_routes();
         let peer = self.peer.scheduler_id();
         let role = sccache_cluster_identity::Role::Scheduler;
-        match transfer {
-            Some(transfer) => self.routes.ordered_transfer(peer, role, &routes, transfer),
-            None => self.routes.ordered(peer, role, &routes),
-        }
+        transfer.map_or_else(
+            || self.routes.ordered(peer, role, &routes),
+            |transfer| self.routes.ordered_transfer(peer, role, &routes, transfer),
+        )
     }
 
     fn send_to_cache(
@@ -263,6 +274,7 @@ impl NativeCacheClient {
     ) -> Result<(reqwest::blocking::Response, std::net::SocketAddr)> {
         let start = Instant::now();
         let mut last_error = None;
+        let body = bytes::Bytes::from(body);
         for address in self.cache_endpoints(transfer) {
             let remaining = timeout
                 .checked_sub(start.elapsed())
@@ -445,7 +457,9 @@ impl NativeCacheClient {
             "original package file length mismatch"
         );
         let response = self.send_stream(operation, &source, source.size, archive)?;
-        decode_response(response, self.metadata_limit)
+        Ok(codec()
+            .with_limit(self.metadata_limit)
+            .deserialize(&response)?)
     }
 
     /// Admit a complete native action.
@@ -928,44 +942,81 @@ impl NativeCacheClient {
         operation: &str,
         metadata: &impl Serialize,
         size: u64,
-        reader: impl Read + Send + 'static,
-    ) -> Result<reqwest::blocking::Response> {
+        mut reader: impl Read,
+    ) -> Result<Vec<u8>> {
         let header = codec()
             .with_limit(self.metadata_limit)
             .serialize(metadata)?;
         let length = size
             .checked_add(u64::try_from(header.len())?)
             .context("native upload length overflow")?;
-        let body = reqwest::blocking::Body::sized(Cursor::new(header).chain(reader), length);
-        let address = self
-            .cache_endpoints(Some(Transfer::Upload(length)))
-            .into_iter()
-            .next()
-            .context("native cache route unavailable")?;
-        let started = Instant::now();
-        match self.request_at(operation, address)?.body(body).send() {
-            Err(error) => {
-                if error.is_connect() {
-                    self.routes.failed(
-                        self.peer.scheduler_id(),
-                        sccache_cluster_identity::Role::Scheduler,
-                        address,
-                    );
-                }
-                Err(error.into())
+        let (path, job) = self.operation_path(operation);
+        let peer = self.peer.scheduler_id();
+        let role = sccache_cluster_identity::Role::Scheduler;
+        let start = Instant::now();
+        let mut last_error = None;
+        for address in self.cache_endpoints(Some(Transfer::Upload(length))) {
+            let remaining = self
+                .timeout
+                .checked_sub(start.elapsed())
+                .context("native upload deadline expired")?;
+            let client = self.routes.streaming_endpoint(peer, role, address)?;
+            let mut request = client
+                .request(reqwest::Method::POST, &path)?
+                .timeout(remaining)
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
+            if let Some(job) = job {
+                request = request.header("X-Sccache-Native-Job", job.to_string());
             }
-            Ok(response) => {
-                let response = response.error_for_status()?;
-                self.routes.transferred(
-                    self.peer.scheduler_id(),
-                    sccache_cluster_identity::Role::Scheduler,
-                    address,
-                    Transfer::Upload(length),
-                    started.elapsed(),
-                );
-                Ok(response)
+            let started = Instant::now();
+            let attempt = upload::send(
+                request,
+                length,
+                self.metadata_limit,
+                Cursor::new(&header).chain(&mut reader),
+            )?;
+            match attempt.result {
+                Ok(response) => {
+                    // An already-provisioned package can return before reading
+                    // the entire archive; it supplies no full-body rate sample.
+                    if attempt.consumed == length {
+                        self.routes.transferred(
+                            peer,
+                            role,
+                            address,
+                            Transfer::Upload(length),
+                            started.elapsed(),
+                        );
+                    }
+                    return Ok(response);
+                }
+                Err(error) => {
+                    let transport = error.downcast_ref::<reqwest::Error>();
+                    let connect = transport.is_some_and(reqwest::Error::is_connect);
+                    let interrupted = transport.is_some_and(|error| {
+                        error.is_connect()
+                            || error.is_timeout()
+                            || error.is_body()
+                            || error.is_request()
+                    });
+                    if interrupted {
+                        self.routes.failed(peer, role, address);
+                    }
+                    // Before any request body is polled, the server cannot
+                    // consume a ticket/claim. A proven connect failure may
+                    // also replay metadata, but never a consumed source byte.
+                    if interrupted
+                        && (attempt.consumed == 0
+                            || (connect && attempt.consumed <= header.len() as u64))
+                    {
+                        last_error = Some(error);
+                    } else {
+                        return Err(error);
+                    }
+                }
             }
         }
+        Err(last_error.context("native upload route unavailable")?)
     }
 
     /// Commit the negotiated result.

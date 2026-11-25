@@ -7,7 +7,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use sccache_cluster_identity::{PeerConfig, PeerCredentials, PeerId, Role, TlsCredentials};
+use sccache_cluster_identity::{
+    ClusterHttpClient, PeerConfig, PeerCredentials, PeerId, Role, TlsCredentials,
+};
 
 use super::cluster_routes::{
     MeasuredReader, PROBE_PATH, PROBE_TIMEOUT, Probe, RouteBook, Transfer,
@@ -32,6 +34,9 @@ pub const fn wildcard(address: SocketAddr) -> SocketAddr {
 }
 
 /// Open a persisted peer from synchronous daemon/worker initialization.
+///
+/// # Errors
+/// Returns an error when scheduler resolution, runtime initialization or enrollment fails.
 pub fn open_peer(
     config: PeerConfig,
     scheduler: &reqwest::Url,
@@ -52,16 +57,20 @@ pub fn open_peer(
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct PathKey {
     peer: PeerId,
-    address: SocketAddr,
     role: Role,
+    address: SocketAddr,
 }
 
-type BlockingPath = (Arc<TlsCredentials>, reqwest::blocking::Client, reqwest::Url);
+struct TransportPath {
+    credentials: Arc<TlsCredentials>,
+    blocking: Option<(reqwest::blocking::Client, reqwest::Url)>,
+    streaming: Option<Arc<ClusterHttpClient>>,
+}
 
 /// Reusable per-path pools. A renewed leaf invalidates only the affected pools.
 pub struct BlockingRoutes {
     current: Arc<Current>,
-    paths: Mutex<HashMap<PathKey, BlockingPath>>,
+    paths: Mutex<HashMap<PathKey, TransportPath>>,
     book: Arc<RouteBook>,
 }
 
@@ -98,6 +107,7 @@ impl BlockingRoutes {
                 .filter(|success| *success)
                 .map(|_| start.elapsed()),
         );
+        drop(probe);
     }
 
     /// Probe in parallel, without sending any application request or job token.
@@ -180,12 +190,13 @@ impl BlockingRoutes {
         self.book.observe(peer, role, address, None);
     }
 
-    pub fn endpoint(
+    fn with_path<T>(
         &self,
         peer: PeerId,
         role: Role,
         address: SocketAddr,
-    ) -> Result<(reqwest::blocking::Client, reqwest::Url)> {
+        open: impl FnOnce(&mut TransportPath) -> Result<T>,
+    ) -> Result<T> {
         let credentials = (self.current)()?;
         let key = PathKey {
             peer,
@@ -196,27 +207,78 @@ impl BlockingRoutes {
             .paths
             .lock()
             .map_err(|_| anyhow::anyhow!("cluster route pool poisoned"))?;
-        if let Some((saved, client, base)) = paths.get(&key)
-            && Arc::ptr_eq(saved, &credentials)
-        {
-            return Ok((client.clone(), base.clone()));
-        }
-        let (client, base) = sccache_cluster_identity::blocking_client(
-            &credentials,
-            peer,
-            role,
-            address,
-            Duration::from_mins(20),
-        )?;
-        if paths.len() >= 256 {
+        if paths.len() >= 256 && !paths.contains_key(&key) {
             paths.clear();
         }
-        paths.insert(key, (credentials, client.clone(), base.clone()));
-        Ok((client, base))
+        let path = paths.entry(key).or_insert_with(|| TransportPath {
+            credentials: Arc::clone(&credentials),
+            blocking: None,
+            streaming: None,
+        });
+        if !Arc::ptr_eq(&path.credentials, &credentials) {
+            *path = TransportPath {
+                credentials,
+                blocking: None,
+                streaming: None,
+            };
+        }
+        let result = open(path);
+        drop(paths);
+        result
+    }
+
+    /// Open or reuse a client pinned to the enrolled peer and chosen endpoint.
+    ///
+    /// # Errors
+    /// Returns an error if credential lookup or transport initialization fails.
+    pub fn endpoint(
+        &self,
+        peer: PeerId,
+        role: Role,
+        address: SocketAddr,
+    ) -> Result<(reqwest::blocking::Client, reqwest::Url)> {
+        self.with_path(peer, role, address, |path| {
+            if let Some(client) = &path.blocking {
+                return Ok(client.clone());
+            }
+            let client = sccache_cluster_identity::blocking_client(
+                &path.credentials,
+                peer,
+                role,
+                address,
+                Duration::from_mins(20),
+            )?;
+            path.blocking = Some(client.clone());
+            Ok(client)
+        })
+    }
+
+    pub(super) fn streaming_endpoint(
+        &self,
+        peer: PeerId,
+        role: Role,
+        address: SocketAddr,
+    ) -> Result<Arc<ClusterHttpClient>> {
+        self.with_path(peer, role, address, |path| {
+            if let Some(client) = &path.streaming {
+                return Ok(Arc::clone(client));
+            }
+            let client = Arc::new(ClusterHttpClient::new(
+                &path.credentials,
+                peer,
+                role,
+                address,
+            )?);
+            path.streaming = Some(Arc::clone(&client));
+            Ok(client)
+        })
     }
 }
 
 /// Refresh the member certificate outside the asynchronous request path.
+///
+/// # Errors
+/// Returns an error when runtime initialization or renewal fails.
 pub fn refresh_blocking(peer: &PeerCredentials) -> Result<Arc<TlsCredentials>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

@@ -231,7 +231,7 @@ fn package_client(client_config: &Path) -> Result<sccache::dist::native::NativeC
         &token,
     )?;
     NativeCacheClient::new(
-        native.endpoint.to_url(),
+        &native.endpoint.to_url(),
         peer,
         Duration::from_secs(native.request_timeout_secs),
         native.max_metadata_bytes,

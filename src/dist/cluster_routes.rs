@@ -30,12 +30,19 @@ pub struct Probe {
 
 impl Probe {
     fn acquire(address: SocketAddr) -> Option<Self> {
-        PROBES
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                (count < MAX_PROBES).then_some(count + 1)
-            })
-            .ok()
-            .map(|_| Self { address })
+        let mut count = PROBES.load(Ordering::Relaxed);
+        while count < MAX_PROBES {
+            match PROBES.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self { address }),
+                Err(actual) => count = actual,
+            }
+        }
+        None
     }
 }
 
@@ -52,14 +59,14 @@ pub enum Transfer {
 }
 
 impl Transfer {
-    fn index(self) -> usize {
+    const fn index(self) -> usize {
         match self {
             Self::Upload(_) => 0,
             Self::Download(_) => 1,
         }
     }
 
-    fn bytes(self) -> u64 {
+    const fn bytes(self) -> u64 {
         match self {
             Self::Upload(bytes) | Self::Download(bytes) => bytes,
         }
@@ -131,6 +138,7 @@ impl RouteBook {
             sample.measured = None;
             pending.push(probe);
         }
+        drop(samples);
         pending
     }
 
@@ -148,7 +156,7 @@ impl RouteBook {
             address,
         };
         if samples.len() < MAX_PATHS || samples.contains_key(&key) {
-            let sample = samples.entry(key).or_insert(Sample {
+            let sample = samples.entry(key).or_insert_with(|| Sample {
                 measured: None,
                 expires: Instant::now(),
                 rates: [None; 2],
@@ -161,6 +169,7 @@ impl RouteBook {
                     FAILURE_TTL
                 };
         }
+        drop(samples);
     }
 
     /// Record completed encoded-body goodput, separately in each direction.
@@ -206,6 +215,7 @@ impl RouteBook {
             bytes_per_second: rate,
             expires: now + RATE_TTL,
         });
+        drop(samples);
     }
 
     pub fn best_rate(
@@ -228,9 +238,12 @@ impl RouteBook {
                 // Alternate paths require a fresh authenticated reachability probe.
                 // An actually used configured primary needs no extra probe when it
                 // is the only endpoint; a recent failure disqualifies either path.
-                if sample.measured.is_none() && (address != routes.primary || sample.expires > now)
-                    || address != routes.primary && sample.expires <= now
-                {
+                let usable = if address == routes.primary {
+                    sample.measured.is_some() || sample.expires <= now
+                } else {
+                    sample.measured.is_some() && sample.expires > now
+                };
+                if !usable {
                     return None;
                 }
                 sample.rates[transfer.index()]
@@ -296,6 +309,7 @@ impl RouteBook {
                 ))
             })
             .collect::<Vec<_>>();
+        drop(samples);
         ranked.sort_by(|a, b| {
             a.0.cmp(&b.0)
                 .then_with(|| a.1.cmp(&b.1))
@@ -348,7 +362,7 @@ impl<R> MeasuredReader<R> {
         }
     }
 
-    pub fn content_length(&self) -> Option<u64> {
+    pub const fn content_length(&self) -> Option<u64> {
         self.length
     }
 }

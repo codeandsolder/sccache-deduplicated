@@ -66,6 +66,7 @@ impl WorkerRoutes {
             paths.clear();
         }
         paths.insert(key, (credentials, Arc::clone(&path)));
+        drop(paths);
         Ok(path)
     }
 
@@ -88,6 +89,7 @@ impl WorkerRoutes {
         }
         anyhow::ensure!(routes.valid(), "invalid worker route advertisement");
         workers.insert(server, routes);
+        drop(workers);
         Ok(())
     }
 
@@ -135,6 +137,7 @@ impl WorkerRoutes {
                 .filter(|success| *success)
                 .map(|_| start.elapsed()),
         );
+        drop(probe);
     }
 
     pub(super) async fn send<T: serde::de::DeserializeOwned>(

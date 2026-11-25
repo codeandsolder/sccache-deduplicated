@@ -79,7 +79,7 @@ fn make_client(endpoint: &TestEndpoint, token: &str) -> Result<NativeCacheClient
         "worker-token" => &endpoint.worker,
         _ => {
             return NativeCacheClient::new(
-                endpoint.url.clone(),
+                &endpoint.url,
                 crate::dist::cluster::open_peer(
                     endpoint.rejected_config.clone(),
                     &endpoint.url,
@@ -92,7 +92,7 @@ fn make_client(endpoint: &TestEndpoint, token: &str) -> Result<NativeCacheClient
         }
     };
     NativeCacheClient::new(
-        endpoint.url.clone(),
+        &endpoint.url,
         Arc::clone(peer),
         Duration::from_secs(10),
         1024 * 1024,

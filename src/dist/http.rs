@@ -182,7 +182,7 @@ pub mod urls {
         scheduler_url: &reqwest::Url,
         server_id: ServerId,
     ) -> Result<reqwest::Url> {
-        Ok(scheduler_url.join(&format!("/api/v1/scheduler/worker_route/{}", server_id))?)
+        Ok(scheduler_url.join(&format!("/api/v1/scheduler/worker_route/{server_id}"))?)
     }
 
     /// Build the scheduler worker-name lookup endpoint for `server_id`.
@@ -194,7 +194,7 @@ pub mod urls {
         scheduler_url: &reqwest::Url,
         server_id: ServerId,
     ) -> Result<reqwest::Url> {
-        Ok(scheduler_url.join(&format!("/api/v1/scheduler/worker_name/{}", server_id))?)
+        Ok(scheduler_url.join(&format!("/api/v1/scheduler/worker_name/{server_id}"))?)
     }
 
     /// Build the scheduler heartbeat endpoint.
@@ -228,26 +228,44 @@ pub mod urls {
     }
 
     /// Build the worker assignment endpoint.
+    ///
+    /// # Errors
+    /// Returns an error if the worker origin is not a valid base URL.
     pub fn server_assign_job(base: &reqwest::Url, job_id: JobId) -> Result<reqwest::Url> {
         Ok(base.join(&format!("/api/v1/distserver/assign_job/{job_id}"))?)
     }
     /// Build the worker native assignment endpoint.
+    ///
+    /// # Errors
+    /// Returns an error if the worker origin is not a valid base URL.
     pub fn server_assign_native_job(base: &reqwest::Url, job_id: JobId) -> Result<reqwest::Url> {
         Ok(base.join(&format!("/api/v5/distserver/assign_native_job/{job_id}"))?)
     }
     /// Build the worker peer blob endpoint.
+    ///
+    /// # Errors
+    /// Returns an error if the worker origin is not a valid base URL.
     pub fn server_native_blob(base: &reqwest::Url) -> Result<reqwest::Url> {
         Ok(base.join("/api/v3/distserver/native_blob")?)
     }
     /// Build the worker native execution endpoint.
+    ///
+    /// # Errors
+    /// Returns an error if the worker origin is not a valid base URL.
     pub fn server_run_native_job(base: &reqwest::Url, job_id: JobId) -> Result<reqwest::Url> {
         Ok(base.join(&format!("/api/v5/distserver/run_native_job/{job_id}"))?)
     }
     /// Build the worker toolchain submission endpoint.
+    ///
+    /// # Errors
+    /// Returns an error if the worker origin is not a valid base URL.
     pub fn server_submit_toolchain(base: &reqwest::Url, job_id: JobId) -> Result<reqwest::Url> {
         Ok(base.join(&format!("/api/v1/distserver/submit_toolchain/{job_id}"))?)
     }
     /// Build the worker archive execution endpoint.
+    ///
+    /// # Errors
+    /// Returns an error if the worker origin is not a valid base URL.
     pub fn server_run_job(base: &reqwest::Url, job_id: JobId) -> Result<reqwest::Url> {
         Ok(base.join(&format!("/api/v2/distserver/run_job/{job_id}"))?)
     }
@@ -1823,7 +1841,7 @@ mod client {
     use super::urls;
     use super::worker_routes::WorkerRoutes;
     use crate::errors::{Context, Result};
-    use sccache_cluster_identity::{PeerConfig, PeerCredentials, Role};
+    use sccache_cluster_identity::PeerCredentials;
 
     const WORKER_NAME_CACHE_TTL: Duration = Duration::from_secs(300);
     const WORKER_NAME_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -1846,19 +1864,14 @@ mod client {
         /// # Errors
         ///
         /// Returns an error if the HTTP client or local toolchain cache cannot be initialized.
-        pub async fn new(
+        pub fn new(
             pool: &tokio::runtime::Handle,
-            scheduler_url: reqwest::Url,
-            cluster: PeerConfig,
+            peer: Arc<PeerCredentials>,
             cache_dir: &Path,
             cache_size: u64,
             toolchain_configs: &[config::DistToolchainConfig],
-            auth_token: String,
             rewrite_includes_only: bool,
         ) -> Result<Self> {
-            let address = sccache_cluster_identity::endpoint(&scheduler_url)?;
-            let peer =
-                Arc::new(PeerCredentials::open(cluster, address, Role::Client, &auth_token).await?);
             let worker_routes = WorkerRoutes::new(peer);
             let client_toolchains =
                 cache::ClientToolchains::new(cache_dir, cache_size, toolchain_configs)
@@ -1979,7 +1992,7 @@ mod client {
                             toolchain_file.into(),
                         ));
                         Ok(client
-                            .post(url.clone())
+                            .post(url)
                             .bearer_auth(&job_alloc.auth)
                             .body(Body::wrap_stream(stream)))
                     },
@@ -2036,7 +2049,7 @@ mod client {
                     |client, base| {
                         let url = urls::server_run_job(base, job_alloc.job_id)?;
                         Ok(client
-                            .post(url.clone())
+                            .post(url)
                             .bearer_auth(&job_alloc.auth)
                             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
                             .header(reqwest::header::CONTENT_LENGTH, body.len())

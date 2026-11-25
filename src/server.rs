@@ -514,17 +514,24 @@ impl DistClientContainer {
                     .clone()
                     .context("distributed cluster trust configuration required")
             );
+            let address = try_or_retry_later!(sccache_cluster_identity::endpoint(&url));
+            let peer = try_or_retry_later!(
+                sccache_cluster_identity::PeerCredentials::open(
+                    cluster,
+                    address,
+                    sccache_cluster_identity::Role::Client,
+                    &auth_token,
+                )
+                .await
+            );
             let dist_client = dist::http::Client::new(
                 &config.pool,
-                url,
-                cluster,
+                Arc::new(peer),
                 &config.cache_dir.join("client"),
                 config.toolchain_cache_size,
                 &config.toolchains,
-                auth_token,
                 config.rewrite_includes_only,
-            )
-            .await;
+            );
             let dist_client =
                 try_or_retry_later!(dist_client.context("failure during dist client creation"));
             if let Ok(res) = dist_client.do_get_status().await {
