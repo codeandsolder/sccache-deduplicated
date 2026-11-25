@@ -73,14 +73,15 @@ pub(super) struct MetricsService {
 struct Feed {
     data: Mutex<MetricsData>,
     changes: broadcast::Sender<Arc<str>>,
-    // Each HTTP subscription owns a receiver. The producer stops at zero.
-    subscribers: watch::Sender<()>,
+    // Once the last lease is dropped this feed cannot be resurrected.
+    subscribers: Mutex<usize>,
+    stopped: watch::Sender<bool>,
 }
 
 impl Feed {
     fn new(view: MetricsView) -> Self {
         let (changes, _) = broadcast::channel(4);
-        let (subscribers, _) = watch::channel(());
+        let (stopped, _) = watch::channel(false);
         Self {
             data: Mutex::new(MetricsData {
                 configured: true,
@@ -88,8 +89,25 @@ impl Feed {
                 ..Default::default()
             }),
             changes,
-            subscribers,
+            subscribers: Mutex::new(1),
+            stopped,
         }
+    }
+
+    fn try_lease(self: &Arc<Self>) -> Option<Lease> {
+        let mut count = self
+            .subscribers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *count == 0 {
+            return None;
+        }
+        *count += 1;
+        Some(Lease(Arc::clone(self)))
+    }
+
+    fn active(&self) -> bool {
+        !*self.stopped.borrow()
     }
 
     fn subscribe(&self) -> Result<(String, broadcast::Receiver<Arc<str>>)> {
@@ -118,9 +136,25 @@ impl Feed {
     }
 }
 
+struct Lease(Arc<Feed>);
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let mut count = self
+            .0
+            .subscribers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *count -= 1;
+        if *count == 0 {
+            self.0.stopped.send_replace(true);
+        }
+    }
+}
+
 fn feed_stream(
     feed: Arc<Feed>,
-    subscription: watch::Receiver<()>,
+    subscription: Lease,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     stream::unfold(
         (feed, subscription, None),
@@ -203,14 +237,16 @@ impl MetricsService {
                 .feeds
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            feeds.retain(|_, weak| {
-                weak.upgrade()
-                    .is_some_and(|feed| feed.subscribers.receiver_count() > 0)
-            });
-            if let Some(feed) = feeds.get(&view).and_then(Weak::upgrade) {
-                let subscription = feed.subscribers.subscribe();
+            feeds.retain(|_, weak| weak.upgrade().is_some_and(|feed| feed.active()));
+            if let Some((feed, subscription)) =
+                feeds.get(&view).and_then(Weak::upgrade).and_then(|feed| {
+                    let lease = feed.try_lease()?;
+                    Some((feed, lease))
+                })
+            {
                 (feed, subscription)
             } else {
+                feeds.remove(&view);
                 if feeds.len() >= MAX_VIEWS {
                     return (
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -219,12 +255,13 @@ impl MetricsService {
                         .into_response();
                 }
                 let feed = Arc::new(Feed::new(view.clone()));
-                let subscription = feed.subscribers.subscribe();
+                let subscription = Lease(Arc::clone(&feed));
                 feeds.insert(view.clone(), Arc::downgrade(&feed));
                 let (source, task_feed) = (Arc::clone(source), Arc::clone(&feed));
                 tokio::spawn(async move {
+                    let mut stopped = task_feed.stopped.subscribe();
                     tokio::select! {
-                        () = task_feed.subscribers.closed() => {}
+                        _ = stopped.wait_for(|stopped| *stopped) => {}
                         () = refresh(source, &task_feed, view) => {}
                     }
                 });
@@ -445,6 +482,18 @@ async fn refresh(source: Arc<Source>, feed: &Feed, view: MetricsView) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn final_lease_cannot_be_resurrected() {
+        let feed = Arc::new(Feed::new(MetricsView::default()));
+        let first = Lease(Arc::clone(&feed));
+        let second = feed.try_lease().expect("active feed");
+        drop(first);
+        assert!(feed.active());
+        drop(second);
+        assert!(!feed.active());
+        assert!(feed.try_lease().is_none());
+    }
+
     #[test]
     fn manifest_is_complete_and_client_cannot_inject_promql() -> Result<()> {
         let panels: Vec<PanelDefinition> = serde_json::from_str(include_str!("../panels.json"))?;
