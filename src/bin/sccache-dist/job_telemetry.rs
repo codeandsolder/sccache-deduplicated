@@ -266,6 +266,7 @@ mod tests {
             vec!["--crate-name=ngspice_rs".into()],
         ] {
             let command = CompileCommand {
+                umask: Some(0o022),
                 executable: "rustc".into(),
                 arguments,
                 env_vars: vec![],
@@ -278,6 +279,7 @@ mod tests {
     #[test]
     fn command_fingerprint_includes_relevant_inputs() {
         let mut command = CompileCommand {
+            umask: Some(0o022),
             executable: "rustc".into(),
             arguments: vec!["--crate-name".into(), "ngspice_rs".into()],
             env_vars: vec![],

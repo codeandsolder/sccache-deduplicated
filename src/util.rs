@@ -41,6 +41,39 @@ pub const BASE64_URL_SAFE_ENGINE: base64::engine::GeneralPurpose =
 
 pub const HASH_BUFFER_SIZE: usize = 128 * 1024;
 
+#[cfg(target_os = "linux")]
+static PROCESS_UMASK: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+
+/// Read the process creation mask without changing the process-wide setting.
+/// The daemon never changes this value after entering its runtime.
+#[must_use = "the creation mask affects both execution and output identity"]
+pub fn current_umask() -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        *PROCESS_UMASK.get_or_init(|| {
+            let status = std::fs::read_to_string("/proc/self/status").ok()?;
+            let mask = status
+                .lines()
+                .find_map(|line| line.strip_prefix("Umask:"))?;
+            u32::from_str_radix(mask.trim(), 8)
+                .ok()
+                .filter(|mask| *mask <= 0o777)
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+/// Record the authenticated mask in a newly initialized isolated executor,
+/// even if its filesystem view does not contain procfs.
+#[cfg(target_os = "linux")]
+pub(crate) fn initialize_shared_umask(mask: u32) -> Result<()> {
+    anyhow::ensure!(mask <= 0o777, "invalid executor umask");
+    PROCESS_UMASK
+        .set(Some(mask))
+        .map_err(|_| anyhow::anyhow!("executor umask already initialized"))
+}
+
 /// Display adapter that deliberately preserves `Debug` escaping and quoting.
 ///
 /// This is used for paths and OS strings in diagnostics where lossy `Display`

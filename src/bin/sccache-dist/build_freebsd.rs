@@ -329,6 +329,7 @@ impl PotBuilder {
             .context("Failed to unpack inputs to pot")?;
 
         let CompileCommand {
+            umask,
             executable,
             arguments,
             env_vars,
@@ -361,8 +362,19 @@ impl PotBuilder {
         // the jail's inherited environment before executing the compiler.
         cmd.arg(cid);
         let shell_cmd = "cd \"$1\" && shift && exec /usr/bin/env -i -- \"$@\"";
-        cmd.args(["/bin/sh", "-c", shell_cmd]);
-        cmd.arg(&executable);
+        if let Some(mask) = umask {
+            anyhow::ensure!(mask <= 0o777, "invalid command umask");
+            cmd.args([
+                "/bin/sh",
+                "-c",
+                "umask \"$1\" && shift && cd \"$1\" && shift && exec /usr/bin/env -i -- \"$@\"",
+                "sccache-umask",
+            ])
+            .arg(format!("{mask:o}"));
+        } else {
+            cmd.args(["/bin/sh", "-c", shell_cmd]);
+            cmd.arg(&executable);
+        }
         cmd.arg(cwd);
         let compile_output =
             run_with_environment(job_id, &mut cmd, env_vars, executable, arguments)?;

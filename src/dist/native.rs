@@ -1077,7 +1077,9 @@ mod client;
 #[cfg(all(target_os = "linux", feature = "dist-client"))]
 mod local;
 #[cfg(all(target_os = "linux", feature = "dist-client"))]
-pub use client::{NativeBuildPolicy, NativeBuildResult, NativeBuildSource};
+pub use crate::protocol::NativeBuildSource;
+#[cfg(all(target_os = "linux", feature = "dist-client"))]
+pub use client::{NativeBuildPolicy, NativeBuildResult};
 #[cfg(all(target_os = "linux", feature = "dist-client"))]
 pub use local::LocalExecutor;
 

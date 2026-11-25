@@ -10,14 +10,15 @@ use std::{
         fs::{MetadataExt, PermissionsExt, symlink},
     },
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread::{self, JoinHandle},
     time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result, ensure};
 use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
+    Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
+    LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, Request, Session, SessionUnmounter,
 };
 use rustix::fs::{AtFlags, CWD, Timestamps, ioctl_ficlone, utimensat};
@@ -29,10 +30,9 @@ use crate::{BlobReader, BlobRef, TreeEntry, TreeManifest, TreeMetadata, TreePath
 use crate::{MaterializationStats, MaterializedTree};
 
 const TTL: Duration = Duration::from_secs(3600);
-const KEEP_CACHE: u32 = 1 << 1;
 
 enum Kind {
-    Directory(BTreeMap<OsString, u64>),
+    Directory(BTreeMap<OsString, INodeNo>),
     File(BlobRef),
     Symlink(Vec<u8>),
 }
@@ -40,15 +40,19 @@ enum Kind {
 struct Node {
     kind: Kind,
     metadata: TreeMetadata,
-    parent: u64,
+    parent: INodeNo,
     nlink: u32,
+}
+
+struct OpenHandles {
+    next: u64,
+    readers: BTreeMap<FileHandle, Arc<Mutex<BlobReader>>>,
 }
 
 struct VirtualFs {
     lease: TreeLease,
     nodes: Vec<Node>,
-    handles: BTreeMap<u64, BlobReader>,
-    next_handle: u64,
+    handles: Mutex<OpenHandles>,
     uid: u32,
     gid: u32,
 }
@@ -59,10 +63,10 @@ impl VirtualFs {
         let mut nodes = vec![Node {
             kind: Kind::Directory(BTreeMap::new()),
             metadata: root,
-            parent: 1,
+            parent: INodeNo::ROOT,
             nlink: 2,
         }];
-        let mut paths = BTreeMap::from([(Vec::new(), 1_u64)]);
+        let mut paths = BTreeMap::from([(Vec::new(), INodeNo::ROOT)]);
         for (path, entry) in &lease.manifest().entries {
             if matches!(entry, TreeEntry::Hardlink(_)) {
                 continue;
@@ -86,7 +90,7 @@ impl VirtualFs {
                 ),
                 TreeEntry::Hardlink(_) => unreachable!("hardlinks handled in second pass"),
             };
-            let ino = u64::try_from(nodes.len())? + 1;
+            let ino = INodeNo(u64::try_from(nodes.len())? + 1);
             let is_dir = matches!(&kind, Kind::Directory(_));
             nodes.push(Node {
                 kind,
@@ -94,7 +98,7 @@ impl VirtualFs {
                 parent,
                 nlink: if is_dir { 2 } else { 1 },
             });
-            let parent_node = &mut nodes[usize::try_from(parent - 1)?];
+            let parent_node = &mut nodes[usize::try_from(parent.0 - 1)?];
             let Kind::Directory(children) = &mut parent_node.kind else {
                 anyhow::bail!("FUSE parent is not a directory");
             };
@@ -126,15 +130,15 @@ impl VirtualFs {
             let ino = *paths
                 .get(target.as_bytes())
                 .context("missing FUSE hardlink target")?;
-            let Kind::File(_) = nodes[usize::try_from(ino - 1)?].kind else {
+            let Kind::File(_) = nodes[usize::try_from(ino.0 - 1)?].kind else {
                 anyhow::bail!("hardlink targets must be regular files");
             };
-            let target = &mut nodes[usize::try_from(ino - 1)?];
+            let target = &mut nodes[usize::try_from(ino.0 - 1)?];
             target.nlink = target
                 .nlink
                 .checked_add(1)
                 .context("FUSE file link count overflow")?;
-            let Kind::Directory(children) = &mut nodes[usize::try_from(parent - 1)?].kind else {
+            let Kind::Directory(children) = &mut nodes[usize::try_from(parent.0 - 1)?].kind else {
                 anyhow::bail!("FUSE hardlink parent is not a directory");
             };
             ensure!(
@@ -147,18 +151,20 @@ impl VirtualFs {
         Ok(Self {
             lease,
             nodes,
-            handles: BTreeMap::new(),
-            next_handle: 1,
+            handles: Mutex::new(OpenHandles {
+                next: 1,
+                readers: BTreeMap::new(),
+            }),
             uid: rustix::process::geteuid().as_raw(),
             gid: rustix::process::getegid().as_raw(),
         })
     }
 
-    fn node(&self, ino: u64) -> Option<&Node> {
-        self.nodes.get(usize::try_from(ino.checked_sub(1)?).ok()?)
+    fn node(&self, ino: INodeNo) -> Option<&Node> {
+        self.nodes.get(usize::try_from(ino.0.checked_sub(1)?).ok()?)
     }
 
-    fn attr(&self, ino: u64) -> Result<FileAttr> {
+    fn attr(&self, ino: INodeNo) -> Result<FileAttr> {
         let node = self.node(ino).context("missing virtual inode")?;
         let (kind, size) = match &node.kind {
             Kind::Directory(_) => (FileType::Directory, 0),
@@ -202,49 +208,52 @@ fn timestamp(ts: TreeTimestamp) -> Result<SystemTime> {
 }
 
 impl Filesystem for VirtualFs {
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let found = self.node(parent).and_then(|node| match &node.kind {
             Kind::Directory(children) => children.get(name).copied(),
             _ => None,
         });
         match found.and_then(|ino| self.attr(ino).ok()) {
-            Some(attr) => reply.entry(&TTL, &attr, 0),
-            None => reply.error(libc::ENOENT),
+            Some(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            None => reply.error(Errno::ENOENT),
         }
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         match self.attr(ino) {
             Ok(attr) => reply.attr(&TTL, &attr),
-            Err(_) => reply.error(libc::ENOENT),
+            Err(_) => reply.error(Errno::ENOENT),
         }
     }
 
-    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
         match self.node(ino).map(|node| &node.kind) {
             Some(Kind::Symlink(target)) => reply.data(target),
-            _ => reply.error(libc::EINVAL),
+            _ => reply.error(Errno::EINVAL),
         }
     }
 
     fn readdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
         let Some(node) = self.node(ino) else {
-            reply.error(libc::ENOENT);
+            reply.error(Errno::ENOENT);
             return;
         };
         let Kind::Directory(children) = &node.kind else {
-            reply.error(libc::ENOTDIR);
+            reply.error(Errno::ENOTDIR);
             return;
         };
         // Avoid cloning every filename on each directory page.
-        let offset = usize::try_from(offset).unwrap_or(0);
+        let Ok(offset) = usize::try_from(offset) else {
+            reply.error(Errno::EOVERFLOW);
+            return;
+        };
         if offset == 0 && reply.add(ino, 1, FileType::Directory, OsStr::new(".")) {
             reply.ok();
             return;
@@ -259,12 +268,12 @@ impl Filesystem for VirtualFs {
                 Some(Kind::File(_)) => FileType::RegularFile,
                 Some(Kind::Symlink(_)) => FileType::Symlink,
                 None => {
-                    reply.error(libc::EIO);
+                    reply.error(Errno::EIO);
                     return;
                 }
             };
-            let Some(cookie) = idx.checked_add(3).and_then(|i| i64::try_from(i).ok()) else {
-                reply.error(libc::EOVERFLOW);
+            let Some(cookie) = idx.checked_add(3).and_then(|i| u64::try_from(i).ok()) else {
+                reply.error(Errno::EOVERFLOW);
                 return;
             };
             if reply.add(child, cookie, kind, name) {
@@ -274,13 +283,20 @@ impl Filesystem for VirtualFs {
         reply.ok();
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        if flags & libc::O_ACCMODE != libc::O_RDONLY {
-            reply.error(libc::EROFS);
+    fn open(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        flags: OpenFlags,
+        kill_suid_gid: bool,
+        reply: ReplyOpen,
+    ) {
+        if flags.0 & (libc::O_ACCMODE | libc::O_TRUNC) != libc::O_RDONLY || kill_suid_gid {
+            reply.error(Errno::EROFS);
             return;
         }
         let Some(Kind::File(blob)) = self.node(ino).map(|node| &node.kind) else {
-            reply.error(libc::EISDIR);
+            reply.error(Errno::EISDIR);
             return;
         };
         let path = self.lease.inner.blob_path(blob.id);
@@ -291,58 +307,82 @@ impl Filesystem for VirtualFs {
             .and_then(|encoding| BlobReader::open(File::open(path)?, encoding));
         match opened {
             Ok(reader) => {
-                let handle = self.next_handle;
-                self.next_handle = self.next_handle.wrapping_add(1);
-                self.handles.insert(handle, reader);
-                reply.opened(handle, KEEP_CACHE);
+                let Ok(mut handles) = self.handles.lock() else {
+                    reply.error(Errno::EIO);
+                    return;
+                };
+                let handle = FileHandle(handles.next);
+                let Some(next) = handles.next.checked_add(1) else {
+                    reply.error(Errno::EMFILE);
+                    return;
+                };
+                handles.next = next;
+                handles.readers.insert(handle, Arc::new(Mutex::new(reader)));
+                reply.opened(handle, FopenFlags::FOPEN_KEEP_CACHE);
             }
             Err(error) => {
                 log::error!("failed to open virtual CAS file: {error:#}");
-                reply.error(libc::EIO);
+                reply.error(Errno::EIO);
             }
         }
     }
 
     fn read(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let Some(reader) = self.handles.get_mut(&fh) else {
-            reply.error(libc::EBADF);
+        // Only hold the table lock while obtaining the reader. A seek/read
+        // pair is atomic per handle; unrelated files can decode independently.
+        let reader = match self.handles.lock() {
+            Ok(handles) => handles.readers.get(&fh).cloned(),
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+        let Some(reader) = reader else {
+            reply.error(Errno::EBADF);
+            return;
+        };
+        let Ok(mut reader) = reader.lock() else {
+            reply.error(Errno::EIO);
             return;
         };
         let mut out = vec![0; size as usize];
-        let result = u64::try_from(offset)
-            .map_err(io::Error::other)
-            .and_then(|at| reader.seek(SeekFrom::Start(at)))
+        let result = reader
+            .seek(SeekFrom::Start(offset))
             .and_then(|_| reader.read(&mut out));
         match result {
             Ok(n) => reply.data(&out[..n]),
             Err(error) => {
                 log::error!("virtual CAS decode failed: {error}");
-                reply.error(libc::EIO);
+                reply.error(Errno::EIO);
             }
         }
     }
 
     fn release(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.handles.remove(&fh);
+        let Ok(mut handles) = self.handles.lock() else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        handles.readers.remove(&fh);
         reply.ok();
     }
 }
@@ -372,15 +412,13 @@ impl ReadOnlyView {
             .tempdir_in(parent)?;
         let mountpoint = directory.path().join("root");
         fs::create_dir(&mountpoint)?;
-        let mut session = Session::new(
-            filesystem,
-            &mountpoint,
-            &[
-                MountOption::RO,
-                MountOption::DefaultPermissions,
-                MountOption::FSName("sccache-native-cas".into()),
-            ],
-        )?;
+        let mut config = Config::default();
+        config.mount_options = vec![
+            MountOption::RO,
+            MountOption::DefaultPermissions,
+            MountOption::FSName("sccache-native-cas".into()),
+        ];
+        let mut session = Session::new(filesystem, &mountpoint, &config)?;
         let unmount = session.unmount_callable();
         let thread = thread::spawn(move || session.run());
         Ok(Self::Fuse {

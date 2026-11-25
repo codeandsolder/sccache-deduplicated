@@ -2634,6 +2634,7 @@ mod scheduler_tests {
                 },
                 mounts: BTreeMap::new(),
                 command: CommandSpec {
+                    umask: 0o022,
                     executable: BuildPath::new(b"/bin/tool".to_vec())?,
                     arguments: Vec::new(),
                     cwd: BuildPath::new(b"/".to_vec())?,
@@ -4158,6 +4159,7 @@ mod server_upload_tests {
             &requester,
             JobId(999),
             CompileCommand {
+                umask: Some(0o022),
                 executable: "cc".to_owned(),
                 arguments: Vec::new(),
                 env_vars: Vec::new(),
@@ -4195,6 +4197,7 @@ mod server_upload_tests {
             &RejectStartRequester,
             job_id,
             CompileCommand {
+                umask: Some(0o022),
                 executable: "cc".to_owned(),
                 arguments: Vec::new(),
                 env_vars: Vec::new(),
