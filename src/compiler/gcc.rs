@@ -16,12 +16,12 @@ use crate::compiler::args::{
     ArgDisposition, ArgInfo, ArgToStringResult, ArgsIter, Argument, FromArg, IntoArg,
     NormalizedDisposition, PathTransformerFn, SearchableArgInfo,
 };
-#[cfg(feature = "dist-client")]
-use crate::compiler::c::is_native_codegen_arg;
 use crate::compiler::c::{
     ArtifactDescriptor, CCompileCommands, CCompileContext, CCompilerImpl, CCompilerKind,
-    CPreprocessContext, ParsedArguments, assembler_include_dirs,
+    CPreprocessContext, ParsedArguments,
 };
+#[cfg(feature = "dist-client")]
+use crate::compiler::c::{assembler_include_dirs, is_native_codegen_arg};
 use crate::compiler::response_files::ResponseFileExpansion;
 use crate::compiler::{
     Cacheable, ColorMode, CompilerArguments, Language, SingleCompileCommand, clang,

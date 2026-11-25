@@ -299,9 +299,9 @@ pub(super) fn serve_peer_blob(
     let Ok(blob) = metadata::<BlobRef>(request, 40) else {
         return Ok(Response::empty_400());
     };
-    let authorized = super::bearer_http_auth(request)
+    let permitted = super::bearer_http_auth(request)
         .is_some_and(|token| authorizer.verify_blob_token(blob, recipient, token).is_ok());
-    if !authorized {
+    if !permitted {
         return Ok(Response::text("invalid peer capability").with_status_code(401));
     }
     match open(blob)? {

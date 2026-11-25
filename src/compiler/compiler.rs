@@ -66,7 +66,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tempfile::TempDir;
 
-use crate::errors::{Context, Error, HttpClientError, ProcessError, Result, anyhow, bail};
+#[cfg(feature = "dist-client")]
+use crate::errors::HttpClientError;
+#[cfg(any(feature = "dist-client", test))]
+use crate::errors::anyhow;
+use crate::errors::{Context, Error, ProcessError, Result, bail};
 
 /// Can dylibs (shared libraries or proc macros) be distributed on this platform?
 #[cfg(all(

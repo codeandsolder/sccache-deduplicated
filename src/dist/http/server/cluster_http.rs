@@ -348,7 +348,6 @@ impl Listener {
         })
     }
 
-    #[cfg(test)]
     pub(super) fn local_addr(&self) -> Result<SocketAddr> {
         Ok(self.socket.local_addr()?)
     }

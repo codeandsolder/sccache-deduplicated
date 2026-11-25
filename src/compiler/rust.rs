@@ -51,6 +51,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env::consts::DLL_EXTENSION;
 #[cfg(feature = "dist-client")]
 use std::env::consts::DLL_PREFIX;
+#[cfg(feature = "dist-client")]
 use std::env::consts::EXE_EXTENSION;
 #[cfg(feature = "dist-client")]
 use std::env::consts::EXE_SUFFIX;

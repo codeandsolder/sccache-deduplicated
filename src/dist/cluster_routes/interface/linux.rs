@@ -646,8 +646,10 @@ pub(in crate::dist) fn advertised_addresses(
         .iter()
         .filter_map(|(&ip, address)| {
             let socket = SocketAddr::new(ip, bind.port());
-            (socket != primary && (bind.is_ipv6() || ip.is_ipv4()) && RouteSet::eligible(socket))
-                .then_some((socket, address.name.as_str()))
+            (socket != primary
+                && (bind.is_ipv6() || socket.is_ipv4())
+                && RouteSet::eligible(socket))
+            .then_some((socket, address.name.as_str()))
         })
         .collect::<Vec<_>>();
     candidates.sort_unstable_by_key(|(socket, name)| (interface_priority(name), *name, *socket));
