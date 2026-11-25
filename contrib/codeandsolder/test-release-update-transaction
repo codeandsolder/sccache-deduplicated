@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# Run the real updater against private files, socket and service fixtures.
+set -euo pipefail
+here="$(cd -- "$(dirname -- "$0")" && pwd -P)"
+root="$(mktemp -d)"
+trap 'rm -rf -- "$root"' EXIT
+mkdir -p "$root"/{bin,state,etc,services,cache}
+cp /etc/{passwd,group,nsswitch.conf} "$root/etc/"
+cp "$here"/{sccache-release-update,host-native-metadata} "$root/"
+sha=2222222222222222222222222222222222222222
+old=1111111111111111111111111111111111111111
+tag=sccache-ci-$sha
+release="$root/cache/$tag"
+mkdir "$release"
+cat > "$release/sccache-linux-x86_64-v2" <<'MOCK'
+#!/bin/bash
+set -euo pipefail
+case "$1" in
+    --version) echo fixture ;;
+    --capabilities) echo direct-metrics ;;
+    --show-stats|cluster-status) echo '{}' ;;
+    *)
+        shift
+        crate= out=
+        while (( $# )); do
+            case "$1" in
+                --crate-name) crate=$2; shift ;;
+                --out-dir) out=$2; shift ;;
+            esac
+            shift
+        done
+        [[ -n "$crate" && -n "$out" ]]
+        printf 'fixture object\n' > "$out/lib${crate}.rlib"
+        ;;
+esac
+MOCK
+cp "$release/sccache-linux-x86_64-v2" "$release/sccache-dist-linux-x86_64-v2"
+chmod +x "$release/"sccache*
+cp "$release/sccache-linux-x86_64-v2" "$root/live"
+cp "$release/sccache-dist-linux-x86_64-v2" "$root/dist"
+printf '\n# old client\n' >> "$root/live"
+printf '\n# old worker\n' >> "$root/dist"
+cp "$root/live" "$root/old-live"
+cp "$root/dist" "$root/old-dist"
+cat > "$release/build.txt" <<EOF
+source_sha=$sha
+rust_toolchain=nightly-2026-11-20
+rustflags=-C target-cpu=x86-64-v2
+features=s3,dist-client,dist-server,direct-metrics
+dist_protocol=5
+rollout_epoch=6
+capabilities=direct-metrics
+EOF
+(cd "$release"; sha256sum sccache-linux-x86_64-v2 sccache-dist-linux-x86_64-v2 build.txt > SHA256SUMS)
+# Produce the initial complete receipt through the same publisher.
+mkdir "$root/old"
+sed "s/^source_sha=.*/source_sha=$old/" "$release/build.txt" > "$root/old/build.txt"
+cp "$release/SHA256SUMS" "$root/old/"
+"$root/host-native-metadata" state-publish "$root/state" "$root/old" "sccache-ci-$old" 2026-11-20T00:00:00Z \
+    "$(sha256sum "$root/live" | cut -d' ' -f1)" "$(sha256sum "$root/dist" | cut -d' ' -f1)"
+cp "$root/state/release.json" "$root/old-state"
+cat > "$root/bin/curl" <<'MOCK'
+#!/bin/bash
+case "${*: -1}" in
+    */releases/tags/*) echo '{"published_at":"2026-11-25T00:00:00Z"}' ;;
+    */compare/*) echo '{"status":"ahead"}' ;;
+    *) exit 1 ;;
+esac
+MOCK
+cat > "$root/bin/systemctl" <<'MOCK'
+#!/bin/bash
+set -euo pipefail
+root="$(dirname "$(dirname "$0")")"
+case "$1" in
+    is-active) [[ -f "$root/services/${!#}" ]] ;;
+    stop|start)
+        echo "$1 $2" >> "$root/service-log"
+        if [[ "$1" == stop && "$2" == sccache-dist-worker.service && -f "$root/fail-stop" ]]; then
+            rm "$root/fail-stop"
+            exit 1
+        fi
+        if [[ "$1" == start ]]; then touch "$root/services/$2"; else rm -f "$root/services/$2"; fi
+        ;;
+    show)
+        case "$*" in
+            *' User '*) echo root ;;
+            *' Group '*) echo root ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    *) exit 1 ;;
+esac
+MOCK
+cat > "$root/bin/sync" <<'MOCK'
+#!/bin/bash
+set -euo pipefail
+root="$(dirname "$(dirname "$0")")"
+if [[ "$*" == "$root/state" && -f "$root/fail-state" ]]; then
+    # The new receipt has already replaced the old one. Force the parent
+    # updater to restore both binaries and the previous complete receipt.
+    jq -e '.source_sha == "2222222222222222222222222222222222222222"' "$root/state/release.json" >/dev/null
+    rm "$root/fail-state"
+    touch "$root/published-before-failure"
+    exit 1
+fi
+exec /usr/bin/sync "$@"
+MOCK
+chmod +x "$root/bin/"*
+bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --unshare-net --die-with-parent \
+    --ro-bind / / --proc /proc --dev /dev --bind "$root" "$root" \
+    --ro-bind "$root/etc" /etc \
+    /bin/bash -s -- "$root" "$tag" "$sha" <<'INNER'
+set -euo pipefail
+root=$1 tag=$2 sha=$3
+export PATH="$root/bin:/usr/bin:/bin"
+export SCCACHE_AUTOUPDATE_STATE_DIR="$root/state" SCCACHE_AUTOUPDATE_CACHE_DIR="$root/cache"
+export SCCACHE_AUTOUPDATE_TAG="$tag" SCCACHE_AUTOUPDATE_LIVE="$root/live" SCCACHE_AUTOUPDATE_DIST_LIVE="$root/dist"
+export SCCACHE_AUTOUPDATE_LOCK="$root/lock" SCCACHE_AUTOUPDATE_DRAIN="$root/drain"
+export SCCACHE_AUTOUPDATE_CLIENT_UDS="$root/client.sock" SCCACHE_AUTOUPDATE_SMOKE_RUSTC=/bin/true
+export SCCACHE_AUTOUPDATE_VERIFY_METRICS=0 SCCACHE_AUTOUPDATE_VERIFY_DIST_SMOKE=0
+export SCCACHE_AUTOUPDATE_EXPECTED_ROLLOUT_EPOCH=6 SCCACHE_AUTOUPDATE_NATIVE_BUNDLE_ROOT=""
+touch "$root/services/sccache-local.service" "$root/services/sccache-dist-worker.service"
+socat UNIX-LISTEN:"$root/client.sock",fork EXEC:/bin/true &
+listener=$!
+trap 'kill "$listener" 2>/dev/null || true' EXIT
+for ((i=0;i<100;i++)); do [[ -S "$root/client.sock" ]] && break; sleep .05; done
+[[ -S "$root/client.sock" ]]
+updater="$root/sccache-release-update"
+unchanged() {
+    cmp "$root/live" "$root/old-live"
+    cmp "$root/dist" "$root/old-dist"
+    cmp "$root/state/release.json" "$root/old-state"
+    [[ -f "$root/services/sccache-local.service" && -f "$root/services/sccache-dist-worker.service" ]]
+}
+touch "$root/drain"
+if "$updater" > "$root/preexisting-drain.log" 2>&1; then exit 1; fi
+unchanged
+[[ -f "$root/drain" && ! -e "$root/service-log" ]]
+rm "$root/drain"
+client_inode=$(stat -c %i "$root/live")
+dist_inode=$(stat -c %i "$root/dist")
+touch "$root/fail-stop"
+if "$updater" > "$root/early-failure.log" 2>&1; then exit 1; fi
+unchanged
+[[ $(stat -c %i "$root/live") == "$client_inode" && $(stat -c %i "$root/dist") == "$dist_inode" ]]
+! rg -q 'sccache-local.service' "$root/service-log"
+[[ ! -e "$root/drain" ]]
+echo 'Early worker failure leaves client and both executable inodes untouched'
+
+touch "$root/fail-state"
+if "$updater" > "$root/late-failure.log" 2>&1; then exit 1; fi
+[[ -f "$root/published-before-failure" ]]
+unchanged
+[[ ! -e "$root/drain" && ! -e "$root/live.new" && ! -e "$root/dist.new" ]]
+[[ -z $(find "$root/state" -maxdepth 1 -name '.release*' -print -quit) ]]
+echo 'Failure after metadata rename rolls back the whole accepted generation'
+
+"$updater" > "$root/success.log" 2>&1
+jq -e --arg sha "$sha" --arg client "$(sha256sum "$root/live" | cut -d' ' -f1)" \
+    --arg dist "$(sha256sum "$root/dist" | cut -d' ' -f1)" \
+    '.schema == 1 and .source_sha == $sha and .binary_sha256 == $client and .dist_binary_sha256 == $dist and .dist_protocol == "5" and (.checksums | length > 0)' \
+    "$root/state/release.json" >/dev/null
+[[ ! -e "$root/drain" ]]
+echo 'Successful update publishes exactly one matching receipt'
+INNER

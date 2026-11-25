@@ -243,6 +243,16 @@ route measurements rather than assuming advertised addresses are usable.
 After the coordinated change, measure throughput, cache reuse, transfer bytes
 and failure recovery under actual load.
 
+The epoch-6 commit publishes the complete installed release receipt atomically
+as `/var/lib/sccache-autoupdate/release.json` (schema 1). The receipt contains
+both executable digests, protocol, source revision, release metadata and the
+complete checksum manifest. Use this single record for operational checks
+(e.g. `jq -r .source_sha /var/lib/sccache-autoupdate/release.json`).
+The old flat metadata is removed only during the coordinated commit; the
+pre-cutover snapshot retains it for protocol-3 rollback. Subsequent
+same-protocol updates save the previous receipt with the executable backups
+and restore it if any part of activation fails.
+
 ### Rollback
 
 If any activation or smoke phase fails, stop advancing. For hosts that have

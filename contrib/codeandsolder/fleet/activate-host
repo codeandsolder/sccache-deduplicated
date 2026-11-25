@@ -193,6 +193,7 @@ case "$phase" in
     [[ ! -f sccache-cmake-launcher ]] || files+=(/usr/local/libexec/sccache-cmake-launcher)
     [[ ! -f sccache-dist-client-preflight ]] || files+=(/usr/local/libexec/sccache-dist-client-preflight)
     for f in "${state_files[@]}"; do files+=("$state/$f"); done
+    files+=("$state/release.json")
     for f in "${files[@]}"; do snapshot_file "$f"; done
     printf '%s\n' "$sha" > "$rollback/release-sha"
     trap - EXIT
@@ -351,22 +352,17 @@ case "$phase" in
       assert_updaters_paused
       systemctl disable "$watchdog_timer"
     fi
-    tag=sccache-ci-$sha
-    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    for f in client_release_tag dist_release_tag release_tag; do printf '%s\n' "$tag" > "$state/$f"; done
-    for f in client_source_sha dist_source_sha source_sha; do printf '%s\n' "$sha" > "$state/$f"; done
-    for f in binary_sha256 client_sha256; do printf '%s\n' "$local_hash" > "$state/$f"; done
-    for f in dist_binary_sha256 dist_sha256; do printf '%s\n' "$dist_hash" > "$state/$f"; done
-    for f in client_updated_at dist_updated_at updated_at; do printf '%s\n' "$now" > "$state/$f"; done
-    printf '5\n' > "$state/dist_protocol"
-    cp "$stage/published-at.txt" "$state/published_at"
-    cp "$bundle/build.txt" "$bundle/SHA256SUMS" "$state/"
+    "$stage/host-native-metadata" state-publish "$state" "$bundle" "sccache-ci-$sha" \
+      "$(cat "$stage/published-at.txt")" "$local_hash" "$dist_hash"
+    # The old flat protocol-3 state is captured in the rollback snapshot.
+    # Do not keep two authoritative release states after the migration.
+    for f in "${state_files[@]}"; do rm -f -- "$state/$f"; done
     echo "committed $role $sha"
     ;;
   open-clients)
     # All hosts must have committed before the operator opens this barrier.
     # Keep the updater-specific guard during full production acceptance.
-    [[ $(cat "$state/source_sha") == "$sha" && $(cat "$state/dist_protocol") == 5 ]]
+    jq -e --arg sha "$sha" ' .schema == 1 and .source_sha == $sha and .dist_protocol == "5" ' "$state/release.json" >/dev/null
     [[ $(cat "$rollback/smoke-ok") == "$sha" ]]
     assert_updaters_paused
     assert_bundle
@@ -374,7 +370,7 @@ case "$phase" in
     echo "clients admitted; automatic updates still held on $role"
     ;;
   resume-updates)
-    [[ $(cat "$state/source_sha") == "$sha" && $(cat "$state/dist_protocol") == 5 ]]
+    jq -e --arg sha "$sha" ' .schema == 1 and .source_sha == $sha and .dist_protocol == "5" ' "$state/release.json" >/dev/null
     [[ -f "$guard" && ! -e "$drain" && ! -e "$client_guard" ]]
     resume_updaters
     if systemctl is-enabled --quiet sccache-release-update.timer; then systemctl start sccache-release-update.timer; fi

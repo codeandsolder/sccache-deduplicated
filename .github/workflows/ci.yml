@@ -106,10 +106,11 @@ jobs:
       - name: Validate managed host scripts
         run: |
           bash -n contrib/codeandsolder/sccache-release-update contrib/codeandsolder/cargo-wrapper contrib/codeandsolder/rustup-wrapper contrib/codeandsolder/test-wrappers
-          shellcheck -x contrib/codeandsolder/sccache-release-update contrib/codeandsolder/cargo-wrapper contrib/codeandsolder/rustup-wrapper contrib/codeandsolder/test-wrappers contrib/codeandsolder/build-host-native contrib/codeandsolder/host-native-metadata contrib/codeandsolder/test-host-native-metadata contrib/codeandsolder/test-release-update-plan
+          shellcheck -x contrib/codeandsolder/sccache-release-update contrib/codeandsolder/cargo-wrapper contrib/codeandsolder/rustup-wrapper contrib/codeandsolder/test-wrappers contrib/codeandsolder/build-host-native contrib/codeandsolder/host-native-metadata contrib/codeandsolder/test-host-native-metadata contrib/codeandsolder/test-release-update-plan contrib/codeandsolder/test-release-update-transaction
           shellcheck -x contrib/codeandsolder/sccache-dist-client-preflight contrib/codeandsolder/test-dist-client-preflight
           contrib/codeandsolder/test-dist-client-preflight
           contrib/codeandsolder/test-release-update-plan
+          sudo contrib/codeandsolder/test-release-update-transaction
           shellcheck -x contrib/codeandsolder/sccache-client contrib/codeandsolder/sccache-cmake-launcher contrib/codeandsolder/test-sccache-router
           contrib/codeandsolder/test-wrappers
           contrib/codeandsolder/test-sccache-router
