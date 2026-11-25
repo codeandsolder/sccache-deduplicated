@@ -281,7 +281,7 @@ home=$(getent passwd "$user" | cut -d: -f6)
 for base in "$home/.rustup/toolchains" /root/.rustup/toolchains /opt/toolchains/rustup/toolchains /var/lib/sccache-native-builder/rustup/toolchains; do
   for channel in nightly-2026-11-20 nightly-2026-11-22 1.99.0; do
     root="$base/$channel-x86_64-unknown-linux-gnu"
-    [[ -f "$root/lib/rustlib/rustup-config.toml" ]] || continue
+    [[ -f "$root/lib/rustlib/multirust-config.toml" ]] || continue
     root=$(realpath -e "$root")
     id=$(printf '%s' "$root" | sha256sum | cut -c1-24)
     printf '%s\t%s\n' "$root" "$catalog_dir/$id.catalog" >> "$stage/rust-installations.tsv"
