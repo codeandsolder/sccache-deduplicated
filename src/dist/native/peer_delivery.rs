@@ -253,7 +253,7 @@ impl<'a> ResultDelivery<'a> {
             obtained: Instant::now(),
             publication_deadline,
             delivered: std::collections::BTreeSet::new(),
-            observation: Default::default(),
+            observation: crate::build_runtime::wire::ClientDeliveryObservation::default(),
         }
     }
 
