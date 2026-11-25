@@ -106,6 +106,7 @@ impl Feed {
             return None;
         }
         *count += 1;
+        drop(count);
         Some(Lease(Arc::clone(self)))
     }
 
@@ -195,17 +196,19 @@ impl MetricsService {
                 view,
                 ..Default::default()
             };
-            return match serde_json::to_string(&MetricsEvent::Reset(data)) {
-                Ok(payload) => Sse::new(
-                    stream::once(
-                        async move { Ok::<_, Infallible>(super::broadcast::event(payload)) },
+            return serde_json::to_string(&MetricsEvent::Reset(data)).map_or_else(
+                |_| StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                |payload| {
+                    Sse::new(
+                        stream::once(async move {
+                            Ok::<_, Infallible>(super::broadcast::event(payload))
+                        })
+                        .chain(stream::pending()),
                     )
-                    .chain(stream::pending()),
-                )
-                .keep_alive(KeepAlive::default())
-                .into_response(),
-                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-            };
+                    .keep_alive(KeepAlive::default())
+                    .into_response()
+                },
+            );
         };
         let (feed, subscriber) = {
             let mut feeds = self
@@ -219,6 +222,7 @@ impl MetricsService {
                     Some((feed, lease))
                 })
             {
+                drop(feeds);
                 (feed, subscription)
             } else {
                 feeds.remove(&view);
@@ -232,6 +236,7 @@ impl MetricsService {
                 let feed = Arc::new(Feed::new(view.clone()));
                 let subscription = Lease(Arc::clone(&feed));
                 feeds.insert(view.clone(), Arc::downgrade(&feed));
+                drop(feeds);
                 let (source, task_feed) = (Arc::clone(source), Arc::clone(&feed));
                 tokio::spawn(async move {
                     let mut stopped = task_feed.stopped.subscribe();
@@ -375,7 +380,7 @@ async fn query(
                 "invalid metric timestamp"
             );
             points.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-            points.dedup_by(|a, b| a.0 == b.0);
+            points.dedup_by(|a, b| a.0.total_cmp(&b.0).is_eq());
             Ok(MetricSeries {
                 key: format!("{index}:{}", serde_json::to_string(&series.metric)?),
                 label: series_label(&series.metric, &definition.legend),
@@ -424,9 +429,10 @@ fn merge_window(
     for mut series in previous {
         // A successful query is authoritative for its entire interval,
         // including absent points and disappeared series.
-        series
-            .points
-            .retain(|(time, _)| *time >= window.retain_from as f64 && *time < window.start as f64);
+        series.points.retain(|(time, _)| {
+            *time >= timestamp_seconds(window.retain_from)
+                && *time < timestamp_seconds(window.start)
+        });
         if !series.points.is_empty() {
             merged.insert(series.key.clone(), series);
         }
@@ -493,7 +499,8 @@ async fn read_panel(
                     .series
                     .extend(previous.into_iter().filter_map(|mut series| {
                         series.points.retain(|(time, _)| {
-                            *time >= window.retain_from as f64 && *time <= window.end as f64
+                            *time >= timestamp_seconds(window.retain_from)
+                                && *time <= timestamp_seconds(window.end)
                         });
                         (!series.points.is_empty()).then_some(series)
                     }));
@@ -701,4 +708,13 @@ mod tests {
         }));
         Ok(())
     }
+}
+
+// Unix epoch seconds fit exactly in f64 throughout the supported clock range.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "metric query timestamps are Unix seconds, not arbitrary large counters"
+)]
+const fn timestamp_seconds(seconds: u64) -> f64 {
+    seconds as f64
 }

@@ -1,10 +1,20 @@
 #![expect(
-    clippy::empty_enum,
+    clippy::empty_enums,
     reason = "Leptos component macros generate uninhabited prop-state enums"
 )]
-#![expect(
-    clippy::unused_async,
-    reason = "Leptos server-function macro requires an async RPC signature"
+#![cfg_attr(
+    feature = "ssr",
+    expect(
+        clippy::unused_async,
+        reason = "Leptos server-function macro requires an async RPC signature"
+    )
+)]
+#![cfg_attr(
+    not(feature = "ssr"),
+    expect(
+        clippy::unused_async_trait_impl,
+        reason = "Leptos client RPC macro generates the async trait method"
+    )
 )]
 use leptos::prelude::*;
 #[cfg(feature = "ssr")]
@@ -18,6 +28,25 @@ mod native;
 #[cfg(target_arch = "wasm32")]
 mod sse;
 mod topology;
+
+fn keyed_index<T: Clone + PartialEq + Send + Sync + 'static>(
+    rows: Memo<Vec<T>>,
+    key: fn(&T) -> &String,
+) -> Memo<std::collections::BTreeMap<String, T>> {
+    Memo::new(move |_| {
+        rows.with(|rows| {
+            rows.iter()
+                .map(|row| (key(row).clone(), row.clone()))
+                .collect()
+        })
+    })
+}
+
+fn index_keys<T: Clone + PartialEq + Send + Sync + 'static>(
+    index: Memo<std::collections::BTreeMap<String, T>>,
+) -> Memo<Vec<String>> {
+    Memo::new(move |_| index.with(|rows| rows.keys().cloned().collect()))
+}
 
 #[server(endpoint = "snapshot")]
 async fn snapshot() -> Result<DashboardData, ServerFnError> {

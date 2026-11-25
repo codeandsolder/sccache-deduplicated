@@ -5,7 +5,6 @@ use crate::{
     styles,
 };
 use leptos::prelude::*;
-use std::collections::BTreeMap;
 
 #[component]
 pub(super) fn NativeStatus(data: Memo<Option<DashboardData>>) -> impl IntoView {
@@ -177,16 +176,8 @@ fn NetworkPanel(telemetry: Memo<Option<NativeTelemetry>>) -> impl IntoView {
 
 #[component]
 fn WorkerTable(workers: Memo<Vec<Worker>>, sampled_at: Memo<Option<u64>>) -> impl IntoView {
-    let indexed = Memo::new(move |_| {
-        workers.with(|workers| {
-            workers
-                .iter()
-                .map(|worker| (worker.id.clone(), worker.clone()))
-                .collect::<BTreeMap<_, _>>()
-        })
-    });
-    let keys =
-        Memo::new(move |_| indexed.with(|workers| workers.keys().cloned().collect::<Vec<_>>()));
+    let indexed = super::keyed_index(workers, |worker| &worker.id);
+    let keys = super::index_keys(indexed);
     view! {
         <section id="workers"><h2>"Workers"</h2>
             <div class=styles::tablewrap><table><thead><tr>
@@ -237,13 +228,7 @@ const PAGE_SIZE: usize = 100;
 fn JobTable(jobs: Memo<Vec<Job>>, sampled_at: Memo<Option<u64>>) -> impl IntoView {
     let filter = RwSignal::new(String::new());
     let page = RwSignal::new(0_usize);
-    let indexed = Memo::new(move |_| {
-        jobs.with(|jobs| {
-            jobs.iter()
-                .map(|job| (job.id.clone(), job.clone()))
-                .collect::<BTreeMap<_, _>>()
-        })
-    });
+    let indexed = super::keyed_index(jobs, |job| &job.id);
     let matching = Memo::new(move |_| {
         let filter = filter.get().to_lowercase();
         jobs.with(|jobs| {
@@ -303,33 +288,32 @@ fn JobCells(job: Job, sampled_at: Memo<Option<u64>>) -> impl IntoView {
 
 #[component]
 fn SpaceStatus(space: CacheSpace, live: Option<u64>) -> impl IntoView {
-    let physical_headroom =
-        space
-            .min_available_bytes
-            .zip(space.reserved_bytes)
-            .map(|(minimum, reserved)| {
-                space
-                    .available_bytes
-                    .saturating_sub(minimum)
-                    .saturating_sub(reserved)
-            });
+    let physical_headroom = space
+        .min_available
+        .zip(space.reserved)
+        .map(|(minimum, reserved)| {
+            space
+                .available
+                .saturating_sub(minimum)
+                .saturating_sub(reserved)
+        });
     let resident_headroom = space
-        .max_resident_bytes
+        .max_resident
         .zip(live)
-        .zip(space.reserved_bytes)
+        .zip(space.reserved)
         .map(|((maximum, live), reserved)| maximum.saturating_sub(live).saturating_sub(reserved));
     let fmt = |value: Option<u64>| value.map_or_else(|| "—".into(), bytes);
     view! {
         <div class=styles::stats>
-            <Stat label="Filesystem free" value=bytes(space.available_bytes)/>
-            <Stat label="Free minimum / target" value=format!("{} / {}",fmt(space.min_available_bytes),fmt(space.target_available_bytes))/>
-            <Stat label="Staging reserved" value=fmt(space.reserved_bytes)/>
-            <Stat label="Resident logical / limit" value=format!("{} / {}",fmt(live),fmt(space.max_resident_bytes))/>
-            <Stat label="Resident target" value=fmt(space.target_resident_bytes)/>
+            <Stat label="Filesystem free" value=bytes(space.available)/>
+            <Stat label="Free minimum / target" value=format!("{} / {}",fmt(space.min_available),fmt(space.target_available))/>
+            <Stat label="Staging reserved" value=fmt(space.reserved)/>
+            <Stat label="Resident logical / limit" value=format!("{} / {}",fmt(live),fmt(space.max_resident))/>
+            <Stat label="Resident target" value=fmt(space.target_resident)/>
             <Stat label="Physical headroom estimate" value=fmt(physical_headroom)/>
             <Stat label="Resident headroom estimate" value=fmt(resident_headroom)/>
         </div>
-        {(space.min_available_bytes.is_some() && space.reserved_bytes.is_none()).then(||view!{<p class=styles::muted>"Space admission or reclamation in progress; reservation observation unavailable."</p>})}
+        {(space.min_available.is_some() && space.reserved.is_none()).then(||view!{<p class=styles::muted>"Space admission or reclamation in progress; reservation observation unavailable."</p>})}
         <p class=styles::muted>"Physical filesystem free space and uncompressed resident bytes are different quantities. Headroom estimates exclude prospective reclamation."</p>
     }
 }

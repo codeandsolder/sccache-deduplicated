@@ -57,6 +57,7 @@ impl<T: Serialize> Feed<T> {
             state.reset = None;
             let _ = self.changes.send(payload);
         }
+        drop(state);
         Ok(())
     }
 
@@ -66,14 +67,14 @@ impl<T: Serialize> Feed<T> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let receiver = self.changes.subscribe();
-        let reset = match &state.reset {
-            Some(reset) => Arc::clone(reset),
-            None => {
-                let reset: Arc<str> = serde_json::to_string(&Reset::Reset(&state.data))?.into();
-                state.reset = Some(Arc::clone(&reset));
-                reset
-            }
+        let reset = if let Some(reset) = &state.reset {
+            Arc::clone(reset)
+        } else {
+            let reset: Arc<str> = serde_json::to_string(&Reset::Reset(&state.data))?.into();
+            state.reset = Some(Arc::clone(&reset));
+            reset
         };
+        drop(state);
         Ok((reset, receiver))
     }
 }

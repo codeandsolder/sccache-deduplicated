@@ -36,12 +36,12 @@ fn service(status: SessionStatus) -> NativeService {
 
 fn space(status: SpaceStatus) -> CacheSpace {
     CacheSpace {
-        available_bytes: status.available_bytes,
-        reserved_bytes: status.reserved_bytes,
-        min_available_bytes: status.policy.map(|policy| policy.min_available_bytes),
-        target_available_bytes: status.policy.map(|policy| policy.target_available_bytes),
-        max_resident_bytes: status.policy.map(|policy| policy.max_resident_bytes),
-        target_resident_bytes: status.policy.map(|policy| policy.target_resident_bytes),
+        available: status.available_bytes,
+        reserved: status.reserved_bytes,
+        min_available: status.policy.map(|policy| policy.min_available_bytes),
+        target_available: status.policy.map(|policy| policy.target_available_bytes),
+        max_resident: status.policy.map(|policy| policy.max_resident_bytes),
+        target_resident: status.policy.map(|policy| policy.target_resident_bytes),
     }
 }
 

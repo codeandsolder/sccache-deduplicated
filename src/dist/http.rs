@@ -1309,7 +1309,6 @@ mod server {
                 }};
             }
 
-            info!("Scheduler listening for clients on {}", public_addr);
             let request_count = atomic::AtomicUsize::new(0);
 
             let registry = Arc::clone(&enrollment);
@@ -1436,6 +1435,10 @@ mod server {
                     response
                 },
             )?;
+            info!(
+                "Scheduler listening for clients on {}",
+                server.local_addr()?
+            );
             server.run()?;
             Err(anyhow!("scheduler HTTPS listener terminated"))
         }

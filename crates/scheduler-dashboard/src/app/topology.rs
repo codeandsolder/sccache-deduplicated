@@ -55,7 +55,7 @@ fn layout(hosts: &[(String, HostRole)]) -> Layout {
     Layout { points, height }
 }
 
-fn role(role: HostRole) -> &'static str {
+const fn role(role: HostRole) -> &'static str {
     match role {
         HostRole::Scheduler => "Scheduler",
         HostRole::Worker => "Worker",
@@ -78,7 +78,7 @@ fn optional_rate(value: Option<u64>) -> String {
     value.map_or_else(|| "—".into(), rate)
 }
 
-fn evidence(value: RouteEvidence) -> &'static str {
+const fn evidence(value: RouteEvidence) -> &'static str {
     match value {
         RouteEvidence::Advertised => "Advertised · not measured",
         RouteEvidence::Measured => "Measured / observed",
@@ -194,7 +194,7 @@ fn GraphCanvas(
                     <For each=move || pair_keys.get() key=Clone::clone children=move |pair: Pair| {
                         let geometry = Memo::new({let pair=pair.clone();move |_| positions.with(|layout| layout.points.get(&pair.0).copied().zip(layout.points.get(&pair.1).copied()))});
                         let state = Memo::new({let pair=pair.clone();move |_| pairs.with(|pairs| pairs.get(&pair).cloned().unwrap_or_default())});
-                        let pair_select=pair.clone();
+                        let pair_select=pair;
                         let highlighted=move || selected.with(|id| id.is_empty() || *id==pair_select.0 || *id==pair_select.1);
                         view!{
                             <path class=move || if state.with(|s|s.active) {styles::topology_active} else if state.with(|s|s.measured) {styles::topology_measured} else {styles::topology_advertised}
@@ -209,7 +209,7 @@ fn GraphCanvas(
                         let host = Memo::new({let id=id.clone();move |_| hosts.with(|hosts|hosts.get(&id).cloned())});
                         let position = Memo::new({let id=id.clone();move |_| positions.with(|p|p.points.get(&id).copied())});
                         let node_id=id.clone();
-                        let click_id=id.clone();
+                        let click_id=id;
                         view!{
                             <g class=styles::topology_node transform=move ||position.with(|p|p.map_or_else(String::new,|p|format!("translate({},{})",p.x,p.y)))
                                 opacity=move ||selected.with(|id| if id.is_empty() || id==&node_id {"1"} else {"0.48"})
@@ -228,15 +228,8 @@ fn GraphCanvas(
 
 #[component]
 fn RouteTable(links: Memo<Vec<NetworkLink>>, hosts: Memo<Hosts>) -> impl IntoView {
-    let indexed = Memo::new(move |_| {
-        links.with(|links| {
-            links
-                .iter()
-                .map(|link| (link.id.clone(), link.clone()))
-                .collect::<BTreeMap<_, _>>()
-        })
-    });
-    let keys = Memo::new(move |_| indexed.with(|links| links.keys().cloned().collect::<Vec<_>>()));
+    let indexed = super::keyed_index(links, |link| &link.id);
+    let keys = super::index_keys(indexed);
     view! {
         <h3>"Directional routes"</h3>
         <div class=styles::tablewrap><table><thead><tr><th>"Source"</th><th>"Destination"</th><th>"Evidence"</th><th>"Wire service"</th><th>"Logical service"</th><th>"Outstanding"</th></tr></thead>
@@ -288,7 +281,7 @@ fn edge_path(a: Point, b: Point) -> String {
     let sign = if b.x > a.x { 1 } else { -1 };
     let start = a.x + 128 * sign;
     let end = b.x - 128 * sign;
-    let middle = (start + end) / 2;
+    let middle = i32::midpoint(start, end);
     let bend = 12 * sign;
     format!(
         "M {start} {} C {middle} {}, {middle} {}, {end} {}",

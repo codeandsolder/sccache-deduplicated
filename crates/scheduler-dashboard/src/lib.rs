@@ -181,12 +181,12 @@ pub struct Snapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheSpace {
-    pub available_bytes: u64,
-    pub reserved_bytes: Option<u64>,
-    pub min_available_bytes: Option<u64>,
-    pub target_available_bytes: Option<u64>,
-    pub max_resident_bytes: Option<u64>,
-    pub target_resident_bytes: Option<u64>,
+    pub available: u64,
+    pub reserved: Option<u64>,
+    pub min_available: Option<u64>,
+    pub target_available: Option<u64>,
+    pub max_resident: Option<u64>,
+    pub target_resident: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

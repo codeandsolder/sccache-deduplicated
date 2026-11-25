@@ -150,7 +150,7 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("scheduler-dashboard-sampler".into())
         .spawn(move || {
-            sample_loop(status_state, snapshot, telemetry, wake);
+            sample_loop(&status_state, snapshot, telemetry, &wake);
         })?;
     let router = router(state, metrics, assets);
     std::thread::Builder::new()
@@ -172,10 +172,10 @@ pub fn spawn(
 }
 
 fn sample_loop(
-    state: DashboardState,
+    state: &DashboardState,
     snapshot: impl Fn() -> Result<Snapshot>,
     telemetry: impl Fn() -> Option<NativeTelemetry>,
-    wake: std::sync::mpsc::Receiver<()>,
+    wake: &std::sync::mpsc::Receiver<()>,
 ) {
     use std::time::Instant;
     const HISTORY_INTERVAL: Duration = Duration::from_secs(2);
